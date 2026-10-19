@@ -42,7 +42,7 @@ static __device__ __forceinline__ void decode_block(unsigned block,
     const unsigned lane = threadIdx.x, g = lane >> 2, tig = lane & 3u;
     const unsigned group = queryHeads / keyHeads;
     const unsigned kh = block / splits, split = block % splits;
-    const unsigned span = (cacheLength + splits - 1) / splits;
+    const unsigned span = (cacheLength + splits * 16u - 1) / (splits * 16u) * 16u;  // gqa_decode::split_span
     const unsigned begin = split * span, end = min(cacheLength, begin + span);
     __shared__ __align__(16) __half kbuf[KT * STRIDE], vbuf[KT * STRIDE];
     __shared__ __align__(16) __half pbuf[2][8 * 24];  // P^T source: [query][key], hi and lo, padded rows

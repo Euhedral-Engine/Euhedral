@@ -25,6 +25,11 @@ using namespace nvfp4pipe;
 constexpr int D = 256, KT = 16, STRIDE = D + 8, ROW = 144, TILE_BYTES = KT * ROW, kRing = 2;
 // mbarrier slots: scores full [0, 2), scores empty [2, 4), V full [4, 6), V empty [6, 8); 32 arrivals each.
 enum { kScoresFull = 0, kScoresEmpty = 2, kValuesFull = 4, kValuesEmpty = 6 };
+// Keys per split: whole 16-key tiles, so the split partition changes only when the length crosses a multiple of
+// splits x 16 keys and the rows of one verification step almost always share it (gqa_fused).
+static __device__ __forceinline__ unsigned split_span(unsigned length, unsigned splits) {
+    return (length + splits * KT - 1) / (splits * KT) * KT;
+}
 // Starts the copy of the raw 144-byte rows of the K tile at `base` (nine 16-byte chunks per token).
 static __device__ __forceinline__ void issue_keys(unsigned char* raw, const unsigned char* const* keyPages, unsigned base,
         unsigned end, unsigned head, unsigned heads, unsigned lane) {
@@ -81,6 +86,22 @@ template <> struct Format<Nvfp4Kv> {
             a[3] = half2_multiply(pairs[(codes1.y >> (8 * tig)) & 0xFFu], scale1);
         }
     };
+    // Keys reading each group's scale byte from the raw row per step instead of holding the row's scale words:
+    // the same fragments in fewer registers.
+    struct LightKeys {
+        const unsigned char* row0;
+        const unsigned char* row1;
+        __device__ __forceinline__ LightKeys(const unsigned char* first, const unsigned char* second) : row0(first), row1(second) {}
+        __device__ __forceinline__ void fragment(int k, unsigned tig, const unsigned* pairs, unsigned (&a)[4]) const {
+            const uint2 codes0 = *reinterpret_cast<const uint2*>(row0 + k * 8);
+            const uint2 codes1 = *reinterpret_cast<const uint2*>(row1 + k * 8);
+            const unsigned scale0 = scale_pair(row0[128 + k]), scale1 = scale_pair(row1[128 + k]);
+            a[0] = half2_multiply(pairs[(codes0.x >> (8 * tig)) & 0xFFu], scale0);
+            a[1] = half2_multiply(pairs[(codes1.x >> (8 * tig)) & 0xFFu], scale1);
+            a[2] = half2_multiply(pairs[(codes0.y >> (8 * tig)) & 0xFFu], scale0);
+            a[3] = half2_multiply(pairs[(codes1.y >> (8 * tig)) & 0xFFu], scale1);
+        }
+    };
     struct Values {
         uint2 codes[8];
         unsigned scales[8];
@@ -131,6 +152,7 @@ template <> struct Format<Bf16Kv> {
             a[3] = bf16kv::widen2(words1[4]);
         }
     };
+    typedef Keys LightKeys;
     struct Values {
         uint4 words[8][2];
         __device__ __forceinline__ void load(const unsigned char* const* valuePages, unsigned base, unsigned end,
@@ -165,7 +187,7 @@ static __device__ __forceinline__ void decode_block(unsigned block,
     const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u, g = lane >> 2, tig = lane & 3u;
     const unsigned group = queryHeads / keyHeads;
     const unsigned kh = block / splits, split = block % splits;
-    const unsigned span = (cacheLength + splits - 1) / splits;
+    const unsigned span = split_span(cacheLength, splits);
     const unsigned begin = split * span, end = min(cacheLength, begin + span);
     const unsigned tiles = begin < end ? (end - begin + KT - 1) / KT : 0;
     __shared__ __align__(16) __half vbuf[2][KT * STRIDE];            // expanded V tiles (warp 0 stages the queries here first)
@@ -314,6 +336,27 @@ static __device__ __forceinline__ void decode_block(unsigned block,
         }
     }
 }
+// The split count of one-row GQA decode over `length` keys.
+static __device__ __forceinline__ unsigned split_count(unsigned length) {
+    const unsigned splits = (length + 31u) / 32u;
+    return splits > 64u ? 64u : splits;
+}
+// The first verified row the fused kernel serves: rows from it on have at least `from` keys and the last row's split
+// count and span. `length` is row 0's key count. Returns `rows` when no row qualifies.
+static __device__ __forceinline__ unsigned first_fused_row(unsigned length, unsigned rows, unsigned from) {
+    const unsigned last = length + rows - 1u;
+    if (last < from) return rows;
+    const unsigned splits = split_count(last), span = split_span(last, splits);
+    unsigned first = rows - 1u;
+    while (first > 0) {
+        const unsigned previous = length + first - 1u;
+        if (previous < from) break;
+        const unsigned s = split_count(previous);
+        if (s != splits || split_span(previous, s) != span) break;
+        first--;
+    }
+    return first;
+}
 }  // namespace gqa_decode
 
 #define EUHEDRAL_ATTENTION_DECODE_GQA(name, Kv)                                                                \
@@ -333,16 +376,18 @@ EUHEDRAL_ATTENTION_DECODE_GQA(euhedral_attention_decode_gqa_bf16, Bf16Kv)
 
 // Row-exact multi-row twin for speculative verification: blockIdx.y is the verified row, which attends
 // the keys up to start + row exactly as the one-row launch above at that position would (same split
-// count and block partition); rows below `from` keys are left to the per-head decode twin. Each row
-// writes its own partials (rowStride floats apart). Grid: keyHeads * (largest split count) x rows.
+// count and block partition); rows below `from` keys are left to the per-head decode twin, and with `fused` set the rows
+// the fused kernel serves (gqa_decode::first_fused_row on) are left to it. Each row writes its own partials (rowStride
+// floats apart). Grid: keyHeads * (largest split count) x rows.
 #define EUHEDRAL_ATTENTION_DECODE_GQA_ROWS(name, Kv)                                                           \
     extern "C" __global__ __launch_bounds__(96) void name(const __nv_bfloat16* queryKey,                           \
             const unsigned char* const* keyPages, const unsigned char* const* valuePages, unsigned int queryHeads, \
             unsigned int keyHeads, const unsigned long long* position, float* partial,                             \
-            unsigned long long rowStride, unsigned int from) {                                                     \
+            unsigned long long rowStride, unsigned int from, unsigned int fused) {                                 \
         const unsigned row = blockIdx.y;                                                                           \
         const unsigned length = (unsigned)*position + row + 1u;                                                    \
         if (length < from) return;                                                                                 \
+        if (fused && row >= gqa_decode::first_fused_row((unsigned)*position + 1u, gridDim.y, from)) return;        \
         unsigned splits = (length + 31u) / 32u;                                                                    \
         if (splits > 64u) splits = 64u;                                                                            \
         if (blockIdx.x >= keyHeads * splits) return;                                                               \

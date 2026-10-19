@@ -52,7 +52,20 @@ static CUfunction attention_qk_norm_rope_rows;
 struct attention_kernels {
     CUfunction append, prefill, prefill_exact, prefill_fa2, decode, decode_exact, decode_gqa, merge;
     CUfunction decode_rows, decode_gqa_rows, merge_rows;
+    /* Fused verifier rows (NVFP4 caches only; NULL for BF16): fused[t - 2] serves t mma tiles of 8 query columns. */
+    CUfunction fused[5];
 };
+/* gqa_fused::Layout<tiles, Nvfp4Kv>::kBytes (native/src/attention/nvfp4_decode_gqa_fused.cuh): two FP16 V tiles, the
+ * scores and probabilities of each query tile, four raw K and V tiles, the pair table and the mbarriers. */
+static uint32_t fused_shared_bytes(uint32_t tiles) {
+    return 2u * 16u * 264u * 2u + tiles * 1024u + tiles * 768u + 2u * 4u * 16u * 144u + 1024u + 8u * (12u + 4u * tiles);
+}
+/* Fewest keys at which the fused verifier kernel is faster than the row twins, by verified rows (6 query heads per KV
+ * head, RTX 5070 Ti): rows that fill their 8-column mma tiles win from 2048 keys, the others only on longer caches. */
+static uint32_t fused_from(uint32_t rows) {
+    static const uint32_t from[9] = {UINT32_MAX, UINT32_MAX, 49152u, 16384u, 4096u, 2048u, 16384u, 16384u, 12288u};
+    return rows < 9u ? from[rows] : UINT32_MAX;
+}
 static struct attention_kernels nvfp4_attention, bf16_attention;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
@@ -87,6 +100,16 @@ static int load_attention_kernels(struct attention_kernels* kernels, const char*
     if (cuFuncSetAttribute(kernels->prefill_fa2, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)FA2_SHARED_BYTES)
             != CUDA_SUCCESS)
         return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    if (strcmp(format, "nvfp4") != 0) return CUDA_SUCCESS;
+    for (uint32_t tiles = 2; tiles <= 6; tiles++) {
+        char name[64];
+        snprintf(name, sizeof name, "euhedral_attention_decode_gqa_%s_fused%u", format, tiles);
+        int status = get_function(attention_module, &kernels->fused[tiles - 2], name);
+        if (status != CUDA_SUCCESS) return status;
+        if (cuFuncSetAttribute(kernels->fused[tiles - 2], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    (int)fused_shared_bytes(tiles)) != CUDA_SUCCESS)
+            return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    }
     return CUDA_SUCCESS;
 }
 
@@ -168,6 +191,8 @@ static void initialize(void) {
         euhedral_cuda_pdl_register(formats[index]->decode_rows);
         euhedral_cuda_pdl_register(formats[index]->decode_gqa_rows);
         euhedral_cuda_pdl_register(formats[index]->merge_rows);
+        for (int tiles = 0; tiles < 5; tiles++)
+            if (formats[index]->fused[tiles] != NULL) euhedral_cuda_pdl_register(formats[index]->fused[tiles]);
     }
 }
 
@@ -674,7 +699,18 @@ static int attention_causal(const struct attention_kernels* kernels, const void*
             if (last >= from) {
                 uint32_t splits = (last + 31u) / 32u;
                 if (splits > 64u) splits = 64u;
-                void* args[] = {&query_key, &keys, &values, &qh, &kh, &position, &scratch, &row_stride, &from_arg};
+                /* The fused kernel serves the rows that share the last row's split partition (all of them unless the
+                 * step crosses a multiple of 1024 keys); the twin takes the others. */
+                const uint32_t tiles = (rows * group + 7u) / 8u < 2u ? 2u : (rows * group + 7u) / 8u;
+                uint32_t fused = tiles <= 6u && kernels->fused[0] != NULL && last >= fused_from(rows) ? 1u : 0u;
+                if (fused) {
+                    uint32_t rows_arg = rows;
+                    void* args[] = {&query_key, &keys, &values, &qh, &kh, &position, &scratch, &row_stride, &rows_arg, &from_arg};
+                    status = launch_and_synchronize_shared(kernels->fused[tiles - 2u], key_heads * splits, 32u * (2u * tiles + 1u),
+                            fused_shared_bytes(tiles), args);
+                    if (status != 0) return status;
+                }
+                void* args[] = {&query_key, &keys, &values, &qh, &kh, &position, &scratch, &row_stride, &from_arg, &fused};
                 status = launch_and_synchronize_2d(kernels->decode_gqa_rows, key_heads * splits, rows, 96, args);
                 if (status != 0) return status;
             }
