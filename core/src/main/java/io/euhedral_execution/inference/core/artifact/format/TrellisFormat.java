@@ -473,8 +473,9 @@ public final class TrellisFormat implements LinearFormat {
                 requireScratch(activations);
                 long scratch = this.launch.scratch();
                 boolean wide = this.rows >= settings.wholeKWideRows();
-                // A verification's rows must equal one-row launches bit for bit: FP32 accumulation.
-                boolean half = settings.halfAccumulate() && !this.launch.rowExact();
+                // Other launches accumulate runs of k16 tiles in FP16; a verification's rows must equal one-row
+                // launches bit for bit, so it accumulates in FP32.
+                boolean half = !this.launch.rowExact();
                 prepass(scratch, half ? COLUMN_FP16 : FRAGMENT_FP16);
                 LinearKernel kernel = wide
                         ? (half ? LinearKernel.TRELLIS_MMA_ROWS64_HALF : LinearKernel.TRELLIS_MMA_ROWS64)
