@@ -54,6 +54,8 @@ class DiskReaderTest {
 
     private void open(boolean async, AsyncReads.Submitter submitter) throws Exception {
         if (async) assumeTrue(AsyncReads.available(), "the machine has no asynchronous reads");
+        if (async && submitter != AsyncReads.NATIVE_SUBMIT)
+            assumeTrue("io_uring".equals(AsyncReads.backend()), "only io_uring submissions can be replaced");
         this.contents = new byte[FILE_BYTES];
         for (int index = 0; index < FILE_BYTES; index++) this.contents[index] = (byte) (index * 31 + (index >>> 9));
         this.file = this.directory.resolve("artifact.edrl");

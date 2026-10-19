@@ -115,7 +115,7 @@ public final class FileRecordSource implements RecordSource {
         }
         if (this.closed.get()) throw new IllegalStateException("the record source is closed");
         long begin = System.nanoTime();
-        AsyncReads.readBlocking(this.fd, destination.address(), size, start);
+        this.async.readBlocking(this.fd, destination.address(), size, start);
         this.readNanos.add(System.nanoTime() - begin);
         this.reads.add(count);
         this.bytesRead.add(size);

@@ -173,7 +173,10 @@ public final class Execution implements AutoCloseable {
             throw new IllegalStateException("the artifact cannot be read for its disk-backed weights", failure);
         }
         this.asyncReads = reads;
-        if (reads != null) this.lake.attach(reads.getDelegate());
+        if (reads != null) {
+            LOG.info("Disk-backed weights are read asynchronously through {}", AsyncReads.backend());
+            this.lake.attach(reads.getDelegate());
+        }
         this.lake.attach(this.diskReader.getDelegate());
     }
 
@@ -191,7 +194,10 @@ public final class Execution implements AutoCloseable {
 
     /// The machine's asynchronous reads, or null: the disk reader then reads positionally on its poll.
     private static AsyncReads openAsyncReads() {
-        if (!AsyncReads.available()) return null;
+        if (!AsyncReads.available()) {
+            LOG.warn("disk-backed weights are read positionally: {}", AsyncReads.unavailableReason());
+            return null;
+        }
         try {
             return AsyncReads.open();
         } catch (RuntimeException unavailable) {
