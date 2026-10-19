@@ -66,7 +66,9 @@ class AsyncReadsTest {
     }
 
     private static AsyncReads open(AsyncReads.Submitter submitter) {
-        assumeTrue(AsyncReads.available(), "no io_uring on this machine");
+        assumeTrue(AsyncReads.available(), "no asynchronous reads on this machine");
+        if (submitter != AsyncReads.NATIVE_SUBMIT)
+            assumeTrue(AsyncReads.kind() == ReadBackend.Kind.IO_URING, "only io_uring submissions can be replaced");
         AsyncReads reads = AsyncReads.open(submitter);
         reads.getDelegate().addDownstream(new io.euhedral_execution.core.generics.LatticeReceiver() {
             @Override

@@ -35,10 +35,11 @@ import org.slf4j.LoggerFactory;
 /// Each quantum registers its disk uses at admission ([#enqueue]), in the order the device consumes them. Every
 /// window slot keeps its own queue of uses, in admission order and, within a quantum, in use order: the order its
 /// copies run on the device, which the staging ring's edges fix. A poll gives each slot whose flag the device lowered
-/// the next use of its queue: it submits the read ([AsyncReads], io_uring). The worker that reaps the read fails the
-/// use's quantum if the read failed, raises the flag, hands the slot to the use's copy ([#claim]) and marks the read
-/// ended, and the next poll takes the slot back; neither the device nor the poll waits for the read's completion
-/// frame. Without asynchronous reads the poll reads positionally itself, one slot at a time.
+/// the next use of its queue: it submits the read ([AsyncReads]: io_uring on Linux, I/O rings or a completion port
+/// on Windows). The worker that reaps the read fails the use's quantum if the read failed, raises the flag, hands the
+/// slot to the use's copy ([#claim]) and marks the read ended, and the next poll takes the slot back; neither the
+/// device nor the poll waits for the read's completion frame. Without asynchronous reads the poll reads positionally
+/// itself, one slot at a time.
 ///
 /// The device never waits for the host: a copy from the window is queued only once its read is in the slot
 /// ([#claim]), so every stream drains on its own, and a worker that a CUDA call holds while a stream is full is
@@ -376,8 +377,8 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         long length = use.lead() + use.byteSize();
         Source source = sourceOf(use.name());
         if (source.channel() == null) {
-            // io_uring is there but this thread cannot submit to it: a blocking read of the buffered descriptor.
-            AsyncReads.readBlocking(source.bufferedFd(), this.window.slotHost(slot), length, use.alignedOffset());
+            // Asynchronous reads are there but this thread cannot submit: a blocking read of the buffered file.
+            this.reads.readBlocking(source.bufferedFd(), this.window.slotHost(slot), length, use.alignedOffset());
             return;
         }
         ByteBuffer target = this.window.slotSegment(slot).asSlice(0, length).asByteBuffer();

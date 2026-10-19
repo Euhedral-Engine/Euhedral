@@ -178,8 +178,8 @@ public final class Qwen4Model implements AutoCloseable {
                     reads == null
                             ? "synchronously, through the page cache"
                             : artifactSource.direct()
-                                    ? "asynchronously, past the page cache"
-                                    : "asynchronously, through the page cache");
+                                    ? "asynchronously (" + AsyncReads.backend() + "), past the page cache"
+                                    : "asynchronously (" + AsyncReads.backend() + "), through the page cache");
             if (plan.expertStore() != ResidencyPlan.ExpertStoreMode.FILE_BACKED) {
                 // The tier is pinned when the machine can page-lock it beside the plan's other pinned memory: the
                 // device's copies then read a record from its slot, with no staging copy.
@@ -233,7 +233,10 @@ public final class Qwen4Model implements AutoCloseable {
 
     /// The machine's asynchronous reads, or null when it has none (they are then made on the workers).
     private static AsyncReads openAsyncReads() {
-        if (!AsyncReads.available()) return null;
+        if (!AsyncReads.available()) {
+            LOG.warn("expert records are read synchronously: {}", AsyncReads.unavailableReason());
+            return null;
+        }
         try {
             return AsyncReads.open();
         } catch (RuntimeException unavailable) {
