@@ -162,10 +162,10 @@ def project_files(repo: str, tag: str) -> dict[str, str]:
     return files
 
 
-def coding_domain(rng: random.Random, count: int, store: Path, excluded: set[str]) -> list[dict]:
+def coding_domain(rng: random.Random, count: int, store: Path, excluded: set[str], agent_tasks=AGENT_TASKS) -> list[dict]:
     agents = []
-    projects = [(repo, tag, project_files(repo, tag)) for repo, tag in PROJECTS]
-    for index, turns in enumerate(AGENT_TASKS):
+    projects = [(repo, tag, project_files(repo, tag)) for repo, tag in PROJECTS] if agent_tasks else []
+    for index, turns in enumerate(agent_tasks):
         repo, tag, files = projects[index % len(projects)]
         fixture = f"fixtures/cal-k-g{index + 1:02d}.json"
         tools = {t["function"]["name"]: {"builtin": t["function"]["name"]} for t in FILE_TOOLS}
@@ -233,8 +233,8 @@ def tool_domain(rng: random.Random, count: int, store: Path, excluded: set[str])
     return out
 
 
-def multilingual_domain(rng: random.Random, count: int, excluded: set[str]) -> list[dict]:
-    per_language = (count - len(CODE_SWITCHING)) // len(AYA_LANGUAGES)
+def multilingual_domain(rng: random.Random, count: int, excluded: set[str], written=CODE_SWITCHING) -> list[dict]:
+    per_language = (count - len(written)) // len(AYA_LANGUAGES)
     chosen: dict[str, list[str]] = {language: [] for language in AYA_LANGUAGES}
     languages = {code: language for language, code in AYA_LANGUAGES.items()}
     # Aya mixes some 65 languages: scan random pages until each of the five has its share.
@@ -254,7 +254,7 @@ def multilingual_domain(rng: random.Random, count: int, excluded: set[str]) -> l
     for language, texts in chosen.items():
         out.extend({"turns": [text], "language": language,
                     "source_url": "https://huggingface.co/datasets/CohereLabs/aya_dataset"} for text in texts)
-    out.extend({"turns": [text], "language": language, "source_url": None} for language, text in CODE_SWITCHING)
+    out.extend({"turns": [text], "language": language, "source_url": None} for language, text in written)
     return out
 
 
@@ -263,12 +263,24 @@ def held_out_texts(t4: Path) -> set[str]:
     return {m["content"].strip() for line in t4.open() for m in json.loads(line)["messages"] if m["role"] == "user"}
 
 
+def store_texts(store: Path) -> set[str]:
+    """The user turns of another store's conversations (the calibration set, the release test)."""
+    return {t.strip() for line in (store / "conversations.jsonl").open() if line.strip()
+            for t in json.loads(line)["turns"]}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("out", type=Path)
     parser.add_argument("--t4", type=Path, required=True, help="the T4 prompts JSONL (tools/holdout/t4_prompts.py)")
     parser.add_argument("--per-domain", type=int, default=40)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--exclude-store", type=Path, action="append", default=[],
+                        help="leave out every prompt of this store (repeatable)")
+    parser.add_argument("--no-written-prompts", action="store_true",
+                        help="leave out the prompts written here (coding-agent tasks, code-switching), which another store holds")
+    parser.add_argument("--prefix", default="cal", help="conversation ID prefix")
+    parser.add_argument("--drop", nargs="*", default=[], help="conversation IDs to leave out (flagged by t5.overlap)")
     args = parser.parse_args(argv)
     global CACHE
     rng = random.Random(args.seed)
@@ -276,25 +288,29 @@ def main(argv: list[str] | None = None) -> int:
     CACHE = args.out / "cache"
     CACHE.mkdir(exist_ok=True)
     excluded = held_out_texts(args.t4)
+    for store in args.exclude_store:
+        excluded |= store_texts(store)
+    dropped = (DROPPED if args.seed == SEED and args.prefix == "cal" else {}) | {cid: "flagged" for cid in args.drop}
     domains = {
         "conversation": conversation_domain(rng, args.per_domain, excluded),
-        "coding": coding_domain(rng, args.per_domain, args.out, excluded),
+        "coding": coding_domain(rng, args.per_domain, args.out, excluded, [] if args.no_written_prompts else AGENT_TASKS),
         "tool_use": tool_domain(rng, args.per_domain, args.out, excluded),
-        "multilingual": multilingual_domain(rng, args.per_domain, excluded),
+        "multilingual": multilingual_domain(rng, args.per_domain, excluded, [] if args.no_written_prompts else CODE_SWITCHING),
     }
-    prefix = {"conversation": "cal-c", "coding": "cal-k", "tool_use": "cal-u", "multilingual": "cal-m"}
+    prefix = {domain: f"{args.prefix}-{letter}" for domain, letter in
+              (("conversation", "c"), ("coding", "k"), ("tool_use", "u"), ("multilingual", "m"))}
     with (args.out / "conversations.jsonl").open("w", encoding="utf-8") as out:
         for domain, items in domains.items():
             for order, item in enumerate(items):
                 cid = f"{prefix[domain]}{order + 1:03d}"
-                if cid in DROPPED:
+                if cid in dropped:
                     continue
                 record = {"id": cid, "domain": domain, "order": order,
                           "language": item.get("language", "en"), "system": item.get("system"),
                           "turns": item["turns"], "tools": item.get("tools", []), "fixture": item.get("fixture"),
                           "source": {"kind": "authored"}, "dataset": item.get("source_url")}
                 out.write(json.dumps(record, ensure_ascii=False) + "\n")
-            print(f"{domain}: {sum(1 for o in range(len(items)) if f'{prefix[domain]}{o + 1:03d}' not in DROPPED)} conversations")
+            print(f"{domain}: {sum(1 for o in range(len(items)) if f'{prefix[domain]}{o + 1:03d}' not in dropped)} conversations")
     return 0
 
 
