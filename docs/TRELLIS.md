@@ -101,6 +101,20 @@ iterations, every weight on the device:
 
 Decode is measured on `decode:32:256` (256 tokens after a 32-token prompt).
 
+The decode GEMM (`euhedral_trellis_mma` and the split epilogue, 3 bits, weights rotated past L2) reads its payload
+at 530 to 770 GB/s: 101 µs for the fused gate and up projection (5120 x 34816), 45 µs for the down projection
+(17408 x 5120), 35 µs for 5120 x 12288 and 21 µs for 6144 x 5120 at 5 rows, about 200 µs per layer. Plain loads in
+the same access pattern (8 warps of 96-byte tiles per block, one k16 row at a time) reach 835, 680, 730 GB/s on the
+first, second and fourth shape. Measured on these shapes and not kept (each output bitwise the same):
+
+- unrolling the K loop by ring cycle, so slots, staging and barriers are compile-time (59 to 62 instructions per
+  tile, from 72): 198 µs per layer, slower on two of the four shapes;
+- an 8-slot ring: 199 µs per layer;
+- each ring cycle's activation fragments loaded at its start: 201 µs per layer;
+- two adjacent tiles per warp, 256 columns per block (1.5 KB contiguous per k16 row): 200 µs per layer;
+- programmatic dependent launch of the prepass, GEMMs and epilogue, the GEMM's first tiles copied before it waits:
+  decode with MTP speculation 149.4 tokens/s after a 4096-token prompt (3 forks), without it 66.7 tokens/s.
+
 The defaults of the four properties are measured on this card, over the 3-bit model's object shapes with the weights
 rotated past L2:
 
