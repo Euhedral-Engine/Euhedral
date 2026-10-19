@@ -21,11 +21,10 @@ An artifact is one `.edrl` file holding the quantized text model, its MTP draft 
 | `nvfp4` | NVFP4 | uncompressed | 14.52 GiB (15.59 GB) | |
 | `nvfp4-compressed` | NVFP4 | compressed | 13.77 GiB (14.79 GB) | 4.25 bits per weight (block scales drawn from a 16-entry table per tensor); not lossless, see [quality](#quality) |
 
-Two mixed artifacts take each projection of the text layers from NVFP4 or from QTIP-style trellis codes at 2.5 to 4.0
-bits per weight (exllamav3's EXL3 format, calibrated by the quantization module), as a search allocated them to fit a 128K
-context on the device, with a Q3 token embedding and NVFP4 heads: `NVFP4-TA`, for the lowest error, 11.02 GiB (11.83 GB),
-mostly trellis 3.0 to 4.0 with 5 NVFP4 projections, and `NVFP4-TB`, for the fastest prefill, 10.96 GiB (11.76 GB), with 66
-of its 320 projections in NVFP4 ([docs/MIXED_QUANTIZATION.md](docs/MIXED_QUANTIZATION.md),
+One mixed artifact, `NVFP4-Trellis-RCO`, takes each projection of the text layers from QTIP-style trellis codes at 2.5 to
+4.0 bits per weight (exllamav3's EXL3 format, calibrated by the quantization module) as a search allocated them for the least
+error with a 128K context on the device: 114 of its 320 projections at 4.0 bits, 88 at 3.5, 45 at 3.0 and 73 at 2.5, with a Q3
+token embedding and NVFP4 heads, 11.17 GiB (11.99 GB) ([docs/MIXED_QUANTIZATION.md](docs/MIXED_QUANTIZATION.md),
 [docs/TRELLIS.md](docs/TRELLIS.md)).
 
 All four artifacts are converted from Swift-1.5 (`ukisai/Swift-1.5-Qwen3.8-27b`, UkisAI's fine-tune of Qwen3.8-27B); the
@@ -46,9 +45,9 @@ with MTP.
 ## Performance
 
 RTX 5070 Ti (16 GB, 70 SMs) in a desktop that also uses the GPU for its display, Linux, one run per row after one warmup. Greedy
-decoding with MTP speculative decoding (two drafted tokens for Q3, four for NVFP4, `NVFP4-TA` and `NVFP4-TB`); decode `tok/s` is
+decoding with MTP speculative decoding (two drafted tokens for Q3, four for NVFP4 and `NVFP4-Trellis-RCO`); decode `tok/s` is
 output tokens per second after the first token. Prefill and time to first token (TTFT) include the whole prompt. Measured on
-2026-10-16 (commit 1eea731; `NVFP4-TA` and `NVFP4-TB` at commit 796929d) with the GPU overclocked: +150 MHz core and +1500 MHz
+2026-10-16 (commit 1eea731; `NVFP4-Trellis-RCO` on 2026-10-19 at commit fea6b96f) with the GPU overclocked: +150 MHz core and +1500 MHz
 memory clock offsets and a 350 W power limit (stock is 300 W). Decode depends on how many drafted tokens the verifier accepts on
 each prompt, which moves single rows by several percent. Rows that stream weights from host memory vary more, by up to 20%
 between runs: the `nvfp4` 4K and 32K and the `nvfp4-compressed` 128K decode rows are the mean of two runs.
@@ -63,8 +62,7 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 | `q3-compressed` | 1,986 | 1,655 | 1,399 | 1,058 |
 | `nvfp4` | 4,111 | 2,883 | 2,182 | 1,399 |
 | `nvfp4-compressed` | 4,033 | 2,844 | 2,160 | 1,413 |
-| `NVFP4-TA` | 1,376 | 1,204 | 1,062 | 853 |
-| `NVFP4-TB` | 1,589 | 1,364 | 1,185 | 931 |
+| `NVFP4-Trellis-RCO` | 2,586 | 2,039 | 1,663 | 1,203 |
 
 **Decode (tokens/s, MTP)**
 
@@ -74,8 +72,7 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 | `q3-compressed` | 114.4 | 103.1 | 93.3 | 65.0 |
 | `nvfp4` | 105.3 | 102.7 | 64.1 | 32.4 |
 | `nvfp4-compressed` | 135.0 | 124.7 | 89.6 | 49.7 |
-| `NVFP4-TA` | 137.8 | 142.8 | 111.3 | 79.0 |
-| `NVFP4-TB` | 132.9 | 125.5 | 106.6 | 82.3 |
+| `NVFP4-Trellis-RCO` | 147.2 | 114.6 | 93.1 | 78.3 |
 
 **Time to first token**
 
@@ -85,8 +82,7 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 | `q3-compressed` | 2.01 s | 19.7 s | 45.5 s | 121 s |
 | `nvfp4` | 0.97 s | 11.4 s | 29.1 s | 91.7 s |
 | `nvfp4-compressed` | 0.99 s | 11.5 s | 29.4 s | 90.9 s |
-| `NVFP4-TA` | 2.89 s | 27.1 s | 59.8 s | 150 s |
-| `NVFP4-TB` | 2.50 s | 24.0 s | 53.6 s | 138 s |
+| `NVFP4-Trellis-RCO` | 1.54 s | 16.1 s | 38.2 s | 107 s |
 
 The 4K and 32K rows run with the default 32,768-token context; the 64K and 128K rows set `max-context-tokens` to 65,536
 and 131,072. Each prompt is followed by 128 generated tokens (64 at 128K). The 128K prompt is generated text; the others are
@@ -98,8 +94,7 @@ chat prompts.
 | `q3-compressed` | 11.00 GiB | 12.2 / 12.8 / 14.0 GiB | none | 128K |
 | `nvfp4` | 14.52 GiB | 14.2 / 14.2 / 14.2 GiB | 1.02 / 1.58 / 2.79 GiB | 128K |
 | `nvfp4-compressed` | 13.77 GiB | 14.2 / 14.2 / 14.2 GiB | 0.27 / 0.84 / 2.02 GiB | 128K |
-| `NVFP4-TA` | 11.02 GiB | 12.2 / 12.7 / 13.9 GiB | none | 128K |
-| `NVFP4-TB` | 10.96 GiB | 12.1 / 12.7 / 13.8 GiB | none | 128K |
+| `NVFP4-Trellis-RCO` | 11.17 GiB | 12.3 / 12.9 / 14.0 GiB | none | 128K |
 
 Device memory is what the engine allocated at its peak during the run: the resident weights, the KV cache of the context, the
 sequence state, and the workspaces. The CUDA context and kernel modules come on top. An uncompressed NVFP4 model is larger than
@@ -134,8 +129,7 @@ Q3 tensors other than the MLP down projections to the codes -3..3, which its los
 | `q3-compressed` | 0.720 | 2.05 | +0.111 ± 0.008 | 0.131 | 89.8% |
 | `nvfp4` | 0.654 | 1.92 | +0.045 ± 0.005 | 0.047 | 94.3% |
 | `nvfp4-compressed` | 0.648 | 1.91 | +0.040 ± 0.005 | 0.046 | 94.3% |
-| `NVFP4-TA` | 0.665 | 1.94 | +0.056 ± 0.006 | 0.071 | 93.0% |
-| `NVFP4-TB` | 0.678 | 1.97 | +0.069 ± 0.007 | 0.087 | 92.1% |
+| `NVFP4-Trellis-RCO` | 0.660 | 1.93 | +0.051 ± 0.006 | 0.072 | 92.9% |
 
 The perplexity is low because most of the set is the model's own text. In every domain the two NVFP4 forms have the least
 error and `q3-compressed` the most; tool use has the largest error for every artifact (KL 0.133 for `nvfp4` to 0.282 for `q3-compressed`) and prose the smallest
@@ -171,9 +165,8 @@ How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
 - **Fastest prefill, and decode at short contexts:** `nvfp4-compressed` (KL 0.046 against BF16 on the held-out
   set): 4,033 tok/s of prefill and 135 tok/s of decode at 4K. On a 16 GB card it keeps 0.27 to 0.84 GiB of weights in host memory at 32K to 64K
   (2.02 GiB at 128K) and streams them in for every token: 125 tok/s at 32K, 90 at 64K and 50 at 128K.
-- **Fastest decode at 32K and beyond:** `NVFP4-TA` (KL 0.071): 138 tok/s at 4K, 143 at 32K, 111 at 64K and 79 at 128K,
-  with no host-backed weights, but the slowest prefill (1,376 tok/s at 4K, 853 at 128K). `NVFP4-TB` (KL 0.087)
-  prefills 9 to 15% faster and decodes 82 tok/s at 128K.
+- **Least error with every weight on the device:** `NVFP4-Trellis-RCO` (KL 0.072): prefill 2,586 tok/s at 4K and 1,203 at
+  128K, decode 147 tok/s at 4K, 115 at 32K, 93 at 64K and 78 at 128K.
 - **Faster prefill with every weight on the device:** `q3` (KL 0.106): 131 tok/s at 4K, 127 at 32K, 109 at 64K and 70 at
   128K, prefill 2,099 tok/s at 4K and 1,085 at 128K.
 - **More room instead of speed:** `q3-compressed` (KL 0.131) is a file about 0.7 GiB smaller than `q3`, which leaves more
