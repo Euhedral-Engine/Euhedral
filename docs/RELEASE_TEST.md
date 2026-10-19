@@ -73,8 +73,8 @@ Any change to a recorded file makes a new version.
 
 ## Quality by domain
 
-KL(BF16 ‖ artifact) and top-1 agreement per domain, measured 2026-10-17 (the README's quality table is the overall
-column):
+KL(BF16 ‖ artifact) and top-1 agreement per domain, measured 2026-10-17 (`NVFP4-Trellis-RCO` on 2026-10-19; the README's
+quality table is the overall column):
 
 | Artifact | Overall | Conversation | Coding | Tool use | Multilingual | Prose | Code |
 |---|---|---|---|---|---|---|---|
@@ -82,8 +82,7 @@ column):
 | `q3-compressed` | 0.131 / 89.8% | 0.141 / 88.1% | 0.109 / 90.4% | 0.282 / 89.7% | 0.098 / 89.9% | 0.069 / 90.8% | 0.091 / 90.5% |
 | `nvfp4` | 0.047 / 94.3% | 0.038 / 93.5% | 0.036 / 94.9% | 0.133 / 93.7% | 0.024 / 94.8% | 0.019 / 95.0% | 0.045 / 94.0% |
 | `nvfp4-compressed` | 0.046 / 94.3% | 0.037 / 93.6% | 0.038 / 95.0% | 0.135 / 93.6% | 0.024 / 94.8% | 0.018 / 94.8% | 0.033 / 93.8% |
-| `NVFP4-TA` | 0.071 / 93.0% | 0.062 / 92.0% | 0.055 / 93.8% | 0.189 / 92.1% | 0.048 / 92.7% | 0.028 / 93.9% | 0.057 / 93.5% |
-| `NVFP4-TB` | 0.087 / 92.1% | 0.081 / 91.0% | 0.074 / 92.7% | 0.221 / 91.4% | 0.065 / 91.5% | 0.038 / 93.1% | 0.053 / 93.0% |
+| `NVFP4-Trellis-RCO` | 0.072 / 92.9% | 0.064 / 92.0% | 0.060 / 93.3% | 0.192 / 92.2% | 0.044 / 93.0% | 0.033 / 93.3% | 0.050 / 93.7% |
 
 ## Scoring
 
