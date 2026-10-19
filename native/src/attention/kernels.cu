@@ -8,6 +8,7 @@
 #include "nvfp4_prefill32.cuh"
 #include "nvfp4_prefill_fa2.cuh"
 #include "nvfp4_decode_gqa.cuh"
+#include "nvfp4_decode_gqa_fused.cuh"
 #include "common/pdl.cuh"
 #include "kv_append.cuh"
 #include "qk_norm_rope.cuh"

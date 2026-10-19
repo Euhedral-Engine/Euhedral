@@ -19,6 +19,14 @@ P, U = C.c_uint64, C.c_uint
 PAGE_TOKENS = 256
 FA2_SHARED = 2 * 2 * 32 * 264 * 2  # fa2::kSharedBytes
 ROW_BYTES = 144
+
+
+def fused_shared(tiles):
+    """gqa_fused::Layout<tiles, Nvfp4Kv>::kBytes: V tiles, scores, probabilities, the raw K and V rings, the pair table,
+    mbarriers."""
+    return 2 * 16 * 264 * 2 + tiles * 1024 + tiles * 768 + 2 * 4 * 16 * ROW_BYTES + 1024 + 8 * (12 + 4 * tiles)
+
+
 if np is not None:
     MAGNITUDES = np.array([0, .5, 1, 1.5, 2, 3, 4, 6], dtype=np.float64)
     SCALES = np.array([(b & 7) * 2.0**-9 if b < 8 else
@@ -211,7 +219,8 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
             for name in [b'euhedral_attention_prefill32_nvfp4', b'euhedral_attention_prefill32_nvfp4_exact',
                          b'euhedral_attention_prefill_fa2_nvfp4',
                          b'euhedral_attention_decode_nvfp4', b'euhedral_attention_decode_nvfp4_exact',
-                         b'euhedral_attention_decode_gqa_nvfp4']:
+                         b'euhedral_attention_decode_gqa_nvfp4'] + [b'euhedral_attention_decode_gqa_nvfp4_fused%d' % t
+                                                                     for t in range(2, 7)]:
                 self.assertEqual(0, self.gpu.function(C.byref(symbol), self.gpu.module, name))
                 self.assertEqual(0, attribute(C.byref(local), 3, symbol))
                 self.assertEqual(0, local.value, name.decode() + ' must not use thread-local decode tables')
@@ -328,7 +337,7 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                             self.gpu.launch('euhedral_attention_decode_gqa_nvfp4_rows',
                                             (heads * min(64, (last + 31) // 32), m),
                                             [P(dqk), P(keys), P(values), U(query_heads), U(heads), P(dstart),
-                                             P(scratch), P(stride), U(2048)], block=96)
+                                             P(scratch), P(stride), U(2048), U(0)], block=96)
                         self.gpu.launch('euhedral_attention_merge_nvfp4_rows', (query_heads, m),
                                         [P(dgate), P(together), P(scratch), U(query_heads), U(heads), P(dstart),
                                          P(stride), U(2048)], block=128)
@@ -352,6 +361,51 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                                             [P(rgate), P(out), P(one), U(query_heads), U(heads), U(splits)], block=128)
                             self.assertEqual(rows[r * row_bytes:(r + 1) * row_bytes], self.gpu.download(out, row_bytes),
                                              f"row {r} at length {length}")
+
+    def test_fused_verifier_rows_equal_row_twins_bitwise(self):
+        """The fused verifier kernel (every row's query heads in one CTA per KV head and key split) writes, bit for bit,
+        the row twins' partials: 2 to 8 rows, rows below and above the 2048-key switch, rows on both sides of a split
+        span change (left to the twin), partial last tiles and pages, every finite cache scale."""
+        query_heads, heads = 24, 4
+        rng = np.random.default_rng(0x2f05)
+        stride = query_heads * 64 * 258
+        for start, realistic in [(2042, True), (3000, False), (4094, True), (8189, False), (16380, True), (40001, False)]:
+            tokens = start + 8
+            with contextlib.ExitStack() as scope:
+                keys, key_pages = self.paged(scope, tokens, heads)
+                values, value_pages = self.paged(scope, tokens, heads)
+                for page in key_pages + value_pages:
+                    raw = rng.integers(0, 256, (PAGE_TOKENS * heads, ROW_BYTES), dtype=np.uint8)
+                    raw[:, 128:] = (rng.integers(0x28, 0x48, (PAGE_TOKENS * heads, 16)) if realistic
+                                    else rng.integers(0, 0x7f, (PAGE_TOKENS * heads, 16)))
+                    self.gpu.htod(page, C.create_string_buffer(raw.tobytes(), raw.nbytes), raw.nbytes)
+                for m in (2, 3, 4, 5, 6, 8):
+                    with self.subTest(start=start, rows=m):
+                        width = (query_heads + heads) * 256
+                        qk, _ = bf16(rng.standard_normal((m, width)).astype(np.float32))
+                        dqk = self.owned(scope, self.gpu.upload(qk.tobytes()))
+                        dstart = self.position(scope, start)
+                        last = start + m
+                        splits = min(64, (last + 31) // 32)
+                        tiles = (m * (query_heads // heads) + 7) // 8
+                        results = []
+                        for fused in (False, True):
+                            scratch = self.owned(scope, self.gpu.zeros(m * stride * 4, 0x11))
+                            if start + 1 < 2048:
+                                self.gpu.launch('euhedral_attention_decode_nvfp4_rows',
+                                                (query_heads * min(64, (min(last, 2047) + 47) // 48), m),
+                                                [P(dqk), P(keys), P(values), U(query_heads), U(heads), P(dstart),
+                                                 P(scratch), P(stride), U(2048)], block=128)
+                            if fused:
+                                self.gpu.launch(f'euhedral_attention_decode_gqa_nvfp4_fused{tiles}', heads * splits,
+                                                [P(dqk), P(keys), P(values), U(query_heads), U(heads), P(dstart),
+                                                 P(scratch), P(stride), U(m), U(2048)],
+                                                block=32 * (2 * tiles + 1), shared=fused_shared(tiles))
+                            self.gpu.launch('euhedral_attention_decode_gqa_nvfp4_rows', (heads * splits, m),
+                                            [P(dqk), P(keys), P(values), U(query_heads), U(heads), P(dstart),
+                                             P(scratch), P(stride), U(2048), U(1 if fused else 0)], block=96)
+                            results.append(self.gpu.download(scratch, m * stride * 4))
+                        self.assertEqual(results[0], results[1])
 
     def test_gqa_decode_warp_specialized_equals_single_warp_reference_bitwise(self):
         """The three-warp GQA decode kernels and the batched merge equal, bit for bit, the single-warp kernels and the
@@ -396,7 +450,7 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                             splits = min(64, (length + 31) // 32)
                             self.gpu.launch('euhedral_attention_decode_gqa_nvfp4_rows' + suffix, (heads * splits, rows),
                                             [P(dqk), P(keys), P(values), U(query_heads), U(heads), P(dfirst), P(scratch),
-                                             P(stride), U(0)], block=decode_block)
+                                             P(stride), U(0), U(0)], block=decode_block)
                             self.gpu.launch('euhedral_attention_merge_nvfp4_rows' + kernel_suffix, (query_heads, rows),
                                             [P(dgate), P(out), P(scratch), U(query_heads), U(heads), P(dfirst), P(stride), U(0)])
                             used = rows * stride * 4

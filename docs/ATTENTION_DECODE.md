@@ -2,8 +2,8 @@
 
 The GQA decode attention kernel serves one query-head group (6 heads) per KV head over an NVFP4 cache (D256, 144-byte rows:
 128 code bytes and 16 E4M3 scales; 256-token pages). It runs from 2048 keys for single-row decode and for the verifier's row twin (below 2048 keys the per-head
-decode kernel runs; a group of more than 8 query heads also keeps the per-head kernel). Sources: `native/src/attention/nvfp4_decode_gqa.cuh` (decode, row twin), `nvfp4_attention.cuh` (merge), `nvfp4_pipe.cuh` (shared
-pipeline helpers). Hardware for every measurement: RTX 5070 Ti (sm_120, 70 SMs), driver 615.71, desktop session running.
+decode kernel runs; a group of more than 8 query heads also keeps the per-head kernel). Sources: `native/src/attention/nvfp4_decode_gqa.cuh` (decode, row twin), `nvfp4_decode_gqa_fused.cuh` (fused verifier rows),
+`nvfp4_attention.cuh` (merge), `nvfp4_pipe.cuh` (shared pipeline helpers). Hardware for every measurement: RTX 5070 Ti (sm_120, 70 SMs), driver 615.71, desktop session running.
 
 ## Cache formats
 
@@ -69,6 +69,36 @@ kernel takes 31 us and the merge 7 us.
 In the model (the `q3` artifact), decode runs at 61.7 tok/s at a 4K context, 60.5 at 16K and 59.0 at 32K. MTP2 decode (3-row
 verify, chat corpus) runs at 111 tok/s at 16K and 101 at 32K.
 
+## Fused verifier rows
+
+A verification of R rows over an NVFP4 cache runs one CTA per (KV head, key split) for all rows at once
+(`euhedral_attention_decode_gqa_nvfp4_fused<T>`): the KV head's R x 6 query heads are the columns of T mma tiles of 8, and each
+16-key tile of K and V is loaded and expanded once for all of them. Warps: T score warps (one query tile each, the QK chain over
+the shared raw K tile), one loader warp (raw K and V tiles by a four-stage cp.async ring, V expanded once to FP16 rows) and T
+consumer warps (online softmax, P hi/lo and the PV chain of one query tile). Up to T = 4 (5 rows) two CTAs fit per SM (96
+registers, 43 KiB of shared memory); T = 5 and 6 run one.
+
+Every query column is computed by the operations of the one-row kernel at its row's length, in the same order, so the partials are
+bit for bit the row twin's and verification stays exact (`test_fused_verifier_rows_equal_row_twins_bitwise`, and
+`SpeculativeVerifyCudaIntegrationTest` at 4100 keys with 5 rows and 9000 keys with 4). That needs the rows to share one split
+partition: a split spans whole 16-key tiles (`split_span`), so the partition of 64 splits changes only where the length crosses a
+multiple of 1024 keys. The fused kernel serves the rows that share the last row's partition; the row twin, launched after it,
+serves the rest (in the rare step that crosses a multiple of 1024) and returns at once for the others.
+
+Decode partials per layer, cold KV, 5 rows (MTP depth 4), real head geometry:
+
+| Keys | 2K | 4K | 16K | 32K | 64K | 128K |
+|---|---|---|---|---|---|---|
+| Fused, 5 rows | 31.9 us | 41.5 us | 85.8 us | 147.2 us | 272.5 us | 505.0 us |
+
+The fused kernel is held back by the tensor pipe (71% active at 64K under Nsight Compute): every product is two mma.sync
+(hi and lo FP16 parts at FP32 accumulation, half rate on this card). Its advantage depends on how fully the rows fill the 8-column
+tiles, so the host launches it from a measured length per row count: 2 rows from 49152 keys, 3 from 16384, 4 from 4096, 5 from
+2048, 6 and 7 from 16384, 8 from 12288. BF16 caches keep the row twin.
+
+In the model (NVFP4-Trellis-RCO, MTP depth 4, the README scenarios), a verification takes 19.64 ms at 4K, 21.36 ms at 32K,
+22.82 ms at 64K and 26.80 ms at 128K, and decode runs at 135.0, 119.8, 107.5 and 88.1 tok/s.
+
 ## Rejected
 
 - **A deeper cp.async ring, or finer key splits.** The loads alone take 28 us of the 16K one-row kernel; the time is the phases of one
@@ -76,9 +106,15 @@ verify, chat corpus) runs at 111 tok/s at 16K and 101 at 32K.
   128 and 256 splits ran at 78 and 76 us because every CTA repeats the query rotation and the merge grows. A 4-stage ring takes 31 KiB
   of shared memory, drops the SM to 3 resident CTAs and runs slower than 2 stages.
 - **Named barriers for the hand-offs.** Nine ids cap the SM at one resident CTA.
-- **Fused verifier rows** (expanding each K and V tile once for all rows). Removing all V expansion and all K and V traffic for rows 1 and
-  2 of the 3-row twin saves 3% at 16K and 19% at 64K, an upper bound; a fused kernel also needs three accumulator sets of 64 registers,
-  one consumer warp per 8 query columns and the producers, about 7 warps at 160 registers, which leaves fewer than two CTAs per SM.
+- **Deeper hand-off rings in the fused kernel** (three V and score slots in place of two): no change at 16K and 64K. Six raw
+  stages (53 KiB of shared memory) leave one CTA per SM: 16% slower at 64K than four.
+- **Register prefetch of V in the fused kernel's loader** (one tile ahead, as in the one-row kernel): with one tile of K and V in
+  flight per CTA and one CTA per SM the kernel waited on DRAM latency and ran no faster than the row twins.
+- **Arithmetic E2M1 expansion** (code bits placed as an FP16 subnormal and scaled by 2^14, in place of the pair table; exact): 1 to 2%
+  on the fused kernel and the twin, within noise. Shared-memory wavefronts are not what holds the fused kernel back.
+- **Dropping the lo FP16 parts** (queries and probabilities as single FP16 values; changes the numerics of one-row decode too):
+  the fused kernel takes 191.6 us at 64K, 29% less (with the arithmetic expansion). Not adopted: the error budget of the relaxed
+  kernels is set against the FP32 kernel.
 - **Row twins in split-major launch order** (the rows of one KV head and key split adjacent, so they share the split's keys and
   values through L2; same per-CTA arithmetic). Real head geometry, random cache, per layer:
 

@@ -254,7 +254,7 @@ extern "C" __global__ void probe_bf16_widen(const unsigned* input, unsigned* out
                             self.gpu.launch('euhedral_attention_decode_gqa_bf16_rows',
                                             (heads * min(64, (last + 31) // 32), m),
                                             [P(dqk), P(keys), P(values), U(query_heads), U(heads), P(dstart),
-                                             P(scratch), P(stride), U(2048)], block=96)
+                                             P(scratch), P(stride), U(2048), U(0)], block=96)
                         self.gpu.launch('euhedral_attention_merge_bf16_rows', (query_heads, m),
                                         [P(dgate), P(together), P(scratch), U(query_heads), U(heads), P(dstart),
                                          P(stride), U(2048)], block=128)
