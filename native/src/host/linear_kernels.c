@@ -19,6 +19,8 @@ static const EuhedralKernelEntry kernels[] = {
     /* Block-scaled FP8 tensor cores (sm_12xa): elsewhere unavailable, and the FP32-accumulating launches run. */
     {"euhedral_trellis_mma_rows_fp8", 0, "trellis_fp8/kernels.cu", 1},
     {"euhedral_trellis_mma_rows64_fp8", 0, "trellis_fp8/kernels.cu", 1},
+    /* Token embedding lookups the weight formats run (LinearFormat#embed). */
+    {"euhedral_nvfp4_embedding", 0, "embedding/kernels.cu"},
 };
 
 static EuhedralKernelTable table = EUHEDRAL_KERNEL_TABLE_INIT(kernels);

@@ -29,7 +29,9 @@ public enum LinearKernel implements TableKernel {
     /// Grid (n/128, ceil(rows/32)), block 256.
     TRELLIS_MMA_ROWS_FP8("euhedral_trellis_mma_rows_fp8"),
     /// [#TRELLIS_MMA_ROWS_FP8] in blocks of 64 rows, two per SM. Grid (n/128, ceil(rows/64)), block 256.
-    TRELLIS_MMA_ROWS64_FP8("euhedral_trellis_mma_rows64_fp8");
+    TRELLIS_MMA_ROWS64_FP8("euhedral_trellis_mma_rows64_fp8"),
+    /// BF16 rows of a row-split NVFP4 token embedding table for token ids. Grid tokens, block 128.
+    NVFP4_EMBEDDING("euhedral_nvfp4_embedding");
 
     private final String symbol;
 

@@ -147,4 +147,21 @@ final class Bf16Format implements LinearFormat {
                 throw new IllegalArgumentException("linear stage received non-linear instruction: " + launch.kind());
         }
     }
+
+    @Override
+    public boolean embeds() {
+        return true;
+    }
+
+    @Override
+    public void embed(ExecutionGpu gpu, EmbeddingLaunch launch) {
+        gpu.embedBf16(
+                launch.tokenIds(),
+                launch.table().deviceAddress(),
+                launch.table().byteSize(),
+                launch.output(),
+                launch.rows(),
+                launch.vocabulary(),
+                launch.hidden());
+    }
 }

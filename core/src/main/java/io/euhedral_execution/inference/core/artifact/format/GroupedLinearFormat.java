@@ -119,4 +119,25 @@ abstract class GroupedLinearFormat implements LinearFormat {
                 weight.byteSize(),
                 weight.layout());
     }
+
+    /// Q3 tables, in either layout ([ExecutionGpu#embedQ3]).
+    @Override
+    public boolean embeds() {
+        return format() == WeightFormat.Q3_G64_FP16;
+    }
+
+    @Override
+    public void embed(ExecutionGpu gpu, EmbeddingLaunch launch) {
+        if (!embeds()) LinearFormat.super.embed(gpu, launch);
+        else
+            gpu.embedQ3(
+                    launch.tokenIds(),
+                    launch.table().deviceAddress(),
+                    launch.table().byteSize(),
+                    launch.output(),
+                    launch.rows(),
+                    launch.vocabulary(),
+                    launch.hidden(),
+                    layout());
+    }
 }

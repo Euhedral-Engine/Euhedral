@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.artifact.WeightLoadException;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
+import io.euhedral_execution.inference.core.gpu.KernelArguments;
 import io.euhedral_execution.inference.core.gpu.ScratchUse;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
@@ -19,6 +20,9 @@ import java.util.List;
 /// Block-scaled NVFP4 ([Nvfp4Layout]) in its plain layout or with SD4 scale tables (compressed). Both serve any
 /// grouped or NVFP4 role and keep the role's kind; their tensor-core kernels take rows independently.
 public final class Nvfp4Format implements LinearFormat {
+
+    private static final ThreadLocal<KernelArguments> EMBEDDING_ARGUMENTS =
+            ThreadLocal.withInitial(KernelArguments::new);
 
     private final WeightLayout layout;
 
@@ -213,5 +217,41 @@ public final class Nvfp4Format implements LinearFormat {
                 launch.inFeatures(),
                 launch.outFeatures(),
                 weight.byteSize());
+    }
+
+    /// Plain (not SD4) tables ([LinearKernel#NVFP4_EMBEDDING]).
+    @Override
+    public boolean embeds() {
+        return !sd4();
+    }
+
+    @Override
+    public void embed(ExecutionGpu gpu, EmbeddingLaunch launch) {
+        if (!embeds()) {
+            LinearFormat.super.embed(gpu, launch);
+            return;
+        }
+        if (launch.hidden() % Nvfp4Layout.BLOCK != 0 || Nvfp4Layout.paddedK(launch.hidden()) != launch.hidden())
+            throw new IllegalArgumentException("an NVFP4 embedding needs a width that is a multiple of 128");
+        gpu.launchTableKernel(
+                LinearKernel.NVFP4_EMBEDDING,
+                launch.rows(),
+                1,
+                1,
+                128,
+                1,
+                1,
+                0,
+                EMBEDDING_ARGUMENTS
+                        .get()
+                        .clear()
+                        .pointer(launch.tokenIds())
+                        .pointer(launch.table().deviceAddress())
+                        .pointer(launch.output())
+                        .int32(launch.rows())
+                        .int32(launch.vocabulary())
+                        .int32(launch.hidden())
+                        .pointer(Nvfp4Layout.scaleOffset(launch.vocabulary(), launch.hidden()))
+                        .pointer(Nvfp4Layout.globalScaleOffset(launch.vocabulary(), launch.hidden())));
     }
 }

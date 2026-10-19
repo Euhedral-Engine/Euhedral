@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core.model.qwen38;
 
 import io.euhedral_execution.inference.core.artifact.TensorHandle;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
+import io.euhedral_execution.inference.core.artifact.format.EmbeddingLaunch;
 import io.euhedral_execution.inference.core.artifact.format.LinearFormat;
 import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
 import io.euhedral_execution.inference.core.artifact.format.LinearLaunch;
@@ -306,28 +307,20 @@ public final class Stages {
             super(graph, stage, instruction, gpu);
         }
 
+        /// The table's format looks the rows up ([LinearFormat#embed]).
         @Override
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
-            if (instruction.weightFormat() == WeightFormat.BF16) {
-                gpu().embedBf16(
-                                tokenIds(context),
-                                instruction.weightAddress(),
-                                instruction.weightByteSize(),
-                                context.workspace().hiddenStateAddress(),
-                                rows(context),
-                                context.plan().weights().config().vocabSize(),
-                                instruction.outputWidth());
-                return;
-            }
-            gpu().embedQ3(
-                            tokenIds(context),
-                            instruction.weightAddress(),
-                            instruction.weightByteSize(),
-                            context.workspace().hiddenStateAddress(),
-                            rows(context),
-                            context.plan().weights().config().vocabSize(),
-                            instruction.outputWidth(),
-                            instruction.weightLayout());
+            TensorHandle table = instruction.weight();
+            LinearFormats.of(table)
+                    .embed(
+                            gpu(),
+                            new EmbeddingLaunch(
+                                    tokenIds(context),
+                                    table,
+                                    context.workspace().hiddenStateAddress(),
+                                    rows(context),
+                                    context.plan().weights().config().vocabSize(),
+                                    instruction.outputWidth()));
         }
     }
 

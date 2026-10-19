@@ -101,6 +101,16 @@ class LinearFormatsTest {
     }
 
     @Test
+    void tokenEmbeddingsAreLookedUpInQ3PlainNvfp4AndBf16() {
+        for (LinearFormat format : LinearFormats.all()) {
+            boolean expected = (format.format() == WeightFormat.Q3_G64_FP16)
+                    || format.format() == WeightFormat.BF16
+                    || (format.format() == WeightFormat.NVFP4 && format.layout() == WeightLayout.ROW_SPLIT_K128_V1);
+            assertEquals(expected, format.embeds(), format.format() + "/" + format.layout());
+        }
+    }
+
+    @Test
     void theTrellisRowAnswersItsStorageQuestions() {
         LinearFormat trellis = LinearFormats.find(WeightFormat.TRELLIS, WeightLayout.TRELLIS_TILE16_V1)
                 .orElseThrow();

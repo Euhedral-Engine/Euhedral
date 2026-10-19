@@ -2444,10 +2444,14 @@ public final class ExecutionPlan {
     /// Q3 kernels only.
     private static final WeightFormat EMBEDDING_FORMAT = WeightFormat.Q3_G64_FP16;
 
+    /// A token embedding table in any format whose [LinearFormat#embeds] holds.
     private static TensorHandle validateEmbedding(TensorHandle handle, long rows, int width) {
-        if (handle.format() != EMBEDDING_FORMAT && handle.format() != WeightFormat.BF16) {
-            throw new IllegalArgumentException("unsupported token embedding format: " + handle.format());
-        }
+        boolean embeds = LinearFormats.find(handle.format(), handle.layout())
+                .map(LinearFormat::embeds)
+                .orElse(false);
+        if (!embeds)
+            throw new IllegalArgumentException(
+                    "unsupported token embedding format: " + handle.format() + "/" + handle.layout());
         return validateQuantized(handle, rows, width, EMBEDDING_FORMAT);
     }
 

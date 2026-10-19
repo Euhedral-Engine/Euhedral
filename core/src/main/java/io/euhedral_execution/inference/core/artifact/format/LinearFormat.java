@@ -94,6 +94,18 @@ public interface LinearFormat {
 
     void linear(ExecutionGpu gpu, LinearLaunch launch);
 
+    // token embedding
+
+    /// Whether a `[vocabulary, hidden]` token embedding table stored in this format can be looked up ([#embed]).
+    default boolean embeds() {
+        return false;
+    }
+
+    /// Queues the lookup `launch` describes, its table in this format, on the selected stream.
+    default void embed(ExecutionGpu gpu, EmbeddingLaunch launch) {
+        throw new UnsupportedOperationException("no token embedding lookup in " + format() + "/" + layout());
+    }
+
     /// Whether the gate/up projection of this format fuses with SwiGLU in a prefill region.
     default boolean gateUpRegion() {
         return false;
