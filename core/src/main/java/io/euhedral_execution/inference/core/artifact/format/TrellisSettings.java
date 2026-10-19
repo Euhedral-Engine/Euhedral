@@ -10,12 +10,17 @@ package io.euhedral_execution.inference.core.artifact.format;
 ///     itself, with no split partials (`euhedral.trellis.whole-k-rows`); the results are bitwise the same
 /// @param wholeKWideRows the fewest rows for which those launches use blocks of 64 rows instead of 32
 ///     (`euhedral.trellis.whole-k-wide-rows`); the results are bitwise the same
-public record TrellisSettings(int mmaMaxRows, int targetCtas, int wholeKRows, int wholeKWideRows) {
+/// @param halfAccumulate whether whole-K launches other than verifications accumulate runs of k16 tiles in FP16, at
+///     twice the tensor-core rate (`euhedral.trellis.half-accumulate`); verifications keep FP32 accumulation, whose
+///     bits equal one-row launches'
+public record TrellisSettings(
+        int mmaMaxRows, int targetCtas, int wholeKRows, int wholeKWideRows, boolean halfAccumulate) {
 
     public static final String MMA_MAX_ROWS = "euhedral.trellis.mma-max-rows";
     public static final String TARGET_CTAS = "euhedral.trellis.target-ctas";
     public static final String WHOLE_K_ROWS = "euhedral.trellis.whole-k-rows";
     public static final String WHOLE_K_WIDE_ROWS = "euhedral.trellis.whole-k-wide-rows";
+    public static final String HALF_ACCUMULATE = "euhedral.trellis.half-accumulate";
 
     /// Decode-type quanta (decode, draft) have up to eight rows and never take the prefill route.
     private static final int MIN_MMA_ROWS = 8;
@@ -51,6 +56,7 @@ public record TrellisSettings(int mmaMaxRows, int targetCtas, int wholeKRows, in
                 Integer.getInteger(MMA_MAX_ROWS, DEFAULT_MMA_MAX_ROWS),
                 Integer.getInteger(TARGET_CTAS, DEFAULT_TARGET_CTAS),
                 Integer.getInteger(WHOLE_K_ROWS, DEFAULT_WHOLE_K_ROWS),
-                Integer.getInteger(WHOLE_K_WIDE_ROWS, DEFAULT_WHOLE_K_WIDE_ROWS));
+                Integer.getInteger(WHOLE_K_WIDE_ROWS, DEFAULT_WHOLE_K_WIDE_ROWS),
+                Boolean.parseBoolean(System.getProperty(HALF_ACCUMULATE, "true")));
     }
 }

@@ -53,6 +53,13 @@ public final class TrellisFormat implements LinearFormat {
     /// Rows per block of [LinearKernel#TRELLIS_MMA_ROWS64] (`kSplitRows64`, native/src/trellis/mma.cuh).
     private static final int WIDE_WHOLE_K_ROW_BLOCK = 64;
 
+    /// Layouts of [LinearKernel#TRELLIS_PREPASS]'s output: FP16 in the tensor-core GEMM's fragment order, BF16 in
+    /// column order (the prefill route), FP16 in column order (the FP16-accumulating GEMM's matrix loads).
+    private static final int FRAGMENT_FP16 = 0;
+
+    private static final int COLUMN_BF16 = 1;
+    private static final int COLUMN_FP16 = 2;
+
     private final TrellisSettings settings;
 
     TrellisFormat() {
@@ -436,7 +443,8 @@ public final class TrellisFormat implements LinearFormat {
                             .int32(this.w));
         }
 
-        void prepass(long activations, boolean bf16) {
+        /// `layout`: [#FRAGMENT_FP16], [#COLUMN_BF16] or [#COLUMN_FP16].
+        void prepass(long activations, int layout) {
             this.gpu.launchTableKernel(
                     LinearKernel.TRELLIS_PREPASS,
                     Math.ceilDiv(this.k, PREPASS_BLOCK_COLUMNS),
@@ -453,7 +461,7 @@ public final class TrellisFormat implements LinearFormat {
                             .int32(this.rows)
                             .int32(this.k)
                             .int32(this.segments)
-                            .int32(bf16 ? 1 : 0));
+                            .int32(layout));
         }
 
         void tensorCore(TrellisSettings settings) {
@@ -464,10 +472,15 @@ public final class TrellisFormat implements LinearFormat {
             if (this.rows >= settings.wholeKRows()) {
                 requireScratch(activations);
                 long scratch = this.launch.scratch();
-                prepass(scratch, false);
                 boolean wide = this.rows >= settings.wholeKWideRows();
+                // A verification's rows must equal one-row launches bit for bit: FP32 accumulation.
+                boolean half = settings.halfAccumulate() && !this.launch.rowExact();
+                prepass(scratch, half ? COLUMN_FP16 : FRAGMENT_FP16);
+                LinearKernel kernel = wide
+                        ? (half ? LinearKernel.TRELLIS_MMA_ROWS64_HALF : LinearKernel.TRELLIS_MMA_ROWS64)
+                        : (half ? LinearKernel.TRELLIS_MMA_ROWS_HALF : LinearKernel.TRELLIS_MMA_ROWS);
                 this.gpu.launchTableKernel(
-                        wide ? LinearKernel.TRELLIS_MMA_ROWS64 : LinearKernel.TRELLIS_MMA_ROWS,
+                        kernel,
                         this.n / TrellisLayout.BLOCK,
                         Math.ceilDiv(this.rows, wide ? WIDE_WHOLE_K_ROW_BLOCK : WHOLE_K_ROW_BLOCK),
                         1,
@@ -493,7 +506,7 @@ public final class TrellisFormat implements LinearFormat {
                     splits == 1 ? 0 : PayloadSizes.multiply(PayloadSizes.multiply(splits, this.rows), this.n * 4L);
             requireScratch(PayloadSizes.add(activations, partials));
             long scratch = this.launch.scratch();
-            prepass(scratch, false);
+            prepass(scratch, FRAGMENT_FP16);
             this.gpu.launchTableKernel(
                     LinearKernel.TRELLIS_MMA,
                     this.n / TrellisLayout.BLOCK,
@@ -547,7 +560,7 @@ public final class TrellisFormat implements LinearFormat {
             long rotatedBytes = PayloadSizes.alignUp(PayloadSizes.multiply(this.rows, this.n * 2L), SCRATCH_ALIGNMENT);
             requireScratch(PayloadSizes.add(PayloadSizes.add(activations, decodedBytes), rotatedBytes));
             long scratch = this.launch.scratch(), decoded = scratch + activations, rotated = decoded + decodedBytes;
-            prepass(scratch, true);
+            prepass(scratch, COLUMN_BF16);
             this.gpu.launchTableKernel(
                     LinearKernel.TRELLIS_DECODE_BF16,
                     (this.k / 16) * (this.n / 16),

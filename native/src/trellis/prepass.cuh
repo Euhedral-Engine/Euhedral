@@ -6,14 +6,14 @@
 #include <cuda_fp16.h>
 #include "trellis/codebook.cuh"
 
-// x bf16 [rows][k], suh f16 [s][k], out [s][rows][k]: FP16 in the tensor-core GEMM's fragment order, or BF16 in
-// column order when bf16_out != 0. Each warp transforms one 128-column block of one row in registers
+// x bf16 [rows][k], suh f16 [s][k], out [s][rows][k], by `layout`: 0 FP16 in the tensor-core GEMM's fragment order,
+// 1 BF16 in column order, 2 FP16 in column order (the FP16-accumulating GEMM's ldmatrix loads). Each warp transforms one 128-column block of one row in registers
 // (trellis_hadamard128_warp), four per block. Rows are independent, so a row's bits do not depend on how many rows run
 // with it.
 //   grid (ceil(k / 512), rows, s), block 128.
 extern "C" __global__ __launch_bounds__(128) void euhedral_trellis_prepass(
         const unsigned short* __restrict__ x, const unsigned short* __restrict__ suh, unsigned short* __restrict__ out,
-        int rows, int k, int s, int bf16_out) {
+        int rows, int k, int s, int layout) {
     const int lane = threadIdx.x & 31, r = blockIdx.y, g = blockIdx.z;
     const int block = blockIdx.x * 4 + (threadIdx.x >> 5);
     if (block * 128 >= k) return;
@@ -29,10 +29,12 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_trellis_prepass(
     }
     trellis_hadamard128_warp(v, lane);
     unsigned short* row = out + ((size_t)g * rows + r) * k;
-    if (bf16_out) {
+    if (layout != 0) {
         unsigned short bits[4];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) bits[j] = __bfloat16_as_ushort(__float2bfloat16_rn(v[j]));
+        for (int j = 0; j < 4; ++j)
+            bits[j] = layout == 1 ? __bfloat16_as_ushort(__float2bfloat16_rn(v[j]))
+                                  : __half_as_ushort(__float2half_rn(v[j]));
         *reinterpret_cast<uint2*>(row + column) =
                 make_uint2(bits[0] | (unsigned int)bits[1] << 16, bits[2] | (unsigned int)bits[3] << 16);
     } else {
