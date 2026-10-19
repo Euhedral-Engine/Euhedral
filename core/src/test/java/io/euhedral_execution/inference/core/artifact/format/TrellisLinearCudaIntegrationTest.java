@@ -181,6 +181,16 @@ class TrellisLinearCudaIntegrationTest {
         return x;
     }
 
+    /// The rms of `actual - wanted` relative to the rms of `wanted`.
+    private static double relativeRms(float[] wanted, float[] actual) {
+        double error = 0, energy = 0;
+        for (int i = 0; i < wanted.length; i++) {
+            error += Math.pow(actual[i] - wanted[i], 2);
+            energy += Math.pow(wanted[i], 2);
+        }
+        return Math.sqrt(error / energy);
+    }
+
     /// `actual` is within `relative` of `wanted` per element, plus `relative` of the row's rms.
     private static void assertClose(float[] wanted, float[] actual, int n, double relative, String label) {
         int rows = wanted.length / n;
@@ -224,16 +234,21 @@ class TrellisLinearCudaIntegrationTest {
                 assertArrayEquals(verify, run(gpu, arena, wholeK, split, x, 40, true, false), "whole-K rows");
                 TrellisFormat wide = new TrellisFormat(new TrellisSettings(32, 140, 16, 16));
                 assertArrayEquals(verify, run(gpu, arena, wide, split, x, 40, true, false), "64-row whole-K blocks");
-                // Whole-K launches that are not verifications accumulate runs of k16 tiles in FP16: close to the
-                // reference, each row independent of the others.
+                // Whole-K launches that are not verifications run on block-scaled FP8 operands (on this device): within
+                // FP8's rounding of the reference (E4M3 keeps 3 mantissa bits of weights and activations), with no
+                // saturation for these activations far above the model's, and each row independent of the others.
+                assertTrue(gpu.tableKernelAvailable(LinearKernel.TRELLIS_MMA_ROWS_FP8));
                 for (int wideRows : new int[] {1024, 16}) {
-                    TrellisFormat half = new TrellisFormat(new TrellisSettings(64, 140, 16, wideRows));
-                    float[] halves = run(gpu, arena, half, split, x, 40, false, false);
-                    assertClose(reference, halves, 512, 0.02, "FP16 accumulation, wide rows " + wideRows);
+                    TrellisFormat fp8 = new TrellisFormat(new TrellisSettings(64, 140, 16, wideRows));
+                    float[] blocks = run(gpu, arena, fp8, split, x, 40, false, false);
+                    assertTrue(
+                            relativeRms(reference, blocks) < 0.05,
+                            "FP8 relative rms " + relativeRms(reference, blocks));
+                    assertClose(reference, blocks, 512, 0.25, "FP8, wide rows " + wideRows);
                     assertArrayEquals(
-                            Arrays.copyOf(halves, 20 * 512),
-                            run(gpu, arena, half, split, x, 20, false, false),
-                            "FP16 accumulation rows, wide rows " + wideRows);
+                            Arrays.copyOf(blocks, 20 * 512),
+                            run(gpu, arena, fp8, split, x, 20, false, false),
+                            "FP8 rows, wide rows " + wideRows);
                 }
                 for (int row : new int[] {0, 17, 39}) {
                     MemorySegment single = arena.allocate(1024 * 2L, 2);

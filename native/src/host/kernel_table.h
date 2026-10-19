@@ -27,6 +27,10 @@ typedef struct {
     const char* name;
     unsigned int max_dynamic_shared_bytes;
     const char* module; /* the module root the kernel is compiled from */
+    /* Nonzero: the module uses architecture-specific features (sm_12xa). On another device its kernels are
+     * unavailable (euhedral_kernel_table_available) and the rest of the table still loads. Every entry of a module
+     * gives the same value. */
+    int architecture_specific;
 } EuhedralKernelEntry;
 
 typedef struct {
@@ -52,6 +56,10 @@ void euhedral_kernel_table_initialize(EuhedralKernelTable* table);
 int euhedral_kernel_table_launch(EuhedralKernelTable* table, int (*ready)(void), int32_t kernel,
         uint32_t grid_x, uint32_t grid_y, uint32_t grid_z, uint32_t block_x, uint32_t block_y, uint32_t block_z,
         uint32_t shared_bytes, const uint64_t* words, const uint8_t* sizes, int32_t count);
+
+/* 1 when kernel `kernel` is loaded, 0 when its module is architecture-specific and does not apply to this device,
+ * or a negative status. */
+int euhedral_kernel_table_available(EuhedralKernelTable* table, int (*ready)(void), int32_t kernel);
 
 /* Defines `static int function(void)`: initialize `table` once and return its status. */
 #ifdef _WIN32

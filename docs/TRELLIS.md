@@ -38,15 +38,21 @@ Each trellis linear is a chain of `linear` table kernels inside the existing lin
   stages its activation rows in shared memory four k16 tiles at a time, so its warps share one copy, and finishes
   each row's Hadamard in one warp's registers. The results are bitwise those of the split launch, with no split
   partials.
-- **Many rows, not a VERIFY:** the same blocks with FP16
-  accumulation, the `m16n8k16` rate twice that of FP32 accumulation on this GPU. Each run of 8 k16 tiles (128
-  products per element) sums in FP16 from zero and is added to FP32 sums; the runs tile K, so the loop over a run is
-  unrolled with its ring slots, chunk slots, staging and barriers fixed at compile time. The prepass writes these
-  launches' activations in column order and each A fragment is one `ldmatrix.x4` from the swizzled chunk. A run's
-  sums stay under 195 (prepass outputs within 0.44, mul1 entries within 3.46), far from FP16's 65504. Each row's
-  result still depends only on its own data, but not with the FP32 bits, so a VERIFY keeps FP32 accumulation. On the
-  held-out set, trellis 3.0 scores dNLL +0.0661 ± 0.0067, KL 0.0761, top-1 92.66% with it and +0.0659 ± 0.0067,
-  KL 0.0776, top-1 92.63% with FP32 accumulation throughout.
+- **Many rows, not a VERIFY, on sm_12xa** (`trellis_fp8/kernels.cu`, an architecture-specific module of the linear
+  table): the same blocks on block-scaled FP8 tensor cores, one `m16n8k32` (`kind::mxf8f6f4`, E4M3 operands, FP32
+  accumulation) per two k16 tiles, four times the rate of the FP32-accumulating `m16n8k16`. The prepass writes these
+  launches' activations as E4M3 with one UE8M0 scale per 32 columns, the least power of two that brings the block's
+  largest value within 448, in the order the MMA's A fragments read them; the decoded weights are rounded to E4M3
+  (within ±3.46, no scale). Blocks stage 8 k16 tiles of activations and their scale bytes at a time; K is a multiple
+  of 128, so the loop over a chunk is unrolled with its ring slots, staging and barrier fixed at compile time. Each
+  row's result depends only on its own data, but not with the FP16 operands' bits, so a VERIFY keeps them. On other
+  devices these launches take the FP32-accumulating blocks. On the held-out set, trellis 3.0 scores dNLL
+  +0.0656 ± 0.0069, KL 0.0787, top-1 92.61% this way, and +0.0659 ± 0.0067, KL 0.0776, top-1 92.63% with FP16
+  operands and FP32 accumulation throughout.
+- **Measured, not kept:** FP16 operands with FP16 accumulation over runs of 8 k16 tiles (twice the FP32-accumulating
+  rate; each run's sums stay under 195): prefill 2,185 tokens/s at 4096 tokens, KL 0.0761 on the held-out set. A
+  fixed activation scale of 2^9 in place of the block scales: prefill 2,612 tokens/s at 4096 tokens, KL 0.0776, but
+  activations past 0.875 (twice the largest prepass output over two calibration sequences) would saturate.
 - **Prefill** (non-VERIFY launches above `euhedral.trellis.mma-max-rows` rows): the whole object decoded to BF16 in
   rotated space, one row-exact BF16 GEMM per segment, and the BF16 epilogue.
 - **Exact numerics:** the scalar FP32 reference.
@@ -90,8 +96,8 @@ iterations, every weight on the device:
 
 | Artifact | Prefill 512 tokens | Prefill 16384 tokens | Decode, MTP speculation | Decode, no speculation |
 |---|---|---|---|---|
-| trellis 3.0 | 1372 tokens/s | 1329 tokens/s (12.3 s) | 232.7 tokens/s | 65.7 tokens/s |
-| trellis 3.5 | 1339 tokens/s | 1224 tokens/s (13.4 s) | 212.9 tokens/s | 59.6 tokens/s |
+| trellis 3.0 | 2773 tokens/s | 2431 tokens/s (6.8 s) | 226.7 tokens/s | 66.1 tokens/s |
+| trellis 3.5 | 2702 tokens/s | 2386 tokens/s (6.9 s) | 214.8 tokens/s | 59.8 tokens/s |
 
 Decode is measured on `decode:32:256` (256 tokens after a 32-token prompt).
 
@@ -107,5 +113,5 @@ rotated past L2:
   and of 64 rows, one step takes 74.4 and 77.6 ms at 80 rows, 77.6 and 83.7 ms at 96, 102.9 and 101.7 ms at 128, and
   364.2 and 319.1 ms at 512.
 - `euhedral.trellis.mma-max-rows` (512): the most rows a launch other than a verification keeps on the tensor-core route.
-  The tensor-core route prefills 512-row chunks at 1372 tokens/s and the prefill route at 490, so every chunk of the
+  The tensor-core route prefills 512-row chunks at 2773 tokens/s and the prefill route at 490, so every chunk of the
   default workspace stays on the tensor-core route and the residency plan reserves no prefill scratch.

@@ -56,6 +56,10 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_qwen4_kernel_count(void) {
     return table.count;
 }
 
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_qwen4_kernel_available(int32_t kernel) {
+    return euhedral_kernel_table_available(&table, table_ready, kernel);
+}
+
 EUHEDRAL_CUDA_EXPORT const char* euhedral_cuda_qwen4_kernel_name(int index) {
     return index >= 0 && index < table.count ? kernels[index].name : NULL;
 }
