@@ -677,6 +677,12 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("DFlash2 selector is not implemented by this GPU");
     }
 
+    /// Whether `kernel` runs on this device: the kernels of an architecture-specific module of a table (sm_12xa
+    /// features) are unavailable elsewhere.
+    public boolean tableKernelAvailable(TableKernel kernel) {
+        return true;
+    }
+
     /// Launches a kernel of the native kernel table with the given geometry on the selected stream (or synchronously
     /// when none is selected). The arguments must match the kernel's signature in count and width.
     public void launchTableKernel(

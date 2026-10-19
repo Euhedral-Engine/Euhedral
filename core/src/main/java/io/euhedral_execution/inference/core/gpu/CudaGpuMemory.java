@@ -18,6 +18,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongConsumer;
@@ -164,6 +165,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
     private final MethodHandle[] tableKernelCount = new MethodHandle[KernelTable.values().length];
     private final MethodHandle[] tableKernelName = new MethodHandle[KernelTable.values().length];
+    private final MethodHandle[] tableKernelAvailable = new MethodHandle[KernelTable.values().length];
+    /// Per table, by kernel index: 0 not yet asked, 1 available, 2 unavailable.
+    private final AtomicIntegerArray[] tableAvailability = new AtomicIntegerArray[KernelTable.values().length];
     private final MethodHandle attentionQkNormRopeBf16;
     private final MethodHandle attentionKvAppendNvfp4;
     private final MethodHandle attentionCausalNvfp4;
@@ -579,6 +583,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                                 ValueLayout.JAVA_INT));
                 this.tableKernelCount[table.ordinal()] =
                         bind(linker, symbols, prefix + "_kernel_count", FunctionDescriptor.of(ValueLayout.JAVA_INT));
+                this.tableKernelAvailable[table.ordinal()] = bind(
+                        linker,
+                        symbols,
+                        prefix + "_kernel_available",
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
                 this.tableKernelName[table.ordinal()] = bind(
                         linker,
                         symbols,
@@ -3013,6 +3022,37 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             throw new GpuMemoryException("table kernel " + kernel + " invocation failed", throwable);
         }
         if (status != 0) throw new GpuMemoryException("table kernel " + kernel, status);
+    }
+
+    @Override
+    public boolean tableKernelAvailable(TableKernel kernel) {
+        ensureOpen();
+        int table = kernel.table().ordinal();
+        AtomicIntegerArray known;
+        synchronized (this.tableAvailability) {
+            known = this.tableAvailability[table];
+            if (known == null) {
+                try {
+                    known = new AtomicIntegerArray((int) this.tableKernelCount[table].invokeExact());
+                } catch (Throwable throwable) {
+                    throw new GpuMemoryException("kernel table query failed", throwable);
+                }
+                this.tableAvailability[table] = known;
+            }
+        }
+        int state = known.get(kernel.index());
+        if (state == 0) {
+            int status;
+            try {
+                status = (int) this.tableKernelAvailable[table].invokeExact(kernel.index());
+            } catch (Throwable throwable) {
+                throw new GpuMemoryException("table kernel " + kernel + " availability query failed", throwable);
+            }
+            if (status < 0) throw new GpuMemoryException("table kernel " + kernel, status);
+            state = status == 1 ? 1 : 2;
+            known.set(kernel.index(), state);
+        }
+        return state == 1;
     }
 
     /// The Flash-Next kernel table's names, in table order (a test compares them with the model's [TableKernel] enum).

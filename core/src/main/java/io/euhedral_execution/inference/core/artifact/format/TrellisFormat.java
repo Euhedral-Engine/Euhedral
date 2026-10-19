@@ -54,11 +54,12 @@ public final class TrellisFormat implements LinearFormat {
     private static final int WIDE_WHOLE_K_ROW_BLOCK = 64;
 
     /// Layouts of [LinearKernel#TRELLIS_PREPASS]'s output: FP16 in the tensor-core GEMM's fragment order, BF16 in
-    /// column order (the prefill route), FP16 in column order (the FP16-accumulating GEMM's matrix loads).
+    /// column order (the prefill route), block-scaled E4M3 for the FP8 GEMM (`s * rows * (k + k / 32)` bytes,
+    /// within the FP16 activations' region).
     private static final int FRAGMENT_FP16 = 0;
 
     private static final int COLUMN_BF16 = 1;
-    private static final int COLUMN_FP16 = 2;
+    private static final int BLOCK_FP8 = 2;
 
     private final TrellisSettings settings;
 
@@ -443,7 +444,7 @@ public final class TrellisFormat implements LinearFormat {
                             .int32(this.w));
         }
 
-        /// `layout`: [#FRAGMENT_FP16], [#COLUMN_BF16] or [#COLUMN_FP16].
+        /// `layout`: [#FRAGMENT_FP16], [#COLUMN_BF16] or [#BLOCK_FP8].
         void prepass(long activations, int layout) {
             this.gpu.launchTableKernel(
                     LinearKernel.TRELLIS_PREPASS,
@@ -473,13 +474,13 @@ public final class TrellisFormat implements LinearFormat {
                 requireScratch(activations);
                 long scratch = this.launch.scratch();
                 boolean wide = this.rows >= settings.wholeKWideRows();
-                // Other launches accumulate runs of k16 tiles in FP16; a verification's rows must equal one-row
-                // launches bit for bit, so it accumulates in FP32.
-                boolean half = !this.launch.rowExact();
-                prepass(scratch, half ? COLUMN_FP16 : FRAGMENT_FP16);
-                LinearKernel kernel = wide
-                        ? (half ? LinearKernel.TRELLIS_MMA_ROWS64_HALF : LinearKernel.TRELLIS_MMA_ROWS64)
-                        : (half ? LinearKernel.TRELLIS_MMA_ROWS_HALF : LinearKernel.TRELLIS_MMA_ROWS);
+                // A verification's rows must equal one-row launches bit for bit: FP16 operands and FP32 sums. Other
+                // launches take block-scaled FP8 operands where the device has them.
+                LinearKernel fp8 = wide ? LinearKernel.TRELLIS_MMA_ROWS64_FP8 : LinearKernel.TRELLIS_MMA_ROWS_FP8;
+                boolean blockFp8 = !this.launch.rowExact() && this.gpu.tableKernelAvailable(fp8);
+                prepass(scratch, blockFp8 ? BLOCK_FP8 : FRAGMENT_FP16);
+                LinearKernel kernel =
+                        blockFp8 ? fp8 : wide ? LinearKernel.TRELLIS_MMA_ROWS64 : LinearKernel.TRELLIS_MMA_ROWS;
                 this.gpu.launchTableKernel(
                         kernel,
                         this.n / TrellisLayout.BLOCK,
