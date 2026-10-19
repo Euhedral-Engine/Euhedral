@@ -338,6 +338,10 @@ and two sequences; 512 is the production chunk. No tolerance was changed.
   Only gate_up gains (3% at 512 to 2048 rows, about 1% of a prefill), which does not pay for a second tile shape and its SD4 twin.
   A 192 x 128 tile would use 3 of 4 m-tiles' worth of a 512-row chunk (89%).
 - **`setmaxnreg` on the 128 x 128 tile**: 1158 against 1165 us for gate_up, no change.
+- **K splits on the 128 x 128 tile at 512 rows** (the default prefill chunk; scaled FP32 partials per split, then
+  `euhedral_nvfp4n_skinny_finish`), weights rotated past L2, tile and finish together. Without splits: down 310 us,
+  GDN output 113 us, input 192 us. Two splits: 291, 125 and 273 us; three: 296, 139 and 322 us. Only down gains
+  (2% of a layer's linears), so the tile keeps one split.
 - **Persistent CTAs again, on the `setmaxnreg` layout**: the per-tile fixed cost falls (gate_up with K = 2560: 668 against 695 us)
   but the K = 20480 time rises (4206 against 4112 us) and K = 5120 is unchanged (1156 against 1163 us).
 - **Where the time goes.** gate_up at 1024 rows takes 695, 1163, 2131 and 4112 us for K = 2560, 5120, 10240 and 20480: the
