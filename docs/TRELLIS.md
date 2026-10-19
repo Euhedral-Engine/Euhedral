@@ -38,6 +38,15 @@ Each trellis linear is a chain of `linear` table kernels inside the existing lin
   stages its activation rows in shared memory four k16 tiles at a time, so its warps share one copy, and finishes
   each row's Hadamard in one warp's registers. The results are bitwise those of the split launch, with no split
   partials.
+- **Many rows, not a VERIFY:** the same blocks with FP16
+  accumulation, the `m16n8k16` rate twice that of FP32 accumulation on this GPU. Each run of 8 k16 tiles (128
+  products per element) sums in FP16 from zero and is added to FP32 sums; the runs tile K, so the loop over a run is
+  unrolled with its ring slots, chunk slots, staging and barriers fixed at compile time. The prepass writes these
+  launches' activations in column order and each A fragment is one `ldmatrix.x4` from the swizzled chunk. A run's
+  sums stay under 195 (prepass outputs within 0.44, mul1 entries within 3.46), far from FP16's 65504. Each row's
+  result still depends only on its own data, but not with the FP32 bits, so a VERIFY keeps FP32 accumulation. On the
+  held-out set, trellis 3.0 scores dNLL +0.0661 ± 0.0067, KL 0.0761, top-1 92.66% with it and +0.0659 ± 0.0067,
+  KL 0.0776, top-1 92.63% with FP32 accumulation throughout.
 - **Prefill** (non-VERIFY launches above `euhedral.trellis.mma-max-rows` rows): the whole object decoded to BF16 in
   rotated space, one row-exact BF16 GEMM per segment, and the BF16 epilogue.
 - **Exact numerics:** the scalar FP32 reference.

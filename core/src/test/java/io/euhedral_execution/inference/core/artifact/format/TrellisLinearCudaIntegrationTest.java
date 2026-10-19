@@ -205,7 +205,7 @@ class TrellisLinearCudaIntegrationTest {
 
     @Test
     void everyRouteAgreesWithTheScalarReference() {
-        TrellisFormat format = new TrellisFormat(new TrellisSettings(32, 140, 128, 1024, true));
+        TrellisFormat format = new TrellisFormat(new TrellisSettings(32, 140, 128, 1024));
         Random random = new Random(7);
         try (CudaGpuMemory gpu = open();
                 Arena arena = Arena.ofConfined()) {
@@ -220,22 +220,20 @@ class TrellisLinearCudaIntegrationTest {
                 float[] verify = run(gpu, arena, format, split, x, 40, true, false);
                 assertClose(reference, verify, 512, 0.02, "verification");
                 // From the whole-K rows each block runs every split itself: the same bits.
-                TrellisFormat wholeK = new TrellisFormat(new TrellisSettings(32, 140, 16, 1024, true));
+                TrellisFormat wholeK = new TrellisFormat(new TrellisSettings(32, 140, 16, 1024));
                 assertArrayEquals(verify, run(gpu, arena, wholeK, split, x, 40, true, false), "whole-K rows");
-                TrellisFormat wide = new TrellisFormat(new TrellisSettings(32, 140, 16, 16, true));
+                TrellisFormat wide = new TrellisFormat(new TrellisSettings(32, 140, 16, 16));
                 assertArrayEquals(verify, run(gpu, arena, wide, split, x, 40, true, false), "64-row whole-K blocks");
                 // Whole-K launches that are not verifications accumulate runs of k16 tiles in FP16: close to the
-                // reference, each row independent of the others; without it, the FP32 bits.
+                // reference, each row independent of the others.
                 for (int wideRows : new int[] {1024, 16}) {
-                    TrellisFormat half = new TrellisFormat(new TrellisSettings(64, 140, 16, wideRows, true));
+                    TrellisFormat half = new TrellisFormat(new TrellisSettings(64, 140, 16, wideRows));
                     float[] halves = run(gpu, arena, half, split, x, 40, false, false);
                     assertClose(reference, halves, 512, 0.02, "FP16 accumulation, wide rows " + wideRows);
                     assertArrayEquals(
                             Arrays.copyOf(halves, 20 * 512),
                             run(gpu, arena, half, split, x, 20, false, false),
                             "FP16 accumulation rows, wide rows " + wideRows);
-                    TrellisFormat full = new TrellisFormat(new TrellisSettings(64, 140, 16, wideRows, false));
-                    assertArrayEquals(verify, run(gpu, arena, full, split, x, 40, false, false), "FP32 accumulation");
                 }
                 for (int row : new int[] {0, 17, 39}) {
                     MemorySegment single = arena.allocate(1024 * 2L, 2);

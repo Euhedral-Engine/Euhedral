@@ -677,7 +677,7 @@ class TrellisPlanTest {
                 ENDS.get(weights.get(3).deviceAddress()));
     }
 
-    private static final TrellisFormat FORMAT = new TrellisFormat(new TrellisSettings(32, 140, 128, 1024, true));
+    private static final TrellisFormat FORMAT = new TrellisFormat(new TrellisSettings(32, 140, 128, 1024));
 
     private static void assertWords(Launch launch, long[] words, int... sizes) {
         assertArrayEquals(words, launch.words(), launch.name());
@@ -786,7 +786,7 @@ class TrellisPlanTest {
     void aLaunchFromTheWideRowsTakesBlocksOfSixtyFourRows() {
         LaunchLog gpu = new LaunchLog();
         var weights = object(gpu, 5120, 17408, 5120);
-        TrellisFormat wide = new TrellisFormat(new TrellisSettings(32, 140, 128, 128, true));
+        TrellisFormat wide = new TrellisFormat(new TrellisSettings(32, 140, 128, 128));
         wide.linear(gpu, launch(weights, 200, 17408, 5120, 1L << 36, 1L << 30, true));
         assertEquals(
                 List.of(LinearKernel.TRELLIS_PREPASS.symbol(), LinearKernel.TRELLIS_MMA_ROWS64.symbol()), gpu.names());
