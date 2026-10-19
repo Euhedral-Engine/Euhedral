@@ -13,10 +13,16 @@ class FullModelCpuReferenceTest {
         for (float sign : new float[] {-1, 1}) {
             short[] row = new short[256];
             java.util.Arrays.fill(row, floatToBf16(sign * 1e30f));
-            // A constant row maps to its DC coefficient. Saturation gives
-            // E2M1 maximum * E4M3 maximum, then inverse H256 divides by 16.
-            double expected = sign * 6.0 * 448.0 / 16.0;
-            for (double value : Nvfp4KvReference.represented(row, 0)) assertEquals(expected, value);
+            // A constant row maps to its DC coefficient, the largest of the first group: saturation gives the largest
+            // magnitude times the largest E4M3 scale. The group's 15 zero coefficients take the smallest magnitude (the
+            // midrise grid has no zero) at that scale, and the other groups are zero. Inverse H256: entry i sums the
+            // coefficients j < 16 with signs (-1)^popcount(i & j), over 16.
+            double[] represented = Nvfp4KvReference.represented(row, 0);
+            for (int i = 0; i < 256; i++) {
+                double sum = sign * Nvfp4KvReference.MAXIMUM * 448.0;
+                for (int j = 1; j < 16; j++) sum += ((Integer.bitCount(i & j) & 1) == 0 ? 1 : -1) * 0.5 * 448.0;
+                assertEquals(sum / 16, represented[i], 1e-9);
+            }
         }
     }
 
@@ -27,7 +33,6 @@ class FullModelCpuReferenceTest {
         int headDim = 256;
         short[] gateValue = new short[(queryHeads + keyValueHeads) * headDim];
         for (int i = 0; i < queryHeads * headDim; i++) gateValue[i] = floatToBf16((i % 7) / 4.0f);
-        // H256 maps each constant row to one coefficient; these scales/codes are exact.
         for (int h = 0; h < keyValueHeads; h++)
             java.util.Arrays.fill(
                     gateValue, (queryHeads + h) * headDim, (queryHeads + h + 1) * headDim, floatToBf16(3.0f * (h + 1)));
@@ -37,10 +42,11 @@ class FullModelCpuReferenceTest {
 
         for (int queryHead = 0; queryHead < queryHeads; queryHead++) {
             int valueHead = queryHead / (queryHeads / keyValueHeads);
+            // One key: the output is the value head's cached representation, gated.
+            double[] cached = Nvfp4KvReference.represented(gateValue, queryHeads * headDim + valueHead * headDim);
             for (int lane = 0; lane < headDim; lane++) {
                 float gate = bf16ToFloat(gateValue[queryHead * headDim + lane]);
-                float value = bf16ToFloat(gateValue[queryHeads * headDim + valueHead * headDim + lane]);
-                float expected = value / (1.0f + (float) Math.exp(-gate));
+                float expected = (float) cached[lane] / (1.0f + (float) Math.exp(-gate));
                 assertEquals(expected, bf16ToFloat(output[queryHead * headDim + lane]), 0.06f);
             }
         }

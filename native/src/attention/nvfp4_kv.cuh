@@ -1,26 +1,27 @@
 #pragma once
-// Group-16 NVFP4 key/value cache codec for D256 attention heads.
+// Group-16 4-bit key/value cache codec for D256 attention heads (the NVFP4 cache format: 4-bit codes, one E4M3 scale
+// per 16 values).
 //
 // Storage contract: device page tables address 256-token pages. Within each page,
 // token-major KV heads contain 144-byte rows: 128 packed-code bytes followed by
 // 16 scale bytes. The low nibble is the even element, and each E4M3 scale covers
 // one contiguous group of 16 represented elements.
-// Every represented value is exactly e2m1(code) * e4m3(scale), applied to the row AFTER the
-// normalized Sylvester H256 rotation. Queries are rotated by the same orthogonal transform, so
+// Every represented value is exactly magnitude(code) * e4m3(scale), applied to the row AFTER the
+// normalized Sylvester H256 rotation. The codes are an INT4 midrise grid: sign bit 3, magnitude m + 0.5 for the low
+// three bits m (0.5 to 7.5), the scale chosen from the group's largest value over 7.5. Queries are rotated by the same orthogonal transform, so
 // q.k is preserved; attention outputs are rotated back with the same (self-inverse) transform.
 //
-// The loader compiles this module for the plain sm_XY target (no E2M1 conversion instructions), so the conversions are exact software routines
-// rather than the sm_100+ cvt instructions. Rounding is round-to-nearest-even with saturation,
-// identical to cvt.rn.satfinite.e2m1x2.f32.
+// Encoding takes the nearest magnitude, ties (the integers) to the larger, saturating at 7.5.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
-// EUHEDRAL_KV_CODEC (measurement builds, set through EUHEDRAL_CUDA_KV_CODEC): 0 is E2M1; 1, 2 and 3 store
-// midrise integer grids in the same nibbles, magnitudes (m + 0.5) for m < 8, 4 and 2 (INT4, INT3, INT2).
+// EUHEDRAL_KV_CODEC: 1 (the default) is the INT4 midrise grid. Measurement builds set another through
+// EUHEDRAL_CUDA_KV_CODEC: 0 is E2M1 (magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6, round to nearest even, the scale over 6),
+// 2 and 3 the INT3 and INT2 midrise grids (m < 4 and m < 2). A module that includes this file may pin its own.
 #ifndef EUHEDRAL_KV_CODEC
-#define EUHEDRAL_KV_CODEC 0
+#define EUHEDRAL_KV_CODEC 1
 #endif
 
 namespace nvfp4kv {
@@ -35,8 +36,8 @@ constexpr float kMaxFinite = EUHEDRAL_KV_CODEC == 0 ? 6.0f : kMidriseLevels - 0.
 constexpr float kScaleMinimum = 1.0f / 512.0f;
 constexpr float kScaleMaximum = 448.0f;
 
-// E2M1 magnitudes indexed by the low three code bits.
-__device__ __forceinline__ float e2m1_magnitude(unsigned int code) {
+// The magnitude of the low three code bits.
+__device__ __forceinline__ float code_magnitude(unsigned int code) {
     const unsigned int magnitude = code & 7u;
     if (EUHEDRAL_KV_CODEC != 0) return static_cast<float>(magnitude) + 0.5f;
     // E2M1 bias is one. Codes 0 and 1 are zero and the 0.5 subnormal;
@@ -48,8 +49,9 @@ __device__ __forceinline__ float e2m1_magnitude(unsigned int code) {
     return __uint_as_float(bits);
 }
 
-// Round-to-nearest-even, saturating. Ties go to the even code (0, 1.0, 2.0, 4.0 are even).
-__device__ __forceinline__ unsigned int e2m1_encode(float value) {
+// The nearest code, saturating. Midrise grids: ties (integers) go to the larger magnitude. E2M1: ties go to the
+// even code (0, 1.0, 2.0, 4.0 are even).
+__device__ __forceinline__ unsigned int encode_code(float value) {
     const float a = fabsf(value);
     unsigned int code;
     if (EUHEDRAL_KV_CODEC != 0) {
@@ -68,8 +70,8 @@ __device__ __forceinline__ unsigned int e2m1_encode(float value) {
     return code | ((__float_as_uint(value) >> 28) & 8u);
 }
 
-__device__ __forceinline__ float e2m1_decode(unsigned int code) {
-    const float magnitude = e2m1_magnitude(code);
+__device__ __forceinline__ float decode_code(unsigned int code) {
+    const float magnitude = code_magnitude(code);
     return (code & 8u) ? -magnitude : magnitude;
 }
 
@@ -99,19 +101,19 @@ __device__ __forceinline__ Group16 quantize_group16(const float* source) {
     const float represented = static_cast<float>(scale);
 #pragma unroll
     for (int i = 0; i < 8; i++) {
-        result.codes_lo |= e2m1_encode(__fdiv_rn(source[i], represented)) << (4 * i);
-        result.codes_hi |= e2m1_encode(__fdiv_rn(source[8 + i], represented)) << (4 * i);
+        result.codes_lo |= encode_code(__fdiv_rn(source[i], represented)) << (4 * i);
+        result.codes_hi |= encode_code(__fdiv_rn(source[8 + i], represented)) << (4 * i);
     }
     return result;
 }
 
-// Expands eight packed codes into FP16 pairs. Every E2M1 value times a legal E4M3 cache scale
-// is exactly representable in FP16 (<= 4 fraction bits, magnitude <= 2688), so this is exact.
+// Expands eight packed codes into FP16 pairs. Every code magnitude times a legal E4M3 cache scale is exactly
+// representable in FP16 (at most eight significant bits, 2^-10 to 3360), so this is exact.
 __device__ __forceinline__ void dequantize8_f16(unsigned int codes, float scale, __half2 (&out)[4]) {
 #pragma unroll
     for (int pair = 0; pair < 4; pair++) {
-        const float lo = e2m1_decode((codes >> (8 * pair)) & 0xFu) * scale;
-        const float hi = e2m1_decode((codes >> (8 * pair + 4)) & 0xFu) * scale;
+        const float lo = decode_code((codes >> (8 * pair)) & 0xFu) * scale;
+        const float hi = decode_code((codes >> (8 * pair + 4)) & 0xFu) * scale;
         out[pair] = __floats2half2_rn(lo, hi);
     }
 }

@@ -192,11 +192,11 @@ static __device__ __forceinline__ void decode_block(unsigned block,
     const unsigned tiles = begin < end ? (end - begin + KT - 1) / KT : 0;
     __shared__ __align__(16) __half vbuf[2][KT * STRIDE];            // expanded V tiles (warp 0 stages the queries here first)
     __shared__ __align__(16) unsigned char kraw[kRing][KT * Format<Kv>::kRow];  // raw K tiles
-    __shared__ __align__(16) unsigned pairs[256];                    // byte of two E2M1 codes -> FP16 pair
+    __shared__ __align__(16) unsigned pairs[256];                    // byte of two cache codes -> FP16 pair
     __shared__ __align__(16) float4 scores[2][32];                   // one lane's four scores per tile
     __shared__ __align__(16) __half pbuf[2][8 * 24];                 // P^T source: [query][key], hi and lo, padded rows
     __shared__ unsigned long long mbarriers[8];
-    for (unsigned i = threadIdx.x; i < 256; i += 96) pairs[i] = e2m1_pair_bits(i);
+    for (unsigned i = threadIdx.x; i < 256; i += 96) pairs[i] = code_pair_bits(i);
     if (threadIdx.x == 0)
         for (int i = 0; i < 8; i++) mbarrier_init(&mbarriers[i], 32);
     // Rotated queries (rows >= group zero) as hi + lo FP16 B fragments: qb[k][part][2]. Warp 0 only.

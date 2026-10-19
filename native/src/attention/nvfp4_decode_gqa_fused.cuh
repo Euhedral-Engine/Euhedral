@@ -81,7 +81,7 @@ static __device__ __forceinline__ void fused_block(unsigned char* shared, const 
     const unsigned R = L::R;
     unsigned* pairs = reinterpret_cast<unsigned*>(shared + L::kPairs);
     unsigned long long* mbarriers = reinterpret_cast<unsigned long long*>(shared + L::kBarriers);
-    for (unsigned i = threadIdx.x; i < 256; i += blockDim.x) pairs[i] = e2m1_pair_bits(i);
+    for (unsigned i = threadIdx.x; i < 256; i += blockDim.x) pairs[i] = code_pair_bits(i);
     if (threadIdx.x == 0)
         for (unsigned i = 0; i < L::kBarrierCount; i++)
             mbarrier_init(&mbarriers[i], (i >= L::kKeysEmpty && i < L::kKeysEmpty + S)

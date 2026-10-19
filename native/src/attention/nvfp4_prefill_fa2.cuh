@@ -186,7 +186,7 @@ static __device__ __forceinline__ void attention_prefill_fa2(
     const unsigned kh = blockIdx.x % keyHeads, first = (blockIdx.x / keyHeads) * 16;
     const unsigned head = kh * group + warp, width = (queryHeads + keyHeads) * D;
     const bool producer = warp >= group;
-    for (unsigned i = threadIdx.x; i < 256; i += blockDim.x) pairs[i] = e2m1_pair_bits(i);
+    for (unsigned i = threadIdx.x; i < 256; i += blockDim.x) pairs[i] = code_pair_bits(i);
     if (threadIdx.x == 0) {
         for (int s = 0; s < 2; s++) {
             mbarrier_init(&mbarriers[s], kProducerWarps * 32);

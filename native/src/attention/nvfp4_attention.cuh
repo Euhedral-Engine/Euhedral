@@ -13,7 +13,7 @@ __device__ __forceinline__ const unsigned char* cache_row(
 
 __device__ __forceinline__ float element(const unsigned char* row, unsigned int d) {
     const unsigned int code = (row[d / 2] >> (4 * (d & 1))) & 15;
-    return e2m1_decode(code) * e4m3_decode(row[128 + d / 16]);
+    return decode_code(code) * e4m3_decode(row[128 + d / 16]);
 }
 
 // All lanes receive the sum. No CTA barrier in the per-key decode loop.
@@ -46,7 +46,7 @@ struct Nvfp4Kv {
         const float scale = nvfp4kv::e4m3_decode(key[128 + lane / 2]);
         float dot = 0;
 #pragma unroll
-        for (int j = 0; j < 8; j++) dot = fmaf(q[j], nvfp4kv::e2m1_decode((codes >> (4 * j)) & 15u), dot);
+        for (int j = 0; j < 8; j++) dot = fmaf(q[j], nvfp4kv::decode_code((codes >> (4 * j)) & 15u), dot);
         return dot * scale;
     }
     // acc = acc * a + v * b over this lane's eight contiguous dimensions.
@@ -55,7 +55,7 @@ struct Nvfp4Kv {
         const unsigned int codes = reinterpret_cast<const unsigned int*>(value)[lane];
         const float weighted = b * nvfp4kv::e4m3_decode(value[128 + lane / 2]);
 #pragma unroll
-        for (int j = 0; j < 8; j++) acc[j] = fmaf(nvfp4kv::e2m1_decode((codes >> (4 * j)) & 15u), weighted, acc[j] * a);
+        for (int j = 0; j < 8; j++) acc[j] = fmaf(nvfp4kv::decode_code((codes >> (4 * j)) & 15u), weighted, acc[j] * a);
     }
 };
 

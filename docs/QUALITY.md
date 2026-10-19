@@ -289,17 +289,21 @@ over the starting positions of the peak 32-step hidden-state error reaches 12% o
 ## KV cache
 
 The cache stores each key and value row after the H256 rotation as 4-bit codes with an E4M3 scale per 16 elements,
-144 bytes per 256-element row (`native/src/attention/nvfp4_kv.cuh`). Measurement builds swap the code grid inside the
-same rows: `EUHEDRAL_CUDA_KV_CODEC=1`, `2` or `3` in the environment of the process that compiles the kernels stores
-midrise integer grids, magnitudes m + 0.5 for m below 8, 4 and 2 (INT4, INT3 and INT2), with the scale chosen from the
-group's largest value as for E2M1; every kernel, the exact twins included, decodes the chosen grid. A fresh Gradle
-daemon carries the variable into the scoring JVM:
+144 bytes per 256-element row (`native/src/attention/nvfp4_kv.cuh`). The codes are an INT4 midrise grid: magnitudes m + 0.5
+for m below 8 (0.5 to 7.5, no zero), the nearest magnitude with integers going to the larger, and the scale chosen from the
+group's largest value over 7.5. Measurement builds swap the grid inside the same rows: `EUHEDRAL_CUDA_KV_CODEC=0` in the
+environment of the process that compiles the kernels stores E2M1 codes (magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6, the scale over
+6), `2` and `3` the INT3 and INT2 midrise grids (m below 4 and 2); every kernel, the exact twins included, decodes the chosen
+grid. The Flash-Next module keeps E2M1. A fresh Gradle daemon carries the variable into the scoring JVM:
 
 ```bash
 ./gradlew --stop
 EUHEDRAL_CUDA_KV_CODEC=2 ./gradlew :quantization:run --args="score --artifact qwen3_8_27b_nvfp4_compressed.edrl \
     --results results.txt --reference swift_t2.kld --name int3-t2"
 ```
+
+NVFP4-Trellis-RCO on the held-out set (dNLL / KL / top-1, one scorer and reference): INT4 midrise +0.0497 / 0.0700 / 92.97%,
+E2M1 +0.0509 / 0.0722 / 92.86%.
 
 T2 is also scored at a 32K context: four 32768-token chunks of the wikitext test text, the second half of each scored
 (65,532 positions 16K to 32K deep), against Swift-1.5 BF16 in llama.cpp with an F16 cache (`llama-perplexity -c 32768

@@ -166,7 +166,7 @@ extern "C" __global__ __launch_bounds__(96) void euhedral_q4_qsa_attention(
     unsigned long long* barriers = reinterpret_cast<unsigned long long*>(shared + kBarrierOffset);
     const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned int g = lane >> 2, tig = lane & 3u;
-    for (unsigned int i = threadIdx.x; i < 256u; i += blockDim.x) pairs[i] = nvfp4pipe::e2m1_pair_bits(i);
+    for (unsigned int i = threadIdx.x; i < 256u; i += blockDim.x) pairs[i] = nvfp4pipe::code_pair_bits(i);
     if (threadIdx.x == 0)
         for (int i = 0; i < 8; i++) nvfp4pipe::mbarrier_init(&barriers[i], 32);
     const unsigned long long unit = blockIdx.x;

@@ -1,9 +1,13 @@
 package io.euhedral_execution.inference.core.gpu;
 
-/// Independent mathematical reference for the persistent NVFP4 representation.
-/// H256 is evaluated from (-1)^popcount(i & j), not the device butterfly tree.
+/// Independent mathematical reference for the persistent NVFP4 cache representation: 4-bit codes on the INT4 midrise
+/// grid (magnitudes m + 0.5, the nearest with integers going to the larger, saturating at 7.5) and one E4M3 scale per
+/// 16 values, chosen from the group's largest value over 7.5. H256 is evaluated from (-1)^popcount(i & j), not the
+/// device
+/// butterfly tree.
 final class Nvfp4KvReference {
-    private static final double[] MAGNITUDES = {0, .5, 1, 1.5, 2, 3, 4, 6};
+    /// The largest code magnitude.
+    static final double MAXIMUM = 7.5;
     private static final double[] SCALES = new double[127];
 
     static {
@@ -21,10 +25,11 @@ final class Nvfp4KvReference {
             double maximum = 0;
             for (int d = 0; d < 16; d++) maximum = Math.max(maximum, Math.abs(rotated[base + d]));
             if (maximum == 0) continue;
-            double scale = SCALES[nearest(Math.clamp((float) maximum / 6.0f, 1.0 / 512, 448), SCALES)];
+            double scale = SCALES[nearest(Math.clamp((float) maximum / (float) MAXIMUM, 1.0 / 512, 448), SCALES)];
             for (int d = 0; d < 16; d++) {
                 float divided = (float) rotated[base + d] / (float) scale;
-                rotated[base + d] = Math.copySign(MAGNITUDES[nearest(Math.abs(divided), MAGNITUDES)], divided) * scale;
+                double magnitude = Math.min(Math.floor(Math.abs(divided)), 7) + 0.5;
+                rotated[base + d] = Math.copySign(magnitude, divided) * scale;
             }
         }
         return transform(rotated);
