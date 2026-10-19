@@ -20,10 +20,10 @@ static __device__ __forceinline__ void mbarrier_wait(unsigned long long* mb, uns
     asm volatile("{\n .reg .pred p;\n WAIT_LOOP:\n mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%0], %1;\n"
                  " @!p bra WAIT_LOOP;\n}" ::"r"(smem_u32(mb)), "r"(parity) : "memory");
 }
-// FP16 pair for a byte holding two E2M1 codes (low nibble first), before the scale: one table lookup plus one
-// FP16 multiply by the group's scale replaces the software expansion. Every product (E2M1 x E4M3: at most five
-// significant bits, 2^-10 to 2688) is exact in FP16, so the multiply equals the FP32 product rounded to FP16.
-static __device__ __forceinline__ unsigned e2m1_pair_bits(unsigned byte) {
+// FP16 pair for a byte holding two cache codes (low nibble first), before the scale: one table lookup plus one
+// FP16 multiply by the group's scale replaces the software expansion. Every product (code magnitude x E4M3: at most
+// eight significant bits, 2^-10 to 3360) is exact in FP16, so the multiply equals the FP32 product rounded to FP16.
+static __device__ __forceinline__ unsigned code_pair_bits(unsigned byte) {
     unsigned pair = 0;
 #pragma unroll
     for (int i = 0; i < 2; i++) {

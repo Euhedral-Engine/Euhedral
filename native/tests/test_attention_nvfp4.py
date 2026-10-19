@@ -28,7 +28,9 @@ def fused_shared(tiles):
 
 
 if np is not None:
-    MAGNITUDES = np.array([0, .5, 1, 1.5, 2, 3, 4, 6], dtype=np.float64)
+    # The cache's INT4 midrise grid (attention/nvfp4_kv.cuh): magnitudes m + 0.5, the scale over 7.5.
+    MAGNITUDES = np.arange(8, dtype=np.float64) + .5
+    MAX_MAGNITUDE = np.float32(7.5)
     SCALES = np.array([(b & 7) * 2.0**-9 if b < 8 else
                        (1 + (b & 7) / 8) * 2.0**((b >> 3) - 7)
                        for b in range(127)], dtype=np.float64)
@@ -53,18 +55,24 @@ def nearest_even(values, representable):
     return np.argmin(np.where(distance == minimum, rank, 2), axis=-1)
 
 
+def encode(values):
+    """Codes of `values` (already divided by the scale): the nearest magnitude, integers to the larger, saturating."""
+    values = np.asarray(values, dtype=np.float32)
+    codes = np.minimum(np.floor(np.abs(values)), 7).astype(np.uint8)
+    return codes | np.signbit(values).astype(np.uint8) * 8
+
+
 def pack_row(row):
     rotated = np.asarray(row, dtype=np.float64) @ H
     groups = rotated.reshape(16, 16)
     maximum = abs(groups).max(axis=1)
-    raw_scale = (maximum.astype(np.float32) / np.float32(6)).astype(np.float32)
+    raw_scale = (maximum.astype(np.float32) / MAX_MAGNITUDE).astype(np.float32)
     scales = nearest_even(np.clip(raw_scale, 2.0**-9, 448), SCALES).astype(np.uint8)
     scales[maximum == 0] = 0
     represented = SCALES[scales]
     divided = np.divide(groups.astype(np.float32), represented.astype(np.float32)[:, None],
                         out=np.zeros((16, 16), np.float32), where=represented[:, None] != 0)
-    codes = nearest_even(abs(divided), MAGNITUDES).astype(np.uint8)
-    codes |= np.signbit(divided).astype(np.uint8) * 8
+    codes = encode(divided)
     packed = (codes[:, ::2] | (codes[:, 1::2] << 4)).ravel()
     return np.concatenate([packed, scales]).tobytes()
 
@@ -84,7 +92,7 @@ class Nvfp4AttentionTest(unittest.TestCase):
         cls.gpu = Gpu(b'#include "attention/kernels.cu"\n#include "attention/reference_decode_gqa.cuh"\n#include "attention/reference_prefill_fa2.cuh"\n' + br'''
 extern "C" __global__ void probe_nvfp4_encode(const float* input, unsigned char* output, unsigned int count) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < count) output[i] = nvfp4kv::e2m1_encode(input[i]);
+    if (i < count) output[i] = nvfp4kv::encode_code(input[i]);
 }
 extern "C" __global__ void probe_nvfp4_groups(const float* input, unsigned char* output, unsigned int count) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -113,7 +121,7 @@ extern "C" __global__ void probe_nvfp4_hadamard(
 extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= 16 * 256) return;
-    const float value = nvfp4kv::e2m1_decode(i % 16) * nvfp4kv::e4m3_decode(i / 16);
+    const float value = nvfp4kv::decode_code(i % 16) * nvfp4kv::e4m3_decode(i / 16);
     fp32[i] = value;
     fp16[i] = __half_as_ushort(__float2half_rn(value));
 }
@@ -141,7 +149,7 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
         return b''.join(self.gpu.download(p, PAGE_TOKENS * heads * ROW_BYTES) for p in pages)
 
     def test_quantizer_midpoints_saturation_and_scale_rounding(self):
-        mids = np.array([.25, .75, 1.25, 1.75, 2.5, 3.5, 5], dtype=np.float32)
+        mids = np.arange(1, 8, dtype=np.float32)
         positive = np.concatenate(([0., 1e-30, 1e30], np.nextafter(mids, -np.inf), mids,
                                    np.nextafter(mids, np.inf))).astype(np.float32)
         inputs = np.concatenate((positive, -positive))
@@ -150,13 +158,12 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
             output = self.owned(scope, self.gpu.zeros(len(inputs)))
             self.gpu.launch('probe_nvfp4_encode', (len(inputs) + 127) // 128,
                             [P(source), P(output), U(len(inputs))])
-            expected = nearest_even(abs(inputs), MAGNITUDES).astype(np.uint8)
-            expected |= np.signbit(inputs).astype(np.uint8) * 8
+            expected = encode(inputs)
             self.assertEqual(expected.tobytes(), self.gpu.download(output, len(inputs)))
         raw_scales = np.concatenate(([0, 1e-30, 1e30], SCALES,
                                      (SCALES[:-1] + SCALES[1:]) / 2)).astype(np.float32)
         groups = np.tile(np.linspace(-1, 1, 16, dtype=np.float32), (len(raw_scales), 1))
-        groups *= (raw_scales * np.float32(6))[:, None]
+        groups *= (raw_scales * MAX_MAGNITUDE)[:, None]
         with contextlib.ExitStack() as scope:
             source = self.owned(scope, self.gpu.upload(groups.tobytes()))
             output = self.owned(scope, self.gpu.zeros(len(groups) * 9))
@@ -167,10 +174,9 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                 maximum = abs(group).max()
                 if maximum == 0:
                     expected.append(bytes(9)); continue
-                scale = int(nearest_even(np.clip(maximum / np.float32(6), 2.**-9, 448), SCALES))
+                scale = int(nearest_even(np.clip(maximum / MAX_MAGNITUDE, 2.**-9, 448), SCALES))
                 divided = group / np.float32(SCALES[scale])
-                codes = nearest_even(abs(divided), MAGNITUDES).astype(np.uint8)
-                codes |= np.signbit(divided).astype(np.uint8) * 8
+                codes = encode(divided)
                 expected.append((codes[::2] | (codes[1::2] << 4)).tobytes() + bytes([scale]))
             self.assertEqual(b''.join(expected), self.gpu.download(output, len(groups) * 9))
 

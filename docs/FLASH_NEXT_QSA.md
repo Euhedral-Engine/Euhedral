@@ -105,7 +105,8 @@ Scores are tiled over rows so that the scratch stays bounded: the FP32 scores of
   `inv_freq = 1 / theta^(2 i / 64)` in FP32, the phase `position * inv_freq` rounded to FP32, `cosf`/`sinf`, rounded to BF16.
   Checked against torch for 765,216 table entries (23,913 positions up to 262,143, all 32 frequencies): identical to torch's CPU
   computation; 3 cosines and 4 sines differ from torch's CUDA results at BF16 rounding boundaries.
-- The cache is the dense engine's NVFP4 codec (Hadamard-rotated rows, E2M1 codes, E4M3 scale per 16): queries are rotated by the
+- The cache is the dense engine's NVFP4 codec with E2M1 codes (Hadamard-rotated rows, E4M3 scale per 16; the Flash-Next module
+  pins the E2M1 grid, where the dense engine's caches use INT4 midrise codes): queries are rotated by the
   same transform, the output is rotated back. The decoded pages equal the fixtures' codec emulation to 1.7e-3 relative RMS, the
   BF16 rounding the fixtures apply to the decoded cache.
 - Scores `S = Q K^T` and `O += P V` use FP16 operands with FP32 accumulation: the rotated queries and the probabilities round to

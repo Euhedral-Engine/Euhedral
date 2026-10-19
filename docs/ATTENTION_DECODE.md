@@ -10,7 +10,8 @@ decode kernel runs; a group of more than 8 query heads also keeps the per-head k
 A sequence keeps its attention caches in one of two formats, chosen per engine (`InferenceConfig.kvCache`,
 `euhedral.inference.kv-cache`; unset, the artifact's, NVFP4):
 
-- **NVFP4** (`nvfp4_kv.cuh`): 144-byte head rows of the H256-rotated keys and values. Queries are rotated into the same basis
+- **NVFP4** (`nvfp4_kv.cuh`): 144-byte head rows of the H256-rotated keys and values, 4-bit codes on the INT4 midrise grid
+  (magnitudes 0.5 to 7.5) with an E4M3 scale per 16 values (docs/QUALITY.md, KV cache). Queries are rotated into the same basis
   and outputs back out of it.
 - **BF16** (`bf16_kv.cuh`): 512-byte head rows, the keys and values as computed, unrotated.
 
@@ -41,9 +42,9 @@ Tiles of 16 keys hand off in order through shared-memory mbarriers. The CTA uses
 4 CTAs per SM are resident and the 256 CTAs of a long context run in one wave. Named barriers would cap the SM at one resident CTA
 (nine ids against sixteen per SM), which is why mbarriers carry the hand-offs.
 
-**Exact-product lookup.** A 256-entry table maps a byte of two E2M1 codes to an FP16 pair; one FP16 multiply by the group scale
-(a hardware `cvt.rn.f16x2.e4m3x2` of the scale byte) follows. Every product (at most five significant bits, 2^-10 to 2688) is exact in
-FP16, so the result equals the FP32 product rounded to FP16 for every legal cache scale.
+**Exact-product lookup.** A 256-entry table maps a byte of two cache codes (INT4 midrise magnitudes m + 0.5) to an FP16 pair; one
+FP16 multiply by the group scale (a hardware `cvt.rn.f16x2.e4m3x2` of the scale byte) follows. Every product (at most eight significant
+bits, 2^-10 to 3360) is exact in FP16, so the result equals the FP32 product rounded to FP16 for every legal cache scale.
 
 **Merge.** One warp per query head. Lanes gather the split statistics (the maximum is order-free) and the per-split rows are loaded
 eight at a time; every sum still adds the splits in order.
@@ -110,7 +111,7 @@ In the model (NVFP4-Trellis-RCO, MTP depth 4, the README scenarios), a verificat
   stages (53 KiB of shared memory) leave one CTA per SM: 16% slower at 64K than four.
 - **Register prefetch of V in the fused kernel's loader** (one tile ahead, as in the one-row kernel): with one tile of K and V in
   flight per CTA and one CTA per SM the kernel waited on DRAM latency and ran no faster than the row twins.
-- **Arithmetic E2M1 expansion** (code bits placed as an FP16 subnormal and scaled by 2^14, in place of the pair table; exact): 1 to 2%
+- **Arithmetic E2M1 expansion** (measured on the earlier E2M1 code grid: code bits placed as an FP16 subnormal and scaled by 2^14, in place of the pair table; exact): 1 to 2%
   on the fused kernel and the twin, within noise. Shared-memory wavefronts are not what holds the fused kernel back.
 - **Dropping the lo FP16 parts** (queries and probabilities as single FP16 values; changes the numerics of one-row decode too):
   the fused kernel takes 191.6 us at 64K, 29% less (with the arithmetic expansion). Not adopted: the error budget of the relaxed
