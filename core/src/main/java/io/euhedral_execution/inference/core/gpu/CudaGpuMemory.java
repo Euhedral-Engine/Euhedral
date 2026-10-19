@@ -21,6 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.LongConsumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -166,8 +167,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle[] tableKernelCount = new MethodHandle[KernelTable.values().length];
     private final MethodHandle[] tableKernelName = new MethodHandle[KernelTable.values().length];
     private final MethodHandle[] tableKernelAvailable = new MethodHandle[KernelTable.values().length];
-    /// Per table, by kernel index: 0 not yet asked, 1 available, 2 unavailable.
-    private final AtomicIntegerArray[] tableAvailability = new AtomicIntegerArray[KernelTable.values().length];
+    /// Per table, by kernel index: 0 not yet asked, 1 available, 2 unavailable. Each table's array is set once.
+    private final AtomicReferenceArray<AtomicIntegerArray> tableAvailability =
+            new AtomicReferenceArray<>(KernelTable.values().length);
     private final MethodHandle attentionQkNormRopeBf16;
     private final MethodHandle attentionKvAppendNvfp4;
     private final MethodHandle attentionCausalNvfp4;
@@ -3028,17 +3030,15 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     public boolean tableKernelAvailable(TableKernel kernel) {
         ensureOpen();
         int table = kernel.table().ordinal();
-        AtomicIntegerArray known;
-        synchronized (this.tableAvailability) {
-            known = this.tableAvailability[table];
-            if (known == null) {
-                try {
-                    known = new AtomicIntegerArray((int) this.tableKernelCount[table].invokeExact());
-                } catch (Throwable throwable) {
-                    throw new GpuMemoryException("kernel table query failed", throwable);
-                }
-                this.tableAvailability[table] = known;
+        AtomicIntegerArray known = this.tableAvailability.get(table);
+        if (known == null) {
+            try {
+                this.tableAvailability.compareAndSet(
+                        table, null, new AtomicIntegerArray((int) this.tableKernelCount[table].invokeExact()));
+            } catch (Throwable throwable) {
+                throw new GpuMemoryException("kernel table query failed", throwable);
             }
+            known = this.tableAvailability.get(table);
         }
         int state = known.get(kernel.index());
         if (state == 0) {
