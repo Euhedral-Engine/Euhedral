@@ -142,12 +142,25 @@ class ArgumentHandlingTest(unittest.TestCase):
         self.assertEqual(options, {"--model", "--out", "--quantization", "--compressed", "--draft-ids-from",
                                    "--ranking", "--device", "--jobs", "--force", "--dflash2",
                                    "--dflash2-projections", "--extend", "--imatrix", "--codes-from",
-                                   "--output-head", "--trellis-from"})
+                                   "--output-head", "--trellis-from", "--token-embedding"})
         for word in ("p2e2", "sd4", "nvmtp", "profile", "mtp-format", "reference"):
             self.assertNotIn(word, out.lower())
 
 
 class RecipeTest(unittest.TestCase):
+    def test_token_embedding_overrides_only_the_embedding(self):
+        for quantization in ("q3", "nvfp4", "trellis"):
+            recipe = recipes.Recipe(quantization, token_embedding="NVFP4")
+            self.assertEqual(recipes.storage(recipe, recipes.TOKEN_EMBEDDING, "Q3G64_F16S"),
+                             ("NVFP4", recipes.LAYOUT_ROW_SPLIT))
+            self.assertEqual(recipes.storage(recipes.Recipe(quantization), recipes.TOKEN_EMBEDDING, "Q3G64_F16S"),
+                             ("Q3G64_F16S", recipes.LAYOUT_ROW_SPLIT))
+        bf16 = recipes.Recipe("trellis", token_embedding="BF16")
+        self.assertEqual(recipes.storage(bf16, recipes.TOKEN_EMBEDDING, "Q3G64_F16S"), ("BF16", recipes.LAYOUT_CONTIGUOUS))
+        self.assertEqual(recipes.storage(bf16, "text/draft_head", "Q3G64_F16S"), ("NVFP4", recipes.LAYOUT_ROW_SPLIT))
+        with self.assertRaises(ValueError):
+            recipes.Recipe("q3", token_embedding="Q8")
+
     def test_output_head_overrides_only_the_lm_head(self):
         recipe = recipes.Recipe("q3", output_head="Q5G64_F16S")
         self.assertEqual(recipes.storage(recipe, "text/output_head", "NVFP4"), ("Q5G64_F16S", recipes.LAYOUT_ROW_SPLIT))

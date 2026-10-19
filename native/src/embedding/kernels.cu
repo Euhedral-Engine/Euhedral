@@ -186,3 +186,56 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_p2e2_embedding(
         base += __shfl_sync(0xffffffffu, inclusive, 31);
     }
 }
+
+// Rows of a row-split NVFP4 table (core artifact Nvfp4Layout): E2M1 codes, two per byte with the even column in the
+// low nibble, K / 2 bytes per row at 0; one E4M3 scale per 16 columns, K / 16 bytes per row at scale_offset; one FP32
+// global scale at global_offset. Each value is bf16(e2m1(code) * (e4m3(scale) * global)), the converter's
+// dequantization. One block per token, one 16-column block per thread and step; an id outside the vocabulary leaves
+// its row as it was, as the Q3 kernels do. Requires hidden_size % 16 == 0.
+static __device__ __forceinline__ float euhedral_e4m3_to_float(unsigned int code) {
+    const unsigned int exponent = (code >> 3) & 15u, mantissa = code & 7u;
+    const float magnitude = exponent == 0u ? (float)mantissa * 0.001953125f  // 2^-9
+                                           : __uint_as_float(((exponent + 120u) << 23) | (mantissa << 20));
+    return (code & 0x80u) != 0u ? -magnitude : magnitude;
+}
+
+extern "C" __global__ __launch_bounds__(128) void euhedral_nvfp4_embedding(
+        const int* token_ids,
+        const unsigned char* table,
+        unsigned short* output,
+        unsigned int token_count,
+        unsigned int vocabulary_size,
+        unsigned int hidden_size,
+        unsigned long long scale_offset,
+        unsigned long long global_offset) {
+    const unsigned int token = (unsigned int)blockIdx.x;
+    if (token >= token_count) return;
+    const int row = token_ids[token];
+    if (row < 0 || (unsigned int)row >= vocabulary_size) return;
+    const float e2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float global = *reinterpret_cast<const float*>(table + global_offset);
+    const unsigned char* codes = table + (unsigned long long)(unsigned int)row * (hidden_size / 2u);
+    const unsigned char* scales = table + scale_offset + (unsigned long long)(unsigned int)row * (hidden_size / 16u);
+    unsigned short* target = output + (unsigned long long)token * hidden_size;
+    for (unsigned int block = threadIdx.x; block < hidden_size / 16u; block += blockDim.x) {
+        const float scale = euhedral_e4m3_to_float(scales[block]) * global;
+        const uint2 packed = *reinterpret_cast<const uint2*>(codes + block * 8u);
+        const unsigned int words[2] = {packed.x, packed.y};
+        unsigned int bits[8];
+#pragma unroll
+        for (int pair = 0; pair < 8; ++pair) {
+            const unsigned int byte = (words[pair >> 2] >> (8 * (pair & 3))) & 0xFFu;
+            unsigned short half[2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const unsigned int code = (byte >> (4 * i)) & 15u;
+                const float value = (code & 8u) != 0u ? -e2m1[code & 7u] : e2m1[code & 7u];
+                half[i] = euhedral_float_to_bfloat16(value * scale);
+            }
+            bits[pair] = half[0] | ((unsigned int)half[1] << 16);
+        }
+        uint4* out = reinterpret_cast<uint4*>(target + block * 16u);
+        out[0] = make_uint4(bits[0], bits[1], bits[2], bits[3]);
+        out[1] = make_uint4(bits[4], bits[5], bits[6], bits[7]);
+    }
+}
