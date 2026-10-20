@@ -157,10 +157,8 @@ final class Shape implements GraphShape {
             // A decode step predicts the experts of a later layer from this one's input, behind the route on its lane
             // so the plan does not wait for it, and its prefetch is a host stage after it retires: a side branch.
             if (!diagnostic
-                    && ((this.key.rows() == 1
-                                    && ExpertCacheOwner.prefetchCandidates() > 0
-                                    && layer + ExpertCacheOwner.prefetchDistance() < this.plan.layers())
-                            || (aheads() && layer + ExpertCacheOwner.aheadDistance() < this.plan.layers()))) {
+                    && ((this.key.rows() == 1 && layer + ExpertCacheOwner.PREFETCH_DISTANCE < this.plan.layers())
+                            || (aheads() && layer + ExpertCacheOwner.AHEAD_DISTANCE < this.plan.layers()))) {
                 int predict = add(Kind.PREDICT, layer, -1, after(route));
                 add(Kind.PREFETCH, layer, -1, retired(predict));
             }
@@ -200,17 +198,15 @@ final class Shape implements GraphShape {
                 this.scratchUsers.stream().mapToInt(Integer::intValue).toArray());
     }
 
-    /// Whether a block launches the experts the device holds together: a decode token's, outside the diagnostic shape
-    /// (`EUHEDRAL_QWEN4_GROUP=0` launches each on its own).
+    /// Whether a block launches the experts the device holds together: a decode token's, outside the diagnostic
+    /// shape.
     boolean groups() {
-        return GROUPS && this.key.rows() == 1 && !this.key.diagnostic() && (this.key.variant() & 1) == 0;
+        return this.key.rows() == 1 && !this.key.diagnostic() && (this.key.variant() & 1) == 0;
     }
-
-    private static final boolean GROUPS = !"0".equals(System.getenv("EUHEDRAL_QWEN4_GROUP"));
 
     /// Whether this shape's blocks look ahead: a prefill chunk's block asks for nearly every expert of its layer.
     boolean aheads() {
-        return this.key.rows() > AHEAD_MIN_ROWS && ExpertCacheOwner.aheadDistance() > 0;
+        return this.key.rows() > AHEAD_MIN_ROWS;
     }
 
     /// Rows above which a shape looks ahead (the decode and the short-chunk shapes do not).

@@ -39,10 +39,6 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     /// producers and consumers.
     static final int LAKE_PARTITIONS = 1;
 
-    /// Decode, verification and draft quanta replay CUDA graphs captured from earlier quanta
-    /// (docs/CUDA_GRAPHS.md); `EUHEDRAL_CUDA_GRAPHS=0` submits every quantum stage by stage instead.
-    public static final boolean CAPTURE_GRAPHS = !"0".equals(System.getenv("EUHEDRAL_CUDA_GRAPHS"));
-
     /// The device lanes of a runtime: `compute` lanes the stages spread over, an optional lane reserved for
     /// host-to-device weight transfers, and whether quanta that carry a capture key are captured into CUDA graphs.
     public record Lanes(int compute, boolean transferLane, boolean captureGraphs) {

@@ -174,21 +174,9 @@ static int load_kernel(const void* anchor, const char* source_name, const char* 
         return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     }
     const int real_architecture = strncmp(architecture, "sm_", 3) == 0;
-    // Measurement builds only: EUHEDRAL_CUDA_KV_CODEC selects the KV cache's code grid (attention/nvfp4_kv.cuh).
-    const char* kv_codec = getenv("EUHEDRAL_CUDA_KV_CODEC");
-    char kv_codec_option[64];
-    int option_count = 5;
-    if (kv_codec != NULL && kv_codec[0] != '\0') {
-        int codec_length = snprintf(kv_codec_option, sizeof(kv_codec_option), "-DEUHEDRAL_KV_CODEC=%s", kv_codec);
-        if (codec_length < 0 || (size_t)codec_length >= sizeof(kv_codec_option)) {
-            nvrtcDestroyProgram(&program);
-            return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
-        }
-        option_count = 6;
-    }
     const char* options[] = {"--std=c++14", architecture_option, include_option, source_include_option,
-            root_include_option, kv_codec_option};
-    nv_status = compile_on_large_stack(program, option_count, options);
+            root_include_option};
+    nv_status = compile_on_large_stack(program, 5, options);
     if (nv_status != NVRTC_SUCCESS) {
         size_t log_size = 0;
         nvrtcGetProgramLogSize(program, &log_size);

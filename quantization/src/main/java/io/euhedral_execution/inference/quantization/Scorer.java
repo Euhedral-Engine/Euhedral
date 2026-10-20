@@ -259,7 +259,7 @@ public final class Scorer implements AutoCloseable {
                 plan,
                 device.gpu,
                 EuhedralInferenceRuntime.laneCount(),
-                EuhedralInferenceRuntime.CAPTURE_GRAPHS,
+                true,
                 Tuning.defaults(),
                 artifactPath,
                 artifact.sources());

@@ -17,29 +17,28 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
-// EUHEDRAL_KV_CODEC: 1 (the default) is the INT4 midrise grid. Measurement builds set another through
-// EUHEDRAL_CUDA_KV_CODEC: 0 is E2M1 (magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6, round to nearest even, the scale over 6),
-// 2 and 3 the INT3 and INT2 midrise grids (m < 4 and m < 2). A module that includes this file may pin its own.
-#ifndef EUHEDRAL_KV_CODEC
-#define EUHEDRAL_KV_CODEC 1
+// A module that defines EUHEDRAL_KV_E2M1 as 1 before including this file keeps the E2M1 grid instead (magnitudes 0,
+// 0.5, 1, 1.5, 2, 3, 4, 6, round to nearest even, the scale over 6): the Flash-Next QSA cache.
+#ifndef EUHEDRAL_KV_E2M1
+#define EUHEDRAL_KV_E2M1 0
 #endif
 
 namespace nvfp4kv {
 
-constexpr unsigned int kMidriseLevels = EUHEDRAL_KV_CODEC == 1 ? 8u : EUHEDRAL_KV_CODEC == 2 ? 4u : 2u;
+constexpr unsigned int kMidriseLevels = 8u;
 
 constexpr int kHeadDim = 256;
 constexpr int kGroup = 16;
 constexpr int kGroups = kHeadDim / kGroup;
 constexpr int kCodeBytes = kHeadDim / 2;
-constexpr float kMaxFinite = EUHEDRAL_KV_CODEC == 0 ? 6.0f : kMidriseLevels - 0.5f;
+constexpr float kMaxFinite = EUHEDRAL_KV_E2M1 ? 6.0f : kMidriseLevels - 0.5f;
 constexpr float kScaleMinimum = 1.0f / 512.0f;
 constexpr float kScaleMaximum = 448.0f;
 
 // The magnitude of the low three code bits.
 __device__ __forceinline__ float code_magnitude(unsigned int code) {
     const unsigned int magnitude = code & 7u;
-    if (EUHEDRAL_KV_CODEC != 0) return static_cast<float>(magnitude) + 0.5f;
+    if (!EUHEDRAL_KV_E2M1) return static_cast<float>(magnitude) + 0.5f;
     // E2M1 bias is one. Codes 0 and 1 are zero and the 0.5 subnormal;
     // normal codes map directly to the FP32 exponent and leading fraction bit.
     // A dynamically indexed local table otherwise emits eight local stores per
@@ -54,7 +53,7 @@ __device__ __forceinline__ float code_magnitude(unsigned int code) {
 __device__ __forceinline__ unsigned int encode_code(float value) {
     const float a = fabsf(value);
     unsigned int code;
-    if (EUHEDRAL_KV_CODEC != 0) {
+    if (!EUHEDRAL_KV_E2M1) {
         code = min(static_cast<unsigned int>(a), kMidriseLevels - 1u);  // nearest (m + 0.5), saturating
         return code | ((__float_as_uint(value) >> 28) & 8u);
     }

@@ -28,12 +28,8 @@ public final class FileRecordSource implements RecordSource {
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AsyncReads async;
     private final int fd;
-    /// Whether the asynchronous reads go past the page cache (every record is block-aligned in the file).
+    /// Whether the asynchronous reads go past the page cache: they do when every record is block-aligned in the file.
     private final boolean direct;
-
-    /// Asynchronous reads past the page cache, where the records allow them; `EUHEDRAL_QWEN4_DIRECT_READS=0` keeps
-    /// them in the page cache, for benchmarks.
-    static final boolean DIRECT_READS = !"0".equals(System.getenv("EUHEDRAL_QWEN4_DIRECT_READS"));
 
     private static final long BLOCK = 4096;
 
@@ -48,7 +44,7 @@ public final class FileRecordSource implements RecordSource {
             ExpertFiles.validate(banks, channel.size());
         }
         this.async = async;
-        this.direct = async != null && DIRECT_READS && aligned(banks);
+        this.direct = async != null && aligned(banks);
         this.fd = async == null ? -1 : async.openFile(file, this.direct);
     }
 

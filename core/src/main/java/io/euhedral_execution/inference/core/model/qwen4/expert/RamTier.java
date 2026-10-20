@@ -3,7 +3,6 @@ package io.euhedral_execution.inference.core.model.qwen4.expert;
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
 import java.io.IOException;
 import java.util.Arrays;
-import java.util.Objects;
 
 /// The expert tier in ordinary (pageable) host memory, between the device cache and the artifact:
 ///
@@ -20,14 +19,14 @@ import java.util.Objects;
 ///
 /// When every record has a slot the tier is resident: [#preload] reads each record once, at load, by
 /// several readers, and inference reads no routed expert from the artifact. Otherwise it is bounded, filled
-/// lazily by the loads that miss it, and replaced by the shards' policy.
+/// at startup with each layer's share, then by the loads that miss it, and replaced by frequency with admission
+/// ([RamTierShard]).
 public final class RamTier implements AutoCloseable {
 
     private static final long PAGE = 4096;
 
     private final ExpertBank[] banks;
     private final ExpertKeys keys;
-    private final ReplacementPolicy policy;
     private final int shards;
     private final long slotBytes;
     private final int slotCount;
@@ -44,28 +43,15 @@ public final class RamTier implements AutoCloseable {
 
     /// A tier of at most `slotCount` slots over `banks`, in `shards` shards. A tier with a slot for every
     /// record is resident, and holds exactly that many.
-    public RamTier(ExpertBank[] banks, int slotCount, int shards, ReplacementPolicy policy) {
-        this(banks, slotCount, shards, policy, null);
+    public RamTier(ExpertBank[] banks, int slotCount, int shards) {
+        this(banks, slotCount, shards, null);
     }
 
     /// As above, in pinned host memory from `pinned` (null: pageable memory). A pinned tier is a staging area
     /// itself: a record in it is copied to the device straight from its slot.
-    public RamTier(ExpertBank[] banks, int slotCount, int shards, ReplacementPolicy policy, GpuMemory pinned) {
-        this(banks, slotCount, shards, policy, pinned, false);
-    }
-
-    /// As above; with `admission` a record replaces a victim only if it was asked for more often (see
-    /// [RamTierShard]).
-    public RamTier(
-            ExpertBank[] banks,
-            int slotCount,
-            int shards,
-            ReplacementPolicy policy,
-            GpuMemory pinned,
-            boolean admission) {
+    public RamTier(ExpertBank[] banks, int slotCount, int shards, GpuMemory pinned) {
         this.banks = banks.clone();
         this.keys = new ExpertKeys(this.banks);
-        this.policy = Objects.requireNonNull(policy, "policy");
         if (shards < 1) throw new IllegalArgumentException("shards must be positive");
         if (slotCount < shards) throw new IllegalArgumentException("every shard needs a slot");
         this.shards = shards;
@@ -94,15 +80,7 @@ public final class RamTier implements AutoCloseable {
         this.shardList = new RamTierShard[shards];
         int first = 0;
         for (int shard = 0; shard < shards; shard++) {
-            this.shardList[shard] = new RamTierShard(
-                    this,
-                    this.keys,
-                    shard,
-                    first,
-                    sizes[shard],
-                    policy == ReplacementPolicy.BANK_PARTITIONED,
-                    policy == ReplacementPolicy.FREQUENCY,
-                    admission);
+            this.shardList[shard] = new RamTierShard(this, this.keys, shard, first, sizes[shard]);
             first += sizes[shard];
         }
         if (this.resident) for (int shard = 0; shard < shards; shard++) this.shardList[shard].assignResident(shard);
@@ -115,10 +93,6 @@ public final class RamTier implements AutoCloseable {
     /// The shard whose owner serves the experts that hash to `shard`.
     public RamTierShard shard(int shard) {
         return this.shardList[shard];
-    }
-
-    public ReplacementPolicy policy() {
-        return this.policy;
     }
 
     public boolean isResident() {

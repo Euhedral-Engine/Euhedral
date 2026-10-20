@@ -27,15 +27,12 @@ import java.util.Set;
 ///
 /// The LM head (the one object too large for the staging slots) leaves the device last: it is mapped into host
 /// memory and read in place over the bus, once per pass whatever the sequence count, when everything else
-/// offloadable is offloaded and the plan still does not fit, or from the first offload with
-/// [#MAP_OUTPUT_HEAD]. The draft head stays resident: every draft of every sequence reads it.
+/// offloadable is offloaded and the plan still does not fit. The draft head stays resident: every draft of every
+/// sequence reads it.
 public final class ResidencyPlanner {
 
     /// Everything outside weights and KV that a running sequence needs on the device.
     static final long RESERVE_BYTES = 1280L << 20;
-
-    /// System property that maps the LM head with the first offloaded object instead of last.
-    public static final String MAP_OUTPUT_HEAD = "euhedral.residency.map-output-head";
 
     /// Most rows of one row-exact verification that an NVFP4 linear runs on the tensor-core decode kernels (8 rows
     /// in 4 groups: `EUHEDRAL_DECODE_MAX_ROWS * DECODE_GROUPS_MAX` in `nvfp4_linear.c`); beyond it row-exact
@@ -117,37 +114,7 @@ public final class ResidencyPlanner {
             long hostBytes,
             KvFormat kvFormat,
             int sequences) {
-        return plan(
-                artifact,
-                profile,
-                freeBytes,
-                maxContextTokens,
-                hostBytes,
-                kvFormat,
-                sequences,
-                Boolean.getBoolean(MAP_OUTPUT_HEAD));
-    }
-
-    /// As above; `mapOutputHeadEarly` maps the LM head with the first offloaded object rather than last.
-    public static Plan plan(
-            Artifact artifact,
-            ArtifactProfile profile,
-            long freeBytes,
-            int maxContextTokens,
-            long hostBytes,
-            KvFormat kvFormat,
-            int sequences,
-            boolean mapOutputHeadEarly) {
-        return plan(
-                artifact,
-                profile,
-                freeBytes,
-                maxContextTokens,
-                hostBytes,
-                kvFormat,
-                sequences,
-                mapOutputHeadEarly,
-                ALL_KV_ON_DEVICE);
+        return plan(artifact, profile, freeBytes, maxContextTokens, hostBytes, kvFormat, sequences, ALL_KV_ON_DEVICE);
     }
 
     /// As above, with `kvDeviceMinimumTokens` of each sequence's attention cache kept on the device, a workspace of
@@ -160,7 +127,6 @@ public final class ResidencyPlanner {
             long hostBytes,
             KvFormat kvFormat,
             int sequences,
-            boolean mapOutputHeadEarly,
             int kvDeviceMinimumTokens) {
         return plan(
                 artifact,
@@ -170,7 +136,6 @@ public final class ResidencyPlanner {
                 hostBytes,
                 kvFormat,
                 sequences,
-                mapOutputHeadEarly,
                 kvDeviceMinimumTokens,
                 InferenceConfig.PREFILL_CHUNK_TOKENS,
                 TrellisSettings.defaults());
@@ -191,7 +156,6 @@ public final class ResidencyPlanner {
             long hostBytes,
             KvFormat kvFormat,
             int sequences,
-            boolean mapOutputHeadEarly,
             int kvDeviceMinimumTokens,
             int workspaceRows,
             TrellisSettings trellis) {
@@ -232,9 +196,7 @@ public final class ResidencyPlanner {
             hostPages = 0;
         }
         return withKvHost(
-                offload(artifact, profile, freeBytes, sequences, hostBytes, mapOutputHeadEarly, fixed, resident),
-                hostPages,
-                kvHost);
+                offload(artifact, profile, freeBytes, sequences, hostBytes, fixed, resident), hostPages, kvHost);
     }
 
     /// Bytes of one attention cache page of a full-attention layer (its K plane then its V plane) in `format`.
@@ -269,7 +231,6 @@ public final class ResidencyPlanner {
             long freeBytes,
             int sequences,
             long hostBytes,
-            boolean mapOutputHeadEarly,
             long fixed,
             Plan resident) {
         TensorDescriptor head = headOf(artifact);
@@ -284,12 +245,11 @@ public final class ResidencyPlanner {
         long step = 64L << 20;
         for (long bytes = step; ; bytes += step) {
             Set<String> selection = HostWeightSelection.select(artifact, bytes);
-            Plan candidate = deviceNeed(
-                    artifact, profile, mapOutputHeadEarly && mappable ? withHead(head, selection) : selection);
+            Plan candidate = deviceNeed(artifact, profile, selection);
             if (candidate.deviceBytes() + fixed <= freeBytes) return tiers(artifact, candidate, fixed, hostBytes, true);
             if (bytes > all) {
                 // Everything else offloadable is offloaded: the LM head goes last.
-                if (!mappable || mapOutputHeadEarly) return tiers(artifact, candidate, fixed, hostBytes, false);
+                if (!mappable) return tiers(artifact, candidate, fixed, hostBytes, false);
                 Set<String> mapped = withHead(head, selection);
                 if (mapped.size() == selection.size()) return tiers(artifact, candidate, fixed, hostBytes, false);
                 Plan last = deviceNeed(artifact, profile, mapped);
@@ -347,7 +307,6 @@ public final class ResidencyPlanner {
             int kvDeviceMinimumTokens,
             int workspaceRows,
             TrellisSettings trellis) {
-        boolean head = Boolean.getBoolean(MAP_OUTPUT_HEAD);
         Plan single = plan(
                 artifact,
                 profile,
@@ -356,7 +315,6 @@ public final class ResidencyPlanner {
                 hostBytes,
                 kvFormat,
                 1,
-                head,
                 kvDeviceMinimumTokens,
                 workspaceRows,
                 trellis);
@@ -375,7 +333,6 @@ public final class ResidencyPlanner {
                     hostBytes,
                     kvFormat,
                     middle,
-                    head,
                     kvDeviceMinimumTokens,
                     workspaceRows,
                     trellis);

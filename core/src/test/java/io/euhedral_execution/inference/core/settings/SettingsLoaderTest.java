@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
@@ -262,5 +263,26 @@ class SettingsLoaderTest {
         assertTrue(RetiredSettings.message("EUHEDRAL_HOST_MEMORY_MIB")
                 .orElseThrow()
                 .contains("with a unit"));
+    }
+
+    /// The experiment switches whose winners the engine hard-wires: setting one fails startup.
+    @Test
+    void everySettledSwitchIsRemoved() {
+        for (String variable : List.of(
+                "EUHEDRAL_LAKE_PARTITIONS",
+                "EUHEDRAL_CUDA_GRAPHS",
+                "EUHEDRAL_CUDA_KV_CODEC",
+                "EUHEDRAL_QWEN4_PREFETCH",
+                "EUHEDRAL_QWEN4_AHEAD",
+                "EUHEDRAL_QWEN4_LINEAR_TC",
+                "EUHEDRAL_QWEN4_LINEAR_SPLIT",
+                "EUHEDRAL_QWEN4_TIER_POLICY",
+                "EUHEDRAL_QWEN4_GPU_POLICY",
+                "EUHEDRAL_QWEN4_TIER_PRELOAD",
+                "EUHEDRAL_QWEN4_PIN_TIER",
+                "EUHEDRAL_QWEN4_TIER_ADMISSION",
+                "EUHEDRAL_QWEN4_GROUP",
+                "EUHEDRAL_QWEN4_DIRECT_READS"))
+            assertEquals(Optional.of("removed: the setting is fixed"), RetiredSettings.message(variable), variable);
     }
 }

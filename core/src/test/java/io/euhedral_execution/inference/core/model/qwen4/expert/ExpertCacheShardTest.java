@@ -58,13 +58,9 @@ class ExpertCacheShardTest {
     }
 
     private ExpertCache cache(int slots, int shards) throws IOException {
-        return cache(slots, shards, ReplacementPolicy.GLOBAL_LRU);
-    }
-
-    private ExpertCache cache(int slots, int shards, ReplacementPolicy policy) throws IOException {
         var store = new FileExpertStore(this.gpu, this.fixture.file, this.fixture.banks, 4);
         var transfer = new GpuExpertTransfer(this.gpu, 4);
-        this.cache = new ExpertCache(store, transfer, this.gpu, slots, this.fixture.slotBytes(), shards, policy);
+        this.cache = new ExpertCache(store, transfer, this.gpu, slots, this.fixture.slotBytes(), shards);
         return this.cache;
     }
 
@@ -328,72 +324,33 @@ class ExpertCacheShardTest {
         this.cache = null;
     }
 
-    /// The model visits its layers in a cycle and each layer reuses its own few experts. Ten slots cannot
-    /// hold the 13 hot experts of the five banks: a global recency order evicts each one just before it is
-    /// needed again, while a quota per bank keeps the experts of the banks that fit.
-    @Test
-    void aLayerAwarePolicyKeepsWhatACyclicPassWouldEvictFromAGlobalRecencyOrder() throws Exception {
-        long[] hits = new long[2];
-        // The device cache replaces by recency: the frequency policy is the host tier's.
-        for (ReplacementPolicy policy :
-                new ReplacementPolicy[] {ReplacementPolicy.BANK_PARTITIONED, ReplacementPolicy.GLOBAL_LRU}) {
-            if (this.cache != null) this.cache.close();
-            cache(10, 1, policy);
-            int[] hotPerBank = {3, 3, 3, 1, 3};
-            for (int pass = 0; pass < 50; pass++)
-                for (int bank = 0; bank < 5; bank++)
-                    for (int hot = 0; hot < hotPerBank[bank]; hot++) {
-                        try (ExpertLease lease = ExpertTestSupport.acquire(this.cache, bank, hot)) {
-                            assertArrayEquals(
-                                    this.fixture.record(bank, hot),
-                                    this.gpu.readDevice(lease.deviceAddress(), lease.byteSize()));
-                        }
-                    }
-            this.cache.checkQuiescent();
-            hits[policy.ordinal()] = this.cache.stats().snapshot().hits();
-        }
-        long requests = 50 * 13;
-        System.out.printf(
-                "cyclic trace, 10 slots: partitioned %.3f, global %.3f%n",
-                (double) hits[0] / requests, (double) hits[1] / requests);
-        assertTrue(hits[1] < requests / 20, "a global order thrashes on the cycle: " + hits[1]);
-        assertTrue(hits[0] > requests / 3, "the partitioned policy keeps a share of every pass: " + hits[0]);
-    }
-
     /// Under S3-FIFO a record asked for again keeps its place through a sweep of records asked for once: the sweep
-    /// passes through the small queue. A recency order loses the hot records to the same sweep.
+    /// passes through the small queue.
     @Test
     void s3FifoKeepsRecordsAskedForAgainThroughASweepOfRecordsAskedForOnce() throws Exception {
-        long[] hotHits = new long[2];
-        ReplacementPolicy[] policies = {ReplacementPolicy.S3_FIFO, ReplacementPolicy.GLOBAL_LRU};
-        for (int p = 0; p < 2; p++) {
-            if (this.cache != null) this.cache.close();
-            cache(10, 1, policies[p]);
-            for (int round = 0; round < 3; round++)
-                for (int hot = 0; hot < 4; hot++)
-                    ExpertTestSupport.acquire(this.cache, 2, hot).close();
-            for (int bank : new int[] {0, 4})
-                for (int expert = 0; expert < 8; expert++)
-                    ExpertTestSupport.acquire(this.cache, bank, expert).close();
-            long before = this.cache.stats().snapshot().hits();
-            for (int hot = 0; hot < 4; hot++) {
-                try (ExpertLease lease = ExpertTestSupport.acquire(this.cache, 2, hot)) {
-                    assertArrayEquals(
-                            this.fixture.record(2, hot), this.gpu.readDevice(lease.deviceAddress(), lease.byteSize()));
-                }
+        cache(10, 1);
+        for (int round = 0; round < 3; round++)
+            for (int hot = 0; hot < 4; hot++)
+                ExpertTestSupport.acquire(this.cache, 2, hot).close();
+        for (int bank : new int[] {0, 4})
+            for (int expert = 0; expert < 8; expert++)
+                ExpertTestSupport.acquire(this.cache, bank, expert).close();
+        long before = this.cache.stats().snapshot().hits();
+        for (int hot = 0; hot < 4; hot++) {
+            try (ExpertLease lease = ExpertTestSupport.acquire(this.cache, 2, hot)) {
+                assertArrayEquals(
+                        this.fixture.record(2, hot), this.gpu.readDevice(lease.deviceAddress(), lease.byteSize()));
             }
-            hotHits[p] = this.cache.stats().snapshot().hits() - before;
-            this.cache.checkQuiescent();
         }
-        assertEquals(4, hotHits[0], "S3-FIFO kept the hot records");
-        assertEquals(0, hotHits[1], "a recency order lost them to the sweep");
+        assertEquals(4, this.cache.stats().snapshot().hits() - before, "S3-FIFO kept the hot records");
+        this.cache.checkQuiescent();
     }
 
     /// S3-FIFO under a random workload with leases held across requests: the bytes are right and the bookkeeping
     /// holds.
     @Test
     void s3FifoServesARandomWorkloadWithLeasesHeld() throws Exception {
-        cache(12, 1, ReplacementPolicy.S3_FIFO);
+        cache(12, 1);
         java.util.SplittableRandom random = new java.util.SplittableRandom(11);
         java.util.ArrayDeque<ExpertLease> held = new java.util.ArrayDeque<>();
         for (int i = 0; i < 3000; i++) {
@@ -413,8 +370,8 @@ class ExpertCacheShardTest {
     }
 
     @Test
-    void aFailedLoadReturnsItsSlotToItsLayerUnderThePartitionedPolicy() throws Exception {
-        cache(4, 1, ReplacementPolicy.BANK_PARTITIONED);
+    void aFailedLoadReturnsItsSlotToItsQueue() throws Exception {
+        cache(4, 1);
         ExpertCacheShard shard = this.cache.shard(0);
         ExpertCacheShard.Load load = miss(shard, 2, 0);
         load.failed(new IllegalStateException("not loaded in this test"));
