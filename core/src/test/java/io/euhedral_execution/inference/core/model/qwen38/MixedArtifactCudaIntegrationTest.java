@@ -229,7 +229,6 @@ class MixedArtifactCudaIntegrationTest {
                 plan,
                 gpu,
                 EuhedralInferenceRuntime.laneCount(),
-                true,
                 Tuning.defaults(),
                 model.artifactPath(),
                 artifact.sources());

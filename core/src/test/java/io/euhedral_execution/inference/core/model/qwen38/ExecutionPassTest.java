@@ -283,7 +283,6 @@ class ExecutionPassTest {
                 plan,
                 new EngineExecutionFixture.SamplingGpu(8),
                 1,
-                false,
                 Tunings.prefillChunkTokens(4));
         var a = new Sequence(1);
         var b = new Sequence(2);

@@ -46,7 +46,7 @@ public final class HostPool implements FrameLake, Ensemble.Frames, AutoCloseable
     /// have no idle sinks of this pool to cycle through.
     public static HostPool startAttachingOnDemand(int sinks) {
         if (sinks < 1) throw new IllegalArgumentException("a host pool needs a sink");
-        return new HostPool(new InferenceLake(ControlPlaneLattice.getOrCreate(), sinks, 1));
+        return new HostPool(new InferenceLake(ControlPlaneLattice.getOrCreate(), sinks));
     }
 
     /// A pool of `sinks` sinks on the process's lattice.

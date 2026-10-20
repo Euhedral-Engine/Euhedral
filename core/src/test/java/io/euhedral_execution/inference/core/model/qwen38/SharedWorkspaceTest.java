@@ -79,7 +79,6 @@ class SharedWorkspaceTest {
                 plan,
                 new EngineExecutionFixture.SamplingGpu(weights.config().vocabSize()),
                 2,
-                false,
                 Tunings.prefillChunkTokens(64));
         try {
             var outcome = runtime.submit(prefill(plan, 3, 65)).get(5, TimeUnit.SECONDS);
@@ -98,8 +97,7 @@ class SharedWorkspaceTest {
         // Embedding-only weights: no sequence state, so every allocation is the workspace's or a graph's.
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var gpu = new ExecutionFixtures.RecordingGpu();
-        var runtime =
-                new Execution(ExecutionFixtures.inlineLattice(), plan, gpu, 2, false, Tunings.prefillChunkTokens(128));
+        var runtime = new Execution(ExecutionFixtures.inlineLattice(), plan, gpu, 2, Tunings.prefillChunkTokens(128));
         try {
             assertEquals(
                     Quantum.Status.SUCCESS,

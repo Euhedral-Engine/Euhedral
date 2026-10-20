@@ -34,8 +34,7 @@ class WorkspaceReuseTest {
     }
 
     private static Execution runtime(ExecutionPlan plan, ExecutionGpu gpu) {
-        return new Execution(
-                ExecutionFixtures.inlineLattice(), plan, gpu, 2, false, Tunings.prefillChunkTokens(MAX_ROWS));
+        return new Execution(ExecutionFixtures.inlineLattice(), plan, gpu, 2, Tunings.prefillChunkTokens(MAX_ROWS));
     }
 
     /// Token IDs padded to 8 bytes, then the 64-bit start position.
@@ -88,7 +87,7 @@ class WorkspaceReuseTest {
             }
         };
         var lattice = new ExecutionFixtures.ManualLattice();
-        var runtime = new Execution(lattice, plan, gpu, 2, false, Tunings.prefillChunkTokens(MAX_ROWS));
+        var runtime = new Execution(lattice, plan, gpu, 2, Tunings.prefillChunkTokens(MAX_ROWS));
         List<List<Long>> first = new ArrayList<>();
         List<List<Long>> second = new ArrayList<>();
 

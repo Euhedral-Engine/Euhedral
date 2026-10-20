@@ -89,7 +89,6 @@ public final class Qwen38Runtime implements ModelRuntime {
                 plan,
                 gpu,
                 EuhedralInferenceRuntime.laneCount(),
-                true,
                 config.tuning(),
                 model.artifactPath(),
                 artifact == null ? Map.of() : artifact.sources());

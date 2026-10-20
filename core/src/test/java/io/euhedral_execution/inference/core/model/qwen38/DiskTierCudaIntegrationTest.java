@@ -129,7 +129,6 @@ class DiskTierCudaIntegrationTest {
                     plan,
                     gpu,
                     io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime.laneCount(),
-                    true,
                     Tuning.defaults(),
                     model.artifactPath());
             Sequence sequence = new Sequence(disk.isEmpty() ? 1 : 2);

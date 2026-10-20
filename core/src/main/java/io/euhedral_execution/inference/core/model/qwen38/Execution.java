@@ -93,28 +93,24 @@ public final class Execution implements AutoCloseable {
         this(lattice, plan, gpu, EuhedralInferenceRuntime.laneCount());
     }
 
-    /// An execution whose graphs share `laneCount` device lanes.
+    /// An execution whose graphs share `laneCount` device lanes. Decode, verification and draft quanta are
+    /// captured into CUDA graphs (docs/CUDA_GRAPHS.md). A plan that stages weights gets one lane fewer for
+    /// compute and a lane for its transfers.
     public Execution(LatticeTerminal lattice, ExecutionPlan plan, ExecutionGpu gpu, int laneCount) {
-        this(lattice, plan, gpu, laneCount, true);
+        this(lattice, plan, gpu, laneCount, Tuning.defaults());
     }
 
-    /// An execution that captures decode, verification and draft quanta into CUDA graphs only with `captureGraphs`.
-    /// A plan that stages weights gets one lane fewer for compute and a lane for its transfers.
+    /// As above, capturing quanta only with `captureGraphs`: stage-by-stage submission is the reference that
+    /// `CapturedQuantaCudaIntegrationTest` compares replays against.
     public Execution(
             LatticeTerminal lattice, ExecutionPlan plan, ExecutionGpu gpu, int laneCount, boolean captureGraphs) {
-        this(lattice, plan, gpu, laneCount, captureGraphs, Tuning.defaults());
+        this(lattice, plan, gpu, laneCount, captureGraphs, Tuning.defaults(), null, Map.of());
     }
 
-    /// As above, with one workspace sized at load for quanta of up to `batching.prefill-chunk-tokens` rows, shared
-    /// passes bounded by `batching`, and host work spread over `host` of `tuning`.
-    public Execution(
-            LatticeTerminal lattice,
-            ExecutionPlan plan,
-            ExecutionGpu gpu,
-            int laneCount,
-            boolean captureGraphs,
-            Tuning tuning) {
-        this(lattice, plan, gpu, laneCount, captureGraphs, tuning, null);
+    /// As above (capturing), with one workspace sized at load for quanta of up to `batching.prefill-chunk-tokens`
+    /// rows, shared passes bounded by `batching`, and host work spread over `host` of `tuning`.
+    public Execution(LatticeTerminal lattice, ExecutionPlan plan, ExecutionGpu gpu, int laneCount, Tuning tuning) {
+        this(lattice, plan, gpu, laneCount, tuning, null);
     }
 
     /// As above, reading the plan's disk-backed weights from `artifact` (null when none is disk-backed): a
@@ -124,14 +120,24 @@ public final class Execution implements AutoCloseable {
             ExecutionPlan plan,
             ExecutionGpu gpu,
             int laneCount,
-            boolean captureGraphs,
             Tuning tuning,
             Path artifact) {
-        this(lattice, plan, gpu, laneCount, captureGraphs, tuning, artifact, Map.of());
+        this(lattice, plan, gpu, laneCount, tuning, artifact, Map.of());
     }
 
     /// As above, reading the disk-backed weights named in `sources` from the file each names instead of `artifact`.
     public Execution(
+            LatticeTerminal lattice,
+            ExecutionPlan plan,
+            ExecutionGpu gpu,
+            int laneCount,
+            Tuning tuning,
+            Path artifact,
+            Map<String, Path> sources) {
+        this(lattice, plan, gpu, laneCount, true, tuning, artifact, sources);
+    }
+
+    private Execution(
             LatticeTerminal lattice,
             ExecutionPlan plan,
             ExecutionGpu gpu,
