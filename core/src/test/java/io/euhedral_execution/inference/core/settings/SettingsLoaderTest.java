@@ -181,7 +181,7 @@ class SettingsLoaderTest {
         Optional<Path> located = SettingsLoader.locate(new String[] {"--config", "/nope"}, Map.of());
         assertEquals(Optional.of(missing), located);
         SettingsException e = assertThrows(SettingsException.class, () -> SettingsLoader.load(located, Map.of()));
-        assertTrue(e.getMessage().contains("/nope"), e.getMessage());
+        assertTrue(e.getMessage().contains(missing.toString()), e.getMessage());
     }
 
     @Test
