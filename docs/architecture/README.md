@@ -1,6 +1,6 @@
 # Architecture
 
-Start with the system overview, then follow the concern you are changing. These hand-maintained Mermaid diagrams describe contracts and responsibilities grounded in the code at `22aa9e12`; they are not generated call graphs. The overview includes both model runtimes. Detailed dense execution diagrams explicitly scope themselves to Qwen3.8.
+Start with the system overview, then follow the concern you are changing. These hand-maintained Mermaid diagrams describe contracts and responsibilities checked against code at `498f7d2c` on 2026-10-20. The overview includes both model runtimes. Detailed dense execution diagrams explicitly scope themselves to Qwen3.8. Dated measurements in the detailed execution documents remain historical results.
 
 | Priority | Diagram | Main question |
 |---|---|---|

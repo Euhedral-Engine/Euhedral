@@ -1,5 +1,15 @@
 # Multi-sequence execution
 
+## Current execution contract
+
+Checked against `498f7d2c` on 2026-10-20. `Execution` assembles ready decode and verification offers from several sequences into one pass, within `batching.max-tokens-per-pass` and `batching.max-sequences-per-pass`; prefill follows its chunked path. Each sequence owns its KV/GDN state. `SequenceOwner` adds device dependencies between quanta of the same sequence, while `WorkspaceOwner` orders shared buffers across all graphs. Conclusions commit in each sequence's admission order.
+
+The default `batching.max-sequences` is 1. A positive value plans for that count; 0 selects a count that fits without increasing the one-sequence weight offload. Flash-Next remains single-sequence, and DFlash2 limits a shared pass to one sequence. The memory plan includes the configured KV format and can move pages beyond `context.kv-cache-on-gpu-tokens` to host memory before offloading weights. See [memory architecture](04-memory-architecture.md) and [operations](../OPERATIONS.md).
+
+MTP can admit its catch-up, recursive drafts and verification together, passing draft token IDs on the device and resuming the generation at verification retirement. Shared state is protected by carried-state edges; in-flight host readback buffers must be distinct. See [speculative decoding](05-speculative-decoding.md).
+
+The measurements and serving settings below describe the dated BF16 experiments. Their 512-row chunks, head placements and sequence counts are experiment conditions; current policy comes from the code and settings above.
+
 ## Baseline (one sequence)
 
 Measured 2026-10-14 by `Bf16BaselineCudaIntegrationTest` on the BF16 Swift-1.5 artifact

@@ -10,9 +10,11 @@ flowchart TB
     Format --> Other[Grouped Q3/Q4/Q5, P2E2 or BF16]
     NV --> Binding[CudaGpuMemory dispatch with row-exact selection]
     TR --> TRoute{Row count and numerical mode}
-    TRoute -->|Decode / VERIFY| TMMA[Rotations, trellis tensor-core route, epilogue]
-    TRoute -->|Large prefill| TBF[Decode weights to BF16, GEMM, epilogue]
+    TRoute -->|Row-exact or small rows| TMMA[Rotations, FP16 operands with FP32 sums, epilogue]
+    TRoute -->|Whole-K prefill within tensor-core threshold| TFP8[Block-scaled FP8 when available, otherwise FP16 accumulation]
+    TRoute -->|Above tensor-core threshold| TBF[Decode weights to BF16, GEMM, epilogue]
     TMMA --> Table[KernelTable / table kernel launch]
+    TFP8 --> Table
     TBF --> Table
     Other --> Binding
     Table --> Binding
@@ -30,7 +32,7 @@ flowchart TB
 
 NVFP4 dispatch distinguishes its plain and compressed scale layouts and selects compatible kernels. Production multi-row prefill can use accelerated numerical routes; verification requires row-exact execution. Optional native routes can report unavailable so a supported fallback can run. Row-exact verification and diagnostic scalar exact numerics are distinct contracts.
 
-Trellis weights carry the packed object plus rotation and segment companions. Small-row execution uses rotations and the trellis tensor-core path. Large prefill can decode the object into BF16 scratch and run GEMM. `TrellisFormat` keeps verification on the row-exact tensor-core route; thresholds and scratch requirements come from its settings and object geometry.
+Trellis weights carry the packed object plus rotation and segment companions. Small-row execution uses rotations, FP16 operands and FP32 sums on the trellis tensor-core path. At the whole-K threshold, production prefill uses block-scaled FP8 kernels when available, otherwise the FP16 whole-K kernels; verification retains FP16 operands and FP32 sums to match one-row execution. Above `kernels.trellis.tensor-core-max-tokens`, non-row-exact launches decode weights into BF16 scratch and run GEMM. The defaults keep the full 512-row prefill chunk on the tensor-core route, with whole-K blocks from 64 rows and wider blocks from 128. `TrellisSettings` derives thresholds from the settings tree and device geometry.
 
 A stage first awaits predecessor markers from other streams, then submits work and satisfies submission edges. This permits successors to enqueue GPU work before earlier device work finishes, while preserving CUDA dependencies. Retirement waits for completion before publishing the quantum's outcome and recycling storage. Eligible shapes can replay a captured CUDA graph instead of repeating stage submissions.
 

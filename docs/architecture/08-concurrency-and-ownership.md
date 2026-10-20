@@ -30,12 +30,16 @@ flowchart TB
 | Sessions and persistent sequence state | Engine tracks sessions; a generation's frame chain serializes its decisions. Sequence commit follows admitted work order. |
 | Workspace access records and pass assembly | Frames ordered on `WorkspaceOwner.HASH`; graph binding adds dependencies for buffer reuse. |
 | Carried sequence state | `SequenceOwner` records prior users per key, accessed during workspace-owner admission; separate sequences have separate records. |
+| Device draft tokens and host-KV device region | Carried-state keys order draft token writers/readers and all attention layers reusing a sequence's host-page device region. |
+| Host logits and proposals | Each in-flight quantum must have its own host readback buffer; an unordered proposal requires the sequence to have no other work in flight. |
 | Reusable graph and storage | Runtime graph pool; returned after quantum retirement before the outcome is published. |
 | Stage mutable fields | One executing thread after publication; concurrent predecessors update arrival state before publication. |
 | CUDA streams and transfer lane | Runtime `LanePool`, shared across graphs; CUDA event waits enforce ordering across streams. |
 | Host buffers used by DMA | Retained until GPU completion is proven; Java submission completion alone is insufficient. |
 
-A sink routes frames by hash. The default lake uses eight sinks with one producer partition each. Equal hashes keep an ordered chain on one sink; different chains can progress concurrently. Increasing producer partitions removes ordering across producers, so the default ordering assumption matters to owner admissions. Worker placement and CUDA stream choice are separate decisions.
+A sink routes frames by hash. The default lake uses eight sinks (`host.task-parallelism`) with one producer partition each. Equal hashes keep an ordered chain on one sink; different chains can progress concurrently. Increasing producer partitions removes ordering across producers, so the default ordering assumption matters to owner admissions. Worker placement and CUDA stream choice are separate decisions. `host.cpus` selects workers explicitly; when absent, topology and the process CPU quota determine the worker set, spreading selected cores across sockets. It does not set the CUDA lane count, which is capped at 64 using the JVM's available processor count.
+
+Several quanta of a sequence may be admitted before any concludes when carried-state edges order their shared device data and their host buffers do not overlap. The MTP chained step uses this to pass draft tokens entirely on the device until verification retires. `Sequence` still concludes the ready prefix in admission order; a failed or partially committing predecessor prevents later work from committing across the invalid frontier.
 
 Stages satisfy submission edges after successful device submission. Deferred stages can instead satisfy their edges when asynchronous work completes. Failures are recorded on the quantum and conclude through its continuation, including rejection handling; they must not strand a generation or leak its admitted lake unit.
 

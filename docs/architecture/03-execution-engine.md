@@ -13,6 +13,8 @@ flowchart TB
     Shared[SharedWorkspace: buffers sized at load] --> R
     R --> Owner[WorkspaceOwner: order accesses across graphs]
     Owner --> Graph[Acquire reusable StageGraph and bind GraphStorage]
+    Owner --> Carried[SequenceOwner: order each sequence's carried-state users]
+    Carried --> Graph
     Graph --> Roots[Publish root StageFrames into InferenceLake]
     Roots --> Workers[Lattice workers]
     Workers --> Stage[Ready stage submits CUDA operations]
@@ -28,7 +30,11 @@ flowchart TB
 
 `Execution` assembles ready offers into passes constrained by row and part limits. Admission runs in the ordering domain of `WorkspaceOwner.HASH`. `EuhedralInferenceRuntime` obtains a graph of the requested shape, prepares its quantum on the home lane and connects workspace accesses to earlier graphs. Stages then publish their own successors; there is no central stage dispatch loop.
 
+Binding also connects first users of carried sequence state to its prior users through `SequenceOwner`: layer KV/GDN state, draft seed rows, device draft tokens, DFlash2 state and any shared device region for host KV pages. This permits several quanta of one sequence in flight when their host readback buffers are distinct and they do not share an unordered proposal. MTP uses this to admit a step's catch-up and drafts ahead of verification. Sequence conclusions still commit in admission order.
+
 CUDA stream ordering, events and graph replay provide device ordering. A Java stage finishing its submission does not by itself prove the GPU finished. Eligible decode, verification and draft shapes can be captured and replayed as CUDA graphs; prompt work uses its prompt shapes and chunking.
+
+Disk-backed quanta use stage submissions rather than graph replay: a disk transfer is released when its asynchronous read arrives. `DiskReader` registers uses in admission order and tracks readiness and reuse per window slot. The read backend is selected for the operating system; worker polling completes reads without a thread per request.
 
 ## Implementation anchors
 
