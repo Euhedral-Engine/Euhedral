@@ -12,6 +12,7 @@ spotless {
 dependencies {
     implementation(libs.euhedral.core)
     implementation(libs.jackson.databind)
+    implementation(libs.jackson.dataformat.yaml)
     api(libs.slf4j.api)
     testImplementation(libs.junit.jupiter)
     testImplementation(libs.junit.platform.launcher)

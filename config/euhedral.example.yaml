@@ -1,0 +1,71 @@
+# Euhedral Inference settings: every key, with its default.
+#
+# The smallest working file sets the three required keys:
+#
+#   model:
+#     artifact: /models/qwen3_8_27b.edrl
+#     tokenizer: /models/Qwen3.8-27B
+#     name: qwen3.8-27b
+#
+# Start the server with:  java --enable-native-access=ALL-UNNAMED -jar euhedral-inference.jar --config <this file>
+# (or set EUHEDRAL_CONFIG to the file's path).
+#
+# Any key can be overridden, or supplied when the file lacks it, by an environment variable named EUHEDRAL_ plus the
+# key path upper-cased with "." and "-" written as "_": model.artifact is EUHEDRAL_MODEL_ARTIFACT and
+# kernels.trellis.target-blocks is EUHEDRAL_KERNELS_TRELLIS_TARGET_BLOCKS. PORT also sets server.port.
+# Sizes take units (4GiB, 700MiB; a plain number is bytes); durations take units (10s, 30m, 1000ms; 0 is zero).
+# "auto" means the value is chosen at startup from the machine. An unknown key stops the server with the key named.
+
+model:
+  artifact: /models/qwen3_8_27b.edrl          # required: the model artifact file
+  tokenizer: /models/Qwen3.8-27B              # required: the directory holding the tokenizer files
+  name: qwen3.8-27b                           # required: the model name clients send as "model"
+
+server:
+  port: 1738                                  # optional, default 1738: the port to listen on
+  shutdown-timeout: 10s                       # optional, default 10s: how long a stop waits for running requests
+  requests:
+    default-max-tokens: 4096                  # optional, default 4096: tokens generated when a request names no limit
+    max-queued: 16                            # optional, default 16: requests waiting for the engine before new ones are refused
+    max-body-size: 1MiB                       # optional, default 1MiB: largest request body
+    timeout: 30m                              # optional, default 30m: longest a request may run
+
+context:
+  max-tokens: 32768                           # optional, default 32768: longest context of one sequence
+  kv-cache-format: auto                       # optional, default auto: nvfp4 | bf16 | auto (the artifact's)
+  kv-cache-on-gpu-tokens: 65536               # optional, default 65536: tokens of a sequence kept on the GPU before its cache spills to the host
+
+prefix-cache:
+  size: 4GiB                                  # optional, default 4GiB: host memory for shared prompt prefixes; 0 disables
+  checkpoint-tokens: 2048                     # optional, default 2048: tokens between stored checkpoints; a positive multiple of 512
+
+batching:
+  max-sequences: 1                            # optional, default 1: sequences held at once; 0 holds as many as fit
+  max-sequences-per-pass: auto                # optional, default auto: sequences in one shared decode or verification pass (auto = no bound)
+  max-tokens-per-pass: auto                   # optional, default auto: rows in one shared pass (auto = prefill-chunk-tokens)
+  prefill-chunk-tokens: 512                   # optional, default 512: rows of the longest prefill chunk
+
+memory:
+  host-limit: auto                            # optional, default auto: host memory the engine may use
+  host-weights-limit: auto                    # optional, default auto: pinned host memory for host-backed weights
+  gpu-limit: auto                             # optional, default auto: device memory the engine may use (auto = what is free)
+  gpu-reserve: 700MiB                         # optional, default 700MiB: device memory left for other programs
+  pinned-buffer-pool: auto                    # optional, default auto: released pinned buffers kept for reuse (auto = the larger of 64MiB and RAM/256)
+  weight-streaming:                           # models that stream weights from disk (Qwen3.8-Flash-Next)
+    concurrent-reads: 8                       # optional, default 8: artifact records read at once
+    read-split: 1                             # optional, default 1: parts one record read is split into
+    copy-streams: 4                           # optional, default 4: CUDA streams copying expert weights to the GPU
+    gpu-streams: 2                            # optional, default 2: GPU streams a step runs on
+
+host:
+  cpus: auto                                  # optional, default auto: CPUs the workers run on, such as 2-5,8 (auto = all)
+  task-parallelism: 8                         # optional, default 8: workers taking host work at once
+  idle-release: 1s                            # optional, default 1s: idle time before workers are released; 0 never releases them
+  native-cache: auto                          # optional, default auto: where the jar unpacks its native files (auto = the user's cache directory)
+
+kernels:
+  trellis:
+    tensor-core-max-tokens: 512               # optional, default 512: most rows of a non-verification launch kept on the tensor-core route; at least 8
+    target-blocks: auto                       # optional, default auto: thread blocks the K split aims for (auto = 8 per streaming multiprocessor)
+    whole-k-min-tokens: 64                    # optional, default 64: fewest rows for blocks that run every K split of their columns themselves
+    wide-block-min-tokens: 128                # optional, default 128: fewest rows for blocks of 64 rows instead of 32
