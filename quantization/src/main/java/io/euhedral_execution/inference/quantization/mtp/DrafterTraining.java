@@ -826,7 +826,7 @@ public final class DrafterTraining {
             }
         }
 
-        /// Overwrites resume.bin: parameters and moments, the epoch's order and cursor, step and best.
+        /// Overwrites resume.bin: parameters and moments, the epoch and its cursor, step and best.
         void writeState() throws IOException {
             long offset = ResumeFile.HEADER;
             for (Drafter.Parameter p : drafter.parameters.values()) {
@@ -840,9 +840,6 @@ public final class DrafterTraining {
             header.setProperty("cursor", Integer.toString(cursor));
             header.setProperty("step", Integer.toString(step));
             header.setProperty("best", Double.toString(best));
-            StringBuilder ids = new StringBuilder();
-            for (int s : order) ids.append(s).append(',');
-            header.setProperty("order", ids.toString());
             resume.header(header);
         }
 
@@ -860,10 +857,7 @@ public final class DrafterTraining {
             cursor = Integer.parseInt(header.getProperty("cursor"));
             step = Integer.parseInt(header.getProperty("step"));
             best = Double.parseDouble(header.getProperty("best"));
-            order = Arrays.stream(header.getProperty("order").split(","))
-                    .filter(s -> !s.isEmpty())
-                    .mapToInt(Integer::parseInt)
-                    .toArray();
+            order = shuffled(epoch); // each epoch's order follows from its number
             return true;
         }
 
