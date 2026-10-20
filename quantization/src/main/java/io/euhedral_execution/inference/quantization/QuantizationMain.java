@@ -14,6 +14,7 @@ import io.euhedral_execution.inference.quantization.mixed.Search;
 import io.euhedral_execution.inference.quantization.mixed.SearchState;
 import io.euhedral_execution.inference.quantization.mixed.Seeds;
 import io.euhedral_execution.inference.quantization.mixed.Sources;
+import io.euhedral_execution.inference.quantization.mtp.DrafterTraining;
 import io.euhedral_execution.inference.quantization.trellis.TrellisQuantizer;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -63,6 +64,9 @@ import java.util.OptionalInt;
 /// reference --artifact ARTIFACT --tokenizer CHECKPOINT --text FILE --out OUT.kld [--context 2560] [--chunks N]
 /// [--parse-special] [--rows 8] [--batch 4] [--host-mib N] [--workers N] [--library LIBEUHEDRAL_CUDA]
 /// rotate --model CHECKPOINT --out CHECKPOINT_DIR [--seed 1] [--library LIBEUHEDRAL_CUDA]
+/// train-drafter --corpus CORPUS_DIR --model CHECKPOINT --artifact ARTIFACT --out DIR [--depths 4] [--rows 1024]
+/// [--keys 4096] [--tokens 16384] [--epochs 1] [--projection-rate 2e-5] [--norm-rate 2e-5] [--warmup 10]
+/// [--holdout 50] [--evaluate-every 50] [--limit N] [--library LIBEUHEDRAL_CUDA]
 /// ```
 public final class QuantizationMain {
 
@@ -81,6 +85,7 @@ public final class QuantizationMain {
                                 "calibrate",
                                 "score",
                                 "generate",
+                                "train-drafter",
                                 "train-blocks",
                                 "train-model",
                                 "rotate",
@@ -106,6 +111,9 @@ public final class QuantizationMain {
                     + "[--context 2560] [--chunks N] [--parse-special] [--rows 8] [--batch 4] "
                     + "[--host-mib N] [--workers N] [--library PATH]");
             System.err.println("       rotate --model CHECKPOINT --out DIR [--seed 1] [--library PATH]");
+            System.err.println("       train-drafter --corpus DIR --model CHECKPOINT --artifact ARTIFACT --out DIR "
+                    + "[--depths 4] [--rows 1024] [--keys 4096] [--tokens 16384] [--epochs 1] [--projection-rate 2e-5] [--norm-rate 2e-5] "
+                    + "[--warmup 10] [--holdout 50] [--evaluate-every 50] [--limit N] [--library PATH]");
             System.err.println(
                     "       assemble --allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT "
                             + "[--draft-depth D] [--copy-buffer-mib 64]");
@@ -231,6 +239,27 @@ public final class QuantizationMain {
                             workers(options),
                             Integer.parseInt(options.getOrDefault("limit", "0")),
                             Path.of(library)));
+            return;
+        }
+        if (args[0].equals("train-drafter")) {
+            DrafterTraining.run(
+                    new DrafterTraining.Settings(
+                            Path.of(required(options, "corpus")),
+                            Path.of(required(options, "model")),
+                            Path.of(required(options, "artifact")),
+                            Path.of(required(options, "out")),
+                            Integer.parseInt(options.getOrDefault("depths", "4")),
+                            Integer.parseInt(options.getOrDefault("rows", "1024")),
+                            Integer.parseInt(options.getOrDefault("keys", "4096")),
+                            Integer.parseInt(options.getOrDefault("tokens", "16384")),
+                            Integer.parseInt(options.getOrDefault("epochs", "1")),
+                            Float.parseFloat(options.getOrDefault("projection-rate", "2e-5")),
+                            Float.parseFloat(options.getOrDefault("norm-rate", "2e-5")),
+                            Integer.parseInt(options.getOrDefault("warmup", "10")),
+                            Integer.parseInt(options.getOrDefault("holdout", "50")),
+                            Integer.parseInt(options.getOrDefault("evaluate-every", "50")),
+                            Integer.parseInt(options.getOrDefault("limit", "0"))),
+                    Path.of(library));
             return;
         }
         if (args[0].equals("reference")) {
