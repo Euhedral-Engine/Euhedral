@@ -21,11 +21,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 /// workers pull from many sources at once instead of all queuing at one, which keeps producers and
 /// consumers off a common cache line and lets the cores work side by side.
 ///
-/// A sink is like a GPU stream. With one producer partition it keeps the order frames were published
+/// A sink is like a GPU stream. It has one producer partition, so it keeps the order frames were published
 /// in, whatever mixture of ordered and unordered frames it carries, and an ordered frame runs in its
 /// own chain's order (frames of one `idHash`), not in queue order: two chains in one sink may run at
-/// the same time. A sink of several partitions keeps no order across producers. More sinks, not more
-/// partitions, reduce contention: partitions only spread the producers.
+/// the same time. More sinks, not producer partitions, reduce contention.
 ///
 /// The lake counts the units it carries (quanta, host tasks). [#completeGracefully] closes
 /// admission; once every admitted unit terminated, the sinks complete and the lattice detaches
@@ -45,7 +44,6 @@ public final class InferenceLake implements FrameLake {
 
     private final LatticeTerminal lattice;
     private final int sinkCount;
-    private final int partitions;
     private final long idleDetachNanos;
     /// The sinks attached now with their watch, or null while none are. Changed under the lock of [#attach].
     private volatile Generation generation;
@@ -57,20 +55,17 @@ public final class InferenceLake implements FrameLake {
     private final AtomicBoolean finished = new AtomicBoolean();
     private final CompletableFuture<Void> termination = new CompletableFuture<>();
 
-    /// A lake of `sinks` ingest sinks of `partitions` producer partitions each. Its sinks attach to `lattice`
-    /// when the first unit is admitted or the first frame published, not before, and detach after the default idle
-    /// time (`host.idle-release`).
-    public InferenceLake(LatticeTerminal lattice, int sinks, int partitions) {
-        this(lattice, sinks, partitions, HostSettings.defaults().idleRelease().toNanos());
+    /// A lake of `sinks` ingest sinks. Its sinks attach to `lattice` when the first unit is admitted or the first
+    /// frame published, not before, and detach after the default idle time (`host.idle-release`).
+    public InferenceLake(LatticeTerminal lattice, int sinks) {
+        this(lattice, sinks, HostSettings.defaults().idleRelease().toNanos());
     }
 
     /// As above, with the idle time in nanoseconds (0 or less: the sinks stay attached).
-    public InferenceLake(LatticeTerminal lattice, int sinks, int partitions, long idleDetachNanos) {
+    public InferenceLake(LatticeTerminal lattice, int sinks, long idleDetachNanos) {
         this.lattice = Objects.requireNonNull(lattice, "lattice");
         if (sinks < 1) throw new IllegalArgumentException("a lake needs at least one sink");
-        if (partitions < 1) throw new IllegalArgumentException("a sink needs at least one partition");
         this.sinkCount = sinks;
-        this.partitions = partitions;
         this.idleDetachNanos = idleDetachNanos;
     }
 
@@ -81,8 +76,7 @@ public final class InferenceLake implements FrameLake {
 
         Generation() {
             for (int i = 0; i < this.sinks.length; i++)
-                this.sinks[i] =
-                        new QueueIngestSink(new PartitionedMpscQueue<>(InferenceLake.this.partitions, QUEUE_CAPACITY));
+                this.sinks[i] = new QueueIngestSink(new PartitionedMpscQueue<>(1, QUEUE_CAPACITY));
         }
 
         /// The sinks drain what they hold and complete; the watch ends.

@@ -393,12 +393,13 @@ class ExpertCacheOwnerTest {
                         this.fixture.banks,
                         2,
                         1));
-        this.owner.prefetch(0, new int[] {5, 6, 7}, 2);
-        assertTrue(tier.shard(0).isFilling(0, 5) && tier.shard(0).isFilling(0, 6), "two reads, the budget");
+        this.owner.prefetch(0, new int[] {5, 6, 7});
+        assertTrue(tier.shard(0).isFilling(0, 5), "the best candidate is read");
+        assertFalse(tier.shard(0).isFilling(0, 6), "one read per layer, the budget");
         assertFalse(tier.shard(0).isFilling(0, 7));
         assertFalse(this.cache.shard(0).holds(0, 5), "a prefetch takes no device slot");
         fetch(0, 5, ExpertCacheOwner.Outcome.FULL);
-        drive(() -> tier.shard(0).isResident(0, 5) && tier.shard(0).isResident(0, 6));
+        drive(() -> tier.shard(0).isResident(0, 5));
         Fetch hit = fetch(0, 5, ExpertCacheOwner.Outcome.LOADING);
         drive(hit::ended);
         drained();
@@ -407,7 +408,7 @@ class ExpertCacheOwnerTest {
                 this.gpu.readDevice(hit.lease().deviceAddress(), hit.lease().byteSize()));
         hit.lease().close();
         drained();
-        assertEquals(2, this.owner.prefetchCounts()[0]);
+        assertEquals(1, this.owner.prefetchCounts()[0]);
         assertEquals(1, tier.prefetchesUsed());
         assertEquals(0, this.owner.readsInFlight());
         tier.checkInvariants();

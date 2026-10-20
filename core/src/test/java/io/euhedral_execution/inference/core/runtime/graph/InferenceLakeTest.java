@@ -64,7 +64,7 @@ class InferenceLakeTest {
     @Test
     void everySinkIsAnUpstreamSourceOfTheLattice() {
         var lattice = new Recording();
-        var lake = new InferenceLake(lattice, 4, 2);
+        var lake = new InferenceLake(lattice, 4);
         assertEquals(0, lattice.sources.size(), "nothing attaches before the first unit");
         assertFalse(lake.isAttached());
         lake.admit();
@@ -78,7 +78,7 @@ class InferenceLakeTest {
     @Test
     void framesOfOneRoutingHashShareASinkAndOthersSpread() {
         var lattice = new Recording();
-        var lake = new InferenceLake(lattice, 4, 1);
+        var lake = new InferenceLake(lattice, 4);
         for (int i = 0; i < 10; i++) lake.publish(new Frame(7));
         int sinksHoldingThem = 0;
         for (LatticeSource source : lattice.sources) {
@@ -104,7 +104,7 @@ class InferenceLakeTest {
     @Test
     void aFramePublishedFromACallbackIsEnqueuedLikeAnyOther() {
         var lattice = new Recording();
-        var lake = new InferenceLake(lattice, 2, 1);
+        var lake = new InferenceLake(lattice, 2);
         lake.publishFromCallback(new Frame(3));
         List<AbstractFrame> pulled = new ArrayList<>();
         for (LatticeSource source : lattice.sources) lattice.pull(source, pulled);
@@ -114,7 +114,7 @@ class InferenceLakeTest {
     @Test
     void theLakeCompletesOnlyAfterEveryAdmittedUnitTerminated() {
         var lattice = new Recording();
-        var lake = new InferenceLake(lattice, 3, 1);
+        var lake = new InferenceLake(lattice, 3);
         lake.admit();
         lake.admit();
         assertEquals(2, lake.active());
@@ -145,7 +145,7 @@ class InferenceLakeTest {
     @Test
     void theSinksDetachWhenNoUnitWasAdmittedForTheIdleTimeAndTheNextFrameAttachesFreshOnes() throws Exception {
         var lattice = new Recording();
-        var lake = new InferenceLake(lattice, 2, 1, 1_000_000);
+        var lake = new InferenceLake(lattice, 2, 1_000_000);
         lake.admit();
         lake.terminated();
         assertEquals(3, lattice.sources.size());
@@ -168,7 +168,7 @@ class InferenceLakeTest {
     @Test
     void anAdmittedUnitKeepsTheSinksAttached() throws Exception {
         var lattice = new Recording();
-        var lake = new InferenceLake(lattice, 2, 1, 1_000_000);
+        var lake = new InferenceLake(lattice, 2, 1_000_000);
         lake.admit();
         Thread.sleep(5);
         lattice.pull(watchOf(lattice, 2), new ArrayList<>());
@@ -181,7 +181,7 @@ class InferenceLakeTest {
     @Test
     void aUnitAdmittedAfterTheDetachAttachesFreshSinks() throws Exception {
         var lattice = new Recording();
-        var lake = new InferenceLake(lattice, 2, 1, 1_000_000);
+        var lake = new InferenceLake(lattice, 2, 1_000_000);
         lake.admit();
         lake.terminated();
         Thread.sleep(5);
@@ -199,7 +199,7 @@ class InferenceLakeTest {
     @Test
     void withoutAnIdleTimeTheSinksStayAttached() throws Exception {
         var lattice = new Recording();
-        var lake = new InferenceLake(lattice, 2, 1, 0);
+        var lake = new InferenceLake(lattice, 2, 0);
         lake.admit();
         lake.terminated();
         Thread.sleep(5);
@@ -210,7 +210,7 @@ class InferenceLakeTest {
     @Test
     void aLakeWithNothingAdmittedCompletesAtOnce() {
         var lattice = new Recording();
-        var lake = new InferenceLake(lattice, 2, 1);
+        var lake = new InferenceLake(lattice, 2);
         lake.completeGracefully();
         assertTrue(lake.isComplete());
         assertEquals(0, lattice.sources.size(), "a lake that was never used never attaches");
@@ -218,7 +218,7 @@ class InferenceLakeTest {
 
     @Test
     void terminatingMoreThanAdmittedIsRejected() {
-        var lake = new InferenceLake(new Recording(), 1, 1);
+        var lake = new InferenceLake(new Recording(), 1);
         assertThrows(IllegalStateException.class, lake::terminated);
     }
 

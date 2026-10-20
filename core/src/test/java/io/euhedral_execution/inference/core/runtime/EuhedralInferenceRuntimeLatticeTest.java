@@ -118,7 +118,6 @@ class EuhedralInferenceRuntimeLatticeTest {
                     plan,
                     gpu,
                     EuhedralInferenceRuntime.laneCount(),
-                    true,
                     Tunings.idleRelease(Duration.ofMillis(50)));
             try {
                 long sequenceId = 5900;

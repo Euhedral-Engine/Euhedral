@@ -359,12 +359,13 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
     /// them that neither the device nor the host tier holds into the tier, while the disk has a read to spare. Any
     /// thread.
     public void publishPrefetch(int bank, int[] experts) {
-        post(() -> prefetch(bank, experts, PREFETCH_READS));
+        post(() -> prefetch(bank, experts));
     }
 
-    /// Reads up to `budget` of `experts` into the host tier, speculatively: it reads only what the disk can take now
-    /// and never waits. Called by the poll.
-    public void prefetch(int bank, int[] experts, int budget) {
+    /// Reads up to [#PREFETCH_READS] of `experts` into the host tier, speculatively: it reads only what the disk can
+    /// take now and never waits. Called by the poll.
+    public void prefetch(int bank, int[] experts) {
+        int budget = PREFETCH_READS;
         for (int expert : experts) {
             if (budget <= 0 || this.reading.get() >= this.reads) return;
             int shardIndex = this.cache.shardOf(bank, expert);

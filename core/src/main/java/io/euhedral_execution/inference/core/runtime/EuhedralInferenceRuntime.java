@@ -34,11 +34,6 @@ import org.slf4j.LoggerFactory;
 /// plan supplies the shapes and quanta, and the model's runtime owns the lake and the host work.
 public final class EuhedralInferenceRuntime implements AutoCloseable {
 
-    /// Producer partitions of each ingest sink of a lake. A sink of one partition keeps the order frames were
-    /// published in, like a stream; more sinks (`host.task-parallelism`), not partitions, spread the contention of
-    /// producers and consumers.
-    static final int LAKE_PARTITIONS = 1;
-
     /// The device lanes of a runtime: `compute` lanes the stages spread over, an optional lane reserved for
     /// host-to-device weight transfers, and whether quanta that carry a capture key are captured into CUDA graphs.
     public record Lanes(int compute, boolean transferLane, boolean captureGraphs) {
@@ -79,10 +74,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     /// detach after `host.idle-release` without work.
     public static InferenceLake newLake(LatticeTerminal lattice, HostSettings host) {
         return new InferenceLake(
-                lattice,
-                host.taskParallelism(),
-                LAKE_PARTITIONS,
-                host.idleRelease().toNanos());
+                lattice, host.taskParallelism(), host.idleRelease().toNanos());
     }
 
     /// A runtime that runs the [GraphShape]s its callers admit through [#admit] on `lanes`, throwing every ready
@@ -168,8 +160,8 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     }
 
     /// One admission run on the workspace's owner: its `idHash` is [WorkspaceOwner#HASH] and it stays ordered, so
-    /// admissions run one at a time, in the order they were published (the lake's sinks have one partition each,
-    /// [#LAKE_PARTITIONS]).
+    /// admissions run one at a time, in the order they were published (the lake's sinks have one producer partition
+    /// each, [InferenceLake]).
     static final class Admission extends AbstractFrame {
         private final Runnable admission;
 

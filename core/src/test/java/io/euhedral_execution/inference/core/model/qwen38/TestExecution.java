@@ -27,7 +27,6 @@ public final class TestExecution {
                     plan,
                     gpu,
                     EuhedralInferenceRuntime.laneCount(),
-                    true,
                     Tunings.prefillChunkTokens(
                             Math.max(InferenceConfig.PREFILL_CHUNK_TOKENS, context.inputTokenCount())));
             try {
