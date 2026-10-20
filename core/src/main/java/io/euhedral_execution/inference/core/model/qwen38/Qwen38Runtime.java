@@ -15,7 +15,9 @@ import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Deco
 import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.state.AttentionKvState;
 import io.euhedral_execution.inference.core.state.KvFormat;
+import io.euhedral_execution.inference.core.state.KvHostPages;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -79,7 +81,8 @@ public final class Qwen38Runtime implements ModelRuntime {
             Artifact artifact,
             ArtifactProfile profile,
             LatticeTerminal lattice) {
-        ExecutionPlan plan = new ExecutionPlan(model.weights(), model.staging(), model.window());
+        ExecutionPlan plan =
+                new ExecutionPlan(model.weights(), model.staging(), model.window(), model.kvHostPages() != null);
         // The workspace is sized at load for the widest quantum: the prefill chunk, unless a diagnostic widens it.
         Execution execution = new Execution(
                 lattice,
@@ -94,6 +97,8 @@ public final class Qwen38Runtime implements ModelRuntime {
         KvFormat kvFormat = ArtifactProfile.kvFormat(config.kvCache(), profile);
         // Last, so nothing that can fail follows the pinned arena.
         PrefixCache prefixCache = openPrefixCache(config, gpu, plan, execution, kvFormat);
+        if (prefixCache != null && model.kvHostPages() != null)
+            prefixCache.limitCheckpoints(model.kvHostPages().devicePages() * AttentionKvState.PAGE_TOKENS);
         return new Qwen38Runtime(
                 Objects.requireNonNull(tokenizer, "tokenizer"),
                 gpu,
@@ -202,6 +207,7 @@ public final class Qwen38Runtime implements ModelRuntime {
                 prefillChunkTokens,
                 release::accept);
         session.useKvFormat(this.kvFormat);
+        session.useKvHostPages(this.model.kvHostPages());
         switch (speculation(options, this.profile, this.plan.drafts(), this.plan.draftsWithDFlash2())) {
             case MTP -> session.enableSpeculativeDecoding(this.profile.draftLength());
             case DFLASH2 -> session.useSpeculativeDecoding(DFlash2Decoder.factory(this.profile.speculativeDepth()));
@@ -317,6 +323,12 @@ public final class Qwen38Runtime implements ModelRuntime {
     /// The format the sessions' sequences keep their attention caches in.
     public KvFormat kvFormat() {
         return this.kvFormat;
+    }
+
+    /// The host pages the sessions' attention caches keep past their device share, or null when every page is on
+    /// the device.
+    public KvHostPages kvHostPages() {
+        return this.model.kvHostPages();
     }
 
     public Qwen38Config config() {

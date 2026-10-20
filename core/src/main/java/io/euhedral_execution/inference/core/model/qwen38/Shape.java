@@ -129,8 +129,8 @@ public final class Shape implements GraphShape {
 
     /// The sequence state stage `stage` carries from one quantum (or chunk) of the sequence to the next: `2L` for
     /// layer L's GDN convolution and recurrent state, `2L + 1` for its KV rows (layer slots include the MTP
-    /// layer's), then the drafters' state ([#seedRowsKey]). A first-layer plan's stages name no layer: their state
-    /// is layer 0's, the sequence's only one.
+    /// layer's), then the drafters' state ([#seedRowsKey]) and the host page region ([#kvRegionKey]). A
+    /// first-layer plan's stages name no layer: their state is layer 0's, the sequence's only one.
     @Override
     public int[] carriedState(int stage) {
         ExecutionPlan.Instruction instruction = this.instructions.get(stage);
@@ -138,7 +138,15 @@ public final class Shape implements GraphShape {
         int drafter = seedRowsKey(this.plan.weights().config().numHiddenLayers());
         return switch (instruction.kind()) {
             case GDN_CONVOLUTION, GDN_RECURRENCE -> new int[] {2 * layer};
-            case ATTENTION_KV_APPEND, ATTENTION_CAUSAL -> new int[] {2 * layer + 1};
+            // With host pages a sequence's base layers share one device region, which orders all their KV stages
+            // across the sequence's quanta too.
+            case ATTENTION_KV_APPEND, ATTENTION_CAUSAL ->
+                this.plan.hostKvPages() && layer < this.plan.weights().config().numHiddenLayers()
+                        ? new int[] {
+                            2 * layer + 1,
+                            kvRegionKey(this.plan.weights().config().numHiddenLayers())
+                        }
+                        : new int[] {2 * layer + 1};
             // The MTP stem reads the seed rows; a final norm of a drafting plan writes them (a seeding quantum's,
             // or an MTP row's recursion hidden).
             case MTP_STEM -> new int[] {drafter};
@@ -161,9 +169,16 @@ public final class Shape implements GraphShape {
         return 2 * (layers + 1);
     }
 
+    /// The carried-state key of a sequence's host page region in a plan of `layers` base layers, after the DFlash2
+    /// keys.
+    static int kvRegionKey(int layers) {
+        return seedRowsKey(layers) + 3;
+    }
+
     @Override
     public int carriedStateCount() {
-        return seedRowsKey(this.plan.weights().config().numHiddenLayers()) + 3;
+        int layers = this.plan.weights().config().numHiddenLayers();
+        return this.plan.hostKvPages() ? kvRegionKey(layers) + 1 : kvRegionKey(layers);
     }
 
     /// The runtime workspace's slots stage `stage` reads or writes: its instruction's buffers, through the region

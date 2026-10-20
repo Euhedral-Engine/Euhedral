@@ -89,6 +89,8 @@ public final class PrefixCache implements AutoCloseable {
     private final Runnable release;
     private final GpuStream stream;
     private final int intervalTokens;
+    /// The last prompt position a checkpoint may end at ([#limitCheckpoints]).
+    private volatile int checkpointLimit = Integer.MAX_VALUE;
     private final KvFormat format;
     private final AtomicLong lookups = new AtomicLong();
     private final AtomicLong captureNanos = new AtomicLong();
@@ -164,6 +166,13 @@ public final class PrefixCache implements AutoCloseable {
         return this.intervalTokens;
     }
 
+    /// Stores no checkpoint past `tokens`: the rows the sequences' caches keep on the device, when the rest of their
+    /// pages live in host memory, which the checkpoint copies do not address.
+    public void limitCheckpoints(int tokens) {
+        if (tokens <= 0) throw new IllegalArgumentException("tokens must be positive");
+        this.checkpointLimit = tokens;
+    }
+
     public PrefixNode root() {
         return this.tree.root();
     }
@@ -173,6 +182,7 @@ public final class PrefixCache implements AutoCloseable {
     /// next chunk is the final one. The latter is what lets a follow-up that extends the prompt, or repeats
     /// it, skip all but the last chunk.
     public boolean wantsCheckpoint(int end, int promptLength) {
+        if (end > this.checkpointLimit) return false;
         if (end % this.intervalTokens == 0) return true;
         return end < promptLength && promptLength - end <= InferenceConfig.PREFILL_CHUNK_TOKENS;
     }

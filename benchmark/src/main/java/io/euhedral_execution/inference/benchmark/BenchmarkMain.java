@@ -117,7 +117,8 @@ public final class BenchmarkMain {
                 options.maxContextTokens(),
                 options.prefixCacheBytes(),
                 options.shutdownTimeout(),
-                options.speculation().equals("artifact"));
+                options.speculation().equals("artifact"),
+                options.kvDeviceMinimumTokens());
         // Load before creating the output, so a refused load leaves no empty result file.
         BenchmarkRunner.Target target;
         try {

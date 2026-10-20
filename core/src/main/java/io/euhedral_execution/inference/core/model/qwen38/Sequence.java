@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.core.model.qwen38;
 import io.euhedral_execution.inference.core.runtime.graph.SequenceOwner;
 import io.euhedral_execution.inference.core.runtime.graph.Sequencer;
 import io.euhedral_execution.inference.core.state.KvFormat;
+import io.euhedral_execution.inference.core.state.KvHostPages;
 import java.lang.invoke.VarHandle;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
@@ -64,6 +65,8 @@ public final class Sequence {
     private final AtomicReference<Terminal> terminal = new AtomicReference<>(ACTIVE);
     private volatile Object kvCacheState;
     private volatile KvFormat kvFormat = KvFormat.NVFP4;
+    /// Where the base layers' caches keep their pages past the device share, or null for every page on the device.
+    private volatile KvHostPages kvHostPages;
     private volatile Object recurrentState;
     private final SequenceCleanup cleanup = new SequenceCleanup();
 
@@ -133,6 +136,18 @@ public final class Sequence {
         Objects.requireNonNull(format, "format");
         if (this.kvCacheState != null) throw new IllegalStateException("the sequence already holds its caches");
         this.kvFormat = format;
+    }
+
+    /// The host pages the sequence's caches take a slot of, or null.
+    public KvHostPages kvHostPages() {
+        return this.kvHostPages;
+    }
+
+    /// Keeps the base layers' cache pages past the device share in a slot of `pages` (null: every page on the
+    /// device). Set before the first quantum.
+    public void useKvHostPages(KvHostPages pages) {
+        if (this.kvCacheState != null) throw new IllegalStateException("the sequence already holds its caches");
+        this.kvHostPages = pages;
     }
 
     /// Sets the KV state; only work in flight does.

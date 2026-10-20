@@ -102,6 +102,7 @@ against the working directory, which is the repository root under `./gradlew :be
 | `artifact`, `tokenizer`, `cudaLibrary` | required | Model artifact, tokenizer directory, native library. |
 | `maxContextTokens` | `32768` | Longest sequence (prompt plus generation) the engine keeps device memory for; scenarios that need more positions are rejected. Recorded in the run snapshot. |
 | `prefixCacheBytes` | `0` | Pinned host memory for the prefix cache ([PREFIX_CACHE.md](PREFIX_CACHE.md)); 0 runs without one. Iterations of a scenario repeat its prompt, so with a cache every iteration after the first restores stored state: use it to measure the restore, never in a comparison of the engine's speed. Recorded in the run snapshot. |
+| `kvDeviceMinimumTokens` | `65536` | Tokens of each sequence's attention cache kept on the GPU when the weights and the whole cache do not fit; the pages past them live in pinned host memory before any weight leaves the GPU ([ATTENTION_DECODE.md](ATTENTION_DECODE.md#cache-pages-in-host-memory)). |
 | `cpus` | `all` | `all`, `one-per-core`, `performance`, `performance-one-per-core`, or IDs/ranges (`"2-5,8"`). |
 | `excludeCpus`, `excludeCores` | `[]` | Processor IDs or Euhedral core IDs removed from the selection. |
 | `scenarios` | default suite | Strings: `prefill:P`, `first-token:P`, `prompt-to-n:P:N`, `decode:P:N`. |

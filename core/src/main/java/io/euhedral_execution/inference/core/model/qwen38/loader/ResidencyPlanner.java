@@ -45,19 +45,36 @@ public final class ResidencyPlanner {
 
     /// The outcome: the objects to keep in host memory and those left in the artifact file, the device bytes the
     /// plan needs, the pinned host bytes of the host-backed objects (`hostArenaBytes`) and of the disk window
-    /// (`windowBytes`, 0 without disk-backed objects), and whether it fits.
+    /// (`windowBytes`, 0 without disk-backed objects), the attention cache pages each sequence keeps in pinned host
+    /// memory per attention layer (`kvHostPages`, 0 when every page is on the device) and their pinned bytes over
+    /// every sequence and layer (`kvHostBytes`), and whether it fits.
     public record Plan(
             Set<String> hostBacked,
             Set<String> diskBacked,
             long deviceBytes,
             long hostArenaBytes,
             long windowBytes,
+            int kvHostPages,
+            long kvHostBytes,
             boolean fits) {
+
+        public Plan(
+                Set<String> hostBacked,
+                Set<String> diskBacked,
+                long deviceBytes,
+                long hostArenaBytes,
+                long windowBytes,
+                boolean fits) {
+            this(hostBacked, diskBacked, deviceBytes, hostArenaBytes, windowBytes, 0, 0L, fits);
+        }
 
         public Plan(Set<String> hostBacked, long deviceBytes, boolean fits) {
             this(hostBacked, Set.of(), deviceBytes, 0L, 0L, fits);
         }
     }
+
+    /// No attention cache page leaves the device: the planners' callers outside the engine.
+    public static final int ALL_KV_ON_DEVICE = Integer.MAX_VALUE;
 
     /// NVFP4 KV bytes of one sequence of `tokens` positions, in whole pages.
     public static long kvBytes(Qwen38Config config, int tokens) {
@@ -120,7 +137,36 @@ public final class ResidencyPlanner {
             KvFormat kvFormat,
             int sequences,
             boolean mapOutputHeadEarly) {
+        return plan(
+                artifact,
+                profile,
+                freeBytes,
+                maxContextTokens,
+                hostBytes,
+                kvFormat,
+                sequences,
+                mapOutputHeadEarly,
+                ALL_KV_ON_DEVICE);
+    }
+
+    /// As above, with `kvDeviceMinimumTokens` of each sequence's attention cache kept on the device. When the
+    /// resident weights and every sequence's whole cache do not fit, each sequence's pages past that many
+    /// tokens go to pinned host memory first (each attention layer's are copied to one device region of the
+    /// sequence's before the layer reads them, [KvHostPages]); only when the weights and the device share
+    /// still do not fit do weights leave the device, as above. The host pages come out of the host memory
+    /// before any weight does.
+    public static Plan plan(
+            Artifact artifact,
+            ArtifactProfile profile,
+            long freeBytes,
+            int maxContextTokens,
+            long hostBytes,
+            KvFormat kvFormat,
+            int sequences,
+            boolean mapOutputHeadEarly,
+            int kvDeviceMinimumTokens) {
         if (sequences < 1) throw new IllegalArgumentException("sequences must be at least 1");
+        if (kvDeviceMinimumTokens <= 0) throw new IllegalArgumentException("kvDeviceMinimumTokens must be positive");
         long extra = sequences == 1
                 ? 0
                 : SequenceFootprint.extraSequenceBytes(
@@ -135,12 +181,72 @@ public final class ResidencyPlanner {
                         RESERVE_BYTES),
                 Math.multiplyExact(sequences - 1L, extra));
         fixed = Math.addExact(fixed, trellisScratchBytes(artifact, profile));
+        Plan resident = deviceNeed(artifact, profile, Set.of());
+        if (resident.deviceBytes() + fixed <= freeBytes) return tiers(artifact, resident, fixed, hostBytes, true);
+        // The cache past the device minimum moves to host memory before any weight leaves the device.
+        int pages = Math.toIntExact((maxContextTokens + 255L) / 256L);
+        int devicePages = (int) Math.min(pages, (kvDeviceMinimumTokens + 255L) / 256L);
+        int hostPages = pages - devicePages;
+        long kvHost = 0;
+        long region = Math.multiplyExact((long) hostPages, pageBytes(artifact.config(), kvFormat));
+        long spilled = Math.multiplyExact(Math.multiplyExact(region, attentionLayers(artifact.config())), sequences);
+        // Host memory that cannot hold the pages leaves the cache on the device and the weights to make room.
+        if (hostPages > 0 && spilled <= hostBytes) {
+            kvHost = spilled;
+            long whole = Math.multiplyExact(sequences, kvBytes(artifact.config(), maxContextTokens, kvFormat));
+            long kept = Math.multiplyExact(
+                    sequences, Math.addExact(kvBytes(artifact.config(), devicePages * 256, kvFormat), region));
+            fixed = Math.addExact(Math.subtractExact(fixed, whole), kept);
+            hostBytes -= kvHost;
+        } else {
+            hostPages = 0;
+        }
+        return withKvHost(
+                offload(artifact, profile, freeBytes, sequences, hostBytes, mapOutputHeadEarly, fixed, resident),
+                hostPages,
+                kvHost);
+    }
+
+    /// Bytes of one attention cache page of a full-attention layer (its K plane then its V plane) in `format`.
+    public static long pageBytes(Qwen38Config config, KvFormat format) {
+        return 2 * AttentionKvState.planePageBytes(config.numKeyValueHeads() * config.attentionHeadDim(), format);
+    }
+
+    /// Full-attention layers of the base model: the layers whose caches may keep pages in host memory.
+    public static int attentionLayers(Qwen38Config config) {
+        int layers = 0;
+        for (LayerType type : config.layerTypes()) if (type == LayerType.FULL_ATTENTION) layers++;
+        return layers;
+    }
+
+    private static Plan withKvHost(Plan plan, int hostPages, long kvHost) {
+        if (kvHost == 0) return plan;
+        return new Plan(
+                plan.hostBacked(),
+                plan.diskBacked(),
+                plan.deviceBytes(),
+                plan.hostArenaBytes(),
+                plan.windowBytes(),
+                hostPages,
+                kvHost,
+                plan.fits());
+    }
+
+    /// The weight offload of [#plan]: grows the offloaded selection until the device need beside `fixed` fits.
+    private static Plan offload(
+            Artifact artifact,
+            ArtifactProfile profile,
+            long freeBytes,
+            int sequences,
+            long hostBytes,
+            boolean mapOutputHeadEarly,
+            long fixed,
+            Plan resident) {
         TensorDescriptor head = headOf(artifact);
         // A mapped NVFP4 head is swept over the bus once per row when a verification outgrows the decode kernels.
         boolean mappable = head != null
                 && !(head.format() == WeightFormat.NVFP4
                         && (long) sequences * (1 + profile.speculativeDepth()) > NVFP4_ROW_EXACT_MAX_ROWS);
-        Plan resident = deviceNeed(artifact, profile, Set.of());
         if (resident.deviceBytes() + fixed <= freeBytes) return tiers(artifact, resident, fixed, hostBytes, true);
         long all = artifactBytes(artifact, profile);
         // Grow the offloaded bytes until the device need fits. The ring grows with the largest selected
@@ -173,7 +279,22 @@ public final class ResidencyPlanner {
             long hostBytes,
             KvFormat kvFormat,
             int cap) {
-        Plan single = plan(artifact, profile, freeBytes, maxContextTokens, hostBytes, kvFormat, 1);
+        return sequencesFor(artifact, profile, freeBytes, maxContextTokens, hostBytes, kvFormat, cap, ALL_KV_ON_DEVICE);
+    }
+
+    /// As above, with `kvDeviceMinimumTokens` of each sequence's cache kept on the device ([#plan]).
+    public static int sequencesFor(
+            Artifact artifact,
+            ArtifactProfile profile,
+            long freeBytes,
+            int maxContextTokens,
+            long hostBytes,
+            KvFormat kvFormat,
+            int cap,
+            int kvDeviceMinimumTokens) {
+        boolean head = Boolean.getBoolean(MAP_OUTPUT_HEAD);
+        Plan single = plan(
+                artifact, profile, freeBytes, maxContextTokens, hostBytes, kvFormat, 1, head, kvDeviceMinimumTokens);
         if (!single.fits()) return 1;
         long offloaded = offloadedBytes(artifact, single);
         int low = 1;
@@ -181,7 +302,16 @@ public final class ResidencyPlanner {
         // Fitting and the offloaded bytes only worsen with the count: search for the largest that is no worse.
         while (low < high) {
             int middle = (low + high + 1) >>> 1;
-            Plan candidate = plan(artifact, profile, freeBytes, maxContextTokens, hostBytes, kvFormat, middle);
+            Plan candidate = plan(
+                    artifact,
+                    profile,
+                    freeBytes,
+                    maxContextTokens,
+                    hostBytes,
+                    kvFormat,
+                    middle,
+                    head,
+                    kvDeviceMinimumTokens);
             if (candidate.fits() && offloadedBytes(artifact, candidate) <= offloaded) low = middle;
             else high = middle - 1;
         }

@@ -25,7 +25,8 @@ class InferencePropertiesTest {
         expected.set(2, 6);
         expected.set(8);
         assertEquals(expected, InferenceProperties.parseCpus(" 2-5, 8 ,"));
-        var config = new InferenceProperties(PATH, PATH, PATH, "3", 4096, Duration.ofSeconds(4), "m", 0, 2048, null, 1)
+        var config = new InferenceProperties(
+                        PATH, PATH, PATH, "3", 4096, Duration.ofSeconds(4), "m", 0, 2048, null, 1, 65536)
                 .toInferenceConfig();
         assertEquals(BitSet.valueOf(new long[] {1L << 3}), config.workerCpus());
         assertEquals(Duration.ofSeconds(4), config.shutdownTimeout());
@@ -40,11 +41,11 @@ class InferencePropertiesTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> new InferenceProperties(
-                        null, PATH, PATH, "1", 4096, Duration.ofSeconds(1), "m", 0, 2048, null, 1));
+                        null, PATH, PATH, "1", 4096, Duration.ofSeconds(1), "m", 0, 2048, null, 1, 65536));
         assertThrows(
                 IllegalArgumentException.class,
                 () -> new InferenceProperties(
-                        PATH, PATH, PATH, "1", 4096, Duration.ofSeconds(1), " ", 0, 2048, null, 1));
+                        PATH, PATH, PATH, "1", 4096, Duration.ofSeconds(1), " ", 0, 2048, null, 1, 65536));
     }
 
     private static InferenceProperties bind(Map<String, String> overrides) {
@@ -96,6 +97,16 @@ class InferencePropertiesTest {
                         .toInferenceConfig()
                         .maxSequences());
         assertThrows(Exception.class, () -> bind(Map.of("euhedral.inference.max-sequences", "-1")));
+    }
+
+    @Test
+    void kvDeviceMinimumTokensBinds() {
+        assertEquals(
+                4096,
+                bind(Map.of("euhedral.inference.kv-device-minimum-tokens", "4096"))
+                        .toInferenceConfig()
+                        .kvDeviceMinimumTokens());
+        assertThrows(Exception.class, () -> bind(Map.of("euhedral.inference.kv-device-minimum-tokens", "0")));
     }
 
     @Test

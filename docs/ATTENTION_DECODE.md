@@ -100,8 +100,44 @@ tiles, so the host launches it from a measured length per row count: 2 rows from
 In the model (NVFP4-Trellis-RCO, MTP depth 4, the README scenarios), a verification takes 19.64 ms at 4K, 21.36 ms at 32K,
 22.82 ms at 64K and 26.80 ms at 128K, and decode runs at 135.0, 119.8, 107.5 and 88.1 tok/s.
 
+## Cache pages in host memory
+
+When the weights and every sequence's whole attention cache do not fit on the GPU, the pages past each sequence's first
+`kv-device-minimum-tokens` tokens (default 65536) live in pinned host memory, and only then do weights leave the device
+(`ResidencyPlanner`). The planner sizes one pinned arena at load: per sequence slot, each attention layer's host pages, and
+one device region that holds a single layer's host pages, which the slot's layers share (`KvHostPages`). A sequence takes a
+slot when its state is attached and returns it when the state closes; a sequence that finds every slot taken is refused,
+never kept waiting. The MTP layer's cache stays on the device.
+
+Pages never move. A cache's page table addresses its host pages in the region (`AttentionKvState.HostRun`), so every
+attention kernel reads them unchanged. Each layer's append copies the host pages the quantum reads into the region before it
+writes, and the pages it wrote back afterwards, on its own stream; the layer's attention runs after the append and the next
+layer's append after that attention, so one region serves all layers. The KV stages of a host-page engine also carry the
+region from one quantum of a sequence to the next. Decode, verification and draft quanta (at most 8 rows, the captured
+ones) copy every reserved host page in and the last two back, so what they queue changes only when the reservation grows,
+which is in the capture fingerprint; prompt chunks copy only the pages they reach and write. Prefix-cache checkpoints stop
+at the device share.
+
+Greedy output is bit for bit that of the same engine with every page on the device (`HostKvPagesCudaIntegrationTest`:
+a 3000-token prompt over 1024 device tokens, decode, MTP verification and drafting).
+
+NVFP4-Trellis-RCO, 32K chat prompt, MTP depth 4, every weight on the GPU, by the cache share kept on it:
+
+| Device share | Host tokens | ms per verification | Decode tok/s | Prefill tok/s |
+|---|---|---|---|---|
+| 32768 (all) | 0 | 20.8 | 147.6 / 123.1 | 2055 |
+| 24576 | 8192 | 24.5 | 128.9 / 107.3 | 2045 |
+| 16384 | 16384 | 27.9 | 115.8 / 95.9 | 2032 |
+| 8192 | 24576 | 31.3 | 104.4 / 86.9 | 2014 |
+
+(Two chat prompts per row; outputs identical across rows.) Each 8192 host tokens add about 3.5 ms to a verification: 145 MiB
+of pages copied in per step, about 41 GB/s.
+
 ## Rejected
 
+- **Reading host pages in place** (page table entries pointing at mapped pinned host memory, no copies): the kernels' 16-byte
+  loads reach 2 to 3 GB/s over the bus. Per layer, 1-row decode takes 22 ms at 64K keys and the 5-row fused verifier 74 ms
+  at 128K.
 - **A deeper cp.async ring, or finer key splits.** The loads alone take 28 us of the 16K one-row kernel; the time is the phases of one
   warp running one after another at about 0.1 instructions per cycle. A cp.async ring on the single-warp kernel left it at 131 us;
   128 and 256 splits ran at 78 and 76 us because every CTA repeats the query rotation and the merge grows. A 4-stage ring takes 31 KiB

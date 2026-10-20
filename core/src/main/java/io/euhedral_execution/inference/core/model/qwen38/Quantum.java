@@ -11,6 +11,7 @@ import io.euhedral_execution.inference.core.model.qwen38.speculative.Speculative
 import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
 import io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint;
 import io.euhedral_execution.inference.core.runtime.graph.SequenceOwner;
+import io.euhedral_execution.inference.core.state.KvHostPages;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
@@ -1089,12 +1090,26 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                             config.linearKeyHeadDim(),
                             config.linearValueHeadDim(),
                             config.linearConvKernelDim());
-                    createdKv = AttentionStates.allocate(
-                            gpu,
-                            config.layerTypes(),
-                            config.numKeyValueHeads() * config.attentionHeadDim(),
-                            plan.weights().mtp() != null,
-                            sequence.kvFormat());
+                    KvHostPages hostPages = sequence.kvHostPages();
+                    KvHostPages.Slot slot = null;
+                    if (hostPages != null) {
+                        slot = hostPages.take();
+                        if (slot == null)
+                            throw new IllegalStateException("every one of the " + hostPages.slots()
+                                    + " sequence slots of host attention cache pages is taken");
+                    }
+                    try {
+                        createdKv = AttentionStates.allocate(
+                                gpu,
+                                config.layerTypes(),
+                                config.numKeyValueHeads() * config.attentionHeadDim(),
+                                plan.weights().mtp() != null,
+                                sequence.kvFormat(),
+                                slot);
+                    } catch (RuntimeException | Error failure) {
+                        if (slot != null) slot.release();
+                        throw failure;
+                    }
                 } else {
                     createdRecurrent = GdnState.allocate(
                             gpu,
