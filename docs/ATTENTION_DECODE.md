@@ -165,4 +165,9 @@ of pages copied in per step, about 41 GB/s.
   sharing the reads helps only at 64K and costs up to 8% at 32K. The same residency bounds any kernel that serves several rows
   from one CTA: one score and one consumer warp per row keep the rows in flight per SM at four unless the queries leave registers.
 - **Shared query rotation** (rotate once per KV head, not per split). Skipping the Hadamard entirely saves 2.5% at 16K and 0.7% at 64K.
+  In the fused verifier (5 rows, cold KV, per layer) it saves 5 to 6 us at every length: 37.2 against 31.3 us at 4K, 497.1
+  against 491.1 us at 128K, at most 0.1 ms of a verification's 16 attention layers. Unrolling the query prologue (the loads
+  of every column in flight at once) saves nothing, so the time is the rotation's arithmetic, not its loads.
 - **Merge inside the decode kernel** (the last CTA merges). The merge is 7 us of 38 us at 16K and fusing removes the launch gap, not the work.
+  After the fused verifier, the 5-row merge takes 9 us at every length and the pair 7 to 18 us more than the decode kernel
+  alone: at most 0.3 ms of a verification, and the last CTA would serialize 30 head merges at the kernel's tail.
