@@ -61,18 +61,27 @@ public final class TrellisFormat implements LinearFormat {
     private static final int COLUMN_BF16 = 1;
     private static final int BLOCK_FP8 = 2;
 
-    private final TrellisSettings settings;
+    /// The thresholds this format always runs with, or null for the device's ([ExecutionGpu#trellisSettings]).
+    private final TrellisSettings fixed;
 
+    /// The registered format: it runs with each device's thresholds.
     TrellisFormat() {
-        this(TrellisSettings.fromProperties());
+        this.fixed = null;
     }
 
+    /// A format that runs with `settings` on every device.
     public TrellisFormat(TrellisSettings settings) {
-        this.settings = Objects.requireNonNull(settings, "settings");
+        this.fixed = Objects.requireNonNull(settings, "settings");
     }
 
-    public TrellisSettings settings() {
-        return this.settings;
+    /// The thresholds this format runs with on `gpu`.
+    public TrellisSettings settings(ExecutionGpu gpu) {
+        return this.fixed != null ? this.fixed : gpu.trellisSettings();
+    }
+
+    /// The thresholds of a plan made before any launch: this format's own, else `planned`.
+    private TrellisSettings settings(TrellisSettings planned) {
+        return this.fixed != null ? this.fixed : planned;
     }
 
     @Override
@@ -155,10 +164,11 @@ public final class TrellisFormat implements LinearFormat {
     /// [TrellisSettings#mmaMaxRows], the larger prefill route (the rotated activations, the whole object decoded to
     /// BF16 `[n, k]`, and the GEMM outputs `[rows, n]`, each region 256-aligned).
     @Override
-    public long planScratchBytes(TensorDescriptor descriptor, int maxRows) {
+    public long planScratchBytes(TensorDescriptor descriptor, int maxRows, TrellisSettings trellis) {
+        TrellisSettings settings = settings(trellis);
         long[] nk = logical(descriptor.shape());
-        long bytes = mmaBytes(maxRows, nk[1], nk[0], SCRATCH_SEGMENTS);
-        if (maxRows > this.settings.mmaMaxRows())
+        long bytes = mmaBytes(settings, maxRows, nk[1], nk[0], SCRATCH_SEGMENTS);
+        if (maxRows > settings.mmaMaxRows())
             bytes = Math.max(bytes, prefillBytes(maxRows, nk[1], nk[0], SCRATCH_SEGMENTS));
         return bytes;
     }
@@ -334,9 +344,10 @@ public final class TrellisFormat implements LinearFormat {
     @Override
     public long scratchBytes(
             ExecutionGpu gpu, ScratchUse use, int rows, int inFeatures, int outFeatures, List<TensorHandle> weights) {
+        TrellisSettings settings = settings(gpu);
         int segments = Math.toIntExact(weights.get(1).shape()[0]);
-        long bytes = mmaBytes(rows, inFeatures, outFeatures, segments);
-        if (rows > this.settings.mmaMaxRows())
+        long bytes = mmaBytes(settings, rows, inFeatures, outFeatures, segments);
+        if (rows > settings.mmaMaxRows())
             bytes = Math.max(bytes, prefillBytes(rows, inFeatures, outFeatures, segments));
         return bytes;
     }
@@ -346,16 +357,20 @@ public final class TrellisFormat implements LinearFormat {
     public long decodeScratchBytes(
             ExecutionGpu gpu, ScratchUse use, int rows, int inFeatures, int outFeatures, List<TensorHandle> weights) {
         return mmaBytes(
-                rows, inFeatures, outFeatures, Math.toIntExact(weights.get(1).shape()[0]));
+                settings(gpu),
+                rows,
+                inFeatures,
+                outFeatures,
+                Math.toIntExact(weights.get(1).shape()[0]));
     }
 
     /// The tensor-core route's scratch for launches of up to `rows` rows: the activations, and the split partials of
     /// the most rows below [TrellisSettings#wholeKRows].
-    private long mmaBytes(long rows, long k, long n, int segments) {
+    private static long mmaBytes(TrellisSettings settings, long rows, long k, long n, int segments) {
         long activations = PayloadSizes.alignUp(
                 PayloadSizes.multiply(PayloadSizes.multiply(segments, rows), k * 2), SCRATCH_ALIGNMENT);
-        int splits = splits(Math.toIntExact(k), Math.toIntExact(n), this.settings.targetCtas());
-        long splitRows = Math.min(rows, this.settings.wholeKRows() - 1L);
+        int splits = splits(Math.toIntExact(k), Math.toIntExact(n), settings.targetCtas());
+        long splitRows = Math.min(rows, settings.wholeKRows() - 1L);
         if (splits == 1 || splitRows == 0) return activations;
         return PayloadSizes.add(activations, PayloadSizes.multiply(PayloadSizes.multiply(splits, splitRows), n * 4));
     }
@@ -395,8 +410,9 @@ public final class TrellisFormat implements LinearFormat {
         run.n = n;
         run.w = w;
         run.segments = segments;
+        TrellisSettings settings = settings(gpu);
         if (gpu.exactNumerics()) run.reference();
-        else if (launch.rowExact() || rows <= this.settings.mmaMaxRows()) run.tensorCore(this.settings);
+        else if (launch.rowExact() || rows <= settings.mmaMaxRows()) run.tensorCore(settings);
         else run.prefill(launch.segmentEnds());
     }
 

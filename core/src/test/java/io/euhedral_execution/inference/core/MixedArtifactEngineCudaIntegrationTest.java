@@ -16,6 +16,7 @@ import io.euhedral_execution.inference.core.model.qwen38.SequenceStateProbe;
 import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.testing.MixedArtifacts;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.nio.file.Files;
@@ -53,8 +54,8 @@ class MixedArtifactEngineCudaIntegrationTest {
         }
 
         @Override
-        ExecutionGpu openGpu(Path path) {
-            ExecutionGpu opened = super.openGpu(path);
+        ExecutionGpu openGpu(Path path, Tuning tuning) {
+            ExecutionGpu opened = super.openGpu(path, tuning);
             this.gpu = (CudaGpuMemory) opened;
             return opened;
         }

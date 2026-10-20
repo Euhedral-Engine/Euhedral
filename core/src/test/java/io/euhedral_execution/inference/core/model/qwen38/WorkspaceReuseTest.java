@@ -12,6 +12,7 @@ import io.euhedral_execution.inference.core.generation.LogitsSampler;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.testing.Tunings;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -33,7 +34,8 @@ class WorkspaceReuseTest {
     }
 
     private static Execution runtime(ExecutionPlan plan, ExecutionGpu gpu) {
-        return new Execution(ExecutionFixtures.inlineLattice(), plan, gpu, 2, false, MAX_ROWS);
+        return new Execution(
+                ExecutionFixtures.inlineLattice(), plan, gpu, 2, false, Tunings.prefillChunkTokens(MAX_ROWS));
     }
 
     /// Token IDs padded to 8 bytes, then the 64-bit start position.
@@ -86,7 +88,7 @@ class WorkspaceReuseTest {
             }
         };
         var lattice = new ExecutionFixtures.ManualLattice();
-        var runtime = new Execution(lattice, plan, gpu, 2, false, MAX_ROWS);
+        var runtime = new Execution(lattice, plan, gpu, 2, false, Tunings.prefillChunkTokens(MAX_ROWS));
         List<List<Long>> first = new ArrayList<>();
         List<List<Long>> second = new ArrayList<>();
 

@@ -5,7 +5,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import io.euhedral_execution.core.generics.LatticeSource;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
+import io.euhedral_execution.inference.core.settings.HostSettings;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -61,7 +61,7 @@ class RegionRuntimeTest {
         }
         assertTrue(this.lattice.sources.stream().allMatch(LatticeSource::isComplete));
         assertEquals(
-                EuhedralInferenceRuntime.LAKE_SINKS + 1,
+                HostSettings.defaults().taskParallelism() + 1,
                 this.lattice.sources.size(),
                 "the lake's sinks and its idle watch, attached once");
         assertFalse(runtime.isAttached());

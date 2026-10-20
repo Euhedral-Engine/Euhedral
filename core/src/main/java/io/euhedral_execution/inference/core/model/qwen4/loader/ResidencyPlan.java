@@ -126,7 +126,8 @@ public record ResidencyPlan(
                         + mib(d.gdnStateBytes())
                         + ", workspace " + mib(d.workspaceBytes()) + ", runtime " + mib(d.runtimeReserveBytes())
                         + ", of which "
-                        + mib(ResidencyPlanner.SYSTEM_RESERVE_BYTES) + " left free for the system)");
+                        + mib(d.runtimeReserveBytes() - ResidencyPlanner.KERNEL_RESERVE_BYTES)
+                        + " left free for the system)");
         line(out, "fixed resident", mib(d.fixedResidentBytes()));
         line(
                 out,

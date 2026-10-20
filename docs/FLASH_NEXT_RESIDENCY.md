@@ -87,7 +87,7 @@ embedding is always `HOST_MAPPED` when the host can pin it. MTP and vision count
 ### Host
 
 Host memory is two budgets from the same physical memory: what the runtime may pin (the host's `MemAvailable` less 10%, at least
-4 GiB) and what it may hold as ordinary memory, which is only what the user offers through `EUHEDRAL_HOST_MEMORY_MIB` (less the same
+4 GiB) and what it may hold as ordinary memory, which is only what the user offers through `memory.host-limit` (less the same
 margin; none when unset). Pinned memory
 is a small tier, taken in this order: the mapped embedding, staged fixed objects, and the staging slots every expert record passes
 through (`max(16, 2 x experts-per-token)` slots of one record). The routed experts are never pinned: they live in ordinary memory, in

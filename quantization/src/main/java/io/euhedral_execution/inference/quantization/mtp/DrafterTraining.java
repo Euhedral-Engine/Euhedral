@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.quantization.checkpoint.Qwen38Objects;
 import io.euhedral_execution.inference.quantization.checkpoint.ResumeFile;
 import io.euhedral_execution.inference.quantization.checkpoint.Safetensors;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
+import io.euhedral_execution.inference.quantization.gpu.CudaLibraries;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import io.euhedral_execution.inference.quantization.gpu.Upload;
 import io.euhedral_execution.inference.quantization.lattice.GpuCompletions;
@@ -81,7 +82,7 @@ public final class DrafterTraining {
     }
 
     /// Starts the run as lattice frames and waits for it: nothing else runs on the calling thread.
-    public static void run(Settings settings, Path library) throws Exception {
+    public static void run(Settings settings, CudaLibraries library) throws Exception {
         if (settings.depths() < 1 || settings.rows() < 1 || settings.keys() < settings.rows())
             throw new IllegalArgumentException("depths and rows must be positive, keys at least rows");
         try (Safetensors store = Safetensors.open(settings.model());

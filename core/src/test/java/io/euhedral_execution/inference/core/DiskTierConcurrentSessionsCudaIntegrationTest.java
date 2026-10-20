@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.core.generation.SessionOptions;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.Tunings;
 import io.euhedral_execution.inference.core.testing.WorkerCpus;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,6 +17,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
@@ -27,7 +29,7 @@ import org.junit.jupiter.api.Timeout;
 /// streams drain and the workers are released. This test was not run against the code before that, so it is not
 /// shown to fail there; [DiskTierManySequencesCudaIntegrationTest] reproduces the hang. The workers are
 /// `-Peuhedral.test.worker-cpus`, or else the first two performance CPUs ([WorkerCpus]).
-// Own JVM: sets the global residency budget properties.
+// Own JVM: loads the engine with residency budgets of its own.
 @ModelGroup.OwnJvm
 class DiskTierConcurrentSessionsCudaIntegrationTest {
 
@@ -52,18 +54,17 @@ class DiskTierConcurrentSessionsCudaIntegrationTest {
         assumeTrue(tokenizer != null, "no tokenizer directory");
         BitSet workers = WorkerCpus.of(2);
         var config = new InferenceConfig(
-                Path.of(artifact),
-                Path.of(tokenizer),
-                Path.of(library),
-                workers,
-                CONTEXT_TOKENS,
-                Duration.ofSeconds(30),
-                0,
-                2048,
-                null,
-                SEQUENCES);
-        System.setProperty("euhedral.residency.device-budget-bytes", Long.toString(8L << 30));
-        System.setProperty("euhedral.residency.host-budget-bytes", Long.toString(2L << 30));
+                        Path.of(artifact),
+                        Path.of(tokenizer),
+                        Path.of(library),
+                        workers,
+                        CONTEXT_TOKENS,
+                        Duration.ofSeconds(30),
+                        0,
+                        2048,
+                        null,
+                        SEQUENCES)
+                .withTuning(Tunings.limits(OptionalLong.of(8L << 30), OptionalLong.of(2L << 30)));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             var runtime = (Qwen38Runtime) engine.modelRuntime();
             assertTrue(runtime.diskBackedWeightBytes() > 0, "weights beyond the host budget are read from disk");
@@ -91,9 +92,6 @@ class DiskTierConcurrentSessionsCudaIntegrationTest {
             } finally {
                 for (GenerationSession session : sessions) session.close();
             }
-        } finally {
-            System.clearProperty("euhedral.residency.device-budget-bytes");
-            System.clearProperty("euhedral.residency.host-budget-bytes");
         }
     }
 

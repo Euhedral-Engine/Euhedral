@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
 import io.euhedral_execution.inference.core.settings.SettingsLoader;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -119,6 +120,24 @@ class InferenceConfigTest {
         assertEquals(1L << 20, config.prefixCacheBytes());
         assertEquals(1024, config.prefixCacheCheckpointTokens());
         assertEquals(3, config.maxSequences());
+    }
+
+    @Test
+    void theSettingsTuneTheEngine() {
+        var config = fromSettings(Map.of(
+                "EUHEDRAL_BATCHING_PREFILL_CHUNK_TOKENS", "1024",
+                "EUHEDRAL_MEMORY_GPU_LIMIT", "8GiB",
+                "EUHEDRAL_HOST_TASK_PARALLELISM", "3",
+                "EUHEDRAL_KERNELS_TRELLIS_TARGET_BLOCKS", "300"));
+        assertEquals(1024, config.tuning().batching().prefillChunkTokens());
+        assertEquals(8L << 30, config.tuning().memory().gpuLimit().getAsLong());
+        assertEquals(3, config.tuning().host().taskParallelism());
+        assertEquals(300, config.tuning().kernels().trellis().targetBlocks().getAsInt());
+        var programmatic = new InferenceConfig(Path.of("a"), Path.of("t"), Path.of("l"), cpus(), Duration.ofSeconds(1));
+        assertEquals(Tuning.defaults(), programmatic.tuning());
+        var tuned = programmatic.withTuning(config.tuning());
+        assertEquals(config.tuning(), tuned.tuning());
+        assertEquals(programmatic.artifactPath(), tuned.artifactPath());
     }
 
     @Test

@@ -28,9 +28,8 @@ staging buffer. A pageable tier copies a hit into a staging buffer first.
 By default the budget is automatic: what the machine can spare now (`MemAvailable`, or the headroom of the process's cgroup and
 its ancestors when that is less), less room for the operating system (10%, never closer than 4 GiB to exhaustion) and for the
 runtime itself (the JVM heap's room to grow, at most 2 GiB; 1 GiB for native allocations; and 6 GiB of page cache for the
-n-gram rows, which settle there in a run). `EUHEDRAL_HOST_MEMORY_MIB` (or
-`-Deuhedral.host.memory-mib`) states the budget instead and is respected as stated: smaller than the automatic one (0 means no RAM
-tier, so every device miss reads the artifact, `FILE_BACKED`) or larger, with a warning when the machine cannot spare that much
+n-gram rows, which settle there in a run). `memory.host-limit` states the budget instead and is respected as stated:
+smaller than the automatic one (too small for a RAM tier, every device miss reads the artifact, `FILE_BACKED`) or larger, with a warning when the machine cannot spare that much
 now. The budget controls memory only: the tier's records, the staging buffers, the copy streams and the chunk size are derived within it. The startup report names the budget and where it came from.
 
 The planner spends the pinned part first, then gives the experts what the resident budget has left:
@@ -96,7 +95,7 @@ nothing else in the tier starts a thread.
 
 Every record of the artifact is 4096-aligned in offset and length, so the artifact is opened with `O_DIRECT`
 (`EUHEDRAL_QWEN4_DIRECT_READS=0` reads through the page cache): the reads go from the device to the slot or buffer, and the page
-cache keeps the memory-mapped n-gram rows instead of records the tier already holds. At most `EUHEDRAL_QWEN4_READS` records (8)
+cache keeps the memory-mapped n-gram rows instead of records the tier already holds. At most `memory.weight-streaming.concurrent-reads` records (8)
 are read at once: the owner's fetch takes a read, and the frame that has the record gives it back on whichever worker runs it,
 before the device copy, so the disk is offered the next record as soon as one is in. The drive reads fastest with a few records
 in flight and slows past about 30 MB (docs/FLASH_NEXT_DISK.md).
@@ -106,7 +105,7 @@ staging buffer), and no worker waits for the disk: each part's frame submits its
 `AsyncReads`) and ends, and the read's completion is a frame that the workers find when they poll the reads' sink. A fill's
 completion then copies its range into the staging buffer. Whichever part runs first takes the staging buffer, and the others use
 it; the parts join (`Join`, a fan-in edge whose arrivals are decided at run time) into the frame that submits the device copy. The
-artifact sees up to the read bound of records in flight. A record is one part by default (`EUHEDRAL_QWEN4_READ_PARTS`): the drive
+artifact sees up to the read bound of records in flight. A record is one part by default (`memory.weight-streaming.read-split`): the drive
 reads a whole record at 6.9 GB/s and a quarter record at 5.2 GB/s at most. A source that cannot read ranges is read whole, and a
 machine without io_uring reads each part on the worker that runs it.
 

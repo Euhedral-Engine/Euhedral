@@ -6,10 +6,12 @@ import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.model.qwen38.ShapeDescription;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.Tunings;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.stream.Stream;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -20,7 +22,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 /// artifact per JVM:
 /// `-Peuhedral.shapes.artifacts=q3`, then `nvfp4`, `nvfp4-compressed`; `-Peuhedral.shapes.record=true` records. Without
 /// the filter the test skips (the CUDA suite runs it as a skip); a filter that names no artifact fails.
-// Own JVM: loads one of several artifacts chosen per JVM, and sets a global residency budget property.
+// Own JVM: loads one of several artifacts chosen per JVM.
 @ModelGroup.OwnJvm
 class ShapeIdentityCudaIntegrationTest {
 
@@ -59,14 +61,14 @@ class ShapeIdentityCudaIntegrationTest {
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         assumeTrue(Files.isRegularFile(Path.of(artifact)), "no artifact " + artifact);
         var config = new InferenceConfig(
-                Path.of(artifact),
-                Path.of(TOKENIZER),
-                Path.of(library),
-                SystemInfo.getPCpuSet(),
-                Duration.ofSeconds(30));
-        // Residency follows the GPU's free memory at load; a fixed budget below it makes every load place the same
-        // weights in host memory, so the staged views compare.
-        System.setProperty("euhedral.residency.device-budget-bytes", Long.toString(DEVICE_BUDGET));
+                        Path.of(artifact),
+                        Path.of(TOKENIZER),
+                        Path.of(library),
+                        SystemInfo.getPCpuSet(),
+                        Duration.ofSeconds(30))
+                // Residency follows the GPU's free memory at load; a fixed budget below it makes every load place the
+                // same weights in host memory, so the staged views compare.
+                .withTuning(Tunings.limits(OptionalLong.of(DEVICE_BUDGET), OptionalLong.empty()));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             var plan = ((Qwen38Runtime) engine.modelRuntime()).plan();
             ShapeDescription.check(GOLDENS, name, ShapeDescription.views(plan));

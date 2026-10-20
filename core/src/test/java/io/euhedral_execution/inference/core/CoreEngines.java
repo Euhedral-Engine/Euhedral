@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.testing.Shared;
+import io.euhedral_execution.inference.core.testing.Tunings;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -15,8 +16,6 @@ import java.util.BitSet;
 ///
 /// A test does not assume a fresh engine: it reads allocated bytes and counters as differences, and ends its sessions.
 public final class CoreEngines {
-    static final String WORKSPACE_ROWS = "euhedral.workspace.rows";
-
     private CoreEngines() {}
 
     /// Closes the shared engine in use, for a test that loads an engine of its own (to check what closing it frees, or
@@ -38,16 +37,10 @@ public final class CoreEngines {
 
     /// The compact Q3 artifact with a workspace wide enough for prefill chunks of up to `rows` tokens.
     static SharedEngines.Held q3Wide(int rows) {
-        String previous = System.getProperty(WORKSPACE_ROWS);
-        System.setProperty(WORKSPACE_ROWS, Integer.toString(rows));
-        try {
-            return SharedEngines.get(
-                    "core:q3:rows" + rows,
-                    () -> config(PrefixCacheEngines.Q3_PROPERTY, PrefixCacheEngines.Q3_DEFAULT, 0));
-        } finally {
-            if (previous == null) System.clearProperty(WORKSPACE_ROWS);
-            else System.setProperty(WORKSPACE_ROWS, previous);
-        }
+        return SharedEngines.get(
+                "core:q3:rows" + rows,
+                () -> config(PrefixCacheEngines.Q3_PROPERTY, PrefixCacheEngines.Q3_DEFAULT, 0)
+                        .withTuning(Tunings.prefillChunkTokens(rows)));
     }
 
     /// The NVFP4 artifact with a context of `maxContextTokens` (0 for the default).

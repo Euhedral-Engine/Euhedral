@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.core.generation.SessionOptions;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.Tunings;
 import io.euhedral_execution.inference.core.testing.WorkerCpus;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -31,7 +32,7 @@ import org.junit.jupiter.api.Timeout;
 /// `Runtime.halt(97)`, which Gradle reports as a failed run. The workers are `-Peuhedral.test.worker-cpus`, or else
 /// the first four performance CPUs ([WorkerCpus]). Skipped unless -Peuhedral.qwen.bf16-artifact names the artifact
 /// and -Peuhedral.qwen.tokenizer-dir its tokenizer.
-// Own JVM: sets the global residency properties.
+// Own JVM: sets the global map-output-head property and a host budget of its own.
 @ModelGroup.OwnJvm
 class DiskTierManySequencesCudaIntegrationTest {
 
@@ -57,17 +58,17 @@ class DiskTierManySequencesCudaIntegrationTest {
         long stallNanos = TimeUnit.SECONDS.toNanos(Long.getLong("euhedral.stress.stall-seconds", 90L));
         BitSet workers = WorkerCpus.of(4);
         var config = new InferenceConfig(
-                Path.of(artifact),
-                Path.of(tokenizer),
-                Path.of(library),
-                workers,
-                6144,
-                Duration.ofSeconds(60),
-                0,
-                2048,
-                null,
-                SEQUENCES);
-        System.setProperty("euhedral.residency.host-budget-bytes", Long.toString(28L << 30));
+                        Path.of(artifact),
+                        Path.of(tokenizer),
+                        Path.of(library),
+                        workers,
+                        6144,
+                        Duration.ofSeconds(60),
+                        0,
+                        2048,
+                        null,
+                        SEQUENCES)
+                .withTuning(Tunings.hostWeightsLimit(28L << 30));
         System.setProperty("euhedral.residency.map-output-head", "true");
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             var runtime = (Qwen38Runtime) engine.modelRuntime();
@@ -136,7 +137,6 @@ class DiskTierManySequencesCudaIntegrationTest {
                     "[stress] %d text pieces in %.0f s (%.2f per second), no stall%n",
                     tokens.get(), seconds, tokens.get() / seconds);
         } finally {
-            System.clearProperty("euhedral.residency.host-budget-bytes");
             System.clearProperty("euhedral.residency.map-output-head");
         }
     }

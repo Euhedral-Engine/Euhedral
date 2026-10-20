@@ -74,10 +74,10 @@ Admission is a frame on the workspace's owner: its `idHash` is `WorkspaceOwner.H
 so admissions run one at a time. A generation's `Admit` admits its quantum itself (Qwen3.8 and Qwen4 alike); only a
 caller outside the owner (tests and tools) publishes the admission as a frame (`publishOnOwner`). Frames keep their publication order when they enter the lattice
 through one source and no queue of more than one partition. The lake's sinks are like GPU streams: each has one
-producer partition (`EUHEDRAL_LAKE_PARTITIONS`), carries any mixture of ordered and unordered frames, and runs an
+producer partition, carries any mixture of ordered and unordered frames, and runs an
 ordered frame in its own chain's order (frames of one `idHash`), not in queue order, so two owners' chains in one
 sink may run at the same time. Admissions therefore bind in the order they were published. The lake has eight sinks
-(`EUHEDRAL_LAKE_SINKS`): more sinks, not partitions, spread the contention of producers and consumers.
+(`host.task-parallelism`): more sinks, not partitions, spread the contention of producers and consumers.
 
 Admission is small:
 
@@ -358,7 +358,7 @@ Every piece of host work a request needs runs as frames on the lattice's workers
   active, no context switch in two seconds and the stack in `ControlPlaneFragment.runCycle` (`Thread.yield`) over
   `QueueIngestSink` polls. The sinks are therefore attached for a busy period (`InferenceLake`): beside them the lake
   attaches an idle watch, a source polled like the sinks, and when no unit has been admitted for a second
-  (`-Deuhedral.lake.idle-detach-ms`, 0 keeps them attached) the watch detaches both; the next unit attaches a fresh set.
+  (`host.idle-release`, 0 keeps them attached) the watch detaches both; the next unit attaches a fresh set.
   A frame is published only while a unit it belongs to is admitted, so none is in flight when the sinks go. Sources the
   lake does not own (the artifact's reads and the expert cache's owner in Flash-Next) stay attached.
 - **Waking a thread outside the lattice per token is expensive.** When a blocked caller drained each token's text from a

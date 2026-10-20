@@ -12,6 +12,7 @@ import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.loader.EngineModelFixture;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -265,7 +266,7 @@ class InferenceEngineTest {
         }
 
         @Override
-        ExecutionGpu openGpu(Path path) {
+        ExecutionGpu openGpu(Path path, Tuning tuning) {
             return this.pinning;
         }
     }
@@ -395,9 +396,9 @@ class InferenceEngineTest {
                 }
 
                 @Override
-                ExecutionGpu openGpu(Path path) {
+                ExecutionGpu openGpu(Path path, Tuning tuning) {
                     if (selected == 1) throw new IllegalStateException("gpu");
-                    return super.openGpu(path);
+                    return super.openGpu(path, tuning);
                 }
 
                 @Override
@@ -409,7 +410,8 @@ class InferenceEngineTest {
                         int maxContext,
                         KvFormat kvFormat,
                         int sequences,
-                        int kvDeviceMinimumTokens)
+                        int kvDeviceMinimumTokens,
+                        Tuning tuning)
                         throws java.io.IOException {
                     if (selected == 2) throw new IllegalStateException("model");
                     if (selected == 3)
@@ -418,7 +420,15 @@ class InferenceEngineTest {
                                 new io.euhedral_execution.inference.core.model.qwen38.loader.Weights(
                                         null, null, null, null, null, null));
                     return super.loadModel(
-                            path, artifact, profile, gpu, maxContext, kvFormat, sequences, kvDeviceMinimumTokens);
+                            path,
+                            artifact,
+                            profile,
+                            gpu,
+                            maxContext,
+                            kvFormat,
+                            sequences,
+                            kvDeviceMinimumTokens,
+                            tuning);
                 }
 
                 @Override
@@ -451,7 +461,16 @@ class InferenceEngineTest {
         var failure = assertThrows(
                 IllegalArgumentException.class,
                 () -> new InferenceEngine.Bootstrap()
-                        .loadModel(Path.of("model.edrl"), artifact, null, null, 262145, KvFormat.NVFP4, 1, 65536));
+                        .loadModel(
+                                Path.of("model.edrl"),
+                                artifact,
+                                null,
+                                null,
+                                262145,
+                                KvFormat.NVFP4,
+                                1,
+                                65536,
+                                Tuning.defaults()));
         assertEquals(
                 "a context of 262145 tokens is longer than the 262144 positions the model supports; set a smaller max "
                         + "context",
@@ -748,7 +767,7 @@ class InferenceEngineTest {
         }
 
         @Override
-        ExecutionGpu openGpu(Path path) {
+        ExecutionGpu openGpu(Path path, Tuning tuning) {
             return gpu;
         }
 
@@ -761,7 +780,8 @@ class InferenceEngineTest {
                 int maxContext,
                 KvFormat kvFormat,
                 int sequences,
-                int kvDeviceMinimumTokens)
+                int kvDeviceMinimumTokens,
+                Tuning tuning)
                 throws java.io.IOException {
             modelLoads++;
             this.kvFormat = kvFormat;

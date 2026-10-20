@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.quantization.Calibrate;
 import io.euhedral_execution.inference.quantization.CalibrationLattice;
+import io.euhedral_execution.inference.quantization.TestLibraries;
 import io.euhedral_execution.inference.quantization.checkpoint.Qwen38Objects;
 import io.euhedral_execution.inference.quantization.checkpoint.Safetensors;
 import io.euhedral_execution.inference.quantization.gptq.Gptq;
@@ -35,7 +36,7 @@ class TrellisCalibrateCudaIntegrationTest {
     void writesTwoLayers(@TempDir Path out) throws Exception {
         Path checkpoint = LinearsTest.checkpoint();
         assumeTrue(Files.isRegularFile(TOKENS), "no calibration tokens");
-        Calibrate.run(settings(checkpoint, out, 2), library());
+        Calibrate.run(settings(checkpoint, out, 2), TestLibraries.of(library()));
         for (int i = 0; i < 2; i++) {
             String header = header(out.resolve("model.language_model.layers." + i + ".safetensors"));
             assertTrue(header.contains("model.language_model.layers." + i + ".mlp.down_proj.trellis"));
@@ -50,12 +51,12 @@ class TrellisCalibrateCudaIntegrationTest {
         assumeTrue(Files.isRegularFile(TOKENS), "no calibration tokens");
         Calibrate.checkpointEvery(1);
         Calibrate.stopAfterLayers(1);
-        Calibrate.run(settings(checkpoint, out, 2), library());
+        Calibrate.run(settings(checkpoint, out, 2), TestLibraries.of(library()));
         assertEquals(0, Calibrate.lastResumeLayer());
         assertTrue(Files.isRegularFile(out.resolve("model.language_model.layers.0.safetensors")));
         assertFalse(Files.exists(out.resolve("model.language_model.layers.1.safetensors")));
         Calibrate.stopAfterLayers(0);
-        Calibrate.run(settings(checkpoint, out, 2), library());
+        Calibrate.run(settings(checkpoint, out, 2), TestLibraries.of(library()));
         assertEquals(1, Calibrate.lastResumeLayer(), "resumed at layer 1");
         for (int i = 0; i < 2; i++)
             assertTrue(Files.isRegularFile(out.resolve("model.language_model.layers." + i + ".safetensors")));

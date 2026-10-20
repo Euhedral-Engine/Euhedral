@@ -12,6 +12,7 @@ import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
 import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -127,5 +128,25 @@ class BenchmarkOptionsTest {
         assertEquals("choose either overwrite or append", rejection("\"overwrite\":true,\"append\":true"));
         assertEquals("append requires JSONL output", rejection("\"output\":\"r.json\",\"append\":true"));
         assertEquals("excludeCpus must not be negative", rejection("\"excludeCpus\":[-1]"));
+    }
+
+    @Test
+    void anEngineConfigTunesTheEngineAndWithoutOneTheDefaultsDo() throws Exception {
+        assertEquals(Tuning.defaults(), load("").engineTuning());
+        Path settings = this.directory.resolve("euhedral.yaml");
+        Files.writeString(settings, """
+                model:
+                  artifact: /ignored.edrl
+                  tokenizer: /ignored
+                  name: ignored
+                batching:
+                  prefill-chunk-tokens: 1024
+                memory:
+                  gpu-limit: 8GiB
+                """);
+        var options = load("\"engineConfig\":\"" + settings.toString().replace("\\", "\\\\") + "\"");
+        assertEquals(1024, options.engineTuning().batching().prefillChunkTokens());
+        assertEquals(8L << 30, options.engineTuning().memory().gpuLimit().getAsLong());
+        assertEquals(Path.of("/m.edrl"), options.artifact(), "the benchmark's own model, not the file's");
     }
 }

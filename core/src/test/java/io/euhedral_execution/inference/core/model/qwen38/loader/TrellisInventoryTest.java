@@ -15,6 +15,7 @@ import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.artifact.WeightLoadException;
 import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
+import io.euhedral_execution.inference.core.artifact.format.TrellisSettings;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.MemoryGpu;
@@ -459,8 +460,12 @@ class TrellisInventoryTest {
         long expected = 0;
         for (TensorDescriptor d : descriptors.values())
             if (d.format() == WeightFormat.TRELLIS)
-                expected = Math.max(expected, LinearFormats.of(d).planScratchBytes(d, InferenceConfig.workspaceRows()));
-        assertEquals(expected, ResidencyPlanner.trellisScratchBytes(artifact, profile));
+                expected = Math.max(
+                        expected,
+                        LinearFormats.of(d).planScratchBytes(d, InferenceConfig.PREFILL_CHUNK_TOKENS, TRELLIS));
+        assertEquals(
+                expected,
+                ResidencyPlanner.trellisScratchBytes(artifact, profile, InferenceConfig.PREFILL_CHUNK_TOKENS, TRELLIS));
         assertTrue(expected > 0);
 
         Map<String, TensorDescriptor> plain = new LinkedHashMap<>(descriptors);
@@ -468,8 +473,13 @@ class TrellisInventoryTest {
         assertEquals(
                 0,
                 ResidencyPlanner.trellisScratchBytes(
-                        new Artifact(null, config(), plain.values().toArray(new TensorDescriptor[0])), profile));
+                        new Artifact(null, config(), plain.values().toArray(new TensorDescriptor[0])),
+                        profile,
+                        InferenceConfig.PREFILL_CHUNK_TOKENS,
+                        TRELLIS));
     }
+
+    private static final TrellisSettings TRELLIS = TrellisSettings.defaults();
 
     @Test
     void onlyThePayloadIsStageable() {

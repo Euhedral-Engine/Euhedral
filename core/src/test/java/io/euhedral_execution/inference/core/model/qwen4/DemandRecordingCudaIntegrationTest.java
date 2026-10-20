@@ -15,6 +15,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.OptionalLong;
 import org.junit.jupiter.api.Test;
 
 /// Records what the expert cache is asked for on a realistic run, for a simulator to replay through other cache
@@ -143,7 +144,7 @@ class DemandRecordingCudaIntegrationTest {
                         TestSupport.artifactPath(),
                         gpu,
                         gpu.deviceMemoryInfo().freeBytes(),
-                        HostBudget.system(),
+                        HostBudget.system(OptionalLong.empty()),
                         Mode.TEXT,
                         context);
                 TestLattice.Run run = lattice.run(gpu, model, context);

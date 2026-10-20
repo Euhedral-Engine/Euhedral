@@ -484,7 +484,7 @@ class TrellisPlanTest {
     void theSharedWorkspaceScratchIsTheLargestOfBothRoutesAtTheWorkspaceRows() {
         Model model = fullModel(n -> false, n -> false);
         ExecutionPlan plan = new ExecutionPlan(model.weights());
-        TrellisSettings settings = TrellisSettings.fromProperties();
+        TrellisSettings settings = new ExecutionFixtures.RecordingGpu().trellisSettings();
         int rows = 512;
         long expected = 0;
         for (Shape shape : plan.shapes()) {
@@ -972,7 +972,7 @@ class TrellisPlanTest {
         assertEquals(ScratchUse.TRELLIS_LINEAR, registered.scratchUse(Kind.TRELLIS_LINEAR, false));
         assertEquals(ScratchUse.TRELLIS_LINEAR, registered.scratchUse(Kind.TRELLIS_LINEAR, true));
         assertFalse(registered.gateUpRegion());
-        assertNotEquals(0, registered.settings().mmaMaxRows());
+        assertNotEquals(0, registered.settings(new LaunchLog()).mmaMaxRows());
         var weights = object(new LaunchLog(), 5120, 17408, 5120);
         assertEquals(
                 weights.getFirst(),

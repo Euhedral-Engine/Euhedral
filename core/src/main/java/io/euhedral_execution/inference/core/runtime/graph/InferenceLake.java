@@ -5,6 +5,7 @@ import io.euhedral_execution.core.generics.LatticeTerminal;
 import io.euhedral_execution.core.ingest.AbstractIngestSink;
 import io.euhedral_execution.core.ingest.QueueIngestSink;
 import io.euhedral_execution.data_structures.queues.PartitionedMpscQueue;
+import io.euhedral_execution.inference.core.settings.HostSettings;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -42,12 +43,6 @@ public final class InferenceLake implements FrameLake {
     private static final int CLOSED = Integer.MIN_VALUE;
     private static final int QUEUE_CAPACITY = 8192;
 
-    /// How long no unit may have been admitted before the sinks detach, in milliseconds
-    /// (`euhedral.lake.idle-detach-ms`); a value of 0 or less keeps them attached.
-    public static final String IDLE_DETACH_PROPERTY = "euhedral.lake.idle-detach-ms";
-
-    private static final long DEFAULT_IDLE_DETACH_MILLIS = 1_000;
-
     private final LatticeTerminal lattice;
     private final int sinkCount;
     private final int partitions;
@@ -63,15 +58,10 @@ public final class InferenceLake implements FrameLake {
     private final CompletableFuture<Void> termination = new CompletableFuture<>();
 
     /// A lake of `sinks` ingest sinks of `partitions` producer partitions each. Its sinks attach to `lattice`
-    /// when the first unit is admitted or the first frame published, not before, and detach after the idle
-    /// time ([#IDLE_DETACH_PROPERTY]).
+    /// when the first unit is admitted or the first frame published, not before, and detach after the default idle
+    /// time (`host.idle-release`).
     public InferenceLake(LatticeTerminal lattice, int sinks, int partitions) {
-        this(
-                lattice,
-                sinks,
-                partitions,
-                java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
-                        Long.getLong(IDLE_DETACH_PROPERTY, DEFAULT_IDLE_DETACH_MILLIS)));
+        this(lattice, sinks, partitions, HostSettings.defaults().idleRelease().toNanos());
     }
 
     /// As above, with the idle time in nanoseconds (0 or less: the sinks stay attached).

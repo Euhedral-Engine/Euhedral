@@ -31,13 +31,13 @@ public final class Storage implements AutoCloseable {
 
         void closeGpu(ExecutionGpu gpu);
 
-        HostBudget hostBudget();
+        HostBudget hostBudget(InferenceConfig config);
     }
 
     private static final Environment SYSTEM = new Environment() {
         @Override
         public ExecutionGpu openGpu(InferenceConfig config) {
-            return new CudaGpuMemory(config.cudaLibraryPath());
+            return new CudaGpuMemory(config.cudaLibraryPath(), config.tuning());
         }
 
         @Override
@@ -51,8 +51,8 @@ public final class Storage implements AutoCloseable {
         }
 
         @Override
-        public HostBudget hostBudget() {
-            return HostBudget.system();
+        public HostBudget hostBudget(InferenceConfig config) {
+            return HostBudget.system(config.tuning().memory().hostLimit());
         }
     };
 
@@ -82,7 +82,13 @@ public final class Storage implements AutoCloseable {
         try {
             long free = environment.freeDeviceBytes(gpu);
             Qwen4Model model = Qwen4Model.open(
-                    config.artifactPath(), gpu, free, environment.hostBudget(), mode, config.maxContextTokens());
+                    config.artifactPath(),
+                    gpu,
+                    free,
+                    environment.hostBudget(config),
+                    mode,
+                    config.maxContextTokens(),
+                    config.tuning().memory());
             LOG.info(
                     "Flash-Next storage loaded: {} expert slots, {} MiB of fixed objects on the device",
                     model.plan().expertCache().slotCount(),

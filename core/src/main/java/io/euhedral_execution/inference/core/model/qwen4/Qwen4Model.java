@@ -24,6 +24,8 @@ import io.euhedral_execution.inference.core.model.qwen4.loader.StorageClass;
 import io.euhedral_execution.inference.core.model.qwen4.loader.Telemetry;
 import io.euhedral_execution.inference.core.model.qwen4.loader.Validator;
 import io.euhedral_execution.inference.core.runtime.graph.AsyncReads;
+import io.euhedral_execution.inference.core.settings.MemorySettings;
+import io.euhedral_execution.inference.core.settings.WeightStreamingSettings;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -72,22 +74,6 @@ public final class Qwen4Model implements AutoCloseable {
                 default -> ReplacementPolicy.S3_FIFO;
             };
 
-    /// Parts one record's artifact read is split into, read side by side as frames of the lattice. One: the disk
-    /// reads a whole record (2.7 MiB) at its full rate, and a quarter record at three quarters of it.
-    /// `euhedral.qwen4.read-parts` (or `EUHEDRAL_QWEN4_READ_PARTS`) overrides it for benchmarks.
-    static final int READ_PARTS = Integer.getInteger(
-            "euhedral.qwen4.read-parts",
-            Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_READ_PARTS", "1")));
-
-    /// Copy streams the experts' device copies are spread over: an order of copies on the device,
-    /// independent of the staging buffers and of the loads in flight. Four: the copies of a layer's misses, or of a
-    /// prefill layer's records, then run side by side instead of one behind the other (one stream: decode -4%,
-    /// prefill 4096 -5%; eight streams are no better in decode). `euhedral.qwen4.copy-streams`
-    /// (or `EUHEDRAL_QWEN4_COPY_STREAMS`) overrides it for benchmarks.
-    static final int COPY_STREAMS = Integer.getInteger(
-            "euhedral.qwen4.copy-streams",
-            Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_COPY_STREAMS", "4")));
-
     /// Whether the RAM tier may be pinned host memory; `EUHEDRAL_QWEN4_PIN_TIER=0` keeps it pageable, for
     /// benchmarks.
     static final boolean PIN_TIER = !"0".equals(System.getenv("EUHEDRAL_QWEN4_PIN_TIER"));
@@ -109,6 +95,8 @@ public final class Qwen4Model implements AutoCloseable {
     /// The artifact's asynchronous reads (null where the machine has none): their completions are frames, so
     /// the owner of the lattice attaches them to it.
     private final AsyncReads asyncReads;
+    /// How the experts stream from the artifact.
+    private final WeightStreamingSettings streaming;
     private boolean closed;
 
     private Qwen4Model(
@@ -122,7 +110,8 @@ public final class Qwen4Model implements AutoCloseable {
             FileExpertStore fileStore,
             FileRecordSource artifactSource,
             GpuExpertTransfer gpuTransfer,
-            AsyncReads asyncReads) {
+            AsyncReads asyncReads,
+            WeightStreamingSettings streaming) {
         this.artifact = artifact;
         this.plan = plan;
         this.fixed = fixed;
@@ -134,22 +123,43 @@ public final class Qwen4Model implements AutoCloseable {
         this.artifactSource = artifactSource;
         this.gpuTransfer = gpuTransfer;
         this.asyncReads = asyncReads;
+        this.streaming = streaming;
     }
 
-    /// Reads and validates the artifact, plans its residency for `freeDeviceBytes`, `host` and
-    /// `maxContextTokens`, and loads the plan. Fails with the plan's explanation when no placement
-    /// can serve the context.
+    /// Opens with the default memory settings ([MemorySettings#defaults]).
     public static Qwen4Model open(
             Path path, ExecutionGpu gpu, long freeDeviceBytes, HostBudget host, Mode mode, int maxContextTokens)
             throws IOException {
-        Artifact artifact = ArtifactReader.read(path);
-        Validator.validateInventory(artifact);
-        ResidencyPlan plan = ResidencyPlanner.plan(artifact, mode, freeDeviceBytes, host, maxContextTokens);
-        return load(path, artifact, plan, gpu);
+        return open(path, gpu, freeDeviceBytes, host, mode, maxContextTokens, MemorySettings.defaults());
     }
 
-    /// Loads `plan`, which must have been made for `artifact`.
-    public static Qwen4Model load(Path path, Artifact artifact, ResidencyPlan plan, ExecutionGpu gpu)
+    /// Reads and validates the artifact, plans its residency for `freeDeviceBytes`, `host`, `maxContextTokens` and
+    /// `memory`, and loads the plan, streaming the experts as `memory.weight-streaming` says. Fails with the plan's
+    /// explanation when no placement can serve the context.
+    public static Qwen4Model open(
+            Path path,
+            ExecutionGpu gpu,
+            long freeDeviceBytes,
+            HostBudget host,
+            Mode mode,
+            int maxContextTokens,
+            MemorySettings memory)
+            throws IOException {
+        Artifact artifact = ArtifactReader.read(path);
+        Validator.validateInventory(artifact);
+        ResidencyPlan plan = ResidencyPlanner.plan(artifact, mode, freeDeviceBytes, host, maxContextTokens, memory);
+        return load(path, artifact, plan, gpu, memory.weightStreaming());
+    }
+
+    /// Loads `plan`, which must have been made for `artifact`. Each expert record's artifact read is split into
+    /// `streaming.read-split` parts, read side by side as frames of the lattice (one: the disk reads a whole
+    /// record, 2.7 MiB, at its full rate, and a quarter record at three quarters of it), and the experts' device
+    /// copies are spread over `streaming.copy-streams` copy streams, an order of copies on the device
+    /// independent of the staging buffers and of the loads in flight (four: the copies of a layer's misses, or of a
+    /// prefill layer's records, run side by side instead of one behind the other; one stream: decode -4%, prefill
+    /// 4096 -5%; eight streams are no better in decode).
+    static Qwen4Model load(
+            Path path, Artifact artifact, ResidencyPlan plan, ExecutionGpu gpu, WeightStreamingSettings streaming)
             throws IOException {
         LOG.info("{}", plan.report());
         if (!plan.fits())
@@ -170,7 +180,7 @@ public final class Qwen4Model implements AutoCloseable {
         try {
             ngram = NgramStore.open(path, artifact, plan.ngram(), gpu);
             // Staging buffers pinned up front; the store pins more if more loads are ever in flight at once.
-            int buffers = ResidencyPlanner.fileStagingSlots(artifact.config());
+            int buffers = ResidencyPlanner.fileStagingSlots(artifact.config(), streaming.concurrentReads());
             reads = openAsyncReads();
             artifactSource = new FileRecordSource(path, cachedBanks, reads);
             LOG.info(
@@ -203,8 +213,8 @@ public final class Qwen4Model implements AutoCloseable {
             // The store owns the source and the tier from here on, and closes them.
             FileRecordSource owned = artifactSource;
             RamTier ownedTier = tier;
-            store = new FileExpertStore(gpu, owned, ownedTier, cachedBanks, buffers, READ_PARTS);
-            transfer = new GpuExpertTransfer(gpu, COPY_STREAMS);
+            store = new FileExpertStore(gpu, owned, ownedTier, cachedBanks, buffers, streaming.readSplit());
+            transfer = new GpuExpertTransfer(gpu, streaming.copyStreams());
             ExpertCache cache = new ExpertCache(
                     store,
                     transfer,
@@ -213,7 +223,8 @@ public final class Qwen4Model implements AutoCloseable {
                     plan.expertCache().slotBytes(),
                     1,
                     DEVICE_POLICY);
-            return new Qwen4Model(artifact, plan, fixed, gpu, ngram, cache, cachedBanks, store, owned, transfer, reads);
+            return new Qwen4Model(
+                    artifact, plan, fixed, gpu, ngram, cache, cachedBanks, store, owned, transfer, reads, streaming);
         } catch (Throwable failure) {
             closeQuietly(transfer, failure);
             if (store != null) closeQuietly(store, failure);
@@ -232,6 +243,11 @@ public final class Qwen4Model implements AutoCloseable {
     }
 
     /// The machine's asynchronous reads, or null when it has none (they are then made on the workers).
+    /// How the experts stream from the artifact.
+    public WeightStreamingSettings streaming() {
+        return this.streaming;
+    }
+
     private static AsyncReads openAsyncReads() {
         if (!AsyncReads.available()) {
             LOG.warn("expert records are read synchronously: {}", AsyncReads.unavailableReason());

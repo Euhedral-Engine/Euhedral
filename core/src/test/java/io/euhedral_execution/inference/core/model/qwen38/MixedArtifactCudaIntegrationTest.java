@@ -6,7 +6,6 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
 import io.euhedral_execution.inference.core.generation.DeviceLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
@@ -16,6 +15,7 @@ import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader
 import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.testing.MixedArtifacts;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -230,7 +230,7 @@ class MixedArtifactCudaIntegrationTest {
                 gpu,
                 EuhedralInferenceRuntime.laneCount(),
                 true,
-                InferenceConfig.PREFILL_CHUNK_TOKENS,
+                Tuning.defaults(),
                 model.artifactPath(),
                 artifact.sources());
     }

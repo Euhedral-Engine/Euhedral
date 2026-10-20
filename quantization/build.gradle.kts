@@ -102,7 +102,8 @@ tasks.named<JavaExec>("run") {
     workingDir = rootProject.projectDir
     val searchVariable = if (System.getProperty("os.name").startsWith("Windows")) "PATH" else "LD_LIBRARY_PATH"
     dependsOn(cudaMathLibraries)
-    systemProperty("euhedral.quantization.cuda-libraries", cudaMathDirectory.get().asFile.absolutePath)
+    val mathDirectory = cudaMathDirectory.get().asFile.absolutePath
+    argumentProviders.add(CommandLineArgumentProvider { listOf("--cuda-libraries", mathDirectory) })
     environment(
         searchVariable,
         listOf(cudaMathDirectory.get().asFile.absolutePath, System.getenv(searchVariable) ?: "")

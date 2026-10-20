@@ -29,6 +29,8 @@ import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactHeader
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.WeightLoader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
+import io.euhedral_execution.inference.core.settings.HostSettings;
+import io.euhedral_execution.inference.core.testing.Tunings;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -103,7 +105,6 @@ class EuhedralInferenceRuntimeLatticeTest {
     void theLakeDetachesWhenIdleAndTheNextQuantumAttachesItAgain() throws Exception {
         BitSet cpus = twoWorkerCpus();
         assumeTrue(!cpus.isEmpty());
-        System.setProperty("euhedral.lake.idle-detach-ms", "50");
         var lattice = createLattice(cpus);
         var gpu = new HeldGpu();
         var plan = new ExecutionPlan(
@@ -112,7 +113,13 @@ class EuhedralInferenceRuntimeLatticeTest {
                 List.of(ExecutionFixtures.q3("projection", 64, 201)));
         try {
             lattice.start();
-            var runtime = new Execution(lattice, plan, gpu);
+            var runtime = new Execution(
+                    lattice,
+                    plan,
+                    gpu,
+                    EuhedralInferenceRuntime.laneCount(),
+                    EuhedralInferenceRuntime.CAPTURE_GRAPHS,
+                    Tunings.idleRelease(Duration.ofMillis(50)));
             try {
                 long sequenceId = 5900;
                 for (int round = 0; round < 3; round++) {
@@ -134,7 +141,6 @@ class EuhedralInferenceRuntimeLatticeTest {
                 runtime.close();
             }
         } finally {
-            System.clearProperty("euhedral.lake.idle-detach-ms");
             LatticeTesting.closeAndAwait(lattice);
         }
     }
@@ -191,7 +197,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                     second.join().status(),
                     () -> String.valueOf(second.join().failure()));
             assertEquals(
-                    EuhedralInferenceRuntime.LAKE_SINKS + 1,
+                    HostSettings.defaults().taskParallelism() + 1,
                     attachments.get(),
                     "the runtime attaches its lake once: its sinks and the idle watch");
             // Later quanta reuse the idle graphs and the lake: no further source is attached.
@@ -201,7 +207,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                 lattice.runUntil(decode::isDone, 4096);
                 assertEquals(Quantum.Status.SUCCESS, decode.join().status());
             }
-            assertEquals(EuhedralInferenceRuntime.LAKE_SINKS + 1, attachments.get());
+            assertEquals(HostSettings.defaults().taskParallelism() + 1, attachments.get());
             assertEquals(0, runtime.activeQuanta());
         } finally {
             lattice.closeWhileStepping(runtime::close);

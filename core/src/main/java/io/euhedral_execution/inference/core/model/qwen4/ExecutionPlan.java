@@ -217,7 +217,8 @@ public final class ExecutionPlan implements AutoCloseable {
         this.bankOrdinals = new int[layers];
         for (int l = 0; l < layers; l++) this.bankOrdinals[l] = model.bankOrdinal("text/layers/" + l + "/moe/experts");
         this.geometry = ExpertOps.Geometry.of(model.expertBanks()[0]);
-        this.expertOwner = new ExpertCacheOwner(model.expertCache(), runtime.lake());
+        this.expertOwner = new ExpertCacheOwner(
+                model.expertCache(), runtime.lake(), model.streaming().concurrentReads());
         // The artifact's reads complete as frames: the workers poll their sink like every other.
         if (model.asyncReads() != null) runtime.lake().attach(model.asyncReads().getDelegate());
         // The cache's bookkeeping is a source too: the workers poll it, and it applies what was posted to it.

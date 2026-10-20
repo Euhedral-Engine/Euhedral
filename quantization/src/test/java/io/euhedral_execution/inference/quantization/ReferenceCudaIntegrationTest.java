@@ -37,12 +37,23 @@ class ReferenceCudaIntegrationTest {
         try {
             Path out = directory.resolve("self.kld");
             ReferenceLogits.run(new ReferenceLogits.Settings(
-                    artifact, tokenizer, text, out, CONTEXT, 2, false, 4, 2, Residency.PLANNED, 6, library));
+                    artifact,
+                    tokenizer,
+                    text,
+                    out,
+                    CONTEXT,
+                    2,
+                    false,
+                    4,
+                    2,
+                    Residency.PLANNED,
+                    6,
+                    TestLibraries.of(library)));
             try (Scorer.Reference reference = Scorer.Reference.open(out)) {
                 assertEquals(CONTEXT, reference.context);
                 assertEquals(2, reference.chunks);
             }
-            try (Scorer scorer = Scorer.open(library, 6)) {
+            try (Scorer scorer = Scorer.open(TestLibraries.of(library), 6)) {
                 Scorer.Result result =
                         scorer.score(artifact, ArtifactReader.read(artifact), List.of(out), 4, 2, Residency.PLANNED);
                 assertTrue(result.meanKl() < 1e-4, "mean KL " + result.meanKl());

@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightStaging;
 import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
+import io.euhedral_execution.inference.core.artifact.format.TrellisSettings;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
@@ -149,7 +150,34 @@ public final class ResidencyPlanner {
                 ALL_KV_ON_DEVICE);
     }
 
-    /// As above, with `kvDeviceMinimumTokens` of each sequence's attention cache kept on the device. When the
+    /// As above, with `kvDeviceMinimumTokens` of each sequence's attention cache kept on the device, a workspace of
+    /// one prefill chunk and the default trellis thresholds.
+    public static Plan plan(
+            Artifact artifact,
+            ArtifactProfile profile,
+            long freeBytes,
+            int maxContextTokens,
+            long hostBytes,
+            KvFormat kvFormat,
+            int sequences,
+            boolean mapOutputHeadEarly,
+            int kvDeviceMinimumTokens) {
+        return plan(
+                artifact,
+                profile,
+                freeBytes,
+                maxContextTokens,
+                hostBytes,
+                kvFormat,
+                sequences,
+                mapOutputHeadEarly,
+                kvDeviceMinimumTokens,
+                InferenceConfig.PREFILL_CHUNK_TOKENS,
+                TrellisSettings.defaults());
+    }
+
+    /// As above, with `kvDeviceMinimumTokens` of each sequence's attention cache kept on the device, a workspace of
+    /// `workspaceRows` rows and the device's `trellis` thresholds (which size the trellis scratch). When the
     /// resident weights and every sequence's whole cache do not fit, each sequence's pages past that many
     /// tokens go to pinned host memory first (each attention layer's are copied to one device region of the
     /// sequence's before the layer reads them, [KvHostPages]); only when the weights and the device share
@@ -164,7 +192,9 @@ public final class ResidencyPlanner {
             KvFormat kvFormat,
             int sequences,
             boolean mapOutputHeadEarly,
-            int kvDeviceMinimumTokens) {
+            int kvDeviceMinimumTokens,
+            int workspaceRows,
+            TrellisSettings trellis) {
         if (sequences < 1) throw new IllegalArgumentException("sequences must be at least 1");
         if (kvDeviceMinimumTokens <= 0) throw new IllegalArgumentException("kvDeviceMinimumTokens must be positive");
         long extra = sequences == 1
@@ -180,7 +210,7 @@ public final class ResidencyPlanner {
                         Math.multiplyExact(sequences, kvBytes(artifact.config(), maxContextTokens, kvFormat)),
                         RESERVE_BYTES),
                 Math.multiplyExact(sequences - 1L, extra));
-        fixed = Math.addExact(fixed, trellisScratchBytes(artifact, profile));
+        fixed = Math.addExact(fixed, trellisScratchBytes(artifact, profile, workspaceRows, trellis));
         Plan resident = deviceNeed(artifact, profile, Set.of());
         if (resident.deviceBytes() + fixed <= freeBytes) return tiers(artifact, resident, fixed, hostBytes, true);
         // The cache past the device minimum moves to host memory before any weight leaves the device.
@@ -292,9 +322,44 @@ public final class ResidencyPlanner {
             KvFormat kvFormat,
             int cap,
             int kvDeviceMinimumTokens) {
+        return sequencesFor(
+                artifact,
+                profile,
+                freeBytes,
+                maxContextTokens,
+                hostBytes,
+                kvFormat,
+                cap,
+                kvDeviceMinimumTokens,
+                InferenceConfig.PREFILL_CHUNK_TOKENS,
+                TrellisSettings.defaults());
+    }
+
+    /// As above, with a workspace of `workspaceRows` rows and the device's `trellis` thresholds ([#plan]).
+    public static int sequencesFor(
+            Artifact artifact,
+            ArtifactProfile profile,
+            long freeBytes,
+            int maxContextTokens,
+            long hostBytes,
+            KvFormat kvFormat,
+            int cap,
+            int kvDeviceMinimumTokens,
+            int workspaceRows,
+            TrellisSettings trellis) {
         boolean head = Boolean.getBoolean(MAP_OUTPUT_HEAD);
         Plan single = plan(
-                artifact, profile, freeBytes, maxContextTokens, hostBytes, kvFormat, 1, head, kvDeviceMinimumTokens);
+                artifact,
+                profile,
+                freeBytes,
+                maxContextTokens,
+                hostBytes,
+                kvFormat,
+                1,
+                head,
+                kvDeviceMinimumTokens,
+                workspaceRows,
+                trellis);
         if (!single.fits()) return 1;
         long offloaded = offloadedBytes(artifact, single);
         int low = 1;
@@ -311,22 +376,23 @@ public final class ResidencyPlanner {
                     kvFormat,
                     middle,
                     head,
-                    kvDeviceMinimumTokens);
+                    kvDeviceMinimumTokens,
+                    workspaceRows,
+                    trellis);
             if (candidate.fits() && offloadedBytes(artifact, candidate) <= offloaded) low = middle;
             else high = middle - 1;
         }
         return low;
     }
 
-    /// The scratch the prefill route of the largest trellis object needs at the workspace's rows (decoded weight,
-    /// rotated activations and outputs); 0 for an artifact with no trellis object.
-    static long trellisScratchBytes(Artifact artifact, ArtifactProfile profile) {
+    /// The scratch the prefill route of the largest trellis object needs at the workspace's `rows` (decoded weight,
+    /// rotated activations and outputs) with the `trellis` thresholds; 0 for an artifact with no trellis object.
+    static long trellisScratchBytes(Artifact artifact, ArtifactProfile profile, int rows, TrellisSettings trellis) {
         long largest = 0;
         for (TensorDescriptor tensor : artifact.tensors()) {
             if (tensor.format() != WeightFormat.TRELLIS
                     || !CompactWeightLoader.uploads(tensor.name(), profile.speculation())) continue;
-            largest = Math.max(
-                    largest, LinearFormats.of(tensor).planScratchBytes(tensor, InferenceConfig.workspaceRows()));
+            largest = Math.max(largest, LinearFormats.of(tensor).planScratchBytes(tensor, rows, trellis));
         }
         return largest;
     }

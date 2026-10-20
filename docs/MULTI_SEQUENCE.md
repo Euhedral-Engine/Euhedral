@@ -4,7 +4,7 @@
 
 Measured 2026-10-14 by `Bf16BaselineCudaIntegrationTest` on the BF16 Swift-1.5 artifact
 (`qwen3_8_27b_bf16.edrl`, Qwen3.8, 54 GB): one 16 GB RTX 5070 Ti, a 4096-token context, BF16 KV cache, the pinned
-host budget set to 24 GiB (`euhedral.residency.host-budget-bytes`, fixed in the test: with the host's own budget
+host budget set to 24 GiB (`memory.host-weights-limit`, fixed in the test: with the host's own budget
 the whole 54 GB model fits in pinned memory, nothing is read from disk, and decode runs at 0.63 tok/s; 24 GiB
 reproduces a disk-tier machine). After load 14.4 GB of the card's 16.3 GB is in
 use (including about 0.5 GB of desktop use), 19550 MiB of the weights are read from the artifact file on every pass
@@ -57,7 +57,7 @@ card's memory does not allow.
 ## BF16 passes
 
 Measured 2026-10-15 on the BF16 Swift-1.5 artifact (54 GB) with the server (context 6144 tokens, 28 GiB of pinned host
-memory for weights, `euhedral.residency.host-budget-bytes`, four worker processors), a 16 GB RTX 5070 Ti and an NVMe
+memory for weights, `memory.host-weights-limit`, four worker processors), a 16 GB RTX 5070 Ti and an NVMe
 artifact file. Scripted conversations (chat prompts of 100 to 700 tokens, at most 256 new tokens per request, greedy
 with MTP speculation) were run through the Python client with `--parallel` equal to the server's sequence count. Rates
 come from the server's pass log (`Execution.passes` at DEBUG) and the speculative counters: tokens per sequence per

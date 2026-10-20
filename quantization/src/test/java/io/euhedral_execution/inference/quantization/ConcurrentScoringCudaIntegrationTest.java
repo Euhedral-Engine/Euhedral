@@ -55,7 +55,7 @@ class ConcurrentScoringCudaIntegrationTest {
         Artifact b = Assemble.view(sources, second, OptionalInt.of(3));
         Path base = sources.path(sources.base());
 
-        try (Scorer scorer = Scorer.open(library, 6)) {
+        try (Scorer scorer = Scorer.open(TestLibraries.of(library), 6)) {
             var gpu = scorer.device().gpu;
             gpu.resetPeakAllocatedBytes();
             Scorer.Result aloneA = scorer.score(base, a, references, ROWS, BATCH, Residency.PLANNED);

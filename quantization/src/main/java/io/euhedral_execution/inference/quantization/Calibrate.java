@@ -7,6 +7,7 @@ import io.euhedral_execution.inference.quantization.checkpoint.Safetensors;
 import io.euhedral_execution.inference.quantization.gptq.Gptq;
 import io.euhedral_execution.inference.quantization.gptq.QuantState;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
+import io.euhedral_execution.inference.quantization.gpu.CudaLibraries;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import io.euhedral_execution.inference.quantization.gpu.Upload;
 import io.euhedral_execution.inference.quantization.lattice.GpuCompletions;
@@ -141,7 +142,7 @@ public final class Calibrate {
 
     /// Starts the calibration on the lattice and waits for it: the setup, then each layer continuing the next,
     /// then the heads, all on the lattice's workers.
-    public static void run(Settings settings, Path library) throws IOException {
+    public static void run(Settings settings, CudaLibraries library) throws IOException {
         if (settings.trellisBits() == null && (settings.recipe() == null || settings.draftIdsFrom() == null))
             throw new IllegalArgumentException("the GPTQ path needs a recipe and draft ids");
         if (settings.trellisBits() != null && (settings.writeBufferMib() < 1 || settings.writeBufferMib() > 1023))

@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.testing.Shared;
 import java.nio.file.Path;
 import java.util.function.Supplier;
@@ -40,8 +41,8 @@ final class SharedEngines {
         private volatile CudaGpuMemory gpu;
 
         @Override
-        ExecutionGpu openGpu(Path path) {
-            ExecutionGpu opened = super.openGpu(path);
+        ExecutionGpu openGpu(Path path, Tuning tuning) {
+            ExecutionGpu opened = super.openGpu(path, tuning);
             this.gpu = (CudaGpuMemory) opened;
             return opened;
         }

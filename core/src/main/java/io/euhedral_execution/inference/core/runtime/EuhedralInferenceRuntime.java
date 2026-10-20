@@ -15,6 +15,7 @@ import io.euhedral_execution.inference.core.runtime.graph.StageGraph;
 import io.euhedral_execution.inference.core.runtime.graph.StageQuantum;
 import io.euhedral_execution.inference.core.runtime.graph.WorkspaceOwner;
 import io.euhedral_execution.inference.core.runtime.graph.WorkspaceUse;
+import io.euhedral_execution.inference.core.settings.HostSettings;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -33,12 +34,10 @@ import org.slf4j.LoggerFactory;
 /// plan supplies the shapes and quanta, and the model's runtime owns the lake and the host work.
 public final class EuhedralInferenceRuntime implements AutoCloseable {
 
-    /// Ingest sinks of a lake (upstream sources of the lattice) and the producer partitions of each. A sink of one
-    /// partition keeps the order frames were published in, like a stream; more sinks, not partitions, spread the
-    /// contention of producers and consumers.
-    public static final int LAKE_SINKS = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_LAKE_SINKS", "8"));
-    public static final int LAKE_PARTITIONS =
-            Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_LAKE_PARTITIONS", "1"));
+    /// Producer partitions of each ingest sink of a lake. A sink of one partition keeps the order frames were
+    /// published in, like a stream; more sinks (`host.task-parallelism`), not partitions, spread the contention of
+    /// producers and consumers.
+    static final int LAKE_PARTITIONS = 1;
 
     /// Decode, verification and draft quanta replay CUDA graphs captured from earlier quanta
     /// (docs/CUDA_GRAPHS.md); `EUHEDRAL_CUDA_GRAPHS=0` submits every quantum stage by stage instead.
@@ -80,9 +79,14 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         return Math.min(Runtime.getRuntime().availableProcessors(), LanePool.MAX_LANES);
     }
 
-    /// A lake of the default shape (sinks and producer partitions) attached to `lattice`.
-    public static InferenceLake newLake(LatticeTerminal lattice) {
-        return new InferenceLake(lattice, LAKE_SINKS, LAKE_PARTITIONS);
+    /// A lake attached to `lattice` of `host.task-parallelism` ingest sinks (upstream sources of the lattice), which
+    /// detach after `host.idle-release` without work.
+    public static InferenceLake newLake(LatticeTerminal lattice, HostSettings host) {
+        return new InferenceLake(
+                lattice,
+                host.taskParallelism(),
+                LAKE_PARTITIONS,
+                host.idleRelease().toNanos());
     }
 
     /// A runtime that runs the [GraphShape]s its callers admit through [#admit] on `lanes`, throwing every ready

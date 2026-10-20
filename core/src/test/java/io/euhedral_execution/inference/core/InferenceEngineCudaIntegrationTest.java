@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -76,8 +77,8 @@ class InferenceEngineCudaIntegrationTest {
         private CudaGpuMemory gpu;
 
         @Override
-        ExecutionGpu openGpu(Path path) {
-            ExecutionGpu opened = super.openGpu(path);
+        ExecutionGpu openGpu(Path path, Tuning tuning) {
+            ExecutionGpu opened = super.openGpu(path, tuning);
             this.gpu = (CudaGpuMemory) opened;
             return opened;
         }

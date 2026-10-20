@@ -148,20 +148,20 @@ class TrellisFormatTest {
         long expected = 8 * rows * k * 2 + n * k * 2 + rows * n * 2;
         // A row limit below the rows reserves the prefill route.
         TrellisFormat prefill = new TrellisFormat(new TrellisSettings(64, 560, 128, 128));
-        long aligned = prefill.planScratchBytes(descriptor(GATE_UP), 512);
+        long aligned = prefill.planScratchBytes(descriptor(GATE_UP), 512, TrellisSettings.defaults());
         // Every region is 256-aligned, and these are.
         assertEquals(expected, aligned);
-        assertTrue(prefill.planScratchBytes(descriptor(GATE_UP), 1024) > aligned);
+        assertTrue(prefill.planScratchBytes(descriptor(GATE_UP), 1024, TrellisSettings.defaults()) > aligned);
         // At the default limit every 512-row chunk stays on the tensor-core route, which needs less.
-        assertTrue(FORMAT.planScratchBytes(descriptor(GATE_UP), 512) < aligned);
-        long small = prefill.planScratchBytes(descriptor(new long[] {40, 8, 56}), 100);
+        assertTrue(FORMAT.planScratchBytes(descriptor(GATE_UP), 512, TrellisSettings.defaults()) < aligned);
+        long small = prefill.planScratchBytes(descriptor(new long[] {40, 8, 56}), 100, TrellisSettings.defaults());
         assertTrue(small >= 128L * 640 * 2 + 100L * 128 * 2 + 8 * 100 * 640 * 2);
         assertEquals(0, small % 256);
         assertEquals(
                 0,
                 LinearFormats.find(WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_V1)
                         .orElseThrow()
-                        .planScratchBytes(descriptor(GATE_UP), 512));
+                        .planScratchBytes(descriptor(GATE_UP), 512, TrellisSettings.defaults()));
     }
 
     @Test
@@ -169,8 +169,14 @@ class TrellisFormatTest {
         // gate_up: k = 5120, n = 34816, three K splits at 560 target blocks.
         long k = 5120, n = 34816, splits = 3;
         TrellisFormat format = new TrellisFormat(new TrellisSettings(512, 560, 128, 128));
-        assertEquals(8 * 127 * k * 2 + splits * 127 * n * 4, format.planScratchBytes(descriptor(GATE_UP), 127));
-        assertEquals(8 * 512 * k * 2 + splits * 127 * n * 4, format.planScratchBytes(descriptor(GATE_UP), 512));
-        assertEquals(8 * 16 * k * 2 + splits * 16 * n * 4, format.planScratchBytes(descriptor(GATE_UP), 16));
+        assertEquals(
+                8 * 127 * k * 2 + splits * 127 * n * 4,
+                format.planScratchBytes(descriptor(GATE_UP), 127, TrellisSettings.defaults()));
+        assertEquals(
+                8 * 512 * k * 2 + splits * 127 * n * 4,
+                format.planScratchBytes(descriptor(GATE_UP), 512, TrellisSettings.defaults()));
+        assertEquals(
+                8 * 16 * k * 2 + splits * 16 * n * 4,
+                format.planScratchBytes(descriptor(GATE_UP), 16, TrellisSettings.defaults()));
     }
 }

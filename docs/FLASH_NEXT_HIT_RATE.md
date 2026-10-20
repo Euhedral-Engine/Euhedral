@@ -128,7 +128,7 @@ kept.
 One copy stream queued a layer's copies one behind the other (a record alone copies in 71-77 us, 37 GB/s; the engine's
 loads measured 188 us submit to retire). A record split over two to four streams copies in the same 71-77 us
 (`CopySplitSpike`, throwaway: the link is the bound), so the gain is in the copies of different loads overlapping.
-Paired screens (`EUHEDRAL_QWEN4_COPY_STREAMS`):
+Paired screens (`memory.weight-streaming.copy-streams`):
 
 | streams, before to after | forks | prefill 4096 | decode cold 64 / 4096 | decode warm 64 / 4096 |
 |---|---|---|---|---|

@@ -6,6 +6,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
 import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.settings.SettingsException;
+import io.euhedral_execution.inference.core.settings.SettingsLoader;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -14,6 +17,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /// Validated `run` configuration, read from a JSON file. Only the three input paths are required;
 /// every other field has the default documented in `docs/BENCHMARKING.md`. Unknown fields are
@@ -30,6 +34,9 @@ import java.util.Objects;
 /// - `output`: a `.json` path writes one document; any other path writes JSONL. Null selects a
 ///   timestamped JSONL file under `benchmark-results/`.
 /// - `gpuMemory`: record device free/total memory before and after each iteration, outside timing.
+/// - `engineConfig`: a server settings file ([SettingsLoader], with its `EUHEDRAL_*` variables) whose engine tuning
+///   (`batching`, `memory`, `host`, `kernels`) the engine runs with; null runs with the defaults. Its other sections
+///   must be valid but are not used: the fields above choose the model, context and prefix cache.
 @JsonIgnoreProperties(ignoreUnknown = false)
 public record BenchmarkOptions(
         @JsonProperty(value = "artifact", required = true) Path artifact,
@@ -55,7 +62,8 @@ public record BenchmarkOptions(
         @JsonProperty("shutdownTimeoutSeconds") Long shutdownTimeoutSeconds,
         @JsonProperty("promptCorpus") String promptCorpus,
         @JsonProperty("speculation") String speculation,
-        @JsonProperty("kvDeviceMinimumTokens") Integer kvDeviceMinimumTokens) {
+        @JsonProperty("kvDeviceMinimumTokens") Integer kvDeviceMinimumTokens,
+        @JsonProperty("engineConfig") Path engineConfig) {
 
     static final ObjectMapper JSON = new ObjectMapper();
 
@@ -167,7 +175,17 @@ public record BenchmarkOptions(
                 options.shutdownTimeoutSeconds(),
                 options.promptCorpus(),
                 options.speculation(),
-                options.kvDeviceMinimumTokens());
+                options.kvDeviceMinimumTokens(),
+                options.engineConfig());
+    }
+
+    /// The engine tuning of [#engineConfig], or the defaults without one.
+    ///
+    /// @throws SettingsException when the file or its variables are invalid
+    public Tuning engineTuning() {
+        return this.engineConfig == null
+                ? Tuning.defaults()
+                : SettingsLoader.load(Optional.of(this.engineConfig)).tuning();
     }
 
     public boolean json() {
