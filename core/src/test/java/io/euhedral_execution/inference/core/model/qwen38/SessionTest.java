@@ -14,6 +14,7 @@ import io.euhedral_execution.core.control_plane.ControlPlaneShard;
 import io.euhedral_execution.core.impl.BaseCloneableObject;
 import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
+import io.euhedral_execution.inference.core.runtime.LatticeTesting;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.core.tokenizer.TokenConstraint;
@@ -134,7 +135,7 @@ class SessionTest {
         } finally {
             session.close();
             runtime.close();
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
         assertLogitsFreedOnceWithTheirGraphs(gpu);
     }
@@ -173,7 +174,7 @@ class SessionTest {
         } finally {
             session.close();
             runtime.close();
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
     }
 
@@ -218,7 +219,7 @@ class SessionTest {
         } finally {
             session.close();
             runtime.close();
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
         assertLogitsFreedOnceWithTheirGraphs(gpu);
     }
@@ -260,7 +261,7 @@ class SessionTest {
         } finally {
             session.close();
             runtime.close();
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
     }
 
@@ -296,7 +297,7 @@ class SessionTest {
         } finally {
             session.close();
             runtime.close();
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
     }
 
@@ -336,7 +337,7 @@ class SessionTest {
             assertEquals(0, runtime.activeQuanta());
         } finally {
             runtime.close();
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
     }
 
@@ -372,7 +373,7 @@ class SessionTest {
         } finally {
             session.close();
             runtime.close();
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
     }
 
@@ -415,7 +416,7 @@ class SessionTest {
         assertEquals(0, runtime.activeQuanta());
         session.close();
         runtime.close();
-        lattice.close();
+        LatticeTesting.closeAndAwait(lattice);
     }
 
     @Test
@@ -477,7 +478,7 @@ class SessionTest {
         } finally {
             session.close();
             runtime.close();
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
         assertLogitsFreedOnceWithTheirGraphs(gpu);
     }
@@ -505,7 +506,7 @@ class SessionTest {
         } finally {
             session.close();
             runtime.close();
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
         assertLogitsFreedOnceWithTheirGraphs(gpu);
     }
@@ -552,7 +553,7 @@ class SessionTest {
         assertEquals(0, runtime.activeQuanta());
         session.close();
         runtime.close();
-        lattice.close();
+        LatticeTesting.closeAndAwait(lattice);
     }
 
     @Test
@@ -599,12 +600,14 @@ class SessionTest {
         assertEquals(0, runtime.activeQuanta());
         session.close();
         runtime.close();
-        lattice.close();
+        LatticeTesting.closeAndAwait(lattice);
     }
 
+    /// The asynchronous form hands text to its callback on the worker before the next quantum is admitted, so a
+    /// cancellation from the callback stops the generation after that token: no further decode runs.
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
-    void outputCallbackCancellationAndClosePreventAnotherDecode() throws Exception {
+    void outputCallbackCancellationPreventsAnotherDecode() throws Exception {
         int vocabularySize = testVocabularySize();
         var weights = ExecutionFixtures.statefulCompactWeights(vocabularySize);
         var plan = new ExecutionPlan(weights);
@@ -616,14 +619,55 @@ class SessionTest {
         awaitWorker(lattice);
         try {
             StringBuilder output = new StringBuilder();
-            assertEquals(List.of(1), session.generate("!", 5, text -> {
-                output.append(text);
-                session.cancel();
-                session.close();
-            }));
+            List<Integer> tokens = session.generateAsync(
+                            "!",
+                            5,
+                            text -> {
+                                output.append(text);
+                                session.cancel();
+                            },
+                            null,
+                            null)
+                    .get(30, TimeUnit.SECONDS);
+            assertEquals(List.of(1), tokens);
             assertEquals(tokenizer.decode(new int[] {1}), output.toString());
             assertEquals(1, session.currentTokenPosition());
             assertEquals(1, gpu.embeddingInputs.size());
+            assertTrue(session.isCancelled());
+            assertEquals(
+                    Sequence.TerminalState.CANCELLED, session.sequenceState().terminalState());
+            assertEquals(0, runtime.activeQuanta());
+        } finally {
+            session.close();
+            runtime.close();
+            LatticeTesting.closeAndAwait(lattice);
+        }
+        assertLogitsFreedOnceWithTheirGraphs(gpu);
+    }
+
+    /// The blocking form hands text to its caller concurrently with later quanta: a cancellation and a close from
+    /// its output callback return at once, end the generation within its budget, and leave the session closed with
+    /// its sequence cancelled. How many decodes ran meanwhile is not fixed.
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void blockingOutputCallbackCancellationAndCloseEndTheGeneration() throws Exception {
+        int vocabularySize = testVocabularySize();
+        var weights = ExecutionFixtures.statefulCompactWeights(vocabularySize);
+        var plan = new ExecutionPlan(weights);
+        var gpu = new SamplingGpu(vocabularySize);
+        var lattice = createLattice();
+        var runtime = new Execution(lattice, plan, gpu);
+        var session = new Session(tokenizer, plan, runtime, gpu, 818, GenerationConfig.greedy(48L));
+        lattice.start();
+        awaitWorker(lattice);
+        try {
+            List<Integer> tokens = session.generate("!", 5, text -> {
+                session.cancel();
+                session.close();
+            });
+            assertFalse(tokens.isEmpty());
+            assertTrue(tokens.size() <= 5, "the generation stayed within its budget");
+            assertEquals(1, tokens.getFirst());
             assertTrue(session.isCancelled());
             assertTrue(session.isClosed());
             assertEquals(
@@ -632,7 +676,7 @@ class SessionTest {
         } finally {
             session.close();
             runtime.close();
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
         assertLogitsFreedOnceWithTheirGraphs(gpu);
     }
