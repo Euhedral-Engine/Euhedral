@@ -15,13 +15,15 @@ import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.runtime.HostFrames;
 import io.euhedral_execution.inference.core.runtime.HostTasks;
+import io.euhedral_execution.inference.core.runtime.LatticeTesting;
+import io.euhedral_execution.inference.core.runtime.SteppingLattice;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -67,7 +69,7 @@ class LatticeHostTest {
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void hostWorkRunsAsFramesOnALatticeAttachedSourceAndCloseDetaches() throws Exception {
         BitSet cpus = twoWorkerCpus();
-        assumeTrue(cpus.cardinality() == 2);
+        assumeTrue(!cpus.isEmpty());
         var lattice = lattice(cpus);
         try {
             lattice.start();
@@ -82,49 +84,36 @@ class LatticeHostTest {
             assertEquals(0, tasks.activeTasks());
             assertThrows(IllegalStateException.class, () -> tasks.run(HostFrames.of(() -> {}, f -> {})));
         } finally {
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
     }
 
+    /// Independent host tasks are all runnable at once, each on its own route, so Euhedral may spread them over its
+    /// workers. Stepped on the test thread: no core count is assumed.
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
-    void independentHostWorkRunsOnSeveralWorkersAtOnce() throws Exception {
-        BitSet cpus = twoWorkerCpus();
-        assumeTrue(cpus.cardinality() == 2);
-        var lattice = lattice(cpus);
-        try {
-            lattice.start();
-            HostTasks tasks = new HostTasks(lattice);
-            Set<String> workers = ConcurrentHashMap.newKeySet();
-            AtomicInteger running = new AtomicInteger();
-            AtomicInteger peak = new AtomicInteger();
-            List<CompletableFuture<Void>> done = new ArrayList<>();
-            for (int i = 0; i < 24; i++)
-                done.add(tasks.onWorker(() -> {
-                    workers.add(Long.toString(Thread.currentThread().threadId()));
-                    peak.accumulateAndGet(running.incrementAndGet(), Math::max);
-                    try {
-                        Thread.sleep(25);
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                    }
-                    running.decrementAndGet();
-                    return null;
-                }));
-            for (var d : done) d.get(20, TimeUnit.SECONDS);
-            assertTrue(workers.size() >= 2, "independent frames used " + workers);
-            assertTrue(peak.get() >= 2, "frames overlapped: " + peak.get());
-            tasks.close();
-        } finally {
-            lattice.close();
+    void independentHostWorkIsRunnableTogetherOnDistinctRoutes() throws Exception {
+        var lattice = new SteppingLattice();
+        HostTasks tasks = new HostTasks(lattice);
+        List<CompletableFuture<long[]>> done = new ArrayList<>();
+        for (int i = 0; i < 24; i++) done.add(tasks.onWorker(SteppingLattice::running));
+        lattice.run(lattice.ready());
+        Set<Long> routes = new HashSet<>();
+        for (var task : done) {
+            assertTrue(task.isDone(), "every independent task ran in the first wave");
+            long[] ran = task.get();
+            assertEquals(1, ran[0]);
+            routes.add(ran[1]);
         }
+        assertEquals(24, routes.size(), "independent tasks share routes");
+        lattice.closeWhileStepping(tasks::close);
     }
 
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void waitingOnAnAsynchronousDependencyOccupiesNoWorker() throws Exception {
         BitSet cpus = twoWorkerCpus();
-        assumeTrue(cpus.cardinality() == 2);
+        assumeTrue(!cpus.isEmpty());
         var lattice = lattice(cpus);
         try {
             lattice.start();
@@ -163,7 +152,7 @@ class LatticeHostTest {
             }
             tasks.close();
         } finally {
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
     }
 
@@ -171,7 +160,7 @@ class LatticeHostTest {
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void aCompletionPublishedFromADriverCallbackThreadRunsOnAWorker() throws Exception {
         BitSet cpus = twoWorkerCpus();
-        assumeTrue(cpus.cardinality() == 2);
+        assumeTrue(!cpus.isEmpty());
         var lattice = lattice(cpus);
         try {
             lattice.start();
@@ -187,7 +176,7 @@ class LatticeHostTest {
             assertNotEquals("fake-cuda-driver", worker, "the callback only enqueued; a worker ran the frame");
             tasks.close();
         } finally {
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
     }
 
@@ -195,7 +184,7 @@ class LatticeHostTest {
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void closeWaitsForTasksThatPublishFurtherTasksAndLeavesNothingAttached() throws Exception {
         BitSet cpus = twoWorkerCpus();
-        assumeTrue(cpus.cardinality() == 2);
+        assumeTrue(!cpus.isEmpty());
         var lattice = lattice(cpus);
         try {
             lattice.start();
@@ -218,7 +207,7 @@ class LatticeHostTest {
             assertEquals(0, tasks.activeTasks());
             assertFalse(failure.isCompletedExceptionally());
         } finally {
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
     }
 }

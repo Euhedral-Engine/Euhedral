@@ -39,7 +39,8 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -91,12 +92,12 @@ class EuhedralInferenceRuntimeLatticeTest {
             }
             assertFalse(runtime.isAttached());
         } finally {
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
     }
 
-    /// On the real lattice: once the runtime has been idle its sinks detach and the lattice has nothing left to poll;
-    /// a quantum submitted after that attaches fresh sinks and runs as before.
+    /// On the real lattice: once the runtime has been idle its sinks detach and the lattice has nothing left
+    /// to poll; a quantum submitted after that attaches fresh sinks and runs as before.
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void theLakeDetachesWhenIdleAndTheNextQuantumAttachesItAgain() throws Exception {
@@ -118,9 +119,9 @@ class EuhedralInferenceRuntimeLatticeTest {
                     var sequence = new Sequence(++sequenceId);
                     var outcome =
                             runtime.submit(new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1}));
-                    awaitHeld(gpu.stream, 1);
-                    Thread driver = Thread.ofPlatform().start(() -> gpu.stream.release(null));
-                    driver.join();
+                    // The quantum holds a retirement boundary on each lane its stages took, as many as the lane count
+                    // (the processor count) and its placement give: a driver releases them until it completes.
+                    releaseUntilDone(gpu.stream, outcome);
                     assertEquals(
                             Quantum.Status.SUCCESS,
                             outcome.get(10, TimeUnit.SECONDS).status());
@@ -134,100 +135,77 @@ class EuhedralInferenceRuntimeLatticeTest {
             }
         } finally {
             System.clearProperty("euhedral.lake.idle-detach-ms");
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
     }
 
+    /// Two quanta of two runtimes, submitted by concurrent callers, share nothing: once both are admitted,
+    /// their stages become runnable together and their embeddings run in the same wave, from frames on
+    /// different routes (so Euhedral may place them on different workers). Stepped on the test thread: no
+    /// core count is assumed.
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
-    void independentQuantaFromConcurrentCallersRunOnDifferentWorkers() throws Exception {
-        BitSet cpus = twoWorkerCpus();
-        assumeTrue(cpus.cardinality() == 2);
-        var probe = new LatticeEdge(new AtomicBoolean());
-        int registrations = probe.getThreadCount();
-        var lattice = createLattice(cpus);
+    void independentQuantaFromConcurrentCallersAreRunnableTogetherOnDistinctRoutes() throws Exception {
+        var plan = new ExecutionPlan(
+                ExecutionFixtures.weights(),
+                ExecutionFixtures.norm(),
+                List.of(ExecutionFixtures.q3("projection", 64, 201)));
+        var gpu = new ConcurrentGpu();
+        var lattice = new SteppingLattice();
+        var attachments = new AtomicInteger();
+        var runtime = new Execution(
+                source -> {
+                    attachments.incrementAndGet();
+                    lattice.addUpstream(source);
+                },
+                plan,
+                gpu);
+        // A second runtime on the same lattice: its quanta share nothing with the first's workspace.
+        var other = new Execution(lattice, plan, gpu);
         try {
-            lattice.start();
-            awaitWorkers(lattice, 2, probe, registrations + 2);
-            var plan = new ExecutionPlan(
-                    ExecutionFixtures.weights(),
-                    ExecutionFixtures.norm(),
-                    List.of(ExecutionFixtures.q3("projection", 64, 201)));
-            var gpu = new ConcurrentGpu();
-            gpu.embeddingGate = new WorkGate(0);
-            var attachments = new AtomicInteger();
-            var runtime = new Execution(
-                    source -> {
-                        attachments.incrementAndGet();
-                        lattice.addUpstream(source);
-                    },
-                    plan,
-                    gpu);
-            // A second runtime on the same lattice: its quanta share nothing with the first's workspace.
-            var other = new Execution(lattice, plan, gpu);
-            try (var calls = java.util.concurrent.Executors.newFixedThreadPool(2)) {
-                try {
-                    // Euhedral admits every quantum on the workspace owner's worker, which is held until both are
-                    // queued (below). Should the gate still hold that worker before the second quantum was admitted,
-                    // the second cannot start: such an attempt is released and made again.
-                    java.util.concurrent.Future<List<Quantum.Outcome>> first = null;
-                    java.util.concurrent.Future<List<Quantum.Outcome>> second = null;
-                    boolean concurrent = false;
-                    for (int attempt = 0; attempt < 10 && !concurrent; attempt++) {
-                        gpu.embeddingGate = new WorkGate(2);
-                        int base = 801 + 2 * attempt;
-                        var owner = holdOwner(runtime);
-                        first = calls.submit(() -> runtime.execute(List.of(new Quantum(
-                                plan, new Sequence(base), Quantum.ExecutionKind.PREFILL, 0, new int[] {1}))));
-                        second = calls.submit(() -> other.execute(List.of(new Quantum(
-                                plan, new Sequence(base + 1), Quantum.ExecutionKind.PREFILL, 0, new int[] {2}))));
-                        letAdmissionsQueue();
-                        owner.countDown();
-                        concurrent = gpu.embeddingGate.awaitEntries(2, TimeUnit.SECONDS);
-                        if (!concurrent) {
-                            gpu.embeddingGate.release();
-                            first.get(10, TimeUnit.SECONDS);
-                            second.get(10, TimeUnit.SECONDS);
-                        }
-                    }
-                    assertTrue(concurrent, "independent quanta did not run concurrently");
-                    assertEquals(2, gpu.embeddingGate.workerCount(), "independent quanta shared one worker");
-                    gpu.embeddingGate.release();
-                    assertEquals(
-                            Quantum.Status.SUCCESS,
-                            first.get(10, TimeUnit.SECONDS).getFirst().status());
-                    assertEquals(
-                            Quantum.Status.SUCCESS,
-                            second.get(10, TimeUnit.SECONDS).getFirst().status());
-                    assertEquals(
-                            EuhedralInferenceRuntime.LAKE_SINKS + 1,
-                            attachments.get(),
-                            "the runtime attaches its lake once: its sinks and the idle watch");
-                    assertEquals(0, runtime.activeQuanta());
-                } finally {
-                    gpu.embeddingGate.release();
-                }
-                // Later quanta reuse the idle graphs and the lake: no further source is attached.
-                for (int index = 0; index < 4; index++) {
-                    assertEquals(
-                            Quantum.Status.SUCCESS,
-                            runtime.execute(List.of(new Quantum(
-                                            plan,
-                                            new Sequence(810 + index),
-                                            Quantum.ExecutionKind.DECODE,
-                                            0,
-                                            new int[] {1})))
-                                    .getFirst()
-                                    .status());
-                }
-                assertEquals(EuhedralInferenceRuntime.LAKE_SINKS + 1, attachments.get());
-            } finally {
-                runtime.close();
-                other.close();
+            CompletableFuture<Quantum.Outcome> first;
+            CompletableFuture<Quantum.Outcome> second;
+            try (var calls = Executors.newFixedThreadPool(2)) {
+                var a = calls.submit(() -> runtime.submit(
+                        new Quantum(plan, new Sequence(801), Quantum.ExecutionKind.PREFILL, 0, new int[] {1})));
+                var b = calls.submit(() -> other.submit(
+                        new Quantum(plan, new Sequence(802), Quantum.ExecutionKind.PREFILL, 0, new int[] {2})));
+                first = a.get(10, TimeUnit.SECONDS);
+                second = b.get(10, TimeUnit.SECONDS);
             }
-            awaitDrained(lattice);
+            var roots = lattice.admitAll();
+            assertEquals(0, gpu.embeddings.size(), "a stage ran before both quanta were admitted");
+            lattice.run(roots);
+            lattice.runUntil(() -> gpu.embeddings.size() >= 2, 256);
+            long[] one = gpu.embeddings.get(0);
+            long[] two = gpu.embeddings.get(1);
+            assertEquals(one[0], two[0], "the independent quanta's embeddings did not run in the same wave");
+            assertTrue(one[1] != two[1], "the independent quanta's embeddings share a route");
+            lattice.runUntil(() -> first.isDone() && second.isDone(), 4096);
+            assertEquals(
+                    Quantum.Status.SUCCESS,
+                    first.join().status(),
+                    () -> String.valueOf(first.join().failure()));
+            assertEquals(
+                    Quantum.Status.SUCCESS,
+                    second.join().status(),
+                    () -> String.valueOf(second.join().failure()));
+            assertEquals(
+                    EuhedralInferenceRuntime.LAKE_SINKS + 1,
+                    attachments.get(),
+                    "the runtime attaches its lake once: its sinks and the idle watch");
+            // Later quanta reuse the idle graphs and the lake: no further source is attached.
+            for (int index = 0; index < 4; index++) {
+                var decode = runtime.submit(
+                        new Quantum(plan, new Sequence(810 + index), Quantum.ExecutionKind.DECODE, 0, new int[] {1}));
+                lattice.runUntil(decode::isDone, 4096);
+                assertEquals(Quantum.Status.SUCCESS, decode.join().status());
+            }
+            assertEquals(EuhedralInferenceRuntime.LAKE_SINKS + 1, attachments.get());
+            assertEquals(0, runtime.activeQuanta());
         } finally {
-            lattice.close();
+            lattice.closeWhileStepping(runtime::close);
+            lattice.closeWhileStepping(other::close);
         }
     }
 
@@ -285,17 +263,72 @@ class EuhedralInferenceRuntimeLatticeTest {
         runtime.close();
     }
 
+    /// Sixteen sequences on two runtimes: the two runtimes' quanta run their embeddings in the same waves,
+    /// and a quantum's sixteen independent projections run together, each from its own route. Stepped on the
+    /// test thread: no core count is assumed.
     @Test
     @Timeout(value = 90, unit = TimeUnit.SECONDS)
-    void euhedralWorkersRunIndependentSequencesAndProjectionsInParallel() throws Exception {
+    void independentSequencesAndProjectionsAreRunnableTogetherOnDistinctRoutes() throws Exception {
+        var plan = new ExecutionPlan(
+                ExecutionFixtures.weights(),
+                ExecutionFixtures.norm(),
+                java.util.stream.IntStream.range(0, 16)
+                        .mapToObj(index -> ExecutionFixtures.q3("projection-" + index, 64, 201 + index))
+                        .toList());
+        var gpu = new ConcurrentGpu();
+        var lattice = new SteppingLattice();
+        // Within one runtime, quanta share its one workspace and follow each other buffer by buffer; two runtimes on
+        // one lattice share nothing, so their quanta are independent.
+        var runtime = new Execution(lattice, plan, gpu);
+        var other = new Execution(lattice, plan, gpu);
+        List<Sequence> sequences = new ArrayList<>();
+        List<CompletableFuture<Quantum.Outcome>> completions = new ArrayList<>();
+        try {
+            for (int sequenceId = 1; sequenceId <= 16; sequenceId++) {
+                Sequence sequence = new Sequence(sequenceId);
+                sequences.add(sequence);
+                completions.add((sequenceId % 2 == 0 ? runtime : other)
+                        .submit(new Quantum(plan, sequence, Quantum.ExecutionKind.PREFILL, 0, new int[] {
+                            sequenceId % ExecutionFixtures.VOCABULARY
+                        })));
+            }
+            lattice.runUntil(() -> completions.stream().allMatch(CompletableFuture::isDone), 1 << 16);
+            assertTrue(
+                    togetherOnDistinctRoutes(gpu.embeddings), "no two embeddings ran in one wave on distinct routes");
+            assertTrue(
+                    togetherOnDistinctRoutes(gpu.projections), "no two projections ran in one wave on distinct routes");
+            for (var completion : completions) {
+                var outcome = completion.join();
+                assertEquals(Quantum.Status.SUCCESS, outcome.status(), () -> String.valueOf(outcome.failure()));
+            }
+            for (Sequence sequence : sequences) assertEquals(1, sequence.currentTokenPosition());
+            assertEquals(0, runtime.activeQuanta());
+            assertEquals(0, other.activeQuanta());
+        } finally {
+            lattice.closeWhileStepping(runtime::close);
+            lattice.closeWhileStepping(other::close);
+            for (Sequence sequence : sequences) sequence.complete();
+        }
+    }
+
+    /// Whether two of `calls` ({wave, route} each) ran in the same wave from different routes.
+    private static boolean togetherOnDistinctRoutes(List<long[]> calls) {
+        for (int i = 0; i < calls.size(); i++)
+            for (int k = i + 1; k < calls.size(); k++)
+                if (calls.get(i)[0] == calls.get(k)[0] && calls.get(i)[1] != calls.get(k)[1]) return true;
+        return false;
+    }
+
+    /// Euhedral's workers, however many the machine has, run sixteen sequences on two runtimes to completion,
+    /// and the runtimes let their sinks go once closed.
+    @Test
+    @Timeout(value = 90, unit = TimeUnit.SECONDS)
+    void euhedralWorkersRunIndependentSequencesToCompletion() throws Exception {
         BitSet cpus = twoWorkerCpus();
-        assumeTrue(cpus.cardinality() >= 2, "requires two available physical CPUs for concurrent workers");
-        var registrationProbe = new LatticeEdge(new AtomicBoolean());
-        int registeredWorkersBeforeStart = registrationProbe.getThreadCount();
+        assumeTrue(!cpus.isEmpty());
         ControlPlaneLattice lattice = createLattice(cpus);
         try {
             lattice.start();
-            awaitWorkers(lattice, 2, registrationProbe, registeredWorkersBeforeStart + 2);
             var plan = new ExecutionPlan(
                     ExecutionFixtures.weights(),
                     ExecutionFixtures.norm(),
@@ -303,75 +336,30 @@ class EuhedralInferenceRuntimeLatticeTest {
                             .mapToObj(index -> ExecutionFixtures.q3("projection-" + index, 64, 201 + index))
                             .toList());
             var gpu = new ConcurrentGpu();
-            // Within one runtime, quanta share its one workspace and follow each other buffer by buffer; two
-            // runtimes on one lattice share nothing, so their quanta are independent.
             var runtime = new Execution(lattice, plan, gpu);
             var other = new Execution(lattice, plan, gpu);
             List<Sequence> sequences = new ArrayList<>();
             List<CompletableFuture<Quantum.Outcome>> completions = new ArrayList<>();
-            gpu.embeddingGate = new WorkGate(0);
-            gpu.projectionGate = new WorkGate(0);
             try {
-                // See the test above: an attempt whose gate holds the workspace owner's worker before the other
-                // sequences were admitted cannot get two workers into the gate; it is released and made again.
-                boolean concurrent = false;
-                for (int attempt = 0; attempt < 10 && !concurrent; attempt++) {
-                    sequences.clear();
-                    completions.clear();
-                    gpu.embeddingGate = new WorkGate(2);
-                    gpu.projectionGate = new WorkGate(2);
-                    var owner = holdOwner(runtime);
-                    for (int sequenceId = 1; sequenceId <= 16; sequenceId++) {
-                        Sequence sequence = new Sequence(attempt * 100 + sequenceId);
-                        sequences.add(sequence);
-                        completions.add((sequenceId % 2 == 0 ? runtime : other)
-                                .submit(new Quantum(plan, sequence, Quantum.ExecutionKind.PREFILL, 0, new int[] {
-                                    sequenceId % ExecutionFixtures.VOCABULARY
-                                })));
-                    }
-                    letAdmissionsQueue();
-                    owner.countDown();
-                    concurrent = gpu.embeddingGate.awaitEntries(3, TimeUnit.SECONDS);
-                    if (!concurrent) {
-                        gpu.embeddingGate.release();
-                        gpu.projectionGate.release();
-                        CompletableFuture.allOf(completions.toArray(CompletableFuture[]::new))
-                                .get(30, TimeUnit.SECONDS);
-                        for (Sequence sequence : sequences) sequence.complete();
-                    }
-                }
-                try {
-                    assertTrue(
-                            concurrent,
-                            "independent sequences did not execute concurrently; activeWorkers="
-                                    + lattice.getActiveWorkers() + ", allowedCpus=" + cpus
-                                    + ", embeddingCalls=" + gpu.embeddingCalls.get());
-                    assertEquals(2, gpu.embeddingGate.workerCount(), "independent sequences used the same worker");
-                } finally {
-                    gpu.embeddingGate.release();
-                }
-                try {
-                    assertTrue(
-                            gpu.projectionGate.awaitEntries(),
-                            "independent projection work did not overlap; activeWorkers="
-                                    + lattice.getActiveWorkers() + ", projectionCalls="
-                                    + gpu.projectionCalls.get());
-                    assertEquals(2, gpu.projectionGate.workerCount(), "projection work used the same worker");
-                } finally {
-                    gpu.projectionGate.release();
+                for (int sequenceId = 1; sequenceId <= 16; sequenceId++) {
+                    Sequence sequence = new Sequence(sequenceId);
+                    sequences.add(sequence);
+                    completions.add((sequenceId % 2 == 0 ? runtime : other)
+                            .submit(new Quantum(plan, sequence, Quantum.ExecutionKind.PREFILL, 0, new int[] {
+                                sequenceId % ExecutionFixtures.VOCABULARY
+                            })));
                 }
                 CompletableFuture.allOf(completions.toArray(CompletableFuture[]::new))
-                        .get(30, TimeUnit.SECONDS);
+                        .get(60, TimeUnit.SECONDS);
                 for (var completion : completions) {
                     var outcome = completion.join();
                     assertEquals(Quantum.Status.SUCCESS, outcome.status(), () -> String.valueOf(outcome.failure()));
                 }
                 for (Sequence sequence : sequences) assertEquals(1, sequence.currentTokenPosition());
+                assertEquals(16 * 16, gpu.projections.size() + gpu.untracedProjections.get());
                 assertEquals(0, runtime.activeQuanta());
                 assertEquals(0, other.activeQuanta());
             } finally {
-                gpu.projectionGate.release();
-                gpu.embeddingGate.release();
                 runtime.close();
                 other.close();
                 for (Sequence sequence : sequences) sequence.complete();
@@ -380,7 +368,7 @@ class EuhedralInferenceRuntimeLatticeTest {
             assertFalse(other.isAttached());
             awaitDrained(lattice);
         } finally {
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
     }
 
@@ -446,7 +434,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                     sequence.complete();
             }
         } finally {
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
     }
 
@@ -512,8 +500,23 @@ class EuhedralInferenceRuntimeLatticeTest {
             if (sequence.terminalState() == Sequence.TerminalState.ACTIVE && !sequence.inFlight()) {
                 sequence.complete();
             }
-            lattice.close();
+            LatticeTesting.closeAndAwait(lattice);
         }
+    }
+
+    /// Releases `stream`'s held boundaries from a driver thread, oldest first, until `outcome` completes.
+    private static void releaseUntilDone(ExecutionFixtures.HoldingStream stream, CompletableFuture<?> outcome)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (!outcome.isDone() && System.nanoTime() < deadline) {
+            if (stream.held() == 0) {
+                Thread.sleep(1);
+                continue;
+            }
+            Thread driver = Thread.ofPlatform().start(() -> stream.release(null));
+            driver.join();
+        }
+        assertTrue(outcome.isDone(), "the quantum did not complete; " + stream.held() + " boundaries held");
     }
 
     private static void awaitHeld(ExecutionFixtures.HoldingStream stream, int boundaries) throws InterruptedException {
@@ -567,30 +570,6 @@ class EuhedralInferenceRuntimeLatticeTest {
                 "worker source partitions did not register before source attachment");
     }
 
-    /// Holds the workspace owner's worker in a frame of its own until the returned latch opens: the admissions
-    /// published meanwhile wait in that worker's cache, in order, and the worker runs them back to back once it is
-    /// free, before it takes a stage. A gate that holds workers inside stages (production stages never block) can
-    /// then hold the owner's worker without keeping a quantum from being admitted.
-    private static CountDownLatch holdOwner(Execution execution) throws InterruptedException {
-        var held = new CountDownLatch(1);
-        var open = new CountDownLatch(1);
-        execution.runtime().publishOnOwner(() -> {
-            held.countDown();
-            try {
-                open.await(30, TimeUnit.SECONDS);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-            }
-        });
-        assertTrue(held.await(10, TimeUnit.SECONDS), "the owner's worker did not take the holding frame");
-        return open;
-    }
-
-    /// Lets the admissions that were published while the owner's worker was held reach its cache.
-    private static void letAdmissionsQueue() throws InterruptedException {
-        Thread.sleep(300);
-    }
-
     private static void awaitDrained(ControlPlaneLattice lattice) throws InterruptedException {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         while (!lattice.isDrained() && System.nanoTime() < deadline) Thread.sleep(1);
@@ -600,11 +579,11 @@ class EuhedralInferenceRuntimeLatticeTest {
     private static final class ConcurrentGpu extends ExecutionGpu {
 
         private final AtomicLong nextAddress = new AtomicLong(1_000L);
-        private final AtomicInteger projectionCalls = new AtomicInteger();
-        private final AtomicInteger normCalls = new AtomicInteger();
-        private final AtomicInteger embeddingCalls = new AtomicInteger();
-        private volatile WorkGate projectionGate = new WorkGate(0);
-        private volatile WorkGate embeddingGate = new WorkGate(0);
+        /// {wave, route} of each embedding and projection a [SteppingLattice] ran; calls on other lattices
+        /// are counted.
+        private final List<long[]> embeddings = new CopyOnWriteArrayList<>();
+        private final List<long[]> projections = new CopyOnWriteArrayList<>();
+        private final AtomicInteger untracedProjections = new AtomicInteger();
 
         @Override
         public long allocate(long byteSize) {
@@ -629,15 +608,13 @@ class EuhedralInferenceRuntimeLatticeTest {
                 int tokenCount,
                 int vocabularySize,
                 int hiddenSize) {
-            this.embeddingCalls.incrementAndGet();
-            this.embeddingGate.enterIfSelected();
+            long[] running = SteppingLattice.running();
+            if (running != null) this.embeddings.add(running);
         }
 
         @Override
         public void rmsNormBf16(
-                long inputAddress, long weightAddress, long outputAddress, int rows, int width, float epsilon) {
-            this.normCalls.incrementAndGet();
-        }
+                long inputAddress, long weightAddress, long outputAddress, int rows, int width, float epsilon) {}
 
         @Override
         public void linearQ3Bf16(
@@ -648,8 +625,9 @@ class EuhedralInferenceRuntimeLatticeTest {
                 int inFeatures,
                 int outFeatures,
                 long weightsByteSize) {
-            this.projectionCalls.incrementAndGet();
-            this.projectionGate.enterIfSelected();
+            long[] running = SteppingLattice.running();
+            if (running != null) this.projections.add(running);
+            else this.untracedProjections.incrementAndGet();
         }
 
         @Override
@@ -854,50 +832,5 @@ class EuhedralInferenceRuntimeLatticeTest {
 
         @Override
         public void synchronize() {}
-    }
-
-    private static final class WorkGate {
-
-        private final CountDownLatch entered;
-        private final CountDownLatch released = new CountDownLatch(1);
-        private final AtomicInteger selected;
-        private final Set<Thread> workers = ConcurrentHashMap.newKeySet();
-
-        private WorkGate(int selectedWorkers) {
-            this.entered = new CountDownLatch(selectedWorkers);
-            this.selected = new AtomicInteger(selectedWorkers);
-            if (selectedWorkers == 0) this.released.countDown();
-        }
-
-        private void enterIfSelected() {
-            int remaining = this.selected.getAndUpdate(value -> value == 0 ? 0 : value - 1);
-            if (remaining == 0) return;
-            this.workers.add(Thread.currentThread());
-            this.entered.countDown();
-            try {
-                if (!this.released.await(15, TimeUnit.SECONDS)) {
-                    throw new IllegalStateException("timed out waiting for the test work gate");
-                }
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                throw new IllegalStateException("interrupted while waiting for the test work gate", interrupted);
-            }
-        }
-
-        private boolean awaitEntries() throws InterruptedException {
-            return awaitEntries(15, TimeUnit.SECONDS);
-        }
-
-        private boolean awaitEntries(long timeout, TimeUnit unit) throws InterruptedException {
-            return this.entered.await(timeout, unit);
-        }
-
-        private int workerCount() {
-            return this.workers.size();
-        }
-
-        private void release() {
-            this.released.countDown();
-        }
     }
 }
