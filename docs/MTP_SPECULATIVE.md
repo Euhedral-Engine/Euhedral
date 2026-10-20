@@ -117,6 +117,28 @@ between them (+53 to +111 ms TTFT at 4096 tokens).
 
 A one-row MTP draft costs about 0.74 ms of GEMV. Most of it is the 360 MiB draft head.
 
+## 5a. Chained steps
+
+With a fixed draft length, every draft verified and no draft listener, a step's quanta are admitted at once when the
+previous verification retires: the catch-up, the recursive drafts and the next verification. They pass the step's
+tokens on the device instead of through the host:
+
+- the sequence's draft tokens (`AttentionStates.draftTokens`) hold the current token and the drafts;
+- a catch-up's embedding writes its last input token there as the current token;
+- each draft's selection writes its drafted token there (`euhedral_selected_token` maps the shortlist row through
+  `text/draft_head_token_ids`);
+- each recursive draft's embedding, and the verification's, read their tokens from there;
+- the carried draft-token key orders these stages across the step's graphs.
+
+Each draft has its own host logits; host logits refuse only a second quantum of the same sequence in flight that
+fills them. The verification's acceptance reads the drafts from their host logits once they retired. A gated draft
+length or a draft listener keeps the host path, where each draft returns to the host before the next is admitted.
+
+NVFP4-Trellis-RCO, MTP depth 4, 4K chat prompt, 256 tokens: 22.14 ms per step, 182.9 tok/s, 4.05 tokens per
+verification. One host hand-off per step remains, from a verification's completion to the next catch-up's launch:
+about 210 us, of which 19 us reach the retirement, 43 us conclude the verification's stages, 59 us reach the next
+step's admission and 89 us admit and launch the catch-up.
+
 ## 6. Rejected and open
 
 **Rejected:**
@@ -130,6 +152,13 @@ A one-row MTP draft costs about 0.74 ms of GEMV. Most of it is the 360 MiB draft
   drafts, which overstated MTP3 at 119 tok/s. Replaced by the chat corpus.
 - **Per-row Q3 linears in verification** (each row through its own one-row launch): Q3 with MTP3 decoded at 42.5 tok/s at 64 tokens
   and 41.9 at 4096. Replaced by the multi-row Q3 twins.
+
+**Not pursued:**
+- **Trimming the last hand-off** (admitting before the host's bookkeeping, cached state fingerprints, concluding only
+  stages with hooks): about 100 to 150 us of the 210 us per step.
+- **Acceptance on the device**, so the next catch-up is queued before the verification retires: the catch-up's rows,
+  the step's positions, the GDN replay rows and the capture key all follow the accepted count, for the remaining
+  60 us or so.
 
 **Open:**
 - **Verification itself is the bottleneck.** Exact multi-row twins of decode attention that share KV reads across the rows
