@@ -127,10 +127,11 @@ public final class Shape implements GraphShape {
         return this.view;
     }
 
-    /// The sequence state stage `stage` carries from one quantum (or chunk) of the sequence to the next: `2L` for
-    /// layer L's GDN convolution and recurrent state, `2L + 1` for its KV rows (layer slots include the MTP
-    /// layer's), then the drafters' state ([#seedRowsKey]) and the host page region ([#kvRegionKey]). A
-    /// first-layer plan's stages name no layer: their state is layer 0's, the sequence's only one.
+    /// The sequence state stage `stage` carries from one quantum (or chunk) of the sequence to the next: `2L`
+    /// for layer L's GDN convolution and recurrent state, `2L + 1` for its KV rows (layer slots include the
+    /// MTP layer's), then the drafters' state ([#seedRowsKey]), the step's draft tokens ([#draftTokensKey])
+    /// and the host page region ([#kvRegionKey]). A first-layer plan's stages name no layer: their state is
+    /// layer 0's, the sequence's only one.
     @Override
     public int[] carriedState(int stage) {
         ExecutionPlan.Instruction instruction = this.instructions.get(stage);
@@ -159,8 +160,28 @@ public final class Shape implements GraphShape {
             case DFLASH_LINEAR -> instruction.inputBuffers().isEmpty() ? new int[] {drafter + 1} : NO_BUFFERS;
             // The DFlash2 context ring: written by the context's keys and values, read by attention.
             case DFLASH_CONTEXT_KV, DFLASH_ATTENTION -> new int[] {drafter + 2};
-            default -> NO_BUFFERS;
+            // A step's tokens on the device: the embedding of a decode, verification or draft reads them (a
+            // catch-up's also writes the current token), the draft head's selection writes each draft.
+            case EMBEDDING -> this.plan.drafts() && stepView() ? new int[] {draftTokensKey(layers())} : NO_BUFFERS;
+            default ->
+                this.plan.drafts()
+                                && this.view == View.MTP_DRAFT
+                                && instruction.outputBuffers().contains(ExecutionPlan.Buffer.LOGITS)
+                        ? new int[] {draftTokensKey(layers())}
+                        : NO_BUFFERS;
         };
+    }
+
+    /// Whether this view runs a step's quanta (decode, verification, drafting), not a prompt's.
+    private boolean stepView() {
+        return switch (this.view) {
+            case DECODE, DECODE_PRELOADED, VERIFY, VERIFY_PRELOADED, MTP_DRAFT, MTP_CATCHUP -> true;
+            default -> false;
+        };
+    }
+
+    private int layers() {
+        return this.plan.weights().config().numHiddenLayers();
     }
 
     /// The carried-state key of the draft seed rows (and the MTP recursion hidden) in a plan of `layers` base
@@ -169,10 +190,16 @@ public final class Shape implements GraphShape {
         return 2 * (layers + 1);
     }
 
-    /// The carried-state key of a sequence's host page region in a plan of `layers` base layers, after the DFlash2
-    /// keys.
-    static int kvRegionKey(int layers) {
+    /// The carried-state key of a step's draft tokens ([AttentionStates#draftTokens]) in a plan of `layers` base
+    /// layers, after the DFlash2 keys.
+    static int draftTokensKey(int layers) {
         return seedRowsKey(layers) + 3;
+    }
+
+    /// The carried-state key of a sequence's host page region in a plan of `layers` base layers, after the draft
+    /// tokens.
+    static int kvRegionKey(int layers) {
+        return draftTokensKey(layers) + 1;
     }
 
     @Override

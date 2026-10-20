@@ -141,3 +141,14 @@ extern "C" __global__ __launch_bounds__(1024) void euhedral_argmax_logprob_bf16(
         }
     }
 }
+
+// The token a selection key chose, written where the next quantum reads its input: `ids[row]` for the selected
+// row of a shortlist head (0xFFFFFFFF minus the key's low word), or the row itself when `ids` is null. A key of 0
+// (no selectable logit) writes row 0's token. One thread.
+extern "C" __global__ void euhedral_selected_token(
+        const unsigned long long* key, const int* ids, int* token) {
+    euhedral_pdl_begin();
+    unsigned long long value = *key;
+    unsigned int row = value == 0ull ? 0u : 0xffffffffu - (unsigned int)(value & 0xffffffffull);
+    *token = ids == nullptr ? (int)row : ids[row];
+}

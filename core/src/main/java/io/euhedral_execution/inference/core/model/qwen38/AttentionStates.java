@@ -22,6 +22,7 @@ public final class AttentionStates implements AutoCloseable {
     private long draftSeedRows;
     private int draftSeedCapacity;
     private long draftRecursionHidden;
+    private long draftTokens;
     /// The DFlash2 drafter's tap rows and context ring; allocated by the first quantum that needs them.
     private DFlash2State dflash2;
     /// Split-KV decode scratch shared by every attention layer of the sequence: a quantum's attention
@@ -120,6 +121,19 @@ public final class AttentionStates implements AutoCloseable {
         return this.draftRecursionHidden;
     }
 
+    /// The tokens of the step being drafted, int32 on the device: the step's current token, then its drafts in order
+    /// ([#DRAFT_TOKEN_SLOTS] slots). The quanta of a step pass them on the device: a catch-up writes the current
+    /// token, each draft its token, and the verification reads them all, ordered by the sequence's carried draft
+    /// tokens.
+    public long draftTokens() {
+        if (this.closed) throw new IllegalStateException("attention sequence states are closed");
+        if (this.draftTokens == 0) this.draftTokens = this.gpu.allocateAsync(4L * DRAFT_TOKEN_SLOTS);
+        return this.draftTokens;
+    }
+
+    /// Slots of [#draftTokens]: the current token and up to 16 drafts.
+    public static final int DRAFT_TOKEN_SLOTS = 17;
+
     /// The sequence's DFlash2 state, allocated on first use.
     public DFlash2State dflash2(io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Config config) {
         if (this.closed) throw new IllegalStateException("attention sequence states are closed");
@@ -179,6 +193,7 @@ public final class AttentionStates implements AutoCloseable {
         for (AttentionKvState state : this.states) if (state != null) state.fingerprint(fingerprint);
         fingerprint.add(this.gpu, this.draftSeedRows).add(this.draftSeedCapacity);
         fingerprint.add(this.gpu, this.draftRecursionHidden);
+        fingerprint.add(this.gpu, this.draftTokens);
         fingerprint.add(this.gpu, this.decodeScratch).add(this.decodeScratchRows);
         if (this.dflash2 != null) this.dflash2.fingerprint(fingerprint);
     }
@@ -215,6 +230,13 @@ public final class AttentionStates implements AutoCloseable {
             else failure.addSuppressed(cleanupFailure);
         }
         try {
+            if (this.draftTokens != 0) this.gpu.freeAsync(this.draftTokens);
+            this.draftTokens = 0;
+        } catch (Throwable cleanupFailure) {
+            if (failure == null) failure = cleanupFailure;
+            else failure.addSuppressed(cleanupFailure);
+        }
+        try {
             if (this.decodeScratch != 0) this.gpu.freeAsync(this.decodeScratch);
             this.decodeScratch = 0;
         } catch (Throwable cleanupFailure) {
@@ -240,6 +262,7 @@ public final class AttentionStates implements AutoCloseable {
         }
         this.closed = this.draftSeedRows == 0
                 && this.draftRecursionHidden == 0
+                && this.draftTokens == 0
                 && this.decodeScratch == 0
                 && (this.dflash2 == null || this.dflash2.released());
         for (AttentionKvState state : this.states) this.closed &= state == null;

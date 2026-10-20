@@ -307,9 +307,36 @@ public final class Stages {
             super(graph, stage, instruction, gpu);
         }
 
-        /// The table's format looks the rows up ([LinearFormat#embed]).
+        /// The table's format looks the rows up ([LinearFormat#embed]). Rows whose tokens the step passes on
+        /// the device ([AttentionStates#draftTokens]) take them into the input record first; a catch-up then
+        /// passes on its last token as the step's current token.
         @Override
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
+            if (context.batched()) {
+                for (Quantum.Segment segment : context.segments())
+                    if (segment.part().tokensOnDevice())
+                        takeDraftTokens(
+                                segment.sequence(), 0, tokenIds(context) + 4L * segment.rowOffset(), segment.rows());
+            } else if (context.draftTokenRead() >= 0) {
+                takeDraftTokens(context.sequenceState(), context.draftTokenRead(), tokenIds(context), rows(context));
+            }
+            embed(context, instruction);
+            if (context.writesCurrentToken())
+                gpu().copyDeviceToDevice(
+                                draftTokens(context.sequenceState()),
+                                tokenIds(context) + 4L * (rows(context) - 1),
+                                Integer.BYTES);
+        }
+
+        private void takeDraftTokens(Sequence sequence, int slot, long destination, int rows) {
+            gpu().copyDeviceToDevice(destination, draftTokens(sequence) + 4L * slot, 4L * rows);
+        }
+
+        private static long draftTokens(Sequence sequence) {
+            return ((AttentionStates) sequence.kvCacheState()).draftTokens();
+        }
+
+        private void embed(Quantum context, ExecutionPlan.Instruction instruction) {
             TensorHandle table = instruction.weight();
             LinearFormats.of(table)
                     .embed(

@@ -63,6 +63,40 @@ class SamplingArgmaxTest(unittest.TestCase):
             self.gpu.free(result)
         return (-1 if key == 0 else 0xFFFFFFFF - (key & 0xFFFFFFFF)), log_probability
 
+    def selected_token(self, key, ids):
+        """euhedral_selected_token: the token a selection key chose, through shortlist row ids (or none)."""
+        key_address = self.gpu.upload(struct.pack('<Q', key))
+        ids_address = self.gpu.upload(struct.pack(f'<{len(ids)}i', *ids)) if ids else 0
+        token = self.gpu.zeros(4, fill=0xA5)
+        try:
+            self.gpu.launch('euhedral_selected_token', 1,
+                            [C.c_uint64(key_address), C.c_uint64(ids_address), C.c_uint64(token)], block=1)
+            return struct.unpack('<i', self.gpu.download(token, 4))[0]
+        finally:
+            self.gpu.free(key_address)
+            if ids_address:
+                self.gpu.free(ids_address)
+            self.gpu.free(token)
+
+    def test_selected_token_maps_the_selected_row_through_the_head_ids(self):
+        ids = [1000 + 7 * row for row in range(32)]
+        row = [NEG_INF] * 32
+        row[19] = 0x3F80
+        for offset in (0, 3):
+            data = struct.pack(f'<{offset + 32}H', *([0] * offset + row))
+            logits = self.gpu.upload(data)
+            result = self.gpu.zeros(8)
+            try:
+                self.gpu.launch('euhedral_argmax_bf16', 1,
+                                [C.c_uint64(logits + 2 * offset), C.c_uint(32), C.c_uint64(result)], block=1024)
+                key = struct.unpack('<Q', self.gpu.download(result, 8))[0]
+            finally:
+                self.gpu.free(logits)
+                self.gpu.free(result)
+            self.assertEqual(ids[19], self.selected_token(key, ids))
+            self.assertEqual(19, self.selected_token(key, None), "without ids the row is the token")
+        self.assertEqual(ids[0], self.selected_token(0, ids), "no selectable logit: row 0")
+
     def test_scored_selection_matches_the_host_argmax_and_log_softmax(self):
         rng = random.Random(99)
         for count in (1, 9, 1024, 8193, 131072, 248320):
