@@ -49,7 +49,7 @@ class PromptTokenizationTest {
     }
 
     private static List<String> texts() throws Exception {
-        String document = Files.readString(Path.of("..", "docs", "FRAME_MODEL.md"));
+        String document = Files.readString(Path.of("..", "docs", "architecture", "FRAME_MODEL.md"));
         StringBuilder pieces = new StringBuilder();
         for (int index = 0; index < 3 * PromptTokenization.CHUNK_PRETOKENS; index++)
             pieces.append(" w").append(index);
