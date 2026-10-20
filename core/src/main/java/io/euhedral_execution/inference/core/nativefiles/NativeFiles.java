@@ -1,5 +1,7 @@
 package io.euhedral_execution.inference.core.nativefiles;
 
+import io.euhedral_execution.hardware_utils.topology.SystemInfo;
+import io.euhedral_execution.hardware_utils.util.OSName;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -16,7 +18,6 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Stream;
@@ -73,7 +74,7 @@ public record NativeFiles(Path root) {
     /// The user's cache directory for native files: `%LOCALAPPDATA%\euhedral` on Windows, else
     /// `$XDG_CACHE_HOME/euhedral`, else `~/.cache/euhedral`.
     public static Path defaultCache() {
-        if (windows()) {
+        if (OSName.isWindows()) {
             String local = System.getenv("LOCALAPPDATA");
             if (local != null && !local.isBlank()) return Path.of(local, "euhedral");
             return Path.of(System.getProperty("user.home"), "AppData", "Local", "euhedral");
@@ -83,14 +84,17 @@ public record NativeFiles(Path root) {
         return Path.of(System.getProperty("user.home"), ".cache", "euhedral");
     }
 
-    /// The platform of the running JVM, as the jars name it: `linux-x64` or `windows-x64`.
+    /// The platform of the running JVM, as the jars name it: `linux-x64` or `windows-x64`, the only products.
     public static String platform() {
-        String architecture = System.getProperty("os.arch").toLowerCase(Locale.ROOT);
-        if (!architecture.equals("amd64") && !architecture.equals("x86_64"))
-            throw new IllegalStateException("no native files for the " + architecture + " architecture; x86-64 only");
-        if (windows()) return "windows-x64";
-        if (System.getProperty("os.name").toLowerCase(Locale.ROOT).startsWith("linux")) return "linux-x64";
-        throw new IllegalStateException("no native files for " + System.getProperty("os.name") + "; Linux or Windows");
+        if (SystemInfo.isX86() && OSName.isLinux()) return "linux-x64";
+        if (SystemInfo.isX86() && OSName.isWindows()) return "windows-x64";
+        throw new IllegalStateException("unsupported platform " + OSName.CURRENT_OS
+                + (SystemInfo.isX86() ? "" : " (not x86-64)") + ": the server runs on Linux or Windows on x86-64");
+    }
+
+    /// The NVIDIA driver library the CUDA library links: `libcuda.so.1`, or `nvcuda.dll` on Windows.
+    public static String driverLibrary() {
+        return OSName.isWindows() ? "nvcuda.dll" : "libcuda.so.1";
     }
 
     /// Unpacks the running jar's native files for this platform into `cacheRoot/<content hash>/` and returns them.
@@ -231,10 +235,6 @@ public record NativeFiles(Path root) {
         } catch (NoSuchAlgorithmException impossible) {
             throw new IllegalStateException(impossible);
         }
-    }
-
-    private static boolean windows() {
-        return System.getProperty("os.name").toLowerCase(Locale.ROOT).startsWith("windows");
     }
 
     /// The native cache cannot hold the unpacked files; the message names `host.native-cache`.

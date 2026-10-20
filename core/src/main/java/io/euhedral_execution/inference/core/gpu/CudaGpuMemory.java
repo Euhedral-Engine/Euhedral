@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.gpu;
 
 import io.euhedral_execution.data_structures.queues.MpmcQueue;
+import io.euhedral_execution.hardware_utils.util.OSName;
 import io.euhedral_execution.inference.core.artifact.P2e2Layout;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
@@ -16,7 +17,6 @@ import java.lang.invoke.MethodType;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -644,8 +644,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     /// Loads the runtime libraries that sit beside `library` ([#LINUX_RUNTIME], [#WINDOWS_RUNTIME]); a layout without
     /// them relies on the system's search path.
     public static void preloadRuntime(Path library, Arena arena) {
-        boolean windows = System.getProperty("os.name").toLowerCase(Locale.ROOT).startsWith("windows");
-        for (String name : windows ? WINDOWS_RUNTIME : LINUX_RUNTIME) {
+        for (String name : OSName.isWindows() ? WINDOWS_RUNTIME : LINUX_RUNTIME) {
             Path runtime = library.toAbsolutePath().resolveSibling(name);
             if (Files.isRegularFile(runtime)) SymbolLookup.libraryLookup(runtime, arena);
         }
