@@ -1,5 +1,6 @@
 LIBRARY cudart64_13.dll
 EXPORTS
+    cudaDeviceGetAttribute
     cudaDeviceSynchronize
     cudaEventCreateWithFlags
     cudaEventDestroy
