@@ -77,7 +77,7 @@
   stable quantity.
 - Clocks move very fast on Blackwell. The whitepaper says clock changes are "1000x faster" than
   before, with separate core and memory rails. On this desktop-shared GPU, paired A/B measurements
-  are mandatory (docs/FRAME_MODEL.md records two per-JVM performance modes 13% apart).
+  are mandatory (docs/architecture/FRAME_MODEL.md records two per-JVM performance modes 13% apart).
 
 ## Peak rates at the observed clock
 

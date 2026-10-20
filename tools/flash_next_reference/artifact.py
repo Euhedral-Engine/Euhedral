@@ -1,4 +1,4 @@
-"""Reading Euhedral's EDRL v3 artifact (`docs/FLASH_NEXT_ARTIFACT.md`) for the reference harness."""
+"""Reading Euhedral's EDRL v3 artifact (`docs/flash-next/FLASH_NEXT_ARTIFACT.md`) for the reference harness."""
 
 from __future__ import annotations
 

@@ -94,7 +94,7 @@ public final class Execution implements AutoCloseable {
     }
 
     /// An execution whose graphs share `laneCount` device lanes. Decode, verification and draft quanta are
-    /// captured into CUDA graphs (docs/CUDA_GRAPHS.md). A plan that stages weights gets one lane fewer for
+    /// captured into CUDA graphs (docs/kernels/CUDA_GRAPHS.md). A plan that stages weights gets one lane fewer for
     /// compute and a lane for its transfers.
     public Execution(LatticeTerminal lattice, ExecutionPlan plan, ExecutionGpu gpu, int laneCount) {
         this(lattice, plan, gpu, laneCount, Tuning.defaults());

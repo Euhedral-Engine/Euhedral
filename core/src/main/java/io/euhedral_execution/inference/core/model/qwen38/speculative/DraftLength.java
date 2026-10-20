@@ -1,6 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen38.speculative;
 
-/// How many tokens an MTP step drafts before its verification (docs/MTP_DRAFT_CONFIDENCE.md): at least `least`, at
+/// How many tokens an MTP step drafts before its verification (docs/speculation/MTP_DRAFT_CONFIDENCE.md): at least `least`, at
 /// most `most`, and past `least` in blocks of `step` drafts, each block only while the running sum of the drafts'
 /// log-probabilities under the draft head is at or above `threshold`. The verification checks every draft, so the
 /// output is greedy decode's whatever the length; the length only decides how many tokens one verification can

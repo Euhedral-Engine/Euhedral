@@ -3,7 +3,7 @@
 #include "common/pdl.cuh"
 
 // P2E2: a lossless, smaller persistent layout of Q3G64_F16S tensors (layout "row-split-p2e2-v1",
-// docs/COMPRESSED_Q3.md). The signed 3-bit codes take 2.3 bits of entropy: -1, 0 and +1 cover 80% of
+// docs/quantization/COMPRESSED_Q3.md). The signed 3-bit codes take 2.3 bits of entropy: -1, 0 and +1 cover 80% of
 // them. P2E2 stores every code as a 2-bit primary symbol t (0: -1, 1: 0, 2: +1, 3: BIG) and every BIG
 // code's value as a 2-bit payload unit p (0: -3, 1: -2, 2: +2, 3: +3) in one stream in row-major
 // order. One u32 per row gives the unit index of the row's first BIG code; a warp that walks a row's

@@ -34,7 +34,7 @@ Frozen 2026-10-17. 112 chunks of 2,560 tokens (286,720 tokens); the second half 
   Swift-1.5's published settings (temperature 1.0, top-p 0.95, top-k 20, min-p 0) with random draws keyed by seed and
   position; tool calls answered from the fixtures. Chat template, thinking and tool-call tokens are kept. The 32
   conversations that offer tools (all of tool use, 8 of coding) were generated with the checkpoint's native
-  `<tool_call>` format ([TOOL_CALLING.md](TOOL_CALLING.md)), so the history the server replays matches what the model
+  `<tool_call>` format ([TOOL_CALLING.md](../TOOL_CALLING.md)), so the history the server replays matches what the model
   wrote: 0.5% of follow-up requests in tool use, 0% in coding, do not continue the previous prompt and completion token
   for token. Version 1 had generated them through a JSON envelope the checkpoint was not trained on and is retired.
 - **Chunks** (`tools/t5/chunks.py`): the first 2,560 tokens of each conversation or document. llama.cpp scores text, so

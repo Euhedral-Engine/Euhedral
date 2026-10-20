@@ -31,7 +31,7 @@ Decode tok/s, chat corpus v2, 256 generated tokens; one paired fork at 16K/32K, 
 
 Notes:
 - **Host-backed weights:** † 1 GiB at 1K/4K. 1.5 GiB everywhere else for NVFP4, because NVFP4 + MTP runs out of memory at 32K with
-  1 GiB. The engine now plans this ([NVFP4_RESIDENCY.md](NVFP4_RESIDENCY.md)).
+  1 GiB. The engine now plans this ([NVFP4_RESIDENCY.md](../quantization/NVFP4_RESIDENCY.md)).
 - **\* No draft twins:** measured before they existed. The draft twins matter at long context; at 1K/4K the draft step is 2-4 ms.
 - **Exactness:** output hashes of every arm equal the non-speculative arm's for every prompt.
 
@@ -65,7 +65,7 @@ MTP layer:
 | `nvfp4` (1 GiB host) | 1024 | 75.3 | **81.7** | 80.7 | 77.0 |
 | `nvfp4` (1 GiB host) | 4096 | 69.2 | **74.3** | 73.5 | 71.8 |
 
-With the tensor-core NVFP4 decode kernels ([NVFP4_NATIVE.md](NVFP4_NATIVE.md), "Decode kernels"), an NVFP4 verification of
+With the tensor-core NVFP4 decode kernels ([NVFP4_NATIVE.md](../kernels/NVFP4_NATIVE.md), "Decode kernels"), an NVFP4 verification of
 8 rows costs little more than one row in its linears, and the depth moves. Benchmark decode tok/s (chat corpus, 256 generated
 tokens, `nvfp4-compressed`, one run per cell; 64K repeated):
 
@@ -120,7 +120,7 @@ rows, every row computed exactly as the one-row launch at its position:
 ## Exact linear twins
 
 NVFP4 linears run the tensor-core decode kernels at every row count up to 8, whose rows are exact by construction and which
-cost at most 1.09× one row at 8 rows ([NVFP4_NATIVE.md](NVFP4_NATIVE.md), "Decode kernels"). The FP32 FMA twins measured below
+cost at most 1.09× one row at 8 rows ([NVFP4_NATIVE.md](../kernels/NVFP4_NATIVE.md), "Decode kernels"). The FP32 FMA twins measured below
 were rejected for NVFP4 for that reason; the Q3, Q4 and Q5 twins keep their design and its M=4 cliff.
 
 Cold-weight operator timing: weight copies rotated past L2, bitwise equal to the one-row GEMV; times are multiples of the one-row

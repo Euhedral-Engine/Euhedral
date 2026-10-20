@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Python reference harness for Qwen3.8-Flash-Next: fixtures from the unmodified upstream transformers `qwen4_exp`
-implementation over the weights of the NVFP4 EDRL v3 artifact. See docs/FLASH_NEXT_REFERENCE.md.
+implementation over the weights of the NVFP4 EDRL v3 artifact. See docs/flash-next/FLASH_NEXT_REFERENCE.md.
 
   PYTHONPATH=tools ~/.cache/flash-next-ref-venv/bin/python tools/flash_next_reference.py list-cases
   ... check-artifact

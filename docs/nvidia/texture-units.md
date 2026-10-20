@@ -110,7 +110,7 @@ with a fixed weight table in 1/257 units:
 | 5120 × 5120 | 21.4 | 614 |
 
 - **Comparison:** Euhedral's tuned one-row Q4/Q5 GEMVs stream at about 800 GB/s, and Q3 at
-  720–800 GB/s (docs/FRAME_MODEL.md).
+  720–800 GB/s (docs/architecture/FRAME_MODEL.md).
 - **At M = 1 the texture path is roughly at parity,** and this first kernel is untuned: one row pair
   per warp and no split-K for the down shape.
 - **Its value is what it frees.** The unpack and convert work leaves the ALUs, the LSU and the
@@ -129,7 +129,7 @@ with a fixed weight table in 1/257 units:
   (4.5 bits). It is asymmetric with a small 16-value block, but the endpoint resolution is limited
   to 8 bits of the row range.
 - **Not lossless from Q3:** the BC4 grid is non-uniform and its endpoints are 8-bit, so it has to be
-  quantized from the BF16 checkpoint. Validate it with the NLL method (docs/NVFP4_COMPRESSED.md),
+  quantized from the BF16 checkpoint. Validate it with the NLL method (docs/quantization/NVFP4_COMPRESSED.md),
   never by weight MSE.
 
 **Costs**

@@ -184,7 +184,7 @@ operator whose kernel depends on the row count then runs each row through its on
   row is bitwise identical to one-row decode.
 - NVFP4 linears through the tensor-core decode kernels (`nvfp4::decode_rows<M>`, M = 1 to 8), whose
   token rows are independent MMA columns with exact products, so every row is bitwise identical to
-  one-row decode ([NVFP4_NATIVE.md](NVFP4_NATIVE.md)).
+  one-row decode ([NVFP4_NATIVE.md](../kernels/NVFP4_NATIVE.md)).
 
 Row-exact execution declines the block-scaled MXFP8 route and the native FP4 route, whose activation quantization and tile
 accumulation differ from the GEMV. There is no second numerics mode for verification: a verifier on native FP4 kernels would

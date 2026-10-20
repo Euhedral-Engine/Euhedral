@@ -38,8 +38,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         /// one-row decode at its position (row-exact execution), with logits for every row.
         VERIFY,
         /// Drafting, which leaves the base sequence position where it is: rows of the MTP layer at MTP positions,
-        /// writing only the MTP layer's cache (docs/MTP_CONTRACT.md §2), or a DFlash2 block, which proposes the
-        /// tokens after its anchor and writes no state (docs/DFLASH2.md).
+        /// writing only the MTP layer's cache (docs/speculation/MTP_CONTRACT.md §2), or a DFlash2 block, which proposes the
+        /// tokens after its anchor and writes no state (docs/speculation/DFLASH2.md).
         DRAFT,
         /// DFlash2 context rows: the drafter's keys and values of committed target rows at their positions, from the
         /// target's tapped hidden rows, into the drafter's own cache. The base sequence position does not move.
@@ -829,7 +829,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     /// Quanta of at most this many rows are captured: decode, verification and draft quanta.
     static final int MAX_CAPTURED_ROWS = 8;
 
-    /// Decode, verification and draft quanta are captured (docs/CUDA_GRAPHS.md). The key holds what their
+    /// Decode, verification and draft quanta are captured (docs/kernels/CUDA_GRAPHS.md). The key holds what their
     /// stages' submissions depend on apart from the input record: the kind, rows and outputs, the launch
     /// geometry of decode attention, and a fingerprint of the workspace and
     /// sequence-owned device addresses. A quantum whose reservation would allocate KV pages or upload a page

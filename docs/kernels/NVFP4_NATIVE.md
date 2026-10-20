@@ -100,7 +100,7 @@ cubin for `sm_<major><minor>a` and only on compute capability 12.x.
     per operand); each warp's fragments 0 and 1 are 16 gate columns and fragments 2 and 3 the same up columns, and SwiGLU is applied
     to BF16-rounded gate and up.
 - **`euhedral_nvfp4n_skinny_{16,32,64}`** and **`euhedral_nvfp4n_skinny_finish`**: the decode-like kernels (below).
-- Every kernel has an `_sd4` twin for the SD4 scale-table layout ([NVFP4_COMPRESSED.md](NVFP4_COMPRESSED.md)); the twin computes,
+- Every kernel has an `_sd4` twin for the SD4 scale-table layout ([NVFP4_COMPRESSED.md](../quantization/NVFP4_COMPRESSED.md)); the twin computes,
   bit for bit, what the plain kernel computes on the tensor expanded to plain NVFP4 (`native/tests/test_nvfp4.py` and
   `test_nvfp4_native.py` check this with every table entry in use). The native kernels fetch the index bytes (half of plain's scale
   bytes, 16-byte boxes of four K tiles) and look each B scale register (4 E4M3 codes) up in registers just before its MMAs: two `prmt` over the
@@ -121,7 +121,7 @@ cubin for `sm_<major><minor>a` and only on compute capability 12.x.
   aligned weights and scratch (the decode kernels: K a multiple of 128 and N of 16).
   A shape the native route declines runs the scalar reference.
 - Verification quanta run row-exact (every row bit for bit as one-row decode) and never take the native route: they run the
-  decode kernels (at most 8 rows) as [MTP_CONTRACT.md](MTP_CONTRACT.md) section 6 requires.
+  decode kernels (at most 8 rows) as [MTP_CONTRACT.md](../speculation/MTP_CONTRACT.md) section 6 requires.
 - Quantized activations, plus FP32 split-K partials for skinny shapes, go into the shared, event-ordered scratch
   (`euhedral_cuda_nvfp4_native_scratch_bytes`).
 
@@ -307,10 +307,10 @@ and two sequences; 512 is the production chunk. No tolerance was changed.
 - **Native FP4 for one row.** Native one-row decode costs 20.0 ms of linears per token against 18.3 ms for the GEMV (9% slower), so
   one row keeps the GEMV with BF16 activations.
 - **Native FP4 drafting** (one row included, where the GEMV stays). Every NVFP4 linear in draft quanta ran native: no faster than the GEMV and acceptance unchanged
-  ([MTP_VERIFIER.md](MTP_VERIFIER.md)).
+  ([MTP_VERIFIER.md](../speculation/MTP_VERIFIER.md)).
 - **Native FP4 verification** (every verifier row on the skinny kernel): about 4% faster than exact verification at depth 4
   against 3, but it changed every generated text (top-1 96.4%, KL 3-6e-3), so verification stays row-exact
-  ([MTP_VERIFIER.md](MTP_VERIFIER.md)).
+  ([MTP_VERIFIER.md](../speculation/MTP_VERIFIER.md)).
 - **cp.async tile variants** (kept in the record because they located the limit). The tile is bound by its loads, not its MMAs:
   with the loads removed it ran at about 600 TFLOPS, with the MMAs removed it took nearly as long as the full kernel.
   - Row-major activation scales (8-byte pieces per row and K tile) cost a third of the load time: gate_up at 1024 rows took

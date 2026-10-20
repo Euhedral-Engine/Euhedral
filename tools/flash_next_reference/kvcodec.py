@@ -16,7 +16,7 @@ core/.../Nvfp4KvReference.java (the mathematical reference):
   * attention sees the INVERSE rotation of the represented row (H256 is self-inverse), i.e. `H^T dequant(quant(H k))`,
     the mathematical value the engine's rotated-domain attention computes.
 
-Deviations from the engine, documented in docs/FLASH_NEXT_REFERENCE.md: the inverse rotation is applied here, in FP32 with
+Deviations from the engine, documented in docs/flash-next/FLASH_NEXT_REFERENCE.md: the inverse rotation is applied here, in FP32 with
 the same butterfly, and the result is rounded to BF16 (the cache dtype upstream uses); the engine keeps the rotated
 representation and rotates queries and outputs instead, with its own accumulation order.
 """

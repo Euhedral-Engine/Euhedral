@@ -51,7 +51,7 @@ This document measures every kind on the card and gives the rules that follow. E
 - Sustained loops ran at 2.80–2.85 GHz and 130–230 W. The power cap was not reached (see
   [system-tuning.md](system-tuning.md)).
 
-**Agreement with earlier measurements.** docs/NVFP4_NATIVE.md measured BF16 98, FP16 190, E4M3 197
+**Agreement with earlier measurements.** docs/kernels/NVFP4_NATIVE.md measured BF16 98, FP16 190, E4M3 197
 and NVFP4 815 TFLOPS with a different harness; these figures agree.
 
 ## The GeForce rules
@@ -114,13 +114,13 @@ Consequences:
   - m16n8k64 FP4 (packed, nibble j = K 8t+j): A rows g / g+8, K 8t..8t+7, then K + 32. B column g.
   - D: d0, d1 at row g, columns 2t, 2t+1; d2, d3 at row g+8.
   - The NVFP4 scale-register contract (which lane supplies which row's scale, byte b ↔ K 16b..16b+15)
-    is in docs/NVFP4_NATIVE.md "Instruction contract", measured on this card.
+    is in docs/kernels/NVFP4_NATIVE.md "Instruction contract", measured on this card.
 - **Containers.** Under `kind::f8f6f4`, E2M1 sits in bits 2–5 of each byte and FP6 in the low 6
   bits. The packed `mxf4` kinds use plain nibbles. `ldmatrix ... .b8x16.b4x16_p64` lands 4-bit data
   in the low bits, so CUTLASS shifts it left by 2 before an `f8f6f4` MMA
   ([mma_traits_sm120.hpp](https://raw.githubusercontent.com/NVIDIA/cutlass/main/include/cute/atom/mma_traits_sm120.hpp)).
 - **Mixing NVFP4 weights with FP8/BF16 activations is impossible in hardware.** `mxf8f6f4` takes only
-  UE8M0 scales per 32, and NVFP4 has E4M3 per 16 (docs/NVFP4_NATIVE.md). Native NVFP4 needs FP4
+  UE8M0 scales per 32, and NVFP4 has E4M3 per 16 (docs/kernels/NVFP4_NATIVE.md). Native NVFP4 needs FP4
   activations.
 - **No TMA multicast on GeForce.** CUTLASS SM120 GEMMs run with cluster shape 1×1×1
   ([CUTLASS example 79a](https://github.com/NVIDIA/cutlass/blob/main/examples/79_blackwell_geforce_gemm/79a_blackwell_geforce_nvfp4_bf16_gemm.cu)).
@@ -134,7 +134,7 @@ Consequences:
   3.5× DRAM.
 - **What tensor cores buy decode is moving the FMAs off the CUDA cores.** Today's scalar GEMVs do
   1 FMA per weight per row on top of the dequant. At 4 rows they become ALU- and register-bound:
-  about 600 GB/s, with a 223-register cliff at M = 4 (docs/MTP_VERIFIER.md).
+  about 600 GB/s, with a 223-register cliff at M = 4 (docs/speculation/MTP_VERIFIER.md).
 - **Layout.** "Swap A and B": weights take the M=16 side, and the 1–4 activation rows sit in the n=8
   columns of B. Dequant then happens once per weight for any M ≤ 8, and the dot products are free.
 - **Precision.** E2M1 × E4M3 scale products need at most 5 significant bits, so NVFP4 weights expand
@@ -152,12 +152,12 @@ Consequences:
 
 | Path | Peak on this card | Notes |
 |---|---|---|
-| BF16 HMMA, FP32 accumulate (Q3/Q4/Q5 today) | 102 | Achieved 57 TFLOPS in the FFN at 512 rows (docs/FRAME_MODEL.md) |
+| BF16 HMMA, FP32 accumulate (Q3/Q4/Q5 today) | 102 | Achieved 57 TFLOPS in the FFN at 512 rows (docs/architecture/FRAME_MODEL.md) |
 | FP16 HMMA, FP16 accumulate inside each 64-K Q3 group, then promotion to FP32 with the group scale | 204 | The scale is applied per group anyway; overflow and drift need the drift test |
 | MXFP8 (`mxf8f6f4` E4M3, unit UE8M0) with FP8 activations | 408 | FP32 accumulate at full rate; activation quantization changes numerics |
-| Two-term FP8 activations (hi + lo) through MXFP8 | 204 effective | Exact for BF16 activations. **Built** (docs/PREFILL_MX.md, which also holds the scale-A register contract): 126 TFLOPS on the FFN gate/up at 512 rows |
+| Two-term FP8 activations (hi + lo) through MXFP8 | 204 effective | Exact for BF16 activations. **Built** (docs/kernels/PREFILL_MX.md, which also holds the scale-A register contract): 126 TFLOPS on the FFN gate/up at 512 rows |
 | INT8 IMMA with two-term int8 activations (int16 split into hi/lo bytes) | 204 effective | Exact, order-independent integer accumulation per Q3 group; Q3 codes are already small integers |
-| NVFP4 native, 1–2 activation terms (today) | 815 | Achieves 225–290 TFLOPS, about 30% (docs/NVFP4_NATIVE.md) |
+| NVFP4 native, 1–2 activation terms (today) | 815 | Achieves 225–290 TFLOPS, about 30% (docs/kernels/NVFP4_NATIVE.md) |
 
 - **The NVFP4 tile is the largest headroom.**
   - CUTLASS-style SM120 block-scaled GEMMs reach 83% of FP4 peak on an RTX PRO 6000 with TMA

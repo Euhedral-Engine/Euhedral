@@ -45,7 +45,7 @@ import java.util.function.Consumer;
 /// the pinned host row into which each sampling quantum copies its final logits before it retires; each
 /// completed prompt-to-output stream is flushed before the decoder is replaced for a later prompt.
 ///
-/// A generation is a chain of frames (docs/FRAME_MODEL.md): each step's quantum throws a Select frame when it
+/// A generation is a chain of frames (docs/architecture/FRAME_MODEL.md): each step's quantum throws a Select frame when it
 /// retires, which samples, emits text and throws the next step's Admit. No thread waits for a quantum.
 public final class Session implements GenerationSession {
 
@@ -159,7 +159,7 @@ public final class Session implements GenerationSession {
 
     /// Generates greedy, unconstrained calls from a fresh sequence with MTP speculative decoding of
     /// `depth` drafts per verification: the same tokens and state as one-row greedy decode, in fewer
-    /// sequential steps (docs/MTP_CONTRACT.md). Requires a plan with a loaded MTP layer and draft head.
+    /// sequential steps (docs/speculation/MTP_CONTRACT.md). Requires a plan with a loaded MTP layer and draft head.
     public void enableSpeculativeDecoding(int depth) {
         if (depth < 0 || depth > MtpDecoder.MAX_VERIFIED)
             throw new IllegalArgumentException("depth must be 0 to " + MtpDecoder.MAX_VERIFIED);

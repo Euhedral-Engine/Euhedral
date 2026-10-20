@@ -10,7 +10,7 @@ import io.euhedral_execution.inference.core.gpu.ScratchUse;
 /// selected stream; none allocates on the hot path.
 ///
 /// The kernels reproduce upstream's BF16 arithmetic, rounding after every tensor operation the way PyTorch does
-/// (docs/FLASH_NEXT_EXECUTION.md).
+/// (docs/flash-next/FLASH_NEXT_EXECUTION.md).
 public final class Ops {
 
     private static final ThreadLocal<KernelArguments> ARGUMENTS = ThreadLocal.withInitial(KernelArguments::new);

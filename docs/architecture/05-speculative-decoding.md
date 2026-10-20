@@ -34,6 +34,6 @@ MTP catch-up commits its cache rows using the verified target hidden states. Rec
 - [Quantum](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/Quantum.java) and [Sequence](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/Sequence.java): retirement and state commit.
 - [ArtifactProfile](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/ArtifactProfile.java): quantization, speculation and the stored draft depth.
 - [Qwen38Runtime](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/Qwen38Runtime.java) and [DFlash2Decoder](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/speculative/DFlash2Decoder.java).
-- [MTP contract](../MTP_CONTRACT.md), [verifier](../MTP_VERIFIER.md) and [DFlash2](../DFLASH2.md).
+- [MTP contract](../speculation/MTP_CONTRACT.md), [verifier](../speculation/MTP_VERIFIER.md) and [DFlash2](../speculation/DFLASH2.md).
 
 The row-exact contract covers logits and state, not merely final token agreement. Existing CUDA integration tests exercise it; this documentation change does not rerun those tests. Kernel variants and checkpoint byte layouts are outside this diagram.

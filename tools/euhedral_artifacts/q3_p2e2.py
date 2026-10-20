@@ -2,7 +2,7 @@
 
 P2E2 ("row-split-p2e2-v1") stores the same Q3G64_F16S values in less memory: the signed 3-bit codes
 are entropy coded as a fixed 2-bit primary plane plus a short payload stream, and the FP16 scale
-plane is kept byte for byte. docs/COMPRESSED_Q3.md specifies the layout. Every transcoded tensor is
+plane is kept byte for byte. docs/quantization/COMPRESSED_Q3.md specifies the layout. Every transcoded tensor is
 decoded back and compared byte for byte with its source before the output is published.
 """
 

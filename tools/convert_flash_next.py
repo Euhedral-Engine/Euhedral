@@ -4,7 +4,7 @@
 The checkpoint is already NVFP4 (E2M1 codes, E4M3 block scales, FP32 global scales); nothing is quantized again.
 Every code, scale and global scale is copied into the artifact's runtime objects: fixed tensors in the row-split
 NVFP4 layout, routed experts as one contiguous record each in per-layer expert banks, n-gram embedding rows
-interleaved with their scales. See docs/FLASH_NEXT_ARTIFACT.md.
+interleaved with their scales. See docs/flash-next/FLASH_NEXT_ARTIFACT.md.
 
     convert_flash_next.py convert CHECKPOINT_DIR ARTIFACT.edrl [--jobs N] [--force]
     convert_flash_next.py verify  ARTIFACT.edrl [--checkpoint CHECKPOINT_DIR] [--jobs N]

@@ -47,7 +47,7 @@ command line).
      - SM zero-copy loads, alone or alongside DMA.
    - That points at the host read path, not at engine count.
 2. **4 KiB pinned pages cost 40% under the translating IOMMU.** Euhedral's single THP arena exists for
-   this reason (docs/NVFP4_RESIDENCY.md "Platform").
+   this reason (docs/quantization/NVFP4_RESIDENCY.md "Platform").
    - **Untested lever:** boot with `intel_iommu=on iommu=pt` (passthrough). DMA would then skip
      translation, which should remove the THP dependence and may lift the 43.5 GB/s H2D ceiling. It
      needs a reboot and is a system change; see [system-tuning.md](system-tuning.md).
@@ -72,7 +72,7 @@ command line).
 | Captured graph, PDL (programmatic) edges | 3.2 µs per graph | **0.30 µs per node** |
 | `WHILE` conditional node, one-kernel body, condition set on the device | none | **3.23 µs per iteration** |
 
-**Where Euhedral stands** (docs/FRAME_MODEL.md, docs/MTP_VERIFIER.md):
+**Where Euhedral stands** (docs/architecture/FRAME_MODEL.md, docs/speculation/MTP_VERIFIER.md):
 - About 772 launches per decode token.
 - At 1K context the GPU is busy 16.85 of 18.76 ms (Q3, one row), so about 10% is host gaps and
   launch latency. MTP steps lose 0.8–1.2 ms per step (3–4%).
@@ -84,7 +84,7 @@ command line).
   - A graph node costs 0.30–0.39 µs against 0.78 µs of host submission per launch.
   - A captured decode quantum would cost one graph launch (a few µs of host time) plus about
     772 × 0.3 µs ≈ 0.23 ms of device-side launch latency.
-  - The earlier estimate of "3–4% at most" (docs/MTP_VERIFIER.md) was for MTP steps; at short
+  - The earlier estimate of "3–4% at most" (docs/speculation/MTP_VERIFIER.md) was for MTP steps; at short
     context the ceiling is about the 10% of host gaps.
   - Graph capture keeps PDL edges, so PDL could return at long context inside a graph.
 - **Shape changes per token** (position, KV length) can be handled three ways:
@@ -106,7 +106,7 @@ can split the 70 SMs into partitions:
 - Uses for Euhedral:
   - keep a partition for the host-weight transfer path, or for zero-copy gathers;
   - run prefill of one request beside decode of another without the decode stream losing SMs.
-- Decode itself is a chain (docs/FRAME_MODEL.md), so splitting one sequence across partitions buys
+- Decode itself is a chain (docs/architecture/FRAME_MODEL.md), so splitting one sequence across partitions buys
   nothing.
 
 **Stream priorities** are supported (`STREAM_PRIORITIES_SUPPORTED = 1`) and unused; Euhedral creates
@@ -121,7 +121,7 @@ beside compute) avoid paying for each other's memory flushes.
 
 ## Compile targets
 
-**Current setup** (docs/NVFP4_NATIVE.md, `native/src/host/cuda_kernel_loader.c`):
+**Current setup** (docs/kernels/NVFP4_NATIVE.md, `native/src/host/cuda_kernel_loader.c`):
 - Every module except `nvfp4_native` is compiled by NVRTC as `compute_90` PTX with
   `--std=c++14` and nothing else. The driver JITs it for sm_120.
 - That PTX cannot use anything newer than sm_90.

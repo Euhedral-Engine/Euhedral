@@ -1,5 +1,5 @@
 #!/bin/bash
-# Weight-only KL of an artifact (docs/QUALITY.md): its dequantized weights in a BF16 GGUF, scored by llama.cpp.
+# Weight-only KL of an artifact (docs/evaluation/QUALITY.md): its dequantized weights in a BF16 GGUF, scored by llama.cpp.
 #
 # Usage: tools/holdout/weight_only.sh NAME ARTIFACT TEMPLATE-BF16.gguf REFERENCE.kld RESULTS.txt [KEEP_REGEX]
 #

@@ -81,11 +81,11 @@ residual, so it does not change the target's numerics. Verification rows are row
 - top-16 ordered by logit then token, and the selector walk.
 
 NVFP4 projections run on the existing NVFP4 dispatch (`linearNvfp4Bf16`): up to 8 rows (the block, a verification's context
-rows) on the tensor-core decode kernels ([NVFP4_NATIVE.md](NVFP4_NATIVE.md), "Decode kernels"), more rows (a prefill chunk's
+rows) on the tensor-core decode kernels ([NVFP4_NATIVE.md](../kernels/NVFP4_NATIVE.md), "Decode kernels"), more rows (a prefill chunk's
 context rows) on the native Blackwell FP4 route. The output head is the target's.
 
 **Prefetch of host-backed weights.** When some target weights are host-backed, a verification streams them through the staging
-ring ([NVFP4_RESIDENCY.md](NVFP4_RESIDENCY.md)), and its first layers wait for the first copies. The block quantum, whose transfer
+ring ([NVFP4_RESIDENCY.md](../quantization/NVFP4_RESIDENCY.md)), and its first layers wait for the first copies. The block quantum, whose transfer
 lane is otherwise idle for its few milliseconds, copies the decode view's first ring slots; a decode or verification quantum that
 finds them loaded runs a view without those transfers (`ExecutionPlan.preloadedVariant`). The runtime marks the ring loaded
 only when every stage of the prefetching quantum ran, under the ring's hold, so any other staging quantum in between (another
@@ -225,7 +225,7 @@ with a DFlash2 artifact. Peak allocated device memory in the runs of section 6: 
   shortlist for the drafter's output head (0.4 ms less per block, at more device memory).
 - **Verification attention** reads the KV cache once per verified row (about 0.6 ms per layer for 7 rows at 64K). A kernel that
   shares each key and value tile across rows must also leave room for more rows in flight per SM than the row twins' 4
-  ([ATTENTION_DECODE.md](ATTENTION_DECODE.md)).
+  ([ATTENTION_DECODE.md](../kernels/ATTENTION_DECODE.md)).
 - **The block** (2.9 ms): 2.1 ms of it streams the drafter's projections and the output head at the DRAM rate; the context
   quantum could join the block quantum.
 - **Q3 artifacts** have no DFlash2 drafter yet.

@@ -1,7 +1,7 @@
 #pragma once
 // Shared helpers of the Flash-Next (qwen4_exp) kernels. Every kernel rounds to BF16 where the upstream PyTorch
 // model does: an elementwise op on a BF16 tensor computes in FP32 and rounds its result to BF16, so a chain of
-// ops is a chain of roundings, reproduced here step by step (docs/FLASH_NEXT_EXECUTION.md).
+// ops is a chain of roundings, reproduced here step by step (docs/flash-next/FLASH_NEXT_EXECUTION.md).
 namespace q4 {
 
 static __device__ __forceinline__ float bf(unsigned short value) {

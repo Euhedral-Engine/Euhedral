@@ -13,7 +13,7 @@ import java.util.Objects;
 /// `fork` identify the JVM, and `engine` holds the engine's `InferenceRunSnapshot` (configuration, model,
 /// runtime identity, and generation settings) for measured rows. Timings are integer nanoseconds and
 /// throughputs are tokens per second; either is null when the work it describes did not complete.
-/// See `docs/BENCHMARKING.md` for every metric's boundaries and denominator.
+/// See `docs/evaluation/BENCHMARKING.md` for every metric's boundaries and denominator.
 @JsonInclude(JsonInclude.Include.ALWAYS)
 public record BenchmarkResult(
         String schema,

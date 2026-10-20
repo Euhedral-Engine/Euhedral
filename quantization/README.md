@@ -87,7 +87,7 @@ stops after the layers, with no MTP file and no index).
     --reference swift_1_5_bf16.kld --name t1 --reference swift_t2.kld --name t2"
 ```
 
-Teacher-forces every chunk of each llama.cpp reference (`llama-perplexity --kl-divergence-base`, docs/QUALITY.md) on
+Teacher-forces every chunk of each llama.cpp reference (`llama-perplexity --kl-divergence-base`, docs/evaluation/QUALITY.md) on
 the artifact and appends a summary per reference to the results file: mean NLL, dNLL, KL(reference || artifact) over
 the reference entries above its 16-nat floor, top-1 agreement with standard errors (chunk-level over several chunks),
 the KL median, p95, p99 and maximum, and delta-p of the forced token. Each chunk of N tokens prefills N / 2 + 1 and
@@ -107,7 +107,7 @@ it; `--host-mib N` sets the host-backed weights instead.
 
 Answers chat prompts (`{"id", "messages", "tools"?}` per line; `tools/gptq/calibration.py prompts ... --chat N`) with the
 artifact's own greedy decode and keeps what the MTP drafter learns from: every token, and the post-final-norm hidden
-of every row the base model ran, which is what seeds the drafter (docs/MTP_CONTRACT.md §2). Prompts are rendered by
+of every row the base model ran, which is what seeds the drafter (docs/speculation/MTP_CONTRACT.md §2). Prompts are rendered by
 the checkpoint's chat template with thinking on and prefilled in the engine's 512-row chunks, as the server does; then
 up to `--batch` sequences (at most 32) decode together, one row each per batched verification, so every row is bit
 for bit the artifact's own one-row decode. The corpus (`Corpus`) is `tokens.bin`, `hidden.bin` (BF16) and

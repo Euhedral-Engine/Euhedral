@@ -133,7 +133,7 @@ Blackwell's hardware LZ4/Snappy/Deflate engine (up to 600 GB/s, built into the c
 driven through nvCOMP) exists only on B200, B300, GB200 and GB300
 ([nvCOMP FAQ](https://docs.nvidia.com/cuda/nvcomp/decompression_engine_faq.html)). **GB203 does not
 have it.** nvCOMP falls back to SM kernels. Euhedral's entropy-coding experiments
-(docs/COMPRESSED_Q3.md) were right to treat decode cost as SM time.
+(docs/quantization/COMPRESSED_Q3.md) were right to treat decode cost as SM time.
 
 ## GSP and AMP
 

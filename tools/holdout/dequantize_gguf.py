@@ -5,7 +5,7 @@ Usage: dequantize_gguf.py ARTIFACT.edrl TEMPLATE-BF16.gguf OUT.gguf [--keep REGE
 
 Scoring OUT.gguf with `llama-perplexity --kl-divergence` measures the artifact's weight rounding alone: llama.cpp runs
 it with its own KV cache and arithmetic, so the engine's NVFP4 KV cache, FP4 prefill activations and relaxed kernels
-are left out (docs/QUALITY.md). TEMPLATE must be the BF16 GGUF of the checkpoint the artifact was converted from
+are left out (docs/evaluation/QUALITY.md). TEMPLATE must be the BF16 GGUF of the checkpoint the artifact was converted from
 (llama.cpp's convert_hf_to_gguf.py --outtype bf16): it is copied, and the data of every tensor the artifact quantizes
 is overwritten in place with the artifact's values rounded to BF16 (metadata, norms and other tensors stay as they
 are). Fused objects are split into llama.cpp's tensors with llama.cpp's head order. Every written tensor is checked

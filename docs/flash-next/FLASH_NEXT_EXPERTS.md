@@ -28,7 +28,7 @@ out.index_add_(rows, weighted)                    BF16 add, one rounding per add
 
 The kernels compute exactly this chain:
 
-- **Weights stay NVFP4** (`row-split-k128-v1`, [NVFP4_NATIVE.md](NVFP4_NATIVE.md)): `gate_up` `[1280][2560]` at record offset 0,
+- **Weights stay NVFP4** (`row-split-k128-v1`, [NVFP4_NATIVE.md](../kernels/NVFP4_NATIVE.md)): `gate_up` `[1280][2560]` at record offset 0,
   `down` `[2560][640]` at record offset 1,843,456, each a complete tensor with its own FP32 global scale. The offsets are kernel
   arguments. No BF16 copy of an expert exists.
 - **Activations are BF16 for every row count.** There is no activation quantization at any size. A weight (E2M1 code times its E4M3

@@ -52,7 +52,7 @@ import java.util.function.Function;
 
 /// The MTP drafter's training corpus ([Corpus]): the artifact's own answers to chat prompts, with the
 /// post-final-norm hidden of every row the base model ran, which is what seeds the drafter
-/// (docs/MTP_CONTRACT.md §2), and the base model's greedy choice after every row, which is what the drafter
+/// (docs/speculation/MTP_CONTRACT.md §2), and the base model's greedy choice after every row, which is what the drafter
 /// learns to draft. A `greedyFraction` of the prompts (chosen by a hash of their ids) is answered greedily; the
 /// others are sampled as the server samples them: the server's default sampling ([SamplingSettings#defaults]) through
 /// the engine's [TokenSampler], seeded by the prompt id, each position's draw keyed by its position.

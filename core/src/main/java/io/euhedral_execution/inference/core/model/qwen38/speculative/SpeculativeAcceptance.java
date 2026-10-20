@@ -7,7 +7,7 @@ import java.util.Objects;
 import java.util.function.IntPredicate;
 import java.util.function.Supplier;
 
-/// Exact-match acceptance of one speculative verification (docs/MTP_CONTRACT.md §4).
+/// Exact-match acceptance of one speculative verification (docs/speculation/MTP_CONTRACT.md §4).
 ///
 /// The verified rows are `[t₀, d₁ .. d_n]`: the last committed token, then n drafts. Row j's selected
 /// token g_j (greedy, or sampled at its position) is base decode's next token after rows 0..j. Drafts are accepted

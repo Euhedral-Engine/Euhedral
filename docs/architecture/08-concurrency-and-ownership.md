@@ -50,6 +50,6 @@ The lake counts admitted units such as generations, quanta and host tasks. Grace
 - [WorkspaceOwner](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/WorkspaceOwner.java), [SequenceOwner](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/SequenceOwner.java) and [StageFrame](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/StageFrame.java).
 - [Generation](../../core/src/main/java/io/euhedral_execution/inference/core/generation/Generation.java), [Admit](../../core/src/main/java/io/euhedral_execution/inference/core/generation/Admit.java) and [Quantum](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/Quantum.java).
 - [HostPool](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/HostPool.java): the search's ingest sinks.
-- [GPU buffer contracts](../../core/src/main/java/io/euhedral_execution/inference/core/gpu/ExecutionGpu.java) and [frame model](../FRAME_MODEL.md).
+- [GPU buffer contracts](../../core/src/main/java/io/euhedral_execution/inference/core/gpu/ExecutionGpu.java) and [frame model](FRAME_MODEL.md).
 
 This diagram omits the external Euhedral-Execution library's internal routing implementation and Flash-Next expert-cache ownership details. It documents the contracts used by this repository.

@@ -18,7 +18,7 @@ public final class AttentionStates implements AutoCloseable {
     private final KvHostPages.Slot hostSlot;
     private boolean closed;
     /// Speculative drafting: base hidden rows that seed MTP rows, and the MTP's own hidden for its next
-    /// recursive row (docs/MTP_CONTRACT.md §4). Allocated by the first quantum that needs them.
+    /// recursive row (docs/speculation/MTP_CONTRACT.md §4). Allocated by the first quantum that needs them.
     private long draftSeedRows;
     private int draftSeedCapacity;
     private long draftRecursionHidden;

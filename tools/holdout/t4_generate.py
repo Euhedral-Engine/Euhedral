@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the T4 documents: the reference model's own answers, thinking included (docs/QUALITY.md, holdout T4).
+"""Generate the T4 documents: the reference model's own answers, thinking included (docs/evaluation/QUALITY.md, holdout T4).
 
 Usage: t4_generate.py SERVER_URL PROMPTS.jsonl OUT.jsonl [--target-tokens N] [--parallel N] [--max-tokens N]
 

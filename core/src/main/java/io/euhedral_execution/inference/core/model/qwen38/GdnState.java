@@ -14,7 +14,7 @@ public final class GdnState implements AutoCloseable {
     private boolean closing;
     private boolean closed;
 
-    /// Speculative verification (docs/MTP_CONTRACT.md §5, ReplaySSM): the state before the latest
+    /// Speculative verification (docs/speculation/MTP_CONTRACT.md §5, ReplaySSM): the state before the latest
     /// verification, its recorded inputs, and replay scratch. Allocated at the first verification.
     private Speculative speculative;
     /// Verified rows the next quantum must replay from the checkpoint before touching this state.

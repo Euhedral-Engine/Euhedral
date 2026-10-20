@@ -22,7 +22,7 @@ tokens, and the next step starts at i plus that count. Predicted tok/s comes fro
 steps ([DFLASH2.md](DFLASH2.md) section 6, `nvfp4-compressed`):
 - each drafted token costs a quarter of MTP4's draft time;
 - a verification costs MTP4's verify time, plus 0.5, 0.6, 0.8 or 1.5 ms per row beyond 5 (4K, 16K, 32K or 64K);
-- a 9-row or wider verification adds an estimated 6 ms, for the exact 9-16-row linears ([NVFP4_NATIVE.md](NVFP4_NATIVE.md)).
+- a 9-row or wider verification adds an estimated 6 ms, for the exact 9-16-row linears ([NVFP4_NATIVE.md](../kernels/NVFP4_NATIVE.md)).
 
 The model predicts MTP4 on chat prompts at 120.5 tok/s at 4K, against 114.5 measured on the benchmark's chat corpus.
 Predictions rank policies; they are not measurements.
@@ -145,7 +145,7 @@ Where the gated lengths' time goes:
 - **Drafts.** Each recursion draft costs 1.0-1.1 ms.
 - **Verified rows.** Each row costs 0.3-0.5 ms on these contexts.
 - **Fewer replays.** A verification's capture key holds its row count and the previous step's pending ReplaySSM rows
-  ([CUDA_GRAPHS.md](CUDA_GRAPHS.md)). Every length a gate chooses multiplies the keys a sequence must see twice
+  ([CUDA_GRAPHS.md](../kernels/CUDA_GRAPHS.md)). Every length a gate chooses multiplies the keys a sequence must see twice
   before replaying. Gated verifications therefore cost 1.2-1.9 ms more than MTP4's while checking 0.2-0.8 more drafts.
 
 ## Rejected

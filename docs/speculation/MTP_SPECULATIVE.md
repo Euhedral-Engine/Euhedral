@@ -42,7 +42,7 @@ identical state, bitwise.
 - **Verifier (row-exact).** Every row goes through the one-row arithmetic (MTP_CONTRACT §6):
   - attention, norms and the GDN recurrence run row by row;
   - Q3, Q4 and Q5 linears use multi-row twins of the one-row GEMVs that repeat its FMA sequence per row; NVFP4 linears use the
-    tensor-core decode kernels, whose token rows are independent MMA columns ([NVFP4_NATIVE.md](NVFP4_NATIVE.md)).
+    tensor-core decode kernels, whose token rows are independent MMA columns ([NVFP4_NATIVE.md](../kernels/NVFP4_NATIVE.md)).
 - **Tests:**
   - `SpeculativeVerifyCudaIntegrationTest`: logits, GDN state and KV after a VERIFY quantum equal
     sequential decode, bitwise, across the 2048-key attention kernel switch; partial commits with replay.
@@ -57,7 +57,7 @@ identical state, bitwise.
 ## 3. Memory
 
 MTP is never host-backed: `HostWeightSelection` only takes `text/layers/N/...` projections and the token embedding (the planner also maps the LM head, read in place, when the device needs room for more sequences; the draft head stays resident because every draft reads it). Sizes of the
-`nvfp4` artifact's objects ([NVFP4_RESIDENCY.md](NVFP4_RESIDENCY.md) for how the engine fits them):
+`nvfp4` artifact's objects ([NVFP4_RESIDENCY.md](../quantization/NVFP4_RESIDENCY.md) for how the engine fits them):
 
 | Item | MiB |
 |---|---|

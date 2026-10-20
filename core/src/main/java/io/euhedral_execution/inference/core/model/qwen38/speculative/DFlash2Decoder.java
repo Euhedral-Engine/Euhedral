@@ -25,7 +25,7 @@ import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import java.util.function.IntPredicate;
 
-/// Greedy DFlash2 speculative decoding for one sequence (docs/DFLASH2.md). Every output token is the token
+/// Greedy DFlash2 speculative decoding for one sequence (docs/speculation/DFLASH2.md). Every output token is the token
 /// ordinary greedy decode produces, and the committed target state is the state it leaves: the drafter only
 /// decides how many tokens one verification commits.
 ///

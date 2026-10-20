@@ -13,7 +13,7 @@ cache takes no device memory: the context length and the weight residency are th
 | `prefix-cache.checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints. A multiple of 512, the prefill chunk. |
 
 The arena is one allocation, 2 MiB aligned with `MADV_HUGEPAGE` and `MADV_COLLAPSE`, registered with `cudaHostRegister`:
-the routine that allocates the host-backed weight arena ([NVFP4_RESIDENCY.md](NVFP4_RESIDENCY.md)), because per-tensor
+the routine that allocates the host-backed weight arena ([NVFP4_RESIDENCY.md](quantization/NVFP4_RESIDENCY.md)), because per-tensor
 pinning falls to 4 KiB pages.
 
 ## What is stored

@@ -1,5 +1,5 @@
 """Python reference harness for Qwen3.8-Flash-Next (`qwen4_exp`): fixtures from the unmodified upstream
-transformers implementation over the weights of Euhedral's NVFP4 EDRL v3 artifact (docs/FLASH_NEXT_REFERENCE.md)."""
+transformers implementation over the weights of Euhedral's NVFP4 EDRL v3 artifact (docs/flash-next/FLASH_NEXT_REFERENCE.md)."""
 
 import sys
 from pathlib import Path

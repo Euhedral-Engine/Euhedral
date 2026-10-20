@@ -25,9 +25,9 @@ and every other setting come from the run's environment. The container and `mise
 | `context.max-tokens` | 32768 | The longest prompt plus completion. The engine keeps device memory for that much KV cache and holds weights in pinned host memory when both do not fit. At most the model's 262144 positions. |
 | `prefix-cache.size` | 4GiB | Pinned host memory for the prefix cache ([PREFIX_CACHE.md](PREFIX_CACHE.md)); 0 turns it off. |
 | `prefix-cache.checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints, a multiple of 512. |
-| `context.kv-cache-format` | the artifact's (`nvfp4`) | The attention cache format: `nvfp4` (144 bytes per head row) or `bf16` (512 bytes, the keys and values as computed). The engine sizes the context's device memory by it ([ATTENTION_DECODE.md](ATTENTION_DECODE.md#cache-formats)). |
+| `context.kv-cache-format` | the artifact's (`nvfp4`) | The attention cache format: `nvfp4` (144 bytes per head row) or `bf16` (512 bytes, the keys and values as computed). The engine sizes the context's device memory by it ([ATTENTION_DECODE.md](kernels/ATTENTION_DECODE.md#cache-formats)). |
 | `batching.max-sequences` | 1 | Generations that run at once, each with its own sequence state (KV cache, recurrent state, workspace) in device memory. Requests beyond it wait in the queue below. `0` takes as many as fit without holding back more weights in host memory than one sequence does; `1` or more is planned exactly as asked, and weights leave the device to make room. Flash-Next artifacts always run one sequence, and `0` yields 1 without a speculation profile or on DFlash2. |
-| `context.kv-cache-on-gpu-tokens` | 65536 | Tokens of each sequence's attention cache that stay in device memory. When the weights and every sequence's whole cache do not fit, the pages past this many tokens move to pinned host memory before any weight leaves the GPU, and each attention layer copies them in before it reads them ([ATTENTION_DECODE.md](ATTENTION_DECODE.md#cache-pages-in-host-memory)). Raise it to keep more of the cache on the GPU at the price of weights in host memory; lower it to fit longer contexts or more sequences. |
+| `context.kv-cache-on-gpu-tokens` | 65536 | Tokens of each sequence's attention cache that stay in device memory. When the weights and every sequence's whole cache do not fit, the pages past this many tokens move to pinned host memory before any weight leaves the GPU, and each attention layer copies them in before it reads them ([ATTENTION_DECODE.md](kernels/ATTENTION_DECODE.md#cache-pages-in-host-memory)). Raise it to keep more of the cache on the GPU at the price of weights in host memory; lower it to fit longer contexts or more sequences. |
 | `batching.max-tokens-per-pass` | the prefill chunk | The most rows one shared decode or verification pass holds; lower it to bound a pass. It also caps the sequence count `batching.max-sequences: 0` chooses. |
 | `batching.max-sequences-per-pass` | unlimited (1 with DFlash2) | The most sequences one shared pass serves; with DFlash2 a pass serves one. |
 | `batching.prefill-chunk-tokens` | 512 | The rows the workspace holds per pass, the longest prefill chunk it runs. |
@@ -39,7 +39,7 @@ and every other setting come from the run's environment. The container and `mise
 | `memory.weight-streaming.*` | 8, 1, 4, 2 | Flash-Next expert streaming: `concurrent-reads` (records read from the artifact at once), `read-split` (parts one record read is split into), `copy-streams` (CUDA streams copying experts to the GPU), `gpu-streams` (device lanes a step spreads over). |
 | `host.task-parallelism` | 8 | Ingest sinks of each pool of ready host work: more spread the contention of the workers that publish and take frames. |
 | `host.idle-release` | 1s | Idle time before the workers stop polling an idle pool of work; `0` never releases them. |
-| `kernels.trellis.*` | 512, auto, 64, 128 | Trellis kernel thresholds ([TRELLIS.md](TRELLIS.md#speed)): `tensor-core-max-tokens`, `target-blocks` (auto = 8 per streaming multiprocessor), `whole-k-min-tokens`, `wide-block-min-tokens`. |
+| `kernels.trellis.*` | 512, auto, 64, 128 | Trellis kernel thresholds ([TRELLIS.md](quantization/TRELLIS.md#speed)): `tensor-core-max-tokens`, `target-blocks` (auto = 8 per streaming multiprocessor), `whole-k-min-tokens`, `wide-block-min-tokens`. |
 | `server.shutdown-timeout` | 10s | How long closing the engine waits for its workers to stop. |
 | `server.requests.default-max-tokens` | 4096 | Completion length when a request sets none. |
 | `server.requests.max-queued` | 16 | Requests waiting while every generation slot is busy; more are refused with 503. |
@@ -53,7 +53,7 @@ The machine needs only the NVIDIA driver: each platform's jar (`euhedral-inferen
 
 An artifact carries the tokenizer of the checkpoint it was made from: `tokenizer.json`, `tokenizer_config.json`, the
 chat template, and the `bos_token_id`, `eos_token_id` and `pad_token_id` of `generation_config.json`, in a section after
-its weights ([FLASH_NEXT_ARTIFACT.md](FLASH_NEXT_ARTIFACT.md#tokenizer-section)). The converters and `quantization
+its weights ([FLASH_NEXT_ARTIFACT.md](flash-next/FLASH_NEXT_ARTIFACT.md#tokenizer-section)). The converters and `quantization
 assemble` / `export-drafter` write it. An artifact without one stops the server with the command that adds it, which
 writes only that section and leaves every other byte of the artifact as it is:
 
@@ -162,7 +162,7 @@ read from the engine when the endpoint is scraped.
 | `euhedral_speculative_accepted_total{drafts}` | counter | Steps by the number of drafted tokens accepted (`0` to the artifact's depth): the acceptance histogram |
 | `euhedral_speculative_accepted_tokens_total` | counter | Drafted tokens accepted; divided by the verifications, the mean accepted per step |
 
-Only greedy, unconstrained requests speculate ([MTP_SPECULATIVE.md](MTP_SPECULATIVE.md)).
+Only greedy, unconstrained requests speculate ([MTP_SPECULATIVE.md](speculation/MTP_SPECULATIVE.md)).
 
 ### Prefix cache
 

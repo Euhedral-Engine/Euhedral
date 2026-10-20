@@ -4,7 +4,7 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.KernelArguments;
 
 /// Typed launches of the QSA (Qwen Sparse Attention) kernels of native/src/qwen4/qsa_*.cuh
-/// (docs/FLASH_NEXT_QSA.md): the geometry each kernel is written for and the argument checks the
+/// (docs/flash-next/FLASH_NEXT_QSA.md): the geometry each kernel is written for and the argument checks the
 /// native launcher cannot make. Every method queues on the GPU's selected stream and none allocates
 /// on the hot path.
 public final class QsaOps {

@@ -73,7 +73,7 @@ class MixedArtifactCudaIntegrationTest {
         assumeTrue(Files.isRegularFile(tokenizer.resolve("tokenizer.json")), "no tokenizer");
         int[] text = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizer))
                 .encodeText(Files.readString(
-                        SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/FRAME_MODEL.md")));
+                        SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/architecture/FRAME_MODEL.md")));
         assumeTrue(text.length >= PROMPT + 2 * ROWS + 500, "the prompt text is too short");
         return text;
     }

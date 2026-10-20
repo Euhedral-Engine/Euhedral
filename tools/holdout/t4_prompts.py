@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the T4 prompt set: a fixed sample of public training-split prompts (docs/QUALITY.md, holdout T4).
+"""Build the T4 prompt set: a fixed sample of public training-split prompts (docs/evaluation/QUALITY.md, holdout T4).
 
 Usage: t4_prompts.py OUT.jsonl
 

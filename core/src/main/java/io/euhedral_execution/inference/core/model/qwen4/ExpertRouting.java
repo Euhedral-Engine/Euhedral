@@ -6,7 +6,7 @@ import java.nio.ByteOrder;
 import java.util.Arrays;
 
 /// Host-side grouping of a chunk's routed (row, expert) pairs by expert, and the description the expert
-/// kernels and the combine read (docs/FLASH_NEXT_EXPERTS.md).
+/// kernels and the combine read (docs/flash-next/FLASH_NEXT_EXPERTS.md).
 ///
 /// A chunk's router output is `topKIds`/`topKWeights`, `[rows][topK]` row-major, ids in `[0, experts]` (the id
 /// `experts` is padding and is skipped, as upstream skips it) and BF16 weight bits. [#plan] groups the pairs by

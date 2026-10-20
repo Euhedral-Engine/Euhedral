@@ -2,7 +2,7 @@
 
 NVFP4: E2M1 values in blocks of 16 along K, one E4M3 scale per block, one FP32 scale per tensor
 (layout row-split-k128-v1). NVFP4-SD4 draws each tensor's block scales from a table of 16 E4M3 codes
-(layout row-split-k128-sd4-v1, docs/NVFP4_COMPRESSED.md). The CUDA path (needs PyTorch) performs the
+(layout row-split-k128-sd4-v1, docs/quantization/NVFP4_COMPRESSED.md). The CUDA path (needs PyTorch) performs the
 same float32/float64 operations in the same order, with IEEE division and round-half-to-even, so its
 output bytes equal the CPU path's.
 """
@@ -34,7 +34,7 @@ SD4_TABLE = 16
 # clips its largest values; 0: never more than plain NVFP4 clips), and is costed exactly up to
 # SD4_ABOVE codes above it; further above, its values all round to zero, so its cost is its energy.
 # Allowing 2 codes below lowered the squared error but not the teacher-forced NLL
-# (docs/NVFP4_COMPRESSED.md), and clipped the largest weights by up to 14%.
+# (docs/quantization/NVFP4_COMPRESSED.md), and clipped the largest weights by up to 14%.
 SD4_BELOW = 0
 SD4_ABOVE = 40
 E4M3_CODES = 127

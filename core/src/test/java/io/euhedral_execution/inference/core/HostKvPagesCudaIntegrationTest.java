@@ -77,10 +77,10 @@ class HostKvPagesCudaIntegrationTest {
     /// A long document of the repository (the tests run from a module directory).
     private static Path document() {
         for (Path directory = Path.of("").toAbsolutePath(); directory != null; directory = directory.getParent()) {
-            Path document = directory.resolve("docs/FRAME_MODEL.md");
+            Path document = directory.resolve("docs/architecture/FRAME_MODEL.md");
             if (Files.isRegularFile(document)) return document;
         }
-        throw new IllegalStateException("no docs/FRAME_MODEL.md above the working directory");
+        throw new IllegalStateException("no docs/architecture/FRAME_MODEL.md above the working directory");
     }
 
     /// Greedy tokens of two sessions over the same long prompt, speculation off then on, and the weight bytes the

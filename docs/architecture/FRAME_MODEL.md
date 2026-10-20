@@ -335,7 +335,7 @@ Every piece of host work a request needs runs as frames on the lattice's workers
   keep-alive (an SSE comment, or Anthropic's `ping`) from the second prefill quantum on. The same tasks probe the queued
   requests, which give up their places. Measured on `q3`: a JSON client that left closed its session 9 ms later, and a
   stream abandoned 1 s into a 13 s prefill let the next request run 0.45 s later.
-- **The prefix cache** ([PREFIX_CACHE.md](PREFIX_CACHE.md)) captures and restores sequence state between quanta. Its
+- **The prefix cache** ([PREFIX_CACHE.md](../PREFIX_CACHE.md)) captures and restores sequence state between quanta. Its
   tree belongs to its owner: lookups, reservations, publications and releases are frames ordered on `PrefixCache.HASH`.
   Its copies are queued asynchronously on the cache's own stream in pieces of at most 16 MiB, so a worker is never held
   for a whole checkpoint, and their device completion is a frame. Each prefix step tells the session what happened and
@@ -407,13 +407,13 @@ prefill, M < 64:             SMALL view: A + D, ordinary FFN and attention
 
 - A: rounded residual add + following RMSNorm (the final model layer keeps its plain residual).
 - B: FFN gate/up with a SwiGLU epilogue, one region (`Q3_GATE_UP_SWIGLU`) for Q3 and NVFP4 weights alike: the paired MXFP8 kernel
-  ([PREFILL_MX.md](PREFILL_MX.md)) or the paired native FP4 kernel ([NVFP4_NATIVE.md](NVFP4_NATIVE.md)). The FFN down is an
+  ([PREFILL_MX.md](../kernels/PREFILL_MX.md)) or the paired native FP4 kernel ([NVFP4_NATIVE.md](../kernels/NVFP4_NATIVE.md)). The FFN down is an
   ordinary linear in every view. There is no streamed FFN view.
 - D: joint BF16 A/B projection + GDN control, submitted before the heavy Q4/Q5 projections.
 - Every view keeps the attention producers as leaf frames: Q4 projection -> Q/K normalization and RoPE
   (into the normalized Q/K buffer), and Q5 projection -> NVFP4 K/V page append, committed at the
   quantum's retirement.
-- Host-backed weights add a `WEIGHT_TRANSFER` stage per use to every view ([NVFP4_RESIDENCY.md](NVFP4_RESIDENCY.md)).
+- Host-backed weights add a `WEIGHT_TRANSFER` stage per use to every view ([NVFP4_RESIDENCY.md](../quantization/NVFP4_RESIDENCY.md)).
 
 Full attention stores K and V in sequence-owned 256-token pages. Each D256 head is rotated by
 normalized H256 and encoded as 128 bytes of E2M1 codes plus 16 E4M3 scales (one per contiguous group
@@ -421,17 +421,17 @@ of 16 values). Device page tables contain raw addresses; growing a sequence allo
 copying existing KV payloads, and sequence cleanup releases pages and any decode scratch only after
 admitted GPU work has drained. Prefill attention is the FlashAttention-2 style leaf with producer warps for quanta of 512 or more
 rows (or 128 or more once the cache holds 2048 keys), and a 32-query by 32-key tile with FP16 tensor-core operands, FP32
-accumulation and online softmax otherwise ([PREFILL_MX.md](PREFILL_MX.md)). Single-token decode splits the visible prefix into
+accumulation and online softmax otherwise ([PREFILL_MX.md](../kernels/PREFILL_MX.md)). Single-token decode splits the visible prefix into
 about 48-key spans (at most 64) per query head below 2048 keys, one CTA each, and merges FP32 softmax statistics in a second
 kernel; from 2048 keys one three-warp tensor-core CTA per KV head and 32-key split serves the whole query-head group
-([ATTENTION_DECODE.md](ATTENTION_DECODE.md)). Correctness is defined against the represented NVFP4 values within the existing
+([ATTENTION_DECODE.md](../kernels/ATTENTION_DECODE.md)). Correctness is defined against the represented NVFP4 values within the existing
 FP16/MMA and BF16-output tolerance.
 
 Decode and VERIFY quanta that start below 1024 tokens launch their kernels with CUDA programmatic dependent launch
 (`euhedral_cuda_pdl_select`): every kernel registered for it begins with `griddepcontrol.wait`
 (`native/src/common/pdl.cuh`), so it cannot read a predecessor's output early. It won 12 of 12 paired forks
 (about +1%) at a 64-token context and 10 of 12 at 1024, so longer contexts keep ordinary launches. Quanta replayed from
-captured CUDA graphs ([CUDA_GRAPHS.md](CUDA_GRAPHS.md)) carry programmatic edges at every position instead.
+captured CUDA graphs ([CUDA_GRAPHS.md](../kernels/CUDA_GRAPHS.md)) carry programmatic edges at every position instead.
 
 `ExecutionPlan.reference(weights)` is the unfused oracle used by tests; staged plans (`prefix`,
 `embeddingOnly`, operator slices) are also reference-only.
@@ -448,7 +448,7 @@ represented-NVFP4 tolerance for decode attention.
   merge 54 us at 1025 keys; attention per decode token at 1024 context 0.54 ms). In `euhedral_attention_decode_nvfp4` lane l owns
   dimensions 8l .. 8l + 7: one 32-bit code word and one scale per lane and row for K and again for V, the query re-laid out once
   through shared memory; 19.7 us per layer at 1024 context (`_exact` keeps the per-element lane + 32 d kernel, which exact numerics
-  select). From 2048 keys the GQA three-warp kernel runs ([ATTENTION_DECODE.md](ATTENTION_DECODE.md)).
+  select). From 2048 keys the GQA three-warp kernel runs ([ATTENTION_DECODE.md](../kernels/ATTENTION_DECODE.md)).
 - **Decode RMSNorm and BF16 projections.** Batched loads and, for a single row, 40 CTAs that each recompute the same reduction and
   write one slice (no global intermediate): the RMSNorm takes 3.0 us and the BF16 projection 3.5 us.
 - **Q3, Q4 and Q5 decode, contiguous ownership.** Three words of a Q3 group hold exactly 32 whole codes, so in
@@ -459,7 +459,7 @@ represented-NVFP4 tolerance for decode attention.
   GB/s. The FP32 accumulation order differs from the scalar references (`native/src/reference/kernels.cu`), which are the exact
   oracle that `CudaGpuMemory.selectExactNumerics` selects (tests only). Against them fewer than 0.1% of outputs differ, never by
   more than one BF16 ulp, and the error against an FP64 evaluation is unchanged. The 2 to 8 row twins reproduce the one-row kernel
-  bit for bit ([MTP_VERIFIER.md](MTP_VERIFIER.md)).
+  bit for bit ([MTP_VERIFIER.md](../speculation/MTP_VERIFIER.md)).
 - **GDN convolution.** 32-row blocks give 1280 CTAs at 512 rows (68 us); each output reads only the previous three inputs.
 - **Decode fusion.** With every decode GEMV near the DRAM roofline (750-850 GB/s), the remaining decode time is small kernels and
   the gaps between launches. Decode runs its own instance of the short-prefill topology: rounded residual add + RMSNorm is one
@@ -469,7 +469,7 @@ represented-NVFP4 tolerance for decode attention.
 - **Prefill attention.** The 32-query tile expands whole 16-element groups per thread (one 8-byte code load, one scale, two 16-byte
   shared stores; the same exact FP16 values) and four threads share each query row's softmax statistics, so the denominator is
   summed in four partial sums (`euhedral_attention_prefill32_nvfp4_exact` keeps the key-ordered sum): 18 ms per 1024-token prompt.
-  The FlashAttention-2 leaf (`euhedral_attention_prefill_fa2_nvfp4`) takes the larger grids ([PREFILL_MX.md](PREFILL_MX.md)).
+  The FlashAttention-2 leaf (`euhedral_attention_prefill_fa2_nvfp4`) takes the larger grids ([PREFILL_MX.md](../kernels/PREFILL_MX.md)).
 - **Prefill QK norm/RoPE and GDN control.** From two rows the QK RMSNorm + RoPE kernel gives one CTA a row
   (`euhedral_attention_qk_norm_rope_rows_bf16`): it computes the row's angles once in shared memory and gives each head to a warp
   whose shuffle tree reproduces the 256-thread RMS reduction; the RoPE rotation is pinned to explicit roundings in both layouts, so
@@ -487,7 +487,7 @@ native FP4 prefill routes, the one-row residual norm, the prefill attention soft
 contiguous and GQA decode attention) is replaced by the exact kernel under exact numerics, and
 `RelaxedNumericsDriftCudaIntegrationTest` compares the two end to end. The Q3 artifact's relaxed numerics measure a hidden-state
 relative error of 6.0e-2, KL 5.1e-3 and top-1 agreement 0.961 over 8 windows of 48 positions, with no growth by position
-([PREFILL_MX.md](PREFILL_MX.md)); a single one-ulp perturbation (the decode attention merge order) gives about 5.4% and KL 2.6e-3,
+([PREFILL_MX.md](../kernels/PREFILL_MX.md)); a single one-ulp perturbation (the decode attention merge order) gives about 5.4% and KL 2.6e-3,
 so the combined error stays at the model's sensitivity floor: one-ulp BF16 differences settle at this level in the 64-layer
 recurrent model whichever operation causes them.
 
@@ -520,7 +520,7 @@ numbers are medians unless said otherwise.
 - **Dense decode (Q3, speculation off, graphs replayed).** From the start of a token's retirement frame to the start of
   the next token's replay frame: 170-180 us, of which the retirement 36, `Select` 20, `Admit` 85, and the hops about 30.
   The token is 17 ms of device time, so the whole boundary is 1%. Speculative steps have three such boundaries, about
-  0.5 ms of 20 ([CUDA_GRAPHS.md](CUDA_GRAPHS.md)). Where a boundary frame runs matters little: the retirement is 27%
+  0.5 ms of 20 ([CUDA_GRAPHS.md](../kernels/CUDA_GRAPHS.md)). Where a boundary frame runs matters little: the retirement is 27%
   slower on an E-core (42 against 33 us), `Admit` is the same on either, and the replay frame's 0.5-0.9 ms check of
   every stage (E-core: twice that) runs behind the launched graph.
 - **Frame-by-frame quanta.** A 64-token prefill is 756 stage frames: the host submits all of them in 18-30 ms, and the

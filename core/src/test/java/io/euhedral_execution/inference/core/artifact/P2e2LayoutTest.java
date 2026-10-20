@@ -104,7 +104,7 @@ class P2e2LayoutTest {
         return codes;
     }
 
-    /// The layout of docs/COMPRESSED_Q3.md with zero scales.
+    /// The layout of docs/quantization/COMPRESSED_Q3.md with zero scales.
     private static MemorySegment encode(Arena arena, int[][] codes) {
         int rows = codes.length, k = codes[0].length;
         int units = 0;

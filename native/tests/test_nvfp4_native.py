@@ -1,4 +1,4 @@
-"""Native Blackwell NVFP4 kernels (native/src/nvfp4_native, docs/NVFP4_NATIVE.md) against float64.
+"""Native Blackwell NVFP4 kernels (native/src/nvfp4_native, docs/kernels/NVFP4_NATIVE.md) against float64.
 
 The linear kernels are checked over the operands they actually consume (the quantized activations
 read back from the activation buffer and the converter's quantized weights), so any deviation beyond

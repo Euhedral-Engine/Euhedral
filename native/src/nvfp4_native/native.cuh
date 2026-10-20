@@ -3,7 +3,7 @@
 //
 // Compiled only for sm_120a/sm_120f (cuda_kernel_loader: arch-specific modules). The instruction is
 //   mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3
-// (SASS OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X). Contract, measured on an RTX 5070 Ti (docs/NVFP4_NATIVE.md):
+// (SASS OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X). Contract, measured on an RTX 5070 Ti (docs/kernels/NVFP4_NATIVE.md):
 // with g = lane / 4 and t = lane % 4,
 //   A (16 x 64): a0 row g, K 8t..8t+7; a1 row g+8; a2, a3 the same rows at K + 32. Nibble j is K 8t+j.
 //   B (64 x 8):  b0 column g, K 8t..8t+7; b1 at K + 32.

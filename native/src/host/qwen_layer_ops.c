@@ -791,7 +791,7 @@ static int attention_causal(const struct attention_kernels* kernels, const void*
     CUfunction decode = exact ? kernels->decode_exact : kernels->decode;
     uint32_t decode_grid = query_heads * splits, decode_block = 128;
     // Relaxed numerics from 2048 keys: one three-warp tensor-core CTA (96 threads) per (KV head, 32-key split, at most 64)
-    // serves the KV head's whole query-head group (docs/ATTENTION_DECODE.md). Shorter contexts keep the per-query-head
+    // serves the KV head's whole query-head group (docs/kernels/ATTENTION_DECODE.md). Shorter contexts keep the per-query-head
     // kernel, which measured faster in decode at 1024 keys.
     uint32_t group = query_heads / key_heads;
     if (!exact && length >= 2048u && group <= 8u) {
