@@ -70,26 +70,30 @@ public final class TokenizerSection {
         return section.array();
     }
 
-    /// Where the artifact's own content ends: the start of its tokenizer section, or the end of the file when it
-    /// has none.
+    /// Where the content of the artifact at `path`, open as `channel`, ends: the start of its tokenizer section, or
+    /// the end of the file when it has none.
     ///
-    /// @throws ArtifactFormatException when the footer is present but names a section the file cannot hold
-    public static long contentEnd(FileChannel channel) throws IOException {
-        return footer(channel).map(Footer::sectionStart).orElse(channel.size());
+    /// @throws ArtifactFormatException naming `path` when the footer is present but names a section the file cannot
+    ///     hold
+    public static long contentEnd(Path path, FileChannel channel) throws IOException {
+        return footer(path, channel).map(Footer::sectionStart).orElse(channel.size());
     }
 
     /// The tokenizer files of the artifact at `path`, or empty when it carries none.
     ///
-    /// @throws ArtifactFormatException when the section is damaged
+    /// @throws ArtifactFormatException naming `path` when the section is damaged
     public static Optional<TokenizerFiles> read(Path path) throws IOException {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-            Optional<Footer> footer = footer(channel);
+            Optional<Footer> footer = footer(path, channel);
             if (footer.isEmpty()) return Optional.empty();
             ByteBuffer body = ByteBuffer.allocate((int) footer.get().bodyLength());
             ArtifactFileAccess.readFully(channel, footer.get().sectionStart(), body, "tokenizer section");
-            if (crc(body.array()) != footer.get().crc())
-                throw new ArtifactFormatException(path + ": the tokenizer section fails its CRC-32");
-            return Optional.of(decode(body.array()));
+            if (crc(body.array()) != footer.get().crc()) throw damaged(path, "the tokenizer section fails its CRC-32");
+            try {
+                return Optional.of(decode(body.array()));
+            } catch (ArtifactFormatException damaged) {
+                throw damaged(path, damaged.getMessage());
+            }
         }
     }
 
@@ -122,7 +126,7 @@ public final class TokenizerSection {
 
     private record Footer(long sectionStart, long bodyLength, int crc) {}
 
-    private static Optional<Footer> footer(FileChannel channel) throws IOException {
+    private static Optional<Footer> footer(Path path, FileChannel channel) throws IOException {
         long size = channel.size();
         if (size < FOOTER_BYTES) return Optional.empty();
         ByteBuffer footer = ByteBuffer.allocate(FOOTER_BYTES).order(ORDER);
@@ -132,10 +136,16 @@ public final class TokenizerSection {
         int crc = footer.getInt();
         int version = footer.getInt();
         if (footer.getLong() != MAGIC) return Optional.empty();
-        if (version != VERSION) throw new ArtifactFormatException("unsupported tokenizer section version " + version);
+        if (version != VERSION) throw damaged(path, "unsupported tokenizer section version " + version + REPAIR);
         if (bodyLength < 0 || bodyLength > MAX_BODY_BYTES || bodyLength > size - FOOTER_BYTES)
-            throw new ArtifactFormatException("the tokenizer section's length is out of range: " + bodyLength);
+            throw damaged(path, "the tokenizer section's length is out of range: " + bodyLength + REPAIR);
         return Optional.of(new Footer(size - FOOTER_BYTES - bodyLength, bodyLength, crc));
+    }
+
+    private static final String REPAIR = "; running package-tokenizer on the artifact again replaces the section";
+
+    private static ArtifactFormatException damaged(Path path, String message) {
+        return new ArtifactFormatException(path + ": " + message);
     }
 
     private static TokenizerFiles decode(byte[] body) throws ArtifactFormatException {

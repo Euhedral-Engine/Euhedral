@@ -305,6 +305,37 @@ class FlashNextConverterTest(unittest.TestCase):
         edrl.convert(self.checkpoint, output, jobs=1, log=self.quiet)
         self.assertEqual(output.read_bytes(), reference.read_bytes())
 
+    def test_a_conversion_stopped_after_its_tokenizer_resumes_without_rewriting(self) -> None:
+        reference = self.convert("reference-section.edrl")
+        output = self.root / "stopped.edrl"
+        original_replace = edrl.os.replace
+
+        def stopped(*_):
+            raise RuntimeError("simulated crash before the rename")
+
+        edrl.os.replace = stopped
+        try:
+            with self.assertRaises(RuntimeError):
+                edrl.convert(self.checkpoint, output, jobs=1, log=self.quiet)
+        finally:
+            edrl.os.replace = original_replace
+        partial = Path(f"{output}.partial")
+        self.assertEqual(reference.stat().st_size, partial.stat().st_size, "the section is already appended")
+        original_work = edrl._work
+        calls = {"count": 0}
+
+        def counted(item):
+            calls["count"] += 1
+            return original_work(item)
+
+        edrl._work = counted
+        try:
+            edrl.convert(self.checkpoint, output, jobs=1, log=self.quiet)
+        finally:
+            edrl._work = original_work
+        self.assertEqual(0, calls["count"])
+        self.assertEqual(output.read_bytes(), reference.read_bytes())
+
     def test_rejects_a_checkpoint_with_an_unknown_tensor(self) -> None:
         source_file = self.checkpoint / "model-00002-of-00002.safetensors"
         extra = self.checkpoint / "model-00003-of-00003.safetensors"

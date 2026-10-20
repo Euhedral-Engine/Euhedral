@@ -334,6 +334,27 @@ class ArtifactBinaryTest {
         assertEquals(TestTokenizer.FILES, TokenizerSection.require(path));
     }
 
+    @Test
+    void aDamagedFooterNamesTheArtifactAndAddingTheTokenizerRepairsIt() throws Exception {
+        Qwen38Config config = sampleConfig();
+        Path path = tempDirectory.resolve("damaged.edrl");
+        CompactArtifactWriter.write(path, artifact(config, descriptors(config)), PAYLOAD, TestTokenizer.FILES);
+        long contentEnd = ArtifactTokenizer.contentEnd(path);
+        byte[] content = Arrays.copyOf(Files.readAllBytes(path), (int) contentEnd);
+        // The footer's version field.
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            channel.write(ByteBuffer.allocate(Integer.BYTES).putInt(0, 99), channel.size() - 12);
+        }
+        var failure = assertThrows(ArtifactFormatException.class, () -> ArtifactReader.read(path));
+        assertTrue(failure.getMessage().startsWith(path + ": "), failure.getMessage());
+        assertTrue(failure.getMessage().contains("package-tokenizer"), failure.getMessage());
+
+        ArtifactTokenizer.add(path, TestTokenizer.FILES);
+        assertArrayEquals(content, Arrays.copyOf(Files.readAllBytes(path), content.length));
+        assertEquals(TestTokenizer.FILES, TokenizerSection.require(path));
+        ArtifactReader.read(path);
+    }
+
     private static byte[] digest(byte[] bytes) throws Exception {
         return MessageDigest.getInstance("SHA-256").digest(bytes);
     }

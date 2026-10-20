@@ -62,6 +62,8 @@ writes only that section and leaves every other byte of the artifact as it is:
 ```
 
 `--out COPY.edrl` writes a copy with the section and leaves the artifact alone. Running it again replaces the section.
+An interrupted run can leave the artifact unreadable (a Flash-Next artifact reports that its header declares fewer bytes
+than its content holds); running the command again repairs it.
 
 ## Starting
 

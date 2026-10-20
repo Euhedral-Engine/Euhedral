@@ -41,5 +41,13 @@ class TokenizerSectionTest(unittest.TestCase):
             self.assertEqual(bytes(range(200)), artifact.read_bytes()[:200])
 
 
+    def test_a_damaged_footer_names_the_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary) / "a.edrl"
+            artifact.write_bytes(bytes(64) + tokenizer_section.FOOTER.pack(
+                tokenizer_section.MAX_BODY_BYTES + 1, 0, tokenizer_section.VERSION, tokenizer_section.MAGIC))
+            with self.assertRaisesRegex(tokenizer_section.SectionError, f"^{artifact}: .*out of range"):
+                tokenizer_section.content_end(artifact)
+
 if __name__ == "__main__":
     unittest.main()

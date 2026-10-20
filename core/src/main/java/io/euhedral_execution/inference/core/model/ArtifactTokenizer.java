@@ -24,14 +24,15 @@ public final class ArtifactTokenizer {
         }
     }
 
-    /// Where the artifact's content ends, from its format: for version 3 the size its header declares; for version 2
-    /// the end of its last payload (or of its tables when it has none).
+    /// Where the artifact's content ends, from its format alone, so a damaged tokenizer section does not hide it: for
+    /// version 3 the size its header declares; for version 2 the end of its last payload (or of its tables when it
+    /// has none).
     public static long contentEnd(Path artifact) throws IOException {
         return switch (ModelArchitecture.detect(artifact)) {
             case QWEN4_EXP ->
                 io.euhedral_execution.inference.core.model.qwen4.loader.ArtifactReader.declaredSize(artifact);
             case QWEN38_DENSE -> {
-                var dense = ArtifactReader.read(artifact);
+                var dense = ArtifactReader.readIgnoringTokenizer(artifact);
                 long end = dense.header().tensorDataOffset();
                 for (TensorDescriptor tensor : dense.tensors())
                     end = Math.max(end, tensor.dataOffset() + tensor.byteSize());

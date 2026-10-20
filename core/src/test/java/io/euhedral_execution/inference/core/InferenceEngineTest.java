@@ -15,7 +15,9 @@ import io.euhedral_execution.inference.core.model.qwen38.loader.EngineModelFixtu
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.state.KvFormat;
+import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
+import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -224,7 +226,7 @@ class InferenceEngineTest {
         var config = config();
         withoutTokenizer();
         var bootstrap = new FakeBootstrap();
-        var failure = assertThrows(java.io.IOException.class, () -> InferenceEngine.load(config, bootstrap));
+        var failure = assertThrows(IOException.class, () -> InferenceEngine.load(config, bootstrap));
         assertTrue(
                 failure.getMessage().contains("carries no tokenizer")
                         && failure.getMessage().contains("package-tokenizer --artifact " + config.artifactPath()),
@@ -439,7 +441,7 @@ class InferenceEngineTest {
                         int sequences,
                         int kvDeviceMinimumTokens,
                         Tuning tuning)
-                        throws java.io.IOException {
+                        throws IOException {
                     if (selected == 2) throw new IllegalStateException("model");
                     if (selected == 3)
                         return EngineModelFixture.load(
@@ -470,7 +472,7 @@ class InferenceEngineTest {
         var config = config();
         withoutTokenizer();
         var bootstrap = new FakeBootstrap();
-        assertThrows(java.io.IOException.class, () -> InferenceEngine.load(config, bootstrap));
+        assertThrows(IOException.class, () -> InferenceEngine.load(config, bootstrap));
         assertFalse(bootstrap.gpuClosed);
         try (var engine = InferenceEngine.load(config(), new FakeBootstrap())) {
             assertFalse(engine.isClosed());
@@ -642,6 +644,22 @@ class InferenceEngineTest {
     }
 
     @Test
+    void snapshotOfAnArtifactWhoseFileIsGoneHasNoMeasuredSize() throws Exception {
+        var config = config();
+        var tokenizer = QwenTokenizer.load(TOKENIZER);
+        Files.delete(config.artifactPath());
+        var bootstrap = new FakeBootstrap() {
+            @Override
+            QwenTokenizer readTokenizer(Path artifact) {
+                return tokenizer;
+            }
+        };
+        try (var engine = InferenceEngine.load(config, bootstrap)) {
+            assertNull(engine.snapshot().model().artifactBytes(), "missing artifact file has no measured size");
+        }
+    }
+
+    @Test
     void snapshotRecordsTheEngineConfigurationIdentityAndSuppliedGeneration() throws Exception {
         var config = config();
         var generation = new GenerationConfig(0.5f, 3, 0.9f, 7L, false);
@@ -807,7 +825,7 @@ class InferenceEngineTest {
                 int sequences,
                 int kvDeviceMinimumTokens,
                 Tuning tuning)
-                throws java.io.IOException {
+                throws IOException {
             modelLoads++;
             this.kvFormat = kvFormat;
             return EngineModelFixture.load(gpu, EngineExecutionFixture.weights());

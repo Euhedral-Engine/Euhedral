@@ -11,9 +11,7 @@ import java.util.List;
 
 /// Checks what the server needs before anything loads, and reports every problem at once, each with the setting that
 /// names it: the artifact the settings point at (with the tokenizer it carries), and the NVIDIA driver with a GPU.
-/// Without it a wrong path surfaces
-/// as the first exception of the engine's load, after the weights
-/// were read.
+/// Without it a wrong path surfaces as the first exception of the engine's load, after the weights were read.
 final class SetupCheck {
     private SetupCheck() {}
 

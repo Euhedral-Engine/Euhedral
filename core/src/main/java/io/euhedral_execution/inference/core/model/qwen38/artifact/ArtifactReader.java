@@ -20,6 +20,16 @@ public final class ArtifactReader {
     private ArtifactReader() {}
 
     public static Artifact read(Path path) throws IOException {
+        return read(path, true);
+    }
+
+    /// Reads the artifact at `path` without looking at its tokenizer section: every byte of the file may hold
+    /// payloads, so a damaged or partly written section does not stop the read. Adding a tokenizer reads this way.
+    public static Artifact readIgnoringTokenizer(Path path) throws IOException {
+        return read(path, false);
+    }
+
+    private static Artifact read(Path path, boolean withTokenizer) throws IOException {
         if (path == null) {
             throw new ArtifactFormatException("input path is null");
         }
@@ -28,7 +38,7 @@ public final class ArtifactReader {
                 throw new ArtifactFormatException("artifact is truncated before the header");
             }
             // Payloads end before the tokenizer section, if the artifact carries one.
-            long fileSize = TokenizerSection.contentEnd(channel);
+            long fileSize = withTokenizer ? TokenizerSection.contentEnd(path, channel) : channel.size();
 
             ArtifactHeader header = readHeader(channel);
             validateHeader(header, fileSize);

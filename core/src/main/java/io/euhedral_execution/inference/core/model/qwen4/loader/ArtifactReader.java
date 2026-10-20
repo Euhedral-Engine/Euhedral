@@ -43,7 +43,7 @@ public final class ArtifactReader {
     public static Artifact read(Path path) throws IOException {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
             if (channel.size() < Header.BYTE_SIZE) throw invalid("artifact is truncated before the header");
-            Header header = readHeader(channel, TokenizerSection.contentEnd(channel));
+            Header header = readHeader(channel, TokenizerSection.contentEnd(path, channel));
             Qwen4Config config = Qwen4Config.fromMetadata(
                     Metadata.decode(readRegion(channel, header.metadataOffset(), header.metadataSize(), "metadata")));
             byte[] tables = readRegion(channel, header.tablesOffset(), header.tablesSize(), "tables");
@@ -90,6 +90,10 @@ public final class ArtifactReader {
                     "unsupported artifact version " + version + ": this reader handles version " + Header.VERSION);
         if (architecture != Header.ARCHITECTURE_QWEN4_EXP) throw invalid("unsupported architecture " + architecture);
         if (reserved != 0) throw invalid("header reserved field must be zero");
+        if (declaredSize < fileSize)
+            throw invalid("header declares " + declaredSize + " bytes but the file's content holds " + fileSize
+                    + ": an interrupted package-tokenizer leaves bytes after the content without a tokenizer footer;"
+                    + " running package-tokenizer on the artifact again repairs it");
         if (declaredSize != fileSize)
             throw invalid("header declares " + declaredSize + " bytes but the file's content holds " + fileSize);
         if (metadataOffset != Header.BYTE_SIZE) throw invalid("metadata must immediately follow the header");
