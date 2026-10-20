@@ -17,7 +17,8 @@ import org.slf4j.LoggerFactory;
 ///
 /// An expert is used through a lease, which pins its slot: a slot that is loading or leased is
 /// never evicted or refilled, so the address a lease exposes is valid until it is closed.
-/// Everything else is replaced by S3-FIFO (docs/flash-next/FLASH_NEXT_CACHE.md): a new record enters a small queue (a tenth
+/// Everything else is replaced by S3-FIFO (docs/flash-next/FLASH_NEXT_CACHE.md): a new record enters a small queue (a
+/// tenth
 /// of the slots), and one asked for again there moves to the main queue; the main queue gives a record asked for
 /// again another round (a 2-bit count). A record evicted from the small queue unused is remembered, and enters the
 /// main queue if it returns. A slot leaves its queue while leased and returns to the tail of it when the last

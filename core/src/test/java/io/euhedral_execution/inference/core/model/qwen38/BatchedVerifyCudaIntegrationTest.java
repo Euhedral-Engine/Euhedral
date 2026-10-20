@@ -42,8 +42,8 @@ class BatchedVerifyCudaIntegrationTest {
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int[] text = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory))
-                .encodeText(Files.readString(
-                        SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/architecture/FRAME_MODEL.md")));
+                .encodeText(Files.readString(SpeculativeVerifyCudaIntegrationTest.repositoryRoot()
+                        .resolve("docs/architecture/FRAME_MODEL.md")));
         int[] prefixes = {300, 411, 530};
         int[][] rounds = {{8, 8, 8}, {5, 8, 3}};
         Path artifact = Path.of(System.getProperty("euhedral.qwen.nvfp4-artifact", SharedQwen38.NVFP4_DEFAULT));
@@ -130,8 +130,8 @@ class BatchedVerifyCudaIntegrationTest {
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int[] text = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory))
-                .encodeText(Files.readString(
-                        SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/architecture/FRAME_MODEL.md")));
+                .encodeText(Files.readString(SpeculativeVerifyCudaIntegrationTest.repositoryRoot()
+                        .resolve("docs/architecture/FRAME_MODEL.md")));
         int[] prefixes = {300, 411, 530};
         Path artifact = Path.of(System.getProperty("euhedral.qwen.nvfp4-artifact", SharedQwen38.NVFP4_DEFAULT));
         long hostBytes = Long.getLong("euhedral.batched.host-mib", 2304L) << 20;

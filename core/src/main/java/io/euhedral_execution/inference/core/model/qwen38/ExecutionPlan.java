@@ -50,7 +50,8 @@ public final class ExecutionPlan {
         ATTENTION_QK_NORM_ROPE,
         ATTENTION_KV_APPEND,
         ATTENTION_CAUSAL,
-        /// MTP stem (docs/speculation/MTP_CONTRACT.md §2): packs [RMSNorm₁₊w(embedding); RMSNorm₁₊w(seed hidden)] per row.
+        /// MTP stem (docs/speculation/MTP_CONTRACT.md §2): packs [RMSNorm₁₊w(embedding); RMSNorm₁₊w(seed hidden)] per
+        /// row.
         MTP_STEM,
         /// Copies a host-backed weight into its staging slot. Its weight's `hostAddress` is the source
         /// and its `deviceAddress` the slot.
@@ -62,7 +63,8 @@ public final class ExecutionPlan {
         /// Copies the target's hidden rows after one tapped layer into the sequence's DFlash2 tap rows (slot
         /// `outputBufferIndex`), in quanta that seed drafting; a no-op otherwise.
         DFLASH_TAP,
-        /// DFlash2 drafter operators (docs/speculation/DFLASH2.md). A linear with no input buffer reads the sequence's tap
+        /// DFlash2 drafter operators (docs/speculation/DFLASH2.md). A linear with no input buffer reads the sequence's
+        /// tap
         /// rows.
         DFLASH_LINEAR,
         DFLASH_RMS_NORM,
@@ -1629,7 +1631,8 @@ public final class ExecutionPlan {
         return new PlanData(List.copyOf(nodes), List.of(), buffers, true, false);
     }
 
-    /// The DFlash2 block view (DRAFT, docs/speculation/DFLASH2.md): the anchor and mask tokens' embedding, the draft layers
+    /// The DFlash2 block view (DRAFT, docs/speculation/DFLASH2.md): the anchor and mask tokens' embedding, the draft
+    /// layers
     /// over all rows of the block at once, the final norm, the target's output head over the proposal rows,
     /// their top candidates, and the selector's path.
     private static PlanData dflash2Block(Weights weights, DFlash2Weights drafter) {

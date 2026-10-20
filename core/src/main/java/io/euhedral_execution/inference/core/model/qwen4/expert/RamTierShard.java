@@ -19,7 +19,8 @@ import java.util.concurrent.atomic.AtomicLongArray;
 /// ## Replacement
 ///
 /// The tier sees only the device's misses, from which recency is already filtered, so it replaces by frequency
-/// (docs/flash-next/FLASH_NEXT_CACHE.md): the victim is the least requested of [#SAMPLE] ready slots drawn at random, the
+/// (docs/flash-next/FLASH_NEXT_CACHE.md): the victim is the least requested of [#SAMPLE] ready slots drawn at random,
+/// the
 /// least recently planned among equals. The counts are halved every [#AGE_PER_SLOT] requests per slot, so a record
 /// that was hot long ago does not hold its slot forever.
 ///

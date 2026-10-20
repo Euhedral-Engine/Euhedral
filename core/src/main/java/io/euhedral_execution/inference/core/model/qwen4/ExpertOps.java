@@ -4,7 +4,8 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.KernelArguments;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertBank;
 
-/// Typed launches of the routed-expert kernels (native/src/qwen4/experts.cuh, docs/flash-next/FLASH_NEXT_EXPERTS.md): the
+/// Typed launches of the routed-expert kernels (native/src/qwen4/experts.cuh, docs/flash-next/FLASH_NEXT_EXPERTS.md):
+/// the
 /// NVFP4 math of resident experts, one expert or several per launch. Every method queues on the GPU's selected stream.
 ///
 /// The experts stay NVFP4 in their cache slots. Activations are BF16 for any number of rows, accumulation is FP32

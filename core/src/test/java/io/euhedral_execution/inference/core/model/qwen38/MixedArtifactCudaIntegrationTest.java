@@ -72,8 +72,8 @@ class MixedArtifactCudaIntegrationTest {
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(tokenizer.resolve("tokenizer.json")), "no tokenizer");
         int[] text = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizer))
-                .encodeText(Files.readString(
-                        SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/architecture/FRAME_MODEL.md")));
+                .encodeText(Files.readString(SpeculativeVerifyCudaIntegrationTest.repositoryRoot()
+                        .resolve("docs/architecture/FRAME_MODEL.md")));
         assumeTrue(text.length >= PROMPT + 2 * ROWS + 500, "the prompt text is too short");
         return text;
     }

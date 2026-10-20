@@ -29,7 +29,8 @@ import java.util.function.Consumer;
 /// One persistent Flash-Next sequence being generated from: prefill chunks, then one decode step per token, with the
 /// engine's sampler, constraint and text decoding around the model. Every token is the target model's own.
 ///
-/// A generation is a chain of frames (docs/architecture/FRAME_MODEL.md): each step's quantum throws a Select frame when it
+/// A generation is a chain of frames (docs/architecture/FRAME_MODEL.md): each step's quantum throws a Select frame when
+/// it
 /// retires, which samples, emits text and throws the next step's Admit. While a step waits for the device or an
 /// expert the generation occupies no thread, and generations of different sessions interleave step by step. The text
 /// callback runs on whichever worker runs a Select, one call at a time and in order. The session hands token ids to

@@ -76,10 +76,12 @@ public record ArtifactProfile(
     }
 
     /// How many tokens an MTP step drafts: the depth the artifact stores when it stores one; else the depth that
-    /// measured fastest for a pure artifact (docs/speculation/MTP_VERIFIER.md). A mixed artifact has no such measurement and
+    /// measured fastest for a pure artifact (docs/speculation/MTP_VERIFIER.md). A mixed artifact has no such
+    /// measurement and
     /// must store its depth. A Q3 verifier row
     /// costs more than an NVFP4 one, whose decode kernels take 8 rows for little more than one, so Q3 drafts less
-    /// deep. Lengths gated on the drafts' confidence measured no faster (docs/speculation/MTP_DRAFT_CONFIDENCE.md). BF16 drafts
+    /// deep. Lengths gated on the drafts' confidence measured no faster (docs/speculation/MTP_DRAFT_CONFIDENCE.md).
+    /// BF16 drafts
     /// as deep as NVFP4: its tensor-core verifier rows cost about what one row does.
     public DraftLength draftLength() {
         if (this.speculation != Speculation.MTP)

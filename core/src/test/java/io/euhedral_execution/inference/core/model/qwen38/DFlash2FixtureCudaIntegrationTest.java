@@ -57,7 +57,8 @@ class DFlash2FixtureCudaIntegrationTest {
         String reference = System.getProperty("euhedral.dflash2.fixtures", "");
         QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"))));
-        // -Peuhedral.dflash2.prompt-tokens takes that many tokens of docs/architecture/FRAME_MODEL.md instead of a chat prompt: past
+        // -Peuhedral.dflash2.prompt-tokens takes that many tokens of docs/architecture/FRAME_MODEL.md instead of a chat
+        // prompt: past
         // 2048 the drafter's window and its ring's wraparound are in play.
         int promptTokens = Integer.getInteger("euhedral.dflash2.prompt-tokens", 0);
         int[] prompt = promptTokens > 0
