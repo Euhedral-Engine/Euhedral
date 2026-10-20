@@ -97,6 +97,14 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     private boolean seedsEveryPart;
     /// A DFlash2 block's host copy of its proposal, queued by its selector stage.
     private DFlash2Proposal proposal;
+    /// The step's tokens on the device ([AttentionStates#draftTokens]): the slot this quantum's rows read their
+    /// tokens from (-1: its input record), the slot its draft head's selection writes the drafted token to (-1:
+    /// none) through the head's row ids (`draftTokenIds`, 0 for a full-vocabulary head), and whether it writes its
+    /// last input token to slot 0 as the step's current token.
+    private int draftTokenRead = -1;
+    private int draftTokenWrite = -1;
+    private long draftTokenIds;
+    private boolean writesCurrentToken;
     /// The quantum's rows in chunks: a prompt's chunks, or one chunk of all its rows.
     private final Chunk[] chunks;
     /// A batched quantum's sequences and their rows ([#batch]); null for a quantum of one sequence.
@@ -133,7 +141,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             SpeculativeAcceptance acceptance,
             SpeculativeAcceptance.Selector selector,
             boolean seedsDraft,
-            int forcedCommittedRows) {
+            int forcedCommittedRows,
+            boolean tokensOnDevice) {
         public Part {
             Objects.requireNonNull(sequence, "sequence");
             Objects.requireNonNull(tokenIds, "tokenIds");
@@ -152,7 +161,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         }
 
         public Part(Sequence sequence, long startPosition, int[] tokenIds) {
-            this(sequence, startPosition, tokenIds, null, null, null, false, 0);
+            this(sequence, startPosition, tokenIds, null, null, null, false, 0, false);
         }
 
         /// This part as a decode step that selects its next token from `logits`.
@@ -165,7 +174,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                     this.acceptance,
                     this.selector,
                     this.seedsDraft,
-                    this.forcedCommittedRows);
+                    this.forcedCommittedRows,
+                    this.tokensOnDevice);
         }
 
         /// This part as a verification resolved by `acceptance` from the rows `selector` reads out of `logits`.
@@ -179,7 +189,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                     Objects.requireNonNull(acceptance, "acceptance"),
                     Objects.requireNonNull(selector, "selector"),
                     this.seedsDraft,
-                    this.forcedCommittedRows);
+                    this.forcedCommittedRows,
+                    this.tokensOnDevice);
         }
 
         /// This part keeping its rows' hidden states as the sequence's draft seed.
@@ -192,7 +203,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                     this.acceptance,
                     this.selector,
                     true,
-                    this.forcedCommittedRows);
+                    this.forcedCommittedRows,
+                    this.tokensOnDevice);
         }
 
         /// This part committing only its first `rows` rows regardless of the selections (state tests).
@@ -206,7 +218,25 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                     this.acceptance,
                     this.selector,
                     this.seedsDraft,
-                    rows);
+                    rows,
+                    this.tokensOnDevice);
+        }
+
+        /// This part reading its rows' tokens from the step's tokens on the device ([AttentionStates#draftTokens]),
+        /// from slot 0, where the quanta before it wrote them: its token ids only size it.
+        public Part onDeviceTokens() {
+            if (this.tokenIds.length > AttentionStates.DRAFT_TOKEN_SLOTS)
+                throw new IllegalArgumentException("more rows than draft token slots");
+            return new Part(
+                    this.sequence,
+                    this.startPosition,
+                    this.tokenIds,
+                    this.hostLogits,
+                    this.acceptance,
+                    this.selector,
+                    this.seedsDraft,
+                    this.forcedCommittedRows,
+                    true);
         }
 
         public boolean verifies() {
@@ -231,6 +261,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         if (part.acceptance() != null) quantum.withAcceptance(part.acceptance(), part.selector());
         if (part.forcedCommittedRows() > 0) quantum.withCommittedRows(part.forcedCommittedRows());
         if (part.seedsDraft()) quantum.seedingDraft();
+        if (part.tokensOnDevice()) quantum.readingDraftTokens(0);
         return quantum;
     }
 
@@ -601,6 +632,43 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         return states.seedRows() + (long) this.draftSeedRow * hidden * Short.BYTES;
     }
 
+    /// Reads this quantum's rows' tokens from the step's tokens on the device from `slot`, where the quanta before
+    /// it wrote them: its own token ids only size it.
+    public Quantum readingDraftTokens(int slot) {
+        if (slot < 0 || slot + this.tokenIds.length > AttentionStates.DRAFT_TOKEN_SLOTS)
+            throw new IllegalArgumentException("draft token slots out of range");
+        this.draftTokenRead = slot;
+        return this;
+    }
+
+    /// A DRAFT quantum whose draft head's selection also writes the drafted token to the step's tokens at `slot`,
+    /// mapped through the head's row ids at `ids` (0: the row is the token).
+    public Quantum writingDraftToken(int slot, long ids) {
+        if (this.kind != ExecutionKind.DRAFT || this.hostLogits == null)
+            throw new IllegalStateException("only a draft with host logits selects a draft token");
+        if (slot < 1 || slot >= AttentionStates.DRAFT_TOKEN_SLOTS)
+            throw new IllegalArgumentException("draft token slot out of range");
+        this.draftTokenWrite = slot;
+        this.draftTokenIds = ids;
+        return this;
+    }
+
+    /// Writes this quantum's last input token to the step's tokens at slot 0: the step's current token.
+    public Quantum writingCurrentToken() {
+        this.writesCurrentToken = true;
+        return this;
+    }
+
+    /// The first slot of the step's tokens this quantum's rows read, or -1 when they come from its input record.
+    public int draftTokenRead() {
+        return this.draftTokenRead;
+    }
+
+    /// Whether this quantum writes its last input token to the step's tokens as the current token.
+    public boolean writesCurrentToken() {
+        return this.writesCurrentToken;
+    }
+
     /// Keeps every row's post-final-norm hidden in the sequence's draft seed rows.
     public Quantum seedingDraft() {
         if (drafting()) throw new IllegalStateException("drafting does not seed itself");
@@ -728,6 +796,12 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             if (this.hostLogits.selectsOnDevice()) this.hostLogits.queueRowSelections(address, logitsRowCount());
             else this.hostLogits.queueRows(address, logitsRowCount());
         } else this.hostLogits.queueFinalRow(address, logitsRowCount());
+        if (this.draftTokenWrite >= 0) {
+            long tokens = ((AttentionStates) this.sequence.kvCacheState()).draftTokens();
+            if (!this.gpu.selectedToken(
+                    this.hostLogits.deviceSelection(), this.draftTokenIds, tokens + 4L * this.draftTokenWrite))
+                throw new IllegalStateException("this GPU cannot pass a drafted token on the device");
+        }
     }
 
     @Override
@@ -791,6 +865,9 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             this.seedsDraft ? 1 : 0,
             this.draftSeedAddress,
             this.draftCommittedRows,
+            this.draftTokenRead,
+            this.draftTokenWrite,
+            this.writesCurrentToken ? 1 : 0,
             attentionGeometry(config.numAttentionHeads() / config.numKeyValueHeads()),
             fingerprint.value()
         });
@@ -897,7 +974,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             beforeClaim.run();
             // The sequence takes several quanta in flight, but not the state no edge orders: the host row and the
             // proposal. A quantum that touches it is refused while other work on the sequence is in flight.
-            if (sharesSequenceState() && this.sequence.inFlight())
+            if (sharesSequenceState())
                 throw new IllegalStateException(
                         "another quantum of the sequence is in flight, and its state takes one quantum at a time");
             try {
@@ -909,6 +986,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                     this.sequence.admit(this, this.startPosition, end);
                 }
                 this.admitted = true;
+                if (this.hostLogits != null) this.hostLogits.admitted(this.sequence);
             } catch (IllegalStateException admissionFailure) {
                 if (this.sequence.cancellationRequested()
                         || this.sequence.terminalState() == Sequence.TerminalState.CANCELLED) {
@@ -956,9 +1034,11 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             for (int index = 0; index < this.tokenIds.length; index++)
                 if (this.tokenIds[index] < 0 || this.tokenIds[index] >= vocabulary)
                     throw new IllegalArgumentException("token ID outside vocabulary at index " + index);
+            // A part's host logits take one quantum at a time; its sequence's carried state is ordered by the edges.
             for (Segment segment : this.segments)
-                if (segment.sequence().inFlight())
-                    throw new IllegalStateException("a batched quantum's sequences must have nothing else in flight");
+                if (segment.part().hostLogits() != null
+                        && segment.part().hostLogits().heldBy(segment.sequence()))
+                    throw new IllegalStateException("another quantum in flight fills a part's host logits");
             // Refused as a whole, before any sequence is admitted: a closed or failed sequence never harms the others.
             for (Segment segment : this.segments) segment.sequence().requireSegmentAdmissible();
             for (Segment segment : this.segments) {
@@ -966,6 +1046,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                 long end = Math.addExact(segment.startPosition(), segment.rows());
                 segment.sequence().admitSegment(work, segment.startPosition(), end);
                 this.segmentWorks[segment.index()] = work;
+                if (segment.part().hostLogits() != null)
+                    segment.part().hostLogits().admitted(segment.sequence());
             }
             this.admitted = true;
             for (Segment segment : this.segments) attachSequenceState(this.shape, segment.sequence(), gpu);
@@ -1147,12 +1229,14 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         }
     }
 
-    /// Whether the quantum touches per-sequence state no edge orders: the session's host row, or a proposal. Its
-    /// layers' GDN and KV state, the MTP cache, the draft seed rows and the DFlash2 taps and ring are carried
-    /// state, which the edges between the sequence's graphs order ([SequenceOwner]), so a quantum that touches
-    /// only those may be admitted while another of the sequence is in flight.
+    /// Whether the quantum would share per-sequence state no edge orders with work in flight: host logits another
+    /// quantum in flight fills, or a proposal while the sequence has anything in flight. Its layers' GDN and KV
+    /// state, the MTP cache, the draft seed rows, the step's draft tokens and the DFlash2 taps and ring are carried
+    /// state, which the edges between the sequence's graphs order ([SequenceOwner]), so a quantum that touches only
+    /// those, and host logits of its own, may be admitted while another of the sequence is in flight.
     private boolean sharesSequenceState() {
-        return this.hostLogits != null || this.proposal != null;
+        if (this.proposal != null) return this.sequence.inFlight();
+        return this.hostLogits != null && this.hostLogits.heldBy(this.sequence);
     }
 
     @Override

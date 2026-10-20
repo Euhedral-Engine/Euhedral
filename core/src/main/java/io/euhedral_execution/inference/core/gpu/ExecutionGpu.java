@@ -229,6 +229,8 @@ public abstract class ExecutionGpu implements GpuMemory {
             ValueLayout.JAVA_INT);
     protected static final FunctionDescriptor ARGMAX_BF16 =
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS);
+    protected static final FunctionDescriptor SELECTED_TOKEN =
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS);
     protected static final FunctionDescriptor SWIGLU_BF16 = FunctionDescriptor.of(
             ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT);
     protected static final FunctionDescriptor ZERO_DEVICE_MEMORY =
@@ -540,6 +542,20 @@ public abstract class ExecutionGpu implements GpuMemory {
     /// As [#argmaxBf16], writing 16 bytes: the key, then the selected logit's natural log softmax probability over
     /// the row as a float (0 when no logit is selectable).
     public boolean argmaxLogProbabilityBf16(long logitsAddress, int count, long resultAddress) {
+        return false;
+    }
+
+    /// Queues a kernel that writes, as an int32 at `tokenAddress`, the token the selection key at
+    /// `keyAddress` ([#argmaxBf16]) chose: `ids[row]` of the selected shortlist row (int32 ids at
+    /// `idsAddress`), or the row itself when `idsAddress` is 0. False, with nothing queued, when this GPU
+    /// cannot select on the device.
+    public boolean selectedToken(long keyAddress, long idsAddress, long tokenAddress) {
+        return false;
+    }
+
+    /// Whether [#selectedToken] queues its kernel on this GPU: a drafted token can pass to the next quantum on the
+    /// device.
+    public boolean passesTokensOnDevice() {
         return false;
     }
 

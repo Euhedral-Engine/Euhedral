@@ -29,6 +29,9 @@ public final class HostLogits implements AutoCloseable {
     private ExecutionGpu.ReadbackBuffer row;
     private ExecutionGpu.ReadbackBuffer selection;
     private long deviceSelection;
+    /// The sequence whose quantum in flight fills these logits, or null: admission and retirement, on the generation's
+    /// chain.
+    private volatile Object holder;
     private ExecutionGpu.ReadbackBuffer rowSelections;
     private long deviceRowSelections;
     private int rowSelectionCapacity;
@@ -185,9 +188,30 @@ public final class HostLogits implements AutoCloseable {
         this.queuedFullRows = rows;
     }
 
+    /// A quantum of `holder` (its sequence) that fills these logits was admitted: until it retires ([#retired]), no
+    /// other of that sequence may be.
+    public void admitted(Object holder) {
+        if (holder != null && this.holder == holder)
+            throw new IllegalStateException("another quantum in flight fills these host logits");
+        this.holder = holder;
+    }
+
+    /// Whether a quantum of `holder` admitted to fill these logits has not retired yet.
+    public boolean heldBy(Object holder) {
+        return holder != null && this.holder == holder;
+    }
+
+    /// The device word of the last selection queued on the device ([#queueFinalRow] with device selection): the
+    /// 64-bit argmax key that the selection's later kernels read in stream order.
+    public long deviceSelection() {
+        if (this.deviceSelection == 0) throw new IllegalStateException("no selection was queued on the device");
+        return this.deviceSelection;
+    }
+
     /// Publishes a queued row or selection once its quantum retired; only a successful quantum's
     /// result becomes readable.
     public void retired(boolean succeeded) {
+        this.holder = null;
         this.ready = succeeded && this.queued;
         this.selectionReady = succeeded && this.queuedSelection;
         this.scored = succeeded && this.queuedSelection && this.queuedScore;

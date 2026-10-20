@@ -130,6 +130,11 @@ public final class MtpDecoder implements SpeculativeDecoding {
     private final HostLogits baseLogits;
     private final HostLogits draftLogits;
     private final int[] draftTokens;
+    private final ExecutionGpu gpu;
+    /// The draft head's row ids on the device, which a chained step's drafts map their selections through.
+    private final long draftTokenIds;
+    /// A chained step's drafts' selections, one per draft (allocated with the first chained step).
+    private HostLogits[] chainLogits;
     /// Whether each vocabulary token is in the draft head's shortlist.
     private final boolean[] inShortlist;
     private final MtpCheckpoint checkpoint;
@@ -208,6 +213,9 @@ public final class MtpDecoder implements SpeculativeDecoding {
         this.draftLogits.selectOnDevice(true);
         this.draftLogits.scoreOnDevice(length.gated());
         this.draftTokens = draftTokenIds(gpu, plan);
+        this.draftTokenIds =
+                plan.weights().runtimeObjects().get("text/draft_head_token_ids").deviceAddress();
+        this.gpu = gpu;
         this.inShortlist = new boolean[plan.weights().config().vocabSize()];
         for (int token : this.draftTokens)
             if (token >= 0 && token < this.inShortlist.length) this.inShortlist[token] = true;
@@ -236,6 +244,26 @@ public final class MtpDecoder implements SpeculativeDecoding {
             gpu.copyDeviceToHost(host, ids.deviceAddress(), host.byteSize());
             return host.toArray(ValueLayout.JAVA_INT);
         }
+    }
+
+    /// Whether a step's quanta are admitted at once, passing the step's tokens on the device: the draft length is
+    /// fixed and fully verified, no listener reads the draft rows on the host, and the GPU passes tokens on the
+    /// device.
+    private boolean chained() {
+        return this.steps == null
+                && !this.length.gated()
+                && this.verified == this.length.most()
+                && this.gpu.passesTokensOnDevice();
+    }
+
+    /// The selections of a chained step's draft `index` (0: the catch-up's).
+    private HostLogits chainLogits(int index) {
+        if (this.chainLogits == null) this.chainLogits = new HostLogits[this.length.most()];
+        if (this.chainLogits[index] == null) {
+            this.chainLogits[index] = new HostLogits(this.gpu, this.plan.draftVocabularySize());
+            this.chainLogits[index].selectOnDevice(true);
+        }
+        return this.chainLogits[index];
     }
 
     public Statistics statistics() {
@@ -800,8 +828,91 @@ public final class MtpDecoder implements SpeculativeDecoding {
                 // Discard the previous step's recursive draft rows, then catch the MTP cache up.
                 mtpCache().truncate(Math.toIntExact(position));
                 current = next;
+                if (chained()) {
+                    chainCommitted = committed;
+                    return chain;
+                }
                 return catchUp(
                         position, committed, true, states().draftSeedRows(committed.length, hidden), true, Then.VERIFY);
+            }
+        };
+
+        /// The rows the last verification committed, which the chained step's catch-up runs.
+        private int[] chainCommitted;
+
+        /// A whole step admitted at once: the catch-up over the committed rows, whose last row drafts the
+        /// first draft, the recursive drafts, and the verification of the current token and the drafts. The
+        /// drafts pass their tokens to each other and to the verification on the device (the sequence's draft
+        /// tokens, ordered by its carried state), so each quantum is enqueued without waiting for the one
+        /// before it; only the verification's conclusion comes back, and the acceptance reads the drafts once
+        /// they retired.
+        private final StepPort chain = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                started = System.nanoTime();
+                aheadRefusal = null;
+                int drafts = length.most();
+                AttentionStates states = states();
+                int[] committed = chainCommitted;
+                refused(runtime.admitAhead(new Quantum(
+                                plan,
+                                sequence,
+                                Quantum.ExecutionKind.DRAFT,
+                                position,
+                                committed,
+                                LogitsRequirement.LAST_TOKEN,
+                                chainLogits(0))
+                        .withDraftSeed(states.draftSeedRows(committed.length, hidden), committed.length)
+                        .writingCurrentToken()
+                        .writingDraftToken(1, draftTokenIds)));
+                long base = position + committed.length;
+                for (int index = 1; index < drafts; index++)
+                    refused(runtime.admitAhead(new Quantum(
+                                    plan,
+                                    sequence,
+                                    Quantum.ExecutionKind.DRAFT,
+                                    base + index - 1,
+                                    new int[1],
+                                    LogitsRequirement.LAST_TOKEN,
+                                    chainLogits(index))
+                            .withDraftSeed(states.draftRecursionHidden(hidden), 1)
+                            .readingDraftTokens(index)
+                            .writingDraftToken(index + 1, draftTokenIds)));
+                rows = new int[drafts + 1];
+                rows[0] = current;
+                position = sequence.currentTokenPosition();
+                int budget = maxNewTokens - output.size();
+                int verifiedCurrent = current;
+                acceptance = new SpeculativeAcceptance(
+                        drafts + 1,
+                        () -> {
+                            int[] verifiedRows = new int[drafts + 1];
+                            verifiedRows[0] = verifiedCurrent;
+                            for (int index = 0; index < drafts; index++)
+                                verifiedRows[index + 1] =
+                                        draftTokens[chainLogits(index).selectedToken()];
+                            return verifiedRows;
+                        },
+                        endOfGeneration,
+                        budget);
+                runtime.offer(
+                        new Quantum.Part(sequence, position, rows)
+                                .onDeviceTokens()
+                                .verifying(
+                                        baseLogits,
+                                        acceptance,
+                                        sampler == null
+                                                ? SpeculativeAcceptance.Selector.GREEDY
+                                                : SpeculativeAcceptance.Selector.sampled(sampler, position + 1))
+                                .seedingDraft(),
+                        select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) throws Exception {
+                if (aheadRefusal != null) throw new IllegalStateException("a chained draft was refused", aheadRefusal);
+                if (acceptance.resolved()) rows = acceptance.rows();
+                return verify.retired(step);
             }
         };
 
@@ -854,5 +965,6 @@ public final class MtpDecoder implements SpeculativeDecoding {
         this.runtime.leave(this.sequence);
         this.baseLogits.close();
         this.draftLogits.close();
+        if (this.chainLogits != null) for (HostLogits logits : this.chainLogits) if (logits != null) logits.close();
     }
 }

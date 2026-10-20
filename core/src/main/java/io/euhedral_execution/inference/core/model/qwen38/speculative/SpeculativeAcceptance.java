@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.core.generation.LogitsSampler;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.function.IntPredicate;
+import java.util.function.Supplier;
 
 /// Exact-match acceptance of one speculative verification (docs/MTP_CONTRACT.md §4).
 ///
@@ -36,7 +37,10 @@ public final class SpeculativeAcceptance {
         }
     }
 
-    private final int[] rows;
+    private int[] rows;
+    /// Supplies the rows at resolution when they were not known at construction.
+    private final Supplier<int[]> lateRows;
+    private final int rowCount;
     private final IntPredicate endOfGeneration;
     private final int maxOutputs;
     private int[] outputs;
@@ -48,13 +52,32 @@ public final class SpeculativeAcceptance {
         if (Objects.requireNonNull(rows, "rows").length == 0) throw new IllegalArgumentException("no verified rows");
         if (maxOutputs <= 0) throw new IllegalArgumentException("maxOutputs must be positive");
         this.rows = rows.clone();
+        this.lateRows = null;
+        this.rowCount = rows.length;
+        this.endOfGeneration = Objects.requireNonNull(endOfGeneration, "endOfGeneration");
+        this.maxOutputs = maxOutputs;
+    }
+
+    /// As above for `rowCount` rows that are known only when the verification resolves: drafts the device passed
+    /// to the verification, which `rows` reads back once they retired.
+    public SpeculativeAcceptance(int rowCount, Supplier<int[]> rows, IntPredicate endOfGeneration, int maxOutputs) {
+        if (rowCount <= 0) throw new IllegalArgumentException("no verified rows");
+        if (maxOutputs <= 0) throw new IllegalArgumentException("maxOutputs must be positive");
+        this.lateRows = Objects.requireNonNull(rows, "rows");
+        this.rowCount = rowCount;
         this.endOfGeneration = Objects.requireNonNull(endOfGeneration, "endOfGeneration");
         this.maxOutputs = maxOutputs;
     }
 
     /// Resolves the step from each row's selected token. Idempotent for the same selections.
     public void resolve(int[] selected) {
-        if (selected.length != this.rows.length) throw new IllegalArgumentException("one selection per verified row");
+        if (selected.length != this.rowCount) throw new IllegalArgumentException("one selection per verified row");
+        if (this.rows == null) {
+            int[] late = this.lateRows.get();
+            if (late.length != this.rowCount)
+                throw new IllegalStateException("the late rows are not the verified rows");
+            this.rows = late.clone();
+        }
         int accepted = 0;
         while (accepted + 1 < this.rows.length && this.rows[accepted + 1] == selected[accepted]) accepted++;
         int[] outputs = new int[accepted + 1];
@@ -102,7 +125,13 @@ public final class SpeculativeAcceptance {
     }
 
     public int verifiedRows() {
-        return this.rows.length;
+        return this.rowCount;
+    }
+
+    /// The verified rows: the current token, then the drafts (known once resolved when they came late).
+    public int[] rows() {
+        if (this.rows == null) throw new IllegalStateException("the verified rows are known once it resolves");
+        return this.rows.clone();
     }
 
     private void requireResolved() {

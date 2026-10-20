@@ -297,6 +297,9 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_argmax_bf16(const void* device_logits, ui
 /* As euhedral_cuda_argmax_bf16, writing 16 bytes: the key, then the selected logit's natural log softmax
  * probability over the row as a float (0 when no logit is selectable). */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_argmax_logprob_bf16(const void* device_logits, uint32_t count, void* device_result);
+/* Writes the token a selection key chose (device_ids[row] of the selected shortlist row, or the row when device_ids
+   is NULL) as an int32 at device_token, on the selected stream. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_selected_token(const void* device_key, const void* device_ids, void* device_token);
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_swiglu_bf16(
         const void* device_gate_up,

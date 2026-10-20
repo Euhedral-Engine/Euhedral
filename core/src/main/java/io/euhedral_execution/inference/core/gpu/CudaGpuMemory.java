@@ -159,6 +159,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle dflashTopKBf16;
     private final MethodHandle dflashSelectBf16;
     private final MethodHandle argmaxBf16;
+    private final MethodHandle selectedToken;
     private final MethodHandle argmaxLogProbabilityBf16;
     private final MethodHandle zeroDeviceMemory;
     /// The launcher, kernel count and kernel name of each table, by [KernelTable] ordinal.
@@ -563,6 +564,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     FunctionDescriptor.of(i32, p, p, p, p, p, p, i32, i32, p, p));
             this.argmaxBf16 = bind(linker, symbols, "euhedral_cuda_argmax_bf16", ARGMAX_BF16);
             this.argmaxLogProbabilityBf16 = bind(linker, symbols, "euhedral_cuda_argmax_logprob_bf16", ARGMAX_BF16);
+            this.selectedToken = bind(linker, symbols, "euhedral_cuda_selected_token", SELECTED_TOKEN);
             this.zeroDeviceMemory = bind(linker, symbols, "euhedral_cuda_zero_device_memory", ZERO_DEVICE_MEMORY);
             for (KernelTable table : KernelTable.values()) {
                 String prefix = "euhedral_cuda_" + table.name().toLowerCase(java.util.Locale.ROOT);
@@ -2780,6 +2782,29 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
         if (status == KERNEL_UNAVAILABLE) return false;
         if (status != 0) throw new GpuMemoryException("BF16 argmax with log-probability", status);
+        return true;
+    }
+
+    @Override
+    public boolean passesTokensOnDevice() {
+        return true;
+    }
+
+    @Override
+    public boolean selectedToken(long keyAddress, long idsAddress, long tokenAddress) {
+        ensureOpen();
+        requireAddresses(keyAddress, tokenAddress);
+        int status;
+        try {
+            status = (int) selectedToken.invokeExact(
+                    MemorySegment.ofAddress(keyAddress),
+                    MemorySegment.ofAddress(idsAddress),
+                    MemorySegment.ofAddress(tokenAddress));
+        } catch (Throwable throwable) {
+            throw new GpuMemoryException("selected token invocation failed", throwable);
+        }
+        if (status == KERNEL_UNAVAILABLE) return false;
+        if (status != 0) throw new GpuMemoryException("selected token", status);
         return true;
     }
 

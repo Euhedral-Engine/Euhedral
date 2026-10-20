@@ -367,7 +367,7 @@ class QuantumTest {
 
     @Test
     @Timeout(10)
-    void aQuantumWithAHostRowIsRefusedWhileAnotherIsInFlight() throws Exception {
+    void aQuantumIsRefusedWhileAnotherOfItsSequenceFillsTheSameHostLogits() throws Exception {
         var weights = EngineExecutionFixture.weights();
         var plan = new ExecutionPlan(weights);
         var stream = new ExecutionFixtures.HoldingStream();
@@ -380,9 +380,17 @@ class QuantumTest {
         var lattice = new ExecutionFixtures.ManualLattice();
         var runtime = new Execution(lattice, plan, gpu);
         var sequence = new Sequence(909);
-        var first = new Quantum(plan, sequence, Quantum.ExecutionKind.PREFILL, 0, new int[64], LogitsRequirement.NONE);
-        // The host row is per-sequence state no edge orders.
+        // Host logits are per-sequence state no edge orders: one quantum of the sequence fills them at a time.
         var hostLogits = new HostLogits(gpu, weights.config().vocabSize());
+        var own = new HostLogits(gpu, weights.config().vocabSize());
+        var first = new Quantum(
+                plan,
+                sequence,
+                Quantum.ExecutionKind.PREFILL,
+                0,
+                new int[64],
+                LogitsRequirement.LAST_TOKEN,
+                hostLogits);
         var second = new Quantum(
                 plan,
                 sequence,
@@ -391,6 +399,8 @@ class QuantumTest {
                 new int[1],
                 LogitsRequirement.LAST_TOKEN,
                 hostLogits);
+        var third = new Quantum(
+                plan, sequence, Quantum.ExecutionKind.PREFILL, 64, new int[1], LogitsRequirement.LAST_TOKEN, own);
         try {
             var firstOutcome = runtime.submit(first);
             lattice.drive();
@@ -401,15 +411,25 @@ class QuantumTest {
             assertInstanceOf(IllegalStateException.class, refused.failure());
             assertEquals(Sequence.TerminalState.ACTIVE, sequence.terminalState(), "the refusal leaves the sequence");
 
-            stream.release(null);
+            // Host logits of its own: admitted behind the first, ordered by the sequence's carried state.
+            var thirdOutcome = runtime.submit(third);
             lattice.drive();
+            assertEquals(2, stream.held(), "both are in flight");
+            while (stream.held() > 0) {
+                stream.release(null);
+                lattice.drive();
+            }
             assertEquals(
                     Quantum.Status.SUCCESS,
                     firstOutcome.get(2, TimeUnit.SECONDS).status());
-            assertEquals(64, sequence.committedFrontier());
+            assertEquals(
+                    Quantum.Status.SUCCESS,
+                    thirdOutcome.get(2, TimeUnit.SECONDS).status());
+            assertEquals(65, sequence.committedFrontier());
         } finally {
             releaseAndClose(stream, lattice, runtime);
             hostLogits.close();
+            own.close();
             sequence.complete();
         }
     }

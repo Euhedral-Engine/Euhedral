@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core.model.qwen38;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
@@ -20,7 +21,7 @@ class PromptStateTest {
     void gdnAndKvStagesCarryTheirLayersState() {
         Shape view = PLAN.forExecution(Quantum.ExecutionKind.PREFILL, 64);
         int layers = PLAN.weights().config().numHiddenLayers();
-        assertEquals(Shape.seedRowsKey(layers) + 3, view.carriedStateCount());
+        assertEquals(Shape.kvRegionKey(layers), view.carriedStateCount());
         boolean gdn = false, kv = false;
         for (int stage = 0; stage < view.topology().size(); stage++) {
             ExecutionPlan.Instruction instruction = view.instructions().get(stage);
@@ -63,6 +64,12 @@ class PromptStateTest {
         assertTrue(
                 carries(draft, ExecutionPlan.Kind.ATTENTION_KV_APPEND, 2 * layers + 1),
                 "the MTP layer appends to its own cache");
+        int tokens = Shape.draftTokensKey(layers);
+        assertTrue(carries(draft, ExecutionPlan.Kind.EMBEDDING, tokens), "a draft reads the step's tokens");
+        assertTrue(
+                carries(plan.forExecution(Quantum.ExecutionKind.VERIFY, 5), ExecutionPlan.Kind.EMBEDDING, tokens),
+                "a verification reads them");
+        assertFalse(carries(prefill, ExecutionPlan.Kind.EMBEDDING, tokens), "a prompt's chunks do not wait for them");
     }
 
     private static boolean carries(Shape view, ExecutionPlan.Kind kind, int key) {
