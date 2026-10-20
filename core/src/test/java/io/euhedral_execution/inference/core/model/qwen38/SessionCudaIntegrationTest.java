@@ -19,6 +19,7 @@ import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.testing.SharedQwen38;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -48,7 +49,7 @@ class SessionCudaIntegrationTest {
         BitSet cpus = twoWorkerCpus();
         assumeTrue(cpus.cardinality() >= 2, "requires two available physical CPUs for the real lattice");
 
-        QwenTokenizer tokenizer = QwenTokenizer.load(tokenizerPath);
+        QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerPath));
         var loaded = SharedQwen38.q3();
         CudaGpuMemory gpu = loaded.gpu();
         ControlPlaneLattice lattice = createLattice(cpus);

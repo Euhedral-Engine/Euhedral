@@ -23,9 +23,6 @@ import org.junit.jupiter.api.Timeout;
 @ModelGroup.OwnJvm
 class TwoSessionsCudaIntegrationTest {
 
-    private static final String TOKENIZER =
-            System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir");
-
     private static String longPrompt() {
         StringBuilder prompt = new StringBuilder("Here is a numbered list of facts.\n");
         for (int i = 1; i <= 160; i++)
@@ -50,11 +47,7 @@ class TwoSessionsCudaIntegrationTest {
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         assumeTrue(Files.isRegularFile(Path.of(artifact)), "no artifact " + artifact);
         var config = new InferenceConfig(
-                Path.of(artifact),
-                Path.of(TOKENIZER),
-                Path.of(library),
-                SystemInfo.getPCpuSet(),
-                Duration.ofSeconds(30));
+                Path.of(artifact), Path.of(library), SystemInfo.getPCpuSet(), Duration.ofSeconds(30));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             int[] prefilling = engine.tokenizer().encodeWithModelSpecialTokens(longPrompt());
             int[] decoding = engine.tokenizer().encodeWithModelSpecialTokens("The capital of France is");
@@ -81,11 +74,7 @@ class TwoSessionsCudaIntegrationTest {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         var config = new InferenceConfig(
-                Path.of(artifact),
-                Path.of(TOKENIZER),
-                Path.of(library),
-                SystemInfo.getPCpuSet(),
-                Duration.ofSeconds(30));
+                Path.of(artifact), Path.of(library), SystemInfo.getPCpuSet(), Duration.ofSeconds(30));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             int[] first = prompt(engine, "square", 4096);
             int[] second = prompt(engine, "cube", 4096);

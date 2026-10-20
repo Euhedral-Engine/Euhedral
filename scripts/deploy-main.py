@@ -2,8 +2,8 @@
 """Pull, build, and deploy main; clean up only after a healthy cutover.
 
 Run on the deployment host from any directory. Every setting comes from the repository's .env (or --env-file):
-copy .env.example and fill it in. The file is passed to the container as its environment, and its host paths are
-mounted into it.
+copy .env.example and fill it in. The file is passed to the container as its environment, and its artifact (which
+carries the tokenizer) is mounted into it.
 """
 
 import argparse
@@ -25,9 +25,9 @@ IMAGE_REPOSITORY = "euhedral-inference"
 REPOSITORY = Path(__file__).resolve().parents[1]
 # What this process runs; the pull below may bring a newer version of the script.
 SCRIPT_SOURCE = Path(__file__).read_bytes()
-REQUIRED = ("EUHEDRAL_ARTIFACT_FILE", "EUHEDRAL_CHECKPOINT_DIR", "EUHEDRAL_MODEL_NAME", "EUHEDRAL_HOST_CPUS")
-# The image fixes these (its /etc/euhedral/config.yaml) and mounts the host files there.
-CONTAINER_PATHS = ("EUHEDRAL_MODEL_ARTIFACT", "EUHEDRAL_MODEL_TOKENIZER")
+REQUIRED = ("EUHEDRAL_ARTIFACT_FILE", "EUHEDRAL_MODEL_NAME", "EUHEDRAL_HOST_CPUS")
+# The image fixes this (its /etc/euhedral/config.yaml) and mounts the host file there.
+CONTAINER_PATHS = ("EUHEDRAL_MODEL_ARTIFACT",)
 DEVICES = ("nvidia0", "nvidiactl", "nvidia-uvm", "nvidia-modeset")
 
 
@@ -35,7 +35,6 @@ DEVICES = ("nvidia0", "nvidiactl", "nvidia-uvm", "nvidia-modeset")
 class Settings:
     env_file: Path
     artifact: Path
-    checkpoint: Path
     model_id: str
     port: int
     driver: Path | None = None
@@ -65,8 +64,8 @@ def load_settings(path):
         raise RuntimeError(f"{path} does not set {', '.join(missing)} (see .env.example)")
     fixed = [key for key in CONTAINER_PATHS if key in values]
     if fixed:
-        raise RuntimeError(f"{path} sets {', '.join(fixed)}, which the image fixes; set the host paths in "
-                           "EUHEDRAL_ARTIFACT_FILE and EUHEDRAL_CHECKPOINT_DIR instead")
+        raise RuntimeError(f"{path} sets {', '.join(fixed)}, which the image fixes; set the host path in "
+                           "EUHEDRAL_ARTIFACT_FILE instead")
     driver, ptx_jit = values.get("EUHEDRAL_CUDA_DRIVER_FILE"), values.get("EUHEDRAL_PTX_JIT_FILE")
     if bool(driver) != bool(ptx_jit):
         raise RuntimeError(f"{path} must set both EUHEDRAL_CUDA_DRIVER_FILE and EUHEDRAL_PTX_JIT_FILE, or neither")
@@ -77,7 +76,6 @@ def load_settings(path):
     return Settings(
         env_file=path.resolve(),
         artifact=Path(values["EUHEDRAL_ARTIFACT_FILE"]),
-        checkpoint=Path(values["EUHEDRAL_CHECKPOINT_DIR"]),
         model_id=values["EUHEDRAL_MODEL_NAME"],
         port=port,
         driver=Path(driver) if driver else None,
@@ -165,7 +163,7 @@ def build_context(repository):
 
 
 def deploy(repository, settings):
-    model, tokenizer, port = settings.artifact, settings.checkpoint, settings.port
+    model, port = settings.artifact, settings.port
     if command("git", "branch", "--show-current") != "main":
         raise RuntimeError("Deploy only from main; switch to main before invoking this script")
     if command("git", "status", "--porcelain", "--untracked-files=no"):
@@ -173,8 +171,6 @@ def deploy(repository, settings):
     for path in (model, settings.driver, settings.ptx_jit):
         if path is not None and not path.is_file():
             raise RuntimeError(f"Missing required host file: {path}")
-    if not tokenizer.is_dir():
-        raise RuntimeError(f"Missing tokenizer directory: {tokenizer}")
     if settings.driver is not None:
         for device in DEVICES:
             if not Path("/dev", device).exists():
@@ -225,7 +221,6 @@ def deploy(repository, settings):
             "--env-file", str(settings.env_file), "-e", f"PORT={port}", "-p", f"127.0.0.1:{port}:{port}",
             *gpu_arguments(settings),
             "--mount", f"type=bind,src={model},dst=/models/model.edrl,readonly",
-            "--mount", f"type=bind,src={tokenizer},dst=/tokenizer,readonly",
             image,
         )
         model_id = verify_ready(port)

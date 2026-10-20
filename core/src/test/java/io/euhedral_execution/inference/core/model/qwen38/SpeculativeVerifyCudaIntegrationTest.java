@@ -11,6 +11,7 @@ import io.euhedral_execution.inference.core.state.AttentionKvState;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.testing.SharedQwen38;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -37,7 +38,7 @@ class SpeculativeVerifyCudaIntegrationTest {
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int prefix = Integer.getInteger("euhedral.speculative.prefix", 300);
         int rows = Integer.getInteger("euhedral.speculative.rows", 4);
-        int[] text = QwenTokenizer.load(tokenizerDirectory)
+        int[] text = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory))
                 .encodeText(Files.readString(repositoryRoot().resolve("docs/FRAME_MODEL.md")));
         int[] prompt = java.util.Arrays.copyOf(text, prefix);
         int[] forced = java.util.Arrays.copyOfRange(text, prefix, prefix + rows);
@@ -93,7 +94,7 @@ class SpeculativeVerifyCudaIntegrationTest {
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int prefix = Integer.getInteger("euhedral.speculative.prefix", 300);
-        int[] text = QwenTokenizer.load(tokenizerDirectory)
+        int[] text = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory))
                 .encodeText(Files.readString(repositoryRoot().resolve("docs/FRAME_MODEL.md")));
         int[] prompt = java.util.Arrays.copyOf(text, prefix);
         var loaded = SharedQwen38.q3();

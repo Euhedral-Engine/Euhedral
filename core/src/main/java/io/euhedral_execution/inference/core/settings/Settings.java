@@ -5,6 +5,7 @@ import java.util.Objects;
 /// Every deployer setting, read once at startup by {@link SettingsLoader}.
 ///
 /// @param model the model to serve
+/// @param sampling sampling for the fields a request leaves out
 /// @param server the HTTP server
 /// @param context the context a sequence may hold
 /// @param prefixCache the prompt prefix cache
@@ -14,6 +15,7 @@ import java.util.Objects;
 /// @param kernels kernel thresholds
 public record Settings(
         ModelSettings model,
+        SamplingSettings sampling,
         ServerSettings server,
         ContextSettings context,
         PrefixCacheSettings prefixCache,
@@ -24,6 +26,7 @@ public record Settings(
 
     public Settings {
         Objects.requireNonNull(model, "model");
+        Objects.requireNonNull(sampling, "sampling");
         Objects.requireNonNull(server, "server");
         Objects.requireNonNull(context, "context");
         Objects.requireNonNull(prefixCache, "prefixCache");

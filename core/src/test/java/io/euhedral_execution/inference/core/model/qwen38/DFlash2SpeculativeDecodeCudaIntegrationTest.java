@@ -12,6 +12,7 @@ import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Deco
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -44,7 +45,7 @@ class DFlash2SpeculativeDecodeCudaIntegrationTest {
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int budget = Integer.getInteger("euhedral.speculative.tokens", 160);
-        QwenTokenizer tokenizer = QwenTokenizer.load(tokenizerDirectory);
+        QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory));
         Path root = SpeculativeVerifyCudaIntegrationTest.repositoryRoot();
         int[] text = tokenizer.encodeText(Files.readString(root.resolve("docs/FRAME_MODEL.md")));
         List<int[]> prompts = List.of(

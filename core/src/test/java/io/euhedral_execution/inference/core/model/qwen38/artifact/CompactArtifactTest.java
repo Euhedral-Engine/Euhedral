@@ -11,6 +11,7 @@ import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
+import io.euhedral_execution.inference.core.testing.TestTokenizer;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -60,7 +61,8 @@ class CompactArtifactTest {
                                 dataOffset),
                         config,
                         new TensorDescriptor[] {descriptor}),
-                new byte[][] {new byte[(int) byteSize]});
+                new byte[][] {new byte[(int) byteSize]},
+                TestTokenizer.FILES);
 
         Artifact decoded = ArtifactReader.read(path);
         assertEquals(ArtifactHeader.COMPACT_VERSION, decoded.header().version());

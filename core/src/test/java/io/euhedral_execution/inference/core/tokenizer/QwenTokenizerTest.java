@@ -24,7 +24,7 @@ class QwenTokenizerTest {
         Path checkpoint =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(checkpoint.resolve("tokenizer.json")));
-        tokenizer = QwenTokenizer.load(checkpoint);
+        tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(checkpoint));
     }
 
     @Test

@@ -17,6 +17,7 @@ sys.path.insert(0, str(TOOLS))
 
 import convert_checkpoint  # noqa: E402
 from euhedral_artifacts import codes, device, edrl, grouped, importance, inventory, pipeline, q3_p2e2, recipes, sources  # noqa: E402
+from euhedral_artifacts import tokenizer_section  # noqa: E402
 from euhedral_artifacts.sources import SourceRef  # noqa: E402
 
 
@@ -305,7 +306,7 @@ def tiny_q3_artifact(path: Path, q3_names: tuple[str, ...] = ("a",)) -> None:
     blob[edrl.HEADER_SIZE + len(metadata):data_base] = table
     for plan, payload in zip(plans, (bytes(q3),) * len(q3_names) + (q4, vector)):
         blob[plan.offset:plan.offset + len(payload)] = payload
-    path.write_bytes(bytes(blob))
+    path.write_bytes(bytes(blob) + tokenizer_section.encode(("{}", "{}", "template", "{}")))
 
 
 class PipelineTest(unittest.TestCase):

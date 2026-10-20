@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.core.artifact.ArtifactFormatException;
 import io.euhedral_execution.inference.core.artifact.CompactTensorLayout;
 import io.euhedral_execution.inference.core.artifact.Nvfp4Layout;
 import io.euhedral_execution.inference.core.artifact.TensorDataType;
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.model.qwen4.Qwen4Config;
@@ -41,9 +42,8 @@ public final class ArtifactReader {
 
     public static Artifact read(Path path) throws IOException {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-            long fileSize = channel.size();
-            if (fileSize < Header.BYTE_SIZE) throw invalid("artifact is truncated before the header");
-            Header header = readHeader(channel, fileSize);
+            if (channel.size() < Header.BYTE_SIZE) throw invalid("artifact is truncated before the header");
+            Header header = readHeader(channel, TokenizerSection.contentEnd(channel));
             Qwen4Config config = Qwen4Config.fromMetadata(
                     Metadata.decode(readRegion(channel, header.metadataOffset(), header.metadataSize(), "metadata")));
             byte[] tables = readRegion(channel, header.tablesOffset(), header.tablesSize(), "tables");
@@ -53,8 +53,23 @@ public final class ArtifactReader {
         }
     }
 
+    /// The size the header of the version 3 artifact at `path` declares: where its content ends, before any tokenizer
+    /// section. Only the magic and version are checked, so a file whose tail is damaged still answers.
+    public static long declaredSize(Path path) throws IOException {
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+            if (channel.size() < Header.BYTE_SIZE) throw invalid("artifact is truncated before the header");
+            ByteBuffer in = ByteBuffer.allocate(Header.BYTE_SIZE).order(ORDER);
+            ArtifactFileAccess.readFully(channel, 0, in, "header");
+            in.flip();
+            if (in.getInt(0) != Header.MAGIC) throw invalid("unsupported artifact magic");
+            if (in.getInt(4) != Header.VERSION) throw invalid("unsupported artifact version " + in.getInt(4));
+            return in.getLong(Header.BYTE_SIZE - Long.BYTES);
+        }
+    }
+
     private record Tables(Tensor[] tensors, ExpertBank[] banks) {}
 
+    /// `fileSize` is where the file's content ends, before any tokenizer section.
     private static Header readHeader(FileChannel channel, long fileSize) throws IOException {
         ByteBuffer in = ByteBuffer.allocate(Header.BYTE_SIZE).order(ORDER);
         ArtifactFileAccess.readFully(channel, 0, in, "header");
@@ -76,7 +91,7 @@ public final class ArtifactReader {
         if (architecture != Header.ARCHITECTURE_QWEN4_EXP) throw invalid("unsupported architecture " + architecture);
         if (reserved != 0) throw invalid("header reserved field must be zero");
         if (declaredSize != fileSize)
-            throw invalid("header declares " + declaredSize + " bytes but the file holds " + fileSize);
+            throw invalid("header declares " + declaredSize + " bytes but the file's content holds " + fileSize);
         if (metadataOffset != Header.BYTE_SIZE) throw invalid("metadata must immediately follow the header");
         if (metadataSize < 0 || metadataSize > Metadata.MAX_BYTES) throw invalid("metadata size is out of range");
         if (tablesOffset != metadataOffset + metadataSize) throw invalid("tables must immediately follow the metadata");

@@ -10,6 +10,7 @@ import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactHeader;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.CompactArtifactWriter;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -20,6 +21,9 @@ import java.util.Random;
 /// source fills with its own bytes, and, for a source with companions, `.suh`, `.svh` and `.segments` after each
 /// projection. Projections are stored as 64 x 64 Q3 objects, a quantized format.
 final class TinyArtifacts {
+
+    /// The tokenizer the tiny artifacts carry: assembly copies it, nothing tokenizes with it.
+    static final TokenizerFiles TOKENIZER = new TokenizerFiles("{}", "{}", "template", "{\"eos_token_id\":[2]}");
 
     static final List<String> PROJECTIONS = List.of(
             "text/layers/0/mlp/gate_up",
@@ -88,7 +92,7 @@ final class TinyArtifacts {
                 tableOffset,
                 table.length,
                 dataOffset);
-        CompactArtifactWriter.write(path, new Artifact(header, config, table), data.toArray(byte[][]::new));
+        CompactArtifactWriter.write(path, new Artifact(header, config, table), data.toArray(byte[][]::new), TOKENIZER);
         return path;
     }
 

@@ -50,8 +50,6 @@ class HostKvPagesCudaIntegrationTest {
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         String artifact = System.getProperty("euhedral.qwen.nvfp4-artifact");
         assumeTrue(artifact != null && Files.isRegularFile(Path.of(artifact)), "no NVFP4 artifact");
-        String tokenizer = System.getProperty("euhedral.qwen.tokenizer-dir");
-        assumeTrue(tokenizer != null, "no tokenizer directory");
 
         var data = ArtifactReader.read(Path.of(artifact));
         var profile = ArtifactProfile.of(data);
@@ -59,9 +57,9 @@ class HostKvPagesCudaIntegrationTest {
                         data, profile, Long.MAX_VALUE, CONTEXT_TOKENS, Long.MAX_VALUE, KvFormat.NVFP4, 1)
                 .deviceBytes();
 
-        Runs device = generate(artifact, tokenizer, library, Integer.MAX_VALUE, null);
+        Runs device = generate(artifact, library, Integer.MAX_VALUE, null);
         // One byte short of the whole cache: the pages past the device share move to host memory.
-        Runs host = generate(artifact, tokenizer, library, DEVICE_TOKENS, whole - 1);
+        Runs host = generate(artifact, library, DEVICE_TOKENS, whole - 1);
         // Host pages leave the device before weights: never more weights in host memory than with every page on it.
         assertTrue(
                 host.hostWeightBytes() <= device.hostWeightBytes(),
@@ -87,11 +85,9 @@ class HostKvPagesCudaIntegrationTest {
 
     /// Greedy tokens of two sessions over the same long prompt, speculation off then on, and the weight bytes the
     /// engine keeps in host memory.
-    private static Runs generate(String artifact, String tokenizer, String library, int deviceTokens, Long budget)
-            throws Exception {
+    private static Runs generate(String artifact, String library, int deviceTokens, Long budget) throws Exception {
         var config = new InferenceConfig(
                         Path.of(artifact),
-                        Path.of(tokenizer),
                         Path.of(library),
                         SystemInfo.getPCpuSet(),
                         CONTEXT_TOKENS,

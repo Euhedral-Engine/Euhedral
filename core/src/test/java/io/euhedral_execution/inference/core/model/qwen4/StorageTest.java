@@ -27,8 +27,7 @@ class StorageTest {
     static InferenceConfig config(Path artifact, int context) {
         BitSet cpus = new BitSet();
         cpus.set(0);
-        return new InferenceConfig(
-                artifact, Path.of("unused"), Path.of("unused"), cpus, context, Duration.ofSeconds(5));
+        return new InferenceConfig(artifact, Path.of("unused"), cpus, context, Duration.ofSeconds(5));
     }
 
     /// A GPU of `freeBytes`, host memory of `pinnable` bytes.

@@ -10,6 +10,7 @@ import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.testing.SharedQwen38;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -65,7 +66,7 @@ class RelaxedNumericsDriftCudaIntegrationTest {
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         String prefixes = System.getProperty("euhedral.numerics.drift.prefix", "256,384,512");
-        QwenTokenizer tokenizer = QwenTokenizer.load(tokenizerDirectory);
+        QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory));
         List<Double> peaks = new ArrayList<>();
         List<Double> growths = new ArrayList<>();
         for (String value : prefixes.split(",")) {

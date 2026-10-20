@@ -1,9 +1,11 @@
 package io.euhedral_execution.inference.core.model.qwen4.loader;
 
 import io.euhedral_execution.inference.core.artifact.ArtifactFormatException;
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.model.qwen4.Qwen4Config;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertBank;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertProjection;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -94,8 +96,8 @@ public final class ArtifactWriter {
     }
 
     /// Writes an artifact whose tensors and banks already have their offsets and sizes; `tensorPayload` and
-    /// `recordPayload` supply the bytes, whose CRC-32s replace the ones in the inputs. Returns the artifact as
-    /// written.
+    /// `recordPayload` supply the bytes, whose CRC-32s replace the ones in the inputs, and `tokenizer` follows the
+    /// content ([TokenizerSection]). Returns the artifact as written.
     public static Artifact write(
             Path path,
             Qwen4Config config,
@@ -104,7 +106,8 @@ public final class ArtifactWriter {
             long dataOffset,
             long fileSize,
             TensorPayload tensorPayload,
-            RecordPayload recordPayload)
+            RecordPayload recordPayload,
+            TokenizerFiles tokenizer)
             throws IOException {
         byte[] metadata = Metadata.encode(config.toMetadata());
         Tensor[] written = new Tensor[tensors.length];
@@ -154,6 +157,8 @@ public final class ArtifactWriter {
             channel.write(ByteBuffer.wrap(metadata), Header.BYTE_SIZE);
             channel.write(ByteBuffer.wrap(tables), Header.BYTE_SIZE + metadata.length);
             channel.write(ByteBuffer.wrap(encodeHeader(metadata.length, tables.length, dataOffset, fileSize)), 0);
+            if (channel.size() < fileSize) channel.write(ByteBuffer.wrap(new byte[1]), fileSize - 1);
+            TokenizerSection.write(channel, fileSize, tokenizer);
         }
         return ArtifactReader.read(path);
     }

@@ -24,27 +24,22 @@ class InferenceConfigTest {
     }
 
     private static InferenceConfig withCache(long bytes, int interval) {
-        return new InferenceConfig(
-                Path.of("a"), Path.of("t"), Path.of("l"), cpus(), 32768, Duration.ofSeconds(1), bytes, interval);
+        return new InferenceConfig(Path.of("a"), Path.of("l"), cpus(), 32768, Duration.ofSeconds(1), bytes, interval);
     }
 
     @Test
     void programmaticConstructorsLeaveThePrefixCacheOff() {
-        var config = new InferenceConfig(Path.of("a"), Path.of("t"), Path.of("l"), cpus(), Duration.ofSeconds(1));
+        var config = new InferenceConfig(Path.of("a"), Path.of("l"), cpus(), Duration.ofSeconds(1));
         assertEquals(0, config.prefixCacheBytes());
         assertEquals(InferenceConfig.DEFAULT_PREFIX_CACHE_CHECKPOINT_TOKENS, config.prefixCacheCheckpointTokens());
-        var sixArguments =
-                new InferenceConfig(Path.of("a"), Path.of("t"), Path.of("l"), cpus(), 4096, Duration.ofSeconds(1));
+        var sixArguments = new InferenceConfig(Path.of("a"), Path.of("l"), cpus(), 4096, Duration.ofSeconds(1));
         assertEquals(0, sixArguments.prefixCacheBytes());
     }
 
     @Test
     void sizesForOneSequenceUnlessToldOtherwise() {
         assertEquals(1, withCache(0, 2048).maxSequences());
-        assertEquals(
-                1,
-                new InferenceConfig(Path.of("a"), Path.of("t"), Path.of("l"), cpus(), Duration.ofSeconds(1))
-                        .maxSequences());
+        assertEquals(1, new InferenceConfig(Path.of("a"), Path.of("l"), cpus(), Duration.ofSeconds(1)).maxSequences());
         assertEquals(0, withSequences(0).maxSequences());
         assertEquals(6, withSequences(6).maxSequences());
         assertThrows(IllegalArgumentException.class, () -> withSequences(-1));
@@ -52,16 +47,7 @@ class InferenceConfigTest {
 
     private static InferenceConfig withSequences(int sequences) {
         return new InferenceConfig(
-                Path.of("a"),
-                Path.of("t"),
-                Path.of("l"),
-                cpus(),
-                32768,
-                Duration.ofSeconds(1),
-                0,
-                2048,
-                null,
-                sequences);
+                Path.of("a"), Path.of("l"), cpus(), 32768, Duration.ofSeconds(1), 0, 2048, null, sequences);
     }
 
     @Test
@@ -84,14 +70,13 @@ class InferenceConfigTest {
     void carriesTheSelectedCacheFormat() {
         assertNull(withCache(0, 2048).kvCache(), "the artifact's format");
         var selected = new InferenceConfig(
-                Path.of("a"), Path.of("t"), Path.of("l"), cpus(), 32768, Duration.ofSeconds(1), 0, 2048, KvFormat.BF16);
+                Path.of("a"), Path.of("l"), cpus(), 32768, Duration.ofSeconds(1), 0, 2048, KvFormat.BF16);
         assertEquals(KvFormat.BF16, selected.kvCache());
     }
 
     private static InferenceConfig fromSettings(Map<String, String> extra) {
         var environment = new HashMap<>(Map.of(
                 "EUHEDRAL_MODEL_ARTIFACT", "m.edrl",
-                "EUHEDRAL_MODEL_TOKENIZER", "tok",
                 "EUHEDRAL_MODEL_NAME", "n",
                 "EUHEDRAL_HOST_CPUS", "0"));
         environment.putAll(extra);
@@ -110,7 +95,6 @@ class InferenceConfigTest {
                 "EUHEDRAL_PREFIX_CACHE_CHECKPOINT_TOKENS", "1024",
                 "EUHEDRAL_BATCHING_MAX_SEQUENCES", "3"));
         assertEquals(Path.of("m.edrl"), config.artifactPath());
-        assertEquals(Path.of("tok"), config.tokenizerDirectory());
         assertEquals(NativeFiles.at(Path.of("native")).library(), config.cudaLibraryPath());
         assertEquals(BitSet.valueOf(new long[] {1}), config.workerCpus());
         assertEquals(4096, config.maxContextTokens());
@@ -133,7 +117,7 @@ class InferenceConfigTest {
         assertEquals(8L << 30, config.tuning().memory().gpuLimit().getAsLong());
         assertEquals(3, config.tuning().host().taskParallelism());
         assertEquals(300, config.tuning().kernels().trellis().targetBlocks().getAsInt());
-        var programmatic = new InferenceConfig(Path.of("a"), Path.of("t"), Path.of("l"), cpus(), Duration.ofSeconds(1));
+        var programmatic = new InferenceConfig(Path.of("a"), Path.of("l"), cpus(), Duration.ofSeconds(1));
         assertEquals(Tuning.defaults(), programmatic.tuning());
         var tuned = programmatic.withTuning(config.tuning());
         assertEquals(config.tuning(), tuned.tuning());

@@ -10,7 +10,8 @@ stores the MTP draft depth it was measured with (`ArtifactProfile` names it `mix
 Every option comes from a pure artifact converted once from its calibration (trellis: `calibrate --format trellis
 --bits B`, one rate for every linear; NVFP4: the GPTQ artifact). `quantization assemble --allocation FILE --source
 OPTION=ARTIFACT... --base OPTION --out ARTIFACT` takes each projection the allocation names from its option's source,
-with its companions, and everything else from the base: the token embedding, the heads and the MTP drafter. The
+with its companions, and everything else from the base: the token embedding, the heads, the MTP drafter and the
+tokenizer. The
 objects taken straight from the checkpoint must be bit for bit equal in every source; `assemble` refuses a source
 that differs. In process the same assembly is a composite view whose objects are read from their source files, which
 is how a search loads candidates without writing them. An allocation that names nothing assembles to a file byte for

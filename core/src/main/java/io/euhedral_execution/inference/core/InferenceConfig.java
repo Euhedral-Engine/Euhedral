@@ -9,7 +9,8 @@ import java.time.Duration;
 import java.util.BitSet;
 import java.util.Objects;
 
-/// Explicit runtime inputs. `workerCpus` are logical processor IDs accepted by Euhedral, not a worker
+/// Explicit runtime inputs. The artifact carries the tokenizer. `workerCpus` are logical processor IDs accepted by
+/// Euhedral, not a worker
 /// count; the engine validates them against [ProcessorTopology] before loading any model resource, and
 /// the set is defensively copied. `maxContextTokens` is the longest sequence (prompt plus generation)
 /// the engine keeps device memory for: weights that do not fit beside that much KV cache stay in pinned
@@ -24,7 +25,6 @@ import java.util.Objects;
 /// runs: batching, memory limits, host workers and kernel thresholds.
 public record InferenceConfig(
         Path artifactPath,
-        Path tokenizerDirectory,
         Path cudaLibraryPath,
         BitSet workerCpus,
         int maxContextTokens,
@@ -45,7 +45,6 @@ public record InferenceConfig(
 
     public InferenceConfig {
         Objects.requireNonNull(artifactPath, "artifactPath");
-        Objects.requireNonNull(tokenizerDirectory, "tokenizerDirectory");
         Objects.requireNonNull(cudaLibraryPath, "cudaLibraryPath");
         workerCpus = (BitSet) Objects.requireNonNull(workerCpus, "workerCpus").clone();
         if (workerCpus.isEmpty()) throw new IllegalArgumentException("workerCpus must not be empty");
@@ -67,7 +66,6 @@ public record InferenceConfig(
     public static InferenceConfig of(Settings settings, NativeFiles nativeFiles) {
         return new InferenceConfig(
                 settings.model().artifact(),
-                settings.model().tokenizer(),
                 nativeFiles.library(),
                 settings.host().selectedCpus(),
                 settings.context().maxTokens(),
@@ -83,7 +81,6 @@ public record InferenceConfig(
     /// The default tuning.
     public InferenceConfig(
             Path artifactPath,
-            Path tokenizerDirectory,
             Path cudaLibraryPath,
             BitSet workerCpus,
             int maxContextTokens,
@@ -95,7 +92,6 @@ public record InferenceConfig(
             int kvDeviceMinimumTokens) {
         this(
                 artifactPath,
-                tokenizerDirectory,
                 cudaLibraryPath,
                 workerCpus,
                 maxContextTokens,
@@ -112,7 +108,6 @@ public record InferenceConfig(
     public InferenceConfig withTuning(Tuning tuning) {
         return new InferenceConfig(
                 this.artifactPath,
-                this.tokenizerDirectory,
                 this.cudaLibraryPath,
                 this.workerCpus,
                 this.maxContextTokens,
@@ -128,7 +123,6 @@ public record InferenceConfig(
     /// The default device share of each sequence's attention cache.
     public InferenceConfig(
             Path artifactPath,
-            Path tokenizerDirectory,
             Path cudaLibraryPath,
             BitSet workerCpus,
             int maxContextTokens,
@@ -139,7 +133,6 @@ public record InferenceConfig(
             int maxSequences) {
         this(
                 artifactPath,
-                tokenizerDirectory,
                 cudaLibraryPath,
                 workerCpus,
                 maxContextTokens,
@@ -154,7 +147,6 @@ public record InferenceConfig(
     /// One sequence.
     public InferenceConfig(
             Path artifactPath,
-            Path tokenizerDirectory,
             Path cudaLibraryPath,
             BitSet workerCpus,
             int maxContextTokens,
@@ -164,7 +156,6 @@ public record InferenceConfig(
             KvFormat kvCache) {
         this(
                 artifactPath,
-                tokenizerDirectory,
                 cudaLibraryPath,
                 workerCpus,
                 maxContextTokens,
@@ -178,7 +169,6 @@ public record InferenceConfig(
     /// The artifact's attention cache format.
     public InferenceConfig(
             Path artifactPath,
-            Path tokenizerDirectory,
             Path cudaLibraryPath,
             BitSet workerCpus,
             int maxContextTokens,
@@ -187,7 +177,6 @@ public record InferenceConfig(
             int prefixCacheCheckpointTokens) {
         this(
                 artifactPath,
-                tokenizerDirectory,
                 cudaLibraryPath,
                 workerCpus,
                 maxContextTokens,
@@ -200,14 +189,12 @@ public record InferenceConfig(
     /// Without a prefix cache: programmatic callers (tests, the benchmark) opt in explicitly.
     public InferenceConfig(
             Path artifactPath,
-            Path tokenizerDirectory,
             Path cudaLibraryPath,
             BitSet workerCpus,
             int maxContextTokens,
             Duration shutdownTimeout) {
         this(
                 artifactPath,
-                tokenizerDirectory,
                 cudaLibraryPath,
                 workerCpus,
                 maxContextTokens,
@@ -217,19 +204,8 @@ public record InferenceConfig(
     }
 
     /// The default context capacity.
-    public InferenceConfig(
-            Path artifactPath,
-            Path tokenizerDirectory,
-            Path cudaLibraryPath,
-            BitSet workerCpus,
-            Duration shutdownTimeout) {
-        this(
-                artifactPath,
-                tokenizerDirectory,
-                cudaLibraryPath,
-                workerCpus,
-                DEFAULT_MAX_CONTEXT_TOKENS,
-                shutdownTimeout);
+    public InferenceConfig(Path artifactPath, Path cudaLibraryPath, BitSet workerCpus, Duration shutdownTimeout) {
+        this(artifactPath, cudaLibraryPath, workerCpus, DEFAULT_MAX_CONTEXT_TOKENS, shutdownTimeout);
     }
 
     @Override

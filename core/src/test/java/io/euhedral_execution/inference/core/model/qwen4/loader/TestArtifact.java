@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.model.qwen4.Qwen4Config;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertBank;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertProjection;
+import io.euhedral_execution.inference.core.testing.TestTokenizer;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -135,7 +136,8 @@ public final class TestArtifact {
                 Math.max(layout.fileSize, 4096L * 256 + 4096),
                 tensor -> payload(
                         seed, tensor.name(), tensor.shape(), tensor.format(), tensor.layout(), (int) tensor.byteSize()),
-                (bank, expert) -> record(seed, bank, expert));
+                (bank, expert) -> record(seed, bank, expert),
+                TestTokenizer.FILES);
     }
 
     private static Layout layout(Qwen4Config config) {

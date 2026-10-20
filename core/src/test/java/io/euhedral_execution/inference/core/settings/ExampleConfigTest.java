@@ -48,6 +48,7 @@ class ExampleConfigTest {
         Settings s = SettingsLoader.load(Optional.of(example()), Map.of());
         Settings expected = new Settings(
                 s.model(),
+                SamplingSettings.defaults(),
                 ServerSettings.defaults(),
                 ContextSettings.defaults(),
                 PrefixCacheSettings.defaults(),

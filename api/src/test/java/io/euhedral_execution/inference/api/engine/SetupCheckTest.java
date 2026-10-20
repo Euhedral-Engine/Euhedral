@@ -5,12 +5,16 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.gpu.GpuMemoryException;
 import io.euhedral_execution.inference.core.settings.Settings;
 import io.euhedral_execution.inference.core.settings.SettingsLoader;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -25,22 +29,19 @@ class SetupCheckTest {
 
     private static final DriverProbe DRIVER = () -> Optional.empty();
 
-    /// The model files the settings name: an artifact and a checkpoint directory.
+    /// The artifact the settings name, carrying a tokenizer (the check reads the section, not the model).
     private Settings installation() throws IOException {
-        Files.createFile(this.directory.resolve("model.edrl"));
-        Path checkpoint = Files.createDirectories(this.directory.resolve("checkpoint"));
-        for (String file : List.of("tokenizer.json", "tokenizer_config.json", "generation_config.json"))
-            Files.createFile(checkpoint.resolve(file));
-        return properties(this.directory.resolve("model.edrl"), checkpoint);
+        Path artifact = Files.write(this.directory.resolve("model.edrl"), new byte[64]);
+        try (FileChannel channel = FileChannel.open(artifact, StandardOpenOption.WRITE)) {
+            TokenizerSection.write(channel, 64, new TokenizerFiles("{}", "{}", "template", "{}"));
+        }
+        return properties(artifact);
     }
 
-    private static Settings properties(Path artifact, Path tokenizer) {
+    private static Settings properties(Path artifact) {
         return SettingsLoader.load(
                 Optional.empty(),
-                Map.of(
-                        "EUHEDRAL_MODEL_ARTIFACT", artifact.toString(),
-                        "EUHEDRAL_MODEL_TOKENIZER", tokenizer.toString(),
-                        "EUHEDRAL_MODEL_NAME", "qwen"));
+                Map.of("EUHEDRAL_MODEL_ARTIFACT", artifact.toString(), "EUHEDRAL_MODEL_NAME", "qwen"));
     }
 
     @Test
@@ -50,18 +51,25 @@ class SetupCheckTest {
 
     @Test
     void reportsEveryProblemWithTheSettingThatNamesIt() throws IOException {
-        Settings complete = installation();
-        Files.delete(complete.model().tokenizer().resolve("tokenizer.json"));
-        Files.delete(complete.model().tokenizer().resolve("generation_config.json"));
-        var problems = SetupCheck.problems(
-                properties(
-                        this.directory.resolve("missing.edrl"), complete.model().tokenizer()),
-                DRIVER);
+        installation();
+        DriverProbe missingDriver = () -> Optional.of("libcuda.so.1 cannot be loaded");
+        var problems = SetupCheck.problems(properties(this.directory.resolve("missing.edrl")), missingDriver);
         assertEquals(2, problems.size(), problems.toString());
         assertTrue(
                 problems.get(0).startsWith("model.artifact (EUHEDRAL_MODEL_ARTIFACT): no file at "), problems.get(0));
-        assertTrue(problems.get(1).startsWith("model.tokenizer (EUHEDRAL_MODEL_TOKENIZER): "), problems.get(1));
-        assertTrue(problems.get(1).contains("has no tokenizer.json, generation_config.json"), problems.get(1));
+        assertTrue(problems.get(1).contains("NVIDIA driver is required"), problems.get(1));
+    }
+
+    @Test
+    void anArtifactWithoutATokenizerNamesTheCommandThatAddsIt() throws IOException {
+        Path artifact = Files.write(this.directory.resolve("old.edrl"), new byte[64]);
+        var problems = SetupCheck.problems(properties(artifact), DRIVER);
+        assertEquals(1, problems.size(), problems.toString());
+        assertTrue(
+                problems.get(0)
+                        .startsWith("model.artifact (EUHEDRAL_MODEL_ARTIFACT): " + artifact + " carries no tokenizer"),
+                problems.get(0));
+        assertTrue(problems.get(0).contains("package-tokenizer --artifact " + artifact), problems.get(0));
     }
 
     @Test

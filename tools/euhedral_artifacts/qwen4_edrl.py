@@ -21,6 +21,7 @@ import zlib
 
 import numpy as np
 
+from euhedral_artifacts import tokenizer_section
 from euhedral_artifacts.edrl import MAGIC, align_up, fail, sha256
 from euhedral_artifacts.nvfp4 import nvfp4_offsets
 from euhedral_artifacts.qwen4_source import (BANK_ALIGNMENT, GROUP_ORDINAL, GROUPS, NGRAM_ROW_LAYOUT, NVFP4_BLOCK,
@@ -251,11 +252,12 @@ def prepare(source: SourceCheckpoint) -> tuple[Plan, bytes, int, int]:
 
 def convert(checkpoint: Path, output: Path, jobs: int = 4, force: bool = False,
             log: Callable[[str], None] = lambda message: print(message, flush=True)) -> dict[str, Any]:
-    """Writes the artifact for the NVFP4 checkpoint directory. Restartable: an interrupted conversion leaves
+    """Writes the artifact for the NVFP4 checkpoint directory, with its tokenizer. Restartable: an interrupted conversion leaves
     `<output>.partial` and `<output>.progress`, and running it again writes only what is missing."""
     if output.exists() and not force:
         fail(f"output already exists; pass --force: {output}")
     source = SourceCheckpoint(checkpoint)
+    tokenizer = tokenizer_section.encode(tokenizer_section.from_checkpoint(checkpoint))
     plan, metadata, data_offset, file_size = prepare(source)
     fingerprint = plan_fingerprint(plan, metadata)
     partial = output.with_name(output.name + ".partial")
@@ -320,6 +322,7 @@ def convert(checkpoint: Path, output: Path, jobs: int = 4, force: bool = False,
         os.fsync(handle.fileno())
         handle.seek(0)
         handle.write(encode_header(len(metadata), len(tables), data_offset, file_size))
+        tokenizer_section.write(handle, file_size, tokenizer)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(partial, output)
@@ -385,7 +388,7 @@ def read_artifact(path: Path) -> dict[str, Any]:
             struct.unpack(HEADER_FORMAT, header))
         if magic != MAGIC or version != VERSION or reserved != 0:
             fail("not an EDRL version 3 artifact")
-        if file_size != path.stat().st_size:
+        if file_size != tokenizer_section.content_end(path):
             fail("file size does not match the header")
         handle.seek(meta_off)
         metadata = decode_metadata(handle.read(meta_size))

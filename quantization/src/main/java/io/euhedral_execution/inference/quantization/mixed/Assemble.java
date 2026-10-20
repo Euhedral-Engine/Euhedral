@@ -1,9 +1,11 @@
 package io.euhedral_execution.inference.quantization.mixed;
 
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactHeader;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.CompactArtifactWriter;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -103,16 +105,21 @@ public final class Assemble {
 
     /// Writes the composite as a standalone artifact file at `out`: header, metadata and tensor table, then each
     /// payload copied exactly from its source file in chunks of at most `copyBufferBytes`, so no payload is ever
-    /// held in memory. The file appears at `out` once complete.
+    /// held in memory, then the tokenizer the base carries. The file appears at `out` once complete.
     public static void write(
             Sources sources, Allocation allocation, OptionalInt draftDepth, Path out, long copyBufferBytes)
             throws IOException {
-        write(view(sources, allocation, draftDepth), out, copyBufferBytes);
+        write(
+                view(sources, allocation, draftDepth),
+                TokenizerSection.require(sources.path(sources.base())),
+                out,
+                copyBufferBytes);
     }
 
-    /// Writes `composite` (each object's payload read from the file [Artifact#pathOf] names) as a standalone
-    /// artifact file at `out`, as [#write] does.
-    public static void write(Artifact composite, Path out, long copyBufferBytes) throws IOException {
+    /// Writes `composite` (each object's payload read from the file [Artifact#pathOf] names), carrying `tokenizer`,
+    /// as a standalone artifact file at `out`, as [#write] does.
+    public static void write(Artifact composite, TokenizerFiles tokenizer, Path out, long copyBufferBytes)
+            throws IOException {
         if (copyBufferBytes < 1) throw new IllegalArgumentException("the copy buffer must be at least one byte");
         TensorDescriptor[] source = composite.tensors();
         long metadataSize = CompactArtifactWriter.metadataSize(composite.config());
@@ -141,8 +148,8 @@ public final class Assemble {
                 dataOffset);
         Path partial = out.resolveSibling(out.getFileName() + ".partial");
         Map<Path, FileChannel> inputs = new HashMap<>();
-        try (FileChannel channel =
-                CompactArtifactWriter.writeLayout(partial, new Artifact(header, composite.config(), placed))) {
+        try (FileChannel channel = CompactArtifactWriter.writeLayout(
+                partial, new Artifact(header, composite.config(), placed), tokenizer)) {
             for (int i = 0; i < source.length; i++) {
                 Path file = composite.pathOf(out, source[i]);
                 FileChannel input = inputs.get(file);

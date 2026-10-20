@@ -14,6 +14,7 @@ import io.euhedral_execution.inference.core.state.KvFormat;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.testing.SharedQwen38Mtp;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -174,8 +175,8 @@ class KvFormatCudaIntegrationTest {
     }
 
     private static QwenTokenizer tokenizer() throws Exception {
-        return QwenTokenizer.load(
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir")));
+        return QwenTokenizer.load(TokenizerFiles.fromCheckpoint(
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"))));
     }
 
     private static int[] document(QwenTokenizer tokenizer) throws Exception {

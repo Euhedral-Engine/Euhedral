@@ -64,8 +64,7 @@ class StorageCudaIntegrationTest {
         for (int context : CONTEXTS) {
             BitSet cpus = new BitSet();
             cpus.set(0);
-            InferenceConfig config =
-                    new InferenceConfig(artifact, Path.of("unused"), library, cpus, context, Duration.ofSeconds(30));
+            InferenceConfig config = new InferenceConfig(artifact, library, cpus, context, Duration.ofSeconds(30));
             Storage storage = Storage.load(config);
             CudaGpuMemory gpu = (CudaGpuMemory) storage.gpu();
             try {

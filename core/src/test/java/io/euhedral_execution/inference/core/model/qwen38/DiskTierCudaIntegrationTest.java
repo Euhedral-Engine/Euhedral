@@ -16,6 +16,7 @@ import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -58,7 +59,7 @@ class DiskTierCudaIntegrationTest {
     private static int[] prompt() throws Exception {
         Path tokenizer =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
-        int[] text = QwenTokenizer.load(tokenizer)
+        int[] text = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizer))
                 .encodeText(Files.readString(
                         SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/FRAME_MODEL.md")));
         assumeTrue(text.length >= PROMPT + 8, "the prompt text is too short");

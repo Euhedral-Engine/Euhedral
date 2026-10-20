@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -33,7 +34,8 @@ class QwenChatTemplateTest {
         QwenTokenizer loaded = sharedTokenizer;
         if (loaded == null) {
             synchronized (QwenChatTemplateTest.class) {
-                if (sharedTokenizer == null) sharedTokenizer = QwenTokenizer.load(checkpoint);
+                if (sharedTokenizer == null)
+                    sharedTokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(checkpoint));
                 loaded = sharedTokenizer;
             }
         }
@@ -320,15 +322,23 @@ class QwenChatTemplateTest {
     }
 
     @Test
-    void loadsFromJinjaFileOrTokenizerConfig(@TempDir Path directory) throws IOException {
+    void packagesTheJinjaFileOrTheTokenizerConfigTemplate(@TempDir Path directory) throws IOException {
         String source = resource("/qwen-chat-template.jinja");
-        assertThrows(IOException.class, () -> QwenChatTemplate.load(directory));
+        Files.writeString(directory.resolve("tokenizer.json"), "{}");
+        Files.writeString(directory.resolve("generation_config.json"), "{\"eos_token_id\":[1],\"top_k\":20}");
+        Files.writeString(directory.resolve("tokenizer_config.json"), "{}");
+        assertThrows(IOException.class, () -> TokenizerFiles.fromCheckpoint(directory));
         Files.writeString(
                 directory.resolve("tokenizer_config.json"),
                 JsonMapper.shared().writeValueAsString(java.util.Map.of("chat_template", source)));
-        QwenChatTemplate.load(directory);
+        TokenizerFiles files = TokenizerFiles.fromCheckpoint(directory);
+        assertEquals("{\"eos_token_id\":[1]}", files.specialTokens(), "only the special-token ids are packaged");
+        QwenChatTemplate.load(files);
         Files.writeString(directory.resolve("chat_template.jinja"), "{{ messages }}");
-        assertThrows(IOException.class, () -> QwenChatTemplate.load(directory), "the .jinja file takes precedence");
+        assertThrows(
+                IOException.class,
+                () -> QwenChatTemplate.load(TokenizerFiles.fromCheckpoint(directory)),
+                "the .jinja file takes precedence");
     }
 
     /// Converts golden template-input messages the same way `ChatRequestMapper` does. Golden tool-call

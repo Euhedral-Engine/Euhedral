@@ -25,8 +25,7 @@ import org.junit.jupiter.api.Timeout;
 /// The `bf16` artifact loaded and closed several times in one JVM with a 24 GiB pinned host budget, each engine
 /// staging host-backed and disk-backed weights for a speculative decode or a 2048-token prefill: every load's
 /// generation produces tokens within a time bound. A generation that misses the bound ends the JVM, whose stuck device
-/// work could not be released otherwise. Skipped unless -Peuhedral.qwen.bf16-artifact names the artifact and
-/// -Peuhedral.qwen.tokenizer-dir its tokenizer.
+/// work could not be released otherwise. Skipped unless -Peuhedral.qwen.bf16-artifact names the artifact.
 // Own JVM: loads the engine several times.
 @ModelGroup.OwnJvm
 class DiskTierReloadCudaIntegrationTest {
@@ -47,7 +46,6 @@ class DiskTierReloadCudaIntegrationTest {
         String artifactProperty = System.getProperty("euhedral.qwen.bf16-artifact");
         assumeTrue(artifactProperty != null && Files.isRegularFile(Path.of(artifactProperty)), "no BF16 artifact");
         Path artifact = Path.of(artifactProperty);
-        Path tokenizer = Path.of(System.getProperty("euhedral.qwen.tokenizer-dir"));
         int cycles = Integer.getInteger("euhedral.reload.cycles", 4);
         long minutes = Long.getLong("euhedral.reload.minutes", 10L);
         System.out.printf(
@@ -56,7 +54,6 @@ class DiskTierReloadCudaIntegrationTest {
             for (int cycle = 1; cycle <= cycles; cycle++) {
                 var config = new InferenceConfig(
                                 artifact,
-                                tokenizer,
                                 Path.of(library),
                                 SystemInfo.getPCpuSet(),
                                 4096,

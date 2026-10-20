@@ -28,7 +28,6 @@ public final class EngineTarget implements BenchmarkRunner.Target {
 
     public static BenchmarkRunner.TargetFactory factory(
             Path artifact,
-            Path tokenizer,
             Path cudaLibrary,
             BitSet workerCpus,
             int maxContextTokens,
@@ -41,7 +40,6 @@ public final class EngineTarget implements BenchmarkRunner.Target {
             try {
                 var engine = InferenceEngine.load(new InferenceConfig(
                         artifact,
-                        tokenizer,
                         cudaLibrary,
                         workerCpus,
                         maxContextTokens,

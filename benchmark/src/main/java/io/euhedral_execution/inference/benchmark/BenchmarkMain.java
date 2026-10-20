@@ -28,7 +28,7 @@ public final class BenchmarkMain {
               run CONFIG.json [--fork-id ID] [--validate-only]
               import --input FILE --implementation LABEL --output FILE [--note TEXT] [--overwrite|--append]
 
-            CONFIG.json requires "artifact", "tokenizer", and "cudaLibrary"; see docs/BENCHMARKING.md.
+            CONFIG.json requires "artifact" and "cudaLibrary"; see docs/BENCHMARKING.md.
             --fork-id labels this JVM as one externally launched fork; iterations are never forks.
             --validate-only checks configuration and prerequisites, prints the plan, and exits without
             touching the GPU. Exit codes: 0 success, 1 a measured row failed or was ineligible, 2 usage,
@@ -119,7 +119,6 @@ public final class BenchmarkMain {
                 Clock.systemUTC());
         var factory = EngineTarget.factory(
                 options.artifact(),
-                options.tokenizer(),
                 options.cudaLibrary(),
                 prepared.workers().processorIds(),
                 options.maxContextTokens(),

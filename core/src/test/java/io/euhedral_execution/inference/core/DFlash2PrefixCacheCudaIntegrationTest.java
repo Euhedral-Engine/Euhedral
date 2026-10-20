@@ -38,15 +38,13 @@ class DFlash2PrefixCacheCudaIntegrationTest {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)));
         Path artifact = Path.of(System.getProperty("euhedral.qwen.dflash2-artifact", ""));
-        Path tokenizer =
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(artifact), "no DFlash2 artifact: " + artifact);
         BitSet cpus = new BitSet();
         var available = SystemInfo.getPCpuSet();
         for (int cpu = available.nextSetBit(0); cpu >= 0 && cpus.cardinality() < 2; cpu = available.nextSetBit(cpu + 1))
             cpus.set(cpu);
         return new InferenceConfig(
-                artifact, tokenizer, Path.of(library), cpus, 8192, Duration.ofSeconds(10), cacheBytes, INTERVAL);
+                artifact, Path.of(library), cpus, 8192, Duration.ofSeconds(10), cacheBytes, INTERVAL);
     }
 
     private static InferenceEngine load(InferenceConfig config, RecordingBootstrap bootstrap) throws Exception {

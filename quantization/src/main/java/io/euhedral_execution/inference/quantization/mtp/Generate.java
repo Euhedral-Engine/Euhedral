@@ -8,7 +8,6 @@ import io.euhedral_execution.core.generics.LatticeSource;
 import io.euhedral_execution.core.ingest.AbstractIngestSink;
 import io.euhedral_execution.data_structures.queues.MpscQueue;
 import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
-import io.euhedral_execution.inference.api.chat.SamplingDefaults;
 import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.generation.DeviceLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
@@ -22,8 +21,10 @@ import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.sampling.TokenSampler;
+import io.euhedral_execution.inference.core.settings.SamplingSettings;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import io.euhedral_execution.inference.quantization.CalibrationLattice;
 import io.euhedral_execution.inference.quantization.Residency;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
@@ -53,7 +54,7 @@ import java.util.function.Function;
 /// post-final-norm hidden of every row the base model ran, which is what seeds the drafter
 /// (docs/MTP_CONTRACT.md §2), and the base model's greedy choice after every row, which is what the drafter
 /// learns to draft. A `greedyFraction` of the prompts (chosen by a hash of their ids) is answered greedily; the
-/// others are sampled as the server samples them: the checkpoint's generation_config ([SamplingDefaults]) through
+/// others are sampled as the server samples them: the server's default sampling ([SamplingSettings#defaults]) through
 /// the engine's [TokenSampler], seeded by the prompt id, each position's draw keyed by its position.
 ///
 /// Each prompt is rendered by the checkpoint's chat template (thinking on, as the template defaults) and
@@ -92,7 +93,9 @@ public final class Generate {
     private final Set<Integer> stops;
     private final AtomicLong sequenceIds = new AtomicLong(1);
     private final KvFormat kvFormat;
-    private final SamplingDefaults sampling;
+    /// How sampled prompts sample: the server's default `sampling` settings.
+    private static final SamplingSettings SAMPLING = SamplingSettings.defaults();
+
     /// Mapped host memory the argmax kernel writes: one int per lane for prefills, one per row for the step.
     private final long prefillChoices, stepChoices;
 
@@ -102,10 +105,8 @@ public final class Generate {
             Execution runtime,
             ExecutionPlan plan,
             Set<Integer> stops,
-            KvFormat kvFormat,
-            SamplingDefaults sampling) {
+            KvFormat kvFormat) {
         this.settings = settings;
-        this.sampling = sampling;
         this.kvFormat = kvFormat;
         this.device = device;
         this.runtime = runtime;
@@ -176,8 +177,9 @@ public final class Generate {
             // The worker's thread compiles the generator's kernels; no stream stays selected on it, since the engine's
             // quanta select their own on the same workers.
             device.cuda.bindThread();
-            QwenTokenizer tokenizer = QwenTokenizer.load(settings.tokenizer());
-            QwenChatTemplate template = QwenChatTemplate.load(settings.tokenizer());
+            TokenizerFiles files = TokenizerFiles.fromCheckpoint(settings.tokenizer());
+            QwenTokenizer tokenizer = QwenTokenizer.load(files);
+            QwenChatTemplate template = QwenChatTemplate.load(files);
             Files.createDirectories(settings.out());
             List<Prompt> prompts = new ArrayList<>();
             try (Corpus.Writer existing = Corpus.Writer.open(settings.out(), 0)) {
@@ -192,14 +194,7 @@ public final class Generate {
             }
             Corpus.Writer writer =
                     Corpus.Writer.open(settings.out(), plan.weights().config().hiddenSize());
-            var generate = new Generate(
-                    settings,
-                    device,
-                    runtime,
-                    plan,
-                    tokenizer.generationEosTokenIds(),
-                    kvFormat,
-                    SamplingDefaults.load(settings.tokenizer()));
+            var generate = new Generate(settings, device, runtime, plan, tokenizer.generationEosTokenIds(), kvFormat);
             var generation = generate.new Generation(prompts, writer);
             lattice.attach(generation);
             return generation;
@@ -281,7 +276,7 @@ public final class Generate {
             this.sampler = greedy(seed)
                     ? null
                     : new TokenSampler(
-                            new GenerationConfig(sampling.temperature(), sampling.topK(), sampling.topP(), seed, false),
+                            new GenerationConfig(SAMPLING.temperature(), SAMPLING.topK(), SAMPLING.topP(), seed, false),
                             vocabulary);
         }
 
@@ -543,10 +538,9 @@ public final class Generate {
         return hash;
     }
 
-    /// Whether the prompt of `seed` is answered greedily: a `greedyFraction` of seeds (all of them when the
-    /// checkpoint's generation_config is greedy).
+    /// Whether the prompt of `seed` is answered greedily: a `greedyFraction` of seeds.
     private boolean greedy(long seed) {
-        return sampling.temperature() <= 0 || (seed >>> 11) * 0x1p-53 < settings.greedyFraction();
+        return (seed >>> 11) * 0x1p-53 < settings.greedyFraction();
     }
 
     private static CompletableFuture<Void> succeeded(CompletableFuture<Quantum.Outcome> outcome) {

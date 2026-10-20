@@ -139,7 +139,6 @@ public final class BenchmarkFixtures {
     public static BenchmarkOptions options(List<Scenario> scenarios, int warmup, int iterations) {
         return new BenchmarkOptions(
                 Path.of("/a"),
-                Path.of("/t"),
                 Path.of("/l"),
                 null,
                 null,

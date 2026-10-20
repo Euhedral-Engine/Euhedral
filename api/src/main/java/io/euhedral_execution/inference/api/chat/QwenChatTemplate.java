@@ -1,15 +1,12 @@
 package io.euhedral_execution.inference.api.chat;
 
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import tools.jackson.databind.JsonNode;
-import tools.jackson.databind.json.JsonMapper;
 
 /// Renders conversations in the ChatML-with-think format of the loaded Qwen checkpoint.
 ///
@@ -178,17 +175,9 @@ public final class QwenChatTemplate {
         }
     }
 
-    /// Loads `chat_template.jinja`, falling back to `tokenizer_config.json`'s `chat_template` string.
-    public static QwenChatTemplate load(Path tokenizerDirectory) throws IOException {
-        Path jinja = tokenizerDirectory.resolve("chat_template.jinja");
-        if (Files.isRegularFile(jinja)) return fromTemplateSource(Files.readString(jinja));
-        Path config = tokenizerDirectory.resolve("tokenizer_config.json");
-        if (Files.isRegularFile(config)) {
-            JsonNode template =
-                    JsonMapper.shared().readTree(Files.readString(config)).path("chat_template");
-            if (template.isString()) return fromTemplateSource(template.asString());
-        }
-        throw new IOException("checkpoint has no chat template in " + tokenizerDirectory);
+    /// The formatter for the chat template the artifact carries.
+    public static QwenChatTemplate load(TokenizerFiles files) throws IOException {
+        return fromTemplateSource(files.chatTemplate());
     }
 
     /// Verifies that `source` is the Qwen template this formatter reproduces.

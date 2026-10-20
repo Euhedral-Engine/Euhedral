@@ -28,12 +28,7 @@ class DiskTierEngineCudaIntegrationTest {
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         Path artifact = Path.of(System.getProperty("euhedral.qwen.artifact", "unset-euhedral.qwen.artifact"));
         assumeTrue(Files.isRegularFile(artifact), "no artifact " + artifact);
-        var config = new InferenceConfig(
-                        artifact,
-                        Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir")),
-                        Path.of(library),
-                        SystemInfo.getPCpuSet(),
-                        Duration.ofSeconds(30))
+        var config = new InferenceConfig(artifact, Path.of(library), SystemInfo.getPCpuSet(), Duration.ofSeconds(30))
                 .withTuning(Tunings.limits(OptionalLong.of(8L << 30), OptionalLong.of(2L << 30)));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             var dense = (Qwen38Runtime) engine.modelRuntime();

@@ -54,7 +54,6 @@ class EuhedralInferenceApplicationTest {
         Path file = file("""
                 model:
                   artifact: /m.edrl
-                  tokenizer: /t
                   name: n
                 server:
                   port: 0
@@ -93,7 +92,6 @@ class EuhedralInferenceApplicationTest {
         Path file = file("""
                 model:
                   artifact: /m.edrl
-                  tokenizer: /t
                   name: n
                 server:
                   port: %d

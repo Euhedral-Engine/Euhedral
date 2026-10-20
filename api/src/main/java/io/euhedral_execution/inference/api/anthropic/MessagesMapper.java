@@ -6,11 +6,11 @@ import io.euhedral_execution.inference.api.chat.ConversationPlanner;
 import io.euhedral_execution.inference.api.chat.FunctionTool;
 import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
 import io.euhedral_execution.inference.api.chat.ResponseFormat;
-import io.euhedral_execution.inference.api.chat.SamplingDefaults;
 import io.euhedral_execution.inference.api.chat.ToolCalling;
 import io.euhedral_execution.inference.api.chat.ToolResults;
 import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.settings.SamplingSettings;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -36,12 +36,12 @@ public class MessagesMapper {
     private static final Set<String> IGNORED = Set.of("metadata", "service_tier");
 
     private final InferenceBackend backend;
-    private final SamplingDefaults samplingDefaults;
+    private final SamplingSettings samplingSettings;
     private final ConversationPlanner planner;
 
-    public MessagesMapper(InferenceBackend backend, SamplingDefaults samplingDefaults, ConversationPlanner planner) {
+    public MessagesMapper(InferenceBackend backend, SamplingSettings samplingSettings, ConversationPlanner planner) {
         this.backend = backend;
-        this.samplingDefaults = samplingDefaults;
+        this.samplingSettings = samplingSettings;
         this.planner = planner;
     }
 
@@ -461,23 +461,23 @@ public class MessagesMapper {
         return stops;
     }
 
-    /// Omitted values take the checkpoint's generation_config; a temperature of 0 is greedy.
+    /// Omitted values take the `sampling` settings; a temperature of 0 is greedy.
     private GenerationConfig sampling(MessagesRequest request) {
-        float temperature = this.samplingDefaults.temperature();
+        float temperature = this.samplingSettings.temperature();
         if (request.temperature() != null) {
             double value = request.temperature();
             if (!(value >= 0.0 && value <= 1.0))
                 throw ApiException.invalidRequest("temperature: must be between 0 and 1", "temperature");
             temperature = (float) value;
         }
-        float topP = this.samplingDefaults.topP();
+        float topP = this.samplingSettings.topP();
         if (request.topP() != null) {
             double value = request.topP();
             if (!(value > 0.0 && value <= 1.0))
                 throw ApiException.invalidRequest("top_p: must be greater than 0 and at most 1", "top_p");
             topP = (float) value;
         }
-        int topK = this.samplingDefaults.topK();
+        int topK = this.samplingSettings.topK();
         if (request.topK() != null) {
             if (request.topK() < 1) throw ApiException.invalidRequest("top_k: must be at least 1", "top_k");
             topK = request.topK();

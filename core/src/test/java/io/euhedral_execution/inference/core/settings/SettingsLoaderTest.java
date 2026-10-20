@@ -17,8 +17,8 @@ import org.junit.jupiter.api.io.TempDir;
 
 class SettingsLoaderTest {
 
-    private static final String MODEL = "model:\n  artifact: /m/a.edrl\n  tokenizer: /m/tok\n  name: q\n";
-    private static final ModelSettings MODEL_SETTINGS = new ModelSettings(Path.of("/m/a.edrl"), Path.of("/m/tok"), "q");
+    private static final String MODEL = "model:\n  artifact: /m/a.edrl\n  name: q\n";
+    private static final ModelSettings MODEL_SETTINGS = new ModelSettings(Path.of("/m/a.edrl"), "q");
 
     @TempDir
     Path dir;
@@ -38,6 +38,7 @@ class SettingsLoaderTest {
     private static Settings defaultsWith(ModelSettings model) {
         return new Settings(
                 model,
+                SamplingSettings.defaults(),
                 ServerSettings.defaults(),
                 ContextSettings.defaults(),
                 PrefixCacheSettings.defaults(),
@@ -58,8 +59,8 @@ class SettingsLoaderTest {
     void missingRequired() throws IOException {
         String message = String.join("|", fails("", Map.of()).problems());
         assertTrue(message.contains("model.artifact"), message);
-        assertTrue(message.contains("model.tokenizer"), message);
         assertTrue(message.contains("model.name"), message);
+        assertTrue(!message.contains("model.tokenizer"), message);
     }
 
     @Test
@@ -68,9 +69,53 @@ class SettingsLoaderTest {
                 Optional.empty(),
                 Map.of(
                         "EUHEDRAL_MODEL_ARTIFACT", "/m/a.edrl",
-                        "EUHEDRAL_MODEL_TOKENIZER", "/m/tok",
                         "EUHEDRAL_MODEL_NAME", "q"));
         assertEquals(defaultsWith(MODEL_SETTINGS), s);
+    }
+
+    @Test
+    void tokenizerVariableIsRetired() {
+        SettingsException e = assertThrows(
+                SettingsException.class,
+                () -> SettingsLoader.load(
+                        Optional.empty(),
+                        Map.of(
+                                "EUHEDRAL_MODEL_ARTIFACT", "/m/a.edrl",
+                                "EUHEDRAL_MODEL_TOKENIZER", "/m/tok",
+                                "EUHEDRAL_MODEL_NAME", "q")));
+        assertEquals(
+                List.of("EUHEDRAL_MODEL_TOKENIZER is retired: removed: the artifact carries its tokenizer"),
+                e.problems());
+    }
+
+    @Test
+    void tokenizerKeyIsRetired() throws IOException {
+        SettingsException e = fails(MODEL.replace("  name: q\n", "  tokenizer: /m/tok\n  name: q\n"), Map.of());
+        assertEquals(List.of("model.tokenizer is retired: removed: the artifact carries its tokenizer"), e.problems());
+    }
+
+    @Test
+    void samplingParses() throws IOException {
+        Settings s = load(MODEL + "sampling:\n  temperature: 0.7\n  top-k: 0\n  top-p: 1\n", Map.of());
+        assertEquals(new SamplingSettings(0.7f, 0, 1.0f), s.sampling());
+        assertEquals(
+                new SamplingSettings(1.0f, 20, 0.95f), load(MODEL, Map.of()).sampling());
+    }
+
+    @Test
+    void samplingOutOfRangeNamesTheKey() throws IOException {
+        assertEquals(
+                List.of("sampling.top-p: must be above 0 and at most 1: 1.5"),
+                fails(MODEL + "sampling:\n  top-p: 1.5\n", Map.of()).problems());
+        assertEquals(
+                List.of("sampling.temperature (EUHEDRAL_SAMPLING_TEMPERATURE): must be 0 or more: -1"),
+                fails(MODEL, Map.of("EUHEDRAL_SAMPLING_TEMPERATURE", "-1")).problems());
+        assertEquals(
+                List.of("sampling.top-k: must be 0 to 2147483647: -2"),
+                fails(MODEL + "sampling:\n  top-k: -2\n", Map.of()).problems());
+        assertTrue(fails(MODEL + "sampling:\n  top-p: NaN\n", Map.of())
+                .getMessage()
+                .contains("sampling.top-p"));
     }
 
     @Test
@@ -241,7 +286,7 @@ class SettingsLoaderTest {
 
     @Test
     void blankRequiredVariableReportsOnlyEmpty() throws IOException {
-        SettingsException e = fails("model:\n  tokenizer: /t\n  name: q\n", Map.of("EUHEDRAL_MODEL_ARTIFACT", " "));
+        SettingsException e = fails("model:\n  name: q\n", Map.of("EUHEDRAL_MODEL_ARTIFACT", " "));
         assertEquals(1, e.problems().size(), e.getMessage());
         assertTrue(e.getMessage().contains("empty"), e.getMessage());
     }

@@ -32,7 +32,7 @@ renders to the same prompt, so the two share cached prefixes.
 | `output_config.effort` | With thinking: `low` and `medium` select the template's levels, `high` and `max` its highest ([REASONING.md](REASONING.md)). Without thinking it is refused. |
 | `output_config.format` | `{"type": "json_schema", "schema": ...}`: the text block is a JSON document of the schema ([STRUCTURED_OUTPUT.md](STRUCTURED_OUTPUT.md)). The earlier top-level `output_format` is accepted too. |
 | `stop_sequences` | Up to 32 non-empty strings, matched in the answer only. |
-| `temperature`, `top_p`, `top_k` | Sampling; `temperature` 0 to 1 (0 is greedy); omitted values take the checkpoint's `generation_config.json` (1.0, 0.95, 20). |
+| `temperature`, `top_p`, `top_k` | Sampling; `temperature` 0 to 1 (0 is greedy); omitted values take the `sampling` settings (1.0, 0.95, 20 by default). |
 | `stream` | Server-sent events, below. |
 | `metadata`, `service_tier`, `cache_control` | Accepted without effect: prefix reuse is automatic. |
 

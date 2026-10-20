@@ -14,6 +14,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from euhedral_artifacts import qwen4_edrl as edrl  # noqa: E402
+from euhedral_artifacts import tokenizer_section  # noqa: E402
 from euhedral_artifacts.nvfp4 import nvfp4_offsets  # noqa: E402
 from euhedral_artifacts.qwen4_source import SourceCheckpoint, build_plan  # noqa: E402
 
@@ -128,6 +129,10 @@ def make_checkpoint(directory: Path, seed: int = 7) -> None:
     m = Maker(seed)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "config.json").write_text(json.dumps(config()))
+    (directory / "tokenizer.json").write_text("{}")
+    (directory / "tokenizer_config.json").write_text("{}")
+    (directory / "chat_template.jinja").write_text("template")
+    (directory / "generation_config.json").write_text(json.dumps({"eos_token_id": [2], "top_k": 20}))
     m.bf16("lm_head.weight", 64, HIDDEN)
     m.bf16("model.language_model.embed_tokens.weight", 64, HIDDEN)
     hyper(m, "model.language_model.hyper_connection_mixer", inject=False)
@@ -218,6 +223,8 @@ class FlashNextConverterTest(unittest.TestCase):
         self.assertEqual(manifest["artifact_bytes"], artifact.stat().st_size)
         self.assertEqual(len(manifest["sha256"]), 64)
         self.assertFalse(Path(f"{artifact}.partial").exists())
+        self.assertEqual(tokenizer_section.encode(tokenizer_section.from_checkpoint(self.checkpoint)),
+                         tokenizer_section.read(artifact), "the artifact carries the checkpoint's tokenizer")
 
     def test_expert_record_decodes_like_the_checkpoint(self) -> None:
         artifact = self.convert()

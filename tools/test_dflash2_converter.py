@@ -9,7 +9,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from euhedral_artifacts import dflash2, edrl  # noqa: E402
+from euhedral_artifacts import dflash2, edrl, tokenizer_section  # noqa: E402
 
 HIDDEN, INTERMEDIATE, HEADS, KV_HEADS, HEAD_DIM, VOCAB = 256, 512, 4, 2, 64, 300
 CONFIG = {
@@ -69,6 +69,7 @@ def write_artifact(path: Path, payloads) -> None:
         output.write(edrl.encode_table(plans))
         for plan in plans:
             plan.writer(output, plan.offset)
+        tokenizer_section.write(output, size, tokenizer_section.encode(("{}", "{}", "template", "{}")))
 
 
 class DFlash2ConverterTest(unittest.TestCase):

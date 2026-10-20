@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.quantization.mtp;
 
 import io.euhedral_execution.inference.core.artifact.TensorDataType;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
@@ -27,7 +28,8 @@ import java.util.Map;
 /// Writes an artifact whose MTP layer is a trained drafter's: every object of the base artifact, except that the MTP
 /// layer's projections are NVFP4 (round to nearest, [Nvfp4Rounding], as the drafter trained them) and its norms BF16,
 /// from a `train-drafter` parameter file (FP32 values in [Drafter]'s parameter order after the file's header) or,
-/// without one, from the checkpoint's MTP weights. The base's own MTP objects and their companions are left out.
+/// without one, from the checkpoint's MTP weights. The base's own MTP objects and their companions are left out; the
+/// base's tokenizer is carried.
 public final class DrafterExport {
 
     public record Settings(Path parameters, Path model, Path artifact, Path out) {}
@@ -149,6 +151,7 @@ public final class DrafterExport {
         try {
             Assemble.write(
                     new Artifact(base.header(), base.config(), tensors.toArray(TensorDescriptor[]::new), sources),
+                    TokenizerSection.require(settings.artifact()),
                     settings.out(),
                     Assemble.DEFAULT_COPY_BUFFER_MIB << 20);
         } finally {

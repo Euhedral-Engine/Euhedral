@@ -6,11 +6,11 @@ import io.euhedral_execution.inference.api.chat.ConversationPlanner;
 import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
 import io.euhedral_execution.inference.api.chat.Reasoning;
 import io.euhedral_execution.inference.api.chat.ResponseFormat;
-import io.euhedral_execution.inference.api.chat.SamplingDefaults;
 import io.euhedral_execution.inference.api.chat.ToolCalling;
 import io.euhedral_execution.inference.api.chat.ToolResults;
 import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.settings.SamplingSettings;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -68,12 +68,12 @@ public class ChatRequestMapper {
             "audio", value -> false);
 
     private final InferenceBackend backend;
-    private final SamplingDefaults samplingDefaults;
+    private final SamplingSettings samplingSettings;
     private final ConversationPlanner planner;
 
-    public ChatRequestMapper(InferenceBackend backend, SamplingDefaults samplingDefaults, ConversationPlanner planner) {
+    public ChatRequestMapper(InferenceBackend backend, SamplingSettings samplingSettings, ConversationPlanner planner) {
         this.backend = backend;
-        this.samplingDefaults = samplingDefaults;
+        this.samplingSettings = samplingSettings;
         this.planner = planner;
     }
 
@@ -297,16 +297,16 @@ public class ChatRequestMapper {
         return requested;
     }
 
-    /// Omitted fields take the checkpoint's generation_config values; temperature or top_p of 0 is greedy.
+    /// Omitted fields take the `sampling` settings; temperature or top_p of 0 is greedy.
     private GenerationConfig sampling(ChatCompletionRequest request) {
-        float temperature = this.samplingDefaults.temperature();
+        float temperature = this.samplingSettings.temperature();
         if (request.temperature() != null) {
             double value = request.temperature();
             if (!(value >= 0.0 && value <= 2.0))
                 throw ApiException.invalidRequest("'temperature' must be between 0 and 2.", "temperature");
             temperature = (float) value;
         }
-        float topP = this.samplingDefaults.topP();
+        float topP = this.samplingSettings.topP();
         if (request.topP() != null) {
             double value = request.topP();
             if (!(value >= 0.0 && value <= 1.0))
@@ -317,7 +317,7 @@ public class ChatRequestMapper {
                 ? request.seed()
                 : ThreadLocalRandom.current().nextLong();
         boolean greedy = temperature == 0.0f || topP == 0.0f;
-        int topK = this.samplingDefaults.topK();
+        int topK = this.samplingSettings.topK();
         if (request.topK() != null) {
             // As vLLM spells it: 0 or -1 turns top-k off.
             if (request.topK() < -1)

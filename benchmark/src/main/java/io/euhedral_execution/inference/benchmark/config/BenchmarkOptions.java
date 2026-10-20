@@ -40,7 +40,6 @@ import java.util.Optional;
 @JsonIgnoreProperties(ignoreUnknown = false)
 public record BenchmarkOptions(
         @JsonProperty(value = "artifact", required = true) Path artifact,
-        @JsonProperty(value = "tokenizer", required = true) Path tokenizer,
 
         @JsonProperty(value = "cudaLibrary", required = true)
         Path cudaLibrary,
@@ -69,7 +68,6 @@ public record BenchmarkOptions(
 
     public BenchmarkOptions {
         Objects.requireNonNull(artifact, "artifact");
-        Objects.requireNonNull(tokenizer, "tokenizer");
         Objects.requireNonNull(cudaLibrary, "cudaLibrary");
         maxContextTokens = maxContextTokens == null ? InferenceConfig.DEFAULT_MAX_CONTEXT_TOKENS : maxContextTokens;
         prefixCacheBytes = prefixCacheBytes == null ? 0L : prefixCacheBytes;
@@ -156,7 +154,6 @@ public record BenchmarkOptions(
                 + ".jsonl");
         return new BenchmarkOptions(
                 options.artifact(),
-                options.tokenizer(),
                 options.cudaLibrary(),
                 options.maxContextTokens(),
                 options.prefixCacheBytes(),

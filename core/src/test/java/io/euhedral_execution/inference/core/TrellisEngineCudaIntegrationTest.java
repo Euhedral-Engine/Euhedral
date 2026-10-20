@@ -49,11 +49,9 @@ class TrellisEngineCudaIntegrationTest {
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         String artifact = System.getProperty(property);
         assumeTrue(artifact != null && Files.isRegularFile(Path.of(artifact)), "no artifact for " + property);
-        String tokenizer = System.getProperty("euhedral.qwen.tokenizer-dir");
-        assumeTrue(tokenizer != null, "no tokenizer directory");
 
         List<List<Integer>> greedy = new ArrayList<>();
-        try (InferenceEngine engine = InferenceEngine.load(config(artifact, tokenizer, library, 2))) {
+        try (InferenceEngine engine = InferenceEngine.load(config(artifact, library, 2))) {
             int[][] prompts = encode(engine);
             for (int[] prompt : prompts)
                 greedy.add(generate(engine, prompt, new SessionOptions(false)).get(10, TimeUnit.MINUTES));
@@ -78,7 +76,7 @@ class TrellisEngineCudaIntegrationTest {
 
         // Enough sequences that the plan moves trellis payloads to host memory.
         int crowded = Integer.getInteger("euhedral.trellis.test.host-sequences", 16);
-        try (InferenceEngine engine = InferenceEngine.load(config(artifact, tokenizer, library, crowded))) {
+        try (InferenceEngine engine = InferenceEngine.load(config(artifact, library, crowded))) {
             long hostBytes = engine.hostBackedWeightBytes();
             System.out.printf(
                     "TRELLIS %s with %d sequences: %d MiB of weights in host memory%n",
@@ -93,10 +91,9 @@ class TrellisEngineCudaIntegrationTest {
         }
     }
 
-    private static InferenceConfig config(String artifact, String tokenizer, String library, int sequences) {
+    private static InferenceConfig config(String artifact, String library, int sequences) {
         return new InferenceConfig(
                 Path.of(artifact),
-                Path.of(tokenizer),
                 Path.of(library),
                 SystemInfo.getPCpuSet(),
                 CONTEXT_TOKENS,

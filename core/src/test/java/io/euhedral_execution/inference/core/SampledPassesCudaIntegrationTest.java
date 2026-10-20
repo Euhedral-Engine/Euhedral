@@ -109,11 +109,8 @@ class SampledPassesCudaIntegrationTest {
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         String artifact = System.getProperty("euhedral.qwen.nvfp4-artifact");
         assumeTrue(artifact != null && Files.isRegularFile(Path.of(artifact)), "no NVFP4 artifact");
-        String tokenizer = System.getProperty("euhedral.qwen.tokenizer-dir");
-        assumeTrue(tokenizer != null, "no tokenizer directory");
         var config = new InferenceConfig(
                 Path.of(artifact),
-                Path.of(tokenizer),
                 Path.of(library),
                 SystemInfo.getPCpuSet(),
                 CONTEXT_TOKENS,

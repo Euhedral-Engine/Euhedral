@@ -3,20 +3,27 @@ package io.euhedral_execution.inference.core.model.qwen38.artifact;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.artifact.ArtifactFormatException;
 import io.euhedral_execution.inference.core.artifact.TensorDataType;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
+import io.euhedral_execution.inference.core.model.ArtifactTokenizer;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
+import io.euhedral_execution.inference.core.testing.TestTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.util.Arrays;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -35,8 +42,8 @@ class ArtifactBinaryTest {
         Path firstPath = tempDirectory.resolve("first.edrl");
         Path secondPath = tempDirectory.resolve("second.edrl");
 
-        CompactArtifactWriter.write(firstPath, artifact, PAYLOAD);
-        CompactArtifactWriter.write(secondPath, artifact, PAYLOAD);
+        CompactArtifactWriter.write(firstPath, artifact, PAYLOAD, TestTokenizer.FILES);
+        CompactArtifactWriter.write(secondPath, artifact, PAYLOAD, TestTokenizer.FILES);
 
         Artifact read = ArtifactReader.read(firstPath);
         assertEquals(artifact.header(), read.header());
@@ -54,7 +61,7 @@ class ArtifactBinaryTest {
     void rejectsInvalidMagic() throws Exception {
         Artifact artifact = artifact(sampleConfig(), descriptors(sampleConfig()));
         Path path = tempDirectory.resolve("invalid-magic.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
 
         byte[] bytes = Files.readAllBytes(path);
         ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).putInt(0, 0);
@@ -67,10 +74,11 @@ class ArtifactBinaryTest {
     void rejectsTruncatedArtifact() throws Exception {
         Artifact artifact = artifact(sampleConfig(), descriptors(sampleConfig()));
         Path path = tempDirectory.resolve("truncated.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
 
+        // The last payload loses its last byte (and the tokenizer after it).
         byte[] bytes = Files.readAllBytes(path);
-        Files.write(path, java.util.Arrays.copyOf(bytes, bytes.length - 1));
+        Files.write(path, java.util.Arrays.copyOf(bytes, (int) ArtifactTokenizer.contentEnd(path) - 1));
 
         assertThrows(ArtifactFormatException.class, () -> ArtifactReader.read(path));
     }
@@ -81,7 +89,7 @@ class ArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         Artifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("invalid-offset.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
 
         byte[] bytes = Files.readAllBytes(path);
         int dataOffsetField = (int) tensorsTableOffset(artifact) + tensorDataOffsetWithinEntry(tensors[0]);
@@ -95,7 +103,7 @@ class ArtifactBinaryTest {
     void rejectsTensorCountThatDoesNotMatchTable() throws Exception {
         Artifact artifact = artifact(sampleConfig(), descriptors(sampleConfig()));
         Path path = tempDirectory.resolve("invalid-count.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
 
         byte[] bytes = Files.readAllBytes(path);
         ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).putInt(32, 3);
@@ -108,7 +116,7 @@ class ArtifactBinaryTest {
     void rejectsLegacyAndUnknownVersions() throws Exception {
         Artifact artifact = artifact(sampleConfig(), descriptors(sampleConfig()));
         Path path = tempDirectory.resolve("invalid-version.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
         byte[] original = Files.readAllBytes(path);
 
         for (int version : new int[] {1, ArtifactHeader.COMPACT_VERSION + 1}) {
@@ -143,14 +151,15 @@ class ArtifactBinaryTest {
 
         assertThrows(
                 ArtifactFormatException.class,
-                () -> CompactArtifactWriter.write(tempDirectory.resolve("legacy.edrl"), legacy, PAYLOAD));
+                () -> CompactArtifactWriter.write(
+                        tempDirectory.resolve("legacy.edrl"), legacy, PAYLOAD, TestTokenizer.FILES));
     }
 
     @Test
     void rejectsNonZeroReservedHeaderField() throws Exception {
         Artifact artifact = artifact(sampleConfig(), descriptors(sampleConfig()));
         Path path = tempDirectory.resolve("invalid-reserved.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
 
         byte[] bytes = Files.readAllBytes(path);
         ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).putInt(36, 1);
@@ -165,7 +174,7 @@ class ArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         Artifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("invalid-data-type.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
 
         byte[] bytes = Files.readAllBytes(path);
         int dataTypeField =
@@ -182,7 +191,7 @@ class ArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         Artifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("invalid-layout.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
 
         byte[] bytes = Files.readAllBytes(path);
         int layoutField = (int) tensorsTableOffset(artifact) + tensorDataOffsetWithinEntry(tensors[0]) - Integer.BYTES;
@@ -198,7 +207,7 @@ class ArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         Artifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("mismatched-byte-size.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
 
         byte[] bytes = Files.readAllBytes(path);
         int byteSizeField = (int) tensorsTableOffset(artifact) + tensorDataOffsetWithinEntry(tensors[0]) + Long.BYTES;
@@ -212,7 +221,7 @@ class ArtifactBinaryTest {
     void rejectsInvalidTensorNameLength() throws Exception {
         Artifact artifact = artifact(sampleConfig(), descriptors(sampleConfig()));
         Path path = tempDirectory.resolve("invalid-name-length.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
 
         byte[] bytes = Files.readAllBytes(path);
         ByteBuffer.wrap(bytes)
@@ -229,7 +238,7 @@ class ArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         Artifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("invalid-byte-size.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
 
         byte[] bytes = Files.readAllBytes(path);
         int byteSizeField = (int) tensorsTableOffset(artifact) + tensorDataOffsetWithinEntry(tensors[0]) + Long.BYTES;
@@ -245,7 +254,7 @@ class ArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         Artifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("invalid-utf8.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
 
         byte[] bytes = Files.readAllBytes(path);
         int activationOffset = (int) artifact.header().metadataOffset()
@@ -265,7 +274,7 @@ class ArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         Artifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("invalid-boolean.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
 
         byte[] bytes = Files.readAllBytes(path);
         int booleanOffset = (int) artifact.header().metadataOffset()
@@ -284,6 +293,52 @@ class ArtifactBinaryTest {
     }
 
     @Test
+    void writtenArtifactsCarryTheirTokenizer() throws Exception {
+        Path path = tempDirectory.resolve("carries.edrl");
+        Artifact artifact = artifact(sampleConfig(), descriptors(sampleConfig()));
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
+        assertEquals(TestTokenizer.FILES, TokenizerSection.require(path));
+        assertEquals(
+                ArtifactTokenizer.contentEnd(path) + TokenizerSection.encode(TestTokenizer.FILES).length,
+                Files.size(path));
+    }
+
+    @Test
+    void anArtifactGainsItsTokenizerWithItsTensorsUnchanged() throws Exception {
+        Qwen38Config config = sampleConfig();
+        TensorDescriptor[] tensors = descriptors(config);
+        Path path = tempDirectory.resolve("old.edrl");
+        CompactArtifactWriter.write(path, artifact(config, tensors), PAYLOAD, TestTokenizer.FILES);
+        long contentEnd = ArtifactTokenizer.contentEnd(path);
+        // An artifact from before the section: its content alone.
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
+            channel.truncate(contentEnd);
+        }
+        byte[] content = Files.readAllBytes(path);
+        Artifact before = ArtifactReader.read(path);
+        var missing = assertThrows(ArtifactFormatException.class, () -> TokenizerSection.require(path));
+        assertTrue(missing.getMessage().contains("package-tokenizer --artifact " + path), missing.getMessage());
+
+        TokenizerFiles files = new TokenizerFiles("{\"t\":1}", "{}", "template", "{\"eos_token_id\":[1]}");
+        ArtifactTokenizer.add(path, files);
+        byte[] file = Files.readAllBytes(path);
+        assertArrayEquals(digest(content), digest(Arrays.copyOf(file, content.length)));
+        assertEquals(files, TokenizerSection.require(path));
+        Artifact after = ArtifactReader.read(path);
+        assertArrayEquals(
+                ArtifactCodec.encodeTensorTable(before.tensors()), ArtifactCodec.encodeTensorTable(after.tensors()));
+
+        // Adding again replaces the section and still leaves the content as it was.
+        ArtifactTokenizer.add(path, TestTokenizer.FILES);
+        assertEquals(content.length + TokenizerSection.encode(TestTokenizer.FILES).length, Files.size(path));
+        assertEquals(TestTokenizer.FILES, TokenizerSection.require(path));
+    }
+
+    private static byte[] digest(byte[] bytes) throws Exception {
+        return MessageDigest.getInstance("SHA-256").digest(bytes);
+    }
+
+    @Test
     void rejectsOverlappingTensorPayloads() throws Exception {
         Qwen38Config config = sampleConfig();
         Artifact validArtifact = artifact(config, descriptors(config));
@@ -297,7 +352,8 @@ class ArtifactBinaryTest {
 
         assertThrows(
                 ArtifactFormatException.class,
-                () -> CompactArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {5, 6, 7, 8}}));
+                () -> CompactArtifactWriter.write(
+                        path, artifact, new byte[][] {{1, 2, 3, 4}, {5, 6, 7, 8}}, TestTokenizer.FILES));
     }
 
     @Test
@@ -306,7 +362,7 @@ class ArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         Artifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("overlapping-data-on-read.edrl");
-        CompactArtifactWriter.write(path, artifact, PAYLOAD);
+        CompactArtifactWriter.write(path, artifact, PAYLOAD, TestTokenizer.FILES);
 
         byte[] bytes = Files.readAllBytes(path);
         int secondDataOffsetField = (int) artifact.header().tensorTableOffset()
