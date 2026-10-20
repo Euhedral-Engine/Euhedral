@@ -19,7 +19,7 @@ public record TrellisSettings(int mmaMaxRows, int targetCtas, int wholeKRows, in
     public static final String WHOLE_K_WIDE_ROWS = "euhedral.trellis.whole-k-wide-rows";
 
     /// Decode-type quanta (decode, draft) have up to eight rows and never take the prefill route.
-    private static final int MIN_MMA_ROWS = 8;
+    public static final int MIN_MMA_ROWS = 8;
 
     /// Measured on an RTX 5070 Ti with Swift-1.5 at 3 bits: the tensor-core route prefills 512-row chunks at 2773
     /// tokens/s, the prefill route at 490, so the tensor-core route serves every chunk the default workspace holds.

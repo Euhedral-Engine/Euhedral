@@ -8,7 +8,7 @@ import java.util.regex.Pattern;
 public final class Sizes {
 
     private static final Pattern SIZE = Pattern.compile("(\\d+)\\s*(B|KiB|MiB|GiB|TiB)?");
-    private static final Pattern DURATION = Pattern.compile("(\\d+)\\s*(ms|s|m|h|d)");
+    private static final Pattern DURATION = Pattern.compile("(\\d+)\\s*(ms|s|m|h)");
 
     private Sizes() {}
 
@@ -30,20 +30,19 @@ public final class Sizes {
         return value << shift;
     }
 
-    /// A duration: whole number with a unit (ms, s, m, h, d); a bare `0` is zero.
+    /// A duration: whole number with a unit (ms, s, m, h); a bare `0` is zero.
     public static Duration parseDuration(String text) {
         String t = text.strip();
         if (t.equals("0")) return Duration.ZERO;
         Matcher m = DURATION.matcher(t);
-        if (!m.matches()) throw new IllegalArgumentException("not a duration (whole number with ms/s/m/h/d): " + text);
+        if (!m.matches()) throw new IllegalArgumentException("not a duration (whole number with ms/s/m/h): " + text);
         long value = number(m.group(1), text);
         try {
             return switch (m.group(2)) {
                 case "ms" -> Duration.ofMillis(value);
                 case "s" -> Duration.ofSeconds(value);
                 case "m" -> Duration.ofMinutes(value);
-                case "h" -> Duration.ofHours(value);
-                default -> Duration.ofDays(value);
+                default -> Duration.ofHours(value);
             };
         } catch (ArithmeticException e) {
             throw new IllegalArgumentException("duration too large: " + text);
