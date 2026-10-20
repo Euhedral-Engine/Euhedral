@@ -5,16 +5,16 @@ import io.euhedral_execution.inference.api.chat.ConversationPlanner;
 import io.euhedral_execution.inference.api.chat.GenerationService;
 import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
 import io.euhedral_execution.inference.api.chat.SamplingDefaults;
-import io.euhedral_execution.inference.api.engine.ApiProperties;
 import io.euhedral_execution.inference.api.metrics.ServerMetrics;
 import io.euhedral_execution.inference.api.openai.ChatRequestMapper;
 import io.euhedral_execution.inference.api.responses.ResponsesMapper;
+import io.euhedral_execution.inference.core.settings.RequestSettings;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringBootConfiguration;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 
@@ -23,7 +23,6 @@ import org.springframework.context.annotation.Import;
 @SpringBootConfiguration
 @ConditionalOnProperty(name = "euhedral.test.scripted-api", havingValue = "true")
 @EnableAutoConfiguration
-@EnableConfigurationProperties(ApiProperties.class)
 @Import({
     OpenAiController.class,
     WebConfiguration.class,
@@ -40,6 +39,13 @@ import org.springframework.context.annotation.Import;
 })
 class ScriptedApiApplication {
     static final SamplingDefaults CHECKPOINT_DEFAULTS = new SamplingDefaults(1.0f, 20, 0.95f);
+
+    /// The request limits, with `euhedral.test.max-queued` as the queue length.
+    @Bean
+    RequestSettings requestSettings(@Value("${euhedral.test.max-queued:16}") int maxQueued) {
+        RequestSettings defaults = RequestSettings.defaults();
+        return new RequestSettings(defaults.defaultMaxTokens(), maxQueued, defaults.maxBodySize(), defaults.timeout());
+    }
 
     @Bean
     ScriptedInferenceBackend scriptedInferenceBackend() {

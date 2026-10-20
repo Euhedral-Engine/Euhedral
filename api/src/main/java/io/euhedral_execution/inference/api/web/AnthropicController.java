@@ -4,7 +4,7 @@ import io.euhedral_execution.inference.api.anthropic.MessagesMapper;
 import io.euhedral_execution.inference.api.anthropic.MessagesRequest;
 import io.euhedral_execution.inference.api.chat.ApiException;
 import io.euhedral_execution.inference.api.chat.GenerationService;
-import io.euhedral_execution.inference.api.engine.ApiProperties;
+import io.euhedral_execution.inference.core.settings.RequestSettings;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.Map;
 import org.springframework.http.MediaType;
@@ -25,10 +25,10 @@ public class AnthropicController {
     private final MessagesMapper messages;
     private final long timeoutMillis;
 
-    public AnthropicController(GenerationService generations, MessagesMapper messages, ApiProperties properties) {
+    public AnthropicController(GenerationService generations, MessagesMapper messages, RequestSettings requests) {
         this.generations = generations;
         this.messages = messages;
-        this.timeoutMillis = properties.requestTimeout().toMillis();
+        this.timeoutMillis = requests.timeout().toMillis();
     }
 
     @PostMapping(path = "/messages", consumes = MediaType.APPLICATION_JSON_VALUE)

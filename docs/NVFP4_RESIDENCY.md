@@ -138,7 +138,7 @@ When the planned weights do not fit, `HostWeightSelection` keeps layer projectio
 device ring of `WeightStaging.SLOTS` = 4 slots on every use.
 
 - **Planner:** the device budget is the resident weights, the staging ring (4 slots of the largest selected tensor), the KV pages
-  of one sequence of `maxContextTokens` (`euhedral.inference.max-context-tokens`, default 32768), and a fixed 1280 MiB reserve for
+  of one sequence of `maxContextTokens` (`context.max-tokens`, default 32768), and a fixed 1280 MiB reserve for
   the per-sequence GDN state, the execution workspaces, the shared scratch and the kernel modules loaded after the model. The
   planner compares that need with the device's free memory at startup and grows the host-backed bytes in 64 MiB steps until it
   fits; if even the largest selection does not fit, startup fails and asks for a smaller maximum context. Nothing is host-backed

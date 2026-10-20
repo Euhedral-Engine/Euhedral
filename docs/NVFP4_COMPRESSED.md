@@ -230,7 +230,7 @@ Single runs at 16K-64K do not separate the artifacts' speeds; their memory does.
 **SD4's value is margin and less staging.** It fits each context with 0.6-0.9 GiB less host memory, which matters as desktop
 memory moves: a plain NVFP4 run at 1920 MiB ran out of memory once the desktop grew from 0.5 to 0.7 GiB.
 
-**Serving 64K.** Set `euhedral.inference.max-context-tokens: 65536`. The engine reads the artifact's quantization and layout and
+**Serving 64K.** Set `context.max-tokens: 65536`. The engine reads the artifact's quantization and layout and
 `ResidencyPlanner` chooses the host-backed weights (embedding first, then layer projections, through a 4-slot device ring) that
 leave room for that much KV cache plus the per-sequence state; startup fails with a message to lower the maximum when even the
 largest selection does not fit. MTP3 is the policy for NVFP4 artifacts.

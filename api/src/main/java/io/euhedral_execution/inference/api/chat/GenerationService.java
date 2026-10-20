@@ -1,8 +1,8 @@
 package io.euhedral_execution.inference.api.chat;
 
-import io.euhedral_execution.inference.api.engine.ApiProperties;
 import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.api.metrics.ServerMetrics;
+import io.euhedral_execution.inference.core.settings.RequestSettings;
 import java.util.ArrayDeque;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -26,13 +26,13 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 /// A request becomes a `DeferredResult` at once. On the workers it is planned (mapped, rendered, encoded,
 /// validated), admitted, and generated; its result is a JSON body or, for a stream, an `SseEmitter` whose events
 /// the workers write, both in the format of the surface's [Responder]. As many generations run at once as the
-/// backend holds sequences ([InferenceBackend#maxActiveGenerations]) and at most `maxQueuedGenerations` wait; a
+/// backend holds sequences ([InferenceBackend#maxActiveGenerations]) and at most `maxQueued` wait; a
 /// finished generation starts the next on a worker. Validation and capacity
 /// failures reach the client as HTTP errors, because a stream's emitter becomes the result only once its request
 /// was planned and admitted.
 ///
 /// At shutdown the web server first stops accepting connections and waits for the requests in flight, queued ones
-/// included, up to `spring.lifecycle.timeout-per-shutdown-phase`. This service stops next, in a lifecycle phase
+/// included, up to `server.shutdown-timeout`. This service stops next, in a lifecycle phase
 /// between that wait and the web server's stop, while responses can still be written: requests still waiting are
 /// refused with 503 and the running generations are stopped and answered with an error. Spring destroys the engine
 /// after that, because this service depends on it.
@@ -53,10 +53,10 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
 
     private final ServerMetrics metrics;
 
-    public GenerationService(InferenceBackend backend, ApiProperties properties, ServerMetrics metrics) {
+    public GenerationService(InferenceBackend backend, RequestSettings requests, ServerMetrics metrics) {
         this.backend = backend;
-        this.requestTimeoutMillis = properties.requestTimeout().toMillis();
-        this.maxQueued = properties.maxQueuedGenerations();
+        this.requestTimeoutMillis = requests.timeout().toMillis();
+        this.maxQueued = requests.maxQueued();
         this.metrics = metrics;
         metrics.bindQueue(this::activeCount, this::queuedCount);
     }

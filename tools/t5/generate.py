@@ -13,7 +13,7 @@ prompt ids start with the previous request's prompt and completion ids (`prefix_
 is visible, with the index of the first differing id. See client.py for why the ids come from the server.
 
 Server requirements: `--parallel` must match the server's maximum number of sequences and
-`euhedral.api.max-queued-generations` must be at least `--parallel`. The server's `euhedral.api.request-timeout`
+`server.requests.max-queued` must be at least `--parallel`. The server's `server.requests.timeout`
 (30m by default, counted from arrival including queue wait) must exceed the longest request; BF16 requests take
 45+ minutes, so start it with, for example, 6h. A timeout answer is recorded as an error and is not retried. The
 server does not expose these settings, so they cannot be checked at startup.

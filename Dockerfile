@@ -33,11 +33,11 @@ COPY --from=build /opt/health/ /opt/euhedral/health/
 # The jar carries its native files (CUDA library, runtime, NVRTC, kernel sources and headers) and unpacks them into
 # the user's cache directory at startup; the NVIDIA Container Toolkit provides the driver.
 COPY --from=build /src/api/build/libs/euhedral-inference-linux-x64.jar /opt/euhedral/app.jar
-ENV EUHEDRAL_INFERENCE_ARTIFACT_PATH=/models/model.edrl \
-    EUHEDRAL_INFERENCE_TOKENIZER_DIRECTORY=/tokenizer \
-    NVIDIA_VISIBLE_DEVICES=all \
+# The model's container paths; mount your own file over it to change settings.
+COPY container/config.yaml /etc/euhedral/config.yaml
+ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
-# The model ID, worker CPUs and the other settings come from the run's environment: docker run --env-file .env
+# The model name (EUHEDRAL_MODEL_NAME) and every other setting come from the run's environment: docker run --env-file .env
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD ["/opt/euhedral/jre/bin/java", "-cp", "/opt/euhedral/health", "HealthProbe"]
-ENTRYPOINT ["/opt/euhedral/jre/bin/java", "--enable-native-access=ALL-UNNAMED", "-jar", "/opt/euhedral/app.jar"]
+ENTRYPOINT ["/opt/euhedral/jre/bin/java", "--enable-native-access=ALL-UNNAMED", "-jar", "/opt/euhedral/app.jar", "--config", "/etc/euhedral/config.yaml"]

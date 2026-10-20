@@ -2,40 +2,46 @@
 
 ## Settings
 
-Each setting is a property or its environment variable: `euhedral.inference.artifact-path` is
-`EUHEDRAL_INFERENCE_ARTIFACT_PATH`. `PORT` sets the port (1738). The container and `mise run deploy` read them from a
-`.env` file ([.env.example](../.env.example)); there the image fixes the artifact and checkpoint paths,
-and `.env` gives the host paths mounted on them (`EUHEDRAL_ARTIFACT_FILE`, `EUHEDRAL_CHECKPOINT_DIR`).
+The server reads one YAML file, `--config <path>` (or `EUHEDRAL_CONFIG`). [config/euhedral.example.yaml](../config/euhedral.example.yaml)
+sets every key and says what it does, its default, and whether it is required; the minimal file is `model.artifact`,
+`model.tokenizer` and `model.name`. Any key can also be set, or overridden, by the variable named `EUHEDRAL_` plus the
+key path in capitals with `.` and `-` as `_`: `model.artifact` is `EUHEDRAL_MODEL_ARTIFACT`. `PORT` also sets
+`server.port`. An unknown key, an invalid value or a variable of a retired name stops the server before anything loads,
+with every problem named on its own line of standard error and exit status 2.
+
+The container starts with `--config /etc/euhedral/config.yaml`, which holds the model's container paths; the model name
+and every other setting come from the run's environment. The container and `mise run deploy` read a `.env` file
+([.env.example](../.env.example)) with the host paths mounted on those container paths (`EUHEDRAL_ARTIFACT_FILE`,
+`EUHEDRAL_CHECKPOINT_DIR`).
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `euhedral.inference.artifact-path` | required | The `.edrl` artifact to serve. |
-| `euhedral.inference.tokenizer-directory` | required | The checkpoint directory (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`). |
-| `euhedral.inference.native-cache` | the user's cache directory | Where the jar unpacks its native files (the CUDA library, llguidance, the CUDA runtime and NVRTC, kernel sources and CUDA headers), in a subdirectory named by their content hash: `$XDG_CACHE_HOME/euhedral`, else `~/.cache/euhedral`; `%LOCALAPPDATA%\euhedral` on Windows. Servers started together share one copy. The directory is per user (keep it `0700`): give each user their own, or leave the default. |
-| `euhedral.inference.worker-cpus` | every available processor | Processor IDs or ranges for the engine's worker threads, for example `2-5,8`; Euhedral pins one worker per selected core. |
-| `euhedral.inference.model-id` | required | The name clients send as `model`. |
-| `euhedral.inference.max-context-tokens` | 32768 | The longest prompt plus completion. The engine keeps device memory for that much KV cache and holds weights in pinned host memory when both do not fit. At most the model's 262144 positions. |
-| `euhedral.inference.prefix-cache-bytes` | 4294967296 | Pinned host memory for the prefix cache ([PREFIX_CACHE.md](PREFIX_CACHE.md)); 0 turns it off. |
-| `euhedral.inference.prefix-cache-checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints, a multiple of 512. |
-| `euhedral.inference.kv-cache` | the artifact's (`nvfp4`) | The attention cache format: `nvfp4` (144 bytes per head row) or `bf16` (512 bytes, the keys and values as computed). The engine sizes the context's device memory by it ([ATTENTION_DECODE.md](ATTENTION_DECODE.md#cache-formats)). |
-| `euhedral.inference.max-sequences` | 1 | Generations that run at once, each with its own sequence state (KV cache, recurrent state, workspace) in device memory. Requests beyond it wait in the queue below. `0` takes as many as fit without holding back more weights in host memory than one sequence does; `1` or more is planned exactly as asked, and weights leave the device to make room. Flash-Next artifacts always run one sequence, and `0` yields 1 without a speculation profile or on DFlash2. |
-| `euhedral.inference.kv-device-minimum-tokens` | 65536 | Tokens of each sequence's attention cache that stay in device memory. When the weights and every sequence's whole cache do not fit, the pages past this many tokens move to pinned host memory before any weight leaves the GPU, and each attention layer copies them in before it reads them ([ATTENTION_DECODE.md](ATTENTION_DECODE.md#cache-pages-in-host-memory)). Raise it to keep more of the cache on the GPU at the price of weights in host memory; lower it to fit longer contexts or more sequences. |
+| `model.artifact` | required | The `.edrl` artifact to serve. |
+| `model.tokenizer` | required | The checkpoint directory (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`). |
+| `host.native-cache` | the user's cache directory | Where the jar unpacks its native files (the CUDA library, llguidance, the CUDA runtime and NVRTC, kernel sources and CUDA headers), in a subdirectory named by their content hash: `$XDG_CACHE_HOME/euhedral`, else `~/.cache/euhedral`; `%LOCALAPPDATA%\euhedral` on Windows. Servers started together share one copy. The directory is per user (keep it `0700`): give each user their own, or leave the default. |
+| `host.cpus` | every available processor | Processor IDs or ranges for the engine's worker threads, for example `2-5,8`; Euhedral pins one worker per selected core. |
+| `model.name` | required | The name clients send as `model`. |
+| `context.max-tokens` | 32768 | The longest prompt plus completion. The engine keeps device memory for that much KV cache and holds weights in pinned host memory when both do not fit. At most the model's 262144 positions. |
+| `prefix-cache.size` | 4GiB | Pinned host memory for the prefix cache ([PREFIX_CACHE.md](PREFIX_CACHE.md)); 0 turns it off. |
+| `prefix-cache.checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints, a multiple of 512. |
+| `context.kv-cache-format` | the artifact's (`nvfp4`) | The attention cache format: `nvfp4` (144 bytes per head row) or `bf16` (512 bytes, the keys and values as computed). The engine sizes the context's device memory by it ([ATTENTION_DECODE.md](ATTENTION_DECODE.md#cache-formats)). |
+| `batching.max-sequences` | 1 | Generations that run at once, each with its own sequence state (KV cache, recurrent state, workspace) in device memory. Requests beyond it wait in the queue below. `0` takes as many as fit without holding back more weights in host memory than one sequence does; `1` or more is planned exactly as asked, and weights leave the device to make room. Flash-Next artifacts always run one sequence, and `0` yields 1 without a speculation profile or on DFlash2. |
+| `context.kv-cache-on-gpu-tokens` | 65536 | Tokens of each sequence's attention cache that stay in device memory. When the weights and every sequence's whole cache do not fit, the pages past this many tokens move to pinned host memory before any weight leaves the GPU, and each attention layer copies them in before it reads them ([ATTENTION_DECODE.md](ATTENTION_DECODE.md#cache-pages-in-host-memory)). Raise it to keep more of the cache on the GPU at the price of weights in host memory; lower it to fit longer contexts or more sequences. |
 | `euhedral.batch.max-rows` | the workspace rows | JVM system property (`-Deuhedral.batch.max-rows=N`), not a Spring property. The most rows one shared decode or verification pass holds; lower it to bound a pass. It also caps the sequence count `max-sequences=0` chooses. |
 | `euhedral.batch.max-parts` | unlimited (1 with DFlash2) | JVM system property. The most sequences one shared pass serves; with DFlash2 a pass serves one. |
-| `euhedral.inference.shutdown-timeout` | 10s | How long closing the engine waits for its workers to stop. |
-| `euhedral.api.default-max-tokens` | 4096 | Completion length when a request sets none. |
-| `euhedral.api.max-queued-generations` | 16 | Requests waiting while every generation slot is busy; more are refused with 503. |
-| `euhedral.api.max-request-bytes` | 1048576 | Request body limit (413 beyond). |
-| `euhedral.api.request-timeout` | 30m | Per-request limit. |
-| `spring.lifecycle.timeout-per-shutdown-phase` | 30s | How long a shutdown waits for requests in flight (below). |
+| `server.shutdown-timeout` | 10s | How long a shutdown waits for requests in flight, and for the engine's workers to stop. |
+| `server.requests.default-max-tokens` | 4096 | Completion length when a request sets none. |
+| `server.requests.max-queued` | 16 | Requests waiting while every generation slot is busy; more are refused with 503. |
+| `server.requests.max-body-size` | 1MiB | Request body limit (413 beyond). |
+| `server.requests.timeout` | 30m | Per-request limit. |
 
 The machine needs only the NVIDIA driver: each platform's jar (`euhedral-inference-linux-x64.jar`,
 `euhedral-inference-windows-x64.jar`) carries the CUDA runtime, NVRTC and the CUDA headers the kernels compile against.
 
 ## Starting
 
-Before anything loads, the server checks the files the settings name (the artifact and the checkpoint's tokenizer
-files), the NVIDIA driver and a GPU it drives, and unpacks its native files into the native cache. It reports every
+Before anything loads, the server reads and validates the settings file and unpacks its native files into the native cache, then checks the files
+the settings name (the artifact and the checkpoint's tokenizer files), the NVIDIA driver and a GPU it drives. It reports every
 problem at once, each with the setting to change, and exits within about a second:
 
 ```text
@@ -47,7 +53,7 @@ Description:
 
 The server cannot start:
 
-    euhedral.inference.artifact-path (EUHEDRAL_INFERENCE_ARTIFACT_PATH): no file at /models/nope.edrl
+    model.artifact (EUHEDRAL_MODEL_ARTIFACT): no file at /models/nope.edrl
     the NVIDIA driver is required, with an NVIDIA Blackwell GPU: libcuda.so.1 cannot be loaded; install the driver (nvidia-smi lists the GPU when it works)
 
 Action:
@@ -80,7 +86,7 @@ engine has closed. The image's Docker health check calls it.
 ## Shutting down
 
 On `SIGTERM` or `SIGINT` the server stops accepting connections and waits up to
-`spring.lifecycle.timeout-per-shutdown-phase` (30 s) for the requests in flight, queued ones included, to finish. What is
+`server.shutdown-timeout` (10 s) for the requests in flight, queued ones included, to finish. What is
 left after that is answered before the server stops: a request still queued gets 503 (`The server is shutting down.`),
 the running generation is stopped at its next quantum and gets an error (in a stream, an `error` event), and the engine
 then closes its sessions, its workers and the GPU. A second signal exits at once.

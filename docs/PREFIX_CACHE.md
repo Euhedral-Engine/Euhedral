@@ -9,8 +9,8 @@ cache takes no device memory: the context length and the weight residency are th
 
 | Property | Default | Meaning |
 |---|---|---|
-| `euhedral.inference.prefix-cache-bytes` | 4294967296 (4 GiB) | Pinned host memory for the cache. 0 turns it off. Memory that cannot be pinned turns it off with a warning, and the engine serves as before. |
-| `euhedral.inference.prefix-cache-checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints. A multiple of 512, the prefill chunk. |
+| `prefix-cache.size` | 4GiB | Pinned host memory for the cache. 0 turns it off. Memory that cannot be pinned turns it off with a warning, and the engine serves as before. |
+| `prefix-cache.checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints. A multiple of 512, the prefill chunk. |
 
 The arena is one allocation, 2 MiB aligned with `MADV_HUGEPAGE` and `MADV_COLLAPSE`, registered with `cudaHostRegister`:
 the routine that allocates the host-backed weight arena ([NVFP4_RESIDENCY.md](NVFP4_RESIDENCY.md)), because per-tensor

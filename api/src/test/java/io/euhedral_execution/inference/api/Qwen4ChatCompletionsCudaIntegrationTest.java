@@ -7,6 +7,9 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.InferenceEngine;
 import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
+import io.euhedral_execution.inference.core.settings.RequestSettings;
+import io.euhedral_execution.inference.core.settings.Settings;
+import io.euhedral_execution.inference.core.settings.SettingsLoader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -15,6 +18,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -26,8 +31,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
-import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.convention.TestBean;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
@@ -52,6 +55,12 @@ class Qwen4ChatCompletionsCudaIntegrationTest {
     @TestBean
     private NativeFiles nativeFiles;
 
+    @TestBean
+    private Settings settings;
+
+    @TestBean
+    private RequestSettings requestSettings;
+
     private static Path artifact;
     private static Path tokenizer;
 
@@ -75,13 +84,25 @@ class Qwen4ChatCompletionsCudaIntegrationTest {
         return NativeFiles.at(library.toAbsolutePath().getParent().getParent());
     }
 
-    @DynamicPropertySource
-    static void engineProperties(DynamicPropertyRegistry registry) {
-        registry.add("euhedral.inference.artifact-path", () -> artifact.toString());
-        registry.add("euhedral.inference.tokenizer-directory", () -> tokenizer.toString());
-        registry.add("euhedral.inference.worker-cpus", () -> "0");
-        registry.add("euhedral.inference.max-context-tokens", () -> "4096");
-        registry.add("euhedral.inference.model-id", () -> MODEL);
+    /// The settings the tests start the server with: the model files the build points at.
+    static Settings settings() {
+        return SettingsLoader.load(
+                Optional.empty(),
+                Map.of(
+                        "EUHEDRAL_MODEL_ARTIFACT",
+                        artifact.toString(),
+                        "EUHEDRAL_MODEL_TOKENIZER",
+                        tokenizer.toString(),
+                        "EUHEDRAL_MODEL_NAME",
+                        MODEL,
+                        "EUHEDRAL_CONTEXT_MAX_TOKENS",
+                        "4096",
+                        "EUHEDRAL_HOST_CPUS",
+                        "0"));
+    }
+
+    static RequestSettings requestSettings() {
+        return settings().server().requests();
     }
 
     @Test

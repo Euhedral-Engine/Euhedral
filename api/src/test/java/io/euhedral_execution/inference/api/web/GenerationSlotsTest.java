@@ -29,7 +29,7 @@ import org.springframework.context.annotation.Import;
 @SpringBootTest(
         classes = ScriptedApiApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"euhedral.test.scripted-api=true", "euhedral.api.max-queued-generations=0"})
+        properties = {"euhedral.test.scripted-api=true", "euhedral.test.max-queued=0"})
 @Import(GenerationSlotsTest.TwoSlots.class)
 @Timeout(60)
 class GenerationSlotsTest {

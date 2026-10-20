@@ -207,14 +207,18 @@ directory at startup, so the machine needs only the NVIDIA driver.
 **3. Run it:**
 
 ```bash
-EUHEDRAL_INFERENCE_ARTIFACT_PATH=/models/qwen-q3.edrl \
-EUHEDRAL_INFERENCE_TOKENIZER_DIRECTORY=/path/to/Qwen3.8-27B \
-EUHEDRAL_INFERENCE_WORKER_CPUS=2-5 \
-EUHEDRAL_INFERENCE_MODEL_ID=qwen \
-java --enable-native-access=ALL-UNNAMED -jar api/build/libs/euhedral-inference-linux-x64.jar
+cat > euhedral.yaml <<'YAML'
+model:
+  artifact: /models/qwen-q3.edrl
+  tokenizer: /path/to/Qwen3.8-27B
+  name: qwen
+YAML
+java --enable-native-access=ALL-UNNAMED -jar api/build/libs/euhedral-inference-linux-x64.jar --config euhedral.yaml
 ```
 
-The server listens on port 1738.
+The file needs only those three keys; [config/euhedral.example.yaml](config/euhedral.example.yaml) sets every key and
+says what it does and its default. Any key can also be given as a variable (`model.name` is `EUHEDRAL_MODEL_NAME`), and
+`EUHEDRAL_CONFIG` names the file in place of `--config`. The server listens on port 1738.
 
 **4. Send a request:**
 
@@ -285,7 +289,7 @@ A field that would change the output and is not implemented is refused with 400,
 ## Docker
 
 The container takes its settings from a `.env` file: copy [.env.example](.env.example) to `.env` (git ignores it) and
-set the artifact and checkpoint paths, the model ID and the worker CPUs.
+set the artifact and checkpoint paths, the model name and the worker CPUs (`host.cpus`).
 
 ```bash
 docker build -t euhedral-inference:local .
@@ -314,9 +318,10 @@ compatible host driver. Hosts without the toolkit can pass the device nodes and 
 
 ## Configuration
 
-The server is configured by environment variables or properties: the five above are required, and
-`EUHEDRAL_INFERENCE_MAX_CONTEXT_TOKENS` (32768) and the prefix cache's size are the ones most deployments change.
-[docs/OPERATIONS.md](docs/OPERATIONS.md) lists every setting and covers startup checks, health, shutdown and metrics.
+The server is configured by one YAML file, with any key overridable by an environment variable: the three `model`
+keys are required, and `context.max-tokens` (32768) and the prefix cache's size are the ones most deployments change.
+[config/euhedral.example.yaml](config/euhedral.example.yaml) lists every key and
+[docs/OPERATIONS.md](docs/OPERATIONS.md) covers startup checks, health, shutdown and metrics.
 
 One generation runs at a time; the engine sizes device memory for one sequence. The prefix cache is the only state kept between requests; it is host memory, so it takes nothing from the context length or the device. Requests are served entirely on the
 engine's worker threads: the container thread hands a request over and returns, and rendering, tokenization, every

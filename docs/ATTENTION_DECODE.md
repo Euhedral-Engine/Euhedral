@@ -8,7 +8,7 @@ decode kernel runs; a group of more than 8 query heads also keeps the per-head k
 ## Cache formats
 
 A sequence keeps its attention caches in one of two formats, chosen per engine (`InferenceConfig.kvCache`,
-`euhedral.inference.kv-cache`; unset, the artifact's, NVFP4):
+`context.kv-cache-format`; unset, the artifact's, NVFP4):
 
 - **NVFP4** (`nvfp4_kv.cuh`): 144-byte head rows of the H256-rotated keys and values, 4-bit codes on the INT4 midrise grid
   (magnitudes 0.5 to 7.5) with an E4M3 scale per 16 values (docs/QUALITY.md, KV cache). Queries are rotated into the same basis
