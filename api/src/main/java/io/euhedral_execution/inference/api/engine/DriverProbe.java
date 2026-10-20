@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.api.engine;
 
+import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -7,7 +8,6 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
-import java.util.Locale;
 import java.util.Optional;
 
 /// Whether the machine has what the jar cannot carry: the NVIDIA driver and a GPU it drives.
@@ -19,9 +19,7 @@ interface DriverProbe {
     /// Loads the driver library (`libcuda.so.1`, or `nvcuda.dll` on Windows) and counts its devices.
     static DriverProbe system() {
         return () -> {
-            String name = System.getProperty("os.name").toLowerCase(Locale.ROOT).startsWith("windows")
-                    ? "nvcuda.dll"
-                    : "libcuda.so.1";
+            String name = NativeFiles.driverLibrary();
             SymbolLookup driver;
             try {
                 driver = SymbolLookup.libraryLookup(name, Arena.global());
