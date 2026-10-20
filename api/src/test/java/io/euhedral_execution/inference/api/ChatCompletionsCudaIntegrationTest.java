@@ -9,6 +9,7 @@ import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.api.engine.EngineInferenceBackend;
 import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.core.InferenceEngine;
+import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -45,6 +46,7 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.convention.TestBean;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -65,6 +67,11 @@ class ChatCompletionsCudaIntegrationTest {
     private static final String MODEL = "qwen-test";
     private static final JsonMapper JSON = JsonMapper.shared();
     private static Path library;
+
+    /// The build's native files, where the build lays them out, in place of the jar's.
+    @TestBean
+    private NativeFiles nativeFiles;
+
     private static Path artifact;
     private static Path tokenizer;
 
@@ -88,11 +95,14 @@ class ChatCompletionsCudaIntegrationTest {
         assumeTrue(Files.isRegularFile(artifact) && Files.isRegularFile(tokenizer.resolve("chat_template.jinja")));
     }
 
+    static NativeFiles nativeFiles() {
+        return NativeFiles.at(library.toAbsolutePath().getParent().getParent());
+    }
+
     @DynamicPropertySource
     static void engineProperties(DynamicPropertyRegistry registry) {
         registry.add("euhedral.inference.artifact-path", () -> artifact.toString());
         registry.add("euhedral.inference.tokenizer-directory", () -> tokenizer.toString());
-        registry.add("euhedral.inference.cuda-library-path", () -> library.toString());
         registry.add("euhedral.inference.worker-cpus", ChatCompletionsCudaIntegrationTest::twoPerformanceCpus);
         registry.add("euhedral.inference.model-id", () -> MODEL);
     }

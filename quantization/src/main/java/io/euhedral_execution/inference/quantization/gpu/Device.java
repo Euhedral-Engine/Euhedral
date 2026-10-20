@@ -25,7 +25,7 @@ public final class Device implements AutoCloseable {
 
     public Device(Path library) {
         this.gpu = new CudaGpuMemory(library);
-        this.cuda = new Cuda();
+        this.cuda = new Cuda(library);
         Arena global = Arena.global();
         SymbolLookup engine = SymbolLookup.libraryLookup(library, global);
         Linker linker = Linker.nativeLinker();

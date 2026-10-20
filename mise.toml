@@ -47,7 +47,7 @@ run = "./gradlew :benchmark:run --args='run benchmark/configs/baseline.json'"
 
 [tasks."full-build"]
 description = "Build, format-check, test, verify and package both CUDA products and the API."
-run = "./gradlew nativeVerify nativePackage :api:bootJar build"
+run = "./gradlew nativeVerify :api:bootJar build"
 
 [tasks."test-deploy"]
 description = "Exercise cutover, rollback and cleanup-order tests without Docker writes."

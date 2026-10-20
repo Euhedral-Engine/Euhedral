@@ -1,5 +1,7 @@
 package io.euhedral_execution.inference.quantization.gpu;
 
+import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
@@ -54,10 +56,17 @@ public final class Cuda {
             potrs;
     private final long context;
     private final String architecture;
+    private final Path headers;
 
-    public Cuda() {
+    /// Opens the device with the CUDA runtime and NVRTC that sit beside the engine's `library`, and compiles against
+    /// the CUDA headers of its layout ([NativeFiles#headersBeside]).
+    public Cuda(Path library) {
+        this.headers = NativeFiles.headersBeside(library);
         SymbolLookup driver = SymbolLookup.libraryLookup("libcuda.so.1", arena);
-        SymbolLookup nvrtc = SymbolLookup.libraryLookup("libnvrtc.so.13", arena);
+        SymbolLookup.libraryLookup(library.toAbsolutePath().resolveSibling("libcudart.so.13"), arena);
+        CudaGpuMemory.preloadRuntime(library, arena);
+        SymbolLookup nvrtc =
+                SymbolLookup.libraryLookup(library.toAbsolutePath().resolveSibling("libnvrtc.so.13"), arena);
         // cuBLAS and cuSOLVER come from the module's download (cudaMathLibraries), loaded by absolute path with their
         // dependencies first, so no library path needs them.
         SymbolLookup cublas = mathLibrary("libnvJitLink.so.13", "libcublasLt.so.13", "libcublas.so.13");
@@ -188,10 +197,9 @@ public final class Cuda {
     /// A compiled kernel function.
     public record Function(long handle, String name) {}
 
-    /// Compiles `source` with NVRTC for this device and returns its kernels by name. Headers resolve against
-    /// EUHEDRAL_CUDA_INCLUDE_DIR (the CUDA headers the engine's build provides).
+    /// Compiles `source` with NVRTC for this device and returns its kernels by name. Headers resolve against the
+    /// CUDA headers of the engine library's layout.
     public List<Function> compile(String sourceName, String source, List<String> functions) {
-        String include = System.getenv("EUHEDRAL_CUDA_INCLUDE_DIR");
         try (Arena local = Arena.ofConfined()) {
             MemorySegment program = local.allocate(PTR);
             check("nvrtcCreateProgram", (int) nvrtcCreateProgram.invokeExact(
@@ -203,7 +211,7 @@ public final class Cuda {
                     0L));
             long handle = program.get(PTR, 0);
             List<String> options = new ArrayList<>(List.of("--std=c++17", "--gpu-architecture=" + architecture));
-            if (include != null && !include.isBlank()) options.add("-I" + include);
+            options.add("-I" + this.headers);
             MemorySegment optionArray = local.allocate(PTR, options.size());
             for (int i = 0; i < options.size(); i++)
                 optionArray.setAtIndex(

@@ -27,7 +27,7 @@ class InferencePropertiesTest {
         assertEquals(expected, InferenceProperties.parseCpus(" 2-5, 8 ,"));
         var config = new InferenceProperties(
                         PATH, PATH, PATH, "3", 4096, Duration.ofSeconds(4), "m", 0, 2048, null, 1, 65536)
-                .toInferenceConfig();
+                .toInferenceConfig(PATH);
         assertEquals(BitSet.valueOf(new long[] {1L << 3}), config.workerCpus());
         assertEquals(Duration.ofSeconds(4), config.shutdownTimeout());
     }
@@ -52,7 +52,6 @@ class InferencePropertiesTest {
         Map<String, String> values = new HashMap<>(Map.of(
                 "euhedral.inference.artifact-path", "/m.edrl",
                 "euhedral.inference.tokenizer-directory", "/t",
-                "euhedral.inference.cuda-library-path", "/lib.so",
                 "euhedral.inference.worker-cpus", "2-3",
                 "euhedral.inference.model-id", "m"));
         values.putAll(overrides);
@@ -66,35 +65,34 @@ class InferencePropertiesTest {
         Map<String, String> values = new HashMap<>(Map.of(
                 "euhedral.inference.artifact-path", "/m.edrl",
                 "euhedral.inference.tokenizer-directory", "/t",
-                "euhedral.inference.cuda-library-path", "/lib.so",
                 "euhedral.inference.model-id", "m"));
         InferenceProperties unset = new Binder(new MapConfigurationPropertySource(values))
                 .bind("euhedral.inference", InferenceProperties.class)
                 .get();
         assertEquals(
                 ProcessorTopology.system().availableProcessorIds(),
-                unset.toInferenceConfig().workerCpus());
+                unset.toInferenceConfig(PATH).workerCpus());
     }
 
     @Test
     void maxContextDefaultsAndBinds() {
         assertEquals(
                 InferenceConfig.DEFAULT_MAX_CONTEXT_TOKENS,
-                bind(Map.of()).toInferenceConfig().maxContextTokens());
+                bind(Map.of()).toInferenceConfig(PATH).maxContextTokens());
         assertEquals(
                 65536,
                 bind(Map.of("euhedral.inference.max-context-tokens", "65536"))
-                        .toInferenceConfig()
+                        .toInferenceConfig(PATH)
                         .maxContextTokens());
     }
 
     @Test
     void maxSequencesDefaultsToOneAndBinds() {
-        assertEquals(1, bind(Map.of()).toInferenceConfig().maxSequences());
+        assertEquals(1, bind(Map.of()).toInferenceConfig(PATH).maxSequences());
         assertEquals(
                 0,
                 bind(Map.of("euhedral.inference.max-sequences", "0"))
-                        .toInferenceConfig()
+                        .toInferenceConfig(PATH)
                         .maxSequences());
         assertThrows(Exception.class, () -> bind(Map.of("euhedral.inference.max-sequences", "-1")));
     }
@@ -104,39 +102,39 @@ class InferencePropertiesTest {
         assertEquals(
                 4096,
                 bind(Map.of("euhedral.inference.kv-device-minimum-tokens", "4096"))
-                        .toInferenceConfig()
+                        .toInferenceConfig(PATH)
                         .kvDeviceMinimumTokens());
         assertThrows(Exception.class, () -> bind(Map.of("euhedral.inference.kv-device-minimum-tokens", "0")));
     }
 
     @Test
     void prefixCacheDefaultsOnAndBinds() {
-        assertEquals(4L << 30, bind(Map.of()).toInferenceConfig().prefixCacheBytes());
-        assertEquals(2048, bind(Map.of()).toInferenceConfig().prefixCacheCheckpointTokens());
+        assertEquals(4L << 30, bind(Map.of()).toInferenceConfig(PATH).prefixCacheBytes());
+        assertEquals(2048, bind(Map.of()).toInferenceConfig(PATH).prefixCacheCheckpointTokens());
         assertEquals(
                 0,
                 bind(Map.of("euhedral.inference.prefix-cache-bytes", "0"))
-                        .toInferenceConfig()
+                        .toInferenceConfig(PATH)
                         .prefixCacheBytes());
         assertEquals(
                 4096,
                 bind(Map.of("euhedral.inference.prefix-cache-checkpoint-tokens", "4096"))
-                        .toInferenceConfig()
+                        .toInferenceConfig(PATH)
                         .prefixCacheCheckpointTokens());
     }
 
     @Test
     void theCacheFormatIsTheArtifactsUnlessBound() {
-        assertEquals(null, bind(Map.of()).toInferenceConfig().kvCache());
+        assertEquals(null, bind(Map.of()).toInferenceConfig(PATH).kvCache());
         assertEquals(
                 KvFormat.BF16,
                 bind(Map.of("euhedral.inference.kv-cache", "bf16"))
-                        .toInferenceConfig()
+                        .toInferenceConfig(PATH)
                         .kvCache());
         assertEquals(
                 KvFormat.NVFP4,
                 bind(Map.of("euhedral.inference.kv-cache", "nvfp4"))
-                        .toInferenceConfig()
+                        .toInferenceConfig(PATH)
                         .kvCache());
         assertThrows(BindException.class, () -> bind(Map.of("euhedral.inference.kv-cache", "fp8")));
     }

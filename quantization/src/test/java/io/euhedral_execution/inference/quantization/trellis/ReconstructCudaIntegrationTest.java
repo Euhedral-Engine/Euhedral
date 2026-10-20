@@ -35,7 +35,7 @@ class ReconstructCudaIntegrationTest {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 Arena arena = Arena.ofConfined()) {
-            Cuda cuda = new Cuda();
+            Cuda cuda = new Cuda(library);
             TrellisKernels kernels = new TrellisKernels(cuda, 0L);
             long wordBytes = trellis.data().remaining();
             long words = gpu.allocate(wordBytes), su = gpu.allocate(2L * k), sv = gpu.allocate(2L * n);
@@ -70,7 +70,7 @@ class ReconstructCudaIntegrationTest {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 Arena arena = Arena.ofConfined()) {
-            Cuda cuda = new Cuda();
+            Cuda cuda = new Cuda(library);
             TrellisKernels kernels = new TrellisKernels(cuda, 0L);
             int rows = 256, cols = 384;
             float[] x = new float[rows * cols];
@@ -95,7 +95,7 @@ class ReconstructCudaIntegrationTest {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 Arena arena = Arena.ofConfined()) {
-            Cuda cuda = new Cuda();
+            Cuda cuda = new Cuda(library);
             TrellisKernels kernels = new TrellisKernels(cuda, 0L);
             int rows = 128, cols = 128;
             float[] x = new float[rows * cols];
@@ -132,7 +132,7 @@ class ReconstructCudaIntegrationTest {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 Arena arena = Arena.ofConfined()) {
-            Cuda cuda = new Cuda();
+            Cuda cuda = new Cuda(library);
             TrellisKernels kernels = new TrellisKernels(cuda, 0L);
             int k = 48, n = 64, first = 16;
             float[] w = new float[k * n];

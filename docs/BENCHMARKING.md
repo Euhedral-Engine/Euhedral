@@ -57,14 +57,11 @@ Change one variable at a time and keep the JSON for every run you compare.
    together with the commit you measured (`git rev-parse HEAD`).
 
 7. **External NVIDIA profiling.** Profile outside Gradle so the profiler sees one JVM. Install the
-   start script, then give it the same native environment `:benchmark:run` sets. The paths shown are
-   the pinned CUDA inputs Gradle downloads; substitute your toolkit's `lib64` and `include` if Gradle
-   uses a local toolkit.
+   start script and build the native product; the library finds the CUDA runtime, NVRTC and the CUDA
+   headers in its own layout (`build/native/linux-x64/`).
 
    ```bash
    ./gradlew :benchmark:installDist nativeBuild
-   export LD_LIBRARY_PATH="$PWD/build/cuda-dev/linux-x64/runtime:$LD_LIBRARY_PATH"
-   export EUHEDRAL_CUDA_INCLUDE_DIR="$PWD/build/cuda-dev/linux-x64/include"
    nsys profile --trace=cuda,nvtx,osrt -o benchmark-results/smoke \
      benchmark/build/install/euhedral-inference-benchmark/bin/euhedral-inference-benchmark \
      run benchmark/configs/smoke.json

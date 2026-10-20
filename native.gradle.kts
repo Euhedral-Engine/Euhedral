@@ -12,7 +12,6 @@ import java.util.zip.ZipFile
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
 import org.gradle.api.tasks.Exec
-import org.gradle.api.tasks.bundling.Zip
 import org.tukaani.xz.XZInputStream
 
 buildscript {
@@ -36,12 +35,6 @@ val os = System.getProperty("os.name").lowercase(Locale.ROOT).let {
 }
 val architecture = System.getProperty("os.arch").lowercase(Locale.ROOT)
 val host = products.firstOrNull { it["hostOs"] == os && architecture in listOf("amd64", "x86_64") }
-val selected = providers.gradleProperty("euhedral.native.products").orNull
-    ?.split(",")?.map(String::trim) ?: products.map { it["id"] as String }
-require(selected.isNotEmpty() && selected.distinct().size == selected.size &&
-    selected.all { id -> products.any { it["id"] == id } }) {
-    "euhedral.native.products must contain unique supported IDs: ${products.map { it["id"] }}"
-}
 
 fun checksum(path: Path): String {
     val digest = MessageDigest.getInstance("SHA-256")
@@ -54,6 +47,18 @@ fun checksum(path: Path): String {
         }
     }
     return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
+// files.sha256 at a product's root: `<sha256>  <relative path>` per file, sorted by path, as sha256sum writes them.
+fun writeFileHashes(root: Path) {
+    val manifest = root.resolve("files.sha256")
+    Files.deleteIfExists(manifest)
+    val lines = Files.walk(root).use { paths ->
+        paths.filter(Files::isRegularFile)
+            .map { root.relativize(it).toString().replace(File.separatorChar, '/') to it }
+            .toList()
+    }.sortedBy { it.first }.map { (relative, path) -> "${checksum(path)}  $relative\n" }
+    Files.writeString(manifest, lines.joinToString(""))
 }
 
 fun fetch(cache: Path, relative: String, sha: String): Path {
@@ -300,23 +305,18 @@ val nativeTasks = products.associate { product ->
     val driverDirectory = providers.gradleProperty("$prefix.driver-library-dir").orNull?.let(::file)
         ?: if (windows) library else if (toolkitReady || explicitLibrary != null && library.resolve("stubs/libcuda.so").isFile)
             library.resolve("stubs") else library
-    if (product == host) {
-        extra["euhedral.native.host.include"] = include.absolutePath
-        extra["euhedral.native.host.runtime"] = if (windows) {
-            if (explicitLibrary != null || toolkitReady) {
-                // The Windows toolkit installs import libraries in lib/x64 and DLLs in bin/x64.
-                library.canonicalFile.parentFile.parentFile.resolve("bin/x64").absolutePath
-            } else downloaded.get().dir("runtime").asFile.absolutePath
-        } else if (explicitLibrary != null || toolkitReady) library.absolutePath
-            else downloaded.get().dir("runtime").asFile.absolutePath
-    }
+    // The CUDA runtime and NVRTC libraries the product loads, installed beside it. The Windows toolkit keeps import
+    // libraries in lib/x64 and the DLLs in bin/x64.
+    val runtimeDirectory = if (explicitLibrary != null || toolkitReady) {
+        if (windows) library.canonicalFile.parentFile.parentFile.resolve("bin/x64") else library
+    } else downloaded.get().dir("runtime").asFile
+    val runtimeFiles = if (windows) listOf("cudart64_13.dll", "nvrtc64_130_0.dll", "nvrtc-builtins64_131.dll")
+        else listOf("libcudart.so.13", "libnvrtc.so.13", "libnvrtc-builtins.so.13.1")
     val verifyInputs = tasks.register("cudaInputs${taskSuffix(id)}") {
         group = "build"
         description = "Resolve CUDA 13.1+ build inputs for $id, without a GPU driver."
         if (explicitInclude == null && !toolkitReady) {
             outputs.dir(downloaded)
-            val runtimeFiles = if (windows) listOf("cudart64_13.dll", "nvrtc64_130_0.dll", "nvrtc-builtins64_131.dll")
-                else listOf("libcudart.so.13", "libnvrtc.so.13", "libnvrtc-builtins.so.13.1")
             outputs.upToDateWhen { runtimeFiles.all { downloaded.get().file("runtime/$it").asFile.isFile } }
             doLast {
                 val platform = redistributables[product["cudaPlatform"]] as Map<*, *>
@@ -378,15 +378,33 @@ val nativeTasks = products.associate { product ->
         inputs.file(rootProject.file("native/native-products.json"))
         inputs.dir(include)
         inputs.dir(library)
+        inputs.files(runtimeFiles.map(runtimeDirectory::resolve))
         if (windows) inputs.dir(imports)
         outputs.dir(nativeRoot.map { it.dir(id) })
         // Zig installs but never removes: clear the CUDA tree so a deleted source leaves no stale copy.
         doFirst { delete(nativeRoot.get().dir("$id/share/euhedral_cuda")) }
-        // The constrained-decoding library sits beside the CUDA library, where the engine looks for it.
+        // The product directory is the layout the server jar carries and unpacks: lib/ (the CUDA library, llguidance,
+        // the CUDA runtime and NVRTC), share/euhedral_cuda/ (kernel sources) and cuda/include/ (the CUDA headers NVRTC
+        // compiles against), with files.sha256 listing every file's hash.
+        doFirst { delete(nativeRoot.get().dir("$id/cuda")) }
         doLast {
+            val root = nativeRoot.get().dir(id).asFile.toPath()
+            val lib = root.resolve("lib")
             val source = llguidanceFile.get().asFile
-            Files.copy(source.toPath(), nativeRoot.get().dir("$id/lib").file(source.name).asFile.toPath(),
-                StandardCopyOption.REPLACE_EXISTING)
+            Files.copy(source.toPath(), lib.resolve(source.name), StandardCopyOption.REPLACE_EXISTING)
+            for (name in runtimeFiles) {
+                Files.copy(runtimeDirectory.resolve(name).toPath(), lib.resolve(name),
+                    StandardCopyOption.REPLACE_EXISTING)
+            }
+            val headers = include.toPath()
+            Files.walk(headers).use { paths ->
+                paths.filter(Files::isRegularFile).forEach {
+                    val target = root.resolve("cuda/include").resolve(headers.relativize(it).toString())
+                    Files.createDirectories(target.parent)
+                    Files.copy(it, target, StandardCopyOption.REPLACE_EXISTING)
+                }
+            }
+            writeFileHashes(root)
         }
         doFirst {
             val required = if (windows) listOf("cuda.lib", "cudart.lib", "nvrtc.lib")
@@ -410,30 +428,13 @@ host?.let {
 } ?: run {
     extra["euhedral.native.host.id"] = "unsupported"
     extra["euhedral.native.host.filename"] = "unsupported"
-    extra["euhedral.native.host.include"] = "unsupported"
-    extra["euhedral.native.host.runtime"] = "unsupported"
 }
+extra["euhedral.native.tasks"] = nativeTasks
 
 tasks.register("nativeBuild") {
     group = "build"
     description = "Build every supported CUDA native product."
     dependsOn(nativeTasks.values)
-}
-
-tasks.register<Zip>("nativePackage") {
-    group = "distribution"
-    description = "Package selected target products and NVRTC sources."
-    dependsOn(selected.map(nativeTasks::getValue))
-    archiveFileName = "euhedral-cuda-native.zip"
-    destinationDirectory = layout.buildDirectory.dir("distributions")
-    selected.forEach { id ->
-        val product = products.single { it["id"] == id }
-        from(nativeRoot.map { it.dir(id) }) {
-            into(id)
-            include("lib/${product["filename"]}", "lib/${product["llguidanceFilename"]}",
-                "share/euhedral_cuda/**/*.cu", "share/euhedral_cuda/**/*.cuh")
-        }
-    }
 }
 
 tasks.register("nativeVerify") {
@@ -465,6 +466,17 @@ tasks.register("nativeVerify") {
                 (product["hostOs"] != "linux" || names.none { it.endsWith(".dll") })) {
                 "CUDA imports do not match target ${product["id"]}"
             }
+            val bundled = if (product["hostOs"] == "windows")
+                listOf("cudart64_13.dll", "nvrtc64_130_0.dll", "nvrtc-builtins64_131.dll")
+                else listOf("libcudart.so.13", "libnvrtc.so.13", "libnvrtc-builtins.so.13.1")
+            for (name in bundled.map { "lib/$it" } + listOf("cuda/include/cuda_fp4.h", "cuda/include/nvrtc.h"))
+                check(prefix.file(name).asFile.isFile) { "Missing $name in ${product["id"]}" }
+            val hashes = prefix.file("files.sha256").asFile
+            check(hashes.isFile) { "Missing files.sha256 in ${product["id"]}" }
+            val listed = hashes.readLines().filter(String::isNotEmpty).map { it.substringAfter("  ") }.toSet()
+            val present = fileTree(prefix) { exclude("files.sha256") }
+                .files.map { it.relativeTo(prefix.asFile).invariantSeparatorsPath }.toSet()
+            check(listed == present) { "files.sha256 does not list the files of ${product["id"]}" }
             val llguidanceBinary = prefix.file("lib/${product["llguidanceFilename"]}").asFile
             check(llguidanceBinary.isFile) { "Missing llguidance for ${product["id"]}: $llguidanceBinary" }
             check(llguidanceBinary.inputStream().use { it.readNBytes(2) }.contentEquals(signature)) {

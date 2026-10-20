@@ -104,17 +104,19 @@ NumPy. `gpu_harness.py` is the shared harness (NVRTC compilation, module loading
 | `test_products.py` | The installed CUDA products against `native-products.json`. |
 
 `native-products.json` defines the two supported targets: `x86_64-linux-gnu` (`linux-x64`)
-and `x86_64-windows-gnu` (`windows-x64`). There is no macOS CUDA product. The normal Gradle
-`nativeBuild` and `:api:bootJar` paths build both products. `nativePackage` writes
-`build/distributions/euhedral-cuda-native.zip` with the selected products. Zig installs each
-product at `build/native/<product>/lib/<library>` and its runtime-compiled CUDA tree at
-`build/native/<product>/share/euhedral_cuda/`; `nativeVerify` checks that the installed tree
-matches `src/` exactly. The Spring Boot JAR build produces
-the native ZIP alongside the application JAR, but does not embed native files: Java FFM loads
-the library from a filesystem path, with the CUDA sources adjacent in the installed product layout.
-The ZIP contains the native library and CUDA sources, not NVIDIA CUDA runtime libraries.
-Deploy target-matching CUDA runtime and NVRTC (including builtins) separately, or use the
-container image, which installs the pinned Linux CUDA user-space runtime libraries.
+and `x86_64-windows-gnu` (`windows-x64`). There is no macOS CUDA product. `nativeBuild` builds
+both products, each into the layout the server jar carries, at `build/native/<product>/`:
+
+- `lib/`: the CUDA library, llguidance, and the CUDA runtime and NVRTC (with its builtins) it links;
+- `share/euhedral_cuda/`: the runtime-compiled CUDA tree, which `nativeVerify` checks equals `src/`;
+- `cuda/include/`: the CUDA headers NVRTC compiles the kernels against;
+- `files.sha256`: every file's SHA-256 and relative path.
+
+The Linux library carries the search path `$ORIGIN`, so it finds the runtime beside it; on Windows the engine loads the
+runtime DLLs from the same directory by full path before the library. The engine passes the headers' directory
+(`cuda/include` beside `lib/`) to the library (`euhedral_cuda_set_include_directory`). `:api:bootJarLinuxX64` and
+`:api:bootJarWindowsX64` embed a product under `META-INF/euhedral-native/<product>/` of
+`euhedral-inference-<product>.jar`, and the server unpacks it at startup; `:api:bootJar` builds the host's.
 
 For ordinary builds Gradle uses the pinned CUDA 13.1 redistributables. Set `CUDA_HOME` or
 `CUDA_PATH` to explicitly select an installed matching host toolkit instead; merely installing
@@ -133,7 +135,7 @@ Gradle invokes Zig directly with argument lists (and honors `ZIG` when set); no 
 by the host build. Build and verify both products with:
 
 ```text
-./gradlew nativeVerify nativePackage :api:bootJar
+./gradlew nativeVerify :api:bootJar
 ```
 
 Explicit per-target overrides take precedence over discovery and download:
@@ -150,11 +152,9 @@ host target. Overrides must be paired, originate from one toolkit root, and prov
 CUDA driver and runtime header versions (13.1+). Windows cross
 builds still require Windows CUDA import libraries, never Linux `.so` files. Set
 `-Peuhedral.cuda.force-download=true` to choose the pinned 13.1 archives over an installed
-toolkit; `-Peuhedral.native.products=linux-x64` restricts packaging (not `nativeBuild`) to
-the Linux product, useful for the container image. `nativeBuildLinuxX64` and
-`nativeBuildWindowsX64` are individual tasks; only the matching product is executed in CUDA
-integration tests. The integration task adds the resolved CUDA runtime DLL/SO directory to
-the test process search path; a compatible host driver is still required.
+toolkit. `nativeBuildLinuxX64` and `nativeBuildWindowsX64` are individual tasks; only the matching
+product is executed in CUDA integration tests, which load it from its layout; a compatible host
+driver is still required.
 
 Build and test with the tasks of `mise.toml`:
 
@@ -163,15 +163,13 @@ mise run native-build      # ./gradlew nativeBuildLinuxX64
 mise run native-test       # python3 -m unittest discover -s native/tests -p 'test_*.py' (needs a GPU)
 mise run native-verify     # ./gradlew nativeVerify: both products, installed tree equals src/
 mise run cuda-test         # ./gradlew :core:cudaIntegrationTest :api:cudaIntegrationTest --rerun-tasks (reserve the GPU first)
-mise run full-build        # ./gradlew nativeVerify nativePackage :api:bootJar build
+mise run full-build        # ./gradlew nativeVerify :api:bootJar build
 ```
 
 The full-model CUDA integration tests need a `q3` artifact (`-Peuhedral.qwen.artifact`) and enough free device memory to keep it
 resident; some also take an `nvfp4` artifact (`-Peuhedral.qwen.nvfp4-artifact`) or a `q3-compressed` artifact
 (`-Peuhedral.qwen.q3-compressed-artifact`). Do not overlap the core and API suites on one GPU.
 
-The runtime needs a compatible NVIDIA driver installed on the host (or injected by NVIDIA
-Container Toolkit), along with target-matching CUDA user-space runtime/NVRTC libraries and
-the CUDA headers used by NVRTC to compile the installed CUDA sources. Set
-`EUHEDRAL_CUDA_INCLUDE_DIR` to their include directory. Driver stubs and development import
-libraries are for linking only, not runtime deployment.
+The runtime needs only a compatible NVIDIA driver installed on the host (or injected by NVIDIA
+Container Toolkit); the product layout carries the CUDA user-space runtime, NVRTC and headers.
+Driver stubs and development import libraries are for linking only, not runtime deployment.

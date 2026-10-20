@@ -1,5 +1,6 @@
 """Validate the installed CUDA products without running a foreign binary."""
 
+import hashlib
 import json
 import pathlib
 import struct
@@ -29,12 +30,28 @@ def elf_needed(data):
     entries = [struct.unpack_from("<QQ", data, dynamic[2] + index)
                for index in range(0, dynamic[5], 16)]
     table = offset(next(value for tag, value in entries if tag == 5))
-    needed = []
+    return {name for tag, name in dynamic_strings(data, entries, table) if tag == 1}
+
+
+def dynamic_strings(data, entries, table):
     for tag, value in entries:
-        if tag == 1:
+        if tag in (1, 29):
             start = table + value
-            needed.append(data[start:data.index(b"\0", start)].decode("ascii"))
-    return set(needed)
+            yield tag, data[start:data.index(b"\0", start)].decode("ascii")
+
+
+def elf_runpath(data):
+    """DT_RUNPATH (29), resolved like DT_NEEDED."""
+    self_header = struct.unpack_from("<16sHHIQQQIHHHHHH", data)
+    program_offset, program_size, program_count = self_header[5], self_header[9], self_header[10]
+    segments = [struct.unpack_from("<IIQQQQQQ", data, program_offset + index * program_size)
+                for index in range(program_count)]
+    dynamic = next(segment for segment in segments if segment[0] == 2)
+    entries = [struct.unpack_from("<QQ", data, dynamic[2] + index) for index in range(0, dynamic[5], 16)]
+    address = next(value for tag, value in entries if tag == 5)
+    table = next(file_offset + address - virtual for kind, _, file_offset, virtual, _, size, _, _ in segments
+                 if kind == 1 and virtual <= address < virtual + size)
+    return [name for tag, name in dynamic_strings(data, entries, table) if tag == 29]
 
 
 def pe_imports(data):
@@ -69,30 +86,35 @@ def pe_imports(data):
 
 
 class NativeProductsTest(unittest.TestCase):
-    def test_boot_jar_does_not_embed_unloadable_native_products(self):
-        application = ROOT / "api" / "build" / "libs" / "euhedral-inference-api.jar"
-        self.assertTrue(application.is_file(), application)
-        with zipfile.ZipFile(application) as packaged:
-            self.assertFalse(any(name.startswith("BOOT-INF/native/") for name in packaged.namelist()))
+    def test_server_jars_carry_their_platform_layout(self):
+        jars = {product["id"]: ROOT / "api" / "build" / "libs" / f"euhedral-inference-{product['id']}.jar"
+                for product in json.loads(MANIFEST.read_text(encoding="utf-8"))["products"]}
+        built = {product: jar for product, jar in jars.items() if jar.is_file()}
+        self.assertTrue(built, "no server jar built")
+        for product, jar in built.items():
+            with self.subTest(product=product), zipfile.ZipFile(jar) as packaged:
+                prefix = f"META-INF/euhedral-native/{product}/"
+                members = {name[len(prefix):] for name in packaged.namelist()
+                           if name.startswith(prefix) and not name.endswith("/")}
+                hashes = packaged.read(prefix + "files.sha256").decode("utf-8").splitlines()
+                listed = {line.split("  ", 1)[1] for line in hashes if line}
+                self.assertEqual(members - {"files.sha256"}, listed)
+                other = {name for name in packaged.namelist() if name.startswith("META-INF/euhedral-native/")
+                         and not name.startswith(prefix) and name != "META-INF/euhedral-native/"}
+                self.assertEqual(set(), other)
 
-    def test_distribution_contains_only_native_products(self):
-        archive = ROOT / "build" / "distributions" / "euhedral-cuda-native.zip"
-        self.assertTrue(archive.is_file(), archive)
-        with zipfile.ZipFile(archive) as packaged:
-            members = {name for name in packaged.namelist() if not name.endswith("/")}
-        products = json.loads(MANIFEST.read_text(encoding="utf-8"))["products"]
-        sources = {path.relative_to(ROOT / "native" / "src").as_posix()
-                   for path in (ROOT / "native" / "src").rglob("*")
-                   if path.is_file() and path.suffix in {".cu", ".cuh"}}
-        expected = {
-            f"{product['id']}/lib/{product['filename']}" for product in products
-        } | {
-            f"{product['id']}/lib/{product['llguidanceFilename']}" for product in products
-        } | {
-            f"{product['id']}/share/euhedral_cuda/{source}"
-            for product in products for source in sources
-        }
-        self.assertEqual(members, expected)
+    def test_product_layout_lists_every_file_with_its_hash(self):
+        for product in json.loads(MANIFEST.read_text(encoding="utf-8"))["products"]:
+            prefix = OUTPUT / product["id"]
+            with self.subTest(product=product["id"]):
+                lines = (prefix / "files.sha256").read_text(encoding="utf-8").splitlines()
+                listed = {line.split("  ", 1)[1]: line.split("  ", 1)[0] for line in lines if line}
+                present = {path.relative_to(prefix).as_posix() for path in prefix.rglob("*")
+                           if path.is_file() and path.name != "files.sha256"}
+                self.assertEqual(set(listed), present)
+                library = f"lib/{product['filename']}"
+                self.assertEqual(hashlib.sha256((prefix / library).read_bytes()).hexdigest(), listed[library])
+                self.assertIn("cuda/include/cuda_fp4.h", listed)
 
     def test_installed_products_match_manifest_and_binary_targets(self):
         products = json.loads(MANIFEST.read_text(encoding="utf-8"))["products"]
@@ -112,6 +134,7 @@ class NativeProductsTest(unittest.TestCase):
                     self.assertEqual(struct.unpack_from("<H", binary, 18)[0], 62)
                     self.assertTrue({"libcuda.so.1", "libcudart.so.13", "libnvrtc.so.13"} <= elf_needed(binary))
                     self.assertFalse(any(name.endswith(".dll") for name in elf_needed(binary)))
+                    self.assertEqual(["$ORIGIN"], elf_runpath(binary))
                 else:
                     self.assertEqual(binary[:2], b"MZ")
                     pe = struct.unpack_from("<I", binary, 0x3C)[0]

@@ -87,6 +87,4 @@ jobs:
           name: cuda-native-${{ matrix.os }}
           if-no-files-found: error
           retention-days: 2
-          path: |
-            build/distributions/euhedral-cuda-native.zip
-            api/build/libs/euhedral-inference-api.jar
+          path: api/build/libs/euhedral-inference-*.jar

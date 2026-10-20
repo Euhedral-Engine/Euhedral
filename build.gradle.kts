@@ -16,8 +16,6 @@ val nativeBuildDirectory = layout.buildDirectory.dir("native")
 apply(from = "native.gradle.kts")
 val hostProductId = extra["euhedral.native.host.id"] as String
 val hostLibraryFilename = extra["euhedral.native.host.filename"] as String
-val hostIncludeDirectory = extra["euhedral.native.host.include"] as String
-val hostRuntimeDirectory = extra["euhedral.native.host.runtime"] as String
 @Suppress("UNCHECKED_CAST")
 val llguidanceTasks = extra["euhedral.llguidance.tasks"] as Map<String, TaskProvider<*>>
 @Suppress("UNCHECKED_CAST")
@@ -133,10 +131,6 @@ subprojects {
                 providers.gradleProperty("euhedral.qwen4.$name").orNull?.let { systemProperty("euhedral.qwen4.$name", it) }
             providers.gradleProperty("euhedral.test.heap").orNull?.let { maxHeapSize = it }
             jvmArgs("--enable-native-access=ALL-UNNAMED")
-            environment("EUHEDRAL_CUDA_INCLUDE_DIR", hostIncludeDirectory)
-            val searchVariable = if (System.getProperty("os.name").startsWith("Windows")) "PATH" else "LD_LIBRARY_PATH"
-            environment(searchVariable, hostRuntimeDirectory + java.io.File.pathSeparator +
-                    (System.getenv(searchVariable) ?: ""))
             useJUnitPlatform()
         }
         tasks.register<Test>("cudaIntegrationTest") {

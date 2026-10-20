@@ -42,7 +42,7 @@ class TrellisKernelsCudaIntegrationTest {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 Arena arena = Arena.ofConfined()) {
-            Cuda cuda = new Cuda();
+            Cuda cuda = new Cuda(library);
             TrellisKernels kernels = new TrellisKernels(cuda, 0L);
             long tiles = gpu.allocate(4L * count * 256), indices = gpu.allocate(2L * count * 256);
             long decoded = gpu.allocate(4L * count * 256), packedDevice = gpu.allocate(2L * count * words);

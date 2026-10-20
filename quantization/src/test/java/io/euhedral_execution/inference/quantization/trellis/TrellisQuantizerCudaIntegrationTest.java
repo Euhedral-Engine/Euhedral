@@ -101,7 +101,7 @@ class TrellisQuantizerCudaIntegrationTest {
     /// The fixture's weights and Hessian on the device, a quantizer on the default stream.
     static final class Fixture implements AutoCloseable {
         final CudaGpuMemory gpu;
-        final Cuda cuda = new Cuda();
+        final Cuda cuda = new Cuda(Path.of(System.getProperty("euhedral.cuda.library")));
         final TrellisQuantizer quantizer;
         final long weight, hessian;
         final int k, n;

@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.InferenceEngine;
+import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -27,6 +28,7 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.convention.TestBean;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -45,6 +47,11 @@ class Qwen4ChatCompletionsCudaIntegrationTest {
     private static final String MODEL = "flash-next-test";
     private static final JsonMapper JSON = JsonMapper.shared();
     private static Path library;
+
+    /// The build's native files, where the build lays them out, in place of the jar's.
+    @TestBean
+    private NativeFiles nativeFiles;
+
     private static Path artifact;
     private static Path tokenizer;
 
@@ -64,11 +71,14 @@ class Qwen4ChatCompletionsCudaIntegrationTest {
         assumeTrue(Files.isRegularFile(artifact) && Files.isRegularFile(tokenizer.resolve("chat_template.jinja")));
     }
 
+    static NativeFiles nativeFiles() {
+        return NativeFiles.at(library.toAbsolutePath().getParent().getParent());
+    }
+
     @DynamicPropertySource
     static void engineProperties(DynamicPropertyRegistry registry) {
         registry.add("euhedral.inference.artifact-path", () -> artifact.toString());
         registry.add("euhedral.inference.tokenizer-directory", () -> tokenizer.toString());
-        registry.add("euhedral.inference.cuda-library-path", () -> library.toString());
         registry.add("euhedral.inference.worker-cpus", () -> "0");
         registry.add("euhedral.inference.max-context-tokens", () -> "4096");
         registry.add("euhedral.inference.model-id", () -> MODEL);

@@ -17,9 +17,8 @@ final class StartupFailureAnalyzer implements FailureAnalyzer {
         for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
             if (cause instanceof SetupCheck.SetupException setup)
                 return new FailureAnalysis(
-                        "The server's settings point at files that are missing:\n\n    "
-                                + String.join("\n    ", setup.problems()),
-                        "Correct the settings above. " + SETTINGS,
+                        "The server cannot start:\n\n    " + String.join("\n    ", setup.problems()),
+                        "Correct what the messages above name. " + SETTINGS,
                         setup);
             if (cause instanceof EngineStartupException engine) return engine(engine);
         }

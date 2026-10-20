@@ -1,3 +1,5 @@
+import org.springframework.boot.gradle.tasks.bundling.BootJar
+
 plugins {
     java
     application
@@ -30,13 +32,32 @@ dependencies {
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
+// One server jar per platform. Each carries its platform's native product directory (the CUDA library, llguidance, the
+// CUDA runtime and NVRTC, kernel sources and CUDA headers) under META-INF/euhedral-native/<platform>/, which the
+// server unpacks into its native cache at startup. `bootJar` builds the host's.
+@Suppress("UNCHECKED_CAST")
+val nativeTasks = rootProject.extra["euhedral.native.tasks"] as Map<String, TaskProvider<*>>
+val hostProductId = rootProject.extra["euhedral.native.host.id"] as String
+val platformJars = nativeTasks.mapValues { (id, nativeTask) ->
+    tasks.register<BootJar>("bootJar${id.split("-").joinToString("") { it.replaceFirstChar(Char::uppercase) }}") {
+        group = "build"
+        description = "Assemble the $id server jar with its native files."
+        archiveFileName = "euhedral-inference-$id.jar"
+        mainClass = application.mainClass
+        targetJavaVersion = provider { java.targetCompatibility }
+        classpath(sourceSets.main.map { it.runtimeClasspath })
+        dependsOn(nativeTask)
+        from(rootProject.layout.buildDirectory.dir("native/$id")) { into("META-INF/euhedral-native/$id") }
+        manifest {
+            attributes("Enable-Native-Access" to "ALL-UNNAMED")
+        }
+    }
+}
+
 tasks.bootJar {
-    archiveFileName = "euhedral-inference-api.jar"
-    // The FFM loader requires a filesystem library beside the installed .cu sources.
-    // Produce the separate native distribution rather than embedding unusable files in the JAR.
-    dependsOn(rootProject.tasks.named("nativePackage"))
-    manifest {
-        attributes("Enable-Native-Access" to "ALL-UNNAMED")
+    platformJars[hostProductId]?.let {
+        enabled = false
+        dependsOn(it)
     }
 }
 

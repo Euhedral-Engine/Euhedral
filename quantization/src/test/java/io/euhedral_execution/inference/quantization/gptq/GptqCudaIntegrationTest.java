@@ -35,7 +35,7 @@ class GptqCudaIntegrationTest {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 Arena arena = Arena.ofConfined()) {
-            Cuda cuda = new Cuda();
+            Cuda cuda = new Cuda(library);
             Gptq gptq = new Gptq(cuda, gpu, 0L);
             long weightDevice = gpu.allocate(2L * n * k), hessianDevice = gpu.allocate(4L * k * k);
             Upload.segment(gpu, weightDevice, MemorySegment.ofBuffer(weight.data()), 2L * n * k);

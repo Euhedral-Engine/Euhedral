@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.core.gpu;
 import io.euhedral_execution.data_structures.queues.MpmcQueue;
 import io.euhedral_execution.inference.core.artifact.P2e2Layout;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
+import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -12,7 +13,10 @@ import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -212,17 +216,27 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         try {
             SymbolLookup symbols;
             try {
+                preloadRuntime(libraryPath, loadedLibraryArena);
                 symbols = SymbolLookup.libraryLookup(libraryPath, loadedLibraryArena);
             } catch (IllegalArgumentException unloadable) {
                 // The loader does not say which library failed; when the file exists, it is one the file links.
                 throw new GpuMemoryException(
-                        "cannot load " + libraryPath + " or a library it links: the CUDA 13 "
-                                + "runtime (libcudart, libnvrtc) must be on the library path and the NVIDIA driver (libcuda) "
-                                + "installed",
+                        "cannot load " + libraryPath + " or a library it links: the CUDA 13 runtime and NVRTC "
+                                + "belong beside it and the NVIDIA driver (libcuda) must be installed",
                         unloadable);
             }
             Linker linker = Linker.nativeLinker();
             this.arena = loadedLibraryArena;
+            String headers = NativeFiles.headersBeside(libraryPath).toString();
+            MethodHandle setIncludeDirectory = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_set_include_directory",
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+            try (Arena local = Arena.ofConfined()) {
+                int status = (int) setIncludeDirectory.invokeExact(local.allocateFrom(headers));
+                if (status != 0) throw new GpuMemoryException("the CUDA include directory " + headers + " is invalid");
+            }
             this.malloc = bind(linker, symbols, "euhedral_cuda_malloc", MALLOC);
             this.free = bind(linker, symbols, "euhedral_cuda_free", FREE);
             this.mallocAsync = bind(linker, symbols, "euhedral_cuda_malloc_async", MALLOC);
@@ -616,6 +630,24 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         } catch (Throwable exception) {
             loadedLibraryArena.close();
             throw new GpuMemoryException("CUDA stream initialization failed", exception);
+        }
+    }
+
+    /// Runtime libraries beside the CUDA library that load first, by full path. NVRTC opens its builtins library by
+    /// name, which resolves to the copy already loaded; Windows also resolves a DLL's imports without the library's
+    /// own directory, so its runtime and NVRTC load first too. Linux finds them through the library's `$ORIGIN`.
+    private static final List<String> LINUX_RUNTIME = List.of("libnvrtc-builtins.so.13.1");
+
+    private static final List<String> WINDOWS_RUNTIME =
+            List.of("cudart64_13.dll", "nvrtc-builtins64_131.dll", "nvrtc64_130_0.dll");
+
+    /// Loads the runtime libraries that sit beside `library` ([#LINUX_RUNTIME], [#WINDOWS_RUNTIME]); a layout without
+    /// them relies on the system's search path.
+    public static void preloadRuntime(Path library, Arena arena) {
+        boolean windows = System.getProperty("os.name").toLowerCase(Locale.ROOT).startsWith("windows");
+        for (String name : windows ? WINDOWS_RUNTIME : LINUX_RUNTIME) {
+            Path runtime = library.toAbsolutePath().resolveSibling(name);
+            if (Files.isRegularFile(runtime)) SymbolLookup.libraryLookup(runtime, arena);
         }
     }
 
