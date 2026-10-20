@@ -71,8 +71,8 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
     // state.
     private static final int SMALL = 0;
     private static final int MAIN = 1;
-    private final int[] lruHead;
-    private final int[] lruTail;
+    private final int[] queueHead;
+    private final int[] queueTail;
     private final int[] used;
     private final byte[] queue;
     private final byte[] freq;
@@ -129,10 +129,10 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         this.ghostStamp = new long[this.keys.keyCount()];
         java.util.Arrays.fill(this.ghostStamp, Long.MIN_VALUE / 2);
         this.smallCap = Math.max(1, slotCount / 10);
-        this.lruHead = new int[2];
-        this.lruTail = new int[2];
-        java.util.Arrays.fill(this.lruHead, NONE);
-        java.util.Arrays.fill(this.lruTail, NONE);
+        this.queueHead = new int[2];
+        this.queueTail = new int[2];
+        java.util.Arrays.fill(this.queueHead, NONE);
+        java.util.Arrays.fill(this.queueTail, NONE);
         this.used = new int[2];
     }
 
@@ -141,9 +141,9 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         return this.queue[slot];
     }
 
-    /// Whether any list holds an evictable resident.
+    /// Whether any queue holds an evictable resident.
     private boolean anyEvictable() {
-        for (int head : this.lruHead) if (head != NONE) return true;
+        for (int head : this.queueHead) if (head != NONE) return true;
         return false;
     }
 
@@ -152,8 +152,8 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
     /// last round (each other one goes round once more, its count lowered). [#NONE] when nothing is evictable.
     private int s3Victim() {
         while (true) {
-            int small = this.lruHead[SMALL];
-            int main = this.lruHead[MAIN];
+            int small = this.queueHead[SMALL];
+            int main = this.queueHead[MAIN];
             if (small != NONE && (this.used[SMALL] >= this.smallCap || main == NONE)) {
                 if (this.freq[small] > 0) {
                     promote(small);
@@ -165,8 +165,8 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
             if (main == NONE) return NONE;
             if (this.freq[main] > 0) {
                 this.freq[main]--;
-                lruRemove(main);
-                lruAppend(main);
+                dequeue(main);
+                enqueue(main);
                 continue;
             }
             return main;
@@ -174,12 +174,12 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
     }
 
     private void promote(int slot) {
-        lruRemove(slot);
+        dequeue(slot);
         this.used[SMALL]--;
         this.queue[slot] = MAIN;
         this.used[MAIN]++;
         this.freq[slot] = 0;
-        lruAppend(slot);
+        enqueue(slot);
     }
 
     private void asked(int slot) {
@@ -390,7 +390,7 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
     /// Pins a resident slot for one more lease.
     private ExpertLease pin(int slot, int bank, int expert) {
         if (this.state[slot] == RESIDENT) {
-            lruRemove(slot);
+            dequeue(slot);
             this.state[slot] = IN_USE;
             nonEvictable();
         }
@@ -407,7 +407,7 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
     /// Takes the free or evicted slot `victim` for `fresh`.
     private void reserve(int victim, Load fresh) {
         if (this.state[victim] == RESIDENT) {
-            lruRemove(victim);
+            dequeue(victim);
             if (this.directory[this.slotKey[victim]] == victim) this.directory[this.slotKey[victim]] = NONE;
             this.used[listOf(victim)]--;
             this.stats.eviction();
@@ -527,10 +527,10 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         evictable(slot);
     }
 
-    /// A slot with no claims becomes the most recently used evictable resident.
+    /// A slot with no claims becomes an evictable resident again: it returns to the tail of its queue.
     private void evictable(int slot) {
         this.state[slot] = RESIDENT;
-        lruAppend(slot);
+        enqueue(slot);
         this.pinned--;
     }
 
@@ -545,22 +545,22 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
 
     // ---------------------------------------------------------------- queues
 
-    private void lruAppend(int slot) {
+    private void enqueue(int slot) {
         int list = listOf(slot);
-        this.prev[slot] = this.lruTail[list];
+        this.prev[slot] = this.queueTail[list];
         this.next[slot] = NONE;
-        if (this.lruTail[list] == NONE) this.lruHead[list] = slot;
-        else this.next[this.lruTail[list]] = slot;
-        this.lruTail[list] = slot;
+        if (this.queueTail[list] == NONE) this.queueHead[list] = slot;
+        else this.next[this.queueTail[list]] = slot;
+        this.queueTail[list] = slot;
     }
 
-    private void lruRemove(int slot) {
+    private void dequeue(int slot) {
         int list = listOf(slot);
         int before = this.prev[slot];
         int after = this.next[slot];
-        if (before == NONE) this.lruHead[list] = after;
+        if (before == NONE) this.queueHead[list] = after;
         else this.next[before] = after;
-        if (after == NONE) this.lruTail[list] = before;
+        if (after == NONE) this.queueTail[list] = before;
         else this.prev[after] = before;
         this.prev[slot] = NONE;
         this.next[slot] = NONE;
@@ -609,7 +609,7 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
     /// Slots holding a loaded expert that no lease pins, which a miss may evict.
     public int evictableSlots() {
         int count = 0;
-        for (int head : this.lruHead) for (int slot = head; slot != NONE; slot = this.next[slot]) count++;
+        for (int head : this.queueHead) for (int slot = head; slot != NONE; slot = this.next[slot]) count++;
         return count;
     }
 
@@ -636,9 +636,9 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
             if (this.state[slot] != EMPTY) throw new IllegalStateException("slot " + slot + " is free but not empty");
         }
         int evictable = 0;
-        for (int list = 0; list < this.lruHead.length; list++) {
+        for (int list = 0; list < this.queueHead.length; list++) {
             int before = NONE;
-            for (int slot = this.lruHead[list]; slot != NONE; slot = this.next[slot]) {
+            for (int slot = this.queueHead[list]; slot != NONE; slot = this.next[slot]) {
                 if (++evictable > this.slotCount) throw new IllegalStateException("a queue loops");
                 if (this.state[slot] != RESIDENT || this.pins[slot] != 0)
                     throw new IllegalStateException("slot " + slot + " is evictable but pinned or not resident");
@@ -647,7 +647,7 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
                     throw new IllegalStateException("slot " + slot + " has a broken back link");
                 before = slot;
             }
-            if (before != this.lruTail[list]) throw new IllegalStateException("a queue tail is wrong");
+            if (before != this.queueTail[list]) throw new IllegalStateException("a queue tail is wrong");
         }
         int[] counted = new int[this.used.length];
         for (int slot = 0; slot < this.slotCount; slot++) if (this.state[slot] != EMPTY) counted[listOf(slot)]++;
