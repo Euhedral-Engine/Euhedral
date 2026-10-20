@@ -1,5 +1,7 @@
 # Testing
 
+For toolchain setup and build commands, see [building and testing](../development/BUILDING.md).
+
 ## Host tests
 
 `./gradlew test` runs the CPU tests of every module. They need no GPU. Tests that touch process-wide state
