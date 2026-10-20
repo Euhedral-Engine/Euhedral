@@ -51,8 +51,11 @@ run = "./gradlew nativeVerify :api:bootJar build"
 
 [tasks."test-deploy"]
 description = "Exercise cutover, rollback and cleanup-order tests without Docker writes."
-run = "python3 -m unittest discover -s scripts -p 'test_*.py'"
+tools = { uv = "0.13.2" }
+run = "uv run --with PyYAML==6.0.3 python -m unittest discover -s scripts -p 'test_*.py'"
 
 [tasks.deploy]
-description = "Pull main, build and deploy, check inference, then remove old Euhedral images."
-run = "python3 scripts/deploy-main.py"
+description = "Deploy from a YAML or .env file: build main, mount files, verify inference, and clean up."
+tools = { uv = "0.13.2" }
+usage = 'arg "<file>" help="Host YAML or Docker-format .env file"'
+run = 'uv run scripts/deploy-main.py "${usage_file?}"'

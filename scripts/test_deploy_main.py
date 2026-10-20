@@ -1,6 +1,7 @@
 """Safety tests for the local production deployment script."""
 
 import importlib.util
+import csv
 import json
 from contextlib import nullcontext
 import tempfile
@@ -39,6 +40,8 @@ class DeploymentTests(unittest.TestCase):
             return "main"
         if args[:3] == ("git", "status", "--porcelain"):
             return ""
+        if args[:3] == ("docker", "info", "--format"):
+            return '{"nvidia": {}, "runc": {}}'
         if args[:3] == ("git", "rev-parse", "HEAD"):
             return "e39805f194a0d2904f7dcb16ef68d9db666d3123"
         if args[:3] == ("git", "rev-parse", "origin/main"):
@@ -151,6 +154,30 @@ class DeploymentTests(unittest.TestCase):
         toolkit = MODULE.Settings(self.env_file, self.model, "qwen", 18080)
         self.assertEqual(["--gpus", "all"], MODULE.gpu_arguments(toolkit))
 
+    def test_yaml_deployment_mounts_configuration_and_model_and_sets_health_port(self):
+        config = self.root / "config, with spaces.yaml"
+        config.write_text(f"model:\n  artifact: {self.model}\n  name: qwen\nserver:\n  port: 18081\n")
+        self.settings = MODULE.load_settings(config)
+        self.deploy(lambda port: "qwen")
+        run = next(event for event in self.events if event[:2] == ("docker", "run"))
+        self.assertNotIn("--env-file", run)
+        self.assertIn("--gpus", run)
+        self.assertIn("EUHEDRAL_SERVER_PORT=18081", run)
+        self.assertIn("EUHEDRAL_MODEL_ARTIFACT=/models/model.edrl", run)
+        self.assertIn("127.0.0.1:18081:18081", run)
+        self.assertEqual(("--config", "/etc/euhedral/custom.yaml"), run[-2:])
+        mounts = [next(csv.reader([run[i + 1]])) for i, arg in enumerate(run) if arg == "--mount"]
+        self.assertIn(["type=bind", f"src={config}", "dst=/etc/euhedral/custom.yaml", "readonly"], mounts)
+        self.assertIn(["type=bind", f"src={self.model}", "dst=/models/model.edrl", "readonly"], mounts)
+
+    def test_missing_gpu_support_fails_before_build_or_cutover(self):
+        self.settings = MODULE.Settings(self.env_file, self.model, "qwen", 18080)
+        with patch.object(MODULE, "select_gpu_access", side_effect=RuntimeError("missing driver libraries")):
+            with self.assertRaisesRegex(RuntimeError, "missing driver libraries"):
+                self.deploy(lambda port: "qwen")
+        self.assertFalse(any(event[:2] in (("docker", "build"), ("docker", "stop"), ("git", "pull"))
+                             for event in self.events))
+
     def test_build_context_contains_only_committed_source(self):
         with MODULE.build_context(SCRIPT.parents[1]) as context:
             self.assertTrue((context / "Dockerfile").is_file())
@@ -167,6 +194,69 @@ class DeploymentTests(unittest.TestCase):
         with patch.object(MODULE, "command", return_value="healthy"), patch.object(MODULE, "get_json", side_effect=response), patch.object(MODULE.time, "monotonic", side_effect=[0, 1, 301]), patch.object(MODULE.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "did not become ready"):
                 MODULE.verify_ready(18080)
+
+
+class GpuAccessTests(unittest.TestCase):
+    def setUp(self):
+        self.settings = MODULE.Settings(None, Path("/model.edrl"), "qwen", 1738)
+
+    def test_explicit_driver_paths_are_preserved_without_probing_docker(self):
+        settings = MODULE.replace(self.settings, driver=Path("/driver"), ptx_jit=Path("/ptx"))
+        with patch.object(MODULE, "command") as command:
+            self.assertIs(settings, MODULE.select_gpu_access(settings))
+        command.assert_not_called()
+
+    def test_nvidia_runtime_uses_docker_gpu_integration(self):
+        with patch.object(MODULE, "command", return_value='{"nvidia": {}, "runc": {}}'), \
+                patch.object(MODULE, "driver_libraries") as libraries:
+            self.assertIs(self.settings, MODULE.select_gpu_access(self.settings))
+        libraries.assert_not_called()
+
+    def test_nvidia_cdi_devices_use_docker_gpu_integration(self):
+        with patch.object(MODULE, "command", return_value='{"runc": {}}'), \
+                patch.object(MODULE, "nvidia_cdi_available", return_value=True), \
+                patch.object(MODULE, "driver_libraries") as libraries:
+            self.assertIs(self.settings, MODULE.select_gpu_access(self.settings))
+        libraries.assert_not_called()
+
+    def test_missing_integration_automatically_mounts_driver_and_devices(self):
+        with patch.object(MODULE, "command", return_value='{"runc": {}}'), \
+                patch.object(MODULE, "nvidia_cdi_available", return_value=False), \
+                patch.object(MODULE, "driver_libraries", return_value=(Path("/driver"), Path("/ptx"))):
+            settings = MODULE.select_gpu_access(self.settings)
+        arguments = MODULE.gpu_arguments(settings)
+        self.assertNotIn("--gpus", arguments)
+        self.assertIn("/dev/nvidia0", arguments)
+        self.assertIn("/dev/nvidia-uvm", arguments)
+        self.assertIn("LD_LIBRARY_PATH=/opt/euhedral/driver", arguments)
+        self.assertEqual((Path("/driver"), Path("/ptx")), (settings.driver, settings.ptx_jit))
+
+    def test_driver_libraries_come_from_the_host_linker_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            driver, ptx = Path(directory) / "libcuda.so.1", Path(directory) / "libnvidia-ptxjitcompiler.so.1"
+            driver.touch()
+            ptx.touch()
+            cache = f"libcuda.so.1 (libc6,x86-64) => {driver}\nlibnvidia-ptxjitcompiler.so.1 (libc6,x86-64) => {ptx}\n"
+            with patch.object(MODULE.shutil, "which", return_value="/usr/sbin/ldconfig"), \
+                    patch.object(MODULE, "command", return_value=cache):
+                self.assertEqual((driver, ptx), MODULE.driver_libraries())
+            with patch.object(MODULE.shutil, "which", return_value="/usr/sbin/ldconfig"), \
+                    patch.object(MODULE, "command", return_value=""):
+                with self.assertRaisesRegex(RuntimeError, "host driver libraries are missing"):
+                    MODULE.driver_libraries()
+
+    def test_cdi_requires_a_specification_with_nvidia_devices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            spec = Path(directory) / "nvidia.yaml"
+            for contents, expected in (
+                ("kind: nvidia.com/gpu\ndevices: [{name: all}]\n", True),
+                ("kind: other.com/gpu\ndevices: [{name: all}]\n", False),
+                ("kind: nvidia.com/gpu\ndevices: []\n", False),
+                ("invalid: [", False),
+            ):
+                spec.write_text(contents)
+                with patch.object(MODULE.Path, "glob", return_value=[spec]):
+                    self.assertEqual(expected, MODULE.nvidia_cdi_available())
 
 
 class SettingsTests(unittest.TestCase):
@@ -194,19 +284,81 @@ class SettingsTests(unittest.TestCase):
                              "EUHEDRAL_HOST_CPUS=0\n")
         self.assertEqual(1738, settings.port)
 
-    def test_refuses_a_missing_file_missing_keys_and_paths_the_image_fixes(self):
+    def test_refuses_a_missing_file_missing_keys_and_unpaired_driver_paths(self):
         with self.assertRaisesRegex(RuntimeError, "copy .env.example"):
             MODULE.load_settings(self.path)
-        with self.assertRaisesRegex(RuntimeError, "does not set EUHEDRAL_HOST_CPUS"):
-            self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_MODEL_NAME=q\n")
-        with self.assertRaisesRegex(RuntimeError, "EUHEDRAL_MODEL_ARTIFACT, which the image fixes"):
-            self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_MODEL_NAME=q\n"
-                      "EUHEDRAL_HOST_CPUS=0\nEUHEDRAL_MODEL_ARTIFACT=/a\n")
+        with self.assertRaisesRegex(RuntimeError, "does not set EUHEDRAL_MODEL_NAME"):
+            self.load("EUHEDRAL_ARTIFACT_FILE=/a\n")
+        with self.assertRaisesRegex(RuntimeError, "EUHEDRAL_ARTIFACT_FILE"):
+            self.load("EUHEDRAL_MODEL_NAME=q\n")
         with self.assertRaisesRegex(RuntimeError, "both EUHEDRAL_CUDA_DRIVER_FILE and EUHEDRAL_PTX_JIT_FILE"):
             self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_MODEL_NAME=q\n"
                       "EUHEDRAL_HOST_CPUS=0\nEUHEDRAL_CUDA_DRIVER_FILE=/d\n")
         with self.assertRaisesRegex(RuntimeError, "expected KEY=VALUE"):
             self.load("just words\n")
+
+    def test_env_accepts_the_model_artifact_variable_and_optional_cpus(self):
+        settings = self.load("EUHEDRAL_MODEL_ARTIFACT=artifacts/model.edrl\nEUHEDRAL_MODEL_NAME=q\n")
+        self.assertEqual(self.path.parent / "artifacts/model.edrl", settings.artifact)
+        self.assertIsNone(settings.config_file)
+
+    def test_server_port_variable_overrides_port_alias(self):
+        settings = self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_MODEL_NAME=q\n"
+                             "PORT=1738\nEUHEDRAL_SERVER_PORT=18080\n")
+        self.assertEqual(18080, settings.port)
+
+    def test_reads_yaml_host_paths_model_and_port(self):
+        self.path = self.path.with_name("settings.yaml")
+        settings = self.load('''
+model:
+  artifact: "models/a b.edrl" # host path relative to this file
+  name: "qwen:custom"
+server:
+  port: 18081
+host:
+  cpus: auto
+''')
+        self.assertEqual(self.path.parent / "models/a b.edrl", settings.artifact)
+        self.assertEqual(("qwen:custom", 18081), (settings.model_id, settings.port))
+        self.assertIsNone(settings.env_file)
+        self.assertEqual(self.path, settings.config_file)
+
+    def test_yaml_defaults_port_and_handles_flow_mappings(self):
+        self.path = self.path.with_name("settings.yml")
+        settings = self.load('model: {artifact: /a.edrl, name: qwen}\n')
+        self.assertEqual(1738, settings.port)
+
+    def test_rejects_bad_yaml_and_missing_model_keys(self):
+        self.path = self.path.with_name("settings.yaml")
+        for text, message in (
+            ("model: [", "invalid YAML"),
+            ("- model", "expected a YAML mapping"),
+            ("model: scalar", "model must be a mapping"),
+            ("model: {artifact: /a}", "model.name"),
+            ("model: {name: q}", "model.artifact"),
+            ("model: {artifact: 123, name: q}", "model.artifact"),
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(RuntimeError, message):
+                self.load(text)
+
+    def test_rejects_invalid_ports_in_both_file_formats(self):
+        for port in ("0", "65536", "bad", "1.5", "true"):
+            with self.subTest(format="env", port=port), self.assertRaisesRegex(RuntimeError, "server port"):
+                self.load(f"EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_MODEL_NAME=q\nPORT={port}\n")
+            yaml_path = self.path.with_suffix(".yaml")
+            yaml_path.write_text(f"model: {{artifact: /a, name: q}}\nserver: {{port: {port}}}\n")
+            with self.subTest(format="yaml", port=port), self.assertRaisesRegex(RuntimeError, "server port"):
+                MODULE.load_settings(yaml_path)
+
+    def test_cli_accepts_only_a_file_argument(self):
+        self.path.write_text("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_MODEL_NAME=q\n")
+        with patch.object(MODULE, "deploy") as deploy:
+            self.assertEqual(0, MODULE.main([str(self.path)]))
+        self.assertEqual(self.path, deploy.call_args.args[1].env_file)
+        with patch.object(MODULE, "deploy") as deploy, patch("sys.stderr"):
+            with self.assertRaises(SystemExit):
+                MODULE.main(["--env-file", str(self.path)])
+        deploy.assert_not_called()
 
 
 if __name__ == "__main__":

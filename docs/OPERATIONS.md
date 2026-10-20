@@ -9,9 +9,12 @@ key path in capitals with `.` and `-` as `_`: `model.artifact` is `EUHEDRAL_MODE
 `server.port`. An unknown key, an invalid value or a variable of a retired name stops the server before anything loads,
 with every problem named on its own line of standard error and exit status 2.
 
-The container starts with `--config /etc/euhedral/config.yaml`, which holds the model's container paths; the model name
-and every other setting come from the run's environment. The container and `mise run deploy` read a `.env` file
-([.env.example](../.env.example)) with the host path mounted on that container path (`EUHEDRAL_ARTIFACT_FILE`).
+`mise deploy <file.yaml|.env>` reads the host model path, model name, and port from the supplied file and
+handles the image build and mounts. YAML uses `model.artifact`, `model.name`, and `server.port`; `.env` uses
+`EUHEDRAL_ARTIFACT_FILE` (or `EUHEDRAL_MODEL_ARTIFACT`), `EUHEDRAL_MODEL_NAME`, and `EUHEDRAL_SERVER_PORT`
+(or `PORT`). Relative host paths resolve from the settings file's directory. Deploy mounts the artifact at
+`/models/model.edrl` and overrides the container setting to match. The Java application never reads `.env`.
+See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 
 | Setting | Default | Meaning |
 |---|---|---|

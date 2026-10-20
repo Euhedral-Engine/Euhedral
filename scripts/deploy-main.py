@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["PyYAML==6.0.3"]
+# ///
 """Pull, build, and deploy main; clean up only after a healthy cutover.
 
-Run on the deployment host from any directory. Every setting comes from the repository's .env (or --env-file):
-copy .env.example and fill it in. The file is passed to the container as its environment, and its artifact (which
-carries the tokenizer) is mounted into it.
+Pass one host YAML or Docker-format .env file. The script reads the model path, public name, and port,
+mounts the model and configuration, and checks inference before removing the previous deployment.
 """
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import csv
+import io
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -25,75 +32,164 @@ IMAGE_REPOSITORY = "euhedral-inference"
 REPOSITORY = Path(__file__).resolve().parents[1]
 # What this process runs; the pull below may bring a newer version of the script.
 SCRIPT_SOURCE = Path(__file__).read_bytes()
-REQUIRED = ("EUHEDRAL_ARTIFACT_FILE", "EUHEDRAL_MODEL_NAME", "EUHEDRAL_HOST_CPUS")
-# The image fixes this (its /etc/euhedral/config.yaml) and mounts the host file there.
-CONTAINER_PATHS = ("EUHEDRAL_MODEL_ARTIFACT",)
+REQUIRED = ("EUHEDRAL_MODEL_NAME",)
 DEVICES = ("nvidia0", "nvidiactl", "nvidia-uvm", "nvidia-modeset")
 
 
 @dataclass(frozen=True)
 class Settings:
-    env_file: Path
+    env_file: Path | None
     artifact: Path
     model_id: str
     port: int
     driver: Path | None = None
     ptx_jit: Path | None = None
+    config_file: Path | None = None
 
 
 def read_env(path):
     """Docker's env-file format: KEY=VALUE lines, values taken literally, # comments on their own lines."""
     values = {}
     for number, line in enumerate(path.read_text().splitlines(), 1):
-        stripped = line.strip()
+        stripped = line.lstrip()
         if not stripped or stripped.startswith("#"):
             continue
         key, separator, value = stripped.partition("=")
-        if not separator or not key:
-            raise RuntimeError(f"{path}:{number}: expected KEY=VALUE, got {line!r}")
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise RuntimeError(f"{path}:{number}: expected KEY=VALUE")
         values[key] = value
     return values
 
 
-def load_settings(path):
-    if not path.is_file():
-        raise RuntimeError(f"No settings file at {path}; copy .env.example to .env and fill it in")
-    values = read_env(path)
-    missing = [key for key in REQUIRED if not values.get(key)]
+def host_path(value, settings_file):
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else settings_file.parent / path).resolve()
+
+
+def read_yaml(path):
+    import yaml
+
+    try:
+        values = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as error:
+        raise RuntimeError(f"{path}: invalid YAML: {error}") from error
+    if not isinstance(values, dict):
+        raise RuntimeError(f"{path}: expected a YAML mapping of settings")
+    for section in ("model", "server"):
+        if section in values and not isinstance(values[section], dict):
+            raise RuntimeError(f"{path}: {section} must be a mapping")
+    model = values.get("model", {})
+    missing = [f"model.{key}" for key in ("artifact", "name")
+               if not isinstance(model.get(key), str) or not model[key].strip()]
     if missing:
-        raise RuntimeError(f"{path} does not set {', '.join(missing)} (see .env.example)")
-    fixed = [key for key in CONTAINER_PATHS if key in values]
-    if fixed:
-        raise RuntimeError(f"{path} sets {', '.join(fixed)}, which the image fixes; set the host path in "
-                           "EUHEDRAL_ARTIFACT_FILE instead")
-    driver, ptx_jit = values.get("EUHEDRAL_CUDA_DRIVER_FILE"), values.get("EUHEDRAL_PTX_JIT_FILE")
+        raise RuntimeError(f"{path} does not set {', '.join(missing)}")
+    return model, values.get("server", {})
+
+
+def load_settings(path):
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise RuntimeError(f"No settings file at {path}; copy .env.example or config/euhedral.example.yaml and fill it in")
+    is_yaml = path.suffix.lower() in (".yaml", ".yml")
+    if is_yaml:
+        model, server = read_yaml(path)
+        artifact, model_id, port = model["artifact"], model["name"], server.get("port", 1738)
+        driver = ptx_jit = None
+    else:
+        values = read_env(path)
+        missing = [key for key in REQUIRED if not values.get(key, "").strip()]
+        artifact = values.get("EUHEDRAL_ARTIFACT_FILE") or values.get("EUHEDRAL_MODEL_ARTIFACT")
+        if not artifact or not artifact.strip():
+            missing.insert(0, "EUHEDRAL_ARTIFACT_FILE (or EUHEDRAL_MODEL_ARTIFACT)")
+        if missing:
+            raise RuntimeError(f"{path} does not set {', '.join(missing)} (see .env.example)")
+        model_id = values["EUHEDRAL_MODEL_NAME"]
+        port = values.get("EUHEDRAL_SERVER_PORT", values.get("PORT", "1738"))
+        driver, ptx_jit = values.get("EUHEDRAL_CUDA_DRIVER_FILE"), values.get("EUHEDRAL_PTX_JIT_FILE")
     if bool(driver) != bool(ptx_jit):
         raise RuntimeError(f"{path} must set both EUHEDRAL_CUDA_DRIVER_FILE and EUHEDRAL_PTX_JIT_FILE, or neither")
     try:
-        port = int(values.get("PORT", "1738"))
+        port = int(str(port))
     except ValueError:
-        raise RuntimeError(f"{path}: PORT must be a number") from None
+        raise RuntimeError(f"{path}: server port must be a whole number") from None
+    if not 1 <= port <= 65535:
+        raise RuntimeError(f"{path}: server port must be between 1 and 65535")
     return Settings(
-        env_file=path.resolve(),
-        artifact=Path(values["EUHEDRAL_ARTIFACT_FILE"]),
-        model_id=values["EUHEDRAL_MODEL_NAME"],
+        env_file=None if is_yaml else path,
+        artifact=host_path(artifact, path),
+        model_id=model_id,
         port=port,
-        driver=Path(driver) if driver else None,
-        ptx_jit=Path(ptx_jit) if ptx_jit else None,
+        driver=host_path(driver, path) if driver else None,
+        ptx_jit=host_path(ptx_jit, path) if ptx_jit else None,
+        config_file=path if is_yaml else None,
     )
 
 
+def mount_file(source, target):
+    output = io.StringIO()
+    csv.writer(output, lineterminator="").writerow(
+        ["type=bind", f"src={source}", f"dst={target}", "readonly"]
+    )
+    return ["--mount", output.getvalue()]
+
+
+def nvidia_cdi_available():
+    import yaml
+
+    for directory in (Path("/etc/cdi"), Path("/var/run/cdi")):
+        for path in directory.glob("*"):
+            if path.suffix.lower() not in (".yaml", ".yml", ".json"):
+                continue
+            try:
+                spec = yaml.safe_load(path.read_text())
+            except (OSError, yaml.YAMLError):
+                continue
+            if isinstance(spec, dict) and spec.get("kind") == "nvidia.com/gpu" and spec.get("devices"):
+                return True
+    return False
+
+
+def driver_libraries():
+    """Find the installed host driver libraries without relying on a distribution's library directory."""
+    executable = shutil.which("ldconfig")
+    if executable is None:
+        raise RuntimeError("Cannot locate NVIDIA driver libraries: ldconfig is unavailable")
+    libraries = {}
+    for line in command(executable, "-p").splitlines():
+        name, separator, location = line.strip().partition(" => ")
+        if separator:
+            name = name.split()[0]
+            if name in ("libcuda.so.1", "libnvidia-ptxjitcompiler.so.1") and Path(location).is_file():
+                libraries.setdefault(name, Path(location).resolve())
+    missing = {"libcuda.so.1", "libnvidia-ptxjitcompiler.so.1"} - libraries.keys()
+    if missing:
+        raise RuntimeError("Docker has no NVIDIA GPU integration and host driver libraries are missing: "
+                           + ", ".join(sorted(missing)))
+    return libraries["libcuda.so.1"], libraries["libnvidia-ptxjitcompiler.so.1"]
+
+
+def select_gpu_access(settings):
+    """Keep explicit driver settings; otherwise use Docker integration or discover the host driver."""
+    if settings.driver is not None:
+        return settings
+    runtimes = json.loads(command("docker", "info", "--format", "{{json .Runtimes}}"))
+    if "nvidia" in runtimes or nvidia_cdi_available():
+        return settings
+    driver, ptx_jit = driver_libraries()
+    print("Docker has no NVIDIA runtime or CDI devices; mounting host GPU devices and driver libraries", flush=True)
+    return replace(settings, driver=driver, ptx_jit=ptx_jit)
+
+
 def gpu_arguments(settings):
-    """The GPU through the NVIDIA Container Toolkit, or, with the driver libraries set, the device nodes and those
-    libraries mounted in a directory on the container's library path."""
+    """The GPU through Docker integration, or the host devices and driver libraries."""
     if settings.driver is None:
         return ["--gpus", "all"]
     arguments = []
     for device in DEVICES:
         arguments += ["--device", f"/dev/{device}"]
-    arguments += ["--mount", f"type=bind,src={settings.driver},dst=/opt/euhedral/driver/libcuda.so.1,readonly",
-                  "--mount", f"type=bind,src={settings.ptx_jit},dst=/opt/euhedral/driver/libnvidia-ptxjitcompiler.so.1,readonly",
-                  "--env", "LD_LIBRARY_PATH=/opt/euhedral/driver"]
+    arguments += mount_file(settings.driver, "/opt/euhedral/driver/libcuda.so.1")
+    arguments += mount_file(settings.ptx_jit, "/opt/euhedral/driver/libnvidia-ptxjitcompiler.so.1")
+    arguments += ["--env", "LD_LIBRARY_PATH=/opt/euhedral/driver"]
     return arguments
 
 
@@ -168,6 +264,7 @@ def deploy(repository, settings):
         raise RuntimeError("Deploy only from main; switch to main before invoking this script")
     if command("git", "status", "--porcelain", "--untracked-files=no"):
         raise RuntimeError("Tracked working-tree changes must be committed or moved before deployment")
+    settings = select_gpu_access(settings)
     for path in (model, settings.driver, settings.ptx_jit):
         if path is not None and not path.is_file():
             raise RuntimeError(f"Missing required host file: {path}")
@@ -218,10 +315,14 @@ def deploy(repository, settings):
             old_renamed = True
         command(
             "docker", "run", "-d", "--name", SERVICE, "--restart", "unless-stopped", "--stop-timeout", "45",
-            "--env-file", str(settings.env_file), "-e", f"PORT={port}", "-p", f"127.0.0.1:{port}:{port}",
+            *(["--env-file", str(settings.env_file)] if settings.env_file else []),
+            *(mount_file(settings.config_file, "/etc/euhedral/custom.yaml") if settings.config_file else []),
+            "-e", "EUHEDRAL_MODEL_ARTIFACT=/models/model.edrl",
+            "-e", f"EUHEDRAL_SERVER_PORT={port}", "-p", f"127.0.0.1:{port}:{port}",
             *gpu_arguments(settings),
-            "--mount", f"type=bind,src={model},dst=/models/model.edrl,readonly",
+            *mount_file(model, "/models/model.edrl"),
             image,
+            *(["--config", "/etc/euhedral/custom.yaml"] if settings.config_file else []),
         )
         model_id = verify_ready(port)
         if model_id != settings.model_id:
@@ -280,14 +381,19 @@ def deploy(repository, settings):
     return revision
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--env-file", type=Path, default=REPOSITORY / ".env", help="settings file (default: .env)")
-    arguments = parser.parse_args()
+    parser.add_argument("file", type=Path, help="host YAML or Docker-format .env file")
+    arguments = parser.parse_args(argv)
     try:
-        deploy(REPOSITORY, load_settings(arguments.env_file))
-    except (RuntimeError, subprocess.CalledProcessError, ValueError) as error:
+        deploy(REPOSITORY, load_settings(arguments.file))
+    except (RuntimeError, subprocess.CalledProcessError, ValueError, OSError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         if isinstance(error, subprocess.CalledProcessError):
-            print(error.output[-4000:], file=sys.stderr)
-        sys.exit(1)
+            print((error.output or "")[-4000:], file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
