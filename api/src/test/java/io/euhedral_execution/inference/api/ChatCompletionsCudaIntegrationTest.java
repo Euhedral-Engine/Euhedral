@@ -11,6 +11,9 @@ import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.core.InferenceEngine;
 import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.settings.RequestSettings;
+import io.euhedral_execution.inference.core.settings.Settings;
+import io.euhedral_execution.inference.core.settings.SettingsLoader;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.Socket;
@@ -25,6 +28,8 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
 import java.util.StringJoiner;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -44,8 +49,6 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
 import org.springframework.test.annotation.DirtiesContext;
-import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.convention.TestBean;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
@@ -71,6 +74,12 @@ class ChatCompletionsCudaIntegrationTest {
     /// The build's native files, where the build lays them out, in place of the jar's.
     @TestBean
     private NativeFiles nativeFiles;
+
+    @TestBean
+    private Settings settings;
+
+    @TestBean
+    private RequestSettings requestSettings;
 
     private static Path artifact;
     private static Path tokenizer;
@@ -99,12 +108,19 @@ class ChatCompletionsCudaIntegrationTest {
         return NativeFiles.at(library.toAbsolutePath().getParent().getParent());
     }
 
-    @DynamicPropertySource
-    static void engineProperties(DynamicPropertyRegistry registry) {
-        registry.add("euhedral.inference.artifact-path", () -> artifact.toString());
-        registry.add("euhedral.inference.tokenizer-directory", () -> tokenizer.toString());
-        registry.add("euhedral.inference.worker-cpus", ChatCompletionsCudaIntegrationTest::twoPerformanceCpus);
-        registry.add("euhedral.inference.model-id", () -> MODEL);
+    /// The settings the tests start the server with: the model files the build points at.
+    static Settings settings() {
+        return SettingsLoader.load(
+                Optional.empty(),
+                Map.of(
+                        "EUHEDRAL_MODEL_ARTIFACT", artifact.toString(),
+                        "EUHEDRAL_MODEL_TOKENIZER", tokenizer.toString(),
+                        "EUHEDRAL_MODEL_NAME", MODEL,
+                        "EUHEDRAL_HOST_CPUS", twoPerformanceCpus()));
+    }
+
+    static RequestSettings requestSettings() {
+        return settings().server().requests();
     }
 
     @Test

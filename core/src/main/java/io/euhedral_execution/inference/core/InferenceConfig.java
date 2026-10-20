@@ -1,5 +1,7 @@
 package io.euhedral_execution.inference.core;
 
+import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
+import io.euhedral_execution.inference.core.settings.Settings;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -62,6 +64,22 @@ public record InferenceConfig(
                     "prefixCacheCheckpointTokens must be a positive multiple of " + PREFILL_CHUNK_TOKENS);
         if (maxSequences < 0) throw new IllegalArgumentException("maxSequences must not be negative");
         if (kvDeviceMinimumTokens <= 0) throw new IllegalArgumentException("kvDeviceMinimumTokens must be positive");
+    }
+
+    /// The engine input the settings describe, with the native library `nativeFiles` holds.
+    public static InferenceConfig of(Settings settings, NativeFiles nativeFiles) {
+        return new InferenceConfig(
+                settings.model().artifact(),
+                settings.model().tokenizer(),
+                nativeFiles.library(),
+                settings.host().selectedCpus(),
+                settings.context().maxTokens(),
+                settings.server().shutdownTimeout(),
+                settings.prefixCache().size(),
+                settings.prefixCache().checkpointTokens(),
+                settings.context().kvCacheFormat().orElse(null),
+                settings.batching().maxSequences(),
+                settings.context().kvCacheOnGpuTokens());
     }
 
     /// The default device share of each sequence's attention cache.

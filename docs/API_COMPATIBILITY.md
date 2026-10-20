@@ -22,7 +22,7 @@ Nothing that changes generation is accepted and ignored.
 |---|---|---|
 | `model` | supported | Must be the served model ID (404 `model_not_found` otherwise). |
 | `messages` | supported | Roles `system`, `developer` (as system), `user`, `assistant`, `tool`. Content: a string or `text` parts. Assistant `tool_calls` and `reasoning_content` replay; `tool` messages need `tool_call_id`. |
-| `max_tokens`, `max_completion_tokens` | supported | Either (they must agree if both are sent); the default is `euhedral.api.default-max-tokens` (4096), capped by the context. |
+| `max_tokens`, `max_completion_tokens` | supported | Either (they must agree if both are sent); the default is `server.requests.default-max-tokens` (4096), capped by the context. |
 | `temperature` | supported | 0 to 2; 0 is greedy. Default from `generation_config.json` (1.0). |
 | `top_p` | supported | 0 to 1; 0 is greedy. Default 0.95. |
 | `top_k` | supported | Not an OpenAI field; accepted as vLLM spells it: at least 1, or 0/-1 for no limit. Default 20. |
@@ -58,7 +58,7 @@ The response is `chat.completion` with one choice. `message.reasoning_content` c
 ## Unsupported on purpose
 
 - **Several sequences at once** (`n` > 1, concurrent generations): the engine sizes device memory for one sequence and
-  runs one generation at a time; others wait in a bounded queue (`euhedral.api.max-queued-generations`, 503 beyond it).
+  runs one generation at a time; others wait in a bounded queue (`server.requests.max-queued`, 503 beyond it).
 - **Log probabilities and logit bias**: sampling selects on the host from the final row; returning probabilities or
   biasing them would be features of their own, and no client this server targets needs them.
 - **Penalties**: not implemented; refused rather than approximated.
@@ -73,14 +73,14 @@ The response is `chat.completion` with one choice. `message.reasoning_content` c
   or constrained requests decode one token per step.
 - Authentication is not implemented: any API key is accepted. Put the server behind a proxy that authenticates if it is
   reachable by others.
-- A request body is limited to `euhedral.api.max-request-bytes` (1 MiB, 413 beyond) and a request to
-  `euhedral.api.request-timeout` (30 minutes).
+- A request body is limited to `server.requests.max-body-size` (1 MiB, 413 beyond) and a request to
+  `server.requests.timeout` (30 minutes).
 
 ## Real clients
 
 `tools/client_compatibility.py` runs the OpenAI and Anthropic Python clients and `curl` against a running server and
 checks what a client relies on: response shapes, stream order, finish and stop reasons, tool-call loops, cached-token
-counts, cancellation and refusals. Start the server with `EUHEDRAL_API_MAX_QUEUED_GENERATIONS=1` so the capacity
+counts, cancellation and refusals. Start the server with `EUHEDRAL_SERVER_REQUESTS_MAX_QUEUED=1` so the capacity
 scenario can fill the queue.
 
 Run on 2026-10-04: RTX 5070 Ti, `qwen3_8_27b_nvfp4_compressed`, openai 3.24.0, anthropic 1.11.0. The prefix-cache

@@ -1,6 +1,5 @@
-# OpenAI-compatible clients use http://<server.address>:<server.port>/v1 as their base URL.
+# Fixed internals; every deployer setting lives in the YAML file the server is started with (--config).
 server:
-  port: ${PORT:1738}
   # Let in-flight completions finish before generation threads and the engine are stopped.
   shutdown: graceful
 
@@ -20,28 +19,5 @@ management:
 spring:
   application:
     name: euhedral-inference-api
-  lifecycle:
-    timeout-per-shutdown-phase: 30s
   main:
     banner-mode: off
-
-euhedral:
-  # Required; each may also be set through EUHEDRAL_INFERENCE_* environment variables.
-  inference:
-    # artifact-path: /path/to/model.edrl
-    # tokenizer-directory: /path/to/checkpoint   (tokenizer.json, chat_template.jinja, generation_config.json)
-    # native-cache: /path/to/cache   (optional; where the jar unpacks its native files; unset: the user's cache directory)
-    # worker-cpus: 2,3            (optional; processor IDs or inclusive ranges, e.g. 2-5,8; unset: every available processor)
-    # model-id: qwen3.8-27b       (the name clients send as "model")
-    # max-context-tokens: 32768   (optional; longest prompt plus completion; longer contexts hold weights in host memory)
-    # prefix-cache-bytes: 4294967296   (optional; pinned host memory that keeps earlier prompts' state for reuse; 0 disables)
-    # prefix-cache-checkpoint-tokens: 2048   (optional; prompt tokens between stored checkpoints; a multiple of 512)
-    # kv-cache: nvfp4   (optional; attention cache format, nvfp4 or bf16; unset: the artifact's)
-    # max-sequences: 1   (optional; generations that run at once, each with its own sequence state; 0: as many as fit without holding back more weights than one sequence does)
-    # kv-device-minimum-tokens: 65536   (optional; tokens of each sequence's attention cache kept on the GPU; past it, pages move to pinned host memory before weights leave the GPU)
-    shutdown-timeout: 10s
-  api:
-    default-max-tokens: 4096
-    max-queued-generations: 16
-    max-request-bytes: 1048576
-    request-timeout: 30m

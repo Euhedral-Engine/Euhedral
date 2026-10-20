@@ -354,7 +354,7 @@ Every piece of host work a request needs runs as frames on the lattice's workers
   throughout. Idle CPU with no request is the same with either: 0.4 cores for 4 workers, 3.6-4.3 for 32.
   That figure is before the first request. The lake attaches its sinks to the lattice when it admits its first unit, and
   a worker polls every attached source, so after a request a worker whose polls find nothing yields in a loop: the
-  production server with one worker (`EUHEDRAL_INFERENCE_WORKER_CPUS=0`) sat at 100% of that core with no generation
+  production server with one worker (`EUHEDRAL_HOST_CPUS=0`) sat at 100% of that core with no generation
   active, no context switch in two seconds and the stack in `ControlPlaneFragment.runCycle` (`Thread.yield`) over
   `QueueIngestSink` polls. The sinks are therefore attached for a busy period (`InferenceLake`): beside them the lake
   attaches an idle watch, a source polled like the sinks, and when no unit has been admitted for a second

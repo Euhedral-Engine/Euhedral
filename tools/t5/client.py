@@ -126,7 +126,7 @@ class ChatClient:
                     continue
                 if _error_code(detail) == "timeout":
                     raise ServerTimeout("the server's request-timeout expired before the request completed; "
-                                        "start it with euhedral.api.request-timeout above the longest request "
+                                        "start it with server.requests.timeout above the longest request "
                                         f"(for example 6h): {detail}") from e
                 if e.code not in RETRYABLE_STATUS or attempt == self.retries:
                     raise RuntimeError(f"server answered {e.code}: {detail}") from e

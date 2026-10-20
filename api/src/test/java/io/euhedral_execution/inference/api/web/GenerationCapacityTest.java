@@ -24,7 +24,7 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 @SpringBootTest(
         classes = ScriptedApiApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"euhedral.test.scripted-api=true", "euhedral.api.max-queued-generations=0"})
+        properties = {"euhedral.test.scripted-api=true", "euhedral.test.max-queued=0"})
 @Timeout(60)
 class GenerationCapacityTest {
     private static final String BODY = "{\"model\":\"" + ScriptedInferenceBackend.MODEL_ID

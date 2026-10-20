@@ -2,9 +2,9 @@ package io.euhedral_execution.inference.api.web;
 
 import io.euhedral_execution.inference.api.anthropic.MessagesRequest;
 import io.euhedral_execution.inference.api.chat.ApiException;
-import io.euhedral_execution.inference.api.engine.ApiProperties;
 import io.euhedral_execution.inference.api.openai.ChatCompletionRequest;
 import io.euhedral_execution.inference.api.responses.ResponsesRequest;
+import io.euhedral_execution.inference.core.settings.RequestSettings;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -20,10 +20,10 @@ import org.springframework.web.servlet.mvc.method.annotation.RequestBodyAdviceAd
 /// the prompt. A declared length is rejected immediately; chunked bodies are counted as they arrive.
 @ControllerAdvice
 final class ChatRequestBodyLimit extends RequestBodyAdviceAdapter {
-    private final int maxBytes;
+    private final long maxBytes;
 
-    ChatRequestBodyLimit(ApiProperties properties) {
-        this.maxBytes = properties.maxRequestBytes();
+    ChatRequestBodyLimit(RequestSettings requests) {
+        this.maxBytes = requests.maxBodySize();
     }
 
     @Override
@@ -46,7 +46,7 @@ final class ChatRequestBodyLimit extends RequestBodyAdviceAdapter {
             @Override
             public InputStream getBody() throws IOException {
                 return new FilterInputStream(message.getBody()) {
-                    private int remaining = maxBytes;
+                    private long remaining = maxBytes;
 
                     @Override
                     public int read() throws IOException {
@@ -59,7 +59,7 @@ final class ChatRequestBodyLimit extends RequestBodyAdviceAdapter {
                     @Override
                     public int read(byte[] bytes, int offset, int length) throws IOException {
                         if (length == 0) return 0;
-                        int count = this.in.read(bytes, offset, Math.min(length, this.remaining + 1));
+                        int count = this.in.read(bytes, offset, (int) Math.min(length, this.remaining + 1));
                         if (count < 0) return count;
                         if (count > this.remaining) throw new TooLarge();
                         this.remaining -= count;

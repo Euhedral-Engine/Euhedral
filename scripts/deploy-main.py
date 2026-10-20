@@ -25,9 +25,9 @@ IMAGE_REPOSITORY = "euhedral-inference"
 REPOSITORY = Path(__file__).resolve().parents[1]
 # What this process runs; the pull below may bring a newer version of the script.
 SCRIPT_SOURCE = Path(__file__).read_bytes()
-REQUIRED = ("EUHEDRAL_ARTIFACT_FILE", "EUHEDRAL_CHECKPOINT_DIR", "EUHEDRAL_INFERENCE_MODEL_ID", "EUHEDRAL_INFERENCE_WORKER_CPUS")
-# The image fixes these and mounts the host files there.
-CONTAINER_PATHS = ("EUHEDRAL_INFERENCE_ARTIFACT_PATH", "EUHEDRAL_INFERENCE_TOKENIZER_DIRECTORY")
+REQUIRED = ("EUHEDRAL_ARTIFACT_FILE", "EUHEDRAL_CHECKPOINT_DIR", "EUHEDRAL_MODEL_NAME", "EUHEDRAL_HOST_CPUS")
+# The image fixes these (its /etc/euhedral/config.yaml) and mounts the host files there.
+CONTAINER_PATHS = ("EUHEDRAL_MODEL_ARTIFACT", "EUHEDRAL_MODEL_TOKENIZER")
 DEVICES = ("nvidia0", "nvidiactl", "nvidia-uvm", "nvidia-modeset")
 
 
@@ -78,7 +78,7 @@ def load_settings(path):
         env_file=path.resolve(),
         artifact=Path(values["EUHEDRAL_ARTIFACT_FILE"]),
         checkpoint=Path(values["EUHEDRAL_CHECKPOINT_DIR"]),
-        model_id=values["EUHEDRAL_INFERENCE_MODEL_ID"],
+        model_id=values["EUHEDRAL_MODEL_NAME"],
         port=port,
         driver=Path(driver) if driver else None,
         ptx_jit=Path(ptx_jit) if ptx_jit else None,

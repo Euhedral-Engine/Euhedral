@@ -295,7 +295,7 @@ public final class SettingsLoader {
         m.put("server.port", fixed(integer(1, 65535)));
         m.put("server.shutdown-timeout", fixed(duration(false)));
         m.put("server.requests.default-max-tokens", fixed(integer(1, Integer.MAX_VALUE)));
-        m.put("server.requests.max-queued", fixed(integer(1, Integer.MAX_VALUE)));
+        m.put("server.requests.max-queued", fixed(integer(0, Integer.MAX_VALUE)));
         m.put("server.requests.max-body-size", fixed(size(1)));
         m.put("server.requests.timeout", fixed(duration(true)));
 

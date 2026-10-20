@@ -207,8 +207,8 @@ python3 tools/convert_checkpoint.py --extend $OUT/qwen3_8_27b_nvfp4_compressed.e
 conversations in `STORE/conversations.jsonl` through the server's chat API, executing tool calls against each
 conversation's fixture. A script that ends before `--target-tokens` continues with follow-up turns from `t5/follow_ups.py` (depth, examples, edge cases; per domain and language). Greedy or sampled decoding comes from `t5.records.plan_decoding`. Token ids are taken from
 the server (`return_token_ids`), not re-tokenized. `--parallel` is required and must match the server's maximum number of
-sequences. The server must run with `euhedral.api.max-queued-generations` at least `--parallel` and with
-`euhedral.api.request-timeout` above the longest request (its 30m default is counted from arrival including queue
+sequences. The server must run with `server.requests.max-queued` at least `--parallel` and with
+`server.requests.timeout` above the longest request (its 30m default is counted from arrival including queue
 wait, and BF16 requests take 45+ minutes; use for example 6h). A request whose prompt plus `--max-tokens` exceeds the server's context is sent again with `max_tokens` cut to the room left. A timeout answer is recorded as an error and not
 retried; a full queue or restarting server (502/503/504) is retried with backoff for about 30 minutes. Ctrl-C stops
 the run: workers stop before their next request and an interrupted conversation is not recorded; a request in

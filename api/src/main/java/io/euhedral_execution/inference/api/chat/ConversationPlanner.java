@@ -1,8 +1,8 @@
 package io.euhedral_execution.inference.api.chat;
 
-import io.euhedral_execution.inference.api.engine.ApiProperties;
 import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.core.guidance.GrammarException;
+import io.euhedral_execution.inference.core.settings.RequestSettings;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -19,12 +19,12 @@ import org.springframework.stereotype.Component;
 public class ConversationPlanner {
     private final InferenceBackend backend;
     private final QwenChatTemplate chatTemplate;
-    private final ApiProperties properties;
+    private final RequestSettings requests;
 
-    public ConversationPlanner(InferenceBackend backend, QwenChatTemplate chatTemplate, ApiProperties properties) {
+    public ConversationPlanner(InferenceBackend backend, QwenChatTemplate chatTemplate, RequestSettings requests) {
         this.backend = backend;
         this.chatTemplate = chatTemplate;
-        this.properties = properties;
+        this.requests = requests;
     }
 
     /// A surface's validated request and the responder that answers it in the surface's format.
@@ -142,6 +142,6 @@ public class ConversationPlanner {
                     "This model's maximum context length is " + context + " tokens, but the messages use "
                             + promptTokens + " tokens.",
                     "messages");
-        return Math.min(this.properties.defaultMaxTokens(), remaining);
+        return Math.min(this.requests.defaultMaxTokens(), remaining);
     }
 }

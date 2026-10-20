@@ -19,7 +19,7 @@ import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 
 /// A shutdown first waits for the requests in flight, queued ones included, up to the drain window
-/// (`spring.lifecycle.timeout-per-shutdown-phase`); what is left when it ends is answered before the server stops:
+/// (`server.shutdown-timeout`); what is left when it ends is answered before the server stops:
 /// the running generation is stopped and its stream ends with an error event, and a queued request is refused
 /// with 503. Each test starts its own server, because it closes it.
 @Timeout(60)
@@ -36,7 +36,7 @@ class ShutdownTest {
 
     private void start(String drainWindow) {
         this.context = new SpringApplicationBuilder(ScriptedApiApplication.class)
-                .properties("euhedral.test.scripted-api=true", "euhedral.api.max-queued-generations=1", "server.port=0")
+                .properties("euhedral.test.scripted-api=true", "euhedral.test.max-queued=1", "server.port=0")
                 // A command-line argument: default properties lose to application.yaml's 30s window.
                 .run("--spring.lifecycle.timeout-per-shutdown-phase=" + drainWindow);
         this.backend = this.context.getBean(ScriptedInferenceBackend.class);

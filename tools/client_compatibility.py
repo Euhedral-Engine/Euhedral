@@ -2,7 +2,7 @@
 """Runs real clients against a running server and prints a compatibility matrix.
 
 Needs the `openai` and `anthropic` packages and `curl`. Start the server with
-EUHEDRAL_API_MAX_QUEUED_GENERATIONS=1 so the capacity scenario can fill the queue:
+EUHEDRAL_SERVER_REQUESTS_MAX_QUEUED=1 so the capacity scenario can fill the queue:
 
     python3 tools/client_compatibility.py --base http://localhost:1738 --model qwen
 

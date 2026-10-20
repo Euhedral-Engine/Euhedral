@@ -25,7 +25,7 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 @SpringBootTest(
         classes = ScriptedApiApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"euhedral.test.scripted-api=true", "euhedral.api.max-queued-generations=1"})
+        properties = {"euhedral.test.scripted-api=true", "euhedral.test.max-queued=1"})
 @Timeout(60)
 class DisconnectTest {
     private static final String MODEL = ScriptedInferenceBackend.MODEL_ID;
