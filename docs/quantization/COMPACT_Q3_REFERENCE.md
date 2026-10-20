@@ -16,11 +16,11 @@ The artifact holds the text model and the MTP draft head, 785 objects and no vis
 - 64 Q4G64_F16S objects, `row-split-k128-v1`: `attention/query_key` and `gdn/query_key`
 - 64 Q5G64_F16S objects, `row-split-k128-v1`: `attention/gate_value` and `gdn/value_z`
 - 5 NVFP4 objects, `row-split-k128-v1`: the MTP layer's projections (`mtp/input_projection` and the four projections of
-  `mtp/layer`). NVFP4 drafts accept more tokens per verification than Q3 ones ([MTP_VERIFIER.md](MTP_VERIFIER.md)).
+  `mtp/layer`). NVFP4 drafts accept more tokens per verification than Q3 ones ([MTP_VERIFIER.md](../speculation/MTP_VERIFIER.md)).
 
 The container is EDRL version 2, the only version the reader accepts: each tensor descriptor carries the source dtype, the
 persistent storage format and the persistent layout as separate fields. After the last payload comes the checkpoint's
-tokenizer section ([FLASH_NEXT_ARTIFACT.md](FLASH_NEXT_ARTIFACT.md#tokenizer-section)).
+tokenizer section ([FLASH_NEXT_ARTIFACT.md](../flash-next/FLASH_NEXT_ARTIFACT.md#tokenizer-section)).
 
 Canonical fused text objects:
 
@@ -55,7 +55,7 @@ Layout sources: `native/src/q3/layout.cuh` and `native/src/q45/layout.cuh` (devi
 
 Quantized linears run by row count. One to eight rows run the decode kernels: the one-row contiguous kernel and its 2 to 8 row
 twins, whose every row equals the one-row result bit for bit (`native/src/q3/contiguous.cuh`, `native/src/q45/contiguous.cuh`).
-Nine or more rows run the block-scaled MXFP8 route ([PREFILL_MX.md](PREFILL_MX.md)). The scalar references in
+Nine or more rows run the block-scaled MXFP8 route ([PREFILL_MX.md](../kernels/PREFILL_MX.md)). The scalar references in
 `native/src/reference/kernels.cu` are the numerical oracle: exact numerics (`CudaGpuMemory.selectExactNumerics`, used by tests
 and never selected in production) run them, and so does any shape no kernel takes.
 

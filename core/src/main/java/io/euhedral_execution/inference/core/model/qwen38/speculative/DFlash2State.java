@@ -5,7 +5,7 @@ import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Config;
 import io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint;
 import java.util.Objects;
 
-/// The DFlash2 drafter's per-sequence state (docs/DFLASH2.md).
+/// The DFlash2 drafter's per-sequence state (docs/speculation/DFLASH2.md).
 ///
 /// - **Tap rows:** the target's hidden rows after each tapped layer, `[row][tap][hidden]` BF16, for the rows of the
 ///   latest target quantum that seeds drafting (a prefill chunk or a verification). The next DRAFT_CONTEXT quantum

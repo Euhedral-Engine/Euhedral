@@ -343,7 +343,7 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
 
     /// The prefetch predicts the next layer: its router applied to a decode step's input, its best
     /// [#PREFETCH_CANDIDATES] experts, at most [#PREFETCH_READS] of them read per layer
-    /// (docs/FLASH_NEXT_PREFETCH.md).
+    /// (docs/flash-next/FLASH_NEXT_PREFETCH.md).
     static final int PREFETCH_DISTANCE = 1;
 
     /// The best experts of the predicted layer's router that a prefetch considers.

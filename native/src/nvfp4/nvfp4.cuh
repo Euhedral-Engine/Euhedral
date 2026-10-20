@@ -4,12 +4,12 @@
 #include "nvfp4/scale_table.cuh"
 
 // NVFP4 weights (WeightFormat.NVFP4, row-split-k128-v1; Nvfp4Layout.java,
-// docs/NVFP4_NATIVE.md). Rows of K values, K padded to
+// docs/kernels/NVFP4_NATIVE.md). Rows of K values, K padded to
 // 128: E2M1 codes two per byte with the even K in the low nibble, then a 256-aligned plane of one
 // E4M3 scale per 16 values, then a 256-aligned FP32 global scale. A weight is
 // e2m1(code) * e4m3(scale) * global.
 //
-// SD4 (row-split-k128-sd4-v1, docs/NVFP4_COMPRESSED.md) stores each block scale
+// SD4 (row-split-k128-sd4-v1, docs/quantization/NVFP4_COMPRESSED.md) stores each block scale
 // as a 4-bit index into the tensor's table of 16 E4M3 codes: the scale plane holds K/32 bytes per row,
 // two indices per byte with the even block in the low nibble, and the table (16 bytes) precedes the
 // global scale at the 256-aligned end of the plane. Kernels look the codes up and then run exactly

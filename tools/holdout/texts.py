@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assemble the T2 and T3 holdout texts (docs/QUALITY.md).
+"""Assemble the T2 and T3 holdout texts (docs/evaluation/QUALITY.md).
 
 Usage: texts.py OUT_DIR
 

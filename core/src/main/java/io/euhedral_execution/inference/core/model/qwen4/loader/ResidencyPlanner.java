@@ -41,7 +41,7 @@ import java.util.regex.Pattern;
 public final class ResidencyPlanner {
 
     /// The CUDA context, kernel modules and graph pools that exist beside the model (about 0.9 GiB
-    /// measured on the dense model's engine, docs/NVFP4_RESIDENCY.md).
+    /// measured on the dense model's engine, docs/quantization/NVFP4_RESIDENCY.md).
     public static final long KERNEL_RESERVE_BYTES = 1024L << 20;
 
     /// The shared expert's width as a prefill's down projection reads it: a multiple of 256, as the native NVFP4

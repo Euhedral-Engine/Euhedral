@@ -1,7 +1,7 @@
 #pragma once
 #include "qwen4/common.cuh"
 
-// QSA indexer: block scores and top-k block selection (docs/FLASH_NEXT_QSA.md).
+// QSA indexer: block scores and top-k block selection (docs/flash-next/FLASH_NEXT_QSA.md).
 //
 // Query row p (position p) sees nb = (p + 1) / 4 complete blocks. The score of block j is
 //   sum over the 4 indexer heads h of relu(q_h . key_j) / sqrt(128)

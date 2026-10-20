@@ -2,7 +2,7 @@
 #include "nvfp4/nvfp4.cuh"
 #include "qwen4/common.cuh"
 
-// Routed-expert math of Flash-Next on a wave of resident experts (docs/FLASH_NEXT_EXPERTS.md).
+// Routed-expert math of Flash-Next on a wave of resident experts (docs/flash-next/FLASH_NEXT_EXPERTS.md).
 //
 // An expert's weights stay NVFP4 (row-split-k128-v1, nvfp4.cuh) inside its cache slot: gate_up [2I x H] at one
 // record offset and down [H x I] at another. Both projections run on BF16 tensor cores as the dense decode kernels

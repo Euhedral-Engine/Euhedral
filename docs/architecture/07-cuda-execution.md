@@ -39,6 +39,6 @@ A stage first awaits predecessor markers from other streams, then submits work a
 - [LinearFormats](../../core/src/main/java/io/euhedral_execution/inference/core/artifact/format/LinearFormats.java), [Nvfp4Format](../../core/src/main/java/io/euhedral_execution/inference/core/artifact/format/Nvfp4Format.java), [TrellisFormat](../../core/src/main/java/io/euhedral_execution/inference/core/artifact/format/TrellisFormat.java) and [TrellisSettings](../../core/src/main/java/io/euhedral_execution/inference/core/artifact/format/TrellisSettings.java).
 - [CudaGpuMemory](../../core/src/main/java/io/euhedral_execution/inference/core/gpu/CudaGpuMemory.java), [KernelTable](../../core/src/main/java/io/euhedral_execution/inference/core/gpu/KernelTable.java) and [C ABI](../../native/include/euhedral_cuda.h).
 - [Native implementations](../../native/src), especially `trellis`, `nvfp4`, `nvfp4_native`, `q3` and `reference`.
-- [StageFrame](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/StageFrame.java), [LanePool](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/LanePool.java) and [CUDA graphs](../CUDA_GRAPHS.md).
+- [StageFrame](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/StageFrame.java), [LanePool](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/LanePool.java) and [CUDA graphs](../kernels/CUDA_GRAPHS.md).
 
 This is a dispatch map rather than an exhaustive kernel catalog. It omits block geometry, tuning measurements and native build steps.

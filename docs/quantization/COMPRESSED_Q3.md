@@ -79,7 +79,7 @@ artifacts no longer hold the same values. `python3 -m euhedral_artifacts.q3_p2e2
 artifact with the values a P2E2 artifact holds, which `P2e2CudaIntegrationTest` uses as the bitwise reference.
 
 **The MLP down projections stay row-split.** Limiting the codes to -3..3 costs the most where the P2E2 bytes it buys are
-fewest. Weight-only KL over wikitext-2 against Swift-1.5 BF16 (docs/QUALITY.md), measured with unsigned group scales: with every
+fewest. Weight-only KL over wikitext-2 against Swift-1.5 BF16 (docs/evaluation/QUALITY.md), measured with unsigned group scales: with every
 Q3 family in P2E2 it is 0.164; taking one family from `q3` instead (row-split, -4 available):
 
 | Family from `q3` | Mean KL | P2E2 saving it gives up |

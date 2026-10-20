@@ -6,7 +6,7 @@
   nvfp4z.py info       SRC       sizes and the compression of each file
 
 NVFP4 tensors (4-bit codes with an E4M3 scale per 16 weights) and BF16 tensors are entropy coded on the GPU; every other
-tensor and every non-safetensors file is stored as it is. See docs/NVFP4_LOSSLESS.md and tools/README.md.
+tensor and every non-safetensors file is stored as it is. See docs/quantization/NVFP4_LOSSLESS.md and tools/README.md.
 """
 
 from __future__ import annotations

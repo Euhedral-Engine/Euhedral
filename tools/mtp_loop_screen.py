@@ -18,7 +18,7 @@ Printed per category (chat, code, agentic, all):
                    looped policies: block k, threshold g, at most `cap` drafts (DLoop: draft another block while the
                    last block's summed log-probability >= g)
 
-Predicted tok/s uses a cost model fitted to measured MTP4 steps (docs/DFLASH2.md section 6, nvfp4-compressed):
+Predicted tok/s uses a cost model fitted to measured MTP4 steps (docs/speculation/DFLASH2.md section 6, nvfp4-compressed):
 draft time per drafted token = MTP4 draft ms / 4; verification = MTP4 verify ms + ROW_MS per row beyond 5, and
 WIDE_MS more from 9 rows (exact 9-16-row linears, about 1.3x one row's 20.7 ms, NVFP4_NATIVE.md). Steps past 8 rows
 are estimates; the engine has never verified them.

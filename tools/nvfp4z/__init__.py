@@ -1,4 +1,4 @@
-"""Lossless compression of NVFP4 checkpoints (docs/NVFP4_LOSSLESS.md).
+"""Lossless compression of NVFP4 checkpoints (docs/quantization/NVFP4_LOSSLESS.md).
 
     kernels.cu   the CUDA kernels (NVRTC): table counting, lane-interleaved rANS encode and decode
     codec        GPU codec: NVFP4 blocks and BF16 high bytes <-> rANS streams, tables, pinned arena

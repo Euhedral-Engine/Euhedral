@@ -12,10 +12,10 @@ not results. Nothing here has been gated in the model yet.
 
 ### 1. Long-context decode and verify attention at DRAM speed
 
-**Status (2026-10-03): done.** See [../ATTENTION_DECODE.md](../ATTENTION_DECODE.md) for the kernel, its performance and the rejected variants.
+**Status (2026-10-03): done.** See [../ATTENTION_DECODE.md](../kernels/ATTENTION_DECODE.md) for the kernel, its performance and the rejected variants.
 
 **Evidence**
-- At 16K, decode attention takes 2.83 ms per token (Q3, one row; docs/MTP_VERIFIER.md "Final
+- At 16K, decode attention takes 2.83 ms per token (Q3, one row; docs/speculation/MTP_VERIFIER.md "Final
   profile at 16K"). It reads 288 MiB of NVFP4 KV (18 KiB per token across 16 layers). At the
   measured 855 GB/s that read takes 0.35 ms, so **attention runs about 8× below DRAM speed.**
 - **Verify:** 6.09 ms (Q3, 3 rows) / 8.22 ms (NVFP4, 4 rows) at 16K. At 32K, about 10 ms per
@@ -43,7 +43,7 @@ cold KV pages, bitwise against the current kernel's per-row results.
 
 ### 2. Get prefill off the half-rate BF16 tensor path
 
-**Status (2026-10-03): done with the MXFP8 option.** See [../PREFILL_MX.md](../PREFILL_MX.md) for the kernels, their performance and the rejected variants.
+**Status (2026-10-03): done with the MXFP8 option.** See [../PREFILL_MX.md](../kernels/PREFILL_MX.md) for the kernels, their performance and the rejected variants.
 
 **Evidence** ([tensor-cores.md](tensor-cores.md))
 - Q3/Q4/Q5 prefill uses BF16 HMMA with FP32 accumulate: a 102 TFLOPS ceiling, 57 achieved in the FFN
@@ -71,17 +71,17 @@ cold KV pages, bitwise against the current kernel's per-row results.
 activation scales are tile-major and its weight scales come as 16-byte boxes. At the FFN shapes it runs at 600–700 TFLOPS (two
 activation terms counted) of the 815 TFLOPS OMMA peak: gate_up 1.18 ms and down 0.53 ms at 1024 rows. NVFP4 prefill is 4,180 tok/s
 at 512 tokens; TTFT at 16K is 5.2 s. Results, the cp.async variants that located the limit, and the persistent-CTA rejection are in
-[NVFP4_NATIVE.md](../NVFP4_NATIVE.md).
+[NVFP4_NATIVE.md](../kernels/NVFP4_NATIVE.md).
 
 **Also tried:** `setmaxnreg` 40/232 with 128 × 256 and 256 × 128 tiles (only gate_up gains, 3%), persistent CTAs, and
-three stages instead of two; none is kept ([NVFP4_NATIVE.md](../NVFP4_NATIVE.md)). The loop itself runs at 90% of the MMA peak;
+three stages instead of two; none is kept ([NVFP4_NATIVE.md](../kernels/NVFP4_NATIVE.md)). The loop itself runs at 90% of the MMA peak;
 the rest is about 150 us of fixed cost per kernel. A 192 × 128 tile and a store warp were not built.
 
 ## Tier 2: clear but smaller, or needs a structural change
 
 ### 4. CUDA graphs for decode and verify quanta
 
-**Built:** [../CUDA_GRAPHS.md](../CUDA_GRAPHS.md). Decode, verification and draft quanta replay captured graphs with
+**Built:** [../CUDA_GRAPHS.md](../kernels/CUDA_GRAPHS.md). Decode, verification and draft quanta replay captured graphs with
 programmatic edges at every position. Production decode is MTP: a replayed 3-row Q3 verification measured 19.02 ms at 4K
 (18.93 ms with programmatic edges) and a one-row draft 0.69 ms, and the host boundaries of a speculative step total about
 0.5 ms, so the bound is a few percent rather than the 10% estimated below for one-row decode.

@@ -103,7 +103,7 @@ the page cache keeps the memory-mapped n-gram rows instead of records the tier a
 `memory.weight-streaming.concurrent-reads` records (8) are read at once: the owner's fetch takes a read, and the frame
 that has the record gives it back on whichever worker runs it, before the device copy, so the disk is offered the next
 record as soon as one is in. The drive reads fastest with a few records in flight and slows past about 30 MB
-(docs/FLASH_NEXT_DISK.md).
+(docs/flash-next/FLASH_NEXT_DISK.md).
 
 A record the tier does not hold is read in page-aligned parts, each straight into its destination (the tier slot of a
 fill, or the staging buffer), and no worker waits for the disk: each part's frame submits its read to the kernel

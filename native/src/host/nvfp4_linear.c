@@ -145,7 +145,7 @@ int euhedral_cuda_linear_nvfp4_bf16(const void* input, const void* weights, void
             tile ? 128u : 256u, 1, 1, 0, euhedral_cuda_submission_stream(), params, NULL));
 }
 
-/* Native Blackwell NVFP4 (native/src/nvfp4_native, docs/NVFP4_NATIVE.md): the BF16 activations are
+/* Native Blackwell NVFP4 (native/src/nvfp4_native, docs/kernels/NVFP4_NATIVE.md): the BF16 activations are
  * quantized to two NVFP4 terms (the value and its quantized residual) into caller scratch, then multiplied
  * with block-scaled FP4 tensor-core MMA (OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X). The module is compiled for
  * this device's sm_12xa target and exists only there. */
@@ -183,7 +183,7 @@ static CUfunction native_linear[2], native_gate_up[2];  /* [layout] */
 static CUfunction native_skinny[2][3];  /* [layout][up to 16, 32 and 64 rows] */
 static int native_status = EUHEDRAL_CUDA_ROUTE_UNAVAILABLE;
 /* Activation terms: the residual term brings the error per linear to about 1%, the relaxed-numerics floor
- * of the drift harness (docs/NVFP4_NATIVE.md). */
+ * of the drift harness (docs/kernels/NVFP4_NATIVE.md). */
 #define NATIVE_TERMS 2u
 
 static void initialize_native(void) {

@@ -173,5 +173,5 @@ On a real stream (`ExpertCacheCudaIntegrationTest`: 6 banks of 64 experts, 8 slo
 device equals the file's bytes and CRC-32; 369 file-backed misses moved 1.00 GB at 8.7 GB/s and 373 arena-backed misses 1.02 GB at 9.3 GB/s,
 measured as bytes over the summed start-to-completion times of single 2.7 MB copies, so each includes the retirement latency of its own
 event. Against the real artifact on the load test above, 1,820 misses (5.04 GB) took 0.27 to 0.33 s of summed transfer time, 15 to 18 GB/s.
-These are not peak pipelined rates, which are not measured here; the huge-page arena's 44 GB/s ([NVFP4_RESIDENCY.md](NVFP4_RESIDENCY.md))
+These are not peak pipelined rates, which are not measured here; the huge-page arena's 44 GB/s ([NVFP4_RESIDENCY.md](../quantization/NVFP4_RESIDENCY.md))
 applies to large pipelined copies of the arena store. Loading the 1 GB arena from a cached file took 0.42 s with 16 readers.

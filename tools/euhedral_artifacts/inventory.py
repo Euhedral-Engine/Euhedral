@@ -105,7 +105,7 @@ def add_quant(plans: list[ObjectPlan], recipe: Recipe, name: str, matrix: Matrix
     calibration = importance.calibration(name, matrix.shape[1]) if importance is not None else None
     if calibration is not None and recipe.quantization == "q3" and recipe.compressed and format_name == Q3_FORMAT \
             and not stays_row_split(name):
-        # Compressed q3 stores these Q3 tensors in P2E2, which holds the codes -3..3 (docs/COMPRESSED_Q3.md).
+        # Compressed q3 stores these Q3 tensors in P2E2, which holds the codes -3..3 (docs/quantization/COMPRESSED_Q3.md).
         calibration = replace(calibration, lowest_code=P2E2_LOWEST_CODE)
     if layout == LAYOUT_SD4:
         plans.append(ObjectPlan(
@@ -143,7 +143,7 @@ def attention_parts(store: SourceStore, prefix: str) -> tuple[MatrixSource, Matr
     return head_part(store, q_name, False), head_part(store, q_name, True)
 
 
-# Bits per family in the q3 artifact (docs/QUALITY.md, allocation probes): the GDN value_z projections in Q4, and the MLP
+# Bits per family in the q3 artifact (docs/evaluation/QUALITY.md, allocation probes): the GDN value_z projections in Q4, and the MLP
 # down projections in Q4 in the first and last six layers, which carry most of their family's error, and in Q3
 # elsewhere. Mixer outputs in Q4 were rejected: better on wikitext, worse on the model's own generations.
 EDGE_DOWN_LAYERS = frozenset(range(6)) | frozenset(range(58, 64))
@@ -206,13 +206,13 @@ def build_plans(store: SourceStore, selected: np.ndarray, recipe: Recipe,
         quant(object_prefix + "mlp/down", source_matrix(store, source_prefix + "mlp.down_proj.weight", (HIDDEN, INTERMEDIATE)),
               "Q4G64_F16S" if layer in EDGE_DOWN_LAYERS else "Q3G64_F16S")
     add_direct(plans, "text/final_norm", (HIDDEN,), store, "model.language_model.norm.weight", (HIDDEN,))
-    # The LM head is NVFP4 in the q3 artifact too: in Q3 it carries a third of the model's weight-only KL (docs/QUALITY.md).
+    # The LM head is NVFP4 in the q3 artifact too: in Q3 it carries a third of the model's weight-only KL (docs/evaluation/QUALITY.md).
     quant("text/output_head", source_matrix(store, "lm_head.weight", (VOCAB_SIZE, HIDDEN)), "NVFP4")
     quant("text/draft_head", gather_matrix(store, "lm_head.weight", selected), "Q3G64_F16S")
     add_direct(plans, "text/draft_head_token_ids", (DRAFT_ROWS,), store, "", (), kind="i32", extra=selected, format_name="I32", source_dtype="INT32")
 
     # The MTP layer is NVFP4 in the q3 artifact: Q3 drafts accept fewer tokens per step and catch up slower
-    # on multi-row verification (docs/MTP_VERIFIER.md).
+    # on multi-row verification (docs/speculation/MTP_VERIFIER.md).
     mtp = "mtp.layers.0."
     quant("mtp/input_projection", source_matrix(store, "mtp.fc.weight", (HIDDEN, 10240)), "NVFP4")
     add_direct(plans, "mtp/embedding_norm", (HIDDEN,), store, "mtp.pre_fc_norm_embedding.weight", (HIDDEN,))

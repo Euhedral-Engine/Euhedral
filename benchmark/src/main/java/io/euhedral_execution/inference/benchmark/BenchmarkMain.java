@@ -21,14 +21,14 @@ import java.util.Map;
 import java.util.UUID;
 
 /// Command line: `run CONFIG.json` measures this engine end to end; `import` stores external rows.
-/// See `docs/BENCHMARKING.md`.
+/// See `docs/evaluation/BENCHMARKING.md`.
 public final class BenchmarkMain {
     static final String USAGE = """
             usage:
               run CONFIG.json [--fork-id ID] [--validate-only]
               import --input FILE --implementation LABEL --output FILE [--note TEXT] [--overwrite|--append]
 
-            CONFIG.json requires "artifact" and "cudaLibrary"; see docs/BENCHMARKING.md.
+            CONFIG.json requires "artifact" and "cudaLibrary"; see docs/evaluation/BENCHMARKING.md.
             --fork-id labels this JVM as one externally launched fork; iterations are never forks.
             --validate-only checks configuration and prerequisites, prints the plan, and exits without
             touching the GPU. Exit codes: 0 success, 1 a measured row failed or was ineligible, 2 usage,

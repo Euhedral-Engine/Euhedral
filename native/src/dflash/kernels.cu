@@ -1,4 +1,4 @@
-// DFlash2 drafter (z-lab/dflash, docs/DFLASH2.md): the operators of its BF16 forward, each rounding where the
+// DFlash2 drafter (z-lab/dflash, docs/speculation/DFLASH2.md): the operators of its BF16 forward, each rounding where the
 // published PyTorch model rounds, so the drafter tracks the reference at every intermediate.
 //
 // Torch evaluates the drafter in BF16 tensors: every elementwise operation rounds its result to BF16, and a linear

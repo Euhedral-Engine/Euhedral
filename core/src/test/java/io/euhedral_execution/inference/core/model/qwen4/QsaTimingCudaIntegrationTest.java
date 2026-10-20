@@ -14,7 +14,7 @@ import org.junit.jupiter.api.Test;
 
 /// Times the QSA layer on the real layer-3 weights: the whole block and its stages for 1, 64 and
 /// 512 rows at histories from 1K to 262K tokens, the history built by running the layer itself over
-/// random rows. Prints a table; asserts nothing (the numbers go to docs/FLASH_NEXT_QSA.md). Enable
+/// random rows. Prints a table; asserts nothing (the numbers go to docs/flash-next/FLASH_NEXT_QSA.md). Enable
 /// with the environment variable EUHEDRAL_QWEN4_TIMING=1.
 /// Own JVM: measures kernel timings: opt-in, needs the device to itself.
 @ModelGroup.OwnJvm

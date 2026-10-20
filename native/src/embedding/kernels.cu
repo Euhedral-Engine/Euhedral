@@ -110,7 +110,7 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_embedding(
     output[output_index + 1ull] = euhedral_float_to_bfloat16((float)second * scale);
 }
 
-// Embedding gather from a P2E2 tensor (q3/p2e2.cuh, docs/COMPRESSED_Q3.md); this module has no
+// Embedding gather from a P2E2 tensor (q3/p2e2.cuh, docs/quantization/COMPRESSED_Q3.md); this module has no
 // include paths, so the layout arithmetic is repeated here. One warp per token walks the row's
 // 1024-code slices in order; each lane decodes its 32 codes (half a group) and writes
 // bf16(code * scale) exactly as euhedral_q3_embedding does. Requires hidden_size % 1024 == 0.

@@ -1,4 +1,4 @@
-"""EDRL version 3: the architecture-tagged container for `qwen4_exp` (docs/FLASH_NEXT_ARTIFACT.md).
+"""EDRL version 3: the architecture-tagged container for `qwen4_exp` (docs/flash-next/FLASH_NEXT_ARTIFACT.md).
 
     header (64 bytes) | metadata | tables | zero padding to 4096 | payloads
 

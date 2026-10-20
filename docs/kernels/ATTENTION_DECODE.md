@@ -11,7 +11,7 @@ A sequence keeps its attention caches in one of two formats, chosen per engine (
 `context.kv-cache-format`; unset, the artifact's, NVFP4):
 
 - **NVFP4** (`nvfp4_kv.cuh`): 144-byte head rows of the H256-rotated keys and values, 4-bit codes on the INT4 midrise grid
-  (magnitudes 0.5 to 7.5) with an E4M3 scale per 16 values (docs/QUALITY.md, KV cache). Queries are rotated into the same basis
+  (magnitudes 0.5 to 7.5) with an E4M3 scale per 16 values (docs/evaluation/QUALITY.md, KV cache). Queries are rotated into the same basis
   and outputs back out of it.
 - **BF16** (`bf16_kv.cuh`): 512-byte head rows, the keys and values as computed, unrotated.
 

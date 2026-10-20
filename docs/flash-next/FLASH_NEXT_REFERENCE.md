@@ -2,7 +2,7 @@
 
 Deterministic fixtures for the Flash-Next (`Qwen/Qwen3.8-Flash-Next`, HF `model_type` `qwen4_exp`) text model, produced by
 the **unmodified** upstream transformers implementation over the weights of the NVFP4 EDRL v3 artifact
-(`docs/FLASH_NEXT_ARTIFACT.md`). The Java engine and the CUDA operators compare against them; the tensor names, dtypes and
+(`docs/flash-next/FLASH_NEXT_ARTIFACT.md`). The Java engine and the CUDA operators compare against them; the tensor names, dtypes and
 shapes below are the contract.
 
 * Upstream: transformers `qwen4_exp` at revision `f5ab85619d989359ef47b5efed8a91a15045627b` (source copy in

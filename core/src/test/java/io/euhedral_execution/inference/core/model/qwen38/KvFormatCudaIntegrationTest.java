@@ -181,7 +181,7 @@ class KvFormatCudaIntegrationTest {
 
     private static int[] document(QwenTokenizer tokenizer) throws Exception {
         return tokenizer.encodeText(Files.readString(
-                SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/FRAME_MODEL.md")));
+                SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/architecture/FRAME_MODEL.md")));
     }
 
     /// Runs one batched verification; returns its logits rows in part order.

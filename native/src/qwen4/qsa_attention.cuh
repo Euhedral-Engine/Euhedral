@@ -3,7 +3,7 @@
 #include "attention/nvfp4_kv.cuh"
 #include "attention/nvfp4_pipe.cuh"
 
-// QSA attention over the NVFP4 KV pages (docs/FLASH_NEXT_QSA.md).
+// QSA attention over the NVFP4 KV pages (docs/flash-next/FLASH_NEXT_QSA.md).
 //
 // Query row p attends the tokens of its selected blocks and the incomplete tail block: with nb = (p + 1) / 4 and the
 // c selected block ids b_0 < ... < b_{c-1}, the key set is

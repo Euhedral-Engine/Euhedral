@@ -68,7 +68,7 @@ RECIPES = tuple(Recipe(quantization, compressed) for quantization in ("q3", "nvf
 
 def stays_row_split(name: str) -> bool:
     """Q3 objects compressed q3 keeps in row-split Q3 with the full code range instead of P2E2 (which holds -3..3): the
-    MLP down projections, where the restriction costs the most KL per byte it saves (docs/COMPRESSED_Q3.md)."""
+    MLP down projections, where the restriction costs the most KL per byte it saves (docs/quantization/COMPRESSED_Q3.md)."""
     return re.fullmatch(r"text/layers/\d+/mlp/down", name) is not None
 
 

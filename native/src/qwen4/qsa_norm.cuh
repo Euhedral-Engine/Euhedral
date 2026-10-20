@@ -3,7 +3,7 @@
 
 // Qwen Sparse Attention (QSA) front end: the per-head RMSNorm and partial RoPE of the attention and indexer
 // vectors, the block-key pooling of the indexer and the raw-key tail it keeps between chunks
-// (docs/FLASH_NEXT_QSA.md). Upstream computes these as BF16 tensor operations, so every step rounds to BF16.
+// (docs/flash-next/FLASH_NEXT_QSA.md). Upstream computes these as BF16 tensor operations, so every step rounds to BF16.
 
 namespace q4 {
 

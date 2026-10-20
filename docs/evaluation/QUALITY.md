@@ -172,7 +172,7 @@ the set above) run through the
 BF16 layers one at a time; the LM head is stored as F16 (BF16 source), the MTP layer is rounded at 4 bits without a
 Hessian, the vision tower is copied. The rows below were scored with exllamav3 against the same Swift-1.5 BF16
 references as above (`dNLL ± chunk-level SE / mean KL / top-1`; exllamav3's scores carry no standard errors), and the
-engine's trellis artifacts (docs/TRELLIS.md) with `score`.
+engine's trellis artifacts (docs/quantization/TRELLIS.md) with `score`.
 
 | Quantizer | T1 | T2 wikitext | T3 code | T4 own generations |
 |---|---|---|---|---|
@@ -202,7 +202,7 @@ throughout (before GPTQ):
 | `nvfp4` | +0.010 ± 0.002 | 0.042 | 0.36 | 91.6% |
 | `nvfp4-compressed` | +0.018 ± 0.002 | 0.043 | 0.36 | 91.6% |
 | `q3` | +0.052 ± 0.003 | 0.116 | 1.12 | 86.3% |
-| `q3-compressed` (MLP down row-split, docs/COMPRESSED_Q3.md) | +0.066 ± 0.004 | 0.142 | 1.46 | 84.9% |
+| `q3-compressed` (MLP down row-split, docs/quantization/COMPRESSED_Q3.md) | +0.066 ± 0.004 | 0.142 | 1.46 | 84.9% |
 
 llama.cpp's own types, quantized from the same BF16 GGUF with the same importance matrix (`llama-quantize --imatrix`;
 IQ3_XXS needs an importance entry for every tensor, so its MTP layer is pruned) and requantized to BF16 for scoring:
@@ -262,7 +262,7 @@ probability either way), so allocation decisions use KL.
 ## Compression-induced error
 
 `compare_teacher_forced.py` compares reports with one another. P2E2 is lossless, so a `q3-compressed` report is byte for byte the
-report of the row-split artifact with the same values (`q3_p2e2 expand`, docs/COMPRESSED_Q3.md); `nvfp4-compressed` (SD4) is
+report of the row-split artifact with the same values (`q3_p2e2 expand`, docs/quantization/COMPRESSED_Q3.md); `nvfp4-compressed` (SD4) is
 compared with `nvfp4`:
 
 ```bash

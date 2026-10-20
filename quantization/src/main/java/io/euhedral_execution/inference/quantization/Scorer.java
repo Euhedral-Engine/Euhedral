@@ -31,7 +31,7 @@ import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 
 /// Teacher-forced scoring of an artifact against llama.cpp BF16 references (`llama-perplexity
-/// --kl-divergence-base`, docs/QUALITY.md). Each chunk of N reference tokens is forced on a fresh sequence: a
+/// --kl-divergence-base`, docs/evaluation/QUALITY.md). Each chunk of N reference tokens is forced on a fresh sequence: a
 /// prefill of N / 2 + 1 tokens, then verifications of `rows` forced tokens, so that step k's logits row
 /// predicts the token the reference's record k does. Every row is scored on the device where the engine left it
 /// (`score.cu`), against the reference row a reader frame has already fetched into mapped host memory; nothing

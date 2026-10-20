@@ -2,7 +2,7 @@
 #include "p2e2.cuh"
 #include "common/pdl.cuh"
 
-// Q3G64_F16S decode kernels (docs/COMPACT_Q3_REFERENCE.md). Prefill runs on block-scaled FP8 tensor cores
+// Q3G64_F16S decode kernels (docs/quantization/COMPACT_Q3_REFERENCE.md). Prefill runs on block-scaled FP8 tensor cores
 // (q3_mx/kernels.cu); the scalar numerical reference lives in reference/kernels.cu.
 
 // Single-row decode with contiguous lane ownership (contiguous.cuh): each lane owns 32 whole codes.
@@ -40,7 +40,7 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_decode_contiguous_
     q3::contiguous_decode_tokens(input, weights, output, rows, in_features, out_features, scale_offset);
 }
 
-// P2E2 tensors (p2e2.cuh, docs/COMPRESSED_Q3.md).
+// P2E2 tensors (p2e2.cuh, docs/quantization/COMPRESSED_Q3.md).
 // Single-row decode from the compressed layout, bitwise identical to euhedral_q3_decode_contiguous on
 // the row-split tensor it encodes. 128 threads, 16 rows per CTA; same shape requirements.
 extern "C" __global__ __launch_bounds__(128, 5) void euhedral_q3_p2e2_decode(

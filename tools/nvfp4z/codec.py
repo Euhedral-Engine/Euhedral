@@ -1,4 +1,4 @@
-"""GPU codec: NVFP4 blocks and BF16 high bytes <-> lane-interleaved rANS streams (kernels.cu, docs/NVFP4_LOSSLESS.md).
+"""GPU codec: NVFP4 blocks and BF16 high bytes <-> lane-interleaved rANS streams (kernels.cu, docs/quantization/NVFP4_LOSSLESS.md).
 
 Needs PyTorch with CUDA. The kernels are compiled at first use with NVRTC through PyTorch and cached on disk.
 Everything here is lossless by construction and checked by decoding on the GPU (`verify=True`).

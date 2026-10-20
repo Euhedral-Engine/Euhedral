@@ -19,7 +19,7 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 ///
 /// Any chunking of a sequence gives the same result (within the arithmetic noise of the linears):
 /// the pooled block keys are computed once, when a block completes, and the raw keys of an
-/// incomplete block are carried in the [QsaState]. See docs/FLASH_NEXT_QSA.md for the
+/// incomplete block are carried in the [QsaState]. See docs/flash-next/FLASH_NEXT_QSA.md for the
 /// arithmetic and the selection rule.
 public final class QsaLayer {
 

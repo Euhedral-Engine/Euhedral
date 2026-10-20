@@ -114,7 +114,7 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_q4_linear_split8_bf16
     linear_split<8>(input, weights, output, rows, k, n);
 }
 
-// BF16 linear on m16n8k16 tensor cores (the scheme of dflash's linear, docs/DFLASH2.md): out = bf16(sum_k in * w)
+// BF16 linear on m16n8k16 tensor cores (the scheme of dflash's linear, docs/speculation/DFLASH2.md): out = bf16(sum_k in * w)
 // with FP32 accumulation, in a different summation order from euhedral_q4_linear_bf16, which stays the exact route.
 // A CTA's four warps own 32 output columns over the whole K (KS = 1), or 8 columns with K in four contiguous parts
 // of whole 32-wide chunks that add in warp order (KS = 4, for outputs of at most 1536). Per 32-wide K chunk a lane

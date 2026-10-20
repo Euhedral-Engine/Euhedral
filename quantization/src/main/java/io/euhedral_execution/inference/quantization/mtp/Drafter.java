@@ -9,7 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/// The MTP drafter (docs/MTP_CONTRACT.md §2) as a trainable FP32 model whose projections run NVFP4-rounded
+/// The MTP drafter (docs/speculation/MTP_CONTRACT.md §2) as a trainable FP32 model whose projections run NVFP4-rounded
 /// (the artifact's rounding, [DrafterKernels#nvfp4Round]) with straight-through gradients into FP32 master
 /// weights, unrolled over `depths` drafts of a window of rows.
 ///

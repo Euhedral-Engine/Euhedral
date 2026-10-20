@@ -77,7 +77,7 @@ python3 tools/convert_checkpoint.py --model CHECKPOINT_DIR --quantization trelli
 
 ## Quality
 
-KL(BF16 reference || artifact) and top-1 agreement on T1 to T4 (docs/QUALITY.md), with the chunk-level standard error:
+KL(BF16 reference || artifact) and top-1 agreement on T1 to T4 (docs/evaluation/QUALITY.md), with the chunk-level standard error:
 
 | Artifact | T1 KL | T2 KL | T3 KL | T4 KL | T1 / T2 / T3 / T4 top-1 |
 |---|---|---|---|---|---|

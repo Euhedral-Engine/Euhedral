@@ -1,4 +1,4 @@
-"""Q3 prefill on block-scaled E4M3 tensor cores (native/src/q3_mx, docs/PREFILL_MX.md) against float64.
+"""Q3 prefill on block-scaled E4M3 tensor cores (native/src/q3_mx, docs/kernels/PREFILL_MX.md) against float64.
 
 The activation quantizer must reproduce BF16 inputs exactly (two E4M3 terms and a power-of-two block scale) wherever
 the element is within the E4M3 range of its block's maximum, and the GEMMs must match an FP64 oracle of the exact

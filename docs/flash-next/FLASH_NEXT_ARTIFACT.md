@@ -83,7 +83,7 @@ The entries, in order: `tokenizer.json`, `tokenizer_config.json`, `chat_template
 `chat_template` string of `tokenizer_config.json`) and `special_tokens.json` (the `bos_token_id`, `eos_token_id` and
 `pad_token_id` of `generation_config.json`, as JSON without spaces). The header's `fileSize` is where the content ends, before
 the section. Because the section follows everything else and the footer is written last, an artifact gains or replaces it
-without any other byte moving: `package-tokenizer` ([OPERATIONS.md](OPERATIONS.md#artifacts-and-their-tokenizer)) truncates the
+without any other byte moving: `package-tokenizer` ([OPERATIONS.md](../OPERATIONS.md#artifacts-and-their-tokenizer)) truncates the
 file to its content and appends the section. `TokenizerSection` (Java) and `tools/euhedral_artifacts/tokenizer_section.py`
 write the same bytes.
 

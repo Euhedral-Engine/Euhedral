@@ -1,4 +1,4 @@
-# Architecture diagrams
+# Architecture
 
 Start with the system overview, then follow the concern you are changing. These hand-maintained Mermaid diagrams describe contracts and responsibilities grounded in the code at `22aa9e12`; they are not generated call graphs. The overview includes both model runtimes. Detailed dense execution diagrams explicitly scope themselves to Qwen3.8.
 
@@ -15,6 +15,13 @@ Start with the system overview, then follow the concern you are changing. These 
 
 Every page has a stated boundary and links to implementation anchors. Mermaid source stays in Markdown so GitHub and compatible editors can render it directly.
 
+## Detailed execution documents
+
+- [Qwen execution model](FRAME_MODEL.md): stage frames, scheduling and device lanes.
+- [Multi-sequence execution](MULTI_SEQUENCE.md): sequence ownership, admission and shared resources.
+
+See the [documentation index](../README.md) for user guides and other topics.
+
 ## Maintaining the diagrams
 
 When a change alters module boundaries, request flow, graph dependencies, residency, speculative commit semantics or resource ownership, update the corresponding page alongside the implementation. Trace changed arrows through their implementation anchors. State whether an arrow means a call, ownership, data movement or an ordering dependency. Keep conditional routes visibly conditional and preserve the distinction between submission and device completion.
@@ -23,4 +30,4 @@ Existing focused design documents under `docs/` supply additional detail and his
 
 Structural dependency graphs can supplement these behavioral views. If added, generate them for a named module or package with the command and revision recorded, and keep them focused enough to answer a specific dependency question. This documentation adds no graph generator.
 
-For Flash-Next, continue with the existing [execution](../FLASH_NEXT_EXECUTION.md), [residency](../FLASH_NEXT_RESIDENCY.md), [lattice](../FLASH_NEXT_LATTICE.md) and [disk](../FLASH_NEXT_DISK.md) documents. For dense execution, the [frame model](../FRAME_MODEL.md), [MTP contract](../MTP_CONTRACT.md) and [CUDA graphs](../CUDA_GRAPHS.md) expand the key invariants.
+For Flash-Next, continue with the existing [execution](../flash-next/FLASH_NEXT_EXECUTION.md), [residency](../flash-next/FLASH_NEXT_RESIDENCY.md), [lattice](../flash-next/FLASH_NEXT_LATTICE.md) and [disk](../flash-next/FLASH_NEXT_DISK.md) documents. For dense execution, the [frame model](FRAME_MODEL.md), [MTP contract](../speculation/MTP_CONTRACT.md) and [CUDA graphs](../kernels/CUDA_GRAPHS.md) expand the key invariants.

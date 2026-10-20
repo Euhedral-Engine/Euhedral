@@ -21,7 +21,7 @@ support the target GPU. This native layer does not install or manage NVIDIA driv
 | `q3_linear_bf16.c` | Q3 decode (one row and the 2 to 8 row twins) and the P2E2 decode and expansion kernels. |
 | `q45_linear.c` | Q4/Q5 decode (one row and the 2 to 8 row twins). |
 | `nvfp4_linear.c` | NVFP4 decode (plain and SD4 scale-table layouts, 1 to 8 rows on BF16 tensor cores) and the native FP4 tensor-core route. |
-| `dflash.c` | The DFlash2 drafter's operators (docs/DFLASH2.md). |
+| `dflash.c` | The DFlash2 drafter's operators (docs/speculation/DFLASH2.md). |
 | `q3_mx.c` | The block-scaled MXFP8 route for Q3/Q4/Q5 linears and the paired gate/up SwiGLU region. |
 | `reference.c`, `.h` | The scalar numerical references (Q3, Q4/Q5, NVFP4 plain and SD4): the oracle exact numerics select, and the fallback for shapes no kernel takes. |
 | `qwen_layer_ops.c` | GDN control, convolution, recurrence and gated norm; residual add, residual RMSNorm and SwiGLU; NVFP4 KV append, QK norm/RoPE and attention; greedy argmax; the BF16-to-FP32 linear. |
@@ -53,7 +53,7 @@ root the host loads; its headers are that module's leaves and strategies:
 | `gdn/` | Gated DeltaNet control, projections, convolution, recurrence and gated RMSNorm. |
 | `attention/` | NVFP4 KV append, QK norm/RoPE, per-head and GQA decode attention with row twins, the 32-row prefill tile and the producer-warp FA2 prefill kernel, and the exact twins and single-warp controls used as test oracles. |
 | `sampling/` | Greedy token selection on the device (argmax over the final logits row). |
-| `qwen4/` | The Flash-Next (`qwen4_exp`) operators: BF16 linear, embedding gather, grouped RMSNorm, the hyper-connection mix and injection, the per-layer embedding (n-gram record expansion, gate, dilated convolution) and the rows of its convolution history, and (with the model's other blocks) the GDN control and gated norm, the router and the shared expert's SwiGLU. [docs/FLASH_NEXT_EXECUTION.md](../docs/FLASH_NEXT_EXECUTION.md). |
+| `qwen4/` | The Flash-Next (`qwen4_exp`) operators: BF16 linear, embedding gather, grouped RMSNorm, the hyper-connection mix and injection, the per-layer embedding (n-gram record expansion, gate, dilated convolution) and the rows of its convolution history, and (with the model's other blocks) the GDN control and gated norm, the router and the shared expert's SwiGLU. [docs/flash-next/FLASH_NEXT_EXECUTION.md](../docs/flash-next/FLASH_NEXT_EXECUTION.md). |
 | `trellis/` | Trellis (EXL3) linear kernels, module root `trellis/kernels.cu`, the entries of the `linear` table: the input prepass (`suh`, 128-point Hadamard), the row-exact FP16 tensor-core GEMM that decodes trellis tiles in registers (fused epilogue, or K-split partials and `epilogue.cuh`), decode to BF16 for prefill and the epilogue of the BF16 route. `codebook.cuh` is the one decode source (mul1 codebook, ring window, tensor-core order, Hadamard butterfly); the quantization module compiles it too. `reference/trellis.cuh` is the scalar reference, compiled into this module. |
 | `dflash/` | The DFlash2 drafter: BF16 tensor-core linear (rows independent of the row count), Qwen3 RMSNorm, grouped dynamic convolution, Q/K norm and RoPE, the context ring append, sliding-window block attention on tensor cores (key splits and a merge), SwiGLU, top-16 and the candidate selector, each rounding where the published PyTorch model rounds. |
 

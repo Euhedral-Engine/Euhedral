@@ -4,7 +4,7 @@
 #include "euhedral_cuda.h"
 #include <stdint.h>
 
-/* P2E2 tensor geometry (native/src/q3/p2e2.cuh, docs/COMPRESSED_Q3.md). The payload plane's length
+/* P2E2 tensor geometry (native/src/q3/p2e2.cuh, docs/quantization/COMPRESSED_Q3.md). The payload plane's length
  * depends on the codes, so a byte size is valid when it lies between an empty and a full payload. */
 #define EUHEDRAL_Q3_P2E2_SLICE 1024u
 #define EUHEDRAL_Q3_P2E2_PAD_WORDS 80u

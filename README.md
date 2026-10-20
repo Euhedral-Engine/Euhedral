@@ -24,8 +24,8 @@ An artifact is one `.edrl` file holding the quantized text model, its MTP draft 
 One mixed artifact, `NVFP4-Trellis-RCO`, takes each projection of the text layers from QTIP-style trellis codes at 2.5 to
 4.0 bits per weight (exllamav3's EXL3 format, calibrated by the quantization module) as a search allocated them for the least
 error with a 128K context on the device: 114 of its 320 projections at 4.0 bits, 88 at 3.5, 45 at 3.0 and 73 at 2.5, with a Q3
-token embedding and NVFP4 heads, 11.17 GiB (11.99 GB) ([docs/MIXED_QUANTIZATION.md](docs/MIXED_QUANTIZATION.md),
-[docs/TRELLIS.md](docs/TRELLIS.md)).
+token embedding and NVFP4 heads, 11.17 GiB (11.99 GB) ([docs/quantization/MIXED_QUANTIZATION.md](docs/quantization/MIXED_QUANTIZATION.md),
+[docs/quantization/TRELLIS.md](docs/quantization/TRELLIS.md)).
 
 All four artifacts are converted from Swift-1.5 (`ukisai/Swift-1.5-Qwen3.8-27b`, UkisAI's fine-tune of Qwen3.8-27B); the
 converter takes either checkpoint.
@@ -36,7 +36,7 @@ host memory. All of that is automatic.
 
 Any artifact can also carry the DFlash2 drafter (`z-lab/Qwen3.8-27B-DFlash2`): the converter appends it with
 `--extend ARTIFACT --dflash2 DIR`, and an artifact that holds it speculates with DFlash2 instead of MTP, with the same
-exact verification ([docs/DFLASH2.md](docs/DFLASH2.md)). The drafter was trained on Qwen3.8-27B, which Swift-1.5
+exact verification ([docs/speculation/DFLASH2.md](docs/speculation/DFLASH2.md)). The drafter was trained on Qwen3.8-27B, which Swift-1.5
 fine-tunes; added to `nvfp4-compressed` (15.04 GiB with the drafter), it decodes 158.6 tok/s at 4K, 128.4 at 32K, 91.4 at 64K
 and 49.4 at 128K tokens of context (chat corpus and 256 generated tokens; at 128K generated text and 64 tokens; MTP on the same
 target: 146.6, 129.9, 103.5 and 49.7); its larger drafter leaves less of the 16 GB for the target, and the artifacts above draft
@@ -100,12 +100,12 @@ Device memory is what the engine allocated at its peak during the run: the resid
 sequence state, and the workspaces. The CUDA context and kernel modules come on top. An uncompressed NVFP4 model is larger than
 the card's memory budget at these contexts, so the engine holds part of it in pinned host memory and streams it in for every token.
 
-Residency is described in [docs/NVFP4_RESIDENCY.md](docs/NVFP4_RESIDENCY.md) and [docs/COMPRESSED_Q3.md](docs/COMPRESSED_Q3.md).
+Residency is described in [docs/quantization/NVFP4_RESIDENCY.md](docs/quantization/NVFP4_RESIDENCY.md) and [docs/quantization/COMPRESSED_Q3.md](docs/quantization/COMPRESSED_Q3.md).
 
 ## Quality
 
 Error is measured four separate ways because they answer different questions. The model and quantization error is
-measured on a held-out quality set ([docs/RELEASE_TEST.md](docs/RELEASE_TEST.md)): 112 chunks of 2,560 tokens, each one
+measured on a held-out quality set ([docs/evaluation/RELEASE_TEST.md](docs/evaluation/RELEASE_TEST.md)): 112 chunks of 2,560 tokens, each one
 independent conversation or document (BF16 Swift-1.5's own answers in conversation, coding, tool use and five other
 languages, with their chat-template, thinking and tool-call tokens, and human-written prose and code published after the
 model's training), the second half of every chunk scored (143,360 tokens), with BF16 Swift-1.5 in llama.cpp as the
@@ -113,12 +113,12 @@ reference.
 
 All four artifacts' decoder layers and heads are rounded by GPTQ: each linear's rounding minimizes the error of
 its outputs on calibration activations of the quantized model, each column's error carried into the columns not yet
-rounded (the `quantization` module, [docs/QUALITY.md](docs/QUALITY.md#gptq)); `q3` also rounds its MTP layer by GPTQ.
+rounded (the `quantization` module, [docs/evaluation/QUALITY.md](docs/evaluation/QUALITY.md#gptq)); `q3` also rounds its MTP layer by GPTQ.
 The token embedding (and the other artifacts' MTP layer) are rounded by calibrated scale search: every group's scale minimizes its
 error weighted by the importance of each input column (`tools/convert_checkpoint.py --imatrix`, see
 [tools/README.md](tools/README.md)) with UkisAI's Swift-1.5 importance matrix (`imatrix-swift15-v1mix.gguf`, from
 `ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF`), and is measured against the Swift-1.5 BF16 checkpoint. `q3-compressed` limits its
-Q3 tensors other than the MLP down projections to the codes -3..3, which its lossless layout stores, while `q3` also uses -4 ([docs/COMPRESSED_Q3.md](docs/COMPRESSED_Q3.md)), so the two hold different values.
+Q3 tensors other than the MLP down projections to the codes -3..3, which its lossless layout stores, while `q3` also uses -4 ([docs/quantization/COMPRESSED_Q3.md](docs/quantization/COMPRESSED_Q3.md)), so the two hold different values.
 
 **Model and quantization error** — the artifact against the BF16 checkpoint on the held-out set:
 
@@ -133,7 +133,7 @@ Q3 tensors other than the MLP down projections to the codes -3..3, which its los
 
 The perplexity is low because most of the set is the model's own text. In every domain the two NVFP4 forms have the least
 error and `q3-compressed` the most; tool use has the largest error for every artifact (KL 0.133 for `nvfp4` to 0.282 for `q3-compressed`) and prose the smallest
-(0.02 to 0.07). Per domain: [docs/RELEASE_TEST.md](docs/RELEASE_TEST.md#quality-by-domain).
+(0.02 to 0.07). Per domain: [docs/evaluation/RELEASE_TEST.md](docs/evaluation/RELEASE_TEST.md#quality-by-domain).
 
 **Compression-induced error** — the compressed artifact against its uncompressed one:
 
@@ -158,7 +158,7 @@ verification are bit for bit those of one-row decoding, and speculative generati
 greedy decoding. This holds for all four artifacts (`SpeculativeVerifyCudaIntegrationTest`,
 `SpeculativeDecodeCudaIntegrationTest`).
 
-How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
+How to reproduce each measurement is in [docs/evaluation/QUALITY.md](docs/evaluation/QUALITY.md).
 
 ## Choosing an artifact
 
@@ -324,7 +324,7 @@ keys are required, and `context.max-tokens` (32768) and the prefix cache's size 
 
 One generation runs at a time; the engine sizes device memory for one sequence. The prefix cache is the only state kept between requests; it is host memory, so it takes nothing from the context length or the device. Requests are served entirely on the
 engine's worker threads: the container thread hands a request over and returns, and rendering, tokenization, every
-quantum and every write to the client run as lattice work (docs/FRAME_MODEL.md, "Host work on the workers").
+quantum and every write to the client run as lattice work (docs/architecture/FRAME_MODEL.md, "Host work on the workers").
 
 ## Building and testing
 
@@ -340,24 +340,26 @@ python3 -m unittest discover -s native/tests -p 'test_*.py'   # kernel tests on 
 ```
 
 Stop any serving container before the GPU suites. The native layer is described in [native/README.md](native/README.md),
-the benchmark harness in [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
+the benchmark harness in [docs/evaluation/BENCHMARKING.md](docs/evaluation/BENCHMARKING.md).
 
 ## More
+
+The [documentation index](docs/README.md) groups user guides and implementation references by topic.
 
 - [docs/API_COMPATIBILITY.md](docs/API_COMPATIBILITY.md), [docs/ANTHROPIC_API.md](docs/ANTHROPIC_API.md), [docs/RESPONSES_API.md](docs/RESPONSES_API.md): the request formats, field by field.
 - [docs/REASONING.md](docs/REASONING.md), [docs/TOOL_CALLING.md](docs/TOOL_CALLING.md), [docs/STRUCTURED_OUTPUT.md](docs/STRUCTURED_OUTPUT.md): reasoning, tools and constrained output.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md): settings, startup, health, shutdown and metrics.
 
-- [docs/FRAME_MODEL.md](docs/FRAME_MODEL.md): how a forward pass is scheduled across device lanes.
+- [docs/architecture/FRAME_MODEL.md](docs/architecture/FRAME_MODEL.md): how a forward pass is scheduled across device lanes.
 - [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md): the state kept between requests, its checkpoints and measured restore times.
-- [docs/MTP_SPECULATIVE.md](docs/MTP_SPECULATIVE.md), [docs/MTP_CONTRACT.md](docs/MTP_CONTRACT.md), [docs/MTP_VERIFIER.md](docs/MTP_VERIFIER.md): speculative decoding and its exactness contract.
-- [docs/DFLASH2.md](docs/DFLASH2.md): the DFlash2 drafter, its artifact, checkpoints, validation and measurements.
-- [docs/MTP_DRAFT_CONFIDENCE.md](docs/MTP_DRAFT_CONFIDENCE.md): MTP draft confidence per output position, and draft-length policies screened on it.
-- [docs/MTP_DRAFTER.md](docs/MTP_DRAFTER.md): the MTP drafter's corpus, training and export, and the drafter NVFP4-Trellis-RCO ships.
-- [docs/PREFILL_MX.md](docs/PREFILL_MX.md), [docs/NVFP4_NATIVE.md](docs/NVFP4_NATIVE.md), [docs/ATTENTION_DECODE.md](docs/ATTENTION_DECODE.md): the prefill, FP4 and attention kernels.
-- [docs/COMPACT_Q3_REFERENCE.md](docs/COMPACT_Q3_REFERENCE.md), [docs/COMPRESSED_Q3.md](docs/COMPRESSED_Q3.md), [docs/NVFP4_COMPRESSED.md](docs/NVFP4_COMPRESSED.md), [docs/NVFP4_RESIDENCY.md](docs/NVFP4_RESIDENCY.md): the artifact formats and memory budgets.
-- [docs/FLASH_NEXT_ARTIFACT.md](docs/FLASH_NEXT_ARTIFACT.md), [docs/FLASH_NEXT_RESIDENCY.md](docs/FLASH_NEXT_RESIDENCY.md): the Qwen3.8-Flash-Next (`qwen4_exp`) artifact, and how its storage is placed and its experts cached.
-- [docs/FLASH_NEXT_EXECUTION.md](docs/FLASH_NEXT_EXECUTION.md), [docs/FLASH_NEXT_QSA.md](docs/FLASH_NEXT_QSA.md), [docs/FLASH_NEXT_EXPERTS.md](docs/FLASH_NEXT_EXPERTS.md), [docs/FLASH_NEXT_REFERENCE.md](docs/FLASH_NEXT_REFERENCE.md): running Flash-Next as a text model (ordinary generation, no speculation, no vision): the four-stream residual, GDN, sparse attention, the expert waves, the sequence state, its validation against the upstream implementation and its first measurements.
+- [docs/speculation/MTP_SPECULATIVE.md](docs/speculation/MTP_SPECULATIVE.md), [docs/speculation/MTP_CONTRACT.md](docs/speculation/MTP_CONTRACT.md), [docs/speculation/MTP_VERIFIER.md](docs/speculation/MTP_VERIFIER.md): speculative decoding and its exactness contract.
+- [docs/speculation/DFLASH2.md](docs/speculation/DFLASH2.md): the DFlash2 drafter, its artifact, checkpoints, validation and measurements.
+- [docs/speculation/MTP_DRAFT_CONFIDENCE.md](docs/speculation/MTP_DRAFT_CONFIDENCE.md): MTP draft confidence per output position, and draft-length policies screened on it.
+- [docs/speculation/MTP_DRAFTER.md](docs/speculation/MTP_DRAFTER.md): the MTP drafter's corpus, training and export, and the drafter NVFP4-Trellis-RCO ships.
+- [docs/kernels/PREFILL_MX.md](docs/kernels/PREFILL_MX.md), [docs/kernels/NVFP4_NATIVE.md](docs/kernels/NVFP4_NATIVE.md), [docs/kernels/ATTENTION_DECODE.md](docs/kernels/ATTENTION_DECODE.md): the prefill, FP4 and attention kernels.
+- [docs/quantization/COMPACT_Q3_REFERENCE.md](docs/quantization/COMPACT_Q3_REFERENCE.md), [docs/quantization/COMPRESSED_Q3.md](docs/quantization/COMPRESSED_Q3.md), [docs/quantization/NVFP4_COMPRESSED.md](docs/quantization/NVFP4_COMPRESSED.md), [docs/quantization/NVFP4_RESIDENCY.md](docs/quantization/NVFP4_RESIDENCY.md): the artifact formats and memory budgets.
+- [docs/flash-next/FLASH_NEXT_ARTIFACT.md](docs/flash-next/FLASH_NEXT_ARTIFACT.md), [docs/flash-next/FLASH_NEXT_RESIDENCY.md](docs/flash-next/FLASH_NEXT_RESIDENCY.md): the Qwen3.8-Flash-Next (`qwen4_exp`) artifact, and how its storage is placed and its experts cached.
+- [docs/flash-next/FLASH_NEXT_EXECUTION.md](docs/flash-next/FLASH_NEXT_EXECUTION.md), [docs/flash-next/FLASH_NEXT_QSA.md](docs/flash-next/FLASH_NEXT_QSA.md), [docs/flash-next/FLASH_NEXT_EXPERTS.md](docs/flash-next/FLASH_NEXT_EXPERTS.md), [docs/flash-next/FLASH_NEXT_REFERENCE.md](docs/flash-next/FLASH_NEXT_REFERENCE.md): running Flash-Next as a text model (ordinary generation, no speculation, no vision): the four-stream residual, GDN, sparse attention, the expert waves, the sequence state, its validation against the upstream implementation and its first measurements.
 - [docs/nvidia/](docs/nvidia/README.md): measurements of this GPU's hardware.
 
 ---

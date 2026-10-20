@@ -53,7 +53,7 @@ verification) on the trellis 2.5, 3.0 and 3.5 sources. The model's prefill match
 Candidates are scored against BF16 logits the engine computes itself: `quantization reference` runs the BF16
 artifact (weights split over the device, pinned host memory and disk by the residency planner) over a text of 8
 chunks of 2560 tokens and writes the logits in llama.cpp's format. The text is built like the held-out set
-([RELEASE_TEST.md](RELEASE_TEST.md)) and disjoint from it: six conversations BF16 Swift-1.5 generated from their own
+([RELEASE_TEST.md](../evaluation/RELEASE_TEST.md)) and disjoint from it: six conversations BF16 Swift-1.5 generated from their own
 prompts (two conversation, two coding, one tool use, one multilingual) and two human-written documents the held-out
 set holds as unscored spares (one prose, one code), cut and ordered by `tools/t5/chunks.py`.
 
@@ -150,7 +150,7 @@ No weight is held in host memory at any of these contexts. Decode without specul
 depth was chosen from 3 to 7: depth 5 decodes fastest after a 4K prompt (143.5 against 140.4 tok/s at depth 4, mean
 of six prompts) but depth 4 is faster at long context (93.1 against 87.2 tok/s at 64K, 78.3 against 71.2 at 128K).
 
-On the held-out set ([RELEASE_TEST.md](RELEASE_TEST.md)): dNLL +0.051 ± 0.006, KL 0.072, top-1 92.9%.
+On the held-out set ([RELEASE_TEST.md](../evaluation/RELEASE_TEST.md)): dNLL +0.051 ± 0.006, KL 0.072, top-1 92.9%.
 
 Measured and not kept: the fastest-prefill point of the front within 1.25 times its search KL (search KL 0.0966,
 11.14 GiB): prefill 2,881 tok/s at 4K and 1,263 at 128K, held-out dNLL +0.075 ± 0.008,

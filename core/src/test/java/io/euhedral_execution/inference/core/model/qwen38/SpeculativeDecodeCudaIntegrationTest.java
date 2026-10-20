@@ -40,7 +40,7 @@ class SpeculativeDecodeCudaIntegrationTest {
         int budget = Integer.getInteger("euhedral.speculative.tokens", 160);
         QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory));
         Path root = SpeculativeVerifyCudaIntegrationTest.repositoryRoot();
-        String frameModel = Files.readString(root.resolve("docs/FRAME_MODEL.md"));
+        String frameModel = Files.readString(root.resolve("docs/architecture/FRAME_MODEL.md"));
         int[] text = tokenizer.encodeText(frameModel);
         List<int[]> prompts = List.of(
                 tokenizer.encodeWithModelSpecialTokens("<|im_start|>user\nWhat is the capital of France? Answer with"

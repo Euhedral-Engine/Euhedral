@@ -1,6 +1,6 @@
 # Memory architecture
 
-This is the dense Qwen3.8 weight and state hierarchy. Residency is planned at load from free device memory, artifact formats, context length, sequence count and a host budget. Flash-Next uses a separate expert cache hierarchy; see its existing [residency design](../FLASH_NEXT_RESIDENCY.md).
+This is the dense Qwen3.8 weight and state hierarchy. Residency is planned at load from free device memory, artifact formats, context length, sequence count and a host budget. Flash-Next uses a separate expert cache hierarchy; see its existing [residency design](../flash-next/FLASH_NEXT_RESIDENCY.md).
 
 ```mermaid
 flowchart LR

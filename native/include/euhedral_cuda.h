@@ -150,7 +150,7 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_select_exact_numerics(int exact);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_nvfp4_bf16(
         const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size);
-/* Native Blackwell NVFP4 linear (docs/NVFP4_NATIVE.md): quantizes the BF16 input rows to two NVFP4 terms in `scratch`
+/* Native Blackwell NVFP4 linear (docs/kernels/NVFP4_NATIVE.md): quantizes the BF16 input rows to two NVFP4 terms in `scratch`
  * (euhedral_cuda_nvfp4_native_scratch_bytes) and multiplies with block-scaled FP4 tensor-core MMA. Returns
  * EUHEDRAL_CUDA_ROUTE_UNAVAILABLE under exact numerics or when in_features is not a multiple of 128; the activations
  * are quantized, so results differ from euhedral_cuda_linear_nvfp4_bf16. */
@@ -169,7 +169,7 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_nvfp4_native_gate_up_swiglu_bf16(
         const void* input, const void* weights, void* output, void* scratch,
         uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes, uint64_t scratch_byte_size);
 
-/* Prefill (9 or more rows) on block-scaled FP8 tensor cores (docs/PREFILL_MX.md): quantizes the BF16 input rows into two E4M3
+/* Prefill (9 or more rows) on block-scaled FP8 tensor cores (docs/kernels/PREFILL_MX.md): quantizes the BF16 input rows into two E4M3
  * terms and a power-of-two block scale in `scratch` (euhedral_cuda_q3_mx_scratch_bytes, 256-aligned) and multiplies
  * with the Q3 codes (exact in E4M3) at the full FP8 MMA rate, FP32 accumulation, FP16 group scales applied in
  * FP32. Returns EUHEDRAL_CUDA_ROUTE_UNAVAILABLE off sm_12x, under exact numerics or row-exact execution, for
@@ -194,7 +194,7 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_mx_gate_up_swiglu_bf16(
         const void* input, const void* weights, void* output, void* scratch,
         uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes, uint64_t scratch_byte_size);
 
-/* P2E2 Q3 tensors (layout row-split-p2e2-v1, docs/COMPRESSED_Q3.md): the same Q3G64_F16S values in
+/* P2E2 Q3 tensors (layout row-split-p2e2-v1, docs/quantization/COMPRESSED_Q3.md): the same Q3G64_F16S values in
  * a smaller, entropy-coded layout. The decode route runs one row on the shapes of the contiguous decode
  * kernel, bitwise identical to it, and returns
  * EUHEDRAL_CUDA_ROUTE_UNAVAILABLE otherwise. Every other route expands the tensor into the row-split
@@ -351,7 +351,7 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_qk_norm_rope_bf16(
         float epsilon,
         double rope_theta);
 
-/* DFlash2 drafter (src/dflash/kernels.cu, docs/DFLASH2.md): BF16 operators that round where the published PyTorch
+/* DFlash2 drafter (src/dflash/kernels.cu, docs/speculation/DFLASH2.md): BF16 operators that round where the published PyTorch
  * model rounds. `position` points at the quantum's uint64 start position in device memory. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_linear_bf16(
         const void* device_input, const void* device_weights, void* device_output,

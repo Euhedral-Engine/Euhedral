@@ -1,4 +1,4 @@
-// Lane-interleaved static rANS for NVFP4 blocks and BF16 high bytes (format in docs/NVFP4_LOSSLESS.md).
+// Lane-interleaved static rANS for NVFP4 blocks and BF16 high bytes (format in docs/quantization/NVFP4_LOSSLESS.md).
 //
 // A segment is coded by L lanes; lane l owns blocks l, l + L, l + 2L, ... (the segment's last block repeats to fill
 // the final row). Per block the decoder reads: the block's E4M3 scale, then for each of the 16 E2M1 codes its

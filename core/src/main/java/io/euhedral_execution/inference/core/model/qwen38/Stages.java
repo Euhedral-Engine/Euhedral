@@ -448,7 +448,7 @@ public final class Stages {
             boolean finalNorm = instruction.outputBuffers().contains(ExecutionPlan.Buffer.FINAL_NORMALIZED);
             int rows = finalNorm ? logitsRows(context) : rows(context);
             if (finalNorm && context.seedsDraft() && context.plan().drafts()) {
-                // Speculative drafting reads every row's post-final-norm hidden (docs/MTP_CONTRACT.md §2): each
+                // Speculative drafting reads every row's post-final-norm hidden (docs/speculation/MTP_CONTRACT.md §2): each
                 // sequence's rows into its own seed rows.
                 long source =
                         context.workspace().address(instruction.inputBuffers().getFirst());
@@ -634,7 +634,7 @@ public final class Stages {
         }
     }
 
-    /// MTP stem (docs/MTP_CONTRACT.md §2): row r of the packed output is
+    /// MTP stem (docs/speculation/MTP_CONTRACT.md §2): row r of the packed output is
     /// [RMSNorm₁₊w(embedding r, embedding_norm); RMSNorm₁₊w(seed r, hidden_norm)], the seed rows coming from
     /// the context (base hidden rows for catch-up, the previous MTP hidden for a recursive row).
     public static final class MtpStem extends Stage {
@@ -1093,7 +1093,7 @@ public final class Stages {
         }
     }
 
-    /// The DFlash2 stages (docs/DFLASH2.md): the target's taps, and the drafter's context and block stages. Each is
+    /// The DFlash2 stages (docs/speculation/DFLASH2.md): the target's taps, and the drafter's context and block stages. Each is
     /// shown to the observer right after it was submitted.
     public abstract static class DFlash2 extends Stage {
 

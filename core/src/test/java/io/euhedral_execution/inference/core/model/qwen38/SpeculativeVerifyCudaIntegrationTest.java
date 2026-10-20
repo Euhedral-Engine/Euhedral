@@ -39,7 +39,7 @@ class SpeculativeVerifyCudaIntegrationTest {
         int prefix = Integer.getInteger("euhedral.speculative.prefix", 300);
         int rows = Integer.getInteger("euhedral.speculative.rows", 4);
         int[] text = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory))
-                .encodeText(Files.readString(repositoryRoot().resolve("docs/FRAME_MODEL.md")));
+                .encodeText(Files.readString(repositoryRoot().resolve("docs/architecture/FRAME_MODEL.md")));
         int[] prompt = java.util.Arrays.copyOf(text, prefix);
         int[] forced = java.util.Arrays.copyOfRange(text, prefix, prefix + rows);
         var loaded = SharedQwen38.q3();
@@ -95,7 +95,7 @@ class SpeculativeVerifyCudaIntegrationTest {
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int prefix = Integer.getInteger("euhedral.speculative.prefix", 300);
         int[] text = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory))
-                .encodeText(Files.readString(repositoryRoot().resolve("docs/FRAME_MODEL.md")));
+                .encodeText(Files.readString(repositoryRoot().resolve("docs/architecture/FRAME_MODEL.md")));
         int[] prompt = java.util.Arrays.copyOf(text, prefix);
         var loaded = SharedQwen38.q3();
         CudaGpuMemory gpu = loaded.gpu();

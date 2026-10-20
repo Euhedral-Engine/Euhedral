@@ -5,7 +5,7 @@ import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
 
 /// Geometry of [WeightLayout#ROW_SPLIT_P2E2_V1], a lossless and smaller layout of Q3G64_F16S tensors
-/// (docs/COMPRESSED_Q3.md, native/src/q3/p2e2.cuh). Rows of `k` codes, `k` a multiple of [#SLICE]:
+/// (docs/quantization/COMPRESSED_Q3.md, native/src/q3/p2e2.cuh). Rows of `k` codes, `k` a multiple of [#SLICE]:
 ///
 /// - primary plane at 0: 2 bits per code, 16 codes per little-endian word;
 /// - row-base plane: one word per row, the payload unit of the row's first BIG code;

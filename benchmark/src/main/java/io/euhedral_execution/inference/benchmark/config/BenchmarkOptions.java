@@ -20,7 +20,7 @@ import java.util.Objects;
 import java.util.Optional;
 
 /// Validated `run` configuration, read from a JSON file. Only the three input paths are required;
-/// every other field has the default documented in `docs/BENCHMARKING.md`. Unknown fields are
+/// every other field has the default documented in `docs/evaluation/BENCHMARKING.md`. Unknown fields are
 /// rejected. Relative paths resolve against the working directory.
 ///
 /// - `prefixCacheBytes`: pinned host memory for the prefix cache, 0 (the default) for none. Iterations repeat

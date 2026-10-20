@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-/// Captured quanta (docs/CUDA_GRAPHS.md) compute what stage-by-stage submission computes. Speculative and
+/// Captured quanta (docs/kernels/CUDA_GRAPHS.md) compute what stage-by-stage submission computes. Speculative and
 /// ordinary greedy generation on a runtime that replays captured graphs must produce the same tokens as on
 /// one that never captures, and the same drafts: every verification accepts as many of them, which the
 /// output tokens alone would not show (the verifier keeps the output exact whatever the drafts are).
@@ -40,7 +40,7 @@ class CapturedQuantaCudaIntegrationTest {
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory));
         String frameModel = Files.readString(
-                SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/FRAME_MODEL.md"));
+                SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/architecture/FRAME_MODEL.md"));
         List<int[]> prompts = List.of(
                 tokenizer.encodeWithModelSpecialTokens("<|im_start|>user\nWrite a Java method that reverses a"
                         + " singly linked list, with a short explanation.<|im_end|>\n<|im_start|>assistant\n"

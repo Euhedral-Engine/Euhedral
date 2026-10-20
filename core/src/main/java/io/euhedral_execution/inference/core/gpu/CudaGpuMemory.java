@@ -2106,12 +2106,12 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     }
 
     /// Rows from which an NVFP4 linear runs on native FP4 tensor cores: up to 8 rows stay on the decode kernels,
-    /// which stream weights as fast, keep BF16 activations and are row-exact (docs/NVFP4_NATIVE.md).
+    /// which stream weights as fast, keep BF16 activations and are row-exact (docs/kernels/NVFP4_NATIVE.md).
     static final int NVFP4_NATIVE_MIN_ROWS = 9;
     /// The paired gate/up region exists only in region views, from 64 rows.
     static final int NVFP4_NATIVE_REGION_MIN_ROWS = 64;
 
-    /// Rows from which a Q3, Q4 or Q5 linear runs on the block-scaled FP8 route (docs/PREFILL_MX.md); smaller
+    /// Rows from which a Q3, Q4 or Q5 linear runs on the block-scaled FP8 route (docs/kernels/PREFILL_MX.md); smaller
     /// quanta (speculative verification, drafting and prompt tails) run the decode kernels.
     static final int Q3_MX_MIN_ROWS = Q3_DECODE_MAX_ROWS + 1;
 

@@ -32,7 +32,7 @@ import org.junit.jupiter.api.Timeout;
 class GreedyAgreementCudaIntegrationTest {
 
     /// Logit difference below which two tokens are interchangeable: the reference's own logits move
-    /// by up to 0.75 between chunkings of one prompt (docs/FLASH_NEXT_REFERENCE.md), whose logits
+    /// by up to 0.75 between chunkings of one prompt (docs/flash-next/FLASH_NEXT_REFERENCE.md), whose logits
     /// are about 20.
     static final double NOISE = 1.0;
 

@@ -29,7 +29,7 @@ import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import java.util.function.IntPredicate;
 
-/// Greedy MTP speculative decoding for one sequence (docs/MTP_CONTRACT.md §4). Every output token is
+/// Greedy MTP speculative decoding for one sequence (docs/speculation/MTP_CONTRACT.md §4). Every output token is
 /// the token ordinary greedy decode produces, and the committed state is the state it leaves: drafts
 /// only decide how many tokens one verification commits.
 ///

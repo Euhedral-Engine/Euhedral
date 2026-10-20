@@ -2,7 +2,7 @@
 
 `tools/nvfp4z.py` stores a checkpoint of NVFP4 safetensors shards in about 90% of its size and rebuilds every shard
 byte for byte. It is an archive and transfer format for the checkpoint files, not an inference artifact: the engine
-reads the artifacts of [tools/README.md](../tools/README.md).
+reads the artifacts of [tools/README.md](../../tools/README.md).
 
 ```bash
 python3 tools/nvfp4z.py compress   CHECKPOINT_DIR  COMPRESSED_DIR   # one .safetensors.nvfp4z per shard, other files copied

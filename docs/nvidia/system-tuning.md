@@ -53,7 +53,7 @@ scales with it.
 1. Raise the offset in steps.
 2. At each step, run `nvbench mem bw`, which should rise.
 3. Back off as soon as bandwidth stops rising or falls.
-4. Then run Euhedral's teacher-forced NLL check (docs/NVFP4_COMPRESSED.md "Quality method") to rule
+4. Then run Euhedral's teacher-forced NLL check (docs/quantization/NVFP4_COMPRESSED.md "Quality method") to rule
    out corruption.
 
 **Not measured here.** This changes hardware settings and needs your go-ahead and root. Reports of
@@ -101,7 +101,7 @@ setups need translation. Weigh both before applying.
 
 ## 5. Host memory
 
-- Keep host-backed weights in the single 2 MiB THP arena (docs/NVFP4_RESIDENCY.md "Platform").
+- Keep host-backed weights in the single 2 MiB THP arena (docs/quantization/NVFP4_RESIDENCY.md "Platform").
   Measured here: `cuMemHostAlloc` without THP is 40% slower H2D, and pageable memory gets 15 GB/s.
 - THP is in `madvise` mode on this host, so only regions that ask for it get huge pages. Euhedral's
   arena asks.

@@ -10,7 +10,7 @@
 #include <pthread.h>
 #endif
 
-/* Q3 prefill on block-scaled FP8 tensor cores (native/src/q3_mx, docs/PREFILL_MX.md): the BF16 activations are
+/* Q3 prefill on block-scaled FP8 tensor cores (native/src/q3_mx, docs/kernels/PREFILL_MX.md): the BF16 activations are
  * split into two E4M3 terms with a power-of-two block scale (exact for BF16), the Q3 codes are exact E4M3, and the
  * MMA accumulates in FP32 at the full FP8 rate of GeForce Blackwell. Needs an sm_12x device; exact numerics
  * and row-exact execution decline it. */

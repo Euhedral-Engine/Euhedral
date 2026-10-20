@@ -727,7 +727,7 @@ public final class InferenceEngine implements AutoCloseable {
         /// Fragment defaults with fixed idle timing: an idle worker parks for the default 15 us. The adaptive
         /// timing derives a worker's park (up to 0.8 ms) and its choice to idle from that worker's own history,
         /// which only work refreshes; after long prefills it left fewer and fewer workers awake, and the
-        /// frame-by-frame quanta of later requests waited on parked workers (docs/FRAME_MODEL.md).
+        /// frame-by-frame quanta of later requests waited on parked workers (docs/architecture/FRAME_MODEL.md).
         static FragmentConfig fragmentConfig() {
             FragmentConfig defaults = FragmentConfig.ofDefaults();
             return new FragmentConfig(

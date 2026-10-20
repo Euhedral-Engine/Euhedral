@@ -35,6 +35,6 @@ CUDA stream ordering, events and graph replay provide device ordering. A Java st
 - [ExecutionPlan](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/ExecutionPlan.java), [Execution](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/Execution.java), [PassAssembler](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/PassAssembler.java) and [SharedWorkspace](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/SharedWorkspace.java).
 - [EuhedralInferenceRuntime](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/EuhedralInferenceRuntime.java): admission, graph pooling and lanes.
 - [StageGraph](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/StageGraph.java), [StageFrame](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/StageFrame.java) and [WorkspaceOwner](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/WorkspaceOwner.java).
-- [CUDA graph contract](../CUDA_GRAPHS.md) and [frame model](../FRAME_MODEL.md).
+- [CUDA graph contract](../kernels/CUDA_GRAPHS.md) and [frame model](FRAME_MODEL.md).
 
 This diagram omits individual transformer operators and kernel selection. See [memory](04-memory-architecture.md), [CUDA](07-cuda-execution.md) and [ownership](08-concurrency-and-ownership.md).

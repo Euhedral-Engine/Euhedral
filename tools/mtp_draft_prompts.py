@@ -184,7 +184,7 @@ def prompts(revision: str):
         SPECULATIVE + "MtpDecoder.java:157:    /// The draft head's token for each of its rows (`text/draft_head_token_ids`).",
         SPECULATIVE + "MtpDecoder.java:159:        TensorHandle ids = plan.weights().runtimeObjects().get(\"text/draft_head_token_ids\");",
         "tools/convert_checkpoint.py:1412:    writer.add(\"text/draft_head_token_ids\", shortlist_ids.astype(np.int32))",
-        "docs/MTP_CONTRACT.md:97:  - **Choice: draft with the shortlist** (argmax over 131,072 rows, then map through",
+        "docs/speculation/MTP_CONTRACT.md:97:  - **Choice: draft with the shortlist** (argmax over 131,072 rows, then map through",
     ])
     yield "agent-grep-then-explain", "agentic", True, TOOLS, [
         {"role": "system", "content": AGENT_SYSTEM},
@@ -238,18 +238,18 @@ def prompts(revision: str):
 
 # Files an agent reads before the task, in order, to fill a long context.
 CONTEXT_FILES = [
-    "docs/MTP_CONTRACT.md",
-    "docs/MTP_VERIFIER.md",
+    "docs/speculation/MTP_CONTRACT.md",
+    "docs/speculation/MTP_VERIFIER.md",
     SPECULATIVE + "SpeculativeDecoding.java",
     SPECULATIVE + "MtpCheckpoint.java",
-    "docs/CUDA_GRAPHS.md",
-    "docs/DFLASH2.md",
+    "docs/kernels/CUDA_GRAPHS.md",
+    "docs/speculation/DFLASH2.md",
     SPECULATIVE + "DFlash2Decoder.java",
-    "docs/ATTENTION_DECODE.md",
-    "docs/NVFP4_NATIVE.md",
-    "docs/FRAME_MODEL.md",
+    "docs/kernels/ATTENTION_DECODE.md",
+    "docs/kernels/NVFP4_NATIVE.md",
+    "docs/architecture/FRAME_MODEL.md",
     "docs/PREFIX_CACHE.md",
-    "docs/NVFP4_RESIDENCY.md",
+    "docs/quantization/NVFP4_RESIDENCY.md",
 ]
 # English prose and code in this repository run about 3.6 characters per token.
 CHARACTERS_PER_TOKEN = 3.6

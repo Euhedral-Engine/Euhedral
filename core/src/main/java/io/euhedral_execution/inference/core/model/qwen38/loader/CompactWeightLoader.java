@@ -353,7 +353,7 @@ final class CompactWeightLoader {
     /// The MTP layer packs its attention projection as the base layers' query/key rows (q, k) followed by
     /// their gate/value rows (gate, v) (tools/euhedral_artifacts). The NVFP4 pack is split here into those two
     /// tensors, each with its rows' codes and scales and the shared global scale, so the MTP layer executes as an
-    /// ordinary attention layer (docs/MTP_CONTRACT.md §1).
+    /// ordinary attention layer (docs/speculation/MTP_CONTRACT.md §1).
     private static void splitMtpAttention(
             Map<String, TensorHandle> handles, GpuMemory gpu, Map<String, int[]> segmentEnds) {
         TensorHandle packed = handles.get(MTP_ATTENTION);
