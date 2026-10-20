@@ -26,7 +26,7 @@ UNAVAILABLE = (f"CUDA probes unavailable: {SKIP_REASON}" if NVRTC is None
 if np is not None:
     import trellis_reference as ref
 
-TARGET_CTAS = 140  # the default of euhedral.trellis.target-ctas
+TARGET_CTAS = 140  # thread blocks the K split aims for (kernels.trellis.target-blocks)
 BITS = {2.5: 40, 3.0: 48, 3.5: 56, 4.0: 64}
 
 

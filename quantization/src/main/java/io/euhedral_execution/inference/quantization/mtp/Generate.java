@@ -27,6 +27,7 @@ import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.quantization.CalibrationLattice;
 import io.euhedral_execution.inference.quantization.Residency;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
+import io.euhedral_execution.inference.quantization.gpu.CudaLibraries;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -80,7 +81,7 @@ public final class Generate {
             int workers,
             int limit,
             double greedyFraction,
-            Path library) {}
+            CudaLibraries library) {}
 
     private final Settings settings;
     private final Device device;

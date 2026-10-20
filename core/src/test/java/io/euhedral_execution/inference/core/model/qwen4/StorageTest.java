@@ -57,7 +57,7 @@ class StorageTest {
         }
 
         @Override
-        public HostBudget hostBudget() {
+        public HostBudget hostBudget(InferenceConfig config) {
             return HostBudget.ofAvailable(64L << 30);
         }
     }

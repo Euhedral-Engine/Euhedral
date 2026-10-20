@@ -11,6 +11,7 @@ import io.euhedral_execution.inference.core.generation.SessionOptions;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.Tunings;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -26,7 +27,7 @@ import org.junit.jupiter.api.Timeout;
 /// generation produces tokens within a time bound. A generation that misses the bound ends the JVM, whose stuck device
 /// work could not be released otherwise. Skipped unless -Peuhedral.qwen.bf16-artifact names the artifact and
 /// -Peuhedral.qwen.tokenizer-dir its tokenizer.
-// Own JVM: sets the global residency budget property and loads the engine several times.
+// Own JVM: loads the engine several times.
 @ModelGroup.OwnJvm
 class DiskTierReloadCudaIntegrationTest {
 
@@ -51,18 +52,18 @@ class DiskTierReloadCudaIntegrationTest {
         long minutes = Long.getLong("euhedral.reload.minutes", 10L);
         System.out.printf(
                 "[reload] pid %d, %d cycles%n", ProcessHandle.current().pid(), cycles);
-        System.setProperty("euhedral.residency.host-budget-bytes", Long.toString(24L << 30));
-        try {
+        {
             for (int cycle = 1; cycle <= cycles; cycle++) {
                 var config = new InferenceConfig(
-                        artifact,
-                        tokenizer,
-                        Path.of(library),
-                        SystemInfo.getPCpuSet(),
-                        4096,
-                        Duration.ofSeconds(60),
-                        0L,
-                        2048);
+                                artifact,
+                                tokenizer,
+                                Path.of(library),
+                                SystemInfo.getPCpuSet(),
+                                4096,
+                                Duration.ofSeconds(60),
+                                0L,
+                                2048)
+                        .withTuning(Tunings.hostWeightsLimit(24L << 30));
                 long loadStart = System.nanoTime();
                 try (InferenceEngine engine = InferenceEngine.load(config)) {
                     var dense = (Qwen38Runtime) engine.modelRuntime();
@@ -96,8 +97,6 @@ class DiskTierReloadCudaIntegrationTest {
                             cycle, mode, prompt.length, newTokens, (System.nanoTime() - start) / 1e9);
                 }
             }
-        } finally {
-            System.clearProperty("euhedral.residency.host-budget-bytes");
         }
     }
 

@@ -4,6 +4,7 @@ import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
+import io.euhedral_execution.inference.core.testing.Tunings;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
@@ -27,7 +28,8 @@ public final class TestExecution {
                     gpu,
                     EuhedralInferenceRuntime.laneCount(),
                     EuhedralInferenceRuntime.CAPTURE_GRAPHS,
-                    Math.max(InferenceConfig.PREFILL_CHUNK_TOKENS, context.inputTokenCount()));
+                    Tunings.prefillChunkTokens(
+                            Math.max(InferenceConfig.PREFILL_CHUNK_TOKENS, context.inputTokenCount())));
             try {
                 return runtime.submit(context, terminalConsumer).get(timeoutSeconds, TimeUnit.SECONDS);
             } finally {

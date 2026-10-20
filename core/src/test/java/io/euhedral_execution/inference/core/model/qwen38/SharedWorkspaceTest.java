@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.runtime.graph.WorkspaceUse;
+import io.euhedral_execution.inference.core.testing.Tunings;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -79,7 +80,7 @@ class SharedWorkspaceTest {
                 new EngineExecutionFixture.SamplingGpu(weights.config().vocabSize()),
                 2,
                 false,
-                64);
+                Tunings.prefillChunkTokens(64));
         try {
             var outcome = runtime.submit(prefill(plan, 3, 65)).get(5, TimeUnit.SECONDS);
             assertEquals(Quantum.Status.FAILED, outcome.status());
@@ -97,7 +98,8 @@ class SharedWorkspaceTest {
         // Embedding-only weights: no sequence state, so every allocation is the workspace's or a graph's.
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var gpu = new ExecutionFixtures.RecordingGpu();
-        var runtime = new Execution(ExecutionFixtures.inlineLattice(), plan, gpu, 2, false, 128);
+        var runtime =
+                new Execution(ExecutionFixtures.inlineLattice(), plan, gpu, 2, false, Tunings.prefillChunkTokens(128));
         try {
             assertEquals(
                     Quantum.Status.SUCCESS,

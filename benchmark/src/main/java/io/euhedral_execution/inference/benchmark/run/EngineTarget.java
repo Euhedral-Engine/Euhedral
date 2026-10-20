@@ -6,6 +6,7 @@ import io.euhedral_execution.inference.core.InferenceEngine;
 import io.euhedral_execution.inference.core.InferenceRunSnapshot;
 import io.euhedral_execution.inference.core.generation.SessionOptions;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.BitSet;
@@ -34,7 +35,8 @@ public final class EngineTarget implements BenchmarkRunner.Target {
             long prefixCacheBytes,
             Duration shutdown,
             boolean speculate,
-            int kvDeviceMinimumTokens) {
+            int kvDeviceMinimumTokens,
+            Tuning tuning) {
         return () -> {
             try {
                 var engine = InferenceEngine.load(new InferenceConfig(
@@ -48,7 +50,8 @@ public final class EngineTarget implements BenchmarkRunner.Target {
                         InferenceConfig.DEFAULT_PREFIX_CACHE_CHECKPOINT_TOKENS,
                         null,
                         1,
-                        kvDeviceMinimumTokens));
+                        kvDeviceMinimumTokens,
+                        tuning));
                 System.out.println("loaded: " + engine.allocatedDeviceBytes() + " device bytes, "
                         + engine.hostBackedWeightBytes() + " host-backed weight bytes");
                 return new EngineTarget(engine, speculate);

@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.Tunings;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -21,7 +22,7 @@ import org.junit.jupiter.api.Timeout;
 /// pinned host memory up to the host budget and the artifact file, its attention caches in BF16. It answers a
 /// factual prompt greedily, with the same tokens whatever share of its weights is read from disk. Skipped unless
 /// -Peuhedral.qwen.bf16-artifact names the artifact (local disk) and -Peuhedral.qwen.tokenizer-dir its tokenizer.
-// Own JVM: sets the global residency budget properties.
+// Own JVM: loads the engine twice.
 @ModelGroup.OwnJvm
 class Bf16ArtifactCudaIntegrationTest {
 
@@ -42,8 +43,8 @@ class Bf16ArtifactCudaIntegrationTest {
     private static List<Integer> generate(Path artifact, Path tokenizer, Path library, long hostBudget, String label)
             throws Exception {
         var config = new InferenceConfig(
-                artifact, tokenizer, library, SystemInfo.getPCpuSet(), 4096, Duration.ofSeconds(60), 0L, 2048);
-        System.setProperty("euhedral.residency.host-budget-bytes", Long.toString(hostBudget));
+                        artifact, tokenizer, library, SystemInfo.getPCpuSet(), 4096, Duration.ofSeconds(60), 0L, 2048)
+                .withTuning(Tunings.hostWeightsLimit(hostBudget));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             var dense = (Qwen38Runtime) engine.modelRuntime();
             assertTrue(dense.diskBackedWeightBytes() > 0, "the BF16 model reads part of its weights from disk");
@@ -64,8 +65,6 @@ class Bf16ArtifactCudaIntegrationTest {
                     output);
             assertTrue(output.toString().contains("Paris"), output.toString());
             return tokens;
-        } finally {
-            System.clearProperty("euhedral.residency.host-budget-bytes");
         }
     }
 }

@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.quantization;
 
 import io.euhedral_execution.inference.quantization.checkpoint.Safetensors;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
+import io.euhedral_execution.inference.quantization.gpu.CudaLibraries;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import io.euhedral_execution.inference.quantization.gpu.Upload;
 import io.euhedral_execution.inference.quantization.training.Ops;
@@ -44,7 +45,7 @@ import java.util.regex.Pattern;
 public final class Rotate {
 
     /// Command-line settings.
-    public record Settings(Path model, Path out, long seed, Path library) {}
+    public record Settings(Path model, Path out, long seed, CudaLibraries library) {}
 
     static final int HIDDEN = 5120;
     private static final int GROUP = 64;

@@ -35,10 +35,6 @@ import java.util.function.Supplier;
 /// around a request (tokenizing, rendering).
 public final class Qwen4Runtime implements ModelRuntime {
 
-    /// Device lanes the stages of a step spread over: the critical chain, the shared expert's side
-    /// branch and the experts. `EUHEDRAL_QWEN4_LANES` overrides it for benchmarks.
-    static final int LANES = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_LANES", "2"));
-
     private final Storage storage;
     private final EuhedralInferenceRuntime runtime;
     private final ExecutionPlan plan;
@@ -69,17 +65,21 @@ public final class Qwen4Runtime implements ModelRuntime {
     }
 
     /// Loads the `qwen4_exp` artifact of `config` as a text model whose host work runs on
-    /// `lattice`, which must be started and outlive the runtime.
+    /// `lattice`, which must be started and outlive the runtime. The stages of a step spread over
+    /// `memory.weight-streaming.gpu-streams` device lanes: the critical chain, the shared expert's side branch and
+    /// the experts.
     public static Qwen4Runtime load(InferenceConfig config, QwenTokenizer tokenizer, LatticeTerminal lattice)
             throws IOException {
-        InferenceLake lake = EuhedralInferenceRuntime.newLake(lattice);
+        InferenceLake lake =
+                EuhedralInferenceRuntime.newLake(lattice, config.tuning().host());
         HostTasks execution = new HostTasks(lake);
         HostTasks host = new HostTasks(lake);
         Storage storage = Storage.load(config);
         EuhedralInferenceRuntime runtime = null;
         try {
             // The plan's one workspace is one buffer whose reuse the runtime's owner orders across graphs.
-            runtime = new EuhedralInferenceRuntime(lake, storage.gpu(), EuhedralInferenceRuntime.Lanes.of(LANES), 1);
+            int lanes = config.tuning().memory().weightStreaming().gpuStreams();
+            runtime = new EuhedralInferenceRuntime(lake, storage.gpu(), EuhedralInferenceRuntime.Lanes.of(lanes), 1);
             ExecutionPlan plan = new ExecutionPlan(storage.gpu(), storage.model(), config.maxContextTokens(), runtime);
             var identity =
                     identity(config.artifactPath(), storage.model().artifact().config());

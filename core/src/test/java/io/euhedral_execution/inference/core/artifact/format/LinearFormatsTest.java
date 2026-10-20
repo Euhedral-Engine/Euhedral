@@ -156,7 +156,10 @@ class LinearFormatsTest {
             assertEquals(row.compressed(), format.compressed(), row.label());
             assertEquals(row.splitsRows(), format.splitsRows(), row.label());
             assertEquals(List.of(), format.companions("text/layers/0/mlp/gate_up"));
-            assertEquals(0, format.planScratchBytes(descriptor("n", row.format(), row.layout(), 64, 128, 0), 8));
+            assertEquals(
+                    0,
+                    format.planScratchBytes(
+                            descriptor("n", row.format(), row.layout(), 64, 128, 0), 8, TrellisSettings.defaults()));
             // The old public entry point for stageability.
             assertEquals(
                     row.stageable(),

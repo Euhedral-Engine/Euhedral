@@ -23,9 +23,15 @@ public final class Device implements AutoCloseable {
     private final java.util.Map<Thread, Long> threadStreams = new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.List<Long> extraStreams = new java.util.concurrent.CopyOnWriteArrayList<>();
 
+    /// The device of the engine's CUDA library at `library`, with cuBLAS and cuSOLVER from the library search path.
     public Device(Path library) {
+        this(CudaLibraries.of(library));
+    }
+
+    public Device(CudaLibraries libraries) {
+        Path library = libraries.engine();
         this.gpu = new CudaGpuMemory(library);
-        this.cuda = new Cuda(library);
+        this.cuda = new Cuda(libraries);
         Arena global = Arena.global();
         SymbolLookup engine = SymbolLookup.libraryLookup(library, global);
         Linker linker = Linker.nativeLinker();

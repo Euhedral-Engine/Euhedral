@@ -105,8 +105,8 @@ class CudaGpuMemoryIntegrationTest {
             second.close();
             assertEquals(2L << 20, gpu.pinnedPoolBytes());
 
-            ExecutionGpu.ReadbackBuffer large = gpu.allocateReadbackBuffer(CudaGpuMemory.PINNED_POOL_BYTES);
-            assertEquals(CudaGpuMemory.PINNED_POOL_BYTES, large.segment().byteSize());
+            ExecutionGpu.ReadbackBuffer large = gpu.allocateReadbackBuffer(gpu.pinnedPoolLimit());
+            assertEquals(gpu.pinnedPoolLimit(), large.segment().byteSize());
             large.close();
             assertEquals(1, gpu.pinnedPoolOverflows(), "a buffer the pool has no room for is set aside");
             assertEquals(2L << 20, gpu.pinnedPoolBytes());

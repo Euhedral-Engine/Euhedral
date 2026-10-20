@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core;
 
 import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
 import io.euhedral_execution.inference.core.settings.Settings;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -19,8 +20,8 @@ import java.util.Objects;
 /// sized for: at least 1, planned exactly as asked (weights may leave the device to make room), or 0 for as many
 /// as fit without offloading more weights than one sequence does. `kvDeviceMinimumTokens` is the tokens of each
 /// sequence's attention cache that stay on the device: when the weights and every sequence's whole cache do not fit,
-/// the
-/// pages past it live in pinned host memory before any weight leaves the device.
+/// the pages past it live in pinned host memory before any weight leaves the device. `tuning` shapes how the engine
+/// runs: batching, memory limits, host workers and kernel thresholds.
 public record InferenceConfig(
         Path artifactPath,
         Path tokenizerDirectory,
@@ -32,15 +33,10 @@ public record InferenceConfig(
         int prefixCacheCheckpointTokens,
         KvFormat kvCache,
         int maxSequences,
-        int kvDeviceMinimumTokens) {
+        int kvDeviceMinimumTokens,
+        Tuning tuning) {
     /// Prompt tokens per prefill quantum, and the grain the prefix cache's checkpoints are aligned to.
     public static final int PREFILL_CHUNK_TOKENS = 512;
-
-    /// The rows a qwen38 workspace holds per quantum, the longest prefill chunk it runs:
-    /// `euhedral.workspace.rows`, by default one prefill chunk.
-    public static int workspaceRows() {
-        return Integer.getInteger("euhedral.workspace.rows", PREFILL_CHUNK_TOKENS);
-    }
 
     public static final int DEFAULT_MAX_CONTEXT_TOKENS = 32768;
     public static final long DEFAULT_PREFIX_CACHE_BYTES = 4L << 30;
@@ -64,6 +60,7 @@ public record InferenceConfig(
                     "prefixCacheCheckpointTokens must be a positive multiple of " + PREFILL_CHUNK_TOKENS);
         if (maxSequences < 0) throw new IllegalArgumentException("maxSequences must not be negative");
         if (kvDeviceMinimumTokens <= 0) throw new IllegalArgumentException("kvDeviceMinimumTokens must be positive");
+        Objects.requireNonNull(tuning, "tuning");
     }
 
     /// The engine input the settings describe, with the native library `nativeFiles` holds.
@@ -79,7 +76,53 @@ public record InferenceConfig(
                 settings.prefixCache().checkpointTokens(),
                 settings.context().kvCacheFormat().orElse(null),
                 settings.batching().maxSequences(),
-                settings.context().kvCacheOnGpuTokens());
+                settings.context().kvCacheOnGpuTokens(),
+                settings.tuning());
+    }
+
+    /// The default tuning.
+    public InferenceConfig(
+            Path artifactPath,
+            Path tokenizerDirectory,
+            Path cudaLibraryPath,
+            BitSet workerCpus,
+            int maxContextTokens,
+            Duration shutdownTimeout,
+            long prefixCacheBytes,
+            int prefixCacheCheckpointTokens,
+            KvFormat kvCache,
+            int maxSequences,
+            int kvDeviceMinimumTokens) {
+        this(
+                artifactPath,
+                tokenizerDirectory,
+                cudaLibraryPath,
+                workerCpus,
+                maxContextTokens,
+                shutdownTimeout,
+                prefixCacheBytes,
+                prefixCacheCheckpointTokens,
+                kvCache,
+                maxSequences,
+                kvDeviceMinimumTokens,
+                Tuning.defaults());
+    }
+
+    /// This configuration with `tuning` in place of its own.
+    public InferenceConfig withTuning(Tuning tuning) {
+        return new InferenceConfig(
+                this.artifactPath,
+                this.tokenizerDirectory,
+                this.cudaLibraryPath,
+                this.workerCpus,
+                this.maxContextTokens,
+                this.shutdownTimeout,
+                this.prefixCacheBytes,
+                this.prefixCacheCheckpointTokens,
+                this.kvCache,
+                this.maxSequences,
+                this.kvDeviceMinimumTokens,
+                tuning);
     }
 
     /// The default device share of each sequence's attention cache.

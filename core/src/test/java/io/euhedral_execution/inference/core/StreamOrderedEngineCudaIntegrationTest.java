@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.SynchronousReferenceGpu;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -117,7 +118,7 @@ class StreamOrderedEngineCudaIntegrationTest {
         private SynchronousReferenceGpu gpu;
 
         @Override
-        ExecutionGpu openGpu(Path path) {
+        ExecutionGpu openGpu(Path path, Tuning tuning) {
             this.gpu = new SynchronousReferenceGpu(path);
             return this.gpu;
         }

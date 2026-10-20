@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.quantization;
 
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
+import io.euhedral_execution.inference.quantization.gpu.CudaLibraries;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
@@ -29,7 +30,7 @@ public final class Score {
             long hostBytes,
             int batch,
             int workers,
-            Path library) {}
+            CudaLibraries library) {}
 
     private Score() {}
 

@@ -12,7 +12,6 @@ import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertCacheShard;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertLease;
 import io.euhedral_execution.inference.core.model.qwen4.expert.RamTierShard;
 import io.euhedral_execution.inference.core.model.qwen4.expert.TierDirective;
-import io.euhedral_execution.inference.core.model.qwen4.loader.ResidencyPlanner;
 import io.euhedral_execution.inference.core.runtime.graph.FrameLake;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -102,9 +101,6 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
         }
     }
 
-    /// Records read from the artifact at once at most ([ResidencyPlanner#DISK_READS]).
-    static final int READS = ResidencyPlanner.DISK_READS;
-
     final ExpertCache cache;
     final FrameLake lake;
     /// Loads reading the artifact now: a physical resource, like the staging pool. The owner's fetch takes a read;
@@ -112,6 +108,8 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
     /// is offered the next record as soon as one is in, not once its copy retired.
     private final AtomicInteger reading = new AtomicInteger();
     final int readParts;
+    /// Records read from the artifact at once at most (`memory.weight-streaming.concurrent-reads`).
+    private final int reads;
     private final ExpertCacheShard.Ticket ticket = new ExpertCacheShard.Ticket();
     private final AtomicInteger inFlight = new AtomicInteger();
     private long nextSeed = HasherApi.mix(0x1a4e_0000L);
@@ -146,9 +144,11 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
     private int causeShard;
     private final Delegate delegate = new Delegate();
 
-    public ExpertCacheOwner(ExpertCache cache, FrameLake lake) {
+    public ExpertCacheOwner(ExpertCache cache, FrameLake lake, int reads) {
+        if (reads < 1) throw new IllegalArgumentException("reads must be positive");
         this.cache = cache;
         this.lake = lake;
+        this.reads = reads;
         this.readParts = cache.store().readParts();
         this.contexts = new ExpertLoad[cache.shardCount()][];
         long seed = HasherApi.mix(0x1a4e_0000L);
@@ -311,7 +311,7 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
             this.cause = Cause.PENDING;
             return Outcome.FULL;
         }
-        if (!inTier && this.reading.get() >= READS) {
+        if (!inTier && this.reading.get() >= this.reads) {
             // The disk has as many records in flight as keep it busy: this one is read once one of them is in.
             reserved.cancel();
             if (buffer >= 0) this.cache.store().releaseStaging(buffer);
@@ -382,7 +382,7 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
     /// and never waits. Called by the poll.
     public void prefetch(int bank, int[] experts, int budget) {
         for (int expert : experts) {
-            if (budget <= 0 || this.reading.get() >= READS) return;
+            if (budget <= 0 || this.reading.get() >= this.reads) return;
             int shardIndex = this.cache.shardOf(bank, expert);
             RamTierShard tier = this.cache.store().tier(shardIndex);
             if (tier == null || !tier.pinned()) return;

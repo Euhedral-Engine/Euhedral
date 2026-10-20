@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.quantization.Residency;
 import io.euhedral_execution.inference.quantization.Scorer;
+import io.euhedral_execution.inference.quantization.TestLibraries;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
@@ -53,7 +54,7 @@ class AssembleCudaIntegrationTest {
         Artifact view = Assemble.view(sources, allocation, OptionalInt.of(3));
 
         Path directory = Files.createTempDirectory(trellis.toAbsolutePath().getParent(), "mixed-");
-        try (Scorer scorer = Scorer.open(library, 6)) {
+        try (Scorer scorer = Scorer.open(TestLibraries.of(library), 6)) {
             Scorer.Result source =
                     scorer.score(trellis, ArtifactReader.read(trellis), references, ROWS, BATCH, Residency.PLANNED);
             Scorer.Result identity = scorer.score(

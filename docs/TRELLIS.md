@@ -32,8 +32,8 @@ Each trellis linear is a chain of `linear` table kernels inside the existing lin
   operand and the activations as B, one `m16n8k16` per k16 tile; larger launches take 16-row activation tiles as A.
   Both orientations give the same bits. The prepass and the epilogue run each 128-column block's Hadamard in one
   warp's registers, the same additions as the shared-memory butterfly of the scalar reference.
-- **Many rows** (at least `euhedral.trellis.whole-k-rows`): the same GEMM, each block covering 32 rows (64 from
-  `euhedral.trellis.whole-k-wide-rows`, half their split sums in registers, two blocks per SM) of a 128-column block
+- **Many rows** (at least `kernels.trellis.whole-k-min-tokens`): the same GEMM, each block covering 32 rows (64 from
+  `kernels.trellis.wide-block-min-tokens`, half their split sums in registers, two blocks per SM) of a 128-column block
   and streaming the whole K range once, adding each split's sums in split order at the split's end. The block
   stages its activation rows in shared memory four k16 tiles at a time, so its warps share one copy, and finishes
   each row's Hadamard in one warp's registers. The results are bitwise those of the split launch, with no split
@@ -53,7 +53,7 @@ Each trellis linear is a chain of `linear` table kernels inside the existing lin
   rate; each run's sums stay under 195): prefill 2,185 tokens/s at 4096 tokens, KL 0.0761 on the held-out set. A
   fixed activation scale of 2^9 in place of the block scales: prefill 2,612 tokens/s at 4096 tokens, KL 0.0776, but
   activations past 0.875 (twice the largest prepass output over two calibration sequences) would saturate.
-- **Prefill** (non-VERIFY launches above `euhedral.trellis.mma-max-rows` rows): the whole object decoded to BF16 in
+- **Prefill** (non-VERIFY launches above `kernels.trellis.tensor-core-max-tokens` rows): the whole object decoded to BF16 in
   rotated space, one row-exact BF16 GEMM per segment, and the BF16 epilogue.
 - **Exact numerics:** the scalar FP32 reference.
 
@@ -115,17 +115,17 @@ first, second and fourth shape. Measured on these shapes and not kept (each outp
 - programmatic dependent launch of the prepass, GEMMs and epilogue, the GEMM's first tiles copied before it waits:
   decode with MTP speculation 149.4 tokens/s after a 4096-token prompt (3 forks), without it 66.7 tokens/s.
 
-The defaults of the four properties are measured on this card, over the 3-bit model's object shapes with the weights
+The defaults of the four `kernels.trellis` settings are measured on this card (70 streaming multiprocessors), over the 3-bit model's object shapes with the weights
 rotated past L2:
 
-- `euhedral.trellis.target-ctas` (560): the thread blocks the tensor-core route's K split aims for. The trellis linears
+- `target-blocks` (auto, 8 per streaming multiprocessor: 560 here): the thread blocks the tensor-core route's K split aims for. The trellis linears
   of one decode step take 14.41 ms at 140, 13.20 ms at 280, 13.01 ms at 560, 13.07 ms at 840 and 13.20 ms at 1120.
-- `euhedral.trellis.whole-k-rows` (64): the fewest rows for which each block runs every K split itself. With split
+- `whole-k-min-tokens` (64): the fewest rows for which each block runs every K split itself. With split
   partials and with whole-K blocks of 32 rows, one step takes 48.6 and 59.4 ms at 48 rows, 56.5 and 64.9 ms at 56, and
   64.4 and 60.4 ms at 64.
-- `euhedral.trellis.whole-k-wide-rows` (128): the fewest rows for which those blocks cover 64 rows. With blocks of 32
+- `wide-block-min-tokens` (128): the fewest rows for which those blocks cover 64 rows. With blocks of 32
   and of 64 rows, one step takes 74.4 and 77.6 ms at 80 rows, 77.6 and 83.7 ms at 96, 102.9 and 101.7 ms at 128, and
   364.2 and 319.1 ms at 512.
-- `euhedral.trellis.mma-max-rows` (512): the most rows a launch other than a verification keeps on the tensor-core route.
+- `tensor-core-max-tokens` (512): the most rows a launch other than a verification keeps on the tensor-core route.
   The tensor-core route prefills 512-row chunks at 2773 tokens/s and the prefill route at 490, so every chunk of the
   default workspace stays on the tensor-core route and the residency plan reserves no prefill scratch.

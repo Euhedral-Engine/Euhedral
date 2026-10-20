@@ -7,6 +7,7 @@ import io.euhedral_execution.inference.quantization.checkpoint.ResumeFile;
 import io.euhedral_execution.inference.quantization.checkpoint.Safetensors;
 import io.euhedral_execution.inference.quantization.gptq.QuantState;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
+import io.euhedral_execution.inference.quantization.gpu.CudaLibraries;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import io.euhedral_execution.inference.quantization.gpu.Upload;
 import io.euhedral_execution.inference.quantization.lattice.GpuCompletions;
@@ -118,7 +119,7 @@ public final class ModelTraining {
     }
 
     /// Starts the run as lattice frames and waits for it: nothing else runs on the calling thread.
-    public static void run(Settings settings, Path library) throws Exception {
+    public static void run(Settings settings, CudaLibraries library) throws Exception {
         try (Safetensors store = Safetensors.open(settings.model());
                 Device device = new Device(library);
                 CalibrationLattice lattice = CalibrationLattice.start(6)) {

@@ -190,7 +190,7 @@ at the copy rate: 2.15 GB in 52 ms is 41 GB/s, against 43.7 GB/s for bare copies
 
 ## Disk-backed weights
 
-Weights the device cannot hold go to pinned host memory only up to the host budget (`EUHEDRAL_HOST_MEMORY_MIB`, or what the
+Weights the device cannot hold go to pinned host memory only up to the host budget (`memory.host-limit`, or what the
 machine can spare: `HostBudget`); the rest of the selection stays in the artifact file and is read on every use. This works for
 every staged format: Q3/Q4/Q5 grouped, NVFP4 and NVFP4-SD4 projections (P2E2 is never staged).
 

@@ -14,6 +14,7 @@ import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.Tunings;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.file.Files;
@@ -53,16 +54,7 @@ class Bf16BaselineCudaIntegrationTest {
         Path artifact = Path.of(artifactProperty);
         Path tokenizer = Path.of(System.getProperty("euhedral.qwen.tokenizer-dir"));
         Path lib = Path.of(library);
-        // A fixed test parameter: 24 GiB of pinned host memory leaves 19550 MiB of the weights to be read from disk.
-        String budget = "euhedral.residency.host-budget-bytes";
-        String previous = System.getProperty(budget);
-        System.setProperty(budget, Long.toString(24L << 30));
-        try {
-            run(artifact, tokenizer, lib);
-        } finally {
-            if (previous == null) System.clearProperty(budget);
-            else System.setProperty(budget, previous);
-        }
+        run(artifact, tokenizer, lib);
     }
 
     private static void run(Path artifact, Path tokenizer, Path lib) throws Exception {
@@ -83,14 +75,17 @@ class Bf16BaselineCudaIntegrationTest {
 
     private static InferenceConfig config(Path artifact, Path tokenizer, Path library, long prefixCacheBytes) {
         return new InferenceConfig(
-                artifact,
-                tokenizer,
-                library,
-                SystemInfo.getPCpuSet(),
-                4096,
-                Duration.ofSeconds(60),
-                prefixCacheBytes,
-                2048);
+                        artifact,
+                        tokenizer,
+                        library,
+                        SystemInfo.getPCpuSet(),
+                        4096,
+                        Duration.ofSeconds(60),
+                        prefixCacheBytes,
+                        2048)
+                // A fixed test parameter: 24 GiB of pinned host memory leaves 19550 MiB of the weights to be read
+                // from disk.
+                .withTuning(Tunings.hostWeightsLimit(24L << 30));
     }
 
     private static List<Integer> decode(InferenceEngine engine, boolean speculation) throws Exception {

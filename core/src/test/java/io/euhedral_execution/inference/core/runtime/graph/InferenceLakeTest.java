@@ -9,6 +9,8 @@ import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeReceiver;
 import io.euhedral_execution.core.generics.LatticeSource;
 import io.euhedral_execution.core.generics.LatticeTerminal;
+import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
+import io.euhedral_execution.inference.core.settings.HostSettings;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -243,7 +245,7 @@ class InferenceLakeTest {
     @Test
     void framesOfOneOwnerLeaveTheLakeInPublicationOrder() {
         var lattice = new Recording();
-        InferenceLake lake = io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime.newLake(lattice);
+        InferenceLake lake = EuhedralInferenceRuntime.newLake(lattice, HostSettings.defaults());
         for (int i = 0; i < 2000; i++) lake.publish(new Owned(0x5eed_0001L, i));
         List<Owned> owned = drainOwned(lattice);
         assertEquals(2000, owned.size());
@@ -253,7 +255,7 @@ class InferenceLakeTest {
     @Test
     void chainsOfTwoOwnersKeepTheirOwnOrder() {
         var lattice = new Recording();
-        InferenceLake lake = io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime.newLake(lattice);
+        InferenceLake lake = EuhedralInferenceRuntime.newLake(lattice, HostSettings.defaults());
         for (int i = 0; i < 2000; i++) lake.publish(new Owned(i % 2 == 0 ? 0xa11cL : 0xb0bL, i));
         int lastA = -1, lastB = -1;
         for (Owned frame : drainOwned(lattice)) {

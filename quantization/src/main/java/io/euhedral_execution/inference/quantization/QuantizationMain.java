@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.quantization;
 
 import io.euhedral_execution.inference.quantization.gptq.Gptq;
+import io.euhedral_execution.inference.quantization.gpu.CudaLibraries;
 import io.euhedral_execution.inference.quantization.mixed.Allocation;
 import io.euhedral_execution.inference.quantization.mixed.Assemble;
 import io.euhedral_execution.inference.quantization.mixed.Cost;
@@ -23,6 +24,7 @@ import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalInt;
 
 /// Command line of the quantization tools:
@@ -70,6 +72,10 @@ import java.util.OptionalInt;
 /// [--holdout 50] [--evaluate-every 50] [--limit N] [--library LIBEUHEDRAL_CUDA]
 /// export-drafter --model CHECKPOINT --artifact BASE_ARTIFACT --out ARTIFACT [--parameters PARAMETERS.bin]
 /// ```
+///
+/// Every command that runs on the GPU takes `--library` (the engine's CUDA library, by default the build's
+/// `build/native/linux-x64/lib/libeuhedral_cuda.so`) and `--cuda-libraries DIR`, the directory of cuBLAS and
+/// cuSOLVER (by default the library search path); the Gradle `run` task passes the module's download.
 public final class QuantizationMain {
 
     private QuantizationMain() {}
@@ -150,9 +156,9 @@ public final class QuantizationMain {
             else if (key.equals("--source")) artifacts.add(value);
             else options.put(key.substring(2), value);
         }
-        String library = options.getOrDefault(
-                "library",
-                System.getProperty("euhedral.cuda.library", "build/native/linux-x64/lib/libeuhedral_cuda.so"));
+        CudaLibraries library = new CudaLibraries(
+                Path.of(options.getOrDefault("library", "build/native/linux-x64/lib/libeuhedral_cuda.so")),
+                Optional.ofNullable(options.get("cuda-libraries")).map(Path::of));
         if (args[0].equals("allocate")) {
             allocate(options, references, artifacts, library);
             return;
@@ -165,7 +171,7 @@ public final class QuantizationMain {
                         options.getOrDefault("rows", "1,2,3,4,5,6,512").split(","))
                     rows.add(Integer.parseInt(count.trim()));
                 Cost.run(
-                        Path.of(library),
+                        library,
                         Sources.open(sources, Option.of(required(options, "base"))),
                         rows,
                         Path.of(required(options, "out")),
@@ -205,7 +211,7 @@ public final class QuantizationMain {
                             Integer.parseInt(options.getOrDefault("accumulate", "8")),
                             !options.containsKey("fp32"),
                             Integer.parseInt(options.getOrDefault("batch", "4"))),
-                    Path.of(library));
+                    library);
             return;
         }
         if (args[0].equals("train-blocks")) {
@@ -227,7 +233,7 @@ public final class QuantizationMain {
                             Integer.parseInt(options.getOrDefault("batch", "4")),
                             Path.of(required(options, "out")),
                             options.containsKey("overlay") ? Path.of(options.get("overlay")) : null),
-                    Path.of(library));
+                    library);
             return;
         }
         if (args[0].equals("generate")) {
@@ -244,7 +250,7 @@ public final class QuantizationMain {
                             workers(options),
                             Integer.parseInt(options.getOrDefault("limit", "0")),
                             Double.parseDouble(options.getOrDefault("greedy-fraction", "0.25")),
-                            Path.of(library)));
+                            library));
             return;
         }
         if (args[0].equals("export-drafter")) {
@@ -273,7 +279,7 @@ public final class QuantizationMain {
                             Integer.parseInt(options.getOrDefault("holdout", "50")),
                             Integer.parseInt(options.getOrDefault("evaluate-every", "50")),
                             Integer.parseInt(options.getOrDefault("limit", "0"))),
-                    Path.of(library));
+                    library);
             return;
         }
         if (args[0].equals("reference")) {
@@ -289,7 +295,7 @@ public final class QuantizationMain {
                     Integer.parseInt(options.getOrDefault("batch", "4")),
                     hostBytes(options),
                     workers(options),
-                    Path.of(library)));
+                    library));
             return;
         }
         if (args[0].equals("rotate")) {
@@ -297,7 +303,7 @@ public final class QuantizationMain {
                     Path.of(required(options, "model")),
                     Path.of(required(options, "out")),
                     Long.parseLong(options.getOrDefault("seed", "1")),
-                    Path.of(library)));
+                    library));
             return;
         }
         if (args[0].equals("score")) {
@@ -314,7 +320,7 @@ public final class QuantizationMain {
                     hostBytes(options),
                     Integer.parseInt(options.getOrDefault("batch", "4")),
                     workers(options),
-                    Path.of(library)));
+                    library));
             return;
         }
         String format = options.getOrDefault("format", "gptq");
@@ -355,7 +361,7 @@ public final class QuantizationMain {
                         "viterbi-scratch-mib", Long.toString(TrellisQuantizer.DEFAULT_VITERBI_SCRATCH_BYTES >> 20))),
                 Long.parseLong(options.getOrDefault("memory-reserve-mib", "1024")),
                 Long.parseLong(options.getOrDefault("write-buffer-mib", "16")));
-        Calibrate.run(settings, Path.of(library));
+        Calibrate.run(settings, library);
     }
 
     private static Map<Option, Path> sourcesOf(List<String> artifacts) {
@@ -377,7 +383,7 @@ public final class QuantizationMain {
 
     /// The search over allocations: the free device memory is measured once, here, after the device is open.
     private static void allocate(
-            Map<String, String> options, List<String> references, List<String> artifacts, String library)
+            Map<String, String> options, List<String> references, List<String> artifacts, CudaLibraries library)
             throws Exception {
         Sources sources = Sources.open(sourcesOf(artifacts), Option.of(required(options, "base")));
         List<Path> referencePaths = references.stream().map(Path::of).toList();
@@ -388,7 +394,7 @@ public final class QuantizationMain {
         int scoreRows = Integer.parseInt(options.getOrDefault("score-rows", "8"));
         int scoreBatch = Integer.parseInt(options.getOrDefault("score-batch", "0"));
         long hostBytes = hostBytes(options);
-        try (Scorer scorer = Scorer.open(Path.of(library), workers)) {
+        try (Scorer scorer = Scorer.open(library, workers)) {
             long free = options.containsKey("free-mib")
                     ? Long.parseLong(options.get("free-mib")) << 20
                     : scorer.freeDeviceBytes();

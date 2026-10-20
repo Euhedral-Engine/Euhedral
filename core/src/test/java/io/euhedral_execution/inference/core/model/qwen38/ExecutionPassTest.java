@@ -13,6 +13,7 @@ import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
 import io.euhedral_execution.inference.core.runtime.graph.FrameSeeds;
+import io.euhedral_execution.inference.core.testing.Tunings;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -277,8 +278,13 @@ class ExecutionPassTest {
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
     void aStepOverThePassRowCapRunsAloneAndWedgesNothing() throws Exception {
         var plan = plan();
-        var execution =
-                new Execution(new PullingLattice(), plan, new EngineExecutionFixture.SamplingGpu(8), 1, false, 4);
+        var execution = new Execution(
+                new PullingLattice(),
+                plan,
+                new EngineExecutionFixture.SamplingGpu(8),
+                1,
+                false,
+                Tunings.prefillChunkTokens(4));
         var a = new Sequence(1);
         var b = new Sequence(2);
         try {

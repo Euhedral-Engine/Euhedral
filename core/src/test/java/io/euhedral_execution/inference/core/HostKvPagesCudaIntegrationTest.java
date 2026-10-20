@@ -17,12 +17,14 @@ import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import io.euhedral_execution.inference.core.state.KvHostPages;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.Tunings;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -40,7 +42,6 @@ class HostKvPagesCudaIntegrationTest {
     private static final int DEVICE_TOKENS = 1024;
     private static final int PROMPT_TOKENS = 3000;
     private static final int NEW_TOKENS = 48;
-    private static final String BUDGET = "euhedral.residency.device-budget-bytes";
 
     @Test
     @Timeout(value = 30, unit = TimeUnit.MINUTES, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
@@ -88,20 +89,20 @@ class HostKvPagesCudaIntegrationTest {
     /// engine keeps in host memory.
     private static Runs generate(String artifact, String tokenizer, String library, int deviceTokens, Long budget)
             throws Exception {
-        String previous = System.getProperty(BUDGET);
-        if (budget != null) System.setProperty(BUDGET, Long.toString(budget));
         var config = new InferenceConfig(
-                Path.of(artifact),
-                Path.of(tokenizer),
-                Path.of(library),
-                SystemInfo.getPCpuSet(),
-                CONTEXT_TOKENS,
-                Duration.ofSeconds(30),
-                0,
-                2048,
-                null,
-                1,
-                deviceTokens);
+                        Path.of(artifact),
+                        Path.of(tokenizer),
+                        Path.of(library),
+                        SystemInfo.getPCpuSet(),
+                        CONTEXT_TOKENS,
+                        Duration.ofSeconds(30),
+                        0,
+                        2048,
+                        null,
+                        1,
+                        deviceTokens)
+                .withTuning(Tunings.limits(
+                        budget == null ? OptionalLong.empty() : OptionalLong.of(budget), OptionalLong.empty()));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             KvHostPages pages = ((Qwen38Runtime) engine.modelRuntime()).kvHostPages();
             if (budget == null) {
@@ -121,9 +122,6 @@ class HostKvPagesCudaIntegrationTest {
                 }
             }
             return new Runs(runs, engine.hostBackedWeightBytes());
-        } finally {
-            if (previous == null) System.clearProperty(BUDGET);
-            else System.setProperty(BUDGET, previous);
         }
     }
 }

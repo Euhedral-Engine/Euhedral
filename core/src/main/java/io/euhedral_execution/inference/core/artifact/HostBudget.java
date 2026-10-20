@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.OptionalLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -21,9 +22,8 @@ import org.slf4j.LoggerFactory;
 /// By default the budget is automatic: what the machine can spare now (`MemAvailable`, or less when the process's
 /// cgroup allows less), less room for the operating system (10%, never closer than 4 GiB to exhaustion) and for the
 /// runtime itself (the JVM heap's room to grow, up to 2 GiB, a native reserve and the page cache of the n-gram rows).
-/// `EUHEDRAL_HOST_MEMORY_MIB` (or the system
-/// property `euhedral.host.memory-mib`) states the budget instead, in MiB, and is respected as stated: it may be
-/// smaller than the automatic one (0 means no RAM tier) or larger (a warning says so, as the memory is not free now).
+/// `memory.host-limit` of the settings states the budget instead, in bytes, and is respected as stated: it may be
+/// smaller than the automatic one or larger (a warning says so, as the memory is not free now).
 public record HostBudget(long pinnableBytes, long residentBytes, Source source) {
 
     private static final Logger LOG = LoggerFactory.getLogger(HostBudget.class);
@@ -36,16 +36,15 @@ public record HostBudget(long pinnableBytes, long residentBytes, Source source) 
 
     /// The most the JVM heap is expected to grow by. A server started without `-Xmx` may grow its heap to a quarter
     /// of the machine, but the engine's own heap is small (under 1 GiB with the model loaded); reserving the
-    /// whole headroom would leave the expert tier a third smaller. A larger heap is stated with
-    /// [#ENVIRONMENT].
+    /// whole headroom would leave the expert tier a third smaller. A larger heap is stated with [#SETTING].
     static final long HEAP_GROWTH_RESERVE = 2L << 30;
 
     /// The page cache the memory-mapped n-gram rows settle at in a run: 5-6 GiB of the 27 GiB tables (the kernel reads
     /// 128 KiB around each fault). Page cache is outside the budget, so the machine keeps room for it.
     static final long NGRAM_WORKING_SET = 6L << 30;
 
-    /// The variable that states the memory available to the engine, in MiB.
-    public static final String ENVIRONMENT = "EUHEDRAL_HOST_MEMORY_MIB";
+    /// The setting that states the memory available to the engine.
+    public static final String SETTING = "memory.host-limit";
 
     /// Where the resident budget came from.
     public enum Source {
@@ -78,19 +77,15 @@ public record HostBudget(long pinnableBytes, long residentBytes, Source source) 
         return new HostBudget(usable, usable, Source.AUTOMATIC);
     }
 
-    /// The budget of this machine and process: automatic, or as stated by [#ENVIRONMENT] (or the property).
-    public static HostBudget system() {
-        return system(true);
+    /// The budget of this machine and process: automatic, or `stated` bytes ([#SETTING]).
+    public static HostBudget system(OptionalLong stated) {
+        return system(stated, true);
     }
 
     /// [#system], with the n-gram rows' page cache in the runtime's reserve only when `ngramRows` (the
     /// models that read them).
-    public static HostBudget system(boolean ngramRows) {
-        return of(
-                System.getenv(ENVIRONMENT),
-                System.getProperty("euhedral.host.memory-mib"),
-                availableBytes(),
-                runtimeReserve() - (ngramRows ? 0 : NGRAM_WORKING_SET));
+    public static HostBudget system(OptionalLong stated, boolean ngramRows) {
+        return of(stated, availableBytes(), runtimeReserve() - (ngramRows ? 0 : NGRAM_WORKING_SET));
     }
 
     /// The pinned memory this budget allows: as stated when stated, else what the machine can spare.
@@ -99,26 +94,24 @@ public record HostBudget(long pinnableBytes, long residentBytes, Source source) 
     }
 
     /// As [#system] over explicit sources, with no runtime reserve.
-    static HostBudget of(String stated, String property, long availableBytes) {
-        return of(stated, property, availableBytes, 0);
+    static HostBudget of(OptionalLong stated, long availableBytes) {
+        return of(stated, availableBytes, 0);
     }
 
-    /// As [#system] over explicit sources: `stated` MiB (null: not stated), the property, the bytes the machine can
-    /// spare now (negative: unknown), and the runtime's own reserve.
-    static HostBudget of(String stated, String property, long availableBytes, long runtimeReserve) {
+    /// As [#system] over explicit sources: `stated` bytes (empty: not stated), the bytes the machine can spare now
+    /// (negative: unknown), and the runtime's own reserve.
+    static HostBudget of(OptionalLong stated, long availableBytes, long runtimeReserve) {
         long machine = availableBytes >= 0
                 ? Math.max(0, ofAvailable(availableBytes).residentBytes() - runtimeReserve)
                 : Long.MAX_VALUE / 4;
-        String value = stated != null && !stated.isBlank() ? stated : property;
-        if (value == null || value.isBlank()) return new HostBudget(machine, machine, Source.AUTOMATIC);
-        long mib = Long.parseLong(value.trim());
-        if (mib < 0) throw new IllegalArgumentException(ENVIRONMENT + " must not be negative: " + mib);
-        long bytes = mib << 20;
+        if (stated.isEmpty()) return new HostBudget(machine, machine, Source.AUTOMATIC);
+        long bytes = stated.getAsLong();
+        if (bytes < 0) throw new IllegalArgumentException(SETTING + " must not be negative: " + bytes);
         if (bytes > machine)
             LOG.warn(
-                    "{}={} MiB is more than this machine can spare now ({} MiB); it is used as stated",
-                    ENVIRONMENT,
-                    mib,
+                    "{} of {} MiB is more than this machine can spare now ({} MiB); it is used as stated",
+                    SETTING,
+                    bytes >> 20,
                     machine >> 20);
         return new HostBudget(machine, bytes, Source.EXPLICIT);
     }
@@ -194,6 +187,6 @@ public record HostBudget(long pinnableBytes, long residentBytes, Source source) 
         return (this.residentBytes >> 20) + " MiB, "
                 + (this.source == Source.AUTOMATIC
                         ? "automatic (available memory less the system's and the runtime's reserves)"
-                        : "stated by " + ENVIRONMENT);
+                        : "stated by " + SETTING);
     }
 }

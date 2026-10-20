@@ -54,11 +54,6 @@ public final class LinearFormats {
                 .orElseThrow(() -> unsupported(handle.format(), handle.layout(), handle.name()));
     }
 
-    /// The knobs the registered trellis format runs with.
-    public static TrellisSettings trellisSettings() {
-        return TRELLIS.settings();
-    }
-
     public static List<LinearFormat> all() {
         return ALL;
     }

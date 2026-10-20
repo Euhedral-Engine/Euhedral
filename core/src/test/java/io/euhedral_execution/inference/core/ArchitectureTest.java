@@ -460,6 +460,82 @@ class ArchitectureTest {
         assertTrue(stale.isEmpty(), "no longer imports a model, remove from the list: " + stale);
     }
 
+    /// A read of a system property or an environment variable.
+    static final Pattern SETTING_READ = Pattern.compile("System\\.getProperty\\(|System\\.getenv\\("
+            + "|Integer\\.getInteger\\(|Long\\.getLong\\(|Boolean\\.getBoolean\\(");
+
+    /// Reads of the platform, not settings: the runtime identity the engine logs, and the operating system that
+    /// chooses the asynchronous read backend and the pageable memory's advice. As `path` to names on the read's
+    /// line.
+    static final Map<String, Set<String>> PLATFORM_READS = Map.of(
+            "InferenceEngine.java", Set.of("\"java.vendor\"", "\"java.vm.name\"", "\"os.name\"", "\"os.arch\""),
+            "runtime/graph/AsyncReads.java", Set.of("\"os.name\""),
+            "model/qwen4/expert/PageableMemory.java", Set.of("\"os.name\""));
+
+    /// Experiment switches that are deleted next, with the paths they switch off. Temporary: the list only shrinks.
+    static final Map<String, Set<String>> SWITCHES_REMOVED_NEXT = Map.of(
+            "InferenceEngine.java", Set.of("MAP_OUTPUT_HEAD"),
+            "model/qwen38/loader/ResidencyPlanner.java", Set.of("MAP_OUTPUT_HEAD"),
+            "runtime/EuhedralInferenceRuntime.java", Set.of("EUHEDRAL_CUDA_GRAPHS"),
+            "model/qwen4/Ops.java", Set.of("EUHEDRAL_QWEN4_LINEAR_TC", "EUHEDRAL_QWEN4_LINEAR_SPLIT"),
+            "model/qwen4/Qwen4Model.java",
+                    Set.of(
+                            "EUHEDRAL_QWEN4_TIER_POLICY",
+                            "EUHEDRAL_QWEN4_TIER_PRELOAD",
+                            "EUHEDRAL_QWEN4_GPU_POLICY",
+                            "EUHEDRAL_QWEN4_PIN_TIER",
+                            "EUHEDRAL_QWEN4_TIER_ADMISSION"),
+            "model/qwen4/ExpertCacheOwner.java", Set.of("EUHEDRAL_QWEN4_PREFETCH", "EUHEDRAL_QWEN4_AHEAD"),
+            "model/qwen4/Shape.java", Set.of("EUHEDRAL_QWEN4_GROUP"),
+            "model/qwen4/expert/FileRecordSource.java", Set.of("EUHEDRAL_QWEN4_DIRECT_READS"));
+
+    /// Each read of a property or a variable in the core outside the settings and the native files, as
+    /// `path:line: code`, with the names an exception may match on that line.
+    private static List<String[]> settingReads() throws IOException {
+        List<String[]> reads = new ArrayList<>();
+        try (Stream<Path> walk = Files.walk(MAIN)) {
+            for (Path file : walk.filter(p -> p.toString().endsWith(".java")).toList()) {
+                String path = relative(file);
+                if (path.startsWith("settings/") || path.startsWith("nativefiles/")) continue;
+                List<String> lines = Files.readAllLines(file);
+                for (int i = 0; i < lines.size(); i++) {
+                    String code = lines.get(i).strip();
+                    if (code.startsWith("//") || code.startsWith("*")) continue;
+                    if (SETTING_READ.matcher(code).find()) reads.add(new String[] {path, (i + 1) + "", code});
+                }
+            }
+        }
+        return reads;
+    }
+
+    private static boolean excepted(Map<String, Set<String>> exceptions, String path, String code) {
+        return exceptions.getOrDefault(path, Set.of()).stream().anyMatch(code::contains);
+    }
+
+    /// Settings come from the settings file and its variables, read once by the settings loader; nothing else in
+    /// the core reads a system property or an environment variable, but for the platform and the switches listed.
+    @Test
+    void onlyTheSettingsReadPropertiesAndVariables() throws IOException {
+        List<String> violations = new ArrayList<>();
+        for (String[] read : settingReads())
+            if (!excepted(PLATFORM_READS, read[0], read[2]) && !excepted(SWITCHES_REMOVED_NEXT, read[0], read[2]))
+                violations.add(read[0] + ":" + read[1] + ": " + read[2]);
+        assertTrue(violations.isEmpty(), "reads outside the settings:\n" + String.join("\n", violations));
+    }
+
+    /// Exceptions that match no read must leave the lists, so they only shrink.
+    @Test
+    void theSettingReadExceptionsNameRealReads() throws IOException {
+        List<String[]> reads = settingReads();
+        List<String> stale = new ArrayList<>();
+        for (var exceptions : List.of(PLATFORM_READS, SWITCHES_REMOVED_NEXT))
+            for (var entry : exceptions.entrySet())
+                for (String name : entry.getValue())
+                    if (reads.stream().noneMatch(r -> r[0].equals(entry.getKey()) && r[2].contains(name)))
+                        stale.add(entry.getKey() + ": " + name);
+        assertTrue(stale.isEmpty(), "no longer read, remove from the list: " + stale);
+    }
+
     /// A source path relative to the main tree, with forward slashes on every platform.
     private static String relative(Path file) {
         return MAIN.relativize(file).toString().replace('\\', '/');

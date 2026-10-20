@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.gpu;
 
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
+import io.euhedral_execution.inference.core.artifact.format.TrellisSettings;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -25,6 +26,11 @@ public abstract class ExecutionGpu implements GpuMemory {
         public void close() {
             release.run();
         }
+    }
+
+    /// The trellis kernels' thresholds on this device; the defaults for a GPU that states none.
+    public TrellisSettings trellisSettings() {
+        return TrellisSettings.defaults();
     }
 
     /// Bytes of released pinned host buffers kept for reuse; 0 for a GPU that keeps none.

@@ -12,6 +12,8 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.HostTasks;
 import io.euhedral_execution.inference.core.runtime.graph.InferenceLake;
+import io.euhedral_execution.inference.core.settings.HostSettings;
+import io.euhedral_execution.inference.core.settings.WeightStreamingSettings;
 import java.time.Duration;
 import java.util.BitSet;
 
@@ -79,7 +81,7 @@ public final class TestLattice implements AutoCloseable {
         ControlPlaneLattice lattice =
                 ControlPlaneLattice.getOrCreate(new LatticeConfig("TestLattice", cpus, Duration.ofSeconds(10), shard));
         lattice.start();
-        InferenceLake lake = EuhedralInferenceRuntime.newLake(lattice);
+        InferenceLake lake = EuhedralInferenceRuntime.newLake(lattice, HostSettings.defaults());
         return new TestLattice(lattice, lake, new HostTasks(lake), cpus);
     }
 
@@ -106,7 +108,7 @@ public final class TestLattice implements AutoCloseable {
                 this.lake,
                 gpu,
                 EuhedralInferenceRuntime.Lanes.of(
-                        Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_LANES", "2"))),
+                        WeightStreamingSettings.defaults().gpuStreams()),
                 1);
         try {
             return new Run(runtime, new ExecutionPlan(gpu, model, maxContextTokens, runtime));

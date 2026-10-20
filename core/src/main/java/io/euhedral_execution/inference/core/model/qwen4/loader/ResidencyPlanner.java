@@ -4,6 +4,7 @@ import io.euhedral_execution.inference.core.artifact.HostBudget;
 import io.euhedral_execution.inference.core.artifact.WeightStaging;
 import io.euhedral_execution.inference.core.model.qwen4.Qwen4Config;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertBank;
+import io.euhedral_execution.inference.core.settings.MemorySettings;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -42,14 +43,6 @@ public final class ResidencyPlanner {
     /// The CUDA context, kernel modules and graph pools that exist beside the model (about 0.9 GiB
     /// measured on the dense model's engine, docs/NVFP4_RESIDENCY.md).
     public static final long KERNEL_RESERVE_BYTES = 1024L << 20;
-
-    /// Device memory left free for the rest of the system (the desktop and other programs on the GPU), which the
-    /// plan never fills: 700 MiB, or `EUHEDRAL_GPU_SYSTEM_RESERVE_MIB`.
-    public static final long SYSTEM_RESERVE_BYTES =
-            Long.parseLong(System.getenv().getOrDefault("EUHEDRAL_GPU_SYSTEM_RESERVE_MIB", "700")) << 20;
-
-    /// What the plan keeps beside the model: the runtime's own memory and the system's share.
-    static final long RUNTIME_RESERVE_BYTES = KERNEL_RESERVE_BYTES + SYSTEM_RESERVE_BYTES;
 
     /// The shared expert's width as a prefill's down projection reads it: a multiple of 256, as the native NVFP4
     /// kernels need for more than 64 rows (they fetch the weight scales 256 values at a time).
@@ -93,23 +86,34 @@ public final class ResidencyPlanner {
         return 2 * config.moe().expertsPerToken();
     }
 
-    /// Records read from the artifact at once at most. A load holds its read only while it reads, and the disk
-    /// reads fastest with a few records in flight: past about 30 MB it slows down (docs/FLASH_NEXT_DISK.md).
-    /// `EUHEDRAL_QWEN4_READS` overrides it for benchmarks.
-    public static final int DISK_READS = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_READS", "8"));
-
     /// Pinned staging slots when expert records pass through the host from the artifact file: one per read the disk
-    /// has in flight ([#DISK_READS]) but no more than a layer has experts, as each load holds its slot until its
-    /// copy retires, and at least two tokens' experts.
-    public static int fileStagingSlots(Qwen4Config config) {
+    /// has in flight (`concurrentReads`, `memory.weight-streaming.concurrent-reads`) but no more than a layer has
+    /// experts, as each load holds its slot until its copy retires, and at least two tokens' experts.
+    public static int fileStagingSlots(Qwen4Config config, int concurrentReads) {
         return Math.max(
-                Math.min(DISK_READS, config.moe().numExperts()),
+                Math.min(concurrentReads, config.moe().numExperts()),
                 2 * config.moe().expertsPerToken());
     }
 
+    /// Plans with the default memory settings ([MemorySettings#defaults]).
     public static ResidencyPlan plan(
             Artifact artifact, Mode mode, long freeBytes, HostBudget host, int maxContextTokens) {
+        return plan(artifact, mode, freeBytes, host, maxContextTokens, MemorySettings.defaults());
+    }
+
+    /// Plans the residency of `artifact` in `mode` for a context of `maxContextTokens` on a device with `freeBytes`
+    /// free and the `host` budget. Beside the model the plan keeps the runtime's own memory and
+    /// `memory.gpu-reserve` left free for the rest of the system (the desktop and other programs on the GPU), and
+    /// stages one record per read `memory.weight-streaming.concurrent-reads` has in flight.
+    public static ResidencyPlan plan(
+            Artifact artifact,
+            Mode mode,
+            long freeBytes,
+            HostBudget host,
+            int maxContextTokens,
+            MemorySettings memory) {
         Qwen4Config config = artifact.config();
+        long runtimeReserve = KERNEL_RESERVE_BYTES + memory.gpuReserve();
         if (maxContextTokens <= 0) throw new IllegalArgumentException("maxContextTokens must be positive");
 
         // What each object is for this mode.
@@ -168,7 +172,7 @@ public final class ResidencyPlanner {
         // The workspace counts the shared expert's padded down projections, which the plan keeps beside it.
         long padding = sharedDownPaddingBytes(config);
         long workspace = SequenceState.workspaceBytes(config) + padding;
-        long reserved = RUNTIME_RESERVE_BYTES + workspace + kv + indexer + gdn;
+        long reserved = runtimeReserve + workspace + kv + indexer + gdn;
 
         // The token embedding is a gather: its rows are read in place from pinned host memory.
         long pinnedLeft = host.pinnableBytes();
@@ -221,7 +225,7 @@ public final class ResidencyPlanner {
                             + "takes %d MiB: %d MiB in all against %d MiB free",
                     maxContextTokens,
                     (kv + indexer + gdn + workspace) >> 20,
-                    RUNTIME_RESERVE_BYTES >> 20,
+                    runtimeReserve >> 20,
                     (fixedBytes - movableBytes) >> 20,
                     need >> 20,
                     ring >> 20,
@@ -260,7 +264,7 @@ public final class ResidencyPlanner {
             chunk = candidate;
         }
         workspace = SequenceState.workspaceBytes(config, chunk) + padding;
-        reserved = RUNTIME_RESERVE_BYTES + workspace + kv + indexer + gdn;
+        reserved = runtimeReserve + workspace + kv + indexer + gdn;
         long cacheBudget = freeBytes - need - reserved;
         ExpertCacheGeometry geometry = ExpertCacheGeometry.derive(cacheBudget, slotBytes, totalExperts, minimumSlots);
         long cacheBytes = geometry.bytes();
@@ -272,7 +276,8 @@ public final class ResidencyPlanner {
         long mapped = (embeddingMapped ? embedding.byteSize() : 0) + selection.mappedBytes;
         long staged = selection.stagedBytes;
         pinnedLeft -= selection.stagedBytes + selection.mappedBytes;
-        long stagingPinned = fileStagingSlots(config) * alignUp(slotBytes, 4096);
+        long stagingPinned =
+                fileStagingSlots(config, memory.weightStreaming().concurrentReads()) * alignUp(slotBytes, 4096);
         pinnedLeft -= stagingPinned;
         if (pinnedLeft < 0 && problem == null)
             problem = "the host cannot pin " + ((host.pinnableBytes() - pinnedLeft) >> 20)
@@ -310,7 +315,7 @@ public final class ResidencyPlanner {
         }
 
         var device = new ResidencyPlan.Device(
-                freeBytes, kv, indexer, gdn, workspace, RUNTIME_RESERVE_BYTES, resident, ring, cacheBytes, slack);
+                freeBytes, kv, indexer, gdn, workspace, runtimeReserve, resident, ring, cacheBytes, slack);
         var hostPlan = new ResidencyPlan.Host(
                 mapped,
                 staged,

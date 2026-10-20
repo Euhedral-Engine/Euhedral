@@ -65,7 +65,9 @@ public interface LinearFormat {
         return rows(object, first, rows, name, gpu);
     }
 
-    default long planScratchBytes(TensorDescriptor descriptor, int maxRows) {
+    /// The scratch an object of `descriptor` needs at `maxRows` rows, planned before any launch with the trellis
+    /// thresholds `trellis` (the formats that have none ignore them).
+    default long planScratchBytes(TensorDescriptor descriptor, int maxRows, TrellisSettings trellis) {
         return 0;
     }
 

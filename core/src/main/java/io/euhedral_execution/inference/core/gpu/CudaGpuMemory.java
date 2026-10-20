@@ -4,7 +4,9 @@ import io.euhedral_execution.data_structures.queues.MpmcQueue;
 import io.euhedral_execution.hardware_utils.util.OSName;
 import io.euhedral_execution.inference.core.artifact.P2e2Layout;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
+import io.euhedral_execution.inference.core.artifact.format.TrellisSettings;
 import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -113,7 +115,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final AtomicInteger openStreams = new AtomicInteger();
     private final AtomicReference<Throwable> poisoned = new AtomicReference<>();
     private final MpmcQueue<Long> availableEvents = new MpmcQueue<>(64, 4);
-    /// Released pinned buffers by size class ([#pinnedCapacity]), kept for reuse up to [#PINNED_POOL_BYTES] in all:
+    /// Released pinned buffers by size class ([#pinnedCapacity]), kept for reuse up to [#pinnedPoolLimit] in all:
     /// freeing pinned memory synchronizes the device, which holds the freeing worker until the device is idle.
     private final ConcurrentHashMap<Long, ConcurrentLinkedQueue<MemorySegment>> pinnedPool = new ConcurrentHashMap<>();
     /// Bytes held in [#pinnedPool].
@@ -209,9 +211,23 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final java.util.concurrent.atomic.AtomicLong scratchFallbacks =
             new java.util.concurrent.atomic.AtomicLong();
     private volatile boolean closed;
+    /// The most bytes of released pinned buffers kept for reuse ([#pinnedPool]).
+    private final long pinnedPoolLimit;
+    /// The trellis kernels' thresholds on this device.
+    private final TrellisSettings trellisSettings;
 
+    /// The CUDA library at `libraryPath`, with the default tuning.
     public CudaGpuMemory(Path libraryPath) {
+        this(libraryPath, Tuning.defaults());
+    }
+
+    /// The CUDA library at `libraryPath`, keeping up to `memory.pinned-buffer-pool` of released pinned buffers (by
+    /// default 1/256 of the machine's memory, at least 64 MiB) and running the trellis kernels with
+    /// `kernels.trellis` on this device.
+    public CudaGpuMemory(Path libraryPath, Tuning tuning) {
         Objects.requireNonNull(libraryPath, "libraryPath");
+        Objects.requireNonNull(tuning, "tuning");
+        this.pinnedPoolLimit = tuning.memory().pinnedBufferPool().orElseGet(CudaGpuMemory::defaultPinnedPoolBytes);
         Arena loadedLibraryArena = Arena.ofShared();
         try {
             SymbolLookup symbols;
@@ -624,6 +640,15 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     bind(linker, symbols, "euhedral_cuda_attention_causal_bf16", ATTENTION_CAUSAL_NVFP4);
             if (!q3MxAvailable() || !nvfp4NativeAvailable())
                 throw new GpuMemoryException("an NVIDIA Blackwell GPU (compute capability 12.x) is required");
+            MethodHandle multiprocessorCount = bind(linker, symbols, "euhedral_cuda_multiprocessor_count", FREE);
+            int multiprocessors;
+            try (Arena local = Arena.ofConfined()) {
+                MemorySegment count = local.allocate(ValueLayout.JAVA_INT);
+                int status = (int) multiprocessorCount.invokeExact(count);
+                if (status != 0) throw new GpuMemoryException("CUDA multiprocessor count query", status);
+                multiprocessors = count.get(ValueLayout.JAVA_INT, 0);
+            }
+            this.trellisSettings = TrellisSettings.of(tuning.kernels().trellis(), multiprocessors);
         } catch (RuntimeException exception) {
             loadedLibraryArena.close();
             throw exception;
@@ -1133,10 +1158,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     /// full-attention layer until it retires. Released buffers are kept ([#pinnedPool]).
     private static final long PINNED_CACHE_BYTES = 64 * 1024;
 
-    /// The most bytes of released pinned buffers kept for reuse (`euhedral.cuda.pinned-pool-bytes`); by default
-    /// 1/256 of the machine's memory, at least 64 MiB. A buffer released beyond it is freed.
-    static final long PINNED_POOL_BYTES = Long.getLong("euhedral.cuda.pinned-pool-bytes", defaultPinnedPoolBytes());
-
+    /// The default most bytes of released pinned buffers kept for reuse: 1/256 of the machine's memory, at least
+    /// 64 MiB. A buffer released beyond the limit is freed.
     private static long defaultPinnedPoolBytes() {
         long total = 0;
         if (java.lang.management.ManagementFactory.getOperatingSystemMXBean()
@@ -1149,6 +1172,16 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (byteSize <= PINNED_CACHE_BYTES) return PINNED_CACHE_BYTES;
         long capacity = Long.highestOneBit(byteSize);
         return capacity == byteSize ? capacity : Math.multiplyExact(capacity, 2);
+    }
+
+    /// The most bytes of released pinned buffers kept for reuse.
+    long pinnedPoolLimit() {
+        return this.pinnedPoolLimit;
+    }
+
+    @Override
+    public TrellisSettings trellisSettings() {
+        return this.trellisSettings;
     }
 
     /// Bytes of released pinned buffers kept for reuse.
@@ -1225,7 +1258,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private void releasePinned(MemorySegment allocation) {
         long capacity = allocation.byteSize();
         pageLocked.remove(allocation.address());
-        if (pinnedPoolBytes.addAndGet(capacity) > PINNED_POOL_BYTES) {
+        if (pinnedPoolBytes.addAndGet(capacity) > this.pinnedPoolLimit) {
             pinnedPoolBytes.addAndGet(-capacity);
             pinnedPoolOverflows.incrementAndGet();
             pinnedExcess.offer(allocation);

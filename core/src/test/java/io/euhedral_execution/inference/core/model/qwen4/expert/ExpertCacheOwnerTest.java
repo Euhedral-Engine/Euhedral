@@ -11,6 +11,7 @@ import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.model.qwen4.ExpertCacheOwner;
 import io.euhedral_execution.inference.core.runtime.graph.AsyncReads;
 import io.euhedral_execution.inference.core.runtime.graph.FrameLake;
+import io.euhedral_execution.inference.core.settings.WeightStreamingSettings;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -63,7 +64,8 @@ class ExpertCacheOwnerTest {
     private void build(int slots, FileExpertStore store) {
         var transfer = new GpuExpertTransfer(this.gpu, 1);
         this.cache = new ExpertCache(store, transfer, this.gpu, slots, this.fixture.slotBytes(), 1);
-        this.owner = new ExpertCacheOwner(this.cache, this.lake);
+        this.owner = new ExpertCacheOwner(
+                this.cache, this.lake, WeightStreamingSettings.defaults().concurrentReads());
     }
 
     /// The pool of ready work: it collects what is published, from any thread.

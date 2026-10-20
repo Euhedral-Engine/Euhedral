@@ -43,6 +43,8 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_host_weights_device_pointer(const void* h
 /// a negated CUDA error when the query fails.
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_memory_type(const void* address);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_device_memory_info(uint64_t* free_byte_size, uint64_t* total_byte_size);
+/// The streaming multiprocessors of the current device.
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_multiprocessor_count(int32_t* count);
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_copy_host_to_device(
         void* device_address,

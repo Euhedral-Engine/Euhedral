@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.quantization.Residency;
 import io.euhedral_execution.inference.quantization.Scorer;
+import io.euhedral_execution.inference.quantization.TestLibraries;
 import io.euhedral_execution.inference.quantization.mixed.SearchState.Measured;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -49,7 +50,7 @@ class SearchCudaIntegrationTest {
                         Option.NVFP4, property("euhedral.qwen.nvfp4-artifact")),
                 Option.TRELLIS_3_0);
         CostTable costs = Cost.run(
-                library,
+                TestLibraries.of(library),
                 sources,
                 List.of(VERIFY_ROWS, CostTable.PREFILL_ROWS),
                 directory.resolve("costs.json"),
@@ -60,7 +61,7 @@ class SearchCudaIntegrationTest {
             errors.put(name, Map.of(Option.NVFP4, 0.004, Option.TRELLIS_3_0, 0.001));
         Priors priors = new Priors(errors);
 
-        try (Scorer scorer = Scorer.open(library, 6)) {
+        try (Scorer scorer = Scorer.open(TestLibraries.of(library), 6)) {
             long free = scorer.freeDeviceBytes();
             int[] scored = {0};
             Search.Scoring scoring = (path, artifact) -> {

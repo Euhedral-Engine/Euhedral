@@ -15,6 +15,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 
@@ -296,7 +297,7 @@ class PerformanceCudaIntegrationTest {
                             TestSupport.artifactPath(),
                             gpu,
                             cap > 0 ? Math.min(free, cap << 20) : free,
-                            HostBudget.system(),
+                            HostBudget.system(OptionalLong.empty()),
                             Mode.TEXT,
                             CONTEXT);
                     TestLattice.Run run = lattice.run(gpu, model, CONTEXT);

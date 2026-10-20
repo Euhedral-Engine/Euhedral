@@ -32,7 +32,7 @@ class ScorerBatchCudaIntegrationTest {
         Path library = property("euhedral.cuda.library");
         Path trellis = property("euhedral.qwen.trellis30-artifact");
         List<Path> references = List.of(property("euhedral.quantization.score-reference"));
-        try (Scorer scorer = Scorer.open(library, 6)) {
+        try (Scorer scorer = Scorer.open(TestLibraries.of(library), 6)) {
             var artifact = ArtifactReader.read(trellis);
             Scorer.Result four = scorer.score(trellis, artifact, references, ROWS, 4, Residency.PLANNED);
             Scorer.Result auto = scorer.score(trellis, artifact, references, ROWS, 0, Residency.PLANNED);

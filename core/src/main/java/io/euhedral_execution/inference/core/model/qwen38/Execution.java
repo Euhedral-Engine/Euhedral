@@ -2,7 +2,6 @@ package io.euhedral_execution.inference.core.model.qwen38;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeTerminal;
-import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.offload.DiskReader;
@@ -18,6 +17,8 @@ import io.euhedral_execution.inference.core.runtime.graph.GraphShape;
 import io.euhedral_execution.inference.core.runtime.graph.InferenceLake;
 import io.euhedral_execution.inference.core.runtime.graph.LanePool;
 import io.euhedral_execution.inference.core.runtime.graph.WorkspaceOwner;
+import io.euhedral_execution.inference.core.settings.BatchingSettings;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -101,18 +102,19 @@ public final class Execution implements AutoCloseable {
     /// A plan that stages weights gets one lane fewer for compute and a lane for its transfers.
     public Execution(
             LatticeTerminal lattice, ExecutionPlan plan, ExecutionGpu gpu, int laneCount, boolean captureGraphs) {
-        this(lattice, plan, gpu, laneCount, captureGraphs, InferenceConfig.PREFILL_CHUNK_TOKENS);
+        this(lattice, plan, gpu, laneCount, captureGraphs, Tuning.defaults());
     }
 
-    /// As above, with one workspace sized at load for quanta of up to `maxRows` rows.
+    /// As above, with one workspace sized at load for quanta of up to `batching.prefill-chunk-tokens` rows, shared
+    /// passes bounded by `batching`, and host work spread over `host` of `tuning`.
     public Execution(
             LatticeTerminal lattice,
             ExecutionPlan plan,
             ExecutionGpu gpu,
             int laneCount,
             boolean captureGraphs,
-            int maxRows) {
-        this(lattice, plan, gpu, laneCount, captureGraphs, maxRows, null);
+            Tuning tuning) {
+        this(lattice, plan, gpu, laneCount, captureGraphs, tuning, null);
     }
 
     /// As above, reading the plan's disk-backed weights from `artifact` (null when none is disk-backed): a
@@ -123,9 +125,9 @@ public final class Execution implements AutoCloseable {
             ExecutionGpu gpu,
             int laneCount,
             boolean captureGraphs,
-            int maxRows,
+            Tuning tuning,
             Path artifact) {
-        this(lattice, plan, gpu, laneCount, captureGraphs, maxRows, artifact, Map.of());
+        this(lattice, plan, gpu, laneCount, captureGraphs, tuning, artifact, Map.of());
     }
 
     /// As above, reading the disk-backed weights named in `sources` from the file each names instead of `artifact`.
@@ -135,7 +137,7 @@ public final class Execution implements AutoCloseable {
             ExecutionGpu gpu,
             int laneCount,
             boolean captureGraphs,
-            int maxRows,
+            Tuning tuning,
             Path artifact,
             Map<String, Path> sources) {
         this.plan = Objects.requireNonNull(plan, "plan");
@@ -144,7 +146,9 @@ public final class Execution implements AutoCloseable {
             throw new IllegalArgumentException("laneCount must be 1 to " + LanePool.MAX_LANES);
         boolean transfers = this.plan.staging() != null;
         int compute = transfers ? Math.min(laneCount, LanePool.MAX_LANES - 1) : laneCount;
-        this.lake = EuhedralInferenceRuntime.newLake(lattice);
+        BatchingSettings batching = tuning.batching();
+        int maxRows = batching.prefillChunkTokens();
+        this.lake = EuhedralInferenceRuntime.newLake(lattice, tuning.host());
         this.hostTasks = new HostTasks(this.lake);
         this.shared = new SharedWorkspace(gpu, this.plan, maxRows);
         this.runtime = new EuhedralInferenceRuntime(
@@ -153,9 +157,10 @@ public final class Execution implements AutoCloseable {
                 new EuhedralInferenceRuntime.Lanes(compute, transfers, captureGraphs),
                 SharedWorkspace.bufferCount(this.plan));
         this.prompts = new PromptShapes(this.runtime);
-        int passRows = Math.min(maxRows, positiveProperty("euhedral.batch.max-rows", maxRows));
-        int passParts =
-                this.plan.draftsWithDFlash2() ? 1 : positiveProperty("euhedral.batch.max-parts", Integer.MAX_VALUE);
+        int passRows = Math.min(maxRows, batching.maxTokensPerPass().orElse(maxRows));
+        int passParts = this.plan.draftsWithDFlash2()
+                ? 1
+                : batching.maxSequencesPerPass().orElse(Integer.MAX_VALUE);
         this.assembler =
                 new PassAssembler<>(o -> o.part().sequence(), o -> o.part().rows(), passRows, passParts, this::runPass);
         if (this.plan.window() == null) {
@@ -178,18 +183,6 @@ public final class Execution implements AutoCloseable {
             this.lake.attach(reads.getDelegate());
         }
         this.lake.attach(this.diskReader.getDelegate());
-    }
-
-    /// The integer property `name` when it is at least 1; otherwise (unset, malformed or smaller) `fallback`, with a
-    /// warning for a value that was set.
-    public static int positiveProperty(String name, int fallback) {
-        Integer value = Integer.getInteger(name);
-        if (value == null) return fallback;
-        if (value < 1) {
-            LOG.warn("{}={} is ignored: a pass needs at least one row and one part", name, value);
-            return fallback;
-        }
-        return value;
     }
 
     /// The machine's asynchronous reads, or null: the disk reader then reads positionally on its poll.

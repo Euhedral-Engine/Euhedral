@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.core.model.qwen4.loader.Mode;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.testing.Shared;
 import io.euhedral_execution.inference.core.testing.SharedQwen38;
+import java.util.OptionalLong;
 import java.util.function.Supplier;
 
 /// The Flash-Next model that the CUDA tests of one JVM share. One model is on the device at a time: asking for another
@@ -89,7 +90,12 @@ final class SharedFlashNext {
             long free = gpu.deviceMemoryInfo().freeBytes();
             long budget = spec.deviceCap() == 0 ? free : Math.min(spec.deviceCap(), free);
             Qwen4Model model = Qwen4Model.open(
-                    TestSupport.artifactPath(), gpu, budget, HostBudget.system(), spec.mode(), spec.context());
+                    TestSupport.artifactPath(),
+                    gpu,
+                    budget,
+                    HostBudget.system(OptionalLong.empty()),
+                    spec.mode(),
+                    spec.context());
             this.current = new Loaded(gpu, model, spec);
             return this.current;
         }

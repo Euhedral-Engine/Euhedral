@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.OptionalLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -37,28 +38,35 @@ class HostBudgetTest {
 
     @Test
     void withoutAStatementTheBudgetIsWhatTheMachineCanSpareLessTheRuntimesReserve() {
-        HostBudget budget = HostBudget.of(null, null, 20 * GIB, 2 * GIB);
+        HostBudget budget = HostBudget.of(OptionalLong.empty(), 20 * GIB, 2 * GIB);
         assertEquals(HostBudget.Source.AUTOMATIC, budget.source());
         assertEquals(HostBudget.ofAvailable(20 * GIB).residentBytes() - 2 * GIB, budget.residentBytes());
         assertEquals(budget.residentBytes(), budget.pinnableBytes());
-        assertEquals(
-                budget.residentBytes(),
-                HostBudget.of(" ", "", 20 * GIB, 2 * GIB).residentBytes());
-        assertEquals(0, HostBudget.of(null, null, 5 * GIB, 2 * GIB).residentBytes(), "never below zero");
-        assertTrue(HostBudget.of(null, null, -1).pinnableBytes() > 1L << 50, "unreadable means unlimited");
+        assertEquals(0, HostBudget.of(OptionalLong.empty(), 5 * GIB, 2 * GIB).residentBytes(), "never below zero");
+        assertTrue(HostBudget.of(OptionalLong.empty(), -1).pinnableBytes() > 1L << 50, "unreadable means unlimited");
     }
 
     @Test
     void aStatedBudgetIsRespectedAsStated() {
-        HostBudget stated = HostBudget.of("32768", null, 8 * GIB);
+        HostBudget stated = HostBudget.of(OptionalLong.of(32 * GIB), 8 * GIB);
         assertEquals(HostBudget.Source.EXPLICIT, stated.source());
         assertEquals(32 * GIB, stated.residentBytes(), "more than the machine spares now is still the user's call");
         assertEquals(
                 HostBudget.ofAvailable(8 * GIB).pinnableBytes(), stated.pinnableBytes(), "pinning follows the machine");
-        assertEquals(1 * GIB, HostBudget.of("1024", null, 48 * GIB).residentBytes(), "less is respected too");
-        assertEquals(0, HostBudget.of("0", null, 48 * GIB).residentBytes(), "zero means no RAM tier");
-        assertEquals(16 * GIB, HostBudget.of(null, "16384", 8 * GIB).residentBytes(), "the property is the fallback");
-        assertEquals(32 * GIB, HostBudget.of("32768", "1", 8 * GIB).residentBytes(), "the variable wins");
+        assertEquals(1 * GIB, HostBudget.of(OptionalLong.of(GIB), 48 * GIB).residentBytes(), "less is respected too");
+    }
+
+    /// `memory.host-limit` states the budget in bytes; it is the only statement, whatever the process environment.
+    @Test
+    void theHostLimitSettingStatesTheBudget() {
+        HostBudget stated = HostBudget.system(OptionalLong.of(1536L << 20));
+        assertEquals(HostBudget.Source.EXPLICIT, stated.source());
+        assertEquals(1536L << 20, stated.residentBytes());
+        assertEquals(1536L << 20, stated.pinnedBytes());
+        assertTrue(stated.describe().contains("memory.host-limit"), stated.describe());
+        assertEquals(
+                HostBudget.Source.AUTOMATIC,
+                HostBudget.system(OptionalLong.empty()).source());
     }
 
     @Test
@@ -80,17 +88,15 @@ class HostBudgetTest {
 
     @Test
     void anInvalidStatementIsRefused() {
-        assertThrows(NumberFormatException.class, () -> HostBudget.of("lots", null, GIB));
-        assertThrows(IllegalArgumentException.class, () -> HostBudget.of("-5", null, GIB));
+        assertThrows(IllegalArgumentException.class, () -> HostBudget.of(OptionalLong.of(-5), GIB));
         assertThrows(IllegalArgumentException.class, () -> new HostBudget(-1, 0));
     }
 
-    @org.junit.jupiter.api.Test
+    @Test
     void aStatedBudgetPinsAsStatedAndAnAutomaticOneWhatTheMachineSpares() {
-        HostBudget stated = HostBudget.of("40960", null, 8L << 30);
-        org.junit.jupiter.api.Assertions.assertEquals(40960L << 20, stated.pinnedBytes());
-        HostBudget automatic = HostBudget.of(null, null, 64L << 30);
-        org.junit.jupiter.api.Assertions.assertEquals(
-                Math.min(automatic.pinnableBytes(), automatic.residentBytes()), automatic.pinnedBytes());
+        HostBudget stated = HostBudget.of(OptionalLong.of(40960L << 20), 8L << 30);
+        assertEquals(40960L << 20, stated.pinnedBytes());
+        HostBudget automatic = HostBudget.of(OptionalLong.empty(), 64L << 30);
+        assertEquals(Math.min(automatic.pinnableBytes(), automatic.residentBytes()), automatic.pinnedBytes());
     }
 }

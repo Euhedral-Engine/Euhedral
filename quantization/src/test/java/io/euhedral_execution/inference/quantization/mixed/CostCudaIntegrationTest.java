@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.quantization.mixed;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import io.euhedral_execution.inference.quantization.TestLibraries;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -34,8 +35,8 @@ class CostCudaIntegrationTest {
                         Option.TRELLIS_3_0, property("euhedral.qwen.trellis30-artifact"),
                         Option.NVFP4, property("euhedral.qwen.nvfp4-artifact")),
                 Option.TRELLIS_3_0);
-        CostTable table =
-                Cost.run(library, sources, List.of(1, 4, 512), directory.resolve("costs.json"), 10, 64L << 20);
+        CostTable table = Cost.run(
+                TestLibraries.of(library), sources, List.of(1, 4, 512), directory.resolve("costs.json"), 10, 64L << 20);
         for (String name : sources.projections()) {
             for (Option option : sources.options()) {
                 Cost.Shape shape = Cost.shape(sources.descriptor(option, name));

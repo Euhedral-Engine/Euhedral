@@ -83,14 +83,14 @@ public final class Qwen38Runtime implements ModelRuntime {
             LatticeTerminal lattice) {
         ExecutionPlan plan =
                 new ExecutionPlan(model.weights(), model.staging(), model.window(), model.kvHostPages() != null);
-        // The workspace is sized at load for the widest quantum: the prefill chunk, unless a diagnostic widens it.
+        // The workspace is sized at load for the widest quantum: `batching.prefill-chunk-tokens`.
         Execution execution = new Execution(
                 lattice,
                 plan,
                 gpu,
                 EuhedralInferenceRuntime.laneCount(),
                 EuhedralInferenceRuntime.CAPTURE_GRAPHS,
-                InferenceConfig.workspaceRows(),
+                config.tuning(),
                 model.artifactPath(),
                 artifact == null ? Map.of() : artifact.sources());
         var identity = identity(config.artifactPath(), artifact, model);

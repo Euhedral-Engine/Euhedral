@@ -9,8 +9,10 @@ import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
+import io.euhedral_execution.inference.quantization.gpu.CudaLibraries;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
@@ -83,7 +85,7 @@ public final class Scorer implements AutoCloseable {
     }
 
     /// One device and the calibration lattice with `workers` workers, for any number of artifacts to be scored.
-    public static Scorer open(Path library, int workers) {
+    public static Scorer open(CudaLibraries library, int workers) {
         Device device = new Device(library);
         try {
             return new Scorer(device, CalibrationLattice.start(workers));
@@ -258,7 +260,7 @@ public final class Scorer implements AutoCloseable {
                 device.gpu,
                 EuhedralInferenceRuntime.laneCount(),
                 EuhedralInferenceRuntime.CAPTURE_GRAPHS,
-                InferenceConfig.PREFILL_CHUNK_TOKENS,
+                Tuning.defaults(),
                 artifactPath,
                 artifact.sources());
     }

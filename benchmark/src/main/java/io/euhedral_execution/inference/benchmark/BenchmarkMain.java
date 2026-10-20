@@ -8,6 +8,8 @@ import io.euhedral_execution.inference.benchmark.run.BenchmarkRunner;
 import io.euhedral_execution.inference.benchmark.run.EngineTarget;
 import io.euhedral_execution.inference.benchmark.run.Prerequisites;
 import io.euhedral_execution.inference.core.ProcessorTopology;
+import io.euhedral_execution.inference.core.settings.SettingsException;
+import io.euhedral_execution.inference.core.settings.Tuning;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.nio.file.Path;
@@ -82,6 +84,12 @@ public final class BenchmarkMain {
             Throwable cause = invalid.getCause() instanceof IllegalArgumentException argument ? argument : invalid;
             throw new IllegalArgumentException(configFile + ": " + cause.getMessage(), invalid);
         }
+        Tuning tuning;
+        try {
+            tuning = options.engineTuning();
+        } catch (SettingsException invalid) {
+            throw new IllegalArgumentException(options.engineConfig() + ": " + invalid.getMessage(), invalid);
+        }
         var prepared = Prerequisites.check(options, ProcessorTopology.system());
         System.out.println("workers: processors " + prepared.workers().processorIds() + ", cores "
                 + prepared.workers().coreIds());
@@ -118,7 +126,8 @@ public final class BenchmarkMain {
                 options.prefixCacheBytes(),
                 options.shutdownTimeout(),
                 options.speculation().equals("artifact"),
-                options.kvDeviceMinimumTokens());
+                options.kvDeviceMinimumTokens(),
+                tuning);
         // Load before creating the output, so a refused load leaves no empty result file.
         BenchmarkRunner.Target target;
         try {

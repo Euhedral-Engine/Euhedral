@@ -7,6 +7,7 @@ import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.core.tokenizer.TokenKind;
+import io.euhedral_execution.inference.quantization.gpu.CudaLibraries;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -40,7 +41,7 @@ public final class ReferenceLogits {
             int batch,
             long hostBytes,
             int workers,
-            Path library) {}
+            CudaLibraries library) {}
 
     private ReferenceLogits() {}
 

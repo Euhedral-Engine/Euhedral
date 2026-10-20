@@ -11,6 +11,7 @@ import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.HostTasks;
 import io.euhedral_execution.inference.core.runtime.graph.InferenceLake;
+import io.euhedral_execution.inference.core.settings.HostSettings;
 import java.time.Duration;
 import java.util.BitSet;
 import java.util.concurrent.CompletableFuture;
@@ -72,7 +73,7 @@ public final class CalibrationLattice implements AutoCloseable {
         ControlPlaneLattice lattice = ControlPlaneLattice.getOrCreate(
                 new LatticeConfig("CalibrationLattice", cpus, Duration.ofSeconds(10), shard));
         lattice.start();
-        InferenceLake lake = EuhedralInferenceRuntime.newLake(lattice);
+        InferenceLake lake = EuhedralInferenceRuntime.newLake(lattice, HostSettings.defaults());
         return new CalibrationLattice(lattice, lake, new HostTasks(lake));
     }
 

@@ -12,6 +12,7 @@ import io.euhedral_execution.inference.core.artifact.format.TrellisLayout;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ScratchUse;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
+import io.euhedral_execution.inference.quantization.gpu.CudaLibraries;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -74,11 +75,11 @@ public final class Cost {
     /// Measures every distinct projection shape of `sources` for every option, at each of `rows`, and writes the
     /// table (with no fixed terms) to `out`.
     ///
-    /// @param library the CUDA library
+    /// @param library the CUDA libraries
     /// @param repeats timed launches per measurement, round-robin over the copies
     /// @param rotateBytes the least payload bytes the copies of an object span
     public static CostTable run(
-            Path library, Sources sources, List<Integer> rows, Path out, int repeats, long rotateBytes)
+            CudaLibraries library, Sources sources, List<Integer> rows, Path out, int repeats, long rotateBytes)
             throws IOException {
         if (repeats < 1) throw new IllegalArgumentException("repeats must be positive: " + repeats);
         if (rows.isEmpty()) throw new IllegalArgumentException("no row counts");

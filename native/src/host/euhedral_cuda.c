@@ -180,6 +180,24 @@ int euhedral_cuda_device_memory_info(uint64_t* free_byte_size, uint64_t* total_b
     return EUHEDRAL_CUDA_SUCCESS;
 }
 
+int euhedral_cuda_multiprocessor_count(int32_t* count) {
+    if (count == NULL) {
+        return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    }
+    int device = 0;
+    cudaError_t status = cudaGetDevice(&device);
+    if (status != cudaSuccess) {
+        return (int) status;
+    }
+    int value = 0;
+    status = cudaDeviceGetAttribute(&value, cudaDevAttrMultiProcessorCount, device);
+    if (status != cudaSuccess) {
+        return (int) status;
+    }
+    *count = (int32_t) value;
+    return EUHEDRAL_CUDA_SUCCESS;
+}
+
 int euhedral_cuda_copy_host_to_device(
         void* device_address,
         const void* host_address,

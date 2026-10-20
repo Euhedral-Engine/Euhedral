@@ -18,6 +18,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
@@ -61,6 +62,13 @@ public final class Cuda {
     /// Opens the device with the CUDA runtime and NVRTC that sit beside the engine's `library`, and compiles against
     /// the CUDA headers of its layout ([NativeFiles#headersBeside]).
     public Cuda(Path library) {
+        this(CudaLibraries.of(library));
+    }
+
+    /// As above, loading cuBLAS and cuSOLVER from the directory `libraries` names, else from the library search
+    /// path.
+    public Cuda(CudaLibraries libraries) {
+        Path library = libraries.engine();
         this.headers = NativeFiles.headersBeside(library);
         SymbolLookup driver = SymbolLookup.libraryLookup("libcuda.so.1", arena);
         SymbolLookup.libraryLookup(library.toAbsolutePath().resolveSibling("libcudart.so.13"), arena);
@@ -69,8 +77,9 @@ public final class Cuda {
                 SymbolLookup.libraryLookup(library.toAbsolutePath().resolveSibling("libnvrtc.so.13"), arena);
         // cuBLAS and cuSOLVER come from the module's download (cudaMathLibraries), loaded by absolute path with their
         // dependencies first, so no library path needs them.
-        SymbolLookup cublas = mathLibrary("libnvJitLink.so.13", "libcublasLt.so.13", "libcublas.so.13");
-        SymbolLookup cusolver = mathLibrary("libcusolver.so.12");
+        SymbolLookup cublas =
+                mathLibrary(libraries.math(), "libnvJitLink.so.13", "libcublasLt.so.13", "libcublas.so.13");
+        SymbolLookup cusolver = mathLibrary(libraries.math(), "libcusolver.so.12");
         cuInit = bind(driver, "cuInit", INT, INT);
         cuDeviceGet = bind(driver, "cuDeviceGet", INT, PTR, INT);
         cuDeviceGetAttribute = bind(driver, "cuDeviceGetAttribute", INT, PTR, INT, INT);
@@ -151,11 +160,10 @@ public final class Cuda {
         bindThread();
     }
 
-    private SymbolLookup mathLibrary(String... names) {
-        String directory = System.getProperty("euhedral.quantization.cuda-libraries", "");
+    private SymbolLookup mathLibrary(Optional<Path> directory, String... names) {
         SymbolLookup last = null;
         for (String name : names) {
-            Path path = directory.isBlank() ? null : Path.of(directory, name);
+            Path path = directory.map(d -> d.resolve(name)).orElse(null);
             last = path != null && Files.isRegularFile(path)
                     ? SymbolLookup.libraryLookup(path, arena)
                     : SymbolLookup.libraryLookup(name, arena);
