@@ -120,7 +120,7 @@ public final class DrafterTraining {
         long head, headBf16Input, logits, logitsBf16, embeddingTable, embeddingScales;
         int[] rowOfToken;
         List<Corpus.Entry> entries;
-        MemorySegment tokenFile, hiddenFile;
+        MemorySegment tokenFile, labelFile, hiddenFile;
         List<Integer> training = new ArrayList<>(), heldOut = new ArrayList<>();
         // Per-window device inputs and outputs.
         long hiddenBf16, hiddenInput, ids, labels, predicted, labelLogProbabilities, loss;
@@ -357,9 +357,12 @@ public final class DrafterTraining {
             }
             try (FileChannel tokens =
                             FileChannel.open(settings.corpus().resolve("tokens.bin"), StandardOpenOption.READ);
+                    FileChannel labels =
+                            FileChannel.open(settings.corpus().resolve("labels.bin"), StandardOpenOption.READ);
                     FileChannel rows =
                             FileChannel.open(settings.corpus().resolve("hidden.bin"), StandardOpenOption.READ)) {
                 tokenFile = tokens.map(FileChannel.MapMode.READ_ONLY, 0, tokens.size(), arena);
+                labelFile = labels.map(FileChannel.MapMode.READ_ONLY, 0, labels.size(), arena);
                 hiddenFile = rows.map(FileChannel.MapMode.READ_ONLY, 0, rows.size(), arena);
             }
         }
@@ -413,11 +416,18 @@ public final class DrafterTraining {
             return tokenFile.getAtIndex(ValueLayout.JAVA_INT_UNALIGNED, entry.token() + position);
         }
 
+        /// The base model's greedy choice for `position`: what a draft of it should be.
+        int label(Corpus.Entry entry, int position) {
+            return labelFile.getAtIndex(ValueLayout.JAVA_INT_UNALIGNED, entry.token() + position);
+        }
+
         /// Uploads the window's base hiddens, every depth's input tokens and labels (the draft-head row
-        /// of the base model's token; on the device -1 for any other), and returns the labels per depth
-        /// on the host: -1 for a prompt token or a position past the sequence, -2 for an answer token
-        /// outside the head (a draft it rejects).
-        int[][] stage(Window window) {
+        /// of the base model's greedy choice; on the device -1 for any other), and returns per depth on
+        /// the host the draft-head rows of what a draft is checked against: the labels when training, the
+        /// text's own tokens (what a verification of a sampled answer accepts) when `evaluation`; -1 for a
+        /// prompt token or a position past the sequence, -2 for an answer token outside the head (a draft
+        /// it rejects).
+        int[][] stage(Window window, boolean evaluation) {
             Corpus.Entry entry = entries.get(window.sequence());
             int count = window.count(), depths = settings.depths(), length = entry.length();
             long bytes = 2L * count * hidden;
@@ -425,25 +435,25 @@ public final class DrafterTraining {
                     hiddenBf16, hiddenFile.asSlice(2L * hidden * (entry.row() + window.a()), bytes), bytes);
             ops.bf16ToFloat(hiddenBf16, (long) count * hidden, hiddenInput);
             int[] tokenIds = new int[depths * count];
-            int[][] labelRows = new int[depths][count];
+            int[][] checked = new int[depths][count];
+            int[] flat = new int[depths * count];
             for (int k = 1; k <= depths; k++) {
                 for (int r = 0; r < count; r++) {
                     int p = window.a() + r, input = p + k, target = p + k + 1;
                     tokenIds[(k - 1) * count + r] = input < length ? token(entry, input) : 0;
                     boolean answer = target < length && target >= entry.prompt();
-                    int row = answer ? rowOfToken[token(entry, target)] : -1;
-                    labelRows[k - 1][r] = answer && row < 0 ? -2 : row;
+                    int labelRow = answer ? rowOfToken[label(entry, target)] : -1;
+                    flat[(k - 1) * count + r] = labelRow;
+                    int row = !answer ? -1 : evaluation ? rowOfToken[token(entry, target)] : labelRow;
+                    checked[k - 1][r] = answer && row < 0 ? -2 : row;
                 }
             }
             Upload.ints(device.gpu, ids, tokenIds);
-            int[] flat = new int[depths * count];
-            for (int k = 0; k < depths; k++)
-                for (int r = 0; r < count; r++) flat[k * count + r] = Math.max(-1, labelRows[k][r]);
             Upload.ints(device.gpu, labels, flat);
             for (int k = 0; k < depths; k++)
                 kernels.q3EmbeddingRows(
                         embeddingTable, ids + 4L * k * count, count, hidden, embeddingScales, embedded[k]);
-            return labelRows;
+            return checked;
         }
 
         /// Every depth's forward pass over the window (depth 1 only for an unlabelled one).
@@ -512,7 +522,7 @@ public final class DrafterTraining {
         /// Enqueues the window's work: a training window's forward, losses and backward, an evaluation window's
         /// forward and argmaxes, or an unlabelled window's depth-1 forward; returns its labels.
         int[][] enqueue(Window window, boolean train) {
-            int[][] labelRows = stage(window);
+            int[][] labelRows = stage(window, !train);
             int depths = window.labelled() ? settings.depths() : 1;
             long[] outputs = forward(window, depths);
             if (!window.labelled()) return labelRows;
@@ -666,6 +676,8 @@ public final class DrafterTraining {
             int index;
             long lineages;
             final long[] accepted = new long[16];
+            /// Lineages and accepted drafts of greedy [0] and sampled [1] answers.
+            final long[] kindLineages = new long[2], kindAccepted = new long[2];
             final long[] reached = new long[16];
 
             Evaluate(boolean initial) {
@@ -727,6 +739,9 @@ public final class DrafterTraining {
                         while (run < depths && labelRows[run][r] >= 0 && argmax[run][r] == labelRows[run][r]) run++;
                         e.accepted[run]++;
                         for (int k = 0; k < run; k++) e.reached[k]++;
+                        int kind = entries.get(window.sequence()).sampled() ? 1 : 0;
+                        e.kindLineages[kind]++;
+                        e.kindAccepted[kind] += run;
                     }
                 }
                 e.index++;
@@ -755,11 +770,16 @@ public final class DrafterTraining {
             }
             log(String.format(
                     Locale.ROOT,
-                    "%s: held-out accepted drafts %.4f per lineage (%d lineages), conditional%s",
+                    "%s: held-out accepted drafts %.4f per lineage (%d lineages), conditional%s; greedy %.4f (%d),"
+                            + " sampled %.4f (%d)",
                     e.initial ? "before training" : "step " + step,
                     mean,
                     e.lineages,
-                    perDepth));
+                    perDepth,
+                    (double) e.kindAccepted[0] / Math.max(1, e.kindLineages[0]),
+                    e.kindLineages[0],
+                    (double) e.kindAccepted[1] / Math.max(1, e.kindLineages[1]),
+                    e.kindLineages[1]));
             if (mean > best) {
                 best = mean;
                 saveParameters(settings.out().resolve("best.bin"));
