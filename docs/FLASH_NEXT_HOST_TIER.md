@@ -78,8 +78,8 @@ The tier replaces by frequency: the victim is the least requested of 32 sampled 
 distance of an expert is a whole pass and a global LRU evicts exactly what the next pass needs. Rejected: the global LRU, and
 per-layer quotas of a shard's slots in proportion to each layer's experts (a layer borrowing the slots of layers not using
 theirs, a victim from the layer furthest over its quota, otherwise the layer's own least recently used record): the quotas keep a
-share of every pass on a cyclic trace that the global LRU thrashes, and on the model's decode the frequency policy is faster
-than the quotas (warm decode at 4096 context 37.2-37.3 against 43.9 ms/token, [FLASH_NEXT_CACHE.md](FLASH_NEXT_CACHE.md)).
+share of every pass on a cyclic trace that the global LRU thrashes. The frequency policy decodes at 26.8-26.9 tok/s warm at
+4096 tokens; the quotas, at 22.8 tok/s, are rejected ([FLASH_NEXT_CACHE.md](FLASH_NEXT_CACHE.md)).
 
 ## Admission
 
