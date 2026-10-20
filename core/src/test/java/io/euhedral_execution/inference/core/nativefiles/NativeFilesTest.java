@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
 import java.net.URL;
@@ -13,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -85,12 +87,12 @@ class NativeFilesTest {
         FileTime written = Files.getLastModifiedTime(first.library());
         List<Path> before = listing(this.cache);
         // A cache that cannot be written still serves a complete directory.
-        Files.setPosixFilePermissions(this.cache, PosixFilePermissions.fromString("r-xr-xr-x"));
+        boolean readOnly = writable(this.cache, false);
         try {
             NativeFiles second = unpack();
             assertEquals(first, second);
         } finally {
-            Files.setPosixFilePermissions(this.cache, PosixFilePermissions.fromString("rwxr-xr-x"));
+            if (readOnly) writable(this.cache, true);
         }
         assertEquals(written, Files.getLastModifiedTime(first.library()));
         assertEquals(before, listing(this.cache));
@@ -126,14 +128,14 @@ class NativeFilesTest {
     @Test
     void anUnwritableCacheNamesItsSetting() throws IOException {
         Files.createDirectories(this.cache);
-        Files.setPosixFilePermissions(this.cache, PosixFilePermissions.fromString("r-xr-xr-x"));
+        assumeTrue(writable(this.cache, false), "the file system has no POSIX permissions");
         try {
             assumeFalse(Files.isWritable(this.cache), "the cache stays writable (running as root)");
             var failure = assertThrows(NativeFiles.CacheException.class, this::unpack);
             assertTrue(failure.getMessage().startsWith("host.native-cache"), failure.getMessage());
             assertTrue(failure.getMessage().contains(this.cache.toString()), failure.getMessage());
         } finally {
-            Files.setPosixFilePermissions(this.cache, PosixFilePermissions.fromString("rwxr-xr-x"));
+            writable(this.cache, true);
         }
     }
 
@@ -156,6 +158,13 @@ class NativeFilesTest {
         assertEquals(root.resolve("lib").resolve(System.mapLibraryName("euhedral_cuda")), files.library());
         assertEquals(root.resolve("cuda/include"), NativeFiles.headersBeside(files.library()));
         assertEquals(root.resolve("share/euhedral_cuda"), files.kernelSources());
+    }
+
+    /// Makes `directory` writable or read-only; false where the file system has no POSIX permissions (Windows).
+    private static boolean writable(Path directory, boolean writable) throws IOException {
+        if (!Files.getFileStore(directory).supportsFileAttributeView(PosixFileAttributeView.class)) return false;
+        Files.setPosixFilePermissions(directory, PosixFilePermissions.fromString(writable ? "rwxr-xr-x" : "r-xr-xr-x"));
+        return true;
     }
 
     private static List<Path> listing(Path root) throws IOException {
