@@ -142,8 +142,9 @@ CRC-32, and with `--checkpoint` every byte of every object against the checkpoin
 
 ## Artifact
 
-`qwen3_8_flash_next_nvfp4.edrl`: 104,913,957,888 bytes (97.71 GiB), 1,606 objects (1,557
-tensors, 49 expert banks of 512 records), SHA-256 `c52ef26dee424671a1f852a762eca12ad6b35c357c3aed54c65a9a726a0f46ec`.
+`qwen3_8_flash_next_nvfp4.edrl`: 104,926,794,297 bytes (97.72 GiB): 104,913,957,888 bytes of content, 1,606 objects
+(1,557 tensors, 49 expert banks of 512 records), and a 12,836,409-byte tokenizer section. SHA-256
+`9a3e5eae309228a4d76780d0a36f52806ce4474b3936b637275c6b91e124f94f`.
 
 | | bytes |
 |---|---|
