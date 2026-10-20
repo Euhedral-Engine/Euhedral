@@ -6,6 +6,8 @@ import io.euhedral_execution.inference.core.settings.SettingsException;
 import io.euhedral_execution.inference.core.settings.SettingsLoader;
 import java.io.PrintStream;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import org.springframework.boot.SpringApplication;
@@ -29,8 +31,18 @@ public class EuhedralInferenceApplication {
                 System.err,
                 (settings, nativeFiles) ->
                         ShutdownSignals.install(application(settings, nativeFiles, EuhedralInferenceApplication.class)
-                                .run(args)));
+                                .run(springArguments(args))));
         if (status != 0) System.exit(status);
+    }
+
+    /// The command-line arguments without `--config` and its value, which only the settings loader reads.
+    static String[] springArguments(String[] args) {
+        List<String> kept = new ArrayList<>();
+        for (int i = 0; i < args.length; i++) {
+            if (args[i].equals("--config")) i++;
+            else if (!args[i].startsWith("--config=")) kept.add(args[i]);
+        }
+        return kept.toArray(String[]::new);
     }
 
     /// What starts the server once the settings are read and the native files are unpacked.
@@ -70,7 +82,7 @@ public class EuhedralInferenceApplication {
     }
 
     /// The application with the settings registered as singletons, and the values Spring itself needs (the port and
-    /// the time a stop waits for running requests) as default properties.
+    /// as default property.
     static SpringApplication application(Settings settings, NativeFiles nativeFiles, Class<?>... sources) {
         SpringApplication application = new SpringApplication(sources);
         application.addInitializers(context -> {
@@ -79,11 +91,8 @@ public class EuhedralInferenceApplication {
             beans.registerSingleton("requestSettings", settings.server().requests());
             beans.registerSingleton("nativeFiles", nativeFiles);
         });
-        application.setDefaultProperties(Map.of(
-                "server.port",
-                String.valueOf(settings.server().port()),
-                "spring.lifecycle.timeout-per-shutdown-phase",
-                settings.server().shutdownTimeout().toMillis() + "ms"));
+        application.setDefaultProperties(
+                Map.of("server.port", String.valueOf(settings.server().port())));
         return application;
     }
 }

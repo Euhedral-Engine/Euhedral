@@ -13,7 +13,8 @@ public record ServerSettings(int port, Duration shutdownTimeout, RequestSettings
     public ServerSettings {
         if (port < 1 || port > 65535) throw new IllegalArgumentException("port must be 1-65535: " + port);
         Objects.requireNonNull(shutdownTimeout, "shutdownTimeout");
-        if (shutdownTimeout.isNegative()) throw new IllegalArgumentException("shutdown-timeout must not be negative");
+        if (shutdownTimeout.isNegative() || shutdownTimeout.isZero())
+            throw new IllegalArgumentException("shutdown-timeout must be positive");
         Objects.requireNonNull(requests, "requests");
     }
 

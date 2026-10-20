@@ -23,7 +23,7 @@ final class SetupCheck {
         return new Checked();
     }
 
-    /// Proof that [#require] passed; the beans that read the model's files depend on it.
+    /// Proof that [#require] passed; the beans that read the model's files take it so the check runs before them.
     record Checked() {}
 
     static List<String> problems(Settings settings, DriverProbe driver) {

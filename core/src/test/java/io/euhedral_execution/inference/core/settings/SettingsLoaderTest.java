@@ -104,6 +104,30 @@ class SettingsLoaderTest {
     }
 
     @Test
+    void reversedCpuRangeNamesTheKey() throws IOException {
+        SettingsException e = fails(MODEL + "host:\n  cpus: 5-2\n", Map.of());
+        assertTrue(e.getMessage().contains("host.cpus"), e.getMessage());
+        e = fails(MODEL, Map.of("EUHEDRAL_HOST_CPUS", "5-2"));
+        assertTrue(e.getMessage().contains("host.cpus (EUHEDRAL_HOST_CPUS)"), e.getMessage());
+    }
+
+    @Test
+    void zeroShutdownTimeoutIsRejected() throws IOException {
+        SettingsException e = fails(MODEL + "server:\n  shutdown-timeout: 0s\n", Map.of());
+        assertTrue(e.getMessage().contains("server.shutdown-timeout"), e.getMessage());
+    }
+
+    @Test
+    void zeroMaxQueuedIsAccepted() throws IOException {
+        assertEquals(
+                0,
+                load(MODEL + "server:\n  requests:\n    max-queued: 0\n", Map.of())
+                        .server()
+                        .requests()
+                        .maxQueued());
+    }
+
+    @Test
     void unknownKey() throws IOException {
         SettingsException e = fails(MODEL + "memory:\n  gpu-limt: 1GiB\n", Map.of());
         assertTrue(e.getMessage().contains("memory.gpu-limt"), e.getMessage());
