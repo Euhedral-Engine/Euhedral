@@ -3,42 +3,38 @@
 This is the dense Qwen3.8 weight and state hierarchy. Residency is planned at load from free device memory, artifact formats, context length, sequence count and a host budget. Flash-Next uses a separate expert cache hierarchy; see its existing [residency design](../flash-next/FLASH_NEXT_RESIDENCY.md).
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 16, "rankSpacing": 28}}}%%
 flowchart LR
     subgraph Disk[Disk]
-        E[EDRL artifact payloads: each object read from the file Artifact.pathOf names]
+        direction TB
+        E[EDRL artifact payloads]
     end
     subgraph Host[Host memory]
+        direction TB
         Arena[Pinned weight arena]
-        Window[Pinned DiskWindow with readiness flags]
+        Window[Pinned disk-read window]
         Mapped[Mapped embedding or output head]
-        Prefix[Pinned PrefixCache checkpoints]
-        HostKV[KvHostPages: pinned attention pages beyond the device share]
+        Prefix[Prefix-cache checkpoints]
+        HostKV[Attention KV pages beyond the device share]
+        Arena ~~~ Window ~~~ Mapped ~~~ Prefix ~~~ HostKV
     end
-    subgraph Device[GPU memory]
+    subgraph GPU[GPU memory]
+        direction TB
         Resident[Resident weights including draft head]
-        Ring[WeightStaging ring]
-        Compute[Execution kernels]
-        Workspace[SharedWorkspace and scratch]
+        Ring[Weight staging ring]
+        Workspace[Shared workspace and scratch]
         State[Per-sequence attention KV and GDN state]
-        KVRegion[Per-sequence device region shared across attention layers]
+        KVRegion[Device region for host KV pages]
+        Compute[Execution kernels]
+        Resident ~~~ Ring ~~~ Workspace ~~~ State ~~~ KVRegion ~~~ Compute
     end
-    E -->|load| Resident
-    E -->|load selected weights| Arena
-    E -->|DiskReader on demand| Window
-    E -->|load mapped objects| Mapped
-    Arena -->|WEIGHT_TRANSFER| Ring
-    Window -->|DISK_TRANSFER after read readiness| Ring
-    Resident --> Compute
-    Ring --> Compute
-    Mapped -->|GPU reads over bus| Compute
-    Workspace <--> Compute
-    State <--> Compute
-    State -->|checkpoint copy| Prefix
-    Prefix -->|restore copy| State
-    HostKV -->|copy before layer attention| KVRegion
-    KVRegion -->|copy appended rows back| HostKV
-    KVRegion <--> Compute
+    Disk -->|Load host weights / disk reads| Host
+    Host -->|Weight transfers / mapped reads| GPU
+    Disk -->|Load resident weights| GPU
+    Host <-->|KV pages / prefix checkpoints| GPU
 ```
+
+The columns show storage tiers; arrows show data movement between tiers. The sections below describe the individual transfer paths.
 
 `ResidencyPlanner` reserves room for KV pages, sequence state, workspaces, staging, scratch and modules, then chooses an offloaded weight selection that fits. Selected weights occupy pinned host memory up to the host budget; remaining supported weights stay in the artifact and use a pinned disk window. The planner can refuse a configuration that cannot fit its required resources.
 
