@@ -11,7 +11,6 @@ import io.euhedral_execution.inference.core.model.qwen4.expert.FileExpertStore;
 import io.euhedral_execution.inference.core.model.qwen4.expert.FileRecordSource;
 import io.euhedral_execution.inference.core.model.qwen4.expert.GpuExpertTransfer;
 import io.euhedral_execution.inference.core.model.qwen4.expert.RamTier;
-import io.euhedral_execution.inference.core.model.qwen4.expert.ReplacementPolicy;
 import io.euhedral_execution.inference.core.model.qwen4.loader.Artifact;
 import io.euhedral_execution.inference.core.model.qwen4.loader.ArtifactReader;
 import io.euhedral_execution.inference.core.model.qwen4.loader.ExpertHierarchyStats;
@@ -53,34 +52,6 @@ public final class Qwen4Model implements AutoCloseable {
     /// Readers that fill the expert tier at startup, each reading about 8 MiB of contiguous records at a time: a few
     /// such reads in flight keep the disk at its sequential rate.
     static final int PRELOAD_READERS = 4;
-
-    /// How the host tier chooses its victims: by frequency, admitting a prefill's records only in place of records
-    /// requested less often (docs/FLASH_NEXT_CACHE.md); `EUHEDRAL_QWEN4_TIER_POLICY=partitioned` replaces by
-    /// recency in per-layer quotas, for benchmarks.
-    static final ReplacementPolicy TIER_POLICY = "partitioned".equals(System.getenv("EUHEDRAL_QWEN4_TIER_POLICY"))
-            ? ReplacementPolicy.BANK_PARTITIONED
-            : ReplacementPolicy.FREQUENCY;
-
-    /// Whether a bounded tier is filled with each layer's share of records at startup;
-    /// `EUHEDRAL_QWEN4_TIER_PRELOAD=0` leaves it empty until loads fill it, for benchmarks.
-    static final boolean TIER_PRELOAD = !"0".equals(System.getenv("EUHEDRAL_QWEN4_TIER_PRELOAD"));
-
-    /// How the device cache replaces its records: S3-FIFO (docs/FLASH_NEXT_CACHE.md). `EUHEDRAL_QWEN4_GPU_POLICY`
-    /// (`global`, `partitioned` or `s3fifo`) overrides it for benchmarks.
-    static final ReplacementPolicy DEVICE_POLICY =
-            switch (System.getenv().getOrDefault("EUHEDRAL_QWEN4_GPU_POLICY", "")) {
-                case "global" -> ReplacementPolicy.GLOBAL_LRU;
-                case "partitioned" -> ReplacementPolicy.BANK_PARTITIONED;
-                default -> ReplacementPolicy.S3_FIFO;
-            };
-
-    /// Whether the RAM tier may be pinned host memory; `EUHEDRAL_QWEN4_PIN_TIER=0` keeps it pageable, for
-    /// benchmarks.
-    static final boolean PIN_TIER = !"0".equals(System.getenv("EUHEDRAL_QWEN4_PIN_TIER"));
-
-    /// Whether a record must have been asked for more often than the tier's victim to replace it;
-    /// `EUHEDRAL_QWEN4_TIER_ADMISSION=0` replaces by recency alone, for benchmarks.
-    static final boolean TIER_ADMISSION = !"0".equals(System.getenv("EUHEDRAL_QWEN4_TIER_ADMISSION"));
 
     private final Artifact artifact;
     private final ResidencyPlan plan;
@@ -193,22 +164,20 @@ public final class Qwen4Model implements AutoCloseable {
             if (plan.expertStore() != ResidencyPlan.ExpertStoreMode.FILE_BACKED) {
                 // The tier is pinned when the machine can page-lock it beside the plan's other pinned memory: the
                 // device's copies then read a record from its slot, with no staging copy.
-                boolean pin = PIN_TIER
-                        && plan.budget().pinnableBytes() - plan.host().pinnedBytes()
-                                >= plan.host().expertRamBytes();
-                tier = new RamTier(
-                        cachedBanks, plan.host().expertRamSlots(), 1, TIER_POLICY, pin ? gpu : null, TIER_ADMISSION);
+                // The tier replaces by frequency with admission, and a bounded one starts with each layer's share
+                // (RamTierShard).
+                boolean pin = plan.budget().pinnableBytes() - plan.host().pinnedBytes()
+                        >= plan.host().expertRamBytes();
+                tier = new RamTier(cachedBanks, plan.host().expertRamSlots(), 1, pin ? gpu : null);
                 LOG.info("Expert tier: {} MiB of {} memory", tier.capacityBytes() >> 20, pin ? "pinned" : "pageable");
-                if (tier.isResident() || TIER_PRELOAD) {
-                    long begin = System.nanoTime();
-                    tier.preload(artifactSource, PRELOAD_READERS);
-                    LOG.info(
-                            "Expert tier loaded: {} records, {} MiB in {} ms ({} MiB/s)",
-                            tier.stats().residentExperts(),
-                            tier.stats().preloadBytes() >> 20,
-                            (System.nanoTime() - begin) / 1_000_000,
-                            (long) (tier.stats().preloadBytesPerSecond() / 1048576.0));
-                }
+                long begin = System.nanoTime();
+                tier.preload(artifactSource, PRELOAD_READERS);
+                LOG.info(
+                        "Expert tier loaded: {} records, {} MiB in {} ms ({} MiB/s)",
+                        tier.stats().residentExperts(),
+                        tier.stats().preloadBytes() >> 20,
+                        (System.nanoTime() - begin) / 1_000_000,
+                        (long) (tier.stats().preloadBytesPerSecond() / 1048576.0));
             }
             // The store owns the source and the tier from here on, and closes them.
             FileRecordSource owned = artifactSource;
@@ -221,8 +190,7 @@ public final class Qwen4Model implements AutoCloseable {
                     gpu,
                     plan.expertCache().slotCount(),
                     plan.expertCache().slotBytes(),
-                    1,
-                    DEVICE_POLICY);
+                    1);
             return new Qwen4Model(
                     artifact, plan, fixed, gpu, ngram, cache, cachedBanks, store, owned, transfer, reads, streaming);
         } catch (Throwable failure) {

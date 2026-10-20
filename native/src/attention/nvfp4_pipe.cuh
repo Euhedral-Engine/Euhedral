@@ -28,7 +28,7 @@ static __device__ __forceinline__ unsigned code_pair_bits(unsigned byte) {
 #pragma unroll
     for (int i = 0; i < 2; i++) {
         const unsigned code = (byte >> (4 * i)) & 15u, magnitude = code & 7u;
-#if EUHEDRAL_KV_CODEC != 0
+#if !EUHEDRAL_KV_E2M1
         // (m + 0.5) in FP16: exponent of 2m + 1 minus one, its fraction bits below the leading one.
         const unsigned odd = 2u * magnitude + 1u, top = 31u - __clz(odd);
         const unsigned bits = (((top + 14u) << 10) | ((odd << (10u - top)) & 0x3ffu)) | ((code & 8u) << 12);

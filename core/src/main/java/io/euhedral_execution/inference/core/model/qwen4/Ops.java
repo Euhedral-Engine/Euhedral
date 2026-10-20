@@ -21,17 +21,9 @@ public final class Ops {
         return ARGUMENTS.get().clear();
     }
 
-    /// Whether BF16 linears whose shape allows it run on tensor cores; `EUHEDRAL_QWEN4_LINEAR_TC=0` keeps the
-    /// FP32 kernel, which exact numerics always use.
-    static final boolean LINEAR_TC = !"0".equals(System.getenv("EUHEDRAL_QWEN4_LINEAR_TC"));
-
-    /// Rows from which a BF16 linear runs on tensor cores: the row count from which the NVFP4 linears leave the
-    /// decode kernels too.
+    /// Rows from which a BF16 linear whose shape allows it runs on tensor cores: the row count from which the NVFP4
+    /// linears leave the decode kernels too. Exact numerics keep the FP32 kernel.
     static final int TC_MIN_ROWS = 9;
-
-    /// Whether decode's BF16 linears split K across warps where one warp per column would leave the device idle
-    /// (`EUHEDRAL_QWEN4_LINEAR_SPLIT=0`: one warp per column, the exact route's kernel).
-    static final boolean LINEAR_SPLIT = !"0".equals(System.getenv("EUHEDRAL_QWEN4_LINEAR_SPLIT"));
 
     /// The K slices of a decode linear of `k` inputs and `n` outputs, by its shape alone: 8 for outputs too few
     /// to fill the device or reductions of 8192 and more, 4 for reductions of 2048 and more, else 1.
@@ -55,12 +47,7 @@ public final class Ops {
         requirePositive(rows, k, n);
         if (k % 8 != 0) throw new IllegalArgumentException("a BF16 linear needs K divisible by 8, got " + k);
         requireAligned(16, input, weights);
-        if (LINEAR_TC
-                && rows >= TC_MIN_ROWS
-                && !gpu.exactNumerics()
-                && k % 32 == 0
-                && n % 8 == 0
-                && (output & 3) == 0) {
+        if (rows >= TC_MIN_ROWS && !gpu.exactNumerics() && k % 32 == 0 && n % 8 == 0 && (output & 3) == 0) {
             // Tensor cores, for prefill chunks: a decode row would use one of an MMA's 16 rows, and the FP32 kernel
             // streams its weights faster. K is split in four for narrow outputs (a function of the shape alone, so a
             // row's bits do not depend on how many rows run with it), four row tiles per weight load above 16 rows.
@@ -87,7 +74,9 @@ public final class Ops {
                             .int32(n));
             return;
         }
-        int slices = rows < TC_MIN_ROWS && LINEAR_SPLIT && !gpu.exactNumerics() ? slices(k, n) : 1;
+        // Below it, decode splits K across warps where one warp per column would leave the device idle; the exact
+        // route keeps one warp per column.
+        int slices = rows < TC_MIN_ROWS && !gpu.exactNumerics() ? slices(k, n) : 1;
         if (slices > 1) {
             gpu.launchTableKernel(
                     slices == 8 ? Kernel.LINEAR_SPLIT8_BF16 : Kernel.LINEAR_SPLIT4_BF16,

@@ -148,7 +148,7 @@ device ring of `WeightStaging.SLOTS` = 4 slots on every use.
   smallest tensor first (GDN query_key, GDN output, attention output, ...); within the last family the layers are spread evenly, so
   the ring holds the smallest possible slot. The MTP layer and draft head are never host-backed (only `text/layers/N/...` projections are
   staged). The LM head is the last object to leave the device: when everything else offloadable is offloaded and the plan still does not
-  fit (or from the first offload with `-Deuhedral.residency.map-output-head=true`, default false) it is mapped in the host arena and
+  fit it is mapped in the host arena (mapping it with the first offload is rejected) and
   read in place over the bus, like the embedding, never staged or disk-backed. The bus streams it once per pass whatever the sequence
   count (2.54 GB BF16 about 60 ms, 0.67 GB NVFP4 about 15 ms at 40 GB/s). An NVFP4 head is mapped only when `maxSequences * (1 + draft
   depth)` is at most 32: row-exact verification above 32 rows runs the scalar reference, a sweep of the head per row. Calls on a mapped

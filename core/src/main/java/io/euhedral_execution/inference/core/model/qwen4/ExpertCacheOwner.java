@@ -341,31 +341,16 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
         return Outcome.LOADING;
     }
 
-    /// The prefetch (`EUHEDRAL_QWEN4_PREFETCH=K,B[,D]`: the router of the layer `D` ahead (1) applied to a decode
-    /// step's input, its best `K` experts, at most `B` of them read per layer; `0`: none). By default the next
-    /// layer's best 10, one read per layer (docs/FLASH_NEXT_PREFETCH.md).
-    static final int[] PREFETCH = prefetchSetting(System.getenv("EUHEDRAL_QWEN4_PREFETCH"));
+    /// The prefetch predicts the next layer: its router applied to a decode step's input, its best
+    /// [#PREFETCH_CANDIDATES] experts, at most [#PREFETCH_READS] of them read per layer
+    /// (docs/FLASH_NEXT_PREFETCH.md).
+    public static final int PREFETCH_DISTANCE = 1;
 
-    private static int[] prefetchSetting(String value) {
-        if (value == null || value.isBlank()) value = "10,1,1";
-        if (value.equals("0")) return new int[] {0, 0, 1};
-        String[] parts = value.split(",");
-        return new int[] {
-            Integer.parseInt(parts[0].trim()),
-            Integer.parseInt(parts[1].trim()),
-            parts.length > 2 ? Integer.parseInt(parts[2].trim()) : 1
-        };
-    }
+    /// The best experts of the predicted layer's router that a prefetch considers.
+    public static final int PREFETCH_CANDIDATES = 10;
 
-    /// How many layers ahead the prefetch predicts.
-    public static int prefetchDistance() {
-        return PREFETCH.length > 2 ? PREFETCH[2] : 1;
-    }
-
-    /// The best experts of the next layer's router to consider, and how many of them a prefetch reads at most.
-    public static int prefetchCandidates() {
-        return PREFETCH[0];
-    }
+    /// The records a prefetch reads per layer at most.
+    static final int PREFETCH_READS = 1;
 
     private final LongAdder prefetches = new LongAdder();
     private final LongAdder prefetchFailures = new LongAdder();
@@ -374,8 +359,7 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
     /// them that neither the device nor the host tier holds into the tier, while the disk has a read to spare. Any
     /// thread.
     public void publishPrefetch(int bank, int[] experts) {
-        if (PREFETCH[1] <= 0) return;
-        post(() -> prefetch(bank, experts, PREFETCH[1]));
+        post(() -> prefetch(bank, experts, PREFETCH_READS));
     }
 
     /// Reads up to `budget` of `experts` into the host tier, speculatively: it reads only what the disk can take now
@@ -407,31 +391,21 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
 
     // ---------------------------------------------------------------- device lookahead
 
-    /// The lookahead (`EUHEDRAL_QWEN4_AHEAD=D[,N]`, `0`: none): a prefill chunk's block asks for nearly every expert of
-    /// its layer, so the layer `D` ahead (1) is predicted from this layer's input by its own router, and what the
-    /// device lacks is loaded into device slots while this layer computes, `N` (1024) loads and held slots at most.
-    /// The disk is offered the next record whenever it has a read to spare, not once the layer's router has run.
-    static final int[] AHEAD = aheadSetting(System.getenv("EUHEDRAL_QWEN4_AHEAD"));
+    /// The lookahead: a prefill chunk's block asks for nearly every expert of its layer, so the next layer is
+    /// predicted from this layer's input by its own router, and what the device lacks is loaded into device slots
+    /// while this layer computes, [#AHEAD_LOADS] loads and held slots at most. The disk is offered the next record
+    /// whenever it has a read to spare, not once the layer's router has run.
+    public static final int AHEAD_DISTANCE = 1;
 
-    private static int[] aheadSetting(String value) {
-        if (value == null || value.isBlank()) return new int[] {1, 1024};
-        if (value.trim().equals("0")) return new int[] {0, 0};
-        String[] parts = value.split(",");
-        return new int[] {Integer.parseInt(parts[0].trim()), parts.length > 1 ? Integer.parseInt(parts[1].trim()) : 1024
-        };
-    }
-
-    /// How many layers ahead a prefill chunk's lookahead predicts; 0 when there is none.
-    public static int aheadDistance() {
-        return AHEAD[0];
-    }
+    /// The loads begun and slots held by the lookahead at most.
+    static final int AHEAD_LOADS = 1024;
 
     /// Wanted records, oldest first: `tag << 32 | bank << 16 | expert`. Touched by the poll only.
     private long[] wants = new long[1024];
 
     private int wantHead;
     private int wantCount;
-    /// Loads begun for the lookahead and slots it holds: at most `AHEAD[1]`.
+    /// Loads begun for the lookahead and slots it holds: at most [#AHEAD_LOADS].
     private int aheadOutstanding;
     /// Layers up to which the block asked for its experts itself, and whose held slots were released (-1: none).
     private int passedTag = -1;
@@ -457,7 +431,6 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
 
     /// Posts the experts layer `tag` is predicted to ask for (most named first), of bank `bank`. Any thread.
     public void publishAhead(int tag, int bank, int[] experts) {
-        if (AHEAD[0] <= 0) return;
         post(() -> {
             if (tag <= this.passedTag) return;
             if (this.wantCount + experts.length > this.wants.length) {
@@ -476,14 +449,12 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
 
     /// Layer `tag`'s block asks for its experts now: what was wanted for it or before is no longer. Any thread.
     public void aheadPassed(int tag) {
-        if (AHEAD[0] <= 0) return;
         post(() -> this.passedTag = Math.max(this.passedTag, tag));
     }
 
     /// Layer `tag` is done with its experts: the slots the lookahead held for it and before it are released; the
     /// last layer of a chunk (`last`) starts the next chunk's bookkeeping over. Any thread.
     public void aheadDone(int tag, boolean last) {
-        if (AHEAD[0] <= 0) return;
         post(() -> {
             this.doneTag = Math.max(this.doneTag, tag);
             this.passedTag = Math.max(this.passedTag, tag);
@@ -507,7 +478,6 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
     /// The quantum ended or stopped: every slot the lookahead holds is released and what is wanted is dropped, and
     /// the loads still under way give their slots back when they arrive. Any thread.
     public void aheadReset() {
-        if (AHEAD[0] <= 0) return;
         post(() -> {
             this.aheadGeneration++;
             for (java.util.ArrayList<ExpertLease> held : this.aheadHeld) {
@@ -564,7 +534,7 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
     /// Slots the lookahead may hold: a third of the cache at most, so the layer's own fetches always find slots
     /// (the holds are released only when the layer is done).
     private int aheadLimit() {
-        return Math.min(AHEAD[1], this.cache.slotCount() / 3);
+        return Math.min(AHEAD_LOADS, this.cache.slotCount() / 3);
     }
 
     private void popWant() {

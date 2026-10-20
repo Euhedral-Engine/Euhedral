@@ -12,7 +12,7 @@ GPU expert cache <-- async H2D --- RAM tier (pinned) <------------- direct reads
 ```
 
 A GPU eviction does not evict from the RAM tier: once warm, a GPU miss is a RAM hit and no artifact read. When the machine can
-page-lock the tier beside the plan's other pinned memory, the tier is pinned (`EUHEDRAL_QWEN4_PIN_TIER=0` keeps it pageable): the
+page-lock the tier beside the plan's other pinned memory, the tier is pinned (a pageable tier where pinning fits is rejected): the
 device's copy reads a record straight from its slot, and a record the tier takes is read straight into its slot, so neither needs a
 staging buffer. A pageable tier copies a hit into a staging buffer first.
 
@@ -71,21 +71,23 @@ pinned tier takes the record) and, for a record the tier does not hold, one of t
 of them taken waits in the owner and leaves the tier as it was: planning a fill takes a slot and evicts its record, and a fetch
 that waits for the disk would otherwise evict a record on every try.
 
-## Replacement: layer-aware
+## Replacement
 
-The model visits layer 0 to 47 and starts again, so the reuse distance of an expert is a whole pass and a global LRU evicts exactly
-what the next pass needs. `BANK_PARTITIONED` gives each layer a quota of a shard's slots in proportion to its experts, lets a layer
-borrow the slots of layers that are not using theirs, takes a victim from the layer furthest over its quota when a layer under its
-quota needs one, and otherwise evicts the layer's own least recently used record. `GLOBAL_LRU` is the baseline; `RamTierTest` runs
-a cyclic trace through both.
+The tier replaces by frequency: the victim is the least requested of 32 sampled ready slots, the least recent among equals
+(`RamTierShard`, [FLASH_NEXT_CACHE.md](FLASH_NEXT_CACHE.md)). The model visits layer 0 to 47 and starts again, so the reuse
+distance of an expert is a whole pass and a global LRU evicts exactly what the next pass needs. Rejected: the global LRU, and
+per-layer quotas of a shard's slots in proportion to each layer's experts (a layer borrowing the slots of layers not using
+theirs, a victim from the layer furthest over its quota, otherwise the layer's own least recently used record): the quotas keep a
+share of every pass on a cyclic trace that the global LRU thrashes, and on the model the frequency policy beats the quotas
+([FLASH_NEXT_CACHE.md](FLASH_NEXT_CACHE.md)).
 
 ## Admission
 
 A prefill visits nearly every expert of a layer once per chunk, so recency alone replaces each record just before the next chunk
-needs it. With admission (the default; `EUHEDRAL_QWEN4_TIER_ADMISSION=0` turns it off), a record that finds no free slot replaces
-the victim only if it was asked for more often than the victim was; otherwise it is read around the tier (`BYPASS`). The request
-counts are halved every ten requests per slot, so a record that was hot long ago does not keep its slot. `RamTierTest` runs
-repeated sweeps through both: recency serves none of them, admission half.
+needs it. With admission, a prefill's record that finds no free slot replaces the victim only if it was asked for more often than
+the victim was; otherwise it is read around the tier (`BYPASS`). The request counts are halved every ten requests per slot, so a
+record that was hot long ago does not keep its slot. Repeated sweeps through 8 slots: recency alone served none of them, admission
+half (`RamTierTest`); a tier without admission is rejected.
 
 ## Startup fill
 
@@ -96,7 +98,7 @@ nothing else in the tier starts a thread.
 ## Reads in parts
 
 Every record of the artifact is 4096-aligned in offset and length, so the artifact is opened with `O_DIRECT`
-(`EUHEDRAL_QWEN4_DIRECT_READS=0` reads through the page cache): the reads go from the device to the slot or buffer, and
+(reading through the page cache is rejected): the reads go from the device to the slot or buffer, and
 the page cache keeps the memory-mapped n-gram rows instead of records the tier already holds. At most
 `memory.weight-streaming.concurrent-reads` records (8) are read at once: the owner's fetch takes a read, and the frame
 that has the record gives it back on whichever worker runs it, before the device copy, so the disk is offered the next
@@ -115,9 +117,10 @@ part on the worker that runs it.
 
 ## Device cache replacement
 
-The device cache can replace by the same layer quotas as the tier (`ReplacementPolicy.BANK_PARTITIONED`). The global recency
-order stays the default: on the model's decode the two keep the same experts (a few popular experts per layer dominate, and no
-cyclic pass evicts them), and `ExpertCacheShardTest` shows where they differ, on a trace that does cycle.
+The device cache replaces by S3-FIFO (`ExpertCacheShard`, [FLASH_NEXT_CACHE.md](FLASH_NEXT_CACHE.md)). The layer quotas and the
+global recency order are rejected: on the model's decode the two keep the same experts (a few popular experts per layer dominate,
+and no cyclic pass evicts them), and S3-FIFO keeps records asked for again through a sweep of records asked for once
+(`ExpertCacheShardTest`).
 
 ## Telemetry
 

@@ -648,7 +648,6 @@ public final class InferenceEngine implements AutoCloseable {
                     host,
                     kvFormat,
                     sequences,
-                    Boolean.getBoolean(ResidencyPlanner.MAP_OUTPUT_HEAD),
                     kvDeviceMinimumTokens,
                     tuning.batching().prefillChunkTokens(),
                     gpu.trellisSettings());

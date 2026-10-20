@@ -463,7 +463,7 @@ final class Stages {
         @Override
         protected void submit() {
             if (this.shape.aheads()) {
-                int ahead = this.layer + ExpertCacheOwner.aheadDistance();
+                int ahead = this.layer + ExpertCacheOwner.AHEAD_DISTANCE;
                 moe().submitPredictionRows(
                                 this.layer,
                                 plan().weights().moe(ahead),
@@ -471,7 +471,7 @@ final class Stages {
                                 rows());
                 return;
             }
-            int ahead = this.layer + ExpertCacheOwner.prefetchDistance();
+            int ahead = this.layer + ExpertCacheOwner.PREFETCH_DISTANCE;
             moe().submitPrediction(
                             this.layer, plan().weights().moe(ahead), storage().mixed());
         }
@@ -493,15 +493,15 @@ final class Stages {
         protected void submit() {
             ExecutionPlan plan = plan();
             if (this.shape.aheads()) {
-                int wanted = this.layer + ExpertCacheOwner.aheadDistance();
+                int wanted = this.layer + ExpertCacheOwner.AHEAD_DISTANCE;
                 plan.expertOwner()
                         .publishAhead(wanted, plan.bankOrdinal(wanted), moe().takePredictedSet(this.layer, rows()));
                 return;
             }
-            int ahead = this.layer + ExpertCacheOwner.prefetchDistance();
+            int ahead = this.layer + ExpertCacheOwner.PREFETCH_DISTANCE;
             int bank = plan.bankOrdinal(ahead);
             ExecutionPlan.ExpertDemand demand = plan.demandListener();
-            int candidates = ExpertCacheOwner.prefetchCandidates();
+            int candidates = ExpertCacheOwner.PREFETCH_CANDIDATES;
             int[] ranked = moe().takePrediction(this.layer, Math.max(candidates, demand != null ? 64 : 0));
             plan.expertOwner()
                     .publishPrefetch(bank, java.util.Arrays.copyOf(ranked, Math.min(ranked.length, candidates)));

@@ -17,11 +17,14 @@ import org.slf4j.LoggerFactory;
 ///
 /// An expert is used through a lease, which pins its slot: a slot that is loading or leased is
 /// never evicted or refilled, so the address a lease exposes is valid until it is closed.
-/// Everything else is replaced least recently used first (a slot's recency is the last time a lease
-/// on it was closed).
+/// Everything else is replaced by S3-FIFO (docs/FLASH_NEXT_CACHE.md): a new record enters a small queue (a tenth
+/// of the slots), and one asked for again there moves to the main queue; the main queue gives a record asked for
+/// again another round (a 2-bit count). A record evicted from the small queue unused is remembered, and enters the
+/// main queue if it returns. A slot leaves its queue while leased and returns to the tail of it when the last
+/// lease closes.
 ///
-/// A miss is a [Load]: [#claim] reserves a slot (a free one, else the least recently used unpinned
-/// resident) and the owner has the record read and its copy submitted on a copy stream. The copy
+/// A miss is a [Load]: [#claim] reserves a slot (a free one, else S3-FIFO's victim among the unpinned
+/// residents) and the owner has the record read and its copy submitted on a copy stream. The copy
 /// records a marker behind itself, and [Load#submitted] answers with a lease that carries that
 /// marker: device work that reads the slot waits for the marker on its own stream, and no thread
 /// waits for the bytes. The slot stays unevictable until [Load#retired], even when the lease was
@@ -64,19 +67,13 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
     private final int[] prev;
     private final int[] next;
     private int freeHead = NONE;
-    // The recency lists of the evictable residents, oldest first: one per layer (bank) under the
-    // partitioned policy, one in all otherwise. `used` counts the slots each list's layer holds in any
-    // state, against its `quota`.
-    private final boolean partitioned;
+    // The queues of the evictable residents, oldest first: SMALL and MAIN. `used` counts each queue's slots in any
+    // state.
+    private static final int SMALL = 0;
+    private static final int MAIN = 1;
     private final int[] lruHead;
     private final int[] lruTail;
     private final int[] used;
-    private final int[] quota;
-    private final int[] slotBank;
-    // S3-FIFO: the two queues are the lists SMALL and MAIN; `used` counts each queue's slots in any state.
-    private static final int SMALL = 0;
-    private static final int MAIN = 1;
-    private final boolean s3;
     private final byte[] queue;
     private final byte[] freq;
     /// When each key was last evicted unused from the small queue, by [#ghostClock]; a key is remembered for as many
@@ -100,21 +97,6 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
             long slotBytes,
             long[] readyMarkers,
             ExpertCacheStats stats) {
-        this(index, banks, deviceBase, slotCount, slotBytes, readyMarkers, stats, ReplacementPolicy.GLOBAL_LRU, 1);
-    }
-
-    /// As above, replacing by `policy`; `shards` is how many shards the cache has, which tells the
-    /// partitioned policy which experts are this shard's.
-    ExpertCacheShard(
-            int index,
-            ExpertBank[] banks,
-            long deviceBase,
-            int slotCount,
-            long slotBytes,
-            long[] readyMarkers,
-            ExpertCacheStats stats,
-            ReplacementPolicy policy,
-            int shards) {
         if (slotCount < 1) throw new IllegalArgumentException("a shard needs at least one slot");
         this.index = index;
         this.banks = banks;
@@ -142,66 +124,27 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
             this.prev[slot] = NONE;
         }
         this.freeHead = 0;
-        this.partitioned = policy == ReplacementPolicy.BANK_PARTITIONED;
-        this.s3 = policy == ReplacementPolicy.S3_FIFO;
-        this.queue = this.s3 ? new byte[slotCount] : null;
-        this.freq = this.s3 ? new byte[slotCount] : null;
-        this.ghostStamp = this.s3 ? new long[this.keys.keyCount()] : null;
-        if (this.s3) java.util.Arrays.fill(this.ghostStamp, Long.MIN_VALUE / 2);
+        this.queue = new byte[slotCount];
+        this.freq = new byte[slotCount];
+        this.ghostStamp = new long[this.keys.keyCount()];
+        java.util.Arrays.fill(this.ghostStamp, Long.MIN_VALUE / 2);
         this.smallCap = Math.max(1, slotCount / 10);
-        int lists = this.s3 ? 2 : this.partitioned ? banks.length : 1;
-        this.lruHead = new int[lists];
-        this.lruTail = new int[lists];
+        this.lruHead = new int[2];
+        this.lruTail = new int[2];
         java.util.Arrays.fill(this.lruHead, NONE);
         java.util.Arrays.fill(this.lruTail, NONE);
-        this.used = new int[lists];
-        this.quota = new int[lists];
-        this.slotBank = new int[slotCount];
-        if (this.partitioned) {
-            int[] owned = new int[banks.length];
-            int total = 0;
-            for (int key = 0; key < this.keys.keyCount(); key++) {
-                if (ExpertKeys.shardOf(key, shards) != index) continue;
-                owned[this.keys.bankOf(key)]++;
-                total++;
-            }
-            for (int bank = 0; bank < banks.length; bank++)
-                this.quota[bank] = total == 0 ? 0 : (int) ((long) slotCount * owned[bank] / total);
-        }
+        this.used = new int[2];
     }
 
-    private int list(int bank) {
-        return this.partitioned ? bank : 0;
-    }
-
-    /// The list `slot` belongs to: its queue under S3-FIFO, its layer's under the partitioned policy.
+    /// The queue `slot` belongs to.
     private int listOf(int slot) {
-        return this.s3 ? this.queue[slot] : list(this.slotBank[slot]);
+        return this.queue[slot];
     }
 
     /// Whether any list holds an evictable resident.
     private boolean anyEvictable() {
         for (int head : this.lruHead) if (head != NONE) return true;
         return false;
-    }
-
-    /// The evictable resident a miss for `bank` replaces: its own layer's oldest when the layer is at
-    /// its quota, otherwise the oldest of the layer furthest over its quota.
-    private int victimFor(int bank) {
-        if (this.s3) return s3Victim();
-        int own = list(bank);
-        if (this.lruHead[own] != NONE && this.used[own] >= this.quota[own]) return this.lruHead[own];
-        int best = NONE;
-        int bestOver = Integer.MIN_VALUE;
-        for (int list = 0; list < this.lruHead.length; list++) {
-            if (this.lruHead[list] == NONE) continue;
-            int over = this.used[list] - this.quota[list];
-            if (over > bestOver) {
-                bestOver = over;
-                best = this.lruHead[list];
-            }
-        }
-        return best;
     }
 
     /// S3-FIFO's victim: the small queue's oldest while that queue holds its share (moving it to the main queue
@@ -240,7 +183,7 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
     }
 
     private void asked(int slot) {
-        if (this.s3 && this.freq[slot] < 3) this.freq[slot]++;
+        if (this.freq[slot] < 3) this.freq[slot]++;
     }
 
     /// Who the leases this shard hands out report to (itself by default: a release is then applied
@@ -310,7 +253,7 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
             ticket.waiting = true;
             return;
         }
-        int victim = this.freeHead != NONE ? this.freeHead : victimFor(bank);
+        int victim = this.freeHead != NONE ? this.freeHead : s3Victim();
         Load fresh = this.spare[victim];
         fresh.begin(key, this.generation[victim] + 1, this.banks[bank].recordBytes(expert), bank, expert);
         reserve(victim, fresh);
@@ -461,7 +404,7 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
                 this.owner, this.banks[bank], bank, expert, slot, generation, slotAddress(slot), readyMarker);
     }
 
-    /// Takes the free or least recently used slot `victim` for `fresh`.
+    /// Takes the free or evicted slot `victim` for `fresh`.
     private void reserve(int victim, Load fresh) {
         if (this.state[victim] == RESIDENT) {
             lruRemove(victim);
@@ -471,12 +414,9 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         } else {
             this.freeHead = this.next[victim];
         }
-        this.slotBank[victim] = fresh.bank;
-        if (this.s3) {
-            boolean remembered = this.ghostClock - this.ghostStamp[fresh.key] < this.slotCount;
-            this.queue[victim] = (byte) (remembered ? MAIN : SMALL);
-            this.freq[victim] = 0;
-        }
+        boolean remembered = this.ghostClock - this.ghostStamp[fresh.key] < this.slotCount;
+        this.queue[victim] = (byte) (remembered ? MAIN : SMALL);
+        this.freq[victim] = 0;
         this.used[listOf(victim)]++;
         this.generation[victim] = fresh.generation;
         this.slotKey[victim] = fresh.key;
@@ -603,7 +543,7 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         }
     }
 
-    // ---------------------------------------------------------------- recency list
+    // ---------------------------------------------------------------- queues
 
     private void lruAppend(int slot) {
         int list = listOf(slot);
@@ -699,7 +639,7 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         for (int list = 0; list < this.lruHead.length; list++) {
             int before = NONE;
             for (int slot = this.lruHead[list]; slot != NONE; slot = this.next[slot]) {
-                if (++evictable > this.slotCount) throw new IllegalStateException("recency list loops");
+                if (++evictable > this.slotCount) throw new IllegalStateException("a queue loops");
                 if (this.state[slot] != RESIDENT || this.pins[slot] != 0)
                     throw new IllegalStateException("slot " + slot + " is evictable but pinned or not resident");
                 if (listOf(slot) != list) throw new IllegalStateException("slot " + slot + " is on another list");
@@ -707,12 +647,12 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
                     throw new IllegalStateException("slot " + slot + " has a broken back link");
                 before = slot;
             }
-            if (before != this.lruTail[list]) throw new IllegalStateException("the recency tail is wrong");
+            if (before != this.lruTail[list]) throw new IllegalStateException("a queue tail is wrong");
         }
         int[] counted = new int[this.used.length];
         for (int slot = 0; slot < this.slotCount; slot++) if (this.state[slot] != EMPTY) counted[listOf(slot)]++;
         if (!java.util.Arrays.equals(counted, this.used))
-            throw new IllegalStateException("the per-layer slot counts are wrong");
+            throw new IllegalStateException("the per-queue slot counts are wrong");
         int empty = 0;
         int resident = 0;
         int inUse = 0;
@@ -741,7 +681,7 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         }
         if (empty != free) throw new IllegalStateException("free list holds " + free + " of " + empty + " empty slots");
         if (resident != evictable)
-            throw new IllegalStateException("recency list holds " + evictable + " of " + resident + " residents");
+            throw new IllegalStateException("the queues hold " + evictable + " of " + resident + " residents");
         if (loadingSlots != this.loading) throw new IllegalStateException("loading count is wrong");
         if (inUse + loadingSlots != this.pinned) throw new IllegalStateException("pinned count is wrong");
     }

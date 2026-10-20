@@ -475,30 +475,6 @@ class ArchitectureTest {
                     "System.getProperty(\"os.name\")",
                     "System.getProperty(\"os.arch\")"));
 
-    /// Experiment switches that are deleted next, with the paths they switch off. Temporary: the list only shrinks.
-    static final Map<String, Set<String>> SWITCHES_REMOVED_NEXT = Map.of(
-            "InferenceEngine.java",
-            Set.of("Boolean.getBoolean(ResidencyPlanner.MAP_OUTPUT_HEAD)"),
-            "model/qwen38/loader/ResidencyPlanner.java",
-            Set.of("Boolean.getBoolean(MAP_OUTPUT_HEAD)"),
-            "runtime/EuhedralInferenceRuntime.java",
-            Set.of("System.getenv(\"EUHEDRAL_CUDA_GRAPHS\")"),
-            "model/qwen4/Ops.java",
-            Set.of("System.getenv(\"EUHEDRAL_QWEN4_LINEAR_TC\")", "System.getenv(\"EUHEDRAL_QWEN4_LINEAR_SPLIT\")"),
-            "model/qwen4/Qwen4Model.java",
-            Set.of(
-                    "System.getenv(\"EUHEDRAL_QWEN4_TIER_POLICY\")",
-                    "System.getenv(\"EUHEDRAL_QWEN4_TIER_PRELOAD\")",
-                    "System.getenv().getOrDefault(\"EUHEDRAL_QWEN4_GPU_POLICY\"",
-                    "System.getenv(\"EUHEDRAL_QWEN4_PIN_TIER\")",
-                    "System.getenv(\"EUHEDRAL_QWEN4_TIER_ADMISSION\")"),
-            "model/qwen4/ExpertCacheOwner.java",
-            Set.of("System.getenv(\"EUHEDRAL_QWEN4_PREFETCH\")", "System.getenv(\"EUHEDRAL_QWEN4_AHEAD\")"),
-            "model/qwen4/Shape.java",
-            Set.of("System.getenv(\"EUHEDRAL_QWEN4_GROUP\")"),
-            "model/qwen4/expert/FileRecordSource.java",
-            Set.of("System.getenv(\"EUHEDRAL_QWEN4_DIRECT_READS\")"));
-
     /// Each read of a property or a variable in the core outside the settings and the native files, as
     /// {path, line, the line's text from the read's start}: one entry per call, so a line with two reads has two.
     private static List<String[]> settingReads() throws IOException {
@@ -526,13 +502,12 @@ class ArchitectureTest {
     }
 
     /// Settings come from the settings file and its variables, read once by the settings loader; nothing else in
-    /// the core reads a system property or an environment variable, but for the platform and the switches listed.
+    /// the core reads a system property or an environment variable, but for the platform reads listed.
     @Test
     void onlyTheSettingsReadPropertiesAndVariables() throws IOException {
         List<String> violations = new ArrayList<>();
         for (String[] read : settingReads())
-            if (!excepted(PLATFORM_READS, read[0], read[2]) && !excepted(SWITCHES_REMOVED_NEXT, read[0], read[2]))
-                violations.add(read[0] + ":" + read[1] + ": " + read[2]);
+            if (!excepted(PLATFORM_READS, read[0], read[2])) violations.add(read[0] + ":" + read[1] + ": " + read[2]);
         assertTrue(violations.isEmpty(), "reads outside the settings:\n" + String.join("\n", violations));
     }
 
@@ -541,11 +516,10 @@ class ArchitectureTest {
     void theSettingReadExceptionsNameRealReads() throws IOException {
         List<String[]> reads = settingReads();
         List<String> stale = new ArrayList<>();
-        for (var exceptions : List.of(PLATFORM_READS, SWITCHES_REMOVED_NEXT))
-            for (var entry : exceptions.entrySet())
-                for (String name : entry.getValue())
-                    if (reads.stream().noneMatch(r -> r[0].equals(entry.getKey()) && r[2].startsWith(name)))
-                        stale.add(entry.getKey() + ": " + name);
+        for (var entry : PLATFORM_READS.entrySet())
+            for (String name : entry.getValue())
+                if (reads.stream().noneMatch(r -> r[0].equals(entry.getKey()) && r[2].startsWith(name)))
+                    stale.add(entry.getKey() + ": " + name);
         assertTrue(stale.isEmpty(), "no longer read, remove from the list: " + stale);
     }
 

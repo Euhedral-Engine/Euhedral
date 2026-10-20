@@ -383,7 +383,7 @@ class ExpertCacheOwnerTest {
                 throw new AssertionError(error);
             }
         });
-        var tier = new RamTier(this.fixture.banks, 10, 1, ReplacementPolicy.FREQUENCY, this.gpu, true);
+        var tier = new RamTier(this.fixture.banks, 10, 1, this.gpu);
         build(
                 6,
                 new FileExpertStore(
@@ -435,7 +435,7 @@ class ExpertCacheOwnerTest {
                 throw new AssertionError(error);
             }
         });
-        var tier = new RamTier(this.fixture.banks, 10, 1, ReplacementPolicy.BANK_PARTITIONED);
+        var tier = new RamTier(this.fixture.banks, 10, 1);
         build(
                 6,
                 new FileExpertStore(
@@ -679,7 +679,7 @@ class ExpertCacheOwnerTest {
 
     @Test
     void aPinnedTierIsCopiedFromInPlaceWithNoStagingBuffer() throws Exception {
-        var tier = new RamTier(this.fixture.banks, 10, 1, ReplacementPolicy.BANK_PARTITIONED, this.gpu);
+        var tier = new RamTier(this.fixture.banks, 10, 1, this.gpu);
         assertTrue(tier.pinned());
         var store = new FileExpertStore(
                 this.gpu, new FileRecordSource(this.fixture.file, this.fixture.banks), tier, this.fixture.banks, 1, 2);
@@ -723,7 +723,7 @@ class ExpertCacheOwnerTest {
     /// a load that does not start, again on every try.
     @Test
     void aFetchThatWaitsLeavesTheTierAsItWas() throws Exception {
-        var tier = new RamTier(this.fixture.banks, 1, 1, ReplacementPolicy.BANK_PARTITIONED, this.gpu);
+        var tier = new RamTier(this.fixture.banks, 1, 1, this.gpu);
         var store = new FileExpertStore(
                 this.gpu, new FileRecordSource(this.fixture.file, this.fixture.banks), tier, this.fixture.banks, 1, 1);
         build(1, store);
@@ -770,7 +770,7 @@ class ExpertCacheOwnerTest {
                 this.real.close();
             }
         };
-        var tier = new RamTier(this.fixture.banks, 10, 1, ReplacementPolicy.BANK_PARTITIONED);
+        var tier = new RamTier(this.fixture.banks, 10, 1);
         build(4, new FileExpertStore(this.gpu, failingReads, tier, this.fixture.banks, 2));
         Fetch failed = fetch(2, 0, ExpertCacheOwner.Outcome.LOADING);
         drive(failed::ended);
@@ -792,7 +792,7 @@ class ExpertCacheOwnerTest {
 
     @Test
     void anArtifactReadInPartsLoadsTheSameBytesWithAndWithoutATierSlot() throws Exception {
-        var tier = new RamTier(this.fixture.banks, 10, 1, ReplacementPolicy.BANK_PARTITIONED);
+        var tier = new RamTier(this.fixture.banks, 10, 1);
         build(
                 6,
                 new FileExpertStore(
@@ -856,7 +856,7 @@ class ExpertCacheOwnerTest {
                 this.real.close();
             }
         };
-        var tier = new RamTier(this.fixture.banks, 10, 1, ReplacementPolicy.BANK_PARTITIONED);
+        var tier = new RamTier(this.fixture.banks, 10, 1);
         build(4, new FileExpertStore(this.gpu, failingPart, tier, this.fixture.banks, 4, 4));
         Fetch[] targets = {new Fetch(), new Fetch(), new Fetch()};
         for (int i = 0; i < 3; i++) this.owner.fetch(targets[i], 2, 1 + i);

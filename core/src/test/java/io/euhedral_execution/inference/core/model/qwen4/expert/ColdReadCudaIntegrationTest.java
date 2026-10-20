@@ -119,7 +119,7 @@ class ColdReadCudaIntegrationTest {
                 bankCount, bytes / 1073741824.0, experts));
         for (int readers : CONCURRENCY) {
             dropCache(path);
-            try (RamTier tier = new RamTier(subset, experts, 8, ReplacementPolicy.BANK_PARTITIONED);
+            try (RamTier tier = new RamTier(subset, experts, 8);
                     FileRecordSource source = new FileRecordSource(path, subset)) {
                 long begin = System.nanoTime();
                 tier.preload(source, readers);

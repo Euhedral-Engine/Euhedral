@@ -95,7 +95,7 @@ public final class Execution implements AutoCloseable {
 
     /// An execution whose graphs share `laneCount` device lanes.
     public Execution(LatticeTerminal lattice, ExecutionPlan plan, ExecutionGpu gpu, int laneCount) {
-        this(lattice, plan, gpu, laneCount, EuhedralInferenceRuntime.CAPTURE_GRAPHS);
+        this(lattice, plan, gpu, laneCount, true);
     }
 
     /// An execution that captures decode, verification and draft quanta into CUDA graphs only with `captureGraphs`.

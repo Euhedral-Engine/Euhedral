@@ -22,8 +22,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-/// The `bf16` artifact serving twelve speculative sequences at once on four workers, its weights read from disk every
-/// pass and its LM head mapped from host memory: the configuration that stalled with the GPU idle and a worker
+/// The `bf16` artifact serving twelve speculative sequences at once on four workers, part of its weights read from
+/// disk every pass and the rest from host memory: the configuration that stalled with the GPU idle and a worker
 /// spinning in a CUDA call. It stalled after 179 s while disk copies waited for their reads on the device, on CPUs
 /// 2-5. Every session keeps generating for the run's duration (`euhedral.stress.minutes`, default 8), and some
 /// token must arrive at least every `euhedral.stress.stall-seconds` (default 90; a pass takes about 4 s).
@@ -32,7 +32,7 @@ import org.junit.jupiter.api.Timeout;
 /// `Runtime.halt(97)`, which Gradle reports as a failed run. The workers are `-Peuhedral.test.worker-cpus`, or else
 /// the first four performance CPUs ([WorkerCpus]). Skipped unless -Peuhedral.qwen.bf16-artifact names the artifact
 /// and -Peuhedral.qwen.tokenizer-dir its tokenizer.
-// Own JVM: sets the global map-output-head property and a host budget of its own.
+// Own JVM: a host budget of its own.
 @ModelGroup.OwnJvm
 class DiskTierManySequencesCudaIntegrationTest {
 
@@ -69,7 +69,6 @@ class DiskTierManySequencesCudaIntegrationTest {
                         null,
                         SEQUENCES)
                 .withTuning(Tunings.hostWeightsLimit(28L << 30));
-        System.setProperty("euhedral.residency.map-output-head", "true");
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             var runtime = (Qwen38Runtime) engine.modelRuntime();
             assertTrue(runtime.diskBackedWeightBytes() > 0, "weights beyond the host budget are read from disk");
@@ -136,8 +135,6 @@ class DiskTierManySequencesCudaIntegrationTest {
             System.out.printf(
                     "[stress] %d text pieces in %.0f s (%.2f per second), no stall%n",
                     tokens.get(), seconds, tokens.get() / seconds);
-        } finally {
-            System.clearProperty("euhedral.residency.map-output-head");
         }
     }
 }

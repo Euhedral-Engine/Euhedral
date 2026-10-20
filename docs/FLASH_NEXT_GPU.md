@@ -67,8 +67,8 @@ relative RMS on the model's shapes (`LinearTensorCoreCudaIntegrationTest`).
 
 They run for 9 rows and more. At one row an MMA uses one of its 16 rows, and the FP32 kernel is faster on most decode
 shapes (profiled per launch: hyper-connection down 19.1 against 29.0 us, router 6.0 against 7.4 us, output head 1.49
-against 1.73 ms; only the hyper-connection up projection was faster, 12.9 against 8.8 us). Exact numerics and
-`EUHEDRAL_QWEN4_LINEAR_TC=0` keep the FP32 kernel everywhere.
+against 1.73 ms; only the hyper-connection up projection was faster, 12.9 against 8.8 us). Exact numerics keep the FP32
+kernel everywhere; the FP32 kernel for prefill rows is rejected.
 
 | scenario | FP32 kernel | tensor cores from 9 rows |
 |---|---|---|
@@ -87,7 +87,7 @@ projection (320 outputs) ran 40 CTAs, and the one- and four-output projections (
 injection) ran one and four warps over K of 2560 and 10,240. `euhedral_q4_linear_split4/8_bf16` give each column 4 or 8
 warps over contiguous slices of K, summed in slice order (deterministic), by the shape alone: 8 slices for fewer than
 64 outputs or K of 8192 and more, 4 for K of 2048 and more. Summation-order noise only: 0 to 1.5e-6 relative RMS on the
-model's shapes. The exact route and `EUHEDRAL_QWEN4_LINEAR_SPLIT=0` keep one warp per column.
+model's shapes. The exact route keeps one warp per column; one warp per column for decode is rejected.
 
 Profiled, per decode step at 64 context: BF16 linears 7.5 to 4.8 ms (hyper-connection down 19.1 to 10.4 us per launch,
 injection 13.2 to 3.0, shared gate 13.2 to 1.7, GDN gates 5.4 to 1.9, router 6.0 to 5.0); the step 36.4 to 34.1 ms.

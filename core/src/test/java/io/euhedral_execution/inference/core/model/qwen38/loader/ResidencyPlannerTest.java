@@ -119,7 +119,7 @@ class ResidencyPlannerTest {
                 + ResidencyPlanner.RESERVE_BYTES;
         // Embedding and every projection leave 880 MiB net of the staging ring: 1000 MiB needs the head too.
         var plan = ResidencyPlanner.plan(
-                artifact(), PROFILE, resident - 1000 * MIB, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1, false);
+                artifact(), PROFILE, resident - 1000 * MIB, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1);
         assertTrue(plan.fits());
         assertTrue(plan.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
         assertFalse(plan.hostBacked().contains("text/draft_head"));
@@ -129,7 +129,7 @@ class ResidencyPlannerTest {
         assertEquals((400 + 600 + 8 * 110) * MIB, plan.hostArenaBytes());
         assertTrue(plan.deviceBytes() <= resident - 1000 * MIB);
         var tooLittle = ResidencyPlanner.plan(
-                artifact(), PROFILE, resident - 2000 * MIB, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1, false);
+                artifact(), PROFILE, resident - 2000 * MIB, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1);
         assertFalse(tooLittle.fits());
     }
 
@@ -138,26 +138,11 @@ class ResidencyPlannerTest {
         long resident = (400 + 600 + 8 * 110 + 50 + 70) * MIB
                 + ResidencyPlanner.kvBytes(config(2), 4096)
                 + ResidencyPlanner.RESERVE_BYTES;
-        var plan = ResidencyPlanner.plan(
-                artifact(), PROFILE, resident - 1000 * MIB, 4096, 1100 * MIB, KvFormat.NVFP4, 1, false);
+        var plan =
+                ResidencyPlanner.plan(artifact(), PROFILE, resident - 1000 * MIB, 4096, 1100 * MIB, KvFormat.NVFP4, 1);
         assertTrue(plan.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
         assertFalse(plan.diskBacked().contains(HostWeightSelection.OUTPUT_HEAD));
         assertTrue(plan.hostBacked().contains(HostWeightSelection.EMBEDDING));
-    }
-
-    @Test
-    void theOutputHeadPropertyMapsItWithTheFirstOffload() {
-        long resident = (400 + 600 + 8 * 110 + 50 + 70) * MIB
-                + ResidencyPlanner.kvBytes(config(2), 4096)
-                + ResidencyPlanner.RESERVE_BYTES;
-        var early = ResidencyPlanner.plan(
-                artifact(), PROFILE, resident - 100 * MIB, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1, true);
-        assertTrue(early.fits());
-        assertTrue(early.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
-        // Plans that fit resident are unchanged.
-        var fits = ResidencyPlanner.plan(artifact(), PROFILE, 64L << 30, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1, true);
-        assertTrue(fits.hostBacked().isEmpty());
-        assertEquals(ResidencyPlanner.plan(artifact(), PROFILE, 64L << 30, 4096).deviceBytes(), fits.deviceBytes());
     }
 
     @Test
@@ -169,32 +154,13 @@ class ResidencyPlannerTest {
         // Rows per verification are sequences x (1 + draft depth).
         int depth = PROFILE.speculativeDepth();
         int most = ResidencyPlanner.NVFP4_ROW_EXACT_MAX_ROWS / (1 + depth);
-        var within = ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, most, true);
+        long more = (most - 1) * ResidencyPlanner.kvBytes(config(2), 4096);
+        var within =
+                ResidencyPlanner.plan(artifact(), PROFILE, free + more, 4096, Long.MAX_VALUE, KvFormat.NVFP4, most);
         assertTrue(within.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
-        var beyond =
-                ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, most + 1, true);
+        var beyond = ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, most + 1);
         assertFalse(beyond.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
-        var late =
-                ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, most + 1, false);
-        assertFalse(late.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
-        assertFalse(late.fits());
-    }
-
-    @Test
-    void theEarlyHeadStaysLastAndTheArenaSplitKeepsItInHostMemory() {
-        long resident = (400 + 600 + 8 * 110 + 50 + 70) * MIB
-                + ResidencyPlanner.kvBytes(config(2), 4096)
-                + ResidencyPlanner.RESERVE_BYTES;
-        var plan = ResidencyPlanner.plan(
-                artifact(), PROFILE, resident - 100 * MIB, 4096, 1100 * MIB, KvFormat.NVFP4, 1, true);
-        var order = new ArrayList<>(plan.hostBacked());
-        order.addAll(plan.diskBacked());
-        assertTrue(plan.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
-        assertFalse(plan.diskBacked().contains(HostWeightSelection.OUTPUT_HEAD));
-        assertEquals(HostWeightSelection.EMBEDDING, order.getFirst());
-        // The head's bytes are in the arena before earlier objects are placed in the window.
-        assertTrue(plan.hostArenaBytes() + plan.windowBytes() <= 1100 * MIB || !plan.fits());
-        assertTrue(plan.hostArenaBytes() >= 1000 * MIB);
+        assertFalse(beyond.fits());
     }
 
     @Test
@@ -203,7 +169,7 @@ class ResidencyPlannerTest {
                 + ResidencyPlanner.kvBytes(config(2), 4096)
                 + ResidencyPlanner.RESERVE_BYTES;
         var plan = ResidencyPlanner.plan(
-                artifact(), PROFILE, resident - 100 * MIB, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1, false);
+                artifact(), PROFILE, resident - 100 * MIB, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1);
         assertTrue(plan.fits());
         assertFalse(plan.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
         assertTrue(HostWeightSelection.select(artifact(), 1L << 40).containsAll(plan.hostBacked()));
@@ -252,7 +218,7 @@ class ResidencyPlannerTest {
 
     private static ResidencyPlanner.Plan spillPlan(long free, long host, int sequences) {
         return ResidencyPlanner.plan(
-                artifact(), PROFILE, free, LONG_CONTEXT, host, KvFormat.NVFP4, sequences, false, DEVICE_TOKENS);
+                artifact(), PROFILE, free, LONG_CONTEXT, host, KvFormat.NVFP4, sequences, DEVICE_TOKENS);
     }
 
     /// Device bytes of a plan whose caches keep `DEVICE_TOKENS` on the device and one region of host pages.

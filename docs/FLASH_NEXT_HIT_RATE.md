@@ -88,12 +88,12 @@ A layer-by-layer prompt moves a third of the bytes, but a chunk of 4,096 rows al
 whole prefill layer today (108 ms per layer with every expert resident, against 104 ms), so the bytes are not what
 bounds a chunk; the idle disk is.
 
-The lookahead predicts the layer `D` ahead (1) from this layer's input: its router applied to the chunk's rows with the
+The lookahead predicts the next layer from this layer's input: its router applied to the chunk's rows with the
 router's own top-k, the experts any row names, most named first (`PREDICT`, `PREFETCH` stages of the prefill shapes, as
 decode has them). The owner keeps these as wants and, whenever the disk has a read to spare and no fetch waits, loads
 them into device slots through the ordinary fetch (tier directive, staging, reads), holding each loaded record's lease
-until the layer is done (`aheadDone` from its finish), at most a third of the slots. The layer's own fetches then find
-the records resident. `EUHEDRAL_QWEN4_AHEAD=D[,N]` (`0`: off).
+until the layer is done (`aheadDone` from its finish), at most a third of the slots and 1024 loads. The layer's own
+fetches then find the records resident. Prefill without the lookahead is rejected (measurements below).
 
 Paired screens, 4 forks alternating, 3 GiB test heap, no cgroup:
 
@@ -161,7 +161,8 @@ block now asks the cache for all its experts in one record (`FETCHALL`, `ExpertC
 device holds are leased by the time the owner answers, and one stage (`GROUP`) launches them as runs of consecutive
 experts, one launch of each kernel and one copy of the slot addresses per run (their work items are consecutive and each
 names its own expert's slot: no kernel changed, the sums are the same). An expert that must be loaded keeps its own fetch
-and expert stages and launches when it arrives. `EUHEDRAL_QWEN4_GROUP=0` launches each on its own.
+and expert stages and launches when it arrives. Launching each expert on its own is rejected for decode (measurements
+below).
 
 `DecodeAbCudaIntegrationTest` takes two arms of the plan in turn, 16-32 tokens each, on one sequence in one process, so
 that what moves on the machine cancels (`EUHEDRAL_QWEN4_AB=1,0`; variant bit 0 is per-expert launches):

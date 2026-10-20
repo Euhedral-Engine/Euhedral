@@ -66,11 +66,11 @@ differ by far more: 12,000 tier slots halve the disk bytes, and Belady halves de
 
 ## In the engine
 
-The tier's `FREQUENCY` policy (`RamTierShard`: the least requested of 32 sampled ready slots, the least recent among
-equals; admission only for a prefill chunk's records) and the device's `S3_FIFO` (`ExpertCacheShard`: a small and a
+The tier's frequency policy (`RamTierShard`: the least requested of 32 sampled ready slots, the least recent among
+equals; admission only for a prefill chunk's records) and the device's S3-FIFO (`ExpertCacheShard`: a small and a
 main queue, 2-bit counts, a ghost stamp per key; a leased slot leaves its queue and returns to its tail) are the
-defaults; `EUHEDRAL_QWEN4_TIER_POLICY=partitioned` and `EUHEDRAL_QWEN4_GPU_POLICY=global` restore the old ones. The
-device's policy switch had never reached the cache before; it does now.
+engine's only policies. The per-layer partitioned recency policy and the global recency order are rejected for both
+(measurements below) and removed.
 
 Quick screens (one process each, about 50 s; the decode phases feed the prompt's tokens, 32 steps twice):
 

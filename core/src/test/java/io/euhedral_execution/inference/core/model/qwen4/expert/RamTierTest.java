@@ -24,9 +24,9 @@ import org.junit.jupiter.api.io.TempDir;
 
 /// The host tier: a record is read from the artifact once and answered from memory after, a resident tier
 /// preloads everything and reads nothing afterwards, a bounded tier stays within its slots and returns the
-/// artifact's bytes, a shard's pinned slot is never taken, shards are independent, and a layer-aware policy
-/// keeps what a cyclic pass would evict from a global LRU. Each shard is driven by one thread at a time, as
-/// its owner drives it.
+/// artifact's bytes, a shard's pinned slot is never taken, shards are independent, the victim is the least
+/// requested record, and a prefill's record enters only in place of one requested less often. Each shard is
+/// driven by one thread at a time, as its owner drives it.
 class RamTierTest {
     // Fixture keys: bank 0 has 8 experts, bank 1 has 3, bank 2 has 16, bank 3 has 1, bank 4 has 12 (40 in all).
 
@@ -48,22 +48,14 @@ class RamTierTest {
         this.gpu.assertAllReleased();
     }
 
-    private FileExpertStore store(int slots, int shards, ReplacementPolicy policy, RecordSource source)
-            throws IOException {
-        RamTier tier = new RamTier(this.fixture.banks, slots, shards, policy);
+    private FileExpertStore store(int slots, int shards, RecordSource source) throws IOException {
+        RamTier tier = new RamTier(this.fixture.banks, slots, shards);
         this.store = new FileExpertStore(this.gpu, source, tier, this.fixture.banks, 4);
         return this.store;
     }
 
-    private FileExpertStore admitting(int slots, ReplacementPolicy policy) throws IOException {
-        RamTier tier = new RamTier(this.fixture.banks, slots, 1, policy, null, true);
-        this.store = new FileExpertStore(
-                this.gpu, new FileRecordSource(this.fixture.file, this.fixture.banks), tier, this.fixture.banks, 4);
-        return this.store;
-    }
-
-    private FileExpertStore store(int slots, int shards, ReplacementPolicy policy) throws IOException {
-        return store(slots, shards, policy, new FileRecordSource(this.fixture.file, this.fixture.banks));
+    private FileExpertStore store(int slots, int shards) throws IOException {
+        return store(slots, shards, new FileRecordSource(this.fixture.file, this.fixture.banks));
     }
 
     private int shardOf(int bank, int expert) {
@@ -72,11 +64,20 @@ class RamTierTest {
                 this.store.ramTier().shards());
     }
 
-    /// One load as a serial source drives it: plan, open, settle. Returns the staged bytes.
+    /// One load of a decode step as a serial source drives it: plan, open, settle. Returns the staged bytes.
     private byte[] load(int bank, int expert, int lane) throws Exception {
+        return load(bank, expert, lane, false);
+    }
+
+    /// One load of a prefill chunk, whose record is subject to admission.
+    private byte[] scan(int bank, int expert) throws Exception {
+        return load(bank, expert, 0, true);
+    }
+
+    private byte[] load(int bank, int expert, int lane, boolean scan) throws Exception {
         RamTierShard shard = this.store.tier(shardOf(bank, expert));
         TierDirective directive = new TierDirective();
-        shard.plan(bank, expert, directive);
+        shard.plan(bank, expert, scan, directive);
         HostRecord record;
         try {
             record = this.store.open(bank, expert, lane, directive);
@@ -95,7 +96,7 @@ class RamTierTest {
 
     @Test
     void aRecordIsReadFromTheArtifactOnceAndThenFromMemory() throws Exception {
-        store(10, 1, ReplacementPolicy.BANK_PARTITIONED);
+        store(10, 1);
         assertArrayEquals(this.fixture.record(2, 5), load(2, 5, 0));
         long afterFirst = this.store.bytesRead();
         assertEquals(this.fixture.banks[2].recordBytes(5), afterFirst);
@@ -113,7 +114,7 @@ class RamTierTest {
 
     @Test
     void aResidentTierPreloadsEverythingAndReadsNothingAfterwards() throws Exception {
-        store(40, 3, ReplacementPolicy.BANK_PARTITIONED);
+        store(40, 3);
         RamTier tier = this.store.ramTier();
         assertTrue(tier.isResident());
         tier.preload(new FileRecordSource(this.fixture.file, this.fixture.banks), 4);
@@ -137,7 +138,7 @@ class RamTierTest {
     void aBoundedTierPreloadsEachLayersShare() throws Exception {
         for (int shards : new int[] {1, 2}) {
             if (this.store != null) this.store.close();
-            store(20, shards, ReplacementPolicy.BANK_PARTITIONED);
+            store(20, shards);
             RamTier tier = this.store.ramTier();
             assertFalse(tier.isResident());
             tier.preload(new FileRecordSource(this.fixture.file, this.fixture.banks), 3);
@@ -163,67 +164,32 @@ class RamTierTest {
 
     @Test
     void aBoundedTierStaysWithinItsSlotsAndReturnsTheArtifactsBytes() throws Exception {
-        for (ReplacementPolicy policy : ReplacementPolicy.values()) {
-            if (this.store != null) this.store.close();
-            store(12, 2, policy);
-            SplittableRandom random = new SplittableRandom(7);
-            for (int i = 0; i < 2000; i++) {
-                int bank = random.nextInt(5);
-                int expert = random.nextInt(this.fixture.banks[bank].expertCount());
-                assertArrayEquals(this.fixture.record(bank, expert), load(bank, expert, 0));
-                assertTrue(this.store.ramTier().stats().residentExperts() <= 12);
-            }
-            this.store.ramTier().checkInvariants();
-            var stats = this.store.ramTier().stats();
-            assertTrue(stats.totalEvictions() > 0, policy + " must evict 40 experts through 12 slots");
-            assertEquals(2000, stats.totalHits() + stats.totalMisses() + stats.totalBypasses());
-            assertEquals(0, stats.totalBypasses(), "with nothing pinned a slot is always found");
+        store(12, 2);
+        SplittableRandom random = new SplittableRandom(7);
+        for (int i = 0; i < 2000; i++) {
+            int bank = random.nextInt(5);
+            int expert = random.nextInt(this.fixture.banks[bank].expertCount());
+            assertArrayEquals(this.fixture.record(bank, expert), load(bank, expert, 0));
+            assertTrue(this.store.ramTier().stats().residentExperts() <= 12);
         }
-    }
-
-    /// The model visits its layers in a cycle and each layer reuses its own few experts. Ten slots cannot
-    /// hold the 15 hot experts of the five banks: a global LRU evicts each one just before it is needed
-    /// again, while a quota per bank keeps the experts of the banks that fit.
-    @Test
-    void aLayerAwarePolicyKeepsWhatACyclicPassWouldEvictFromAGlobalLru() throws Exception {
-        double global = cyclicHitRate(ReplacementPolicy.GLOBAL_LRU);
-        this.store.close();
-        double partitioned = cyclicHitRate(ReplacementPolicy.BANK_PARTITIONED);
-        System.out.printf("cyclic trace, 10 slots: global LRU %.3f, bank partitioned %.3f%n", global, partitioned);
-        assertTrue(global < 0.05, "a global LRU thrashes on the cycle: " + global);
-        assertTrue(partitioned > 0.3, "the partitioned policy keeps a share of every pass: " + partitioned);
-    }
-
-    private double cyclicHitRate(ReplacementPolicy policy) throws Exception {
-        store(10, 1, policy);
-        int[] hotPerBank = {3, 3, 3, 1, 3};
-        for (int pass = 0; pass < 50; pass++)
-            for (int bank = 0; bank < 5; bank++) for (int hot = 0; hot < hotPerBank[bank]; hot++) load(bank, hot, 0);
         this.store.ramTier().checkInvariants();
-        return this.store.ramTier().stats().hitRate();
+        var stats = this.store.ramTier().stats();
+        assertTrue(stats.totalEvictions() > 0, "40 experts must be evicted through 12 slots");
+        assertEquals(2000, stats.totalHits() + stats.totalMisses() + stats.totalBypasses());
+        assertEquals(0, stats.totalBypasses(), "with nothing pinned a decode step's record always finds a slot");
     }
 
     /// A prefill visits every expert of a layer once per chunk. Eight slots cannot hold the 16 experts of bank 2:
-    /// recency replaces each record just before the next sweep needs it, while admission keeps the records the
-    /// tier has and serves half of every sweep.
+    /// admission keeps the records the tier has and serves half of every sweep.
     @Test
-    void admissionKeepsAShareOfARepeatedSweepThatRecencyThrashes() throws Exception {
-        double recency = sweepHitRate(false);
-        this.store.close();
-        double admitted = sweepHitRate(true);
-        System.out.printf("sweeps of 16 records through 8 slots: recency %.3f, admission %.3f%n", recency, admitted);
-        assertTrue(recency < 0.05, "recency thrashes on the sweep: " + recency);
-        assertTrue(admitted > 0.4, "admission keeps half of every sweep: " + admitted);
-    }
-
-    private double sweepHitRate(boolean admission) throws Exception {
-        if (admission) admitting(8, ReplacementPolicy.GLOBAL_LRU);
-        else store(8, 1, ReplacementPolicy.GLOBAL_LRU);
+    void admissionKeepsAShareOfARepeatedSweep() throws Exception {
+        store(8, 1);
         for (int sweep = 0; sweep < 20; sweep++)
             for (int expert = 0; expert < 16; expert++)
-                assertArrayEquals(this.fixture.record(2, expert), load(2, expert, 0));
+                assertArrayEquals(this.fixture.record(2, expert), scan(2, expert));
         this.store.ramTier().checkInvariants();
-        return this.store.ramTier().stats().hitRate();
+        double admitted = this.store.ramTier().stats().hitRate();
+        assertTrue(admitted > 0.4, "admission keeps half of every sweep: " + admitted);
     }
 
     /// A preloaded record holds its slot only until a request needs it: with admission, the first request of a
@@ -231,22 +197,22 @@ class RamTierTest {
     /// an ordinary record from then on.
     @Test
     void aPreloadedRecordGivesWayToTheFirstRequestOfAnother() throws Exception {
-        admitting(8, ReplacementPolicy.GLOBAL_LRU);
+        store(8, 1);
         RamTier tier = this.store.ramTier();
         tier.preload(new FileRecordSource(this.fixture.file, this.fixture.banks), 2);
         RamTierShard shard = this.store.tier(0);
         assertTrue(shard.isResident(2, 0));
         // The shares round down: two slots are free and take the first two records.
         assertEquals(6, tier.stats().residentExperts());
-        load(2, 14, 0);
-        load(2, 13, 0);
+        scan(2, 14);
+        scan(2, 13);
         assertEquals(0, tier.stats().totalEvictions());
         assertFalse(shard.isResident(2, 15));
-        assertArrayEquals(this.fixture.record(2, 15), load(2, 15, 0));
+        assertArrayEquals(this.fixture.record(2, 15), scan(2, 15));
         assertTrue(shard.isResident(2, 15), "the first request replaced a preloaded record");
         assertEquals(1, tier.stats().totalEvictions());
-        load(2, 0, 0);
-        assertArrayEquals(this.fixture.record(4, 11), load(4, 11, 0));
+        scan(2, 0);
+        assertArrayEquals(this.fixture.record(4, 11), scan(4, 11));
         assertTrue(shard.isResident(2, 0), "a preloaded record that was asked for is not a placeholder any more");
         tier.checkInvariants();
     }
@@ -260,11 +226,11 @@ class RamTierTest {
         return mode.ordinal();
     }
 
-    /// Under the frequency policy the victim is the least requested record; a decode step's record always enters,
+    /// The victim is the least requested record; a decode step's record always enters,
     /// and a prefill's only in place of a record requested less often.
     @Test
     void theFrequencyPolicyEvictsTheLeastRequestedAndAdmitsOnlyAPrefillsRecords() throws Exception {
-        RamTier tier = new RamTier(this.fixture.banks, 2, 1, ReplacementPolicy.FREQUENCY, null, true);
+        RamTier tier = new RamTier(this.fixture.banks, 2, 1);
         this.store = new FileExpertStore(
                 this.gpu, new FileRecordSource(this.fixture.file, this.fixture.banks), tier, this.fixture.banks, 4);
         RamTierShard shard = this.store.tier(0);
@@ -285,15 +251,15 @@ class RamTierTest {
     /// A record asked for more often than the victim replaces it; until then it is read around the tier.
     @Test
     void aRecordAskedForMoreOftenThanTheVictimReplacesIt() throws Exception {
-        admitting(1, ReplacementPolicy.GLOBAL_LRU);
+        store(1, 1);
         RamTierShard shard = this.store.tier(0);
-        load(0, 0, 0);
+        scan(0, 0);
         assertTrue(shard.isResident(0, 0), "a free slot takes the first record");
-        load(0, 1, 0);
-        load(0, 1, 0);
+        scan(0, 1);
+        scan(0, 1);
         assertTrue(shard.isResident(0, 0), "asked for once before, as often as the victim: read around the tier");
         assertFalse(shard.isResident(0, 1));
-        assertArrayEquals(this.fixture.record(0, 1), load(0, 1, 0));
+        assertArrayEquals(this.fixture.record(0, 1), scan(0, 1));
         assertTrue(shard.isResident(0, 1), "asked for twice before, more often than the victim: it replaces it");
         var stats = this.store.ramTier().stats();
         assertEquals(2, stats.totalBypasses());
@@ -303,7 +269,7 @@ class RamTierTest {
 
     @Test
     void aPinnedSlotIsNeverTakenAndALoadWithoutASlotBypasses() throws Exception {
-        store(1, 1, ReplacementPolicy.GLOBAL_LRU);
+        store(1, 1);
         RamTierShard shard = this.store.tier(0);
         assertArrayEquals(this.fixture.record(0, 0), load(0, 0, 0));
 
@@ -329,7 +295,7 @@ class RamTierTest {
 
     @Test
     void aFillingSlotIsUnavailableUntilItsFillIsSettled() throws Exception {
-        store(1, 1, ReplacementPolicy.GLOBAL_LRU);
+        store(1, 1);
         RamTierShard shard = this.store.tier(0);
         TierDirective fill = new TierDirective();
         shard.plan(0, 0, fill);
@@ -369,7 +335,7 @@ class RamTierTest {
                 this.real.close();
             }
         };
-        store(2, 1, ReplacementPolicy.GLOBAL_LRU, failing);
+        store(2, 1, failing);
         assertThrows(IOException.class, () -> load(0, 0, 0));
         RamTierShard shard = this.store.tier(0);
         shard.checkInvariants();
@@ -383,7 +349,7 @@ class RamTierTest {
     @Test
     void shardsAreIndependentAndEachRunsOnItsOwnThread() throws Exception {
         int shards = 3;
-        store(24, shards, ReplacementPolicy.BANK_PARTITIONED);
+        store(24, shards);
         for (int shard = 0; shard < shards; shard++) {
             int mine = shard;
             assertTrue(
