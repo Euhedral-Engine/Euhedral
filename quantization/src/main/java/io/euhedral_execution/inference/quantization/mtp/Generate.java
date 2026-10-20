@@ -34,6 +34,7 @@ import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -200,7 +201,7 @@ public final class Generate {
                     var role = QwenChatTemplate.Role.valueOf(
                             message.path("role").asText().toUpperCase(Locale.ROOT));
                     turns.add(new QwenChatTemplate.Turn(
-                            role, message.path("content").asText("")));
+                            role, message.path("content").asText(""), toolCalls(json, message)));
                 }
                 List<Map<String, Object>> tools = new ArrayList<>();
                 for (JsonNode tool : record.path("tools")) tools.add(json.convertValue(tool, Map.class));
@@ -208,6 +209,20 @@ public final class Generate {
                 prompts.add(new Prompt(record.path("id").asText(), tokenizer.encodeText(text)));
             }
             return prompts;
+        }
+
+        /// An assistant message's OpenAI `tool_calls` (`function.arguments` a JSON object or its text).
+        @SuppressWarnings("unchecked")
+        static List<QwenChatTemplate.ToolCall> toolCalls(ObjectMapper json, JsonNode message) throws IOException {
+            List<QwenChatTemplate.ToolCall> calls = new ArrayList<>();
+            for (JsonNode call : message.path("tool_calls")) {
+                JsonNode function = call.path("function");
+                JsonNode arguments = function.path("arguments");
+                if (arguments.isTextual()) arguments = json.readTree(arguments.asText());
+                calls.add(new QwenChatTemplate.ToolCall(
+                        function.path("name").asText(), json.convertValue(arguments, LinkedHashMap.class)));
+            }
+            return calls;
         }
     }
 
