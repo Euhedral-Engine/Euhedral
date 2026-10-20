@@ -12,9 +12,12 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
@@ -36,6 +39,9 @@ public record NativeFiles(Path root) {
     private static final String RESOURCES = "META-INF/euhedral-native/";
     private static final String SETTING = "host.native-cache";
     private static final int ATTEMPTS = 8;
+    private static final String UNPACKING = ".unpack-";
+    /// Age after which a temporary unpack directory belongs to a start that stopped.
+    static final Duration ABANDONED = Duration.ofHours(1);
 
     public NativeFiles {
         Objects.requireNonNull(root, "root");
@@ -107,25 +113,41 @@ public record NativeFiles(Path root) {
     /// sibling directory and renames it into place, so concurrent unpacks, in one process or several, never
     /// expose a partial directory; the first rename wins and the others discard their copy.
     static NativeFiles unpack(Path cacheRoot, ClassLoader loader, String platform) {
+        return unpack(cacheRoot, loader, platform, () -> {});
+    }
+
+    /// As [#unpack(Path, ClassLoader, String)]; `beforeDiscard` runs after a damaged directory was found and before
+    /// it is moved aside, where a concurrent unpack may replace it.
+    static NativeFiles unpack(Path cacheRoot, ClassLoader loader, String platform, Runnable beforeDiscard) {
         String prefix = RESOURCES + platform + "/";
         byte[] listing = resource(loader, prefix + HASHES, platform);
         Map<String, String> hashes = parse(listing);
         Path target =
                 cacheRoot.resolve(HexFormat.of().formatHex(sha256(listing)).substring(0, 16));
+        if (complete(target, hashes)) return new NativeFiles(target);
+        removeAbandoned(cacheRoot);
+        IOException lastFailure = null;
         for (int attempt = 0; attempt < ATTEMPTS; attempt++) {
-            if (complete(target, hashes)) return new NativeFiles(target);
             Path temporary = null;
             try {
                 Files.createDirectories(cacheRoot);
-                temporary = Files.createTempDirectory(cacheRoot, target.getFileName() + ".unpack-");
+                temporary = Files.createTempDirectory(cacheRoot, target.getFileName() + UNPACKING);
                 write(loader, prefix, hashes, temporary);
                 Files.write(temporary.resolve(HASHES), listing);
-                if (Files.exists(target) && !complete(target, hashes)) discard(cacheRoot, target);
+                Object damaged = identity(target);
+                if (damaged != null) {
+                    beforeDiscard.run();
+                    discard(cacheRoot, target, damaged, hashes);
+                }
                 try {
                     Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE);
                     temporary = null;
-                } catch (FileSystemException taken) {
-                    // Another unpack renamed its copy first: reuse it if it is complete, else try again.
+                    return new NativeFiles(target);
+                } catch (FileSystemException refused) {
+                    // Another unpack renamed its copy into place first, or the rename itself failed.
+                    if (complete(target, hashes)) return new NativeFiles(target);
+                    if (!Files.exists(target)) throw refused;
+                    lastFailure = refused;
                 }
             } catch (IOException | UncheckedIOException failure) {
                 throw new CacheException(
@@ -135,15 +157,31 @@ public record NativeFiles(Path root) {
             } finally {
                 if (temporary != null) deleteTree(temporary);
             }
+            if (complete(target, hashes)) return new NativeFiles(target);
         }
-        if (complete(target, hashes)) return new NativeFiles(target);
         throw new CacheException(
-                SETTING + ": the native files in " + target + " keep changing while they unpack", null);
+                SETTING + ": cannot place the native files at " + target + ": "
+                        + (lastFailure == null ? "it keeps changing while they unpack" : lastFailure.getMessage()),
+                lastFailure);
     }
 
-    /// Moves a damaged directory aside under a temporary name and deletes it; a concurrent unpack may have done so
-    /// already.
-    private static void discard(Path cacheRoot, Path target) throws IOException {
+    /// The file-system identity of an existing directory at `target` (its file key, or the path where the file
+    /// system has none), or null when there is none.
+    private static Object identity(Path target) {
+        try {
+            if (!Files.isDirectory(target)) return null;
+            Object key = Files.readAttributes(target, BasicFileAttributes.class).fileKey();
+            return key != null ? key : target;
+        } catch (IOException gone) {
+            return null;
+        }
+    }
+
+    /// Moves the damaged directory `damaged` at `target` aside and deletes it. What was moved is deleted only when it
+    /// is that same directory and still incomplete: a directory a concurrent unpack renamed into place meanwhile is
+    /// renamed back (or, if yet another took its place, left aside), never deleted.
+    private static void discard(Path cacheRoot, Path target, Object damaged, Map<String, String> hashes)
+            throws IOException {
         Path aside = Files.createTempDirectory(cacheRoot, target.getFileName() + ".discard-");
         Files.delete(aside);
         try {
@@ -151,7 +189,35 @@ public record NativeFiles(Path root) {
         } catch (NoSuchFileException gone) {
             return;
         }
-        deleteTree(aside);
+        Object moved = Files.readAttributes(aside, BasicFileAttributes.class).fileKey();
+        boolean same = moved == null || moved.equals(damaged);
+        if (same && !complete(aside, hashes)) {
+            deleteTree(aside);
+            return;
+        }
+        try {
+            Files.move(aside, target, StandardCopyOption.ATOMIC_MOVE);
+        } catch (FileSystemException occupied) {
+            // A third copy took the name; this complete one stays aside, unused.
+        }
+    }
+
+    /// Deletes temporary unpack directories older than [#ABANDONED], which a stopped start leaves behind.
+    private static void removeAbandoned(Path cacheRoot) {
+        if (!Files.isDirectory(cacheRoot)) return;
+        Instant cutoff = Instant.now().minus(ABANDONED);
+        try (Stream<Path> entries = Files.list(cacheRoot)) {
+            for (Path entry : entries.toList()) {
+                if (!entry.getFileName().toString().contains(UNPACKING)) continue;
+                try {
+                    if (Files.getLastModifiedTime(entry).toInstant().isBefore(cutoff)) deleteTree(entry);
+                } catch (IOException gone) {
+                    // Another start removed it.
+                }
+            }
+        } catch (IOException unreadable) {
+            // The unpack that follows reports an unusable cache.
+        }
     }
 
     private static void write(ClassLoader loader, String prefix, Map<String, String> hashes, Path directory)

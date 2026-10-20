@@ -2,23 +2,28 @@ package io.euhedral_execution.inference.core.nativefiles;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -152,6 +157,51 @@ class NativeFilesTest {
     }
 
     @Test
+    void aGoodDirectoryPlacedWhileADamagedOneIsDiscardedSurvives() throws IOException {
+        NativeFiles first = unpack();
+        Path good = NativeFiles.unpack(this.directory.resolve("other"), this.resources, PLATFORM)
+                .root();
+        Files.write(first.library(), bytes("library", 100));
+        Object[] placed = new Object[1];
+        // Between this unpack judging the directory damaged and moving it aside, another replaces it with a good one.
+        NativeFiles second = NativeFiles.unpack(this.cache, this.resources, PLATFORM, () -> {
+            try {
+                deleteTree(first.root());
+                Files.move(good, first.root());
+                placed[0] = Files.readAttributes(first.root(), BasicFileAttributes.class)
+                        .fileKey();
+            } catch (IOException failure) {
+                throw new UncheckedIOException(failure);
+            }
+        });
+        assertEquals(first, second);
+        assertArrayEquals(bytes("library", 4096), Files.readAllBytes(second.library()));
+        assertEquals(
+                placed[0],
+                Files.readAttributes(second.root(), BasicFileAttributes.class).fileKey());
+        try (Stream<Path> entries = Files.list(this.cache)) {
+            assertEquals(List.of(second.root()), entries.toList());
+        }
+    }
+
+    @Test
+    void abandonedUnpacksAreRemovedAndRecentOnesKept() throws IOException {
+        NativeFiles first = unpack();
+        deleteTree(first.root());
+        String key = first.root().getFileName().toString();
+        Path abandoned = Files.createDirectories(this.cache.resolve(key + ".unpack-1"));
+        Files.writeString(abandoned.resolve("partial"), "x");
+        Files.setLastModifiedTime(
+                abandoned,
+                FileTime.from(Instant.now().minus(NativeFiles.ABANDONED).minusSeconds(60)));
+        Path recent = Files.createDirectories(this.cache.resolve(key + ".unpack-2"));
+        NativeFiles second = unpack();
+        assertEquals(first, second);
+        assertFalse(Files.exists(abandoned));
+        assertTrue(Files.isDirectory(recent));
+    }
+
+    @Test
     void theBuildLayoutIsUsedWhereItIs() {
         Path root = this.directory.resolve("build/native/linux-x64");
         NativeFiles files = NativeFiles.at(root);
@@ -165,6 +215,12 @@ class NativeFilesTest {
         if (!Files.getFileStore(directory).supportsFileAttributeView(PosixFileAttributeView.class)) return false;
         Files.setPosixFilePermissions(directory, PosixFilePermissions.fromString(writable ? "rwxr-xr-x" : "r-xr-xr-x"));
         return true;
+    }
+
+    private static void deleteTree(Path root) throws IOException {
+        try (Stream<Path> paths = Files.walk(root)) {
+            for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.delete(path);
+        }
     }
 
     private static List<Path> listing(Path root) throws IOException {

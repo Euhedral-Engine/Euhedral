@@ -641,12 +641,16 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private static final List<String> WINDOWS_RUNTIME =
             List.of("cudart64_13.dll", "nvrtc-builtins64_131.dll", "nvrtc64_130_0.dll");
 
-    /// Loads the runtime libraries that sit beside `library` ([#LINUX_RUNTIME], [#WINDOWS_RUNTIME]); a layout without
-    /// them relies on the system's search path.
+    /// Loads the runtime libraries that sit beside `library` ([#LINUX_RUNTIME], [#WINDOWS_RUNTIME]).
+    ///
+    /// @throws GpuMemoryException when one is missing from the library's directory
     public static void preloadRuntime(Path library, Arena arena) {
         for (String name : OSName.isWindows() ? WINDOWS_RUNTIME : LINUX_RUNTIME) {
             Path runtime = library.toAbsolutePath().resolveSibling(name);
-            if (Files.isRegularFile(runtime)) SymbolLookup.libraryLookup(runtime, arena);
+            if (!Files.isRegularFile(runtime))
+                throw new GpuMemoryException("the CUDA runtime library " + runtime + " is missing; it belongs beside "
+                        + library.getFileName() + ", as the native files lay it out");
+            SymbolLookup.libraryLookup(runtime, arena);
         }
     }
 

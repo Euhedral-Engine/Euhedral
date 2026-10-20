@@ -32,7 +32,7 @@ int euhedral_cuda_set_include_directory(const char* path) {
     if (current != NULL && strcmp(current, path) == 0) return EUHEDRAL_CUDA_SUCCESS;
     size_t length = strlen(path);
     char* copy = malloc(length + 1u);
-    if (copy == NULL) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    if (copy == NULL) return (int)cudaErrorMemoryAllocation;
     memcpy(copy, path, length + 1u);
     atomic_store_explicit(&cuda_include_directory, copy, memory_order_release);
     return EUHEDRAL_CUDA_SUCCESS;
