@@ -17,6 +17,8 @@ management:
       application: euhedral-inference
 
 spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
   application:
     name: euhedral-inference-api
   main:

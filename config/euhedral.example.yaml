@@ -23,10 +23,10 @@ model:
 
 server:
   port: 1738                                  # optional, default 1738: the port to listen on
-  shutdown-timeout: 10s                       # optional, default 10s: how long a stop waits for running requests
+  shutdown-timeout: 10s                       # optional, default 10s: how long closing the engine waits for its workers to stop
   requests:
     default-max-tokens: 4096                  # optional, default 4096: tokens generated when a request names no limit
-    max-queued: 16                            # optional, default 16: requests waiting for the engine before new ones are refused
+    max-queued: 16                            # optional, default 16: requests waiting for the engine before new ones are refused (0 rejects any request that would wait)
     max-body-size: 1MiB                       # optional, default 1MiB: largest request body
     timeout: 30m                              # optional, default 30m: longest a request may run
 

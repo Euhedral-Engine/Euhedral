@@ -293,7 +293,7 @@ public final class SettingsLoader {
         m.put("model.name", required(SettingsLoader::name));
 
         m.put("server.port", fixed(integer(1, 65535)));
-        m.put("server.shutdown-timeout", fixed(duration(false)));
+        m.put("server.shutdown-timeout", fixed(duration(true)));
         m.put("server.requests.default-max-tokens", fixed(integer(1, Integer.MAX_VALUE)));
         m.put("server.requests.max-queued", fixed(integer(0, Integer.MAX_VALUE)));
         m.put("server.requests.max-body-size", fixed(size(1)));
@@ -397,6 +397,11 @@ public final class SettingsLoader {
     private static Object cpus(String text) {
         if (!CPUS.matcher(text).matches())
             throw new IllegalArgumentException("must be a CPU list such as 2-5,8: " + text);
+        try {
+            HostSettings.parseCpus(text);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("must be a CPU list such as 2-5,8: " + text);
+        }
         return text;
     }
 

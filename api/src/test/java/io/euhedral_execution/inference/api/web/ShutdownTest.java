@@ -19,7 +19,7 @@ import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 
 /// A shutdown first waits for the requests in flight, queued ones included, up to the drain window
-/// (`server.shutdown-timeout`); what is left when it ends is answered before the server stops:
+/// (`spring.lifecycle.timeout-per-shutdown-phase`); what is left when it ends is answered before the server stops:
 /// the running generation is stopped and its stream ends with an error event, and a queued request is refused
 /// with 503. Each test starts its own server, because it closes it.
 @Timeout(60)

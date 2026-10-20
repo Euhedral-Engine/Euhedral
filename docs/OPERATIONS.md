@@ -29,7 +29,7 @@ and every other setting come from the run's environment. The container and `mise
 | `context.kv-cache-on-gpu-tokens` | 65536 | Tokens of each sequence's attention cache that stay in device memory. When the weights and every sequence's whole cache do not fit, the pages past this many tokens move to pinned host memory before any weight leaves the GPU, and each attention layer copies them in before it reads them ([ATTENTION_DECODE.md](ATTENTION_DECODE.md#cache-pages-in-host-memory)). Raise it to keep more of the cache on the GPU at the price of weights in host memory; lower it to fit longer contexts or more sequences. |
 | `euhedral.batch.max-rows` | the workspace rows | JVM system property (`-Deuhedral.batch.max-rows=N`), not a Spring property. The most rows one shared decode or verification pass holds; lower it to bound a pass. It also caps the sequence count `max-sequences=0` chooses. |
 | `euhedral.batch.max-parts` | unlimited (1 with DFlash2) | JVM system property. The most sequences one shared pass serves; with DFlash2 a pass serves one. |
-| `server.shutdown-timeout` | 10s | How long a shutdown waits for requests in flight, and for the engine's workers to stop. |
+| `server.shutdown-timeout` | 10s | How long closing the engine waits for its workers to stop. |
 | `server.requests.default-max-tokens` | 4096 | Completion length when a request sets none. |
 | `server.requests.max-queued` | 16 | Requests waiting while every generation slot is busy; more are refused with 503. |
 | `server.requests.max-body-size` | 1MiB | Request body limit (413 beyond). |
@@ -86,7 +86,7 @@ engine has closed. The image's Docker health check calls it.
 ## Shutting down
 
 On `SIGTERM` or `SIGINT` the server stops accepting connections and waits up to
-`server.shutdown-timeout` (10 s) for the requests in flight, queued ones included, to finish. What is
+`spring.lifecycle.timeout-per-shutdown-phase` (30 s, fixed) for the requests in flight, queued ones included, to finish. What is
 left after that is answered before the server stops: a request still queued gets 503 (`The server is shutting down.`),
 the running generation is stopped at its next quantum and gets an error (in a stream, an `error` event), and the engine
 then closes its sessions, its workers and the GPU. A second signal exits at once.

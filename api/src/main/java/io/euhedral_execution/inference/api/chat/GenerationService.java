@@ -32,7 +32,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 /// was planned and admitted.
 ///
 /// At shutdown the web server first stops accepting connections and waits for the requests in flight, queued ones
-/// included, up to `server.shutdown-timeout`. This service stops next, in a lifecycle phase
+/// included, up to `spring.lifecycle.timeout-per-shutdown-phase`. This service stops next, in a lifecycle phase
 /// between that wait and the web server's stop, while responses can still be written: requests still waiting are
 /// refused with 503 and the running generations are stopped and answered with an error. Spring destroys the engine
 /// after that, because this service depends on it.

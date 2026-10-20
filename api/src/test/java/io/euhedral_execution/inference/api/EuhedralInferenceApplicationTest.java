@@ -97,7 +97,6 @@ class EuhedralInferenceApplicationTest {
                   name: n
                 server:
                   port: %d
-                  shutdown-timeout: 7s
                   requests:
                     default-max-tokens: 99
                     max-queued: 3
@@ -111,13 +110,19 @@ class EuhedralInferenceApplicationTest {
                         settings, files, Probe.class)
                 .run()) {
             assertEquals(String.valueOf(port), context.getEnvironment().getProperty("local.server.port"));
-            assertEquals("7000ms", context.getEnvironment().getProperty("spring.lifecycle.timeout-per-shutdown-phase"));
             assertSame(settings, context.getBean(Settings.class));
             assertSame(files, context.getBean(NativeFiles.class));
             assertEquals(
                     new RequestSettings(99, 3, 2048, Duration.ofMinutes(5)), context.getBean(RequestSettings.class));
             assertEquals(Optional.empty(), settings.host().nativeCache());
         }
+    }
+
+    @Test
+    void configIsNotPassedOnToSpring() {
+        assertEquals(List.of("--x=1", "--y"), List.of(EuhedralInferenceApplication.springArguments(new String[] {
+            "--x=1", "--config", "f.yaml", "--config=g.yaml", "--y"
+        })));
     }
 
     @SpringBootConfiguration
