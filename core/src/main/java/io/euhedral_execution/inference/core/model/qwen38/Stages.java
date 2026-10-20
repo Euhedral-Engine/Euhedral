@@ -927,6 +927,9 @@ public final class Stages {
                 this.pendingAppendStates[index] = state;
                 this.pendingAppendRows[index] = part.rows();
                 state.prepareAppend(part.position(), part.rows());
+                // Host pages: the rows this quantum reads come into the device region first, and the pages it writes
+                // go back after the append, on this stream; the layer's attention reads them through the table.
+                state.stageIn(part.position(), part.rows());
                 gpu().attentionKvAppend(
                                 state.format(),
                                 input(context, instruction, 0) + part.rowOffset() * rowBytes,
@@ -938,6 +941,7 @@ public final class Stages {
                                 keyValueWidth,
                                 part.position(),
                                 part.positionAddress());
+                state.stageOut(part.position(), part.rows());
                 state.appendSubmitted(part.rows());
             }
         }

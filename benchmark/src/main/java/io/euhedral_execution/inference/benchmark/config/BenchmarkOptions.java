@@ -25,6 +25,8 @@ import java.util.Objects;
 ///   selects, as the server does; `off` decodes them one token per quantum, the ordinary-decoding control arm.
 /// - `cpus`: `all`, `one-per-core`, `performance`, `performance-one-per-core`, or IDs/ranges such as `2-5,8`.
 /// - `maxContextTokens`: the longest sequence (prompt plus generation) the engine keeps device memory for.
+/// - `kvDeviceMinimumTokens`: the tokens of each sequence's attention cache kept on the GPU when the cache must
+///   leave it (default 65536).
 /// - `output`: a `.json` path writes one document; any other path writes JSONL. Null selects a
 ///   timestamped JSONL file under `benchmark-results/`.
 /// - `gpuMemory`: record device free/total memory before and after each iteration, outside timing.
@@ -52,7 +54,8 @@ public record BenchmarkOptions(
         @JsonProperty("gpuMemory") Boolean gpuMemory,
         @JsonProperty("shutdownTimeoutSeconds") Long shutdownTimeoutSeconds,
         @JsonProperty("promptCorpus") String promptCorpus,
-        @JsonProperty("speculation") String speculation) {
+        @JsonProperty("speculation") String speculation,
+        @JsonProperty("kvDeviceMinimumTokens") Integer kvDeviceMinimumTokens) {
 
     static final ObjectMapper JSON = new ObjectMapper();
 
@@ -76,6 +79,10 @@ public record BenchmarkOptions(
         shutdownTimeoutSeconds = shutdownTimeoutSeconds == null ? 10L : shutdownTimeoutSeconds;
         promptCorpus = promptCorpus == null ? "words" : promptCorpus.strip();
         speculation = speculation == null ? "artifact" : speculation.strip();
+        kvDeviceMinimumTokens = kvDeviceMinimumTokens == null
+                ? InferenceConfig.DEFAULT_KV_DEVICE_MINIMUM_TOKENS
+                : kvDeviceMinimumTokens;
+        if (kvDeviceMinimumTokens <= 0) throw new IllegalArgumentException("kvDeviceMinimumTokens must be positive");
         if (!speculation.equals("artifact") && !speculation.equals("off"))
             throw new IllegalArgumentException("speculation must be \"artifact\" or \"off\"");
         if (!promptCorpus.equals("words") && !promptCorpus.equals("chat"))
@@ -159,7 +166,8 @@ public record BenchmarkOptions(
                 options.gpuMemory(),
                 options.shutdownTimeoutSeconds(),
                 options.promptCorpus(),
-                options.speculation());
+                options.speculation(),
+                options.kvDeviceMinimumTokens());
     }
 
     public boolean json() {

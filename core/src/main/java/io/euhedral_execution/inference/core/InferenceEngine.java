@@ -28,6 +28,7 @@ import io.euhedral_execution.inference.core.model.qwen4.Qwen4Runtime;
 import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.state.KvFormat;
+import io.euhedral_execution.inference.core.state.KvHostPages;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -121,9 +122,22 @@ public final class InferenceEngine implements AutoCloseable {
             ArtifactProfile profile = artifact == null ? null : ArtifactProfile.of(artifact);
             KvFormat kvFormat = ArtifactProfile.kvFormat(config.kvCache(), profile);
             int sequences = bootstrap.resolveSequences(
-                    artifact, profile, gpu, config.maxContextTokens(), kvFormat, config.maxSequences());
+                    artifact,
+                    profile,
+                    gpu,
+                    config.maxContextTokens(),
+                    kvFormat,
+                    config.maxSequences(),
+                    config.kvDeviceMinimumTokens());
             model = bootstrap.loadModel(
-                    config.artifactPath(), artifact, profile, gpu, config.maxContextTokens(), kvFormat, sequences);
+                    config.artifactPath(),
+                    artifact,
+                    profile,
+                    gpu,
+                    config.maxContextTokens(),
+                    kvFormat,
+                    sequences,
+                    config.kvDeviceMinimumTokens());
             lattice = bootstrap.createLattice(config);
             bootstrap.startLattice(lattice);
             Qwen38Runtime dense = Qwen38Runtime.open(config, tokenizer, gpu, model, artifact, profile, lattice);
@@ -556,7 +570,8 @@ public final class InferenceEngine implements AutoCloseable {
                 ExecutionGpu gpu,
                 int maxContextTokens,
                 KvFormat kvFormat,
-                int requested)
+                int requested,
+                int kvDeviceMinimumTokens)
                 throws IOException {
             if (requested >= 1) return requested;
             if (profile == null || profile.speculation() == ArtifactProfile.Speculation.DFLASH2) return 1;
@@ -571,7 +586,8 @@ public final class InferenceEngine implements AutoCloseable {
                                             : 0)));
             long free = deviceBudget(gpu);
             long host = hostBudget();
-            int low = ResidencyPlanner.sequencesFor(artifact, profile, free, maxContextTokens, host, kvFormat, cap);
+            int low = ResidencyPlanner.sequencesFor(
+                    artifact, profile, free, maxContextTokens, host, kvFormat, cap, kvDeviceMinimumTokens);
             LOG.info("Sequences: {} of {} tokens each (auto)", low, maxContextTokens);
             return low;
         }
@@ -594,7 +610,9 @@ public final class InferenceEngine implements AutoCloseable {
         /// Loads the artifact's executed objects, its attention caches in `kvFormat`, moving off the
         /// device only as many weights as a context of `maxContextTokens` needs to fit in its free
         /// memory: into pinned host memory up to the host budget ([HostBudget],
-        /// `euhedral.residency.host-budget-bytes` in tests), the rest read from the artifact on use.
+        /// `euhedral.residency.host-budget-bytes` in tests), the rest read from the artifact on use. Before any
+        /// weight moves, each sequence's cache pages past `kvDeviceMinimumTokens` move to pinned host memory
+        /// ([ResidencyPlanner]); the model then holds those pages.
         Qwen38Model loadModel(
                 Path path,
                 Artifact artifact,
@@ -602,7 +620,8 @@ public final class InferenceEngine implements AutoCloseable {
                 ExecutionGpu gpu,
                 int maxContextTokens,
                 KvFormat kvFormat,
-                int sequences)
+                int sequences,
+                int kvDeviceMinimumTokens)
                 throws IOException {
             int positions = artifact.config().maxPositionEmbeddings();
             if (maxContextTokens > positions)
@@ -610,7 +629,16 @@ public final class InferenceEngine implements AutoCloseable {
                         + positions + " positions the model supports; set a smaller max context");
             long free = deviceBudget(gpu);
             long host = hostBudget();
-            var plan = ResidencyPlanner.plan(artifact, profile, free, maxContextTokens, host, kvFormat, sequences);
+            var plan = ResidencyPlanner.plan(
+                    artifact,
+                    profile,
+                    free,
+                    maxContextTokens,
+                    host,
+                    kvFormat,
+                    sequences,
+                    Boolean.getBoolean(ResidencyPlanner.MAP_OUTPUT_HEAD),
+                    kvDeviceMinimumTokens);
             if (!plan.fits() && plan.hostArenaBytes() + plan.windowBytes() > host)
                 throw new IOException("the weights the GPU cannot hold need "
                         + ((plan.hostArenaBytes() + plan.windowBytes()) >> 20) + " MiB of host memory (the token "
@@ -646,7 +674,35 @@ public final class InferenceEngine implements AutoCloseable {
                         head >> 20,
                         head / 40_000_000L);
             }
-            return Qwen38Model.load(path, artifact, gpu, profile.speculation(), plan.hostBacked(), plan.diskBacked());
+            if (plan.kvHostPages() > 0) {
+                int devicePages = (int) ((Math.min(maxContextTokens, (long) kvDeviceMinimumTokens) + 255) / 256);
+                LOG.info(
+                        "Attention caches: {} tokens of each sequence on the GPU, the rest ({} MiB in all) in pinned"
+                                + " host memory, copied in for each attention layer",
+                        devicePages * 256,
+                        plan.kvHostBytes() >> 20);
+            }
+            Qwen38Model model =
+                    Qwen38Model.load(path, artifact, gpu, profile.speculation(), plan.hostBacked(), plan.diskBacked());
+            if (plan.kvHostPages() == 0) return model;
+            try {
+                int devicePages = (int) ((Math.min(maxContextTokens, (long) kvDeviceMinimumTokens) + 255) / 256);
+                model.useKvHostPages(KvHostPages.allocate(
+                        gpu,
+                        sequences,
+                        ResidencyPlanner.attentionLayers(artifact.config()),
+                        devicePages,
+                        plan.kvHostPages(),
+                        ResidencyPlanner.pageBytes(artifact.config(), kvFormat)));
+                return model;
+            } catch (RuntimeException | Error failure) {
+                try {
+                    model.close();
+                } catch (RuntimeException | Error cleanup) {
+                    failure.addSuppressed(cleanup);
+                }
+                throw failure;
+            }
         }
 
         /// Fragment defaults with fixed idle timing: an idle worker parks for the default 15 us. The adaptive

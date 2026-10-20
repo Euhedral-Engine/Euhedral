@@ -30,7 +30,28 @@ import java.util.Objects;
 /// conclusions (the commits and discards), which the sequence runs in admission order, own `length`. A later
 /// quantum's append may run while an earlier one concludes, so a conclusion touches nothing the appends own
 /// except, between quanta, the submitted frontier.
+///
+/// With a [HostRun], only the first `devicePages` pages are device memory. The pages past them live in pinned host
+/// memory, and the table addresses them in the run's device region instead: an append first copies the host pages
+/// the quantum reads into the region ([#stageIn]) and afterwards copies the pages it wrote back ([#stageOut]), both
+/// on its stream, so the attention after it reads every row through the table as for device pages. Quanta of up to
+/// [#STAGED_TAIL_ROWS] rows (the captured ones) copy every reserved host page in and the last two back, so what they
+/// queue changes only with the reservation, which the fingerprint carries.
 public final class AttentionKvState implements AutoCloseable {
+    /// Rows of the quanta whose host page copies depend only on the reservation: decode, verification and draft
+    /// quanta, which append at the end of the reserved rows and touch at most its last two pages.
+    public static final int STAGED_TAIL_ROWS = 8;
+
+    /// Host pages of one cache: the first `devicePages` pages are device memory, the next `pages` pinned host memory
+    /// at `host`, read and written through the device region at `region` (one page of [#planePageBytes] K then V
+    /// bytes each).
+    public record HostRun(int devicePages, int pages, long host, long region) {
+        public HostRun {
+            if (devicePages <= 0 || pages <= 0 || host == 0 || region == 0)
+                throw new IllegalArgumentException("a host run needs device pages, host pages and addresses");
+        }
+    }
+
     public static final int PAGE_TOKENS = 256;
     /// Bytes of an NVFP4 head row ([KvFormat#NVFP4]).
     public static final int HEAD_ROW_BYTES = 144;
@@ -38,6 +59,7 @@ public final class AttentionKvState implements AutoCloseable {
     private final KvFormat format;
     private final long planePageBytes;
     private final List<Long> pages = new ArrayList<>();
+    private final HostRun host;
     /// Table uploads' staging, each with the frontier its append reaches. The appends release what a committed
     /// append queued; the close releases the rest.
     private final List<Pending> pendingStaging = new ArrayList<>();
@@ -59,11 +81,17 @@ public final class AttentionKvState implements AutoCloseable {
     }
 
     public AttentionKvState(ExecutionGpu gpu, int keyValueWidth, KvFormat format) {
+        this(gpu, keyValueWidth, format, null);
+    }
+
+    /// A cache whose pages past `host`'s device pages live in its host run (null: every page on the device).
+    public AttentionKvState(ExecutionGpu gpu, int keyValueWidth, KvFormat format, HostRun host) {
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         this.format = Objects.requireNonNull(format, "format");
         if (keyValueWidth <= 0 || keyValueWidth % 256 != 0)
             throw new IllegalArgumentException("the KV cache requires complete D256 heads");
         this.planePageBytes = planePageBytes(keyValueWidth, format);
+        this.host = host;
     }
 
     /// Bytes of one plane (K or V) of one page of `keyValueWidth`-wide rows in `format`.
@@ -90,8 +118,15 @@ public final class AttentionKvState implements AutoCloseable {
         if (required <= this.capacity) return;
         int count = Math.toIntExact(((long) required + PAGE_TOKENS - 1) / PAGE_TOKENS);
         int nextCapacity = Math.toIntExact((long) count * PAGE_TOKENS);
+        int device = count;
+        if (this.host != null) {
+            if (count > this.host.devicePages() + this.host.pages())
+                throw new IllegalStateException("an attention cache of " + required + " rows is longer than the "
+                        + (this.host.devicePages() + this.host.pages()) * PAGE_TOKENS + " rows planned for it");
+            device = Math.min(count, this.host.devicePages());
+        }
         // Retain ownership of successful allocations if a later operation fails.
-        while (this.pages.size() < count) this.pages.add(allocate(2 * this.planePageBytes));
+        while (this.pages.size() < device) this.pages.add(allocate(2 * this.planePageBytes));
         int slots = Math.max(1, this.tableSlots);
         while (slots < count) slots = Math.multiplyExact(slots, 2);
         long tableBytes = (long) slots * 2 * Long.BYTES;
@@ -104,8 +139,10 @@ public final class AttentionKvState implements AutoCloseable {
             MemorySegment entries = staging.segment();
             entries.fill((byte) 0);
             for (int i = 0; i < count; i++) {
-                entries.setAtIndex(ValueLayout.JAVA_LONG_UNALIGNED, i, this.pages.get(i));
-                entries.setAtIndex(ValueLayout.JAVA_LONG_UNALIGNED, slots + i, this.pages.get(i) + this.planePageBytes);
+                long page =
+                        i < device ? this.pages.get(i) : this.host.region() + (i - device) * 2 * this.planePageBytes;
+                entries.setAtIndex(ValueLayout.JAVA_LONG_UNALIGNED, i, page);
+                entries.setAtIndex(ValueLayout.JAVA_LONG_UNALIGNED, slots + i, page + this.planePageBytes);
             }
             // No reader of this layer's table precedes this stage in the quantum, and an earlier quantum's readers
             // precede it through the carried KV edge, so the stream orders the rewrite.
@@ -133,7 +170,54 @@ public final class AttentionKvState implements AutoCloseable {
                 .add(this.gpu, this.table)
                 .add(this.tableSlots)
                 .add(this.gpu, this.decodeScratch)
-                .add(this.format.ordinal());
+                .add(this.format.ordinal())
+                .add(reservedHostPages());
+    }
+
+    /// Host pages the reserved rows reach (0 without a host run).
+    public int reservedHostPages() {
+        if (this.host == null) return 0;
+        return Math.max(0, this.capacity / PAGE_TOKENS - this.host.devicePages());
+    }
+
+    /// Queues on the selected stream the copy of the host pages an append of `rows` rows at `start` and the
+    /// attention after it read into the device region: every reserved one for a quantum of at most
+    /// [#STAGED_TAIL_ROWS] rows, otherwise those holding the rows before `start + rows`. Nothing without host
+    /// pages.
+    public void stageIn(long start, int rows) {
+        ensureOpen();
+        int reserved = reservedHostPages();
+        if (reserved == 0) return;
+        int pages = rows <= STAGED_TAIL_ROWS
+                ? reserved
+                : Math.min(
+                        reserved,
+                        Math.toIntExact((start + rows + PAGE_TOKENS - 1) / PAGE_TOKENS) - this.host.devicePages());
+        if (pages <= 0) return;
+        this.gpu.copyHostToDeviceAsync(this.host.region(), this.host.host(), pages * 2 * this.planePageBytes);
+    }
+
+    /// Queues on the selected stream the copy back to host memory of the host pages an append of `rows` rows
+    /// at `start` wrote: the last two reserved ones for a quantum of at most [#STAGED_TAIL_ROWS] rows (an
+    /// append at the end of the reservation touches no other), otherwise exactly those holding its rows.
+    public void stageOut(long start, int rows) {
+        ensureOpen();
+        int reserved = reservedHostPages();
+        if (reserved == 0) return;
+        int device = this.host.devicePages();
+        int first;
+        int end;
+        if (rows <= STAGED_TAIL_ROWS) {
+            end = reserved;
+            first = Math.max(0, end - 2);
+        } else {
+            first = Math.max(0, Math.toIntExact(start / PAGE_TOKENS) - device);
+            end = Math.min(reserved, Math.toIntExact((start + rows + PAGE_TOKENS - 1) / PAGE_TOKENS) - device);
+        }
+        if (end <= first) return;
+        long offset = first * 2 * this.planePageBytes;
+        this.gpu.copyDeviceToHostAsync(
+                this.host.host() + offset, this.host.region() + offset, (end - first) * 2 * this.planePageBytes);
     }
 
     /// Records that the writes for `tokenCount` reserved rows after the submitted frontier were submitted to the
@@ -218,7 +302,7 @@ public final class AttentionKvState implements AutoCloseable {
         return this.decodeScratch;
     }
 
-    /// Device pages, K plane first then V plane in each (tests compare committed rows).
+    /// Device pages, K plane first then V plane in each (tests compare committed rows); without the host pages.
     public List<Long> pageAddresses() {
         ensureOpen();
         return List.copyOf(this.pages);

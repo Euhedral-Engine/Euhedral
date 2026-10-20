@@ -15,7 +15,10 @@ import java.util.Objects;
 /// stored checkpoints, a multiple of the prefill chunk. `kvCache` is the format sequences keep their attention
 /// caches in; null takes the artifact's. `maxSequences` is the number of concurrent sequences device memory is
 /// sized for: at least 1, planned exactly as asked (weights may leave the device to make room), or 0 for as many
-/// as fit without offloading more weights than one sequence does.
+/// as fit without offloading more weights than one sequence does. `kvDeviceMinimumTokens` is the tokens of each
+/// sequence's attention cache that stay on the device: when the weights and every sequence's whole cache do not fit,
+/// the
+/// pages past it live in pinned host memory before any weight leaves the device.
 public record InferenceConfig(
         Path artifactPath,
         Path tokenizerDirectory,
@@ -26,7 +29,8 @@ public record InferenceConfig(
         long prefixCacheBytes,
         int prefixCacheCheckpointTokens,
         KvFormat kvCache,
-        int maxSequences) {
+        int maxSequences,
+        int kvDeviceMinimumTokens) {
     /// Prompt tokens per prefill quantum, and the grain the prefix cache's checkpoints are aligned to.
     public static final int PREFILL_CHUNK_TOKENS = 512;
 
@@ -39,6 +43,7 @@ public record InferenceConfig(
     public static final int DEFAULT_MAX_CONTEXT_TOKENS = 32768;
     public static final long DEFAULT_PREFIX_CACHE_BYTES = 4L << 30;
     public static final int DEFAULT_PREFIX_CACHE_CHECKPOINT_TOKENS = 2048;
+    public static final int DEFAULT_KV_DEVICE_MINIMUM_TOKENS = 65536;
 
     public InferenceConfig {
         Objects.requireNonNull(artifactPath, "artifactPath");
@@ -56,6 +61,33 @@ public record InferenceConfig(
             throw new IllegalArgumentException(
                     "prefixCacheCheckpointTokens must be a positive multiple of " + PREFILL_CHUNK_TOKENS);
         if (maxSequences < 0) throw new IllegalArgumentException("maxSequences must not be negative");
+        if (kvDeviceMinimumTokens <= 0) throw new IllegalArgumentException("kvDeviceMinimumTokens must be positive");
+    }
+
+    /// The default device share of each sequence's attention cache.
+    public InferenceConfig(
+            Path artifactPath,
+            Path tokenizerDirectory,
+            Path cudaLibraryPath,
+            BitSet workerCpus,
+            int maxContextTokens,
+            Duration shutdownTimeout,
+            long prefixCacheBytes,
+            int prefixCacheCheckpointTokens,
+            KvFormat kvCache,
+            int maxSequences) {
+        this(
+                artifactPath,
+                tokenizerDirectory,
+                cudaLibraryPath,
+                workerCpus,
+                maxContextTokens,
+                shutdownTimeout,
+                prefixCacheBytes,
+                prefixCacheCheckpointTokens,
+                kvCache,
+                maxSequences,
+                DEFAULT_KV_DEVICE_MINIMUM_TOKENS);
     }
 
     /// One sequence.

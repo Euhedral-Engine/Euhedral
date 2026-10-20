@@ -62,6 +62,96 @@ class AttentionKvStateTest {
         assertEquals(256L * 512 * 64, AttentionKvState.planePageBytes(16384, KvFormat.BF16));
     }
 
+    private static final long HOST = 0x1000_0000L;
+    private static final long REGION = 0x2000_0000L;
+    /// One page of a 1024-wide NVFP4 cache: 256 rows of 4 heads x 144 bytes, K then V.
+    private static final long PAGE = 2L * 256 * 144 * 4;
+
+    @Test
+    void pagesPastTheDeviceShareAreAddressedThroughTheRegion() {
+        RecordingGpu gpu = new RecordingGpu();
+        var run = new AttentionKvState.HostRun(2, 4, HOST, REGION);
+        try (AttentionKvState state = new AttentionKvState(gpu, 1024, KvFormat.NVFP4, run)) {
+            state.prepareAppend(0, 1000);
+            assertEquals(2, state.pageAddresses().size(), "only the device share is device memory");
+            long[] table = gpu.tableEntries.get(state.keyCacheAddress());
+            int slots = table.length / 2;
+            assertEquals(state.pageAddresses().get(1), table[1]);
+            assertEquals(REGION, table[2]);
+            assertEquals(REGION + PAGE, table[3]);
+            assertEquals(REGION + PAGE / 2, table[slots + 2]);
+            assertEquals(2, state.reservedHostPages());
+            assertThrows(IllegalStateException.class, () -> state.prepareAppend(0, 6 * 256 + 1));
+        }
+        assertTrue(gpu.allocations.isEmpty());
+    }
+
+    @Test
+    void decodeSizedQuantaCopyEveryReservedHostPageInAndTheLastTwoBack() {
+        RecordingGpu gpu = new RecordingGpu();
+        var run = new AttentionKvState.HostRun(2, 4, HOST, REGION);
+        try (AttentionKvState state = new AttentionKvState(gpu, 1024, KvFormat.NVFP4, run)) {
+            state.prepareAppend(0, 1290);
+            commit(state, 1290);
+            state.prepareAppend(1290, 5);
+            gpu.hostCopies.clear();
+            state.stageIn(1290, 5);
+            state.stageOut(1290, 5);
+            // 1295 rows reach 6 pages: 4 on the host, all copied in; the last two copied back.
+            assertArrayEquals(new long[] {REGION, HOST, 4 * PAGE}, gpu.hostCopies.get(0));
+            assertArrayEquals(new long[] {HOST + 2 * PAGE, REGION + 2 * PAGE, 2 * PAGE}, gpu.hostCopies.get(1));
+            assertEquals(2, gpu.hostCopies.size());
+        }
+    }
+
+    @Test
+    void promptChunksCopyOnlyThePagesTheyReachAndWrite() {
+        RecordingGpu gpu = new RecordingGpu();
+        var run = new AttentionKvState.HostRun(2, 4, HOST, REGION);
+        try (AttentionKvState state = new AttentionKvState(gpu, 1024, KvFormat.NVFP4, run)) {
+            state.prepareAppend(0, 1500);
+            state.appendSubmitted(512);
+            gpu.hostCopies.clear();
+            state.stageIn(512, 512);
+            state.stageOut(512, 512);
+            // Rows 512..1023 are the third and fourth pages: the first two host pages.
+            assertArrayEquals(new long[] {REGION, HOST, 2 * PAGE}, gpu.hostCopies.get(0));
+            assertArrayEquals(new long[] {HOST, REGION, 2 * PAGE}, gpu.hostCopies.get(1));
+            gpu.hostCopies.clear();
+            state.stageIn(0, 512);
+            state.stageOut(0, 512);
+            assertTrue(gpu.hostCopies.isEmpty(), "a chunk on the device share copies nothing");
+        }
+    }
+
+    @Test
+    void aCacheWithoutHostPagesCopiesNothing() {
+        RecordingGpu gpu = new RecordingGpu();
+        try (AttentionKvState state = new AttentionKvState(gpu, 1024)) {
+            state.prepareAppend(0, 3000);
+            state.stageIn(0, 3000);
+            state.stageOut(0, 3000);
+            assertTrue(gpu.hostCopies.isEmpty());
+            assertEquals(0, state.reservedHostPages());
+        }
+    }
+
+    @Test
+    void theFingerprintFollowsTheReservedHostPages() {
+        RecordingGpu gpu = new RecordingGpu();
+        var run = new AttentionKvState.HostRun(1, 8, HOST, REGION);
+        try (AttentionKvState state = new AttentionKvState(gpu, 1024, KvFormat.NVFP4, run)) {
+            state.prepareAppend(0, 600);
+            var first = new io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint();
+            state.fingerprint(first);
+            commit(state, 600);
+            state.prepareAppend(600, 300);
+            var second = new io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint();
+            state.fingerprint(second);
+            assertNotEquals(first.value(), second.value());
+        }
+    }
+
     @Test
     void fingerprintIncludesTheCacheFormat() {
         RecordingGpu gpu = new RecordingGpu();
@@ -399,6 +489,19 @@ class AttentionKvStateTest {
         private final List<Long> asyncAllocated = new ArrayList<>();
         private final List<Long> asyncFreed = new ArrayList<>();
         private int syncFrees;
+
+        private final List<long[]> hostCopies = new ArrayList<>();
+
+        /// Host page copies: {destination, source, bytes}, the source host for a copy in.
+        @Override
+        public void copyHostToDeviceAsync(long deviceAddress, long hostAddress, long bytes) {
+            hostCopies.add(new long[] {deviceAddress, hostAddress, bytes});
+        }
+
+        @Override
+        public void copyDeviceToHostAsync(long hostAddress, long deviceAddress, long bytes) {
+            hostCopies.add(new long[] {hostAddress, deviceAddress, bytes});
+        }
 
         @Override
         public long allocateAsync(long byteSize) {

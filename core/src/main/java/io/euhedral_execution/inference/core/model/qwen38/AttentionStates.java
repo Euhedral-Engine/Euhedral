@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Stat
 import io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
 import io.euhedral_execution.inference.core.state.KvFormat;
+import io.euhedral_execution.inference.core.state.KvHostPages;
 import java.util.Objects;
 
 /// Persistent per-layer key/value caches for one Qwen sequence.
@@ -13,6 +14,8 @@ public final class AttentionStates implements AutoCloseable {
     private final AttentionKvState[] states;
     private final ExecutionGpu gpu;
     private final KvFormat format;
+    /// The slot of host pages the base layers' caches keep past their device pages, or null.
+    private final KvHostPages.Slot hostSlot;
     private boolean closed;
     /// Speculative drafting: base hidden rows that seed MTP rows, and the MTP's own hidden for its next
     /// recursive row (docs/MTP_CONTRACT.md §4). Allocated by the first quantum that needs them.
@@ -28,10 +31,11 @@ public final class AttentionStates implements AutoCloseable {
     private int decodeScratchHeads;
     private int decodeScratchRows;
 
-    private AttentionStates(ExecutionGpu gpu, AttentionKvState[] states, KvFormat format) {
+    private AttentionStates(ExecutionGpu gpu, AttentionKvState[] states, KvFormat format, KvHostPages.Slot hostSlot) {
         this.gpu = gpu;
         this.states = states;
         this.format = format;
+        this.hostSlot = hostSlot;
     }
 
     public static AttentionStates allocate(ExecutionGpu gpu, LayerType[] layerTypes, int keyValueWidth) {
@@ -47,16 +51,33 @@ public final class AttentionStates implements AutoCloseable {
     /// As [#allocate(ExecutionGpu, LayerType[], int, boolean)], every cache in `format`.
     public static AttentionStates allocate(
             ExecutionGpu gpu, LayerType[] layerTypes, int keyValueWidth, boolean mtpLayer, KvFormat format) {
+        return allocate(gpu, layerTypes, keyValueWidth, mtpLayer, format, null);
+    }
+
+    /// As above, the base layers' caches keeping their pages past the device share in `hostSlot` (null: every page
+    /// on the device), which the states return when they close. The MTP layer's cache stays on the device.
+    public static AttentionStates allocate(
+            ExecutionGpu gpu,
+            LayerType[] layerTypes,
+            int keyValueWidth,
+            boolean mtpLayer,
+            KvFormat format,
+            KvHostPages.Slot hostSlot) {
         Objects.requireNonNull(gpu, "gpu");
         Objects.requireNonNull(layerTypes, "layerTypes");
         Objects.requireNonNull(format, "format");
         AttentionKvState[] states = new AttentionKvState[layerTypes.length + (mtpLayer ? 1 : 0)];
+        int attention = 0;
         for (int index = 0; index < states.length; index++) {
-            if (index == layerTypes.length || layerTypes[index] == LayerType.FULL_ATTENTION) {
+            if (index == layerTypes.length) {
                 states[index] = new AttentionKvState(gpu, keyValueWidth, format);
+            } else if (layerTypes[index] == LayerType.FULL_ATTENTION) {
+                AttentionKvState.HostRun run = hostSlot == null ? null : hostSlot.run(attention);
+                states[index] = new AttentionKvState(gpu, keyValueWidth, format, run);
+                attention++;
             }
         }
-        return new AttentionStates(gpu, states, format);
+        return new AttentionStates(gpu, states, format, hostSlot);
     }
 
     /// The format every cache of the sequence stores its rows in.
@@ -222,6 +243,8 @@ public final class AttentionStates implements AutoCloseable {
                 && this.decodeScratch == 0
                 && (this.dflash2 == null || this.dflash2.released());
         for (AttentionKvState state : this.states) this.closed &= state == null;
+        // The host pages are reused only once every state over them is closed, after its quanta retired.
+        if (this.closed && this.hostSlot != null) this.hostSlot.release();
         if (failure instanceof Error error) throw error;
         if (failure instanceof RuntimeException runtimeException) throw runtimeException;
         if (failure != null) throw new IllegalStateException("failed to release attention sequence states", failure);

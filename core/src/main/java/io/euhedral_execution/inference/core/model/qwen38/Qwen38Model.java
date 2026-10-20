@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.core.model.qwen38.loader.ObjectLoader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.WeightLoader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
 import io.euhedral_execution.inference.core.model.qwen38.offload.DiskWindow;
+import io.euhedral_execution.inference.core.state.KvHostPages;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
@@ -29,6 +30,8 @@ public final class Qwen38Model implements AutoCloseable {
     /// The pinned window disk-backed weights are read into, and the artifact they are read from; null without any.
     private final DiskWindow window;
     private final Path artifactPath;
+    /// The host pages the sequences' attention caches keep past their device share, or null; the model owns them.
+    private volatile KvHostPages kvHostPages;
 
     private Qwen38Model(
             Allocations allocations, Weights weights, WeightStaging staging, DiskWindow window, Path artifactPath) {
@@ -103,6 +106,18 @@ public final class Qwen38Model implements AutoCloseable {
         return this.staging;
     }
 
+    /// The host pages of the sequences' attention caches, or null when every page is on the device.
+    public KvHostPages kvHostPages() {
+        return this.kvHostPages;
+    }
+
+    /// Gives the model the host pages its sequences' caches keep past their device share; it closes them. Set once,
+    /// before any sequence runs.
+    public void useKvHostPages(KvHostPages pages) {
+        if (this.kvHostPages != null) throw new IllegalStateException("the model already has host attention pages");
+        this.kvHostPages = Objects.requireNonNull(pages, "pages");
+    }
+
     public static Qwen38Model loadFirstLayer(Path path, Artifact artifact, GpuMemory gpu) throws IOException {
         return load(gpu, memory -> WeightLoader.loadFirstLayer(path, artifact, memory));
     }
@@ -169,7 +184,11 @@ public final class Qwen38Model implements AutoCloseable {
 
     @Override
     public void close() {
-        this.allocations.close();
+        try {
+            if (this.kvHostPages != null) this.kvHostPages.close();
+        } finally {
+            this.allocations.close();
+        }
     }
 
     private static final class Allocations implements GpuMemory, AutoCloseable {

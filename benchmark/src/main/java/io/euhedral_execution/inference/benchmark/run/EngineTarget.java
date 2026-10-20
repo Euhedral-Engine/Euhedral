@@ -33,7 +33,8 @@ public final class EngineTarget implements BenchmarkRunner.Target {
             int maxContextTokens,
             long prefixCacheBytes,
             Duration shutdown,
-            boolean speculate) {
+            boolean speculate,
+            int kvDeviceMinimumTokens) {
         return () -> {
             try {
                 var engine = InferenceEngine.load(new InferenceConfig(
@@ -44,7 +45,10 @@ public final class EngineTarget implements BenchmarkRunner.Target {
                         maxContextTokens,
                         shutdown,
                         prefixCacheBytes,
-                        InferenceConfig.DEFAULT_PREFIX_CACHE_CHECKPOINT_TOKENS));
+                        InferenceConfig.DEFAULT_PREFIX_CACHE_CHECKPOINT_TOKENS,
+                        null,
+                        1,
+                        kvDeviceMinimumTokens));
                 System.out.println("loaded: " + engine.allocatedDeviceBytes() + " device bytes, "
                         + engine.hostBackedWeightBytes() + " host-backed weight bytes");
                 return new EngineTarget(engine, speculate);

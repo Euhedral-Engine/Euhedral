@@ -24,6 +24,7 @@ import io.euhedral_execution.inference.core.runtime.PromptSink;
 import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.state.KvFormat;
+import io.euhedral_execution.inference.core.state.KvHostPages;
 import io.euhedral_execution.inference.core.tokenizer.IncrementalDecoder;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.core.tokenizer.TokenConstraint;
@@ -138,6 +139,12 @@ public final class Session implements GenerationSession {
     /// Keeps the sequence's attention caches in `format`. Set before the first prompt.
     public void useKvFormat(KvFormat format) {
         this.sequence.useKvFormat(format);
+    }
+
+    /// Keeps the cache pages past the device share in a slot of `pages` (null: every page on the device). Set before
+    /// the first prompt.
+    public void useKvHostPages(KvHostPages pages) {
+        this.sequence.useKvHostPages(pages);
     }
 
     /// Reuses and stores the state of this session's first prompt in `cache`; null stops using one. Set before

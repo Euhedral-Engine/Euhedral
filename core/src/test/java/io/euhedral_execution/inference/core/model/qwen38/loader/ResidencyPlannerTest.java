@@ -246,6 +246,74 @@ class ResidencyPlannerTest {
                 1, ResidencyPlanner.sequencesFor(artifact, PROFILE, 1L << 30, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 7));
     }
 
+    private static final long WEIGHTS = (400 + 600 + 8 * 110 + 50 + 70) * MIB;
+    private static final int LONG_CONTEXT = 262144;
+    private static final int DEVICE_TOKENS = 4096;
+
+    private static ResidencyPlanner.Plan spillPlan(long free, long host, int sequences) {
+        return ResidencyPlanner.plan(
+                artifact(), PROFILE, free, LONG_CONTEXT, host, KvFormat.NVFP4, sequences, false, DEVICE_TOKENS);
+    }
+
+    /// Device bytes of a plan whose caches keep `DEVICE_TOKENS` on the device and one region of host pages.
+    private static long deviceShare(int sequences) {
+        long region = (LONG_CONTEXT - DEVICE_TOKENS) / 256L * ResidencyPlanner.pageBytes(config(2), KvFormat.NVFP4);
+        return sequences * (ResidencyPlanner.kvBytes(config(2), DEVICE_TOKENS) + region);
+    }
+
+    @Test
+    void noCachePageLeavesTheDeviceWhenEverythingFits() {
+        var plan = spillPlan(64L << 30, Long.MAX_VALUE, 1);
+        assertTrue(plan.fits());
+        assertEquals(0, plan.kvHostPages());
+        assertEquals(0, plan.kvHostBytes());
+        assertTrue(plan.hostBacked().isEmpty());
+    }
+
+    @Test
+    void cachePagesPastTheDeviceMinimumLeaveBeforeAnyWeight() {
+        long free = WEIGHTS + ResidencyPlanner.RESERVE_BYTES + deviceShare(1) + MIB;
+        assertTrue(free < WEIGHTS + ResidencyPlanner.RESERVE_BYTES + ResidencyPlanner.kvBytes(config(2), LONG_CONTEXT));
+        var plan = spillPlan(free, Long.MAX_VALUE, 1);
+        assertTrue(plan.fits());
+        assertTrue(plan.hostBacked().isEmpty());
+        int hostPages = (LONG_CONTEXT - DEVICE_TOKENS) / 256;
+        assertEquals(hostPages, plan.kvHostPages());
+        // Each of the 2 attention layers keeps its host pages; one device region holds one layer's.
+        assertEquals(2L * hostPages * ResidencyPlanner.pageBytes(config(2), KvFormat.NVFP4), plan.kvHostBytes());
+        assertEquals(WEIGHTS + ResidencyPlanner.RESERVE_BYTES + deviceShare(1), plan.deviceBytes());
+    }
+
+    @Test
+    void weightsLeaveOnlyWhenTheDeviceShareStillDoesNotFit() {
+        long free = WEIGHTS + ResidencyPlanner.RESERVE_BYTES + deviceShare(1) - 200 * MIB;
+        var plan = spillPlan(free, Long.MAX_VALUE, 1);
+        assertTrue(plan.fits());
+        assertTrue(plan.kvHostPages() > 0);
+        assertFalse(plan.hostBacked().isEmpty());
+        assertTrue(plan.deviceBytes() <= free);
+    }
+
+    @Test
+    void aHostBudgetThatCannotHoldThePagesKeepsTheCacheOnTheDevice() {
+        long free = WEIGHTS + ResidencyPlanner.RESERVE_BYTES + deviceShare(1) + MIB;
+        var plan = spillPlan(free, 64 * MIB, 1);
+        assertEquals(0, plan.kvHostPages());
+        assertFalse(plan.hostBacked().isEmpty());
+    }
+
+    @Test
+    void moreSequencesFitBesideResidentWeightsWithHostPages() {
+        long free = WEIGHTS + ResidencyPlanner.RESERVE_BYTES + 3 * deviceShare(1) + 64 * MIB;
+        var artifact = artifact();
+        int allDevice = ResidencyPlanner.sequencesFor(
+                artifact, PROFILE, free, LONG_CONTEXT, Long.MAX_VALUE, KvFormat.NVFP4, 16);
+        int spilled = ResidencyPlanner.sequencesFor(
+                artifact, PROFILE, free, LONG_CONTEXT, Long.MAX_VALUE, KvFormat.NVFP4, 16, DEVICE_TOKENS);
+        assertTrue(spilled > allDevice, spilled + " sequences with host pages, " + allDevice + " without");
+        assertTrue(spillPlan(free, Long.MAX_VALUE, spilled).hostBacked().isEmpty());
+    }
+
     @Test
     void sequencesBeyondWhatFitAreReported() {
         assertFalse(ResidencyPlanner.plan(artifact(), PROFILE, 3000L * MIB, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 4096)

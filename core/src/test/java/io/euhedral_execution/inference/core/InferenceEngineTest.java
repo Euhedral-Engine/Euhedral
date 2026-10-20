@@ -408,7 +408,8 @@ class InferenceEngineTest {
                         ExecutionGpu gpu,
                         int maxContext,
                         KvFormat kvFormat,
-                        int sequences)
+                        int sequences,
+                        int kvDeviceMinimumTokens)
                         throws java.io.IOException {
                     if (selected == 2) throw new IllegalStateException("model");
                     if (selected == 3)
@@ -416,7 +417,8 @@ class InferenceEngineTest {
                                 gpu,
                                 new io.euhedral_execution.inference.core.model.qwen38.loader.Weights(
                                         null, null, null, null, null, null));
-                    return super.loadModel(path, artifact, profile, gpu, maxContext, kvFormat, sequences);
+                    return super.loadModel(
+                            path, artifact, profile, gpu, maxContext, kvFormat, sequences, kvDeviceMinimumTokens);
                 }
 
                 @Override
@@ -449,7 +451,7 @@ class InferenceEngineTest {
         var failure = assertThrows(
                 IllegalArgumentException.class,
                 () -> new InferenceEngine.Bootstrap()
-                        .loadModel(Path.of("model.edrl"), artifact, null, null, 262145, KvFormat.NVFP4, 1));
+                        .loadModel(Path.of("model.edrl"), artifact, null, null, 262145, KvFormat.NVFP4, 1, 65536));
         assertEquals(
                 "a context of 262145 tokens is longer than the 262144 positions the model supports; set a smaller max "
                         + "context",
@@ -758,7 +760,8 @@ class InferenceEngineTest {
                 ExecutionGpu gpu,
                 int maxContext,
                 KvFormat kvFormat,
-                int sequences)
+                int sequences,
+                int kvDeviceMinimumTokens)
                 throws java.io.IOException {
             modelLoads++;
             this.kvFormat = kvFormat;

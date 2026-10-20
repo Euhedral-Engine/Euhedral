@@ -336,6 +336,7 @@ public final class ExecutionPlan {
     /// The plan's own topology.
     private final Shape shape;
     private final WeightStaging staging;
+    private final boolean hostKvPages;
     /// The disk window of this plan family, or null when no weight is disk-backed.
     private final DiskWindow window;
     // The views of a full model; null otherwise.
@@ -462,7 +463,14 @@ public final class ExecutionPlan {
     /// stages them through `staging`, and reads the disk-backed ones through `window`, which must be present
     /// when any weight is disk-backed.
     public ExecutionPlan(Weights weights, WeightStaging staging, DiskWindow window) {
-        this(Objects.requireNonNull(weights, "weights"), planFromLoadedWeights(weights), staging, window);
+        this(weights, staging, window, false);
+    }
+
+    /// As above; with `hostKvPages` the sequences' base-layer caches may keep pages in host memory, which every
+    /// layer's append copies through one device region per sequence, so the KV stages also carry that region
+    /// ([Shape#carriedState]).
+    public ExecutionPlan(Weights weights, WeightStaging staging, DiskWindow window, boolean hostKvPages) {
+        this(Objects.requireNonNull(weights, "weights"), planFromLoadedWeights(weights), staging, window, hostKvPages);
     }
 
     /// Unfused reference topology for every execution kind. This is a correctness oracle for tests and is never
@@ -489,6 +497,11 @@ public final class ExecutionPlan {
             this.scratchRegions = regions;
         }
         return regions;
+    }
+
+    /// Whether the sequences' base-layer caches may keep pages in host memory.
+    public boolean hostKvPages() {
+        return this.hostKvPages;
     }
 
     /// The staging ring of this plan family, or null when no weight is host-backed.
@@ -711,9 +724,15 @@ public final class ExecutionPlan {
     /// The plan of `data`; a full model also builds its views, which stage host-backed weights through
     /// `staging` and read disk-backed ones through `window`.
     private ExecutionPlan(Weights weights, PlanData data, WeightStaging staging, DiskWindow window) {
+        this(weights, data, staging, window, false);
+    }
+
+    private ExecutionPlan(
+            Weights weights, PlanData data, WeightStaging staging, DiskWindow window, boolean hostKvPages) {
         this.weights = weights;
         this.staging = staging;
         this.window = window;
+        this.hostKvPages = hostKvPages;
         this.shape = new Shape(Shape.View.OWN, this, data, false, false);
         if (!data.fullModel()) {
             this.smallPrefill = null;

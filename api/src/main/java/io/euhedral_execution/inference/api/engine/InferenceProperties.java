@@ -21,7 +21,9 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 /// `prefixCacheCheckpointTokens` is the prompt tokens between stored checkpoints, a multiple of 512. `kvCache` is the
 /// format of the attention cache, `nvfp4` or `bf16`; unset, the artifact's (NVFP4). `maxSequences` is the
 /// generations that run at once, each with its own sequence state in device memory (default 1; 0 takes as many as
-/// fit without holding back more weights than one sequence does).
+/// fit without holding back more weights than one sequence does). `kvDeviceMinimumTokens` is the tokens of each
+/// sequence's attention cache that stay in device memory (default 65536): when the weights and every sequence's whole
+/// cache do not fit, the pages past it move to pinned host memory before any weight leaves the GPU.
 @ConfigurationProperties("euhedral.inference")
 public record InferenceProperties(
         Path artifactPath,
@@ -34,7 +36,8 @@ public record InferenceProperties(
         @DefaultValue("4294967296") long prefixCacheBytes,
         @DefaultValue("2048") int prefixCacheCheckpointTokens,
         KvFormat kvCache,
-        @DefaultValue("1") int maxSequences) {
+        @DefaultValue("1") int maxSequences,
+        @DefaultValue("65536") int kvDeviceMinimumTokens) {
 
     public InferenceProperties {
         require(artifactPath, "artifact-path");
@@ -53,6 +56,8 @@ public record InferenceProperties(
                     "euhedral.inference.prefix-cache-checkpoint-tokens must be a positive multiple of 512");
         if (maxSequences < 0)
             throw new IllegalArgumentException("euhedral.inference.max-sequences must not be negative");
+        if (kvDeviceMinimumTokens <= 0)
+            throw new IllegalArgumentException("euhedral.inference.kv-device-minimum-tokens must be positive");
     }
 
     /// Converts to the core record, which performs its own lifetime and CPU-set validation.
@@ -67,7 +72,8 @@ public record InferenceProperties(
                 this.prefixCacheBytes,
                 this.prefixCacheCheckpointTokens,
                 this.kvCache,
-                this.maxSequences);
+                this.maxSequences,
+                this.kvDeviceMinimumTokens);
     }
 
     /// The selected processors: the configured ones, or, when none are configured, every available one the
