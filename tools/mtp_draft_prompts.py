@@ -11,7 +11,9 @@ Three categories of eight prompts, rendered with the checkpoint's chat template 
            test output), most with thinking enabled, ending where the agent's next turn starts.
 
 With --context TOKENS the set is long-context instead: the four chat document tasks over a document prefix of about
-TOKENS, and four agentic transcripts whose earlier turns read repository files until the prompt is about that long.
+TOKENS (the corpus document, continued by the repository's docs when it is shorter), and four agentic transcripts
+whose earlier turns read repository files (the listed ones, then the docs and the Qwen3.8 sources) until the prompt is
+about that long.
 
 Repository files are read at REV (default main), so the prompts do not depend on the working tree. Each line is
 {"name", "category", "thinking", "text"}.
@@ -253,9 +255,24 @@ CONTEXT_FILES = [
 CHARACTERS_PER_TOKEN = 3.6
 
 
+def more_files(revision: str, used: set[str]) -> list[str]:
+    """Further repository files for contexts the files above do not fill: the docs, then the engine's Qwen3.8 sources,
+    in path order."""
+    listed = subprocess.run(["git", "-C", str(ROOT), "ls-tree", "-r", "--name-only", revision], check=True,
+                            capture_output=True, text=True).stdout.split()
+    docs = sorted(p for p in listed if p.startswith("docs/") and p.endswith(".md"))
+    sources = sorted(p for p in listed if p.startswith("core/src/main/java/") and "/qwen38/" in p and p.endswith(".java"))
+    return [p for p in docs + sources if p not in used]
+
+
 def long_prompts(revision: str, tokens: int):
     budget = int(tokens * CHARACTERS_PER_TOKEN)
     document = show(revision, CORPUS).replace("\r\n", "\n")
+    # A context longer than the corpus document continues with further documents of the repository.
+    for path in more_files(revision, {CORPUS}):
+        if len(document) >= budget:
+            break
+        document += f"\n\n# {path}\n\n" + show(revision, path).replace("\r\n", "\n")
     quoted = []
     for paragraph in document.split("\n\n"):
         if sum(len(p) + 2 for p in quoted) + len(paragraph) > budget - 600:
@@ -280,7 +297,9 @@ def long_prompts(revision: str, tokens: int):
     for name, request, path, text in tasks:
         messages = [{"role": "system", "content": AGENT_SYSTEM}, user(request)]
         used, call_id = len(AGENT_SYSTEM) + len(request) + len(text) + 3000, 0
-        for context_path in CONTEXT_FILES:
+        for context_path in CONTEXT_FILES + more_files(revision, set(CONTEXT_FILES) | {path}):
+            if used >= budget - 2000:
+                break
             content = show(revision, context_path)
             if used + len(content) > budget:
                 continue
