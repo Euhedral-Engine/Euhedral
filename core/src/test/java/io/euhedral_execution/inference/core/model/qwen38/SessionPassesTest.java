@@ -13,6 +13,7 @@ import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.runtime.LatticeTesting;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
@@ -44,7 +45,7 @@ class SessionPassesTest {
         assumeTrue(
                 Files.isRegularFile(TOKENIZER_DIRECTORY.resolve("tokenizer.json")),
                 "skipped: no tokenizer.json in " + TOKENIZER_DIRECTORY + "; pass -Peuhedral.qwen.tokenizer-dir=...");
-        tokenizer = QwenTokenizer.load(TOKENIZER_DIRECTORY);
+        tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(TOKENIZER_DIRECTORY));
     }
 
     @Test

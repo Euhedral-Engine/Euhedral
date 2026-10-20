@@ -4,16 +4,18 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
-/// Environment variables that once configured the server and no longer do. Setting one fails startup, so a stale
-/// environment file is caught instead of silently ignored.
+/// Environment variables (and file keys) that once configured the server and no longer do. Setting one fails startup,
+/// so a stale environment or configuration file is caught instead of silently ignored.
 public final class RetiredSettings {
 
     private static final String BUNDLED = "removed: the jar carries its native files";
     private static final String SETTLED = "removed: the setting is fixed";
+    private static final String TOKENIZER = "removed: the artifact carries its tokenizer";
 
     private static final Map<String, String> RETIRED = Map.ofEntries(
             renamed("EUHEDRAL_INFERENCE_ARTIFACT_PATH", "model.artifact"),
-            renamed("EUHEDRAL_INFERENCE_TOKENIZER_DIRECTORY", "model.tokenizer"),
+            Map.entry("EUHEDRAL_INFERENCE_TOKENIZER_DIRECTORY", TOKENIZER),
+            Map.entry("EUHEDRAL_MODEL_TOKENIZER", TOKENIZER),
             renamed("EUHEDRAL_INFERENCE_MODEL_ID", "model.name"),
             renamed("EUHEDRAL_INFERENCE_WORKER_CPUS", "host.cpus"),
             renamed("EUHEDRAL_INFERENCE_MAX_CONTEXT_TOKENS", "context.max-tokens"),
@@ -56,6 +58,11 @@ public final class RetiredSettings {
     /// What to do about a retired variable, or empty when the variable is not retired.
     public static Optional<String> message(String variable) {
         return Optional.ofNullable(RETIRED.get(variable));
+    }
+
+    /// What to do about a retired key of the file, such as `model.tokenizer`, or empty when the key is not retired.
+    public static Optional<String> keyMessage(String key) {
+        return message(SettingsLoader.variableName(key));
     }
 
     /// Every retired variable name.

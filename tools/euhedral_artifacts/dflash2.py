@@ -45,6 +45,7 @@ import numpy as np
 
 from euhedral_artifacts.edrl import (FORMAT_ORDINAL, HEADER_SIZE, LAYOUT_ORDINAL, MAGIC, VERSION, ObjectPlan,
                                      assign_offsets, encode_descriptors, encode_table, fail, read_table)
+from euhedral_artifacts import tokenizer_section
 from euhedral_artifacts.nvfp4 import nvfp4_offsets, quantize_nvfp4_matrix
 from euhedral_artifacts.sources import SourceStore, concat_matrix, read_json, source_matrix
 
@@ -202,12 +203,13 @@ def extend(artifact: Path, draft: Path, output_path: Path, projections: str = "b
            check: bool = True) -> None:
     """Writes `output_path`: the artifact `artifact` (its metadata and every object, byte for byte) followed by
     the `dflash2/` objects of the drafter checkpoint directory `draft`. `check` holds the drafter to the
-    published configuration (tests turn it off for small drafters)."""
+    published configuration (tests turn it off for small drafters). The tokenizer `artifact` carries is carried."""
     if output_path.exists() and not force:
         fail(f"output already exists; pass --force: {output_path}")
     config = read_json(draft / "config.json")
     if check:
         check_draft(config)
+    tokenizer = tokenizer_section.require(artifact)
     with artifact.open("rb") as source:
         _, metadata, objects = read_table(source)
     if any(obj["name"].startswith(PREFIX) for obj in objects):
@@ -247,6 +249,7 @@ def extend(artifact: Path, draft: Path, output_path: Path, projections: str = "b
                     plan.writer(output, plan.offset)
                     if index % 16 == 0 or index == len(plans) - 1:
                         print(f"dflash2 {index + 1}/{len(plans)} {plan.name}", flush=True)
+                tokenizer_section.write(output, file_size, tokenizer)
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(temporary, output_path)

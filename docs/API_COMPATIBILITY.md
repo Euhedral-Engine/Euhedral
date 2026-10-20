@@ -23,9 +23,9 @@ Nothing that changes generation is accepted and ignored.
 | `model` | supported | Must be the served model ID (404 `model_not_found` otherwise). |
 | `messages` | supported | Roles `system`, `developer` (as system), `user`, `assistant`, `tool`. Content: a string or `text` parts. Assistant `tool_calls` and `reasoning_content` replay; `tool` messages need `tool_call_id`. |
 | `max_tokens`, `max_completion_tokens` | supported | Either (they must agree if both are sent); the default is `server.requests.default-max-tokens` (4096), capped by the context. |
-| `temperature` | supported | 0 to 2; 0 is greedy. Default from `generation_config.json` (1.0). |
-| `top_p` | supported | 0 to 1; 0 is greedy. Default 0.95. |
-| `top_k` | supported | Not an OpenAI field; accepted as vLLM spells it: at least 1, or 0/-1 for no limit. Default 20. |
+| `temperature` | supported | 0 to 2; 0 is greedy. Default `sampling.temperature` (1.0). |
+| `top_p` | supported | 0 to 1; 0 is greedy. Default `sampling.top-p` (0.95). |
+| `top_k` | supported | Not an OpenAI field; accepted as vLLM spells it: at least 1, or 0/-1 for no limit. Default `sampling.top-k` (20). |
 | `seed` | supported | Seeds the sampler's random stream; greedy requests do not use it. |
 | `stop` | supported | A string or up to 4 strings; matched in the answer, not in the reasoning. |
 | `stream` | supported | Server-sent events, `chat.completion.chunk`, ending with `data: [DONE]`. |

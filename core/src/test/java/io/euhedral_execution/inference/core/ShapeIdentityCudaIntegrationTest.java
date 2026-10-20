@@ -27,8 +27,6 @@ import org.junit.jupiter.params.provider.MethodSource;
 class ShapeIdentityCudaIntegrationTest {
 
     private static final Path GOLDENS = Path.of("src/test/resources/shapes");
-    private static final String TOKENIZER =
-            System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir");
     private static final List<String> NAMES = List.of("q3", "nvfp4", "nvfp4-compressed");
     /// The device memory the residency planner sees: below what is free on the 16 GB card, whatever else runs.
     private static final long DEVICE_BUDGET = 14L << 30;
@@ -61,11 +59,7 @@ class ShapeIdentityCudaIntegrationTest {
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         assumeTrue(Files.isRegularFile(Path.of(artifact)), "no artifact " + artifact);
         var config = new InferenceConfig(
-                        Path.of(artifact),
-                        Path.of(TOKENIZER),
-                        Path.of(library),
-                        SystemInfo.getPCpuSet(),
-                        Duration.ofSeconds(30))
+                        Path.of(artifact), Path.of(library), SystemInfo.getPCpuSet(), Duration.ofSeconds(30))
                 // Residency follows the GPU's free memory at load; a fixed budget below it makes every load place the
                 // same weights in host memory, so the staged views compare.
                 .withTuning(Tunings.limits(OptionalLong.of(DEVICE_BUDGET), OptionalLong.empty()));

@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
@@ -44,7 +45,7 @@ class PromptMaterialTest {
     @Test
     void matchesTheQwenTokenizerCountUsedByTheSession() throws Exception {
         assumeTrue(Files.isRegularFile(TOKENIZER.resolve("tokenizer.json")), "Qwen tokenizer assets unavailable");
-        QwenTokenizer tokenizer = QwenTokenizer.load(TOKENIZER);
+        QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(TOKENIZER));
         for (int target : new int[] {32, 256, 1024}) {
             var prompt = PromptMaterial.build(
                     target, PromptMaterial.DEFAULT_SEED, text -> tokenizer.encodeWithModelSpecialTokens(text).length);

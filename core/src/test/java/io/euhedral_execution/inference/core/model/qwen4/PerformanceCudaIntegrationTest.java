@@ -7,6 +7,7 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen4.loader.Mode;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -45,7 +46,7 @@ class PerformanceCudaIntegrationTest {
         int characters = (int) Math.min(Integer.MAX_VALUE, Math.max(1L << 16, tokens * 16L));
         int[] ids = ENCODED.get(characters);
         if (ids == null) {
-            QwenTokenizer tokenizer = QwenTokenizer.load(tokenizerDirectory);
+            QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory));
             StringBuilder text = new StringBuilder();
             try (Stream<Path> docs = Files.list(SpeculativeRoot.docs())) {
                 for (Path doc :

@@ -23,15 +23,13 @@ class DeploymentTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.model = self.root / "model.edrl"
         self.model.touch()
-        self.tokenizer = self.root / "tokenizer"
-        self.tokenizer.mkdir()
         self.driver = self.root / "libcuda.so.1"
         self.driver.touch()
         self.ptx = self.root / "libnvidia-ptxjitcompiler.so.1"
         self.ptx.touch()
         self.env_file = self.root / ".env"
         self.env_file.touch()
-        self.settings = MODULE.Settings(self.env_file, self.model, self.tokenizer, "qwen3.8-27b-nvfp4-compressed", 18080,
+        self.settings = MODULE.Settings(self.env_file, self.model, "qwen3.8-27b-nvfp4-compressed", 18080,
                                         self.driver, self.ptx)
         self.events = []
 
@@ -150,7 +148,7 @@ class DeploymentTests(unittest.TestCase):
             self.assertEqual("qwen", MODULE.verify_ready(18080))
 
     def test_without_driver_libraries_the_container_toolkit_provides_the_gpu(self):
-        toolkit = MODULE.Settings(self.env_file, self.model, self.tokenizer, "qwen", 18080)
+        toolkit = MODULE.Settings(self.env_file, self.model, "qwen", 18080)
         self.assertEqual(["--gpus", "all"], MODULE.gpu_arguments(toolkit))
 
     def test_build_context_contains_only_committed_source(self):
@@ -186,26 +184,26 @@ class SettingsTests(unittest.TestCase):
         self.assertLessEqual(set(MODULE.REQUIRED), example.keys())
 
     def test_reads_docker_env_file_syntax(self):
-        settings = self.load("# comment\n\nEUHEDRAL_ARTIFACT_FILE=/m/a b.edrl\nEUHEDRAL_CHECKPOINT_DIR=/c\n"
+        settings = self.load("# comment\n\nEUHEDRAL_ARTIFACT_FILE=/m/a b.edrl\n"
                              "EUHEDRAL_MODEL_NAME=qwen\nEUHEDRAL_HOST_CPUS=2-5\nPORT=18080\n")
         self.assertEqual(Path("/m/a b.edrl"), settings.artifact)
         self.assertEqual(("qwen", 18080, None), (settings.model_id, settings.port, settings.driver))
 
     def test_port_defaults_to_the_servers(self):
-        settings = self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_CHECKPOINT_DIR=/c\nEUHEDRAL_MODEL_NAME=q\n"
+        settings = self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_MODEL_NAME=q\n"
                              "EUHEDRAL_HOST_CPUS=0\n")
         self.assertEqual(1738, settings.port)
 
     def test_refuses_a_missing_file_missing_keys_and_paths_the_image_fixes(self):
         with self.assertRaisesRegex(RuntimeError, "copy .env.example"):
             MODULE.load_settings(self.path)
-        with self.assertRaisesRegex(RuntimeError, "EUHEDRAL_CHECKPOINT_DIR, EUHEDRAL_HOST_CPUS"):
+        with self.assertRaisesRegex(RuntimeError, "does not set EUHEDRAL_HOST_CPUS"):
             self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_MODEL_NAME=q\n")
         with self.assertRaisesRegex(RuntimeError, "EUHEDRAL_MODEL_ARTIFACT, which the image fixes"):
-            self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_CHECKPOINT_DIR=/c\nEUHEDRAL_MODEL_NAME=q\n"
+            self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_MODEL_NAME=q\n"
                       "EUHEDRAL_HOST_CPUS=0\nEUHEDRAL_MODEL_ARTIFACT=/a\n")
         with self.assertRaisesRegex(RuntimeError, "both EUHEDRAL_CUDA_DRIVER_FILE and EUHEDRAL_PTX_JIT_FILE"):
-            self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_CHECKPOINT_DIR=/c\nEUHEDRAL_MODEL_NAME=q\n"
+            self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_MODEL_NAME=q\n"
                       "EUHEDRAL_HOST_CPUS=0\nEUHEDRAL_CUDA_DRIVER_FILE=/d\n")
         with self.assertRaisesRegex(RuntimeError, "expected KEY=VALUE"):
             self.load("just words\n")

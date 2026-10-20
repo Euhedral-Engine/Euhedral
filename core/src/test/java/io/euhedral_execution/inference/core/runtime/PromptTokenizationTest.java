@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -38,7 +39,7 @@ class PromptTokenizationTest {
     @BeforeAll
     static void load() throws Exception {
         assumeTrue(Files.isRegularFile(TOKENIZER_DIRECTORY.resolve("tokenizer.json")), "no tokenizer assets");
-        tokenizer = QwenTokenizer.load(TOKENIZER_DIRECTORY);
+        tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(TOKENIZER_DIRECTORY));
         workers = Executors.newFixedThreadPool(8);
     }
 

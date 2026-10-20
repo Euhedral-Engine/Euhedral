@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.core.guidance;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -19,7 +20,7 @@ final class GuidanceFixtures {
             Path checkpoint =
                     Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
             assumeTrue(Files.isRegularFile(checkpoint.resolve("tokenizer.json")));
-            tokenizer = QwenTokenizer.load(checkpoint);
+            tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(checkpoint));
         }
         return tokenizer;
     }

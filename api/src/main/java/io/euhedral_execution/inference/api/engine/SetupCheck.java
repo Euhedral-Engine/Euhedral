@@ -1,14 +1,17 @@
 package io.euhedral_execution.inference.api.engine;
 
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.settings.Settings;
 import io.euhedral_execution.inference.core.settings.SettingsLoader;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
 /// Checks what the server needs before anything loads, and reports every problem at once, each with the setting that
-/// names it: the model files the settings point at, and the NVIDIA driver with a GPU. Without it a wrong path surfaces
+/// names it: the artifact the settings point at (with the tokenizer it carries), and the NVIDIA driver with a GPU.
+/// Without it a wrong path surfaces
 /// as the first exception of the engine's load, after the weights
 /// were read.
 final class SetupCheck {
@@ -32,16 +35,12 @@ final class SetupCheck {
         if (!Files.isRegularFile(artifact)) problems.add(setting("model.artifact") + ": no file at " + artifact);
         else if (!Files.isReadable(artifact))
             problems.add(setting("model.artifact") + ": " + artifact + " is not readable");
-
-        Path tokenizer = settings.model().tokenizer();
-        if (!Files.isDirectory(tokenizer)) problems.add(setting("model.tokenizer") + ": no directory at " + tokenizer);
         else {
-            List<String> missing = new ArrayList<>();
-            for (String file : List.of("tokenizer.json", "tokenizer_config.json", "generation_config.json"))
-                if (!Files.isRegularFile(tokenizer.resolve(file))) missing.add(file);
-            if (!missing.isEmpty())
-                problems.add(setting("model.tokenizer") + ": " + tokenizer + " has no " + String.join(", ", missing)
-                        + "; it is the checkpoint's directory, with its tokenizer files");
+            try {
+                TokenizerSection.require(artifact);
+            } catch (IOException missing) {
+                problems.add(setting("model.artifact") + ": " + missing.getMessage());
+            }
         }
 
         driver.problem()

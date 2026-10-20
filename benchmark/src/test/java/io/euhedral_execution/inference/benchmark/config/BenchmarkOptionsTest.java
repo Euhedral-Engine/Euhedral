@@ -22,8 +22,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 class BenchmarkOptionsTest {
     private static final Instant NOW = Instant.parse("2026-09-25T12:00:00Z");
-    private static final String REQUIRED =
-            "\"artifact\":\"/m.edrl\",\"tokenizer\":\"/tok\",\"cudaLibrary\":\"/lib.so\"";
+    private static final String REQUIRED = "\"artifact\":\"/m.edrl\",\"cudaLibrary\":\"/lib.so\"";
 
     @TempDir
     Path directory;
@@ -108,7 +107,7 @@ class BenchmarkOptionsTest {
     @Test
     void rejectsInvalidConfigurationBeforeAnyModelWork() throws Exception {
         Path file = this.directory.resolve("missing.json");
-        Files.writeString(file, "{\"artifact\":\"/m\",\"tokenizer\":\"/t\"}");
+        Files.writeString(file, "{\"artifact\":\"/m\"}");
         assertThrows(MismatchedInputException.class, () -> BenchmarkOptions.load(file, NOW), "cudaLibrary required");
         assertInstanceOf(UnrecognizedPropertyException.class, assertThrows(Exception.class, () -> load("\"bogus\":1")));
         assertInstanceOf(
@@ -137,7 +136,6 @@ class BenchmarkOptionsTest {
         Files.writeString(settings, """
                 model:
                   artifact: /ignored.edrl
-                  tokenizer: /ignored
                   name: ignored
                 batching:
                   prefill-chunk-tokens: 1024

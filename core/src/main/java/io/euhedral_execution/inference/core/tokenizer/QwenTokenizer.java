@@ -3,7 +3,6 @@ package io.euhedral_execution.inference.core.tokenizer;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
-import java.nio.file.Path;
 import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -20,9 +19,8 @@ import java.util.regex.Pattern;
 
 /// Immutable Qwen BPE tokenizer loaded from one checkpoint's tokenizer assets.
 ///
-/// <p>Load it once from a directory containing {@code tokenizer.json} and
-/// {@code tokenizer_config.json}, then share the instance. Encoding does not access files or
-/// depend on inference execution, scheduling, GPU, or sequence state.
+/// Load it once from the [TokenizerFiles] an artifact carries, then share the instance. Encoding does not access
+/// files or depend on inference execution, scheduling, GPU, or sequence state.
 public final class QwenTokenizer {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final int BYTE_UNICODE_OFFSET = 256;
@@ -77,15 +75,12 @@ public final class QwenTokenizer {
         this.controlTokenPattern = compileControlPattern(controlTokenIds.keySet());
     }
 
-    /// Loads the Qwen tokenizer data from the selected checkpoint directory.
-    public static QwenTokenizer load(Path checkpointDirectory) throws IOException {
-        Objects.requireNonNull(checkpointDirectory, "checkpointDirectory");
-        Path tokenizerPath = checkpointDirectory.resolve("tokenizer.json");
-        Path configPath = checkpointDirectory.resolve("tokenizer_config.json");
-        Path generationConfigPath = checkpointDirectory.resolve("generation_config.json");
-        JsonNode tokenizer = JSON.readTree(tokenizerPath.toFile());
-        JsonNode config = JSON.readTree(configPath.toFile());
-        JsonNode generationConfig = JSON.readTree(generationConfigPath.toFile());
+    /// Builds the tokenizer from the files an artifact carries.
+    public static QwenTokenizer load(TokenizerFiles files) throws IOException {
+        Objects.requireNonNull(files, "files");
+        JsonNode tokenizer = JSON.readTree(files.tokenizer());
+        JsonNode config = JSON.readTree(files.tokenizerConfig());
+        JsonNode specialTokens = JSON.readTree(files.specialTokens());
 
         JsonNode model = tokenizer.path("model");
         if (!"BPE".equals(model.path("type").asText())) {
@@ -168,8 +163,8 @@ public final class QwenTokenizer {
         if (bosToken != null && resolvedBosTokenId == null) {
             throw new IOException("Qwen tokenizer BOS token is absent from added-token metadata");
         }
-        Set<Integer> generationEosTokenIds = readTokenIds(generationConfig.path("eos_token_id"));
-        Integer generationBosTokenId = nullableTokenId(generationConfig.path("bos_token_id"));
+        Set<Integer> generationEosTokenIds = readTokenIds(specialTokens.path("eos_token_id"));
+        Integer generationBosTokenId = nullableTokenId(specialTokens.path("bos_token_id"));
         for (int tokenId : generationEosTokenIds) {
             if (tokenId < 0 || tokenId >= tokensById.size() || tokensById.get(tokenId) == null) {
                 throw new IOException("Qwen generation EOS ID is absent from tokenizer vocabulary: " + tokenId);

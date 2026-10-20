@@ -1,11 +1,12 @@
 # Euhedral Inference settings: every key, with its default.
 #
-# The smallest working file sets the three required keys:
+# The smallest working file sets the two required keys:
 #
 #   model:
 #     artifact: /models/qwen3_8_27b.edrl
-#     tokenizer: /models/Qwen3.8-27B
 #     name: qwen3.8-27b
+#
+# The artifact carries its tokenizer and chat template.
 #
 # Start the server with:  java --enable-native-access=ALL-UNNAMED -jar euhedral-inference.jar --config <this file>
 # (or set EUHEDRAL_CONFIG to the file's path).
@@ -18,8 +19,12 @@
 
 model:
   artifact: /models/qwen3_8_27b.edrl          # required: the model artifact file
-  tokenizer: /models/Qwen3.8-27B              # required: the directory holding the tokenizer files
   name: qwen3.8-27b                           # required: the model name clients send as "model"
+
+sampling:                                     # used for the fields a request leaves out
+  temperature: 1.0                            # optional, default 1.0: 0 is greedy decoding
+  top-k: 20                                   # optional, default 20: the most likely tokens kept; 0 keeps every token
+  top-p: 0.95                                 # optional, default 0.95: the probability mass kept, above 0 and at most 1
 
 server:
   port: 1738                                  # optional, default 1738: the port to listen on

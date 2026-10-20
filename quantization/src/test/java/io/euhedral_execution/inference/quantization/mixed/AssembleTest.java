@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import java.io.IOException;
@@ -112,6 +113,7 @@ class AssembleTest {
         Assemble.write(sources, allocation, OptionalInt.of(2), out, 100);
         assertFalse(java.nio.file.Files.exists(directory.resolve("mixed.edrl.partial")));
         Artifact written = ArtifactReader.read(out);
+        assertEquals(TinyArtifacts.TOKENIZER, TokenizerSection.require(out), "the base's tokenizer is carried");
         assertEquals(2, written.config().draftDepth().getAsInt());
         assertEquals(view.tensors().length, written.tensors().length);
         for (int i = 0; i < view.tensors().length; i++) {

@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.core;
 import static org.junit.jupiter.api.Assertions.*;
 
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
@@ -14,8 +15,11 @@ import io.euhedral_execution.inference.core.model.qwen38.loader.EngineModelFixtu
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.state.KvFormat;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.BitSet;
 import java.util.List;
@@ -52,7 +56,6 @@ class InferenceEngineTest {
         var base = config();
         var bf16 = new InferenceConfig(
                 base.artifactPath(),
-                base.tokenizerDirectory(),
                 base.cudaLibraryPath(),
                 base.workerCpus(),
                 base.maxContextTokens(),
@@ -182,27 +185,51 @@ class InferenceEngineTest {
     }
 
     InferenceConfig config(long prefixCacheBytes, int prefixCacheCheckpointTokens) throws Exception {
-        Files.writeString(directory.resolve("tokenizer.json"), """
-            {"model":{"type":"BPE","vocab":{"!":0,"A":1,"B":2,"C":3,"D":4,"E":5,"F":6},"merges":[]},
-             "normalizer":{"type":"NFC"},
-             "pre_tokenizer":{"type":"Sequence","pretokenizers":[
-             {"type":"Split","pattern":{"Regex":"."},"behavior":"Isolated","invert":false},
-             {"type":"ByteLevel"}]},
-             "added_tokens":[{"content":"<eos>","id":7,"special":true}]}
-            """);
-        Files.writeString(directory.resolve("tokenizer_config.json"), "{\"eos_token\":\"<eos>\"}");
-        Files.writeString(directory.resolve("generation_config.json"), "{\"eos_token_id\":7}");
+        // The bootstrap fakes the model; the file only carries the tokenizer.
+        Path artifact = Files.write(directory.resolve("model.edrl"), new byte[64]);
+        try (FileChannel channel = FileChannel.open(artifact, StandardOpenOption.WRITE)) {
+            TokenizerSection.write(channel, 64, TOKENIZER);
+        }
         BitSet cpus = new BitSet();
         cpus.set(SystemInfo.getPCpuSet().nextSetBit(0));
         return new InferenceConfig(
                 directory.resolve("model.edrl"),
-                directory,
                 directory.resolve("lib.so"),
                 cpus,
                 InferenceConfig.DEFAULT_MAX_CONTEXT_TOKENS,
                 Duration.ofSeconds(10),
                 prefixCacheBytes,
                 prefixCacheCheckpointTokens);
+    }
+
+    private static final TokenizerFiles TOKENIZER =
+            new TokenizerFiles("""
+            {"model":{"type":"BPE","vocab":{"!":0,"A":1,"B":2,"C":3,"D":4,"E":5,"F":6},"merges":[]},
+             "normalizer":{"type":"NFC"},
+             "pre_tokenizer":{"type":"Sequence","pretokenizers":[
+             {"type":"Split","pattern":{"Regex":"."},"behavior":"Isolated","invert":false},
+             {"type":"ByteLevel"}]},
+             "added_tokens":[{"content":"<eos>","id":7,"special":true}]}
+            """, "{\"eos_token\":\"<eos>\"}", "template", "{\"eos_token_id\":7}");
+
+    /// The artifact as it was before artifacts carried their tokenizer.
+    private void withoutTokenizer() throws Exception {
+        try (FileChannel channel = FileChannel.open(directory.resolve("model.edrl"), StandardOpenOption.WRITE)) {
+            channel.truncate(64);
+        }
+    }
+
+    @Test
+    void anArtifactWithoutATokenizerFailsNamingTheCommandThatAddsIt() throws Exception {
+        var config = config();
+        withoutTokenizer();
+        var bootstrap = new FakeBootstrap();
+        var failure = assertThrows(java.io.IOException.class, () -> InferenceEngine.load(config, bootstrap));
+        assertTrue(
+                failure.getMessage().contains("carries no tokenizer")
+                        && failure.getMessage().contains("package-tokenizer --artifact " + config.artifactPath()),
+                failure.getMessage());
+        assertEquals(0, bootstrap.artifactReads);
     }
 
     @Test
@@ -441,7 +468,7 @@ class InferenceEngineTest {
             assertEquals(bootstrap.gpu.allocated(), bootstrap.gpu.freed());
         }
         var config = config();
-        Files.delete(directory.resolve("tokenizer.json"));
+        withoutTokenizer();
         var bootstrap = new FakeBootstrap();
         assertThrows(java.io.IOException.class, () -> InferenceEngine.load(config, bootstrap));
         assertFalse(bootstrap.gpuClosed);
@@ -497,11 +524,7 @@ class InferenceEngineTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> new InferenceConfig(
-                        config.artifactPath(),
-                        directory,
-                        config.cudaLibraryPath(),
-                        new BitSet(),
-                        Duration.ofSeconds(1)));
+                        config.artifactPath(), config.cudaLibraryPath(), new BitSet(), Duration.ofSeconds(1)));
     }
 
     @Test
@@ -600,11 +623,11 @@ class InferenceEngineTest {
                 return WorkerProcessorSelectionTest.HYBRID;
             }
         };
-        Files.delete(config().tokenizerDirectory().resolve("tokenizer.json"));
+        config();
+        withoutTokenizer();
         for (int unavailable : new int[] {13, 2}) {
             var config = new InferenceConfig(
                     directory.resolve("model.edrl"),
-                    directory,
                     directory.resolve("lib.so"),
                     ProcessorTopology.bits(0, unavailable),
                     Duration.ofSeconds(10));
@@ -634,7 +657,9 @@ class InferenceEngineTest {
             assertNull(engine.snapshot().generation());
             assertEquals(
                     directory.resolve("model.edrl").toString(), snapshot.model().artifactPath());
-            assertNull(snapshot.model().artifactBytes(), "missing artifact file has no measured size");
+            assertEquals(
+                    Files.size(directory.resolve("model.edrl")),
+                    snapshot.model().artifactBytes());
             assertEquals(
                     Qwen38Runtime.dimensions(((Qwen38Runtime) engine.modelRuntime()).config()),
                     snapshot.model().dimensions());

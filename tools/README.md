@@ -1,8 +1,10 @@
 # Artifact converter
 
 `convert_checkpoint.py` converts a Qwen3.8-27B Hugging Face checkpoint directory (BF16 safetensors,
-`config.json`, `tokenizer_config.json`) to one of the four artifacts the engine ships. Two choices select
-the artifact: the quantization and the representation.
+`config.json`, `tokenizer.json`, `tokenizer_config.json`, `generation_config.json`, the chat template) to one of the
+four artifacts the engine ships; the artifact carries the checkpoint's tokenizer
+([docs/OPERATIONS.md](../docs/OPERATIONS.md#artifacts-and-their-tokenizer)). Two choices select the artifact: the
+quantization and the representation.
 
 | Artifact | Quantization | Representation | Weights |
 |---|---|---|---|

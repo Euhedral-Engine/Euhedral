@@ -19,7 +19,8 @@ The artifact holds the text model and the MTP draft head, 785 objects and no vis
   `mtp/layer`). NVFP4 drafts accept more tokens per verification than Q3 ones ([MTP_VERIFIER.md](MTP_VERIFIER.md)).
 
 The container is EDRL version 2, the only version the reader accepts: each tensor descriptor carries the source dtype, the
-persistent storage format and the persistent layout as separate fields.
+persistent storage format and the persistent layout as separate fields. After the last payload comes the checkpoint's
+tokenizer section ([FLASH_NEXT_ARTIFACT.md](FLASH_NEXT_ARTIFACT.md#tokenizer-section)).
 
 Canonical fused text objects:
 

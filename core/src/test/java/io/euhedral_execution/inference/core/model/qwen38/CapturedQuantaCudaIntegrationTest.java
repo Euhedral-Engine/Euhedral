@@ -13,6 +13,7 @@ import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.testing.SharedQwen38Mtp;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -37,7 +38,7 @@ class CapturedQuantaCudaIntegrationTest {
     void replayedQuantaGenerateTheSameTokensAndDraftsAsStageByStageSubmission() throws Throwable {
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
-        QwenTokenizer tokenizer = QwenTokenizer.load(tokenizerDirectory);
+        QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory));
         String frameModel = Files.readString(
                 SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/FRAME_MODEL.md"));
         List<int[]> prompts = List.of(

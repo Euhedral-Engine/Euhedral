@@ -62,7 +62,6 @@ class Qwen4ChatCompletionsCudaIntegrationTest {
     private RequestSettings requestSettings;
 
     private static Path artifact;
-    private static Path tokenizer;
 
     @LocalServerPort
     private int port;
@@ -76,23 +75,20 @@ class Qwen4ChatCompletionsCudaIntegrationTest {
         assumeTrue(configuredLibrary != null && Files.isRegularFile(Path.of(configuredLibrary)));
         library = Path.of(configuredLibrary);
         artifact = Path.of(System.getProperty("euhedral.qwen4.artifact", "unset-euhedral.qwen4.artifact"));
-        tokenizer = Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "unset-euhedral.qwen4.tokenizer-dir"));
-        assumeTrue(Files.isRegularFile(artifact) && Files.isRegularFile(tokenizer.resolve("chat_template.jinja")));
+        assumeTrue(Files.isRegularFile(artifact));
     }
 
     static NativeFiles nativeFiles() {
         return NativeFiles.at(library.toAbsolutePath().getParent().getParent());
     }
 
-    /// The settings the tests start the server with: the model files the build points at.
+    /// The settings the tests start the server with: the artifact the build points at.
     static Settings settings() {
         return SettingsLoader.load(
                 Optional.empty(),
                 Map.of(
                         "EUHEDRAL_MODEL_ARTIFACT",
                         artifact.toString(),
-                        "EUHEDRAL_MODEL_TOKENIZER",
-                        tokenizer.toString(),
                         "EUHEDRAL_MODEL_NAME",
                         MODEL,
                         "EUHEDRAL_CONTEXT_MAX_TOKENS",

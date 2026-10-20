@@ -4,11 +4,11 @@ import io.euhedral_execution.inference.api.anthropic.MessagesMapper;
 import io.euhedral_execution.inference.api.chat.ConversationPlanner;
 import io.euhedral_execution.inference.api.chat.GenerationService;
 import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
-import io.euhedral_execution.inference.api.chat.SamplingDefaults;
 import io.euhedral_execution.inference.api.metrics.ServerMetrics;
 import io.euhedral_execution.inference.api.openai.ChatRequestMapper;
 import io.euhedral_execution.inference.api.responses.ResponsesMapper;
 import io.euhedral_execution.inference.core.settings.RequestSettings;
+import io.euhedral_execution.inference.core.settings.SamplingSettings;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import org.springframework.beans.factory.annotation.Value;
@@ -38,7 +38,8 @@ import org.springframework.context.annotation.Import;
     ChatRequestMapper.class
 })
 class ScriptedApiApplication {
-    static final SamplingDefaults CHECKPOINT_DEFAULTS = new SamplingDefaults(1.0f, 20, 0.95f);
+    /// The `sampling` settings, apart from the defaults so a test sees they reach the request mapping.
+    static final SamplingSettings SAMPLING = new SamplingSettings(0.6f, 30, 0.9f);
 
     /// The request limits, with `euhedral.test.max-queued` as the queue length.
     @Bean
@@ -60,7 +61,7 @@ class ScriptedApiApplication {
     }
 
     @Bean
-    SamplingDefaults samplingDefaults() {
-        return CHECKPOINT_DEFAULTS;
+    SamplingSettings sampling() {
+        return SAMPLING;
     }
 }

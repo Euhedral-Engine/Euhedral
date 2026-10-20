@@ -18,6 +18,7 @@ import numpy as np
 
 from euhedral_artifacts.edrl import (FORMAT_Q3, HEADER_FORMAT, LAYOUT_P2E2, LAYOUT_ROW_SPLIT, PAYLOAD_ALIGNMENT, align_up,
                                      encode_descriptors, fail, read_table)
+from euhedral_artifacts import tokenizer_section
 from euhedral_artifacts.recipes import stays_row_split
 
 SLICE = 1024
@@ -163,9 +164,10 @@ def decode(tensor: bytes | np.ndarray, rows: int, k: int) -> bytes:
 def transcode(input_path: Path, output_path: Path, force: bool = False, expand: bool = False) -> dict[str, Any]:
     """Writes the P2E2 artifact of the Q3 artifact `input_path`; returns its manifest fields. With `expand`, the
     reverse: the row-split Q3 artifact whose values the P2E2 artifact `input_path` stores (the reference that the
-    P2E2 kernels must reproduce bit for bit)."""
+    P2E2 kernels must reproduce bit for bit). The tokenizer `input_path` carries is carried."""
     if output_path.exists() and not force:
         fail(f"output already exists; pass --force: {output_path}")
+    tokenizer = tokenizer_section.require(input_path)
     with input_path.open("rb") as source:
         header, metadata, objects = read_table(source)
         data_offset = struct.unpack(HEADER_FORMAT, header)[7]
@@ -210,7 +212,7 @@ def transcode(input_path: Path, output_path: Path, force: bool = False, expand: 
                     cursor = out["offset"] + len(payload)
                     if index % 32 == 0 or index == len(objects):
                         print(f"transcoded {index}/{len(objects)} {obj['name']}", flush=True)
-                sink.truncate(cursor)
+                tokenizer_section.write(sink, cursor, tokenizer)
                 table = encode_descriptors(planned)
                 if len(table) != data_offset - struct.unpack(HEADER_FORMAT, header)[4]:
                     fail("tensor table size changed")

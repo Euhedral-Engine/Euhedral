@@ -17,6 +17,7 @@ import io.euhedral_execution.inference.core.model.qwen38.EngineExecutionFixture.
 import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -42,7 +43,7 @@ class SessionPrefixCacheTest {
     @BeforeAll
     static void loadTokenizer() throws Exception {
         assumeTrue(Files.isRegularFile(TOKENIZER_DIRECTORY.resolve("tokenizer.json")));
-        tokenizer = QwenTokenizer.load(TOKENIZER_DIRECTORY);
+        tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(TOKENIZER_DIRECTORY));
     }
 
     private record Harness(

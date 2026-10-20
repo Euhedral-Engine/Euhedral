@@ -7,15 +7,24 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.artifact.ArtifactFormatException;
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
+import io.euhedral_execution.inference.core.model.ArtifactTokenizer;
 import io.euhedral_execution.inference.core.model.qwen4.Qwen4Config;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertBank;
+import io.euhedral_execution.inference.core.testing.TestTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -50,6 +59,44 @@ class ArtifactReaderTest {
         var report = Validator.verifyChecksums(this.path, read, 2);
         assertEquals(5 * 8, report.expertRecords());
         assertTrue(report.checkedBytes() > 0);
+    }
+
+    @Test
+    void anArtifactGainsItsTokenizerWithItsContentUnchanged() throws IOException {
+        long declared = ArtifactReader.declaredSize(this.path);
+        assertEquals(this.artifact.header().fileSize(), declared);
+        assertEquals(Optional.of(TestTokenizer.FILES), TokenizerSection.read(this.path));
+        // An artifact from before the section: its content alone.
+        try (FileChannel channel = FileChannel.open(this.path, StandardOpenOption.WRITE)) {
+            channel.truncate(declared);
+        }
+        byte[] content = Files.readAllBytes(this.path);
+        var missing = assertThrows(ArtifactFormatException.class, () -> TokenizerSection.require(this.path));
+        assertTrue(missing.getMessage().contains("package-tokenizer --artifact " + this.path), missing.getMessage());
+
+        TokenizerFiles files = new TokenizerFiles("{\"t\":1}", "{}", "template", "{\"eos_token_id\":[1]}");
+        ArtifactTokenizer.add(this.path, files);
+        byte[] file = Files.readAllBytes(this.path);
+        assertArrayEquals(content, Arrays.copyOf(file, content.length));
+        assertEquals(files, TokenizerSection.require(this.path));
+        Artifact read = ArtifactReader.read(this.path);
+        assertEquals(declared, read.header().fileSize());
+        assertArrayEquals(
+                ArtifactWriter.encodeTables(this.artifact.tensors(), this.artifact.banks()),
+                ArtifactWriter.encodeTables(read.tensors(), read.banks()));
+        Validator.verifyChecksums(this.path, read, 2);
+    }
+
+    @Test
+    void bytesAfterTheContentWithoutAFooterAreRejected() throws IOException {
+        try (FileChannel channel = FileChannel.open(this.path, StandardOpenOption.WRITE)) {
+            channel.truncate(ArtifactReader.declaredSize(this.path));
+            channel.write(ByteBuffer.wrap(new byte[100]), channel.size());
+        }
+        var failure = assertThrows(ArtifactFormatException.class, () -> ArtifactReader.read(this.path));
+        assertTrue(failure.getMessage().contains("header declares"), failure.getMessage());
+        ArtifactTokenizer.add(this.path, TestTokenizer.FILES);
+        ArtifactReader.read(this.path);
     }
 
     @Test
@@ -125,7 +172,7 @@ class ArtifactReaderTest {
         try (RandomAccessFile file = new RandomAccessFile(this.path.toFile(), "rw")) {
             file.setLength(file.length() - 4096);
         }
-        assertRejected("file holds");
+        assertRejected("content holds");
         Files.write(this.path, new byte[10]);
         assertRejected("truncated");
     }

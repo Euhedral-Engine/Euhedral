@@ -31,8 +31,7 @@ import org.junit.jupiter.api.Timeout;
 /// speculation off and on (tokens per second, the disk and transfer bytes each quantum kind issues, tokens per
 /// verification) and prompt prefill (a 2048-token prompt, a 512-token turn appended to a conversation, with the prefix
 /// cache off and on). It prints the numbers a multi-sequence plan is sized from, and asserts that speculation does
-/// not change greedy output. Skipped unless -Peuhedral.qwen.bf16-artifact names the artifact (local disk) and
-/// -Peuhedral.qwen.tokenizer-dir its tokenizer.
+/// not change greedy output. Skipped unless -Peuhedral.qwen.bf16-artifact names the artifact (local disk).
 // Own JVM: loads the engine several times.
 @ModelGroup.OwnJvm
 class Bf16BaselineCudaIntegrationTest {
@@ -52,15 +51,14 @@ class Bf16BaselineCudaIntegrationTest {
         String artifactProperty = System.getProperty("euhedral.qwen.bf16-artifact");
         assumeTrue(artifactProperty != null && Files.isRegularFile(Path.of(artifactProperty)), "no BF16 artifact");
         Path artifact = Path.of(artifactProperty);
-        Path tokenizer = Path.of(System.getProperty("euhedral.qwen.tokenizer-dir"));
         Path lib = Path.of(library);
-        run(artifact, tokenizer, lib);
+        run(artifact, lib);
     }
 
-    private static void run(Path artifact, Path tokenizer, Path lib) throws Exception {
+    private static void run(Path artifact, Path lib) throws Exception {
         // One engine serves both modes (statistics are read as differences) and the cold prefill; a second one
         // keeps a prefix cache.
-        try (InferenceEngine engine = InferenceEngine.load(config(artifact, tokenizer, lib, 0L))) {
+        try (InferenceEngine engine = InferenceEngine.load(config(artifact, lib, 0L))) {
             List<Integer> plain = decode(engine, false);
             List<Integer> speculative = decode(engine, true);
             assertEquals(NEW_TOKENS, plain.size(), "speculation off generates the requested tokens");
@@ -68,15 +66,14 @@ class Bf16BaselineCudaIntegrationTest {
             assertEquals(plain, speculative, "speculation must not change greedy output");
             prefill(engine, "prefix cache off", false);
         }
-        try (InferenceEngine engine = InferenceEngine.load(config(artifact, tokenizer, lib, 1L << 30))) {
+        try (InferenceEngine engine = InferenceEngine.load(config(artifact, lib, 1L << 30))) {
             prefill(engine, "prefix cache on", true);
         }
     }
 
-    private static InferenceConfig config(Path artifact, Path tokenizer, Path library, long prefixCacheBytes) {
+    private static InferenceConfig config(Path artifact, Path library, long prefixCacheBytes) {
         return new InferenceConfig(
                         artifact,
-                        tokenizer,
                         library,
                         SystemInfo.getPCpuSet(),
                         4096,

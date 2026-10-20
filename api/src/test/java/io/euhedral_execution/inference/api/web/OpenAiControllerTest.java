@@ -134,13 +134,13 @@ class OpenAiControllerTest {
     }
 
     @Test
-    void samplingMapsOntoGenerationConfigWithCheckpointDefaults() throws Exception {
+    void samplingMapsOntoGenerationConfigWithTheSamplingSettings() throws Exception {
         completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"seed\":42," + HELLO + "}")
                 .andExpect(status().isOk());
         var defaults = this.backend.only().config;
-        assertEquals(1.0f, defaults.temperature());
-        assertEquals(20, defaults.topK());
-        assertEquals(0.95f, defaults.topP());
+        assertEquals(ScriptedApiApplication.SAMPLING.temperature(), defaults.temperature());
+        assertEquals(ScriptedApiApplication.SAMPLING.topK(), defaults.topK());
+        assertEquals(ScriptedApiApplication.SAMPLING.topP(), defaults.topP());
         assertEquals(42L, defaults.seed());
         assertFalse(defaults.greedy());
 
@@ -253,8 +253,13 @@ class OpenAiControllerTest {
         completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"repeat_penalty\":1.0," + HELLO + "}")
                 .andExpect(status().isOk());
         assertEquals(1, this.backend.generations.size());
-        assertEquals(20, this.backend.only().config.topK(), "neutral penalty must not change sampling");
-        assertEquals(0.95f, this.backend.only().config.topP());
+        assertEquals(
+                ScriptedApiApplication.SAMPLING.topK(),
+                this.backend.only().config.topK(),
+                "neutral penalty must not change sampling");
+        assertEquals(
+                ScriptedApiApplication.SAMPLING.topP(),
+                this.backend.only().config.topP());
     }
 
     @Test

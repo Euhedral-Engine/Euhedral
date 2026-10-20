@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.benchmark.result.ResultStore;
 import io.euhedral_execution.inference.core.InferenceEngine;
 import io.euhedral_execution.inference.core.ProcessorTopology;
 import io.euhedral_execution.inference.core.WorkerProcessorSelection;
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -29,15 +30,13 @@ public final class Prerequisites {
     public static Prepared check(BenchmarkOptions options, ProcessorTopology topology) throws IOException {
         requireFile(options.artifact(), "artifact");
         requireFile(options.cudaLibrary(), "cuda-library");
-        if (!Files.isRegularFile(options.tokenizer().resolve("tokenizer.json")))
-            throw new IllegalArgumentException("tokenizer directory has no tokenizer.json: " + options.tokenizer());
         ResultStore.checkOutput(options.output(), options.overwrite(), options.append());
         WorkerProcessorSelection workers =
                 resolveWorkers(options.cpus(), options.excludeCpus(), options.excludeCores(), topology);
 
         int modelContext = InferenceEngine.maxPositionEmbeddings(options.artifact());
         int context = Math.min(modelContext, options.maxContextTokens());
-        QwenTokenizer tokenizer = QwenTokenizer.load(options.tokenizer());
+        QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerSection.require(options.artifact()));
         // One prompt per scenario (words), or one per corpus task (chat): iteration i runs prompt i mod size.
         Map<Integer, List<PromptMaterial>> byTarget = new HashMap<>();
         Map<Scenario, List<PromptMaterial>> prompts = new LinkedHashMap<>();

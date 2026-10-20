@@ -24,7 +24,7 @@ None shares a user message with T4, the held-out set or the calibration set.
 
 `quantization generate` answered them on NVFP4-Trellis-RCO with thinking on:
 
-- 75% sampled as the server samples: generation_config's temperature 1.0, top-k 20 and top-p 0.95 through the engine's
+- 75% sampled as the server samples by default: temperature 1.0, top-k 20 and top-p 0.95 through the engine's
   `TokenSampler`, seeded by the prompt id;
 - 25% greedy.
 
@@ -60,7 +60,7 @@ own tokens):
 Conditional acceptance at the end: 0.79, 0.77, 0.79 and 0.80 at drafts 1 to 4.
 
 `export-drafter` writes the layer into the artifact as NVFP4 projections (round to nearest, byte for byte the
-converter's) and BF16 norms.
+converter's) and BF16 norms; the base artifact's tokenizer is carried.
 
 ## In the model
 

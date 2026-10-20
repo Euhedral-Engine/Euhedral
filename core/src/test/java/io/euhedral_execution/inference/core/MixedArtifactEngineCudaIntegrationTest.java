@@ -64,12 +64,8 @@ class MixedArtifactEngineCudaIntegrationTest {
     private static InferenceConfig config(Path trellis) {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
-        Path tokenizer =
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
-        assumeTrue(Files.isRegularFile(tokenizer.resolve("tokenizer.json")), "no tokenizer");
         return new InferenceConfig(
                 trellis,
-                tokenizer,
                 Path.of(library),
                 SystemInfo.getPCpuSet(),
                 CONTEXT_TOKENS,

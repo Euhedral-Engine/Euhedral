@@ -30,8 +30,7 @@ import org.junit.jupiter.api.Timeout;
 ///
 /// A stalled run cannot close its engine, whose device work never ends, so the test ends the JVM with
 /// `Runtime.halt(97)`, which Gradle reports as a failed run. The workers are `-Peuhedral.test.worker-cpus`, or else
-/// the first four performance CPUs ([WorkerCpus]). Skipped unless -Peuhedral.qwen.bf16-artifact names the artifact
-/// and -Peuhedral.qwen.tokenizer-dir its tokenizer.
+/// the first four performance CPUs ([WorkerCpus]). Skipped unless -Peuhedral.qwen.bf16-artifact names the artifact.
 // Own JVM: a host budget of its own.
 @ModelGroup.OwnJvm
 class DiskTierManySequencesCudaIntegrationTest {
@@ -52,14 +51,11 @@ class DiskTierManySequencesCudaIntegrationTest {
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         String artifact = System.getProperty("euhedral.qwen.bf16-artifact");
         assumeTrue(artifact != null && Files.isRegularFile(Path.of(artifact)), "no BF16 artifact");
-        String tokenizer = System.getProperty("euhedral.qwen.tokenizer-dir");
-        assumeTrue(tokenizer != null, "no tokenizer directory");
         long minutes = Long.getLong("euhedral.stress.minutes", 8L);
         long stallNanos = TimeUnit.SECONDS.toNanos(Long.getLong("euhedral.stress.stall-seconds", 90L));
         BitSet workers = WorkerCpus.of(4);
         var config = new InferenceConfig(
                         Path.of(artifact),
-                        Path.of(tokenizer),
                         Path.of(library),
                         workers,
                         6144,

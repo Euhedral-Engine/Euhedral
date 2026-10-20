@@ -1,21 +1,23 @@
 package io.euhedral_execution.inference.api.engine;
 
 import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
-import io.euhedral_execution.inference.api.chat.SamplingDefaults;
 import io.euhedral_execution.inference.api.metrics.EngineMetrics;
 import io.euhedral_execution.inference.api.metrics.ServerMetrics;
 import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.InferenceEngine;
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.guidance.Llguidance;
 import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
+import io.euhedral_execution.inference.core.settings.SamplingSettings;
 import io.euhedral_execution.inference.core.settings.Settings;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.io.IOException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
-/// Creates the process's single `InferenceEngine` and the checkpoint-derived chat adapters.
+/// Creates the process's single `InferenceEngine` and the chat adapters for the tokenizer its artifact carries.
 ///
 /// Singletons are created before the embedded server's connector starts, so a load failure aborts
 /// startup without ever serving HTTP. Spring destroys the engine after the web server and the
@@ -30,23 +32,29 @@ public class InferenceEngineConfiguration {
         return SetupCheck.require(settings);
     }
 
-    /// Loaded before the engine so an unsupported template fails fast without touching the GPU.
+    /// The tokenizer files the artifact carries, read before the engine so an unsupported template fails fast
+    /// without touching the GPU.
     @Bean
-    QwenChatTemplate qwenChatTemplate(Settings settings, SetupCheck.Checked checked) {
+    TokenizerFiles tokenizerFiles(Settings settings, SetupCheck.Checked checked) {
         try {
-            return QwenChatTemplate.load(settings.model().tokenizer());
+            return TokenizerSection.require(settings.model().artifact());
+        } catch (IOException | RuntimeException failure) {
+            throw new EngineStartupException("Reading the artifact's tokenizer", failure);
+        }
+    }
+
+    @Bean
+    QwenChatTemplate qwenChatTemplate(TokenizerFiles tokenizerFiles) {
+        try {
+            return QwenChatTemplate.load(tokenizerFiles);
         } catch (IOException | RuntimeException failure) {
             throw new EngineStartupException("Reading the chat template", failure);
         }
     }
 
     @Bean
-    SamplingDefaults samplingDefaults(Settings settings, SetupCheck.Checked checked) {
-        try {
-            return SamplingDefaults.load(settings.model().tokenizer());
-        } catch (IOException | RuntimeException failure) {
-            throw new EngineStartupException("Reading generation_config.json", failure);
-        }
+    SamplingSettings samplingSettings(Settings settings) {
+        return settings.sampling();
     }
 
     /// Loaded before the engine, so a library that does not load fails without the weights' load before it.

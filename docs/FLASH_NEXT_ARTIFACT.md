@@ -5,8 +5,8 @@ instead of layer norms, sparse attention with an indexer, and an n-gram embeddin
 carries it as its own architecture (`ModelArchitecture.QWEN4_EXP`) with its own container version, loader, residency planner and
 storage classes; the dense path (EDRL version 2) is unchanged.
 
-The artifact holds everything the runtime needs (configuration, tokenizer-independent weights, layouts). Nothing reads
-`config.json`, safetensors metadata, Hugging Face code or Python after conversion.
+The artifact holds everything the runtime needs (configuration, weights, layouts, the tokenizer). Nothing reads
+`config.json`, the checkpoint's tokenizer files, safetensors metadata, Hugging Face code or Python after conversion.
 
 ## Source checkpoint
 
@@ -49,7 +49,7 @@ n-gram shard 2,500,012 rows x 160.
 All integers in the header, metadata and tables are big-endian.
 
 ```
-header (64) | metadata | tables | zero padding to 4096 | payloads
+header (64) | metadata | tables | zero padding to 4096 | payloads | tokenizer section
 ```
 
 Header: `int32 magic 0x5157454E, int32 version 3, int32 architecture (1 = qwen4_exp), int32 reserved 0, int64 metadataOffset (64),
@@ -68,6 +68,24 @@ The CRC-32 is IEEE (`zlib.crc32`, `java.util.zip.CRC32`) over the object's bytes
 
 Dense artifacts stay version 2; a v2 reader rejects a version 3 file, and `ModelArchitecture.detect` tells them apart from the
 first twelve bytes.
+
+### Tokenizer section
+
+Both versions (2 and 3) end with the tokenizer of the source checkpoint, after `fileSize` (version 3) or the last payload
+(version 2), found from a footer in the last 24 bytes:
+
+```
+body:   int32 entryCount (4), then per entry: int32 nameLength, UTF-8 name, int32 dataLength, UTF-8 data
+footer: int64 bodyLength, int32 CRC-32 of the body, int32 version (1), "EDRLTOKN"
+```
+
+The entries, in order: `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` (the checkpoint's file, else the
+`chat_template` string of `tokenizer_config.json`) and `special_tokens.json` (the `bos_token_id`, `eos_token_id` and
+`pad_token_id` of `generation_config.json`, as JSON without spaces). The header's `fileSize` is where the content ends, before
+the section. Because the section follows everything else and the footer is written last, an artifact gains or replaces it
+without any other byte moving: `package-tokenizer` ([OPERATIONS.md](OPERATIONS.md#artifacts-and-their-tokenizer)) truncates the
+file to its content and appends the section. `TokenizerSection` (Java) and `tools/euhedral_artifacts/tokenizer_section.py`
+write the same bytes.
 
 ### Objects
 
@@ -118,7 +136,7 @@ python3 tools/convert_flash_next.py verify  ARTIFACT.edrl --checkpoint CHECKPOIN
 n-gram layers that disagree with the config), preallocates `ARTIFACT.edrl.partial`, writes objects in parallel worker processes
 (experts in chunks of 64) and journals each completed chunk with its CRC-32s in `ARTIFACT.edrl.progress`. Run again after an
 interruption and only the missing chunks are written; the finished bytes equal an uninterrupted conversion's. It then writes the
-tables and the header, renames the file into place and writes `ARTIFACT.edrl.manifest.json` (artifact size, object counts,
+tables, the header and the checkpoint's tokenizer section, renames the file into place and writes `ARTIFACT.edrl.manifest.json` (artifact size, object counts,
 bytes per group, format and layout counts, source checkpoint, SHA-256). `verify` checks that no ranges overlap, every range's
 CRC-32, and with `--checkpoint` every byte of every object against the checkpoint.
 

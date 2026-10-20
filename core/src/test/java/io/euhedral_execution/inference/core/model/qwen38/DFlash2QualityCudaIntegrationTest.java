@@ -7,6 +7,7 @@ import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Deco
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.io.BufferedWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -41,8 +42,8 @@ class DFlash2QualityCudaIntegrationTest {
         String report = System.getProperty("euhedral.dflash2.report", "");
         assumeTrue(Files.isRegularFile(artifact) && !report.isEmpty(), "needs a DFlash2 artifact and a report path");
         int budget = Integer.getInteger("euhedral.speculative.tokens", 256);
-        QwenTokenizer tokenizer = QwenTokenizer.load(
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir")));
+        QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"))));
         try (CudaGpuMemory gpu = new CudaGpuMemory(Path.of(System.getProperty("euhedral.cuda.library")));
                 Qwen38Model model = DFlash2SpeculativeDecodeCudaIntegrationTest.load(artifact, gpu, 4096);
                 var lattice = new PullingLattice();

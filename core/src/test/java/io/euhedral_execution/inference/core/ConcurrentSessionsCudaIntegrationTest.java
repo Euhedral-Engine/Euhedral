@@ -30,12 +30,8 @@ class ConcurrentSessionsCudaIntegrationTest {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         Path artifact = Path.of(System.getProperty("euhedral.qwen4.artifact", "unset-euhedral.qwen4.artifact"));
-        Path tokenizer =
-                Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "unset-euhedral.qwen4.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(artifact), "no artifact " + artifact);
-        assumeTrue(Files.isRegularFile(tokenizer.resolve("tokenizer.json")), "no tokenizer in " + tokenizer);
-        var config = new InferenceConfig(
-                artifact, tokenizer, Path.of(library), SystemInfo.getPCpuSet(), Duration.ofSeconds(30));
+        var config = new InferenceConfig(artifact, Path.of(library), SystemInfo.getPCpuSet(), Duration.ofSeconds(30));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             int[] first = engine.tokenizer()
                     .encodeWithModelSpecialTokens("Write a short poem about the sea and the lighthouse keeper.");

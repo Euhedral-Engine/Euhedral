@@ -23,9 +23,6 @@ import org.junit.jupiter.api.Timeout;
 @ModelGroup.OwnJvm
 class ScratchCudaIntegrationTest {
 
-    private static final String TOKENIZER =
-            System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir");
-
     @Test
     @Timeout(900)
     void prefillAndDecodeTakeOnlyTheBoundScratch() throws Exception {
@@ -37,11 +34,7 @@ class ScratchCudaIntegrationTest {
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         assumeTrue(Files.isRegularFile(Path.of(artifact)), "no artifact " + artifact);
         var config = new InferenceConfig(
-                Path.of(artifact),
-                Path.of(TOKENIZER),
-                Path.of(library),
-                SystemInfo.getPCpuSet(),
-                Duration.ofSeconds(30));
+                Path.of(artifact), Path.of(library), SystemInfo.getPCpuSet(), Duration.ofSeconds(30));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             var gpu = (CudaGpuMemory) ((Qwen38Runtime) engine.modelRuntime()).gpu();
             StringBuilder prompt = new StringBuilder();

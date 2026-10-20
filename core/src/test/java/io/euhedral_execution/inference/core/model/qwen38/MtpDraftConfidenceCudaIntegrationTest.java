@@ -12,6 +12,7 @@ import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpDecoder;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.io.BufferedWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -44,8 +45,8 @@ class MtpDraftConfidenceCudaIntegrationTest {
         int budget = Integer.getInteger("euhedral.speculative.tokens", 512);
         int drafts = Integer.getInteger("euhedral.mtp.drafts", MtpDecoder.MAX_DRAFTS);
         int context = Integer.getInteger("euhedral.mtp.context", 16384);
-        QwenTokenizer tokenizer = QwenTokenizer.load(
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir")));
+        QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"))));
         var mapper = new ObjectMapper();
         List<JsonNode> entries = Files.readAllLines(prompts).stream()
                 .filter(line -> !line.isBlank())

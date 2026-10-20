@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.core.artifact.ArtifactFormatException;
 import io.euhedral_execution.inference.core.artifact.CompactTensorLayout;
 import io.euhedral_execution.inference.core.artifact.TensorDataType;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import java.io.IOException;
@@ -23,10 +24,11 @@ public final class ArtifactReader {
             throw new ArtifactFormatException("input path is null");
         }
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-            long fileSize = channel.size();
-            if (fileSize < ArtifactHeader.BYTE_SIZE) {
+            if (channel.size() < ArtifactHeader.BYTE_SIZE) {
                 throw new ArtifactFormatException("artifact is truncated before the header");
             }
+            // Payloads end before the tokenizer section, if the artifact carries one.
+            long fileSize = TokenizerSection.contentEnd(channel);
 
             ArtifactHeader header = readHeader(channel);
             validateHeader(header, fileSize);

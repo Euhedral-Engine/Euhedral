@@ -31,12 +31,7 @@ class DFlash2LoadCudaIntegrationTest {
         BitSet cpus = new BitSet();
         cpus.set(0, Math.min(8, Runtime.getRuntime().availableProcessors()));
         var config = new InferenceConfig(
-                artifact,
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir")),
-                Path.of(System.getProperty("euhedral.cuda.library")),
-                cpus,
-                4096,
-                Duration.ofSeconds(10));
+                artifact, Path.of(System.getProperty("euhedral.cuda.library")), cpus, 4096, Duration.ofSeconds(10));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             assertEquals("dflash2", engine.description().speculation());
             var weights = ((Qwen38Runtime) engine.modelRuntime()).plan().weights();

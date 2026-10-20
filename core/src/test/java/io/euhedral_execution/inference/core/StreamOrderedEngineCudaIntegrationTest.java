@@ -38,9 +38,7 @@ class StreamOrderedEngineCudaIntegrationTest {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "CUDA library is required");
         Path artifact = Path.of(System.getProperty("euhedral.qwen.artifact", "unset-euhedral.qwen.artifact"));
-        Path tokenizer =
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
-        assumeTrue(Files.isRegularFile(artifact) && Files.isRegularFile(tokenizer.resolve("tokenizer.json")));
+        assumeTrue(Files.isRegularFile(artifact));
         BitSet cpus = new BitSet();
         var available = SystemInfo.getPCpuSet();
         for (int cpu = available.nextSetBit(0); cpu >= 0 && cpus.cardinality() < 2; cpu = available.nextSetBit(cpu + 1))
@@ -49,7 +47,7 @@ class StreamOrderedEngineCudaIntegrationTest {
 
         // The reference engine needs the device to itself: release the shared engine first.
         CoreEngines.releaseDevice();
-        Result reference = generateOnReference(artifact, tokenizer, Path.of(library), cpus);
+        Result reference = generateOnReference(artifact, Path.of(library), cpus);
         Result streamOrdered = generateStreamOrdered();
         assertEquals(reference.tokens(), streamOrdered.tokens(), "stream ordering changed committed token IDs");
         assertEquals(reference.position(), streamOrdered.position(), "KV/GDN sequence advancement differs");
@@ -57,9 +55,8 @@ class StreamOrderedEngineCudaIntegrationTest {
         assertTrue(streamOrdered.tokens().size() >= 4, "expected several decode quanta");
     }
 
-    private static Result generateOnReference(Path artifact, Path tokenizer, Path library, BitSet cpus)
-            throws Exception {
-        var config = new InferenceConfig(artifact, tokenizer, library, cpus, Duration.ofSeconds(10));
+    private static Result generateOnReference(Path artifact, Path library, BitSet cpus) throws Exception {
+        var config = new InferenceConfig(artifact, library, cpus, Duration.ofSeconds(10));
         var bootstrap = new ReferenceBootstrap();
         Result result;
         try (var engine = InferenceEngine.load(config, bootstrap)) {

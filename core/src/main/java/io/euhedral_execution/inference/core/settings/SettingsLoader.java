@@ -143,7 +143,9 @@ public final class SettingsLoader {
             boolean leaf = LEAVES.containsKey(key);
             boolean section = !leaf && LEAVES.keySet().stream().anyMatch(k -> k.startsWith(key + "."));
             if (!leaf && !section) {
-                problems.add("unknown setting " + key);
+                problems.add(RetiredSettings.keyMessage(key)
+                        .map(message -> key + " is retired: " + message)
+                        .orElse("unknown setting " + key));
             } else if (value.isNull()) {
                 problems.add(key + " has no value");
             } else if (section) {
@@ -192,8 +194,13 @@ public final class SettingsLoader {
 
     private static Settings build(Map<String, Object> v) {
         Get g = new Get(v);
-        ModelSettings model =
-                new ModelSettings(g.path("model.artifact"), g.path("model.tokenizer"), g.text("model.name"));
+        ModelSettings model = new ModelSettings(g.path("model.artifact"), g.text("model.name"));
+
+        SamplingSettings sampled = SamplingSettings.defaults();
+        SamplingSettings sampling = new SamplingSettings(
+                g.decimal("sampling.temperature", sampled.temperature()),
+                g.integer("sampling.top-k", sampled.topK()),
+                g.decimal("sampling.top-p", sampled.topP()));
 
         RequestSettings rd = RequestSettings.defaults();
         ServerSettings sd = ServerSettings.defaults();
@@ -252,7 +259,7 @@ public final class SettingsLoader {
                 g.integer("kernels.trellis.whole-k-min-tokens", td.wholeKMinTokens()),
                 g.integer("kernels.trellis.wide-block-min-tokens", td.wideBlockMinTokens())));
 
-        return new Settings(model, server, context, prefixCache, batching, memory, host, kernels);
+        return new Settings(model, sampling, server, context, prefixCache, batching, memory, host, kernels);
     }
 
     /// Typed reads of the parsed values; a missing key reads as its default.
@@ -263,6 +270,10 @@ public final class SettingsLoader {
 
         String text(String key) {
             return (String) values.get(key);
+        }
+
+        float decimal(String key, float fallback) {
+            return values.containsKey(key) ? (Float) values.get(key) : fallback;
         }
 
         int integer(String key, int fallback) {
@@ -289,8 +300,11 @@ public final class SettingsLoader {
     private static Map<String, Leaf> leaves() {
         Map<String, Leaf> m = new LinkedHashMap<>();
         m.put("model.artifact", required(SettingsLoader::path));
-        m.put("model.tokenizer", required(SettingsLoader::path));
         m.put("model.name", required(SettingsLoader::name));
+
+        m.put("sampling.temperature", fixed(SettingsLoader::temperature));
+        m.put("sampling.top-k", fixed(integer(0, Integer.MAX_VALUE)));
+        m.put("sampling.top-p", fixed(SettingsLoader::topP));
 
         m.put("server.port", fixed(integer(1, 65535)));
         m.put("server.shutdown-timeout", fixed(duration(true)));
@@ -359,6 +373,29 @@ public final class SettingsLoader {
                 throw new IllegalArgumentException("must be " + min + " to " + max + ": " + text);
             return value;
         };
+    }
+
+    private static Object temperature(String text) {
+        float value = decimal(text);
+        if (value < 0) throw new IllegalArgumentException("must be 0 or more: " + text);
+        return value;
+    }
+
+    private static Object topP(String text) {
+        float value = decimal(text);
+        if (value <= 0 || value > 1) throw new IllegalArgumentException("must be above 0 and at most 1: " + text);
+        return value;
+    }
+
+    private static float decimal(String text) {
+        float value;
+        try {
+            value = Float.parseFloat(text);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("not a number: " + text);
+        }
+        if (!Float.isFinite(value)) throw new IllegalArgumentException("not a finite number: " + text);
+        return value;
     }
 
     private static Function<String, Object> size(long min) {

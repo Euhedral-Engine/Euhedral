@@ -15,6 +15,7 @@ import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Prop
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -54,8 +55,8 @@ class DFlash2FixtureCudaIntegrationTest {
         Path dump = Path.of(System.getProperty("euhedral.dflash2.dump", "build/dflash2-fixture"))
                 .toAbsolutePath();
         String reference = System.getProperty("euhedral.dflash2.fixtures", "");
-        QwenTokenizer tokenizer = QwenTokenizer.load(
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir")));
+        QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"))));
         // -Peuhedral.dflash2.prompt-tokens takes that many tokens of docs/FRAME_MODEL.md instead of a chat prompt: past
         // 2048 the drafter's window and its ring's wraparound are in play.
         int promptTokens = Integer.getInteger("euhedral.dflash2.prompt-tokens", 0);

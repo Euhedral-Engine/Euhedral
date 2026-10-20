@@ -54,9 +54,7 @@ public final class CoreEngines {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "CUDA library is required");
         Path artifact = Path.of(System.getProperty(artifactProperty, artifactDefault));
-        Path tokenizer =
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
-        assumeTrue(Files.isRegularFile(artifact) && Files.isRegularFile(tokenizer.resolve("tokenizer.json")));
+        assumeTrue(Files.isRegularFile(artifact));
         BitSet cpus = new BitSet();
         var available = SystemInfo.getPCpuSet();
         for (int cpu = available.nextSetBit(0); cpu >= 0 && cpus.cardinality() < 2; cpu = available.nextSetBit(cpu + 1))
@@ -64,7 +62,7 @@ public final class CoreEngines {
         assumeTrue(cpus.cardinality() == 2);
         Duration shutdown = Duration.ofSeconds(10);
         return maxContextTokens == 0
-                ? new InferenceConfig(artifact, tokenizer, Path.of(library), cpus, shutdown)
-                : new InferenceConfig(artifact, tokenizer, Path.of(library), cpus, maxContextTokens, shutdown);
+                ? new InferenceConfig(artifact, Path.of(library), cpus, shutdown)
+                : new InferenceConfig(artifact, Path.of(library), cpus, maxContextTokens, shutdown);
     }
 }

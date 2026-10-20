@@ -35,8 +35,6 @@ class TokenIdentityCudaIntegrationTest {
 
     private static final int NEW_TOKENS = 32;
     private static final Path GOLDENS = Path.of("src/test/resources/identity");
-    private static final String QWEN38_TOKENIZER =
-            System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir");
 
     /// Flash-Next first: it pins host memory from the process's cgroup headroom, which the page cache of the dense
     /// artifacts read later would take.
@@ -50,23 +48,16 @@ class TokenIdentityCudaIntegrationTest {
                     throw new IllegalArgumentException("euhedral.identity.artifacts names no artifact: " + name);
         return Stream.of(
                 Arguments.of(
-                        "flash-next",
-                        System.getProperty("euhedral.qwen4.artifact", "unset-euhedral.qwen4.artifact"),
-                        System.getProperty("euhedral.qwen4.tokenizer-dir", "unset-euhedral.qwen4.tokenizer-dir")),
-                Arguments.of(
-                        "q3",
-                        System.getProperty("euhedral.qwen.artifact", "unset-euhedral.qwen.artifact"),
-                        QWEN38_TOKENIZER),
+                        "flash-next", System.getProperty("euhedral.qwen4.artifact", "unset-euhedral.qwen4.artifact")),
+                Arguments.of("q3", System.getProperty("euhedral.qwen.artifact", "unset-euhedral.qwen.artifact")),
                 Arguments.of(
                         "nvfp4",
-                        System.getProperty("euhedral.qwen.nvfp4-artifact", "unset-euhedral.qwen.nvfp4-artifact"),
-                        QWEN38_TOKENIZER),
+                        System.getProperty("euhedral.qwen.nvfp4-artifact", "unset-euhedral.qwen.nvfp4-artifact")),
                 Arguments.of(
                         "nvfp4-compressed",
                         System.getProperty(
                                 "euhedral.qwen.nvfp4-compressed-artifact",
-                                "unset-euhedral.qwen.nvfp4-compressed-artifact"),
-                        QWEN38_TOKENIZER));
+                                "unset-euhedral.qwen.nvfp4-compressed-artifact")));
     }
 
     /// A short prompt, and two numbered lists of about 3,000 and 8,500 tokens (6 and 17 prefill chunks).
@@ -98,20 +89,15 @@ class TokenIdentityCudaIntegrationTest {
     @ParameterizedTest(name = "{0}")
     @MethodSource("artifacts")
     @Timeout(3600)
-    void greedyTokensMatchTheRecordedBaseline(String name, String artifact, String tokenizer) throws Exception {
+    void greedyTokensMatchTheRecordedBaseline(String name, String artifact) throws Exception {
         // `-Peuhedral.identity.artifacts=q3,flash-next` runs only those, so each artifact can load in its own JVM.
         String only = System.getProperty("euhedral.identity.artifacts");
         assumeTrue(only == null || List.of(only.strip().split("\\s*,\\s*")).contains(name), "not selected: " + name);
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         assumeTrue(Files.isRegularFile(Path.of(artifact)), "no artifact " + artifact);
-        assumeTrue(Files.isRegularFile(Path.of(tokenizer, "tokenizer.json")), "no tokenizer in " + tokenizer);
         var config = new InferenceConfig(
-                Path.of(artifact),
-                Path.of(tokenizer),
-                Path.of(library),
-                SystemInfo.getPCpuSet(),
-                Duration.ofSeconds(30));
+                Path.of(artifact), Path.of(library), SystemInfo.getPCpuSet(), Duration.ofSeconds(30));
         List<String> lines = new ArrayList<>();
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             for (String prompt : prompts()) {

@@ -3,24 +3,25 @@
 ## Settings
 
 The server reads one YAML file, `--config <path>` (or `EUHEDRAL_CONFIG`). [config/euhedral.example.yaml](../config/euhedral.example.yaml)
-sets every key and says what it does, its default, and whether it is required; the minimal file is `model.artifact`,
-`model.tokenizer` and `model.name`. Any key can also be set, or overridden, by the variable named `EUHEDRAL_` plus the
+sets every key and says what it does, its default, and whether it is required; the minimal file is `model.artifact`
+and `model.name`. Any key can also be set, or overridden, by the variable named `EUHEDRAL_` plus the
 key path in capitals with `.` and `-` as `_`: `model.artifact` is `EUHEDRAL_MODEL_ARTIFACT`. `PORT` also sets
 `server.port`. An unknown key, an invalid value or a variable of a retired name stops the server before anything loads,
 with every problem named on its own line of standard error and exit status 2.
 
 The container starts with `--config /etc/euhedral/config.yaml`, which holds the model's container paths; the model name
 and every other setting come from the run's environment. The container and `mise run deploy` read a `.env` file
-([.env.example](../.env.example)) with the host paths mounted on those container paths (`EUHEDRAL_ARTIFACT_FILE`,
-`EUHEDRAL_CHECKPOINT_DIR`).
+([.env.example](../.env.example)) with the host path mounted on that container path (`EUHEDRAL_ARTIFACT_FILE`).
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `model.artifact` | required | The `.edrl` artifact to serve. |
-| `model.tokenizer` | required | The checkpoint directory (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`). |
+| `model.artifact` | required | The `.edrl` artifact to serve. It carries the checkpoint's tokenizer, chat template and special-token ids ([Artifacts and their tokenizer](#artifacts-and-their-tokenizer)). |
 | `host.native-cache` | the user's cache directory | Where the jar unpacks its native files (the CUDA library, llguidance, the CUDA runtime and NVRTC, kernel sources and CUDA headers), in a subdirectory named by their content hash: `$XDG_CACHE_HOME/euhedral`, else `~/.cache/euhedral`; `%LOCALAPPDATA%\euhedral` on Windows. Servers started together share one copy. The directory is per user (keep it `0700`): give each user their own, or leave the default. |
 | `host.cpus` | every available processor | Processor IDs or ranges for the engine's worker threads, for example `2-5,8`; Euhedral pins one worker per selected core. |
 | `model.name` | required | The name clients send as `model`. |
+| `sampling.temperature` | 1.0 | Temperature for a request that sets none; 0 is greedy decoding. |
+| `sampling.top-k` | 20 | Top-k for a request that sets none (the OpenAI APIs have no field for it); 0 keeps every token. |
+| `sampling.top-p` | 0.95 | Top-p for a request that sets none, above 0 and at most 1. |
 | `context.max-tokens` | 32768 | The longest prompt plus completion. The engine keeps device memory for that much KV cache and holds weights in pinned host memory when both do not fit. At most the model's 262144 positions. |
 | `prefix-cache.size` | 4GiB | Pinned host memory for the prefix cache ([PREFIX_CACHE.md](PREFIX_CACHE.md)); 0 turns it off. |
 | `prefix-cache.checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints, a multiple of 512. |
@@ -48,10 +49,24 @@ and every other setting come from the run's environment. The container and `mise
 The machine needs only the NVIDIA driver: each platform's jar (`euhedral-inference-linux-x64.jar`,
 `euhedral-inference-windows-x64.jar`) carries the CUDA runtime, NVRTC and the CUDA headers the kernels compile against.
 
+### Artifacts and their tokenizer
+
+An artifact carries the tokenizer of the checkpoint it was made from: `tokenizer.json`, `tokenizer_config.json`, the
+chat template, and the `bos_token_id`, `eos_token_id` and `pad_token_id` of `generation_config.json`, in a section after
+its weights ([FLASH_NEXT_ARTIFACT.md](FLASH_NEXT_ARTIFACT.md#tokenizer-section)). The converters and `quantization
+assemble` / `export-drafter` write it. An artifact without one stops the server with the command that adds it, which
+writes only that section and leaves every other byte of the artifact as it is:
+
+```bash
+./gradlew :quantization:run --args="package-tokenizer --artifact ARTIFACT.edrl --tokenizer CHECKPOINT_DIR"
+```
+
+`--out COPY.edrl` writes a copy with the section and leaves the artifact alone. Running it again replaces the section.
+
 ## Starting
 
 Before anything loads, the server reads and validates the settings file and unpacks its native files into the native cache, then checks the files
-the settings name (the artifact and the checkpoint's tokenizer files), the NVIDIA driver and a GPU it drives. It reports every
+the settings name (the artifact, and the tokenizer it carries), the NVIDIA driver and a GPU it drives. It reports every
 problem at once, each with the setting to change, and exits within about a second:
 
 ```text

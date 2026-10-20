@@ -19,6 +19,7 @@ import io.euhedral_execution.inference.core.settings.Tuning;
 import io.euhedral_execution.inference.core.testing.MixedArtifacts;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -70,7 +71,7 @@ class MixedArtifactCudaIntegrationTest {
         Path tokenizer =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(tokenizer.resolve("tokenizer.json")), "no tokenizer");
-        int[] text = QwenTokenizer.load(tokenizer)
+        int[] text = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizer))
                 .encodeText(Files.readString(
                         SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/FRAME_MODEL.md")));
         assumeTrue(text.length >= PROMPT + 2 * ROWS + 500, "the prompt text is too short");

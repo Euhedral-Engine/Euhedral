@@ -21,7 +21,7 @@ import org.junit.jupiter.api.Timeout;
 /// The unquantized Qwen3.8 model (a `bf16` artifact, 54 GB) on one 16 GB card: its weights split between the device,
 /// pinned host memory up to the host budget and the artifact file, its attention caches in BF16. It answers a
 /// factual prompt greedily, with the same tokens whatever share of its weights is read from disk. Skipped unless
-/// -Peuhedral.qwen.bf16-artifact names the artifact (local disk) and -Peuhedral.qwen.tokenizer-dir its tokenizer.
+/// -Peuhedral.qwen.bf16-artifact names the artifact (local disk).
 // Own JVM: loads the engine twice.
 @ModelGroup.OwnJvm
 class Bf16ArtifactCudaIntegrationTest {
@@ -34,16 +34,14 @@ class Bf16ArtifactCudaIntegrationTest {
         String artifactProperty = System.getProperty("euhedral.qwen.bf16-artifact");
         assumeTrue(artifactProperty != null && Files.isRegularFile(Path.of(artifactProperty)), "no BF16 artifact");
         Path artifact = Path.of(artifactProperty);
-        Path tokenizer = Path.of(System.getProperty("euhedral.qwen.tokenizer-dir"));
-        List<Integer> roomy = generate(artifact, tokenizer, Path.of(library), 24L << 30, "host budget 24 GiB");
-        List<Integer> tight = generate(artifact, tokenizer, Path.of(library), 8L << 30, "host budget 8 GiB");
+        List<Integer> roomy = generate(artifact, Path.of(library), 24L << 30, "host budget 24 GiB");
+        List<Integer> tight = generate(artifact, Path.of(library), 8L << 30, "host budget 8 GiB");
         assertEquals(roomy, tight);
     }
 
-    private static List<Integer> generate(Path artifact, Path tokenizer, Path library, long hostBudget, String label)
-            throws Exception {
+    private static List<Integer> generate(Path artifact, Path library, long hostBudget, String label) throws Exception {
         var config = new InferenceConfig(
-                        artifact, tokenizer, library, SystemInfo.getPCpuSet(), 4096, Duration.ofSeconds(60), 0L, 2048)
+                        artifact, library, SystemInfo.getPCpuSet(), 4096, Duration.ofSeconds(60), 0L, 2048)
                 .withTuning(Tunings.hostWeightsLimit(hostBudget));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             var dense = (Qwen38Runtime) engine.modelRuntime();

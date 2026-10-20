@@ -33,7 +33,7 @@ COPY --from=build /opt/health/ /opt/euhedral/health/
 # The jar carries its native files (CUDA library, runtime, NVRTC, kernel sources and headers) and unpacks them into
 # the user's cache directory at startup; the NVIDIA Container Toolkit provides the driver.
 COPY --from=build /src/api/build/libs/euhedral-inference-linux-x64.jar /opt/euhedral/app.jar
-# The model's container paths; mount your own file over it to change settings.
+# The artifact's container path; mount your own file over it to change settings.
 COPY container/config.yaml /etc/euhedral/config.yaml
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility

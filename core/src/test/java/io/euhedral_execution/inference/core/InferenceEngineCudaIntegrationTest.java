@@ -27,16 +27,14 @@ class InferenceEngineCudaIntegrationTest {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)));
         Path artifact = Path.of(System.getProperty("euhedral.qwen.artifact", "unset-euhedral.qwen.artifact"));
-        Path tokenizer =
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
-        assumeTrue(Files.isRegularFile(artifact) && Files.isRegularFile(tokenizer.resolve("tokenizer.json")));
+        assumeTrue(Files.isRegularFile(artifact));
         BitSet cpus = new BitSet();
         var available = SystemInfo.getPCpuSet();
         for (int cpu = available.nextSetBit(0); cpu >= 0 && cpus.cardinality() < 2; cpu = available.nextSetBit(cpu + 1))
             cpus.set(cpu);
         assumeTrue(cpus.cardinality() == 2);
         CoreEngines.releaseDevice();
-        var config = new InferenceConfig(artifact, tokenizer, Path.of(library), cpus, Duration.ofSeconds(10));
+        var config = new InferenceConfig(artifact, Path.of(library), cpus, Duration.ofSeconds(10));
         // Only records the engine's CUDA binding, whose allocations stay readable after the engine closed;
         // inference uses exclusively the public engine/session surface.
         var bootstrap = new RecordingBootstrap();

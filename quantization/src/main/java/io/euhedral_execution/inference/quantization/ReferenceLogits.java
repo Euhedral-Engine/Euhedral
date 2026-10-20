@@ -7,6 +7,7 @@ import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.core.tokenizer.TokenKind;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import io.euhedral_execution.inference.quantization.gpu.CudaLibraries;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import java.io.IOException;
@@ -94,7 +95,7 @@ public final class ReferenceLogits {
                 || settings.batch() * settings.rows() > 32)
             throw new IllegalArgumentException("--rows (at most 8) times --batch must be at most 32");
         if (settings.context() < 4) throw new IllegalArgumentException("--context is at least 4 tokens");
-        QwenTokenizer tokenizer = QwenTokenizer.load(settings.tokenizer());
+        QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(settings.tokenizer()));
         int[][] chunks = chunks(
                 tokenizer,
                 Files.readString(settings.text(), StandardCharsets.UTF_8),

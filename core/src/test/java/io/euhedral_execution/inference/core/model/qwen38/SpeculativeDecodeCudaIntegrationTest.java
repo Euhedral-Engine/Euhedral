@@ -13,6 +13,7 @@ import io.euhedral_execution.inference.core.state.AttentionKvState;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.testing.SharedQwen38Mtp;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -37,7 +38,7 @@ class SpeculativeDecodeCudaIntegrationTest {
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int budget = Integer.getInteger("euhedral.speculative.tokens", 160);
-        QwenTokenizer tokenizer = QwenTokenizer.load(tokenizerDirectory);
+        QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory));
         Path root = SpeculativeVerifyCudaIntegrationTest.repositoryRoot();
         String frameModel = Files.readString(root.resolve("docs/FRAME_MODEL.md"));
         int[] text = tokenizer.encodeText(frameModel);

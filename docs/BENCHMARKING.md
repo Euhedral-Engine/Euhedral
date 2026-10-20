@@ -90,13 +90,13 @@ Change one variable at a time and keep the JSON for every run you compare.
 
 ## Configuration
 
-`run CONFIG.json [--fork-id ID] [--validate-only]`. The config is JSON. Only `artifact`,
-`tokenizer`, and `cudaLibrary` are required, and unknown fields are rejected. Relative paths resolve
+`run CONFIG.json [--fork-id ID] [--validate-only]`. The config is JSON. Only `artifact` and
+`cudaLibrary` are required, and unknown fields are rejected. Relative paths resolve
 against the working directory, which is the repository root under `./gradlew :benchmark:run`.
 
 | Field | Default | Meaning |
 | ----- | ------- | ------- |
-| `artifact`, `tokenizer`, `cudaLibrary` | required | Model artifact, tokenizer directory, native library. |
+| `artifact`, `cudaLibrary` | required | Model artifact (with the tokenizer it carries), native library. |
 | `maxContextTokens` | `32768` | Longest sequence (prompt plus generation) the engine keeps device memory for; scenarios that need more positions are rejected. Recorded in the run snapshot. |
 | `prefixCacheBytes` | `0` | Pinned host memory for the prefix cache ([PREFIX_CACHE.md](PREFIX_CACHE.md)); 0 runs without one. Iterations of a scenario repeat its prompt, so with a cache every iteration after the first restores stored state: use it to measure the restore, never in a comparison of the engine's speed. Recorded in the run snapshot. |
 | `kvDeviceMinimumTokens` | `65536` | Tokens of each sequence's attention cache kept on the GPU when the weights and the whole cache do not fit; the pages past them live in pinned host memory before any weight leaves the GPU ([ATTENTION_DECODE.md](ATTENTION_DECODE.md#cache-pages-in-host-memory)). |

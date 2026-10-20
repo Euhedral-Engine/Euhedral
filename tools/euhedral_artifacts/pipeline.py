@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 
-from euhedral_artifacts import dflash2, q3_p2e2
+from euhedral_artifacts import dflash2, q3_p2e2, tokenizer_section
 from euhedral_artifacts.edrl import (FORMAT_ORDINAL, HEADER_SIZE, LAYOUT_ORDINAL, MAGIC, VERSION, ObjectPlan,
                                      assign_offsets, encode_table, fail, read_table, sha256)
 from euhedral_artifacts.importance import ImportanceMatrix
@@ -74,7 +74,8 @@ def write_artifact(model: Path, config: dict[str, Any], output_path: Path, recip
     uncompressed form), at `output_path`, through a temporary file renamed into place. With `draft` the
     DFlash2 drafter checkpoint in that directory is added as `dflash2/` objects; with `importance` the
     weights are rounded by calibrated scale search; objects `codes_from` holds codes for take them from there;
-    with `trellis` the linears come from that EXL3 checkpoint."""
+    with `trellis` the linears come from that EXL3 checkpoint. The artifact carries the checkpoint's tokenizer."""
+    tokenizer = tokenizer_section.encode(tokenizer_section.from_checkpoint(model))
     with SourceStore(model) as store, contextlib.ExitStack() as drafts:
         plans = build_plans(store, selected, recipe, importance, codes_from, trellis)
         if draft is not None:
@@ -102,6 +103,7 @@ def write_artifact(model: Path, config: dict[str, Any], output_path: Path, recip
                 output.write(metadata)
                 output.write(table)
                 write_objects(temporary, output, plans, jobs)
+                tokenizer_section.write(output, file_size, tokenizer)
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(temporary, output_path)

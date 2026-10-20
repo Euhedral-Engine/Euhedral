@@ -9,6 +9,7 @@ import io.euhedral_execution.core.generics.AbstractExecutor;
 import io.euhedral_execution.core.impl.BaseCloneableObject;
 import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.inference.core.artifact.HostBudget;
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.generation.GenerationSession;
 import io.euhedral_execution.inference.core.generation.SessionOptions;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
@@ -98,7 +99,7 @@ public final class InferenceEngine implements AutoCloseable {
 
     /// Loads all model resources and starts the lattice before returning an engine.
     /// Worker processor IDs are checked against the host [ProcessorTopology] before the tokenizer, model,
-    /// or GPU is loaded. The execution policy and weight residency are derived from the artifact.
+    /// or GPU is loaded. The tokenizer, execution policy and weight residency all come from the artifact.
     public static InferenceEngine load(InferenceConfig config) throws IOException {
         return load(config, new Bootstrap());
     }
@@ -117,7 +118,7 @@ public final class InferenceEngine implements AutoCloseable {
         Qwen38Model model = null;
         ControlPlaneLattice lattice = null;
         try {
-            QwenTokenizer tokenizer = QwenTokenizer.load(config.tokenizerDirectory());
+            QwenTokenizer tokenizer = bootstrap.readTokenizer(config.artifactPath());
             Artifact artifact = bootstrap.readArtifact(config.artifactPath());
             gpu = bootstrap.openGpu(config.cudaLibraryPath(), config.tuning());
             ArtifactProfile profile = artifact == null ? null : ArtifactProfile.of(artifact);
@@ -184,7 +185,7 @@ public final class InferenceEngine implements AutoCloseable {
         ControlPlaneLattice lattice = null;
         Qwen4Runtime runtime = null;
         try {
-            QwenTokenizer tokenizer = QwenTokenizer.load(config.tokenizerDirectory());
+            QwenTokenizer tokenizer = bootstrap.readTokenizer(config.artifactPath());
             lattice = bootstrap.createLattice(config);
             bootstrap.startLattice(lattice);
             runtime = Qwen4Runtime.load(config, tokenizer, lattice);
@@ -554,6 +555,11 @@ public final class InferenceEngine implements AutoCloseable {
 
         Artifact readArtifact(Path path) throws IOException {
             return ArtifactReader.read(path);
+        }
+
+        /// The tokenizer the artifact carries; an artifact without one fails naming the command that adds it.
+        QwenTokenizer readTokenizer(Path artifact) throws IOException {
+            return QwenTokenizer.load(TokenizerSection.require(artifact));
         }
 
         ExecutionGpu openGpu(Path path, Tuning tuning) {

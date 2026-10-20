@@ -210,14 +210,14 @@ directory at startup, so the machine needs only the NVIDIA driver.
 cat > euhedral.yaml <<'YAML'
 model:
   artifact: /models/qwen-q3.edrl
-  tokenizer: /path/to/Qwen3.8-27B
   name: qwen
 YAML
 java --enable-native-access=ALL-UNNAMED -jar api/build/libs/euhedral-inference-linux-x64.jar --config euhedral.yaml
 ```
 
-The file needs only those three keys; [config/euhedral.example.yaml](config/euhedral.example.yaml) sets every key and
-says what it does and its default. Any key can also be given as a variable (`model.name` is `EUHEDRAL_MODEL_NAME`), and
+The file needs only those two keys: the artifact carries its tokenizer and chat template.
+[config/euhedral.example.yaml](config/euhedral.example.yaml) sets every key and says what it does and its default,
+among them the `sampling` defaults a request that names none gets (temperature 1.0, top-k 20, top-p 0.95). Any key can also be given as a variable (`model.name` is `EUHEDRAL_MODEL_NAME`), and
 `EUHEDRAL_CONFIG` names the file in place of `--config`. The server listens on port 1738.
 
 **4. Send a request:**
@@ -289,18 +289,17 @@ A field that would change the output and is not implemented is refused with 400,
 ## Docker
 
 The container takes its settings from a `.env` file: copy [.env.example](.env.example) to `.env` (git ignores it) and
-set the artifact and checkpoint paths, the model name and the worker CPUs (`host.cpus`).
+set the artifact path, the model name and the worker CPUs (`host.cpus`).
 
 ```bash
 docker build -t euhedral-inference:local .
 set -a; . ./.env; set +a
 docker run --rm --gpus all --env-file .env -p "$PORT:$PORT" --stop-timeout 45 \
   --mount type=bind,src="$EUHEDRAL_ARTIFACT_FILE",dst=/models/model.edrl,readonly \
-  --mount type=bind,src="$EUHEDRAL_CHECKPOINT_DIR",dst=/tokenizer,readonly \
   euhedral-inference:local
 ```
 
-The model and tokenizer are not in the image. It carries the CUDA runtime and NVRTC userspace libraries, the native
+The model (with the tokenizer its artifact carries) is not in the image. It carries the CUDA runtime and NVRTC userspace libraries, the native
 library and the kernel sources, but not the NVIDIA kernel driver: `--gpus all` needs the NVIDIA Container Toolkit and a
 compatible host driver. Hosts without the toolkit can pass the device nodes and the driver libraries explicitly:
 

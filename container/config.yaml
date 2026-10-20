@@ -1,6 +1,5 @@
-# The container's settings: the model's paths inside the image. The model name is required too; give it as
-# EUHEDRAL_MODEL_NAME. Every other key of config/euhedral.example.yaml has a default and is a variable (docker run -e
-# or --env-file), or mount a complete file over this one.
+# The container's settings: the artifact's path inside the image (it carries the tokenizer). The model name is
+# required too; give it as EUHEDRAL_MODEL_NAME. Every other key of config/euhedral.example.yaml has a default and is
+# a variable (docker run -e or --env-file), or mount a complete file over this one.
 model:
   artifact: /models/model.edrl
-  tokenizer: /tokenizer

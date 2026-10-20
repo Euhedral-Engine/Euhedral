@@ -3,14 +3,16 @@ package io.euhedral_execution.inference.core.model.qwen38.artifact;
 import io.euhedral_execution.inference.core.artifact.ArtifactFileAccess;
 import io.euhedral_execution.inference.core.artifact.ArtifactFormatException;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
+import io.euhedral_execution.inference.core.artifact.TokenizerSection;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
-/// Writes compact version 2 EDRL metadata, descriptors, and small test payloads.
+/// Writes compact version 2 EDRL metadata, descriptors, the tokenizer section, and small test payloads.
 ///
 /// The production converter writes large payloads directly in deterministic descriptor order; this
 /// writer intentionally accepts byte arrays so compact format round-trip tests do not allocate a
@@ -37,7 +39,9 @@ public final class CompactArtifactWriter {
         }
     }
 
-    public static void write(Path path, Artifact artifact, byte[][] tensorData) throws IOException {
+    /// Writes `artifact` with `tensorData` as its payloads and `tokenizer` as the tokenizer it carries.
+    public static void write(Path path, Artifact artifact, byte[][] tensorData, TokenizerFiles tokenizer)
+            throws IOException {
         if (tensorData == null) {
             throw new ArtifactFormatException("compact writer arguments are incomplete");
         }
@@ -50,7 +54,7 @@ public final class CompactArtifactWriter {
                 throw new ArtifactFormatException("compact payload size mismatch: " + tensors[i].name());
             }
         }
-        try (FileChannel channel = writeLayout(path, artifact)) {
+        try (FileChannel channel = writeLayout(path, artifact, tokenizer)) {
             for (int i = 0; i < tensors.length; i++) {
                 if (tensorData[i].length != 0) {
                     writeAt(channel, tensors[i].dataOffset(), ByteBuffer.wrap(tensorData[i]));
@@ -59,11 +63,11 @@ public final class CompactArtifactWriter {
         }
     }
 
-    /// Creates `path` with `artifact`'s header, metadata and tensor table, and sized to hold every payload, which
-    /// the caller writes at the descriptors' offsets (a large payload in chunks: nothing here holds one). The file
-    /// is returned open for writing.
-    public static FileChannel writeLayout(Path path, Artifact artifact) throws IOException {
-        if (path == null || artifact == null || artifact.header() == null) {
+    /// Creates `path` with `artifact`'s header, metadata and tensor table, sized to hold every payload, which the
+    /// caller writes at the descriptors' offsets (a large payload in chunks: nothing here holds one), and with
+    /// `tokenizer` after the payloads ([TokenizerSection]). The file is returned open for writing.
+    public static FileChannel writeLayout(Path path, Artifact artifact, TokenizerFiles tokenizer) throws IOException {
+        if (path == null || artifact == null || artifact.header() == null || tokenizer == null) {
             throw new ArtifactFormatException("compact writer arguments are incomplete");
         }
         if (artifact.header().version() != ArtifactHeader.COMPACT_VERSION) {
@@ -116,6 +120,7 @@ public final class CompactArtifactWriter {
             writeAt(channel, 0, header);
             writeAt(channel, artifact.header().metadataOffset(), ByteBuffer.wrap(metadata));
             writeAt(channel, artifact.header().tensorTableOffset(), ByteBuffer.wrap(table));
+            TokenizerSection.write(channel, fileSize, tokenizer);
             return channel;
         } catch (IOException | RuntimeException failure) {
             channel.close();

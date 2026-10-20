@@ -15,6 +15,7 @@ import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.testing.SharedQwen38;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -40,7 +41,7 @@ class BatchedVerifyCudaIntegrationTest {
     void batchedRowsAndStatesEqualEachSequenceVerifiedAlone() throws Throwable {
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
-        int[] text = QwenTokenizer.load(tokenizerDirectory)
+        int[] text = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory))
                 .encodeText(Files.readString(
                         SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/FRAME_MODEL.md")));
         int[] prefixes = {300, 411, 530};
@@ -128,7 +129,7 @@ class BatchedVerifyCudaIntegrationTest {
     private static void withSequences(Body body) throws Throwable {
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
-        int[] text = QwenTokenizer.load(tokenizerDirectory)
+        int[] text = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizerDirectory))
                 .encodeText(Files.readString(
                         SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/FRAME_MODEL.md")));
         int[] prefixes = {300, 411, 530};

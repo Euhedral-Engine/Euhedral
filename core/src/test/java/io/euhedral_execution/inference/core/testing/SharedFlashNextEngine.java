@@ -9,7 +9,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.BitSet;
 
-/// The Flash-Next text engine (one worker on CPU 0, the artifact's tokenizer) that CUDA tests of one JVM share, in the
+/// The Flash-Next text engine (one worker on CPU 0) that CUDA tests of one JVM share, in the
 /// [ModelGroup#FLASH_NEXT_ENGINE] scope.
 public final class SharedFlashNextEngine {
     private SharedFlashNextEngine() {}
@@ -50,17 +50,9 @@ public final class SharedFlashNextEngine {
     private static InferenceConfig config(int context) {
         Path artifact = Path.of(System.getProperty("euhedral.qwen4.artifact", "unset-euhedral.qwen4.artifact"));
         assumeTrue(Files.isRegularFile(artifact), "no Flash-Next artifact at " + artifact);
-        Path tokenizers =
-                Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "unset-euhedral.qwen4.tokenizer-dir"));
-        assumeTrue(Files.isRegularFile(tokenizers.resolve("tokenizer.json")), "no tokenizer at " + tokenizers);
         BitSet cpus = new BitSet();
         cpus.set(0);
         return new InferenceConfig(
-                artifact,
-                tokenizers,
-                Path.of(System.getProperty("euhedral.cuda.library")),
-                cpus,
-                context,
-                Duration.ofSeconds(30));
+                artifact, Path.of(System.getProperty("euhedral.cuda.library")), cpus, context, Duration.ofSeconds(30));
     }
 }

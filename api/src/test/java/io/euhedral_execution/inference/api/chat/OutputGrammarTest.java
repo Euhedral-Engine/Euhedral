@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.core.guidance.GrammarCompiler;
 import io.euhedral_execution.inference.core.guidance.GrammarConstraint;
 import io.euhedral_execution.inference.core.guidance.Llguidance;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -31,7 +32,7 @@ class OutputGrammarTest {
         Path checkpoint =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(checkpoint.resolve("tokenizer.json")));
-        tokenizer = QwenTokenizer.load(checkpoint);
+        tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(checkpoint));
         compiler = GrammarCompiler.forTokenizer(
                 Llguidance.load(Path.of(System.getProperty("euhedral.llguidance.library"))), tokenizer, 248320);
     }

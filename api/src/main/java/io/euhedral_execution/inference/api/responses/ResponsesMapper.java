@@ -7,11 +7,11 @@ import io.euhedral_execution.inference.api.chat.FunctionTool;
 import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
 import io.euhedral_execution.inference.api.chat.Reasoning;
 import io.euhedral_execution.inference.api.chat.ResponseFormat;
-import io.euhedral_execution.inference.api.chat.SamplingDefaults;
 import io.euhedral_execution.inference.api.chat.ToolCalling;
 import io.euhedral_execution.inference.api.chat.ToolResults;
 import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.settings.SamplingSettings;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -44,12 +44,12 @@ public class ResponsesMapper {
             Set.of("previous_response_id", "conversation", "background", "prompt", "max_tool_calls", "top_logprobs");
 
     private final InferenceBackend backend;
-    private final SamplingDefaults samplingDefaults;
+    private final SamplingSettings samplingSettings;
     private final ConversationPlanner planner;
 
-    public ResponsesMapper(InferenceBackend backend, SamplingDefaults samplingDefaults, ConversationPlanner planner) {
+    public ResponsesMapper(InferenceBackend backend, SamplingSettings samplingSettings, ConversationPlanner planner) {
         this.backend = backend;
-        this.samplingDefaults = samplingDefaults;
+        this.samplingSettings = samplingSettings;
         this.planner = planner;
     }
 
@@ -434,14 +434,14 @@ public class ResponsesMapper {
     }
 
     private GenerationConfig sampling(ResponsesRequest request) {
-        float temperature = this.samplingDefaults.temperature();
+        float temperature = this.samplingSettings.temperature();
         if (request.temperature() != null) {
             double value = request.temperature();
             if (!(value >= 0.0 && value <= 2.0))
                 throw ApiException.invalidRequest("'temperature' must be between 0 and 2.", "temperature");
             temperature = (float) value;
         }
-        float topP = this.samplingDefaults.topP();
+        float topP = this.samplingSettings.topP();
         if (request.topP() != null) {
             double value = request.topP();
             if (!(value >= 0.0 && value <= 1.0))
@@ -451,7 +451,7 @@ public class ResponsesMapper {
         boolean greedy = temperature == 0.0f || topP == 0.0f;
         return new GenerationConfig(
                 temperature,
-                this.samplingDefaults.topK(),
+                this.samplingSettings.topK(),
                 greedy ? 1.0f : topP,
                 ThreadLocalRandom.current().nextLong(),
                 greedy);

@@ -71,6 +71,7 @@ import java.util.OptionalInt;
 /// [--keys 4096] [--tokens 16384] [--epochs 1] [--projection-rate 2e-5] [--norm-rate 2e-5] [--warmup 10]
 /// [--holdout 50] [--evaluate-every 50] [--limit N] [--library LIBEUHEDRAL_CUDA]
 /// export-drafter --model CHECKPOINT --artifact BASE_ARTIFACT --out ARTIFACT [--parameters PARAMETERS.bin]
+/// package-tokenizer --artifact ARTIFACT --tokenizer CHECKPOINT [--out ARTIFACT]
 /// ```
 ///
 /// Every command that runs on the GPU takes `--library` (the engine's CUDA library, by default the build's
@@ -101,7 +102,8 @@ public final class QuantizationMain {
                                 "assemble",
                                 "cost",
                                 "allocate",
-                                "reference")
+                                "reference",
+                                "package-tokenizer")
                         .contains(args[0])) {
             System.err.println(
                     "usage: calibrate --model DIR --quantization nvfp4|q3 [--compressed] [--output-head FORMAT] --tokens T.npy "
@@ -134,6 +136,7 @@ public final class QuantizationMain {
                     + "[--verify-rows 5] [--workers N] [--library PATH]");
             System.err.println("       cost --source OPTION=ARTIFACT... --base OPTION --out COSTS.json "
                     + "[--rows 1,2,3,4,5,6,512] [--repeats 50] [--rotate-mib 256] [--library PATH]");
+            System.err.println("       package-tokenizer --artifact ARTIFACT --tokenizer CHECKPOINT [--out ARTIFACT]");
             System.exit(2);
         }
         Map<String, String> options = new HashMap<>();
@@ -155,6 +158,13 @@ public final class QuantizationMain {
             else if (key.equals("--prompts")) prompts.add(value);
             else if (key.equals("--source")) artifacts.add(value);
             else options.put(key.substring(2), value);
+        }
+        if (args[0].equals("package-tokenizer")) {
+            PackageTokenizer.run(
+                    Path.of(required(options, "artifact")),
+                    Path.of(required(options, "tokenizer")),
+                    options.containsKey("out") ? Path.of(options.get("out")) : null);
+            return;
         }
         CudaLibraries library = new CudaLibraries(
                 Path.of(options.getOrDefault("library", "build/native/linux-x64/lib/libeuhedral_cuda.so")),
