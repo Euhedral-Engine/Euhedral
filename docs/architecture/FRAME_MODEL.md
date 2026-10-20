@@ -1,5 +1,7 @@
 # Qwen execution model
 
+The execution contracts below were checked against `498f7d2c` on 2026-10-20. Measurements and rejected variants record the hardware and implementation at the time of each experiment; they do not establish current defaults.
+
 A Qwen execution plan defines a static DAG of execution stages. A reusable runtime instance represents
 those stages as independent Euhedral frames. Admission exposes only root frames, through the runtime's
 `InferenceLake`. Successful stages create successor readiness and publish ready
@@ -14,8 +16,8 @@ work, or walks the graph after admission.
 
 ## Immutable plan and reusable graph
 
-`ExecutionPlan` owns the weights, the staging, and its `Shape`s: its own shape and the views (decode and
-the prefill region views, the drafts). It is never the live scheduler. A `Shape` (`model/qwen38`, a
+`ExecutionPlan` borrows the loaded model's weights, staging ring and disk window, and owns its `Shape`s:
+its own shape and the views (decode and the prefill region views, the drafts). It is never the live scheduler. A `Shape` (`model/qwen38`, a
 `GraphShape`) is the schema of one view: the stages, each an immutable stage spec (an instruction with its
 weight bindings and its input and output buffers), the dependency edges, and static metadata. It is built
 through `ShapeBuilder` (`runtime/graph`), the same builder Qwen4's shape uses, and `stageTopology()` exposes
@@ -88,6 +90,8 @@ Admission is small:
 3. bind the graph behind the previous users of each workspace buffer it touches (`WorkspaceOwner.bind`), then publish
    the root stages to the lake.
 
+Binding also orders carried sequence state through `SequenceOwner`: GDN and KV per layer, draft seeds, device draft tokens, DFlash2 taps/ring and the shared device region for host KV pages. A graph's first users wait on the previous graph's last users of each key for that sequence. Different sequences have separate records.
+
 After that, admission is out of the execution path. A quantum whose preparation fails reaches its
 terminal outcome at admission, after the stream proves that queued initialization stopped. A quantum is
 admitted at most once: if admission itself fails, the failure is thrown and the quantum's outcome fails
@@ -153,8 +157,7 @@ failed, or was cancelled.
 
 ## Device lanes
 
-CPU scheduling and CUDA ordering are separate. The runtime owns a pool of CUDA streams, its lanes: one per available processor, at
-most 64, plus one lane reserved for host-to-device weight transfers when the artifact stages weights from host memory. Each graph
+CPU scheduling and CUDA ordering are separate. The runtime owns a pool of CUDA streams, its lanes. Without staged weights it uses one compute lane per JVM-available processor, at most 64. With staged weights it uses at most 63 compute lanes plus one reserved transfer lane, keeping the total at most 64. Each graph
 has a home lane, which prepares its quantum and carries its retirement boundary. A stage chooses its lane each time it runs and
 submits with that lane selected on the submitting thread, whichever Euhedral worker runs it:
 
@@ -206,7 +209,7 @@ them.
 
 - `SUBMITTED`, the ordinary edge: the consumer needs only the producer's successful submission. Stream
   order runs the consumer's device work after the producer's, so the host never waits for the
-  producer's completion. Every edge of the current plans is a submission edge.
+  producer's completion. Dense production stage dependencies use submission edges; diagnostic shapes can request retirement boundaries.
 - `RETIRED`, the device-completion edge: the consumer needs the producer's device work to have
   retired. The producer arms it after submitting (event plus host callback); the driver callback only
   enqueues the edge's frame, which confirms retirement on a worker before satisfying the edge. It is
@@ -278,10 +281,9 @@ cancellation still commits (SUCCESS), and the sequence then ends CANCELLED. The 
 first-writer-wins.
 The persistent state closes only in `complete()`, which the session's lifecycle runs after its generation ended.
 
-The sequence allows several quanta in flight; the state they share does not yet. `AttentionKvState` takes one
-append at a time, the decode scratch and the session's host logits row are one per sequence, and quanta on
-different lanes have no device edge between them, so a quantum that touches that state is refused while other work
-on its sequence is in flight, and today's sessions admit one quantum of a sequence at a time.
+Several quanta of one sequence can be in flight. Carried-state edges order their device accesses, including KV appends; conclusions publish only the rows each retired quantum committed, leaving later appended rows submitted. Host logits still take one writer at a time per buffer, and a proposal without carried-state ordering requires the sequence to have no work in flight. `Quantum.sharesSequenceState` enforces those restrictions.
+
+Normal fixed-length MTP uses distinct readback buffers to admit catch-up, recursive drafts and target verification as one step. Each draft writes its selected token into the sequence's device token storage, and the next draft or verification reads it under the carried-token edges. The host resumes generation at verification's conclusion. A draft observer, gated length, partial verification or GPU without device token passing uses the separately retired draft path instead. See [speculative decoding](05-speculative-decoding.md).
 
 ## Failure and cancellation
 
@@ -321,9 +323,9 @@ Every piece of host work a request needs runs as frames on the lattice's workers
   session's `GenerationFrames` recycles the three frame types through `FrameManager`s, one frame of a chain live at a
   time. Tokenization's join throws the first `Admit`. Only tests, tools and the blocking `generate` wait, each on its own
   thread.
-- **The server** (`ChatCompletionService`): a container thread turns a request into a `DeferredResult` and returns.
-  Rendering and validation run as one frame (`Execution.onWorker`), encoding as tokenization frames. One
-  generation runs; a bounded list waits, and the worker that finishes a generation starts the next. Stop-sequence matching
+- **The server** (`ConversationPlanner`, `GenerationService`, `ChatGeneration`): a container thread turns a request into a `DeferredResult` and returns.
+  Rendering and validation run as one frame (`Execution.onWorker`), encoding as tokenization frames. A
+  bounded set of generations runs up to the backend's sequence capacity; a bounded queue waits, and a completed generation releases a slot for the next request. Stop-sequence matching
   and tool-call parsing run in the text callback. Network writes are queued per request (`SerialTasks`) and run on workers
   one at a time in output order: a write that blocks holds only its worker, and the other workers take the remaining
   work meanwhile.
@@ -415,9 +417,9 @@ prefill, M < 64:             SMALL view: A + D, ordinary FFN and attention
   quantum's retirement.
 - Host-backed weights add a `WEIGHT_TRANSFER` stage per use to every view ([NVFP4_RESIDENCY.md](../quantization/NVFP4_RESIDENCY.md)).
 
-Full attention stores K and V in sequence-owned 256-token pages. Each D256 head is rotated by
-normalized H256 and encoded as 128 bytes of E2M1 codes plus 16 E4M3 scales (one per contiguous group
-of 16 values). Device page tables contain raw addresses; growing a sequence allocates new pages without
+Full attention stores K and V in sequence-owned 256-token pages. With the NVFP4 cache format, each D256 head is rotated by
+normalized H256 and encoded as 128 bytes of INT4 midrise codes (magnitudes 0.5 through 7.5) plus 16 E4M3 scales (one per contiguous group
+of 16 values). The BF16 cache keeps unrotated 512-byte head rows; `context.kv-cache-format` chooses the format. Device page tables contain raw addresses; growing a sequence allocates new pages without
 copying existing KV payloads, and sequence cleanup releases pages and any decode scratch only after
 admitted GPU work has drained. Prefill attention is the FlashAttention-2 style leaf with producer warps for quanta of 512 or more
 rows (or 128 or more once the cache holds 2048 keys), and a 32-query by 32-key tile with FP16 tensor-core operands, FP32
@@ -426,6 +428,8 @@ about 48-key spans (at most 64) per query head below 2048 keys, one CTA each, an
 kernel; from 2048 keys one three-warp tensor-core CTA per KV head and 32-key split serves the whole query-head group
 ([ATTENTION_DECODE.md](../kernels/ATTENTION_DECODE.md)). Correctness is defined against the represented NVFP4 values within the existing
 FP16/MMA and BF16-output tolerance.
+
+When the full cache and weights do not fit, the planner can move pages beyond `context.kv-cache-on-gpu-tokens` to pinned host memory before offloading weights. Each sequence slot owns host pages per attention layer and one device region shared by those layers. A layer copies its host pages into the region before attention and copies appended rows back afterward; carried-state edges protect region reuse. Prefix checkpoints then stop at the device-page frontier. See [memory architecture](04-memory-architecture.md).
 
 Decode and VERIFY quanta that start below 1024 tokens launch their kernels with CUDA programmatic dependent launch
 (`euhedral_cuda_pdl_select`): every kernel registered for it begins with `griddepcontrol.wait`

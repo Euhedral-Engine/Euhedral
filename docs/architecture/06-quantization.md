@@ -23,7 +23,7 @@ flowchart TD
     EXL3 --> Convert
     Checkpoint --> Convert
     Importance[Importance matrix and draft shortlist] --> Convert
-    Convert --> Artifact[EDRL metadata, layouts and tensor payloads]
+    Convert --> Artifact[EDRL metadata, layouts, tensor payloads and tokenizer section]
     Artifact --> Load[ArtifactReader and WeightLoader validation]
     Artifact --> Sources[Calibrated source artifacts, one per option: NVFP4, trellis 2.5 to 4.0]
     Sources --> Assemble[assemble: allocation file picks each projection's option]
@@ -49,6 +49,10 @@ The loop is layerwise: collect statistics, round, substitute decoded weights and
 
 `Recipe` determines tensor roles and storage rules. GPTQ writes codes read by `--codes-from`. Trellis allocation assigns rates to budgeted linears, and `Exl3Writer` writes the checkpoint used by `--trellis-from`; output and draft heads have their own rounding path. The converter handles embeddings and packs metadata plus payloads, using importance weights where applicable. Check the [quantization guide](../../quantization/README.md) for format-specific head and MTP handling.
 
+The converter embeds the checkpoint's tokenizer, chat template and generation special-token IDs after the payloads. `assemble` preserves the base artifact's tokenizer section in its written output. A serving artifact therefore carries both its execution representation and the prompt/token contract; the engine requires the tokenizer section at startup.
+
+The module also has an MTP training path: `generate` records target answers and per-position greedy choices, `train-drafter` fine-tunes the MTP layer on that corpus, and `export-drafter` writes an artifact with the trained MTP weights and embedded tokenizer. That path complements the calibration and mixed-allocation pipeline shown above; its corpus and training contract are in [the MTP drafter guide](../speculation/MTP_DRAFTER.md).
+
 ## Mixed artifacts and references
 
 `assemble` builds a mixed artifact from calibrated sources without recalibrating: `Sources` opens one artifact per option, checks that the objects taken straight from the checkpoint (norms, GDN state tensors, the small BF16 projections, the draft-head shortlist) are bit for bit the same in every source and that the projections are the same linears, and takes every unlisted object, the heads, the embedding and the MTP drafter from the base. A chosen projection brings its companions (trellis `suh`, `svh`, `segments`) from its own source. The composite view runs in process through the engine's per-object source files; a written artifact copies the payloads exactly.
@@ -69,5 +73,6 @@ Across formats, `allocate` searches for mixed artifacts on the Pareto front of K
 - [GPTQ](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/gptq/Gptq.java), [TrellisQuantizer](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/trellis/TrellisQuantizer.java) and [Exl3Writer](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/trellis/Exl3Writer.java).
 - [Assemble](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Assemble.java), [Sources](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Sources.java), [Search](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Search.java), [Rco](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Rco.java), [FidelityModel](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/FidelityModel.java), [Cost](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Cost.java), [CostTable](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/CostTable.java), [ReferenceLogits](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/ReferenceLogits.java) and [Scorer](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/Scorer.java).
 - [Converter entry point](../../tools/convert_checkpoint.py), [converter package](../../tools/euhedral_artifacts), [tools guide](../../tools/README.md) and [Score](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/Score.java).
+- [Generate](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mtp/Generate.java), [DrafterTraining](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mtp/DrafterTraining.java) and [DrafterExport](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mtp/DrafterExport.java): corpus, MTP fine-tuning and artifact export.
 
-This diagram omits training/rotation commands, individual quantizer kernels, format byte layouts and the separate Flash-Next converter path. It makes no quality or throughput claim.
+This diagram omits the MTP training subgraph, rotation commands, individual quantizer kernels, format byte layouts and the separate Flash-Next converter path. It makes no quality or throughput claim.

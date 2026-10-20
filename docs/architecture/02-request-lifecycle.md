@@ -55,6 +55,8 @@ sequenceDiagram
 
 `GenerationService` bounds active requests by `maxActiveGenerations()` and waiting requests by `maxQueuedGenerations`. Validation failures reach the HTTP error handler before an emitter is published. Client disconnects, request timeouts and shutdown stop generation or remove the waiting admission; completion releases the session and slot.
 
+Planning maps protocol fields using the configured sampling defaults, compiles output grammars, renders the artifact's chat template and encodes with its tokenizer. A fresh unconstrained dense generation can speculate when its strategy supports the requested selection mode; a grammar or reasoning constraint uses ordinary decoding. MTP supports position-aware sampling as well as greedy selection. An MTP step can enqueue catch-up, recursive drafts and verification together, passing draft token IDs on the device; the generation continuation then observes the verification's retirement.
+
 The core generation chain is `Admit → quantum → Select → Admit/Finish`. A session can skip a quantum when a step needs no device work. The first output can come from prompt logits; the diagram groups that selection with generation rather than implying an extra decode is always required.
 
 ## Implementation anchors
