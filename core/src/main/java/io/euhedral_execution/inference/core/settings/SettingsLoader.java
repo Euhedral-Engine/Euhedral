@@ -1,8 +1,10 @@
 package io.euhedral_execution.inference.core.settings;
 
+import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import io.euhedral_execution.inference.core.artifact.format.TrellisSettings;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -10,6 +12,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -51,10 +54,16 @@ public final class SettingsLoader {
     }
 
     /// The configuration file named by `--config <path>` or `--config=<path>`, else by `EUHEDRAL_CONFIG`.
+    ///
+    /// @throws SettingsException when `--config` has no path
     public static Optional<Path> locate(String[] args, Map<String, String> environment) {
         for (int i = 0; i < args.length; i++) {
-            if (args[i].equals("--config") && i + 1 < args.length) return Optional.of(Path.of(args[i + 1]));
-            if (args[i].startsWith("--config=")) return Optional.of(Path.of(args[i].substring("--config=".length())));
+            String value = null;
+            if (args[i].equals("--config")) value = i + 1 < args.length ? args[i + 1] : "";
+            else if (args[i].startsWith("--config=")) value = args[i].substring("--config=".length());
+            if (value == null) continue;
+            if (value.isBlank()) throw new SettingsException(List.of("--config needs a file path"));
+            return Optional.of(Path.of(value));
         }
         String variable = environment.get("EUHEDRAL_CONFIG");
         return variable == null || variable.isBlank() ? Optional.empty() : Optional.of(Path.of(variable));
@@ -73,7 +82,8 @@ public final class SettingsLoader {
         Map<String, String> raw = new LinkedHashMap<>();
         Map<String, String> source = new LinkedHashMap<>();
         file.ifPresent(f -> readFile(f, raw, source, problems));
-        applyEnvironment(environment, raw, source, problems);
+        Set<String> blank = new HashSet<>();
+        applyEnvironment(environment, raw, source, blank, problems);
 
         Map<String, Object> values = new LinkedHashMap<>();
         for (Map.Entry<String, Leaf> entry : LEAVES.entrySet()) {
@@ -81,7 +91,7 @@ public final class SettingsLoader {
             Leaf leaf = entry.getValue();
             String text = raw.get(key);
             if (text == null) {
-                if (leaf.required())
+                if (leaf.required() && !blank.contains(key))
                     problems.add(key + " is required (set it in the file or as " + variableName(key) + ")");
                 continue;
             }
@@ -111,7 +121,8 @@ public final class SettingsLoader {
         }
         JsonNode root;
         try {
-            root = new ObjectMapper(new YAMLFactory()).readTree(Files.readString(file));
+            root = new ObjectMapper(new YAMLFactory().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION))
+                    .readTree(Files.readString(file));
         } catch (IOException e) {
             problems.add("configuration file " + file + " is not valid YAML: " + e.getMessage());
             return;
@@ -150,6 +161,7 @@ public final class SettingsLoader {
             Map<String, String> environment,
             Map<String, String> raw,
             Map<String, String> source,
+            Set<String> blank,
             List<String> problems) {
         for (String variable : RetiredSettings.variables())
             if (environment.containsKey(variable))
@@ -165,6 +177,7 @@ public final class SettingsLoader {
             if (value == null) continue;
             if (value.isBlank()) {
                 problems.add(variable + " is empty");
+                blank.add(key);
                 continue;
             }
             raw.put(key, value);
@@ -313,7 +326,9 @@ public final class SettingsLoader {
         m.put("host.idle-release", fixed(duration(false)));
         m.put("host.native-cache", optional(SettingsLoader::path));
 
-        m.put("kernels.trellis.tensor-core-max-tokens", fixed(integer(8, Integer.MAX_VALUE)));
+        m.put(
+                "kernels.trellis.tensor-core-max-tokens",
+                fixed(integer(TrellisSettings.MIN_MMA_ROWS, Integer.MAX_VALUE)));
         m.put("kernels.trellis.target-blocks", optional(integer(1, Integer.MAX_VALUE)));
         m.put("kernels.trellis.whole-k-min-tokens", fixed(integer(1, Integer.MAX_VALUE)));
         m.put("kernels.trellis.wide-block-min-tokens", fixed(integer(1, Integer.MAX_VALUE)));

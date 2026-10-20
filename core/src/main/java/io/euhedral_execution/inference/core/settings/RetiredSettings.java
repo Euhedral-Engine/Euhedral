@@ -27,8 +27,8 @@ public final class RetiredSettings {
             renamed("EUHEDRAL_API_MAX_QUEUED_GENERATIONS", "server.requests.max-queued"),
             renamed("EUHEDRAL_API_MAX_REQUEST_BYTES", "server.requests.max-body-size"),
             renamed("EUHEDRAL_API_REQUEST_TIMEOUT", "server.requests.timeout"),
-            renamed("EUHEDRAL_HOST_MEMORY_MIB", "memory.host-limit"),
-            renamed("EUHEDRAL_GPU_SYSTEM_RESERVE_MIB", "memory.gpu-reserve"),
+            resized("EUHEDRAL_HOST_MEMORY_MIB", "memory.host-limit"),
+            resized("EUHEDRAL_GPU_SYSTEM_RESERVE_MIB", "memory.gpu-reserve"),
             renamed("EUHEDRAL_LAKE_SINKS", "host.task-parallelism"),
             renamed("EUHEDRAL_QWEN4_READS", "memory.weight-streaming.concurrent-reads"),
             renamed("EUHEDRAL_QWEN4_READ_PARTS", "memory.weight-streaming.read-split"),
@@ -65,6 +65,10 @@ public final class RetiredSettings {
 
     private static Map.Entry<String, String> renamed(String variable, String key) {
         return Map.entry(variable, "renamed to " + key + " (" + SettingsLoader.variableName(key) + ")");
+    }
+
+    private static Map.Entry<String, String> resized(String variable, String key) {
+        return Map.entry(variable, renamed(variable, key).getValue() + "; give a size with a unit such as 24GiB");
     }
 
     private static Map.Entry<String, String> settled(String variable) {

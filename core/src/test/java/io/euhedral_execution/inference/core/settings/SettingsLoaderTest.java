@@ -190,4 +190,42 @@ class SettingsLoaderTest {
         assertEquals(Optional.of(Path.of("/b")), SettingsLoader.locate(new String[0], Map.of("EUHEDRAL_CONFIG", "/b")));
         assertEquals(Optional.empty(), SettingsLoader.locate(new String[0], Map.of()));
     }
+
+    @Test
+    void configWithoutPath() {
+        assertThrows(SettingsException.class, () -> SettingsLoader.locate(new String[] {"--config"}, Map.of()));
+        assertThrows(SettingsException.class, () -> SettingsLoader.locate(new String[] {"--config="}, Map.of()));
+    }
+
+    @Test
+    void duplicateKey() throws IOException {
+        SettingsException e = fails(MODEL + "server:\n  port: 1\n  port: 2\n", Map.of());
+        assertTrue(e.getMessage().contains("port"), e.getMessage());
+    }
+
+    @Test
+    void blankRequiredVariableReportsOnlyEmpty() throws IOException {
+        SettingsException e = fails("model:\n  tokenizer: /t\n  name: q\n", Map.of("EUHEDRAL_MODEL_ARTIFACT", " "));
+        assertEquals(1, e.problems().size(), e.getMessage());
+        assertTrue(e.getMessage().contains("empty"), e.getMessage());
+    }
+
+    @Test
+    void durationDaysRejected() throws IOException {
+        SettingsException e = fails(MODEL + "server:\n  shutdown-timeout: 1d\n", Map.of());
+        assertTrue(e.getMessage().contains("server.shutdown-timeout"), e.getMessage());
+    }
+
+    @Test
+    void everyRetiredMessageIsRemovedOrNamesAKey() {
+        for (String variable : RetiredSettings.variables()) {
+            String message = RetiredSettings.message(variable).orElseThrow();
+            boolean ok = message.startsWith("removed")
+                    || SettingsLoader.knownKeys().stream().anyMatch(k -> message.startsWith("renamed to " + k + " ("));
+            assertTrue(ok, variable + ": " + message);
+        }
+        assertTrue(RetiredSettings.message("EUHEDRAL_HOST_MEMORY_MIB")
+                .orElseThrow()
+                .contains("with a unit"));
+    }
 }
