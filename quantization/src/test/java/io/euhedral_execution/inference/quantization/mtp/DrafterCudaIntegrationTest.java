@@ -19,7 +19,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /// The drafter's training kernels and its backward pass, at small dimensions: NVFP4 rounding byte for byte as the
-/// converter rounds (tools/euhedral_artifacts/nvfp4.py, transcribed below in float32), the decoder of artifact rows,
+/// converter rounds ([Nvfp4Rounding]), the decoder of artifact rows,
 /// the draft head's cross-entropy against double arithmetic, and the unrolled drafter's gradients against central
 /// differences of its forward pass (projections unrounded), across a window that attends an earlier window's keys.
 class DrafterCudaIntegrationTest {
@@ -73,63 +73,42 @@ class DrafterCudaIntegrationTest {
 
     // ------------------------------------------------------------ NVFP4
 
-    private static final float[] E2M1 = {0f, 0.5f, 1f, 1.5f, 2f, 3f, 4f, 6f};
-
-    private static float e4m3(int code) {
-        return code < 8 ? (code & 7) / 8f * 0.015625f : (1 + (code & 7) / 8f) * (float) Math.pow(2, (code >> 3) - 7);
-    }
-
-    /// nvfp4.py round_to_table over an ascending table, in float32.
-    private static int roundToTable(float value, float[] table) {
-        int upper = 0;
-        while (upper < table.length && table[upper] < value) upper++;
-        upper = Math.min(Math.max(upper, 1), table.length - 1);
-        int lower = upper - 1;
-        float below = value - table[lower], above = table[upper] - value;
-        int index = above < below || (above == below && upper % 2 == 0) ? upper : lower;
-        if (value >= table[table.length - 1]) index = table.length - 1;
-        if (value <= table[0]) index = 0;
-        return index;
-    }
-
     @Test
     void nvfp4RoundingIsTheConvertersByteForByte() {
-        int rows = 12, k = 64;
+        int rows = 12, k = 128;
         float[] w = random(rows * k, 0.05);
         for (int i = 0; i < 16; i++) w[3 * k + i] = 0f; // an all-zero block
         w[5 * k + 7] = 1.7f; // an outlier that sets the global scale
         w[7 * k + 20] = -0.25f;
-        float[] e4m3 = new float[127];
-        for (int c = 0; c < 127; c++) e4m3[c] = e4m3(c);
-        float amax = 0;
-        for (float v : w) amax = Math.max(amax, Math.abs(v));
-        float global = amax / 2688f;
-        byte[] expectedPacked = new byte[rows * k / 2], expectedScales = new byte[rows * k / 16];
+        MemorySegment host = Arena.ofAuto().allocate(4L * w.length, 8);
+        MemorySegment.copy(w, 0, host, ValueLayout.JAVA_FLOAT, 0, w.length);
+        MemorySegment expected = Arena.ofAuto().allocate(Nvfp4Rounding.bytes(rows, k), 8);
+        Nvfp4Rounding.round(host, rows, k, expected);
+        long scaleOffset = 256L * ((rows * k / 2 + 255) / 256);
+        long globalOffset = 256L * ((scaleOffset + rows * k / 16 + 255) / 256);
+        float global = expected.get(ValueLayout.JAVA_FLOAT_UNALIGNED, globalOffset);
         float[] expectedValues = new float[rows * k];
-        for (int b = 0; b < rows * k / 16; b++) {
-            float largest = 0;
-            for (int i = 0; i < 16; i++) largest = Math.max(largest, Math.abs(w[b * 16 + i]));
-            int scale = roundToTable(largest / 6f / global, e4m3);
-            float decode = e4m3[scale] * global;
-            expectedScales[b] = (byte) scale;
-            int[] codes = new int[16];
-            for (int i = 0; i < 16; i++) {
-                float v = w[b * 16 + i];
-                int magnitude = roundToTable(decode > 0 ? Math.abs(v) / decode : 0f, E2M1);
-                codes[i] = magnitude | (v < 0 && magnitude > 0 ? 8 : 0);
-                expectedValues[b * 16 + i] = E2M1[magnitude] * ((codes[i] & 8) != 0 ? -1f : 1f) * decode;
-            }
-            for (int i = 0; i < 8; i++) expectedPacked[b * 8 + i] = (byte) (codes[2 * i] | (codes[2 * i + 1] << 4));
+        for (int i = 0; i < rows * k; i++) {
+            int code = (expected.get(ValueLayout.JAVA_BYTE, i / 2) >> (4 * (i & 1))) & 15;
+            int scale = expected.get(ValueLayout.JAVA_BYTE, scaleOffset + i / 16);
+            expectedValues[i] =
+                    Nvfp4Rounding.E2M1[code & 7] * ((code & 8) != 0 ? -1f : 1f) * (Nvfp4Rounding.E4M3[scale] * global);
         }
         long values = upload(w), out = allocate(4L * rows * k), maximum = allocate(4);
         long packed = allocate(rows * k / 2), scales = allocate(rows * k / 16), global32 = allocate(4);
         ops.zero(maximum, 1);
         kernels.absoluteMaximum(values, (long) rows * k, maximum);
         kernels.nvfp4Round(values, out, packed, scales, rows, k, maximum);
+        float amax = 0;
+        for (float v : w) amax = Math.max(amax, Math.abs(v));
         assertEquals(amax, Float.intBitsToFloat(download(maximum, 4).get(ValueLayout.JAVA_INT, 0)));
         assertArrayEquals(expectedValues, floats(out, (long) rows * k));
-        assertArrayEquals(expectedPacked, download(packed, rows * k / 2).toArray(ValueLayout.JAVA_BYTE));
-        assertArrayEquals(expectedScales, download(scales, rows * k / 16).toArray(ValueLayout.JAVA_BYTE));
+        assertArrayEquals(
+                expected.asSlice(0, rows * k / 2).toArray(ValueLayout.JAVA_BYTE),
+                download(packed, rows * k / 2).toArray(ValueLayout.JAVA_BYTE));
+        assertArrayEquals(
+                expected.asSlice(scaleOffset, rows * k / 16).toArray(ValueLayout.JAVA_BYTE),
+                download(scales, rows * k / 16).toArray(ValueLayout.JAVA_BYTE));
         // The artifact decoder reads the same values back (as BF16).
         Upload.floats(device.gpu, global32, new float[] {global});
         long bf16 = allocate(2L * rows * k);
@@ -137,8 +116,8 @@ class DrafterCudaIntegrationTest {
         short[] decoded = download(bf16, 2L * rows * k).toArray(ValueLayout.JAVA_SHORT);
         for (int i = 0; i < rows * k; i++) {
             int bits = Float.floatToRawIntBits(expectedValues[i]);
-            short expected = (short) ((bits + 0x7fff + ((bits >> 16) & 1)) >>> 16);
-            assertEquals(expected, decoded[i], "decoded value " + i);
+            short value = (short) ((bits + 0x7fff + ((bits >> 16) & 1)) >>> 16);
+            assertEquals(value, decoded[i], "decoded value " + i);
         }
     }
 
