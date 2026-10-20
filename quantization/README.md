@@ -113,7 +113,41 @@ up to `--batch` sequences (at most 32) decode together, one row each per batched
 for bit the artifact's own one-row decode. The corpus (`Corpus`) is `tokens.bin`, `hidden.bin` (BF16) and
 `index.jsonl`; a stopped run resumes by prompt id. The run's bookkeeping is a lattice source that quanta post records
 to. Each sequence holds about 336 MiB of device memory (144 MiB of it GDN state), so a larger `--batch` moves more
-weights to host memory on a 16 GB card.
+weights to host memory on a 16 GB card. On NVFP4-Trellis-RCO, `--batch 8` answers at 258 tok/s with 1.1 GiB of weights in
+host memory; `--batch 12` moves 3.0 GiB there and answers at 69 tok/s.
+
+`tools/mtp_corpus_prompts.py` writes the drafter's prompts from training splits: UltraChat first turns and second
+turns, Magicoder problems, Hermes function calls (the call itself, and the answer after the dataset's tool calls and
+responses), coding-agent turns over pallets projects after the agent listed a package and read one file, Aya prompts
+in five languages and GSM8K questions; none shares a user message with T4, the held-out set or the calibration set.
+An assistant message of a prompt may carry OpenAI `tool_calls`, which the chat template renders.
+
+## MTP drafter training
+
+```bash
+./gradlew :quantization:run --args="train-drafter --corpus corpus/ --model /path/to/checkpoint \
+    --artifact qwen3_8_27b_nvfp4_trellis_rco.edrl --out drafter/ [--depths 4] [--rows 1024] [--keys 4096] \
+    [--tokens 16384] [--epochs 1] [--projection-rate 2e-5] [--norm-rate 2e-5] [--warmup 10] [--holdout 50] \
+    [--evaluate-every 50]"
+./gradlew :quantization:run --args="export-drafter --model /path/to/checkpoint \
+    --artifact qwen3_8_27b_nvfp4_trellis_rco.edrl --out drafted.edrl [--parameters drafter/best.bin]"
+```
+
+`train-drafter` trains every parameter of the MTP layer from the checkpoint's weights, in FP32 with Adam, on the
+corpus (`DrafterTraining`, `Drafter`, `drafter.cu`). Its projections run NVFP4-rounded exactly as the export rounds
+them, with straight-through gradients. The recursion is unrolled to `--depths` drafts as the decoder runs it: row r
+of a window of `--rows` lineages reads the base model's hidden at position a + r, its depth-k row reads the depth-(k -
+1) row's output and the token at a + r + k, sits at position a + r + k - 1 and attends the depth-1 keys of every position
+up to a + r (from up to `--keys` positions back, earlier windows of the sequence included) and its own lineage's deeper
+keys. Each depth's loss is the cross-entropy of the artifact's draft head (its NVFP4 shortlist, frozen) against the
+base model's token, on answer tokens; token embeddings are the artifact's Q3 rows. An update follows every
+`--tokens` trained lineages. Every `--holdout`-th sequence is held out: an evaluation counts, over held-out lineages
+whose drafts all have targets, the leading drafts equal to the base model's tokens, the drafts a verification
+accepts. `out/best.bin` keeps the best evaluation's parameters; a run resumes from `out/resume.bin`.
+
+`export-drafter` writes the base artifact with its MTP layer replaced: NVFP4 projections (round to nearest,
+`Nvfp4Rounding`, byte for byte the converter's `quantize_nvfp4_rows`) and BF16 norms, from a parameter file or, without
+one, from the checkpoint's MTP weights.
 
 ## Libraries
 
@@ -134,6 +168,10 @@ The fixtures below are frozen outputs of a PyTorch reference of the calibration 
 - `LayerForwardCudaIntegrationTest`: layers 0 and 3 against the reference's BF16 forward (fixture in
   `-Peuhedral.quantization.forward-fixture=DIR`).
 - `ForwardPipelineCudaIntegrationTest`: the frame pipeline equals the sequential forward bit for bit.
+- `DrafterCudaIntegrationTest`: the training kernel's NVFP4 rounding equals `Nvfp4Rounding` byte for byte; the
+  draft head's cross-entropy equals double arithmetic; the unrolled drafter's gradients (three depths, a window
+  attending an earlier window's keys) equal central differences of its forward pass.
+- `GeneratePromptTest`: assistant tool calls of a prompt (CPU).
 
 ```bash
 ./gradlew :quantization:cudaIntegrationTest --rerun -Peuhedral.quantization.checkpoint=/path/to/checkpoint \
