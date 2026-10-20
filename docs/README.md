@@ -6,6 +6,8 @@ Start with the repository [quick start](../README.md#quick-start) to convert a c
 
 | Guide | Contents |
 |---|---|
+| [Getting started](GETTING_STARTED.md) | Checkpoint conversion, client examples, and Windows setup |
+| [Docker deployment](DEPLOYMENT.md) | Container setup and deployment from main |
 | [API compatibility](API_COMPATIBILITY.md) | Supported request fields across all three APIs |
 | [Anthropic Messages](ANTHROPIC_API.md) | Requests, responses and streaming for Anthropic clients |
 | [OpenAI Responses](RESPONSES_API.md) | Stateless requests, responses and streaming |
@@ -19,6 +21,7 @@ Start with the repository [quick start](../README.md#quick-start) to convert a c
 
 | Folder | Contents |
 |---|---|
+| [Building and testing](development/BUILDING.md) | Development tools, build commands, and test entry points |
 | [Architecture](architecture/README.md) | System diagrams, execution model and multi-sequence execution |
 | [Evaluation](evaluation/README.md) | Testing, benchmarking, quality measurement and release checks |
 | [Quantization](quantization/README.md) | Artifact formats, compression, mixed quantization and residency |
