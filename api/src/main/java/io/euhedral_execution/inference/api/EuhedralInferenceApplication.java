@@ -81,8 +81,8 @@ public class EuhedralInferenceApplication {
         }
     }
 
-    /// The application with the settings registered as singletons, and the values Spring itself needs (the port and
-    /// as default property.
+    /// The application with the settings registered as singletons, and the server port passed to Spring as a default
+    /// property.
     static SpringApplication application(Settings settings, NativeFiles nativeFiles, Class<?>... sources) {
         SpringApplication application = new SpringApplication(sources);
         application.addInitializers(context -> {

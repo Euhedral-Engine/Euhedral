@@ -86,13 +86,13 @@ engine has closed. The image's Docker health check calls it.
 ## Shutting down
 
 On `SIGTERM` or `SIGINT` the server stops accepting connections and waits up to
-`spring.lifecycle.timeout-per-shutdown-phase` (30 s, fixed) for the requests in flight, queued ones included, to finish. What is
-left after that is answered before the server stops: a request still queued gets 503 (`The server is shutting down.`),
+`spring.lifecycle.timeout-per-shutdown-phase` (30 s, fixed) for the requests in flight, queued ones included, to
+finish. What is left after that is answered before the server stops: a request still queued gets 503 (`The server is shutting down.`),
 the running generation is stopped at its next quantum and gets an error (in a stream, an `error` event), and the engine
 then closes its sessions, its workers and the GPU. A second signal exits at once.
 
 Give the process longer than the window to exit: Docker's default is 10 s, so run the container with
-`--stop-timeout 45` (Kubernetes: `terminationGracePeriodSeconds: 45`), or shorten the window.
+`--stop-timeout 45` (Kubernetes: `terminationGracePeriodSeconds: 45`).
 
 ## Metrics
 
