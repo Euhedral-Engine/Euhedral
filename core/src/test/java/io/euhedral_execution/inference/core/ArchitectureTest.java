@@ -329,6 +329,7 @@ class ArchitectureTest {
             "prefix",
             "runtime",
             "sampling",
+            "settings",
             "state",
             "tokenizer");
 
