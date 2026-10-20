@@ -23,7 +23,7 @@ import org.slf4j.LoggerFactory;
 /// cgroup allows less), less room for the operating system (10%, never closer than 4 GiB to exhaustion) and for the
 /// runtime itself (the JVM heap's room to grow, up to 2 GiB, a native reserve and the page cache of the n-gram rows).
 /// `memory.host-limit` of the settings states the budget instead, in bytes, and is respected as stated: it may be
-/// smaller than the automatic one or larger (a warning says so, as the memory is not free now).
+/// smaller than the automatic one (0 means no RAM tier) or larger (a warning says so, as the memory is not free now).
 public record HostBudget(long pinnableBytes, long residentBytes, Source source) {
 
     private static final Logger LOG = LoggerFactory.getLogger(HostBudget.class);

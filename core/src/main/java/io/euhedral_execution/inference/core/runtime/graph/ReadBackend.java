@@ -1,8 +1,8 @@
 package io.euhedral_execution.inference.core.runtime.graph;
 
+import io.euhedral_execution.hardware_utils.util.OSName;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.Locale;
 import java.util.function.BooleanSupplier;
 
 /// The operating system's half of [AsyncReads]: how a file is opened, how a read is handed to the kernel and how its
@@ -38,17 +38,18 @@ interface ReadBackend extends AutoCloseable {
     /// The backend for the system named `osName` (the `os.name` property), or null when it has none. `ioRings` says
     /// whether Windows' I/O rings can read; it is asked only on Windows, so nothing of Windows' is looked up
     /// elsewhere.
-    static Kind choose(String osName, BooleanSupplier ioRings) {
-        String os = osName == null ? "" : osName.toLowerCase(Locale.ROOT);
-        if (os.startsWith("linux")) return Kind.IO_URING;
-        if (os.startsWith("windows")) return ioRings.getAsBoolean() ? Kind.IORING : Kind.COMPLETION_PORT;
-        return null;
+    static Kind choose(OSName os, BooleanSupplier ioRings) {
+        return switch (os) {
+            case LINUX -> Kind.IO_URING;
+            case WINDOWS -> ioRings.getAsBoolean() ? Kind.IORING : Kind.COMPLETION_PORT;
+            default -> null;
+        };
     }
 
-    /// Why `osName` has no asynchronous reads.
-    static String unsupported(String osName) {
+    /// Why `os` has no asynchronous reads.
+    static String unsupported(OSName os) {
         return "asynchronous reads need Linux (io_uring) or Windows (I/O rings or I/O completion ports); this machine"
-                + " runs " + osName;
+                + " runs " + os;
     }
 
     /// What the reads of one submitting thread go through. The thread is its only submitter; [#reap] is called by

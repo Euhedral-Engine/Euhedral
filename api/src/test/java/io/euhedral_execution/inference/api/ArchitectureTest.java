@@ -24,7 +24,7 @@ class ArchitectureTest {
             + "|Integer\\.getInteger\\(|Long\\.getLong\\(|Boolean\\.getBoolean\\(");
 
     /// The entry point hands the process environment to the settings loader, which reads it once.
-    /// As `path` to names on the read's line.
+    /// As `path` to the calls, each written as the read's text from its start.
     private static final Map<String, Set<String>> EXCEPTIONS =
             Map.of("EuhedralInferenceApplication.java", Set.of("System.getenv()"));
 
@@ -38,14 +38,16 @@ class ArchitectureTest {
                 List<String> lines = Files.readAllLines(file);
                 for (int i = 0; i < lines.size(); i++) {
                     String code = lines.get(i).strip();
-                    if (code.startsWith("//")
-                            || code.startsWith("*")
-                            || !SETTING_READ.matcher(code).find()) continue;
-                    var names = EXCEPTIONS.getOrDefault(path, Set.of()).stream()
-                            .filter(code::contains)
-                            .toList();
-                    if (names.isEmpty()) violations.add(path + ":" + (i + 1) + ": " + code);
-                    else names.forEach(name -> used.add(path + "|" + name));
+                    if (code.startsWith("//") || code.startsWith("*")) continue;
+                    var matcher = SETTING_READ.matcher(code);
+                    while (matcher.find()) {
+                        String call = code.substring(matcher.start());
+                        var names = EXCEPTIONS.getOrDefault(path, Set.of()).stream()
+                                .filter(call::startsWith)
+                                .toList();
+                        if (names.isEmpty()) violations.add(path + ":" + (i + 1) + ": " + call);
+                        else names.forEach(name -> used.add(path + "|" + name));
+                    }
                 }
             }
         }

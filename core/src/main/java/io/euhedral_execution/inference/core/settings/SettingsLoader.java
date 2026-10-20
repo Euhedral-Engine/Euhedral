@@ -311,7 +311,7 @@ public final class SettingsLoader {
         m.put("batching.max-tokens-per-pass", optional(integer(1, Integer.MAX_VALUE)));
         m.put("batching.prefill-chunk-tokens", fixed(integer(1, Integer.MAX_VALUE)));
 
-        m.put("memory.host-limit", optional(size(1)));
+        m.put("memory.host-limit", optional(size(0)));
         m.put("memory.host-weights-limit", optional(size(1)));
         m.put("memory.gpu-limit", optional(size(1)));
         m.put("memory.gpu-reserve", fixed(size(0)));

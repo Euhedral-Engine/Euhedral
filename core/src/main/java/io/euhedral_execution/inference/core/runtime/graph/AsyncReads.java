@@ -4,6 +4,7 @@ import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeReceiver;
 import io.euhedral_execution.core.generics.LatticeSource;
 import io.euhedral_execution.core.ingest.AbstractIngestSink;
+import io.euhedral_execution.hardware_utils.util.OSName;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
@@ -78,7 +79,7 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
     static final long MAX_READ = Integer.MAX_VALUE & ~(DIRECT_ALIGNMENT - 1);
 
     /// This system's backend, or null when it has none.
-    private static final ReadBackend.Kind KIND = ReadBackend.choose(System.getProperty("os.name"), () -> {
+    private static final ReadBackend.Kind KIND = ReadBackend.choose(OSName.CURRENT_OS, () -> {
         try {
             return IoRingBackend.usable();
         } catch (Throwable missing) {
@@ -90,8 +91,7 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
     private static final Throwable UNAVAILABLE = unavailability(KIND);
 
     private static Throwable unavailability(ReadBackend.Kind kind) {
-        if (kind == null)
-            return new UnsupportedOperationException(ReadBackend.unsupported(System.getProperty("os.name")));
+        if (kind == null) return new UnsupportedOperationException(ReadBackend.unsupported(OSName.CURRENT_OS));
         try {
             return switch (kind) {
                 case IO_URING -> UringBackend.unavailable();
