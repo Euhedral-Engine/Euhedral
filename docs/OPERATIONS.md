@@ -11,7 +11,7 @@ and `.env` gives the host paths mounted on them (`EUHEDRAL_ARTIFACT_FILE`, `EUHE
 |---|---|---|
 | `euhedral.inference.artifact-path` | required | The `.edrl` artifact to serve. |
 | `euhedral.inference.tokenizer-directory` | required | The checkpoint directory (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`). |
-| `euhedral.inference.native-cache` | the user's cache directory | Where the jar unpacks its native files (the CUDA library, llguidance, the CUDA runtime and NVRTC, kernel sources and CUDA headers), in a subdirectory named by their content hash: `$XDG_CACHE_HOME/euhedral`, else `~/.cache/euhedral`; `%LOCALAPPDATA%\euhedral` on Windows. Servers started together share one copy. |
+| `euhedral.inference.native-cache` | the user's cache directory | Where the jar unpacks its native files (the CUDA library, llguidance, the CUDA runtime and NVRTC, kernel sources and CUDA headers), in a subdirectory named by their content hash: `$XDG_CACHE_HOME/euhedral`, else `~/.cache/euhedral`; `%LOCALAPPDATA%\euhedral` on Windows. Servers started together share one copy. The directory is per user (keep it `0700`): give each user their own, or leave the default. |
 | `euhedral.inference.worker-cpus` | every available processor | Processor IDs or ranges for the engine's worker threads, for example `2-5,8`; Euhedral pins one worker per selected core. |
 | `euhedral.inference.model-id` | required | The name clients send as `model`. |
 | `euhedral.inference.max-context-tokens` | 32768 | The longest prompt plus completion. The engine keeps device memory for that much KV cache and holds weights in pinned host memory when both do not fit. At most the model's 262144 positions. |

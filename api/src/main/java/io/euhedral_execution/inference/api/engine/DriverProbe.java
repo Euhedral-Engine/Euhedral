@@ -27,13 +27,13 @@ interface DriverProbe {
                 return Optional.of(name + " cannot be loaded");
             }
             Linker linker = Linker.nativeLinker();
-            MethodHandle init = linker.downcallHandle(
-                    driver.find("cuInit").orElseThrow(),
-                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
-            MethodHandle count = linker.downcallHandle(
-                    driver.find("cuDeviceGetCount").orElseThrow(),
-                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
             try (Arena local = Arena.ofConfined()) {
+                MethodHandle init = linker.downcallHandle(
+                        driver.find("cuInit").orElseThrow(),
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+                MethodHandle count = linker.downcallHandle(
+                        driver.find("cuDeviceGetCount").orElseThrow(),
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
                 int status = (int) init.invokeExact(0);
                 if (status != 0) return Optional.of("the driver finds no usable GPU (cuInit returned " + status + ")");
                 MemorySegment devices = local.allocate(ValueLayout.JAVA_INT);

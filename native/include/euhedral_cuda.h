@@ -25,7 +25,8 @@ extern "C" {
 #endif
 
 /* The CUDA headers the kernels compile against with NVRTC. Kernels do not compile until it is set. Returns
- * EUHEDRAL_CUDA_INVALID_ARGUMENT for a null, empty or overlong path. */
+ * EUHEDRAL_CUDA_INVALID_ARGUMENT for a null, empty or overlong path and cudaErrorMemoryAllocation when the path
+ * cannot be copied. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_set_include_directory(const char* path);
 EUHEDRAL_CUDA_EXPORT void* euhedral_cuda_malloc(uint64_t byte_size);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_free(void* address);

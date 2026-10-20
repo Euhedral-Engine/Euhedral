@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.api.engine;
 
 import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -22,7 +23,7 @@ final class SetupCheck {
         try {
             files = NativeFiles.unpack(
                     properties.nativeCache() != null ? properties.nativeCache() : NativeFiles.defaultCache());
-        } catch (NativeFiles.CacheException | IllegalStateException failure) {
+        } catch (NativeFiles.CacheException | IllegalStateException | UncheckedIOException failure) {
             problems.add(failure.getMessage());
         }
         if (!problems.isEmpty()) throw new SetupException(problems);
