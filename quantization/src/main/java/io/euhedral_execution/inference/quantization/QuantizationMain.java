@@ -14,6 +14,7 @@ import io.euhedral_execution.inference.quantization.mixed.Search;
 import io.euhedral_execution.inference.quantization.mixed.SearchState;
 import io.euhedral_execution.inference.quantization.mixed.Seeds;
 import io.euhedral_execution.inference.quantization.mixed.Sources;
+import io.euhedral_execution.inference.quantization.mtp.DrafterExport;
 import io.euhedral_execution.inference.quantization.mtp.DrafterTraining;
 import io.euhedral_execution.inference.quantization.trellis.TrellisQuantizer;
 import java.nio.file.Path;
@@ -67,6 +68,7 @@ import java.util.OptionalInt;
 /// train-drafter --corpus CORPUS_DIR --model CHECKPOINT --artifact ARTIFACT --out DIR [--depths 4] [--rows 1024]
 /// [--keys 4096] [--tokens 16384] [--epochs 1] [--projection-rate 2e-5] [--norm-rate 2e-5] [--warmup 10]
 /// [--holdout 50] [--evaluate-every 50] [--limit N] [--library LIBEUHEDRAL_CUDA]
+/// export-drafter --model CHECKPOINT --artifact BASE_ARTIFACT --out ARTIFACT [--parameters PARAMETERS.bin]
 /// ```
 public final class QuantizationMain {
 
@@ -86,6 +88,7 @@ public final class QuantizationMain {
                                 "score",
                                 "generate",
                                 "train-drafter",
+                                "export-drafter",
                                 "train-blocks",
                                 "train-model",
                                 "rotate",
@@ -111,6 +114,8 @@ public final class QuantizationMain {
                     + "[--context 2560] [--chunks N] [--parse-special] [--rows 8] [--batch 4] "
                     + "[--host-mib N] [--workers N] [--library PATH]");
             System.err.println("       rotate --model CHECKPOINT --out DIR [--seed 1] [--library PATH]");
+            System.err.println(
+                    "       export-drafter --model CHECKPOINT --artifact BASE --out ARTIFACT [--parameters FILE]");
             System.err.println("       train-drafter --corpus DIR --model CHECKPOINT --artifact ARTIFACT --out DIR "
                     + "[--depths 4] [--rows 1024] [--keys 4096] [--tokens 16384] [--epochs 1] [--projection-rate 2e-5] [--norm-rate 2e-5] "
                     + "[--warmup 10] [--holdout 50] [--evaluate-every 50] [--limit N] [--library PATH]");
@@ -239,6 +244,14 @@ public final class QuantizationMain {
                             workers(options),
                             Integer.parseInt(options.getOrDefault("limit", "0")),
                             Path.of(library)));
+            return;
+        }
+        if (args[0].equals("export-drafter")) {
+            DrafterExport.run(new DrafterExport.Settings(
+                    options.containsKey("parameters") ? Path.of(options.get("parameters")) : null,
+                    Path.of(required(options, "model")),
+                    Path.of(required(options, "artifact")),
+                    Path.of(required(options, "out"))));
             return;
         }
         if (args[0].equals("train-drafter")) {

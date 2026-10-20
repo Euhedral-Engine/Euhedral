@@ -107,8 +107,13 @@ public final class Assemble {
     public static void write(
             Sources sources, Allocation allocation, OptionalInt draftDepth, Path out, long copyBufferBytes)
             throws IOException {
+        write(view(sources, allocation, draftDepth), out, copyBufferBytes);
+    }
+
+    /// Writes `composite` (each object's payload read from the file [Artifact#pathOf] names) as a standalone
+    /// artifact file at `out`, as [#write] does.
+    public static void write(Artifact composite, Path out, long copyBufferBytes) throws IOException {
         if (copyBufferBytes < 1) throw new IllegalArgumentException("the copy buffer must be at least one byte");
-        Artifact composite = view(sources, allocation, draftDepth);
         TensorDescriptor[] source = composite.tensors();
         long metadataSize = CompactArtifactWriter.metadataSize(composite.config());
         long tableOffset = ArtifactHeader.BYTE_SIZE + metadataSize;
