@@ -48,7 +48,7 @@ import java.util.OptionalInt;
 /// [--rows 8] [--host-mib N] [--batch 4] [--workers N] [--library LIBEUHEDRAL_CUDA]
 /// generate --artifact ARTIFACT --tokenizer CHECKPOINT --out CORPUS_DIR (--prompts PROMPTS.jsonl)... [--max-tokens
 /// 4096]
-/// [--batch 12] [--host-mib N] [--limit N] [--workers N] [--library LIBEUHEDRAL_CUDA]
+/// [--batch 12] [--greedy-fraction 0.25] [--host-mib N] [--limit N] [--workers N] [--library LIBEUHEDRAL_CUDA]
 /// assemble --allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT [--draft-depth D]
 /// [--copy-buffer-mib 64]
 /// allocate --source OPTION=ARTIFACT... --base OPTION --costs COSTS.json --priors PRIORS.json
@@ -109,7 +109,7 @@ public final class QuantizationMain {
                     + "[--values DIR] [--rows 8] [--host-mib N] [--batch 4] [--workers N] [--library PATH]");
             System.err.println(
                     "       generate --artifact ARTIFACT --tokenizer CHECKPOINT --out DIR (--prompts P.jsonl)... "
-                            + "[--max-tokens 4096] [--batch 12] [--host-mib N] [--limit N] [--workers N] [--library PATH]");
+                            + "[--max-tokens 4096] [--batch 12] [--greedy-fraction 0.25] [--host-mib N] [--limit N] [--workers N] [--library PATH]");
             System.err.println("       reference --artifact ARTIFACT --tokenizer CHECKPOINT --text FILE --out OUT.kld "
                     + "[--context 2560] [--chunks N] [--parse-special] [--rows 8] [--batch 4] "
                     + "[--host-mib N] [--workers N] [--library PATH]");
@@ -243,6 +243,7 @@ public final class QuantizationMain {
                             hostBytes(options),
                             workers(options),
                             Integer.parseInt(options.getOrDefault("limit", "0")),
+                            Double.parseDouble(options.getOrDefault("greedy-fraction", "0.25")),
                             Path.of(library)));
             return;
         }

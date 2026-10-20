@@ -17,21 +17,23 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-/// The MTP drafter's training corpus, a directory of three append-only files:
+/// The MTP drafter's training corpus, a directory of four append-only files:
 ///
 /// - `tokens.bin`: every sequence's tokens (int32, little endian), the prompt then the answer, the last token the one
 ///   the base model chose but never ran;
+/// - `labels.bin`: for each token of `tokens.bin`, the base model's greedy choice at its position (the token itself
+///   in the prompt): what a draft of that position should be;
 /// - `hidden.bin`: the post-final-norm hidden (BF16 [hidden]) of every row the base model ran: all of a sequence's
 ///   tokens but the last;
 /// - `index.jsonl`: one line per sequence, written after its rows: its id, first token and first hidden row, token
-///   count and prompt length.
+///   count, prompt length and whether its answer was sampled (otherwise greedy, its labels its tokens).
 ///
-/// The base model chose every answer token greedily, so the target's choice after row p (the label MTP row p - 1
-/// learns) is token p + 1 wherever p + 1 is an answer token.
+/// A corpus written before labels were kept is greedy throughout: opening it for writing makes its labels its
+/// tokens.
 public final class Corpus {
 
     /// One sequence of the corpus.
-    public record Entry(String id, long token, long row, int length, int prompt) {}
+    public record Entry(String id, long token, long row, int length, int prompt, boolean sampled) {}
 
     private Corpus() {}
 
@@ -49,7 +51,8 @@ public final class Corpus {
                     node.path("token").asLong(),
                     node.path("row").asLong(),
                     node.path("length").asInt(),
-                    node.path("prompt").asInt()));
+                    node.path("prompt").asInt(),
+                    node.path("sampled").asBoolean(false)));
         }
         return entries;
     }
@@ -57,7 +60,7 @@ public final class Corpus {
     /// Appends sequences to a corpus, from one owner; a corpus left with rows beyond its index (a stopped run) is cut
     /// back to it.
     public static final class Writer implements AutoCloseable {
-        private final FileChannel tokens, hidden, index;
+        private final FileChannel tokens, labels, hidden, index;
         private final int width;
         private final Set<String> ids = new HashSet<>();
         private long tokenCount, rowCount;
@@ -73,6 +76,7 @@ public final class Corpus {
                 StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.READ
             };
             tokens = FileChannel.open(directory.resolve("tokens.bin"), options);
+            labels = FileChannel.open(directory.resolve("labels.bin"), options);
             hidden = FileChannel.open(directory.resolve("hidden.bin"), options);
             index = FileChannel.open(
                     directory.resolve("index.jsonl"),
@@ -80,6 +84,11 @@ public final class Corpus {
                     StandardOpenOption.WRITE,
                     StandardOpenOption.APPEND);
             tokens.truncate(4 * tokenCount);
+            labels.truncate(4 * tokenCount);
+            // Sequences written before labels were kept were answered greedily: their labels are their tokens.
+            labels.position(labels.size());
+            for (long at = labels.size(); at < 4 * tokenCount; )
+                at += tokens.transferTo(at, 4 * tokenCount - at, labels);
             if (width > 0) hidden.truncate(2L * width * rowCount);
         }
 
@@ -93,19 +102,32 @@ public final class Corpus {
             return Set.copyOf(ids);
         }
 
-        /// Appends a sequence: `length` tokens of which `prompt` are the prompt, and `rows` hidden rows from `source`.
-        public void write(String id, int[] values, int length, int prompt, MemorySegment source, int rows) {
+        /// Appends a sequence: `length` tokens of which `prompt` are the prompt, their labels, whether its answer was
+        /// sampled, and `rows` hidden rows from `source`.
+        public void write(
+                String id,
+                int[] values,
+                int[] labelValues,
+                int length,
+                int prompt,
+                boolean sampled,
+                MemorySegment source,
+                int rows) {
             if (rows != length - 1) throw new IllegalArgumentException("a sequence keeps a hidden row per token run");
             try {
                 ByteBuffer buffer = ByteBuffer.allocate(4 * length).order(ByteOrder.LITTLE_ENDIAN);
                 for (int i = 0; i < length; i++) buffer.putInt(values[i]);
                 writeFully(tokens, buffer.flip(), 4 * tokenCount);
+                buffer.clear();
+                for (int i = 0; i < length; i++) buffer.putInt(labelValues[i]);
+                writeFully(labels, buffer.flip(), 4 * tokenCount);
                 writeFully(hidden, source.asSlice(0, 2L * width * rows).asByteBuffer(), 2L * width * rowCount);
                 tokens.force(false);
+                labels.force(false);
                 hidden.force(false);
                 String line = String.format(
-                        "{\"id\":\"%s\",\"token\":%d,\"row\":%d,\"length\":%d,\"prompt\":%d}%n",
-                        id.replace("\\", "\\\\").replace("\"", "\\\""), tokenCount, rowCount, length, prompt);
+                        "{\"id\":\"%s\",\"token\":%d,\"row\":%d,\"length\":%d,\"prompt\":%d,\"sampled\":%b}%n",
+                        id.replace("\\", "\\\\").replace("\"", "\\\""), tokenCount, rowCount, length, prompt, sampled);
                 index.write(ByteBuffer.wrap(line.getBytes(StandardCharsets.UTF_8)));
                 index.force(false);
                 ids.add(id);
@@ -123,6 +145,7 @@ public final class Corpus {
         @Override
         public void close() throws IOException {
             tokens.close();
+            labels.close();
             hidden.close();
             index.close();
         }

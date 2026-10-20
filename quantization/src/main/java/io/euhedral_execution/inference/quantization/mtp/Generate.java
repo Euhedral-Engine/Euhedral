@@ -8,6 +8,7 @@ import io.euhedral_execution.core.generics.LatticeSource;
 import io.euhedral_execution.core.ingest.AbstractIngestSink;
 import io.euhedral_execution.data_structures.queues.MpscQueue;
 import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
+import io.euhedral_execution.inference.api.chat.SamplingDefaults;
 import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.generation.DeviceLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
@@ -19,6 +20,8 @@ import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
+import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.sampling.TokenSampler;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.quantization.CalibrationLattice;
@@ -29,6 +32,7 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
@@ -44,9 +48,12 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
-/// The MTP drafter's training corpus ([Corpus]): the artifact's own greedy answers to chat prompts, with the
+/// The MTP drafter's training corpus ([Corpus]): the artifact's own answers to chat prompts, with the
 /// post-final-norm hidden of every row the base model ran, which is what seeds the drafter
-/// (docs/MTP_CONTRACT.md §2).
+/// (docs/MTP_CONTRACT.md §2), and the base model's greedy choice after every row, which is what the drafter
+/// learns to draft. A `greedyFraction` of the prompts (chosen by a hash of their ids) is answered greedily; the
+/// others are sampled as the server samples them: the checkpoint's generation_config ([SamplingDefaults]) through
+/// the engine's [TokenSampler], seeded by the prompt id, each position's draw keyed by its position.
 ///
 /// Each prompt is rendered by the checkpoint's chat template (thinking on, as the template defaults) and
 /// prefilled in the engine's 512-row chunks, as the server prefills it. Up to `batch` sequences then decode
@@ -72,6 +79,7 @@ public final class Generate {
             long hostBytes,
             int workers,
             int limit,
+            double greedyFraction,
             Path library) {}
 
     private final Settings settings;
@@ -83,6 +91,7 @@ public final class Generate {
     private final Set<Integer> stops;
     private final AtomicLong sequenceIds = new AtomicLong(1);
     private final KvFormat kvFormat;
+    private final SamplingDefaults sampling;
     /// Mapped host memory the argmax kernel writes: one int per lane for prefills, one per row for the step.
     private final long prefillChoices, stepChoices;
 
@@ -92,8 +101,10 @@ public final class Generate {
             Execution runtime,
             ExecutionPlan plan,
             Set<Integer> stops,
-            KvFormat kvFormat) {
+            KvFormat kvFormat,
+            SamplingDefaults sampling) {
         this.settings = settings;
+        this.sampling = sampling;
         this.kvFormat = kvFormat;
         this.device = device;
         this.runtime = runtime;
@@ -105,6 +116,7 @@ public final class Generate {
                 device.cuda.compileResource("mtp.cu", List.of("argmax_rows")).getFirst();
         this.prefillChoices = device.gpu.allocateHostWeights(4L * settings.batch());
         this.stepChoices = device.gpu.allocateHostWeights(4L * settings.batch());
+        this.stepLogits = Arena.ofShared().allocate(2L * vocabulary * settings.batch(), 16);
     }
 
     /// Longest rendered prompt the residency plan makes room for, ahead of `maxTokens` of generation.
@@ -179,7 +191,14 @@ public final class Generate {
             }
             Corpus.Writer writer =
                     Corpus.Writer.open(settings.out(), plan.weights().config().hiddenSize());
-            var generate = new Generate(settings, device, runtime, plan, tokenizer.generationEosTokenIds(), kvFormat);
+            var generate = new Generate(
+                    settings,
+                    device,
+                    runtime,
+                    plan,
+                    tokenizer.generationEosTokenIds(),
+                    kvFormat,
+                    SamplingDefaults.load(settings.tokenizer()));
             var generation = generate.new Generation(prompts, writer);
             lattice.attach(generation);
             return generation;
@@ -241,18 +260,34 @@ public final class Generate {
         final Sequence sequence = sequence();
         final Arena arena = Arena.ofShared();
         final MemorySegment rows;
-        int[] tokens;
+        /// Null when the slot decodes greedily.
+        final TokenSampler sampler;
+        /// Each token, and the base model's greedy choice for its position (the prompt's own tokens there).
+        int[] tokens, labels;
         int length, ran;
-        /// The token the next step feeds: the base model's greedy choice after the last row it ran.
-        int next;
+        /// The token the next step feeds (sampled, or the greedy choice) and the greedy choice itself.
+        int next, nextLabel;
 
         Slot(Prompt prompt, int lane) {
             this.prompt = prompt;
             this.lane = lane;
             int capacity = prompt.tokens().length + settings.maxTokens();
             this.tokens = Arrays.copyOf(prompt.tokens(), capacity + 1);
+            this.labels = Arrays.copyOf(prompt.tokens(), capacity + 1);
             this.length = prompt.tokens().length;
             this.rows = arena.allocate((long) capacity * hidden * Short.BYTES, 16);
+            long seed = seed(prompt.id());
+            this.sampler = greedy(seed)
+                    ? null
+                    : new TokenSampler(
+                            new GenerationConfig(sampling.temperature(), sampling.topK(), sampling.topP(), seed, false),
+                            vocabulary);
+        }
+
+        /// Sets the next token from the greedy choice and, when sampling, the BF16 logits row at `row`.
+        void choose(int greedy, MemorySegment row) {
+            nextLabel = greedy;
+            next = sampler == null ? greedy : sampler.selectToken(floats(row), length);
         }
 
         /// Copies `count` hidden rows from the sequence's draft seed rows, which the quantum that ran them
@@ -327,8 +362,9 @@ public final class Generate {
                                 if (failure != null) throw new IllegalStateException("a step failed", failure);
                                 for (int k = 0; k < stepped.size(); k++) {
                                     Slot slot = stepped.get(k);
+                                    slot.labels[slot.length] = slot.nextLabel;
                                     slot.tokens[slot.length++] = slot.next;
-                                    slot.next = choices[k];
+                                    slot.choose(choices[k], logitRow(k));
                                 }
                             }));
                 }
@@ -348,9 +384,17 @@ public final class Generate {
                 Slot slot = iterator.next();
                 if (!slot.finished()) continue;
                 iterator.remove();
+                slot.labels[slot.length] = slot.nextLabel;
                 slot.tokens[slot.length++] = slot.next;
                 writer.write(
-                        slot.prompt.id(), slot.tokens, slot.length, slot.prompt.tokens().length, slot.rows, slot.ran);
+                        slot.prompt.id(),
+                        slot.tokens,
+                        slot.labels,
+                        slot.length,
+                        slot.prompt.tokens().length,
+                        slot.sampler != null,
+                        slot.rows,
+                        slot.ran);
                 generated += slot.length - slot.prompt.tokens().length;
                 lanes.add(slot.lane);
                 slot.close();
@@ -421,7 +465,10 @@ public final class Generate {
                     if (!last) return;
                     try (DeviceLogits logits = done.logitsOutput().orElseThrow()) {
                         long row = logits.deviceAddress() + (long) (logits.tokenCount() - 1) * vocabulary * Short.BYTES;
-                        slot.next = choose(row, 1, prefillChoices + 4L * slot.lane)[0];
+                        int greedy = choose(row, 1, prefillChoices + 4L * slot.lane)[0];
+                        MemorySegment copy = slot.sampler == null ? null : slot.arena.allocate(2L * vocabulary, 16);
+                        if (copy != null) device.gpu.copyDeviceToHost(copy, row, 2L * vocabulary);
+                        slot.choose(greedy, copy);
                     }
                 }));
             });
@@ -441,6 +488,10 @@ public final class Generate {
         return succeeded(runtime.submit(quantum, done -> {
                     try (DeviceLogits logits = done.logitsOutput().orElseThrow()) {
                         chosen[0] = choose(logits.deviceAddress(), slots.size(), stepChoices);
+                        // The rows the sampled slots draw from, for the poll that applies the step.
+                        if (slots.stream().anyMatch(slot -> slot.sampler != null))
+                            device.gpu.copyDeviceToHost(
+                                    stepLogits, logits.deviceAddress(), 2L * vocabulary * slots.size());
                     }
                     for (Slot slot : slots) slot.keep(1);
                 }))
@@ -467,6 +518,34 @@ public final class Generate {
         MemorySegment.copy(
                 MemorySegment.ofAddress(out).reinterpret(4L * rows), ValueLayout.JAVA_INT, 0, chosen, 0, rows);
         return chosen;
+    }
+
+    /// The step's logits rows in host memory (BF16), copied when a sampled slot steps.
+    private MemorySegment stepLogits;
+
+    private MemorySegment logitRow(int row) {
+        return stepLogits.asSlice(2L * vocabulary * row, 2L * vocabulary);
+    }
+
+    /// FP32 of a BF16 logits row (exact: BF16 is the upper half of FP32).
+    private float[] floats(MemorySegment row) {
+        float[] values = new float[vocabulary];
+        for (int i = 0; i < vocabulary; i++)
+            values[i] = Float.intBitsToFloat((row.getAtIndex(ValueLayout.JAVA_SHORT, i) & 0xffff) << 16);
+        return values;
+    }
+
+    /// A prompt id's sampling seed: FNV-1a over its UTF-8 bytes.
+    static long seed(String id) {
+        long hash = 0xcbf29ce484222325L;
+        for (byte b : id.getBytes(StandardCharsets.UTF_8)) hash = (hash ^ (b & 0xff)) * 0x100000001b3L;
+        return hash;
+    }
+
+    /// Whether the prompt of `seed` is answered greedily: a `greedyFraction` of seeds (all of them when the
+    /// checkpoint's generation_config is greedy).
+    private boolean greedy(long seed) {
+        return sampling.temperature() <= 0 || (seed >>> 11) * 0x1p-53 < settings.greedyFraction();
     }
 
     private static CompletableFuture<Void> succeeded(CompletableFuture<Quantum.Outcome> outcome) {
