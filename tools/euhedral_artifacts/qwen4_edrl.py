@@ -263,7 +263,9 @@ def convert(checkpoint: Path, output: Path, jobs: int = 4, force: bool = False,
     partial = output.with_name(output.name + ".partial")
     progress = output.with_name(output.name + ".progress")
     done: dict[tuple[str, int, int, int], list[int]] = {}
-    if partial.exists() and progress.exists() and partial.stat().st_size == file_size:
+    # Bytes past the content are a tokenizer section written by a run stopped before the rename; writing the section
+    # again truncates them.
+    if partial.exists() and progress.exists() and partial.stat().st_size >= file_size:
         lines = progress.read_text().splitlines()
         if lines and json.loads(lines[0]).get("fingerprint") == fingerprint:
             for line in lines[1:]:

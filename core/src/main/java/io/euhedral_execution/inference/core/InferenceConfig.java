@@ -10,19 +10,18 @@ import java.util.BitSet;
 import java.util.Objects;
 
 /// Explicit runtime inputs. The artifact carries the tokenizer. `workerCpus` are logical processor IDs accepted by
-/// Euhedral, not a worker
-/// count; the engine validates them against [ProcessorTopology] before loading any model resource, and
-/// the set is defensively copied. `maxContextTokens` is the longest sequence (prompt plus generation)
-/// the engine keeps device memory for: weights that do not fit beside that much KV cache stay in pinned
-/// host memory, chosen automatically. `prefixCacheBytes` is the pinned host memory that keeps the state of
-/// earlier prompts for reuse (0 turns the cache off) and `prefixCacheCheckpointTokens` the prompt tokens between
-/// stored checkpoints, a multiple of the prefill chunk. `kvCache` is the format sequences keep their attention
-/// caches in; null takes the artifact's. `maxSequences` is the number of concurrent sequences device memory is
-/// sized for: at least 1, planned exactly as asked (weights may leave the device to make room), or 0 for as many
-/// as fit without offloading more weights than one sequence does. `kvDeviceMinimumTokens` is the tokens of each
-/// sequence's attention cache that stay on the device: when the weights and every sequence's whole cache do not fit,
-/// the pages past it live in pinned host memory before any weight leaves the device. `tuning` shapes how the engine
-/// runs: batching, memory limits, host workers and kernel thresholds.
+/// Euhedral, not a worker count; the engine validates them against [ProcessorTopology] before loading any model
+/// resource, and the set is defensively copied. `maxContextTokens` is the longest sequence (prompt plus generation) the
+/// engine keeps device memory for: weights that do not fit beside that much KV cache stay in pinned host memory, chosen
+/// automatically. `prefixCacheBytes` is the pinned host memory that keeps the state of earlier prompts for reuse (0
+/// turns the cache off) and `prefixCacheCheckpointTokens` the prompt tokens between stored checkpoints, a multiple of
+/// the prefill chunk. `kvCache` is the format sequences keep their attention caches in; null takes the artifact's.
+/// `maxSequences` is the number of concurrent sequences device memory is sized for: at least 1, planned exactly as
+/// asked (weights may leave the device to make room), or 0 for as many as fit without offloading more weights than one
+/// sequence does. `kvDeviceMinimumTokens` is the tokens of each sequence's attention cache that stay on the device:
+/// when the weights and every sequence's whole cache do not fit, the pages past it live in pinned host memory before
+/// any weight leaves the device. `tuning` shapes how the engine runs: batching, memory limits, host workers and kernel
+/// thresholds.
 public record InferenceConfig(
         Path artifactPath,
         Path cudaLibraryPath,

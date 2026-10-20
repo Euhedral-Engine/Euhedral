@@ -43,7 +43,7 @@ class TokenizerSectionTest {
         Path path = Files.write(directory.resolve("a.edrl"), content);
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
             TokenizerSection.write(channel, content.length, FILES);
-            assertEquals(content.length, TokenizerSection.contentEnd(channel));
+            assertEquals(content.length, TokenizerSection.contentEnd(path, channel));
         }
         byte[] file = Files.readAllBytes(path);
         assertArrayEquals(content, Arrays.copyOf(file, content.length));
@@ -58,7 +58,7 @@ class TokenizerSectionTest {
         TokenizerFiles other = new TokenizerFiles("{}", "{}", "template", "{}");
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
             TokenizerSection.write(channel, content.length, FILES);
-            TokenizerSection.write(channel, TokenizerSection.contentEnd(channel), other);
+            TokenizerSection.write(channel, TokenizerSection.contentEnd(path, channel), other);
         }
         byte[] file = Files.readAllBytes(path);
         assertEquals(content.length + TokenizerSection.encode(other).length, file.length);
@@ -71,7 +71,7 @@ class TokenizerSectionTest {
         Path path = Files.write(directory.resolve("a.edrl"), content(100));
         assertEquals(Optional.empty(), TokenizerSection.read(path));
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-            assertEquals(100, TokenizerSection.contentEnd(channel));
+            assertEquals(100, TokenizerSection.contentEnd(path, channel));
         }
     }
 
@@ -85,6 +85,7 @@ class TokenizerSectionTest {
         ArtifactFormatException failure =
                 assertThrows(ArtifactFormatException.class, () -> TokenizerSection.read(path));
         assertTrue(failure.getMessage().contains("CRC-32"), failure.getMessage());
+        assertTrue(failure.getMessage().startsWith(path + ": "), failure.getMessage());
     }
 
     private static byte[] content(int size) {

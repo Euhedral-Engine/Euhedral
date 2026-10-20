@@ -94,7 +94,9 @@ class ArtifactReaderTest {
             channel.write(ByteBuffer.wrap(new byte[100]), channel.size());
         }
         var failure = assertThrows(ArtifactFormatException.class, () -> ArtifactReader.read(this.path));
-        assertTrue(failure.getMessage().contains("header declares"), failure.getMessage());
+        assertTrue(
+                failure.getMessage().contains("running package-tokenizer on the artifact again repairs it"),
+                failure.getMessage());
         ArtifactTokenizer.add(this.path, TestTokenizer.FILES);
         ArtifactReader.read(this.path);
     }

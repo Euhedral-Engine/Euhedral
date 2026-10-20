@@ -21,6 +21,7 @@ SPECIAL_TOKEN_KEYS = ("bos_token_id", "eos_token_id", "pad_token_id")
 MAGIC = b"EDRLTOKN"
 VERSION = 1
 FOOTER = struct.Struct(">qIi8s")
+MAX_BODY_BYTES = 1 << 30
 
 
 class SectionError(ValueError):
@@ -59,7 +60,7 @@ def encode(files: tuple[str, str, str, str]) -> bytes:
     return bytes(body) + FOOTER.pack(len(body), zlib.crc32(body), VERSION, MAGIC)
 
 
-def _footer(handle: BinaryIO) -> tuple[int, int, int] | None:
+def _footer(handle: BinaryIO, path: Path) -> tuple[int, int, int] | None:
     """(section start, body length, CRC-32), or None without a section."""
     size = handle.seek(0, 2)
     if size < FOOTER.size:
@@ -69,23 +70,23 @@ def _footer(handle: BinaryIO) -> tuple[int, int, int] | None:
     if magic != MAGIC:
         return None
     if version != VERSION:
-        raise SectionError(f"unsupported tokenizer section version {version}")
-    if length < 0 or length > size - FOOTER.size:
-        raise SectionError(f"the tokenizer section's length is out of range: {length}")
+        raise SectionError(f"{path}: unsupported tokenizer section version {version}")
+    if length < 0 or length > MAX_BODY_BYTES or length > size - FOOTER.size:
+        raise SectionError(f"{path}: the tokenizer section's length is out of range: {length}")
     return size - FOOTER.size - length, length, crc
 
 
 def content_end(path: Path) -> int:
     """Where the artifact's content ends: the start of its tokenizer section, or the end of the file."""
     with path.open("rb") as handle:
-        footer = _footer(handle)
+        footer = _footer(handle, path)
         return footer[0] if footer else handle.seek(0, 2)
 
 
 def read(path: Path) -> bytes | None:
     """The artifact's tokenizer section (body and footer) as it is stored, or None when it carries none."""
     with path.open("rb") as handle:
-        footer = _footer(handle)
+        footer = _footer(handle, path)
         if footer is None:
             return None
         start, length, crc = footer
