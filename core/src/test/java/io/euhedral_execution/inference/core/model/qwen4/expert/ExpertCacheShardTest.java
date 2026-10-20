@@ -28,7 +28,7 @@ import org.junit.jupiter.api.io.TempDir;
 /// The shard of the cache is single-owner: these tests are its owner, so they call it with no lock
 /// and nothing else running. A miss is a load whose lease carries the marker of its copy, so it
 /// exists before the bytes arrive, and its slot stays unevictable until the copy retired.
-/// Everything else is replaced least recently used first.
+/// Everything else is replaced by S3-FIFO.
 class ExpertCacheShardTest {
 
     @TempDir
@@ -222,14 +222,14 @@ class ExpertCacheShardTest {
     }
 
     @Test
-    void theLeastRecentlyUsedResidentIsEvictedFirst() throws Exception {
+    void aRecordAskedForAgainMovesToTheMainQueueAndAnUnaskedOneIsEvicted() throws Exception {
         cache(3, 1);
         for (int expert = 0; expert < 3; expert++)
             ExpertTestSupport.acquire(this.cache, 2, expert).close();
-        // 0 becomes the most recently used; 1 is now the least.
+        // 0 is asked for again: when the small queue gives up a victim, 0 moves to the main queue instead.
         ExpertTestSupport.acquire(this.cache, 2, 0).close();
         ExpertTestSupport.acquire(this.cache, 2, 3).close();
-        assertFalse(this.cache.isResident(2, 1), "the least recently used was evicted");
+        assertFalse(this.cache.isResident(2, 1), "the oldest record asked for once was evicted");
         assertTrue(this.cache.isResident(2, 0));
         assertTrue(this.cache.isResident(2, 2));
         assertTrue(this.cache.isResident(2, 3));

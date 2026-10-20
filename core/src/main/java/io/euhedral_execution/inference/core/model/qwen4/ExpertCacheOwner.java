@@ -344,10 +344,10 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
     /// The prefetch predicts the next layer: its router applied to a decode step's input, its best
     /// [#PREFETCH_CANDIDATES] experts, at most [#PREFETCH_READS] of them read per layer
     /// (docs/FLASH_NEXT_PREFETCH.md).
-    public static final int PREFETCH_DISTANCE = 1;
+    static final int PREFETCH_DISTANCE = 1;
 
     /// The best experts of the predicted layer's router that a prefetch considers.
-    public static final int PREFETCH_CANDIDATES = 10;
+    static final int PREFETCH_CANDIDATES = 10;
 
     /// The records a prefetch reads per layer at most.
     static final int PREFETCH_READS = 1;
@@ -396,7 +396,7 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
     /// predicted from this layer's input by its own router, and what the device lacks is loaded into device slots
     /// while this layer computes, [#AHEAD_LOADS] loads and held slots at most. The disk is offered the next record
     /// whenever it has a read to spare, not once the layer's router has run.
-    public static final int AHEAD_DISTANCE = 1;
+    static final int AHEAD_DISTANCE = 1;
 
     /// The loads begun and slots held by the lookahead at most.
     static final int AHEAD_LOADS = 1024;

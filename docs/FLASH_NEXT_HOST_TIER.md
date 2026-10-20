@@ -78,8 +78,8 @@ The tier replaces by frequency: the victim is the least requested of 32 sampled 
 distance of an expert is a whole pass and a global LRU evicts exactly what the next pass needs. Rejected: the global LRU, and
 per-layer quotas of a shard's slots in proportion to each layer's experts (a layer borrowing the slots of layers not using
 theirs, a victim from the layer furthest over its quota, otherwise the layer's own least recently used record): the quotas keep a
-share of every pass on a cyclic trace that the global LRU thrashes, and on the model the frequency policy beats the quotas
-([FLASH_NEXT_CACHE.md](FLASH_NEXT_CACHE.md)).
+share of every pass on a cyclic trace that the global LRU thrashes, and on the model's decode the frequency policy is faster
+than the quotas (warm decode at 4096 context 37.2-37.3 against 43.9 ms/token, [FLASH_NEXT_CACHE.md](FLASH_NEXT_CACHE.md)).
 
 ## Admission
 
@@ -87,7 +87,7 @@ A prefill visits nearly every expert of a layer once per chunk, so recency alone
 needs it. With admission, a prefill's record that finds no free slot replaces the victim only if it was asked for more often than
 the victim was; otherwise it is read around the tier (`BYPASS`). The request counts are halved every ten requests per slot, so a
 record that was hot long ago does not keep its slot. Repeated sweeps through 8 slots: recency alone served none of them, admission
-half (`RamTierTest`); a tier without admission is rejected.
+half; a tier without admission is rejected.
 
 ## Startup fill
 
