@@ -199,17 +199,19 @@ The token ranking chooses the draft head's vocabulary shortlist (`--ranking`), o
 ./gradlew :api:bootJar
 ```
 
+This builds the jar for the machine's platform, `api/build/libs/euhedral-inference-linux-x64.jar`
+(`:api:bootJarWindowsX64` builds `euhedral-inference-windows-x64.jar`). The jar carries its native files: the CUDA
+library, the CUDA runtime and NVRTC, the kernel sources and the CUDA headers. It unpacks them into the user's cache
+directory at startup, so the machine needs only the NVIDIA driver.
+
 **3. Run it:**
 
 ```bash
-CUDA=build/cuda-dev/linux-x64
-EUHEDRAL_CUDA_INCLUDE_DIR=$PWD/$CUDA/include LD_LIBRARY_PATH=$PWD/$CUDA/runtime \
 EUHEDRAL_INFERENCE_ARTIFACT_PATH=/models/qwen-q3.edrl \
 EUHEDRAL_INFERENCE_TOKENIZER_DIRECTORY=/path/to/Qwen3.8-27B \
-EUHEDRAL_INFERENCE_CUDA_LIBRARY_PATH=$PWD/build/native/linux-x64/lib/libeuhedral_cuda.so \
 EUHEDRAL_INFERENCE_WORKER_CPUS=2-5 \
 EUHEDRAL_INFERENCE_MODEL_ID=qwen \
-java --enable-native-access=ALL-UNNAMED -jar api/build/libs/euhedral-inference-api.jar
+java --enable-native-access=ALL-UNNAMED -jar api/build/libs/euhedral-inference-linux-x64.jar
 ```
 
 The server listens on port 1738.

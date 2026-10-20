@@ -27,7 +27,7 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 SCRIPT_SOURCE = Path(__file__).read_bytes()
 REQUIRED = ("EUHEDRAL_ARTIFACT_FILE", "EUHEDRAL_CHECKPOINT_DIR", "EUHEDRAL_INFERENCE_MODEL_ID", "EUHEDRAL_INFERENCE_WORKER_CPUS")
 # The image fixes these and mounts the host files there.
-CONTAINER_PATHS = ("EUHEDRAL_INFERENCE_ARTIFACT_PATH", "EUHEDRAL_INFERENCE_TOKENIZER_DIRECTORY", "EUHEDRAL_INFERENCE_CUDA_LIBRARY_PATH")
+CONTAINER_PATHS = ("EUHEDRAL_INFERENCE_ARTIFACT_PATH", "EUHEDRAL_INFERENCE_TOKENIZER_DIRECTORY")
 DEVICES = ("nvidia0", "nvidiactl", "nvidia-uvm", "nvidia-modeset")
 
 
@@ -87,14 +87,15 @@ def load_settings(path):
 
 def gpu_arguments(settings):
     """The GPU through the NVIDIA Container Toolkit, or, with the driver libraries set, the device nodes and those
-    libraries mounted beside the native library."""
+    libraries mounted in a directory on the container's library path."""
     if settings.driver is None:
         return ["--gpus", "all"]
     arguments = []
     for device in DEVICES:
         arguments += ["--device", f"/dev/{device}"]
-    arguments += ["--mount", f"type=bind,src={settings.driver},dst=/opt/euhedral/lib/libcuda.so.1,readonly",
-                  "--mount", f"type=bind,src={settings.ptx_jit},dst=/opt/euhedral/lib/libnvidia-ptxjitcompiler.so.1,readonly"]
+    arguments += ["--mount", f"type=bind,src={settings.driver},dst=/opt/euhedral/driver/libcuda.so.1,readonly",
+                  "--mount", f"type=bind,src={settings.ptx_jit},dst=/opt/euhedral/driver/libnvidia-ptxjitcompiler.so.1,readonly",
+                  "--env", "LD_LIBRARY_PATH=/opt/euhedral/driver"]
     return arguments
 
 

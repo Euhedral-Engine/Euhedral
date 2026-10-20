@@ -4,14 +4,14 @@
 
 Each setting is a property or its environment variable: `euhedral.inference.artifact-path` is
 `EUHEDRAL_INFERENCE_ARTIFACT_PATH`. `PORT` sets the port (1738). The container and `mise run deploy` read them from a
-`.env` file ([.env.example](../.env.example)); there the image fixes the artifact, checkpoint and CUDA library paths,
+`.env` file ([.env.example](../.env.example)); there the image fixes the artifact and checkpoint paths,
 and `.env` gives the host paths mounted on them (`EUHEDRAL_ARTIFACT_FILE`, `EUHEDRAL_CHECKPOINT_DIR`).
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `euhedral.inference.artifact-path` | required | The `.edrl` artifact to serve. |
 | `euhedral.inference.tokenizer-directory` | required | The checkpoint directory (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`). |
-| `euhedral.inference.cuda-library-path` | required | `libeuhedral_cuda.so` (`euhedral_cuda.dll` on Windows). `libllguidance.so` sits beside it and the kernel sources in `../share/euhedral_cuda/`, as the build lays them out. |
+| `euhedral.inference.native-cache` | the user's cache directory | Where the jar unpacks its native files (the CUDA library, llguidance, the CUDA runtime and NVRTC, kernel sources and CUDA headers), in a subdirectory named by their content hash: `$XDG_CACHE_HOME/euhedral`, else `~/.cache/euhedral`; `%LOCALAPPDATA%\euhedral` on Windows. Servers started together share one copy. |
 | `euhedral.inference.worker-cpus` | every available processor | Processor IDs or ranges for the engine's worker threads, for example `2-5,8`; Euhedral pins one worker per selected core. |
 | `euhedral.inference.model-id` | required | The name clients send as `model`. |
 | `euhedral.inference.max-context-tokens` | 32768 | The longest prompt plus completion. The engine keeps device memory for that much KV cache and holds weights in pinned host memory when both do not fit. At most the model's 262144 positions. |
@@ -29,15 +29,14 @@ and `.env` gives the host paths mounted on them (`EUHEDRAL_ARTIFACT_FILE`, `EUHE
 | `euhedral.api.request-timeout` | 30m | Per-request limit. |
 | `spring.lifecycle.timeout-per-shutdown-phase` | 30s | How long a shutdown waits for requests in flight (below). |
 
-`EUHEDRAL_CUDA_INCLUDE_DIR` points at the CUDA headers the kernels compile against at startup (else `CUDA_HOME/include`,
-`CUDA_PATH/include`, `/usr/local/cuda/include`); `LD_LIBRARY_PATH` must reach the CUDA runtime and NVRTC libraries. The
-image sets both.
+The machine needs only the NVIDIA driver: each platform's jar (`euhedral-inference-linux-x64.jar`,
+`euhedral-inference-windows-x64.jar`) carries the CUDA runtime, NVRTC and the CUDA headers the kernels compile against.
 
 ## Starting
 
-Before anything loads, the server checks the files the settings name: the artifact, the checkpoint's tokenizer files,
-the CUDA library with llguidance and the kernel sources beside it, and the CUDA headers. It reports every problem at
-once, each with the setting to change, and exits within about a second:
+Before anything loads, the server checks the files the settings name (the artifact and the checkpoint's tokenizer
+files), the NVIDIA driver and a GPU it drives, and unpacks its native files into the native cache. It reports every
+problem at once, each with the setting to change, and exits within about a second:
 
 ```text
 ***************************
@@ -46,14 +45,14 @@ APPLICATION FAILED TO START
 
 Description:
 
-The server's settings point at files that are missing:
+The server cannot start:
 
     euhedral.inference.artifact-path (EUHEDRAL_INFERENCE_ARTIFACT_PATH): no file at /models/nope.edrl
-    euhedral.inference.cuda-library-path (EUHEDRAL_INFERENCE_CUDA_LIBRARY_PATH): the constrained-decoding library belongs at /opt/euhedral/lib/libllguidance.so, beside the CUDA library, and is missing
+    the NVIDIA driver is required, with an NVIDIA Blackwell GPU: libcuda.so.1 cannot be loaded; install the driver (nvidia-smi lists the GPU when it works)
 
 Action:
 
-Correct the settings above. The settings and their environment variables are listed in docs/OPERATIONS.md.
+Correct what the messages above name. The settings and their environment variables are listed in docs/OPERATIONS.md.
 ```
 
 What fails later, while the engine loads, is reported the same way, with the messages of its causes instead of the

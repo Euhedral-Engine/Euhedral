@@ -13,7 +13,9 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 ///
 /// `workerCpus` lists processor IDs accepted by Euhedral, not a worker count: comma-separated IDs and
 /// inclusive ranges such as `2,3,8-11`; unset, every processor the process may run on, and Euhedral pins one worker
-/// per core. `modelId` is the public name clients send as `model`.
+/// per core. `modelId` is the public name clients send as `model`. `nativeCache` is the directory the jar unpacks its
+/// native files into; unset, the user's cache directory (`$XDG_CACHE_HOME/euhedral`, `~/.cache/euhedral`, or
+/// `%LOCALAPPDATA%\euhedral` on Windows).
 /// `maxContextTokens` is the longest prompt plus completion a request may use (default 32768); the
 /// engine keeps device memory for that much context and holds back weights in pinned host memory when
 /// the GPU cannot fit both. `prefixCacheBytes` is the pinned host memory that keeps the state of earlier prompts,
@@ -28,7 +30,7 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 public record InferenceProperties(
         Path artifactPath,
         Path tokenizerDirectory,
-        Path cudaLibraryPath,
+        Path nativeCache,
         String workerCpus,
         @DefaultValue("32768") int maxContextTokens,
         @DefaultValue("10s") Duration shutdownTimeout,
@@ -42,7 +44,6 @@ public record InferenceProperties(
     public InferenceProperties {
         require(artifactPath, "artifact-path");
         require(tokenizerDirectory, "tokenizer-directory");
-        require(cudaLibraryPath, "cuda-library-path");
         require(shutdownTimeout, "shutdown-timeout");
         require(modelId, "model-id");
         if (modelId.isBlank()) throw new IllegalArgumentException("euhedral.inference.model-id must not be blank");
@@ -60,12 +61,13 @@ public record InferenceProperties(
             throw new IllegalArgumentException("euhedral.inference.kv-device-minimum-tokens must be positive");
     }
 
-    /// Converts to the core record, which performs its own lifetime and CPU-set validation.
-    public InferenceConfig toInferenceConfig() {
+    /// Converts to the core record, which performs its own lifetime and CPU-set validation, with the CUDA library
+    /// the server unpacked.
+    public InferenceConfig toInferenceConfig(Path cudaLibrary) {
         return new InferenceConfig(
                 this.artifactPath,
                 this.tokenizerDirectory,
-                this.cudaLibraryPath,
+                cudaLibrary,
                 selectedCpus(),
                 this.maxContextTokens,
                 this.shutdownTimeout,

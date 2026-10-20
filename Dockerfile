@@ -20,8 +20,7 @@ RUN curl -fsSL https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown
     && rm /tmp/rustup-init \
     && cargo install cargo-zigbuild --version 0.23.4 --locked
 COPY . .
-RUN ./gradlew :api:bootJar -Peuhedral.native.products=linux-x64 \
-    -Peuhedral.cuda.force-download=true --no-daemon
+RUN ./gradlew :api:bootJarLinuxX64 -Peuhedral.cuda.force-download=true --no-daemon
 RUN "$JAVA_HOME/bin/jlink" --add-modules \
     java.base,java.compiler,java.desktop,java.instrument,java.logging,java.management,java.naming,java.net.http,java.prefs,java.security.jgss,java.security.sasl,java.sql,java.xml,jdk.crypto.ec,jdk.jfr,jdk.management,jdk.unsupported \
     --strip-debug --no-man-pages --no-header-files --compress=zip-6 --output /opt/euhedral-jre \
@@ -31,16 +30,10 @@ FROM gcr.io/distroless/cc-debian13:nonroot
 WORKDIR /opt/euhedral
 COPY --from=build /opt/euhedral-jre/ /opt/euhedral/jre/
 COPY --from=build /opt/health/ /opt/euhedral/health/
-COPY --from=build /src/api/build/libs/euhedral-inference-api.jar /opt/euhedral/app.jar
-COPY --from=build /src/build/native/linux-x64/lib/libeuhedral_cuda.so /opt/euhedral/lib/libeuhedral_cuda.so
-COPY --from=build /src/build/native/linux-x64/lib/libllguidance.so /opt/euhedral/lib/libllguidance.so
-COPY --from=build /src/build/native/linux-x64/share/euhedral_cuda/ /opt/euhedral/share/euhedral_cuda/
-COPY --from=build /src/build/cuda-dev/linux-x64/runtime/ /opt/euhedral/lib/
-COPY --from=build /src/build/cuda-dev/linux-x64/include/ /opt/euhedral/cuda/include/
-ENV LD_LIBRARY_PATH=/opt/euhedral/lib \
-    EUHEDRAL_CUDA_INCLUDE_DIR=/opt/euhedral/cuda/include \
-    EUHEDRAL_INFERENCE_CUDA_LIBRARY_PATH=/opt/euhedral/lib/libeuhedral_cuda.so \
-    EUHEDRAL_INFERENCE_ARTIFACT_PATH=/models/model.edrl \
+# The jar carries its native files (CUDA library, runtime, NVRTC, kernel sources and headers) and unpacks them into
+# the user's cache directory at startup; the NVIDIA Container Toolkit provides the driver.
+COPY --from=build /src/api/build/libs/euhedral-inference-linux-x64.jar /opt/euhedral/app.jar
+ENV EUHEDRAL_INFERENCE_ARTIFACT_PATH=/models/model.edrl \
     EUHEDRAL_INFERENCE_TOKENIZER_DIRECTORY=/tokenizer \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility

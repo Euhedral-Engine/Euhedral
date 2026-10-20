@@ -30,7 +30,7 @@ euhedral:
   inference:
     # artifact-path: /path/to/model.edrl
     # tokenizer-directory: /path/to/checkpoint   (tokenizer.json, chat_template.jinja, generation_config.json)
-    # cuda-library-path: /path/to/libeuhedral_cuda.so
+    # native-cache: /path/to/cache   (optional; where the jar unpacks its native files; unset: the user's cache directory)
     # worker-cpus: 2,3            (optional; processor IDs or inclusive ranges, e.g. 2-5,8; unset: every available processor)
     # model-id: qwen3.8-27b       (the name clients send as "model")
     # max-context-tokens: 32768   (optional; longest prompt plus completion; longer contexts hold weights in host memory)

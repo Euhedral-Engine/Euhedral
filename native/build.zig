@@ -60,6 +60,9 @@ pub fn build(b: *std.Build) void {
         library.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ cuda_driver_lib_dir, "libcuda.so" }) });
         library.root_module.linkSystemLibrary("pthread", .{});
         library.root_module.linkSystemLibrary("dl", .{});
+        // The CUDA runtime and NVRTC are installed beside the library (lib/), so it finds them without a search path.
+        library.root_module.addRPathSpecial("$ORIGIN");
+        library.linker_enable_new_dtags = true;
     }
     if (target.result.os.tag == .windows) {
         const install = b.addInstallFile(library.getEmittedBin(), "lib/euhedral_cuda.dll");

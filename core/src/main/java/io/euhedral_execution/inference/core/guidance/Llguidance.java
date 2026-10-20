@@ -80,11 +80,6 @@ public final class Llguidance {
         return LOADED.computeIfAbsent(resolved, Llguidance::new);
     }
 
-    /// Where the library sits in an installation: beside the CUDA library.
-    public static Path besideLibrary(Path cudaLibrary) {
-        return cudaLibrary.toAbsolutePath().resolveSibling(System.mapLibraryName("llguidance"));
-    }
-
     private static MethodHandle bind(SymbolLookup symbols, String name, FunctionDescriptor descriptor) {
         MemorySegment symbol =
                 symbols.find(name).orElseThrow(() -> new IllegalStateException("the llguidance library lacks " + name));

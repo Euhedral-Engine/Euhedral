@@ -6,6 +6,7 @@
 #include <nvrtc.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,22 @@
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
+
+/* Set once per opened library, before any kernel compiles; a replaced value is never freed, since a compile on
+ * another thread may still read it. */
+static _Atomic(const char*) cuda_include_directory = NULL;
+
+int euhedral_cuda_set_include_directory(const char* path) {
+    if (path == NULL || path[0] == '\0' || strlen(path) >= PATH_MAX) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    const char* current = atomic_load_explicit(&cuda_include_directory, memory_order_acquire);
+    if (current != NULL && strcmp(current, path) == 0) return EUHEDRAL_CUDA_SUCCESS;
+    size_t length = strlen(path);
+    char* copy = malloc(length + 1u);
+    if (copy == NULL) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    memcpy(copy, path, length + 1u);
+    atomic_store_explicit(&cuda_include_directory, copy, memory_order_release);
+    return EUHEDRAL_CUDA_SUCCESS;
+}
 
 int euhedral_cuda_bind_thread_context(void) {
     int device = 0;
@@ -122,22 +139,12 @@ static int load_kernel(const void* anchor, const char* source_name, const char* 
     nvrtcResult nv_status = nvrtcCreateProgram(&program, source, source_name, 0, NULL, NULL);
     free(source);
     if (nv_status != NVRTC_SUCCESS) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
-    const char* include_directory = getenv("EUHEDRAL_CUDA_INCLUDE_DIR");
+    const char* include_directory = atomic_load_explicit(&cuda_include_directory, memory_order_acquire);
     char include_option[PATH_MAX + 16];
-    char home_include[PATH_MAX];
-    if (include_directory == NULL || include_directory[0] == '\0') {
-        const char* cuda_home = getenv("CUDA_HOME");
-        if (cuda_home == NULL || cuda_home[0] == '\0') cuda_home = getenv("CUDA_PATH");
-        if (cuda_home != NULL && cuda_home[0] != '\0') {
-            int home_length = snprintf(home_include, sizeof(home_include), "%s/include", cuda_home);
-            if (home_length < 0 || (size_t)home_length >= sizeof(home_include)) {
-                nvrtcDestroyProgram(&program);
-                return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
-            }
-            include_directory = home_include;
-        } else {
-            include_directory = "/usr/local/cuda/include";
-        }
+    if (include_directory == NULL) {
+        fprintf(stderr, "Euhedral CUDA: no CUDA include directory is set; cannot compile %s\n", source_name);
+        nvrtcDestroyProgram(&program);
+        return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     }
     int include_length = snprintf(include_option, sizeof(include_option), "-I%s", include_directory);
     if (include_length < 0 || (size_t)include_length >= sizeof(include_option)) {

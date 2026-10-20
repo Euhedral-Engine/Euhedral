@@ -6,6 +6,7 @@ import io.euhedral_execution.inference.api.metrics.EngineMetrics;
 import io.euhedral_execution.inference.api.metrics.ServerMetrics;
 import io.euhedral_execution.inference.core.InferenceEngine;
 import io.euhedral_execution.inference.core.guidance.Llguidance;
+import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
 import java.io.IOException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,11 +24,16 @@ import org.springframework.context.annotation.Configuration;
 public class InferenceEngineConfiguration {
     private static final Logger LOG = LoggerFactory.getLogger(InferenceEngineConfiguration.class);
 
-    /// Loaded before the engine so an unsupported template fails fast without touching the GPU. The first bean to
-    /// read the settings' files, so it checks all of them first.
+    /// The jar's native files, unpacked into the native cache. The first bean to read the settings' files, so it
+    /// checks all of them first.
     @Bean
-    QwenChatTemplate qwenChatTemplate(InferenceProperties properties) {
-        SetupCheck.require(properties);
+    NativeFiles nativeFiles(InferenceProperties properties) {
+        return SetupCheck.require(properties);
+    }
+
+    /// Loaded before the engine so an unsupported template fails fast without touching the GPU.
+    @Bean
+    QwenChatTemplate qwenChatTemplate(InferenceProperties properties, NativeFiles nativeFiles) {
         try {
             return QwenChatTemplate.load(properties.tokenizerDirectory());
         } catch (IOException | RuntimeException failure) {
@@ -46,9 +52,9 @@ public class InferenceEngineConfiguration {
 
     /// Loaded before the engine, so a library that does not load fails without the weights' load before it.
     @Bean
-    Llguidance llguidance(InferenceProperties properties, QwenChatTemplate chatTemplate) {
+    Llguidance llguidance(NativeFiles nativeFiles, QwenChatTemplate chatTemplate) {
         try {
-            return Llguidance.load(Llguidance.besideLibrary(properties.cudaLibraryPath()));
+            return Llguidance.load(nativeFiles.guidanceLibrary());
         } catch (RuntimeException failure) {
             throw new EngineStartupException("Loading the constrained-decoding library", failure);
         }
@@ -57,10 +63,13 @@ public class InferenceEngineConfiguration {
     /// Depends on the template and library beans only to order their validation before the GPU load.
     @Bean(destroyMethod = "close")
     InferenceEngine inferenceEngine(
-            InferenceProperties properties, QwenChatTemplate chatTemplate, Llguidance llguidance) {
+            InferenceProperties properties,
+            NativeFiles nativeFiles,
+            QwenChatTemplate chatTemplate,
+            Llguidance llguidance) {
         LOG.info("Loading inference engine for model {}", properties.modelId());
         try {
-            return InferenceEngine.load(properties.toInferenceConfig());
+            return InferenceEngine.load(properties.toInferenceConfig(nativeFiles.library()));
         } catch (InferenceEngine.StartupFailure failure) {
             // Rollback failed inside load; retry once so a failed startup does not strand device resources.
             try {

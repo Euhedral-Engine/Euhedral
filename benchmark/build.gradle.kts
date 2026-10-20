@@ -1,5 +1,3 @@
-import java.io.File
-
 plugins {
     java
     application
@@ -27,14 +25,9 @@ dependencies {
 }
 
 val hostProductId = rootProject.extra["euhedral.native.host.id"] as String
-val hostIncludeDirectory = rootProject.extra["euhedral.native.host.include"] as String
-val hostRuntimeDirectory = rootProject.extra["euhedral.native.host.runtime"] as String
 
-// Matches cudaIntegrationTest: build the host native library and expose its CUDA runtime/NVRTC inputs.
+// Matches cudaIntegrationTest: build the host native library, which carries its CUDA runtime, NVRTC and headers.
 tasks.named<JavaExec>("run") {
     dependsOn(rootProject.tasks.named("nativeBuild${hostProductId.split("-").joinToString("") { it.replaceFirstChar(Char::uppercase) }}"))
     workingDir = rootProject.projectDir
-    environment("EUHEDRAL_CUDA_INCLUDE_DIR", hostIncludeDirectory)
-    val searchVariable = if (System.getProperty("os.name").startsWith("Windows")) "PATH" else "LD_LIBRARY_PATH"
-    environment(searchVariable, hostRuntimeDirectory + File.pathSeparator + (System.getenv(searchVariable) ?: ""))
 }

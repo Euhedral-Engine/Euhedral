@@ -96,19 +96,16 @@ val cudaMathLibraries = tasks.register("cudaMathLibraries") {
 }
 
 val hostProductId = rootProject.extra["euhedral.native.host.id"] as String
-val hostIncludeDirectory = rootProject.extra["euhedral.native.host.include"] as String
-val hostRuntimeDirectory = rootProject.extra["euhedral.native.host.runtime"] as String
 
 tasks.named<JavaExec>("run") {
     dependsOn(rootProject.tasks.named("nativeBuild${hostProductId.split("-").joinToString("") { it.replaceFirstChar(Char::uppercase) }}"))
     workingDir = rootProject.projectDir
-    environment("EUHEDRAL_CUDA_INCLUDE_DIR", hostIncludeDirectory)
     val searchVariable = if (System.getProperty("os.name").startsWith("Windows")) "PATH" else "LD_LIBRARY_PATH"
     dependsOn(cudaMathLibraries)
     systemProperty("euhedral.quantization.cuda-libraries", cudaMathDirectory.get().asFile.absolutePath)
     environment(
         searchVariable,
-        listOf(hostRuntimeDirectory, cudaMathDirectory.get().asFile.absolutePath, System.getenv(searchVariable) ?: "")
+        listOf(cudaMathDirectory.get().asFile.absolutePath, System.getenv(searchVariable) ?: "")
             .joinToString(File.pathSeparator))
 }
 
@@ -120,15 +117,13 @@ tasks.withType<Test>().configureEach {
     }
 }
 
-// The CUDA test tasks the root build registers also need this module's cuBLAS/cuSOLVER and the CUDA headers its
-// kernels compile against.
+// The CUDA test tasks the root build registers also need this module's cuBLAS/cuSOLVER.
 tasks.withType<Test>().matching { it.name.startsWith("cuda") }.configureEach {
     dependsOn(cudaMathLibraries)
     systemProperty("euhedral.quantization.cuda-libraries", cudaMathDirectory.get().asFile.absolutePath)
-    environment("EUHEDRAL_CUDA_INCLUDE_DIR", hostIncludeDirectory)
     environment(
         "LD_LIBRARY_PATH",
-        listOf(hostRuntimeDirectory, cudaMathDirectory.get().asFile.absolutePath, System.getenv("LD_LIBRARY_PATH") ?: "")
+        listOf(cudaMathDirectory.get().asFile.absolutePath, System.getenv("LD_LIBRARY_PATH") ?: "")
             .joinToString(File.pathSeparator))
 }
 

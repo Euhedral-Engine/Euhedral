@@ -326,6 +326,7 @@ class ArchitectureTest {
             "gpu",
             "guidance",
             "model",
+            "nativefiles",
             "prefix",
             "runtime",
             "sampling",
