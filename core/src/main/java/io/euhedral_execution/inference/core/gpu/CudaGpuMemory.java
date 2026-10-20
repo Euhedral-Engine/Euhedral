@@ -1,7 +1,6 @@
 package io.euhedral_execution.inference.core.gpu;
 
 import io.euhedral_execution.data_structures.queues.MpmcQueue;
-import io.euhedral_execution.hardware_utils.util.OSName;
 import io.euhedral_execution.inference.core.artifact.P2e2Layout;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.nativefiles.NativeFiles;
@@ -17,6 +16,7 @@ import java.lang.invoke.MethodType;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -633,25 +633,29 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
     }
 
-    /// Runtime libraries beside the CUDA library that load first, by full path. NVRTC opens its builtins library by
-    /// name, which resolves to the copy already loaded; Windows also resolves a DLL's imports without the library's
-    /// own directory, so its runtime and NVRTC load first too. Linux finds them through the library's `$ORIGIN`.
-    private static final List<String> LINUX_RUNTIME = List.of("libnvrtc-builtins.so.13.1");
+    /// Runtime libraries beside the CUDA library that load first, by full path, per platform ([NativeFiles#platform]).
+    /// NVRTC opens its builtins library by name, which resolves to the copy already loaded; Windows also resolves a
+    /// DLL's imports without the library's own directory, so its runtime and NVRTC load first too. Linux finds them
+    /// through the library's `$ORIGIN`.
+    private static final Map<String, List<String>> RUNTIME = Map.of(
+            "linux-x64", List.of("libnvrtc-builtins.so.13.1"),
+            "windows-x64", List.of("cudart64_13.dll", "nvrtc-builtins64_131.dll", "nvrtc64_130_0.dll"));
 
-    private static final List<String> WINDOWS_RUNTIME =
-            List.of("cudart64_13.dll", "nvrtc-builtins64_131.dll", "nvrtc64_130_0.dll");
-
-    /// Loads the runtime libraries that sit beside `library` ([#LINUX_RUNTIME], [#WINDOWS_RUNTIME]).
+    /// Loads the runtime libraries that sit beside `library` ([#RUNTIME]).
     ///
+    /// @throws IllegalStateException when the server does not run on this platform
     /// @throws GpuMemoryException when one is missing from the library's directory
     public static void preloadRuntime(Path library, Arena arena) {
-        for (String name : OSName.isWindows() ? WINDOWS_RUNTIME : LINUX_RUNTIME) {
-            Path runtime = library.toAbsolutePath().resolveSibling(name);
-            if (!Files.isRegularFile(runtime))
-                throw new GpuMemoryException("the CUDA runtime library " + runtime + " is missing; it belongs beside "
-                        + library.getFileName() + ", as the native files lay it out");
-            SymbolLookup.libraryLookup(runtime, arena);
-        }
+        List<String> names = RUNTIME.get(NativeFiles.platform());
+        Path directory = library.toAbsolutePath().getParent();
+        List<Path> missing = names.stream()
+                .map(directory::resolve)
+                .filter(path -> !Files.isRegularFile(path))
+                .toList();
+        if (!missing.isEmpty())
+            throw new GpuMemoryException("the CUDA runtime libraries " + missing + " are missing; they belong beside "
+                    + library.getFileName() + ", as the native files lay it out");
+        names.forEach(name -> SymbolLookup.libraryLookup(directory.resolve(name), arena));
     }
 
     @Override
