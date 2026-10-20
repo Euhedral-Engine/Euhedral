@@ -31,7 +31,8 @@ import org.junit.jupiter.api.Timeout;
 /// file): teacher-forced decode of the benchmark corpus document, recording every step's BF16 logits
 /// row. Artifacts compare by their per-token negative log-likelihood of the document (paired, on the
 /// same tokens) and by the KL divergence between their logits rows (tools/compare_teacher_forced.py,
-/// docs/quantization/NVFP4_COMPRESSED.md). Scoring against a BF16 reference is the quantization module's `score` command.
+/// docs/quantization/NVFP4_COMPRESSED.md). Scoring against a BF16 reference is the quantization module's `score`
+/// command.
 ///
 /// Report format, little endian: int32 steps, int32 vocabulary, then per step the int32 forced next
 /// token and the logits row as `vocabulary` BF16 values.

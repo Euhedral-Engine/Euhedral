@@ -45,7 +45,8 @@ import java.util.function.Consumer;
 /// the pinned host row into which each sampling quantum copies its final logits before it retires; each
 /// completed prompt-to-output stream is flushed before the decoder is replaced for a later prompt.
 ///
-/// A generation is a chain of frames (docs/architecture/FRAME_MODEL.md): each step's quantum throws a Select frame when it
+/// A generation is a chain of frames (docs/architecture/FRAME_MODEL.md): each step's quantum throws a Select frame when
+/// it
 /// retires, which samples, emits text and throws the next step's Admit. No thread waits for a quantum.
 public final class Session implements GenerationSession {
 

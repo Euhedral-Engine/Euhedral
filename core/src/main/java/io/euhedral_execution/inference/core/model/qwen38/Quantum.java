@@ -38,7 +38,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         /// one-row decode at its position (row-exact execution), with logits for every row.
         VERIFY,
         /// Drafting, which leaves the base sequence position where it is: rows of the MTP layer at MTP positions,
-        /// writing only the MTP layer's cache (docs/speculation/MTP_CONTRACT.md §2), or a DFlash2 block, which proposes the
+        /// writing only the MTP layer's cache (docs/speculation/MTP_CONTRACT.md §2), or a DFlash2 block, which
+        /// proposes the
         /// tokens after its anchor and writes no state (docs/speculation/DFLASH2.md).
         DRAFT,
         /// DFlash2 context rows: the drafter's keys and values of committed target rows at their positions, from the

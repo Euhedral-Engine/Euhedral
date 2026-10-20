@@ -60,8 +60,8 @@ class DiskTierCudaIntegrationTest {
         Path tokenizer =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int[] text = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(tokenizer))
-                .encodeText(Files.readString(
-                        SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/architecture/FRAME_MODEL.md")));
+                .encodeText(Files.readString(SpeculativeVerifyCudaIntegrationTest.repositoryRoot()
+                        .resolve("docs/architecture/FRAME_MODEL.md")));
         assumeTrue(text.length >= PROMPT + 8, "the prompt text is too short");
         return text;
     }
