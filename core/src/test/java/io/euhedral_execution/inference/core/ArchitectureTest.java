@@ -464,33 +464,43 @@ class ArchitectureTest {
     static final Pattern SETTING_READ = Pattern.compile("System\\.getProperty\\(|System\\.getenv\\("
             + "|Integer\\.getInteger\\(|Long\\.getLong\\(|Boolean\\.getBoolean\\(");
 
-    /// Reads of the platform, not settings: the runtime identity the engine logs, and the operating system that
-    /// chooses the asynchronous read backend and the pageable memory's advice. As `path` to names on the read's
-    /// line.
+    /// Reads of the platform, not settings: the runtime identity the engine logs. As `path` to the calls, each written
+    /// as
+    /// the read's text from its start.
     static final Map<String, Set<String>> PLATFORM_READS = Map.of(
-            "InferenceEngine.java", Set.of("\"java.vendor\"", "\"java.vm.name\"", "\"os.name\"", "\"os.arch\""),
-            "runtime/graph/AsyncReads.java", Set.of("\"os.name\""),
-            "model/qwen4/expert/PageableMemory.java", Set.of("\"os.name\""));
+            "InferenceEngine.java",
+            Set.of(
+                    "System.getProperty(\"java.vendor\")",
+                    "System.getProperty(\"java.vm.name\")",
+                    "System.getProperty(\"os.name\")",
+                    "System.getProperty(\"os.arch\")"));
 
     /// Experiment switches that are deleted next, with the paths they switch off. Temporary: the list only shrinks.
     static final Map<String, Set<String>> SWITCHES_REMOVED_NEXT = Map.of(
-            "InferenceEngine.java", Set.of("MAP_OUTPUT_HEAD"),
-            "model/qwen38/loader/ResidencyPlanner.java", Set.of("MAP_OUTPUT_HEAD"),
-            "runtime/EuhedralInferenceRuntime.java", Set.of("EUHEDRAL_CUDA_GRAPHS"),
-            "model/qwen4/Ops.java", Set.of("EUHEDRAL_QWEN4_LINEAR_TC", "EUHEDRAL_QWEN4_LINEAR_SPLIT"),
+            "InferenceEngine.java",
+            Set.of("Boolean.getBoolean(ResidencyPlanner.MAP_OUTPUT_HEAD)"),
+            "model/qwen38/loader/ResidencyPlanner.java",
+            Set.of("Boolean.getBoolean(MAP_OUTPUT_HEAD)"),
+            "runtime/EuhedralInferenceRuntime.java",
+            Set.of("System.getenv(\"EUHEDRAL_CUDA_GRAPHS\")"),
+            "model/qwen4/Ops.java",
+            Set.of("System.getenv(\"EUHEDRAL_QWEN4_LINEAR_TC\")", "System.getenv(\"EUHEDRAL_QWEN4_LINEAR_SPLIT\")"),
             "model/qwen4/Qwen4Model.java",
-                    Set.of(
-                            "EUHEDRAL_QWEN4_TIER_POLICY",
-                            "EUHEDRAL_QWEN4_TIER_PRELOAD",
-                            "EUHEDRAL_QWEN4_GPU_POLICY",
-                            "EUHEDRAL_QWEN4_PIN_TIER",
-                            "EUHEDRAL_QWEN4_TIER_ADMISSION"),
-            "model/qwen4/ExpertCacheOwner.java", Set.of("EUHEDRAL_QWEN4_PREFETCH", "EUHEDRAL_QWEN4_AHEAD"),
-            "model/qwen4/Shape.java", Set.of("EUHEDRAL_QWEN4_GROUP"),
-            "model/qwen4/expert/FileRecordSource.java", Set.of("EUHEDRAL_QWEN4_DIRECT_READS"));
+            Set.of(
+                    "System.getenv(\"EUHEDRAL_QWEN4_TIER_POLICY\")",
+                    "System.getenv(\"EUHEDRAL_QWEN4_TIER_PRELOAD\")",
+                    "System.getenv().getOrDefault(\"EUHEDRAL_QWEN4_GPU_POLICY\"",
+                    "System.getenv(\"EUHEDRAL_QWEN4_PIN_TIER\")",
+                    "System.getenv(\"EUHEDRAL_QWEN4_TIER_ADMISSION\")"),
+            "model/qwen4/ExpertCacheOwner.java",
+            Set.of("System.getenv(\"EUHEDRAL_QWEN4_PREFETCH\")", "System.getenv(\"EUHEDRAL_QWEN4_AHEAD\")"),
+            "model/qwen4/Shape.java",
+            Set.of("System.getenv(\"EUHEDRAL_QWEN4_GROUP\")"),
+            "model/qwen4/expert/FileRecordSource.java",
+            Set.of("System.getenv(\"EUHEDRAL_QWEN4_DIRECT_READS\")"));
 
     /// Each read of a property or a variable in the core outside the settings and the native files, as
-    /// `path:line: code`, with the names an exception may match on that line.
+    /// {path, line, the line's text from the read's start}: one entry per call, so a line with two reads has two.
     private static List<String[]> settingReads() throws IOException {
         List<String[]> reads = new ArrayList<>();
         try (Stream<Path> walk = Files.walk(MAIN)) {
@@ -501,15 +511,18 @@ class ArchitectureTest {
                 for (int i = 0; i < lines.size(); i++) {
                     String code = lines.get(i).strip();
                     if (code.startsWith("//") || code.startsWith("*")) continue;
-                    if (SETTING_READ.matcher(code).find()) reads.add(new String[] {path, (i + 1) + "", code});
+                    var matcher = SETTING_READ.matcher(code);
+                    while (matcher.find())
+                        reads.add(new String[] {path, (i + 1) + "", code.substring(matcher.start())});
                 }
             }
         }
         return reads;
     }
 
-    private static boolean excepted(Map<String, Set<String>> exceptions, String path, String code) {
-        return exceptions.getOrDefault(path, Set.of()).stream().anyMatch(code::contains);
+    /// Whether the read whose text starts `call` is one of `path`'s exceptions.
+    private static boolean excepted(Map<String, Set<String>> exceptions, String path, String call) {
+        return exceptions.getOrDefault(path, Set.of()).stream().anyMatch(call::startsWith);
     }
 
     /// Settings come from the settings file and its variables, read once by the settings loader; nothing else in
@@ -531,7 +544,7 @@ class ArchitectureTest {
         for (var exceptions : List.of(PLATFORM_READS, SWITCHES_REMOVED_NEXT))
             for (var entry : exceptions.entrySet())
                 for (String name : entry.getValue())
-                    if (reads.stream().noneMatch(r -> r[0].equals(entry.getKey()) && r[2].contains(name)))
+                    if (reads.stream().noneMatch(r -> r[0].equals(entry.getKey()) && r[2].startsWith(name)))
                         stale.add(entry.getKey() + ": " + name);
         assertTrue(stale.isEmpty(), "no longer read, remove from the list: " + stale);
     }

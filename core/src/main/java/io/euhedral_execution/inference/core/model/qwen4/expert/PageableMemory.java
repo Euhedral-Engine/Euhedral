@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen4.expert;
 
+import io.euhedral_execution.hardware_utils.util.OSName;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -28,7 +29,7 @@ final class PageableMemory implements AutoCloseable {
     static {
         MethodHandle mmap = null;
         MethodHandle munmap = null;
-        if (System.getProperty("os.name", "").toLowerCase().contains("linux")) {
+        if (OSName.isLinux()) {
             try {
                 Linker linker = Linker.nativeLinker();
                 var lookup = linker.defaultLookup();

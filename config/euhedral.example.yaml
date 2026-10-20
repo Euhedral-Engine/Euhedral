@@ -46,7 +46,7 @@ batching:
   prefill-chunk-tokens: 512                   # optional, default 512: rows of the longest prefill chunk
 
 memory:
-  host-limit: auto                            # optional, default auto: host memory the engine may use
+  host-limit: auto                            # optional, default auto: host memory the engine may use (0: no RAM tier)
   host-weights-limit: auto                    # optional, default auto: pinned host memory for host-backed weights
   gpu-limit: auto                             # optional, default auto: device memory the engine may use (auto = what is free)
   gpu-reserve: 700MiB                         # optional, default 700MiB: device memory left for other programs

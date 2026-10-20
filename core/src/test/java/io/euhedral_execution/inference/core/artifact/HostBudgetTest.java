@@ -54,6 +54,7 @@ class HostBudgetTest {
         assertEquals(
                 HostBudget.ofAvailable(8 * GIB).pinnableBytes(), stated.pinnableBytes(), "pinning follows the machine");
         assertEquals(1 * GIB, HostBudget.of(OptionalLong.of(GIB), 48 * GIB).residentBytes(), "less is respected too");
+        assertEquals(0, HostBudget.of(OptionalLong.of(0), 48 * GIB).residentBytes(), "zero means no RAM tier");
     }
 
     /// `memory.host-limit` states the budget in bytes; it is the only statement, whatever the process environment.

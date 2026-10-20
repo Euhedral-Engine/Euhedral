@@ -103,7 +103,12 @@ tasks.named<JavaExec>("run") {
     val searchVariable = if (System.getProperty("os.name").startsWith("Windows")) "PATH" else "LD_LIBRARY_PATH"
     dependsOn(cudaMathLibraries)
     val mathDirectory = cudaMathDirectory.get().asFile.absolutePath
-    argumentProviders.add(CommandLineArgumentProvider { listOf("--cuda-libraries", mathDirectory) })
+    // After the user's subcommand and options, unless they name the directory themselves or run no command.
+    val userArgs = this
+    argumentProviders.add(CommandLineArgumentProvider {
+        val given = userArgs.args.orEmpty()
+        if (given.isEmpty() || "--cuda-libraries" in given) emptyList() else listOf("--cuda-libraries", mathDirectory)
+    })
     environment(
         searchVariable,
         listOf(cudaMathDirectory.get().asFile.absolutePath, System.getenv(searchVariable) ?: "")

@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeReceiver;
 import io.euhedral_execution.core.generics.LatticeSource;
+import io.euhedral_execution.hardware_utils.util.OSName;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -33,29 +34,29 @@ class ReadBackendTest {
 
     @Test
     void linuxReadsThroughIoUringWithoutProbingWindows() {
-        assertEquals(ReadBackend.Kind.IO_URING, ReadBackend.choose("Linux", NOT_ON_THIS_SYSTEM));
+        assertEquals(ReadBackend.Kind.IO_URING, ReadBackend.choose(OSName.LINUX, NOT_ON_THIS_SYSTEM));
     }
 
     @Test
     void windowsReadsThroughItsRingsWhenItHasThemAndItsCompletionPortOtherwise() {
-        assertEquals(ReadBackend.Kind.IORING, ReadBackend.choose("Windows 11", () -> true));
-        assertEquals(ReadBackend.Kind.COMPLETION_PORT, ReadBackend.choose("Windows 10", () -> false));
-        assertEquals(ReadBackend.Kind.IORING, ReadBackend.choose("Windows Server 2022", () -> true));
+        assertEquals(ReadBackend.Kind.IORING, ReadBackend.choose(OSName.WINDOWS, () -> true));
+        assertEquals(ReadBackend.Kind.COMPLETION_PORT, ReadBackend.choose(OSName.WINDOWS, () -> false));
     }
 
     @Test
     void otherSystemsHaveNoBackendAndSaySo() {
-        assertNull(ReadBackend.choose("Mac OS X", NOT_ON_THIS_SYSTEM));
-        assertNull(ReadBackend.choose("FreeBSD", NOT_ON_THIS_SYSTEM));
-        assertNull(ReadBackend.choose(null, NOT_ON_THIS_SYSTEM));
-        String reason = ReadBackend.unsupported("Mac OS X");
-        assertTrue(reason.contains("Linux") && reason.contains("Windows") && reason.contains("Mac OS X"), reason);
+        assertNull(ReadBackend.choose(OSName.MACOS, NOT_ON_THIS_SYSTEM));
+        assertNull(ReadBackend.choose(OSName.UNSUPPORTED, NOT_ON_THIS_SYSTEM));
+        String reason = ReadBackend.unsupported(OSName.MACOS);
+        assertTrue(
+                reason.contains("Linux") && reason.contains("Windows") && reason.contains(OSName.MACOS.toString()),
+                reason);
     }
 
     /// The class initializes on any system: nothing of another system's is looked up.
     @Test
     void thisMachineReadsThroughItsOwnSystemsBackend() {
-        ReadBackend.Kind expected = ReadBackend.choose(System.getProperty("os.name"), () -> false);
+        ReadBackend.Kind expected = ReadBackend.choose(OSName.CURRENT_OS, () -> false);
         if (AsyncReads.available()) {
             assertNull(AsyncReads.unavailableReason());
             ReadBackend.Kind kind = AsyncReads.kind();

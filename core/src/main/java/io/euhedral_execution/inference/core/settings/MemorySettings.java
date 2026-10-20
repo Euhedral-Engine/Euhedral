@@ -20,7 +20,9 @@ public record MemorySettings(
         WeightStreamingSettings weightStreaming) {
 
     public MemorySettings {
-        positive(hostLimit, "host-limit");
+        Objects.requireNonNull(hostLimit, "host-limit");
+        if (hostLimit.isPresent() && hostLimit.getAsLong() < 0)
+            throw new IllegalArgumentException("host-limit must not be negative");
         positive(hostWeightsLimit, "host-weights-limit");
         positive(gpuLimit, "gpu-limit");
         if (gpuReserve < 0) throw new IllegalArgumentException("gpu-reserve must not be negative");

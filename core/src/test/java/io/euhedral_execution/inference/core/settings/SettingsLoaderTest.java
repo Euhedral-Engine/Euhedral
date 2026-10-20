@@ -84,6 +84,17 @@ class SettingsLoaderTest {
         assertEquals(280, s.kernels().trellis().targetBlocks().getAsInt());
     }
 
+    /// A host limit of 0 leaves no RAM tier: every expert the device misses is read from the artifact.
+    @Test
+    void aHostLimitOfZeroIsAccepted() throws IOException {
+        Settings s = load(MODEL + "memory:\n  host-limit: 0\n", Map.of());
+        assertEquals(0, s.memory().hostLimit().getAsLong());
+        assertTrue(String.join(
+                        "|",
+                        fails(MODEL + "memory:\n  gpu-limit: 0\n", Map.of()).problems())
+                .contains("memory.gpu-limit"));
+    }
+
     @Test
     void variableAutoClearsFileValue() throws IOException {
         Settings s = load(MODEL + "memory:\n  gpu-limit: 1GiB\n", Map.of("EUHEDRAL_MEMORY_GPU_LIMIT", "auto"));

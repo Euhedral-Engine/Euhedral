@@ -579,7 +579,7 @@ public final class InferenceEngine implements AutoCloseable {
                 throws IOException {
             if (requested >= 1) return requested;
             if (profile == null || profile.speculation() == ArtifactProfile.Speculation.DFLASH2) return 1;
-            int chunk = tuning.batching().prefillChunkTokens();
+            int chunk = InferenceConfig.PREFILL_CHUNK_TOKENS;
             int rows = Math.min(chunk, tuning.batching().maxTokensPerPass().orElse(chunk));
             int cap = Math.max(
                     1,
@@ -599,7 +599,7 @@ public final class InferenceEngine implements AutoCloseable {
                     kvFormat,
                     cap,
                     kvDeviceMinimumTokens,
-                    chunk,
+                    tuning.batching().prefillChunkTokens(),
                     gpu.trellisSettings());
             LOG.info("Sequences: {} of {} tokens each (auto)", low, maxContextTokens);
             return low;
