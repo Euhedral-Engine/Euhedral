@@ -178,6 +178,7 @@ impl Quantum {
     ) -> Result<Self, WorkspaceError> {
         workspace.view(rows as u64)?;
         let logits_rows = if kind == QuantumKind::Verify { rows } else { 1 };
+        workspace.rows().check_logits(logits_rows as u64)?;
         Ok(Self {
             kind,
             rows,
