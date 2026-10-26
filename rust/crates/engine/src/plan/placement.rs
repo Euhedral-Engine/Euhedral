@@ -6,6 +6,7 @@
 //! graph's critical chain on one lane and spreads the other branches of a fan-out.
 
 use std::collections::VecDeque;
+use std::mem;
 
 use euhedral_graph::LaneId;
 
@@ -177,14 +178,16 @@ pub(crate) fn path_placement(edges: &[Vec<usize>], lanes: usize) -> Vec<LaneId> 
     let lanes = lanes.max(1);
     let path = path_predecessors(edges);
     let mut placed: Vec<LaneId> = Vec::with_capacity(edges.len());
-    let mut turn = 1usize;
+    let mut turn = 0usize;
     for (node, predecessors) in edges.iter().enumerate() {
         let lane = match path[node] {
             // The path predecessor comes first: edges point to earlier nodes.
             Some(predecessor) => placed[predecessor],
             None if predecessors.is_empty() => LaneId(0),
+            None if lanes == 1 => LaneId(0),
             None => {
-                let lane = LaneId((turn % lanes) as u16);
+                // The lanes after the home lane, in turn.
+                let lane = LaneId((1 + turn % (lanes - 1)) as u16);
                 turn += 1;
                 lane
             }
@@ -192,6 +195,34 @@ pub(crate) fn path_placement(edges: &[Vec<usize>], lanes: usize) -> Vec<LaneId> 
         placed.push(lane);
     }
     placed
+}
+
+/// Which stages end a lane: those with no descendant on their own lane. A graph's retirement boundary is the latest
+/// marker per lane, and the latest marker of a lane is that of one of these (two of them when no edge orders them).
+/// `edges[node]` lists the nodes before `node`; `lanes[node]` is the lane of `node`.
+pub(crate) fn lane_sinks(edges: &[Vec<usize>], lanes: &[LaneId]) -> Vec<bool> {
+    let count = edges.len();
+    // below[node]: the nodes after `node` by any chain, as bits.
+    let mut after: Vec<Vec<u64>> = vec![vec![0; words(count)]; count];
+    for node in (0..count).rev() {
+        let mut mine = mem::take(&mut after[node]);
+        // `node` precedes its successors, which are later: they are already complete.
+        for successor in node + 1..count {
+            if edges[successor].contains(&node) {
+                for (word, other) in mine.iter_mut().zip(&after[successor]) {
+                    *word |= other;
+                }
+                mine[successor / 64] |= 1 << (successor % 64);
+            }
+        }
+        after[node] = mine;
+    }
+    (0..count)
+        .map(|node| {
+            !(node + 1..count)
+                .any(|later| after[node][later / 64] >> (later % 64) & 1 == 1 && lanes[later] == lanes[node])
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -286,6 +317,35 @@ mod tests {
             "the first branch off the chain takes the next lane"
         );
         assert_eq!(lanes[3], LaneId(2));
+    }
+
+    #[test]
+    fn branches_take_the_lanes_after_the_home_lane_in_turn_and_never_the_home_lane() {
+        // Six branches off a root, joined: with 3 lanes they alternate between lanes 1 and 2.
+        let mut edges = vec![vec![]];
+        edges.extend((0..6).map(|_| vec![0]));
+        edges.push((1..=6).collect());
+        let lanes = path_placement(&edges, 3);
+        assert_eq!(lanes[1], LaneId(0), "the first branch is the critical chain");
+        let others: Vec<u16> = lanes[2..7].iter().map(|lane| lane.0).collect();
+        assert_eq!(others, vec![1, 2, 1, 2, 1]);
+        assert!(path_placement(&edges, 2)[2..7].iter().all(|lane| *lane == LaneId(1)));
+    }
+
+    #[test]
+    fn a_stage_signals_when_no_stage_after_it_runs_on_its_lane() {
+        // 0 -> 1 -> 3 and 0 -> 2 -> 3, with 2 on lane 1 and the rest on lane 0.
+        let edges = [vec![], vec![0], vec![0], vec![1, 2]];
+        let lanes = [LaneId(0), LaneId(0), LaneId(1), LaneId(0)];
+        assert_eq!(lane_sinks(&edges, &lanes), vec![false, false, true, true]);
+        // Two unordered stages that end the same lane both signal, and so does the only stage of another.
+        let edges = [vec![], vec![0], vec![0]];
+        let lanes = [LaneId(0), LaneId(1), LaneId(1)];
+        assert_eq!(lane_sinks(&edges, &lanes), vec![true, true, true]);
+        // A later stage on the lane reached through another lane's stage still covers the earlier one.
+        let edges = [vec![], vec![0], vec![1]];
+        let lanes = [LaneId(0), LaneId(1), LaneId(0)];
+        assert_eq!(lane_sinks(&edges, &lanes), vec![false, true, true]);
     }
 
     #[test]

@@ -164,6 +164,8 @@ pub struct KvCache {
     reserved: u64,
     /// The rows that were reserved when the latest [`KvCache::reserve`] call began: what that call had to grow from.
     reserved_before: u64,
+    /// How many times [`KvCache::reserve`] has been called: stamped into the views taken after it.
+    epoch: u64,
     submitted: u64,
     committed: u64,
 }
@@ -215,6 +217,7 @@ impl KvCache {
             table_slots: 0,
             reserved: 0,
             reserved_before: 0,
+            epoch: 0,
             submitted: 0,
             committed: 0,
         })
@@ -315,6 +318,7 @@ impl KvCache {
             });
         }
         self.reserved_before = self.reserved;
+        self.epoch += 1;
         let required = start + rows;
         if required <= self.reserved {
             return Ok(());
@@ -470,6 +474,11 @@ impl KvCache {
             .map(|table| table.generation())
     }
 
+    /// The number of [`KvCache::reserve`] calls so far.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// The device region the host pages are read and written through, when the cache has host pages.
     pub fn host_region(&self) -> Option<&DeviceBuffer> {
         self.host.as_ref().map(|host| &*host.region)
@@ -510,6 +519,7 @@ impl KvCache {
             plane_page_bytes: self.plane_page_bytes,
             reserved: self.reserved,
             reserved_before: self.reserved_before,
+            epoch: self.epoch,
             ready: None,
             tables: self
                 .store
@@ -592,6 +602,7 @@ pub struct KvView {
     plane_page_bytes: u64,
     reserved: u64,
     reserved_before: u64,
+    epoch: u64,
     ready: Option<Marker>,
     tables: Vec<Option<LayerTable>>,
     host: Option<HostView>,
@@ -640,6 +651,13 @@ impl KvView {
     /// Rows backed by pages when the view was taken.
     pub fn reserved(&self) -> u64 {
         self.reserved
+    }
+
+    /// The reservation this view followed: the number of [`KvCache::reserve`] calls the cache had had when the view
+    /// was taken. [`SequenceState::refs`](crate::state::SequenceState::refs) checks that exactly one call separates
+    /// the views of two quanta.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Whether the reservation that backed an append of `rows` rows at `start` had to allocate pages or upload a page

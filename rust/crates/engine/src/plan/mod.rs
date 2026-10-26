@@ -24,6 +24,7 @@ use thiserror::Error;
 use crate::model::Speculation;
 use crate::model::{LayerIndex, ModelConfig, Role};
 use crate::residency::planner::ResidencyPlan;
+use crate::stages::Placed;
 use buffers::Access;
 pub use builder::{Entry, Formats, StageKind, WeightLookup};
 use builder::{Node, base_nodes, mtp_nodes};
@@ -59,6 +60,8 @@ struct VariantPlan {
     lanes: Vec<LaneId>,
     spec: StageGraphSpec,
     width: usize,
+    /// Whether each stage ends with a signalled marker: those with no descendant on their own lane.
+    signalled: Vec<bool>,
 }
 
 /// The execution plan of a loaded model.
@@ -199,6 +202,13 @@ impl Plan {
         self.variant(view.variant()).map(|plan| plan.lanes.as_slice())
     }
 
+    /// Whether each stage of `view` ends with a signalled marker: the stages with no descendant on their own lane.
+    /// A graph retires when the latest marker of each lane it used is reached, and a lane's completion word reaches
+    /// only signalled markers, so these stages signal and the others do not.
+    pub fn signalled(&self, view: View) -> Option<&[bool]> {
+        self.variant(view.variant()).map(|plan| plan.signalled.as_slice())
+    }
+
     /// The stages with no predecessor in the graph of `view`: where a quantum enters, and what the previous quantum
     /// of the chain must be ordered before.
     pub fn roots(&self, view: View) -> Option<Vec<usize>> {
@@ -216,18 +226,6 @@ impl Plan {
     /// work. The next quantum of a chain orders its roots behind it.
     pub fn sink(&self, view: View) -> Option<usize> {
         self.variant(view.variant()).map(|plan| plan.entries.len() - 1)
-    }
-
-    /// How many capture keys one sequence can produce: the graphs one sequence's cache can hold before a key would
-    /// have to evict another. Every captured view (decode, each verification width, each draft width) times the
-    /// geometries of decode attention its positions pass through (the 48-key splits below 2048 keys and the one beyond)
-    /// times the flags a step's quanta differ by (seeding drafting, writing the current token).
-    pub fn capture_key_space(&self) -> usize {
-        const GEOMETRIES: usize = 2048 / 48 + 2;
-        const FLAGS: usize = 4;
-        let verifications = (2..=MAX_CAPTURED_ROWS).count();
-        let drafts = if self.drafts() { MAX_CAPTURED_ROWS } else { 0 };
-        (1 + verifications + drafts) * GEOMETRIES * FLAGS
     }
 
     /// The rows a verification covers at most: one more than the drafts, as a view captured into graphs.
@@ -265,12 +263,17 @@ impl VariantPlan {
             lanes: Vec::new(),
             spec: StageGraphSpec::new(),
             width,
+            signalled: Vec::new(),
         })
     }
 
     /// Places the stages over `lanes` lanes and makes the graph.
     fn place(&mut self, lanes: usize) -> Result<(), PlanBuildError> {
         self.lanes = placement::path_placement(&self.edges, lanes);
+        self.signalled = placement::lane_sinks(&self.edges, &self.lanes);
+        for (entry, signal) in self.entries.iter_mut().zip(&self.signalled) {
+            entry.stage = Arc::new(Placed::new(Arc::clone(&entry.launch), *signal));
+        }
         let mut spec = StageGraphSpec::new();
         let ids: Vec<_> = self
             .entries

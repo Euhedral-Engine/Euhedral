@@ -6,7 +6,7 @@
 //! model is ready, or with the error that stopped it. The calling thread waits for the latch and for nothing else.
 
 use std::fmt;
-use std::mem::ManuallyDrop;
+use std::mem::{self, ManuallyDrop};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
@@ -421,7 +421,24 @@ impl EngineRuntime {
     /// Frees the device memory. Waits for the device.
     fn release(self) {
         let Self { device, .. } = self;
-        drop(ManuallyDrop::into_inner(device));
+        let DeviceState {
+            weights,
+            workspace,
+            sequence,
+        } = ManuallyDrop::into_inner(device);
+        // The sequence goes first, by `close`, which refuses while a quantum is in flight. The lattice is closed by
+        // now, so a quantum still counted will never be dropped: the caches are left allocated (the process is
+        // ending) rather than freed under it.
+        if let Err(busy) = sequence.close() {
+            log::error!(
+                "the sequence still has {} quanta in flight at shutdown: its device memory stays allocated until the \
+                 process exits",
+                busy.in_flight
+            );
+            mem::forget(busy);
+        }
+        drop(workspace);
+        drop(weights);
     }
 }
 

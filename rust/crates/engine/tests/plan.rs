@@ -363,5 +363,99 @@ fn prefill_and_exact_never_captured() {
     assert!(!View::Verify { rows: 9 }.capturable());
     assert!(!View::CatchUp { rows: 9 }.capturable());
     assert!(View::Decode.capturable() && View::Verify { rows: 5 }.capturable() && View::Draft { rows: 4 }.capturable());
-    assert!(built().plan.capture_key_space() > 0);
+}
+
+/// The stages every chain of `edges` leads to the last one from: all of them, for a funnel.
+fn ancestors_of_last(edges: &[Vec<usize>]) -> Vec<bool> {
+    let mut reaches = vec![false; edges.len()];
+    *reaches.last_mut().unwrap() = true;
+    for stage in (0..edges.len()).rev() {
+        if reaches[stage] {
+            for &producer in &edges[stage] {
+                reaches[producer] = true;
+            }
+        }
+    }
+    reaches
+}
+
+#[test]
+fn every_stage_is_an_ancestor_of_the_sink_in_every_view() {
+    let plan = &built().plan;
+    for view in [
+        View::Decode,
+        View::Verify { rows: 5 },
+        View::Verify { rows: 9 },
+        View::PrefillChunk,
+        View::Draft { rows: 1 },
+        View::CatchUp { rows: 9 },
+    ] {
+        let edges = plan.edges(view).unwrap();
+        let sink = plan.sink(view).unwrap();
+        assert_eq!(sink, edges.len() - 1, "{view:?}");
+        let reaches = ancestors_of_last(edges);
+        let loose: Vec<usize> = (0..edges.len()).filter(|stage| !reaches[*stage]).collect();
+        assert!(
+            loose.is_empty(),
+            "{view:?}: stages {loose:?} are not ancestors of the sink, so its marker would not cover them"
+        );
+        assert_eq!(plan.roots(view).unwrap(), vec![0], "{view:?}");
+    }
+}
+
+/// The stages with no later stage on their lane that they precede, worked out from the edges by closure.
+fn lane_sinks(edges: &[Vec<usize>], lanes: &[LaneId]) -> Vec<bool> {
+    let count = edges.len();
+    let mut precedes = vec![vec![false; count]; count];
+    for (stage, producers) in edges.iter().enumerate() {
+        for &producer in producers {
+            precedes[producer][stage] = true;
+        }
+    }
+    for through in 0..count {
+        let onward = precedes[through].clone();
+        for row in precedes.iter_mut() {
+            if row[through] {
+                for (reached, via) in row.iter_mut().zip(&onward) {
+                    *reached |= *via;
+                }
+            }
+        }
+    }
+    (0..count)
+        .map(|stage| !(0..count).any(|later| precedes[stage][later] && lanes[later] == lanes[stage]))
+        .collect()
+}
+
+#[test]
+fn the_signalled_stages_are_exactly_the_sinks_of_their_lanes() {
+    let plan = &built().plan;
+    for view in [
+        View::Decode,
+        View::Verify { rows: 5 },
+        View::PrefillChunk,
+        View::Draft { rows: 2 },
+    ] {
+        let signalled = plan.signalled(view).unwrap();
+        let wanted = lane_sinks(plan.edges(view).unwrap(), plan.placement(view).unwrap());
+        assert_eq!(signalled, wanted.as_slice(), "{view:?}");
+        let count = signalled.iter().filter(|signal| **signal).count();
+        let lanes = plan.placement(view).unwrap();
+        for lane in 0..plan.fan_out_width() {
+            let used = lanes.iter().any(|placed| usize::from(placed.0) == lane);
+            let ends = signalled
+                .iter()
+                .zip(lanes)
+                .filter(|(signal, placed)| **signal && usize::from(placed.0) == lane)
+                .count();
+            assert_eq!(
+                ends >= 1,
+                used,
+                "{view:?}: lane {lane} ends in a signalled stage when it has stages"
+            );
+        }
+        // The selection ends its lane, and almost every other stage does not: a flag write per stage is not paid.
+        assert!(signalled[plan.sink(view).unwrap()]);
+        assert!(count <= 8, "{view:?}: {count} of {} stages signal", signalled.len());
+    }
 }

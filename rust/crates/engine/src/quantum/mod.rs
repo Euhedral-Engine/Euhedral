@@ -6,10 +6,12 @@
 //! - **Stage by stage**: the view's stage graph, each stage on the lane the plan placed it on, ordered behind its
 //!   predecessors by markers. Prefill, a quantum whose reservation allocated pages, the first sight of a key, and
 //!   anything a graph cannot repeat run so.
-//! - **Recording**, on the second sight of a key: the launches of every stage are captured on the quantum's lane in
-//!   the order of the view, the graph is instantiated, kept in the sequence's [`GraphCache`], and launched.
-//! - **Replay**: every later quantum with the key is one graph launch on the home lane, behind the input record's
-//!   upload and the reservation that backs its cache rows.
+//! - **Recording**, on the second sight of a key: the quantum runs stage by stage, and a record stage beside its
+//!   stages captures the same launches on a lane of its own (relaxed capture, nothing is submitted twice), instantiates
+//!   the graph and keeps it in the sequence's [`GraphCache`]. The device never waits for a capture or an
+//!   instantiation.
+//! - **Replay**: from the next sight after the recording has finished, a quantum with the key is one graph launch on
+//!   the home lane, behind the input record's upload and the reservation that backs its cache rows.
 //!
 //! The host side effects of a quantum (the input record's upload, the KV reservation, the frontiers, the logits
 //! bookkeeping) are the owner's, before the graph is launched and after it retires, so a replay needs no checking
@@ -28,7 +30,7 @@ use euhedral_graph::{
     EdgeKind, ExternalEdge, GraphError, GraphRuntime, LaneId, Marker, QuantumOutcome, QuantumRef, Stage, StageCx,
     StageError, StageGraph, StageGraphSpec, StageId, StageSpec, Submitted,
 };
-use euhedral_inference_cuda::{AllocationId, CudaError, CudaLane, PinnedPool, Submission, SubmitMode, ops};
+use euhedral_inference_cuda::{AllocationId, CudaError, CudaLane, GraphExec, PinnedPool, Submission, SubmitMode, ops};
 use thiserror::Error;
 
 pub use capture_key::{CaptureKey, split_geometry};
@@ -39,8 +41,7 @@ use crate::plan::{MAX_CAPTURED_ROWS, Plan, Variant, View};
 use crate::stages::DraftSeed;
 use crate::stages::Quantum;
 use crate::stages::attention::{KvSource, takes_decode_scratch};
-use crate::stages::{QuantumError, QuantumKind, StageLaunch, fatal, run_eager_dyn};
-use crate::state::attention::DRAFT_TOKEN_SLOTS;
+use crate::stages::{QuantumError, QuantumKind, StageLaunch, fatal};
 use crate::workspace::BufferSlot;
 
 /// How a quantum runs.
@@ -49,8 +50,10 @@ pub enum Disposition {
     /// Stage by stage, through the view's stage graph.
     #[default]
     Eager,
-    /// As a captured graph: the slot's graph is launched, and recorded first if the slot has none.
-    Captured(Arc<GraphSlot>),
+    /// Stage by stage, and the record stage captures the same launches into the slot's graph.
+    Record(Arc<GraphSlot>),
+    /// One launch of the slot's recorded graph.
+    Replay(Arc<GraphSlot>),
 }
 
 /// Why a quantum's input record could not be uploaded.
@@ -280,6 +283,7 @@ impl Quantum {
                 .draft_token_write
                 .and_then(|write| Some((slot(write.slot)?, write.ids.get()))),
             writes_current_token: self.writes_current_token,
+            row_exact: self.mode.row_exact,
             split_geometry: split_geometry(start, rows, group),
             reserved_host_pages: [host_pages(KvSource::Base), host_pages(KvSource::Mtp)],
             replay_rows: capture_key::trimmed(self.seq.replay_layers()),
@@ -303,20 +307,32 @@ fn latest_per_lane(markers: impl IntoIterator<Item = Marker>, own: Option<LaneId
     latest
 }
 
-/// The one stage of a captured quantum's graph: it launches the view's graph on the lane it was given, recording it
-/// first if the quantum's slot has none, and ends with a signalled marker.
-struct CapturedStage {
+/// The record stage of a quantum that records: beside the quantum's stages it captures the same launches on the capture
+/// lane, in the order of the view, and keeps the graph in the quantum's slot. It has no edge to a stage: the capture
+/// submits nothing, so it neither waits for the quantum's device work nor delays it, and the quantum stays alive until
+/// it is done. Other quanta record nothing.
+struct RecordStage {
     launches: Arc<[Arc<dyn StageLaunch>]>,
+    lane: LaneId,
 }
 
-impl CapturedStage {
+/// Why a recording failed.
+enum RecordFailure {
+    /// A stage refused the quantum.
+    Stage(StageError),
+    /// The device could not capture or instantiate.
+    Cuda(CudaError),
+}
+
+impl From<CudaError> for RecordFailure {
+    fn from(error: CudaError) -> Self {
+        RecordFailure::Cuda(error)
+    }
+}
+
+impl RecordStage {
     /// Records the launches of every stage that has work, in the order of the view, on `lane`.
-    fn record(
-        &self,
-        quantum: &Quantum,
-        lane: &CudaLane,
-        mode: SubmitMode,
-    ) -> Result<euhedral_inference_cuda::GraphExec, RecordFailure> {
+    fn record(&self, quantum: &Quantum, lane: &CudaLane, mode: SubmitMode) -> Result<GraphExec, RecordFailure> {
         graph_cache::record_on(lane, mode, |submission| {
             for launch in self.launches.iter() {
                 if launch.idle(quantum) {
@@ -328,6 +344,7 @@ impl CapturedStage {
         })
     }
 
+    /// The hash the stages of `quantum` submit in check mode.
     #[cfg(feature = "test-oracles")]
     fn hash(&self, quantum: &Quantum, lane: &CudaLane, mode: SubmitMode) -> Result<u64, RecordFailure> {
         let (outcome, hash) = Submission::hashed(lane, mode, |submission| {
@@ -344,27 +361,68 @@ impl CapturedStage {
     }
 }
 
-/// Why a recording failed.
-enum RecordFailure {
-    /// A stage refused the quantum: the quantum fails.
-    Stage(StageError),
-    /// The device could not capture or instantiate: the key is abandoned and the quantum runs its stages one after
-    /// another on its lane.
-    Cuda(CudaError),
-}
+impl Stage<Quantum> for RecordStage {
+    fn run(&self, quantum: &Quantum, _cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+        let Disposition::Record(slot) = &quantum.disposition else {
+            return Ok(Submitted::done());
+        };
+        let Some(lane) = quantum.lanes.get(self.lane) else {
+            slot.release();
+            return Err(fatal(format!(
+                "the capture lane {} is not in the lane table",
+                self.lane.0
+            )));
+        };
+        let mode = SubmitMode {
+            // The graph's launches overlap at every position (programmatic dependent launch).
+            pdl: true,
+            row_exact: quantum.mode.row_exact,
+        };
+        match self.record(quantum, lane, mode) {
+            Ok(graph) => {
+                #[cfg(feature = "test-oracles")]
+                if let Ok(hash) = self.hash(quantum, lane, mode) {
+                    slot.set_recorded_hash(hash);
+                }
+                slot.publish(graph);
+            }
+            // The quantum runs its stages whatever the recording does; a stage that refuses it fails the quantum there.
+            Err(RecordFailure::Stage(error)) => {
+                log::warn!("a quantum's graph was not recorded, a stage refused it: {error:?}");
+                slot.release();
+            }
+            // The lane is held by another recording: this key is tried again at its next sight.
+            Err(RecordFailure::Cuda(CudaError::LaneBusy(_))) => slot.release(),
+            Err(RecordFailure::Cuda(error)) => {
+                log::warn!("a quantum's graph could not be recorded, its key runs stage by stage: {error}");
+                slot.abandon();
+            }
+        }
+        Ok(Submitted::done())
+    }
 
-impl From<CudaError> for RecordFailure {
-    fn from(error: CudaError) -> Self {
-        RecordFailure::Cuda(error)
+    fn abandoned(&self, quantum: &Quantum) {
+        if let Disposition::Record(slot) = &quantum.disposition {
+            slot.release();
+        }
     }
 }
 
-impl Stage<Quantum> for CapturedStage {
+/// The one stage of a replayed quantum's graph: it launches the quantum's recorded graph on the home lane and ends
+/// with a signalled marker.
+struct ReplayStage {
+    launches: Arc<[Arc<dyn StageLaunch>]>,
+}
+
+impl Stage<Quantum> for ReplayStage {
     fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        let Disposition::Captured(slot) = &quantum.disposition else {
+        let Disposition::Replay(slot) = &quantum.disposition else {
             return Err(fatal(
-                "a captured stage was started with a quantum that was not admitted to a graph",
+                "a replay stage was started with a quantum that has no recorded graph",
             ));
+        };
+        let Some(graph) = slot.graph() else {
+            return Err(fatal("a replayed quantum's graph is gone"));
         };
         quantum.check_prepared()?;
         let id = cx.lane.ok_or_else(|| fatal("the graph launch was given no lane"))?;
@@ -372,7 +430,7 @@ impl Stage<Quantum> for CapturedStage {
             .lanes
             .get(id)
             .ok_or_else(|| fatal(format!("lane {} is not in the lane table", id.0)))?;
-        // A capture does not wait: the markers the quantum depends on are waited for before the graph launches.
+        // A graph does not wait: the markers the quantum depends on are waited for before it launches.
         let waits = latest_per_lane(
             cx.waits
                 .iter()
@@ -380,38 +438,6 @@ impl Stage<Quantum> for CapturedStage {
                 .chain(self.launches.iter().flat_map(|launch| launch.waits(quantum))),
             Some(id),
         );
-        let mode = SubmitMode {
-            // The graph's launches overlap at every position (programmatic dependent launch).
-            pdl: true,
-            row_exact: quantum.mode.row_exact,
-        };
-        if slot.graph().is_none() && !slot.is_broken() {
-            if !slot.claim() {
-                // Another quantum of the key is recording it.
-                return Err(StageError::Retry);
-            }
-            match self.record(quantum, lane, mode) {
-                Ok(graph) => {
-                    #[cfg(feature = "test-oracles")]
-                    if let Ok(hash) = self.hash(quantum, lane, mode) {
-                        slot.set_recorded_hash(hash);
-                    }
-                    slot.publish(graph);
-                }
-                Err(RecordFailure::Stage(error)) => {
-                    slot.release();
-                    return Err(error);
-                }
-                Err(RecordFailure::Cuda(CudaError::LaneBusy(_))) => {
-                    slot.release();
-                    return Err(StageError::Retry);
-                }
-                Err(RecordFailure::Cuda(error)) => {
-                    log::warn!("a quantum's graph could not be recorded, its key runs stage by stage: {error}");
-                    slot.abandon();
-                }
-            }
-        }
         let submission = match Submission::begin(lane, quantum.mode) {
             Ok(submission) => submission,
             Err(CudaError::LaneBusy(_)) => return Err(StageError::Retry),
@@ -420,26 +446,15 @@ impl Stage<Quantum> for CapturedStage {
         for marker in waits {
             submission.wait(marker).map_err(fatal)?;
         }
-        match slot.graph() {
-            Some(graph) => {
-                graph.launch(&submission).map_err(fatal)?;
-                slot.launched();
-            }
-            None => {
-                for launch in self.launches.iter() {
-                    if !launch.idle(quantum) {
-                        launch.launch(quantum, &submission)?;
-                    }
-                }
-            }
-        }
+        graph.launch(&submission).map_err(fatal)?;
+        slot.launched();
         let marker = submission.finish_signalled().map_err(fatal)?;
         Ok(Submitted::marker(marker))
     }
 }
 
-/// The stage graph of a captured quantum: one stage on the home lane.
-fn captured_spec() -> StageGraphSpec {
+/// The stage graph of a replayed quantum: one stage on the home lane.
+fn replay_spec() -> StageGraphSpec {
     let mut spec = StageGraphSpec::new();
     spec.stage(StageSpec {
         name: "graph",
@@ -458,8 +473,10 @@ pub struct Started {
     pub root: StageId,
     /// The stage whose marker covers the quantum's device work.
     pub sink: StageId,
-    /// Whether the quantum runs as a captured graph.
-    pub captured: bool,
+    /// Whether the quantum is one launch of a recorded graph.
+    pub replayed: bool,
+    /// Whether the quantum's launches are being recorded beside its stages.
+    pub recording: bool,
 }
 
 /// What stops a quantum from starting.
@@ -475,7 +492,7 @@ pub enum StartError {
 pub struct Executor {
     plan: Arc<Plan>,
     eager: Vec<Option<Arc<StageGraph<Quantum>>>>,
-    captured: Vec<Option<Arc<StageGraph<Quantum>>>>,
+    replay: Vec<Option<Arc<StageGraph<Quantum>>>>,
 }
 
 impl fmt::Debug for Executor {
@@ -485,38 +502,52 @@ impl fmt::Debug for Executor {
 }
 
 impl Executor {
-    /// The graphs of every view of `plan`, run on `runtime` (whose lane pool has at least
-    /// [`Plan::fan_out_width`] lanes). `retire` receives each quantum, with its outcome, once its device work has
-    /// completed.
+    /// The graphs of every view of `plan`, run on `runtime` (whose lane pool has the plan's
+    /// [`Plan::fan_out_width`] lanes, then `capture`, a lane that only recordings use, and lanes the owner uses). The
+    /// graphs of the views that are captured have a record stage on `capture`. `retire` receives each quantum, with
+    /// its outcome, once its device work has completed.
     pub fn new(
         plan: Arc<Plan>,
         runtime: &GraphRuntime,
+        capture: LaneId,
         retire: impl Fn(Quantum, QuantumOutcome) + Send + Sync + 'static,
     ) -> Result<Executor, GraphError> {
         let retire: Arc<dyn Fn(Quantum, QuantumOutcome) + Send + Sync> = Arc::new(retire);
         let mut eager = Vec::with_capacity(Variant::ALL.len());
-        let mut captured = Vec::with_capacity(Variant::ALL.len());
+        let mut replay = Vec::with_capacity(Variant::ALL.len());
         for variant in Variant::ALL {
             let view = variant.representative();
-            let (Some(spec), Some(entries)) = (plan.spec(view), plan.stages(view)) else {
+            let (Some(mut spec), Some(entries)) = (plan.spec(view), plan.stages(view)) else {
                 eager.push(None);
-                captured.push(None);
+                replay.push(None);
                 continue;
             };
+            let mut stages: Vec<Arc<dyn Stage<Quantum>>> =
+                entries.iter().map(|entry| Arc::clone(&entry.stage)).collect();
+            let launches: Arc<[Arc<dyn StageLaunch>]> = entries.iter().map(|entry| Arc::clone(&entry.launch)).collect();
+            if view.capturable() {
+                spec.stage(StageSpec {
+                    name: "record",
+                    ordered: None,
+                    lanes: vec![capture],
+                });
+                stages.push(Arc::new(RecordStage {
+                    launches: Arc::clone(&launches),
+                    lane: capture,
+                }));
+            }
             let again = Arc::clone(&retire);
             eager.push(Some(StageGraph::new(
                 spec,
-                entries.iter().map(|entry| Arc::clone(&entry.stage)).collect(),
+                stages,
                 runtime.clone(),
                 move |quantum, outcome| again(quantum, outcome),
             )?));
-            captured.push(if view.capturable() {
-                let launches: Arc<[Arc<dyn StageLaunch>]> =
-                    entries.iter().map(|entry| Arc::clone(&entry.launch)).collect();
+            replay.push(if view.capturable() {
                 let again = Arc::clone(&retire);
                 Some(StageGraph::new(
-                    captured_spec(),
-                    vec![Arc::new(CapturedStage { launches }) as Arc<dyn Stage<Quantum>>],
+                    replay_spec(),
+                    vec![Arc::new(ReplayStage { launches }) as Arc<dyn Stage<Quantum>>],
                     runtime.clone(),
                     move |quantum, outcome| again(quantum, outcome),
                 )?)
@@ -524,7 +555,7 @@ impl Executor {
                 None
             });
         }
-        Ok(Executor { plan, eager, captured })
+        Ok(Executor { plan, eager, replay })
     }
 
     /// The plan the executor runs.
@@ -532,10 +563,10 @@ impl Executor {
         &self.plan
     }
 
-    /// Starts `quantum`: validates it, asks `cache` whether to capture it, and runs it on the graph that follows.
-    /// With `after`, the previous quantum of the chain, the new quantum's root waits on the device for the previous
-    /// one's sink (the chain's token passes from one quantum's selection to the next's embedding, so nothing of the
-    /// next could overlap it). Keep the previous [`Started`] until this call returns, then drop it.
+    /// Starts `quantum`: validates it, asks `cache` whether to record or replay it, and runs it on the graph that
+    /// follows. With `after`, the previous quantum of the chain, the new quantum's root waits on the device for the
+    /// previous one's sink (the chain's token passes from one quantum's selection to the next's embedding, so nothing
+    /// of the next could overlap it). Keep the previous [`Started`] until this call returns, then drop it.
     pub fn start(
         &self,
         cache: &mut GraphCache,
@@ -547,22 +578,25 @@ impl Executor {
         let view = quantum.view();
         let variant = view.variant();
         let eager = self.eager[variant.index()].as_ref().ok_or(StartError::NoView(view))?;
-        let admission = cache.admit(quantum.capture_key());
-        let (graph, captured, root, sink) = match (admission, self.captured[variant.index()].as_ref()) {
-            (Admission::Captured(slot), Some(graph)) => {
-                quantum.disposition = Disposition::Captured(slot);
-                (graph, true, StageId(0), StageId(0))
-            }
-            _ => {
-                let stages = self.plan.stages(view).map_or(0, <[_]>::len);
-                (eager, false, StageId(0), StageId((stages - 1) as u16))
-            }
-        };
+        let stages = self.plan.stages(view).map_or(0, <[_]>::len);
+        let stage_by_stage = StageId((stages - 1) as u16);
+        let (graph, replayed, recording, sink) =
+            match (cache.admit(quantum.capture_key()), &self.replay[variant.index()]) {
+                (Admission::Replay(slot), Some(graph)) => {
+                    quantum.disposition = Disposition::Replay(slot);
+                    (graph, true, false, StageId(0))
+                }
+                (Admission::Record(slot), _) => {
+                    quantum.disposition = Disposition::Record(slot);
+                    (eager, false, true, stage_by_stage)
+                }
+                _ => (eager, false, false, stage_by_stage),
+            };
         let external = after
             .map(|previous| ExternalEdge {
                 from: previous.reference.clone(),
                 from_stage: previous.sink,
-                to_stage: root,
+                to_stage: StageId(0),
                 kind: EdgeKind::Submission,
             })
             .into_iter()
@@ -570,9 +604,10 @@ impl Executor {
         let reference = graph.start(quantum, kill, external);
         Ok(Started {
             reference,
-            root,
+            root: StageId(0),
             sink,
-            captured,
+            replayed,
+            recording,
         })
     }
 
@@ -582,7 +617,7 @@ impl Executor {
     /// launch bakes in shows here as a difference. The quantum must have been admitted to a recorded graph.
     #[cfg(feature = "test-oracles")]
     pub fn check_replay_for_tests(&self, quantum: &Quantum, lane: &CudaLane) -> Result<ReplayCheck, StartError> {
-        let Disposition::Captured(slot) = &quantum.disposition else {
+        let (Disposition::Record(slot) | Disposition::Replay(slot)) = &quantum.disposition else {
             return Err(StartError::Quantum(QuantumError::Invalid {
                 what: "the quantum was not admitted to a graph".to_string(),
             }));
@@ -640,14 +675,4 @@ impl ReplayCheck {
     pub fn matches(&self) -> bool {
         self.recorded != 0 && self.recorded == self.now
     }
-}
-
-/// Eager submission of one stage seen through [`StageLaunch`], for a caller that holds the stage list.
-pub fn run_stage(stage: &dyn StageLaunch, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-    run_eager_dyn(stage, quantum, cx)
-}
-
-/// Whether draft token slots `slot..slot + rows` are in range (`AttentionStates.DRAFT_TOKEN_SLOTS`).
-pub fn draft_slots_in_range(slot: usize, rows: usize) -> bool {
-    (slot + rows) as u64 <= DRAFT_TOKEN_SLOTS
 }

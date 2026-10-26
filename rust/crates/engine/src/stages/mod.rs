@@ -25,10 +25,10 @@ pub mod mtp;
 pub mod norm;
 pub mod sampling;
 
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::sync::Arc;
 
-use euhedral_graph::{LaneId, LanePool, Marker, StageCx, StageError, Submitted};
+use euhedral_graph::{LaneId, LanePool, Marker, Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{
     AllocationId, CudaError, CudaLane, CudaLibrary, DevicePtr, PooledPinned, Submission, SubmitMode,
 };
@@ -590,30 +590,37 @@ impl<L: Launch> StageLaunch for L {
     }
 }
 
-/// The stage for eager submission: begins a submission of the quantum's mode on the lane the graph chose, waits for
-/// the markers of the predecessors on other lanes, calls [`Launch::launch`], and finishes with the marker of the
-/// work.
-///
-/// The marker is signalled: it also writes the lane's completion word. A graph's retirement boundary is the latest
-/// marker of every lane the quantum used, and [`DeviceQueue::completed`](euhedral_graph::DeviceQueue::completed)
-/// reaches a marker only by a signalled one, so a lane whose last marker was not signalled would never be reached.
+/// The stage for eager submission, standing alone: begins a submission of the quantum's mode on the lane the graph
+/// chose, waits for the markers of the predecessors on other lanes, calls [`Launch::launch`], and finishes with the
+/// marker of the work, signalled ([`run_stage`]).
 ///
 /// A lane held by another submission answers [`StageError::Retry`], before anything was queued; every other failure
 /// is fatal to the quantum.
 pub fn run_eager<L: Launch>(stage: &L, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-    run_eager_dyn(stage, quantum, cx)
+    run_stage(stage, quantum, cx, true)
 }
 
-/// [`run_eager`] for a stage seen through [`StageLaunch`].
-pub fn run_eager_dyn<L: StageLaunch + ?Sized>(
+/// Runs a stage as [`run_eager`] does, with its marker signalled or not.
+///
+/// A signalled marker also writes the lane's completion word, which is how the host finds that the marker is reached
+/// ([`DeviceQueue::completed`](euhedral_graph::DeviceQueue::completed)). A graph's retirement boundary is the latest
+/// marker of every lane the quantum used, so the last stage of each lane must signal, and the others need not: the
+/// plan computes which those are ([`Plan::signalled`](crate::plan::Plan::signalled)). A stage that has nothing to
+/// launch for the quantum but is to signal still ends a submission on its lane, behind the markers it waits for, with
+/// a signalled marker and no launch, so the lane's last marker is reachable whatever the quantum skips.
+pub fn run_stage<L: StageLaunch + ?Sized>(
     stage: &L,
     quantum: &Quantum,
     cx: &StageCx<'_>,
+    signal: bool,
 ) -> Result<Submitted, StageError> {
-    if stage.idle(quantum) {
+    let idle = stage.idle(quantum);
+    if idle && !signal {
         return Ok(Submitted::done());
     }
-    quantum.check_prepared()?;
+    if !idle {
+        quantum.check_prepared()?;
+    }
     let id = cx
         .lane
         .ok_or_else(|| fatal("a stage with device work was given no lane"))?;
@@ -626,12 +633,52 @@ pub fn run_eager_dyn<L: StageLaunch + ?Sized>(
         Err(CudaError::LaneBusy(_)) => return Err(StageError::Retry),
         Err(error) => return Err(fatal(error)),
     };
-    for marker in cx.waits.iter().copied().chain(stage.waits(quantum)) {
-        submission.wait(marker).map_err(fatal)?;
+    let own = cx.waits.iter().copied();
+    if idle {
+        for marker in own {
+            submission.wait(marker).map_err(fatal)?;
+        }
+    } else {
+        for marker in own.chain(stage.waits(quantum)) {
+            submission.wait(marker).map_err(fatal)?;
+        }
+        stage.launch(quantum, &submission)?;
     }
-    stage.launch(quantum, &submission)?;
-    let marker = submission.finish_signalled().map_err(fatal)?;
+    let marker = if signal {
+        submission.finish_signalled()
+    } else {
+        submission.finish()
+    }
+    .map_err(fatal)?;
     Ok(Submitted::marker(marker))
+}
+
+/// A stage of a plan's graph: runs as [`run_stage`] with the signalling the plan gave it.
+pub struct Placed {
+    launch: Arc<dyn StageLaunch>,
+    signal: bool,
+}
+
+impl Placed {
+    /// The stage `launch`, whose marker is signalled when `signal`.
+    pub fn new(launch: Arc<dyn StageLaunch>, signal: bool) -> Self {
+        Self { launch, signal }
+    }
+}
+
+impl fmt::Debug for Placed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Placed")
+            .field("signal", &self.signal)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Stage<Quantum> for Placed {
+    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+        run_stage(&*self.launch, quantum, cx, self.signal)
+    }
 }
 
 /// Makes `$stage` a `Stage<Quantum>` that runs eagerly ([`run_eager`]).
