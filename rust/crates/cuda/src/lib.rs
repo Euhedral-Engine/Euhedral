@@ -3,13 +3,18 @@
 //! - [`CudaLibrary`] loads `libeuhedral_cuda` (preloading its runtime, setting the kernel include directory, binding
 //!   the device) and carries the generated entry points ([`sys`]).
 //! - [`DeviceBuffer`], [`PinnedBuffer`] and [`HostWeightsArena`] own device, page-locked and host-weight memory.
+//! - [`PinnedPool`] recycles pinned buffers; [`RetireList`] frees a buffer once the lane work that last used it has
+//!   retired.
 //! - [`CudaLane`] is one stream with an event ring and a host-mapped completion word, and implements
 //!   `DeviceQueue`: `completed()` is one atomic read.
-//! - [`Submission`] selects a lane for the calling thread; [`ops`] holds the operations, each taking one.
+//! - [`Submission`] takes a lane (one at a time; a second `begin` returns `LaneBusy`) and selects it for the calling
+//!   thread; [`ops`] holds the operations, each taking one.
 //! - [`GraphRecorder`] and [`GraphExec`] capture a lane's submissions and replay them.
 //!
-//! Nothing here waits for the device except the calls documented as blocking (`synchronize`, the host copies), which
-//! are for startup, shutdown and tests; there is no callback from the driver into Rust.
+//! The device waits are the ones documented as blocking: `synchronize` (library and lane), the host copies, and every
+//! drop that frees device or pinned memory (`cudaFree` and `cudaFreeHost` wait for the device). Those are for startup,
+//! shutdown and tests; on the hot path buffers go through the pool and the retire list instead. There is no callback
+//! from the driver into Rust.
 
 mod device;
 mod error;
@@ -18,6 +23,9 @@ mod lane;
 mod library;
 mod memory;
 pub mod ops;
+mod pool;
+mod retire;
+mod stack;
 mod submission;
 
 /// The generated declarations of the C ABI (`cargo xtask bindings` rewrites this file).
@@ -38,4 +46,6 @@ pub use graph::{GraphExec, GraphRecorder};
 pub use lane::CudaLane;
 pub use library::CudaLibrary;
 pub use memory::{AllocationId, DeviceBuffer, DevicePtr, HostWeightsArena, PinnedBuffer};
+pub use pool::{PinnedPool, PooledPinned};
+pub use retire::RetireList;
 pub use submission::{Submission, SubmitMode};

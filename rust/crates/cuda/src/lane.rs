@@ -4,28 +4,74 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use euhedral_graph::{DeviceQueue, LaneId};
+use euhedral_graph::{DeviceQueue, LaneId, Marker};
 
 use crate::error::{CudaError, check};
 use crate::library::CudaLibrary;
 use crate::memory::{DevicePtr, PinnedBuffer};
+use crate::sys::EuhedralCuda;
 
 /// The events a lane records its markers on, in a ring: marker `value` (counting from 1) uses slot
-/// `(value - 1) % len`. A marker older than the ring is stale: the lane's later work has reused its event, and a
-/// wait on it waits for that later work. The ring is sized to the most markers the plan keeps in flight.
+/// `(value - 1) % len`. A marker older than the ring is stale: the lane's later work has reused its event, so a wait
+/// on it is refused. The ring is sized to the most markers the plan keeps in flight.
 ///
-/// The handles live in the library, not in the lane, so a submission on one lane can wait for a marker of another.
-/// A handle of 0 is a lane that was dropped: waiting for it is refused by the C library.
+/// The ring sits in the library, not in the lane, so a submission on one lane can wait for a marker of another. Lane
+/// ids are never reused and the events are destroyed with the library, so a wait never meets a destroyed event.
 #[derive(Debug)]
 pub(crate) struct EventRing {
     handles: Box<[AtomicU64]>,
+    /// Markers issued so far.
+    issued: AtomicU64,
 }
 
 impl EventRing {
-    /// The event for marker `value`; `None` for value 0, which every lane has always reached.
+    fn new(handles: Vec<u64>) -> EventRing {
+        EventRing {
+            handles: handles.into_iter().map(AtomicU64::new).collect(),
+            issued: AtomicU64::new(0),
+        }
+    }
+
+    /// Claims the next marker value, counting from 1.
+    pub(crate) fn claim(&self) -> u64 {
+        self.issued.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// The event marker `value` records on.
     pub(crate) fn event(&self, value: u64) -> Option<u64> {
-        let slot = usize::try_from((value.checked_sub(1)?) % self.handles.len() as u64).ok()?;
+        let slot = usize::try_from(value.checked_sub(1)? % self.handles.len() as u64).ok()?;
         Some(self.handles[slot].load(Ordering::Acquire))
+    }
+
+    /// The event to wait on for `marker`: `None` for value 0 (always reached), an error for a marker that is not
+    /// issued yet or is older than the ring.
+    pub(crate) fn waitable(&self, marker: Marker) -> Result<Option<u64>, CudaError> {
+        if marker.value == 0 {
+            return Ok(None);
+        }
+        let issued = self.issued.load(Ordering::Acquire);
+        if marker.value > issued {
+            return Err(CudaError::FutureMarker { marker, issued });
+        }
+        if marker.value + self.handles.len() as u64 <= issued {
+            return Err(CudaError::StaleMarker {
+                marker,
+                ring: self.handles.len(),
+                issued,
+            });
+        }
+        Ok(self.event(marker.value))
+    }
+
+    /// Destroys every event. Run once, when the library goes.
+    pub(crate) fn destroy(&self, library: &EuhedralCuda) {
+        for handle in &self.handles {
+            let event = handle.swap(0, Ordering::AcqRel);
+            if event != 0 {
+                // SAFETY: the event was created for this ring and is destroyed once.
+                let _ = unsafe { library.euhedral_cuda_completion_event_destroy(event) };
+            }
+        }
     }
 }
 
@@ -98,7 +144,8 @@ fn widen(previous: u64, word: u32) -> u64 {
 
 /// One CUDA stream with an event ring and a completion word: a lane of a `LanePool`.
 ///
-/// Work reaches a lane through a [`Submission`](crate::Submission). Its markers (event ring) order work across lanes
+/// Work reaches a lane through a [`Submission`](crate::Submission), one at a time: a second `begin` while one is live
+/// fails with `LaneBusy`, never blocks. Its markers (event ring) order work across lanes
 /// on the device; its completion word, written by [`Submission::signal`](crate::Submission::signal), is what
 /// [`DeviceQueue::completed`] reads, so the host learns of progress without a call into CUDA.
 pub struct CudaLane {
@@ -106,8 +153,8 @@ pub struct CudaLane {
     id: LaneId,
     name: String,
     stream: u64,
-    /// Markers issued so far; the next marker's value is this plus one.
-    issued: AtomicU64,
+    /// Whether a submission or a capture holds the lane.
+    owned: AtomicBool,
     capturing: AtomicBool,
     word: CompletionWord,
     word_device: DevicePtr,
@@ -158,7 +205,9 @@ impl CudaLane {
         stream: u64,
     ) -> Result<Arc<CudaLane>, CudaError> {
         let memory = PinnedBuffer::alloc(library, 64)?;
-        let word_device = memory.device_address()?;
+        // SAFETY: the word is only ever accessed through atomic loads and stores, on the host here and by the device
+        // through stream memory operations, and `memory` outlives every use of the address (the lane keeps both).
+        let word_device = unsafe { memory.device_address()? };
         let word = memory.word(0);
         word.store(0, Ordering::Release);
         // SAFETY: the word lies in `memory`, which the lane keeps for as long as it keeps `word`.
@@ -170,19 +219,16 @@ impl CudaLane {
             // SAFETY: the call takes no arguments.
             let event = unsafe { api.euhedral_cuda_completion_event_create() };
             if event == 0 {
-                destroy_events(library, &handles);
+                EventRing::new(handles).destroy(api);
                 return Err(CudaError::NullAllocation {
                     call: "euhedral_cuda_completion_event_create",
                     bytes: 0,
                 });
             }
-            handles.push(AtomicU64::new(event));
+            handles.push(event);
         }
-        let ring = EventRing {
-            handles: handles.into_boxed_slice(),
-        };
-        if let Err((error, ring)) = library.register_ring(id, ring) {
-            destroy_events(library, &ring.handles);
+        if let Err((error, ring)) = library.register_ring(id, EventRing::new(handles)) {
+            ring.destroy(api);
             return Err(error);
         }
         Ok(Arc::new(CudaLane {
@@ -190,7 +236,7 @@ impl CudaLane {
             id,
             name: format!("cuda lane {}", id.0),
             stream,
-            issued: AtomicU64::new(0),
+            owned: AtomicBool::new(false),
             capturing: AtomicBool::new(false),
             word,
             word_device,
@@ -203,7 +249,11 @@ impl CudaLane {
     }
 
     /// Blocks until the lane's queued work finishes. For startup, shutdown and tests.
+    /// Refused while the lane is captured into a graph (synchronizing a capturing stream invalidates the capture).
     pub fn synchronize(&self) -> Result<(), CudaError> {
+        if self.is_capturing() {
+            return Err(CudaError::Capturing("a lane synchronization"));
+        }
         // SAFETY: the stream is this lane's live stream.
         check("euhedral_cuda_stream_synchronize", unsafe {
             self.library.api().euhedral_cuda_stream_synchronize(self.stream)
@@ -223,8 +273,21 @@ impl CudaLane {
     }
 
     /// Claims the next marker value.
-    pub(crate) fn next_value(&self) -> u64 {
-        self.issued.fetch_add(1, Ordering::Relaxed) + 1
+    pub(crate) fn next_value(&self) -> Result<u64, CudaError> {
+        Ok(self.library.ring(self.id)?.claim())
+    }
+
+    /// Takes the lane for one submission or capture, without blocking.
+    pub(crate) fn try_own(&self) -> Result<(), CudaError> {
+        self.owned
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| CudaError::LaneBusy(self.id))
+    }
+
+    /// Gives the lane back.
+    pub(crate) fn disown(&self) {
+        self.owned.store(false, Ordering::Release);
     }
 
     pub(crate) fn is_capturing(&self) -> bool {
@@ -249,30 +312,9 @@ impl DeviceQueue for CudaLane {
 
 impl Drop for CudaLane {
     fn drop(&mut self) {
-        let api = self.library.api();
-        if let Ok(ring) = self.library.ring(self.id) {
-            // Later waits on this lane's markers find handle 0 and are refused, not undefined.
-            for handle in &ring.handles {
-                let event = handle.swap(0, Ordering::AcqRel);
-                if event != 0 {
-                    // SAFETY: the event was created by this lane and is destroyed once.
-                    let _ = unsafe { api.euhedral_cuda_completion_event_destroy(event) };
-                }
-            }
-        }
-        // SAFETY: the stream is this lane's; destroying it lets queued work finish first.
-        let _ = unsafe { api.euhedral_cuda_stream_destroy(self.stream) };
-    }
-}
-
-fn destroy_events(library: &CudaLibrary, handles: &[AtomicU64]) {
-    for handle in handles {
-        // SAFETY: the events were created by the caller and are destroyed once.
-        let _ = unsafe {
-            library
-                .api()
-                .euhedral_cuda_completion_event_destroy(handle.load(Ordering::Acquire))
-        };
+        // SAFETY: the stream is this lane's; destroying it lets queued work finish first. The lane's events stay: a
+        // wait on another lane may still be using one, and the library destroys them when it goes.
+        let _ = unsafe { self.library.api().euhedral_cuda_stream_destroy(self.stream) };
     }
 }
 
@@ -311,13 +353,36 @@ mod tests {
 
     #[test]
     fn the_ring_reuses_events_in_order_and_value_zero_has_none() {
-        let ring = EventRing {
-            handles: (10..13).map(AtomicU64::new).collect(),
-        };
+        let ring = EventRing::new(vec![10, 11, 12]);
         assert_eq!(ring.event(0), None);
         assert_eq!(
             [1, 2, 3, 4].map(|value| ring.event(value)),
             [Some(10), Some(11), Some(12), Some(10)]
         );
+    }
+
+    #[test]
+    fn a_wait_is_refused_for_a_marker_not_issued_or_older_than_the_ring() {
+        let ring = EventRing::new(vec![10, 11, 12]);
+        let marker = |value| Marker { lane: LaneId(0), value };
+        assert!(matches!(
+            ring.waitable(marker(1)),
+            Err(CudaError::FutureMarker { issued: 0, .. })
+        ));
+        assert_eq!(ring.waitable(marker(0)).unwrap(), None);
+        for expected in 1..=4 {
+            assert_eq!(ring.claim(), expected);
+        }
+        // Four issued on a ring of three: marker 1 shares its event with marker 4.
+        assert!(matches!(
+            ring.waitable(marker(1)),
+            Err(CudaError::StaleMarker { ring: 3, issued: 4, .. })
+        ));
+        assert_eq!(ring.waitable(marker(2)).unwrap(), Some(11));
+        assert_eq!(ring.waitable(marker(4)).unwrap(), Some(10));
+        assert!(matches!(
+            ring.waitable(marker(5)),
+            Err(CudaError::FutureMarker { issued: 4, .. })
+        ));
     }
 }

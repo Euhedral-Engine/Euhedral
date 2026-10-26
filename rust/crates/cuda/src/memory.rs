@@ -5,9 +5,11 @@ use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
+use euhedral_graph::Marker;
+
 use crate::error::{CudaError, check};
 use crate::library::CudaLibrary;
-use crate::submission::Submission;
+use crate::submission::{Submission, capture_selected};
 
 /// A device address, opaque to the host. Zero is null.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -42,8 +44,10 @@ pub struct AllocationId(pub u64);
 
 /// A device allocation, freed on drop.
 ///
-/// Dropping a buffer frees it with `cudaFree`, which waits for the device. Free long-lived buffers at shutdown;
-/// [`DeviceBuffer::free_async`] frees a stream-ordered buffer on its lane without waiting.
+/// Dropping a buffer frees it at once with `cudaFree`, which waits for the device (and the memory may still be in use
+/// by queued work only if the caller dropped it too early: nothing here tracks its readers). Free long-lived buffers
+/// at shutdown. To free without waiting, retire the buffer with the marker of its last use
+/// ([`RetireList`](crate::RetireList)), or free it in stream order with [`DeviceBuffer::free_async`].
 #[derive(Debug)]
 pub struct DeviceBuffer {
     library: Arc<CudaLibrary>,
@@ -95,11 +99,15 @@ impl DeviceBuffer {
     }
 
     /// Frees the buffer in stream order on the submission's lane: the memory returns to the pool once the lane
-    /// reaches this point, after every reader queued before it. A buffer allocated with [`DeviceBuffer::alloc`] is
-    /// freed in stream order too.
-    pub fn free_async(mut self, submission: &Submission<'_>) -> Result<(), CudaError> {
+    /// reaches this point, after every reader queued before it on that lane. `readers` are the markers of the last
+    /// uses on other lanes; the free waits for each on the device first, so a reader on another lane never sees
+    /// reused memory. Pass every lane that still reads the buffer.
+    pub fn free_async(mut self, submission: &Submission<'_>, readers: &[Marker]) -> Result<(), CudaError> {
         if submission.lane().is_capturing() {
             return Err(CudaError::Capturing("a stream-ordered free"));
+        }
+        for reader in readers {
+            submission.wait(*reader)?;
         }
         // SAFETY: the address is this buffer's live allocation, and the submission has selected a stream.
         let status = unsafe { self.library.api().euhedral_cuda_free_async(self.ptr().as_mut()) };
@@ -131,6 +139,9 @@ impl DeviceBuffer {
     /// Copies `host` into the buffer at `offset` and returns when the copy is done. Startup, shutdown and tests: it
     /// blocks, and outside a submission it runs on the legacy stream, which does not order against lane work.
     pub fn copy_from_host(&self, offset: usize, host: &[u8]) -> Result<(), CudaError> {
+        if capture_selected() {
+            return Err(CudaError::Capturing("a blocking host copy"));
+        }
         let destination = self.range(offset, host.len())?;
         // SAFETY: `destination` lies inside this allocation and `host` is a live slice of the stated length.
         let status = unsafe {
@@ -146,6 +157,9 @@ impl DeviceBuffer {
     /// Copies `host.len()` bytes from the buffer at `offset` and returns when the copy is done. See
     /// [`DeviceBuffer::copy_from_host`].
     pub fn copy_to_host(&self, offset: usize, host: &mut [u8]) -> Result<(), CudaError> {
+        if capture_selected() {
+            return Err(CudaError::Capturing("a blocking host copy"));
+        }
         let source = self.range(offset, host.len())?;
         // SAFETY: `source` lies inside this allocation and `host` is a live exclusive slice of the stated length.
         let status = unsafe {
@@ -268,7 +282,13 @@ impl PinnedBuffer {
     }
 
     /// The address at which the device reads and writes this memory.
-    pub fn device_address(&self) -> Result<DevicePtr, CudaError> {
+    ///
+    /// # Safety
+    /// Device work through the address races with the host's references to the same bytes ([`PinnedBuffer::as_slice`],
+    /// [`PinnedBuffer::as_mut_slice`] and the pointers). The caller must keep the buffer alive until that work has
+    /// retired, and touch the bytes the device accesses only through atomics ([`PinnedBuffer::word`]) or after the
+    /// work retires.
+    pub unsafe fn device_address(&self) -> Result<DevicePtr, CudaError> {
         device_address(&self.library, self.pointer.as_ptr().cast_const().cast())
     }
 }
@@ -339,7 +359,12 @@ impl HostWeightsArena {
     }
 
     /// The address at which kernels read this memory in place.
-    pub fn device_address(&self) -> Result<DevicePtr, CudaError> {
+    ///
+    /// # Safety
+    /// Kernels read the arena through the address while the host may write it ([`HostWeightsArena::as_mut_slice`]).
+    /// The caller must keep the arena alive until every such kernel has retired, and not write bytes a pending kernel
+    /// reads.
+    pub unsafe fn device_address(&self) -> Result<DevicePtr, CudaError> {
         device_address(&self.library, self.pointer.as_ptr().cast_const().cast())
     }
 }
@@ -356,6 +381,8 @@ impl Drop for HostWeightsArena {
     }
 }
 
+/// The device address of registered host memory. Taking the address is harmless; the callers' `unsafe` is about what
+/// the device does through it.
 fn device_address(library: &CudaLibrary, host: *const c_void) -> Result<DevicePtr, CudaError> {
     let mut device = 0u64;
     // SAFETY: `host` is the start of a live registered allocation and `device` is a live local.
