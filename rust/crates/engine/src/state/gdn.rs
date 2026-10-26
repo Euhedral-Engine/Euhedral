@@ -3,6 +3,7 @@
 //! ReplaySSM).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, Submission, ops};
 
@@ -37,7 +38,9 @@ pub struct GdnState {
     recurrent: DeviceBuffer,
     speculative: Option<GdnSpeculative>,
     /// Verified rows the next quantum must replay from the checkpoint before touching this state.
-    pending_replay_rows: u32,
+    /// An atomic: the stages of a quantum read and clear it through a shared reference, and the sequence's owner
+    /// sets it between quanta.
+    pending_replay_rows: AtomicU32,
 }
 
 impl GdnState {
@@ -58,16 +61,16 @@ impl GdnState {
 
     /// Verified rows the next quantum must replay.
     pub fn pending_replay_rows(&self) -> u32 {
-        self.pending_replay_rows
+        self.pending_replay_rows.load(Ordering::Acquire)
     }
 
     /// After a verification committed `rows` of its rows: replay them from the checkpoint before the state is next
     /// used, or nothing when every row was committed (0).
-    pub fn set_pending_replay_rows(&mut self, rows: u32) -> Result<(), &'static str> {
+    pub fn set_pending_replay_rows(&self, rows: u32) -> Result<(), &'static str> {
         if rows > 0 && self.speculative.is_none() {
             return Err("a state with no speculative buffers has nothing to replay from");
         }
-        self.pending_replay_rows = rows;
+        self.pending_replay_rows.store(rows, Ordering::Release);
         Ok(())
     }
 
@@ -144,7 +147,7 @@ impl GdnStates {
                 convolution,
                 recurrent,
                 speculative,
-                pending_replay_rows: 0,
+                pending_replay_rows: AtomicU32::new(0),
             }));
         }
         Ok(GdnStates { layers })

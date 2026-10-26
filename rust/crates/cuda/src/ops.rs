@@ -121,6 +121,30 @@ pub unsafe fn copy_device_to_readback(
     )
 }
 
+/// Queues the copy of `bytes` device bytes into a pinned buffer at `offset`, for a buffer the host shares by `&`: the
+/// host reads it only through [`PinnedBuffer::word`], and only once the lane's work up to this copy has retired
+/// ([`copy_device_to_readback`] is the exclusive form).
+///
+/// # Safety
+/// The copy runs after this call returns. `destination` must stay alive until the lane's work up to this copy has
+/// retired, and the host must not access its bytes in that range, other than through [`PinnedBuffer::word`], before
+/// then. No other copy may write the range meanwhile.
+pub unsafe fn copy_device_to_readback_shared(
+    submission: &Submission<'_>,
+    destination: &PinnedBuffer,
+    offset: usize,
+    source: DevicePtr,
+    bytes: usize,
+) -> Result<(), CudaError> {
+    let start = pinned_range(destination, offset, bytes)?;
+    // SAFETY: the range is inside the pinned buffer, which the caller keeps alive; the caller's contract keeps the
+    // host's accesses atomic until the copy has retired.
+    entry!(
+        submission,
+        euhedral_cuda_copy_device_to_readback(start.cast_mut().cast(), source.as_const(), bytes as u64)
+    )
+}
+
 /// Queues the copy of `bytes` bytes at `offset` of a host-weights arena to the device.
 ///
 /// # Safety
@@ -223,6 +247,15 @@ pub fn copy_device_to_device_2d(
 
 pub fn zero_device_memory(submission: &Submission<'_>, address: DevicePtr, bytes: u64) -> Result<(), CudaError> {
     entry!(submission, euhedral_cuda_zero_device_memory(address.as_mut(), bytes))
+}
+
+/// Selects row-exact execution for the launches queued after this call on the calling thread (the `row_exact`
+/// of the submission's [`SubmitMode`](crate::SubmitMode) is selected when it begins and cleared when it ends).
+/// A stage that must run part of its work row-exact, and the rest as its quantum does, selects around that part
+/// and then restores the submission's mode.
+pub fn select_row_exact(submission: &Submission<'_>, enabled: bool) {
+    // SAFETY: the call sets this thread's launch state, which the submission's drop clears.
+    unsafe { submission.api().euhedral_cuda_row_exact_select(i32::from(enabled)) }
 }
 
 // Stream flags.
@@ -449,6 +482,35 @@ pub fn attention_kv_append_nvfp4(
     )
 }
 
+/// As [`attention_kv_append_nvfp4`] into BF16 pages: each head row stored as computed, 512 bytes.
+pub fn attention_kv_append_bf16(
+    submission: &Submission<'_>,
+    query_key: DevicePtr,
+    gate: DevicePtr,
+    keys: DevicePtr,
+    values: DevicePtr,
+    rows: u32,
+    query_width: u32,
+    key_width: u32,
+    start: u64,
+    position: DevicePtr,
+) -> Result<(), CudaError> {
+    entry!(
+        submission,
+        euhedral_cuda_attention_kv_append_bf16(
+            query_key.as_const(),
+            gate.as_const(),
+            keys.as_mut(),
+            values.as_mut(),
+            rows,
+            query_width,
+            key_width,
+            start,
+            position.as_const(),
+        )
+    )
+}
+
 /// Causal attention over NVFP4 pages. `scratch` holds `query_heads * 64 * 258` FP32 elements for single-token decode
 /// and is null for prefill.
 pub fn attention_causal_nvfp4(
@@ -470,6 +532,43 @@ pub fn attention_causal_nvfp4(
     entry!(
         submission,
         euhedral_cuda_attention_causal_nvfp4(
+            query_key.as_const(),
+            gate.as_const(),
+            keys.as_const(),
+            values.as_const(),
+            output.as_mut(),
+            rows,
+            query_heads,
+            key_heads,
+            head_dim,
+            cache_length,
+            start,
+            position.as_const(),
+            scratch.as_mut(),
+        )
+    )
+}
+
+/// As [`attention_causal_nvfp4`] over BF16 pages.
+pub fn attention_causal_bf16(
+    submission: &Submission<'_>,
+    query_key: DevicePtr,
+    gate: DevicePtr,
+    keys: DevicePtr,
+    values: DevicePtr,
+    output: DevicePtr,
+    rows: u32,
+    query_heads: u32,
+    key_heads: u32,
+    head_dim: u32,
+    cache_length: u32,
+    start: u64,
+    position: DevicePtr,
+    scratch: DevicePtr,
+) -> Result<(), CudaError> {
+    entry!(
+        submission,
+        euhedral_cuda_attention_causal_bf16(
             query_key.as_const(),
             gate.as_const(),
             keys.as_const(),
