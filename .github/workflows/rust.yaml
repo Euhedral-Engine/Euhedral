@@ -31,7 +31,6 @@ jobs:
       cancel-in-progress: true
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-      RUSTEE_DEPLOY_KEY: ${{ secrets.RUSTEE_DEPLOY_KEY }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -41,12 +40,6 @@ jobs:
           install: true
           install_args: rust
           cache: true
-      # RustEE is private. Runs without the secret (pull requests from forks) build without the key, which is enough
-      # while no crate depends on RustEE.
-      - uses: webfactory/ssh-agent@v0.10.0
-        if: env.RUSTEE_DEPLOY_KEY != ''
-        with:
-          ssh-private-key: ${{ secrets.RUSTEE_DEPLOY_KEY }}
       - name: Cache cargo registry, git checkouts and build output
         uses: actions/cache@v6.1.0
         with:

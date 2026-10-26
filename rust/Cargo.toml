@@ -8,7 +8,7 @@ rust-version = "1.99.1"
 publish = false
 
 # The RustEE crates (euhedral-core, euhedral-graph, euhedral-hardware-utils, euhedral-hashing) join
-# [workspace.dependencies] as git dependencies pinned by `rev` once CI can fetch the private repository.
+# [workspace.dependencies] as git dependencies pinned by `rev` when the first crate uses them.
 [workspace.dependencies]
 tempfile = "3.27"
 
