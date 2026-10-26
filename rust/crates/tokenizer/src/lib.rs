@@ -8,6 +8,7 @@
 mod byte_level;
 mod error;
 mod files;
+mod lossy;
 mod stream;
 mod tokenizer;
 

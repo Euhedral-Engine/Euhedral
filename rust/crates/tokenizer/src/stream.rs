@@ -1,4 +1,5 @@
 use crate::error::TokenizerError;
+use crate::lossy::decode_lossy;
 
 /// What the vocabulary holds for one token ID.
 #[derive(Debug, Clone)]
@@ -65,7 +66,7 @@ impl<'a> TokenStream<'a> {
     }
 
     fn flush(&mut self) -> String {
-        let text = String::from_utf8_lossy(&self.pending).into_owned();
+        let text = decode_lossy(&self.pending);
         self.pending.clear();
         text
     }
@@ -75,7 +76,7 @@ impl<'a> TokenStream<'a> {
         if safe == 0 {
             return String::new();
         }
-        let text = String::from_utf8_lossy(&self.pending[..safe]).into_owned();
+        let text = decode_lossy(&self.pending[..safe]);
         self.pending.drain(..safe);
         text
     }
@@ -186,6 +187,15 @@ mod tests {
         let mut stream = TokenStream::new(&pieces);
         assert_eq!(stream.push(4).unwrap(), "\u{fffd}");
         assert_eq!(stream.push(0).unwrap(), "A");
+    }
+
+    #[test]
+    fn a_surrogate_encoding_is_one_replacement_character_as_in_java() {
+        let bytes = |bytes: &[u8]| Piece::Bytes(bytes.into());
+        let pieces = vec![bytes(&[0xed]), bytes(&[0xa0]), bytes(&[0x80]), bytes(b"A")];
+        assert_eq!(stream_all(&pieces, &[0, 1, 2]), "\u{fffd}");
+        assert_eq!(stream_all(&pieces, &[0, 1, 3]), "\u{fffd}A");
+        assert_eq!(stream_all(&pieces, &[0, 1]), "\u{fffd}");
     }
 
     #[test]
