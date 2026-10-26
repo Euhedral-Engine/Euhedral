@@ -404,6 +404,13 @@ impl HostWeightsArena {
         self.pointer.as_ptr()
     }
 
+    /// The start of the arena as a pointer the device may write through. The arena's owner promises not to read or
+    /// write the bytes a queued device copy writes until it has retired; this crate's copy operations are the only
+    /// callers.
+    pub(crate) fn device_writable_ptr(&self) -> *mut u8 {
+        self.pointer.as_ptr()
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }

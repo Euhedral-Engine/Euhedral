@@ -5,4 +5,5 @@ pub mod error;
 pub mod formats;
 pub mod model;
 pub mod residency;
+pub mod state;
 pub mod workspace;
