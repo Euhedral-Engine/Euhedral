@@ -597,6 +597,10 @@ impl<L: Launch> StageLaunch for L {
 /// A lane held by another submission answers [`StageError::Retry`], before anything was queued; every other failure
 /// is fatal to the quantum.
 pub fn run_eager<L: Launch>(stage: &L, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+    // Standing alone, a stage has no lane to end: with nothing to launch it queues nothing.
+    if stage.idle(quantum) {
+        return Ok(Submitted::done());
+    }
     run_stage(stage, quantum, cx, true)
 }
 

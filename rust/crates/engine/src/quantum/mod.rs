@@ -230,10 +230,9 @@ impl Quantum {
         if let Some(selection) = &self.selection {
             generations.push(selection.generation());
         }
-        for source in [KvSource::Base, KvSource::Mtp] {
-            if let Some(view) = self.seq.kv(source) {
-                view.generations(&mut generations);
-            }
+        // Only the cache the quantum's attention reads: the MTP cache growing does not change a base quantum's graph.
+        if let Some(view) = self.attention_source().and_then(|source| self.seq.kv(source)) {
+            view.generations(&mut generations);
         }
         generations
     }

@@ -181,6 +181,13 @@ impl GraphCache {
             .count()
     }
 
+    /// The keys the cache holds, each with whether its graph is recorded.
+    pub fn keys(&self) -> impl Iterator<Item = (&CaptureKey, bool)> {
+        self.entries
+            .iter()
+            .map(|(key, entry)| (key, entry.slot.graph().is_some()))
+    }
+
     /// Keys released to make room or because the sequence passed their geometry.
     pub fn evictions(&self) -> u64 {
         self.evictions

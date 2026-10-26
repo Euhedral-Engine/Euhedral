@@ -46,7 +46,7 @@ use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{
     LayerIndex, LayerKind, MTP_ATTENTION_PACK, ModelConfig, Role, WeightRef, object_key,
 };
-use euhedral_inference_engine::plan::{Formats, Plan, WeightLookup};
+use euhedral_inference_engine::plan::{Formats, Plan, View, WeightLookup};
 use euhedral_inference_engine::quantum::{Admission, CaptureKey, Executor, GraphCache};
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, nvfp4, plan as residency_plan};
 use euhedral_inference_engine::stages::attention::KvSource;
@@ -189,6 +189,20 @@ fn load_model(artifact: &mut Artifact, library: &Arc<CudaLibrary>, lane: &CudaLa
     }
 }
 
+/// The reduced model, loaded once for the tests of this binary: its weights are read-only, so every test's world
+/// reads the same buffers (each test still owns its library, lanes, lattice and workspace). It is never freed.
+fn shared_model() -> Option<&'static Model> {
+    static SHARED: OnceLock<Option<Model>> = OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            let library = library()?;
+            let mut artifact = Artifact::open()?;
+            let loader = CudaLane::new(&library, LaneId(63), 16).unwrap();
+            Some(load_model(&mut artifact, &library, &loader))
+        })
+        .as_ref()
+}
+
 /// A lattice, the lanes and the plan: what a test's quanta run on.
 struct World {
     library: Arc<CudaLibrary>,
@@ -206,17 +220,14 @@ struct World {
     lattice: Arc<ControlPlaneLattice>,
     lake: Arc<Lake>,
     unit: Option<UnitGuard>,
-    _model: Model,
 }
 
 impl World {
     fn open() -> Option<World> {
+        let model = shared_model()?;
         let library = library()?;
-        let mut artifact = Artifact::open()?;
         let config = reduced_config();
         let residency = residency_plan(&rco_config(), &common::rco_table(), &common::settings(8192), 15 << 30).unwrap();
-        let loader = CudaLane::new(&library, LaneId(63), 16).unwrap();
-        let model = load_model(&mut artifact, &library, &loader);
         let formats = Formats::new(
             Arc::new(TrellisLinear::from_settings(
                 &TrellisKernelSettings::default(),
@@ -289,7 +300,6 @@ impl World {
             lattice,
             lake,
             unit: Some(unit),
-            _model: model,
         })
     }
 
@@ -615,8 +625,9 @@ impl Run {
             self.replayed[index] += 1;
         }
         self.recorded += usize::from(started.recording);
-        let (quantum, outcome) = waiting.wait();
+        // Nothing is chained to this quantum: its reference is not held, or it would never retire.
         drop(started);
+        let (quantum, outcome) = waiting.wait();
         assert_eq!(outcome, QuantumOutcome::Completed, "{step:?} at {start}");
 
         let keys: Vec<u64> = (0..logits_rows)
@@ -740,17 +751,22 @@ fn replay_equals_stage_by_stage() {
     );
     assert_eq!(reference.replayed, [0; 3], "the reference never replays");
     assert_eq!(reference.recorded, 0, "the reference never records");
-    // Each key is seen, recorded on its second sight while the quantum runs, and replayed from the third: of the
-    // 13 decode quanta, 12 verifications and 6 drafts at least these replay.
+    // A key is run stage by stage on its first sight, recorded on its second (while that quantum runs) and replayed
+    // from the third. Decode: 4 at positions 16 to 21, 3 after the replayed rows at 34 to 36, 1 at the next span.
+    // Verification: rows 3 at 22 to 31 twice, rows 5 and rows 2 once each (the 5-row quanta cross a span). Drafts: the first reserves the MTP cache's first page and has no key, then 3 replays after the sight and the recording.
     let [decode, verify, draft] = captured.replayed;
-    assert!(decode >= 6, "decode: {decode} replays");
-    assert!(verify >= 6, "verification: {verify} replays");
-    assert!(draft >= 3, "draft: {draft} replays");
-    assert!(captured.recorded >= 6, "{} graphs were recorded", captured.recorded);
-    assert!(
-        captured.cache.recorded() >= 6,
-        "decode, verifications and drafts have graphs"
+    assert_eq!(
+        [decode, verify, draft],
+        [8, 3, 3],
+        "replays of decode, verification and draft quanta"
     );
+    // Decode at 17 and at 62, verification of 3 rows at 25, of 5 rows at 40 (its first sight was the quantum that
+    // accepted two rows) and at 50, of 2 rows at 57, and the draft at 2.
+    assert_eq!(captured.recorded, 7, "graphs recorded beside their second sights");
+    // The sequence has passed the first span of decode and of the 5-row verification, whose graphs were released;
+    // decode, 3 and 5 and 2 rows of verification and the draft keep theirs.
+    assert_eq!(captured.cache.recorded(), 5, "graphs the cache holds at the end");
+    assert!(captured.cache.evictions() >= 2, "the passed geometries were released");
     println!(
         "{} quanta, {} keyed, replayed {:?} (decode, verification, draft), {} recorded",
         scenario().len(),
@@ -860,6 +876,58 @@ fn a_graph_is_replayed_only_after_its_recording_finished() {
     run.step(&world, Step::Decode);
     assert_eq!((run.recorded, run.replayed[0]), (1, 1));
     run.close(&world);
+    world.close();
+}
+
+/// The device memory a recorded graph holds: the free device memory before and after the quantum that records it, for
+/// twenty geometries of decode and of a 3-row verification (the model of this test has four layers; the 64-layer
+/// model's graphs have about 16 times the nodes). `cudaMemGetInfo` counts in steps of 2 MiB, so the mean over many
+/// graphs is the figure. Run alone: any other process's allocations are in the difference.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact; run alone"]
+fn a_recorded_graph_holds_device_memory_that_is_measured() {
+    const GEOMETRIES: u64 = 20;
+    let Some(world) = World::open() else { return };
+    let free = || world.library.free_bytes().unwrap() as i64;
+    let mut report = Vec::new();
+    for (name, step) in [
+        ("decode", Step::Decode),
+        ("verification of 3 rows", Step::Verify { rows: 3, commit: 3 }),
+    ] {
+        let mut run = Run::new(&world, GraphCache::with_capacity(8));
+        run.step(&world, Step::Prefill(16));
+        // Warm: the kernels this view launches are loaded by the first quanta.
+        for _ in 0..3 {
+            run.step(&world, step);
+        }
+        let mut held = 0i64;
+        for geometry in 1..=GEOMETRIES {
+            // A position inside a span of 48 keys and off every page boundary (a quantum that grows the cache is not recorded).
+            let mut position = 48 * geometry + 60;
+            if position % 256 > 249 {
+                position += 8;
+            }
+            run.skip_to(&world, position);
+            run.step(&world, step);
+            let before = free();
+            run.step(&world, step);
+            held += before - free();
+            assert!(
+                run.recorded as u64 > geometry,
+                "{name}: the second quantum of a geometry records"
+            );
+        }
+        report.push(format!(
+            "{name}: {} KiB a graph on average over {GEOMETRIES} graphs",
+            held / 1024 / GEOMETRIES as i64
+        ));
+        run.close(&world);
+    }
+    println!(
+        "device memory a recorded graph holds ({} stages in the 4-layer model's decode view): {}",
+        world.plan.stages(View::Decode).map_or(0, <[_]>::len),
+        report.join("; ")
+    );
     world.close();
 }
 
@@ -1041,6 +1109,7 @@ fn the_row_exact_mode_is_part_of_the_capture_key() {
     let mut sequence = light.sequence(1024, 1);
     let first = light.quantum(&mut sequence, QuantumKind::Decode, 1, 0, false);
     assert!(first.capture_key().is_none(), "the first reservation allocates");
+    drop(first);
     sequence.kv.commit(1).unwrap();
     let decode = light.quantum(&mut sequence, QuantumKind::Decode, 1, 1, false);
     let decode = decode
