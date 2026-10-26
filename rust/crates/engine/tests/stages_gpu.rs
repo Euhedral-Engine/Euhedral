@@ -20,6 +20,9 @@
     reason = "a test reports the error it measured against its reference"
 )]
 
+#[path = "common/linear_gpu.rs"]
+mod linear_gpu;
+
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::slice;
@@ -35,21 +38,22 @@ use euhedral_graph::{
     Submitted,
 };
 use euhedral_inference_cuda::{
-    CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, PinnedPool, Submission, SubmitMode, ops,
+    CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, GraphRecorder, PinnedPool, Submission, SubmitMode, ops,
 };
 use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorDataType, WeightFormat, WeightLayout};
-use euhedral_inference_engine::formats::{LinearFormat, LinearMode, ScratchRegion};
+use euhedral_inference_engine::formats::{LinearFormat, LinearMode, Q3Embedding, ScratchRegion};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{ModelConfig, WeightRef};
 use euhedral_inference_engine::stages::attention::{AttentionCausal, KvAppend, KvSource, QkNormRope};
 use euhedral_inference_engine::stages::elementwise::{ResidualAdd, Swiglu};
+use euhedral_inference_engine::stages::embed::Embed;
 use euhedral_inference_engine::stages::gdn::{GdnConvolution, GdnGatedRmsNorm, GdnProjectControl, GdnRecurrence};
 use euhedral_inference_engine::stages::linear::{Linear, LinearRows};
 use euhedral_inference_engine::stages::mtp::MtpStem;
 use euhedral_inference_engine::stages::norm::{NormRows, ResidualRmsNorm, RmsNormUnitOffset};
 use euhedral_inference_engine::stages::sampling::{Argmax, SelectedRows, SelectedToken, Selection};
 use euhedral_inference_engine::stages::{
-    DraftSeed, DraftTokenWrite, InputRecordRef, LaneTable, Quantum, QuantumKind, SequenceRefs,
+    DraftSeed, DraftTokenWrite, InputRecordRef, LaneTable, Launch, Quantum, QuantumError, QuantumKind, SequenceRefs,
 };
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
@@ -1512,4 +1516,592 @@ fn a_completion_edge_after_the_argmax_finds_its_keys_on_the_host() {
     lattice.close();
     assert_eq!(parts[1], Some(1), "the quantum completed");
     assert_eq!(parts[0].map(|key| key & 0xFFFF_FFFF), Some(0xFFFF_FFFF - 4242));
+}
+
+// Independent references for the GDN convolution and recurrence and for the Q/K norm with RoPE, at the model's
+// dimensions. The tolerances are those of the Java operation tests (`LayerGpuOperationsIntegrationTest`,
+// `AttentionCudaIntegrationTest`): 0.004 on the convolution (its state exactly), 0.008 on the recurrence output and
+// 1e-4 on its state, 0.012 on the rotated rows.
+
+fn silu(x: f64) -> f64 {
+    x / (1.0 + (-x).exp())
+}
+
+/// The bf16 values of `values` as the device sees them.
+fn rounded(values: &[f32]) -> Vec<f32> {
+    bf16_values(&bf16_bytes(values))
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn gdn_convolution_matches_the_host_reference_and_carries_the_tail() {
+    let Some(rig) = rig() else { return };
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
+    let workspace = rig.workspace(&config, 8, 8, &[]);
+    let (rows, kernel) = (3usize, config.linear_conv_kernel_dim);
+    let (qk_width, value_width, channels) = (
+        config.gdn_query_key_width(),
+        config.gdn_value_width(),
+        config.gdn_convolution_channels(),
+    );
+    let mut rng = Rng(0x5eed_0001);
+    let query_key = rounded(&rng.values(rows * qk_width, 0.25));
+    let value_z = rounded(&rng.values(rows * 2 * value_width, 0.25));
+    let weights = rounded(&rng.values(kernel * channels, 0.2));
+    let initial = rounded(&rng.values(channels * (kernel - 1), 0.25));
+    put(&workspace, BufferSlot::QkProjected, 0, &bf16_bytes(&query_key));
+    put(&workspace, BufferSlot::ValueZProjected, 0, &bf16_bytes(&value_z));
+    let weight_buffer = upload(&rig.library, &bf16_bytes(&weights));
+    let state = sequence.device.gdn.layer(0).unwrap().convolution();
+    state.copy_from_host(0, &bf16_bytes(&initial)).unwrap();
+    let stage = GdnConvolution::new(
+        0,
+        BufferSlot::QkProjected,
+        BufferSlot::ValueZProjected,
+        weight_buffer.ptr(),
+        BufferSlot::GdnConvolved,
+    );
+    let quantum = rig.quantum(QuantumKind::Prefill, rows, 0, &workspace, &sequence, &config);
+    assert!(rig.run(&stage, &quantum).is_some());
+    rig.sync();
+
+    let input = |row: usize, channel: usize| -> f32 {
+        if channel < qk_width {
+            query_key[row * qk_width + channel]
+        } else {
+            value_z[row * 2 * value_width + channel - qk_width]
+        }
+    };
+    let mut expected = vec![0f32; rows * channels];
+    let mut tail = vec![0f32; channels * (kernel - 1)];
+    for channel in 0..channels {
+        for row in 0..rows {
+            let mut sum = 0f64;
+            for tap in 0..kernel {
+                let source = (row + tap) as isize - (kernel as isize - 1);
+                let value = if source < 0 {
+                    initial[channel * (kernel - 1) + (source + kernel as isize - 1) as usize]
+                } else {
+                    input(source as usize, channel)
+                };
+                sum += f64::from(value) * f64::from(weights[tap * channels + channel]);
+            }
+            expected[row * channels + channel] = silu(sum) as f32;
+        }
+        for history in 0..kernel - 1 {
+            let source = (rows + history) as isize - (kernel as isize - 1);
+            tail[channel * (kernel - 1) + history] = if source < 0 {
+                initial[channel * (kernel - 1) + (source + kernel as isize - 1) as usize]
+            } else {
+                input(source as usize, channel)
+            };
+        }
+    }
+    let got = bf16_values(&get(&workspace, BufferSlot::GdnConvolved, 0, rows * channels * 2));
+    assert_close("the convolution", &got, &expected, 0.0, 0.004);
+    assert_eq!(
+        bf16_values(&download(state)),
+        tail,
+        "the state carries the last rows of the input"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn gdn_recurrence_matches_the_host_reference() {
+    let Some(rig) = rig() else { return };
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
+    let workspace = rig.workspace(&config, 8, 8, &[]);
+    let rows = 2usize;
+    let (key_heads, value_heads, dim) = (
+        config.linear_num_key_heads,
+        config.linear_num_value_heads,
+        config.linear_key_head_dim,
+    );
+    let (qk_width, value_width) = (config.gdn_query_key_width(), config.gdn_value_width());
+    let channels = config.gdn_convolution_channels();
+    let mut rng = Rng(0x5eed_0002);
+    let convolved = rounded(&rng.values(rows * channels, 1.0));
+    let alpha: Vec<f32> = (0..rows * value_heads)
+        .map(|_| 0.7 + 0.29 * (rng.next() * 0.5 + 0.5))
+        .collect();
+    let beta: Vec<f32> = (0..rows * value_heads)
+        .map(|_| 0.2 + 0.6 * (rng.next() * 0.5 + 0.5))
+        .collect();
+    let initial = rng.values(value_heads * dim * dim, 0.05);
+    put(&workspace, BufferSlot::GdnConvolved, 0, &bf16_bytes(&convolved));
+    put(&workspace, BufferSlot::GdnAlpha, 0, &f32_bytes(&alpha));
+    put(&workspace, BufferSlot::GdnBeta, 0, &f32_bytes(&beta));
+    let state = sequence.device.gdn.layer(0).unwrap().recurrent();
+    state.copy_from_host(0, &f32_bytes(&initial)).unwrap();
+    let stage = GdnRecurrence::new(
+        0,
+        BufferSlot::GdnConvolved,
+        BufferSlot::GdnAlpha,
+        BufferSlot::GdnBeta,
+        BufferSlot::GdnRecurrent,
+    );
+    let quantum = rig.quantum(QuantumKind::Prefill, rows, 0, &workspace, &sequence, &config);
+    assert!(rig.run(&stage, &quantum).is_some());
+    rig.sync();
+
+    let scale = 1.0 / (dim as f64).sqrt();
+    let normalized = |at: usize| -> Vec<f64> {
+        let row = &convolved[at..at + dim];
+        let inverse = 1.0 / (row.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() + 1e-6).sqrt();
+        row.iter().map(|x| f64::from(*x) * inverse).collect()
+    };
+    let mut state_ref: Vec<f64> = initial.iter().map(|x| f64::from(*x)).collect();
+    let mut expected = vec![0f32; rows * value_width];
+    for row in 0..rows {
+        for head in 0..value_heads {
+            let key_head = head / (value_heads / key_heads);
+            let query = normalized(row * channels + key_head * dim);
+            let key = normalized(row * channels + key_heads * dim + key_head * dim);
+            let a = f64::from(alpha[row * value_heads + head]);
+            let b = f64::from(beta[row * value_heads + head]);
+            for dv in 0..dim {
+                let at = (head * dim + dv) * dim;
+                let dot: f64 = (0..dim).map(|k| state_ref[at + k] * key[k]).sum();
+                let value = f64::from(convolved[row * channels + qk_width + head * dim + dv]);
+                let delta = b * (value - a * dot);
+                let mut out = 0.0;
+                for k in 0..dim {
+                    state_ref[at + k] = a * state_ref[at + k] + delta * key[k];
+                    out += state_ref[at + k] * query[k];
+                }
+                expected[row * value_width + head * dim + dv] = (out * scale) as f32;
+            }
+        }
+    }
+    let got = bf16_values(&get(&workspace, BufferSlot::GdnRecurrent, 0, rows * value_width * 2));
+    assert_close("the recurrence output", &got, &expected, 0.0, 0.008);
+    let got_state: Vec<f32> = download(state)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| f32::from_ne_bytes(*word))
+        .collect();
+    let want_state: Vec<f32> = state_ref.iter().map(|x| *x as f32).collect();
+    assert_close("the recurrent state", &got_state, &want_state, 0.0, 1e-4);
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn qk_norm_rope_matches_the_host_reference() {
+    let Some(rig) = rig() else { return };
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
+    let workspace = rig.workspace(&config, 8, 8, &[]);
+    let (rows, start) = (3usize, 1234u64);
+    let (query_heads, key_heads, head_dim) = (
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        config.attention_head_dim,
+    );
+    // Everything below comes from the config: the partial rotary dimension, the theta and the head counts.
+    let rotary = (head_dim as f64 * config.partial_rotary_factor + 0.5).floor() as usize;
+    let width = (query_heads + key_heads) * head_dim;
+    let mut rng = Rng(0x5eed_0003);
+    let input = rounded(&rng.values(rows * width, 0.6));
+    let query_norm = rounded(&(0..head_dim).map(|i| 0.02 * (i % 9) as f32 - 0.08).collect::<Vec<_>>());
+    let key_norm = rounded(
+        &(0..head_dim)
+            .map(|i| -0.015 * (i % 9) as f32 + 0.06)
+            .collect::<Vec<_>>(),
+    );
+    put(&workspace, BufferSlot::QkProjected, 0, &bf16_bytes(&input));
+    let query_buffer = upload(&rig.library, &bf16_bytes(&query_norm));
+    let key_buffer = upload(&rig.library, &bf16_bytes(&key_norm));
+    let stage = QkNormRope::new(
+        BufferSlot::QkProjected,
+        BufferSlot::AttentionQkNormalized,
+        query_buffer.ptr(),
+        key_buffer.ptr(),
+    );
+    let quantum = rig.quantum(QuantumKind::Prefill, rows, start, &workspace, &sequence, &config);
+    assert!(rig.run(&stage, &quantum).is_some());
+    rig.sync();
+
+    let mut expected = vec![0f32; rows * width];
+    for row in 0..rows {
+        for head in 0..query_heads + key_heads {
+            let at = row * width + head * head_dim;
+            let weights = if head < query_heads { &query_norm } else { &key_norm };
+            let squares: f64 = input[at..at + head_dim].iter().map(|x| f64::from(*x).powi(2)).sum();
+            let inverse = 1.0 / (squares / head_dim as f64 + config.rms_norm_epsilon).sqrt();
+            let normalized: Vec<f64> = (0..head_dim)
+                .map(|d| f64::from(input[at + d]) * inverse * (1.0 + f64::from(weights[d])))
+                .collect();
+            let half = rotary / 2;
+            for d in 0..head_dim {
+                expected[at + d] = if d < rotary {
+                    let frequency = if d < half { d } else { d - half };
+                    let angle =
+                        (start + row as u64) as f64 * config.rope_theta.powf(-2.0 * frequency as f64 / rotary as f64);
+                    let (cosine, sine) = (angle.cos(), angle.sin());
+                    if d < half {
+                        normalized[d] * cosine - normalized[d + half] * sine
+                    } else {
+                        normalized[d] * cosine + normalized[d - half] * sine
+                    }
+                } else {
+                    normalized[d]
+                } as f32;
+            }
+        }
+    }
+    let got = bf16_values(&get(&workspace, BufferSlot::AttentionQkNormalized, 0, rows * width * 2));
+    assert_close("the rotated rows", &got, &expected, 0.0, 0.012);
+}
+
+// The quantum's mode, and the embedding stage.
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn a_quantum_runs_row_exact_if_and_only_if_it_verifies() {
+    let Some(rig) = rig() else { return };
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
+    let workspace = rig.workspace(&config, 8, 8, &[]);
+    let make = |kind, row_exact| {
+        Quantum::new(
+            kind,
+            2,
+            InputRecordRef::new(0),
+            Arc::clone(&workspace),
+            SequenceRefs::new(Arc::clone(&sequence.device)),
+            SubmitMode { pdl: false, row_exact },
+            Arc::clone(&config),
+            rig.lanes.clone(),
+        )
+    };
+    assert!(make(QuantumKind::Verify, true).is_ok());
+    assert!(make(QuantumKind::Decode, false).is_ok());
+    assert_eq!(
+        make(QuantumKind::Verify, false).unwrap_err(),
+        QuantumError::RowExact {
+            kind: QuantumKind::Verify,
+            expected: true,
+            given: false
+        }
+    );
+    assert!(make(QuantumKind::Draft, true).is_err());
+    assert!(make(QuantumKind::Prefill, true).is_err());
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
+    let Some(rig) = rig() else { return };
+    let Some(mut artifact) = linear_gpu::Artifact::open() else {
+        return;
+    };
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
+    let workspace = rig.workspace(&config, 8, 8, &[]);
+    let (_table, weight) = artifact.plain(&rig.library, "text/token_embedding");
+    let hidden = weight.shape[1] as usize;
+    assert_eq!(hidden, config.hidden_size);
+    let stage = Embed::new(weight.clone(), BufferSlot::HiddenState);
+    let tokens = &sequence.device.scratch.draft().unwrap().tokens;
+    let id_bytes = |ids: &[i32]| -> Vec<u8> { ids.iter().flat_map(|id| id.to_ne_bytes()).collect() };
+
+    // The reference: the Q3 lookup of `ids` by itself.
+    let reference = |ids: &[i32]| -> Vec<u8> {
+        let input = upload(&rig.library, &id_bytes(ids));
+        let output = DeviceBuffer::alloc(&rig.library, ids.len() * hidden * 2).unwrap();
+        rig.submit(|submission| Q3Embedding.submit(submission, &weight, input.ptr(), output.ptr(), ids.len()));
+        download(&output)
+    };
+    let looked_up = |rows: usize| get(&workspace, BufferSlot::HiddenState, 0, rows * hidden * 2);
+
+    // The ids of the input record.
+    let ids = [0, 151_643, 151_643, 42, 7];
+    put(&workspace, BufferSlot::TokenIds, 0, &id_bytes(&ids));
+    let quantum = rig.quantum(QuantumKind::Prefill, ids.len(), 0, &workspace, &sequence, &config);
+    assert!(rig.run(&stage, &quantum).is_some());
+    rig.sync();
+    assert!(
+        looked_up(ids.len()) == reference(&ids),
+        "the stage looks up what the format does"
+    );
+    assert!(
+        download(tokens)[..4] != 0i32.to_ne_bytes() || ids[0] == 0,
+        "no step token is written unasked"
+    );
+
+    // Rows that read their ids from slots 2.. of the step's tokens, and the last of them the step's current token.
+    let step = [10, 101, 202, 303, 404, 505, 606];
+    tokens.copy_from_host(0, &id_bytes(&step)).unwrap();
+    let rows = 3;
+    let quantum = rig
+        .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
+        .reading_draft_tokens(2)
+        .writing_current_token();
+    assert!(rig.run(&stage, &quantum).is_some());
+    rig.sync();
+    assert!(looked_up(rows) == reference(&step[2..5]), "ids from the step's tokens");
+    assert_eq!(get(&workspace, BufferSlot::TokenIds, 0, 12), id_bytes(&step[2..5]));
+    assert_eq!(
+        download(tokens)[..4],
+        404i32.to_ne_bytes(),
+        "slot 0 holds the last token"
+    );
+    assert_eq!(download(tokens)[4..8], 101i32.to_ne_bytes(), "the other slots stay");
+
+    // Slots past the step's tokens are refused.
+    let past = rig
+        .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
+        .reading_draft_tokens(16);
+    let cx = StageCx {
+        stage: StageId(0),
+        lane: Some(LaneId(0)),
+        waits: &[],
+        lanes: &rig.pool,
+    };
+    assert!(stage.run(&past, &cx).is_err());
+
+    // Its launch records into a graph, and the replay does what the eager launch did.
+    put(&workspace, BufferSlot::HiddenState, 0, &vec![0u8; rows * hidden * 2]);
+    let recorder = GraphRecorder::begin(&rig.lane).unwrap();
+    {
+        let submission = recorder.submission(quantum.mode()).unwrap();
+        stage.launch(&quantum, &submission).unwrap();
+    }
+    let graph = recorder.end().unwrap();
+    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
+    graph.launch(&submission).unwrap();
+    submission.finish().unwrap();
+    rig.sync();
+    assert!(
+        looked_up(rows) == reference(&step[2..5]),
+        "the replay looks up the same rows"
+    );
+}
+
+// Capture.
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn every_stage_launches_inside_a_graph_capture_and_the_replay_selects() {
+    let Some(rig) = rig() else { return };
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let (sequence, _retained) = rig.sequence(&config, 1, KvFormat::Nvfp4, 256);
+    let workspace = rig.workspace(&config, 8, 8, &[1 << 20]);
+    let selection = Arc::new(Selection::new(&rig.library, 8).unwrap());
+    let mut rng = Rng(0xcafe_0001);
+    let hidden = config.hidden_size;
+    let heads = config.linear_num_value_heads;
+
+    // Inputs for every slot the stages read, and the weights they name.
+    for (slot, width, scale) in [
+        (BufferSlot::HiddenState, hidden, 1.0),
+        (BufferSlot::MixerDelta, hidden, 1.0),
+        (BufferSlot::InputNormalized, hidden, 1.0),
+        (BufferSlot::GateUp, 2 * config.intermediate_size, 1.0),
+        (BufferSlot::QkProjected, 7168, 0.5),
+        (BufferSlot::ValueZProjected, 12_288, 0.5),
+        (BufferSlot::GdnRecurrent, config.gdn_value_width(), 1.0),
+        (BufferSlot::AttentionQkNormalized, 7168, 0.5),
+    ] {
+        put(&workspace, slot, 0, &bf16_bytes(&rng.values(width, scale)));
+    }
+    put(&workspace, BufferSlot::GdnAlpha, 0, &f32_bytes(&vec![0.9; heads]));
+    put(&workspace, BufferSlot::GdnBeta, 0, &f32_bytes(&vec![0.5; heads]));
+    let mut logits = rng.values(VOCABULARY, 1.0);
+    logits[31_337] = 8.0;
+    put(&workspace, BufferSlot::Logits, 0, &bf16_bytes(&logits));
+    let norm_weight = upload(&rig.library, &bf16_bytes(&rng.values(hidden, 0.2)));
+    let head_weight = upload(&rig.library, &bf16_bytes(&rng.values(256, 0.2)));
+    let conv_weight = upload(
+        &rig.library,
+        &bf16_bytes(&rng.values(config.gdn_convolution_channels() * 4, 0.2)),
+    );
+    let a_weight = upload(&rig.library, &bf16_bytes(&rng.values(heads * hidden, 0.05)));
+    let control = upload(&rig.library, &f32_bytes(&vec![0.1; heads]));
+    let seed = upload(&rig.library, &bf16_bytes(&rng.values(hidden, 0.5)));
+    let format = Arc::new(StubFormat {
+        calls: AtomicUsize::new(0),
+        rows: AtomicUsize::new(0),
+        flags: AtomicUsize::new(0),
+        scratch_bytes: AtomicUsize::new(0),
+        scratch_needed: 0,
+    });
+
+    // One decode quantum that selects, passes its token on and seeds drafting, with every stage of a layer's pass.
+    let quantum = rig
+        .quantum(QuantumKind::Decode, 1, 0, &workspace, &sequence, &config)
+        .with_selection(Arc::clone(&selection))
+        .with_draft_seed(DraftSeed::Address(seed.ptr()))
+        .with_draft_token_write(DraftTokenWrite {
+            slot: 1,
+            ids: DevicePtr::NULL,
+        });
+    let stages: Vec<(&str, Box<dyn LaunchOnly>)> = vec![
+        (
+            "residual add",
+            boxed(ResidualAdd::new(
+                BufferSlot::HiddenState,
+                BufferSlot::MixerDelta,
+                BufferSlot::MixerHidden,
+            )),
+        ),
+        (
+            "fused norm",
+            boxed(ResidualRmsNorm::new(
+                BufferSlot::HiddenState,
+                BufferSlot::MixerDelta,
+                norm_weight.ptr(),
+                BufferSlot::FinalHiddenState,
+                BufferSlot::PostMixerNormalized,
+            )),
+        ),
+        (
+            "norm",
+            boxed(RmsNormUnitOffset::new(
+                BufferSlot::MixerHidden,
+                BufferSlot::InputNormalized,
+                norm_weight.ptr(),
+                NormRows::All,
+            )),
+        ),
+        (
+            "final norm",
+            boxed(RmsNormUnitOffset::new(
+                BufferSlot::MixerHidden,
+                BufferSlot::FinalNormalized,
+                norm_weight.ptr(),
+                NormRows::Final,
+            )),
+        ),
+        ("swiglu", boxed(Swiglu::new(BufferSlot::GateUp, BufferSlot::Swiglu))),
+        (
+            "linear",
+            boxed(Linear::new(
+                Arc::clone(&format) as Arc<dyn LinearFormat>,
+                stub_weight(),
+                BufferSlot::InputNormalized,
+                BufferSlot::MixerDelta,
+                LinearRows::All,
+                None,
+            )),
+        ),
+        (
+            "gdn project",
+            boxed(GdnProjectControl::new(
+                BufferSlot::InputNormalized,
+                a_weight.ptr(),
+                a_weight.ptr(),
+                control.ptr(),
+                control.ptr(),
+                BufferSlot::AProjected,
+                BufferSlot::BProjected,
+            )),
+        ),
+        (
+            "gdn convolution",
+            boxed(GdnConvolution::new(
+                0,
+                BufferSlot::QkProjected,
+                BufferSlot::ValueZProjected,
+                conv_weight.ptr(),
+                BufferSlot::GdnConvolved,
+            )),
+        ),
+        (
+            "gdn recurrence",
+            boxed(GdnRecurrence::new(
+                0,
+                BufferSlot::GdnConvolved,
+                BufferSlot::GdnAlpha,
+                BufferSlot::GdnBeta,
+                BufferSlot::GdnRecurrent,
+            )),
+        ),
+        (
+            "gdn norm",
+            boxed(GdnGatedRmsNorm::new(
+                BufferSlot::GdnRecurrent,
+                BufferSlot::ValueZProjected,
+                head_weight.ptr(),
+                BufferSlot::GdnNormalized,
+            )),
+        ),
+        (
+            "qk norm rope",
+            boxed(QkNormRope::new(
+                BufferSlot::QkProjected,
+                BufferSlot::AttentionQkNormalized,
+                head_weight.ptr(),
+                head_weight.ptr(),
+            )),
+        ),
+        ("kv append", boxed(attention_append())),
+        ("attention", boxed(attention_causal())),
+        (
+            "mtp stem",
+            boxed(MtpStem::new(
+                BufferSlot::HiddenState,
+                norm_weight.ptr(),
+                norm_weight.ptr(),
+                BufferSlot::MtpNormed,
+                BufferSlot::MtpPacked,
+            )),
+        ),
+        (
+            "argmax",
+            boxed(Argmax::new(BufferSlot::Logits, VOCABULARY, SelectedRows::Last)),
+        ),
+        ("selected token", boxed(SelectedToken)),
+    ];
+
+    // Eagerly first: it loads every kernel module, which a capture cannot.
+    for (name, stage) in &stages {
+        let submission = Submission::begin(&rig.lane, quantum.mode()).unwrap();
+        stage
+            .launch_on(&quantum, &submission)
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        submission.finish().unwrap();
+        rig.sync();
+    }
+
+    // Then every launch in one capture: no begin, wait, marker or signal among them.
+    let recorder = GraphRecorder::begin(&rig.lane).unwrap();
+    {
+        let submission = recorder.submission(quantum.mode()).unwrap();
+        for (name, stage) in &stages {
+            stage
+                .launch_on(&quantum, &submission)
+                .unwrap_or_else(|error| panic!("{name} in a capture: {error:?}"));
+        }
+    }
+    let graph = recorder.end().unwrap();
+
+    // The graph's launch is followed by the argmax's signal step: the marker the lane's completion word reaches.
+    let submission = Submission::begin(&rig.lane, quantum.mode()).unwrap();
+    graph.launch(&submission).unwrap();
+    let marker = Argmax::signal(submission).unwrap();
+    rig.sync();
+    assert!(rig.lane.completed() >= marker.value);
+    assert_eq!(selection.token(0), Some(31_337));
+    let tokens = download(&sequence.device.scratch.draft().unwrap().tokens);
+    assert_eq!(tokens[4..8], 31_337i32.to_ne_bytes(), "the drafted token was passed on");
+}
+
+/// A stage as the capture test holds it: only its launches.
+trait LaunchOnly {
+    fn launch_on(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError>;
+}
+
+impl<L: Launch> LaunchOnly for L {
+    fn launch_on(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+        self.launch(quantum, submission)
+    }
+}
+
+fn boxed<L: Launch + 'static>(stage: L) -> Box<dyn LaunchOnly> {
+    Box::new(stage)
 }

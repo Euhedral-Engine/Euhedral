@@ -325,6 +325,11 @@ impl Quantum {
         self.rows
     }
 
+    /// The mode its submissions run in (row-exact exactly for a verification).
+    pub fn mode(&self) -> SubmitMode {
+        self.mode
+    }
+
     pub fn start_position(&self) -> u64 {
         self.input.start_position
     }
