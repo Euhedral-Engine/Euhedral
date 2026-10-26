@@ -117,6 +117,8 @@ impl<'l> Submission<'l> {
             return Ok(());
         }
         let ring = self.lane.library().ring(marker.lane)?;
+        // `waitable` reads the lane's issued count before the wait is queued. A concurrent record on that lane can
+        // reuse the event in between, which only widens the wait to the later work: conservative, never wrong.
         let Some(event) = ring.waitable(marker)? else {
             return Ok(());
         };
@@ -182,7 +184,7 @@ impl<'l> Submission<'l> {
             self.lane
                 .library()
                 .api()
-                .euhedral_cuda_write_host_flag(self.lane.word_device().0, value as u32)
+                .euhedral_cuda_write_host_flag(self.lane.word_device().get(), value as u32)
         };
         check("euhedral_cuda_write_host_flag", status)
     }

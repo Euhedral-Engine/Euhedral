@@ -12,9 +12,10 @@
 //! - [`GraphRecorder`] and [`GraphExec`] capture a lane's submissions and replay them.
 //!
 //! The device waits are the ones documented as blocking: `synchronize` (library and lane), the host copies, and every
-//! drop that frees device or pinned memory (`cudaFree` and `cudaFreeHost` wait for the device). Those are for startup,
-//! shutdown and tests; on the hot path buffers go through the pool and the retire list instead. There is no callback
-//! from the driver into Rust.
+//! plain drop that frees device or pinned memory (`cudaFree` and `cudaFreeHost` wait for the whole device under the
+//! driver's lock, which can deadlock against a lane parked on a host flag). Those are for startup, shutdown and tests;
+//! on a running engine pinned buffers come from the pool and stream-ordered device buffers go through the retire list
+//! or `free_async`, none of which wait. There is no callback from the driver into Rust.
 
 mod device;
 mod error;
@@ -47,5 +48,5 @@ pub use lane::CudaLane;
 pub use library::CudaLibrary;
 pub use memory::{AllocationId, DeviceBuffer, DevicePtr, HostWeightsArena, PinnedBuffer};
 pub use pool::{PinnedPool, PooledPinned};
-pub use retire::RetireList;
+pub use retire::{Retire, RetireList};
 pub use submission::{Submission, SubmitMode};

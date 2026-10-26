@@ -13,35 +13,11 @@ use euhedral_inference_cuda::{
     PinnedPool, RetireList, Submission, SubmitMode, ops,
 };
 
-/// The tests share one device and park lanes on host flags, and `cudaFree` and `cudaFreeHost` wait for the whole
-/// device, so two tests running at once can deadlock inside the driver (one parked on its flag, the other waiting for
-/// the device while holding the driver's lock). Each test holds this for its whole run.
-// A test fixture: the tests are the only threads, and they are serialized, not coordinated.
-#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
-static DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// The loaded library, and the device for as long as it lives.
-struct Fixture {
-    library: Arc<CudaLibrary>,
-    _device: std::sync::MutexGuard<'static, ()>,
-}
-
-impl std::ops::Deref for Fixture {
-    type Target = Arc<CudaLibrary>;
-
-    fn deref(&self) -> &Arc<CudaLibrary> {
-        &self.library
-    }
-}
-
-fn library() -> Option<Fixture> {
+/// The loaded library. The tests run in parallel on one device: none calls CUDA's allocator, frees or synchronizes
+/// while a lane of its own is parked on a host flag, because a synchronizing call waits for every lane on the device.
+fn library() -> Option<Arc<CudaLibrary>> {
     let path = test_support::require_property("euhedral.cuda.library")?;
-    let device = DEVICE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let library = CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads");
-    Some(Fixture {
-        library,
-        _device: device,
-    })
+    Some(CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads"))
 }
 
 fn lane(library: &Arc<CudaLibrary>, id: u16, ring: usize) -> Arc<CudaLane> {
@@ -97,7 +73,7 @@ fn alloc_copy_roundtrip() {
     arena.as_mut_slice()[..4].copy_from_slice(&[1, 2, 3, 4]);
     assert_eq!(arena.as_ptr() as usize % (2 << 20), 0, "2 MiB aligned");
     // SAFETY: no kernel reads the arena.
-    assert_ne!(unsafe { arena.device_address() }.expect("mapped").0, 0);
+    assert_ne!(unsafe { arena.device_address() }.expect("mapped").get(), 0);
 }
 
 #[test]
@@ -396,9 +372,8 @@ fn waits_on_stale_and_future_markers_are_refused() {
 
 #[test]
 #[ignore = "needs a GPU and the native library"]
-fn pinned_pool_recycles_and_retire_list_waits_for_the_marker() {
+fn pinned_pool_reuses_released_buffers_even_past_its_limit() {
     let Some(library) = library() else { return };
-    let lane = lane(&library, 0, 2);
     let pool = PinnedPool::new(&library, 1 << 20);
     let first = pool.acquire(10_000).expect("a pooled buffer");
     assert_eq!(first.len(), 10_000);
@@ -410,30 +385,79 @@ fn pinned_pool_recycles_and_retire_list_waits_for_the_marker() {
     assert_eq!(second.buffer().as_ptr(), address, "a released buffer is reused");
     assert_eq!(pool.held_bytes(), 0);
     drop(second);
-    let big = pool.acquire(2 << 20).expect("a buffer past the limit");
-    drop(big);
-    assert_eq!(pool.overflows(), 1);
-    assert_eq!(pool.trim(), 1);
 
-    // A retired buffer is kept while its gate is closed and freed once the marker is reached.
+    // Past the limit: the buffers stay in their classes and are reused; only trim frees them.
+    let tight_over = PinnedPool::new(&library, 8192);
+    let (a, b) = (
+        tight_over.acquire(5000).expect("a"),
+        tight_over.acquire(5000).expect("b"),
+    );
+    let addresses_over = [a.buffer().as_ptr(), b.buffer().as_ptr()];
+    drop((a, b));
+    assert_eq!(tight_over.over_limit_bytes(), 8192);
+    let (c, d) = (
+        tight_over.acquire(5000).expect("c"),
+        tight_over.acquire(5000).expect("d"),
+    );
+    let mut reused = [c.buffer().as_ptr(), d.buffer().as_ptr()];
+    reused.sort();
+    let mut expected = addresses_over;
+    expected.sort();
+    assert_eq!(
+        reused, expected,
+        "buffers released past the limit are reused by the next acquires"
+    );
+    drop((c, d));
+    assert_eq!(tight_over.trim(), 1, "trim frees down to the limit");
+    assert_eq!(tight_over.held_bytes(), 8192);
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn retired_buffers_are_released_after_their_marker_without_blocking() {
+    let Some(library) = library() else { return };
+    let (lane, reaper) = (lane(&library, 0, 2), lane(&library, 1, 2));
+    let lanes = LanePool::new(vec![
+        Arc::clone(&lane) as Arc<dyn DeviceQueue>,
+        Arc::clone(&reaper) as _,
+    ]);
+    let pool = PinnedPool::new(&library, 1 << 20);
     let list = RetireList::new();
-    let pool_of_lanes = LanePool::new(vec![Arc::clone(&lane) as Arc<dyn DeviceQueue>]);
     let (gate, gate_device) = flag(&library);
+
+    // Everything is allocated before the lane parks on its gate: nothing below calls into CUDA's allocator.
+    let pooled = pool.acquire(4096).expect("pooled buffer");
+    let device = {
+        let submission = submit(&lane);
+        DeviceBuffer::alloc_async(&submission, 1 << 16).expect("stream-ordered buffer")
+    };
+    let plain = DeviceBuffer::alloc(&library, 4096).expect("plain buffer");
     let marker = {
         let submission = submit(&lane);
         ops::wait_host_flag(&submission, gate_device, 1).expect("wait");
+        ops::zero_device_memory(&submission, device.ptr(), 1 << 16).expect("zero");
         submission.finish_signalled().expect("finish")
     };
-    let held_before = pool.held_bytes();
-    list.retire(pool.acquire(4096).expect("buffer"), marker);
-    assert_eq!(list.reap(|m| pool_of_lanes.reached(m)), 0);
-    assert_eq!(list.pending(), 1);
+
+    let (error, plain) = list.retire(plain, marker).unwrap_err();
+    assert!(error.to_string().contains("alloc_async"), "{error}");
+    list.retire(pooled, marker)
+        .map_err(|(error, _)| error)
+        .expect("a pooled buffer retires");
+    list.retire(device, marker)
+        .map_err(|(error, _)| error)
+        .expect("a stream-ordered buffer retires");
+    assert_eq!(list.pending(), 2);
+
+    let released = |list: &RetireList| {
+        let submission = submit(&reaper);
+        list.reap(|m| lanes.reached(m), &submission).expect("reap")
+    };
+    assert_eq!(released(&list), 0, "the lane is parked on its gate");
     gate.word(0).store(1, std::sync::atomic::Ordering::Release);
     lane.synchronize().expect("lane");
-    assert_eq!(list.reap(|m| pool_of_lanes.reached(m)), 1);
-    assert_eq!(
-        pool.held_bytes(),
-        held_before + 4096,
-        "the retired buffer went back to the pool"
-    );
+    assert_eq!(released(&list), 2);
+    reaper.synchronize().expect("the stream-ordered free retires");
+    assert_eq!(pool.held_bytes(), 4096, "the pooled buffer went back to its pool");
+    drop(plain);
 }

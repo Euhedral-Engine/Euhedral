@@ -168,12 +168,12 @@ pub fn zero_device_memory(submission: &Submission<'_>, address: DevicePtr, bytes
 
 /// Queues a wait until the host-mapped 32-bit word at `flag` equals `value`.
 pub fn wait_host_flag(submission: &Submission<'_>, flag: DevicePtr, value: u32) -> Result<(), CudaError> {
-    entry!(submission, euhedral_cuda_wait_host_flag(flag.0, value))
+    entry!(submission, euhedral_cuda_wait_host_flag(flag.get(), value))
 }
 
 /// Queues a write of `value` to the host-mapped 32-bit word at `flag`.
 pub fn write_host_flag(submission: &Submission<'_>, flag: DevicePtr, value: u32) -> Result<(), CudaError> {
-    entry!(submission, euhedral_cuda_write_host_flag(flag.0, value))
+    entry!(submission, euhedral_cuda_write_host_flag(flag.get(), value))
 }
 
 // Embedding.
