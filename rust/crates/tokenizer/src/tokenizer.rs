@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use euhedral_inference_edrl::TokenizerSection;
+use tokenizers::Tokenizer as HfTokenizer;
 
 use crate::byte_level::ByteLevel;
 use crate::error::TokenizerError;
@@ -18,7 +19,7 @@ const SPECIAL_TOKENS: &str = "special_tokens.json";
 /// number of frames at once. Added tokens (`<|im_start|>`, `<think>`, ...) found in a text encode to their own IDs;
 /// everything between them is NFC-normalized, split by the checkpoint's expression and merged by BPE.
 pub struct Tokenizer {
-    inner: tokenizers::Tokenizer,
+    inner: HfTokenizer,
     pieces: Vec<Piece>,
     control_ids: HashMap<String, u32>,
     eos_id: u32,
@@ -50,8 +51,8 @@ impl Tokenizer {
 
         let description: TokenizerJson = files::parse(TOKENIZER_JSON, tokenizer_json)?;
         description.check_structure()?;
-        let inner = tokenizers::Tokenizer::from_bytes(tokenizer_json)
-            .map_err(|failure| TokenizerError::Library(failure.to_string()))?;
+        let inner =
+            HfTokenizer::from_bytes(tokenizer_json).map_err(|failure| TokenizerError::Library(failure.to_string()))?;
 
         let Vocabulary {
             pieces,
@@ -188,7 +189,7 @@ struct Vocabulary {
     special_ids: Vec<u32>,
 }
 
-fn build_vocabulary(inner: &tokenizers::Tokenizer, description: &TokenizerJson) -> Result<Vocabulary, TokenizerError> {
+fn build_vocabulary(inner: &HfTokenizer, description: &TokenizerJson) -> Result<Vocabulary, TokenizerError> {
     let alphabet = ByteLevel::new();
     let vocabulary = inner.get_vocab(false);
     let mut added = Vec::with_capacity(description.added_tokens.len());
