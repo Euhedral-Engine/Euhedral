@@ -36,8 +36,6 @@ pub struct GdnState {
     convolution: DeviceBuffer,
     recurrent: DeviceBuffer,
     speculative: Option<GdnSpeculative>,
-    /// Verified rows the next quantum must replay from the checkpoint before touching this state.
-    pending_replay_rows: u32,
 }
 
 impl GdnState {
@@ -54,21 +52,6 @@ impl GdnState {
     /// The speculative buffers, when the sequence verifies.
     pub fn speculative(&self) -> Option<&GdnSpeculative> {
         self.speculative.as_ref()
-    }
-
-    /// Verified rows the next quantum must replay.
-    pub fn pending_replay_rows(&self) -> u32 {
-        self.pending_replay_rows
-    }
-
-    /// After a verification committed `rows` of its rows: replay them from the checkpoint before the state is next
-    /// used, or nothing when every row was committed (0).
-    pub fn set_pending_replay_rows(&mut self, rows: u32) -> Result<(), &'static str> {
-        if rows > 0 && self.speculative.is_none() {
-            return Err("a state with no speculative buffers has nothing to replay from");
-        }
-        self.pending_replay_rows = rows;
-        Ok(())
     }
 
     /// The device bytes this layer holds.
@@ -144,7 +127,6 @@ impl GdnStates {
                 convolution,
                 recurrent,
                 speculative,
-                pending_replay_rows: 0,
             }));
         }
         Ok(GdnStates { layers })

@@ -92,10 +92,10 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
     let Some(library) = library() else { return };
     let lane = lane(&library);
     let pool = PinnedPool::new(&library, 64 << 20);
-    let mut cache = KvCache::new(&library, 2, 1024, KvFormat::Nvfp4, 4096, 0).unwrap();
+    let retire = Arc::new(RetireList::new());
+    let mut cache = KvCache::new(&library, &retire, 2, 1024, KvFormat::Nvfp4, 4096, 0).unwrap();
     let plane = cache.plane_page_bytes();
     assert_eq!(plane, 256 * 144 * 4);
-    let retire = RetireList::new();
 
     // 300 rows need two pages and a table of two slots per plane.
     let mut retained = KvRetained::default();
@@ -127,7 +127,7 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
         assert_eq!(entries[3], pages[1] + plane);
         assert_eq!(cache.value_table(layer).unwrap().get(), key.get() + 2 * 8);
     }
-    assert!(retained.outgrown.is_empty(), "the first table replaces nothing");
+    assert_eq!(retire.pending(), 0, "the first table replaces nothing");
     assert_eq!(retained.staging.len(), 2);
     for staging in retained.staging.drain(..) {
         retire.retire(staging, marker).ok().unwrap();
@@ -159,10 +159,15 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
             submitted: 240
         })
     ));
-    // Growing past two pages doubles the table: the outgrown tables come back to be retired.
+    // Growing past two pages doubles the table. No view holds the old tables, so the cache's let-go is their last:
+    // they are handed to the retire list for the stream-ordered free.
     cache.reserve(&submission, &pool, 240, 300, &mut retained).unwrap();
     assert_eq!(cache.reserved(), 768);
-    assert_eq!(retained.outgrown.len(), 2);
+    assert_eq!(
+        retire.pending(),
+        4,
+        "two staging buffers retired earlier, and the two old tables"
+    );
     assert_eq!(retained.staging.len(), 2);
     assert_eq!(
         cache.value_table(0).unwrap().get(),
@@ -176,9 +181,6 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
     // The staging goes back to the pool once the lane reached the marker; the outgrown tables are freed on a lane.
     let reached = |marker: Marker| lane.completed() >= marker.value;
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-    for table in retained.outgrown.drain(..) {
-        retire.retire(table, marker).ok().unwrap();
-    }
     assert_eq!(retire.reap(reached, &submission).unwrap(), 6);
     submission.finish().unwrap();
     lane.synchronize().unwrap();
@@ -205,7 +207,16 @@ fn host_pages_are_read_and_written_through_the_device_region() {
     let lane = lane(&library);
     let pool = PinnedPool::new(&library, 64 << 20);
     // One page on the device, two in host memory.
-    let mut cache = KvCache::new(&library, 1, 1024, KvFormat::Nvfp4, 256, 512).unwrap();
+    let mut cache = KvCache::new(
+        &library,
+        &Arc::new(RetireList::new()),
+        1,
+        1024,
+        KvFormat::Nvfp4,
+        256,
+        512,
+    )
+    .unwrap();
     let page = 2 * cache.plane_page_bytes();
     assert_eq!(cache.planned_rows(), 768);
     let mut retained = KvRetained::default();
@@ -285,12 +296,6 @@ fn gdn_state_is_zeroed_and_as_large_as_the_planner_says() {
     let used = before - library.free_bytes().unwrap();
     assert!(used >= states.device_bytes(), "{used} < {}", states.device_bytes());
 
-    let mut states = states;
-    let state = states.layer_mut(0).unwrap();
-    assert_eq!(state.pending_replay_rows(), 0);
-    state.set_pending_replay_rows(3).unwrap();
-    assert_eq!(state.pending_replay_rows(), 3);
-
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
     let plain = GdnStates::allocate(&library, &config, 0, &submission).unwrap();
     drop(submission);
@@ -300,8 +305,6 @@ fn gdn_state_is_zeroed_and_as_large_as_the_planner_says() {
         plain.device_bytes(),
         48 * (state.convolution().bytes() + state.recurrent().bytes()) as u64
     );
-    let mut plain = plain;
-    assert!(plain.layer_mut(0).unwrap().set_pending_replay_rows(1).is_err());
     lane.synchronize().unwrap();
 }
 
@@ -349,7 +352,16 @@ fn primed_staging_means_a_reservation_allocates_nothing() {
     let Some(library) = library() else { return };
     let lane = lane(&library);
     let pool = PinnedPool::new(&library, 64 << 20);
-    let mut cache = KvCache::new(&library, 2, 1024, KvFormat::Nvfp4, 8192, 0).unwrap();
+    let mut cache = KvCache::new(
+        &library,
+        &Arc::new(RetireList::new()),
+        2,
+        1024,
+        KvFormat::Nvfp4,
+        8192,
+        0,
+    )
+    .unwrap();
     cache.prime_staging(&pool, 2).unwrap();
     let primed = pool.allocated_bytes();
     assert!(primed > 0);

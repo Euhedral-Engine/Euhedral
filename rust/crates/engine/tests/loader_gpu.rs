@@ -205,8 +205,8 @@ fn startup_loads_rco_and_reports_ready() {
     assert_eq!(sequence.kv.layers(), 16);
     assert_eq!(sequence.kv.planned_rows(), 8192);
     assert_eq!(sequence.mtp_kv.as_ref().map(|kv| kv.layers()), Some(1));
-    assert!(sequence.gdn.layer(0).unwrap().speculative().is_some());
-    assert!(sequence.scratch.draft().is_some());
+    assert!(sequence.device.gdn.layer(0).unwrap().speculative().is_some());
+    assert!(sequence.device.scratch.draft().is_some());
     owner.shutdown(runtime).unwrap();
 }
 

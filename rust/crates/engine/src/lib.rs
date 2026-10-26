@@ -7,6 +7,7 @@ mod frames;
 pub mod model;
 pub mod residency;
 pub mod runtime;
+pub mod stages;
 mod startup;
 pub mod state;
 mod warmup;

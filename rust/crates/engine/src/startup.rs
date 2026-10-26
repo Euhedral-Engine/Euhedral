@@ -492,7 +492,7 @@ fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: Has
         let workspace = Workspace::allocate(&core.library, &artifact.config, plan.rows, &regions)?;
         let lane = &core.transfer[0];
         let submission = Submission::begin(lane, SubmitMode::default())?;
-        let sequence = SequenceState::allocate(&core.library, &artifact.config, &plan, &submission)?;
+        let sequence = SequenceState::allocate(&core.library, &core.retire, &artifact.config, &plan, &submission)?;
         sequence.prime_staging(&core.pool)?;
         let marker = submission.finish_signalled()?;
         Ok::<_, EngineError>((ring, arena, loans, workspace, sequence, marker))
