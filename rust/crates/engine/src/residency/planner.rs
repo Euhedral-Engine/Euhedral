@@ -18,7 +18,9 @@ use crate::model::{
     trellis_logical, validate_inventory,
 };
 use crate::residency::footprint::{self, PAGE_TOKENS};
-use crate::residency::scratch::{TRELLIS_BLOCK, TrellisThresholds, trellis_plan_bytes};
+use crate::residency::scratch::{
+    MAX_SEGMENTS, TRELLIS_BLOCK, TrellisThresholds, trellis_mma_bytes, trellis_plan_bytes,
+};
 use crate::workspace::{self, WorkspaceRows};
 
 /// Everything outside the weights and the cache that one running sequence needs on the device
@@ -97,6 +99,9 @@ pub struct ResidencyPlan {
     pub workspace_bytes: u64,
     /// Bytes of the largest linear scratch (the trellis prefill route of the largest object at the chunk's rows).
     pub scratch_bytes: u64,
+    /// Bytes of the scratch of the tensor-core route alone, which a decode-type launch running beside another takes
+    /// (`LinearFormat.decodeScratchBytes`).
+    pub decode_scratch_bytes: u64,
     /// The device bytes the plan reserves in all: the weights, the cache, the runtime's reserve and the scratch.
     pub device_bytes: u64,
     /// The device bytes the plan was made against: free, at most the limit, less the reserve.
@@ -211,7 +216,9 @@ pub fn plan_with(
     };
     let workspace_bytes = workspace::workspace_bytes(config, rows);
     let thresholds = trellis_thresholds(settings, inputs.multiprocessors);
-    let scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, inputs.multiprocessors.is_none());
+    let widest = inputs.multiprocessors.is_none();
+    let scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::Plan);
+    let decode_scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::TensorCore);
 
     let budget = inputs
         .device_free
@@ -263,6 +270,7 @@ pub fn plan_with(
         kv_host_bytes,
         workspace_bytes,
         scratch_bytes,
+        decode_scratch_bytes,
         device_bytes,
         budget_bytes: available,
         kv_format,
@@ -271,6 +279,15 @@ pub fn plan_with(
         draft_depth,
         max_context_tokens: max_tokens as usize,
     })
+}
+
+/// Which of a trellis object's routes a scratch is for.
+#[derive(Clone, Copy)]
+enum Route {
+    /// Every route the object may take at the rows: the tensor-core route and, above its row limit, the prefill route.
+    Plan,
+    /// The tensor-core route alone.
+    TensorCore,
 }
 
 /// The thresholds of the trellis routes (`TrellisSettings.of`): the target blocks are 8 per multiprocessor unless
@@ -298,6 +315,7 @@ fn trellis_scratch(
     rows: u64,
     thresholds: TrellisThresholds,
     widest: bool,
+    route: Route,
 ) -> u64 {
     let mut largest = 0;
     for entry in table.entries() {
@@ -315,7 +333,10 @@ fn trellis_scratch(
         } else {
             thresholds
         };
-        largest = largest.max(trellis_plan_bytes(thresholds, rows, k, n));
+        largest = largest.max(match route {
+            Route::Plan => trellis_plan_bytes(thresholds, rows, k, n),
+            Route::TensorCore => trellis_mma_bytes(thresholds, rows, k, n, MAX_SEGMENTS),
+        });
     }
     largest
 }

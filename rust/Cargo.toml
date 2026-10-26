@@ -14,6 +14,7 @@ crc32fast = "1.5"
 euhedral-core = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "97fc2c49d0fd7fb99f5193a841d41998732134e4" }
 euhedral-graph = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "97fc2c49d0fd7fb99f5193a841d41998732134e4", default-features = false }
 euhedral-hardware-utils = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "97fc2c49d0fd7fb99f5193a841d41998732134e4" }
+euhedral-hashing = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "97fc2c49d0fd7fb99f5193a841d41998732134e4" }
 java-properties = "2"
 libloading = "0.8"
 serde = { version = "1", features = ["derive"] }

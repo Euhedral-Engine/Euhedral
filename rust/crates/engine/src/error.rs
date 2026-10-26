@@ -1,6 +1,7 @@
 //! The errors of the engine: what stopped a startup, and why a plan was refused.
 
 use std::io;
+use std::path::Path;
 
 use euhedral_inference_cuda::CudaError;
 use euhedral_inference_edrl::EdrlError;
@@ -73,4 +74,20 @@ pub enum EngineError {
     /// The runtime could not start the lattice or one of its sources.
     #[error("{0}")]
     Runtime(String),
+}
+
+impl EngineError {
+    pub(crate) fn io(what: impl Into<String>, source: io::Error) -> Self {
+        Self::Io {
+            what: what.into(),
+            source,
+        }
+    }
+
+    pub(crate) fn artifact(path: &Path, source: EdrlError) -> Self {
+        Self::Artifact {
+            path: path.display().to_string(),
+            source,
+        }
+    }
 }

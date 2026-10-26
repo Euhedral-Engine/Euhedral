@@ -10,6 +10,7 @@ publish.workspace = true
 euhedral-core.workspace = true
 euhedral-graph = { workspace = true, features = ["async-io"] }
 euhedral-hardware-utils.workspace = true
+euhedral-hashing.workspace = true
 euhedral-inference-cuda = { path = "../cuda" }
 euhedral-inference-edrl = { path = "../edrl" }
 euhedral-inference-settings = { path = "../settings" }

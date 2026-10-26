@@ -3,7 +3,12 @@
 
 pub mod error;
 pub mod formats;
+mod frames;
 pub mod model;
 pub mod residency;
+pub mod runtime;
+mod startup;
 pub mod state;
 pub mod workspace;
+
+pub use runtime::{EngineRuntime, StartupGuard, StartupReport};

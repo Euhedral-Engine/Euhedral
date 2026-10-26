@@ -2,5 +2,6 @@
 
 pub mod budget;
 pub mod footprint;
+pub mod loader;
 pub mod planner;
 pub mod scratch;
