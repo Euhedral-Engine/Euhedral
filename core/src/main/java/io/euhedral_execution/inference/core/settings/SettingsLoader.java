@@ -344,6 +344,9 @@ public final class SettingsLoader {
         m.put("host.task-parallelism", fixed(integer(1, Integer.MAX_VALUE)));
         m.put("host.idle-release", fixed(duration(false)));
         m.put("host.native-cache", optional(SettingsLoader::path));
+        // Read by the Rust engine, which sizes its lattice's batches with it; this engine checks the value and does not
+        // use it.
+        m.put("host.max-batch-size", optional(integer(1, Integer.MAX_VALUE)));
 
         m.put(
                 "kernels.trellis.tensor-core-max-tokens",

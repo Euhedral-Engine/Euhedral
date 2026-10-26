@@ -9,6 +9,8 @@ pub mod residency;
 pub mod runtime;
 mod startup;
 pub mod state;
+mod warmup;
 pub mod workspace;
 
-pub use runtime::{EngineRuntime, StartupGuard, StartupReport};
+pub use runtime::{EngineRuntime, StartupGuard, StartupReport, fragment_config, lattice_config};
+pub use warmup::Warmed;

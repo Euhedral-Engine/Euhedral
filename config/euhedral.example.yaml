@@ -70,6 +70,7 @@ host:
   cpus: auto                                  # optional, default auto: CPUs the workers run on, such as 2-5,8 (auto = all)
   task-parallelism: 8                         # optional, default 8: workers taking host work at once
   idle-release: 1s                            # optional, default 1s: idle time before workers are released; 0 never releases them
+  max-batch-size: auto                        # optional, default auto: most frames a lattice worker takes from its cache at once (auto = the runtime's default); 1 or 2 makes workers poll one frame at a time, so other workers can steal what waits behind a heavy frame
   native-cache: auto                          # optional, default auto: where the jar unpacks its native files (auto = the user's cache directory)
 
 kernels:

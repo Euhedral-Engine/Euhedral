@@ -359,6 +359,9 @@ pub struct HostSettings {
     pub task_parallelism: u32,
     /// Idle time before workers are released; zero never releases them.
     pub idle_release: Duration,
+    /// The most frames a lattice worker takes from its cache at once; `auto` is the runtime's default. 1 or 2 makes the
+    /// workers poll their caches one frame at a time, so that other workers can steal what waits behind a heavy frame.
+    pub max_batch_size: Auto<u32>,
     /// Where native files are unpacked; `auto` is the user's cache directory.
     pub native_cache: Auto<PathBuf>,
 }
@@ -369,6 +372,7 @@ impl Default for HostSettings {
             cpus: Auto::Auto,
             task_parallelism: 8,
             idle_release: Duration::from_secs(1),
+            max_batch_size: Auto::Auto,
             native_cache: Auto::Auto,
         }
     }

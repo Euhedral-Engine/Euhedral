@@ -2,9 +2,7 @@
 //!
 //! Each step is a frame that owns the [`Startup`] and what the steps before it made, does one thing, and offers the
 //! next frame to a lake: the control lake for the steps that only follow one another, the host lake for parsing and
-//! planning, the stages lake for work that submits to the device, and the blocking lake (a small lattice of its own)
-//! for the work that has to wait: the waiting allocators and frees of the device, pinned allocations and the kernel
-//! compiler. Reads go through `AsyncIo` and device work through a
+//! planning, the stages lake for work that touches the device. Reads go through `AsyncIo` and device work through a
 //! transfer lane; a step that has to wait for either registers a continuation and returns. Nothing waits.
 //!
 //! The steps, in order:
@@ -43,6 +41,7 @@ use crate::residency::loader::{self, LoadOutcome, Ring};
 use crate::residency::planner::{Placement, PlanInputs, ResidencyPlan, plan_with};
 use crate::runtime::{Core, EngineRuntime, StartupReport, Units, raw_file};
 use crate::state::SequenceState;
+use crate::warmup;
 use crate::workspace::Workspace;
 
 /// The most transfer lanes (and so upload chains) a startup makes; a library holds 64 lanes in all, and the rest
@@ -167,8 +166,11 @@ fn host(core: &Core) -> &Arc<Lake> {
     &core.host
 }
 
-fn blocking(core: &Core) -> &Arc<Lake> {
-    &core.blocking
+/// The lake of the startup's device work. Its waiting calls (the allocators and frees of the device, pinned
+/// allocations, the kernel compiler) are startup's and shutdown's alone, each under a scoped allow, and run in the
+/// frames of this lake, one at a time, before any request exists.
+fn device(core: &Core) -> &Arc<Lake> {
+    &core.stages
 }
 
 /// Begins the startup: the rest runs as frames.
@@ -436,7 +438,7 @@ fn plan(startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>)
             .map_err(EngineError::from)
         });
     match planned {
-        Ok(plan) => startup.then(blocking, move |startup| allocate(startup, artifact, plan, ends)),
+        Ok(plan) => startup.then(device, move |startup| allocate(startup, artifact, plan, ends)),
         Err(error) => startup.fail(error),
     }
 }
@@ -534,9 +536,9 @@ fn assemble(
     let LoadOutcome { arena, result } = outcome;
     let stats = match result {
         Ok(stats) => stats,
-        // Freeing the arena waits for the device: it goes on the blocking lattice.
+        // Freeing the arena waits for the device: it is a frame of the stages lake.
         Err(error) => {
-            return startup.then(blocking, move |startup| {
+            return startup.then(device, move |startup| {
                 drop(arena);
                 drop((workspace, sequence));
                 startup.fail(error);
@@ -551,37 +553,36 @@ fn assemble(
     let allocated = plan.arena_bytes + workspace.retained_bytes() + sequence.device_bytes();
     let begun = core.started;
     // The pool keeps what the load staged, up to `memory.pinned-buffer-pool` when that is stated; trimming frees
-    // pinned memory, which waits for the device, so it runs on the blocking lattice.
-    startup.then(blocking, move |startup| {
+    // pinned memory, which waits for the device, so it is a frame of its own, after the load.
+    startup.then(device, move |startup| {
         trim_pool(&startup.core);
-        warm(startup, move |startup, warm| {
-            let core = Arc::clone(&startup.core);
-            let in_use = core
-                .library
-                .free_bytes()
-                .map(|free| core.library.device().total_bytes.saturating_sub(free))
-                .unwrap_or(0);
-            let report = StartupReport {
-                ready: begun.elapsed(),
-                load: stats.elapsed,
-                uploaded_bytes: stats.bytes,
-                pieces: stats.pieces,
-                chains: ring.depth,
-                piece_bytes: ring.piece_bytes,
-                objects,
-                allocated_bytes: allocated,
-                device_bytes_in_use: in_use,
-                warmed: warm,
-            };
-            let runtime = EngineRuntime::assemble(core, plan, artifact.config, weights, workspace, sequence, report);
-            startup.succeed(runtime);
-        });
+        let warmed = warmup::run(&startup.core, &artifact.config, &weights, &workspace);
+        let core = Arc::clone(&startup.core);
+        let in_use = core
+            .library
+            .free_bytes()
+            .map(|free| core.library.device().total_bytes.saturating_sub(free))
+            .unwrap_or(0);
+        let report = StartupReport {
+            ready: begun.elapsed(),
+            load: stats.elapsed,
+            uploaded_bytes: stats.bytes,
+            pieces: stats.pieces,
+            chains: ring.depth,
+            piece_bytes: ring.piece_bytes,
+            objects,
+            allocated_bytes: allocated,
+            device_bytes_in_use: in_use,
+            warmed,
+        };
+        let runtime = EngineRuntime::assemble(core, plan, artifact.config, weights, workspace, sequence, report);
+        startup.succeed(runtime);
     });
 }
 
 /// Allocates the pinned staging the upload will take, before it starts: `depth` buffers of every size class up to a
 /// piece, and two per chain of the piece's. The allocation is the slow part of a pinned buffer and may wait for the
-/// driver, so it is done here, on the blocking lattice, and the chains find the pool stocked.
+/// driver, so it is done here, in the startup's allocation frame, and the chains find the pool stocked.
 fn prime_pool(core: &Core, ring: &Ring) -> Result<(), EngineError> {
     let top = ring.piece_bytes.ilog2();
     for class in 12..=top {
@@ -596,7 +597,7 @@ fn prime_pool(core: &Core, ring: &Ring) -> Result<(), EngineError> {
 
 #[allow(
     clippy::disallowed_methods,
-    reason = "no-wait, freeing pinned memory waits for the device: the startup trims its staging once, when the weights are on the device and no copy is in flight, on the blocking lattice"
+    reason = "no-wait, freeing pinned memory waits for the device: the startup trims its staging once, when the weights are on the device and no copy is in flight, "
 )]
 fn trim_pool(core: &Core) {
     core.pool.trim();
@@ -644,9 +645,4 @@ fn tensors(
         );
     }
     tensors
-}
-
-/// Warms the kernel modules (see [`crate::warmup`]), then hands the startup to `next`.
-fn warm(startup: Startup, next: impl FnOnce(Startup, usize) + Send + 'static) {
-    next(startup, 0);
 }

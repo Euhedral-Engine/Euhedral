@@ -6,16 +6,16 @@
 //! model is ready, or with the error that stopped it. The calling thread waits for the latch and for nothing else.
 
 use std::fmt;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use euhedral_core::config::LatticeConfig;
+use euhedral_core::config::{FragmentConfig, LatticeConfig};
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::LatticeSource;
-use euhedral_core::impls::DefaultExecutor;
+use euhedral_core::impls::{BaseCloneableObject, DefaultExecutor};
 use euhedral_graph::{
     AsyncIo, Completions, DeviceQueue, Lake, LaneId, LanePool, LatchSetter, OwnedFile, RawFile, UnitGuard,
 };
@@ -28,6 +28,7 @@ use crate::model::{ModelConfig, Weights};
 use crate::residency::planner::ResidencyPlan;
 use crate::startup;
 use crate::state::SequenceState;
+use crate::warmup::Warmed;
 use crate::workspace::Workspace;
 
 /// The events a transfer lane's ring holds: its markers are found by the completion word, not by waits on events, so
@@ -45,11 +46,6 @@ pub(crate) struct Core {
     pub(crate) host: Arc<Lake>,
     /// Control: the steps of a startup and of a shutdown.
     pub(crate) control: Arc<Lake>,
-    /// Work that has to block: the waiting allocators and frees of the device, and the kernel compiler. It runs on a
-    /// small lattice of its own, so that no worker of the main lattice waits.
-    pub(crate) blocking: Arc<Lake>,
-    /// The small lattice behind `blocking`: one CPU of the main lattice's.
-    pub(crate) blocking_lattice: Arc<ControlPlaneLattice>,
     pub(crate) io: Arc<AsyncIo>,
     pub(crate) completions: Arc<Completions>,
     pub(crate) lanes: Arc<LanePool>,
@@ -91,7 +87,6 @@ pub(crate) struct Units {
     _stages: UnitGuard,
     _host: UnitGuard,
     _control: UnitGuard,
-    _blocking: UnitGuard,
 }
 
 impl Core {
@@ -102,7 +97,6 @@ impl Core {
             _stages: self.stages.admit().map_err(closed)?,
             _host: self.host.admit().map_err(closed)?,
             _control: self.control.admit().map_err(closed)?,
-            _blocking: self.blocking.admit().map_err(closed)?,
         })
     }
 
@@ -111,14 +105,12 @@ impl Core {
         self.control.complete_gracefully();
         self.host.complete_gracefully();
         self.stages.complete_gracefully();
-        self.blocking.complete_gracefully();
         self.lattice.close();
-        self.blocking_lattice.close();
     }
 }
 
 /// The numbers of one startup.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StartupReport {
     /// From the call of `start` to ready.
     pub ready: Duration,
@@ -138,8 +130,8 @@ pub struct StartupReport {
     pub allocated_bytes: u64,
     /// Bytes in use on the device when the model became ready (the whole device's, every process).
     pub device_bytes_in_use: u64,
-    /// Kernel modules compiled and loaded before the model became ready.
-    pub warmed: usize,
+    /// The kernel modules launched once before the model became ready, and those that were not.
+    pub warmed: Warmed,
 }
 
 /// Keeps a startup's lattice alive on the calling thread. A lattice stops when its last owner drops it, which waits
@@ -329,34 +321,41 @@ impl Drop for EngineRuntime {
     }
 }
 
+/// The fragment configuration of the engine's lattice: RustEE's default, with the most frames a worker takes at once
+/// from `host.max-batch-size` when that is stated. A size of 1 or 2 makes the workers poll their caches one frame at
+/// a time (`FragmentConfig::polls`), so that other workers can steal what waits behind a heavy frame.
+pub fn fragment_config(settings: &Settings) -> FragmentConfig {
+    let fragment = FragmentConfig::default();
+    let stated = match settings.host.max_batch_size {
+        Auto::Value(size) => NonZeroU64::new(u64::from(size)),
+        Auto::Auto => None,
+    };
+    match stated {
+        Some(size) => fragment.with_max_batch_size(size),
+        None => fragment,
+    }
+}
+
+/// The engine's lattice: [`fragment_config`], frames run by RustEE's default executor, and the workers on the CPUs of
+/// `host.cpus` (`auto` is all of them). Nothing is pinned or restricted beyond that list.
+pub fn lattice_config(settings: &Settings) -> LatticeConfig {
+    let cloneable = BaseCloneableObject::new(fragment_config(settings), DefaultExecutor::new());
+    let mut config = LatticeConfig::new(Arc::new(cloneable));
+    if let Auto::Value(cpus) = &settings.host.cpus {
+        config.allowed_cpus = cpus.ids().map(|cpu| cpu as usize).collect::<CpuSet>();
+    }
+    config
+}
+
 /// Builds the lattice, the lakes, the lanes and the pools of a startup, on the calling thread.
 fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineError> {
     let started = Instant::now();
     let library = CudaLibrary::load(library_path)?;
     let runtime = |what: &str, error: &dyn fmt::Display| EngineError::Runtime(format!("{what}: {error}"));
 
-    let mut config = LatticeConfig::with_executor(DefaultExecutor::new());
-    if let Auto::Value(cpus) = &settings.host.cpus {
-        config.allowed_cpus = cpus.ids().map(|cpu| cpu as usize).collect::<CpuSet>();
-    }
+    let config = lattice_config(settings);
     let lattice = ControlPlaneLattice::new(config)
         .map_err(|error| runtime("the lattice would not start", &format!("{error:?}")))?;
-
-    // The blocking work gets one CPU of its own lattice. The main lattice keeps all of its CPUs.
-    let mut blocking_config = LatticeConfig::with_executor(DefaultExecutor::new());
-    blocking_config.name = "EuhedralBlocking".to_string();
-    blocking_config.shard_name = "EuhedralBlockingShard".to_string();
-    blocking_config.allowed_cpus = lattice.config().allowed_cpus.first().map_or_else(
-        || lattice.config().allowed_cpus.clone(),
-        |cpu| CpuSet::range(cpu, cpu + 1),
-    );
-    let blocking_lattice = ControlPlaneLattice::new(blocking_config)
-        .map_err(|error| runtime("the blocking lattice would not start", &format!("{error:?}")))?;
-    let blocking = Lake::new(
-        Arc::clone(&blocking_lattice),
-        NonZeroUsize::MIN,
-        settings.host.idle_release,
-    );
 
     let sinks = NonZeroUsize::new(settings.host.task_parallelism as usize).unwrap_or(NonZeroUsize::MIN);
     let idle_release = settings.host.idle_release;
@@ -391,8 +390,6 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
         stages,
         host,
         control,
-        blocking,
-        blocking_lattice,
         io,
         completions,
         lanes,

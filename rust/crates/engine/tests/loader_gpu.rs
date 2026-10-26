@@ -114,6 +114,16 @@ fn startup_loads_rco_and_reports_ready() {
         report.device_bytes_in_use as f64 / f64::from(1 << 30),
     );
 
+    // The modules that need only the engine's own buffers were launched once before ready.
+    println!(
+        "warmed {:?}, not warmed {:?}",
+        report.warmed.modules, report.warmed.failed
+    );
+    assert!(report.warmed.failed.is_empty(), "{:?}", report.warmed.failed);
+    for module in ["norm", "elementwise", "sampling", "embedding", "nvfp4"] {
+        assert!(report.warmed.modules.contains(&module), "{module} was not warmed");
+    }
+
     // Every object of the plan was uploaded: the pieces account for every byte the plan copies.
     let expected: u64 = pieces(plan, report.piece_bytes)
         .iter()
@@ -453,4 +463,20 @@ fn a_nan_nvfp4_scale_stops_the_load_and_names_the_tensor() {
     };
     assert_eq!(name, "text/draft_head");
     assert_eq!(reason, "NVFP4 block scale at byte 1234 is NaN");
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn startup_works_with_workers_that_poll_one_frame_at_a_time() {
+    let Some(machine) = machine() else { return };
+    let mut settings = settings(&machine.artifact, 4096);
+    settings.host.max_batch_size = euhedral_inference_settings::Auto::Value(2);
+    let (runtime, _guard) = start(&settings, &machine.library);
+    let runtime = runtime.expect("the engine starts in poll mode");
+    println!(
+        "poll mode: ready in {:.2} s, upload {:.2} s",
+        runtime.report().ready.as_secs_f64(),
+        runtime.report().load.as_secs_f64()
+    );
+    assert_eq!(runtime.weights().len(), 786);
 }

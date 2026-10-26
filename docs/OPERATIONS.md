@@ -41,6 +41,7 @@ See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 | `memory.pinned-buffer-pool` | 1/256 of the machine's memory, at least 64 MiB | Released pinned staging buffers kept for reuse. |
 | `memory.weight-streaming.*` | 8, 1, 4, 2 | Flash-Next expert streaming: `concurrent-reads` (records read from the artifact at once), `read-split` (parts one record read is split into), `copy-streams` (CUDA streams copying experts to the GPU), `gpu-streams` (device lanes a step spreads over). |
 | `host.task-parallelism` | 8 | Ingest sinks of each pool of ready host work: more spread the contention of the workers that publish and take frames. |
+| `host.max-batch-size` | auto | Most frames a lattice worker takes from its cache at once (auto is the runtime's default). `1` or `2` makes the workers poll their caches one frame at a time, so other workers can steal what waits behind a heavy frame. Read by the Rust engine; the Java engine checks the value and ignores it. |
 | `host.idle-release` | 1s | Idle time before the workers stop polling an idle pool of work; `0` never releases them. |
 | `kernels.trellis.*` | 512, auto, 64, 128 | Trellis kernel thresholds ([TRELLIS.md](quantization/TRELLIS.md#speed)): `tensor-core-max-tokens`, `target-blocks` (auto = 8 per streaming multiprocessor), `whole-k-min-tokens`, `wide-block-min-tokens`. |
 | `server.shutdown-timeout` | 10s | How long closing the engine waits for its workers to stop. |

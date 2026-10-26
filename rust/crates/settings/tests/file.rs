@@ -117,7 +117,7 @@ fn file_must_be_a_mapping_and_must_exist() {
 #[test]
 fn values_parse() {
     let settings = load(&format!(
-        "{MODEL}context:\n  kv-cache-format: bf16\nmemory:\n  gpu-limit: 1GiB\n  host-limit: 0\nhost:\n  cpus: 2-5,8\n  idle-release: 0\n\
+        "{MODEL}context:\n  kv-cache-format: bf16\nmemory:\n  gpu-limit: 1GiB\n  host-limit: 0\nhost:\n  cpus: 2-5,8\n  idle-release: 0\n  max-batch-size: 2\n\
          server:\n  requests:\n    timeout: 90s\n    max-body-size: 2MiB\n"
     ))
     .unwrap();
@@ -129,6 +129,7 @@ fn values_parse() {
         [2, 3, 4, 5, 8]
     );
     assert_eq!(settings.host.idle_release, Duration::ZERO);
+    assert_eq!(settings.host.max_batch_size, Auto::Value(2));
     assert_eq!(settings.server.requests.timeout, Duration::from_secs(90));
     assert_eq!(settings.server.requests.max_body_size, ByteSize::mib(2));
 }
