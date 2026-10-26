@@ -23,6 +23,7 @@
 #[path = "common/linear_gpu.rs"]
 mod linear_gpu;
 
+use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::slice;
@@ -101,6 +102,24 @@ fn config(kinds: Vec<LayerType>) -> Arc<ModelConfig> {
     }))
 }
 
+thread_local! {
+    /// The lane of the rig made on this thread: the host copies of the helpers run on it.
+    static LANE: RefCell<Option<Arc<CudaLane>>> = const { RefCell::new(None) };
+}
+
+/// Runs `copy` (a blocking host copy) on the rig's lane. Outside a submission such a copy runs on the legacy stream,
+/// which does not order against the lane's work: a kernel could start before the copy's DMA completed, or a read
+/// could see a kernel's results half written. In a submission the copy is queued on the lane and waits for it.
+fn on_lane<T>(copy: impl FnOnce() -> T) -> T {
+    let lane = LANE
+        .with(|lane| lane.borrow().clone())
+        .expect("a rig was made on this thread");
+    let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
+    let out = copy();
+    drop(submission);
+    out
+}
+
 struct Rig {
     library: Arc<CudaLibrary>,
     lane: Arc<CudaLane>,
@@ -112,6 +131,7 @@ struct Rig {
 fn rig() -> Option<Rig> {
     let library = library()?;
     let lane = CudaLane::new(&library, LaneId(0), 256).unwrap();
+    LANE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&lane)));
     let pool = LanePool::new(vec![Arc::clone(&lane) as Arc<dyn DeviceQueue>]);
     Some(Rig {
         lanes: LaneTable::new(vec![Arc::clone(&lane)]).unwrap(),
@@ -180,10 +200,7 @@ impl Rig {
         };
         // The admission uploads the input record: the start position, after the token ids.
         let offset = InputRecordRef::position_offset(rows) as usize;
-        workspace
-            .buffer(BufferSlot::TokenIds)
-            .copy_from_host(offset, &start.to_ne_bytes())
-            .unwrap();
+        put(workspace, BufferSlot::TokenIds, offset, &start.to_ne_bytes());
         Quantum::new(
             kind,
             rows,
@@ -279,25 +296,25 @@ fn bf16_values(bytes: &[u8]) -> Vec<f32> {
 
 /// Writes `bytes` at `offset` of the workspace slot `slot`.
 fn put(workspace: &Workspace, slot: BufferSlot, offset: usize, bytes: &[u8]) {
-    workspace.buffer(slot).copy_from_host(offset, bytes).unwrap();
+    on_lane(|| workspace.buffer(slot).copy_from_host(offset, bytes)).unwrap();
 }
 
 /// Reads `bytes` bytes at `offset` of the workspace slot `slot`.
 fn get(workspace: &Workspace, slot: BufferSlot, offset: usize, bytes: usize) -> Vec<u8> {
     let mut out = vec![0u8; bytes];
-    workspace.buffer(slot).copy_to_host(offset, &mut out).unwrap();
+    on_lane(|| workspace.buffer(slot).copy_to_host(offset, &mut out)).unwrap();
     out
 }
 
 fn upload(library: &Arc<CudaLibrary>, bytes: &[u8]) -> DeviceBuffer {
     let buffer = DeviceBuffer::alloc(library, bytes.len()).unwrap();
-    buffer.copy_from_host(0, bytes).unwrap();
+    on_lane(|| buffer.copy_from_host(0, bytes)).unwrap();
     buffer
 }
 
 fn download(buffer: &DeviceBuffer) -> Vec<u8> {
     let mut out = vec![0u8; buffer.bytes()];
-    buffer.copy_to_host(0, &mut out).unwrap();
+    on_lane(|| buffer.copy_to_host(0, &mut out)).unwrap();
     out
 }
 
@@ -1292,7 +1309,7 @@ fn argmax_lowest_id_tie_break() {
     // The drafted token passes to the step's tokens: the row itself, or through the draft head's ids.
     let draft = sequence.device.scratch.draft().unwrap();
     let ids = upload(&rig.library, &vec![0u8; VOCABULARY * 4]);
-    ids.copy_from_host(12_345 * 4, &31_337i32.to_ne_bytes()).unwrap();
+    on_lane(|| ids.copy_from_host(12_345 * 4, &31_337i32.to_ne_bytes())).unwrap();
     let pass = SelectedToken;
     for (slot, ids_ptr, expected) in [(2usize, DevicePtr::NULL, 12_345i32), (3, ids.ptr(), 31_337)] {
         let drafting = rig
@@ -1554,7 +1571,7 @@ fn gdn_convolution_matches_the_host_reference_and_carries_the_tail() {
     put(&workspace, BufferSlot::ValueZProjected, 0, &bf16_bytes(&value_z));
     let weight_buffer = upload(&rig.library, &bf16_bytes(&weights));
     let state = sequence.device.gdn.layer(0).unwrap().convolution();
-    state.copy_from_host(0, &bf16_bytes(&initial)).unwrap();
+    on_lane(|| state.copy_from_host(0, &bf16_bytes(&initial))).unwrap();
     let stage = GdnConvolution::new(
         0,
         BufferSlot::QkProjected,
@@ -1635,7 +1652,7 @@ fn gdn_recurrence_matches_the_host_reference() {
     put(&workspace, BufferSlot::GdnAlpha, 0, &f32_bytes(&alpha));
     put(&workspace, BufferSlot::GdnBeta, 0, &f32_bytes(&beta));
     let state = sequence.device.gdn.layer(0).unwrap().recurrent();
-    state.copy_from_host(0, &f32_bytes(&initial)).unwrap();
+    on_lane(|| state.copy_from_host(0, &f32_bytes(&initial))).unwrap();
     let stage = GdnRecurrence::new(
         0,
         BufferSlot::GdnConvolved,
@@ -1803,6 +1820,8 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
     let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
     let workspace = rig.workspace(&config, 8, 8, &[]);
     let (_table, weight) = artifact.plain(&rig.library, "text/token_embedding");
+    // The shared helper uploads on the legacy stream; the lane must not start before the upload is done.
+    rig.library.synchronize().unwrap();
     let hidden = weight.shape[1] as usize;
     assert_eq!(hidden, config.hidden_size);
     let stage = Embed::new(weight.clone(), BufferSlot::HiddenState);
@@ -1835,7 +1854,7 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
 
     // Rows that read their ids from slots 2.. of the step's tokens, and the last of them the step's current token.
     let step = [10, 101, 202, 303, 404, 505, 606];
-    tokens.copy_from_host(0, &id_bytes(&step)).unwrap();
+    on_lane(|| tokens.copy_from_host(0, &id_bytes(&step))).unwrap();
     let rows = 3;
     let quantum = rig
         .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
