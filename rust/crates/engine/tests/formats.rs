@@ -614,14 +614,54 @@ mod formats {
         for rows in 1..=8usize {
             assert_eq!(native.scratch_bytes(&weight, rows, none), 0);
         }
+        // The route's own scratch, or the skinny route's at 64 rows where that is larger (65 rows and more).
         for rows in [9usize, 64, 65, 512] {
-            assert_eq!(
-                native.scratch_bytes(&weight, rows, none) as u64,
-                nvfp4_native_scratch_bytes(rows as u64, 17408, 5120)
-            );
+            let own = nvfp4_native_scratch_bytes(rows as u64, 17408, 5120);
+            let skinny = nvfp4_native_scratch_bytes((rows as u64).min(64), 17408, 5120);
+            assert_eq!(native.scratch_bytes(&weight, rows, none) as u64, own.max(skinny));
             assert!(native.scratch_bytes(&weight, rows, none) > 0);
             assert_eq!(portable.scratch_bytes(&weight, rows, none), 0);
         }
+    }
+
+    #[test]
+    fn nvfp4_scratch_covers_every_smaller_launch() {
+        use euhedral_inference_engine::formats::LinearFormat;
+        // Every NVFP4 projection of the RCO artifact: the heads and the MTP layer.
+        let shapes = [
+            (248_320u64, 5120u64),
+            (131_072, 5120),
+            (5120, 10_240),
+            (7168, 5120),
+            (5120, 6144),
+            (34_816, 5120),
+            (5120, 17_408),
+        ];
+        let format = Nvfp4Linear::with_native_route(true);
+        let none = LinearMode::default();
+        for (out, input) in shapes {
+            let weight = nvfp4(out, input, WeightLayout::RowSplitK128V1);
+            let mut needed = 0u64;
+            for rows in 1..=600usize {
+                if rows >= 9 {
+                    needed = needed.max(nvfp4_native_scratch_bytes(rows as u64, input, out));
+                }
+                let granted = format.scratch_bytes(&weight, rows, none) as u64;
+                assert!(
+                    granted >= needed,
+                    "{out}x{input}: {granted} bytes for {rows} rows, a launch of fewer needs {needed}"
+                );
+                // And no more than the launches it covers can use.
+                assert!(granted <= needed, "{out}x{input}: {granted} bytes for {rows} rows");
+            }
+        }
+        // The skinny kernels' split-K partials make 64 rows need more than 65.
+        let weight = nvfp4(5120, 17_408, WeightLayout::RowSplitK128V1);
+        assert!(nvfp4_native_scratch_bytes(64, 17_408, 5120) > nvfp4_native_scratch_bytes(65, 17_408, 5120));
+        assert_eq!(
+            format.scratch_bytes(&weight, 65, none) as u64,
+            nvfp4_native_scratch_bytes(64, 17_408, 5120)
+        );
     }
 
     #[test]

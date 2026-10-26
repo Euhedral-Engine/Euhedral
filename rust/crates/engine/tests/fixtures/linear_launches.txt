@@ -43,6 +43,36 @@ scratch=915456,915456
 euhedral_trellis_prepass grid=10,3,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i3,i5120,i1,i0
 euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700007800,p600000000,i3,i5120,i4096,i40,i18,i1
 euhedral_trellis_epilogue grid=8,3,1 block=128,1,1 smem=0 args=p700007800,i18,p400000000,p600000000,i3,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=5 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1525760,1525760
+euhedral_trellis_prepass grid=10,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i1,i0
+euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000c800,p600000000,i5,i5120,i4096,i40,i18,i1
+euhedral_trellis_epilogue grid=8,5,1 block=128,1,1 smem=0 args=p70000c800,i18,p400000000,p600000000,i5,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=5 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1525760,1525760
+euhedral_trellis_prepass grid=10,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i1,i0
+euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000c800,p600000000,i5,i5120,i4096,i40,i18,i1
+euhedral_trellis_epilogue grid=8,5,1 block=128,1,1 smem=0 args=p70000c800,i18,p400000000,p600000000,i5,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=5 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1525760,1525760
+euhedral_trellis_prepass grid=10,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i1,i0
+euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000c800,p600000000,i5,i5120,i4096,i40,i18,i1
+euhedral_trellis_epilogue grid=8,5,1 block=128,1,1 smem=0 args=p70000c800,i18,p400000000,p600000000,i5,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=6 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1830912,1830912
+euhedral_trellis_prepass grid=10,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i1,i0
+euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i6,i5120,i4096,i40,i18,i1
+euhedral_trellis_epilogue grid=8,6,1 block=128,1,1 smem=0 args=p70000f000,i18,p400000000,p600000000,i6,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=6 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1830912,1830912
+euhedral_trellis_prepass grid=10,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i1,i0
+euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i6,i5120,i4096,i40,i18,i1
+euhedral_trellis_epilogue grid=8,6,1 block=128,1,1 smem=0 args=p70000f000,i18,p400000000,p600000000,i6,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=6 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1830912,1830912
+euhedral_trellis_prepass grid=10,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i1,i0
+euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i6,i5120,i4096,i40,i18,i1
+euhedral_trellis_epilogue grid=8,6,1 block=128,1,1 smem=0 args=p70000f000,i18,p400000000,p600000000,i6,i4096
 case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=8 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=2441216,2441216
 euhedral_trellis_prepass grid=10,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i1,i0
@@ -73,6 +103,21 @@ scratch=2746368,2746368
 euhedral_trellis_prepass grid=10,9,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i9,i5120,i1,i0
 euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700016800,p600000000,i9,i5120,i4096,i40,i18,i1
 euhedral_trellis_epilogue grid=8,9,1 block=128,1,1 smem=0 args=p700016800,i18,p400000000,p600000000,i9,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=20 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6103040,6103040
+euhedral_trellis_prepass grid=10,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i1,i0
+euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700032000,p600000000,i20,i5120,i4096,i40,i18,i1
+euhedral_trellis_epilogue grid=8,20,1 block=128,1,1 smem=0 args=p700032000,i18,p400000000,p600000000,i20,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=20 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6103040,6103040
+euhedral_trellis_prepass grid=10,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i1,i0
+euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700032000,p600000000,i20,i5120,i4096,i40,i18,i1
+euhedral_trellis_epilogue grid=8,20,1 block=128,1,1 smem=0 args=p700032000,i18,p400000000,p600000000,i20,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=20 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6103040,6103040
+euhedral_trellis_prepass grid=10,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i1,i0
+euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700032000,p600000000,i20,i5120,i4096,i40,i18,i1
+euhedral_trellis_epilogue grid=8,20,1 block=128,1,1 smem=0 args=p700032000,i18,p400000000,p600000000,i20,i4096
 case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=32 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=9764864,9764864
 euhedral_trellis_prepass grid=10,32,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i5120,i1,i0
@@ -240,6 +285,36 @@ scratch=946176,946176
 euhedral_trellis_prepass grid=10,3,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i3,i5120,i2,i0
 euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i3,i5120,i12288,i40,i6,i2
 euhedral_trellis_epilogue grid=24,3,1 block=128,1,1 smem=0 args=p70000f000,i6,p400000000,p600000000,i3,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=5 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1576960,1576960
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i12288,i40,i6,i2
+euhedral_trellis_epilogue grid=24,5,1 block=128,1,1 smem=0 args=p700019000,i6,p400000000,p600000000,i5,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=5 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1576960,1576960
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i12288,i40,i6,i2
+euhedral_trellis_epilogue grid=24,5,1 block=128,1,1 smem=0 args=p700019000,i6,p400000000,p600000000,i5,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=5 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1576960,1576960
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i12288,i40,i6,i2
+euhedral_trellis_epilogue grid=24,5,1 block=128,1,1 smem=0 args=p700019000,i6,p400000000,p600000000,i5,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=6 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1892352,1892352
+euhedral_trellis_prepass grid=10,6,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i2,i0
+euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001e000,p600000000,i6,i5120,i12288,i40,i6,i2
+euhedral_trellis_epilogue grid=24,6,1 block=128,1,1 smem=0 args=p70001e000,i6,p400000000,p600000000,i6,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=6 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1892352,1892352
+euhedral_trellis_prepass grid=10,6,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i2,i0
+euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001e000,p600000000,i6,i5120,i12288,i40,i6,i2
+euhedral_trellis_epilogue grid=24,6,1 block=128,1,1 smem=0 args=p70001e000,i6,p400000000,p600000000,i6,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=6 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1892352,1892352
+euhedral_trellis_prepass grid=10,6,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i2,i0
+euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001e000,p600000000,i6,i5120,i12288,i40,i6,i2
+euhedral_trellis_epilogue grid=24,6,1 block=128,1,1 smem=0 args=p70001e000,i6,p400000000,p600000000,i6,i12288
 case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=8 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=2523136,2523136
 euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
@@ -270,6 +345,21 @@ scratch=2838528,2838528
 euhedral_trellis_prepass grid=10,9,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i9,i5120,i2,i0
 euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002d000,p600000000,i9,i5120,i12288,i40,i6,i2
 euhedral_trellis_epilogue grid=24,9,1 block=128,1,1 smem=0 args=p70002d000,i6,p400000000,p600000000,i9,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=20 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6307840,6307840
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i12288,i40,i6,i2
+euhedral_trellis_epilogue grid=24,20,1 block=128,1,1 smem=0 args=p700064000,i6,p400000000,p600000000,i20,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=20 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6307840,6307840
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i12288,i40,i6,i2
+euhedral_trellis_epilogue grid=24,20,1 block=128,1,1 smem=0 args=p700064000,i6,p400000000,p600000000,i20,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=20 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6307840,6307840
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i12288,i40,i6,i2
+euhedral_trellis_epilogue grid=24,20,1 block=128,1,1 smem=0 args=p700064000,i6,p400000000,p600000000,i20,i12288
 case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=32 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=10092544,10092544
 euhedral_trellis_prepass grid=10,32,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i5120,i2,i0
@@ -441,6 +531,36 @@ scratch=897024,897024
 euhedral_trellis_prepass grid=12,3,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i3,i6144,i1,i0
 euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700009000,p600000000,i3,i6144,i5120,i40,i14,i1
 euhedral_trellis_epilogue grid=10,3,1 block=128,1,1 smem=0 args=p700009000,i14,p400000000,p600000000,i3,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=5 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1495040,1495040
+euhedral_trellis_prepass grid=12,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i5,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70000f000,i14,p400000000,p600000000,i5,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=5 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1495040,1495040
+euhedral_trellis_prepass grid=12,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i5,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70000f000,i14,p400000000,p600000000,i5,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=5 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1495040,1495040
+euhedral_trellis_prepass grid=12,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i5,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70000f000,i14,p400000000,p600000000,i5,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=6 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1794048,1794048
+euhedral_trellis_prepass grid=12,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700012000,p600000000,i6,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,6,1 block=128,1,1 smem=0 args=p700012000,i14,p400000000,p600000000,i6,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=6 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1794048,1794048
+euhedral_trellis_prepass grid=12,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700012000,p600000000,i6,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,6,1 block=128,1,1 smem=0 args=p700012000,i14,p400000000,p600000000,i6,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=6 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1794048,1794048
+euhedral_trellis_prepass grid=12,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700012000,p600000000,i6,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,6,1 block=128,1,1 smem=0 args=p700012000,i14,p400000000,p600000000,i6,i5120
 case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=8 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=2392064,2392064
 euhedral_trellis_prepass grid=12,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i6144,i1,i0
@@ -471,6 +591,21 @@ scratch=2691072,2691072
 euhedral_trellis_prepass grid=12,9,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i9,i6144,i1,i0
 euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001b000,p600000000,i9,i6144,i5120,i40,i14,i1
 euhedral_trellis_epilogue grid=10,9,1 block=128,1,1 smem=0 args=p70001b000,i14,p400000000,p600000000,i9,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=20 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=5980160,5980160
+euhedral_trellis_prepass grid=12,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70003c000,p600000000,i20,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p70003c000,i14,p400000000,p600000000,i20,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=20 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=5980160,5980160
+euhedral_trellis_prepass grid=12,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70003c000,p600000000,i20,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p70003c000,i14,p400000000,p600000000,i20,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=20 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=5980160,5980160
+euhedral_trellis_prepass grid=12,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70003c000,p600000000,i20,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p70003c000,i14,p400000000,p600000000,i20,i5120
 case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=32 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=9568256,9568256
 euhedral_trellis_prepass grid=12,32,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i6144,i1,i0
@@ -638,6 +773,36 @@ scratch=1314816,1314816
 euhedral_trellis_prepass grid=10,3,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i3,i5120,i2,i0
 euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i3,i5120,i34816,i40,i3,i2
 euhedral_trellis_epilogue grid=68,3,1 block=128,1,1 smem=0 args=p70000f000,i3,p400000000,p600000000,i3,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=5 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2191360,2191360
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i34816,i40,i3,i2
+euhedral_trellis_epilogue grid=68,5,1 block=128,1,1 smem=0 args=p700019000,i3,p400000000,p600000000,i5,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=5 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2191360,2191360
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i34816,i40,i3,i2
+euhedral_trellis_epilogue grid=68,5,1 block=128,1,1 smem=0 args=p700019000,i3,p400000000,p600000000,i5,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=5 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2191360,2191360
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i34816,i40,i3,i2
+euhedral_trellis_epilogue grid=68,5,1 block=128,1,1 smem=0 args=p700019000,i3,p400000000,p600000000,i5,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=6 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2629632,2629632
+euhedral_trellis_prepass grid=10,6,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i2,i0
+euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001e000,p600000000,i6,i5120,i34816,i40,i3,i2
+euhedral_trellis_epilogue grid=68,6,1 block=128,1,1 smem=0 args=p70001e000,i3,p400000000,p600000000,i6,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=6 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2629632,2629632
+euhedral_trellis_prepass grid=10,6,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i2,i0
+euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001e000,p600000000,i6,i5120,i34816,i40,i3,i2
+euhedral_trellis_epilogue grid=68,6,1 block=128,1,1 smem=0 args=p70001e000,i3,p400000000,p600000000,i6,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=6 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2629632,2629632
+euhedral_trellis_prepass grid=10,6,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i2,i0
+euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001e000,p600000000,i6,i5120,i34816,i40,i3,i2
+euhedral_trellis_epilogue grid=68,6,1 block=128,1,1 smem=0 args=p70001e000,i3,p400000000,p600000000,i6,i34816
 case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=8 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=3506176,3506176
 euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
@@ -668,6 +833,21 @@ scratch=3944448,3944448
 euhedral_trellis_prepass grid=10,9,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i9,i5120,i2,i0
 euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002d000,p600000000,i9,i5120,i34816,i40,i3,i2
 euhedral_trellis_epilogue grid=68,9,1 block=128,1,1 smem=0 args=p70002d000,i3,p400000000,p600000000,i9,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=20 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=8765440,8765440
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i34816,i40,i3,i2
+euhedral_trellis_epilogue grid=68,20,1 block=128,1,1 smem=0 args=p700064000,i3,p400000000,p600000000,i20,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=20 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=8765440,8765440
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i34816,i40,i3,i2
+euhedral_trellis_epilogue grid=68,20,1 block=128,1,1 smem=0 args=p700064000,i3,p400000000,p600000000,i20,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=20 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=8765440,8765440
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i34816,i40,i3,i2
+euhedral_trellis_epilogue grid=68,20,1 block=128,1,1 smem=0 args=p700064000,i3,p400000000,p600000000,i20,i34816
 case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=32 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=14024704,14024704
 euhedral_trellis_prepass grid=10,32,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i5120,i2,i0
@@ -839,6 +1019,36 @@ scratch=964608,964608
 euhedral_trellis_prepass grid=34,3,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i3,i17408,i1,i0
 euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019800,p600000000,i3,i17408,i5120,i40,i14,i1
 euhedral_trellis_epilogue grid=10,3,1 block=128,1,1 smem=0 args=p700019800,i14,p400000000,p600000000,i3,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=5 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1607680,1607680
+euhedral_trellis_prepass grid=34,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002a800,p600000000,i5,i17408,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70002a800,i14,p400000000,p600000000,i5,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=5 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1607680,1607680
+euhedral_trellis_prepass grid=34,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002a800,p600000000,i5,i17408,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70002a800,i14,p400000000,p600000000,i5,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=5 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1607680,1607680
+euhedral_trellis_prepass grid=34,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002a800,p600000000,i5,i17408,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70002a800,i14,p400000000,p600000000,i5,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=6 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1929216,1929216
+euhedral_trellis_prepass grid=34,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700033000,p600000000,i6,i17408,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,6,1 block=128,1,1 smem=0 args=p700033000,i14,p400000000,p600000000,i6,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=6 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1929216,1929216
+euhedral_trellis_prepass grid=34,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700033000,p600000000,i6,i17408,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,6,1 block=128,1,1 smem=0 args=p700033000,i14,p400000000,p600000000,i6,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=6 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1929216,1929216
+euhedral_trellis_prepass grid=34,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700033000,p600000000,i6,i17408,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,6,1 block=128,1,1 smem=0 args=p700033000,i14,p400000000,p600000000,i6,i5120
 case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=8 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=2572288,2572288
 euhedral_trellis_prepass grid=34,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i17408,i1,i0
@@ -869,6 +1079,21 @@ scratch=2893824,2893824
 euhedral_trellis_prepass grid=34,9,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i9,i17408,i1,i0
 euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70004c800,p600000000,i9,i17408,i5120,i40,i14,i1
 euhedral_trellis_epilogue grid=10,9,1 block=128,1,1 smem=0 args=p70004c800,i14,p400000000,p600000000,i9,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=20 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6430720,6430720
+euhedral_trellis_prepass grid=34,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000aa000,p600000000,i20,i17408,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p7000aa000,i14,p400000000,p600000000,i20,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=20 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6430720,6430720
+euhedral_trellis_prepass grid=34,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000aa000,p600000000,i20,i17408,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p7000aa000,i14,p400000000,p600000000,i20,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=20 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6430720,6430720
+euhedral_trellis_prepass grid=34,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000aa000,p600000000,i20,i17408,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p7000aa000,i14,p400000000,p600000000,i20,i5120
 case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=32 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=10289152,10289152
 euhedral_trellis_prepass grid=34,32,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i17408,i1,i0
@@ -1036,6 +1261,36 @@ scratch=964608,964608
 euhedral_trellis_prepass grid=34,3,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i3,i17408,i1,i0
 euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019800,p600000000,i3,i17408,i5120,i56,i14,i1
 euhedral_trellis_epilogue grid=10,3,1 block=128,1,1 smem=0 args=p700019800,i14,p400000000,p600000000,i3,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=5 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1607680,1607680
+euhedral_trellis_prepass grid=34,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002a800,p600000000,i5,i17408,i5120,i56,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70002a800,i14,p400000000,p600000000,i5,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=5 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1607680,1607680
+euhedral_trellis_prepass grid=34,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002a800,p600000000,i5,i17408,i5120,i56,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70002a800,i14,p400000000,p600000000,i5,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=5 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1607680,1607680
+euhedral_trellis_prepass grid=34,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002a800,p600000000,i5,i17408,i5120,i56,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70002a800,i14,p400000000,p600000000,i5,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=6 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1929216,1929216
+euhedral_trellis_prepass grid=34,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700033000,p600000000,i6,i17408,i5120,i56,i14,i1
+euhedral_trellis_epilogue grid=10,6,1 block=128,1,1 smem=0 args=p700033000,i14,p400000000,p600000000,i6,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=6 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1929216,1929216
+euhedral_trellis_prepass grid=34,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700033000,p600000000,i6,i17408,i5120,i56,i14,i1
+euhedral_trellis_epilogue grid=10,6,1 block=128,1,1 smem=0 args=p700033000,i14,p400000000,p600000000,i6,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=6 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1929216,1929216
+euhedral_trellis_prepass grid=34,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700033000,p600000000,i6,i17408,i5120,i56,i14,i1
+euhedral_trellis_epilogue grid=10,6,1 block=128,1,1 smem=0 args=p700033000,i14,p400000000,p600000000,i6,i5120
 case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=8 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=2572288,2572288
 euhedral_trellis_prepass grid=34,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i17408,i1,i0
@@ -1066,6 +1321,21 @@ scratch=2893824,2893824
 euhedral_trellis_prepass grid=34,9,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i9,i17408,i1,i0
 euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70004c800,p600000000,i9,i17408,i5120,i56,i14,i1
 euhedral_trellis_epilogue grid=10,9,1 block=128,1,1 smem=0 args=p70004c800,i14,p400000000,p600000000,i9,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=20 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6430720,6430720
+euhedral_trellis_prepass grid=34,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000aa000,p600000000,i20,i17408,i5120,i56,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p7000aa000,i14,p400000000,p600000000,i20,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=20 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6430720,6430720
+euhedral_trellis_prepass grid=34,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000aa000,p600000000,i20,i17408,i5120,i56,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p7000aa000,i14,p400000000,p600000000,i20,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=20 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6430720,6430720
+euhedral_trellis_prepass grid=34,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000aa000,p600000000,i20,i17408,i5120,i56,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p7000aa000,i14,p400000000,p600000000,i20,i5120
 case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=32 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=10289152,10289152
 euhedral_trellis_prepass grid=34,32,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i17408,i1,i0
@@ -1233,6 +1503,36 @@ scratch=921600,921600
 euhedral_trellis_prepass grid=10,3,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i3,i5120,i2,i0
 euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i3,i5120,i7168,i64,i10,i2
 euhedral_trellis_epilogue grid=14,3,1 block=128,1,1 smem=0 args=p70000f000,i10,p400000000,p600000000,i3,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=5 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1536000,1536000
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,5,1 block=128,1,1 smem=0 args=p700019000,i10,p400000000,p600000000,i5,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=5 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1536000,1536000
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,5,1 block=128,1,1 smem=0 args=p700019000,i10,p400000000,p600000000,i5,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=5 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1536000,1536000
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,5,1 block=128,1,1 smem=0 args=p700019000,i10,p400000000,p600000000,i5,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=6 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1843200,1843200
+euhedral_trellis_prepass grid=10,6,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001e000,p600000000,i6,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,6,1 block=128,1,1 smem=0 args=p70001e000,i10,p400000000,p600000000,i6,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=6 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1843200,1843200
+euhedral_trellis_prepass grid=10,6,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001e000,p600000000,i6,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,6,1 block=128,1,1 smem=0 args=p70001e000,i10,p400000000,p600000000,i6,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=6 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1843200,1843200
+euhedral_trellis_prepass grid=10,6,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001e000,p600000000,i6,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,6,1 block=128,1,1 smem=0 args=p70001e000,i10,p400000000,p600000000,i6,i7168
 case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=8 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=2457600,2457600
 euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
@@ -1263,6 +1563,21 @@ scratch=2764800,2764800
 euhedral_trellis_prepass grid=10,9,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i9,i5120,i2,i0
 euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002d000,p600000000,i9,i5120,i7168,i64,i10,i2
 euhedral_trellis_epilogue grid=14,9,1 block=128,1,1 smem=0 args=p70002d000,i10,p400000000,p600000000,i9,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=20 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6144000,6144000
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,20,1 block=128,1,1 smem=0 args=p700064000,i10,p400000000,p600000000,i20,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=20 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6144000,6144000
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,20,1 block=128,1,1 smem=0 args=p700064000,i10,p400000000,p600000000,i20,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=20 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6144000,6144000
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,20,1 block=128,1,1 smem=0 args=p700064000,i10,p400000000,p600000000,i20,i7168
 case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=32 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
 scratch=9830400,9830400
 euhedral_trellis_prepass grid=10,32,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i5120,i2,i0
@@ -1389,6 +1704,494 @@ case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=1024 rowExact=
 scratch=109051904,39034880
 euhedral_trellis_prepass grid=10,1024,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1024,i5120,i2,i0
 euhedral_trellis_mma_rows64 grid=56,16,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i1024,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=1 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=307200,307200
+euhedral_trellis_prepass grid=10,1,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700005000,p600000000,i1,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,1,1 block=128,1,1 smem=0 args=p700005000,i10,p400000000,p600000000,i1,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=1 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=307200,307200
+euhedral_trellis_prepass grid=10,1,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700005000,p600000000,i1,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,1,1 block=128,1,1 smem=0 args=p700005000,i10,p400000000,p600000000,i1,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=1 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=307200,307200
+euhedral_trellis_prepass grid=10,1,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700005000,p600000000,i1,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,1,1 block=128,1,1 smem=0 args=p700005000,i10,p400000000,p600000000,i1,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=2 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=614400,614400
+euhedral_trellis_prepass grid=10,2,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i2,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000a000,p600000000,i2,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,2,1 block=128,1,1 smem=0 args=p70000a000,i10,p400000000,p600000000,i2,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=2 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=614400,614400
+euhedral_trellis_prepass grid=10,2,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i2,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000a000,p600000000,i2,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,2,1 block=128,1,1 smem=0 args=p70000a000,i10,p400000000,p600000000,i2,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=2 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=614400,614400
+euhedral_trellis_prepass grid=10,2,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i2,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000a000,p600000000,i2,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,2,1 block=128,1,1 smem=0 args=p70000a000,i10,p400000000,p600000000,i2,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=3 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=921600,921600
+euhedral_trellis_prepass grid=10,3,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i3,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i3,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,3,1 block=128,1,1 smem=0 args=p70000f000,i10,p400000000,p600000000,i3,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=3 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=921600,921600
+euhedral_trellis_prepass grid=10,3,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i3,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i3,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,3,1 block=128,1,1 smem=0 args=p70000f000,i10,p400000000,p600000000,i3,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=3 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=921600,921600
+euhedral_trellis_prepass grid=10,3,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i3,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i3,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,3,1 block=128,1,1 smem=0 args=p70000f000,i10,p400000000,p600000000,i3,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=5 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1536000,1536000
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,5,1 block=128,1,1 smem=0 args=p700019000,i10,p400000000,p600000000,i5,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=5 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1536000,1536000
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,5,1 block=128,1,1 smem=0 args=p700019000,i10,p400000000,p600000000,i5,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=5 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1536000,1536000
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,5,1 block=128,1,1 smem=0 args=p700019000,i10,p400000000,p600000000,i5,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=6 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1843200,1843200
+euhedral_trellis_prepass grid=10,6,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001e000,p600000000,i6,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,6,1 block=128,1,1 smem=0 args=p70001e000,i10,p400000000,p600000000,i6,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=6 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1843200,1843200
+euhedral_trellis_prepass grid=10,6,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001e000,p600000000,i6,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,6,1 block=128,1,1 smem=0 args=p70001e000,i10,p400000000,p600000000,i6,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=6 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1843200,1843200
+euhedral_trellis_prepass grid=10,6,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001e000,p600000000,i6,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,6,1 block=128,1,1 smem=0 args=p70001e000,i10,p400000000,p600000000,i6,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=8 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2457600,2457600
+euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700028000,p600000000,i8,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,8,1 block=128,1,1 smem=0 args=p700028000,i10,p400000000,p600000000,i8,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=8 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2457600,2457600
+euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700028000,p600000000,i8,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,8,1 block=128,1,1 smem=0 args=p700028000,i10,p400000000,p600000000,i8,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=8 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2457600,2457600
+euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700028000,p600000000,i8,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,8,1 block=128,1,1 smem=0 args=p700028000,i10,p400000000,p600000000,i8,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=9 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2764800,2764800
+euhedral_trellis_prepass grid=10,9,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i9,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002d000,p600000000,i9,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,9,1 block=128,1,1 smem=0 args=p70002d000,i10,p400000000,p600000000,i9,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=9 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2764800,2764800
+euhedral_trellis_prepass grid=10,9,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i9,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002d000,p600000000,i9,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,9,1 block=128,1,1 smem=0 args=p70002d000,i10,p400000000,p600000000,i9,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=9 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2764800,2764800
+euhedral_trellis_prepass grid=10,9,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i9,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002d000,p600000000,i9,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,9,1 block=128,1,1 smem=0 args=p70002d000,i10,p400000000,p600000000,i9,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=20 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6144000,6144000
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,20,1 block=128,1,1 smem=0 args=p700064000,i10,p400000000,p600000000,i20,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=20 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6144000,6144000
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,20,1 block=128,1,1 smem=0 args=p700064000,i10,p400000000,p600000000,i20,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=20 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=6144000,6144000
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,20,1 block=128,1,1 smem=0 args=p700064000,i10,p400000000,p600000000,i20,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=32 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=9830400,9830400
+euhedral_trellis_prepass grid=10,32,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000a0000,p600000000,i32,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,32,1 block=128,1,1 smem=0 args=p7000a0000,i10,p400000000,p600000000,i32,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=32 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=9830400,9830400
+euhedral_trellis_prepass grid=10,32,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000a0000,p600000000,i32,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,32,1 block=128,1,1 smem=0 args=p7000a0000,i10,p400000000,p600000000,i32,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=32 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=9830400,9830400
+euhedral_trellis_prepass grid=10,32,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000a0000,p600000000,i32,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,32,1 block=128,1,1 smem=0 args=p7000a0000,i10,p400000000,p600000000,i32,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=63 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19353600,19353600
+euhedral_trellis_prepass grid=10,63,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i63,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70013b000,p600000000,i63,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,63,1 block=128,1,1 smem=0 args=p70013b000,i10,p400000000,p600000000,i63,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=63 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19353600,19353600
+euhedral_trellis_prepass grid=10,63,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i63,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70013b000,p600000000,i63,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,63,1 block=128,1,1 smem=0 args=p70013b000,i10,p400000000,p600000000,i63,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=63 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19353600,19353600
+euhedral_trellis_prepass grid=10,63,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i63,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70013b000,p600000000,i63,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,63,1 block=128,1,1 smem=0 args=p70013b000,i10,p400000000,p600000000,i63,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=64 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19374080,19374080
+euhedral_trellis_prepass grid=10,64,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i5120,i2,i2
+euhedral_trellis_mma_rows_fp8 grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=64 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19374080,19374080
+euhedral_trellis_prepass grid=10,64,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i5120,i2,i0
+euhedral_trellis_mma_rows grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=64 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19374080,19374080
+euhedral_trellis_prepass grid=10,64,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i5120,i2,i0
+euhedral_trellis_mma_rows grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=65 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19394560,19394560
+euhedral_trellis_prepass grid=10,65,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i65,i5120,i2,i2
+euhedral_trellis_mma_rows_fp8 grid=56,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i65,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=65 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19394560,19394560
+euhedral_trellis_prepass grid=10,65,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i65,i5120,i2,i0
+euhedral_trellis_mma_rows grid=56,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i65,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=65 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19394560,19394560
+euhedral_trellis_prepass grid=10,65,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i65,i5120,i2,i0
+euhedral_trellis_mma_rows grid=56,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i65,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=127 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=20664320,20664320
+euhedral_trellis_prepass grid=10,127,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i127,i5120,i2,i2
+euhedral_trellis_mma_rows_fp8 grid=56,4,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i127,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=127 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=20664320,20664320
+euhedral_trellis_prepass grid=10,127,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i127,i5120,i2,i0
+euhedral_trellis_mma_rows grid=56,4,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i127,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=127 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=20664320,20664320
+euhedral_trellis_prepass grid=10,127,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i127,i5120,i2,i0
+euhedral_trellis_mma_rows grid=56,4,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i127,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=128 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=20684800,20684800
+euhedral_trellis_prepass grid=10,128,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i128,i5120,i2,i2
+euhedral_trellis_mma_rows64_fp8 grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i128,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=128 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=20684800,20684800
+euhedral_trellis_prepass grid=10,128,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i128,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i128,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=128 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=20684800,20684800
+euhedral_trellis_prepass grid=10,128,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i128,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i128,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=512 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=28549120,28549120
+euhedral_trellis_prepass grid=10,512,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i512,i5120,i2,i2
+euhedral_trellis_mma_rows64_fp8 grid=56,8,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i512,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=512 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=28549120,28549120
+euhedral_trellis_prepass grid=10,512,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i512,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,8,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i512,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=512 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=28549120,28549120
+euhedral_trellis_prepass grid=10,512,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i512,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,8,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i512,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=513 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=91260928,28569600
+euhedral_trellis_prepass grid=10,513,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i513,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p700a05000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,9,1 block=128,1,1 smem=0 args=p700000000,p700a05000,p705005000,i513,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,9,1 block=128,1,1 smem=0 args=p700502800,p704605000,p705608000,i513,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,513,1 block=128,1,1 smem=0 args=p705005000,p500000000,i2,p400000000,p600000000,i513,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=513 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=91260928,28569600
+euhedral_trellis_prepass grid=10,513,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i513,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p700a05000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,9,1 block=128,1,1 smem=0 args=p700000000,p700a05000,p705005000,i513,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,9,1 block=128,1,1 smem=0 args=p700502800,p704605000,p705608000,i513,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,513,1 block=128,1,1 smem=0 args=p705005000,p500000000,i2,p400000000,p600000000,i513,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=513 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=91260928,28569600
+euhedral_trellis_prepass grid=10,513,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i513,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,9,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i513,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=1024 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=109051904,39034880
+euhedral_trellis_prepass grid=10,1024,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1024,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p701400000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,16,1 block=128,1,1 smem=0 args=p700000000,p701400000,p705a00000,i1024,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,16,1 block=128,1,1 smem=0 args=p700a00000,p705000000,p706600000,i1024,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,1024,1 block=128,1,1 smem=0 args=p705a00000,p500000000,i2,p400000000,p600000000,i1024,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=1024 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=109051904,39034880
+euhedral_trellis_prepass grid=10,1024,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1024,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p701400000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,16,1 block=128,1,1 smem=0 args=p700000000,p701400000,p705a00000,i1024,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,16,1 block=128,1,1 smem=0 args=p700a00000,p705000000,p706600000,i1024,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,1024,1 block=128,1,1 smem=0 args=p705a00000,p500000000,i2,p400000000,p600000000,i1024,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=1024 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=109051904,39034880
+euhedral_trellis_prepass grid=10,1024,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1024,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,16,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i1024,i5120,i7168,i64,i10,i2
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=1 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=299008,299008
+euhedral_trellis_prepass grid=12,1,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700003000,p600000000,i1,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,1,1 block=128,1,1 smem=0 args=p700003000,i14,p400000000,p600000000,i1,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=1 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=299008,299008
+euhedral_trellis_prepass grid=12,1,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700003000,p600000000,i1,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,1,1 block=128,1,1 smem=0 args=p700003000,i14,p400000000,p600000000,i1,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=1 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=299008,299008
+euhedral_trellis_prepass grid=12,1,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700003000,p600000000,i1,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,1,1 block=128,1,1 smem=0 args=p700003000,i14,p400000000,p600000000,i1,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=2 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=598016,598016
+euhedral_trellis_prepass grid=12,2,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i2,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700006000,p600000000,i2,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,2,1 block=128,1,1 smem=0 args=p700006000,i14,p400000000,p600000000,i2,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=2 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=598016,598016
+euhedral_trellis_prepass grid=12,2,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i2,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700006000,p600000000,i2,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,2,1 block=128,1,1 smem=0 args=p700006000,i14,p400000000,p600000000,i2,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=2 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=598016,598016
+euhedral_trellis_prepass grid=12,2,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i2,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700006000,p600000000,i2,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,2,1 block=128,1,1 smem=0 args=p700006000,i14,p400000000,p600000000,i2,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=3 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=897024,897024
+euhedral_trellis_prepass grid=12,3,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i3,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700009000,p600000000,i3,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,3,1 block=128,1,1 smem=0 args=p700009000,i14,p400000000,p600000000,i3,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=3 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=897024,897024
+euhedral_trellis_prepass grid=12,3,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i3,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700009000,p600000000,i3,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,3,1 block=128,1,1 smem=0 args=p700009000,i14,p400000000,p600000000,i3,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=3 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=897024,897024
+euhedral_trellis_prepass grid=12,3,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i3,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700009000,p600000000,i3,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,3,1 block=128,1,1 smem=0 args=p700009000,i14,p400000000,p600000000,i3,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=5 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1495040,1495040
+euhedral_trellis_prepass grid=12,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i5,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70000f000,i14,p400000000,p600000000,i5,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=5 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1495040,1495040
+euhedral_trellis_prepass grid=12,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i5,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70000f000,i14,p400000000,p600000000,i5,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=5 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1495040,1495040
+euhedral_trellis_prepass grid=12,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i5,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70000f000,i14,p400000000,p600000000,i5,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=6 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1794048,1794048
+euhedral_trellis_prepass grid=12,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700012000,p600000000,i6,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,6,1 block=128,1,1 smem=0 args=p700012000,i14,p400000000,p600000000,i6,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=6 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1794048,1794048
+euhedral_trellis_prepass grid=12,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700012000,p600000000,i6,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,6,1 block=128,1,1 smem=0 args=p700012000,i14,p400000000,p600000000,i6,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=6 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=1794048,1794048
+euhedral_trellis_prepass grid=12,6,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i6,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700012000,p600000000,i6,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,6,1 block=128,1,1 smem=0 args=p700012000,i14,p400000000,p600000000,i6,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=8 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2392064,2392064
+euhedral_trellis_prepass grid=12,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700018000,p600000000,i8,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,8,1 block=128,1,1 smem=0 args=p700018000,i14,p400000000,p600000000,i8,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=8 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2392064,2392064
+euhedral_trellis_prepass grid=12,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700018000,p600000000,i8,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,8,1 block=128,1,1 smem=0 args=p700018000,i14,p400000000,p600000000,i8,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=8 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2392064,2392064
+euhedral_trellis_prepass grid=12,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700018000,p600000000,i8,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,8,1 block=128,1,1 smem=0 args=p700018000,i14,p400000000,p600000000,i8,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=9 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2691072,2691072
+euhedral_trellis_prepass grid=12,9,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i9,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001b000,p600000000,i9,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,9,1 block=128,1,1 smem=0 args=p70001b000,i14,p400000000,p600000000,i9,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=9 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2691072,2691072
+euhedral_trellis_prepass grid=12,9,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i9,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001b000,p600000000,i9,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,9,1 block=128,1,1 smem=0 args=p70001b000,i14,p400000000,p600000000,i9,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=9 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=2691072,2691072
+euhedral_trellis_prepass grid=12,9,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i9,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70001b000,p600000000,i9,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,9,1 block=128,1,1 smem=0 args=p70001b000,i14,p400000000,p600000000,i9,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=20 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=5980160,5980160
+euhedral_trellis_prepass grid=12,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70003c000,p600000000,i20,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p70003c000,i14,p400000000,p600000000,i20,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=20 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=5980160,5980160
+euhedral_trellis_prepass grid=12,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70003c000,p600000000,i20,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p70003c000,i14,p400000000,p600000000,i20,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=20 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=5980160,5980160
+euhedral_trellis_prepass grid=12,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70003c000,p600000000,i20,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p70003c000,i14,p400000000,p600000000,i20,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=32 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=9568256,9568256
+euhedral_trellis_prepass grid=12,32,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700060000,p600000000,i32,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,32,1 block=128,1,1 smem=0 args=p700060000,i14,p400000000,p600000000,i32,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=32 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=9568256,9568256
+euhedral_trellis_prepass grid=12,32,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700060000,p600000000,i32,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,32,1 block=128,1,1 smem=0 args=p700060000,i14,p400000000,p600000000,i32,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=32 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=9568256,9568256
+euhedral_trellis_prepass grid=12,32,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700060000,p600000000,i32,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,32,1 block=128,1,1 smem=0 args=p700060000,i14,p400000000,p600000000,i32,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=63 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=18837504,18837504
+euhedral_trellis_prepass grid=12,63,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i63,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000bd000,p600000000,i63,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,63,1 block=128,1,1 smem=0 args=p7000bd000,i14,p400000000,p600000000,i63,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=63 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=18837504,18837504
+euhedral_trellis_prepass grid=12,63,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i63,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000bd000,p600000000,i63,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,63,1 block=128,1,1 smem=0 args=p7000bd000,i14,p400000000,p600000000,i63,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=63 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=18837504,18837504
+euhedral_trellis_prepass grid=12,63,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i63,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000bd000,p600000000,i63,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,63,1 block=128,1,1 smem=0 args=p7000bd000,i14,p400000000,p600000000,i63,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=64 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=18849792,18849792
+euhedral_trellis_prepass grid=12,64,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i6144,i1,i2
+euhedral_trellis_mma_rows_fp8 grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=64 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=18849792,18849792
+euhedral_trellis_prepass grid=12,64,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i6144,i1,i0
+euhedral_trellis_mma_rows grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=64 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=18849792,18849792
+euhedral_trellis_prepass grid=12,64,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i6144,i1,i0
+euhedral_trellis_mma_rows grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=65 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=18862080,18862080
+euhedral_trellis_prepass grid=12,65,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i65,i6144,i1,i2
+euhedral_trellis_mma_rows_fp8 grid=40,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i65,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=65 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=18862080,18862080
+euhedral_trellis_prepass grid=12,65,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i65,i6144,i1,i0
+euhedral_trellis_mma_rows grid=40,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i65,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=65 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=18862080,18862080
+euhedral_trellis_prepass grid=12,65,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i65,i6144,i1,i0
+euhedral_trellis_mma_rows grid=40,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i65,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=127 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19623936,19623936
+euhedral_trellis_prepass grid=12,127,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i127,i6144,i1,i2
+euhedral_trellis_mma_rows_fp8 grid=40,4,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i127,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=127 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19623936,19623936
+euhedral_trellis_prepass grid=12,127,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i127,i6144,i1,i0
+euhedral_trellis_mma_rows grid=40,4,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i127,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=127 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19623936,19623936
+euhedral_trellis_prepass grid=12,127,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i127,i6144,i1,i0
+euhedral_trellis_mma_rows grid=40,4,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i127,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=128 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19636224,19636224
+euhedral_trellis_prepass grid=12,128,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i128,i6144,i1,i2
+euhedral_trellis_mma_rows64_fp8 grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i128,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=128 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19636224,19636224
+euhedral_trellis_prepass grid=12,128,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i128,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i128,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=128 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=19636224,19636224
+euhedral_trellis_prepass grid=12,128,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i128,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i128,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=512 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=24354816,24354816
+euhedral_trellis_prepass grid=12,512,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i512,i6144,i1,i2
+euhedral_trellis_mma_rows64_fp8 grid=40,8,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i512,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=512 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=24354816,24354816
+euhedral_trellis_prepass grid=12,512,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i512,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,8,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i512,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=512 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=24354816,24354816
+euhedral_trellis_prepass grid=12,512,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i512,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,8,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i512,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=513 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=74471424,24367104
+euhedral_trellis_prepass grid=12,513,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i513,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p700603000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,9,1 block=128,1,1 smem=0 args=p700000000,p700603000,p704203000,i513,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,513,1 block=128,1,1 smem=0 args=p704203000,p500000000,i1,p400000000,p600000000,i513,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=513 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=74471424,24367104
+euhedral_trellis_prepass grid=12,513,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i513,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p700603000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,9,1 block=128,1,1 smem=0 args=p700000000,p700603000,p704203000,i513,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,513,1 block=128,1,1 smem=0 args=p704203000,p500000000,i1,p400000000,p600000000,i513,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=513 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=74471424,24367104
+euhedral_trellis_prepass grid=12,513,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i513,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,9,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i513,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=1024 rowExact=false fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=85983232,30646272
+euhedral_trellis_prepass grid=12,1024,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1024,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p700c00000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,16,1 block=128,1,1 smem=0 args=p700000000,p700c00000,p704800000,i1024,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,1024,1 block=128,1,1 smem=0 args=p704800000,p500000000,i1,p400000000,p600000000,i1024,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=1024 rowExact=false fp8=false exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=85983232,30646272
+euhedral_trellis_prepass grid=12,1024,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1024,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p700c00000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,16,1 block=128,1,1 smem=0 args=p700000000,p700c00000,p704800000,i1024,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,1024,1 block=128,1,1 smem=0 args=p704800000,p500000000,i1,p400000000,p600000000,i1024,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=1024 rowExact=true fp8=true exact=false target=560 mma=512 wholeK=64 wide=128
+scratch=85983232,30646272
+euhedral_trellis_prepass grid=12,1024,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1024,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,16,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i1024,i6144,i5120,i40,i14,i1
 case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=1 rowExact=false fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
 scratch=206848,206848
 euhedral_trellis_prepass grid=10,1,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1,i5120,i1,i0
@@ -1767,6 +2570,129 @@ case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=128 rowExact=t
 scratch=15265792,15265792
 euhedral_trellis_prepass grid=10,128,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i128,i5120,i2,i0
 euhedral_trellis_mma_rows64 grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i128,i5120,i7168,i64,i7,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=1 rowExact=false fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=221184,221184
+euhedral_trellis_prepass grid=10,1,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1,i5120,i2,i0
+euhedral_trellis_mma grid=56,7,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700005000,p600000000,i1,i5120,i7168,i64,i7,i2
+euhedral_trellis_epilogue grid=14,1,1 block=128,1,1 smem=0 args=p700005000,i7,p400000000,p600000000,i1,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=1 rowExact=false fp8=false exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=221184,221184
+euhedral_trellis_prepass grid=10,1,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1,i5120,i2,i0
+euhedral_trellis_mma grid=56,7,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700005000,p600000000,i1,i5120,i7168,i64,i7,i2
+euhedral_trellis_epilogue grid=14,1,1 block=128,1,1 smem=0 args=p700005000,i7,p400000000,p600000000,i1,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=1 rowExact=true fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=221184,221184
+euhedral_trellis_prepass grid=10,1,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1,i5120,i2,i0
+euhedral_trellis_mma grid=56,7,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700005000,p600000000,i1,i5120,i7168,i64,i7,i2
+euhedral_trellis_epilogue grid=14,1,1 block=128,1,1 smem=0 args=p700005000,i7,p400000000,p600000000,i1,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=8 rowExact=false fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=1769472,1769472
+euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
+euhedral_trellis_mma grid=56,7,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700028000,p600000000,i8,i5120,i7168,i64,i7,i2
+euhedral_trellis_epilogue grid=14,8,1 block=128,1,1 smem=0 args=p700028000,i7,p400000000,p600000000,i8,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=8 rowExact=false fp8=false exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=1769472,1769472
+euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
+euhedral_trellis_mma grid=56,7,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700028000,p600000000,i8,i5120,i7168,i64,i7,i2
+euhedral_trellis_epilogue grid=14,8,1 block=128,1,1 smem=0 args=p700028000,i7,p400000000,p600000000,i8,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=8 rowExact=true fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=1769472,1769472
+euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
+euhedral_trellis_mma grid=56,7,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700028000,p600000000,i8,i5120,i7168,i64,i7,i2
+euhedral_trellis_epilogue grid=14,8,1 block=128,1,1 smem=0 args=p700028000,i7,p400000000,p600000000,i8,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=64 rowExact=false fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=13955072,13955072
+euhedral_trellis_prepass grid=10,64,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i5120,i2,i2
+euhedral_trellis_mma_rows_fp8 grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i5120,i7168,i64,i7,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=64 rowExact=false fp8=false exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=13955072,13955072
+euhedral_trellis_prepass grid=10,64,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i5120,i2,i0
+euhedral_trellis_mma_rows grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i5120,i7168,i64,i7,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=64 rowExact=true fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=13955072,13955072
+euhedral_trellis_prepass grid=10,64,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i5120,i2,i0
+euhedral_trellis_mma_rows grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i5120,i7168,i64,i7,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=128 rowExact=false fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=15265792,15265792
+euhedral_trellis_prepass grid=10,128,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i128,i5120,i2,i2
+euhedral_trellis_mma_rows64_fp8 grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i128,i5120,i7168,i64,i7,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=128 rowExact=false fp8=false exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=15265792,15265792
+euhedral_trellis_prepass grid=10,128,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i128,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i128,i5120,i7168,i64,i7,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=128 rowExact=true fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=15265792,15265792
+euhedral_trellis_prepass grid=10,128,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i128,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i128,i5120,i7168,i64,i7,i2
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=1 rowExact=false fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=217088,217088
+euhedral_trellis_prepass grid=12,1,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1,i6144,i1,i0
+euhedral_trellis_mma grid=40,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700003000,p600000000,i1,i6144,i5120,i40,i10,i1
+euhedral_trellis_epilogue grid=10,1,1 block=128,1,1 smem=0 args=p700003000,i10,p400000000,p600000000,i1,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=1 rowExact=false fp8=false exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=217088,217088
+euhedral_trellis_prepass grid=12,1,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1,i6144,i1,i0
+euhedral_trellis_mma grid=40,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700003000,p600000000,i1,i6144,i5120,i40,i10,i1
+euhedral_trellis_epilogue grid=10,1,1 block=128,1,1 smem=0 args=p700003000,i10,p400000000,p600000000,i1,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=1 rowExact=true fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=217088,217088
+euhedral_trellis_prepass grid=12,1,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i1,i6144,i1,i0
+euhedral_trellis_mma grid=40,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700003000,p600000000,i1,i6144,i5120,i40,i10,i1
+euhedral_trellis_epilogue grid=10,1,1 block=128,1,1 smem=0 args=p700003000,i10,p400000000,p600000000,i1,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=8 rowExact=false fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=1736704,1736704
+euhedral_trellis_prepass grid=12,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i6144,i1,i0
+euhedral_trellis_mma grid=40,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700018000,p600000000,i8,i6144,i5120,i40,i10,i1
+euhedral_trellis_epilogue grid=10,8,1 block=128,1,1 smem=0 args=p700018000,i10,p400000000,p600000000,i8,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=8 rowExact=false fp8=false exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=1736704,1736704
+euhedral_trellis_prepass grid=12,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i6144,i1,i0
+euhedral_trellis_mma grid=40,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700018000,p600000000,i8,i6144,i5120,i40,i10,i1
+euhedral_trellis_epilogue grid=10,8,1 block=128,1,1 smem=0 args=p700018000,i10,p400000000,p600000000,i8,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=8 rowExact=true fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=1736704,1736704
+euhedral_trellis_prepass grid=12,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i6144,i1,i0
+euhedral_trellis_mma grid=40,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700018000,p600000000,i8,i6144,i5120,i40,i10,i1
+euhedral_trellis_epilogue grid=10,8,1 block=128,1,1 smem=0 args=p700018000,i10,p400000000,p600000000,i8,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=64 rowExact=false fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=13688832,13688832
+euhedral_trellis_prepass grid=12,64,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i6144,i1,i2
+euhedral_trellis_mma_rows_fp8 grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i6144,i5120,i40,i10,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=64 rowExact=false fp8=false exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=13688832,13688832
+euhedral_trellis_prepass grid=12,64,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i6144,i1,i0
+euhedral_trellis_mma_rows grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i6144,i5120,i40,i10,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=64 rowExact=true fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=13688832,13688832
+euhedral_trellis_prepass grid=12,64,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i6144,i1,i0
+euhedral_trellis_mma_rows grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i6144,i5120,i40,i10,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=128 rowExact=false fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=14475264,14475264
+euhedral_trellis_prepass grid=12,128,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i128,i6144,i1,i2
+euhedral_trellis_mma_rows64_fp8 grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i128,i6144,i5120,i40,i10,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=128 rowExact=false fp8=false exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=14475264,14475264
+euhedral_trellis_prepass grid=12,128,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i128,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i128,i6144,i5120,i40,i10,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=128 rowExact=true fp8=true exact=false target=384 mma=512 wholeK=64 wide=128
+scratch=14475264,14475264
+euhedral_trellis_prepass grid=12,128,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i128,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i128,i6144,i5120,i40,i10,i1
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=5 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1525760,1525760
+euhedral_trellis_prepass grid=10,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i1,i0
+euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000c800,p600000000,i5,i5120,i4096,i40,i18,i1
+euhedral_trellis_epilogue grid=8,5,1 block=128,1,1 smem=0 args=p70000c800,i18,p400000000,p600000000,i5,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=5 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1525760,1525760
+euhedral_trellis_prepass grid=10,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i1,i0
+euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000c800,p600000000,i5,i5120,i4096,i40,i18,i1
+euhedral_trellis_epilogue grid=8,5,1 block=128,1,1 smem=0 args=p70000c800,i18,p400000000,p600000000,i5,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=5 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1525760,1525760
+euhedral_trellis_prepass grid=10,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i1,i0
+euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000c800,p600000000,i5,i5120,i4096,i40,i18,i1
+euhedral_trellis_epilogue grid=8,5,1 block=128,1,1 smem=0 args=p70000c800,i18,p400000000,p600000000,i5,i4096
 case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=8 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=2441216,2441216
 euhedral_trellis_prepass grid=10,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i1,i0
@@ -1814,6 +2740,23 @@ scratch=42256384,5187584
 euhedral_trellis_prepass grid=10,17,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i17,i5120,i1,i0
 euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002a800,p600000000,i17,i5120,i4096,i40,i18,i1
 euhedral_trellis_epilogue grid=8,17,1 block=128,1,1 smem=0 args=p70002a800,i18,p400000000,p600000000,i17,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=20 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=42311680,6103040
+euhedral_trellis_prepass grid=10,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i1,i1
+euhedral_trellis_decode_bf16 grid=81920,1,1 block=256,1,1 smem=0 args=p200000000,p700032000,i5120,i4096,i40
+euhedral_q4_linear_tc_rows_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p700000000,p700032000,p702832000,i20,i5120,i4096
+euhedral_trellis_epilogue_bf16 grid=32,20,1 block=128,1,1 smem=0 args=p702832000,p500000000,i1,p400000000,p600000000,i20,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=20 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=42311680,6103040
+euhedral_trellis_prepass grid=10,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i1,i1
+euhedral_trellis_decode_bf16 grid=81920,1,1 block=256,1,1 smem=0 args=p200000000,p700032000,i5120,i4096,i40
+euhedral_q4_linear_tc_rows_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p700000000,p700032000,p702832000,i20,i5120,i4096
+euhedral_trellis_epilogue_bf16 grid=32,20,1 block=128,1,1 smem=0 args=p702832000,p500000000,i1,p400000000,p600000000,i20,i4096
+case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=20 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=42311680,6103040
+euhedral_trellis_prepass grid=10,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i1,i0
+euhedral_trellis_mma grid=32,18,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700032000,p600000000,i20,i5120,i4096,i40,i18,i1
+euhedral_trellis_epilogue grid=8,20,1 block=128,1,1 smem=0 args=p700032000,i18,p400000000,p600000000,i20,i4096
 case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=31 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=42514432,9459712
 euhedral_trellis_prepass grid=10,31,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i31,i5120,i1,i1
@@ -1879,6 +2822,21 @@ case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=100 rowExact=true fp8=tru
 scratch=43786240,10166272
 euhedral_trellis_prepass grid=10,100,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i100,i5120,i1,i0
 euhedral_trellis_mma_rows64 grid=32,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i100,i5120,i4096,i40,i18,i1
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=5 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1576960,1576960
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i12288,i40,i6,i2
+euhedral_trellis_epilogue grid=24,5,1 block=128,1,1 smem=0 args=p700019000,i6,p400000000,p600000000,i5,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=5 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1576960,1576960
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i12288,i40,i6,i2
+euhedral_trellis_epilogue grid=24,5,1 block=128,1,1 smem=0 args=p700019000,i6,p400000000,p600000000,i5,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=5 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1576960,1576960
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i12288,i40,i6,i2
+euhedral_trellis_epilogue grid=24,5,1 block=128,1,1 smem=0 args=p700019000,i6,p400000000,p600000000,i5,i12288
 case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=8 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=2523136,2523136
 euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
@@ -1928,6 +2886,25 @@ scratch=126595072,5361664
 euhedral_trellis_prepass grid=10,17,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i17,i5120,i2,i0
 euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700055000,p600000000,i17,i5120,i12288,i40,i6,i2
 euhedral_trellis_epilogue grid=24,17,1 block=128,1,1 smem=0 args=p700055000,i6,p400000000,p600000000,i17,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=20 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=126730240,6307840
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=245760,1,1 block=256,1,1 smem=0 args=p200000000,p700064000,i5120,i12288,i40
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p700064000,p707864000,i20,i5120,i6144
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700032000,p703c64000,p7078a0000,i20,i5120,i6144
+euhedral_trellis_epilogue_bf16 grid=96,20,1 block=128,1,1 smem=0 args=p707864000,p500000000,i2,p400000000,p600000000,i20,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=20 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=126730240,6307840
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=245760,1,1 block=256,1,1 smem=0 args=p200000000,p700064000,i5120,i12288,i40
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p700064000,p707864000,i20,i5120,i6144
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700032000,p703c64000,p7078a0000,i20,i5120,i6144
+euhedral_trellis_epilogue_bf16 grid=96,20,1 block=128,1,1 smem=0 args=p707864000,p500000000,i2,p400000000,p600000000,i20,i12288
+case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=20 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=126730240,6307840
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=96,6,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i12288,i40,i6,i2
+euhedral_trellis_epilogue grid=24,20,1 block=128,1,1 smem=0 args=p700064000,i6,p400000000,p600000000,i20,i12288
 case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=31 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=127225856,9777152
 euhedral_trellis_prepass grid=10,31,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i31,i5120,i2,i1
@@ -2001,6 +2978,21 @@ case gdn/value_z n=12288 k=5120 w=40 ends=[6144,12288] rows=100 rowExact=true fp
 scratch=130334720,11190272
 euhedral_trellis_prepass grid=10,100,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i100,i5120,i2,i0
 euhedral_trellis_mma_rows64 grid=96,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i100,i5120,i12288,i40,i6,i2
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=5 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1495040,1495040
+euhedral_trellis_prepass grid=12,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i5,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70000f000,i14,p400000000,p600000000,i5,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=5 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1495040,1495040
+euhedral_trellis_prepass grid=12,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i5,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70000f000,i14,p400000000,p600000000,i5,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=5 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1495040,1495040
+euhedral_trellis_prepass grid=12,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i5,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70000f000,i14,p400000000,p600000000,i5,i5120
 case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=8 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=2392064,2392064
 euhedral_trellis_prepass grid=12,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i6144,i1,i0
@@ -2048,6 +3040,23 @@ scratch=63297536,5083136
 euhedral_trellis_prepass grid=12,17,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i17,i6144,i1,i0
 euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700033000,p600000000,i17,i6144,i5120,i40,i14,i1
 euhedral_trellis_epilogue grid=10,17,1 block=128,1,1 smem=0 args=p700033000,i14,p400000000,p600000000,i17,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=20 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63365120,5980160
+euhedral_trellis_prepass grid=12,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p70003c000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p70003c000,p703c3c000,i20,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,20,1 block=128,1,1 smem=0 args=p703c3c000,p500000000,i1,p400000000,p600000000,i20,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=20 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63365120,5980160
+euhedral_trellis_prepass grid=12,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p70003c000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p70003c000,p703c3c000,i20,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,20,1 block=128,1,1 smem=0 args=p703c3c000,p500000000,i1,p400000000,p600000000,i20,i5120
+case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=20 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63365120,5980160
+euhedral_trellis_prepass grid=12,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70003c000,p600000000,i20,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p70003c000,i14,p400000000,p600000000,i20,i5120
 case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=31 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=63612928,9269248
 euhedral_trellis_prepass grid=12,31,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i31,i6144,i1,i1
@@ -2113,6 +3122,21 @@ case gdn/output n=5120 k=6144 w=40 ends=[5120] rows=100 rowExact=true fp8=true e
 scratch=65167360,10117120
 euhedral_trellis_prepass grid=12,100,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i100,i6144,i1,i0
 euhedral_trellis_mma_rows64 grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i100,i6144,i5120,i40,i14,i1
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=5 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=2191360,2191360
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i34816,i40,i3,i2
+euhedral_trellis_epilogue grid=68,5,1 block=128,1,1 smem=0 args=p700019000,i3,p400000000,p600000000,i5,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=5 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=2191360,2191360
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i34816,i40,i3,i2
+euhedral_trellis_epilogue grid=68,5,1 block=128,1,1 smem=0 args=p700019000,i3,p400000000,p600000000,i5,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=5 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=2191360,2191360
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i34816,i40,i3,i2
+euhedral_trellis_epilogue grid=68,5,1 block=128,1,1 smem=0 args=p700019000,i3,p400000000,p600000000,i5,i34816
 case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=8 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=3506176,3506176
 euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
@@ -2162,6 +3186,25 @@ scratch=358047744,7450624
 euhedral_trellis_prepass grid=10,17,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i17,i5120,i2,i0
 euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700055000,p600000000,i17,i5120,i34816,i40,i3,i2
 euhedral_trellis_epilogue grid=68,17,1 block=128,1,1 smem=0 args=p700055000,i3,p400000000,p600000000,i17,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=20 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=358318080,8765440
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=696320,1,1 block=256,1,1 smem=0 args=p200000000,p700064000,i5120,i34816,i40
+euhedral_q4_linear_tc_rows_bf16 grid=544,1,1 block=128,1,1 smem=0 args=p700000000,p700064000,p715464000,i20,i5120,i17408
+euhedral_q4_linear_tc_rows_bf16 grid=544,1,1 block=128,1,1 smem=0 args=p700032000,p70aa64000,p71550e000,i20,i5120,i17408
+euhedral_trellis_epilogue_bf16 grid=272,20,1 block=128,1,1 smem=0 args=p715464000,p500000000,i2,p400000000,p600000000,i20,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=20 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=358318080,8765440
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=696320,1,1 block=256,1,1 smem=0 args=p200000000,p700064000,i5120,i34816,i40
+euhedral_q4_linear_tc_rows_bf16 grid=544,1,1 block=128,1,1 smem=0 args=p700000000,p700064000,p715464000,i20,i5120,i17408
+euhedral_q4_linear_tc_rows_bf16 grid=544,1,1 block=128,1,1 smem=0 args=p700032000,p70aa64000,p71550e000,i20,i5120,i17408
+euhedral_trellis_epilogue_bf16 grid=272,20,1 block=128,1,1 smem=0 args=p715464000,p500000000,i2,p400000000,p600000000,i20,i34816
+case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=20 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=358318080,8765440
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=272,3,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i34816,i40,i3,i2
+euhedral_trellis_epilogue grid=68,20,1 block=128,1,1 smem=0 args=p700064000,i3,p400000000,p600000000,i20,i34816
 case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=31 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=359309312,13586432
 euhedral_trellis_prepass grid=10,31,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i31,i5120,i2,i1
@@ -2235,6 +3278,21 @@ case mlp/gate_up n=34816 k=5120 w=40 ends=[17408,34816] rows=100 rowExact=true f
 scratch=365527040,14999552
 euhedral_trellis_prepass grid=10,100,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i100,i5120,i2,i0
 euhedral_trellis_mma_rows64 grid=272,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i100,i5120,i34816,i40,i3,i2
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=5 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1607680,1607680
+euhedral_trellis_prepass grid=34,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002a800,p600000000,i5,i17408,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70002a800,i14,p400000000,p600000000,i5,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=5 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1607680,1607680
+euhedral_trellis_prepass grid=34,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002a800,p600000000,i5,i17408,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70002a800,i14,p400000000,p600000000,i5,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=5 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1607680,1607680
+euhedral_trellis_prepass grid=34,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002a800,p600000000,i5,i17408,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70002a800,i14,p400000000,p600000000,i5,i5120
 case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=8 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=2572288,2572288
 euhedral_trellis_prepass grid=34,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i17408,i1,i0
@@ -2282,6 +3340,23 @@ scratch=179023872,5466112
 euhedral_trellis_prepass grid=34,17,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i17,i17408,i1,i0
 euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700090800,p600000000,i17,i17408,i5120,i40,i14,i1
 euhedral_trellis_epilogue grid=10,17,1 block=128,1,1 smem=0 args=p700090800,i14,p400000000,p600000000,i17,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=20 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=179159040,6430720
+euhedral_trellis_prepass grid=34,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i17408,i1,i1
+euhedral_trellis_decode_bf16 grid=348160,1,1 block=256,1,1 smem=0 args=p200000000,p7000aa000,i17408,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p7000aa000,p70aaaa000,i20,i17408,i5120
+euhedral_trellis_epilogue_bf16 grid=40,20,1 block=128,1,1 smem=0 args=p70aaaa000,p500000000,i1,p400000000,p600000000,i20,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=20 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=179159040,6430720
+euhedral_trellis_prepass grid=34,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i17408,i1,i1
+euhedral_trellis_decode_bf16 grid=348160,1,1 block=256,1,1 smem=0 args=p200000000,p7000aa000,i17408,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p7000aa000,p70aaaa000,i20,i17408,i5120
+euhedral_trellis_epilogue_bf16 grid=40,20,1 block=128,1,1 smem=0 args=p70aaaa000,p500000000,i1,p400000000,p600000000,i20,i5120
+case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=20 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=179159040,6430720
+euhedral_trellis_prepass grid=34,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000aa000,p600000000,i20,i17408,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p7000aa000,i14,p400000000,p600000000,i20,i5120
 case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=31 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=179654656,9967616
 euhedral_trellis_prepass grid=34,31,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i31,i17408,i1,i1
@@ -2347,6 +3422,21 @@ case mlp/down n=5120 k=17408 w=40 ends=[5120] rows=100 rowExact=true fp8=true ex
 scratch=182763520,12369920
 euhedral_trellis_prepass grid=34,100,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i100,i17408,i1,i0
 euhedral_trellis_mma_rows64 grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i100,i17408,i5120,i40,i14,i1
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=5 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1607680,1607680
+euhedral_trellis_prepass grid=34,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002a800,p600000000,i5,i17408,i5120,i56,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70002a800,i14,p400000000,p600000000,i5,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=5 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1607680,1607680
+euhedral_trellis_prepass grid=34,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002a800,p600000000,i5,i17408,i5120,i56,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70002a800,i14,p400000000,p600000000,i5,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=5 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1607680,1607680
+euhedral_trellis_prepass grid=34,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70002a800,p600000000,i5,i17408,i5120,i56,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70002a800,i14,p400000000,p600000000,i5,i5120
 case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=8 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=2572288,2572288
 euhedral_trellis_prepass grid=34,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i17408,i1,i0
@@ -2394,6 +3484,23 @@ scratch=179023872,5466112
 euhedral_trellis_prepass grid=34,17,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i17,i17408,i1,i0
 euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700090800,p600000000,i17,i17408,i5120,i56,i14,i1
 euhedral_trellis_epilogue grid=10,17,1 block=128,1,1 smem=0 args=p700090800,i14,p400000000,p600000000,i17,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=20 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=179159040,6430720
+euhedral_trellis_prepass grid=34,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i17408,i1,i1
+euhedral_trellis_decode_bf16 grid=348160,1,1 block=256,1,1 smem=0 args=p200000000,p7000aa000,i17408,i5120,i56
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p7000aa000,p70aaaa000,i20,i17408,i5120
+euhedral_trellis_epilogue_bf16 grid=40,20,1 block=128,1,1 smem=0 args=p70aaaa000,p500000000,i1,p400000000,p600000000,i20,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=20 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=179159040,6430720
+euhedral_trellis_prepass grid=34,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i17408,i1,i1
+euhedral_trellis_decode_bf16 grid=348160,1,1 block=256,1,1 smem=0 args=p200000000,p7000aa000,i17408,i5120,i56
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p7000aa000,p70aaaa000,i20,i17408,i5120
+euhedral_trellis_epilogue_bf16 grid=40,20,1 block=128,1,1 smem=0 args=p70aaaa000,p500000000,i1,p400000000,p600000000,i20,i5120
+case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=20 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=179159040,6430720
+euhedral_trellis_prepass grid=34,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i17408,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p7000aa000,p600000000,i20,i17408,i5120,i56,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p7000aa000,i14,p400000000,p600000000,i20,i5120
 case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=31 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=179654656,9967616
 euhedral_trellis_prepass grid=34,31,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i31,i17408,i1,i1
@@ -2459,6 +3566,21 @@ case mlp/down-w56 n=5120 k=17408 w=56 ends=[5120] rows=100 rowExact=true fp8=tru
 scratch=182763520,12369920
 euhedral_trellis_prepass grid=34,100,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i100,i17408,i1,i0
 euhedral_trellis_mma_rows64 grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i100,i17408,i5120,i56,i14,i1
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=5 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1536000,1536000
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,5,1 block=128,1,1 smem=0 args=p700019000,i10,p400000000,p600000000,i5,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=5 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1536000,1536000
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,5,1 block=128,1,1 smem=0 args=p700019000,i10,p400000000,p600000000,i5,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=5 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1536000,1536000
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,5,1 block=128,1,1 smem=0 args=p700019000,i10,p400000000,p600000000,i5,i7168
 case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=8 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=2457600,2457600
 euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
@@ -2508,6 +3630,25 @@ scratch=73992192,5222400
 euhedral_trellis_prepass grid=10,17,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i17,i5120,i2,i0
 euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700055000,p600000000,i17,i5120,i7168,i64,i10,i2
 euhedral_trellis_epilogue grid=14,17,1 block=128,1,1 smem=0 args=p700055000,i10,p400000000,p600000000,i17,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=20 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=74096640,6144000
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p700064000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p700064000,p704664000,i20,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p700032000,p703c64000,p7046a0000,i20,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,20,1 block=128,1,1 smem=0 args=p704664000,p500000000,i2,p400000000,p600000000,i20,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=20 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=74096640,6144000
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p700064000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p700064000,p704664000,i20,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p700032000,p703c64000,p7046a0000,i20,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,20,1 block=128,1,1 smem=0 args=p704664000,p500000000,i2,p400000000,p600000000,i20,i7168
+case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=20 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=74096640,6144000
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,20,1 block=128,1,1 smem=0 args=p700064000,i10,p400000000,p600000000,i20,i7168
 case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=31 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
 scratch=74479616,9523200
 euhedral_trellis_prepass grid=10,31,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i31,i5120,i2,i1
@@ -2581,6 +3722,306 @@ case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=100 rowExact=t
 scratch=76881920,10936320
 euhedral_trellis_prepass grid=10,100,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i100,i5120,i2,i0
 euhedral_trellis_mma_rows64 grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i100,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=5 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1536000,1536000
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,5,1 block=128,1,1 smem=0 args=p700019000,i10,p400000000,p600000000,i5,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=5 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1536000,1536000
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,5,1 block=128,1,1 smem=0 args=p700019000,i10,p400000000,p600000000,i5,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=5 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1536000,1536000
+euhedral_trellis_prepass grid=10,5,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700019000,p600000000,i5,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,5,1 block=128,1,1 smem=0 args=p700019000,i10,p400000000,p600000000,i5,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=8 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=2457600,2457600
+euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700028000,p600000000,i8,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,8,1 block=128,1,1 smem=0 args=p700028000,i10,p400000000,p600000000,i8,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=8 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=2457600,2457600
+euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700028000,p600000000,i8,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,8,1 block=128,1,1 smem=0 args=p700028000,i10,p400000000,p600000000,i8,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=8 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=2457600,2457600
+euhedral_trellis_prepass grid=10,8,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700028000,p600000000,i8,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,8,1 block=128,1,1 smem=0 args=p700028000,i10,p400000000,p600000000,i8,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=16 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=4915200,4915200
+euhedral_trellis_prepass grid=10,16,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i16,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700050000,p600000000,i16,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,16,1 block=128,1,1 smem=0 args=p700050000,i10,p400000000,p600000000,i16,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=16 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=4915200,4915200
+euhedral_trellis_prepass grid=10,16,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i16,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700050000,p600000000,i16,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,16,1 block=128,1,1 smem=0 args=p700050000,i10,p400000000,p600000000,i16,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=16 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=4915200,4915200
+euhedral_trellis_prepass grid=10,16,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i16,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700050000,p600000000,i16,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,16,1 block=128,1,1 smem=0 args=p700050000,i10,p400000000,p600000000,i16,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=17 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=73992192,5222400
+euhedral_trellis_prepass grid=10,17,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i17,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p700055000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p700055000,p704655000,i17,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p70002a800,p703c55000,p704688000,i17,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,17,1 block=128,1,1 smem=0 args=p704655000,p500000000,i2,p400000000,p600000000,i17,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=17 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=73992192,5222400
+euhedral_trellis_prepass grid=10,17,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i17,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p700055000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p700055000,p704655000,i17,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p70002a800,p703c55000,p704688000,i17,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,17,1 block=128,1,1 smem=0 args=p704655000,p500000000,i2,p400000000,p600000000,i17,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=17 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=73992192,5222400
+euhedral_trellis_prepass grid=10,17,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i17,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700055000,p600000000,i17,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,17,1 block=128,1,1 smem=0 args=p700055000,i10,p400000000,p600000000,i17,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=20 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=74096640,6144000
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p700064000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p700064000,p704664000,i20,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p700032000,p703c64000,p7046a0000,i20,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,20,1 block=128,1,1 smem=0 args=p704664000,p500000000,i2,p400000000,p600000000,i20,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=20 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=74096640,6144000
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p700064000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p700064000,p704664000,i20,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p700032000,p703c64000,p7046a0000,i20,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,20,1 block=128,1,1 smem=0 args=p704664000,p500000000,i2,p400000000,p600000000,i20,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=20 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=74096640,6144000
+euhedral_trellis_prepass grid=10,20,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700064000,p600000000,i20,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,20,1 block=128,1,1 smem=0 args=p700064000,i10,p400000000,p600000000,i20,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=31 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=74479616,9523200
+euhedral_trellis_prepass grid=10,31,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i31,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p70009b000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p70009b000,p70469b000,i31,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p70004d800,p703c9b000,p7046f8000,i31,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,31,1 block=128,1,1 smem=0 args=p70469b000,p500000000,i2,p400000000,p600000000,i31,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=31 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=74479616,9523200
+euhedral_trellis_prepass grid=10,31,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i31,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p70009b000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p70009b000,p70469b000,i31,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p70004d800,p703c9b000,p7046f8000,i31,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,31,1 block=128,1,1 smem=0 args=p70469b000,p500000000,i2,p400000000,p600000000,i31,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=31 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=74479616,9523200
+euhedral_trellis_prepass grid=10,31,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i31,i5120,i2,i0
+euhedral_trellis_mma grid=56,10,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70009b000,p600000000,i31,i5120,i7168,i64,i10,i2
+euhedral_trellis_epilogue grid=14,31,1 block=128,1,1 smem=0 args=p70009b000,i10,p400000000,p600000000,i31,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=32 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=74514432,9543680
+euhedral_trellis_prepass grid=10,32,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p7000a0000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p7000a0000,p7046a0000,i32,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p700050000,p703ca0000,p704700000,i32,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,32,1 block=128,1,1 smem=0 args=p7046a0000,p500000000,i2,p400000000,p600000000,i32,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=32 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=74514432,9543680
+euhedral_trellis_prepass grid=10,32,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p7000a0000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p7000a0000,p7046a0000,i32,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p700050000,p703ca0000,p704700000,i32,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,32,1 block=128,1,1 smem=0 args=p7046a0000,p500000000,i2,p400000000,p600000000,i32,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=32 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=74514432,9543680
+euhedral_trellis_prepass grid=10,32,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i5120,i2,i0
+euhedral_trellis_mma_rows grid=56,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i32,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=64 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=75628544,10199040
+euhedral_trellis_prepass grid=10,64,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p700140000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p700140000,p704740000,i64,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p7000a0000,p703d40000,p704800000,i64,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,64,1 block=128,1,1 smem=0 args=p704740000,p500000000,i2,p400000000,p600000000,i64,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=64 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=75628544,10199040
+euhedral_trellis_prepass grid=10,64,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p700140000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,1,1 block=128,1,1 smem=0 args=p700000000,p700140000,p704740000,i64,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,1,1 block=128,1,1 smem=0 args=p7000a0000,p703d40000,p704800000,i64,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,64,1 block=128,1,1 smem=0 args=p704740000,p500000000,i2,p400000000,p600000000,i64,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=64 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=75628544,10199040
+euhedral_trellis_prepass grid=10,64,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i5120,i7168,i64,i10,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=100 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=76881920,10936320
+euhedral_trellis_prepass grid=10,100,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i100,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p7001f4000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,2,1 block=128,1,1 smem=0 args=p700000000,p7001f4000,p7047f4000,i100,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,2,1 block=128,1,1 smem=0 args=p7000fa000,p703df4000,p704920000,i100,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,100,1 block=128,1,1 smem=0 args=p7047f4000,p500000000,i2,p400000000,p600000000,i100,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=100 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=76881920,10936320
+euhedral_trellis_prepass grid=10,100,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i100,i5120,i2,i1
+euhedral_trellis_decode_bf16 grid=143360,1,1 block=256,1,1 smem=0 args=p200000000,p7001f4000,i5120,i7168,i64
+euhedral_q4_linear_tc_rows_bf16 grid=192,2,1 block=128,1,1 smem=0 args=p700000000,p7001f4000,p7047f4000,i100,i5120,i6144
+euhedral_q4_linear_tc_rows_split_bf16 grid=128,2,1 block=128,1,1 smem=0 args=p7000fa000,p703df4000,p704920000,i100,i5120,i1024
+euhedral_trellis_epilogue_bf16 grid=56,100,1 block=128,1,1 smem=0 args=p7047f4000,p500000000,i2,p400000000,p600000000,i100,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=100 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=76881920,10936320
+euhedral_trellis_prepass grid=10,100,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i100,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i100,i5120,i7168,i64,i10,i2
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=5 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1495040,1495040
+euhedral_trellis_prepass grid=12,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i5,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70000f000,i14,p400000000,p600000000,i5,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=5 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1495040,1495040
+euhedral_trellis_prepass grid=12,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i5,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70000f000,i14,p400000000,p600000000,i5,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=5 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=1495040,1495040
+euhedral_trellis_prepass grid=12,5,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i5,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000f000,p600000000,i5,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,5,1 block=128,1,1 smem=0 args=p70000f000,i14,p400000000,p600000000,i5,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=8 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=2392064,2392064
+euhedral_trellis_prepass grid=12,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700018000,p600000000,i8,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,8,1 block=128,1,1 smem=0 args=p700018000,i14,p400000000,p600000000,i8,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=8 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=2392064,2392064
+euhedral_trellis_prepass grid=12,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700018000,p600000000,i8,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,8,1 block=128,1,1 smem=0 args=p700018000,i14,p400000000,p600000000,i8,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=8 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=2392064,2392064
+euhedral_trellis_prepass grid=12,8,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i8,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700018000,p600000000,i8,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,8,1 block=128,1,1 smem=0 args=p700018000,i14,p400000000,p600000000,i8,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=16 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=4784128,4784128
+euhedral_trellis_prepass grid=12,16,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i16,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700030000,p600000000,i16,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,16,1 block=128,1,1 smem=0 args=p700030000,i14,p400000000,p600000000,i16,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=16 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=4784128,4784128
+euhedral_trellis_prepass grid=12,16,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i16,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700030000,p600000000,i16,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,16,1 block=128,1,1 smem=0 args=p700030000,i14,p400000000,p600000000,i16,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=16 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=4784128,4784128
+euhedral_trellis_prepass grid=12,16,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i16,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700030000,p600000000,i16,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,16,1 block=128,1,1 smem=0 args=p700030000,i14,p400000000,p600000000,i16,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=17 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63297536,5083136
+euhedral_trellis_prepass grid=12,17,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i17,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p700033000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p700033000,p703c33000,i17,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,17,1 block=128,1,1 smem=0 args=p703c33000,p500000000,i1,p400000000,p600000000,i17,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=17 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63297536,5083136
+euhedral_trellis_prepass grid=12,17,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i17,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p700033000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p700033000,p703c33000,i17,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,17,1 block=128,1,1 smem=0 args=p703c33000,p500000000,i1,p400000000,p600000000,i17,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=17 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63297536,5083136
+euhedral_trellis_prepass grid=12,17,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i17,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700033000,p600000000,i17,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,17,1 block=128,1,1 smem=0 args=p700033000,i14,p400000000,p600000000,i17,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=20 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63365120,5980160
+euhedral_trellis_prepass grid=12,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p70003c000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p70003c000,p703c3c000,i20,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,20,1 block=128,1,1 smem=0 args=p703c3c000,p500000000,i1,p400000000,p600000000,i20,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=20 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63365120,5980160
+euhedral_trellis_prepass grid=12,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p70003c000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p70003c000,p703c3c000,i20,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,20,1 block=128,1,1 smem=0 args=p703c3c000,p500000000,i1,p400000000,p600000000,i20,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=20 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63365120,5980160
+euhedral_trellis_prepass grid=12,20,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i20,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70003c000,p600000000,i20,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,20,1 block=128,1,1 smem=0 args=p70003c000,i14,p400000000,p600000000,i20,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=31 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63612928,9269248
+euhedral_trellis_prepass grid=12,31,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i31,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p70005d000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p70005d000,p703c5d000,i31,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,31,1 block=128,1,1 smem=0 args=p703c5d000,p500000000,i1,p400000000,p600000000,i31,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=31 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63612928,9269248
+euhedral_trellis_prepass grid=12,31,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i31,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p70005d000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p70005d000,p703c5d000,i31,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,31,1 block=128,1,1 smem=0 args=p703c5d000,p500000000,i1,p400000000,p600000000,i31,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=31 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63612928,9269248
+euhedral_trellis_prepass grid=12,31,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i31,i6144,i1,i0
+euhedral_trellis_mma grid=40,14,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70005d000,p600000000,i31,i6144,i5120,i40,i14,i1
+euhedral_trellis_epilogue grid=10,31,1 block=128,1,1 smem=0 args=p70005d000,i14,p400000000,p600000000,i31,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=32 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63635456,9281536
+euhedral_trellis_prepass grid=12,32,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p700060000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p700060000,p703c60000,i32,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,32,1 block=128,1,1 smem=0 args=p703c60000,p500000000,i1,p400000000,p600000000,i32,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=32 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63635456,9281536
+euhedral_trellis_prepass grid=12,32,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p700060000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p700060000,p703c60000,i32,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,32,1 block=128,1,1 smem=0 args=p703c60000,p500000000,i1,p400000000,p600000000,i32,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=32 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=63635456,9281536
+euhedral_trellis_prepass grid=12,32,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i6144,i1,i0
+euhedral_trellis_mma_rows grid=40,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i32,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=64 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=64356352,9674752
+euhedral_trellis_prepass grid=12,64,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p7000c0000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p7000c0000,p703cc0000,i64,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,64,1 block=128,1,1 smem=0 args=p703cc0000,p500000000,i1,p400000000,p600000000,i64,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=64 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=64356352,9674752
+euhedral_trellis_prepass grid=12,64,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p7000c0000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,1,1 block=128,1,1 smem=0 args=p700000000,p7000c0000,p703cc0000,i64,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,64,1 block=128,1,1 smem=0 args=p703cc0000,p500000000,i1,p400000000,p600000000,i64,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=64 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=64356352,9674752
+euhedral_trellis_prepass grid=12,64,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i64,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i64,i6144,i5120,i40,i14,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=100 rowExact=false fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=65167360,10117120
+euhedral_trellis_prepass grid=12,100,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i100,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p70012c000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,2,1 block=128,1,1 smem=0 args=p700000000,p70012c000,p703d2c000,i100,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,100,1 block=128,1,1 smem=0 args=p703d2c000,p500000000,i1,p400000000,p600000000,i100,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=100 rowExact=false fp8=false exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=65167360,10117120
+euhedral_trellis_prepass grid=12,100,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i100,i6144,i1,i1
+euhedral_trellis_decode_bf16 grid=122880,1,1 block=256,1,1 smem=0 args=p200000000,p70012c000,i6144,i5120,i40
+euhedral_q4_linear_tc_rows_bf16 grid=160,2,1 block=128,1,1 smem=0 args=p700000000,p70012c000,p703d2c000,i100,i6144,i5120
+euhedral_trellis_epilogue_bf16 grid=40,100,1 block=128,1,1 smem=0 args=p703d2c000,p500000000,i1,p400000000,p600000000,i100,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=100 rowExact=true fp8=true exact=false target=560 mma=16 wholeK=32 wide=64
+scratch=65167360,10117120
+euhedral_trellis_prepass grid=12,100,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i100,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,2,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i100,i6144,i5120,i40,i14,i1
 case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=4 rowExact=false fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
 scratch=1351680,1351680
 euhedral_trellis_prepass grid=10,4,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i4,i5120,i1,i0
@@ -2938,6 +4379,108 @@ case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=33 rowExact=tr
 scratch=9277440,9277440
 euhedral_trellis_prepass grid=10,33,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i33,i5120,i2,i0
 euhedral_trellis_mma_rows64 grid=56,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i33,i5120,i7168,i64,i20,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=4 rowExact=false fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=2375680,2375680
+euhedral_trellis_prepass grid=10,4,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i4,i5120,i2,i0
+euhedral_trellis_mma grid=56,20,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700014000,p600000000,i4,i5120,i7168,i64,i20,i2
+euhedral_trellis_epilogue grid=14,4,1 block=128,1,1 smem=0 args=p700014000,i20,p400000000,p600000000,i4,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=4 rowExact=false fp8=false exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=2375680,2375680
+euhedral_trellis_prepass grid=10,4,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i4,i5120,i2,i0
+euhedral_trellis_mma grid=56,20,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700014000,p600000000,i4,i5120,i7168,i64,i20,i2
+euhedral_trellis_epilogue grid=14,4,1 block=128,1,1 smem=0 args=p700014000,i20,p400000000,p600000000,i4,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=4 rowExact=true fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=2375680,2375680
+euhedral_trellis_prepass grid=10,4,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i4,i5120,i2,i0
+euhedral_trellis_mma grid=56,20,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p700014000,p600000000,i4,i5120,i7168,i64,i20,i2
+euhedral_trellis_epilogue grid=14,4,1 block=128,1,1 smem=0 args=p700014000,i20,p400000000,p600000000,i4,i7168
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=16 rowExact=false fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=8929280,8929280
+euhedral_trellis_prepass grid=10,16,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i16,i5120,i2,i2
+euhedral_trellis_mma_rows_fp8 grid=56,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i16,i5120,i7168,i64,i20,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=16 rowExact=false fp8=false exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=8929280,8929280
+euhedral_trellis_prepass grid=10,16,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i16,i5120,i2,i0
+euhedral_trellis_mma_rows grid=56,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i16,i5120,i7168,i64,i20,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=16 rowExact=true fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=8929280,8929280
+euhedral_trellis_prepass grid=10,16,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i16,i5120,i2,i0
+euhedral_trellis_mma_rows grid=56,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i16,i5120,i7168,i64,i20,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=32 rowExact=false fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=9256960,9256960
+euhedral_trellis_prepass grid=10,32,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i5120,i2,i2
+euhedral_trellis_mma_rows64_fp8 grid=56,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i32,i5120,i7168,i64,i20,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=32 rowExact=false fp8=false exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=9256960,9256960
+euhedral_trellis_prepass grid=10,32,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i32,i5120,i7168,i64,i20,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=32 rowExact=true fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=9256960,9256960
+euhedral_trellis_prepass grid=10,32,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i32,i5120,i7168,i64,i20,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=33 rowExact=false fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=9277440,9277440
+euhedral_trellis_prepass grid=10,33,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i33,i5120,i2,i2
+euhedral_trellis_mma_rows64_fp8 grid=56,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i33,i5120,i7168,i64,i20,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=33 rowExact=false fp8=false exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=9277440,9277440
+euhedral_trellis_prepass grid=10,33,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i33,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i33,i5120,i7168,i64,i20,i2
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=33 rowExact=true fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=9277440,9277440
+euhedral_trellis_prepass grid=10,33,2 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i33,i5120,i2,i0
+euhedral_trellis_mma_rows64 grid=56,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i33,i5120,i7168,i64,i20,i2
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=4 rowExact=false fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=2015232,2015232
+euhedral_trellis_prepass grid=12,4,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i4,i6144,i1,i0
+euhedral_trellis_mma grid=40,24,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000c000,p600000000,i4,i6144,i5120,i40,i24,i1
+euhedral_trellis_epilogue grid=10,4,1 block=128,1,1 smem=0 args=p70000c000,i24,p400000000,p600000000,i4,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=4 rowExact=false fp8=false exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=2015232,2015232
+euhedral_trellis_prepass grid=12,4,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i4,i6144,i1,i0
+euhedral_trellis_mma grid=40,24,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000c000,p600000000,i4,i6144,i5120,i40,i24,i1
+euhedral_trellis_epilogue grid=10,4,1 block=128,1,1 smem=0 args=p70000c000,i24,p400000000,p600000000,i4,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=4 rowExact=true fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=2015232,2015232
+euhedral_trellis_prepass grid=12,4,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i4,i6144,i1,i0
+euhedral_trellis_mma grid=40,24,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p70000c000,p600000000,i4,i6144,i5120,i40,i24,i1
+euhedral_trellis_epilogue grid=10,4,1 block=128,1,1 smem=0 args=p70000c000,i24,p400000000,p600000000,i4,i5120
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=16 rowExact=false fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=7569408,7569408
+euhedral_trellis_prepass grid=12,16,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i16,i6144,i1,i2
+euhedral_trellis_mma_rows_fp8 grid=40,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i16,i6144,i5120,i40,i24,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=16 rowExact=false fp8=false exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=7569408,7569408
+euhedral_trellis_prepass grid=12,16,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i16,i6144,i1,i0
+euhedral_trellis_mma_rows grid=40,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i16,i6144,i5120,i40,i24,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=16 rowExact=true fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=7569408,7569408
+euhedral_trellis_prepass grid=12,16,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i16,i6144,i1,i0
+euhedral_trellis_mma_rows grid=40,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i16,i6144,i5120,i40,i24,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=32 rowExact=false fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=7766016,7766016
+euhedral_trellis_prepass grid=12,32,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i6144,i1,i2
+euhedral_trellis_mma_rows64_fp8 grid=40,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i32,i6144,i5120,i40,i24,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=32 rowExact=false fp8=false exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=7766016,7766016
+euhedral_trellis_prepass grid=12,32,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i32,i6144,i5120,i40,i24,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=32 rowExact=true fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=7766016,7766016
+euhedral_trellis_prepass grid=12,32,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i32,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i32,i6144,i5120,i40,i24,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=33 rowExact=false fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=7778304,7778304
+euhedral_trellis_prepass grid=12,33,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i33,i6144,i1,i2
+euhedral_trellis_mma_rows64_fp8 grid=40,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i33,i6144,i5120,i40,i24,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=33 rowExact=false fp8=false exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=7778304,7778304
+euhedral_trellis_prepass grid=12,33,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i33,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i33,i6144,i5120,i40,i24,i1
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=33 rowExact=true fp8=true exact=false target=1120 mma=512 wholeK=16 wide=32
+scratch=7778304,7778304
+euhedral_trellis_prepass grid=12,33,1 block=128,1,1 smem=0 args=p100000000,p300000000,p700000000,i33,i6144,i1,i0
+euhedral_trellis_mma_rows64 grid=40,1,1 block=256,1,1 smem=0 args=p700000000,p200000000,p500000000,p400000000,p600000000,i33,i6144,i5120,i40,i24,i1
 case gdn/query_key n=4096 k=5120 w=40 ends=[4096] rows=1 rowExact=false fp8=true exact=true target=560 mma=512 wholeK=64 wide=128
 scratch=305152,305152
 euhedral_trellis_reference grid=4096,1,1 block=128,1,1 smem=20480 args=p100000000,p200000000,p300000000,p400000000,p500000000,i1,p600000000,i1,i5120,i4096,i40
@@ -3001,3 +4544,21 @@ euhedral_trellis_reference grid=57344,1,1 block=128,1,1 smem=20480 args=p1000000
 case attention/query_key n=7168 k=5120 w=64 ends=[6144,7168] rows=100 rowExact=false fp8=true exact=true target=560 mma=512 wholeK=64 wide=128
 scratch=20111360,20111360
 euhedral_trellis_reference grid=716800,1,1 block=128,1,1 smem=20480 args=p100000000,p200000000,p300000000,p400000000,p500000000,i2,p600000000,i100,i5120,i7168,i64
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=1 rowExact=false fp8=true exact=true target=560 mma=512 wholeK=64 wide=128
+scratch=307200,307200
+euhedral_trellis_reference grid=7168,1,1 block=128,1,1 smem=20480 args=p100000000,p200000000,p300000000,p400000000,p500000000,i2,p600000000,i1,i5120,i7168,i64
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=8 rowExact=false fp8=true exact=true target=560 mma=512 wholeK=64 wide=128
+scratch=2457600,2457600
+euhedral_trellis_reference grid=57344,1,1 block=128,1,1 smem=20480 args=p100000000,p200000000,p300000000,p400000000,p500000000,i2,p600000000,i8,i5120,i7168,i64
+case attention/gate_value n=7168 k=5120 w=64 ends=[6144,7168] rows=100 rowExact=false fp8=true exact=true target=560 mma=512 wholeK=64 wide=128
+scratch=20111360,20111360
+euhedral_trellis_reference grid=716800,1,1 block=128,1,1 smem=20480 args=p100000000,p200000000,p300000000,p400000000,p500000000,i2,p600000000,i100,i5120,i7168,i64
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=1 rowExact=false fp8=true exact=true target=560 mma=512 wholeK=64 wide=128
+scratch=299008,299008
+euhedral_trellis_reference grid=5120,1,1 block=128,1,1 smem=24576 args=p100000000,p200000000,p300000000,p400000000,p500000000,i1,p600000000,i1,i6144,i5120,i40
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=8 rowExact=false fp8=true exact=true target=560 mma=512 wholeK=64 wide=128
+scratch=2392064,2392064
+euhedral_trellis_reference grid=40960,1,1 block=128,1,1 smem=24576 args=p100000000,p200000000,p300000000,p400000000,p500000000,i1,p600000000,i8,i6144,i5120,i40
+case attention/output n=5120 k=6144 w=40 ends=[5120] rows=100 rowExact=false fp8=true exact=true target=560 mma=512 wholeK=64 wide=128
+scratch=19292160,19292160
+euhedral_trellis_reference grid=512000,1,1 block=128,1,1 smem=24576 args=p100000000,p200000000,p300000000,p400000000,p500000000,i1,p600000000,i100,i6144,i5120,i40

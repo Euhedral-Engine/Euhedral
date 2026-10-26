@@ -42,6 +42,9 @@ use linear_gpu::{
     upload, values,
 };
 
+/// The target blocks the fixture was recorded with.
+const FIXTURE_TARGET_BLOCKS: usize = 560;
+
 const VERIFY: LinearMode = LinearMode {
     row_exact: true,
     prefill: false,
@@ -269,22 +272,46 @@ fn launch_shapes_match_java_goldens() {
     let Some(rig) = rig() else { return };
     let Some(mut artifact) = Artifact::open() else { return };
     let java = java_launches();
-    let sm_count = rig.library.device().sm_count as usize;
     let fp8 = rig
         .library
         .linear_kernel_available(LinearKernel::TrellisMmaRowsFp8.index())
         .unwrap();
-    let format = TrellisLinear::from_settings(&TrellisKernelSettings::default(), rig.library.device().sm_count)
-        .with_shape_recording();
+    // The fixture's thresholds, whatever device runs this: 560 target blocks (8 per multiprocessor of 70) and the
+    // defaults of the others.
+    let format = TrellisLinear::new(FIXTURE_TARGET_BLOCKS, 512, 64, 128).with_shape_recording();
     let mut random = Random::new(3);
     let x = upload(&rig.library, &activations(&mut random, 512, 17408));
     ShapeRecorder::take();
     let mut compared = 0;
-    // One decode layer's linears (the first GDN layer): decode, a two-row twin, a verification, a draft-sized batch
-    // over the whole-K threshold, and a prefill chunk.
-    for tensor in ["gdn/query_key", "gdn/value_z", "gdn/output", "mlp/gate_up", "mlp/down"] {
-        let object = artifact.trellis(&rig.library, &format!("text/layers/0/{tensor}"));
-        for (rows, row_exact) in [(1usize, false), (2, false), (8, true), (64, false), (512, false)] {
+    // One decode layer's linears (the first GDN layer) and a full-attention layer's (the fourth): decode, a two-row
+    // twin, a four-draft verification (5 rows) and a seven-draft one (8), a batch of 6 and of 20, a batch over the
+    // whole-K threshold, and a prefill chunk.
+    let layers = [
+        (
+            0,
+            ["gdn/query_key", "gdn/value_z", "gdn/output", "mlp/gate_up", "mlp/down"].as_slice(),
+        ),
+        (
+            3,
+            ["attention/query_key", "attention/gate_value", "attention/output"].as_slice(),
+        ),
+    ];
+    let launches = [
+        (1usize, false),
+        (2, false),
+        (5, true),
+        (6, false),
+        (8, true),
+        (20, false),
+        (64, false),
+        (512, false),
+    ];
+    for (tensor, layer) in layers
+        .iter()
+        .flat_map(|(layer, tensors)| tensors.iter().map(move |t| (*t, *layer)))
+    {
+        let object = artifact.trellis(&rig.library, &format!("text/layers/{layer}/{tensor}"));
+        for (rows, row_exact) in launches {
             let mode = LinearMode {
                 row_exact,
                 prefill: false,
@@ -296,16 +323,15 @@ fn launch_shapes_match_java_goldens() {
                 .collect();
             assert!(!recorded.is_empty(), "{tensor} recorded nothing");
             // A verification is recorded once, whatever the device: it never takes the FP8 kernels.
-            let key = java_key(&object, rows, row_exact, row_exact || fp8, 8 * sm_count);
-            let Some(expected) = java.get(&key) else {
-                println!("no Java case for {tensor} rows {rows} on {sm_count} multiprocessors: {key}");
-                continue;
-            };
+            let key = java_key(&object, rows, row_exact, row_exact || fp8, FIXTURE_TARGET_BLOCKS);
+            let expected = java
+                .get(&key)
+                .unwrap_or_else(|| panic!("the fixture has no case {key}"));
             assert_eq!(&recorded, expected, "{tensor} rows {rows} rowExact {row_exact}");
             compared += 1;
         }
     }
-    assert!(compared >= 20, "only {compared} launches were compared with Java's");
+    assert!(compared >= 60, "only {compared} launches were compared with Java's");
 
     // NVFP4: the library queues these launches itself, so the geometry is what the route computes for the shape.
     // The expectations are read from native/src/host/nvfp4_linear.c.

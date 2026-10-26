@@ -4,7 +4,7 @@ use std::array;
 use std::ffi::{CStr, CString, c_int};
 use std::fmt;
 use std::path::{self, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use euhedral_graph::LaneId;
@@ -15,6 +15,10 @@ use crate::error::{CudaError, check};
 use crate::lane::EventRing;
 use crate::memory::AllocationId;
 use crate::sys::EuhedralCuda;
+
+/// The exact-numerics selection, which the C library keeps for the whole process. The host formats whose route depends
+/// on it (the trellis linears) read this mirror; only the test oracle sets it.
+static EXACT_NUMERICS: AtomicBool = AtomicBool::new(false);
 
 /// The most lanes a `LanePool` holds.
 pub(crate) const MAX_LANES: usize = 64;
@@ -195,7 +199,14 @@ impl CudaLibrary {
     #[cfg(feature = "test-oracles")]
     pub fn exact_numerics_for_tests(&self, exact: bool) -> bool {
         // SAFETY: the call takes an integer.
-        unsafe { self.api.euhedral_cuda_select_exact_numerics(c_int::from(exact)) != 0 }
+        let previous = unsafe { self.api.euhedral_cuda_select_exact_numerics(c_int::from(exact)) != 0 };
+        EXACT_NUMERICS.store(exact, Ordering::Relaxed);
+        previous
+    }
+
+    /// Whether exact numerics are selected for this process (always false outside the test oracle).
+    pub fn exact_numerics(&self) -> bool {
+        EXACT_NUMERICS.load(Ordering::Relaxed)
     }
 
     pub(crate) fn api(&self) -> &EuhedralCuda {
