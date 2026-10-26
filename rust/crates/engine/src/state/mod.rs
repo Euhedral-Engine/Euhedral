@@ -223,3 +223,25 @@ impl Drop for SequenceState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_quantum_is_in_flight_until_its_guard_is_dropped() {
+        let flight = Arc::new(Flight::default());
+        assert_eq!(flight.count(), 0);
+        let first = flight.begin();
+        let second = first.clone();
+        assert_eq!(
+            flight.count(),
+            2,
+            "a clone of the references is the same quantum, counted again"
+        );
+        drop(first);
+        assert_eq!(flight.count(), 1);
+        drop(second);
+        assert_eq!(flight.count(), 0, "the owner may free the caches");
+    }
+}

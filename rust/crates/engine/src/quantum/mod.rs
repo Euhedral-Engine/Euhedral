@@ -582,12 +582,22 @@ impl Executor {
     /// launch bakes in shows here as a difference. The quantum must have been admitted to a recorded graph.
     #[cfg(feature = "test-oracles")]
     pub fn check_replay_for_tests(&self, quantum: &Quantum, lane: &CudaLane) -> Result<ReplayCheck, StartError> {
-        let view = quantum.view();
         let Disposition::Captured(slot) = &quantum.disposition else {
             return Err(StartError::Quantum(QuantumError::Invalid {
                 what: "the quantum was not admitted to a graph".to_string(),
             }));
         };
+        Ok(ReplayCheck {
+            recorded: slot.recorded_hash(),
+            now: self.stages_hash_for_tests(quantum, lane)?,
+        })
+    }
+
+    /// The hash of what the stages of `quantum` would submit, in the C library's check mode on `lane`: nothing is
+    /// submitted.
+    #[cfg(feature = "test-oracles")]
+    pub fn stages_hash_for_tests(&self, quantum: &Quantum, lane: &CudaLane) -> Result<u64, StartError> {
+        let view = quantum.view();
         let entries = self.plan.stages(view).ok_or(StartError::NoView(view))?;
         let mode = SubmitMode {
             pdl: true,
@@ -611,10 +621,7 @@ impl Executor {
                 what: format!("{error:?}"),
             })
         })?;
-        Ok(ReplayCheck {
-            recorded: slot.recorded_hash(),
-            now: hash,
-        })
+        Ok(hash)
     }
 }
 

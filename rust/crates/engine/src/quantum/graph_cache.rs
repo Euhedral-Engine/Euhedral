@@ -123,6 +123,17 @@ pub struct GraphCache {
 }
 
 impl GraphCache {
+    /// A cache that captures nothing: every quantum runs stage by stage. The reference that a capturing cache is
+    /// compared with.
+    pub fn disabled() -> GraphCache {
+        GraphCache {
+            capacity: 0,
+            entries: HashMap::new(),
+            clock: 0,
+            evictions: 0,
+        }
+    }
+
     /// A cache for up to `capacity` keys (the plan's `capture_key_space`).
     pub fn with_capacity(capacity: usize) -> GraphCache {
         GraphCache {
@@ -163,6 +174,9 @@ impl GraphCache {
     /// the second the quantum is captured.
     pub fn admit(&mut self, key: Option<CaptureKey>) -> Admission {
         let Some(key) = key else { return Admission::Eager };
+        if self.capacity == 0 {
+            return Admission::Eager;
+        }
         self.clock += 1;
         if !self.entries.contains_key(&key) && self.entries.len() >= self.capacity {
             self.evict();

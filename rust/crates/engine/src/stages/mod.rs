@@ -28,14 +28,16 @@ pub mod sampling;
 use std::fmt::Display;
 use std::sync::Arc;
 
-use euhedral_graph::{LaneId, Marker, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::{AllocationId, CudaError, CudaLane, DevicePtr, PooledPinned, Submission, SubmitMode};
+use euhedral_graph::{LaneId, LanePool, Marker, StageCx, StageError, Submitted};
+use euhedral_inference_cuda::{
+    AllocationId, CudaError, CudaLane, CudaLibrary, DevicePtr, PooledPinned, Submission, SubmitMode,
+};
 use thiserror::Error;
 
 use crate::model::ModelConfig;
 use crate::quantum::Disposition;
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
-use crate::state::{FlightGuard, KvView, SequenceDevice};
+use crate::state::{FlightGuard, KvView, SequenceDevice, StaleReservation};
 use crate::workspace::{BufferSlot, Workspace, WorkspaceError};
 use attention::KvSource;
 use sampling::{Selection, SelectionLease};
@@ -180,6 +182,24 @@ impl SequenceRefs {
     /// The sequence's shared device part.
     pub fn device(&self) -> &SequenceDevice {
         &self.device
+    }
+
+    /// Orders the quantum's stages that read a cache behind the work that reserved its rows, `marker`, for the views
+    /// of both caches ([`KvView::ordered_after`]): the marker is kept while its lane's event ring holds it, dropped
+    /// when its work has completed, and refused when it is older than the ring and not reached.
+    pub fn ordered_after(
+        mut self,
+        marker: Marker,
+        lanes: &LanePool,
+        library: &CudaLibrary,
+    ) -> Result<Self, StaleReservation> {
+        if let Some(view) = self.kv.take() {
+            self.kv = Some(view.ordered_after(marker, lanes, library)?);
+        }
+        if let Some(view) = self.mtp_kv.take() {
+            self.mtp_kv = Some(view.ordered_after(marker, lanes, library)?);
+        }
+        Ok(self)
     }
 
     /// The rows each GDN layer replays, by model layer.
