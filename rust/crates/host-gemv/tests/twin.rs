@@ -3,6 +3,8 @@
 mod common;
 
 use common::{Rng, Weights, quantized, random_activations, random_weights};
+use std::env;
+
 use euhedral_inference_host_gemv::contract::{MAX_PAIR_SUM, f32_to_bf16};
 use euhedral_inference_host_gemv::{Isa, available, detected, gemv_nvfp4, is_available};
 
@@ -161,4 +163,20 @@ fn avx2_pair_sums_never_saturate() {
             }
         }
     }
+}
+
+/// CI sets `EUHEDRAL_EXPECT_ISA` (a variant name such as `avx512-vnni` or `neon-dotprod`) on the jobs that exist to run
+/// that variant (Intel SDE, an arm64 runner); the job fails if the variant was not selected, so it cannot pass by
+/// silently skipping the kernel. Every other test iterates `available()`, so a variant listed there is executed.
+#[test]
+#[allow(clippy::disallowed_methods, reason = "environment: a test reads its CI expectation")]
+fn the_expected_isa_is_available() {
+    let Ok(expected) = env::var("EUHEDRAL_EXPECT_ISA") else {
+        return;
+    };
+    let names: Vec<&str> = available().into_iter().map(Isa::name).collect();
+    assert!(
+        names.contains(&expected.as_str()),
+        "expected {expected} among the available variants {names:?}"
+    );
 }

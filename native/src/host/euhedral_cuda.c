@@ -198,6 +198,22 @@ int euhedral_cuda_multiprocessor_count(int32_t* count) {
     return EUHEDRAL_CUDA_SUCCESS;
 }
 
+int euhedral_cuda_compute_capability(int32_t* major, int32_t* minor) {
+    if (major == NULL || minor == NULL) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    int device = 0;
+    cudaError_t status = cudaGetDevice(&device);
+    if (status != cudaSuccess) return (int) status;
+    int high = 0;
+    int low = 0;
+    status = cudaDeviceGetAttribute(&high, cudaDevAttrComputeCapabilityMajor, device);
+    if (status != cudaSuccess) return (int) status;
+    status = cudaDeviceGetAttribute(&low, cudaDevAttrComputeCapabilityMinor, device);
+    if (status != cudaSuccess) return (int) status;
+    *major = (int32_t) high;
+    *minor = (int32_t) low;
+    return EUHEDRAL_CUDA_SUCCESS;
+}
+
 int euhedral_cuda_copy_host_to_device(
         void* device_address,
         const void* host_address,

@@ -41,7 +41,8 @@ pub struct Weights {
 
 impl Weights {
     pub fn view(&self) -> Nvfp4View<'_> {
-        Nvfp4View::new(&self.codes, &self.scales, self.global, self.n, self.k).expect("valid view")
+        Nvfp4View::new(&self.codes, &self.scales, self.global, self.n, self.k)
+            .unwrap_or_else(|error| panic!("invalid fixture: {error}"))
     }
 
     /// The dequantised weight `e2m1 * e4m3 * global` of element `col` of row `row`, in f64.

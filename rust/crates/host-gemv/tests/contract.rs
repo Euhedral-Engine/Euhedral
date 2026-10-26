@@ -119,3 +119,59 @@ fn row_split_payload_parses_planes_and_global() {
     );
     assert!(Nvfp4View::new(&w.codes[..10], &w.scales, 1.0, n, k).is_err());
 }
+
+#[test]
+fn views_reject_what_the_java_validation_rejects() {
+    let mut rng = Rng::new(9);
+    let (n, k) = (3usize, 160usize);
+    let w = random_weights(&mut rng, n, k);
+    let new = |scales: &[u8], global: f32| Nvfp4View::new(&w.codes, scales, global, n, k).map(|_| ());
+    assert_eq!(new(&w.scales, w.global), Ok(()));
+    // The global scale: NaN, infinite, negative, and so large that e4m3 * global overflows.
+    for global in [
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        -1.0,
+        -f32::MIN_POSITIVE,
+        f32::MAX,
+    ] {
+        assert!(
+            matches!(new(&w.scales, global), Err(LayoutError::Global(_))),
+            "global {global}"
+        );
+    }
+    assert_eq!(new(&w.scales, 0.0), Ok(()));
+    // Both NaN scale codes, in the first byte, in the middle and in the padding of the last row.
+    for code in [0x7fu8, 0xff] {
+        for offset in [0, 7, n * padded_k(k) / 16 - 1] {
+            let mut scales = w.scales.clone();
+            scales[offset] = code;
+            assert_eq!(
+                new(&scales, w.global),
+                Err(LayoutError::ScaleNan { offset }),
+                "code {code:#x} at {offset}"
+            );
+        }
+    }
+    // The same checks through the payload parser.
+    let kp = padded_k(k);
+    let scale_offset = (n * kp / 2).div_ceil(256) * 256;
+    let global_offset = (scale_offset + n * kp / 16).div_ceil(256) * 256;
+    let mut payload = vec![0u8; global_offset + 4];
+    payload[..n * kp / 2].copy_from_slice(&w.codes);
+    payload[scale_offset..scale_offset + n * kp / 16].copy_from_slice(&w.scales);
+    payload[global_offset..].copy_from_slice(&w.global.to_le_bytes());
+    assert!(Nvfp4View::from_row_split(&payload, n, k).is_ok());
+    payload[global_offset..].copy_from_slice(&f32::NAN.to_le_bytes());
+    assert!(matches!(
+        Nvfp4View::from_row_split(&payload, n, k),
+        Err(LayoutError::Global(_))
+    ));
+    payload[global_offset..].copy_from_slice(&w.global.to_le_bytes());
+    payload[scale_offset + 5] = 0x7f;
+    assert_eq!(
+        Nvfp4View::from_row_split(&payload, n, k).unwrap_err(),
+        LayoutError::ScaleNan { offset: 5 }
+    );
+}

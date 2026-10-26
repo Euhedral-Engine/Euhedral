@@ -2,6 +2,14 @@
 
 use std::ops::Range;
 
+#[cfg(target_arch = "aarch64")]
+use crate::aarch64_dotprod::gemv_dotprod;
+#[cfg(target_arch = "x86_64")]
+use crate::x86_avx2::gemv_avx2;
+#[cfg(target_arch = "x86_64")]
+use crate::x86_avx512vnni::gemv_avx512vnni;
+#[cfg(target_arch = "x86_64")]
+use crate::x86_avxvnni::gemv_avxvnni;
 use crate::{Nvfp4View, QuantizedRows, scalar};
 
 /// An instruction-set variant of the GEMV kernel. Every variant computes the same bits as [`Isa::Scalar`].
@@ -92,16 +100,16 @@ pub fn gemv_nvfp4(isa: Isa, w: &Nvfp4View<'_>, x: &QuantizedRows, rows_out: Rang
         Isa::Scalar => scalar::gemv(w, x, rows_out, y),
         #[cfg(target_arch = "x86_64")]
         // SAFETY: availability was checked above; the bounds were asserted above.
-        Isa::Avx2 => unsafe { crate::x86_avx2::gemv_avx2(w, x, &rows_out, y) },
+        Isa::Avx2 => unsafe { gemv_avx2(w, x, &rows_out, y) },
         #[cfg(target_arch = "x86_64")]
         // SAFETY: as above.
-        Isa::AvxVnni => unsafe { crate::x86_avxvnni::gemv_avxvnni(w, x, &rows_out, y) },
+        Isa::AvxVnni => unsafe { gemv_avxvnni(w, x, &rows_out, y) },
         #[cfg(target_arch = "x86_64")]
         // SAFETY: as above.
-        Isa::Avx512Vnni => unsafe { crate::x86_avx512vnni::gemv_avx512vnni(w, x, &rows_out, y) },
+        Isa::Avx512Vnni => unsafe { gemv_avx512vnni(w, x, &rows_out, y) },
         #[cfg(target_arch = "aarch64")]
         // SAFETY: as above.
-        Isa::NeonDotprod => unsafe { crate::aarch64_dotprod::gemv_dotprod(w, x, &rows_out, y) },
+        Isa::NeonDotprod => unsafe { gemv_dotprod(w, x, &rows_out, y) },
         #[allow(unreachable_patterns)]
         _ => unreachable!("is_available rejects variants of other architectures"),
     }

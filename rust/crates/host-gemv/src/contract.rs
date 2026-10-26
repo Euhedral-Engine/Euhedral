@@ -11,6 +11,21 @@
 //! 5. The accumulators combine in the fixed tree [`reduce8`].
 //!
 //! Every operation above is correctly rounded IEEE-754 binary32, so every variant produces the same bits.
+//!
+//! # Platform requirements
+//!
+//! * The scalar twin's fused multiply-add is `f32::mul_add`. Where the target has no FMA instruction that is a call to
+//!   the platform's `fmaf`, and exactness relies on that being correctly rounded: glibc and the Windows UCRT are, the
+//!   old mingw runtime was not. The SIMD variants use the hardware FMA, which always is.
+//!
+//! # Padding invariant
+//!
+//! A row is stored padded to whole 128-value chunks, and the activations are padded with zeros to the same width. The
+//! SIMD kernels run every group of the padded chunk (up to `padded_k / 16`), the scalar twin stops at `k / 16`. The
+//! two agree because a padded group has an all-zero activation block: its int32 dot is 0 whatever the padding codes
+//! hold, and its coefficient is `(t_g * 0) * 0.5 = 0` because `t_g` is finite (validated: finite global, scale codes
+//! at most 480, so [`crate::Nvfp4View`] rejects a global that could overflow `t_g`). `fma(0, 0, a) = a` bit for bit,
+//! as an accumulator is never -0.
 
 /// Elements per scale group of the weights.
 pub const GROUP: usize = 16;
@@ -47,8 +62,9 @@ pub const E2M1_X2_ABS: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, 1, 2, 3, 4, 6, 8,
 /// and an activation (at most 127). The pair sums of both nibble halves added in int16 stay below `i16::MAX` too.
 pub const MAX_PAIR_SUM: i32 = 2 * 127 * 12;
 
-/// An E4M3 scale code as f32. The sign bit is ignored (a valid tensor has none) and code 0x7F is a finite 480 as on
-/// the GPU. Exact: at most four significant bits.
+/// An E4M3 scale code as f32, exact (at most four significant bits). The sign bit is ignored, as on the GPU. Codes 0x7F
+/// and 0xFF are NaN in E4M3: `Nvfp4Layout.validate` rejects them and so does [`crate::Nvfp4View`], so a valid tensor
+/// never reaches this function with one (the bit pattern would decode to 480, as the GPU's shift-and-multiply does).
 #[inline]
 pub fn decode_e4m3(code: u8) -> f32 {
     let e = u32::from(code >> 3) & 15;

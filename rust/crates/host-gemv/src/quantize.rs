@@ -4,7 +4,7 @@
 //! `s = 0` and `q = 0`. The inputs must be finite. Every step is correctly rounded or exact, so the AVX2 build of the
 //! same code (selected at run time) gives the same bits as the portable build.
 
-use crate::contract::{BLOCK, CHUNK, bf16_to_f32, padded_k};
+use crate::contract::{BLOCK, CHUNK, bf16_to_f32, padded_k, x_position};
 
 /// Quantised activation rows. The int8 values of a row are stored per 128-value chunk de-interleaved (see
 /// [`crate::contract::x_position`]) and padded with zeros to a whole chunk; the storage is private to the crate.
@@ -39,7 +39,7 @@ impl QuantizedRows {
 
     /// The int8 value of element `col` of row `row`.
     pub fn value(&self, row: usize, col: usize) -> i8 {
-        self.q[row * padded_k(self.k) + crate::contract::x_position(col)]
+        self.q[row * padded_k(self.k) + x_position(col)]
     }
 
     pub(crate) fn q(&self) -> &[i8] {

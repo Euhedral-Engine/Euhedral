@@ -8,6 +8,13 @@
 //! Options: `--rows N` (output rows of one tensor, default 4096), `--k K` (default 5120, a multiple of 32),
 //! `--rotate-mib MIB` (total weight bytes across the copies, default 1024), `--passes P` (timed rotations, default 2).
 
+#![allow(
+    clippy::print_stdout,
+    clippy::expect_used,
+    reason = "a binary: its table on stdout is the result, and a failed setup aborts the run"
+)]
+
+use std::env;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -28,7 +35,7 @@ fn parse_options() -> Options {
         rotate_mib: 1024,
         passes: 2,
     };
-    let mut args = std::env::args().skip(1);
+    let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
         let value = args.next().unwrap_or_else(|| panic!("{flag} needs a value"));
         let value: usize = value

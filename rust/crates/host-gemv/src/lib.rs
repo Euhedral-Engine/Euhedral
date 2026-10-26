@@ -29,12 +29,16 @@ use contract::{BLOCK, CHUNK, GROUP, padded_k};
 /// The alignment of the planes of a row-split NVFP4 tensor.
 const PLANE_ALIGNMENT: usize = 256;
 
+/// The largest accepted global scale: the largest E4M3 scale (480 as decoded) times it must stay finite, so that every
+/// group scale `t_g` is finite (see the padding invariant in [`contract`]).
+const MAX_GLOBAL: f32 = f32::MAX / 480.0;
+
 fn align_up(value: usize, alignment: usize) -> usize {
     value.div_ceil(alignment) * alignment
 }
 
 /// A weight tensor that does not fit the layout it was given.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LayoutError {
     /// `k` is not a positive multiple of 32 (the activation block).
     Width(usize),
@@ -44,6 +48,10 @@ pub enum LayoutError {
         need: usize,
         have: usize,
     },
+    /// The global scale is not a finite, non-negative number, or so large that a group scale `e4m3 * global` overflows.
+    Global(f32),
+    /// The scale plane holds an E4M3 NaN code (0x7F or 0xFF) at this byte offset.
+    ScaleNan { offset: usize },
 }
 
 impl fmt::Display for LayoutError {
@@ -51,6 +59,11 @@ impl fmt::Display for LayoutError {
         match self {
             Self::Width(k) => write!(f, "row width must be a positive multiple of {BLOCK}: {k}"),
             Self::TooShort { what, need, have } => write!(f, "{what} needs {need} bytes, has {have}"),
+            Self::Global(global) => write!(
+                f,
+                "the global scale must be finite, non-negative and at most {MAX_GLOBAL}: {global}"
+            ),
+            Self::ScaleNan { offset } => write!(f, "the block scale at byte {offset} of the scale plane is NaN"),
         }
     }
 }
@@ -73,7 +86,9 @@ pub struct Nvfp4View<'a> {
 }
 
 impl<'a> Nvfp4View<'a> {
-    /// A view over the two planes. `k` must be a positive multiple of 32.
+    /// A view over the two planes. `k` must be a positive multiple of 32. Validates as `Nvfp4Layout.validate` does: the
+    /// global scale is finite and non-negative (and small enough that group scales cannot overflow), and no scale byte
+    /// of the plane, padding included, is an E4M3 NaN (0x7F or 0xFF). The scan reads the scale plane once.
     pub fn new(codes: &'a [u8], scales: &'a [u8], global: f32, n: usize, k: usize) -> Result<Self, LayoutError> {
         if k == 0 || !k.is_multiple_of(BLOCK) {
             return Err(LayoutError::Width(k));
@@ -92,6 +107,12 @@ impl<'a> Nvfp4View<'a> {
                 need: n * (kp / GROUP),
                 have: scales.len(),
             });
+        }
+        if !global.is_finite() || !(0.0..=MAX_GLOBAL).contains(&global) {
+            return Err(LayoutError::Global(global));
+        }
+        if let Some(offset) = scales[..n * (kp / GROUP)].iter().position(|&b| b & 0x7f == 0x7f) {
+            return Err(LayoutError::ScaleNan { offset });
         }
         Ok(Self {
             codes,
@@ -112,14 +133,13 @@ impl<'a> Nvfp4View<'a> {
         let scale_offset = align_up(n * (kp / 2), PLANE_ALIGNMENT);
         let global_offset = align_up(scale_offset + n * (kp / GROUP), PLANE_ALIGNMENT);
         let need = global_offset + size_of::<f32>();
-        let Some(global_bytes) = payload.get(global_offset..need) else {
-            return Err(LayoutError::TooShort {
-                what: "payload",
-                need,
-                have: payload.len(),
-            });
+        let too_short = || LayoutError::TooShort {
+            what: "payload",
+            need,
+            have: payload.len(),
         };
-        let global = f32::from_le_bytes(global_bytes.try_into().expect("four bytes"));
+        let global_bytes = payload.get(global_offset..need).ok_or_else(too_short)?;
+        let global = f32::from_le_bytes(<[u8; 4]>::try_from(global_bytes).map_err(|_| too_short())?);
         Self::new(
             &payload[..scale_offset],
             &payload[scale_offset..global_offset],

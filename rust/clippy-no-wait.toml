@@ -1,6 +1,8 @@
 # The no-thread, no-wait rules of this workspace: nothing here blocks or spins, and the threads belong to the lattice.
+# Every library crate of the workspace (every crate except xtask and the binaries, whose main thread may block) has a
+# clippy.toml that is byte-identical to this file; scripts/check-layers.sh checks the copies.
 # A listed call is allowed only in a test fixture (peer threads, arrival races) or where a call has no non-blocking
-# form, under an `#[allow(clippy::disallowed_methods)]` that says why.
+# form (startup, shutdown, a test), under an `#[allow(clippy::disallowed_methods)]` that names the rule it excepts.
 disallowed-methods = [
     { path = "std::thread::spawn", reason = "the lattice owns the threads" },
     { path = "std::thread::Builder::spawn", reason = "the lattice owns the threads" },
@@ -29,6 +31,16 @@ disallowed-methods = [
     { path = "std::net::TcpListener::accept", reason = "blocking I/O: use AsyncIo::accept" },
     { path = "std::process::Command::output", reason = "waits for a child process" },
     { path = "std::process::Child::wait", reason = "waits for a child process" },
+    # Waiting driver calls of the CUDA library (the generated `EuhedralCuda` methods), banned where the crate links
+    # them (allow-invalid: absent elsewhere). `CudaLibrary::synchronize` and `CudaLane::synchronize` are the only
+    # callers of the synchronize calls; the copies and frees below are named at each wrapper that may wait.
+    { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_synchronize", reason = "nothing waits on the device: poll the lane's completion word (startup, shutdown and tests only)", allow-invalid = true },
+    { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_stream_synchronize", reason = "nothing waits on a stream: poll the lane's completion word (startup, shutdown and tests only)", allow-invalid = true },
+    { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_copy_host_to_device", reason = "a synchronous copy waits for the device: queue euhedral_cuda_copy_upload_to_device on a lane", allow-invalid = true },
+    { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_copy_device_to_host", reason = "a synchronous copy waits for the device: queue euhedral_cuda_copy_device_to_readback on a lane", allow-invalid = true },
+    { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_free", reason = "cudaFree waits for the device: free at shutdown, or use euhedral_cuda_free_async on a lane", allow-invalid = true },
+    { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_host_free", reason = "freeing pinned memory waits for the device: free at shutdown", allow-invalid = true },
+    { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_host_weights_free", reason = "freeing pinned memory waits for the device: free at shutdown", allow-invalid = true },
     { path = "std::env::var", reason = "configuration is read in one place, the settings crate; binaries read the environment in main" },
     { path = "std::env::var_os", reason = "configuration is read in one place, the settings crate; binaries read the environment in main" },
     { path = "std::env::vars", reason = "configuration is read in one place, the settings crate; binaries read the environment in main" },
@@ -44,3 +56,13 @@ disallowed-types = [
     { path = "std::sync::Barrier", reason = "nothing waits" },
     { path = "std::net::TcpStream", reason = "sockets go through AsyncIo (raw fds)" },
 ]
+
+# `std::path::Path::new(..)` written out in code is a fully qualified name: import the type (the absolute_paths lint).
+# Two segments (`io::Error`) pass; a path from a crate root with more does not. `use` items are not checked.
+absolute-paths-max-segments = 2
+
+# Tests may unwrap, expect and print; library code may not (the unwrap_used, expect_used, print_stdout and
+# print_stderr lints).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true

@@ -1,0 +1,18 @@
+[package]
+name = "euhedral-inference-edrl"
+version = "0.1.0"
+description = "Parser for .edrl model artifacts: header, metadata, tensor table and packaged tokenizer section."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+test-support = { path = "../test-support" }
+
+[lints]
+workspace = true

@@ -334,6 +334,11 @@ public final class SettingsLoader {
         m.put("memory.weight-streaming.read-split", fixed(integer(1, Integer.MAX_VALUE)));
         m.put("memory.weight-streaming.copy-streams", fixed(integer(1, Integer.MAX_VALUE)));
         m.put("memory.weight-streaming.gpu-streams", fixed(integer(1, Integer.MAX_VALUE)));
+        // The host-layers keys configure the Rust engine's host tier. They are accepted so one file serves both
+        // engines; this engine checks their values and does not use them.
+        m.put("memory.host-layers.compute", optional(SettingsLoader::hostLayerCompute));
+        m.put("memory.host-layers.gemv-rows", optional(integer(1, Integer.MAX_VALUE)));
+        m.put("memory.host-layers.prefill-slots", optional(integer(1, Integer.MAX_VALUE)));
 
         m.put("host.cpus", optional(SettingsLoader::cpus));
         m.put("host.task-parallelism", fixed(integer(1, Integer.MAX_VALUE)));
@@ -428,6 +433,13 @@ public final class SettingsLoader {
             case "nvfp4" -> KvFormat.NVFP4;
             case "bf16" -> KvFormat.BF16;
             default -> throw new IllegalArgumentException("must be nvfp4, bf16 or auto: " + text);
+        };
+    }
+
+    private static Object hostLayerCompute(String text) {
+        return switch (text.toLowerCase(Locale.ROOT)) {
+            case "cpu", "stream" -> text.toLowerCase(Locale.ROOT);
+            default -> throw new IllegalArgumentException("must be auto, cpu or stream: " + text);
         };
     }
 

@@ -7,8 +7,13 @@
 //! For the key `euhedral.qwen.artifact` the environment variable is `EUHEDRAL_TEST_QWEN_ARTIFACT`: the `euhedral.`
 //! prefix is dropped, the rest is upper-cased, and `.` and `-` become `_`.
 
-// This crate exists to read the environment and a file for tests, so the workspace bans on both do not apply.
-#![allow(clippy::disallowed_methods)]
+// A test helper rather than engine code, so it keeps the library clippy.toml and excepts itself: its whole job is to
+// read the environment and a properties file, and to print a skip line.
+#![allow(
+    clippy::disallowed_methods,
+    clippy::print_stdout,
+    reason = "single reader of the environment and blocking I/O are the purpose of this test helper"
+)]
 
 use std::env;
 use std::fs;
