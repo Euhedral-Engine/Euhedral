@@ -26,14 +26,32 @@ disallowed-methods = [
     { path = "std::fs::read_to_string", reason = "blocking I/O: use AsyncIo" },
     { path = "std::fs::write", reason = "blocking I/O: use AsyncIo" },
     { path = "std::fs::copy", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::fs::File::open", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::fs::File::create", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::fs::OpenOptions::open", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::fs::read_dir", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::fs::metadata", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::io::stdin", reason = "blocking I/O: a read from standard input waits" },
     { path = "std::net::TcpStream::connect", reason = "blocking I/O: use AsyncIo" },
     { path = "std::net::TcpStream::connect_timeout", reason = "blocking I/O: use AsyncIo" },
     { path = "std::net::TcpListener::accept", reason = "blocking I/O: use AsyncIo::accept" },
     { path = "std::process::Command::output", reason = "waits for a child process" },
     { path = "std::process::Child::wait", reason = "waits for a child process" },
-    # Waiting driver calls of the CUDA library (the generated `EuhedralCuda` methods), banned where the crate links
-    # them (allow-invalid: absent elsewhere). `CudaLibrary::synchronize` and `CudaLane::synchronize` are the only
-    # callers of the synchronize calls; the copies and frees below are named at each wrapper that may wait.
+    { path = "std::process::Child::wait_with_output", reason = "waits for a child process" },
+    { path = "std::process::Command::status", reason = "waits for a child process" },
+    { path = "std::thread::JoinHandle::join", reason = "nothing waits: the lattice owns the threads" },
+    { path = "std::thread::ScopedJoinHandle::join", reason = "nothing waits: the lattice owns the threads" },
+    # Waiting calls of the CUDA library, banned where the crate is linked (allow-invalid: absent elsewhere). The
+    # safe wrappers that wait (startup, shutdown and tests) are banned for every other crate, and the generated
+    # `EuhedralCuda` methods they call are banned inside the cuda crate, so the wrapper that waits carries the scoped
+    # allow. A raw call through a generated fn-pointer field, `(api.euhedral_cuda_free)(p)`, is not seen by clippy and
+    # needs the same allow by convention (see the cuda crate docs).
+    { path = "euhedral_inference_cuda::CudaLibrary::synchronize", reason = "nothing waits on the device: poll the lane's completion word (startup, shutdown and tests only)", allow-invalid = true },
+    { path = "euhedral_inference_cuda::CudaLane::synchronize", reason = "nothing waits on a stream: poll the lane's completion word (startup, shutdown and tests only)", allow-invalid = true },
+    { path = "euhedral_inference_cuda::DeviceBuffer::copy_from_host", reason = "a synchronous copy waits for the device: queue ops::copy_upload_to_device on a lane", allow-invalid = true },
+    { path = "euhedral_inference_cuda::DeviceBuffer::copy_to_host", reason = "a synchronous copy waits for the device: queue ops::copy_device_to_readback on a lane", allow-invalid = true },
+    { path = "euhedral_inference_cuda::ops::copy_host_to_device", reason = "a synchronous copy waits for the device: queue ops::copy_upload_to_device on a lane", allow-invalid = true },
+    { path = "euhedral_inference_cuda::ops::copy_device_to_host", reason = "a synchronous copy waits for the device: queue ops::copy_device_to_readback on a lane", allow-invalid = true },
     { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_synchronize", reason = "nothing waits on the device: poll the lane's completion word (startup, shutdown and tests only)", allow-invalid = true },
     { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_stream_synchronize", reason = "nothing waits on a stream: poll the lane's completion word (startup, shutdown and tests only)", allow-invalid = true },
     { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_copy_host_to_device", reason = "a synchronous copy waits for the device: queue euhedral_cuda_copy_upload_to_device on a lane", allow-invalid = true },
@@ -41,6 +59,10 @@ disallowed-methods = [
     { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_free", reason = "cudaFree waits for the device: free at shutdown, or use euhedral_cuda_free_async on a lane", allow-invalid = true },
     { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_host_free", reason = "freeing pinned memory waits for the device: free at shutdown", allow-invalid = true },
     { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_host_weights_free", reason = "freeing pinned memory waits for the device: free at shutdown", allow-invalid = true },
+    # RustEE's blocking helpers (allow-invalid: the crates are linked only where they are used).
+    { path = "euhedral_core::utils::spin_wait::await_while", reason = "nothing waits or spins: continue on the completion", allow-invalid = true },
+    { path = "euhedral_core::config::CloneLivenessRegistry::await_termination", reason = "nothing waits: shutdown belongs to the lattice's owner", allow-invalid = true },
+    { path = "euhedral_hardware_utils::affinity::PinnedThreadExecutor::await_termination", reason = "nothing waits: shutdown belongs to the lattice's owner", allow-invalid = true },
     { path = "std::env::var", reason = "configuration is read in one place, the settings crate; binaries read the environment in main" },
     { path = "std::env::var_os", reason = "configuration is read in one place, the settings crate; binaries read the environment in main" },
     { path = "std::env::vars", reason = "configuration is read in one place, the settings crate; binaries read the environment in main" },

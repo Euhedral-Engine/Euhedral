@@ -9,6 +9,10 @@
     clippy::expect_used,
     reason = "a test file: a failed unwrap is the failure"
 )]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, waiting calls: a test synchronizes a lane and copies synchronously to check results"
+)]
 
 use std::iter;
 use std::path::PathBuf;

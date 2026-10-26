@@ -260,6 +260,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no-wait, blocking I/O: the test writes a fixture file"
+    )]
     fn a_library_without_its_runtime_beside_it_names_what_is_missing() {
         let product = tempfile::tempdir().unwrap();
         let lib = product.path().join("lib");

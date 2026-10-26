@@ -10,6 +10,11 @@
 //!
 //! Nothing here waits for the device except the calls documented as blocking (`synchronize`, the host copies), which
 //! are for startup, shutdown and tests; there is no callback from the driver into Rust.
+//!
+//! The waiting wrappers and the waiting entry points they call are banned by the workspace clippy rules, and the
+//! wrapper that legitimately waits carries a scoped allow. The generated [`sys::EuhedralCuda`] also exposes each entry
+//! point as a `pub` function-pointer field; clippy cannot see a call through a field, so `(api.euhedral_cuda_free)(p)`
+//! needs the same scoped allow by convention. Call the methods, which are banned, rather than the fields.
 
 mod device;
 mod error;

@@ -12,6 +12,10 @@
     clippy::expect_used,
     reason = "a test file: a failed unwrap is the failure"
 )]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: a test reads a fixture artifact and waits for a child process"
+)]
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -35,10 +39,6 @@ fn read_range(file: &mut File, range: Range<u64>) -> Vec<u8> {
 }
 
 /// The artifact's table as the Python reader prints it.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "nothing waits: this test fixture waits for a child process"
-)]
 fn python_table(artifact: &Path) -> Vec<Value> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let tools = manifest.join("../../../tools");
