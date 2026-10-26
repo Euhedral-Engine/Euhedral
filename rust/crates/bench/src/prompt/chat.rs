@@ -39,6 +39,25 @@ const DOCUMENT: &str = include_str!(
     "../../../../../benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md"
 );
 
+/// Builds every task's prompt text for `target_tokens`, in task order, as Java's `ChatPromptCorpus.build` does: the
+/// target is refused when any task's standalone prompt is above it, not only the one an iteration runs.
+pub fn build_all<C>(target_tokens: usize, count: C) -> Result<Vec<Built>, PromptError>
+where
+    C: FnMut(&str) -> Result<usize, TokenizerError>,
+{
+    build_all_from(target_tokens, DOCUMENT, count)
+}
+
+/// As [`build_all`], quoting `document`.
+pub fn build_all_from<C>(target_tokens: usize, document: &str, mut count: C) -> Result<Vec<Built>, PromptError>
+where
+    C: FnMut(&str) -> Result<usize, TokenizerError>,
+{
+    (0..TASKS)
+        .map(|task| build_from(task, target_tokens, document, &mut count))
+        .collect()
+}
+
 /// Builds task `task`'s prompt text for `target_tokens`; `count` is the number of tokens a text encodes to.
 pub fn build<C>(task: usize, target_tokens: usize, count: C) -> Result<Built, PromptError>
 where
@@ -154,6 +173,28 @@ mod tests {
             Err(PromptError::TargetTooSmall { target: 5, .. })
         ));
         assert!(matches!(build(0, 0, count), Err(PromptError::ZeroTarget)));
+    }
+
+    #[test]
+    fn a_target_between_the_shortest_and_the_longest_standalone_prompt_is_refused_whole() {
+        // Java builds all four tasks and throws when any standalone prompt is above the target.
+        let words: Vec<usize> = STANDALONE_TASKS
+            .iter()
+            .map(|task| count(&chat(None, task)).unwrap())
+            .collect();
+        let shortest = *words.iter().min().unwrap();
+        let longest = *words.iter().max().unwrap();
+        assert!(shortest < longest, "the tasks differ in length: {words:?}");
+        let target = shortest;
+        let shortest_task = words.iter().position(|&tokens| tokens == shortest).unwrap();
+        // The shortest task alone fits, as the old per-iteration build allowed.
+        assert!(build(shortest_task, target, count).is_ok());
+        let refused = build_all(target, count).unwrap_err();
+        assert!(matches!(refused, PromptError::TargetTooSmall { target: t, .. } if t == target));
+        // At the longest standalone prompt every task fits.
+        let built = build_all(longest, count).unwrap();
+        assert_eq!(built.len(), TASKS);
+        assert!(built.iter().all(|prompt| prompt.tokens <= longest));
     }
 
     #[test]

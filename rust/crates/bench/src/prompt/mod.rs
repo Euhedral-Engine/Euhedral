@@ -64,9 +64,9 @@ impl PromptCorpus {
         }
     }
 
-    /// The prompt measured iteration `iteration` runs, of at most `target_tokens` tokens. `seed` picks the words
-    /// (the chat corpus is fixed and ignores it). Only the prompt this iteration needs is built, so a target below
-    /// the shortest of the other chat prompts does not fail it.
+    /// The prompt measured iteration `iteration` runs, of at most `target_tokens` tokens: element `iteration` modulo
+    /// [`size`](Self::size) of [`prompts`](Self::prompts). That builds the whole set, so a caller that runs many
+    /// iterations of one target builds it once with `prompts` and indexes it itself.
     pub fn prompt(
         self,
         target_tokens: usize,
@@ -74,19 +74,21 @@ impl PromptCorpus {
         seed: u64,
         tok: &Tokenizer,
     ) -> Result<Prompt, PromptError> {
-        let mut count = counter(tok);
-        let built = match self {
-            PromptCorpus::Chat => chat::build(iteration % chat::TASKS, target_tokens, &mut count)?,
-            PromptCorpus::Words => words::build(target_tokens, seed, &mut count)?,
-        };
-        finish(built, tok)
+        let mut prompts = self.prompts(target_tokens, seed, tok)?;
+        let index = iteration % prompts.len();
+        Ok(prompts.swap_remove(index))
     }
 
-    /// Every prompt of one target, in iteration order.
+    /// Every prompt of one target, in iteration order. `seed` picks the words (the chat corpus is fixed and ignores
+    /// it). A chat target is refused when any task's standalone prompt is above it, where Java's
+    /// `Prerequisites.check` refuses it, whichever iteration would have run that task.
     pub fn prompts(self, target_tokens: usize, seed: u64, tok: &Tokenizer) -> Result<Vec<Prompt>, PromptError> {
-        (0..self.size())
-            .map(|iteration| self.prompt(target_tokens, iteration, seed, tok))
-            .collect()
+        let mut count = counter(tok);
+        let built = match self {
+            PromptCorpus::Chat => chat::build_all(target_tokens, &mut count)?,
+            PromptCorpus::Words => vec![words::build(target_tokens, seed, &mut count)?],
+        };
+        built.into_iter().map(|built| finish(built, tok)).collect()
     }
 }
 
