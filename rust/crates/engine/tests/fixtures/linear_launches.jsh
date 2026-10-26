@@ -68,13 +68,16 @@ void emit(RecordingGpu gpu, String name, int n, int k, int w, int[] ends, int ro
 
 record Shape(String name, int n, int k, int w, int[] ends) {}
 
+// The shapes of the RCO artifact's layers 0 and 3: names, outputs, inputs, words per tile, and the segment ends the
+// artifact stores.
 var shapes = List.of(
         new Shape("gdn/query_key", 4096, 5120, 40, new int[] {4096}),
         new Shape("gdn/value_z", 12288, 5120, 40, new int[] {6144, 12288}),
         new Shape("gdn/output", 5120, 6144, 40, new int[] {5120}),
-        new Shape("mlp/gate_up", 34816, 5120, 48, new int[] {17408, 34816}),
-        new Shape("mlp/down", 5120, 17408, 56, new int[] {5120}),
-        new Shape("attention/query_key", 7168, 5120, 64, new int[] {3584, 7168}));
+        new Shape("mlp/gate_up", 34816, 5120, 40, new int[] {17408, 34816}),
+        new Shape("mlp/down", 5120, 17408, 40, new int[] {5120}),
+        new Shape("mlp/down-w56", 5120, 17408, 56, new int[] {5120}),
+        new Shape("attention/query_key", 7168, 5120, 64, new int[] {6144, 7168}));
 
 // (target blocks, tensor-core max rows, whole-K rows, wide rows, rows)
 var variants = List.of(
