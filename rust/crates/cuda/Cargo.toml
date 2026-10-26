@@ -11,7 +11,7 @@ publish.workspace = true
 test-oracles = []
 
 [dependencies]
-euhedral-graph.workspace = true
+euhedral-graph = { workspace = true, features = ["async-io"] }
 libloading.workspace = true
 thiserror.workspace = true
 

@@ -4,6 +4,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+use euhedral_graph::IoMemory;
+
 use crate::error::CudaError;
 use crate::library::CudaLibrary;
 use crate::memory::PinnedBuffer;
@@ -150,6 +153,31 @@ impl PooledPinned {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+/// A loan is a region `AsyncIo::read_into` can fill: the first [`PooledPinned::len`] bytes of the pooled buffer. The
+/// loan comes back in the continuation, so dropping it there returns the buffer to the pool.
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+// SAFETY: the region is the first `len` bytes of the pooled `PinnedBuffer`, which `IoMemory for PinnedBuffer` covers:
+// live, valid for reads and writes, and in place when the loan moves (the loan holds the buffer, whose pointer is
+// raw). `len` is at most the buffer's size (`acquire` rounds the request up to a size class) and never changes. The
+// loan is exclusive, so nothing else refers to the region while the operation owns the loan. A loan the engine
+// leaks (a ring that broke) is never dropped, so its buffer never returns to the pool while the kernel may write it.
+unsafe impl IoMemory for PooledPinned {
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant: a loan holds its buffer until it is dropped"
+    )]
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.buffer
+            .as_mut()
+            .expect("a loan holds its buffer until dropped")
+            .as_mut_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.len
     }
 }
 
