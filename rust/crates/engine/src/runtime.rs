@@ -6,6 +6,7 @@
 //! model is ready, or with the error that stopped it. The calling thread waits for the latch and for nothing else.
 
 use std::fmt;
+use std::mem::ManuallyDrop;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
@@ -54,6 +55,8 @@ pub(crate) struct Core {
     pub(crate) pool: Arc<PinnedPool>,
     /// Pinned host bytes the load may use.
     pub(crate) host_pinned_bytes: u64,
+    /// The pinned pool's size (`memory.pinned-buffer-pool`, resolved): what it keeps, and the ring's budget.
+    pub(crate) pool_bytes: u64,
     pub(crate) started: Instant,
     /// Whether the startup delivered a runtime, which then closes the lattice itself.
     pub(crate) delivered: AtomicBool,
@@ -130,21 +133,53 @@ pub struct StartupReport {
     pub allocated_bytes: u64,
     /// Bytes in use on the device when the model became ready (the whole device's, every process).
     pub device_bytes_in_use: u64,
+    /// Pinned bytes the staging pool holds at ready: the upload's ring and the cache's table staging.
+    pub pinned_staging_bytes: u64,
+    /// Pinned bytes the pool had to allocate while the upload ran; 0, because the ring is acquired before it.
+    pub pinned_growth_during_load: u64,
     /// The kernel modules launched once before the model became ready, and those that were not.
     pub warmed: Warmed,
 }
 
-/// Keeps a startup's lattice alive on the calling thread. A lattice stops when its last owner drops it, which waits
-/// for its workers; if the last owner were a worker's frame, that wait could never end. Hold the guard until the
-/// startup's latch has fired. When the startup failed, dropping the guard stops the lattice, on the dropping thread;
-/// when it delivered a runtime, the runtime stops the lattice when it drops.
-pub struct StartupGuard {
-    _core: Option<Arc<Core>>,
+/// The owner of a started engine's lattice and device memory, held by `main` (or the test): the one place the engine
+/// closes the lattice and frees device memory with calls that wait.
+///
+/// The contract:
+/// - [`EngineRuntime::start`] returns it; keep it until the engine is done.
+/// - A startup that failed (the latch carried an error): dropping the owner closes the lattice, on the dropping
+///   thread, which must not be a worker of that lattice.
+/// - A startup that succeeded: call [`RuntimeOwner::shutdown`] with the runtime from the latch. It closes the lakes and
+///   the lattice, then frees the weights, the workspace and the sequence state. Dropping the owner or the runtime
+///   without it closes nothing and frees nothing (the process's exit does): no `Drop` of the engine waits.
+#[must_use = "the owner closes the lattice and frees the device memory: hold it until the engine is done"]
+pub struct RuntimeOwner {
+    core: Option<Arc<Core>>,
 }
 
-impl Drop for StartupGuard {
+impl RuntimeOwner {
+    /// Stops the engine: closes the lakes and the lattice, waiting for the workers, then frees the device memory of
+    /// `runtime`. Call it from the thread that started the engine, once no frame is running. It fails, leaving the
+    /// device memory allocated until the process exits, if another handle to `runtime` is alive.
+    pub fn shutdown(mut self, runtime: Arc<EngineRuntime>) -> Result<(), EngineError> {
+        if let Some(core) = self.core.take() {
+            core.close();
+        }
+        match Arc::try_unwrap(runtime) {
+            Ok(runtime) => {
+                runtime.release();
+                Ok(())
+            }
+            Err(_) => Err(EngineError::Runtime(
+                "another handle to the runtime is alive: its device memory stays allocated until the process exits"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+impl Drop for RuntimeOwner {
     fn drop(&mut self) {
-        if let Some(core) = &self._core
+        if let Some(core) = &self.core
             && !core.delivered.load(Ordering::Acquire)
         {
             core.close();
@@ -152,10 +187,17 @@ impl Drop for StartupGuard {
     }
 }
 
-impl fmt::Debug for StartupGuard {
+impl fmt::Debug for RuntimeOwner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("StartupGuard").finish_non_exhaustive()
+        formatter.debug_struct("RuntimeOwner").finish_non_exhaustive()
     }
+}
+
+/// What the engine keeps on the device. Freed only by [`RuntimeOwner::shutdown`], because freeing waits.
+struct DeviceState {
+    weights: Weights,
+    workspace: Workspace,
+    sequence: SequenceState,
 }
 
 /// A started engine: the model on the device and the machinery that runs it.
@@ -163,10 +205,8 @@ pub struct EngineRuntime {
     core: Arc<Core>,
     plan: ResidencyPlan,
     config: ModelConfig,
-    // The device memory is freed after the lattice has stopped (see `Drop`): the fields below it address no frame.
-    weights: Weights,
-    workspace: Workspace,
-    sequence: SequenceState,
+    // Never dropped by `Drop`: freeing waits for the device, so only `release` (the owner's shutdown) frees it.
+    device: ManuallyDrop<DeviceState>,
     report: StartupReport,
 }
 
@@ -185,24 +225,24 @@ impl EngineRuntime {
     /// the modules are warm, or with the error that stopped the startup, before anything was allocated on the device
     /// when the artifact or the plan is what failed.
     ///
-    /// Call it from the main thread, then wait on the latch. Keep the returned [`StartupGuard`] until the latch has
-    /// fired: it keeps the lattice's teardown, if the startup fails, on the calling thread.
+    /// Call it from the main thread, then wait on the latch. Keep the returned [`RuntimeOwner`] until the engine is
+    /// done (see its contract): it closes the lattice and frees the device memory, on the calling thread.
     pub fn start(
         settings: &Settings,
         library: &Path,
         ready: LatchSetter<Result<Arc<EngineRuntime>, EngineError>>,
-    ) -> StartupGuard {
+    ) -> RuntimeOwner {
         match build(settings, library) {
             Ok(core) => {
-                let guard = StartupGuard {
-                    _core: Some(Arc::clone(&core)),
+                let owner = RuntimeOwner {
+                    core: Some(Arc::clone(&core)),
                 };
                 startup::run(core, ready);
-                guard
+                owner
             }
             Err(error) => {
                 ready.set(Err(error));
-                StartupGuard { _core: None }
+                RuntimeOwner { core: None }
             }
         }
     }
@@ -220,9 +260,11 @@ impl EngineRuntime {
             core,
             plan,
             config,
-            weights,
-            workspace,
-            sequence,
+            device: ManuallyDrop::new(DeviceState {
+                weights,
+                workspace,
+                sequence,
+            }),
             report,
         }
     }
@@ -239,22 +281,22 @@ impl EngineRuntime {
 
     /// The model's tensors on the device.
     pub fn weights(&self) -> &Weights {
-        &self.weights
+        &self.device.weights
     }
 
     /// The workspace, sized for a prefill chunk.
     pub fn workspace(&self) -> &Workspace {
-        &self.workspace
+        &self.device.workspace
     }
 
     /// The device state of the one sequence the pilot holds.
     pub fn sequence(&self) -> &SequenceState {
-        &self.sequence
+        &self.device.sequence
     }
 
     /// The device state of the sequence, to reserve and commit its cache.
     pub fn sequence_mut(&mut self) -> &mut SequenceState {
-        &mut self.sequence
+        &mut self.device.sequence
     }
 
     /// What the startup measured.
@@ -313,11 +355,11 @@ impl EngineRuntime {
     }
 }
 
-impl Drop for EngineRuntime {
-    fn drop(&mut self) {
-        // The lattice stops first: no frame runs while the device memory goes. The main thread waits here, which is
-        // shutdown's to do.
-        self.core.close();
+impl EngineRuntime {
+    /// Frees the device memory. Waits for the device.
+    fn release(self) {
+        let Self { device, .. } = self;
+        drop(ManuallyDrop::into_inner(device));
     }
 }
 
@@ -365,7 +407,8 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
     let io = AsyncIo::open().map_err(|error| EngineError::io("the asynchronous file I/O would not open", error))?;
 
     // One transfer lane per upload chain, the most the settings allow; the startup uses as many as its ring needs.
-    let chains = startup::transfer_lanes(settings);
+    let machine = startup::read_machine();
+    let chains = startup::transfer_lanes(settings, library.max_lanes());
     let mut transfer = Vec::with_capacity(chains);
     for lane in 0..chains {
         transfer.push(CudaLane::new(&library, LaneId(lane as u16), TRANSFER_RING)?);
@@ -382,7 +425,8 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
     lattice
         .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
         .map_err(|error| runtime("the lattice would not take the completions", &format!("{error:?}")))?;
-    let pool = PinnedPool::new(&library, startup::pool_limit(settings));
+    let pool_bytes = startup::pinned_pool_bytes(settings, &machine);
+    let pool = PinnedPool::new(&library, pool_bytes);
     Ok(Arc::new(Core {
         settings: settings.clone(),
         library,
@@ -395,7 +439,8 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
         lanes,
         transfer,
         pool,
-        host_pinned_bytes: startup::host_pinned_bytes(settings),
+        host_pinned_bytes: startup::host_pinned_bytes(settings, &machine),
+        pool_bytes,
         started,
         delivered: AtomicBool::new(false),
     }))

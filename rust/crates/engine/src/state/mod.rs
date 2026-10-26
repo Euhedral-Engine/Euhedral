@@ -6,7 +6,7 @@ pub mod kv;
 
 use std::sync::Arc;
 
-use euhedral_inference_cuda::{CudaLibrary, Submission};
+use euhedral_inference_cuda::{CudaError, CudaLibrary, PinnedPool, Submission};
 
 use crate::error::EngineError;
 use crate::model::ModelConfig;
@@ -79,6 +79,16 @@ impl SequenceState {
             gdn,
             scratch,
         })
+    }
+
+    /// Allocates the pinned staging the caches' reservations take (two sets per cache: one in flight, one being
+    /// reserved), so that no reservation on the request path allocates. Startup only.
+    pub fn prime_staging(&self, pool: &Arc<PinnedPool>) -> Result<(), CudaError> {
+        self.kv.prime_staging(pool, 2)?;
+        if let Some(mtp) = &self.mtp_kv {
+            mtp.prime_staging(pool, 2)?;
+        }
+        Ok(())
     }
 
     /// The device bytes the state holds now (the cache grows as it is reserved).

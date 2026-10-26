@@ -247,6 +247,9 @@ pub struct MemorySettings {
     pub gpu_limit: Auto<ByteSize>,
     /// Device memory left for other programs.
     pub gpu_reserve: ByteSize,
+    /// Device memory the dense model's plan keeps beside the weights and the cache for the first sequence's state, the
+    /// workspaces and the kernel modules; `auto` is 1280 MiB.
+    pub runtime_reserve: Auto<ByteSize>,
     /// Released pinned buffers kept for reuse.
     pub pinned_buffer_pool: Auto<ByteSize>,
     /// Streaming of weights from disk.
@@ -262,6 +265,7 @@ impl Default for MemorySettings {
             host_weights_limit: Auto::Auto,
             gpu_limit: Auto::Auto,
             gpu_reserve: ByteSize::mib(700),
+            runtime_reserve: Auto::Auto,
             pinned_buffer_pool: Auto::Auto,
             weight_streaming: WeightStreamingSettings::default(),
             host_layers: HostLayersSettings::default(),

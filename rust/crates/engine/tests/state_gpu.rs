@@ -342,3 +342,32 @@ fn the_workspace_holds_one_buffer_per_slot_and_refuses_a_larger_quantum() {
     addresses.dedup();
     assert_eq!(addresses.len(), BufferSlot::ALL.len());
 }
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn primed_staging_means_a_reservation_allocates_nothing() {
+    let Some(library) = library() else { return };
+    let lane = lane(&library);
+    let pool = PinnedPool::new(&library, 64 << 20);
+    let mut cache = KvCache::new(&library, 2, 1024, KvFormat::Nvfp4, 8192, 0).unwrap();
+    cache.prime_staging(&pool, 2).unwrap();
+    let primed = pool.allocated_bytes();
+    assert!(primed > 0);
+    // Reserve page by page up to the planned rows, so the table doubles through every size it can have.
+    let mut retained = KvRetained::default();
+    let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
+    for page in 0..32u64 {
+        cache
+            .reserve(&submission, &pool, page * 256, 256, &mut retained)
+            .unwrap();
+        cache.appended(256).unwrap();
+        // The caller retires the staging behind the lane's marker; here the sets in flight are the two primed.
+        if retained.staging.len() >= 4 {
+            retained.staging.clear();
+        }
+    }
+    submission.finish().unwrap();
+    lane.synchronize().unwrap();
+    assert_eq!(pool.allocated_bytes(), primed, "no reservation allocated pinned memory");
+    assert_eq!(cache.reserved(), 8192);
+}

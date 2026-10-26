@@ -12,5 +12,5 @@ pub mod state;
 mod warmup;
 pub mod workspace;
 
-pub use runtime::{EngineRuntime, StartupGuard, StartupReport, fragment_config, lattice_config};
+pub use runtime::{EngineRuntime, RuntimeOwner, StartupReport, fragment_config, lattice_config};
 pub use warmup::Warmed;

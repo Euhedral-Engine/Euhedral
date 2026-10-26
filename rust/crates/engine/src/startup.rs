@@ -23,7 +23,7 @@ use std::sync::atomic::Ordering;
 
 use euhedral_core::frames::Frame;
 use euhedral_graph::{IoBuf, IoDone, Join, Lake, LatchSetter, OpenSpec, OwnedFile};
-use euhedral_inference_cuda::{DeviceBuffer, Submission, SubmitMode};
+use euhedral_inference_cuda::{DeviceBuffer, PooledPinned, Submission, SubmitMode};
 use euhedral_inference_edrl::{
     HEADER_BYTES, Header, Metadata, ReadPlan, Region, TensorTable, TokenizerFooter, TrellisCompanions, WeightFormat,
     WeightLayout, content_end,
@@ -44,49 +44,56 @@ use crate::state::SequenceState;
 use crate::warmup;
 use crate::workspace::Workspace;
 
-/// The most transfer lanes (and so upload chains) a startup makes; a library holds 64 lanes in all, and the rest
-/// belong to the stage graphs.
-const MAX_TRANSFER_LANES: usize = 32;
-
-/// The transfer lanes a startup makes: `host.task-parallelism`, the workers that take host work at once.
-pub(crate) fn transfer_lanes(settings: &Settings) -> usize {
-    (settings.host.task_parallelism as usize).clamp(2, MAX_TRANSFER_LANES)
+/// The transfer lanes a startup makes: `host.task-parallelism`, the workers that take host work at once, at least 2
+/// and at most half of the library's lanes, which leaves the other half to the stage graphs.
+pub(crate) fn transfer_lanes(settings: &Settings, library_lanes: usize) -> usize {
+    (settings.host.task_parallelism as usize).clamp(2, (library_lanes / 2).max(2))
 }
 
-/// The size the pinned pool is trimmed to once the weights are on the device: `memory.pinned-buffer-pool` when stated;
-/// otherwise the pool keeps what it has (no trim).
-pub(crate) fn pool_limit(settings: &Settings) -> u64 {
+/// The pinned buffers the pool keeps for reuse, and the budget of the upload's staging ring: `memory.pinned-buffer-pool`
+/// when stated, else 1/256 of the machine's memory, at least 64 MiB (`CudaGpuMemory.defaultPinnedPoolBytes`, the
+/// default `docs/OPERATIONS.md` documents).
+pub(crate) fn pinned_pool_bytes(settings: &Settings, machine: &Machine) -> u64 {
     settings
         .memory
         .pinned_buffer_pool
         .value()
-        .map_or(u64::MAX, |size| size.bytes())
+        .map_or_else(|| budget::default_pinned_pool_bytes(machine.total), |size| size.bytes())
+}
+
+/// What the machine reports of its memory, read once before the lattice exists.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Machine {
+    /// What it can spare now (`MemAvailable`, or the least cgroup headroom when that is less).
+    pub(crate) available: Option<u64>,
+    /// What it has (`MemTotal`).
+    pub(crate) total: Option<u64>,
 }
 
 /// The pinned host memory the load may use: `memory.host-weights-limit`, else the host budget (`memory.host-limit`
 /// as stated, else what the machine can spare). Read once, on the calling thread, before the lattice exists.
-pub(crate) fn host_pinned_bytes(settings: &Settings) -> u64 {
+pub(crate) fn host_pinned_bytes(settings: &Settings, machine: &Machine) -> u64 {
     if let Some(limit) = settings.memory.host_weights_limit.value() {
         return limit.bytes();
     }
     let stated = settings.memory.host_limit.value().map(|size| size.bytes());
-    HostBudget::of(stated, machine_available_bytes(), 0).pinned_bytes()
+    HostBudget::of(stated, machine.available, 0).pinned_bytes()
 }
 
-/// The memory the machine and the process's cgroups can spare now (`HostBudget.availableBytes`): `MemAvailable`, or
-/// the least headroom of the process's cgroup and its ancestors when that is less.
+/// Reads the machine's memory: what it can spare now (`HostBudget.availableBytes`: `MemAvailable`, or the least headroom
+/// of the process's cgroup and its ancestors when that is less) and what it has.
 #[cfg(target_os = "linux")]
 #[allow(
     clippy::disallowed_methods,
     reason = "no-wait, blocking I/O: a few small reads of /proc and /sys/fs/cgroup, once, on the calling thread before the lattice exists; they hold no device and never wait on one"
 )]
-fn machine_available_bytes() -> Option<u64> {
+pub(crate) fn read_machine() -> Machine {
     use std::fs;
     use std::path::Path;
 
-    let meminfo = fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|text| budget::mem_available(&text));
+    let meminfo = fs::read_to_string("/proc/meminfo").ok();
+    let total = meminfo.as_deref().and_then(budget::mem_total);
+    let meminfo = meminfo.as_deref().and_then(budget::mem_available);
     let root = Path::new("/sys/fs/cgroup");
     let own = fs::read_to_string("/proc/self/cgroup").ok();
     let mut least: Option<u64> = None;
@@ -106,13 +113,16 @@ fn machine_available_bytes() -> Option<u64> {
             }
         }
     }
-    budget::available_bytes(meminfo, least)
+    Machine {
+        available: budget::available_bytes(meminfo, least),
+        total,
+    }
 }
 
 /// Other platforms report no figure, which the budget reads as no limit.
 #[cfg(not(target_os = "linux"))]
-fn machine_available_bytes() -> Option<u64> {
-    None
+pub(crate) fn read_machine() -> Machine {
+    Machine::default()
 }
 
 /// The startup in flight: the shared parts, the latch to set, and the units that keep the lakes open.
@@ -448,10 +458,16 @@ fn plan(startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>)
 fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: HashMap<String, Arc<[u32]>>) {
     let core = Arc::clone(&startup.core);
     let allocated = (|| {
-        let largest = plan.device.iter().map(|placement| placement.bytes).max().unwrap_or(0);
-        let ring = Ring::sized(&core.settings, largest, core.host_pinned_bytes, core.transfer.len());
+        let ring = Ring::sized(
+            core.settings.host.task_parallelism,
+            core.pool_bytes,
+            core.host_pinned_bytes,
+            core.transfer.len(),
+        );
         let arena = DeviceBuffer::alloc(&core.library, plan.arena_bytes as usize)?;
-        prime_pool(&core, &ring)?;
+        // Every pinned allocation of the startup happens here: the ring of the upload, and the staging the cache's
+        // page tables will take. Once the chains run, the pool allocates nothing.
+        let loans = loader::acquire_loans(&core, &ring)?;
         // The workspace's linear scratch: the larger of the trellis routes' and the NVFP4 native route's at the
         // chunk's rows; the second region is the tensor-core route alone.
         let chunk = plan.rows.rows;
@@ -474,14 +490,15 @@ fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: Has
         let lane = &core.transfer[0];
         let submission = Submission::begin(lane, SubmitMode::default())?;
         let sequence = SequenceState::allocate(&core.library, &artifact.config, &plan, &submission)?;
+        sequence.prime_staging(&core.pool)?;
         let marker = submission.finish_signalled()?;
-        Ok::<_, EngineError>((ring, arena, workspace, sequence, marker))
+        Ok::<_, EngineError>((ring, arena, loans, workspace, sequence, marker))
     })();
     match allocated {
-        Ok((ring, arena, workspace, sequence, marker)) => {
+        Ok((ring, arena, loans, workspace, sequence, marker)) => {
             // The state is zeroed when the lane reaches the marker; the load starts then.
             let frame = step(Kind::Startup, 0, move || {
-                load(startup, artifact, plan, ends, ring, arena, workspace, sequence)
+                load(startup, artifact, plan, ends, ring, arena, loans, workspace, sequence)
             });
             core.completions.after_marker(marker, frame);
         }
@@ -501,6 +518,7 @@ fn load(
     ends: HashMap<String, Arc<[u32]>>,
     ring: Ring,
     arena: DeviceBuffer,
+    loans: Vec<PooledPinned>,
     workspace: Workspace,
     sequence: SequenceState,
 ) {
@@ -515,7 +533,7 @@ fn load(
             assemble(startup, artifact, plan, ends, ring, workspace, sequence, outcome)
         });
     };
-    loader::start(&core, file, names, pieces, chains, arena, done);
+    loader::start(&core, file, names, pieces, chains, arena, loans, done);
 }
 
 /// Step 6: assembles the tensors by layer and role, warms the kernel modules and sets the latch.
@@ -556,43 +574,40 @@ fn assemble(
     // pinned memory, which waits for the device, so it is a frame of its own, after the load.
     startup.then(device, move |startup| {
         trim_pool(&startup.core);
-        let warmed = warmup::run(&startup.core, &artifact.config, &weights, &workspace);
+        let (warmed, marker) = warmup::run(&startup.core, &artifact.config, &weights, &workspace);
         let core = Arc::clone(&startup.core);
-        let in_use = core
-            .library
-            .free_bytes()
-            .map(|free| core.library.device().total_bytes.saturating_sub(free))
-            .unwrap_or(0);
-        let report = StartupReport {
-            ready: begun.elapsed(),
-            load: stats.elapsed,
-            uploaded_bytes: stats.bytes,
-            pieces: stats.pieces,
-            chains: ring.depth,
-            piece_bytes: ring.piece_bytes,
-            objects,
-            allocated_bytes: allocated,
-            device_bytes_in_use: in_use,
-            warmed,
-        };
-        let runtime = EngineRuntime::assemble(core, plan, artifact.config, weights, workspace, sequence, report);
-        startup.succeed(runtime);
+        let (completions, stages) = (Arc::clone(&core.completions), Arc::clone(&core.stages));
+        // The report and the latch wait for the lane to reach the warm-up's last launch: a completion, not a wait.
+        let ready = step(Kind::Startup, 0, move || {
+            let in_use = core
+                .library
+                .free_bytes()
+                .map(|free| core.library.device().total_bytes.saturating_sub(free))
+                .unwrap_or(0);
+            let report = StartupReport {
+                ready: begun.elapsed(),
+                load: stats.elapsed,
+                uploaded_bytes: stats.bytes,
+                pieces: stats.pieces,
+                chains: ring.depth,
+                piece_bytes: ring.piece_bytes,
+                objects,
+                allocated_bytes: allocated,
+                device_bytes_in_use: in_use,
+                pinned_staging_bytes: core.pool.allocated_bytes(),
+                pinned_growth_during_load: stats.pinned_growth,
+                warmed,
+            };
+            let runtime = EngineRuntime::assemble(core, plan, artifact.config, weights, workspace, sequence, report);
+            startup.succeed(runtime);
+        });
+        match marker {
+            Some(marker) => completions.after_marker(marker, ready),
+            None => {
+                let _ = stages.offer(ready);
+            }
+        }
     });
-}
-
-/// Allocates the pinned staging the upload will take, before it starts: `depth` buffers of every size class up to a
-/// piece, and two per chain of the piece's. The allocation is the slow part of a pinned buffer and may wait for the
-/// driver, so it is done here, in the startup's allocation frame, and the chains find the pool stocked.
-fn prime_pool(core: &Core, ring: &Ring) -> Result<(), EngineError> {
-    let top = ring.piece_bytes.ilog2();
-    for class in 12..=top {
-        let count = if class == top { 2 * ring.depth } else { ring.depth };
-        let loans = (0..count)
-            .map(|_| core.pool.acquire(1 << class))
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(loans);
-    }
-    Ok(())
 }
 
 #[allow(

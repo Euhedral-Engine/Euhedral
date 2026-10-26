@@ -20,7 +20,7 @@
 use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::model::{ArtifactProfile, Quantization, Speculation};
 use euhedral_inference_engine::residency::planner::{
-    ARENA_ALIGNMENT, PlacementSource, PlanInputs, RUNTIME_RESERVE_BYTES, plan, plan_with,
+    ARENA_ALIGNMENT, DEFAULT_RUNTIME_RESERVE_BYTES, PlacementSource, PlanInputs, plan, plan_with,
 };
 use euhedral_inference_engine::workspace::{BufferSlot, WorkspaceError, WorkspaceRows, slot_bytes, workspace_bytes};
 use euhedral_inference_settings::{Auto, ByteSize, KvFormat};
@@ -83,11 +83,11 @@ fn rco_fits_resident_at_131072_on_16_gib() {
         plan.device_bytes - plan.arena_bytes,
         JAVA_KV_131072 + 1280 * MIB + JAVA_TRELLIS_SCRATCH_512
     );
-    assert_eq!(RUNTIME_RESERVE_BYTES, 1280 * MIB);
+    assert_eq!(DEFAULT_RUNTIME_RESERVE_BYTES, 1280 * MIB);
     assert_eq!(
         plan.budget_bytes,
-        16 * GIB - 700 * MIB,
-        "the default reserve is 700 MiB"
+        16 * GIB,
+        "the dense plan's budget is what is free (Java InferenceEngine.deviceBudget); memory.gpu-reserve is not used"
     );
     assert!(plan.device_bytes <= plan.budget_bytes);
 }
@@ -154,7 +154,7 @@ fn planner_refuses_when_weights_do_not_fit() {
         panic!("expected WeightsDoNotFit, got {error:?}");
     };
     assert_eq!(free, 8 * GIB);
-    assert_eq!(available, 8 * GIB - 700 * MIB);
+    assert_eq!(available, 8 * GIB);
     let arena = plan_with(&config(), &rco_table(), &settings(32_768), inputs(16 * GIB))
         .unwrap()
         .arena_bytes;
@@ -200,25 +200,25 @@ fn kv_spills_beyond_kv_cache_on_gpu_tokens_when_short() {
     assert!(need_spilled < need_whole);
 
     // Room for the whole cache: nothing spills.
-    let roomy = plan_with(&config, &table, &settings, inputs(need_whole + 700 * MIB)).unwrap();
+    let roomy = plan_with(&config, &table, &settings, inputs(need_whole)).unwrap();
     assert_eq!((roomy.kv_device_tokens, roomy.kv_host_tokens), (131_072, 0));
 
     // One byte short of that: the cache past 32768 tokens moves to the host.
-    let short = plan_with(&config, &table, &settings, inputs(need_whole + 700 * MIB - 1)).unwrap();
+    let short = plan_with(&config, &table, &settings, inputs(need_whole - 1)).unwrap();
     assert_eq!((short.kv_device_tokens, short.kv_host_tokens), (32_768, 98_304));
     assert_eq!(short.kv_device_bytes, kept);
     assert_eq!(short.kv_host_bytes, spilled);
     assert_eq!(short.device_bytes, need_spilled);
 
     // The boundary of the spilled plan.
-    assert!(plan_with(&config, &table, &settings, inputs(need_spilled + 700 * MIB)).is_ok());
+    assert!(plan_with(&config, &table, &settings, inputs(need_spilled)).is_ok());
     assert!(matches!(
-        plan_with(&config, &table, &settings, inputs(need_spilled + 700 * MIB - 1)),
+        plan_with(&config, &table, &settings, inputs(need_spilled - 1)),
         Err(PlanError::WeightsDoNotFit { .. })
     ));
 
     // Host memory that cannot hold the pages leaves the weights to make room, which they cannot.
-    let mut host_short = inputs(need_whole + 700 * MIB - 1);
+    let mut host_short = inputs(need_whole - 1);
     host_short.host_pinned_bytes = spilled - 1;
     assert!(matches!(
         plan_with(&config, &table, &settings, host_short),
@@ -230,7 +230,7 @@ fn kv_spills_beyond_kv_cache_on_gpu_tokens_when_short() {
     // A context that already fits in kv-cache-on-gpu-tokens has nothing to spill.
     settings.context.max_tokens = 32_768;
     settings.context.kv_cache_on_gpu_tokens = 65_536;
-    let small_short = arena + JAVA_KV_32768 + 1280 * MIB + JAVA_TRELLIS_SCRATCH_512 + 700 * MIB - 1;
+    let small_short = arena + JAVA_KV_32768 + 1280 * MIB + JAVA_TRELLIS_SCRATCH_512 - 1;
     assert!(matches!(
         plan_with(&config, &table, &settings, inputs(small_short)),
         Err(PlanError::WeightsDoNotFit { .. })
@@ -281,27 +281,29 @@ fn workspace_sized_for_prefill_chunk() {
 }
 
 #[test]
-fn gpu_reserve_and_limit_respected() {
+fn gpu_limit_respected_and_gpu_reserve_not_used_by_the_dense_plan() {
     let table = rco_table();
     let config = config();
     let base = settings(32_768);
-    let need = {
-        let plan = plan_with(&config, &table, &base, inputs(16 * GIB)).unwrap();
-        plan.device_bytes
-    };
+    let need = plan_with(&config, &table, &base, inputs(16 * GIB))
+        .unwrap()
+        .device_bytes;
 
-    // The reserve comes off what is free.
-    let mut reserved = base.clone();
-    reserved.memory.gpu_reserve = ByteSize::gib(1);
-    assert!(plan_with(&config, &table, &reserved, inputs(need + GIB)).is_ok());
+    // The plan fits exactly what is free, with no gpu-reserve taken off (Java InferenceEngine.deviceBudget).
+    assert!(plan_with(&config, &table, &base, inputs(need)).is_ok());
     assert!(matches!(
-        plan_with(&config, &table, &reserved, inputs(need + GIB - 1)),
+        plan_with(&config, &table, &base, inputs(need - 1)),
         Err(PlanError::WeightsDoNotFit { .. })
     ));
+    let mut reserved = base.clone();
+    reserved.memory.gpu_reserve = ByteSize::gib(8);
+    assert!(
+        plan_with(&config, &table, &reserved, inputs(need)).is_ok(),
+        "gpu-reserve is a Flash-Next setting"
+    );
 
     // The limit caps what is free, however much is.
     let mut limited = base.clone();
-    limited.memory.gpu_reserve = ByteSize(0);
     limited.memory.gpu_limit = Auto::Value(ByteSize(need));
     assert!(plan_with(&config, &table, &limited, inputs(64 * GIB)).is_ok());
     limited.memory.gpu_limit = Auto::Value(ByteSize(need - 1));
@@ -311,14 +313,37 @@ fn gpu_reserve_and_limit_respected() {
     };
     assert_eq!(available, need - 1);
     assert_eq!(free, 64 * GIB, "the free memory is reported as it was");
+}
 
-    // A reserve that takes everything leaves no budget.
-    let mut empty = base;
-    empty.memory.gpu_reserve = ByteSize::gib(16);
+#[test]
+fn the_runtime_reserve_is_a_setting_whose_auto_is_javas() {
+    let table = rco_table();
+    let config = config();
+    let base = settings(32_768);
+    let auto = plan_with(&config, &table, &base, inputs(16 * GIB)).unwrap();
+    let mut stated = base.clone();
+    stated.memory.runtime_reserve = Auto::Value(ByteSize::mib(1280));
+    assert_eq!(
+        plan_with(&config, &table, &stated, inputs(16 * GIB))
+            .unwrap()
+            .device_bytes,
+        auto.device_bytes
+    );
+
+    stated.memory.runtime_reserve = Auto::Value(ByteSize::mib(2000));
+    let larger = plan_with(&config, &table, &stated, inputs(16 * GIB)).unwrap();
+    assert_eq!(larger.device_bytes, auto.device_bytes + 720 * MIB);
     assert!(matches!(
-        plan_with(&config, &table, &empty, inputs(16 * GIB)),
-        Err(PlanError::NoBudget { .. })
+        plan_with(&config, &table, &stated, inputs(larger.device_bytes - 1)),
+        Err(PlanError::WeightsDoNotFit { .. })
     ));
+    stated.memory.runtime_reserve = Auto::Value(ByteSize(0));
+    assert_eq!(
+        plan_with(&config, &table, &stated, inputs(16 * GIB))
+            .unwrap()
+            .device_bytes,
+        auto.device_bytes - 1280 * MIB
+    );
 }
 
 #[test]

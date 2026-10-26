@@ -330,6 +330,9 @@ public final class SettingsLoader {
         m.put("memory.gpu-limit", optional(size(1)));
         m.put("memory.gpu-reserve", fixed(size(0)));
         m.put("memory.pinned-buffer-pool", optional(size(0)));
+        // Read by the Rust engine, whose planner sizes the dense model's runtime reserve with it (Java uses 1280 MiB);
+        // this engine checks the value and does not use it.
+        m.put("memory.runtime-reserve", optional(size(0)));
         m.put("memory.weight-streaming.concurrent-reads", fixed(integer(1, Integer.MAX_VALUE)));
         m.put("memory.weight-streaming.read-split", fixed(integer(1, Integer.MAX_VALUE)));
         m.put("memory.weight-streaming.copy-streams", fixed(integer(1, Integer.MAX_VALUE)));

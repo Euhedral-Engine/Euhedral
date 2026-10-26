@@ -2,14 +2,17 @@
 //! its source and a module load, which can take a second) happens at startup and not inside a request.
 //!
 //! The launches are real ones over the engine's own buffers and weights, one row each, with zeroed inputs. They run
-//! in one frame of the stages lake (the compile blocks the worker that launches, which is startup's to do), on the first transfer lane, which is idle
-//! by then, and they are followed by one wait for the lane. A launch that fails does not stop the startup: the
+//! in one frame of the stages lake, on the first transfer lane, which is idle by then. The compile happens inside
+//! the launch call, in the C library, and has no asynchronous form: it blocks the worker that launches, once, at
+//! startup. Nothing waits for the launches to run: the startup continues when the lane reaches the last launch's
+//! marker (`Completions::after_marker`). A launch that fails does not stop the startup: the
 //! module is listed in the report as not warmed, and compiles on its first real use.
 //!
 //! The modules of the elementwise, norm, sampling, embedding and NVFP4 sources are warmed here. The trellis,
 //! attention and Gated DeltaNet launches take shapes, tables and state that only a stage of the decode graph has; the
 //! stages that own those launches warm them.
 
+use euhedral_graph::Marker;
 use euhedral_inference_cuda::{CudaError, CudaLane, Submission, SubmitMode, ops};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 
@@ -30,27 +33,38 @@ pub struct Warmed {
 struct Launcher<'a> {
     lane: &'a CudaLane,
     warmed: Warmed,
+    /// The marker of the last launch queued: the lane reaches it when every launch has run.
+    last: Option<Marker>,
 }
 
 impl Launcher<'_> {
     fn launch(&mut self, module: &'static str, work: impl FnOnce(&Submission<'_>) -> Result<(), CudaError>) {
         let result = Submission::begin(self.lane, SubmitMode::default()).and_then(|submission| {
             work(&submission)?;
-            submission.finish().map(|_| ())
+            submission.finish_signalled()
         });
         match result {
-            Ok(()) => self.warmed.modules.push(module),
+            Ok(marker) => {
+                self.warmed.modules.push(module);
+                self.last = Some(marker);
+            }
             Err(error) => self.warmed.failed.push(format!("{module}: {error}")),
         }
     }
 }
 
 /// Warms the modules the engine's loaded model can launch with only its own buffers.
-pub(crate) fn run(core: &Core, config: &ModelConfig, weights: &Weights, workspace: &Workspace) -> Warmed {
+pub(crate) fn run(
+    core: &Core,
+    config: &ModelConfig,
+    weights: &Weights,
+    workspace: &Workspace,
+) -> (Warmed, Option<Marker>) {
     let lane = &core.transfer[0];
     let mut launcher = Launcher {
         lane,
         warmed: Warmed::default(),
+        last: None,
     };
     let hidden = config.hidden_size as u32;
     let intermediate = config.intermediate_size as u32;
@@ -181,8 +195,7 @@ pub(crate) fn run(core: &Core, config: &ModelConfig, weights: &Weights, workspac
             }
         }
     }
-    wait(lane, &mut launcher.warmed);
-    launcher.warmed
+    (launcher.warmed, launcher.last)
 }
 
 /// `(rows, columns)` of a two-dimensional tensor, as the launches take them.
@@ -190,15 +203,5 @@ fn matrix(weight: &WeightRef) -> Option<(u32, u32)> {
     match weight.shape.as_slice() {
         [out, input] => Some((u32::try_from(*out).ok()?, u32::try_from(*input).ok()?)),
         _ => None,
-    }
-}
-
-#[allow(
-    clippy::disallowed_methods,
-    reason = "no-wait, waiting driver call: the warm-up runs once, in one startup frame, before the model is ready, and its launches must have run before the first request"
-)]
-fn wait(lane: &CudaLane, warmed: &mut Warmed) {
-    if let Err(error) = lane.synchronize() {
-        warmed.failed.push(format!("a warm-up launch failed to run: {error}"));
     }
 }

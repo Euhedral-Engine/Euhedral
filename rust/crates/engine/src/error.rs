@@ -21,7 +21,7 @@ pub enum PlanError {
     /// The weights alone, beside the state every sequence needs, do not fit the device budget.
     #[error(
         "the weights need {weights_needed} bytes on the device beside {state_needed} bytes of state, but only \
-         {available} bytes are available ({free} free, limited by memory.gpu-limit and memory.gpu-reserve); weights \
+         {available} bytes are available ({free} free, limited by memory.gpu-limit); weights \
          cannot be backed by host memory yet"
     )]
     WeightsDoNotFit {
@@ -30,10 +30,6 @@ pub enum PlanError {
         available: u64,
         free: u64,
     },
-
-    /// The device has no budget left after the limit and the reserve.
-    #[error("the device budget is empty: {free} bytes are free and memory.gpu-reserve takes {reserve}")]
-    NoBudget { free: u64, reserve: u64 },
 
     /// A setting the plan reads is out of range.
     #[error("{0}")]

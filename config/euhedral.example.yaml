@@ -55,6 +55,7 @@ memory:
   host-weights-limit: auto                    # optional, default auto: pinned host memory for host-backed weights
   gpu-limit: auto                             # optional, default auto: device memory the engine may use (auto = what is free)
   gpu-reserve: 700MiB                         # optional, default 700MiB: device memory left for other programs
+  runtime-reserve: auto                       # optional, default auto: device memory the dense model's plan keeps beside the weights and the cache for the first sequence's state, the workspaces and the kernel modules (auto = 1280MiB)
   pinned-buffer-pool: auto                    # optional, default auto: released pinned buffers kept for reuse (auto = the larger of 64MiB and RAM/256)
   weight-streaming:                           # models that stream weights from disk (Qwen3.8-Flash-Next)
     concurrent-reads: 8                       # optional, default 8: artifact records read at once

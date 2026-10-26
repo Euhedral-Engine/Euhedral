@@ -35,6 +35,7 @@ pub struct PinnedPool {
     library: Arc<CudaLibrary>,
     limit_bytes: u64,
     held_bytes: AtomicU64,
+    allocated_bytes: AtomicU64,
     classes: Box<[Stack<PinnedBuffer>]>,
 }
 
@@ -54,6 +55,7 @@ impl PinnedPool {
             library: Arc::clone(library),
             limit_bytes,
             held_bytes: AtomicU64::new(0),
+            allocated_bytes: AtomicU64::new(0),
             classes: (0..CLASSES).map(|_| Stack::new()).collect(),
         })
     }
@@ -70,13 +72,23 @@ impl PinnedPool {
                 self.held_bytes.fetch_sub(capacity as u64, Ordering::Relaxed);
                 buffer
             }
-            None => PinnedBuffer::alloc(&self.library, capacity)?,
+            None => {
+                let buffer = PinnedBuffer::alloc(&self.library, capacity)?;
+                self.allocated_bytes.fetch_add(capacity as u64, Ordering::Relaxed);
+                buffer
+            }
         };
         Ok(PooledPinned {
             pool: Arc::clone(self),
             buffer: Some(buffer),
             len: bytes,
         })
+    }
+
+    /// Bytes of pinned memory this pool has allocated and not freed: the buffers on loan and the released ones. An
+    /// `acquire` that has to allocate raises it, so a stretch of work that must not allocate leaves it where it was.
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes.load(Ordering::Relaxed)
     }
 
     /// Bytes of released buffers waiting for reuse.
@@ -97,6 +109,7 @@ impl PinnedPool {
             while self.over_limit_bytes() > 0 {
                 let Some(buffer) = self.classes[class].pop() else { break };
                 self.held_bytes.fetch_sub(buffer.len() as u64, Ordering::Relaxed);
+                self.allocated_bytes.fetch_sub(buffer.len() as u64, Ordering::Relaxed);
                 drop(buffer);
                 freed += 1;
             }
@@ -149,6 +162,24 @@ impl PooledPinned {
     /// The bytes requested.
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// The bytes the loan can hold: its size class.
+    pub fn capacity(&self) -> usize {
+        self.buffer().len()
+    }
+
+    /// Sets the bytes the loan stands for, at most its [`capacity`](Self::capacity): a loan reused for a shorter
+    /// piece, or a longer one, without a new allocation.
+    pub fn set_len(&mut self, len: usize) -> Result<(), CudaError> {
+        if len == 0 || len > self.capacity() {
+            return Err(CudaError::Argument(format!(
+                "a loan of {} bytes cannot stand for {len} bytes",
+                self.capacity()
+            )));
+        }
+        self.len = len;
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {

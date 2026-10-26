@@ -3,8 +3,8 @@
 //!
 //! The artifact comes from the `euhedral.qwen.rco-artifact` property and the library from `euhedral.cuda.library`
 //! (`EUHEDRAL_TEST_QWEN_RCO_ARTIFACT` and `EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, or `gradle.properties`); a
-//! test skips with a message when either is absent. The truncated copy of the corrupt-artifact test is written under
-//! `euhedral.test.scratch` (`EUHEDRAL_TEST_TEST_SCRATCH`), a directory on a disk with room, and deleted afterwards.
+//! test skips with a message when either is absent. The corrupt copies of the artifact are sparse files under cargo's
+//! `CARGO_TARGET_TMPDIR` (inside the target directory, on the work drive), deleted afterwards.
 
 #![allow(
     clippy::unwrap_used,
@@ -21,7 +21,7 @@
 )]
 
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -32,9 +32,9 @@ use euhedral_inference_edrl::WeightFormat;
 use euhedral_inference_engine::error::{EngineError, PlanError};
 use euhedral_inference_engine::model::{LayerIndex, NormKind, Role};
 use euhedral_inference_engine::residency::loader::pieces;
-use euhedral_inference_engine::residency::planner::{RUNTIME_RESERVE_BYTES, nvfp4};
+use euhedral_inference_engine::residency::planner::{DEFAULT_RUNTIME_RESERVE_BYTES, nvfp4};
 use euhedral_inference_engine::workspace::BufferSlot;
-use euhedral_inference_engine::{EngineRuntime, StartupGuard};
+use euhedral_inference_engine::{EngineRuntime, RuntimeOwner};
 use euhedral_inference_settings::{ByteSize, ModelSettings, Settings};
 use sha2::{Digest, Sha256};
 
@@ -63,7 +63,7 @@ fn settings(artifact: &Path, max_tokens: u32) -> Settings {
 }
 
 /// Starts the engine and waits for the latch, as `main` does.
-fn start(settings: &Settings, library: &Path) -> (Result<Arc<EngineRuntime>, EngineError>, StartupGuard) {
+fn start(settings: &Settings, library: &Path) -> (Result<Arc<EngineRuntime>, EngineError>, RuntimeOwner) {
     let (ready, waiting) = Latch::new();
     let guard = EngineRuntime::start(settings, library, ready);
     (waiting.wait(), guard)
@@ -96,7 +96,7 @@ fn download(library: &Arc<CudaLibrary>, lane: &CudaLane, ptr: DevicePtr, bytes: 
 fn startup_loads_rco_and_reports_ready() {
     let Some(machine) = machine() else { return };
     let settings = settings(&machine.artifact, 8192);
-    let (runtime, _guard) = start(&settings, &machine.library);
+    let (runtime, owner) = start(&settings, &machine.library);
     let runtime = runtime.expect("the engine starts");
     let (plan, report) = (runtime.plan(), runtime.report());
     println!(
@@ -149,9 +149,25 @@ fn startup_loads_rco_and_reports_ready() {
     assert!(report.allocated_bytes >= plan.arena_bytes);
     let working = report.allocated_bytes - plan.arena_bytes;
     assert!(
-        working < RUNTIME_RESERVE_BYTES,
-        "the workspace and the state take {working}, the reserve is {RUNTIME_RESERVE_BYTES}"
+        working < DEFAULT_RUNTIME_RESERVE_BYTES,
+        "the workspace and the state take {working}, the reserve is {DEFAULT_RUNTIME_RESERVE_BYTES}"
     );
+
+    // The staging ring is acquired before the upload and never grows: two loans per chain, and the pool allocated nothing
+    // while the chains ran. Beside the ring the pool holds only the cache's table staging.
+    let ring = 2 * report.chains as u64 * report.piece_bytes;
+    assert_eq!(report.pinned_growth_during_load, 0);
+    assert!(
+        report.pinned_staging_bytes >= ring,
+        "{} < {ring}",
+        report.pinned_staging_bytes
+    );
+    assert!(
+        report.pinned_staging_bytes <= ring + (1 << 20),
+        "{} > {ring} + 1 MiB",
+        report.pinned_staging_bytes
+    );
+    assert!(report.chains <= runtime.library().max_lanes() / 2);
 
     // The model is addressable by layer and role.
     let weights = runtime.weights();
@@ -191,7 +207,7 @@ fn startup_loads_rco_and_reports_ready() {
     assert_eq!(sequence.mtp_kv.as_ref().map(|kv| kv.layers()), Some(1));
     assert!(sequence.gdn.layer(0).unwrap().speculative().is_some());
     assert!(sequence.scratch.draft().is_some());
-    drop(runtime);
+    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
@@ -199,7 +215,7 @@ fn startup_loads_rco_and_reports_ready() {
 fn uploaded_bytes_match_file_sha() {
     let Some(machine) = machine() else { return };
     let settings = settings(&machine.artifact, 4096);
-    let (runtime, _guard) = start(&settings, &machine.library);
+    let (runtime, owner) = start(&settings, &machine.library);
     let runtime = runtime.expect("the engine starts");
     let library = Arc::clone(runtime.library());
     let lane = CudaLane::new(&library, LaneId(48), 4).unwrap();
@@ -274,6 +290,8 @@ fn uploaded_bytes_match_file_sha() {
     }
     let _ = pack;
     lane.synchronize().unwrap();
+    drop(lane);
+    owner.shutdown(runtime).unwrap();
 }
 
 /// A truncated copy of the artifact, under the scratch directory, deleted when the guard drops.
@@ -285,25 +303,26 @@ impl Drop for Truncated {
     }
 }
 
-fn truncated_copy(artifact: &Path, bytes: u64) -> Option<Truncated> {
-    let scratch = PathBuf::from(test_support::require_property("euhedral.test.scratch")?);
-    fs::create_dir_all(&scratch).unwrap();
-    let path = scratch.join(format!("corrupt-artifact-{}.edrl", process::id()));
-    let copy = Truncated(path);
+/// A copy of the artifact's header, metadata and table that ends at `bytes`: the file is sparse, so it costs a few
+/// hundred KiB on disk, and the table names payloads past its end.
+fn truncated_copy(artifact: &Path, bytes: u64) -> Truncated {
+    let copy =
+        Truncated(Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("corrupt-artifact-{}.edrl", process::id())));
+    let header_bytes = read_file(artifact, 0, 48);
+    let header = euhedral_inference_edrl::Header::parse(header_bytes.as_slice().try_into().unwrap()).unwrap();
     let mut out = File::create(&copy.0).unwrap();
-    let mut input = File::open(artifact).unwrap().take(bytes);
-    io::copy(&mut input, &mut out).unwrap();
+    out.set_len(bytes).unwrap();
+    out.write_all(&read_file(artifact, 0, header.data_offset() as usize))
+        .unwrap();
     out.flush().unwrap();
-    Some(copy)
+    copy
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn startup_fails_before_device_alloc_on_corrupt_artifact() {
     let Some(machine) = machine() else { return };
-    let Some(truncated) = truncated_copy(&machine.artifact, 64 << 20) else {
-        return;
-    };
+    let truncated = truncated_copy(&machine.artifact, 64 << 20);
     let library = CudaLibrary::load(&machine.library).unwrap();
     let before = library.free_bytes().unwrap();
 
@@ -357,7 +376,7 @@ fn a_plan_that_does_not_fit_fails_before_device_alloc() {
     else {
         panic!("expected a plan refusal, got {error:?}");
     };
-    assert!(*weights_needed > 11 << 30 && *available < 2 << 30);
+    assert!(*weights_needed > 11 << 30 && *available == 2 << 30);
     let message = error.to_string();
     assert!(
         message.contains(&weights_needed.to_string()) && message.contains(&available.to_string()),
@@ -372,12 +391,11 @@ fn a_plan_that_does_not_fit_fails_before_device_alloc() {
 
 /// A sparse copy of the artifact of the same length: the header, the metadata, the table, the footer and every payload
 /// under 1 MiB (norms, the trellis companions) are real; the big payloads read as zeros, which every format accepts.
-fn sparse_copy(artifact: &Path) -> Option<Truncated> {
+fn sparse_copy(artifact: &Path) -> Truncated {
     use euhedral_inference_edrl::{Header, ReadPlan, Region, TensorTable, TokenizerFooter, content_end};
 
-    let scratch = PathBuf::from(test_support::require_property("euhedral.test.scratch")?);
-    fs::create_dir_all(&scratch).unwrap();
-    let copy = Truncated(scratch.join(format!("sparse-artifact-{}.edrl", process::id())));
+    let copy =
+        Truncated(Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sparse-artifact-{}.edrl", process::id())));
     let length = fs::metadata(artifact).unwrap().len();
     let probe = ReadPlan::probe(length).unwrap();
     let header_bytes = read_file(artifact, 0, 48);
@@ -411,7 +429,7 @@ fn sparse_copy(artifact: &Path) -> Option<Truncated> {
         );
     }
     put(footer_range.start, &footer_bytes);
-    Some(copy)
+    copy
 }
 
 #[test]
@@ -420,9 +438,7 @@ fn a_nan_nvfp4_scale_stops_the_load_and_names_the_tensor() {
     use euhedral_inference_edrl::{Header, ReadPlan, Region, TensorTable, TokenizerFooter, content_end};
 
     let Some(machine) = machine() else { return };
-    let Some(sparse) = sparse_copy(&machine.artifact) else {
-        return;
-    };
+    let sparse = sparse_copy(&machine.artifact);
     let length = fs::metadata(&sparse.0).unwrap().len();
     let header_bytes = read_file(&sparse.0, 0, 48);
     let header = Header::parse(header_bytes.as_slice().try_into().unwrap()).unwrap();
@@ -447,8 +463,7 @@ fn a_nan_nvfp4_scale_stops_the_load_and_names_the_tensor() {
     // The zeros load: every scale is 0.0 and the global scale 0.0 is finite and not negative.
     let settings = settings(&sparse.0, 4096);
     let (runtime, guard) = start(&settings, &machine.library);
-    drop(runtime.expect("an artifact of zeros loads"));
-    drop(guard);
+    guard.shutdown(runtime.expect("an artifact of zeros loads")).unwrap();
 
     // One E4M3 NaN among the draft head's scales stops the load, and the error says which tensor and which byte.
     let mut file = fs::OpenOptions::new().write(true).open(&sparse.0).unwrap();
@@ -471,7 +486,7 @@ fn startup_works_with_workers_that_poll_one_frame_at_a_time() {
     let Some(machine) = machine() else { return };
     let mut settings = settings(&machine.artifact, 4096);
     settings.host.max_batch_size = euhedral_inference_settings::Auto::Value(2);
-    let (runtime, _guard) = start(&settings, &machine.library);
+    let (runtime, owner) = start(&settings, &machine.library);
     let runtime = runtime.expect("the engine starts in poll mode");
     println!(
         "poll mode: ready in {:.2} s, upload {:.2} s",
@@ -479,4 +494,5 @@ fn startup_works_with_workers_that_poll_one_frame_at_a_time() {
         runtime.report().load.as_secs_f64()
     );
     assert_eq!(runtime.weights().len(), 786);
+    owner.shutdown(runtime).unwrap();
 }

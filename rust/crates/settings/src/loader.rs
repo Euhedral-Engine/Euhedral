@@ -521,6 +521,9 @@ fn leaves() -> Vec<Leaf> {
             assign!(s.memory.gpu_limit, auto_or(t, |t| size(t, 1)))
         }),
         fixed("memory.gpu-reserve", |s, t| assign!(s.memory.gpu_reserve, size(t, 0))),
+        optional("memory.runtime-reserve", |s, t| {
+            assign!(s.memory.runtime_reserve, auto_or(t, |t| size(t, 0)))
+        }),
         optional("memory.pinned-buffer-pool", |s, t| {
             assign!(s.memory.pinned_buffer_pool, auto_or(t, |t| size(t, 0)))
         }),

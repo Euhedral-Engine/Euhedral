@@ -21,7 +21,8 @@
 use std::sync::Arc;
 
 use euhedral_inference_cuda::{
-    CudaError, CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena, PinnedPool, PooledPinned, Submission, ops,
+    AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena, PinnedPool, PooledPinned,
+    Submission, ops,
 };
 use euhedral_inference_settings::KvFormat;
 use thiserror::Error;
@@ -194,6 +195,24 @@ impl KvCache {
         pages * 2 * self.plane_page_bytes + tables + self.host.as_ref().map_or(0, |host| host.region.bytes() as u64)
     }
 
+    /// Allocates, in `pool`, the pinned staging every reservation of this cache can take, so that
+    /// [`KvCache::reserve`] never allocates: for each size of page table the cache can grow to, `copies` sets of one
+    /// buffer per layer (a reservation holds one set until the caller retires it behind its marker). The allocation
+    /// waits: startup only.
+    pub fn prime_staging(&self, pool: &Arc<PinnedPool>, copies: usize) -> Result<(), CudaError> {
+        let mut slots = 1u64;
+        loop {
+            let loans = (0..copies * self.layers.len())
+                .map(|_| pool.acquire((slots * 16) as usize))
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(loans);
+            if slots >= self.max_pages {
+                return Ok(());
+            }
+            slots *= 2;
+        }
+    }
+
     /// Whether appending `rows` rows at `start` fits the reserved pages, so that reserving neither allocates nor
     /// uploads a page table.
     pub fn reserves(&self, start: u64, rows: u64) -> bool {
@@ -358,7 +377,7 @@ impl KvCache {
     }
 
     /// The allocation behind layer `layer`'s page table, for the capture key of a graph that reads it.
-    pub fn table_generation(&self, layer: usize) -> Option<euhedral_inference_cuda::AllocationId> {
+    pub fn table_generation(&self, layer: usize) -> Option<AllocationId> {
         self.layers.get(layer)?.table.as_ref().map(DeviceBuffer::generation)
     }
 

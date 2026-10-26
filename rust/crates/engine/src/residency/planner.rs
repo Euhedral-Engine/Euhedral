@@ -1,7 +1,8 @@
 //! The residency plan: which objects go where on the device, and whether the model, its cache and its working memory
 //! fit the memory the device has (`ResidencyPlanner`).
 //!
-//! The device budget is what the device has free, at most `memory.gpu-limit`, less `memory.gpu-reserve`. Against it
+//! The device budget is what the device has free, at most `memory.gpu-limit` (`InferenceEngine.deviceBudget`; the
+//! dense model does not use `memory.gpu-reserve`). Against it
 //! the plan sets the resident weights, the attention cache of a context of `context.max-tokens`, the runtime's own
 //! reserve (the first sequence's state, the execution workspaces, the shared scratch and the kernel modules loaded
 //! after the model: `ResidencyPlanner.RESERVE_BYTES`) and the prefill scratch of the largest trellis object. When
@@ -23,10 +24,10 @@ use crate::residency::scratch::{
 };
 use crate::workspace::{self, WorkspaceRows};
 
-/// Everything outside the weights and the cache that one running sequence needs on the device
-/// (`ResidencyPlanner.RESERVE_BYTES`): its GDN state, the execution workspaces, the shared scratch and the kernel
-/// modules the first launches compile.
-pub const RUNTIME_RESERVE_BYTES: u64 = 1280 << 20;
+/// What `memory.runtime-reserve: auto` means: Java's `ResidencyPlanner.RESERVE_BYTES`. The reserve is everything
+/// outside the weights and the cache that one running sequence needs on the device: its GDN state, the execution
+/// workspaces, the shared scratch and the kernel modules the first launches compile.
+pub const DEFAULT_RUNTIME_RESERVE_BYTES: u64 = 1280 << 20;
 
 /// Device allocations start on this many bytes, like the driver's.
 pub const ARENA_ALIGNMENT: u64 = 256;
@@ -104,7 +105,7 @@ pub struct ResidencyPlan {
     pub decode_scratch_bytes: u64,
     /// The device bytes the plan reserves in all: the weights, the cache, the runtime's reserve and the scratch.
     pub device_bytes: u64,
-    /// The device bytes the plan was made against: free, at most the limit, less the reserve.
+    /// The device bytes the plan was made against: free, at most `memory.gpu-limit`.
     pub budget_bytes: u64,
     /// The cache format.
     pub kv_format: KvFormat,
@@ -220,17 +221,17 @@ pub fn plan_with(
     let scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::Plan);
     let decode_scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::TensorCore);
 
-    let budget = inputs
+    let available = inputs
         .device_free
         .min(settings.memory.gpu_limit.value().map_or(u64::MAX, |size| size.bytes()));
-    let reserve = settings.memory.gpu_reserve.bytes();
-    let available = budget.saturating_sub(reserve);
-    if available == 0 {
-        return Err(PlanError::NoBudget { free: budget, reserve });
-    }
+    let runtime_reserve = settings
+        .memory
+        .runtime_reserve
+        .value()
+        .map_or(DEFAULT_RUNTIME_RESERVE_BYTES, |size| size.bytes());
 
     let whole_kv = footprint::kv_bytes(config, max_tokens, kv_format);
-    let fixed = whole_kv + RUNTIME_RESERVE_BYTES + scratch_bytes;
+    let fixed = whole_kv + runtime_reserve + scratch_bytes;
     let mut kv_device_tokens = footprint::pages_for(max_tokens) * PAGE_TOKENS;
     let (mut kv_host_tokens, mut kv_device_bytes, mut kv_host_bytes) = (0, whole_kv, 0);
     let mut device_bytes = arena_bytes + fixed;

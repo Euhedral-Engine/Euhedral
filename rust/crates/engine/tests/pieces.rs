@@ -11,7 +11,6 @@ mod common;
 use common::{config, rco_table, settings};
 use euhedral_inference_engine::residency::loader::{Check, Piece, Ring, check_piece, pieces};
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, nvfp4, plan};
-use euhedral_inference_settings::{Auto, ByteSize};
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -198,38 +197,28 @@ fn a_nan_scale_or_a_bad_global_scale_is_refused_and_named() {
 }
 
 #[test]
-fn the_staging_ring_follows_the_settings_and_the_model() {
-    let mut settings = settings(8192);
-    // Auto: a piece is the largest object cut 64 ways, a power of two within 1 MiB to 32 MiB.
-    let ring = Ring::sized(&settings, 715_161_604, 64 * GIB, 32);
+fn the_staging_ring_follows_the_pool_budget_and_the_lanes() {
+    // Two loans per chain fill the budget: a piece is budget / (2 x depth), a power of two.
+    let ring = Ring::sized(8, 256 * MIB, 64 * GIB, 32);
     assert_eq!(ring.depth, 8, "host.task-parallelism");
-    assert_eq!(ring.piece_bytes, 8 * MIB);
+    assert_eq!(ring.piece_bytes, 16 * MIB);
+    assert_eq!(ring.pinned_bytes(), 256 * MIB);
     assert_eq!(
-        ring.pinned_bytes(),
-        2 * 8 * 8 * MIB,
-        "a read and a copy in flight per chain"
+        Ring::sized(8, 64 * MIB, 64 * GIB, 32).piece_bytes,
+        4 * MIB,
+        "the 64 MiB floor of the default pool"
     );
-    assert_eq!(Ring::sized(&settings, 100 * MIB, 64 * GIB, 32).piece_bytes, MIB);
-    assert_eq!(Ring::sized(&settings, 100 * GIB, 64 * GIB, 32).piece_bytes, 32 * MIB);
-    // A stated pool is the ring's: depth pieces fill it.
-    settings.memory.pinned_buffer_pool = Auto::Value(ByteSize::mib(256));
-    assert_eq!(Ring::sized(&settings, 715_161_604, 64 * GIB, 32).piece_bytes, 32 * MIB);
-    settings.memory.pinned_buffer_pool = Auto::Value(ByteSize::mib(24));
     assert_eq!(
-        Ring::sized(&settings, 715_161_604, 64 * GIB, 32).piece_bytes,
-        2 * MIB,
-        "24 MiB / 8, rounded down"
+        Ring::sized(8, 100 * MIB, 64 * GIB, 32).piece_bytes,
+        4 * MIB,
+        "rounded down to a power of two"
     );
-    // The host budget bounds the ring, and the lanes bound its depth.
-    settings.memory.pinned_buffer_pool = Auto::Auto;
-    let tight = Ring::sized(&settings, 715_161_604, 40 * MIB, 32);
-    assert!(tight.depth as u64 * tight.piece_bytes <= 40 * MIB);
-    settings.host.task_parallelism = 64;
-    assert_eq!(Ring::sized(&settings, 715_161_604, 64 * GIB, 16).depth, 16);
-    settings.host.task_parallelism = 1;
-    assert_eq!(
-        Ring::sized(&settings, 715_161_604, 64 * GIB, 16).depth,
-        2,
-        "at least two chains"
-    );
+    // The copy granularity bounds a piece: one AsyncIo read piece at least, 32 MiB at most.
+    assert_eq!(Ring::sized(8, 16 * GIB, 64 * GIB, 32).piece_bytes, 32 * MIB);
+    assert_eq!(Ring::sized(8, MIB, 64 * GIB, 32).piece_bytes, 256 * 1024);
+    // The host budget bounds the ring too, and the lanes bound its depth.
+    let tight = Ring::sized(8, 256 * MIB, 40 * MIB, 32);
+    assert!(tight.pinned_bytes() <= 40 * MIB);
+    assert_eq!(Ring::sized(64, 256 * MIB, 64 * GIB, 16).depth, 16);
+    assert_eq!(Ring::sized(1, 256 * MIB, 64 * GIB, 16).depth, 2, "at least two chains");
 }

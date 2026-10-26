@@ -80,6 +80,12 @@ impl HostBudget {
     }
 }
 
+/// What `memory.pinned-buffer-pool: auto` resolves to: 1/256 of the machine's memory, at least 64 MiB
+/// (`CudaGpuMemory.defaultPinnedPoolBytes`); 64 MiB when the machine's memory is unknown.
+pub fn default_pinned_pool_bytes(total_memory: Option<u64>) -> u64 {
+    (64 << 20).max(total_memory.unwrap_or(0) / 256)
+}
+
 /// `MemAvailable` in bytes from the text of `/proc/meminfo`.
 pub fn mem_available(meminfo: &str) -> Option<u64> {
     meminfo_kib(meminfo, "MemAvailable:")
@@ -162,6 +168,13 @@ mod tests {
             HostBudget::of(None, None, 0).pinned_bytes() > 1 << 50,
             "unknown memory is not a limit"
         );
+    }
+
+    #[test]
+    fn auto_pinned_pool_is_a_256th_of_memory_and_at_least_64_mib() {
+        assert_eq!(default_pinned_pool_bytes(Some(64 * GIB)), 256 << 20);
+        assert_eq!(default_pinned_pool_bytes(Some(8 * GIB)), 64 << 20);
+        assert_eq!(default_pinned_pool_bytes(None), 64 << 20);
     }
 
     #[test]
