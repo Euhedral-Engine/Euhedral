@@ -17,17 +17,22 @@
 //! **The chain.** A greedy request keeps two quanta in flight. The one admitted behind another runs behind it on the
 //! device (the graph's external edge waits for its sink), and takes its token id from the selection the earlier one
 //! wrote ([`Quantum::token_from`]), so the host need not have read it: there is no gap between the end of one step and
-//! the start of the next. The cost is one quantum that may run for nothing, the one that follows a stop token; its kill
-//! switch is set when the stop token is read and its rows never become part of the sequence.
+//! the start of the next. The cost is one quantum that may run for nothing, the one that follows a stop token or a
+//! failure. It runs to its end and its rows never become part of the sequence (`discard`). It is not stopped with its
+//! kill switch: a quantum killed while its stages are being submitted leaves a last marker on a lane that no signalled
+//! marker follows (only the ends of the lanes' chains signal), the lane's completion word never reaches the quantum's
+//! retirement boundary, and the quantum never retires, which would keep the request from ending.
 //!
 //! **The records.** The owner reserves a quantum's cache rows and uploads its input record on its own lane
 //! when it admits it. Consecutive quanta use the two input records in turn, so the upload of the quantum behind never
 //! overwrites what the quantum ahead is still reading.
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter};
 use std::mem;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 
@@ -57,7 +62,7 @@ use crate::workspace::{BufferSlot, Workspace};
 const OVERLAP_MAX_START_POSITION: u64 = 1024;
 
 /// Quanta of a greedy request in flight at once: the one running, and the one admitted behind it.
-const GREEDY_DEPTH: usize = 2;
+pub(crate) const GREEDY_DEPTH: usize = 2;
 
 /// What an owner is told.
 pub(crate) enum Message {
@@ -99,6 +104,9 @@ pub(crate) struct Shared {
     pub(crate) chunk: usize,
     /// Rows the context holds.
     pub(crate) capacity: u64,
+    /// A test hook: the owner panics at the end of the turn in which it has admitted this many quanta.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) panic_after_admissions: AtomicU64,
 }
 
 /// A step of a request.
@@ -128,7 +136,6 @@ struct Flying {
     rows: usize,
     last_chunk: bool,
     selection: Option<Arc<Selection>>,
-    kill: Arc<AtomicBool>,
     retained: KvRetained,
     admitted: Instant,
     replayed: bool,
@@ -170,6 +177,8 @@ struct Run {
     stopping: Option<FinishReason>,
     /// A teacher-forced step's logits row is being copied.
     waiting_logits: bool,
+    /// Turns of the owner that panicked during this request.
+    panics: u32,
     began: Instant,
     /// Rows the context holds.
     capacity: u64,
@@ -204,19 +213,19 @@ impl Run {
         }
     }
 
-    /// Sets the kill switch of every quantum in flight: they run behind the one that ended the request.
-    fn kill_flying(&self) {
-        for flying in &self.in_flight {
-            flying.kill.store(true, Ordering::Release);
+    /// Whether `step` selects a token, and so takes one of the sequence's selections.
+    fn selects(&self, step: Step) -> bool {
+        match step {
+            Step::Prefill { last, .. } => last && self.wanted > 0,
+            Step::Decode => true,
         }
     }
 
-    /// Ends the request with `reason` unless it already ends: no more steps, and the quanta in flight are killed.
+    /// Ends the request with `reason` unless it already ends: no more steps. The quanta in flight run to their end and are discarded: see the module documentation.
     fn stop(&mut self, reason: FinishReason) {
         if self.stopping.is_none() {
             self.stopping = Some(reason);
         }
-        self.kill_flying();
         self.chain = None;
     }
 }
@@ -391,6 +400,7 @@ impl Owner {
             previous: None,
             stopping: None,
             waiting_logits: false,
+            panics: 0,
             began: Instant::now(),
             capacity,
             _units: units,
@@ -398,16 +408,32 @@ impl Owner {
         Ok(())
     }
 
-    /// Whether the owner has something to do: a message to take in, a quantum to admit, or an ending to make.
+    /// Whether the sequence has a selection no quantum holds. A step that selects waits for one: the quanta in flight
+    /// retire, and are dropped, and then a selection is free.
+    fn selection_free(&self) -> bool {
+        self.sequence.selections.leased() < self.sequence.selections.len()
+    }
+
+    /// The next step the request can admit now: it has room for one and, when the step selects, a selection to give it.
+    fn admissible(&self) -> Option<Step> {
+        let run = self.run.as_ref()?;
+        if run.waiting_logits || run.in_flight.len() >= run.depth() {
+            return None;
+        }
+        let next = run.next_step(self.shared.chunk)?;
+        (!run.selects(next) || self.selection_free()).then_some(next)
+    }
+
+    /// Whether the owner has something to do: a message to take in, a quantum to admit, an ending to make, or parked
+    /// quanta whose work on the owner's lane may have run.
     pub(crate) fn needs_attention(&self) -> bool {
-        if !self.inbox.is_empty() {
+        if !self.inbox.is_empty() || !self.parked.is_empty() {
             return true;
         }
         let Some(run) = &self.run else {
             return false;
         };
-        let admits =
-            !run.waiting_logits && run.in_flight.len() < run.depth() && run.next_step(self.shared.chunk).is_some();
+        let admits = self.admissible().is_some();
         let ends = run.in_flight.is_empty()
             && !run.waiting_logits
             && (run.stopping.is_some() || run.next_step(self.shared.chunk).is_none());
@@ -427,7 +453,51 @@ impl Owner {
         self.reap();
         self.conclude();
         self.admit_ready();
+        #[cfg(feature = "test-oracles")]
+        self.test_panic();
         self.finish_if_done();
+    }
+
+    /// The test hook: panics once the request has admitted the number of quanta the hook names.
+    #[cfg(feature = "test-oracles")]
+    fn test_panic(&self) {
+        let admitted = self.run.as_ref().map_or(0, |run| run.admitted);
+        let after = self.shared.panic_after_admissions.load(Ordering::Acquire);
+        if admitted >= after && self.shared.panic_after_admissions.swap(u64::MAX, Ordering::AcqRel) == after {
+            panic!("the owner's test hook fired after {admitted} admissions");
+        }
+    }
+
+    /// A turn of the owner panicked: the request fails, the quanta in flight are stopped, and the turns that follow
+    /// conclude them and end the request as any failed one. A turn that panics again ends the request here, leaking what
+    /// was in flight, which can no longer be accounted for.
+    pub(crate) fn panicked(&mut self, payload: &(dyn Any + Send)) {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic with no message".to_string());
+        log::error!("the owner panicked: {message}");
+        let Some(run) = self.run.as_mut() else { return };
+        run.panics += 1;
+        if run.panics < 2 {
+            return self.fail(format!("the owner panicked: {message}"));
+        }
+        let Some(mut run) = self.run.take() else { return };
+        log::error!("the owner panicked again: the request ends with its quanta still in flight");
+        mem::forget(mem::take(&mut run.in_flight));
+        mem::forget(run.chain.take());
+        self.used = true;
+        let outcome = GenerationOutcome {
+            reason: FinishReason::Failed(format!("the owner panicked: {message}")),
+            prompt_tokens: run.prompt.len(),
+            generated: run.generated,
+            elapsed: run.began.elapsed(),
+        };
+        self.finished = Some(match run.mode {
+            Mode::Greedy { listener } => Finished::Greedy(listener, outcome),
+            Mode::Forced { sink, .. } => Finished::Forced(sink, outcome),
+        });
     }
 
     fn receive(&mut self, message: Message) {
@@ -619,12 +689,7 @@ impl Owner {
     /// Admits quanta while the request has steps and room for them.
     fn admit_ready(&mut self) {
         let chunk = self.shared.chunk;
-        loop {
-            let Some(run) = self.run.as_ref() else { return };
-            if run.waiting_logits || run.in_flight.len() >= run.depth() {
-                break;
-            }
-            let Some(next) = run.next_step(chunk) else { break };
+        while let Some(next) = self.admissible() {
             if let Err(why) = self.admit(next) {
                 self.fail(why);
                 return;
@@ -737,11 +802,12 @@ impl Owner {
         quantum.prepared_after(prepared);
 
         let selection = quantum.selection().cloned();
+        // A kill switch that is never set: see the module documentation.
         let kill = Arc::new(AtomicBool::new(false));
         let admitted = Instant::now();
         let started = shared
             .executor
-            .start(&mut self.cache, quantum, Arc::clone(&kill), run.chain.as_ref())
+            .start(&mut self.cache, quantum, kill, run.chain.as_ref())
             .map_err(why("starting the quantum"))?;
 
         run.in_flight.push_back(Flying {
@@ -750,7 +816,6 @@ impl Owner {
             rows,
             last_chunk: matches!(next, Step::Prefill { last: true, .. }),
             selection: selection.clone(),
-            kill,
             retained,
             admitted,
             replayed: started.replayed,
@@ -932,8 +997,10 @@ impl Frame for OwnerFrame {
     }
 
     fn execute(&mut self) -> Result<(), FrameError> {
-        if let Some(owner) = self.owner.as_mut() {
-            owner.work();
+        if let Some(owner) = self.owner.as_mut()
+            && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| owner.work()))
+        {
+            owner.panicked(payload.as_ref());
         }
         Ok(())
     }

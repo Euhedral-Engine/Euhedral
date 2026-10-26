@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.core.tokenizer.TokenizerFiles;
@@ -66,14 +67,14 @@ class GreedyReferenceCudaIntegrationTest {
                         artifact,
                         data,
                         gpu,
-                        io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile.Speculation.NONE,
+                        ArtifactProfile.Speculation.NONE,
                         HostWeightSelection.select(data, hostBytes));
                 var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
             var runtime = new Execution(lattice, plan, gpu);
             try {
                 var sequence = new Sequence(1);
-                sequence.useKvFormat(io.euhedral_execution.inference.core.state.KvFormat.valueOf(
+                sequence.useKvFormat(KvFormat.valueOf(
                         System.getProperty("euhedral.greedy.kv-cache", "nvfp4").toUpperCase(Locale.ROOT)));
                 List<Integer> generated = new ArrayList<>();
                 boolean eos = false;

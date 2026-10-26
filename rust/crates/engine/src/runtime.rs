@@ -25,6 +25,7 @@ use euhedral_inference_cuda::{CudaLane, CudaLibrary, PinnedPool, RetireList};
 use euhedral_inference_settings::{Auto, Settings};
 
 use crate::error::EngineError;
+use crate::generation::GREEDY_DEPTH;
 use crate::generation::{AdmissionError, Generation, GenerationRequest, LogitsSink};
 use crate::model::{ModelConfig, Weights};
 use crate::plan::Plan;
@@ -39,15 +40,17 @@ use crate::workspace::Workspace;
 /// the ring only has to exist.
 const TRANSFER_RING: usize = 2;
 
-/// The events a stage lane's ring holds: the most markers of the lane that stay in flight, until their last consumer
-/// has waited for them. A quantum records one marker per stage it runs, at most a few thousand, and a marker is waited
-/// for by the quantum itself and by the one admitted behind it. The startup refuses a plan whose quanta would not fit
-/// in `STAGE_RING_QUANTA` of them ([`Core::stage_lanes`]).
-pub(crate) const STAGE_RING: usize = 8192;
+/// The quanta whose markers a stage lane's ring must hold: those in flight, and the one the owner prepares behind them.
+pub(crate) const STAGE_RING_QUANTA: usize = GREEDY_DEPTH + 1;
 
-/// The quanta the ring of a stage lane must hold the markers of: the one running, the one admitted behind it, and the
-/// one the owner is preparing.
-pub(crate) const STAGE_RING_QUANTA: usize = 3;
+/// The events a stage lane's ring holds, sized before the model is read: the most markers of the lane that stay in
+/// flight, until their last consumer has waited for them. A quantum records one marker per stage it runs, a marker is
+/// waited for by the quantum itself and by the ones admitted behind it, so the ring holds the stages of the biggest view
+/// of the model the engine runs ([`Plan::stage_bound`]) for [`STAGE_RING_QUANTA`] quanta, rounded up to a power of two.
+/// The startup refuses a plan that needs more ([`Core::stage_ring`]).
+pub(crate) fn stage_ring() -> usize {
+    (Plan::stage_bound() * STAGE_RING_QUANTA).next_power_of_two()
+}
 
 /// What the frames of the engine share: the lattice and everything that feeds it, and the device.
 pub(crate) struct Core {
@@ -66,6 +69,8 @@ pub(crate) struct Core {
     /// The lanes the stage graphs run on, by lane id: the plan's compute lanes (`0..` [`Plan::lane_width`]), the lane
     /// the recording of graphs captures on, and the owner's lane (reservations and input records).
     pub(crate) stage_lanes: Vec<Arc<CudaLane>>,
+    /// The events in the ring of each stage lane ([`stage_ring`]).
+    pub(crate) stage_ring: usize,
     /// Every lane of the pool in lane id order: the stage lanes, then the transfer lanes.
     pub(crate) lane_table: LaneTable,
     /// The transfer lanes, one per upload chain, with the ids after the stage lanes; the first also zeroes the
@@ -391,6 +396,13 @@ impl EngineRuntime {
         self.generation.generate(request)
     }
 
+    /// A test hook: the sequence's owner panics at the end of the turn in which the next request has admitted `quanta`
+    /// quanta. The request ends with a failure and the engine serves the next.
+    #[cfg(feature = "test-oracles")]
+    pub fn panic_after_admissions_for_tests(&self, quanta: u64) {
+        self.generation.panic_after_admissions(quanta);
+    }
+
     /// Starts a teacher-forced run on the engine's sequence, as [`EngineRuntime::generate`] does: prefills `prefix`,
     /// then decodes the `forced` tokens one row at a time, and hands the logits row of each step to `sink`. Step `k`
     /// of the sink holds the model's prediction of `forced[k]`.
@@ -527,9 +539,10 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
     let machine = startup::read_machine();
     let chains = startup::transfer_lanes(settings, library.max_lanes().saturating_sub(Plan::lane_width() + 2));
     let compute = Plan::lane_width();
+    let ring = stage_ring();
     let mut stage_lanes = Vec::with_capacity(compute + 2);
     for lane in 0..compute + 2 {
-        stage_lanes.push(CudaLane::new(&library, LaneId(lane as u16), STAGE_RING)?);
+        stage_lanes.push(CudaLane::new(&library, LaneId(lane as u16), ring)?);
     }
     let mut transfer = Vec::with_capacity(chains);
     for lane in 0..chains {
@@ -570,6 +583,7 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
         completions,
         lanes,
         stage_lanes,
+        stage_ring: ring,
         lane_table,
         transfer,
         pool,

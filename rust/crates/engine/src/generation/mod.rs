@@ -14,11 +14,13 @@ mod teacher_forced;
 
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
+#[cfg(feature = "test-oracles")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use euhedral_core::generics::FrameSink;
 use euhedral_core::generics::LatticeSource;
 use euhedral_data_structures::queues::{MpmcQueue, Multi, Producer};
-use euhedral_graph::{GraphRuntime, RetryCounts};
+use euhedral_graph::{DEFAULT_RETRY_BACKSTOP, GraphRuntime, RetryCounts};
 use euhedral_inference_cuda::CudaLibrary;
 
 use crate::error::EngineError;
@@ -27,12 +29,13 @@ use crate::model::{ModelConfig, Weights};
 use crate::plan::{Formats, Plan, View};
 use crate::quantum::{Executor, GraphCache};
 use crate::residency::planner::ResidencyPlan;
-use crate::runtime::{Core, STAGE_RING, STAGE_RING_QUANTA, Units};
+use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
 use crate::state::SequenceState;
 use crate::workspace::Workspace;
 use baton::Baton;
 pub use listener::GenerationListener;
 pub use request::{AdmissionError, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation};
+pub(crate) use source::GREEDY_DEPTH;
 use source::{GenerationSource, Message, Owner, Retired, Shared};
 pub use teacher_forced::LogitsSink;
 
@@ -61,7 +64,9 @@ impl Generation {
         sequence: SequenceState,
     ) -> Result<Generation, Box<(EngineError, SequenceState)>> {
         let capacity = sequence.kv.planned_rows().min(residency.max_context_tokens as u64);
-        let queue = MpmcQueue::<Message>::new(256);
+        // An unbounded queue, whose chunk holds the messages the protocol has in flight: the quanta in flight retire into
+        // it, and a teacher-forced step posts one row. Offering to it cannot fail, so no message is ever dropped.
+        let queue = MpmcQueue::<Message>::new(GREEDY_DEPTH + 2);
         let (producer, inbox) = (queue.producer(), queue.consumer());
         let executor = match Self::executor(core, config, residency, weights, &producer) {
             Ok(executor) => executor,
@@ -75,6 +80,8 @@ impl Generation {
             producer,
             chunk: residency.rows.rows as usize,
             capacity,
+            #[cfg(feature = "test-oracles")]
+            panic_after_admissions: AtomicU64::new(u64::MAX),
         });
         let cache = GraphCache::with_capacity(core.settings.kernels.graphs.captures_per_view as usize);
         let home = Arc::new(Baton::new());
@@ -117,10 +124,11 @@ impl Generation {
         .filter_map(|view| plan.stages(*view).map(<[_]>::len))
         .max()
         .unwrap_or(0);
-        if stages * STAGE_RING_QUANTA > STAGE_RING {
+        if stages * STAGE_RING_QUANTA > core.stage_ring {
             return Err(EngineError::Runtime(format!(
-                "a quantum of {stages} stages records a marker per stage and the lanes' rings of {STAGE_RING} events \
-                 do not hold the markers of {STAGE_RING_QUANTA} quanta"
+                "a quantum of {stages} stages records a marker per stage and the lanes' rings of {} events \
+                 do not hold the markers of {STAGE_RING_QUANTA} quanta",
+                core.stage_ring
             )));
         }
         let runtime = GraphRuntime {
@@ -128,7 +136,7 @@ impl Generation {
             completions: Arc::clone(&core.completions),
             lanes: Arc::clone(&core.lanes),
             retries: Arc::new(RetryCounts::default()),
-            retry_backstop: euhedral_graph::DEFAULT_RETRY_BACKSTOP,
+            retry_backstop: DEFAULT_RETRY_BACKSTOP,
         };
         let retiring = inbox.clone();
         Executor::new(
@@ -186,6 +194,12 @@ impl Generation {
             )));
         }
         Ok(())
+    }
+
+    /// The test hook: the owner panics at the end of the turn in which a request has admitted `quanta` quanta.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn panic_after_admissions(&self, quanta: u64) {
+        self.shared.panic_after_admissions.store(quanta, Ordering::Release);
     }
 
     /// Looks at the sequence while no request holds it.

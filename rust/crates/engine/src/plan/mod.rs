@@ -145,12 +145,9 @@ impl Plan {
         })
     }
 
-    /// The lanes the graphs of any model of this family need, from the topology of its views alone: the width of the
-    /// widest view of a model with one layer of each kind and an MTP layer. The width comes from the fan-out inside a
-    /// layer, so more layers do not change it; [`Plan::build`] measures the real one, and a runtime that made fewer
-    /// lanes refuses the plan. The lanes of a runtime are made before the model's metadata is read, which is why the
-    /// width is asked for here and not from a plan.
-    pub fn lane_width() -> usize {
+    /// The node lists (base views, then MTP views) of a model of the family whose layers are `kinds`, over described
+    /// weights: the plan's topology without a model.
+    fn probe_nodes(kinds: Vec<LayerKind>) -> Vec<Vec<Node>> {
         let weight = WeightRef {
             name: String::new(),
             shape: vec![1, 1],
@@ -164,7 +161,7 @@ impl Plan {
         let config = ModelConfig {
             vocab_size: 1,
             hidden_size: 1,
-            num_hidden_layers: 2,
+            num_hidden_layers: kinds.len(),
             num_attention_heads: 1,
             num_key_value_heads: 1,
             attention_head_dim: 1,
@@ -178,7 +175,7 @@ impl Plan {
             rope_theta: 1.0,
             partial_rotary_factor: 1.0,
             max_position_embeddings: 1,
-            layer_kinds: vec![LayerKind::GatedDeltaNet, LayerKind::FullAttention],
+            layer_kinds: kinds,
             num_experts: 0,
             tie_word_embeddings: false,
             attention_output_gate: true,
@@ -186,9 +183,20 @@ impl Plan {
             draft_depth: None,
         };
         let stub = Described(weight);
-        let lists = [base_nodes(&config, &stub), mtp_nodes(&config, &stub)];
+        [base_nodes(&config, &stub), mtp_nodes(&config, &stub)]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// The lanes the graphs of any model of this family need, from the topology of its views alone: the width of the
+    /// widest view of a model with one layer of each kind and an MTP layer. The width comes from the fan-out inside a
+    /// layer, so more layers do not change it; [`Plan::build`] measures the real one, and a runtime that made fewer
+    /// lanes refuses the plan. The lanes of a runtime are made before the model's metadata is read, which is why the
+    /// width is asked for here and not from a plan.
+    pub fn lane_width() -> usize {
         let mut width = 1;
-        for nodes in lists.iter().flatten() {
+        for nodes in Self::probe_nodes(vec![LayerKind::GatedDeltaNet, LayerKind::FullAttention]) {
             for variant in Variant::ALL {
                 let regions: Vec<Option<usize>> = nodes.iter().map(|node| node.make.scratch_region(variant)).collect();
                 let region_count = regions.iter().flatten().max().map_or(1, |region| region + 1);
@@ -206,6 +214,19 @@ impl Plan {
             }
         }
         width
+    }
+
+    /// The most stages any view of the model the engine runs can have, from the topology alone: the stages of
+    /// [`ModelConfig::SUPPORTED_LAYERS`] layers of the kind with more of them. A quantum records a marker per stage it
+    /// runs, so this bounds the markers one lane records for a quantum, and sizes the lanes' event rings before the
+    /// model is read. [`Plan::build`] has the real count.
+    pub fn stage_bound() -> usize {
+        [LayerKind::GatedDeltaNet, LayerKind::FullAttention]
+            .into_iter()
+            .flat_map(|kind| Self::probe_nodes(vec![kind; ModelConfig::SUPPORTED_LAYERS]))
+            .map(|nodes| nodes.len())
+            .max()
+            .unwrap_or(0)
     }
 
     fn variant(&self, variant: Variant) -> Option<&VariantPlan> {

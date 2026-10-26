@@ -26,9 +26,7 @@ use euhedral_inference_engine::model::ModelConfig;
 use euhedral_inference_engine::residency::footprint;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvError, KvRetained};
-use euhedral_inference_engine::workspace::{
-    BufferSlot, INPUT_RECORDS, Workspace, WorkspaceError, WorkspaceRows, slot_bytes, workspace_bytes,
-};
+use euhedral_inference_engine::workspace::{BufferSlot, Workspace, WorkspaceError, WorkspaceRows, workspace_bytes};
 use euhedral_inference_settings::KvFormat;
 
 fn library() -> Option<Arc<CudaLibrary>> {
@@ -322,10 +320,8 @@ fn the_workspace_holds_one_buffer_per_slot_and_refuses_a_larger_quantum() {
     let workspace = Workspace::allocate(&library, &config, rows, &[1 << 20, 0, 2 << 20]).unwrap();
     assert_eq!(
         workspace.retained_bytes(),
-        workspace_bytes(&config, rows)
-            + (INPUT_RECORDS - 1) * slot_bytes(&config, BufferSlot::TokenIds, rows)
-            + (3 << 20),
-        "regions of 0 bytes are not allocated, and the input record is held once more for the quantum behind"
+        workspace_bytes(&config, rows) + (3 << 20),
+        "regions of 0 bytes are not allocated"
     );
     let view = workspace.view(64).unwrap();
     assert_eq!(view.rows(), 64);

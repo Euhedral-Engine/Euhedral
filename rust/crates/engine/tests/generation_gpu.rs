@@ -305,7 +305,7 @@ fn a_stop_token_ends_the_generation_and_leaves_no_overshoot_in_the_sequence() {
     let prompt_rows = reference.prompt.len() as u64;
 
     // The token the Java engine selected sixth ends the generation when it is a stop token: the quantum that already
-    // follows it (it feeds the stop token) is stopped, and its row never reaches the cache.
+    // follows it (it feeds the stop token) runs to its end, and its row never reaches the cache.
     let stop = reference.generated[5];
     assert!(
         !reference.generated[..5].contains(&stop),
@@ -514,4 +514,31 @@ fn teacher_forced_logits_bitwise_equal_java_report() {
     assert_eq!(columns[3], "+0.00000", "no paired NLL difference: {candidate}");
     assert_eq!(columns[5], "0.000000", "no KL divergence: {candidate}");
     assert_eq!(columns[6], "1.0000", "the same top-1 token at every step: {candidate}");
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
+fn a_panic_in_the_owner_ends_the_request_with_a_failure_and_the_engine_serves_the_next() {
+    let Some(machine) = machine() else { return };
+    let reference = greedy_reference(&machine);
+    let (runtime, owner) = start(&machine, 4096);
+
+    // The owner panics in the turn that has admitted a third quantum, with two in flight: the request fails, the quanta
+    // in flight run to their end and are discarded, and the listener is told as the last call.
+    runtime.panic_after_admissions_for_tests(3);
+    let recording = generate(&runtime, &reference.prompt, 128, &[]);
+    match &recording.outcome.reason {
+        FinishReason::Failed(why) => assert!(why.contains("panicked"), "{why}"),
+        other => panic!("the request should have failed, ended with {other:?}"),
+    }
+    assert!(recording.tokens.len() < 128);
+    assert_eq!(recording.tokens, reference.generated[..recording.tokens.len()]);
+    assert_eq!(sequence_state(&runtime).1, 0, "no quantum is left in flight");
+    assert_eq!(sequence_state(&runtime).2, 0, "no selection is left leased");
+
+    // The engine serves the next request, from a reset sequence, with the Java engine's tokens.
+    let recording = generate(&runtime, &reference.prompt, 128, &[]);
+    assert_eq!(recording.outcome.reason, FinishReason::Length);
+    assert_eq!(recording.tokens, reference.generated);
+    owner.shutdown(runtime).unwrap();
 }
