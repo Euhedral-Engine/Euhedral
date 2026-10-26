@@ -20,6 +20,7 @@ mod model;
 mod retired;
 mod sizes;
 
+use std::env;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -74,5 +75,5 @@ pub fn load_file(path: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Se
 // The environment is read here and nowhere else in the engine.
 #[allow(clippy::disallowed_methods)]
 pub fn process_env(name: &str) -> Option<String> {
-    std::env::var(name).ok()
+    env::var(name).ok()
 }

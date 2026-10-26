@@ -75,6 +75,9 @@ impl fmt::Display for SettingsError {
 impl Error for SettingsError {}
 
 /// Every problem found in the settings, never empty.
+///
+/// A duplicate key in the file is reported by the YAML parser, which names the key's last segment (`port`, not
+/// `server.port`) with its line and column.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SettingsErrors(pub Vec<SettingsError>);
 

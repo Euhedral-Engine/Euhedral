@@ -4,7 +4,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use euhedral_inference_settings::{
@@ -100,7 +100,7 @@ fn value_in_place_of_a_section_and_back() {
 fn file_must_be_a_mapping_and_must_exist() {
     assert!(problems("- a\n- b\n")[0].contains("must hold a mapping"));
     assert!(problems("a: [")[0].contains("is not valid YAML"));
-    let missing = load_file(std::path::Path::new("/nope/euhedral.yaml"), &no_env).unwrap_err();
+    let missing = load_file(Path::new("/nope/euhedral.yaml"), &no_env).unwrap_err();
     assert_eq!(
         missing.0[0].message(),
         "configuration file not found: /nope/euhedral.yaml"

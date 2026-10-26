@@ -39,8 +39,12 @@ impl ByteSize {
         if digits.is_empty() {
             return Err(format!("not a size (whole number, optional B/KiB/MiB/GiB/TiB): {text}"));
         }
-        let value: u64 = digits.parse().map_err(|_| format!("number too large: {text}"))?;
-        if value > u64::MAX >> shift {
+        // The same limits as the Java engine, so one file serves both: a size fits in a signed 64-bit count of bytes.
+        let value: u64 = digits
+            .parse::<i64>()
+            .map_err(|_| format!("number too large: {text}"))?
+            .unsigned_abs();
+        if value > (i64::MAX as u64) >> shift {
             return Err(format!("size too large: {text}"));
         }
         Ok(Self(value << shift))
@@ -65,13 +69,18 @@ pub fn parse_duration(text: &str) -> Result<Duration, String> {
     if digits.is_empty() {
         return Err(invalid());
     }
-    let value: u64 = digits.parse().map_err(|_| format!("number too large: {text}"))?;
+    // The same limits as the Java engine: the count and the seconds it makes fit in a signed 64-bit integer.
+    let value: i64 = digits.parse().map_err(|_| format!("number too large: {text}"))?;
     let too_large = || format!("duration too large: {text}");
+    let seconds = |factor: i64| {
+        let seconds = value.checked_mul(factor).ok_or_else(too_large)?;
+        Ok(Duration::from_secs(seconds.unsigned_abs()))
+    };
     match unit.trim_start() {
-        "ms" => Ok(Duration::from_millis(value)),
-        "s" => Ok(Duration::from_secs(value)),
-        "m" => value.checked_mul(60).map(Duration::from_secs).ok_or_else(too_large),
-        "h" => value.checked_mul(3600).map(Duration::from_secs).ok_or_else(too_large),
+        "ms" => Ok(Duration::from_millis(value.unsigned_abs())),
+        "s" => seconds(1),
+        "m" => seconds(60),
+        "h" => seconds(3600),
         _ => Err(invalid()),
     }
 }
@@ -88,6 +97,7 @@ mod tests {
         assert_eq!(ByteSize::parse("1KiB"), Ok(ByteSize(1024)));
         assert_eq!(ByteSize::parse("2 MiB"), Ok(ByteSize::mib(2)));
         assert_eq!(ByteSize::parse("0"), Ok(ByteSize(0)));
+        assert_eq!(ByteSize::parse("8388607TiB"), Ok(ByteSize(8_388_607 << 40)));
     }
 
     #[test]
@@ -113,6 +123,10 @@ mod tests {
         assert_eq!(parse_duration("1000ms"), Ok(Duration::from_secs(1)));
         assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7200)));
         assert_eq!(parse_duration("0"), Ok(Duration::ZERO));
+        assert_eq!(
+            parse_duration("9223372036854775807ms"),
+            Ok(Duration::from_millis(i64::MAX as u64))
+        );
     }
 
     #[test]
