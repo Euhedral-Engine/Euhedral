@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/test-support"]
+members = ["crates/cuda", "crates/test-support", "xtask"]
 resolver = "3"
 
 [workspace.package]
@@ -9,10 +9,13 @@ publish = false
 
 # The RustEE crates (euhedral-core, euhedral-graph, euhedral-hardware-utils, euhedral-hashing) join
 # [workspace.dependencies] as git dependencies on https://github.com/Euhedral-Engine/RustEE.git pinned by `rev`
-# when the first crate uses them.
+# when the first crate uses them. euhedral-graph is the first.
 [workspace.dependencies]
+euhedral-graph = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "377201b2b7f617483b4f2e6c8d0f1060ea4f7d11", default-features = false }
 java-properties = "2"
+libloading = "0.8"
 tempfile = "3.27"
+thiserror = "2"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

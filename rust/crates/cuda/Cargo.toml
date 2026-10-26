@@ -1,0 +1,23 @@
+[package]
+name = "euhedral-inference-cuda"
+version = "0.1.0"
+description = "The Euhedral CUDA library from Rust: bindings, device and pinned memory, submissions, lanes and graphs."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# `exact_numerics_for_tests`: the process-wide switch to the scalar reference kernels.
+test-oracles = []
+
+[dependencies]
+euhedral-graph.workspace = true
+libloading.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+test-support = { path = "../test-support" }
+
+[lints]
+workspace = true

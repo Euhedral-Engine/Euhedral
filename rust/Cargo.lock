@@ -54,6 +54,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "euhedral-core"
+version = "0.1.0"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=377201b2b7f617483b4f2e6c8d0f1060ea4f7d11#377201b2b7f617483b4f2e6c8d0f1060ea4f7d11"
+dependencies = [
+ "euhedral-data-structures",
+ "euhedral-hardware-utils",
+ "euhedral-hashing",
+ "log",
+]
+
+[[package]]
+name = "euhedral-data-structures"
+version = "0.1.0"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=377201b2b7f617483b4f2e6c8d0f1060ea4f7d11#377201b2b7f617483b4f2e6c8d0f1060ea4f7d11"
+
+[[package]]
+name = "euhedral-graph"
+version = "0.1.0"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=377201b2b7f617483b4f2e6c8d0f1060ea4f7d11#377201b2b7f617483b4f2e6c8d0f1060ea4f7d11"
+dependencies = [
+ "euhedral-core",
+ "libc",
+]
+
+[[package]]
+name = "euhedral-hardware-utils"
+version = "0.1.0"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=377201b2b7f617483b4f2e6c8d0f1060ea4f7d11#377201b2b7f617483b4f2e6c8d0f1060ea4f7d11"
+dependencies = [
+ "libc",
+ "log",
+ "windows-sys",
+]
+
+[[package]]
+name = "euhedral-hashing"
+version = "0.1.0"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=377201b2b7f617483b4f2e6c8d0f1060ea4f7d11#377201b2b7f617483b4f2e6c8d0f1060ea4f7d11"
+
+[[package]]
+name = "euhedral-inference-cuda"
+version = "0.1.0"
+dependencies = [
+ "euhedral-graph",
+ "libloading",
+ "tempfile",
+ "test-support",
+ "thiserror",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -94,10 +145,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "log"
+version = "0.4.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "memchr"
@@ -116,6 +183,24 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "proc-macro2"
+version = "1.0.107"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
+dependencies = [
+ "unicode-ident",
+]
+
+[[package]]
+name = "quote"
+version = "1.0.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
+dependencies = [
+ "proc-macro2",
+]
 
 [[package]]
 name = "r-efi"
@@ -184,6 +269,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "syn"
+version = "3.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -205,6 +301,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "thiserror"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "unicode-ident"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -218,3 +340,7 @@ checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
