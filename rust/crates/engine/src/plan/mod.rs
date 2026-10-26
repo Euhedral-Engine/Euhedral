@@ -18,11 +18,12 @@ use std::fmt;
 use std::sync::Arc;
 
 use euhedral_graph::{EdgeKind, GraphError, LaneId, StageGraphSpec, StageSpec};
-use euhedral_inference_edrl::{WeightFormat, WeightLayout};
+use euhedral_inference_cuda::DevicePtr;
+use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
 use thiserror::Error;
 
 use crate::model::Speculation;
-use crate::model::{LayerIndex, ModelConfig, Role};
+use crate::model::{LayerIndex, LayerKind, ModelConfig, Role, WeightRef};
 use crate::residency::planner::ResidencyPlan;
 use crate::stages::Placed;
 use buffers::Access;
@@ -30,6 +31,15 @@ pub use builder::{Entry, Formats, StageKind, WeightLookup};
 use builder::{Node, base_nodes, mtp_nodes};
 pub(crate) use views::Variant;
 pub use views::{DECODE_MAX_ROWS, MAX_CAPTURED_ROWS, View};
+
+/// A weight lookup that has every weight: the same described tensor for any layer and role.
+struct Described(WeightRef);
+
+impl WeightLookup for Described {
+    fn weight(&self, _layer: LayerIndex, _role: Role) -> Option<&WeightRef> {
+        Some(&self.0)
+    }
+}
 
 /// Why a plan could not be built.
 #[derive(Debug, Error)]
@@ -133,6 +143,69 @@ impl Plan {
             lanes,
             draft_depth: if drafts { residency.draft_depth } else { 0 },
         })
+    }
+
+    /// The lanes the graphs of any model of this family need, from the topology of its views alone: the width of the
+    /// widest view of a model with one layer of each kind and an MTP layer. The width comes from the fan-out inside a
+    /// layer, so more layers do not change it; [`Plan::build`] measures the real one, and a runtime that made fewer
+    /// lanes refuses the plan. The lanes of a runtime are made before the model's metadata is read, which is why the
+    /// width is asked for here and not from a plan.
+    pub fn lane_width() -> usize {
+        let weight = WeightRef {
+            name: String::new(),
+            shape: vec![1, 1],
+            dtype: TensorDataType::Bf16,
+            format: WeightFormat::Nvfp4,
+            layout: WeightLayout::ContiguousLeV1,
+            ptr: DevicePtr::NULL,
+            bytes: 0,
+            trellis: None,
+        };
+        let config = ModelConfig {
+            vocab_size: 1,
+            hidden_size: 1,
+            num_hidden_layers: 2,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            attention_head_dim: 1,
+            intermediate_size: 1,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_key_head_dim: 1,
+            linear_value_head_dim: 1,
+            linear_conv_kernel_dim: 1,
+            rms_norm_epsilon: 1.0,
+            rope_theta: 1.0,
+            partial_rotary_factor: 1.0,
+            max_position_embeddings: 1,
+            layer_kinds: vec![LayerKind::GatedDeltaNet, LayerKind::FullAttention],
+            num_experts: 0,
+            tie_word_embeddings: false,
+            attention_output_gate: true,
+            mtp_layer_count: 1,
+            draft_depth: None,
+        };
+        let stub = Described(weight);
+        let lists = [base_nodes(&config, &stub), mtp_nodes(&config, &stub)];
+        let mut width = 1;
+        for nodes in lists.iter().flatten() {
+            for variant in Variant::ALL {
+                let regions: Vec<Option<usize>> = nodes.iter().map(|node| node.make.scratch_region(variant)).collect();
+                let region_count = regions.iter().flatten().max().map_or(1, |region| region + 1);
+                let access: Vec<Access> = nodes
+                    .iter()
+                    .zip(&regions)
+                    .map(|(node, region)| Access {
+                        scratch: *region,
+                        ..node.make.access()
+                    })
+                    .collect();
+                let deps: Vec<Vec<usize>> = nodes.iter().map(|node| node.deps.clone()).collect();
+                let edges = hazards::with_hazards(&access, &deps, region_count);
+                width = width.max(placement::fan_out_width(&edges));
+            }
+        }
+        width
     }
 
     fn variant(&self, variant: Variant) -> Option<&VariantPlan> {

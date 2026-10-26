@@ -132,6 +132,16 @@ impl GdnStates {
         Ok(GdnStates { layers })
     }
 
+    /// Queues the zeroing of every layer's convolution and recurrent state on `submission`: the state of a sequence
+    /// that has seen no token. The speculative buffers hold nothing a quantum reads before it writes it.
+    pub fn zero(&self, submission: &Submission<'_>) -> Result<(), CudaError> {
+        for state in self.layers.iter().flatten() {
+            ops::zero_device_memory(submission, state.convolution.ptr(), state.convolution.bytes() as u64)?;
+            ops::zero_device_memory(submission, state.recurrent.ptr(), state.recurrent.bytes() as u64)?;
+        }
+        Ok(())
+    }
+
     /// The state of layer `layer`, if it is a GDN layer.
     pub fn layer(&self, layer: usize) -> Option<&GdnState> {
         self.layers.get(layer)?.as_ref()

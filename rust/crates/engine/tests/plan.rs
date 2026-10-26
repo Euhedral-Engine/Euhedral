@@ -304,6 +304,11 @@ fn fan_out_width_is_plan_width() {
         "the joint projection, query/key and value/z run at once"
     );
     assert_eq!(plan.fan_out_width(), 3);
+    assert_eq!(
+        Plan::lane_width(),
+        plan.fan_out_width(),
+        "the lanes a runtime makes before it knows the model are the width of the model's plan"
+    );
     // Every graph names lanes within the pool the width sizes: the root only the home lane, the rest any of them.
     for view in [View::Decode, View::PrefillChunk, View::Draft { rows: 2 }] {
         let spec = plan.spec(view).unwrap();

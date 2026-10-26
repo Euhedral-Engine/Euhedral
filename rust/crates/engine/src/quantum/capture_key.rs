@@ -30,6 +30,10 @@ pub struct CaptureKey {
     /// The slot a drafted token is passed on to, and the address of the head's row ids that map it.
     pub draft_write: Option<(u8, u64)>,
     pub writes_current_token: bool,
+    /// The input record the quantum's ids and positions are read from: its launches bake the address.
+    pub input_record: u8,
+    /// The selection whose keys the quantum's token is read from, on the device: its launch bakes the address.
+    pub token_from: Option<AllocationId>,
     /// Whether the quantum runs row-exact (a verification): the Linear stages take other routes.
     pub row_exact: bool,
     /// The split counts of decode attention and whether the fused verifier serves the rows ([`split_geometry`]).
@@ -57,6 +61,8 @@ impl CaptureKey {
             && self.draft_read == other.draft_read
             && self.draft_write == other.draft_write
             && self.writes_current_token == other.writes_current_token
+            && self.input_record == other.input_record
+            && self.token_from == other.token_from
             && self.row_exact == other.row_exact
             && self.reserved_host_pages == other.reserved_host_pages
             && self.replay_rows == other.replay_rows

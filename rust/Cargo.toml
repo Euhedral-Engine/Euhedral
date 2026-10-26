@@ -12,6 +12,7 @@ publish = false
 [workspace.dependencies]
 crc32fast = "1.5"
 euhedral-core = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "8b0e85cf5187a8a0f8319077933554db24cda53d" }
+euhedral-data-structures = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "8b0e85cf5187a8a0f8319077933554db24cda53d" }
 euhedral-graph = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "8b0e85cf5187a8a0f8319077933554db24cda53d", default-features = false }
 euhedral-hardware-utils = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "8b0e85cf5187a8a0f8319077933554db24cda53d" }
 euhedral-hashing = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "8b0e85cf5187a8a0f8319077933554db24cda53d" }

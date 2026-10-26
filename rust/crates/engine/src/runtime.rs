@@ -6,7 +6,7 @@
 //! model is ready, or with the error that stopped it. The calling thread waits for the latch and for nothing else.
 
 use std::fmt;
-use std::mem::{self, ManuallyDrop};
+use std::mem::ManuallyDrop;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
@@ -25,8 +25,11 @@ use euhedral_inference_cuda::{CudaLane, CudaLibrary, PinnedPool, RetireList};
 use euhedral_inference_settings::{Auto, Settings};
 
 use crate::error::EngineError;
+use crate::generation::{AdmissionError, Generation, GenerationRequest, LogitsSink};
 use crate::model::{ModelConfig, Weights};
+use crate::plan::Plan;
 use crate::residency::planner::ResidencyPlan;
+use crate::stages::LaneTable;
 use crate::startup;
 use crate::state::SequenceState;
 use crate::warmup::Warmed;
@@ -35,6 +38,16 @@ use crate::workspace::Workspace;
 /// The events a transfer lane's ring holds: its markers are found by the completion word, not by waits on events, so
 /// the ring only has to exist.
 const TRANSFER_RING: usize = 2;
+
+/// The events a stage lane's ring holds: the most markers of the lane that stay in flight, until their last consumer
+/// has waited for them. A quantum records one marker per stage it runs, at most a few thousand, and a marker is waited
+/// for by the quantum itself and by the one admitted behind it. The startup refuses a plan whose quanta would not fit
+/// in `STAGE_RING_QUANTA` of them ([`Core::stage_lanes`]).
+pub(crate) const STAGE_RING: usize = 8192;
+
+/// The quanta the ring of a stage lane must hold the markers of: the one running, the one admitted behind it, and the
+/// one the owner is preparing.
+pub(crate) const STAGE_RING_QUANTA: usize = 3;
 
 /// What the frames of the engine share: the lattice and everything that feeds it, and the device.
 pub(crate) struct Core {
@@ -50,7 +63,13 @@ pub(crate) struct Core {
     pub(crate) io: Arc<AsyncIo>,
     pub(crate) completions: Arc<Completions>,
     pub(crate) lanes: Arc<LanePool>,
-    /// The transfer lanes (lane ids `0..`), one per upload chain; the first also zeroes the sequence state.
+    /// The lanes the stage graphs run on, by lane id: the plan's compute lanes (`0..` [`Plan::lane_width`]), the lane
+    /// the recording of graphs captures on, and the owner's lane (reservations and input records).
+    pub(crate) stage_lanes: Vec<Arc<CudaLane>>,
+    /// Every lane of the pool in lane id order: the stage lanes, then the transfer lanes.
+    pub(crate) lane_table: LaneTable,
+    /// The transfer lanes, one per upload chain, with the ids after the stage lanes; the first also zeroes the
+    /// sequence state.
     pub(crate) transfer: Vec<Arc<CudaLane>>,
     pub(crate) pool: Arc<PinnedPool>,
     /// Buffers waiting to be freed in stream order: the pages and page tables of the caches, once their last quantum
@@ -96,6 +115,21 @@ pub(crate) struct Units {
 }
 
 impl Core {
+    /// The lane recordings of graphs capture on.
+    pub(crate) fn capture_lane(&self) -> LaneId {
+        LaneId((self.stage_lanes.len() - 2) as u16)
+    }
+
+    /// The owner's lane: the sequence's reservations and its quanta's input records.
+    pub(crate) fn owner_lane(&self) -> &Arc<CudaLane> {
+        &self.stage_lanes[self.stage_lanes.len() - 1]
+    }
+
+    /// The lanes the plan's graphs run on.
+    pub(crate) fn compute_lanes(&self) -> usize {
+        self.stage_lanes.len() - 2
+    }
+
     /// Admits a unit on every lake.
     pub(crate) fn admit(&self) -> Result<Units, EngineError> {
         let closed = |error| EngineError::Runtime(format!("a lake would not take work: {error}"));
@@ -251,20 +285,22 @@ impl fmt::Debug for RuntimeOwner {
     }
 }
 
-/// What the engine keeps on the device. Freed only by [`RuntimeOwner::shutdown`], because freeing waits.
+/// What the engine keeps on the device. Freed only by [`RuntimeOwner::shutdown`], because freeing waits. The sequence
+/// is the generation's.
 struct DeviceState {
     weights: Weights,
-    workspace: Workspace,
-    sequence: SequenceState,
+    workspace: Arc<Workspace>,
 }
 
 /// A started engine: the model on the device and the machinery that runs it.
 pub struct EngineRuntime {
     core: Arc<Core>,
     plan: ResidencyPlan,
-    config: ModelConfig,
+    config: Arc<ModelConfig>,
     // Never dropped by `Drop`: freeing waits for the device, so only `release` (the owner's shutdown) frees it.
     device: ManuallyDrop<DeviceState>,
+    // The sequence and the graphs that run it. Closed by `release`.
+    generation: Generation,
     report: StartupReport,
 }
 
@@ -306,21 +342,18 @@ impl EngineRuntime {
     pub(crate) fn assemble(
         core: Arc<Core>,
         plan: ResidencyPlan,
-        config: ModelConfig,
+        config: Arc<ModelConfig>,
         weights: Weights,
-        workspace: Workspace,
-        sequence: SequenceState,
+        workspace: Arc<Workspace>,
+        generation: Generation,
         report: StartupReport,
     ) -> EngineRuntime {
         EngineRuntime {
             core,
             plan,
             config,
-            device: ManuallyDrop::new(DeviceState {
-                weights,
-                workspace,
-                sequence,
-            }),
+            device: ManuallyDrop::new(DeviceState { weights, workspace }),
+            generation,
             report,
         }
     }
@@ -345,14 +378,29 @@ impl EngineRuntime {
         &self.device.workspace
     }
 
-    /// The device state of the one sequence the pilot holds.
-    pub fn sequence(&self) -> &SequenceState {
-        &self.device.sequence
+    /// Reads the device state of the one sequence the engine holds, when no generation is running on it: `None` while
+    /// one is.
+    pub fn inspect_sequence<R>(&self, read: impl FnOnce(&SequenceState) -> R) -> Option<R> {
+        self.generation.inspect(read)
     }
 
-    /// The device state of the sequence, to reserve and commit its cache.
-    pub fn sequence_mut(&mut self) -> &mut SequenceState {
-        &mut self.device.sequence
+    /// Starts generating from `request`'s prompt on the engine's sequence, and returns at once: the request runs as
+    /// frames on the engine's lattice, and its listener is told of it there. The sequence takes one request at a time;
+    /// it starts each from nothing, whatever the one before left in it.
+    pub fn generate(&self, request: GenerationRequest) -> Result<(), AdmissionError> {
+        self.generation.generate(request)
+    }
+
+    /// Starts a teacher-forced run on the engine's sequence, as [`EngineRuntime::generate`] does: prefills `prefix`,
+    /// then decodes the `forced` tokens one row at a time, and hands the logits row of each step to `sink`. Step `k`
+    /// of the sink holds the model's prediction of `forced[k]`.
+    pub fn teacher_forced(
+        &self,
+        prefix: Vec<u32>,
+        forced: Vec<u32>,
+        sink: Box<dyn LogitsSink>,
+    ) -> Result<(), AdmissionError> {
+        self.generation.teacher_forced(prefix, forced, sink)
     }
 
     /// What the startup measured.
@@ -420,23 +468,12 @@ impl EngineRuntime {
 impl EngineRuntime {
     /// Frees the device memory. Waits for the device.
     fn release(self) {
-        let Self { device, .. } = self;
-        let DeviceState {
-            weights,
-            workspace,
-            sequence,
-        } = ManuallyDrop::into_inner(device);
+        let Self { device, generation, .. } = self;
+        let DeviceState { weights, workspace } = ManuallyDrop::into_inner(device);
         // The sequence goes first, by `close`, which refuses while a quantum is in flight. The lattice is closed by
         // now, so a quantum still counted will never be dropped: the caches are left allocated (the process is
         // ending) rather than freed under it.
-        if let Err(busy) = sequence.close() {
-            log::error!(
-                "the sequence still has {} quanta in flight at shutdown: its device memory stays allocated until the \
-                 process exits",
-                busy.in_flight
-            );
-            mem::forget(busy);
-        }
+        generation.close();
         drop(workspace);
         drop(weights);
     }
@@ -485,14 +522,26 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
 
     let io = AsyncIo::open().map_err(|error| EngineError::io("the asynchronous file I/O would not open", error))?;
 
-    // One transfer lane per upload chain, the most the settings allow; the startup uses as many as its ring needs.
+    // The stage graphs' lanes first, so that their ids are the plan's (`0..`), then one transfer lane per upload chain,
+    // the most the settings allow; the startup uses as many as its ring needs.
     let machine = startup::read_machine();
-    let chains = startup::transfer_lanes(settings, library.max_lanes());
+    let chains = startup::transfer_lanes(settings, library.max_lanes().saturating_sub(Plan::lane_width() + 2));
+    let compute = Plan::lane_width();
+    let mut stage_lanes = Vec::with_capacity(compute + 2);
+    for lane in 0..compute + 2 {
+        stage_lanes.push(CudaLane::new(&library, LaneId(lane as u16), STAGE_RING)?);
+    }
     let mut transfer = Vec::with_capacity(chains);
     for lane in 0..chains {
-        transfer.push(CudaLane::new(&library, LaneId(lane as u16), TRANSFER_RING)?);
+        transfer.push(CudaLane::new(
+            &library,
+            LaneId((compute + 2 + lane) as u16),
+            TRANSFER_RING,
+        )?);
     }
-    let queues: Vec<Arc<dyn DeviceQueue>> = transfer
+    let every: Vec<Arc<CudaLane>> = stage_lanes.iter().chain(&transfer).cloned().collect();
+    let lane_table = LaneTable::new(every.clone())?;
+    let queues: Vec<Arc<dyn DeviceQueue>> = every
         .iter()
         .map(|lane| Arc::clone(lane) as Arc<dyn DeviceQueue>)
         .collect();
@@ -520,6 +569,8 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
         io,
         completions,
         lanes,
+        stage_lanes,
+        lane_table,
         transfer,
         pool,
         retire: Arc::new(RetireList::new()),

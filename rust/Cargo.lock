@@ -362,6 +362,7 @@ name = "euhedral-inference-engine"
 version = "0.1.0"
 dependencies = [
  "euhedral-core",
+ "euhedral-data-structures",
  "euhedral-graph",
  "euhedral-hardware-utils",
  "euhedral-hashing",
@@ -369,6 +370,7 @@ dependencies = [
  "euhedral-inference-edrl",
  "euhedral-inference-engine",
  "euhedral-inference-settings",
+ "euhedral-inference-tokenizer",
  "log",
  "sha2",
  "tempfile",

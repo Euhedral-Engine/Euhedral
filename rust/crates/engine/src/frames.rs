@@ -24,6 +24,10 @@ pub(crate) enum Kind {
     UploadCopy,
     /// One chain of the weight upload: its copy completions.
     UploadDone,
+    /// The owner of the engine's sequence: one turn of its work.
+    Owner,
+    /// The arrival of a teacher-forced step's logits row.
+    Logits,
 }
 
 /// The id hash of a frame of `kind` on chain `chain`: distinct per kind and chain, mixed so that the chains spread

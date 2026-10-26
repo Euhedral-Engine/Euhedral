@@ -323,6 +323,8 @@ mod tests {
             draft_read: None,
             draft_write: None,
             writes_current_token: false,
+            input_record: 0,
+            token_from: None,
             row_exact: false,
             split_geometry: geometry,
             reserved_host_pages: [0, 0],

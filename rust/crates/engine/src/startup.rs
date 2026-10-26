@@ -32,6 +32,7 @@ use euhedral_inference_settings::Settings;
 
 use crate::error::EngineError;
 use crate::frames::{Kind, step};
+use crate::generation::Generation;
 use crate::model::{
     LayerIndex, MTP_ATTENTION_PACK, ModelConfig, Role, TrellisParts, WeightRef, Weights, companion_name,
     trellis_logical, validate_inventory,
@@ -601,8 +602,23 @@ fn assemble(
                 pinned_growth_during_load: stats.pinned_growth,
                 warmed,
             };
-            let runtime = EngineRuntime::assemble(core, plan, artifact.config, weights, workspace, sequence, report);
-            startup.succeed(runtime);
+            let config = Arc::new(artifact.config);
+            let workspace = Arc::new(workspace);
+            match Generation::new(&core, &config, &plan, &weights, &workspace, sequence) {
+                Ok(generation) => {
+                    let runtime = EngineRuntime::assemble(core, plan, config, weights, workspace, generation, report);
+                    startup.succeed(runtime);
+                }
+                // The plan is refused: what is on the device is freed in a frame of the stages lake, which may wait.
+                Err(refused) => {
+                    let (error, sequence) = *refused;
+                    let stages = Arc::clone(&core.stages);
+                    let _ = stages.offer(step(Kind::Startup, 0, move || {
+                        drop((weights, workspace, sequence));
+                        startup.fail(error);
+                    }));
+                }
+            }
         });
         match marker {
             Some(marker) => completions.after_marker(marker, ready),

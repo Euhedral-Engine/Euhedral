@@ -4,6 +4,7 @@
 pub mod error;
 pub mod formats;
 mod frames;
+pub mod generation;
 pub mod model;
 pub mod plan;
 pub mod quantum;

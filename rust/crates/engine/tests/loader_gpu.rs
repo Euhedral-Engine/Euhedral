@@ -201,12 +201,15 @@ fn startup_loads_rco_and_reports_ready() {
     assert_eq!(workspace.view(512).unwrap().rows(), 512);
     assert!(workspace.view(513).is_err());
     assert!(workspace.buffer(BufferSlot::Logits).bytes() > 0);
-    let sequence = runtime.sequence();
-    assert_eq!(sequence.kv.layers(), 16);
-    assert_eq!(sequence.kv.planned_rows(), 8192);
-    assert_eq!(sequence.mtp_kv.as_ref().map(|kv| kv.layers()), Some(1));
-    assert!(sequence.device.gdn.layer(0).unwrap().speculative().is_some());
-    assert!(sequence.device.scratch.draft().is_some());
+    runtime
+        .inspect_sequence(|sequence| {
+            assert_eq!(sequence.kv.layers(), 16);
+            assert_eq!(sequence.kv.planned_rows(), 8192);
+            assert_eq!(sequence.mtp_kv.as_ref().map(|kv| kv.layers()), Some(1));
+            assert!(sequence.device.gdn.layer(0).unwrap().speculative().is_some());
+            assert!(sequence.device.scratch.draft().is_some());
+        })
+        .expect("no generation holds the sequence");
     owner.shutdown(runtime).unwrap();
 }
 

@@ -13,6 +13,7 @@ test-oracles = ["euhedral-inference-cuda/test-oracles"]
 
 [dependencies]
 euhedral-core.workspace = true
+euhedral-data-structures.workspace = true
 euhedral-graph = { workspace = true, features = ["async-io"] }
 euhedral-hardware-utils.workspace = true
 euhedral-hashing.workspace = true
@@ -25,6 +26,7 @@ thiserror.workspace = true
 [dev-dependencies]
 euhedral-inference-engine = { path = ".", features = ["test-oracles"] }
 euhedral-inference-cuda = { path = "../cuda", features = ["test-oracles"] }
+euhedral-inference-tokenizer = { path = "../tokenizer" }
 sha2.workspace = true
 tempfile.workspace = true
 test-support = { path = "../test-support" }

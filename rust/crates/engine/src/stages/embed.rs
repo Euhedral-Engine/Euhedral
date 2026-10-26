@@ -2,7 +2,7 @@
 //! MTP step on the device.
 
 use euhedral_graph::{Marker, Stage, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::{Submission, ops};
+use euhedral_inference_cuda::{DevicePtr, Submission, ops};
 
 use super::{Launch, Quantum, eager, fatal};
 use crate::formats::Q3Embedding;
@@ -72,6 +72,10 @@ impl Launch for Embed {
             }
             ops::copy_device_to_device(submission, ids, step_tokens()?.offset(4 * slot as u64), 4 * rows as u64)
                 .map_err(fatal)?;
+        }
+        if let Some(previous) = &quantum.token_from {
+            // The token the quantum before selected: the row of the key is the token, the head has no ids.
+            ops::selected_token(submission, previous.device_keys(), DevicePtr::NULL, ids).map_err(fatal)?;
         }
         Q3Embedding
             .submit(submission, &self.table, ids, quantum.slot(self.output), rows)

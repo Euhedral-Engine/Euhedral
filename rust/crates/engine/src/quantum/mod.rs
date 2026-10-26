@@ -80,7 +80,8 @@ impl Quantum {
     /// at the next 8-byte boundary) into pinned memory from `pool`, and queues its upload to the workspace's input
     /// slot on `submission`. The pinned copy is held until the quantum is dropped. Finish the submission, and record
     /// its marker with [`Quantum::prepared_after`]: the quantum's first stage waits for it on the device. Rows that
-    /// read their ids from the step's tokens (`reading_draft_tokens`) need no ids; the record then carries zeros.
+    /// read their ids from the step's tokens (`reading_draft_tokens`) or from the selection of the quantum before them
+    /// ([`Quantum::token_from`]) need no ids; the record then carries zeros.
     ///
     /// The owner reserves the cache's rows (`KvCache::reserve`, which needs the cache) before it takes the views the
     /// quantum reads ([`SequenceState::refs`](crate::state::SequenceState::refs)); that reservation is not part of
@@ -89,7 +90,7 @@ impl Quantum {
         let zeros;
         let ids: &[u32] = if self.tokens.len() == self.rows {
             &self.tokens
-        } else if self.draft_token_read.is_some() {
+        } else if self.draft_token_read.is_some() || self.token_from.is_some() {
             zeros = vec![0u32; self.rows];
             &zeros
         } else {
@@ -283,6 +284,8 @@ impl Quantum {
                 .draft_token_write
                 .and_then(|write| Some((slot(write.slot)?, write.ids.get()))),
             writes_current_token: self.writes_current_token,
+            input_record: self.record as u8,
+            token_from: self.token_from.as_ref().map(|selection| selection.generation()),
             row_exact: self.mode.row_exact,
             split_geometry: split_geometry(start, rows, group),
             reserved_host_pages: keyed_host_pages(source, host_pages(KvSource::Base), host_pages(KvSource::Mtp)),
