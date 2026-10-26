@@ -13,8 +13,14 @@ run = "./gradlew spotlessCheck"
 description = "Apply Java formatting."
 run = "./gradlew spotlessApply"
 
+[tasks."rust-layers"]
+description = "Check the Rust workspace's dependency layers and clippy.toml copies, proving the check fails on planted violations."
+dir = "rust"
+run = "scripts/check-layers.sh --self-test"
+
 [tasks."rust-check"]
-description = "Check Rust formatting and lints, then run the CPU Rust tests."
+description = "Check Rust layers, formatting and lints, then run the CPU Rust tests."
+depends = ["rust-layers"]
 dir = "rust"
 run = [
   "cargo fmt --all --check",

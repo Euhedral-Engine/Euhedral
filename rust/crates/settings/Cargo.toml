@@ -1,0 +1,16 @@
+[package]
+name = "euhedral-inference-settings"
+version = "0.1.0"
+description = "The one place the engine reads its YAML configuration and the EUHEDRAL_ environment overrides."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_yaml_ng.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

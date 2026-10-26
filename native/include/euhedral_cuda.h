@@ -45,6 +45,8 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_memory_type(const void* address);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_device_memory_info(uint64_t* free_byte_size, uint64_t* total_byte_size);
 /// The streaming multiprocessors of the current device.
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_multiprocessor_count(int32_t* count);
+/// The compute capability (major, minor) of the current device.
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_compute_capability(int32_t* major, int32_t* minor);
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_copy_host_to_device(
         void* device_address,
@@ -393,6 +395,11 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_stream_destroy(uint64_t stream);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_stream_synchronize(uint64_t stream);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_stream_select(uint64_t stream);
 EUHEDRAL_CUDA_EXPORT void euhedral_cuda_stream_clear(void);
+/// Programmatic dependent launch for the calling thread's later launches (nonzero enables, zero disables).
+EUHEDRAL_CUDA_EXPORT void euhedral_cuda_pdl_select(int enabled);
+/// Row-exact execution for the calling thread: a multi-row call computes each row exactly as a one-row call at that
+/// row's position would (speculative verification).
+EUHEDRAL_CUDA_EXPORT void euhedral_cuda_row_exact_select(int enabled);
 /// Queues on the selected stream a wait until the host-mapped 32-bit word at `device_address` equals `value`.
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_wait_host_flag(uint64_t device_address, uint32_t value);
 /// Queues on the selected stream a write of `value` to the host-mapped 32-bit word at `device_address`.

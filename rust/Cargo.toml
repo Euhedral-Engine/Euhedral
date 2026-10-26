@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/test-support"]
+members = ["crates/bench", "crates/cuda", "crates/edrl", "crates/host-gemv", "crates/settings", "crates/test-support", "crates/tokenizer", "xtask"]
 resolver = "3"
 
 [workspace.package]
@@ -9,14 +9,30 @@ publish = false
 
 # The RustEE crates (euhedral-core, euhedral-graph, euhedral-hardware-utils, euhedral-hashing) join
 # [workspace.dependencies] as git dependencies on https://github.com/Euhedral-Engine/RustEE.git pinned by `rev`
-# when the first crate uses them.
+# when the first crate uses them. euhedral-graph is the first.
 [workspace.dependencies]
+crc32fast = "1.5"
+euhedral-graph = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "377201b2b7f617483b4f2e6c8d0f1060ea4f7d11", default-features = false }
 java-properties = "2"
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
 tempfile = "3.27"
+thiserror = "2"
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
 
 [workspace.lints.clippy]
+absolute_paths = "warn"
+dbg_macro = "warn"
+expect_used = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+todo = "warn"
 undocumented_unsafe_blocks = "warn"
+unwrap_used = "warn"

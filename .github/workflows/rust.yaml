@@ -47,16 +47,75 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin/bindgen
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             rust/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml', 'mise.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+      - name: Install bindgen
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y --no-install-recommends libclang-dev
+          cargo install bindgen-cli --version 0.72.1 --locked
+      - name: Check the CUDA bindings are current
+        if: runner.os == 'Linux'
+        working-directory: rust
+        run: cargo xtask bindings --check
+      - name: Layers
+        if: runner.os == 'Linux'
+        working-directory: rust
+        run: scripts/check-layers.sh --self-test
       - name: Check formatting
         working-directory: rust
         run: cargo fmt --all --check
       - name: Lint
         working-directory: rust
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check the aarch64 kernels
+        if: runner.os == 'Linux'
+        working-directory: rust
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          cargo check --target aarch64-unknown-linux-gnu -p euhedral-inference-host-gemv
       - name: Test
         working-directory: rust
         run: cargo test --workspace
+      # No runner has AVX-512, so the 512-bit kernel runs under Intel's emulator (a pinned release, checked by hash).
+      # EUHEDRAL_EXPECT_ISA makes the tests fail if the variant was not among the available ones.
+      - name: Test the AVX-512 VNNI kernel under Intel SDE
+        if: runner.os == 'Linux'
+        working-directory: rust
+        env:
+          EUHEDRAL_EXPECT_ISA: avx512-vnni
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "${{ runner.temp }}/sde/sde64 -spr --"
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/sde.tar.xz" https://downloadmirror.intel.com/859732/sde-external-9.58.0-2025-06-16-lin.tar.xz
+          echo "f849acecad4c9b108259c643b2688fd65c35723cd23368abe5dd64b917cc18c0  $RUNNER_TEMP/sde.tar.xz" | sha256sum --check -
+          mkdir "$RUNNER_TEMP/sde"
+          tar -xJf "$RUNNER_TEMP/sde.tar.xz" -C "$RUNNER_TEMP/sde" --strip-components=1
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          cargo test -p euhedral-inference-host-gemv --test twin --test bound --test contract
+
+  # The NEON dot-product kernel runs natively on an arm64 runner.
+  arm:
+    runs-on: ubuntu-24.04-arm
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-arm
+      cancel-in-progress: true
+    env:
+      MISE_AUTO_INSTALL: "false"
+      EUHEDRAL_EXPECT_ISA: neon-dotprod
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v5.0.0
+        with:
+          install: true
+          install_args: rust
+          cache: true
+      - name: Test the NEON kernel
+        working-directory: rust
+        run: cargo test -p euhedral-inference-host-gemv
