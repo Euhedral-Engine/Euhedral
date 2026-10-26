@@ -61,6 +61,10 @@ memory:
     read-split: 1                             # optional, default 1: parts one record read is split into
     copy-streams: 4                           # optional, default 4: CUDA streams copying expert weights to the GPU
     gpu-streams: 2                            # optional, default 2: GPU streams a step runs on
+  host-layers:                                # layers whose weights stay in host memory
+    compute: auto                             # optional, default auto: auto | cpu | stream (cpu reads the weights in place; stream copies them to the GPU)
+    gemv-rows: auto                           # optional, default auto: rows of one CPU GEMV chunk (auto = sized from the cache and the row's byte size)
+    prefill-slots: auto                       # optional, default auto: staging slots for prefill of host-resident layers
 
 host:
   cpus: auto                                  # optional, default auto: CPUs the workers run on, such as 2-5,8 (auto = all)
