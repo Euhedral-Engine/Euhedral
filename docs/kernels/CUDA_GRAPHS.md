@@ -19,6 +19,9 @@ not change with its position. The host keeps its copy of the position to validat
 - kind, rows, logits requirement, host logits, draft seed and committed rows;
 - the split counts that size decode attention (48-key splits below 2048 keys, 32-key splits from 2048, at most 64 each): below
   2048 keys the key changes every 48 positions, from 2048 it is constant;
+- whether the fused verifier attention kernel serves the rows (NVFP4 caches, 2 to 8 rows, at most 6 mma tiles): the host picks
+  it at launch once the last row reaches `fused_from(rows)` keys (`qwen_layer_ops.c`; 49152, 16384, 4096, 2048, 16384, 16384,
+  12288 for rows 2 to 8), so the key changes once when a context crosses that length (`AttentionLaunchGeometry`);
 - a fingerprint of the workspace storage and of every sequence-owned device address (KV page tables, decode scratch, draft seed
   rows, GDN states and their speculative checkpoints, the host logits' buffers), plus the pending ReplaySSM rows. Each
   address enters with its allocation's identity (`GpuMemory.allocationId`): a new session can receive a closed session's
