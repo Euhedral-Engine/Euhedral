@@ -142,7 +142,10 @@ impl Startup {
 
     /// Ends the startup with the runtime.
     fn succeed(mut self, runtime: EngineRuntime) {
-        self.core.delivered.store(true, Ordering::Release);
+        self.core
+            .teardown
+            .device_bytes
+            .store(runtime.report().allocated_bytes, Ordering::Release);
         if let Some(ready) = self.ready.take() {
             ready.set(Ok(Arc::new(runtime)));
         }

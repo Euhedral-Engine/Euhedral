@@ -19,7 +19,7 @@ use euhedral_core::config::FragmentConfig;
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_graph::{Join, Lake, Latch};
-use euhedral_inference_engine::{fragment_config, lattice_config};
+use euhedral_inference_engine::{RuntimeOwner, Teardown, fragment_config, lattice_config};
 use euhedral_inference_settings::{Auto, ModelSettings, Settings};
 
 struct Counted {
@@ -101,4 +101,43 @@ fn a_lattice_in_poll_mode_runs_frames() {
 #[test]
 fn a_lattice_in_drain_mode_runs_frames() {
     assert_eq!(run_frames(&settings(Auto::Auto), 256), 256);
+}
+
+#[test]
+fn dropping_the_owner_closes_the_lakes_and_the_lattice_whatever_handles_are_alive() {
+    let settings = settings(Auto::Auto);
+    let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
+    let lakes: Vec<Arc<Lake>> = (0..2)
+        .map(|_| {
+            Lake::new(
+                Arc::clone(&lattice),
+                NonZeroUsize::new(1).unwrap(),
+                Duration::from_secs(1),
+            )
+        })
+        .collect();
+    let teardown = Teardown::new(Arc::clone(&lattice), lakes.clone());
+    let owner = RuntimeOwner::over(Arc::clone(&teardown));
+
+    // The engine is working: a frame has run on the lattice.
+    let unit = lakes[0].admit().unwrap();
+    let (done, finished) = Latch::new();
+    let join = Join::new(1, move |parts: Vec<Option<usize>>| done.set(parts.len()));
+    let frame = Counted {
+        header: FrameHeader::new(1),
+        ran: Arc::new(AtomicUsize::new(0)),
+        join,
+        part: 0,
+    };
+    assert!(lakes[0].offer(Box::new(frame)).is_ok());
+    assert_eq!(finished.wait(), 1);
+    drop(unit);
+
+    // `teardown` stands for a handle a frame still holds (the runtime's, in an engine): the drop closes anyway.
+    drop(owner);
+    for lake in &lakes {
+        assert!(lake.admit().is_err(), "a closed lake takes no unit");
+    }
+    assert!(lattice.start().is_err(), "a closed lattice does not start again");
+    teardown.close();
 }

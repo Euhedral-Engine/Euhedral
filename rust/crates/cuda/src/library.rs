@@ -92,12 +92,12 @@ impl CudaLibrary {
         }))
     }
 
-    /// The path this library was loaded from.
     /// The most lanes this library holds: lane ids are `0..max_lanes()`.
     pub fn max_lanes(&self) -> usize {
         MAX_LANES
     }
 
+    /// The path this library was loaded from.
     pub fn path(&self) -> &Path {
         &self.path
     }

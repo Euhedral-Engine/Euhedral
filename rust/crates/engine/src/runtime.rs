@@ -10,7 +10,7 @@ use std::mem::ManuallyDrop;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use euhedral_core::config::{FragmentConfig, LatticeConfig};
@@ -58,8 +58,8 @@ pub(crate) struct Core {
     /// The pinned pool's size (`memory.pinned-buffer-pool`, resolved): what it keeps, and the ring's budget.
     pub(crate) pool_bytes: u64,
     pub(crate) started: Instant,
-    /// Whether the startup delivered a runtime, which then closes the lattice itself.
-    pub(crate) delivered: AtomicBool,
+    /// What stops the lattice and its lakes, shared with the owner.
+    pub(crate) teardown: Arc<Teardown>,
 }
 
 impl fmt::Debug for Core {
@@ -102,14 +102,6 @@ impl Core {
             _control: self.control.admit().map_err(closed)?,
         })
     }
-
-    /// Closes the lakes and the lattice. Waits for the lattice's workers to stop: shutdown only.
-    pub(crate) fn close(&self) {
-        self.control.complete_gracefully();
-        self.host.complete_gracefully();
-        self.stages.complete_gracefully();
-        self.lattice.close();
-    }
 }
 
 /// The numbers of one startup.
@@ -141,48 +133,111 @@ pub struct StartupReport {
     pub warmed: Warmed,
 }
 
+/// What stops an engine: its lakes and its lattice, and the count of device bytes that nothing has freed yet. Closing
+/// waits for the lattice's workers, so only the engine's owner does it, on `main`.
+pub struct Teardown {
+    lakes: Vec<Arc<Lake>>,
+    lattice: Arc<ControlPlaneLattice>,
+    /// Device bytes the runtime allocated and `shutdown` has not freed.
+    pub(crate) device_bytes: AtomicU64,
+}
+
+impl Teardown {
+    /// The teardown of `lattice` and the `lakes` that feed it.
+    pub fn new(lattice: Arc<ControlPlaneLattice>, lakes: Vec<Arc<Lake>>) -> Arc<Teardown> {
+        Arc::new(Teardown {
+            lakes,
+            lattice,
+            device_bytes: AtomicU64::new(0),
+        })
+    }
+
+    /// Closes the lakes, then the lattice. Idempotent. Waits for the workers: never from a worker.
+    pub fn close(&self) {
+        for lake in &self.lakes {
+            lake.complete_gracefully();
+        }
+        self.lattice.close();
+    }
+}
+
+impl fmt::Debug for Teardown {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Teardown").finish_non_exhaustive()
+    }
+}
+
 /// The owner of a started engine's lattice and device memory, held by `main` (or the test): the one place the engine
 /// closes the lattice and frees device memory with calls that wait.
 ///
 /// The contract:
-/// - [`EngineRuntime::start`] returns it; keep it until the engine is done.
-/// - A startup that failed (the latch carried an error): dropping the owner closes the lattice, on the dropping
-///   thread, which must not be a worker of that lattice.
-/// - A startup that succeeded: call [`RuntimeOwner::shutdown`] with the runtime from the latch. It closes the lakes and
-///   the lattice, then frees the weights, the workspace and the sequence state. Dropping the owner or the runtime
-///   without it closes nothing and frees nothing (the process's exit does): no `Drop` of the engine waits.
+/// - [`EngineRuntime::start`] returns it; keep it on the thread that started the engine until the engine is done.
+///   That thread must not be a worker of the engine's lattice.
+/// - To stop the engine, call [`RuntimeOwner::shutdown`] with the runtime from the latch. It closes the lakes and the
+///   lattice, then frees the weights, the workspace and the sequence state.
+/// - Dropping the owner always closes the lakes and the lattice, whatever happened to the startup and whatever
+///   handles to the runtime are still alive, so that no worker ever runs the last drop of the lattice. Without
+///   `shutdown` the device memory is not freed (freeing waits; no `Drop` of the runtime does it): it stays allocated
+///   until the process exits, and the drop logs the number of bytes.
 #[must_use = "the owner closes the lattice and frees the device memory: hold it until the engine is done"]
 pub struct RuntimeOwner {
-    core: Option<Arc<Core>>,
+    teardown: Option<Arc<Teardown>>,
 }
 
 impl RuntimeOwner {
+    /// The owner of `teardown`. [`EngineRuntime::start`] makes one; this is for tests of the contract.
+    pub fn over(teardown: Arc<Teardown>) -> RuntimeOwner {
+        RuntimeOwner {
+            teardown: Some(teardown),
+        }
+    }
+
     /// Stops the engine: closes the lakes and the lattice, waiting for the workers, then frees the device memory of
     /// `runtime`. Call it from the thread that started the engine, once no frame is running. It fails, leaving the
-    /// device memory allocated until the process exits, if another handle to `runtime` is alive.
+    /// device memory allocated until the process exits (and logging how much), if another handle to `runtime` is
+    /// alive.
     pub fn shutdown(mut self, runtime: Arc<EngineRuntime>) -> Result<(), EngineError> {
-        if let Some(core) = self.core.take() {
-            core.close();
+        let teardown = self.teardown.take();
+        if let Some(teardown) = &teardown {
+            teardown.close();
         }
         match Arc::try_unwrap(runtime) {
             Ok(runtime) => {
                 runtime.release();
+                if let Some(teardown) = &teardown {
+                    teardown.device_bytes.store(0, Ordering::Release);
+                }
                 Ok(())
             }
-            Err(_) => Err(EngineError::Runtime(
-                "another handle to the runtime is alive: its device memory stays allocated until the process exits"
-                    .to_string(),
-            )),
+            Err(_) => {
+                if let Some(teardown) = &teardown {
+                    teardown.log_leak();
+                }
+                Err(EngineError::Runtime(
+                    "another handle to the runtime is alive: its device memory stays allocated until the process exits"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+}
+
+impl Teardown {
+    fn log_leak(&self) {
+        let bytes = self.device_bytes.load(Ordering::Acquire);
+        if bytes > 0 {
+            log::error!(
+                "{bytes} bytes of device memory stay allocated until the process exits: the engine was not shut down"
+            );
         }
     }
 }
 
 impl Drop for RuntimeOwner {
     fn drop(&mut self) {
-        if let Some(core) = &self.core
-            && !core.delivered.load(Ordering::Acquire)
-        {
-            core.close();
+        if let Some(teardown) = self.teardown.take() {
+            teardown.close();
+            teardown.log_leak();
         }
     }
 }
@@ -234,15 +289,13 @@ impl EngineRuntime {
     ) -> RuntimeOwner {
         match build(settings, library) {
             Ok(core) => {
-                let owner = RuntimeOwner {
-                    core: Some(Arc::clone(&core)),
-                };
+                let owner = RuntimeOwner::over(Arc::clone(&core.teardown));
                 startup::run(core, ready);
                 owner
             }
             Err(error) => {
                 ready.set(Err(error));
-                RuntimeOwner { core: None }
+                RuntimeOwner { teardown: None }
             }
         }
     }
@@ -427,6 +480,10 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
         .map_err(|error| runtime("the lattice would not take the completions", &format!("{error:?}")))?;
     let pool_bytes = startup::pinned_pool_bytes(settings, &machine);
     let pool = PinnedPool::new(&library, pool_bytes);
+    let teardown = Teardown::new(
+        Arc::clone(&lattice),
+        vec![Arc::clone(&stages), Arc::clone(&host), Arc::clone(&control)],
+    );
     Ok(Arc::new(Core {
         settings: settings.clone(),
         library,
@@ -442,6 +499,6 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
         host_pinned_bytes: startup::host_pinned_bytes(settings, &machine),
         pool_bytes,
         started,
-        delivered: AtomicBool::new(false),
+        teardown,
     }))
 }

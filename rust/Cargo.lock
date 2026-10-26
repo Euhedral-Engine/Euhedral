@@ -368,6 +368,7 @@ dependencies = [
  "euhedral-inference-cuda",
  "euhedral-inference-edrl",
  "euhedral-inference-settings",
+ "log",
  "sha2",
  "tempfile",
  "test-support",
