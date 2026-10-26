@@ -46,7 +46,7 @@ fn parse(file: &[u8]) -> Result<Parsed, EdrlError> {
 
 fn section(file: &[u8], parsed: &Parsed) -> Result<TokenizerSection, EdrlError> {
     let footer = parsed.footer.as_ref().expect("the file has a tokenizer section");
-    TokenizerSection::parse(range(file, footer.body_range(file.len() as u64)?), footer)
+    TokenizerSection::parse(range(file, footer.body_range(file.len() as u64)?).to_vec(), footer)
 }
 
 fn entry<'a>(parsed: &'a Parsed, name: &str) -> &'a TensorEntry {
@@ -81,10 +81,10 @@ fn parses_header_metadata_table() {
     let parsed = parse(FIXTURE).unwrap();
 
     let header = &parsed.header;
-    assert_eq!(header.version, 2);
-    assert_eq!(header.metadata_offset, HEADER_BYTES as u64);
-    assert_eq!(header.tensor_count, 11);
-    assert_eq!(header.metadata_range().end, header.tensor_table_offset);
+    assert_eq!(header.version(), 2);
+    assert_eq!(header.metadata_offset(), HEADER_BYTES as u64);
+    assert_eq!(header.tensor_count(), 11);
+    assert_eq!(header.metadata_range().end, header.tensor_table_offset());
     assert_eq!(header.table_range().end, header.data_offset());
 
     let metadata = &parsed.metadata;
@@ -116,7 +116,7 @@ fn parses_header_metadata_table() {
     assert_eq!(metadata.draft_depth, Some(4));
 
     let table = &parsed.table;
-    let names: Vec<&str> = table.entries().iter().map(|entry| entry.name.as_str()).collect();
+    let names: Vec<&str> = table.entries().iter().map(|entry| entry.name()).collect();
     assert_eq!(
         names,
         [
@@ -225,14 +225,14 @@ fn parses_header_metadata_table() {
     ];
     for (index, (name, shape, dtype, format, layout, bytes)) in expected.into_iter().enumerate() {
         let entry = &table.entries()[index];
-        assert_eq!(entry.name, name);
-        assert_eq!(entry.shape, shape, "{name}");
-        assert_eq!(entry.dtype, dtype, "{name}");
-        assert_eq!(entry.format, format, "{name}");
-        assert_eq!(entry.layout, layout, "{name}");
-        assert_eq!(entry.bytes, bytes, "{name}");
-        assert_eq!(entry.offset % 4096, 0, "{name} is block-aligned");
-        assert!(entry.offset >= header.data_offset(), "{name}");
+        assert_eq!(entry.name(), name);
+        assert_eq!(entry.shape(), shape, "{name}");
+        assert_eq!(entry.dtype(), dtype, "{name}");
+        assert_eq!(entry.format(), format, "{name}");
+        assert_eq!(entry.layout(), layout, "{name}");
+        assert_eq!(entry.bytes(), bytes, "{name}");
+        assert_eq!(entry.offset() % 4096, 0, "{name} is block-aligned");
+        assert!(entry.offset() >= header.data_offset(), "{name}");
         // The payload is where the entry says: the converter filled each with its 1-based index.
         let payload = range(FIXTURE, entry.range());
         if name != "trellis.segments" {
@@ -269,13 +269,25 @@ fn rejects_bad_magic() {
     file[0] ^= 0xff;
     assert!(matches!(parse(&file), Err(EdrlError::BadMagic { .. })));
 
+    // A file that is not an artifact at all reports the magic, not a later offset check.
+    let text = [b'A'; HEADER_BYTES];
+    assert_eq!(
+        Header::parse(&text).err(),
+        Some(EdrlError::BadMagic { found: 0x4141_4141 })
+    );
+
     let mut file = FIXTURE.to_vec();
     file[7] = 3;
     assert_eq!(parse(&file).err(), Some(EdrlError::UnsupportedVersion { found: 3 }));
 
     let mut file = FIXTURE.to_vec();
-    file[28] = 1; // the reserved field
-    assert!(matches!(parse(&file), Err(EdrlError::Invalid { .. })));
+    file[39] = 1; // the reserved field
+    assert_eq!(
+        parse(&file).err(),
+        Some(EdrlError::Invalid {
+            what: "header reserved field must be zero".into()
+        })
+    );
 
     assert!(matches!(
         ReadPlan::probe(HEADER_BYTES as u64 - 1),
@@ -286,7 +298,7 @@ fn rejects_bad_magic() {
 #[test]
 fn rejects_overlapping_payloads() {
     let mut file = FIXTURE.to_vec();
-    let embed = entry(&parse(&file).unwrap(), "embed").offset;
+    let embed = entry(&parse(&file).unwrap(), "embed").offset();
     // `ids` now starts inside `embed`.
     let at = offset_field(&file, "ids", 1);
     put_i64(&mut file, at, embed as i64 + 32);
@@ -312,7 +324,7 @@ fn rejects_payloads_outside_the_content() {
         &FIXTURE[range.start as usize..range.end as usize]
     };
     // The same table against a file that ends inside the last payload.
-    let short = last.offset + last.bytes - 1;
+    let short = last.offset() + last.bytes() - 1;
     assert!(matches!(
         TensorTable::parse(table_bytes, &parsed.header, short),
         Err(EdrlError::Invalid { .. })
@@ -367,7 +379,12 @@ fn rejects_sizes_the_layout_does_not_allow() {
         put_i64(&mut file, at, size);
         // Keep the payload inside the content: it only ever shrinks or grows by a few hundred bytes of padding.
         let result = parse(&file);
-        assert_eq!(result.is_ok(), accepted, "p2e2 of {size} bytes (stored {})", p2e2.bytes);
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "p2e2 of {size} bytes (stored {})",
+            p2e2.bytes()
+        );
     }
 }
 
@@ -398,7 +415,7 @@ fn rejects_bad_tokenizer_crc() {
 
     // A body of the wrong length is refused before its CRC is looked at.
     assert!(matches!(
-        TokenizerSection::parse(&file[body.start as usize..body.end as usize - 1], &footer),
+        TokenizerSection::parse(file[body.start as usize..body.end as usize - 1].to_vec(), &footer),
         Err(EdrlError::Truncated { .. })
     ));
 
@@ -441,29 +458,29 @@ fn rejects_a_tokenizer_body_that_is_not_the_four_entries() {
     let mut renamed = body.clone();
     renamed[8] = b'T'; // "Tokenizer.json"
     assert!(matches!(
-        TokenizerSection::parse(&renamed, &reseal(&renamed)),
+        TokenizerSection::parse(renamed.clone(), &reseal(&renamed)),
         Err(EdrlError::Invalid { .. })
     ));
     let mut trailing = body.clone();
     trailing.push(0);
     assert!(matches!(
-        TokenizerSection::parse(&trailing, &reseal(&trailing)),
+        TokenizerSection::parse(trailing.clone(), &reseal(&trailing)),
         Err(EdrlError::Invalid { .. })
     ));
     let mut three = body.clone();
     three[3] = 3;
     assert!(matches!(
-        TokenizerSection::parse(&three, &reseal(&three)),
+        TokenizerSection::parse(three.clone(), &reseal(&three)),
         Err(EdrlError::Invalid { .. })
     ));
     let mut not_utf8 = body.clone();
     let at = body.len() - 5; // inside special_tokens.json
     not_utf8[at] = 0xff;
     assert!(matches!(
-        TokenizerSection::parse(&not_utf8, &reseal(&not_utf8)),
+        TokenizerSection::parse(not_utf8.clone(), &reseal(&not_utf8)),
         Err(EdrlError::Invalid { .. })
     ));
-    assert!(TokenizerSection::parse(&body, &reseal(&body)).is_ok());
+    assert!(TokenizerSection::parse(body.clone(), &reseal(&body)).is_ok());
 }
 
 #[test]
@@ -573,15 +590,15 @@ fn trellis_segments_validated() {
 
     let suh = entry(&parsed, "trellis.suh");
     let payload = entry(&parsed, "trellis");
-    let n = payload.shape[1] * 16;
+    let n = payload.shape()[1] * 16;
     assert_eq!(n, 256);
-    assert_eq!(TrellisCompanions::check_rows(&ends, n, suh.shape[0]), Ok(()));
+    assert_eq!(TrellisCompanions::check_rows(&ends, n, suh.shape()[0]), Ok(()));
     assert!(
         TrellisCompanions::check_rows(&ends, n, 3).is_err(),
         "one suh row per segment"
     );
     assert!(
-        TrellisCompanions::check_rows(&ends, 384, suh.shape[0]).is_err(),
+        TrellisCompanions::check_rows(&ends, 384, suh.shape()[0]).is_err(),
         "the last end is n"
     );
 
@@ -631,14 +648,11 @@ fn read_plan_lists_ranges_in_file_order() {
     let regions: Vec<Region> = plan.reads().iter().map(|read| read.region).collect();
     assert_eq!(
         regions,
-        [
-            Region::Header,
-            Region::Metadata,
-            Region::Table,
-            Region::TokenizerBody,
-            Region::TokenizerFooter
-        ]
+        // The header and the footer are what `probe` already fetched.
+        [Region::Metadata, Region::Table, Region::TokenizerBody]
     );
+    assert_eq!(plan.range(Region::Header), None);
+    assert_eq!(plan.range(Region::TokenizerFooter), None);
     let starts: Vec<u64> = plan.reads().iter().map(|read| read.range.start).collect();
     assert!(
         starts.windows(2).all(|pair| pair[0] < pair[1]),
@@ -655,4 +669,25 @@ fn read_plan_lists_ranges_in_file_order() {
 
     // A file too short for its header's regions has no plan.
     assert!(ReadPlan::new(&parsed.header, 100, None).is_err());
+}
+
+#[test]
+fn rejects_duplicate_tensor_names() {
+    let mut file = FIXTURE.to_vec();
+    // `nvfp4` becomes a second `embed`.
+    let at = entry_position(&file, "nvfp4") + 4;
+    file[at..at + 5].copy_from_slice(b"embed");
+    assert_eq!(
+        parse(&file).err(),
+        Some(EdrlError::DuplicateName { name: "embed".into() })
+    );
+}
+
+#[test]
+fn a_hostile_tensor_count_is_a_truncated_table() {
+    let parsed = parse(FIXTURE).unwrap();
+    let mut file = FIXTURE.to_vec();
+    file[32..36].copy_from_slice(&1_000_000i32.to_be_bytes());
+    assert!(matches!(parse(&file), Err(EdrlError::Truncated { .. })));
+    assert_eq!(parsed.header.tensor_count(), 11);
 }

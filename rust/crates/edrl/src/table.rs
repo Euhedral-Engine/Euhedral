@@ -7,24 +7,55 @@ use crate::reader::{Reader, checked_end, non_negative};
 
 const MAX_RANK: i32 = 64;
 const MAX_NAME_BYTES: usize = 1 << 20;
+/// The smallest entry: a one-byte name, rank 0, and the ordinals, offset and size.
+const MIN_ENTRY_BYTES: usize = 4 + 1 + 4 + 12 + 16;
 
 /// One tensor descriptor: where its payload is and how to read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorEntry {
-    pub name: String,
-    pub shape: Vec<u64>,
-    pub dtype: TensorDataType,
-    pub format: WeightFormat,
-    pub layout: WeightLayout,
-    /// Where the payload starts in the file.
-    pub offset: u64,
-    /// The payload's size.
-    pub bytes: u64,
+    name: String,
+    shape: Vec<u64>,
+    dtype: TensorDataType,
+    format: WeightFormat,
+    layout: WeightLayout,
+    offset: u64,
+    bytes: u64,
 }
 
 impl TensorEntry {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+
+    pub fn dtype(&self) -> TensorDataType {
+        self.dtype
+    }
+
+    pub fn format(&self) -> WeightFormat {
+        self.format
+    }
+
+    pub fn layout(&self) -> WeightLayout {
+        self.layout
+    }
+
+    /// Where the payload starts in the file.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// The payload's size.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     /// The payload's byte range.
     pub fn range(&self) -> std::ops::Range<u64> {
+        // `TensorTable::parse` checked that the end does not overflow.
         self.offset..self.offset + self.bytes
     }
 }
@@ -49,8 +80,10 @@ impl TensorTable {
             return Err(EdrlError::invalid("tensor table has trailing or missing bytes"));
         }
         let mut reader = Reader::new(bytes);
-        let mut entries = Vec::with_capacity(header.tensor_count.min(MAX_COUNT) as usize);
-        for _ in 0..header.tensor_count {
+        // The capacity is bounded by what the bytes can hold, so a hostile count allocates nothing large.
+        let capacity = (header.tensor_count().min(MAX_COUNT) as usize).min(bytes.len() / MIN_ENTRY_BYTES);
+        let mut entries = Vec::with_capacity(capacity);
+        for _ in 0..header.tensor_count() {
             entries.push(entry(&mut reader, header, content_end)?);
         }
         if reader.remaining() != 0 {
@@ -59,7 +92,11 @@ impl TensorTable {
         validate_non_overlapping(&entries)?;
         let mut index = HashMap::with_capacity(entries.len());
         for (position, entry) in entries.iter().enumerate() {
-            index.entry(entry.name.clone()).or_insert(position);
+            if index.insert(entry.name.clone(), position).is_some() {
+                return Err(EdrlError::DuplicateName {
+                    name: entry.name.clone(),
+                });
+            }
         }
         Ok(TensorTable { entries, index })
     }
@@ -77,7 +114,7 @@ impl TensorTable {
         self.entries.is_empty()
     }
 
-    /// The entry named `name` (the first, should a table repeat a name).
+    /// The entry named `name`; names are unique.
     pub fn get(&self, name: &str) -> Option<&TensorEntry> {
         self.index.get(name).map(|position| &self.entries[*position])
     }

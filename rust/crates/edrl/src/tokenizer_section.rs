@@ -96,17 +96,17 @@ pub struct TokenizerSection {
 
 impl TokenizerSection {
     /// Decodes `body` (the bytes before the footer), which must be exactly the footer's body length and match its
-    /// CRC-32.
-    pub fn parse(body: &[u8], footer: &TokenizerFooter) -> Result<TokenizerSection, EdrlError> {
+    /// CRC-32. The section keeps the buffer, so the loader's read is not copied.
+    pub fn parse(body: Vec<u8>, footer: &TokenizerFooter) -> Result<TokenizerSection, EdrlError> {
         if body.len() as u64 != footer.body_length {
             return Err(EdrlError::Truncated {
                 what: "tokenizer section",
             });
         }
-        if crc32fast::hash(body) != footer.crc {
+        if crc32fast::hash(&body) != footer.crc {
             return Err(EdrlError::TokenizerCrc);
         }
-        let mut reader = Reader::new(body);
+        let mut reader = Reader::new(&body);
         let count = section_int(&mut reader)?;
         if usize::try_from(count).ok() != Some(TOKENIZER_ENTRIES.len()) {
             return Err(EdrlError::invalid(format!(
@@ -116,14 +116,14 @@ impl TokenizerSection {
         }
         let mut data = [0..0, 0..0, 0..0, 0..0];
         for (index, expected) in TOKENIZER_ENTRIES.iter().enumerate() {
-            let name = &body[text(&mut reader, body)?];
+            let name = &body[text(&mut reader, &body)?];
             if name != expected.as_bytes() {
                 return Err(EdrlError::invalid(format!(
                     "tokenizer section entry {index} is {}, not {expected}",
                     String::from_utf8_lossy(name)
                 )));
             }
-            data[index] = text(&mut reader, body)?;
+            data[index] = text(&mut reader, &body)?;
         }
         if reader.remaining() != 0 {
             return Err(EdrlError::invalid("the tokenizer section has trailing bytes"));

@@ -1,6 +1,6 @@
 //! Parses the header, metadata, table and footer of a real artifact and compares the tensor table with the one the
-//! converter's Python reader (`tools/euhedral_artifacts/edrl.py`) reads. Needs `euhedral.qwen.artifact` (in
-//! `~/.gradle/gradle.properties`, or `EUHEDRAL_TEST_QWEN_ARTIFACT`) to name an RCO NVFP4 + trellis artifact, and
+//! converter's Python reader (`tools/euhedral_artifacts/edrl.py`) reads. Needs `euhedral.qwen.rco-artifact` (in
+//! `~/.gradle/gradle.properties`, or `EUHEDRAL_TEST_QWEN_RCO_ARTIFACT`) to name an RCO NVFP4 + trellis artifact, and
 //! `python3`. Never reads a payload.
 //!
 //! ```text
@@ -19,7 +19,7 @@ use euhedral_inference_edrl::{
 };
 use serde_json::Value;
 
-const KEY: &str = "euhedral.qwen.artifact";
+const KEY: &str = "euhedral.qwen.rco-artifact";
 
 fn read_range(file: &mut File, range: Range<u64>) -> Vec<u8> {
     file.seek(SeekFrom::Start(range.start)).unwrap();
@@ -46,7 +46,7 @@ fn python_table(artifact: &Path) -> Vec<Value> {
 }
 
 #[test]
-#[ignore = "needs the real RCO artifact (euhedral.qwen.artifact) and python3"]
+#[ignore = "needs the real RCO artifact (euhedral.qwen.rco-artifact) and python3"]
 fn real_artifact_inventory_matches_python() {
     let Some(path) = test_support::require_property(KEY) else {
         return;
@@ -85,7 +85,7 @@ fn real_artifact_inventory_matches_python() {
     )
     .unwrap();
     let section = TokenizerSection::parse(
-        &read_range(&mut file, plan.range(Region::TokenizerBody).unwrap()),
+        read_range(&mut file, plan.range(Region::TokenizerBody).unwrap()),
         &footer,
     )
     .unwrap();
@@ -106,18 +106,18 @@ fn real_artifact_inventory_matches_python() {
     // The Python reader sees the same table: same names, shapes, ordinals, offsets and sizes.
     let expected = python_table(&path);
     assert_eq!(table.len(), expected.len());
-    assert_eq!(table.len() as u32, header.tensor_count);
+    assert_eq!(table.len() as u32, header.tensor_count());
     let mut formats: BTreeMap<String, usize> = BTreeMap::new();
     for (entry, python) in table.entries().iter().zip(&expected) {
-        assert_eq!(python["name"], entry.name.as_str());
-        assert_eq!(python["shape"], serde_json::json!(entry.shape), "{}", entry.name);
-        assert_eq!(python["dtype"], entry.dtype as u64, "{}", entry.name);
-        assert_eq!(python["format"], entry.format as u64, "{}", entry.name);
-        assert_eq!(python["layout"], entry.layout as u64, "{}", entry.name);
-        assert_eq!(python["offset"], entry.offset, "{}", entry.name);
-        assert_eq!(python["bytes"], entry.bytes, "{}", entry.name);
+        assert_eq!(python["name"], entry.name());
+        assert_eq!(python["shape"], serde_json::json!(entry.shape()), "{}", entry.name());
+        assert_eq!(python["dtype"], entry.dtype() as u64, "{}", entry.name());
+        assert_eq!(python["format"], entry.format() as u64, "{}", entry.name());
+        assert_eq!(python["layout"], entry.layout() as u64, "{}", entry.name());
+        assert_eq!(python["offset"], entry.offset(), "{}", entry.name());
+        assert_eq!(python["bytes"], entry.bytes(), "{}", entry.name());
         *formats
-            .entry(format!("{:?}/{:?}", entry.format, entry.layout))
+            .entry(format!("{:?}/{:?}", entry.format(), entry.layout()))
             .or_default() += 1;
     }
     println!("{} tensors: {formats:?}", table.len());

@@ -18,12 +18,12 @@ pub(crate) const MAX_METADATA_BYTES: u64 = 8 << 20;
 /// int32 tensorCount, int32 reserved (zero), int64 tensorDataOffset`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
-    pub version: u32,
-    pub metadata_offset: u64,
-    pub metadata_size: u64,
-    pub tensor_table_offset: u64,
-    pub tensor_count: u32,
-    pub tensor_data_offset: u64,
+    version: u32,
+    metadata_offset: u64,
+    metadata_size: u64,
+    tensor_table_offset: u64,
+    tensor_count: u32,
+    tensor_data_offset: u64,
 }
 
 impl Header {
@@ -32,7 +32,13 @@ impl Header {
     pub fn parse(bytes: &[u8; HEADER_BYTES]) -> Result<Header, EdrlError> {
         let mut reader = Reader::new(bytes);
         let magic = reader.u32("header magic")?;
+        if magic != MAGIC {
+            return Err(EdrlError::BadMagic { found: magic });
+        }
         let version = reader.u32("header version")?;
+        if version != COMPACT_VERSION {
+            return Err(EdrlError::UnsupportedVersion { found: version });
+        }
         let metadata_offset = non_negative(reader.i64("metadata offset")?, "metadata")?;
         let metadata_size = non_negative(reader.i64("metadata size")?, "metadata")?;
         let tensor_table_offset = non_negative(reader.i64("tensor table offset")?, "tensor table")?;
@@ -42,12 +48,6 @@ impl Header {
 
         if reserved != 0 {
             return Err(EdrlError::invalid("header reserved field must be zero"));
-        }
-        if magic != MAGIC {
-            return Err(EdrlError::BadMagic { found: magic });
-        }
-        if version != COMPACT_VERSION {
-            return Err(EdrlError::UnsupportedVersion { found: version });
         }
         let tensor_count = u32::try_from(tensor_count)
             .ok()
@@ -76,8 +76,34 @@ impl Header {
         })
     }
 
+    /// The container version (always 2).
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Where the metadata starts: right after the header.
+    pub fn metadata_offset(&self) -> u64 {
+        self.metadata_offset
+    }
+
+    /// The size of the metadata region.
+    pub fn metadata_size(&self) -> u64 {
+        self.metadata_size
+    }
+
+    /// Where the tensor table starts: right after the metadata.
+    pub fn tensor_table_offset(&self) -> u64 {
+        self.tensor_table_offset
+    }
+
+    /// How many entries the tensor table holds.
+    pub fn tensor_count(&self) -> u32 {
+        self.tensor_count
+    }
+
     /// The metadata bytes: they follow the header.
     pub fn metadata_range(&self) -> Range<u64> {
+        // `parse` checked that the end does not overflow.
         self.metadata_offset..self.metadata_offset + self.metadata_size
     }
 
@@ -156,16 +182,13 @@ impl ReadPlan {
         })
     }
 
-    /// The header, metadata and table, the tokenizer body when `footer` is present, and the footer, for an
-    /// artifact of `file_len` bytes. `header` must fit the content: see [`Header::check_extent`].
+    /// The reads that remain once [`ReadPlan::probe`]'s header and footer are fetched and parsed: the metadata and
+    /// the table, then the tokenizer body when `footer` is present. `header` must fit the content: see
+    /// [`Header::check_extent`].
     pub fn new(header: &Header, file_len: u64, footer: Option<&TokenizerFooter>) -> Result<ReadPlan, EdrlError> {
         let content_end = content_end(file_len, footer)?;
         header.check_extent(content_end)?;
         let mut reads = vec![
-            PlannedRead {
-                region: Region::Header,
-                range: 0..HEADER_BYTES as u64,
-            },
             PlannedRead {
                 region: Region::Metadata,
                 range: header.metadata_range(),
@@ -179,10 +202,6 @@ impl ReadPlan {
             reads.push(PlannedRead {
                 region: Region::TokenizerBody,
                 range: footer.body_range(file_len)?,
-            });
-            reads.push(PlannedRead {
-                region: Region::TokenizerFooter,
-                range: footer_range(file_len),
             });
         }
         Ok(ReadPlan { reads })

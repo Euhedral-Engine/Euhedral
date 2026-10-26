@@ -24,6 +24,9 @@ pub enum EdrlError {
     /// Two tensor payloads share bytes.
     #[error("tensor data ranges overlap: {first} and {second}")]
     Overlap { first: String, second: String },
+    /// Two tensors share a name.
+    #[error("tensor name appears twice: {name}")]
+    DuplicateName { name: String },
     /// The tokenizer section's footer names an unsupported version.
     #[error(
         "unsupported tokenizer section version {found}; running package-tokenizer on the artifact again replaces the section"
