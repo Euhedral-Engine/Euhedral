@@ -832,9 +832,9 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
 
     /// Decode, verification and draft quanta are captured (docs/kernels/CUDA_GRAPHS.md). The key holds what their
     /// stages' submissions depend on apart from the input record: the kind, rows and outputs, the launch
-    /// geometry of decode attention, and a fingerprint of the workspace and
-    /// sequence-owned device addresses. A quantum whose reservation would allocate KV pages or upload a page
-    /// table is not captured; neither are quanta under exact numerics or with host-staged weights.
+    /// geometry of decode attention (split counts and the fused verifier choice), and a fingerprint of the
+    /// workspace and sequence-owned device addresses. A quantum whose reservation would allocate KV pages or
+    /// upload a page table is not captured; neither are quanta under exact numerics or with host-staged weights.
     @Override
     public Object captureKey() {
         if (this.kind == ExecutionKind.PREFILL || this.tokenIds.length > MAX_CAPTURED_ROWS) return null;
@@ -869,20 +869,13 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             this.draftTokenRead,
             this.draftTokenWrite,
             this.writesCurrentToken ? 1 : 0,
-            attentionGeometry(config.numAttentionHeads() / config.numKeyValueHeads()),
+            AttentionLaunchGeometry.of(
+                    config.numAttentionHeads() / config.numKeyValueHeads(),
+                    attention.format(),
+                    this.startPosition,
+                    this.tokenIds.length),
             fingerprint.value()
         });
-    }
-
-    /// The split counts that size decode attention's launches (host dispatch in qwen_layer_ops.c): rows
-    /// below 2048 keys split into 48-key spans, rows from 2048 keys (query-head groups up to 8) into 32-key
-    /// spans, at most 64 each. Every other position-dependent value is read from the input record.
-    private long attentionGeometry(int group) {
-        long first = this.startPosition + 1, last = this.startPosition + this.tokenIds.length;
-        long from = group <= 8 ? 2048 : Long.MAX_VALUE;
-        long below = first < from ? Math.min(64, (Math.min(last, from - 1) + 47) / 48) : 0;
-        long above = last >= from ? Math.min(64, (last + 31) / 32) : 0;
-        return below << 8 | above;
     }
 
     private static final class CaptureKey {
