@@ -30,3 +30,6 @@ __pycache__/
 
 # Local settings (.env.example is the template)
 .env
+
+# Rust
+rust/target/

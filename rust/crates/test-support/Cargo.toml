@@ -1,0 +1,15 @@
+[package]
+name = "test-support"
+version = "0.1.0"
+description = "Test-only helpers: machine settings for tests come from the environment or ~/.gradle/gradle.properties."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
