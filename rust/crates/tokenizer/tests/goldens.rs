@@ -6,6 +6,20 @@
 //! cargo test -p euhedral-inference-tokenizer -- --ignored
 //! ```
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test file: a failed unwrap is the failure"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: a test reads a fixture artifact"
+)]
+#![allow(
+    clippy::print_stdout,
+    reason = "a test prints its skip line when the machine has no artifact"
+)]
+
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;

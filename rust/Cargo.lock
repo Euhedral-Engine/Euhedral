@@ -356,6 +356,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "euhedral-inference-host-gemv"
+version = "0.1.0"
+
+[[package]]
 name = "euhedral-inference-settings"
 version = "0.1.0"
 dependencies = [

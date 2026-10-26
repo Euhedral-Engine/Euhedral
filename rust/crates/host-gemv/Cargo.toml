@@ -1,0 +1,15 @@
+[package]
+name = "euhedral-inference-host-gemv"
+version = "0.1.0"
+description = "CPU NVFP4 GEMV over host-resident weights with runtime ISA dispatch and an exact scalar twin."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+autobenches = false
+
+[[bin]]
+name = "gemv-probe"
+path = "benches/gemv.rs"
+
+[lints]
+workspace = true

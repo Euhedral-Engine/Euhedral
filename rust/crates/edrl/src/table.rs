@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::ops::Range;
+use std::str;
 
 use crate::error::EdrlError;
 use crate::format::{TensorDataType, WeightFormat, WeightLayout, accepts_byte_size};
@@ -54,7 +56,7 @@ impl TensorEntry {
     }
 
     /// The payload's byte range.
-    pub fn range(&self) -> std::ops::Range<u64> {
+    pub fn range(&self) -> Range<u64> {
         // `TensorTable::parse` checked that the end does not overflow.
         self.offset..self.offset + self.bytes
     }
@@ -130,7 +132,7 @@ fn entry(reader: &mut Reader<'_>, header: &Header, content_end: u64) -> Result<T
                 "tensor name length is outside the supported range: {name_length}"
             ))
         })?;
-    let name = std::str::from_utf8(reader.take(name_length, "tensor name")?)
+    let name = str::from_utf8(reader.take(name_length, "tensor name")?)
         .map_err(|_| EdrlError::invalid("tensor name is not valid UTF-8"))?
         .to_owned();
     let rank = reader.i32("tensor rank")?;

@@ -1,11 +1,23 @@
 //! Submissions: the guard that selects a lane's stream for the calling thread.
 
+use std::cell::Cell;
 use std::marker::PhantomData;
 
 use euhedral_graph::Marker;
 
 use crate::error::{CudaError, check};
 use crate::lane::CudaLane;
+use crate::sys::EuhedralCuda;
+
+thread_local! {
+    /// Whether the thread's live submission is on a lane being captured.
+    static CAPTURE_SELECTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the calling thread holds a submission on a lane that is being captured into a graph.
+pub(crate) fn capture_selected() -> bool {
+    CAPTURE_SELECTED.with(Cell::get)
+}
 
 /// How a submission launches.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -29,27 +41,48 @@ pub struct SubmitMode {
 /// assert_send::<euhedral_inference_cuda::Submission<'static>>();
 /// ```
 ///
-/// Only one submission exists per thread at a time; [`Submission::begin`] on a thread that has one fails.
+/// A lane has one submission at a time, and a thread has one at a time: [`Submission::begin`] fails with
+/// `LaneBusy` when the lane is held, and with a status error when the thread already selected a stream. Nothing
+/// waits for the lane to come free. That exclusivity is what keeps the order work lands in the stream the same as the
+/// order the lane's markers were claimed in, which [`CudaLane`]'s completion word relies on.
 #[derive(Debug)]
 pub struct Submission<'l> {
     lane: &'l CudaLane,
     mode: SubmitMode,
+    /// Whether dropping this submission gives the lane back (a capture's submissions borrow the capture's hold).
+    owns_lane: bool,
     /// Raw pointers are neither `Send` nor `Sync`.
     thread_bound: PhantomData<*const ()>,
 }
 
 impl<'l> Submission<'l> {
-    /// Selects `lane`'s stream, and `mode`, for the calling thread.
+    /// Takes `lane`, and selects its stream and `mode`, for the calling thread.
     pub fn begin(lane: &'l CudaLane, mode: SubmitMode) -> Result<Submission<'l>, CudaError> {
+        lane.try_own()?;
+        Self::select(lane, mode, true)
+    }
+
+    /// A submission on a lane the caller already holds (a graph capture's).
+    pub(crate) fn borrowing(lane: &'l CudaLane, mode: SubmitMode) -> Result<Submission<'l>, CudaError> {
+        Self::select(lane, mode, false)
+    }
+
+    fn select(lane: &'l CudaLane, mode: SubmitMode, owns_lane: bool) -> Result<Submission<'l>, CudaError> {
         let api = lane.library().api();
         // SAFETY: the stream is the lane's live stream.
-        check("euhedral_cuda_stream_select", unsafe {
-            api.euhedral_cuda_stream_select(lane.stream())
-        })?;
+        let status = unsafe { api.euhedral_cuda_stream_select(lane.stream()) };
+        if let Err(error) = check("euhedral_cuda_stream_select", status) {
+            if owns_lane {
+                lane.disown();
+            }
+            return Err(error);
+        }
         // From here the guard exists, so a failure below still clears the stream on drop.
+        CAPTURE_SELECTED.with(|selected| selected.set(lane.is_capturing()));
         let submission = Submission {
             lane,
             mode,
+            owns_lane,
             thread_bound: PhantomData,
         };
         // SAFETY: the calls take integers and set this thread's state.
@@ -74,7 +107,8 @@ impl<'l> Submission<'l> {
     }
 
     /// Orders the work queued after this call behind `marker` on the device. The host does not wait. A marker of this
-    /// lane, or value 0, needs no wait: the lane runs in order. Not allowed while the lane is captured into a graph
+    /// lane, or value 0, needs no wait: the lane runs in order. A marker the lane has not issued, or one older than its
+    /// event ring (its event now belongs to a later marker), is an error. Not allowed while the lane is captured into a graph
     /// (a capture is one lane's work; the graph's launch is ordered by the submission that launches it).
     pub fn wait(&self, marker: Marker) -> Result<(), CudaError> {
         if self.lane.is_capturing() {
@@ -84,10 +118,12 @@ impl<'l> Submission<'l> {
             return Ok(());
         }
         let ring = self.lane.library().ring(marker.lane)?;
-        let Some(event) = ring.event(marker.value) else {
+        // `waitable` reads the lane's issued count before the wait is queued. A concurrent record on that lane can
+        // reuse the event in between, which only widens the wait to the later work: conservative, never wrong.
+        let Some(event) = ring.waitable(marker)? else {
             return Ok(());
         };
-        // SAFETY: both handles are live; a dropped lane's handle is 0, which the call refuses.
+        // SAFETY: both handles are live: events are destroyed only when the library goes.
         let status = unsafe {
             self.lane
                 .library()
@@ -117,7 +153,7 @@ impl<'l> Submission<'l> {
             return Err(CudaError::Capturing("a marker"));
         }
         let library = self.lane.library();
-        let value = self.lane.next_value();
+        let value = self.lane.next_value()?;
         let ring = library.ring(self.lane.id())?;
         let event = ring
             .event(value)
@@ -138,14 +174,18 @@ impl<'l> Submission<'l> {
     /// Queues a write of `value` (its low 32 bits) to the lane's host-mapped completion word, after the work queued
     /// so far. `DeviceQueue::completed` widens the word, so values must not move backwards or jump by 2^31 or more.
     ///
-    /// Do not signal inside a graph capture: the graph would write the same value on every replay.
+    /// Refused while the lane is captured into a graph: the graph would write the same value on every replay. Signal
+    /// after the graph's launch.
     pub fn signal(&self, value: u64) -> Result<(), CudaError> {
+        if self.lane.is_capturing() {
+            return Err(CudaError::Capturing("a completion signal"));
+        }
         // SAFETY: the address is the lane's mapped word; the submission has selected the lane's stream.
         let status = unsafe {
             self.lane
                 .library()
                 .api()
-                .euhedral_cuda_write_host_flag(self.lane.word_device().0, value as u32)
+                .euhedral_cuda_write_host_flag(self.lane.word_device().get(), value as u32)
         };
         check("euhedral_cuda_write_host_flag", status)
     }
@@ -154,7 +194,7 @@ impl<'l> Submission<'l> {
         self.lane.stream()
     }
 
-    pub(crate) fn api(&self) -> &crate::sys::EuhedralCuda {
+    pub(crate) fn api(&self) -> &EuhedralCuda {
         self.lane.library().api()
     }
 }
@@ -171,6 +211,10 @@ impl Drop for Submission<'_> {
                 api.euhedral_cuda_row_exact_select(0);
             }
             api.euhedral_cuda_stream_clear();
+        }
+        CAPTURE_SELECTED.with(|selected| selected.set(false));
+        if self.owns_lane {
+            self.lane.disown();
         }
     }
 }

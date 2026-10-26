@@ -1,6 +1,12 @@
 //! A tiny byte-level BPE tokenizer built in memory, packaged as an artifact's tokenizer section. No artifact is
 //! needed.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test file: a failed unwrap is the failure"
+)]
+
 use euhedral_inference_edrl::{FOOTER_BYTES, TOKENIZER_ENTRIES, TokenizerFooter, TokenizerSection};
 use euhedral_inference_tokenizer::{Tokenizer, TokenizerError};
 use serde_json::{Value, json};

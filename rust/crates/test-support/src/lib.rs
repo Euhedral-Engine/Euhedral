@@ -7,9 +7,6 @@
 //! For the key `euhedral.qwen.artifact` the environment variable is `EUHEDRAL_TEST_QWEN_ARTIFACT`: the `euhedral.`
 //! prefix is dropped, the rest is upper-cased, and `.` and `-` become `_`.
 
-// This crate exists to read the environment and a file for tests, so the workspace bans on both do not apply.
-#![allow(clippy::disallowed_methods)]
-
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,6 +16,10 @@ const ENV_PREFIX: &str = "EUHEDRAL_TEST_";
 
 /// The value of a `euhedral.*` key: the environment variable `EUHEDRAL_TEST_<KEY>` first, then the Gradle user home's
 /// `gradle.properties` (`GRADLE_USER_HOME`, else `~/.gradle`).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "single reader of the environment: this test helper resolves machine settings for tests"
+)]
 pub fn gradle_property(key: &str) -> Option<String> {
     lookup(key, |name| env::var(name).ok(), gradle_user_home().as_deref())
 }
@@ -26,6 +27,7 @@ pub fn gradle_property(key: &str) -> Option<String> {
 /// Like [`gradle_property`], but prints a skip line and returns `None` when the key is absent, so a test can
 /// `let Some(path) = require_property(key) else { return };`. libtest captures the line from a passing test; run
 /// with `--nocapture` to see it.
+#[allow(clippy::print_stdout, reason = "the skip line is this helper's output")]
 pub fn require_property(key: &str) -> Option<String> {
     let value = gradle_property(key);
     if value.is_none() {
@@ -51,6 +53,10 @@ fn env_name(key: &str) -> String {
 }
 
 /// The lookup with the environment and the Gradle home injected, so tests do not touch the real ones.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: a test helper reads the properties file"
+)]
 fn lookup(key: &str, environment: impl Fn(&str) -> Option<String>, gradle_home: Option<&Path>) -> Option<String> {
     if let Some(value) = environment(&env_name(key)).filter(|value| !value.is_empty()) {
         return Some(value);
@@ -59,6 +65,10 @@ fn lookup(key: &str, environment: impl Fn(&str) -> Option<String>, gradle_home: 
     properties_value(&text, key)
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "single reader of the environment: this test helper resolves machine settings for tests"
+)]
 fn gradle_user_home() -> Option<PathBuf> {
     if let Some(home) = env::var_os("GRADLE_USER_HOME").filter(|home| !home.is_empty()) {
         return Some(PathBuf::from(home));
@@ -73,6 +83,10 @@ fn properties_value(text: &str, key: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: the tests write a fixture file"
+)]
 mod tests {
     use super::*;
 

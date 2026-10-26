@@ -1,7 +1,14 @@
 //! The environment: overrides, the `PORT` alias, retired variables, and finding the configuration file.
 
-// Writing a fixture file in a test.
-#![allow(clippy::disallowed_methods)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test file: a failed unwrap is the failure"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: writes fixture files in tests"
+)]
 
 use std::collections::HashMap;
 use std::ffi::OsString;

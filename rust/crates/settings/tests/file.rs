@@ -1,7 +1,14 @@
 //! Reading the YAML file: values, `auto`, and every kind of mistake in it.
 
-// Writing a fixture file in a test.
-#![allow(clippy::disallowed_methods)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test file: a failed unwrap is the failure"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: writes fixture files in tests"
+)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

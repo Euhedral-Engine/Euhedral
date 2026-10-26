@@ -1,5 +1,11 @@
 //! `config/euhedral.example.yaml` is the master example: it sets every key, and its values are the defaults.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test file: a failed unwrap is the failure"
+)]
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
@@ -17,8 +23,10 @@ fn no_env(_: &str) -> Option<String> {
 }
 
 /// The dotted key paths the file sets, read from its indentation (two spaces per level).
-// Reading a fixture file in a test.
-#[allow(clippy::disallowed_methods)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: reads a fixture file in a test"
+)]
 fn keys_in_file() -> BTreeSet<String> {
     let text = fs::read_to_string(example()).expect("example file");
     let mut stack: Vec<String> = Vec::new();

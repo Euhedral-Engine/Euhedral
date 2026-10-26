@@ -72,8 +72,10 @@ pub fn load_file(path: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Se
 }
 
 /// The process environment, for [`load`]. A variable that is not valid Unicode reads as absent.
-// The environment is read here and nowhere else in the engine.
-#[allow(clippy::disallowed_methods)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "single reader of the environment: configuration is parsed in the settings crate and nowhere else"
+)]
 pub fn process_env(name: &str) -> Option<String> {
     env::var(name).ok()
 }

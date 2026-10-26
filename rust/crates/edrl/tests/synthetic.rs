@@ -1,6 +1,14 @@
 //! Parses `fixtures/tiny.edrl`, written by `fixtures/make_fixture.py` with the converter's own writers, and
 //! variations of it. No artifact or GPU is needed.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test file: a failed unwrap is the failure"
+)]
+
+use std::ops::Range;
+
 use euhedral_inference_edrl::{
     EdrlError, FOOTER_BYTES, HEADER_BYTES, Header, LayerType, Metadata, ModelMetadata, ReadPlan, Region,
     TensorDataType, TensorEntry, TensorTable, TokenizerFooter, TokenizerSection, TrellisCompanions, WeightFormat,
@@ -17,7 +25,7 @@ struct Parsed {
     content_end: u64,
 }
 
-fn range(bytes: &[u8], range: std::ops::Range<u64>) -> &[u8] {
+fn range(bytes: &[u8], range: Range<u64>) -> &[u8] {
     &bytes[range.start as usize..range.end as usize]
 }
 

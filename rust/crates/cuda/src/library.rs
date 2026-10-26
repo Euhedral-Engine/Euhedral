@@ -1,8 +1,9 @@
 //! Loading the CUDA library and binding the device.
 
+use std::array;
 use std::ffi::{CStr, CString, c_int};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{self, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -23,9 +24,12 @@ pub(crate) const MAX_LANES: usize = 64;
 /// directory, so its runtime and NVRTC load first too. Linux finds them through the library's `$ORIGIN`.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const RUNTIME: &[&str] = &["libnvrtc-builtins.so.13.1"];
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 const RUNTIME: &[&str] = &["cudart64_13.dll", "nvrtc-builtins64_131.dll", "nvrtc64_130_0.dll"];
-#[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), windows)))]
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+)))]
 const RUNTIME: &[&str] = &[];
 
 /// The loaded CUDA library: its entry points, the device it bound, and the event rings of the lanes created on it.
@@ -58,7 +62,7 @@ impl CudaLibrary {
     /// against. Loading preloads the runtime libraries beside the library, sets that include directory and reads the
     /// device, which binds it.
     pub fn load(library: &Path) -> Result<Arc<CudaLibrary>, CudaError> {
-        let library = std::path::absolute(library).map_err(|_| CudaError::LibraryMissing(library.to_path_buf()))?;
+        let library = path::absolute(library).map_err(|_| CudaError::LibraryMissing(library.to_path_buf()))?;
         if !library.is_file() {
             return Err(CudaError::LibraryMissing(library));
         }
@@ -84,7 +88,7 @@ impl CudaLibrary {
             path: library,
             device,
             allocations: AtomicU64::new(0),
-            rings: std::array::from_fn(|_| OnceLock::new()),
+            rings: array::from_fn(|_| OnceLock::new()),
         }))
     }
 
@@ -143,6 +147,10 @@ impl CudaLibrary {
     }
 
     /// Blocks until all device work finishes. For startup, shutdown and tests; nothing on a hot path waits.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no-wait, waiting driver call: the device synchronizes only at startup, shutdown and in tests"
+    )]
     pub fn synchronize(&self) -> Result<(), CudaError> {
         // SAFETY: the call takes no arguments.
         check("euhedral_cuda_synchronize", unsafe {
@@ -176,12 +184,22 @@ impl CudaLibrary {
         slot.set(ring).map_err(|ring| (CudaError::LaneInUse(id), ring))
     }
 
-    /// The event ring of lane `id`.
+    /// The event ring of lane `id`; its events live as long as the library.
     pub(crate) fn ring(&self, id: LaneId) -> Result<&EventRing, CudaError> {
         self.rings
             .get(usize::from(id.0))
             .and_then(OnceLock::get)
             .ok_or(CudaError::UnknownLane(id))
+    }
+}
+
+impl Drop for CudaLibrary {
+    fn drop(&mut self) {
+        // Lane ids are never reused, so no event is destroyed while a lane could still wait on it: they go together,
+        // here, before the library handle closes.
+        for ring in self.rings.iter().filter_map(OnceLock::get) {
+            ring.destroy(&self.api);
+        }
     }
 }
 
@@ -240,6 +258,8 @@ fn read_device(api: &EuhedralCuda) -> Result<DeviceInfo, CudaError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{self, File};
+
     use super::*;
 
     #[test]
@@ -253,12 +273,16 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no-wait, blocking I/O: the test writes a fixture file"
+    )]
     fn a_library_without_its_runtime_beside_it_names_what_is_missing() {
         let product = tempfile::tempdir().unwrap();
         let lib = product.path().join("lib");
-        std::fs::create_dir(&lib).unwrap();
+        fs::create_dir(&lib).unwrap();
         let library = lib.join("libeuhedral_cuda.so");
-        std::fs::File::create(&library).unwrap();
+        File::create(&library).unwrap();
         let error = CudaLibrary::load(&library).unwrap_err();
         let message = error.to_string();
         if RUNTIME.is_empty() {

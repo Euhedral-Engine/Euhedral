@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::str;
 
 use crate::error::EdrlError;
 use crate::reader::Reader;
@@ -143,7 +144,7 @@ impl TokenizerSection {
     /// The text of the entry `name`.
     pub fn text(&self, name: &str) -> Option<&str> {
         // Validated as UTF-8 by `parse`.
-        self.file(name).and_then(|bytes| std::str::from_utf8(bytes).ok())
+        self.file(name).and_then(|bytes| str::from_utf8(bytes).ok())
     }
 }
 
@@ -158,7 +159,7 @@ fn text(reader: &mut Reader<'_>, body: &[u8]) -> Result<Range<usize>, EdrlError>
     let truncated = || EdrlError::invalid("the tokenizer section is truncated");
     let length = usize::try_from(section_int(reader)?).map_err(|_| truncated())?;
     let bytes = reader.take(length, "tokenizer section").map_err(|_| truncated())?;
-    if std::str::from_utf8(bytes).is_err() {
+    if str::from_utf8(bytes).is_err() {
         return Err(EdrlError::invalid("the tokenizer section holds text that is not UTF-8"));
     }
     let end = body.len() - reader.remaining();

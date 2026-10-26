@@ -1,9 +1,12 @@
-//! One safe function per C entry point the pilot path uses. Each takes the [`Submission`] first and queues its work
-//! on the submission's lane; none waits for the device unless it says so.
+//! One function per C entry point the pilot path uses. Each takes the [`Submission`] first and queues its work on the
+//! submission's lane; none waits for the device unless it says so.
 //!
-//! Device addresses are [`DevicePtr`]s: the host never dereferences them, and a wrong address is reported by the
-//! driver (or faults the kernel), not by the host's memory model, so these functions are safe. The two asynchronous
-//! host copies read or write host memory after they return and are `unsafe` for that reason.
+//! Device addresses are [`DevicePtr`]s: the host never dereferences them, and a wrong device address is reported by
+//! the driver (or faults the kernel), not by the host's memory model, so the functions on device memory are safe.
+//! Host memory is different. The two asynchronous host copies read or write host memory after they return and are
+//! `unsafe`; so is taking the device address of mapped host memory
+//! ([`PinnedBuffer::device_address`](crate::PinnedBuffer::device_address)), which is how a kernel or a flag operation
+//! (`wait_host_flag`, `write_host_flag`) gets to host bytes. The host's side of that contract is stated there.
 //!
 //! Every function mirrors the parameter list of its C entry point (`native/include/euhedral_cuda.h`), which documents
 //! the shapes, alignments and routes.
@@ -26,14 +29,29 @@ macro_rules! entry {
     }};
 }
 
+/// The error for an operation that synchronizes or allocates, which a capture cannot take.
+fn refuse_capture(submission: &Submission<'_>, what: &'static str) -> Result<(), CudaError> {
+    if submission.lane().is_capturing() {
+        Err(CudaError::Capturing(what))
+    } else {
+        Ok(())
+    }
+}
+
 // Copies.
 
 /// Copies `source` to the device and returns when it is done: the selected stream is synchronized. Startup and tests.
+/// Refused (`Capturing`) while the lane is captured.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, synchronous copy: documented as startup and tests only"
+)]
 pub fn copy_host_to_device(
     submission: &Submission<'_>,
     destination: DevicePtr,
     source: &[u8],
 ) -> Result<(), CudaError> {
+    refuse_capture(submission, "a blocking host copy")?;
     entry!(
         submission,
         euhedral_cuda_copy_host_to_device(destination.as_mut(), source.as_ptr().cast(), source.len() as u64)
@@ -41,12 +59,17 @@ pub fn copy_host_to_device(
 }
 
 /// Copies device memory into `destination` and returns when it is done: the selected stream is synchronized.
-/// Startup and tests.
+/// Startup and tests. Refused (`Capturing`) while the lane is captured.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, synchronous copy: documented as startup and tests only"
+)]
 pub fn copy_device_to_host(
     submission: &Submission<'_>,
     destination: &mut [u8],
     source: DevicePtr,
 ) -> Result<(), CudaError> {
+    refuse_capture(submission, "a blocking host copy")?;
     entry!(
         submission,
         euhedral_cuda_copy_device_to_host(
@@ -153,12 +176,12 @@ pub fn zero_device_memory(submission: &Submission<'_>, address: DevicePtr, bytes
 
 /// Queues a wait until the host-mapped 32-bit word at `flag` equals `value`.
 pub fn wait_host_flag(submission: &Submission<'_>, flag: DevicePtr, value: u32) -> Result<(), CudaError> {
-    entry!(submission, euhedral_cuda_wait_host_flag(flag.0, value))
+    entry!(submission, euhedral_cuda_wait_host_flag(flag.get(), value))
 }
 
 /// Queues a write of `value` to the host-mapped 32-bit word at `flag`.
 pub fn write_host_flag(submission: &Submission<'_>, flag: DevicePtr, value: u32) -> Result<(), CudaError> {
-    entry!(submission, euhedral_cuda_write_host_flag(flag.0, value))
+    entry!(submission, euhedral_cuda_write_host_flag(flag.get(), value))
 }
 
 // Embedding.

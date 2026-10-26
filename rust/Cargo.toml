@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/bench", "crates/cuda", "crates/edrl", "crates/settings", "crates/test-support", "crates/tokenizer", "xtask"]
+members = ["crates/bench", "crates/cuda", "crates/edrl", "crates/host-gemv", "crates/settings", "crates/test-support", "crates/tokenizer", "xtask"]
 resolver = "3"
 
 [workspace.package]
@@ -28,4 +28,11 @@ unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
 
 [workspace.lints.clippy]
+absolute_paths = "warn"
+dbg_macro = "warn"
+expect_used = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+todo = "warn"
 undocumented_unsafe_blocks = "warn"
+unwrap_used = "warn"

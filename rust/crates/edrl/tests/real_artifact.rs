@@ -7,6 +7,16 @@
 //! cargo test -p euhedral-inference-edrl -- --ignored
 //! ```
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test file: a failed unwrap is the failure"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: a test reads a fixture artifact and waits for a child process"
+)]
+
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -29,8 +39,6 @@ fn read_range(file: &mut File, range: Range<u64>) -> Vec<u8> {
 }
 
 /// The artifact's table as the Python reader prints it.
-// A local test fixture: it waits for a child process, which the workspace bans in engine code.
-#[allow(clippy::disallowed_methods)]
 fn python_table(artifact: &Path) -> Vec<Value> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let tools = manifest.join("../../../tools");
