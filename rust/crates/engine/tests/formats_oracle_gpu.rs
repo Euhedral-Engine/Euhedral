@@ -17,17 +17,24 @@
 mod linear_gpu;
 
 use euhedral_inference_engine::formats::{LinearMode, Nvfp4Linear, TrellisLinear};
-use linear_gpu::{Artifact, Random, activations, rig, synthetic_trellis, upload, values};
+use linear_gpu::{Artifact, Random, Rig, activations, rig, synthetic_trellis, upload, values};
 
 const PLAIN: LinearMode = LinearMode {
     row_exact: false,
     prefill: false,
 };
 
+/// One test runs both checks one after the other: the switch is process-wide, so two tests of this binary would see
+/// each other's selection.
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
-fn exact_numerics_run_every_nvfp4_launch_on_the_scalar_reference() {
+fn exact_numerics_run_every_launch_on_the_scalar_reference() {
     let Some(rig) = rig() else { return };
+    nvfp4_follows_the_switch(&rig);
+    trellis_follows_the_switch(&rig);
+}
+
+fn nvfp4_follows_the_switch(rig: &Rig) {
     let Some(mut artifact) = Artifact::open() else { return };
     let (_weights, weight) = artifact.plain(&rig.library, "mtp/layer/attention/output");
     let (n, k) = (5120usize, 6144usize);
@@ -67,10 +74,7 @@ fn exact_numerics_run_every_nvfp4_launch_on_the_scalar_reference() {
     assert_eq!(again, ordinary[1]);
 }
 
-#[test]
-#[ignore = "needs a GPU and the native library"]
-fn exact_numerics_run_every_trellis_launch_on_the_scalar_reference() {
-    let Some(rig) = rig() else { return };
+fn trellis_follows_the_switch(rig: &Rig) {
     let mut random = Random::new(13);
     let object = synthetic_trellis(&rig.library, &mut random, 512, 1024, 56, &[128, 512]);
     let x = upload(&rig.library, &activations(&mut random, 8, 1024));

@@ -104,6 +104,9 @@ pub fn fp16(value: f32) -> u16 {
 pub fn upload(library: &Arc<CudaLibrary>, bytes: &[u8]) -> DeviceBuffer {
     let buffer = DeviceBuffer::alloc(library, bytes.len().max(256)).unwrap();
     buffer.copy_from_host(0, bytes).unwrap();
+    // Outside a submission the copy runs on the legacy stream, which is not ordered against the lane's work: wait for
+    // it before any lane work reads the buffer. A test-only wait.
+    library.synchronize().unwrap();
     buffer
 }
 
