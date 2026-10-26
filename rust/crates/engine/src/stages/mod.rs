@@ -1,18 +1,24 @@
 //! The stages of a quantum: one `Stage<Quantum>` per layer operation (`model/qwen38/Stages.java`).
 //!
 //! A stage is built once with what does not change from quantum to quantum (its weights, the buffer slots it reads
-//! and writes, its layer), and runs once per quantum: it takes the lane the graph chose, orders itself behind the
-//! markers of its predecessors on other lanes, queues its launches and returns the marker of that work. It never
-//! waits. The geometry of the quantum (rows, start position, kind, the model's dimensions) comes from the
-//! [`Quantum`] it is given; the buffers come from the quantum's workspace.
+//! and writes, its layer). Its work is its [`Launch::launch`]: the kernel launches and copies of one quantum on a
+//! submission it is given, and nothing else (no begin, no finish, no waits, no marker, no signal), so that a graph
+//! capture can record it. The one generic [`run_eager`] is the stage for eager submission: it takes the lane the
+//! graph chose, orders itself behind the markers of its predecessors on other lanes, calls `launch`, and returns the
+//! marker of that work. It never waits.
 //!
-//! What is not a stage's: the reservation of KV pages and the upload of the input record (the quantum's admission),
-//! the frontiers of the caches (`appended`, `commit`: the quantum's admission and retirement), and the replay a
-//! verification leaves for the next quantum (set by the sequence's owner once acceptance is known). A stage only
-//! reads those.
+//! The geometry of the quantum (rows, start position, kind, the model's dimensions) comes from the [`Quantum`] it is
+//! given; the buffers come from the quantum's workspace. A stage mutates nothing the quantum does not own: the
+//! caches it reads are [`KvView`]s copied at admission, the GDN and scratch buffers are the sequence's shared
+//! device part, and the rows to replay are a value of the quantum.
+//!
+//! What is not a stage's: the reservation of KV pages and the growth of page tables, the frontiers of the caches
+//! (`appended`, `commit`), the upload of the input record, and the replay rows a verification leaves for the next
+//! quantum. They belong to the sequence's owner, who sets them on the quantum at admission.
 
 pub mod attention;
 pub mod elementwise;
+pub mod embed;
 pub mod gdn;
 pub mod linear;
 pub mod mtp;
@@ -23,11 +29,13 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use euhedral_graph::{LaneId, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::{CudaError, CudaLane, DevicePtr, Submission, SubmitMode};
+use euhedral_inference_cuda::{AllocationId, CudaError, CudaLane, DevicePtr, Submission, SubmitMode};
+use thiserror::Error;
 
 use crate::model::ModelConfig;
-use crate::state::SequenceState;
+use crate::state::{KvView, SequenceDevice};
 use crate::workspace::{BufferSlot, Workspace, WorkspaceError};
+use attention::KvSource;
 use sampling::Selection;
 
 /// What a quantum is, which sets the routes of its stages (`Quantum.ExecutionKind`).
@@ -116,23 +124,77 @@ impl LaneTable {
     }
 }
 
-/// The sequence a quantum belongs to: its device state, which the stages read (the KV page tables, the GDN buffers,
-/// the attention scratch). The frontiers and the replay rows change between quanta, under the sequence's owner.
+/// The sequence a quantum belongs to, as its stages read it: the sequence's shared device part (the GDN state and the
+/// attention scratch), a view of each cache as it was at admission, and the rows each GDN layer replays first.
 #[derive(Clone, Debug)]
 pub struct SequenceRefs {
-    state: Arc<SequenceState>,
+    device: Arc<SequenceDevice>,
+    kv: Option<KvView>,
+    mtp_kv: Option<KvView>,
+    replay_rows: Vec<u32>,
 }
 
 impl SequenceRefs {
-    /// The references of a quantum of the sequence whose state is `state`.
-    pub fn new(state: Arc<SequenceState>) -> Self {
-        Self { state }
+    /// The references of a quantum of the sequence whose shared device part is `device`, with no cache and nothing
+    /// to replay.
+    pub fn new(device: Arc<SequenceDevice>) -> Self {
+        Self {
+            device,
+            kv: None,
+            mtp_kv: None,
+            replay_rows: Vec::new(),
+        }
     }
 
-    /// The sequence's device state.
-    pub fn state(&self) -> &SequenceState {
-        &self.state
+    /// The base model's cache as it is at admission (`KvCache::view`, after the reservation).
+    pub fn with_kv(mut self, view: KvView) -> Self {
+        self.kv = Some(view);
+        self
     }
+
+    /// The MTP layer's cache as it is at admission.
+    pub fn with_mtp_kv(mut self, view: KvView) -> Self {
+        self.mtp_kv = Some(view);
+        self
+    }
+
+    /// The rows each GDN layer replays from its checkpoint before its own rows, by model layer index: what the
+    /// last verification ran past the rows it accepted. Layers beyond the vector replay nothing.
+    pub fn with_replay_rows(mut self, rows: Vec<u32>) -> Self {
+        self.replay_rows = rows;
+        self
+    }
+
+    /// The sequence's shared device part.
+    pub fn device(&self) -> &SequenceDevice {
+        &self.device
+    }
+
+    /// The view of the cache `source`, if the quantum has one.
+    pub fn kv(&self, source: KvSource) -> Option<&KvView> {
+        match source {
+            KvSource::Base => self.kv.as_ref(),
+            KvSource::Mtp => self.mtp_kv.as_ref(),
+        }
+    }
+
+    /// The rows the GDN layer `layer` replays first.
+    pub fn replay_rows(&self, layer: usize) -> u32 {
+        self.replay_rows.get(layer).copied().unwrap_or(0)
+    }
+}
+
+/// Why a quantum was refused.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum QuantumError {
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
+    #[error("a {kind:?} quantum runs row-exact: {expected}, not {given}")]
+    RowExact {
+        kind: QuantumKind,
+        expected: bool,
+        given: bool,
+    },
 }
 
 /// One quantum, as the stages see it. Its fields are `pub(crate)` and are set through constructors, so that the
@@ -154,6 +216,10 @@ pub struct Quantum {
     pub(crate) seeds_draft: bool,
     pub(crate) draft_seed: Option<DraftSeed>,
     pub(crate) draft_token_write: Option<DraftTokenWrite>,
+    /// The slot of the step's tokens this quantum's rows read their token ids from, instead of the input record.
+    pub(crate) draft_token_read: Option<usize>,
+    /// Whether the quantum writes its last input token to slot 0 of the step's tokens as the step's current token.
+    pub(crate) writes_current_token: bool,
     /// The device words and the pinned readback the quantum's argmax fills.
     pub(crate) selection: Option<Arc<Selection>>,
 }
@@ -161,7 +227,8 @@ pub struct Quantum {
 impl Quantum {
     /// A quantum of `rows` rows of `kind` starting at `input`'s position, over `workspace` and `seq`, whose stages
     /// submit with `mode` on the lanes of `lanes`. It scores one row (decode, and the last row of a prefill); see
-    /// [`Quantum::with_logits_rows`]. Refused when the workspace was sized for fewer rows.
+    /// [`Quantum::with_logits_rows`]. A verification is row-exact and nothing else is (as `Quantum` in Java): `mode`
+    /// must say so. Refused when the workspace was sized for fewer rows.
     #[allow(
         clippy::too_many_arguments,
         reason = "the fields the plan fixes for a quantum; a builder would only rename them"
@@ -175,8 +242,16 @@ impl Quantum {
         mode: SubmitMode,
         config: Arc<ModelConfig>,
         lanes: LaneTable,
-    ) -> Result<Self, WorkspaceError> {
+    ) -> Result<Self, QuantumError> {
         workspace.view(rows as u64)?;
+        let exact = kind == QuantumKind::Verify;
+        if mode.row_exact != exact {
+            return Err(QuantumError::RowExact {
+                kind,
+                expected: exact,
+                given: mode.row_exact,
+            });
+        }
         let logits_rows = if kind == QuantumKind::Verify { rows } else { 1 };
         workspace.rows().check_logits(logits_rows as u64)?;
         Ok(Self {
@@ -192,6 +267,8 @@ impl Quantum {
             seeds_draft: false,
             draft_seed: None,
             draft_token_write: None,
+            draft_token_read: None,
+            writes_current_token: false,
             selection: None,
         })
     }
@@ -221,6 +298,19 @@ impl Quantum {
         self
     }
 
+    /// The rows read their token ids from the step's tokens on the device, from `slot` (the tokens the quanta before
+    /// this one wrote), not from the input record.
+    pub fn reading_draft_tokens(mut self, slot: usize) -> Self {
+        self.draft_token_read = Some(slot);
+        self
+    }
+
+    /// The quantum's last input token is written to slot 0 of the step's tokens as the step's current token.
+    pub fn writing_current_token(mut self) -> Self {
+        self.writes_current_token = true;
+        self
+    }
+
     /// The device words and readback the quantum's argmax fills.
     pub fn with_selection(mut self, selection: Arc<Selection>) -> Self {
         self.selection = Some(selection);
@@ -241,6 +331,12 @@ impl Quantum {
 
     pub fn logits_rows(&self) -> usize {
         self.logits_rows
+    }
+
+    /// The allocation serial of layer `layer`'s page table in the cache `source` as of admission: part of the key
+    /// of a captured graph that reads the table.
+    pub fn table_generation(&self, source: KvSource, layer: usize) -> Option<AllocationId> {
+        self.seq.kv(source)?.table_generation(layer)
     }
 
     /// The words and readback the quantum's argmax fills, if it selects.
@@ -280,18 +376,36 @@ pub(crate) fn launch_u32(value: usize, what: &str) -> Result<u32, StageError> {
     u32::try_from(value).map_err(|_| fatal(format!("{what} {value} exceeds a launch")))
 }
 
-/// Runs `work` on the lane the graph chose, behind the markers its predecessors left on other lanes, and returns
-/// the marker of what it queued. With `signalled` the marker's completion word is written too, which is what a
-/// completion edge's successor is found by (`Submission::finish_signalled`).
+/// The launches of a stage for one quantum.
+pub trait Launch: Send + Sync {
+    /// Whether the stage has nothing to queue for `quantum` (a norm of no logits rows, a selection that scores
+    /// nothing). An idle stage queues nothing and leaves no marker, so its successors wait for nothing.
+    fn idle(&self, quantum: &Quantum) -> bool {
+        let _ = quantum;
+        false
+    }
+
+    /// Queues the stage's kernel launches and copies on `submission`, for `quantum`. Nothing else: no wait for a
+    /// marker, no marker, no completion signal, no synchronization, no allocation, so the launches can be captured
+    /// into a graph. It reads, and does not change, anything the quantum shares.
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError>;
+
+    /// Whether the marker of this stage's work must also write the lane's completion word, so that a completion
+    /// edge after it is found by a poll of the lane. Eager submission finishes the submission signalled
+    /// ([`run_eager`]); a graph launch is followed by the same finish on the submission that launched it.
+    const SIGNALLED: bool = false;
+}
+
+/// The stage for eager submission: begins a submission of the quantum's mode on the lane the graph chose, waits for
+/// the markers of the predecessors on other lanes, calls [`Launch::launch`], and finishes with the marker of the
+/// work (signalled for a stage whose [`Launch::SIGNALLED`] is set).
 ///
-/// A lane held by another submission answers [`StageError::Retry`], before anything was queued; every other
-/// failure is fatal to the quantum.
-pub(crate) fn submit(
-    quantum: &Quantum,
-    cx: &StageCx<'_>,
-    signalled: bool,
-    work: impl FnOnce(&Submission<'_>) -> Result<(), StageError>,
-) -> Result<Submitted, StageError> {
+/// A lane held by another submission answers [`StageError::Retry`], before anything was queued; every other failure
+/// is fatal to the quantum.
+pub fn run_eager<L: Launch>(stage: &L, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+    if stage.idle(quantum) {
+        return Ok(Submitted::done());
+    }
     let id = cx
         .lane
         .ok_or_else(|| fatal("a stage with device work was given no lane"))?;
@@ -307,8 +421,8 @@ pub(crate) fn submit(
     for marker in cx.waits {
         submission.wait(*marker).map_err(fatal)?;
     }
-    work(&submission)?;
-    let marker = if signalled {
+    stage.launch(quantum, &submission)?;
+    let marker = if L::SIGNALLED {
         submission.finish_signalled()
     } else {
         submission.finish()
@@ -316,6 +430,18 @@ pub(crate) fn submit(
     .map_err(fatal)?;
     Ok(Submitted::marker(marker))
 }
+
+/// Makes `$stage` a `Stage<Quantum>` that runs eagerly ([`run_eager`]).
+macro_rules! eager {
+    ($($stage:ty),+ $(,)?) => {$(
+        impl Stage<Quantum> for $stage {
+            fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+                super::run_eager(self, quantum, cx)
+            }
+        }
+    )+};
+}
+pub(crate) use eager;
 
 #[cfg(test)]
 mod tests {

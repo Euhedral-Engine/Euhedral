@@ -51,10 +51,10 @@ use euhedral_inference_engine::stages::sampling::{Argmax, SelectedRows, Selected
 use euhedral_inference_engine::stages::{
     DraftSeed, DraftTokenWrite, InputRecordRef, LaneTable, Quantum, QuantumKind, SequenceRefs,
 };
-use euhedral_inference_engine::state::SequenceState;
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvRetained};
+use euhedral_inference_engine::state::{SequenceDevice, SequenceState};
 use euhedral_inference_engine::workspace::{BufferSlot, Workspace, WorkspaceRows};
 use euhedral_inference_settings::{KvFormat, ModelSettings, Settings};
 
@@ -152,8 +152,23 @@ impl Rig {
         rows: usize,
         start: u64,
         workspace: &Arc<Workspace>,
-        sequence: &Arc<SequenceState>,
+        sequence: &SequenceState,
         config: &Arc<ModelConfig>,
+    ) -> Quantum {
+        self.quantum_replaying(kind, rows, start, workspace, sequence, config, Vec::new())
+    }
+
+    /// As `quantum`, with the rows each GDN layer replays first (what the owner sets at admission).
+    #[allow(clippy::too_many_arguments, reason = "a test helper over the fields of a quantum")]
+    fn quantum_replaying(
+        &self,
+        kind: QuantumKind,
+        rows: usize,
+        start: u64,
+        workspace: &Arc<Workspace>,
+        sequence: &SequenceState,
+        config: &Arc<ModelConfig>,
+        replay: Vec<u32>,
     ) -> Quantum {
         let mode = SubmitMode {
             pdl: false,
@@ -170,7 +185,9 @@ impl Rig {
             rows,
             InputRecordRef::new(start),
             Arc::clone(workspace),
-            SequenceRefs::new(Arc::clone(sequence)),
+            SequenceRefs::new(Arc::clone(&sequence.device))
+                .with_kv(sequence.kv.view())
+                .with_replay_rows(replay),
             mode,
             Arc::clone(config),
             self.lanes.clone(),
@@ -202,8 +219,7 @@ impl Rig {
             SequenceState {
                 kv,
                 mtp_kv: None,
-                gdn,
-                scratch,
+                device: Arc::new(SequenceDevice { gdn, scratch }),
             },
             retained,
         )
@@ -449,7 +465,7 @@ impl LinearFormat for StubFormat {
         ops::copy_device_to_device(submission, y, x, (rows * 8) as u64)
     }
 
-    fn scratch_bytes(&self, _rows: usize) -> usize {
+    fn scratch_bytes(&self, _weight: &WeightRef, _rows: usize, _mode: LinearMode) -> usize {
         self.scratch_needed
     }
 }
@@ -611,7 +627,12 @@ impl<'r> GdnRig<'r> {
     }
 
     /// Runs the convolution and the recurrence over `rows` as one quantum of `kind`; returns the recurrence output.
-    fn step(&self, sequence: &Arc<SequenceState>, kind: QuantumKind, rows: &[GdnRow]) -> Vec<f32> {
+    fn step(&self, sequence: &SequenceState, kind: QuantumKind, rows: &[GdnRow]) -> Vec<f32> {
+        self.step_replaying(sequence, kind, rows, 0)
+    }
+
+    /// As `step`, replaying `replay` rows of the layer's checkpoint first.
+    fn step_replaying(&self, sequence: &SequenceState, kind: QuantumKind, rows: &[GdnRow], replay: u32) -> Vec<f32> {
         for (index, row) in rows.iter().enumerate() {
             put(
                 &self.workspace,
@@ -638,9 +659,15 @@ impl<'r> GdnRig<'r> {
                 &f32_bytes(&row.beta),
             );
         }
-        let quantum = self
-            .rig
-            .quantum(kind, rows.len(), 0, &self.workspace, sequence, &self.config);
+        let quantum = self.rig.quantum_replaying(
+            kind,
+            rows.len(),
+            0,
+            &self.workspace,
+            sequence,
+            &self.config,
+            vec![replay],
+        );
         assert!(self.rig.run(&self.convolution, &quantum).is_some());
         assert!(self.rig.run(&self.recurrence, &quantum).is_some());
         self.rig.sync();
@@ -653,8 +680,8 @@ impl<'r> GdnRig<'r> {
     }
 
     /// The layer's convolution and recurrent state.
-    fn state(&self, sequence: &Arc<SequenceState>) -> (Vec<u8>, Vec<u8>) {
-        let layer = sequence.gdn.layer(0).unwrap();
+    fn state(&self, sequence: &SequenceState) -> (Vec<u8>, Vec<u8>) {
+        let layer = sequence.device.gdn.layer(0).unwrap();
         (download(layer.convolution()), download(layer.recurrent()))
     }
 }
@@ -711,15 +738,8 @@ fn gdn_replay_restores_committed_rows() {
         gdn.step(&replayed, QuantumKind::Decode, slice::from_ref(row));
     }
     gdn.step(&replayed, QuantumKind::Verify, verified);
-    let layer = replayed.gdn.layer(0).unwrap();
-    assert_eq!(layer.pending_replay_rows(), 0);
-    layer.set_pending_replay_rows(3).unwrap();
-    let replayed_next = gdn.step(&replayed, QuantumKind::Decode, next);
-    assert_eq!(
-        layer.pending_replay_rows(),
-        0,
-        "the replay clears the layer's pending rows"
-    );
+    // The owner admits the next quantum with the three accepted rows to replay.
+    let replayed_next = gdn.step_replaying(&replayed, QuantumKind::Decode, next, 3);
     assert_eq!(replayed_next, accepted_next, "the next row after a replay");
     assert_eq!(
         gdn.state(&replayed),
@@ -743,8 +763,7 @@ fn gdn_replay_restores_committed_rows() {
         gdn.step(&full, QuantumKind::Decode, slice::from_ref(row));
     }
     gdn.step(&full, QuantumKind::Verify, verified);
-    full.gdn.layer(0).unwrap().set_pending_replay_rows(5).unwrap();
-    let full_next = gdn.step(&full, QuantumKind::Decode, next);
+    let full_next = gdn.step_replaying(&full, QuantumKind::Decode, next, 5);
     let all_decoded = gdn.sequence();
     for row in history.iter().chain(verified) {
         gdn.step(&all_decoded, QuantumKind::Decode, slice::from_ref(row));
@@ -869,7 +888,7 @@ fn fill_cache(
     rig: &Rig,
     config: &Arc<ModelConfig>,
     workspace: &Arc<Workspace>,
-    sequence: &Arc<SequenceState>,
+    sequence: &SequenceState,
     rng: &mut Rng,
     start: u64,
     rows: u64,
@@ -1267,7 +1286,7 @@ fn argmax_lowest_id_tie_break() {
     assert!(rig.run(&last, &silent).is_none());
 
     // The drafted token passes to the step's tokens: the row itself, or through the draft head's ids.
-    let draft = sequence.scratch.draft().unwrap();
+    let draft = sequence.device.scratch.draft().unwrap();
     let ids = upload(&rig.library, &vec![0u8; VOCABULARY * 4]);
     ids.copy_from_host(12_345 * 4, &31_337i32.to_ne_bytes()).unwrap();
     let pass = SelectedToken;
@@ -1378,7 +1397,7 @@ fn mtp_stem_concatenates_e_h() {
     }
 
     // Seeded from the sequence's draft seed rows, from row 2 (a catch-up after the quantum that wrote them).
-    let seed_rows = sequence.scratch.draft().unwrap().seed_rows.ptr();
+    let seed_rows = sequence.device.scratch.draft().unwrap().seed_rows.ptr();
     rig.submit(|submission| {
         ops::copy_device_to_device(
             submission,

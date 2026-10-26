@@ -2,9 +2,9 @@
 //! `Stages.SwiGlu`).
 
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::ops;
+use euhedral_inference_cuda::{Submission, ops};
 
-use super::{Quantum, fatal, launch_u32, submit};
+use super::{Launch, Quantum, eager, fatal, launch_u32};
 use crate::workspace::BufferSlot;
 
 /// `output = residual + delta`, rounded to BF16, for the quantum's rows.
@@ -25,21 +25,17 @@ impl ResidualAdd {
     }
 }
 
-impl Stage<Quantum> for ResidualAdd {
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        let rows = quantum.rows_u32()?;
-        let width = launch_u32(quantum.config.hidden_size, "the hidden size")?;
-        submit(quantum, cx, false, |submission| {
-            ops::residual_add_bf16(
-                submission,
-                quantum.slot(self.residual),
-                quantum.slot(self.delta),
-                quantum.slot(self.output),
-                rows,
-                width,
-            )
-            .map_err(fatal)
-        })
+impl Launch for ResidualAdd {
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+        ops::residual_add_bf16(
+            submission,
+            quantum.slot(self.residual),
+            quantum.slot(self.delta),
+            quantum.slot(self.output),
+            quantum.rows_u32()?,
+            launch_u32(quantum.config.hidden_size, "the hidden size")?,
+        )
+        .map_err(fatal)
     }
 }
 
@@ -56,19 +52,17 @@ impl Swiglu {
     }
 }
 
-impl Stage<Quantum> for Swiglu {
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        let rows = quantum.rows_u32()?;
-        let intermediate = launch_u32(quantum.config.intermediate_size, "the intermediate size")?;
-        submit(quantum, cx, false, |submission| {
-            ops::swiglu_bf16(
-                submission,
-                quantum.slot(self.gate_up),
-                quantum.slot(self.output),
-                rows,
-                intermediate,
-            )
-            .map_err(fatal)
-        })
+impl Launch for Swiglu {
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+        ops::swiglu_bf16(
+            submission,
+            quantum.slot(self.gate_up),
+            quantum.slot(self.output),
+            quantum.rows_u32()?,
+            launch_u32(quantum.config.intermediate_size, "the intermediate size")?,
+        )
+        .map_err(fatal)
     }
 }
+
+eager!(ResidualAdd, Swiglu);

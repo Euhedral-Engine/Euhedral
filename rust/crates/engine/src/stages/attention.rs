@@ -9,9 +9,9 @@ use euhedral_graph::{Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{CudaError, DevicePtr, Submission, ops};
 use euhedral_inference_settings::KvFormat;
 
-use super::{Quantum, QuantumKind, fatal, launch_u32, submit};
+use super::{Launch, Quantum, QuantumKind, eager, fatal, launch_u32};
 use crate::residency::footprint::DRAFT_TWIN_ROWS;
-use crate::state::kv::KvCache;
+use crate::state::KvView;
 use crate::workspace::BufferSlot;
 
 /// Which of a sequence's caches a layer reads and writes.
@@ -55,15 +55,11 @@ type Attend = fn(
     DevicePtr,
 ) -> Result<(), CudaError>;
 
-fn cache(quantum: &Quantum, source: KvSource) -> Result<&KvCache, StageError> {
-    let state = quantum.seq.state();
-    match source {
-        KvSource::Base => Ok(&state.kv),
-        KvSource::Mtp => state
-            .mtp_kv
-            .as_ref()
-            .ok_or_else(|| fatal("the sequence has no MTP cache")),
-    }
+fn cache(quantum: &Quantum, source: KvSource) -> Result<&KvView, StageError> {
+    quantum
+        .seq
+        .kv(source)
+        .ok_or_else(|| fatal(format!("the quantum has no view of the {source:?} cache")))
 }
 
 /// The rotary dimension: the head dimension times the partial rotary factor, rounded (`Math.round`).
@@ -91,33 +87,30 @@ impl QkNormRope {
     }
 }
 
-impl Stage<Quantum> for QkNormRope {
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+impl Launch for QkNormRope {
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
         let config = &quantum.config;
-        let rows = quantum.rows_u32()?;
         let rotary = launch_u32(
             rotary_dim(config.attention_head_dim, config.partial_rotary_factor),
             "the rotary dimension",
         )?;
-        submit(quantum, cx, false, |submission| {
-            ops::attention_qk_norm_rope_bf16(
-                submission,
-                quantum.slot(self.input),
-                self.query_norm,
-                self.key_norm,
-                quantum.slot(self.output),
-                rows,
-                launch_u32(config.num_attention_heads, "the query heads")?,
-                launch_u32(config.num_key_value_heads, "the key value heads")?,
-                launch_u32(config.attention_head_dim, "the head dimension")?,
-                rotary,
-                quantum.input.start_position(),
-                quantum.position(),
-                quantum.epsilon(),
-                config.rope_theta,
-            )
-            .map_err(fatal)
-        })
+        ops::attention_qk_norm_rope_bf16(
+            submission,
+            quantum.slot(self.input),
+            self.query_norm,
+            self.key_norm,
+            quantum.slot(self.output),
+            quantum.rows_u32()?,
+            launch_u32(config.num_attention_heads, "the query heads")?,
+            launch_u32(config.num_key_value_heads, "the key value heads")?,
+            launch_u32(config.attention_head_dim, "the head dimension")?,
+            rotary,
+            quantum.input.start_position(),
+            quantum.position(),
+            quantum.epsilon(),
+            config.rope_theta,
+        )
+        .map_err(fatal)
     }
 }
 
@@ -148,45 +141,40 @@ impl KvAppend {
     }
 }
 
-impl Stage<Quantum> for KvAppend {
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+impl Launch for KvAppend {
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
         let config = &quantum.config;
         let cache = cache(quantum, self.source)?;
         let start = quantum.input.start_position();
         let rows = quantum.rows as u64;
         if !cache.reserves(start, rows) {
             return Err(fatal(format!(
-                "an append of {rows} rows at {start} is not reserved: the cache holds {} rows",
+                "an append of {rows} rows at {start} is not reserved: the cache held {} rows at admission",
                 cache.reserved()
             )));
         }
         let (Some(keys), Some(values)) = (cache.key_table(self.layer), cache.value_table(self.layer)) else {
             return Err(fatal(format!("layer {} of the cache has no page table", self.layer)));
         };
-        let query_width = launch_u32(config.attention_query_width(), "the query width")?;
-        let key_width = launch_u32(config.kv_width(), "the key width")?;
-        let launch_rows = quantum.rows_u32()?;
-        submit(quantum, cx, false, |submission| {
-            cache.stage_in(submission, self.layer, start, rows).map_err(fatal)?;
-            let append: Append = match cache.format() {
-                KvFormat::Nvfp4 => ops::attention_kv_append_nvfp4,
-                KvFormat::Bf16 => ops::attention_kv_append_bf16,
-            };
-            append(
-                submission,
-                quantum.slot(self.query_key),
-                quantum.slot(self.gate_value),
-                keys,
-                values,
-                launch_rows,
-                query_width,
-                key_width,
-                start,
-                quantum.position(),
-            )
-            .map_err(fatal)?;
-            cache.stage_out(submission, self.layer, start, rows).map_err(fatal)
-        })
+        cache.stage_in(submission, self.layer, start, rows).map_err(fatal)?;
+        let append: Append = match cache.format() {
+            KvFormat::Nvfp4 => ops::attention_kv_append_nvfp4,
+            KvFormat::Bf16 => ops::attention_kv_append_bf16,
+        };
+        append(
+            submission,
+            quantum.slot(self.query_key),
+            quantum.slot(self.gate_value),
+            keys,
+            values,
+            quantum.rows_u32()?,
+            launch_u32(config.attention_query_width(), "the query width")?,
+            launch_u32(config.kv_width(), "the key width")?,
+            start,
+            quantum.position(),
+        )
+        .map_err(fatal)?;
+        cache.stage_out(submission, self.layer, start, rows).map_err(fatal)
     }
 }
 
@@ -226,8 +214,8 @@ impl AttentionCausal {
     }
 }
 
-impl Stage<Quantum> for AttentionCausal {
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+impl Launch for AttentionCausal {
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
         let config = &quantum.config;
         let cache = cache(quantum, self.source)?;
         let start = quantum.input.start_position();
@@ -238,7 +226,7 @@ impl Stage<Quantum> for AttentionCausal {
         let cache_length = u32::try_from(start + quantum.rows as u64)
             .map_err(|_| fatal(format!("{} keys exceed a launch", start + quantum.rows as u64)))?;
         let scratch = if takes_decode_scratch(quantum.kind, quantum.rows) {
-            let scratch = &quantum.seq.state().scratch;
+            let scratch = &quantum.seq.device().scratch;
             if quantum.rows as u64 > scratch.decode_rows() {
                 return Err(fatal(format!(
                     "{} attention rows exceed the {} the decode scratch holds",
@@ -250,35 +238,31 @@ impl Stage<Quantum> for AttentionCausal {
         } else {
             DevicePtr::NULL
         };
-        let rows = quantum.rows_u32()?;
-        let query_heads = launch_u32(config.num_attention_heads, "the query heads")?;
-        let key_heads = launch_u32(config.num_key_value_heads, "the key value heads")?;
-        let head_dim = launch_u32(config.attention_head_dim, "the head dimension")?;
-        submit(quantum, cx, false, |submission| {
-            let attend: Attend = match cache.format() {
-                KvFormat::Nvfp4 => ops::attention_causal_nvfp4,
-                KvFormat::Bf16 => ops::attention_causal_bf16,
-            };
-            attend(
-                submission,
-                quantum.slot(self.query_key),
-                quantum.slot(self.gate_value),
-                keys,
-                values,
-                quantum.slot(self.output),
-                rows,
-                query_heads,
-                key_heads,
-                head_dim,
-                cache_length,
-                start,
-                quantum.position(),
-                scratch,
-            )
-            .map_err(fatal)
-        })
+        let attend: Attend = match cache.format() {
+            KvFormat::Nvfp4 => ops::attention_causal_nvfp4,
+            KvFormat::Bf16 => ops::attention_causal_bf16,
+        };
+        attend(
+            submission,
+            quantum.slot(self.query_key),
+            quantum.slot(self.gate_value),
+            keys,
+            values,
+            quantum.slot(self.output),
+            quantum.rows_u32()?,
+            launch_u32(config.num_attention_heads, "the query heads")?,
+            launch_u32(config.num_key_value_heads, "the key value heads")?,
+            launch_u32(config.attention_head_dim, "the head dimension")?,
+            cache_length,
+            start,
+            quantum.position(),
+            scratch,
+        )
+        .map_err(fatal)
     }
 }
+
+eager!(QkNormRope, KvAppend, AttentionCausal);
 
 #[cfg(test)]
 mod tests {

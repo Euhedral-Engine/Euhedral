@@ -3,9 +3,9 @@
 //! quantum (the base hidden rows for a catch-up, the previous MTP hidden for a recursive row).
 
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::{DevicePtr, ops};
+use euhedral_inference_cuda::{DevicePtr, Submission, ops};
 
-use super::{DraftSeed, Quantum, fatal, launch_u32, submit};
+use super::{DraftSeed, Launch, Quantum, eager, fatal, launch_u32};
 use crate::workspace::BufferSlot;
 
 /// Where the stem's two halves land in a packed row, in bytes: the embedding half first, then the hidden half.
@@ -45,8 +45,8 @@ impl MtpStem {
     }
 }
 
-impl Stage<Quantum> for MtpStem {
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+impl Launch for MtpStem {
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
         let hidden = quantum.config.hidden_size;
         let rows = quantum.rows_u32()?;
         let width = launch_u32(hidden, "the hidden size")?;
@@ -56,7 +56,7 @@ impl Stage<Quantum> for MtpStem {
             Some(DraftSeed::SeedRow(first)) => {
                 let draft = quantum
                     .seq
-                    .state()
+                    .device()
                     .scratch
                     .draft()
                     .ok_or_else(|| fatal("the sequence has no draft seed rows"))?;
@@ -73,29 +73,29 @@ impl Stage<Quantum> for MtpStem {
         let normalized = quantum.slot(self.normalized);
         let packed = quantum.slot(self.packed);
         let [embedding_half, hidden_half] = half_offsets(row_bytes);
-        submit(quantum, cx, false, |submission| {
-            let epsilon = quantum.epsilon();
-            for (input, weight, half) in [
-                (quantum.slot(self.embedding), self.embedding_norm, embedding_half),
-                (seed, self.hidden_norm, hidden_half),
-            ] {
-                ops::rms_norm_unit_offset_bf16(submission, input, weight, normalized, rows, width, epsilon)
-                    .map_err(fatal)?;
-                ops::copy_device_to_device_2d(
-                    submission,
-                    packed.offset(half),
-                    2 * row_bytes,
-                    normalized,
-                    row_bytes,
-                    row_bytes,
-                    u64::from(rows),
-                )
+        let epsilon = quantum.epsilon();
+        for (input, weight, half) in [
+            (quantum.slot(self.embedding), self.embedding_norm, embedding_half),
+            (seed, self.hidden_norm, hidden_half),
+        ] {
+            ops::rms_norm_unit_offset_bf16(submission, input, weight, normalized, rows, width, epsilon)
                 .map_err(fatal)?;
-            }
-            Ok(())
-        })
+            ops::copy_device_to_device_2d(
+                submission,
+                packed.offset(half),
+                2 * row_bytes,
+                normalized,
+                row_bytes,
+                row_bytes,
+                u64::from(rows),
+            )
+            .map_err(fatal)?;
+        }
+        Ok(())
     }
 }
+
+eager!(MtpStem);
 
 #[cfg(test)]
 mod tests {

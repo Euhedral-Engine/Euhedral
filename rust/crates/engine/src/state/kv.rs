@@ -70,8 +70,9 @@ impl KvRetained {
 /// The pages past the device share: one pinned arena for every layer and the device region they share.
 #[derive(Debug)]
 struct HostPages {
-    /// Declared first: it is freed before the region the tables address.
-    arena: HostWeightsArena,
+    /// Declared first: it is freed before the region the tables address. Shared with the views of the quanta that
+    /// copy pages to and from it.
+    arena: Arc<HostWeightsArena>,
     region: DeviceBuffer,
     device_pages: u64,
     /// Bytes of one layer's host pages.
@@ -122,7 +123,10 @@ impl KvCache {
             let region_bytes = host_pages * 2 * plane;
             let layer_bytes = region_bytes;
             Some(HostPages {
-                arena: HostWeightsArena::alloc(library, (layer_bytes * layers as u64) as usize)?,
+                arena: Arc::new(HostWeightsArena::alloc(
+                    library,
+                    (layer_bytes * layers as u64) as usize,
+                )?),
                 region: DeviceBuffer::alloc(library, region_bytes as usize)?,
                 device_pages,
                 layer_bytes,
@@ -387,8 +391,13 @@ impl KvCache {
     }
 
     /// The pinned arena that holds the host pages, one run of pages per layer, when the cache has host pages.
+    pub fn host_arena(&self) -> Option<&HostWeightsArena> {
+        self.host.as_ref().map(|host| &*host.arena)
+    }
+
+    /// The arena, for writing, while no quantum's view holds it.
     pub fn host_arena_mut(&mut self) -> Option<&mut HostWeightsArena> {
-        self.host.as_mut().map(|host| &mut host.arena)
+        self.host.as_mut().and_then(|host| Arc::get_mut(&mut host.arena))
     }
 
     /// The device pages of layer `layer`, each its K plane then its V plane.
@@ -406,13 +415,116 @@ impl KvCache {
         })
     }
 
+    /// What the stages of a quantum read of this cache, as it is now: copy it into the quantum at admission, after
+    /// the reservation. The cache itself stays with its owner.
+    pub fn view(&self) -> KvView {
+        let slots = self.table_slots;
+        KvView {
+            format: self.format,
+            plane_page_bytes: self.plane_page_bytes,
+            reserved: self.reserved,
+            tables: self
+                .layers
+                .iter()
+                .map(|layer| {
+                    layer.table.as_ref().map(|table| LayerTable {
+                        key: table.ptr(),
+                        value: table.ptr().offset(slots * 8),
+                        generation: table.generation(),
+                    })
+                })
+                .collect(),
+            host: self.host.as_ref().map(|host| HostView {
+                arena: Arc::clone(&host.arena),
+                region: host.region.ptr(),
+                device_pages: host.device_pages,
+                layer_bytes: host.layer_bytes,
+                reserved_host_pages: self.reserved_host_pages(),
+            }),
+        }
+    }
+
+    /// As [`KvView::stage_in`], for the cache as it is now.
+    pub fn stage_in(&self, submission: &Submission<'_>, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
+        self.view().stage_in(submission, layer, start, rows)
+    }
+
+    /// As [`KvView::stage_out`], for the cache as it is now.
+    pub fn stage_out(&self, submission: &Submission<'_>, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
+        self.view().stage_out(submission, layer, start, rows)
+    }
+}
+
+/// The page tables of one layer as a view holds them.
+#[derive(Clone, Copy, Debug)]
+struct LayerTable {
+    key: DevicePtr,
+    value: DevicePtr,
+    generation: AllocationId,
+}
+
+/// The pinned arena and device region of a cache's host pages, as a view holds them.
+#[derive(Clone, Debug)]
+struct HostView {
+    arena: Arc<HostWeightsArena>,
+    region: DevicePtr,
+    device_pages: u64,
+    layer_bytes: u64,
+    reserved_host_pages: u64,
+}
+
+/// What a quantum's stages read of an attention cache: its format, the device addresses of each layer's page tables
+/// and their allocation serials, the rows reserved when the quantum was admitted, and what the copies of host pages
+/// need. It is a value copied at admission, so no stage touches the cache the owner reserves and commits. The
+/// pages and tables it names must stay alive until the quantum has retired; the owner keeps them (outgrown tables go
+/// to a [`KvRetained`]).
+#[derive(Clone, Debug)]
+pub struct KvView {
+    format: KvFormat,
+    plane_page_bytes: u64,
+    reserved: u64,
+    tables: Vec<Option<LayerTable>>,
+    host: Option<HostView>,
+}
+
+impl KvView {
+    /// The format of the rows.
+    pub fn format(&self) -> KvFormat {
+        self.format
+    }
+
+    /// Rows backed by pages when the view was taken.
+    pub fn reserved(&self) -> u64 {
+        self.reserved
+    }
+
+    /// Whether appending `rows` rows at `start` fits the reserved pages.
+    pub fn reserves(&self, start: u64, rows: u64) -> bool {
+        start + rows <= self.reserved
+    }
+
+    /// The device address of layer `layer`'s K page-address table.
+    pub fn key_table(&self, layer: usize) -> Option<DevicePtr> {
+        self.tables.get(layer)?.as_ref().map(|table| table.key)
+    }
+
+    /// The device address of layer `layer`'s V page-address table.
+    pub fn value_table(&self, layer: usize) -> Option<DevicePtr> {
+        self.tables.get(layer)?.as_ref().map(|table| table.value)
+    }
+
+    /// The allocation behind layer `layer`'s page table, for the capture key of a graph that reads it.
+    pub fn table_generation(&self, layer: usize) -> Option<AllocationId> {
+        self.tables.get(layer)?.as_ref().map(|table| table.generation)
+    }
+
     /// Queues on `submission`'s lane the copy of layer `layer`'s host pages that an append of `rows` rows at `start`
     /// and the attention after it read into the device region: every reserved one for a quantum of at most
     /// [`STAGED_TAIL_ROWS`] rows, otherwise those holding the rows before `start + rows`. Nothing without host
     /// pages.
     pub fn stage_in(&self, submission: &Submission<'_>, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
         let Some(host) = &self.host else { return Ok(()) };
-        let reserved = self.reserved_host_pages();
+        let reserved = host.reserved_host_pages;
         if reserved == 0 {
             return Ok(());
         }
@@ -425,12 +537,12 @@ impl KvCache {
             return Ok(());
         }
         let offset = layer as u64 * host.layer_bytes;
-        // SAFETY: the arena lives as long as the cache; the host pages of a layer are written only by the copy
-        // `stage_out` queues on the same lane, which the lane orders before this one.
+        // SAFETY: the arena lives as long as the view (it is shared); the host pages of a layer are written only by
+        // the copy `stage_out` queues on the same lane, which the lane orders before this one.
         unsafe {
             ops::copy_host_weights_to_device(
                 submission,
-                host.region.ptr(),
+                host.region,
                 &host.arena,
                 offset as usize,
                 (pages * 2 * self.plane_page_bytes) as usize,
@@ -444,7 +556,7 @@ impl KvCache {
     /// end of the reservation touches no other), otherwise exactly those holding its rows.
     pub fn stage_out(&self, submission: &Submission<'_>, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
         let Some(host) = &self.host else { return Ok(()) };
-        let reserved = self.reserved_host_pages();
+        let reserved = host.reserved_host_pages;
         if reserved == 0 {
             return Ok(());
         }
@@ -467,7 +579,7 @@ impl KvCache {
                 submission,
                 &host.arena,
                 offset as usize,
-                host.region.ptr().offset(first * page),
+                host.region.offset(first * page),
                 ((end - first) * page) as usize,
             )
         }?;

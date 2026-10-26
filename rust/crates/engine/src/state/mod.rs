@@ -15,16 +15,29 @@ use crate::residency::planner::ResidencyPlan;
 use attention::AttentionScratch;
 use gdn::GdnStates;
 use kv::KvCache;
+pub use kv::KvView;
 
-/// The device state of one sequence.
+/// What the stages of a quantum read of a sequence: its GDN state and its attention scratch. Allocated once, at
+/// full size, and shared by every quantum of the sequence; nothing about it changes while quanta run, except the
+/// contents of the buffers the stages write.
+#[derive(Debug)]
+pub struct SequenceDevice {
+    pub gdn: GdnStates,
+    pub scratch: AttentionScratch,
+}
+
+/// The device state of one sequence, as its owner holds it.
+///
+/// The owner holds what changes between quanta: the attention caches, whose frontiers it moves and whose pages and
+/// page tables it grows (`reserve`, `appended`, `commit`), and the rows the next quantum replays. A quantum gets
+/// the shared [`SequenceDevice`] and a [`KvView`] of each cache, copied at its admission (`KvCache::view`).
 #[derive(Debug)]
 pub struct SequenceState {
     /// The caches of the full-attention layers (the first `attention layers` of the plan's cache).
     pub kv: KvCache,
     /// The MTP layer's own cache, when the sequence drafts: it follows the base layers' at layer index 64.
     pub mtp_kv: Option<KvCache>,
-    pub gdn: GdnStates,
-    pub scratch: AttentionScratch,
+    pub device: Arc<SequenceDevice>,
 }
 
 impl SequenceState {
@@ -76,8 +89,7 @@ impl SequenceState {
         Ok(SequenceState {
             kv,
             mtp_kv,
-            gdn,
-            scratch,
+            device: Arc::new(SequenceDevice { gdn, scratch }),
         })
     }
 
@@ -95,7 +107,7 @@ impl SequenceState {
     pub fn device_bytes(&self) -> u64 {
         self.kv.device_bytes()
             + self.mtp_kv.as_ref().map_or(0, KvCache::device_bytes)
-            + self.gdn.device_bytes()
-            + self.scratch.device_bytes()
+            + self.device.gdn.device_bytes()
+            + self.device.scratch.device_bytes()
     }
 }

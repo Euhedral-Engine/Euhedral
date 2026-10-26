@@ -285,12 +285,6 @@ fn gdn_state_is_zeroed_and_as_large_as_the_planner_says() {
     let used = before - library.free_bytes().unwrap();
     assert!(used >= states.device_bytes(), "{used} < {}", states.device_bytes());
 
-    let mut states = states;
-    let state = states.layer_mut(0).unwrap();
-    assert_eq!(state.pending_replay_rows(), 0);
-    state.set_pending_replay_rows(3).unwrap();
-    assert_eq!(state.pending_replay_rows(), 3);
-
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
     let plain = GdnStates::allocate(&library, &config, 0, &submission).unwrap();
     drop(submission);
@@ -300,8 +294,6 @@ fn gdn_state_is_zeroed_and_as_large_as_the_planner_says() {
         plain.device_bytes(),
         48 * (state.convolution().bytes() + state.recurrent().bytes()) as u64
     );
-    let mut plain = plain;
-    assert!(plain.layer_mut(0).unwrap().set_pending_replay_rows(1).is_err());
     lane.synchronize().unwrap();
 }
 

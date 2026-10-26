@@ -8,10 +8,11 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use euhedral_graph::Marker;
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, DevicePtr, PinnedBuffer, ops};
+use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, DevicePtr, PinnedBuffer, Submission, ops};
 
-use super::{Quantum, fatal, launch_u32, submit};
+use super::{Launch, Quantum, eager, fatal, launch_u32};
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
 use crate::workspace::BufferSlot;
 
@@ -117,12 +118,25 @@ impl Argmax {
     }
 }
 
-impl Stage<Quantum> for Argmax {
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+impl Argmax {
+    /// The signal step of a selection that was launched in a graph: finishes `submission`, on which the graph was
+    /// launched, with a marker whose completion word is written. Eager submission does the same after
+    /// [`Launch::launch`]; a graph capture cannot hold the marker or the signal, so the launch of the graph is
+    /// followed by this.
+    pub fn signal(submission: Submission<'_>) -> Result<Marker, CudaError> {
+        submission.finish_signalled()
+    }
+}
+
+impl Launch for Argmax {
+    const SIGNALLED: bool = true;
+
+    fn idle(&self, quantum: &Quantum) -> bool {
+        quantum.logits_rows == 0
+    }
+
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
         let logits_rows = quantum.logits_rows;
-        if logits_rows == 0 {
-            return Ok(Submitted::done());
-        }
         let selection = quantum
             .selection
             .as_ref()
@@ -147,29 +161,28 @@ impl Stage<Quantum> for Argmax {
         // The slot's rows are the model's vocabulary wide, whatever head wrote fewer entries into them.
         let row_bytes = quantum.config.vocab_size as u64 * 2;
         let logits = quantum.slot(self.logits);
-        submit(quantum, cx, true, |submission| {
-            for row in 0..count {
-                ops::argmax_bf16(
-                    submission,
-                    logits.offset((first + row) as u64 * row_bytes),
-                    entries,
-                    selection.device_keys().offset((row * KEY_BYTES) as u64),
-                )
-                .map_err(fatal)?;
-            }
-            // SAFETY: the selection is held by the quantum (an `Arc`), which retires only after this stage's marker
-            // is reached; the host reads the keys through atomic words, and only once that marker has been reached.
-            unsafe {
-                ops::copy_device_to_readback_shared(
-                    submission,
-                    selection.readback(),
-                    0,
-                    selection.device_keys(),
-                    count * KEY_BYTES,
-                )
-            }
-            .map_err(fatal)
-        })
+        for row in 0..count {
+            ops::argmax_bf16(
+                submission,
+                logits.offset((first + row) as u64 * row_bytes),
+                entries,
+                selection.device_keys().offset((row * KEY_BYTES) as u64),
+            )
+            .map_err(fatal)?;
+        }
+        // SAFETY: the selection is held by the quantum (an `Arc`), which retires only after the marker that follows
+        // this launch is reached; the host reads the keys through atomic words, and only once that marker has been
+        // reached.
+        unsafe {
+            ops::copy_device_to_readback_shared(
+                submission,
+                selection.readback(),
+                0,
+                selection.device_keys(),
+                count * KEY_BYTES,
+            )
+        }
+        .map_err(fatal)
     }
 }
 
@@ -179,10 +192,14 @@ impl Stage<Quantum> for Argmax {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SelectedToken;
 
-impl Stage<Quantum> for SelectedToken {
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+impl Launch for SelectedToken {
+    fn idle(&self, quantum: &Quantum) -> bool {
+        quantum.draft_token_write.is_none()
+    }
+
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
         let Some(write) = quantum.draft_token_write else {
-            return Ok(Submitted::done());
+            return Ok(());
         };
         let selection = quantum
             .selection
@@ -190,7 +207,7 @@ impl Stage<Quantum> for SelectedToken {
             .ok_or_else(|| fatal("a quantum that passes a drafted token has no selection words"))?;
         let draft = quantum
             .seq
-            .state()
+            .device()
             .scratch
             .draft()
             .ok_or_else(|| fatal("the sequence has no draft buffers"))?;
@@ -200,17 +217,17 @@ impl Stage<Quantum> for SelectedToken {
                 write.slot
             )));
         }
-        submit(quantum, cx, false, |submission| {
-            ops::selected_token(
-                submission,
-                selection.device_keys(),
-                write.ids,
-                draft.tokens.ptr().offset(4 * write.slot as u64),
-            )
-            .map_err(fatal)
-        })
+        ops::selected_token(
+            submission,
+            selection.device_keys(),
+            write.ids,
+            draft.tokens.ptr().offset(4 * write.slot as u64),
+        )
+        .map_err(fatal)
     }
 }
+
+eager!(Argmax, SelectedToken);
 
 #[cfg(test)]
 mod tests {

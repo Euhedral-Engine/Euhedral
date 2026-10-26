@@ -3,15 +3,16 @@
 //! `GdnConvolution`, `GdnRecurrence`, `GdnGatedNorm`).
 //!
 //! A verification checkpoints each layer's state and the rows it ran, so that the rows the verifier accepted can be
-//! rebuilt: the state has run past them (ReplaySSM, `docs/speculation/MTP_CONTRACT.md`). The sequence's owner
-//! leaves the number of accepted rows in the layer's `pending_replay_rows` once acceptance is known; the next
-//! quantum's convolution stage of the layer restores the checkpoint and replays those rows, row-exact, before it
-//! runs its own rows.
+//! rebuilt: the state has run past them (ReplaySSM, `docs/speculation/MTP_CONTRACT.md`). Once acceptance is known,
+//! the sequence's owner sets the number of accepted rows on the next quantum it admits
+//! (`SequenceRefs::with_replay_rows`); that quantum's convolution stage of the layer restores the checkpoint and
+//! replays those rows, row-exact, before it runs its own rows. The owner clears the rows when the quantum is
+//! admitted: the stage only reads them.
 
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{CudaError, DevicePtr, Submission, ops};
 
-use super::{Quantum, QuantumKind, fatal, launch_u32, submit};
+use super::{Launch, Quantum, QuantumKind, eager, fatal, launch_u32};
 use crate::state::gdn::{GdnSpeculative, GdnState};
 use crate::workspace::BufferSlot;
 
@@ -19,7 +20,7 @@ use crate::workspace::BufferSlot;
 fn layer_state(quantum: &Quantum, layer: usize) -> Result<&GdnState, StageError> {
     quantum
         .seq
-        .state()
+        .device()
         .gdn
         .layer(layer)
         .ok_or_else(|| fatal(format!("layer {layer} has no GDN state")))
@@ -79,27 +80,22 @@ impl GdnProjectControl {
     }
 }
 
-impl Stage<Quantum> for GdnProjectControl {
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        let rows = quantum.rows_u32()?;
-        let width = launch_u32(quantum.config.hidden_size, "the hidden size")?;
-        let heads = launch_u32(quantum.config.linear_num_value_heads, "the value heads")?;
-        submit(quantum, cx, false, |submission| {
-            ops::gdn_project_control_fp32(
-                submission,
-                quantum.slot(self.input),
-                self.a_weight,
-                self.b_weight,
-                self.a_log,
-                self.dt_bias,
-                quantum.slot(self.alpha),
-                quantum.slot(self.beta),
-                rows,
-                width,
-                heads,
-            )
-            .map_err(fatal)
-        })
+impl Launch for GdnProjectControl {
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+        ops::gdn_project_control_fp32(
+            submission,
+            quantum.slot(self.input),
+            self.a_weight,
+            self.b_weight,
+            self.a_log,
+            self.dt_bias,
+            quantum.slot(self.alpha),
+            quantum.slot(self.beta),
+            quantum.rows_u32()?,
+            launch_u32(quantum.config.hidden_size, "the hidden size")?,
+            launch_u32(quantum.config.linear_num_value_heads, "the value heads")?,
+        )
+        .map_err(fatal)
     }
 }
 
@@ -136,9 +132,14 @@ impl GdnConvolution {
     /// Restores the layer's state from the checkpoint of the last verification and runs the accepted rows through
     /// the same convolution and recurrence kernels, row-exact, so that the state is bit for bit what one-row decode
     /// of those rows leaves.
-    fn replay(&self, quantum: &Quantum, submission: &Submission<'_>, state: &GdnState) -> Result<(), StageError> {
+    fn replay(
+        &self,
+        quantum: &Quantum,
+        submission: &Submission<'_>,
+        state: &GdnState,
+        rows: usize,
+    ) -> Result<(), StageError> {
         let config = &quantum.config;
-        let rows = state.pending_replay_rows() as usize;
         let buffers = speculative(state, rows)?;
         let (query_key_width, value_width, channels) = widths(quantum)?;
         let kernel = launch_u32(config.linear_conv_kernel_dim, "the convolution kernel")?;
@@ -192,8 +193,7 @@ impl GdnConvolution {
         })();
         // The rest of the stage runs as the quantum does.
         ops::select_row_exact(submission, quantum.mode.row_exact);
-        replayed.map_err(fatal)?;
-        state.set_pending_replay_rows(0).map_err(fatal)
+        replayed.map_err(fatal)
     }
 }
 
@@ -207,60 +207,57 @@ fn widths(quantum: &Quantum) -> Result<(u32, u32, u32), StageError> {
     ))
 }
 
-impl Stage<Quantum> for GdnConvolution {
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+impl Launch for GdnConvolution {
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
         let config = &quantum.config;
         let state = layer_state(quantum, self.layer)?;
-        let rows = quantum.rows_u32()?;
         let (query_key_width, value_width, channels) = widths(quantum)?;
-        let kernel = launch_u32(config.linear_conv_kernel_dim, "the convolution kernel")?;
         let query_key = quantum.slot(self.query_key);
         let value_z = quantum.slot(self.value_z);
-        submit(quantum, cx, false, |submission| {
-            // A verification before this quantum accepted only part of its rows: rebuild this layer's state first.
-            if state.pending_replay_rows() > 0 {
-                self.replay(quantum, submission, state)?;
-            }
-            if quantum.kind == QuantumKind::Verify {
-                let buffers = speculative(state, quantum.rows)?;
-                let rows = quantum.rows as u64;
-                ops::copy_device_to_device(
-                    submission,
-                    buffers.convolution_checkpoint.ptr(),
-                    state.convolution().ptr(),
-                    state.convolution().bytes() as u64,
-                )
-                .map_err(fatal)?;
-                ops::copy_device_to_device(
-                    submission,
-                    buffers.query_key_rows.ptr(),
-                    query_key,
-                    rows * u64::from(query_key_width) * 2,
-                )
-                .map_err(fatal)?;
-                ops::copy_device_to_device(
-                    submission,
-                    buffers.value_z_rows.ptr(),
-                    value_z,
-                    rows * 2 * u64::from(value_width) * 2,
-                )
-                .map_err(fatal)?;
-            }
-            ops::gdn_convolution_bf16(
+        // A verification before this quantum accepted only part of its rows: rebuild this layer's state first.
+        let replay = quantum.seq.replay_rows(self.layer) as usize;
+        if replay > 0 {
+            self.replay(quantum, submission, state, replay)?;
+        }
+        if quantum.kind == QuantumKind::Verify {
+            let buffers = speculative(state, quantum.rows)?;
+            let rows = quantum.rows as u64;
+            ops::copy_device_to_device(
                 submission,
-                query_key,
-                value_z,
-                self.weights,
+                buffers.convolution_checkpoint.ptr(),
                 state.convolution().ptr(),
-                quantum.slot(self.output),
-                rows,
-                query_key_width,
-                value_width,
-                channels,
-                kernel,
+                state.convolution().bytes() as u64,
             )
-            .map_err(fatal)
-        })
+            .map_err(fatal)?;
+            ops::copy_device_to_device(
+                submission,
+                buffers.query_key_rows.ptr(),
+                query_key,
+                rows * u64::from(query_key_width) * 2,
+            )
+            .map_err(fatal)?;
+            ops::copy_device_to_device(
+                submission,
+                buffers.value_z_rows.ptr(),
+                value_z,
+                rows * 2 * u64::from(value_width) * 2,
+            )
+            .map_err(fatal)?;
+        }
+        ops::gdn_convolution_bf16(
+            submission,
+            query_key,
+            value_z,
+            self.weights,
+            state.convolution().ptr(),
+            quantum.slot(self.output),
+            quantum.rows_u32()?,
+            query_key_width,
+            value_width,
+            channels,
+            launch_u32(config.linear_conv_kernel_dim, "the convolution kernel")?,
+        )
+        .map_err(fatal)
     }
 }
 
@@ -287,48 +284,41 @@ impl GdnRecurrence {
     }
 }
 
-impl Stage<Quantum> for GdnRecurrence {
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+impl Launch for GdnRecurrence {
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
         let config = &quantum.config;
         let state = layer_state(quantum, self.layer)?;
-        let rows = quantum.rows_u32()?;
-        let key_heads = launch_u32(config.linear_num_key_heads, "the key heads")?;
         let value_heads = launch_u32(config.linear_num_value_heads, "the value heads")?;
-        let key_head_dim = launch_u32(config.linear_key_head_dim, "the key head dimension")?;
-        let value_head_dim = launch_u32(config.linear_value_head_dim, "the value head dimension")?;
         let alpha = quantum.slot(self.alpha);
         let beta = quantum.slot(self.beta);
-        submit(quantum, cx, false, |submission| {
-            if quantum.kind == QuantumKind::Verify {
-                let buffers = speculative(state, quantum.rows)?;
-                let control_bytes = quantum.rows as u64 * u64::from(value_heads) * 4;
-                ops::copy_device_to_device(
-                    submission,
-                    buffers.recurrent_checkpoint.ptr(),
-                    state.recurrent().ptr(),
-                    state.recurrent().bytes() as u64,
-                )
-                .map_err(fatal)?;
-                ops::copy_device_to_device(submission, buffers.alpha_rows.ptr(), alpha, control_bytes)
-                    .map_err(fatal)?;
-                ops::copy_device_to_device(submission, buffers.beta_rows.ptr(), beta, control_bytes).map_err(fatal)?;
-            }
-            ops::gdn_recurrence_bf16(
+        if quantum.kind == QuantumKind::Verify {
+            let buffers = speculative(state, quantum.rows)?;
+            let control_bytes = quantum.rows as u64 * u64::from(value_heads) * 4;
+            ops::copy_device_to_device(
                 submission,
-                quantum.slot(self.convolved),
-                alpha,
-                beta,
+                buffers.recurrent_checkpoint.ptr(),
                 state.recurrent().ptr(),
-                quantum.slot(self.output),
-                rows,
-                key_heads,
-                value_heads,
-                key_head_dim,
-                value_head_dim,
-                output_scale(config.linear_key_head_dim),
+                state.recurrent().bytes() as u64,
             )
-            .map_err(fatal)
-        })
+            .map_err(fatal)?;
+            ops::copy_device_to_device(submission, buffers.alpha_rows.ptr(), alpha, control_bytes).map_err(fatal)?;
+            ops::copy_device_to_device(submission, buffers.beta_rows.ptr(), beta, control_bytes).map_err(fatal)?;
+        }
+        ops::gdn_recurrence_bf16(
+            submission,
+            quantum.slot(self.convolved),
+            alpha,
+            beta,
+            state.recurrent().ptr(),
+            quantum.slot(self.output),
+            quantum.rows_u32()?,
+            launch_u32(config.linear_num_key_heads, "the key heads")?,
+            value_heads,
+            launch_u32(config.linear_key_head_dim, "the key head dimension")?,
+            launch_u32(config.linear_value_head_dim, "the value head dimension")?,
+            output_scale(config.linear_key_head_dim),
+        )
+        .map_err(fatal)
     }
 }
 
@@ -352,28 +342,25 @@ impl GdnGatedRmsNorm {
     }
 }
 
-impl Stage<Quantum> for GdnGatedRmsNorm {
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+impl Launch for GdnGatedRmsNorm {
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
         let config = &quantum.config;
-        let rows = quantum.rows_u32()?;
-        let heads = launch_u32(config.linear_num_value_heads, "the value heads")?;
-        let head_dim = launch_u32(config.linear_value_head_dim, "the value head dimension")?;
-        submit(quantum, cx, false, |submission| {
-            ops::gdn_gated_rms_norm_bf16(
-                submission,
-                quantum.slot(self.recurrent),
-                quantum.slot(self.value_z),
-                self.weight,
-                quantum.slot(self.output),
-                rows,
-                heads,
-                head_dim,
-                quantum.epsilon(),
-            )
-            .map_err(fatal)
-        })
+        ops::gdn_gated_rms_norm_bf16(
+            submission,
+            quantum.slot(self.recurrent),
+            quantum.slot(self.value_z),
+            self.weight,
+            quantum.slot(self.output),
+            quantum.rows_u32()?,
+            launch_u32(config.linear_num_value_heads, "the value heads")?,
+            launch_u32(config.linear_value_head_dim, "the value head dimension")?,
+            quantum.epsilon(),
+        )
+        .map_err(fatal)
     }
 }
+
+eager!(GdnProjectControl, GdnConvolution, GdnRecurrence, GdnGatedRmsNorm);
 
 #[cfg(test)]
 mod tests {
