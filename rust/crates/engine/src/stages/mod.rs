@@ -243,6 +243,11 @@ impl Quantum {
         self.logits_rows
     }
 
+    /// The words and readback the quantum's argmax fills, if it selects.
+    pub fn selection(&self) -> Option<&Arc<Selection>> {
+        self.selection.as_ref()
+    }
+
     /// The device address of `slot`.
     pub(crate) fn slot(&self, slot: BufferSlot) -> DevicePtr {
         self.workspace.buffer(slot).ptr()

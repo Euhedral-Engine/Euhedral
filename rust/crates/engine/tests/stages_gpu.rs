@@ -20,15 +20,26 @@
     reason = "a test reports the error it measured against its reference"
 )]
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::slice;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
-use euhedral_graph::{DeviceQueue, LaneId, LanePool, Marker, Stage, StageCx, StageId};
+use euhedral_core::control_plane::ControlPlaneLattice;
+use euhedral_core::generics::{FrameSink, LatticeSource};
+use euhedral_graph::{
+    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, GraphRuntime, Join, Lake, LaneId, LanePool, Latch,
+    Marker, QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageId, StageSpec,
+    Submitted,
+};
 use euhedral_inference_cuda::{
     CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, PinnedPool, Submission, SubmitMode, ops,
 };
 use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorDataType, WeightFormat, WeightLayout};
 use euhedral_inference_engine::formats::{LinearFormat, LinearMode, ScratchRegion};
+use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{ModelConfig, WeightRef};
 use euhedral_inference_engine::stages::attention::{AttentionCausal, KvAppend, KvSource, QkNormRope};
 use euhedral_inference_engine::stages::elementwise::{ResidualAdd, Swiglu};
@@ -45,7 +56,7 @@ use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvRetained};
 use euhedral_inference_engine::workspace::{BufferSlot, Workspace, WorkspaceRows};
-use euhedral_inference_settings::KvFormat;
+use euhedral_inference_settings::{KvFormat, ModelSettings, Settings};
 
 // The rig.
 
@@ -239,8 +250,10 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 
 fn bf16_values(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(2)
-        .map(|pair| from_bf16(u16::from_ne_bytes([pair[0], pair[1]])))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| from_bf16(u16::from_ne_bytes(*pair)))
         .collect()
 }
 
@@ -412,8 +425,6 @@ struct StubFormat {
     scratch_bytes: AtomicUsize,
     scratch_needed: usize,
 }
-
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 impl LinearFormat for StubFormat {
     fn submit(
@@ -662,16 +673,16 @@ fn gdn_replay_restores_committed_rows() {
     // One-row decode of the history, the accepted rows and the next row: the state the replay must reproduce.
     let decoded = gdn.sequence();
     for row in history {
-        gdn.step(&decoded, QuantumKind::Decode, std::slice::from_ref(row));
+        gdn.step(&decoded, QuantumKind::Decode, slice::from_ref(row));
     }
     let mut decoded_outputs = Vec::new();
     for row in verified {
-        decoded_outputs.push(gdn.step(&decoded, QuantumKind::Decode, std::slice::from_ref(row)));
+        decoded_outputs.push(gdn.step(&decoded, QuantumKind::Decode, slice::from_ref(row)));
     }
     // The state after the accepted three: the verification's row-exact rows are what decode would have computed.
     let verified_whole = gdn.sequence();
     for row in history {
-        gdn.step(&verified_whole, QuantumKind::Decode, std::slice::from_ref(row));
+        gdn.step(&verified_whole, QuantumKind::Decode, slice::from_ref(row));
     }
     let verified_outputs = gdn.step(&verified_whole, QuantumKind::Verify, verified);
     assert_eq!(
@@ -690,14 +701,14 @@ fn gdn_replay_restores_committed_rows() {
     // The accepted prefix: decode of the history and the first three rows, then the next row.
     let accepted = gdn.sequence();
     for row in history.iter().chain(&verified[..3]) {
-        gdn.step(&accepted, QuantumKind::Decode, std::slice::from_ref(row));
+        gdn.step(&accepted, QuantumKind::Decode, slice::from_ref(row));
     }
     let accepted_next = gdn.step(&accepted, QuantumKind::Decode, next);
 
     // The verification ran past the accepted rows; the next quantum replays them before its own.
     let replayed = gdn.sequence();
     for row in history {
-        gdn.step(&replayed, QuantumKind::Decode, std::slice::from_ref(row));
+        gdn.step(&replayed, QuantumKind::Decode, slice::from_ref(row));
     }
     gdn.step(&replayed, QuantumKind::Verify, verified);
     let layer = replayed.gdn.layer(0).unwrap();
@@ -719,7 +730,7 @@ fn gdn_replay_restores_committed_rows() {
     // Without the replay the state has run past the accepted rows.
     let unreplayed = gdn.sequence();
     for row in history {
-        gdn.step(&unreplayed, QuantumKind::Decode, std::slice::from_ref(row));
+        gdn.step(&unreplayed, QuantumKind::Decode, slice::from_ref(row));
     }
     gdn.step(&unreplayed, QuantumKind::Verify, verified);
     let unreplayed_next = gdn.step(&unreplayed, QuantumKind::Decode, next);
@@ -729,14 +740,14 @@ fn gdn_replay_restores_committed_rows() {
     // A replay of every row of the verification is its own checkpoint run again: all five rows, then the next.
     let full = gdn.sequence();
     for row in history {
-        gdn.step(&full, QuantumKind::Decode, std::slice::from_ref(row));
+        gdn.step(&full, QuantumKind::Decode, slice::from_ref(row));
     }
     gdn.step(&full, QuantumKind::Verify, verified);
     full.gdn.layer(0).unwrap().set_pending_replay_rows(5).unwrap();
     let full_next = gdn.step(&full, QuantumKind::Decode, next);
     let all_decoded = gdn.sequence();
     for row in history.iter().chain(verified) {
-        gdn.step(&all_decoded, QuantumKind::Decode, std::slice::from_ref(row));
+        gdn.step(&all_decoded, QuantumKind::Decode, slice::from_ref(row));
     }
     assert_eq!(full_next, gdn.step(&all_decoded, QuantumKind::Decode, next));
     assert_eq!(gdn.state(&full), gdn.state(&all_decoded));
@@ -776,8 +787,10 @@ fn gdn_project_control_and_gated_norm_match_the_host_reference() {
     rig.sync();
     let read = |slot| -> Vec<f32> {
         get(&workspace, slot, 0, rows * GDN_HEADS * 4)
-            .chunks_exact(4)
-            .map(|word| f32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_ne_bytes(*word))
             .collect()
     };
     let (alpha, beta) = (read(BufferSlot::GdnAlpha), read(BufferSlot::GdnBeta));
@@ -822,4 +835,662 @@ fn gdn_project_control_and_gated_norm_match_the_host_reference() {
         }
     }
     assert_close("the gated norm", &got, &expected, 0.02, 1e-3);
+}
+
+// Attention.
+
+/// Width of a projected query and key row, and of a gate and value row: 24 query heads and 4 key heads of 256.
+const ATTENTION_ROW: usize = 7168;
+const ATTENTION_QUERY: usize = 6144;
+
+/// The attention layer's stages over the cache's layer 0, from the workspace slots a layer of the plan uses.
+fn attention_append() -> KvAppend {
+    KvAppend::new(
+        KvSource::Base,
+        0,
+        BufferSlot::AttentionQkNormalized,
+        BufferSlot::ValueZProjected,
+    )
+}
+
+fn attention_causal() -> AttentionCausal {
+    AttentionCausal::new(
+        KvSource::Base,
+        0,
+        BufferSlot::AttentionQkNormalized,
+        BufferSlot::ValueZProjected,
+        BufferSlot::AttentionContext,
+    )
+}
+
+/// Appends `rows` rows of random keys and values at `start` (a prefill chunk), in chunks the workspace holds, and
+/// returns the rows' query/key and gate/value data.
+fn fill_cache(
+    rig: &Rig,
+    config: &Arc<ModelConfig>,
+    workspace: &Arc<Workspace>,
+    sequence: &Arc<SequenceState>,
+    rng: &mut Rng,
+    start: u64,
+    rows: u64,
+) -> (Vec<f32>, Vec<f32>) {
+    let chunk = workspace.rows().rows;
+    let (mut query_key, mut gate_value) = (Vec::new(), Vec::new());
+    let mut done = 0;
+    while done < rows {
+        let n = chunk.min(rows - done);
+        let qk = bf16_values(&bf16_bytes(&rng.values(n as usize * ATTENTION_ROW, 1.0)));
+        let gv = bf16_values(&bf16_bytes(&rng.values(n as usize * ATTENTION_ROW, 1.0)));
+        put(workspace, BufferSlot::AttentionQkNormalized, 0, &bf16_bytes(&qk));
+        put(workspace, BufferSlot::ValueZProjected, 0, &bf16_bytes(&gv));
+        let quantum = rig.quantum(
+            QuantumKind::Prefill,
+            n as usize,
+            start + done,
+            workspace,
+            sequence,
+            config,
+        );
+        assert!(rig.run(&attention_append(), &quantum).is_some());
+        rig.sync();
+        query_key.extend(qk);
+        gate_value.extend(gv);
+        done += n;
+    }
+    (query_key, gate_value)
+}
+
+/// Checks that the multi-row attention of `m` rows at `start`, on the verification's row-exact route and on the
+/// draft route (the same twins without the row-exact mode), equals `m` one-row attentions bit for bit.
+fn check_row_twins(format: KvFormat, start: u64, m: usize) {
+    let Some(rig) = rig() else { return };
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let (sequence, _retained) = rig.sequence(&config, 1, format, start + m as u64);
+    let sequence = Arc::new(sequence);
+    let workspace = rig.workspace(&config, 512, 8, &[]);
+    let mut rng = Rng(0xdead_beef_cafe_f00d ^ start);
+    fill_cache(&rig, &config, &workspace, &sequence, &mut rng, 0, start);
+
+    // The rows of the step: appended once, then attended to by the twins and by the singles.
+    let qk = bf16_values(&bf16_bytes(&rng.values(m * ATTENTION_ROW, 1.0)));
+    let gv = bf16_values(&bf16_bytes(&rng.values(m * ATTENTION_ROW, 1.0)));
+    put(&workspace, BufferSlot::AttentionQkNormalized, 0, &bf16_bytes(&qk));
+    put(&workspace, BufferSlot::ValueZProjected, 0, &bf16_bytes(&gv));
+    let verify = rig.quantum(QuantumKind::Verify, m, start, &workspace, &sequence, &config);
+    assert!(rig.run(&attention_append(), &verify).is_some());
+    assert!(rig.run(&attention_causal(), &verify).is_some());
+    rig.sync();
+    let bytes = m * ATTENTION_QUERY * 2;
+    let twins = get(&workspace, BufferSlot::AttentionContext, 0, bytes);
+    assert!(
+        bf16_values(&twins).iter().any(|value| *value != 0.0),
+        "the attention wrote nothing"
+    );
+
+    let draft = rig.quantum(QuantumKind::Draft, m, start, &workspace, &sequence, &config);
+    assert!(rig.run(&attention_causal(), &draft).is_some());
+    rig.sync();
+    let draft_twins = get(&workspace, BufferSlot::AttentionContext, 0, bytes);
+    assert!(
+        draft_twins == twins,
+        "the draft route's twins differ from the verification's"
+    );
+
+    let single = AttentionCausal::new(
+        KvSource::Base,
+        0,
+        BufferSlot::QkProjected,
+        BufferSlot::GateUp,
+        BufferSlot::AttentionContext,
+    );
+    for row in 0..m {
+        put(
+            &workspace,
+            BufferSlot::QkProjected,
+            0,
+            &bf16_bytes(&qk[row * ATTENTION_ROW..(row + 1) * ATTENTION_ROW]),
+        );
+        put(
+            &workspace,
+            BufferSlot::GateUp,
+            0,
+            &bf16_bytes(&gv[row * ATTENTION_ROW..(row + 1) * ATTENTION_ROW]),
+        );
+        let decode = rig.quantum(
+            QuantumKind::Decode,
+            1,
+            start + row as u64,
+            &workspace,
+            &sequence,
+            &config,
+        );
+        assert!(rig.run(&single, &decode).is_some());
+        rig.sync();
+        let one = get(&workspace, BufferSlot::AttentionContext, 0, ATTENTION_QUERY * 2);
+        assert!(
+            twins[row * ATTENTION_QUERY * 2..(row + 1) * ATTENTION_QUERY * 2] == one[..],
+            "{format:?} {m} rows at {start}: row {row} differs from its one-row attention"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn attention_row_twins_equal_single_rows() {
+    for format in [KvFormat::Nvfp4, KvFormat::Bf16] {
+        // Below 2048 keys, the per-head kernel; above, the three-warp one; and a step that crosses 2048.
+        check_row_twins(format, 1000, 5);
+        check_row_twins(format, 2100, 8);
+        check_row_twins(format, 2044, 8);
+        check_row_twins(format, 300, 2);
+    }
+}
+
+/// The reference of one decode row's attention over BF16 keys and values: per query head the softmax of
+/// `q . k / 16` over the keys, the weighted values, and the output gate `1 / (1 + exp(-gate))`.
+fn reference_decode(query: &[f32], gate: &[f32], keys: &[Vec<f32>], values: &[Vec<f32>]) -> Vec<f32> {
+    let group = 6; // 24 query heads over 4 key heads
+    let mut out = Vec::new();
+    for head in 0..24 {
+        let kv_head = head / group;
+        let q = &query[head * 256..(head + 1) * 256];
+        let scores: Vec<f64> = keys
+            .iter()
+            .map(|key| {
+                q.iter()
+                    .zip(&key[kv_head * 256..(kv_head + 1) * 256])
+                    .map(|(q, k)| f64::from(*q) * f64::from(*k))
+                    .sum::<f64>()
+                    / 16.0
+            })
+            .collect();
+        let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let weights: Vec<f64> = scores.iter().map(|score| (score - maximum).exp()).collect();
+        let total: f64 = weights.iter().sum();
+        for d in 0..256 {
+            let context: f64 = weights
+                .iter()
+                .zip(values)
+                .map(|(w, value)| w * f64::from(value[kv_head * 256 + d]))
+                .sum::<f64>()
+                / total;
+            let g = f64::from(gate[head * 256 + d]);
+            out.push((context / (1.0 + (-g).exp())) as f32);
+        }
+    }
+    out
+}
+
+/// The `rows`-row cache `format` after a prefill of `n` rows and one decode row at `n`: returns the decode row's
+/// attention output, the cache (to read its pages) and the data.
+struct ReadBack {
+    sequence: Arc<SequenceState>,
+    output: Vec<f32>,
+    keys: Vec<Vec<f32>>,
+    values: Vec<Vec<f32>>,
+    gate: Vec<f32>,
+    query: Vec<f32>,
+}
+
+fn append_then_decode(rig: &Rig, format: KvFormat, n: u64) -> ReadBack {
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let (sequence, _retained) = rig.sequence(&config, 1, format, n + 1);
+    let sequence = Arc::new(sequence);
+    let workspace = rig.workspace(&config, 512, 8, &[]);
+    let mut rng = Rng(0x0123_4567_89ab_cdef);
+    let (qk, gv) = fill_cache(rig, &config, &workspace, &sequence, &mut rng, 0, n);
+
+    // One decode row after the prompt: appended, then attended.
+    let step_qk = bf16_values(&bf16_bytes(&rng.values(ATTENTION_ROW, 1.0)));
+    let step_gv = bf16_values(&bf16_bytes(&rng.values(ATTENTION_ROW, 1.0)));
+    put(&workspace, BufferSlot::AttentionQkNormalized, 0, &bf16_bytes(&step_qk));
+    put(&workspace, BufferSlot::ValueZProjected, 0, &bf16_bytes(&step_gv));
+    let decode = rig.quantum(QuantumKind::Decode, 1, n, &workspace, &sequence, &config);
+    assert!(rig.run(&attention_append(), &decode).is_some());
+    assert!(rig.run(&attention_causal(), &decode).is_some());
+    rig.sync();
+    let output = bf16_values(&get(&workspace, BufferSlot::AttentionContext, 0, ATTENTION_QUERY * 2));
+
+    // The keys and values of every position, 1024 wide each: the key part follows the query part of a row.
+    let rows = |data: &[f32], extra: &[f32]| -> Vec<Vec<f32>> {
+        data.chunks(ATTENTION_ROW)
+            .chain(extra.chunks(ATTENTION_ROW))
+            .map(|row| row[ATTENTION_QUERY..].to_vec())
+            .collect()
+    };
+    ReadBack {
+        keys: rows(&qk, &step_qk),
+        values: rows(&gv, &step_gv),
+        gate: step_gv[..ATTENTION_QUERY].to_vec(),
+        query: step_qk[..ATTENTION_QUERY].to_vec(),
+        output,
+        sequence,
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn kv_append_then_decode_reads_back() {
+    let Some(rig) = rig() else { return };
+    let n = 300u64;
+
+    // BF16 pages hold the rows exactly as appended: 512 bytes per head row, token-major.
+    let bf16 = append_then_decode(&rig, KvFormat::Bf16, n);
+    let kv = &bf16.sequence.kv;
+    let plane = kv.plane_page_bytes() as usize;
+    assert_eq!(plane, 256 * 4 * 512);
+    let pages: Vec<DevicePtr> = kv.pages(0).collect();
+    assert_eq!(pages.len(), 2, "301 rows take two pages");
+    for (page, address) in pages.iter().enumerate() {
+        let mut bytes = vec![0u8; 2 * plane];
+        rig.submit(|submission| ops::copy_device_to_host(submission, &mut bytes, *address));
+        let tokens = if page == 0 { 256 } else { 45 };
+        for token in 0..tokens {
+            let position = page * 256 + token;
+            for head in 0..4 {
+                let at = (token * 4 + head) * 512;
+                let key = &bf16.keys[position][head * 256..(head + 1) * 256];
+                let value = &bf16.values[position][head * 256..(head + 1) * 256];
+                assert!(bytes[at..at + 512] == bf16_bytes(key)[..], "key {position} head {head}");
+                assert!(
+                    bytes[plane + at..plane + at + 512] == bf16_bytes(value)[..],
+                    "value {position} head {head}"
+                );
+            }
+        }
+    }
+    // The decode row reads them back: its attention is the reference over the appended rows.
+    let expected = reference_decode(&bf16.query, &bf16.gate, &bf16.keys, &bf16.values);
+    assert_close("decode attention over BF16 pages", &bf16.output, &expected, 0.02, 2e-3);
+
+    // The NVFP4 cache quantizes the same rows; the decode row reads them back within the quantization's error.
+    let nvfp4 = append_then_decode(&rig, KvFormat::Nvfp4, n);
+    let error = nvfp4
+        .output
+        .iter()
+        .zip(&expected)
+        .map(|(a, e)| f64::from(a - e).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let scale = expected.iter().map(|e| f64::from(*e).powi(2)).sum::<f64>().sqrt();
+    println!("decode attention over NVFP4 pages: relative error {:.4}", error / scale);
+    assert!(
+        error / scale < 0.15,
+        "NVFP4 decode attention is {:.3} off its reference",
+        error / scale
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn qk_norm_rope_rows_equal_single_rows() {
+    let Some(rig) = rig() else { return };
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
+    let sequence = Arc::new(sequence);
+    let workspace = rig.workspace(&config, 8, 8, &[]);
+    let mut rng = Rng(0x0f0f_0f0f_1234_9876);
+    let (m, start) = (5usize, 40_000u64);
+    let query_norm = upload(&rig.library, &bf16_bytes(&rng.values(256, 0.5)));
+    let key_norm = upload(&rig.library, &bf16_bytes(&rng.values(256, 0.5)));
+    let rows = bf16_values(&bf16_bytes(&rng.values(m * ATTENTION_ROW, 2.0)));
+    let stage = |input, output| QkNormRope::new(input, output, query_norm.ptr(), key_norm.ptr());
+    put(&workspace, BufferSlot::QkProjected, 0, &bf16_bytes(&rows));
+    let verify = rig.quantum(QuantumKind::Verify, m, start, &workspace, &sequence, &config);
+    assert!(
+        rig.run(
+            &stage(BufferSlot::QkProjected, BufferSlot::AttentionQkNormalized),
+            &verify
+        )
+        .is_some()
+    );
+    rig.sync();
+    let together = get(&workspace, BufferSlot::AttentionQkNormalized, 0, m * ATTENTION_ROW * 2);
+    assert!(
+        bf16_values(&together) != rows,
+        "the norm and the rotation change the rows"
+    );
+    for row in 0..m {
+        put(
+            &workspace,
+            BufferSlot::GateUp,
+            0,
+            &bf16_bytes(&rows[row * ATTENTION_ROW..(row + 1) * ATTENTION_ROW]),
+        );
+        let decode = rig.quantum(
+            QuantumKind::Decode,
+            1,
+            start + row as u64,
+            &workspace,
+            &sequence,
+            &config,
+        );
+        assert!(
+            rig.run(&stage(BufferSlot::GateUp, BufferSlot::AttentionContext), &decode)
+                .is_some()
+        );
+        rig.sync();
+        let one = get(&workspace, BufferSlot::AttentionContext, 0, ATTENTION_ROW * 2);
+        assert!(
+            together[row * ATTENTION_ROW * 2..(row + 1) * ATTENTION_ROW * 2] == one[..],
+            "row {row} of the verification differs from its one-row launch"
+        );
+    }
+}
+
+// Sampling.
+
+const VOCABULARY: usize = 248_320;
+
+/// The token the host's argmax chooses over a BF16 row: the lowest id among the maxima, never NaN or negative
+/// infinity; `None` when no entry is selectable.
+fn host_argmax(row: &[f32]) -> Option<u32> {
+    let mut best: Option<(usize, f32)> = None;
+    for (id, value) in row.iter().enumerate() {
+        if value.is_nan() || *value == f32::NEG_INFINITY {
+            continue;
+        }
+        if best.is_none_or(|(_, maximum)| *value > maximum) {
+            best = Some((id, *value));
+        }
+    }
+    best.map(|(id, _)| id as u32)
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn argmax_lowest_id_tie_break() {
+    let Some(rig) = rig() else { return };
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
+    let sequence = Arc::new(sequence);
+    let workspace = rig.workspace(&config, 8, 8, &[]);
+    let selection = Arc::new(Selection::new(&rig.library, 8).unwrap());
+    let mut rng = Rng(0xabcd_ef01_2345_6789);
+
+    // Five logits rows: a unique maximum, three equal maxima, nothing selectable, NaNs around one value, and a
+    // maximum at the last id.
+    let mut rows: Vec<Vec<f32>> = (0..5).map(|_| rng.values(VOCABULARY, 1.0)).collect();
+    rows[0][12_345] = 5.0;
+    for id in [200_000, 5000, 77] {
+        rows[1][id] = 6.0;
+    }
+    rows[2] = vec![f32::NEG_INFINITY; VOCABULARY];
+    rows[3] = vec![f32::NAN; VOCABULARY];
+    rows[3][9] = 1.0;
+    rows[4][VOCABULARY - 1] = 7.0;
+    for (index, row) in rows.iter().enumerate() {
+        put(&workspace, BufferSlot::Logits, index * VOCABULARY * 2, &bf16_bytes(row));
+    }
+    let expected: Vec<Option<u32>> = rows
+        .iter()
+        .map(|row| host_argmax(&bf16_values(&bf16_bytes(row))))
+        .collect();
+    assert_eq!(
+        expected,
+        [Some(12_345), Some(77), None, Some(9), Some(VOCABULARY as u32 - 1)]
+    );
+
+    // A verification selects every row, and the stage's marker is signalled for the continuation that follows it.
+    let every = Argmax::new(BufferSlot::Logits, VOCABULARY, SelectedRows::Each);
+    let verify = rig
+        .quantum(QuantumKind::Verify, 5, 0, &workspace, &sequence, &config)
+        .with_selection(Arc::clone(&selection));
+    let marker = rig.run(&every, &verify).expect("a marker for the completion edge");
+    rig.sync();
+    assert!(
+        rig.lane.completed() >= marker.value,
+        "the lane's completion word reaches the argmax stage's marker"
+    );
+    let selected: Vec<Option<u32>> = (0..5).map(|row| selection.token(row)).collect();
+    assert_eq!(selected, expected);
+    assert_eq!(selection.key(2), Some(0));
+    assert_eq!(selection.key(1).unwrap() & 0xFFFF_FFFF, 0xFFFF_FFFF - 77);
+
+    // A prompt chunk or a decode row selects the last logits row only.
+    let last = Argmax::new(BufferSlot::Logits, VOCABULARY, SelectedRows::Last);
+    let prefill = rig
+        .quantum(QuantumKind::Prefill, 5, 0, &workspace, &sequence, &config)
+        .with_logits_rows(5)
+        .unwrap()
+        .with_selection(Arc::clone(&selection));
+    assert!(rig.run(&last, &prefill).is_some());
+    rig.sync();
+    assert_eq!(selection.token(0), Some(VOCABULARY as u32 - 1));
+
+    // A chunk that is not the last scores nothing: no work and no marker.
+    let silent = rig
+        .quantum(QuantumKind::Prefill, 5, 0, &workspace, &sequence, &config)
+        .with_logits_rows(0)
+        .unwrap()
+        .with_selection(Arc::clone(&selection));
+    assert!(rig.run(&last, &silent).is_none());
+
+    // The drafted token passes to the step's tokens: the row itself, or through the draft head's ids.
+    let draft = sequence.scratch.draft().unwrap();
+    let ids = upload(&rig.library, &vec![0u8; VOCABULARY * 4]);
+    ids.copy_from_host(12_345 * 4, &31_337i32.to_ne_bytes()).unwrap();
+    let pass = SelectedToken;
+    for (slot, ids_ptr, expected) in [(2usize, DevicePtr::NULL, 12_345i32), (3, ids.ptr(), 31_337)] {
+        let drafting = rig
+            .quantum(QuantumKind::Draft, 1, 0, &workspace, &sequence, &config)
+            .with_selection(Arc::clone(&selection))
+            .with_draft_token_write(DraftTokenWrite { slot, ids: ids_ptr });
+        assert!(rig.run(&last, &drafting).is_some());
+        assert!(rig.run(&pass, &drafting).is_some());
+        rig.sync();
+        let tokens = download(&draft.tokens);
+        let at = slot * 4;
+        assert_eq!(
+            i32::from_ne_bytes(tokens[at..at + 4].try_into().unwrap()),
+            expected,
+            "slot {slot}"
+        );
+    }
+    // Nothing to pass without a draft token write.
+    let plain = rig
+        .quantum(QuantumKind::Decode, 1, 0, &workspace, &sequence, &config)
+        .with_selection(Arc::clone(&selection));
+    assert!(rig.run(&pass, &plain).is_none());
+}
+
+// The MTP stem.
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn mtp_stem_concatenates_e_h() {
+    let Some(rig) = rig() else { return };
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
+    let sequence = Arc::new(sequence);
+    let workspace = rig.workspace(&config, 8, 8, &[]);
+    let (rows, hidden) = (4usize, 5120usize);
+    let mut rng = Rng(0x7777_1111_2222_3333);
+    let embedding = bf16_values(&bf16_bytes(&rng.values(rows * hidden, 3.0)));
+    let seed = bf16_values(&bf16_bytes(&rng.values(rows * hidden, 0.5)));
+    let embedding_norm = bf16_values(&bf16_bytes(&rng.values(hidden, 0.5)));
+    let hidden_norm = bf16_values(&bf16_bytes(&rng.values(hidden, 0.5)));
+    put(&workspace, BufferSlot::HiddenState, 0, &bf16_bytes(&embedding));
+    let embedding_norm_buffer = upload(&rig.library, &bf16_bytes(&embedding_norm));
+    let hidden_norm_buffer = upload(&rig.library, &bf16_bytes(&hidden_norm));
+    let seed_buffer = upload(&rig.library, &bf16_bytes(&seed));
+    let stem = MtpStem::new(
+        BufferSlot::HiddenState,
+        embedding_norm_buffer.ptr(),
+        hidden_norm_buffer.ptr(),
+        BufferSlot::MtpNormed,
+        BufferSlot::MtpPacked,
+    );
+
+    // The (1 + w) norm of one row, on the host.
+    let norm = |row: &[f32], weight: &[f32]| -> Vec<f32> {
+        let scale = 1.0 / (row.iter().map(|x| x * x).sum::<f32>() / hidden as f32 + 1e-6).sqrt();
+        row.iter().zip(weight).map(|(x, w)| x * scale * (1.0 + w)).collect()
+    };
+    let expected: Vec<f32> = (0..rows)
+        .flat_map(|row| {
+            let mut packed = norm(&embedding[row * hidden..(row + 1) * hidden], &embedding_norm);
+            packed.extend(norm(&seed[row * hidden..(row + 1) * hidden], &hidden_norm));
+            packed
+        })
+        .collect();
+
+    // Seeded from rows at an address (a recursive draft's hidden).
+    let draft = rig
+        .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
+        .with_draft_seed(DraftSeed::Address(seed_buffer.ptr()));
+    assert!(rig.run(&stem, &draft).is_some());
+    rig.sync();
+    let packed = get(&workspace, BufferSlot::MtpPacked, 0, rows * 2 * hidden * 2);
+    assert_close("the packed rows", &bf16_values(&packed), &expected, 0.02, 1e-3);
+
+    // The halves are the single norm launches, bit for bit: [norm(e); norm(h)] per row.
+    let single = |input: &DeviceBuffer, weight: &DeviceBuffer| -> Vec<u8> {
+        let output = DeviceBuffer::alloc(&rig.library, rows * hidden * 2).unwrap();
+        rig.submit(|submission| {
+            ops::rms_norm_unit_offset_bf16(
+                submission,
+                input.ptr(),
+                weight.ptr(),
+                output.ptr(),
+                rows as u32,
+                hidden as u32,
+                1e-6,
+            )
+        });
+        download(&output)
+    };
+    let embedding_buffer = upload(&rig.library, &bf16_bytes(&embedding));
+    let (e_half, h_half) = (
+        single(&embedding_buffer, &embedding_norm_buffer),
+        single(&seed_buffer, &hidden_norm_buffer),
+    );
+    for row in 0..rows {
+        let at = row * 2 * hidden * 2;
+        assert!(
+            packed[at..at + hidden * 2] == e_half[row * hidden * 2..(row + 1) * hidden * 2],
+            "e of row {row}"
+        );
+        assert!(
+            packed[at + hidden * 2..at + 2 * hidden * 2] == h_half[row * hidden * 2..(row + 1) * hidden * 2],
+            "h of row {row}"
+        );
+    }
+
+    // Seeded from the sequence's draft seed rows, from row 2 (a catch-up after the quantum that wrote them).
+    let seed_rows = sequence.scratch.draft().unwrap().seed_rows.ptr();
+    rig.submit(|submission| {
+        ops::copy_device_to_device(
+            submission,
+            seed_rows.offset((2 * hidden * 2) as u64),
+            seed_buffer.ptr(),
+            (rows * hidden * 2) as u64,
+        )
+    });
+    let catch_up = rig
+        .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
+        .with_draft_seed(DraftSeed::SeedRow(2));
+    assert!(rig.run(&stem, &catch_up).is_some());
+    rig.sync();
+    assert!(get(&workspace, BufferSlot::MtpPacked, 0, rows * 2 * hidden * 2) == packed);
+
+    // A stem with no rows to seed it, or seeded past the rows the sequence holds, is refused.
+    let unseeded = rig.quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config);
+    let cx = StageCx {
+        stage: StageId(0),
+        lane: Some(LaneId(0)),
+        waits: &[],
+        lanes: &rig.pool,
+    };
+    assert!(stem.run(&unseeded, &cx).is_err());
+    let past = rig
+        .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
+        .with_draft_seed(DraftSeed::SeedRow(14));
+    assert!(stem.run(&past, &cx).is_err());
+}
+
+// The stages in a graph.
+
+/// A host stage behind the argmax by a completion edge: it reads the selection the argmax wrote.
+struct ReadSelection {
+    seen: Arc<Join<u64>>,
+}
+
+impl Stage<Quantum> for ReadSelection {
+    fn run(&self, quantum: &Quantum, _cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+        let selection = quantum.selection().expect("the quantum selects");
+        self.seen.arrive(0, selection.key(0).unwrap());
+        Ok(Submitted::done())
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn a_completion_edge_after_the_argmax_finds_its_keys_on_the_host() {
+    let Some(rig) = rig() else { return };
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
+    let sequence = Arc::new(sequence);
+    let workspace = rig.workspace(&config, 8, 8, &[]);
+    let selection = Arc::new(Selection::new(&rig.library, 8).unwrap());
+    let mut row = Rng(99).values(VOCABULARY, 1.0);
+    row[4242] = 9.0;
+    put(&workspace, BufferSlot::Logits, 0, &bf16_bytes(&row));
+    let quantum = rig
+        .quantum(QuantumKind::Decode, 1, 0, &workspace, &sequence, &config)
+        .with_selection(Arc::clone(&selection));
+
+    // The argmax runs on a lane of the graph, and the host stage after it by a completion edge.
+    let settings = Settings::with_model(ModelSettings::default());
+    let lattice = ControlPlaneLattice::new(lattice_config(&settings)).unwrap();
+    let lake = Lake::new(
+        Arc::clone(&lattice),
+        NonZeroUsize::new(2).unwrap(),
+        Duration::from_secs(1),
+    );
+    let lanes = Arc::new(LanePool::new(vec![Arc::clone(&rig.lane) as Arc<dyn DeviceQueue>]));
+    let completions = Completions::new(Arc::clone(&lanes));
+    lattice
+        .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
+        .unwrap();
+    let (done, finished) = Latch::new();
+    // Part 0 is the key the host stage read, part 1 the retirement of the quantum.
+    let join = Join::new(2, move |parts: Vec<Option<u64>>| done.set(parts));
+    let retired = Arc::clone(&join);
+    let mut spec = StageGraphSpec::new();
+    let argmax = spec.stage(StageSpec {
+        name: "argmax",
+        ordered: None,
+        lanes: vec![LaneId(0)],
+    });
+    let read = spec.stage(StageSpec {
+        name: "read",
+        ordered: None,
+        lanes: vec![],
+    });
+    spec.edge(argmax, read, EdgeKind::Completion);
+    let graph = StageGraph::new(
+        spec,
+        vec![
+            Arc::new(Argmax::new(BufferSlot::Logits, VOCABULARY, SelectedRows::Last)),
+            Arc::new(ReadSelection { seen: join }),
+        ],
+        GraphRuntime {
+            stages: Arc::clone(&lake) as Arc<dyn FrameSink>,
+            completions,
+            lanes,
+            retries: Arc::new(RetryCounts::default()),
+            retry_backstop: DEFAULT_RETRY_BACKSTOP,
+        },
+        move |_quantum, outcome| retired.arrive(1, u64::from(outcome == QuantumOutcome::Completed)),
+    )
+    .unwrap();
+    let unit = lake.admit().unwrap();
+    let _ = graph.start(quantum, Arc::new(AtomicBool::new(false)), Vec::new());
+    let parts = finished.wait();
+    drop(unit);
+    lake.complete_gracefully();
+    lattice.close();
+    assert_eq!(parts[1], Some(1), "the quantum completed");
+    assert_eq!(parts[0].map(|key| key & 0xFFFF_FFFF), Some(0xFFFF_FFFF - 4242));
 }
