@@ -7,7 +7,7 @@ use std::path::{self, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use euhedral_graph::LaneId;
+use euhedral_graph::{LaneId, Marker};
 use libloading::Library;
 
 use crate::device::DeviceInfo;
@@ -211,6 +211,13 @@ impl CudaLibrary {
 
     pub(crate) fn api(&self) -> &EuhedralCuda {
         &self.api
+    }
+
+    /// Whether a wait on `marker` would be accepted now: value 0 (always reached), or a marker its lane has issued
+    /// and whose event the lane's later markers have not reused. A marker older than its lane's event ring is refused
+    /// by [`Submission::wait`](crate::Submission::wait); the caller orders behind the lane another way.
+    pub fn marker_waitable(&self, marker: Marker) -> bool {
+        self.ring(marker.lane).and_then(|ring| ring.waitable(marker)).is_ok()
     }
 
     /// The next allocation serial. A serial is never reused, so a buffer read by a captured graph is told apart from

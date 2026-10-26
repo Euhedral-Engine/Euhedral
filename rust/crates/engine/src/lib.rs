@@ -5,6 +5,8 @@ pub mod error;
 pub mod formats;
 mod frames;
 pub mod model;
+pub mod plan;
+pub mod quantum;
 pub mod residency;
 pub mod runtime;
 pub mod stages;

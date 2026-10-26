@@ -29,17 +29,19 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use euhedral_graph::{LaneId, Marker, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::{AllocationId, CudaError, CudaLane, DevicePtr, Submission, SubmitMode};
+use euhedral_inference_cuda::{AllocationId, CudaError, CudaLane, DevicePtr, PooledPinned, Submission, SubmitMode};
 use thiserror::Error;
 
 use crate::model::ModelConfig;
-use crate::state::{KvView, SequenceDevice};
+use crate::quantum::Disposition;
+use crate::state::attention::DRAFT_TOKEN_SLOTS;
+use crate::state::{FlightGuard, KvView, SequenceDevice};
 use crate::workspace::{BufferSlot, Workspace, WorkspaceError};
 use attention::KvSource;
-use sampling::Selection;
+use sampling::{Selection, SelectionLease};
 
 /// What a quantum is, which sets the routes of its stages (`Quantum.ExecutionKind`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum QuantumKind {
     /// Rows of the prompt, in chunks.
     Prefill,
@@ -132,6 +134,9 @@ pub struct SequenceRefs {
     kv: Option<KvView>,
     mtp_kv: Option<KvView>,
     replay_rows: Vec<u32>,
+    /// Counts the quantum as in flight on its sequence until it is dropped, so the sequence's owner knows when it may
+    /// free the caches (`SequenceState::refs`).
+    flight: Option<FlightGuard>,
 }
 
 impl SequenceRefs {
@@ -143,7 +148,14 @@ impl SequenceRefs {
             kv: None,
             mtp_kv: None,
             replay_rows: Vec::new(),
+            flight: None,
         }
+    }
+
+    /// The references with the quantum counted as in flight on its sequence until it is dropped.
+    pub fn in_flight(mut self, guard: FlightGuard) -> Self {
+        self.flight = Some(guard);
+        self
     }
 
     /// The base model's cache as it is at admission (`KvCache::view`, after the reservation).
@@ -168,6 +180,11 @@ impl SequenceRefs {
     /// The sequence's shared device part.
     pub fn device(&self) -> &SequenceDevice {
         &self.device
+    }
+
+    /// The rows each GDN layer replays, by model layer.
+    pub fn replay_layers(&self) -> &[u32] {
+        &self.replay_rows
     }
 
     /// The view of the cache `source`, if the quantum has one.
@@ -195,6 +212,24 @@ pub enum QuantumError {
         expected: bool,
         given: bool,
     },
+    #[error("draft token slots {slot}..{end} are out of the {DRAFT_TOKEN_SLOTS} the step's tokens hold")]
+    DraftTokenSlots { slot: usize, end: usize },
+    #[error("a drafted token goes to slot 1 to {}, not {slot}; slot 0 is the step's current token", DRAFT_TOKEN_SLOTS - 1)]
+    DraftTokenWriteSlot { slot: usize },
+    #[error("only a draft quantum {what}, not a {kind:?} one")]
+    NotDraft { what: &'static str, kind: QuantumKind },
+    #[error("a draft quantum does not seed drafting itself")]
+    DraftSeedsItself,
+    #[error("the sequence has no draft buffers, which {what} needs")]
+    NoDraftBuffers { what: &'static str },
+    #[error("{rows} draft seed rows from row {first} exceed the {capacity} the sequence holds")]
+    DraftSeedRows { first: u32, rows: usize, capacity: u64 },
+    #[error("{given} token ids for {rows} rows")]
+    TokenCount { given: usize, rows: usize },
+    #[error("token id {id} at row {row} is outside the vocabulary of {vocabulary}")]
+    TokenOutsideVocabulary { id: u32, row: usize, vocabulary: usize },
+    #[error("{what}")]
+    Invalid { what: String },
 }
 
 /// One quantum, as the stages see it. Its fields are `pub(crate)` and are set through constructors, so that the
@@ -222,6 +257,20 @@ pub struct Quantum {
     pub(crate) writes_current_token: bool,
     /// The device words and the pinned readback the quantum's argmax fills.
     pub(crate) selection: Option<Arc<Selection>>,
+    /// The lease on `selection` when it came from the sequence's pool: the words are the quantum's until it is
+    /// dropped, after its owner read the keys.
+    pub(crate) lease: Option<SelectionLease>,
+    /// The token ids of the rows, the input record's first part ([`Quantum::with_tokens`]).
+    pub(crate) tokens: Vec<u32>,
+    /// The pinned copy of the input record, held until the quantum is dropped: its upload reads it.
+    pub(crate) staging: Option<PooledPinned>,
+    /// Whether the input record was queued for upload ([`Quantum::prepare`]); the marker of that work must then be
+    /// recorded with [`Quantum::prepared_after`] before the quantum starts.
+    pub(crate) uploaded: bool,
+    /// The marker of the work that uploaded the input record: the quantum's first stage waits for it on the device.
+    pub(crate) prepared: Option<Marker>,
+    /// How the quantum runs: stage by stage, recording a graph, or replaying one.
+    pub(crate) disposition: Disposition,
 }
 
 impl Quantum {
@@ -270,6 +319,12 @@ impl Quantum {
             draft_token_read: None,
             writes_current_token: false,
             selection: None,
+            lease: None,
+            tokens: Vec::new(),
+            staging: None,
+            uploaded: false,
+            prepared: None,
+            disposition: Disposition::Eager,
         })
     }
 
@@ -280,41 +335,130 @@ impl Quantum {
         Ok(self)
     }
 
-    /// The base rows' post-final-norm hidden also seed the sequence's drafting.
-    pub fn seeding_draft(mut self) -> Self {
+    /// The base rows' post-final-norm hidden also seed the sequence's drafting. Refused for a draft quantum, which
+    /// does not seed itself, and for rows the sequence's draft seed rows cannot hold.
+    pub fn seeding_draft(mut self) -> Result<Self, QuantumError> {
+        if self.kind == QuantumKind::Draft {
+            return Err(QuantumError::DraftSeedsItself);
+        }
+        let draft = self.seq.device().scratch.draft().ok_or(QuantumError::NoDraftBuffers {
+            what: "seeding drafting",
+        })?;
+        if self.rows as u64 > draft.seed_capacity {
+            return Err(QuantumError::DraftSeedRows {
+                first: 0,
+                rows: self.rows,
+                capacity: draft.seed_capacity,
+            });
+        }
         self.seeds_draft = true;
-        self
+        Ok(self)
     }
 
-    /// The rows an MTP draft quantum normalizes beside its embedding rows.
-    pub fn with_draft_seed(mut self, seed: DraftSeed) -> Self {
+    /// The rows an MTP draft quantum normalizes beside its embedding rows. Refused for a quantum that does not draft,
+    /// and for seed rows of the sequence that its rows would run past.
+    pub fn with_draft_seed(mut self, seed: DraftSeed) -> Result<Self, QuantumError> {
+        self.require_draft("takes a draft seed")?;
+        if let DraftSeed::SeedRow(first) = seed {
+            let draft = self.seq.device().scratch.draft().ok_or(QuantumError::NoDraftBuffers {
+                what: "a seed from the sequence's rows",
+            })?;
+            if u64::from(first) + self.rows as u64 > draft.seed_capacity {
+                return Err(QuantumError::DraftSeedRows {
+                    first,
+                    rows: self.rows,
+                    capacity: draft.seed_capacity,
+                });
+            }
+        }
         self.draft_seed = Some(seed);
-        self
+        Ok(self)
     }
 
-    /// The selected token of a draft quantum goes to the step's tokens.
-    pub fn with_draft_token_write(mut self, write: DraftTokenWrite) -> Self {
+    /// The selected token of a draft quantum goes to the step's tokens. The slot is 1 or more (slot 0 is the step's
+    /// current token) and below the slots the step's tokens hold (`Quantum.writingDraftToken`).
+    pub fn with_draft_token_write(mut self, write: DraftTokenWrite) -> Result<Self, QuantumError> {
+        self.require_draft("passes a drafted token on")?;
+        if write.slot < 1 || write.slot as u64 >= DRAFT_TOKEN_SLOTS {
+            return Err(QuantumError::DraftTokenWriteSlot { slot: write.slot });
+        }
+        self.require_draft_buffers("passing a drafted token on")?;
         self.draft_token_write = Some(write);
-        self
+        Ok(self)
     }
 
     /// The rows read their token ids from the step's tokens on the device, from `slot` (the tokens the quanta before
-    /// this one wrote), not from the input record.
-    pub fn reading_draft_tokens(mut self, slot: usize) -> Self {
+    /// this one wrote), not from the input record. The slots `slot..slot + rows` are those the step's tokens hold
+    /// (`Quantum.readingDraftTokens`).
+    pub fn reading_draft_tokens(mut self, slot: usize) -> Result<Self, QuantumError> {
+        let end = slot + self.rows;
+        if end as u64 > DRAFT_TOKEN_SLOTS {
+            return Err(QuantumError::DraftTokenSlots { slot, end });
+        }
+        self.require_draft_buffers("reading the step's tokens")?;
         self.draft_token_read = Some(slot);
-        self
+        Ok(self)
     }
 
     /// The quantum's last input token is written to slot 0 of the step's tokens as the step's current token.
-    pub fn writing_current_token(mut self) -> Self {
+    pub fn writing_current_token(mut self) -> Result<Self, QuantumError> {
+        self.require_draft_buffers("writing the step's current token")?;
         self.writes_current_token = true;
-        self
+        Ok(self)
+    }
+
+    fn require_draft(&self, what: &'static str) -> Result<(), QuantumError> {
+        if self.kind == QuantumKind::Draft {
+            Ok(())
+        } else {
+            Err(QuantumError::NotDraft { what, kind: self.kind })
+        }
+    }
+
+    fn require_draft_buffers(&self, what: &'static str) -> Result<(), QuantumError> {
+        if self.seq.device().scratch.draft().is_some() {
+            Ok(())
+        } else {
+            Err(QuantumError::NoDraftBuffers { what })
+        }
     }
 
     /// The device words and readback the quantum's argmax fills.
     pub fn with_selection(mut self, selection: Arc<Selection>) -> Self {
         self.selection = Some(selection);
         self
+    }
+
+    /// The words and readback of a selection leased from the sequence's pool: the quantum holds the lease until it is
+    /// dropped, so no other quantum is given the words before the owner has read the keys.
+    pub fn with_selection_lease(mut self, lease: SelectionLease) -> Self {
+        self.selection = Some(Arc::clone(lease.selection()));
+        self.lease = Some(lease);
+        self
+    }
+
+    /// The token ids of the quantum's rows, one per row, each in the vocabulary: the first part of its input record
+    /// ([`Quantum::prepare`] uploads them).
+    pub fn with_tokens(mut self, tokens: Vec<u32>) -> Result<Self, QuantumError> {
+        if tokens.len() != self.rows {
+            return Err(QuantumError::TokenCount {
+                given: tokens.len(),
+                rows: self.rows,
+            });
+        }
+        if let Some((row, id)) = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, id)| **id as usize >= self.config.vocab_size)
+        {
+            return Err(QuantumError::TokenOutsideVocabulary {
+                id: *id,
+                row,
+                vocabulary: self.config.vocab_size,
+            });
+        }
+        self.tokens = tokens;
+        Ok(self)
     }
 
     pub fn kind(&self) -> QuantumKind {
@@ -403,23 +547,53 @@ pub trait Launch: Send + Sync {
     /// into a graph. It reads, and does not change, anything the quantum shares. A quantum for which the stage is
     /// [`Launch::idle`] queues nothing: calling `launch` on it is allowed (a capture does not ask) and does nothing.
     fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError>;
+}
 
-    /// Whether the marker of this stage's work must also write the lane's completion word, so that a completion
-    /// edge after it is found by a poll of the lane. Eager submission finishes the submission signalled
-    /// ([`run_eager`]); a graph launch is followed by the same finish on the submission that launched it.
-    const SIGNALLED: bool = false;
+/// [`Launch`] without its generics, for the stages a plan keeps as a list: what a graph capture calls, in order.
+pub trait StageLaunch: Send + Sync {
+    fn idle(&self, quantum: &Quantum) -> bool;
+    fn waits(&self, quantum: &Quantum) -> Vec<Marker>;
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError>;
+}
+
+impl<L: Launch> StageLaunch for L {
+    fn idle(&self, quantum: &Quantum) -> bool {
+        Launch::idle(self, quantum)
+    }
+
+    fn waits(&self, quantum: &Quantum) -> Vec<Marker> {
+        Launch::waits(self, quantum)
+    }
+
+    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+        Launch::launch(self, quantum, submission)
+    }
 }
 
 /// The stage for eager submission: begins a submission of the quantum's mode on the lane the graph chose, waits for
 /// the markers of the predecessors on other lanes, calls [`Launch::launch`], and finishes with the marker of the
-/// work (signalled for a stage whose [`Launch::SIGNALLED`] is set).
+/// work.
+///
+/// The marker is signalled: it also writes the lane's completion word. A graph's retirement boundary is the latest
+/// marker of every lane the quantum used, and [`DeviceQueue::completed`](euhedral_graph::DeviceQueue::completed)
+/// reaches a marker only by a signalled one, so a lane whose last marker was not signalled would never be reached.
 ///
 /// A lane held by another submission answers [`StageError::Retry`], before anything was queued; every other failure
 /// is fatal to the quantum.
 pub fn run_eager<L: Launch>(stage: &L, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+    run_eager_dyn(stage, quantum, cx)
+}
+
+/// [`run_eager`] for a stage seen through [`StageLaunch`].
+pub fn run_eager_dyn<L: StageLaunch + ?Sized>(
+    stage: &L,
+    quantum: &Quantum,
+    cx: &StageCx<'_>,
+) -> Result<Submitted, StageError> {
     if stage.idle(quantum) {
         return Ok(Submitted::done());
     }
+    quantum.check_prepared()?;
     let id = cx
         .lane
         .ok_or_else(|| fatal("a stage with device work was given no lane"))?;
@@ -436,12 +610,7 @@ pub fn run_eager<L: Launch>(stage: &L, quantum: &Quantum, cx: &StageCx<'_>) -> R
         submission.wait(marker).map_err(fatal)?;
     }
     stage.launch(quantum, &submission)?;
-    let marker = if L::SIGNALLED {
-        submission.finish_signalled()
-    } else {
-        submission.finish()
-    }
-    .map_err(fatal)?;
+    let marker = submission.finish_signalled().map_err(fatal)?;
     Ok(Submitted::marker(marker))
 }
 
