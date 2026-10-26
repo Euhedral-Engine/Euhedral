@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/test-support"]
+members = ["crates/edrl", "crates/test-support"]
 resolver = "3"
 
 [workspace.package]
@@ -11,8 +11,11 @@ publish = false
 # [workspace.dependencies] as git dependencies on https://github.com/Euhedral-Engine/RustEE.git pinned by `rev`
 # when the first crate uses them.
 [workspace.dependencies]
+crc32fast = "1.5"
 java-properties = "2"
+serde_json = "1"
 tempfile = "3.27"
+thiserror = "2"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
