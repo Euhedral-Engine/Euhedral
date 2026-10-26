@@ -618,6 +618,9 @@ pub struct EuhedralCuda {
     pub euhedral_cuda_linear_kernel_name: unsafe extern "C" fn(
         index: ::std::os::raw::c_int,
     ) -> *const ::std::os::raw::c_char,
+    pub euhedral_cuda_linear_kernel_available: unsafe extern "C" fn(
+        kernel: i32,
+    ) -> ::std::os::raw::c_int,
     pub euhedral_cuda_linear_launch: unsafe extern "C" fn(
         kernel: i32,
         grid_x: u32,
@@ -946,6 +949,9 @@ impl EuhedralCuda {
         let euhedral_cuda_linear_kernel_name = __library
             .get(b"euhedral_cuda_linear_kernel_name\0")
             .map(|sym| *sym)?;
+        let euhedral_cuda_linear_kernel_available = __library
+            .get(b"euhedral_cuda_linear_kernel_available\0")
+            .map(|sym| *sym)?;
         let euhedral_cuda_linear_launch = __library
             .get(b"euhedral_cuda_linear_launch\0")
             .map(|sym| *sym)?;
@@ -1052,6 +1058,7 @@ impl EuhedralCuda {
             euhedral_cuda_qwen4_launch,
             euhedral_cuda_linear_kernel_count,
             euhedral_cuda_linear_kernel_name,
+            euhedral_cuda_linear_kernel_available,
             euhedral_cuda_linear_launch,
         })
     }
@@ -2390,6 +2397,12 @@ impl EuhedralCuda {
         index: ::std::os::raw::c_int,
     ) -> *const ::std::os::raw::c_char {
         (self.euhedral_cuda_linear_kernel_name)(index)
+    }
+    pub unsafe fn euhedral_cuda_linear_kernel_available(
+        &self,
+        kernel: i32,
+    ) -> ::std::os::raw::c_int {
+        (self.euhedral_cuda_linear_kernel_available)(kernel)
     }
     pub unsafe fn euhedral_cuda_linear_launch(
         &self,

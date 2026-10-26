@@ -360,6 +360,43 @@ pub fn linear_launch(
     )
 }
 
+/// Launches kernel `kernel` of the Flash-Next table, with the arguments laid out as [`linear_launch`] takes them.
+pub fn qwen4_launch(
+    submission: &Submission<'_>,
+    kernel: i32,
+    grid: [u32; 3],
+    block: [u32; 3],
+    shared_bytes: u32,
+    words: &[u64],
+    sizes: &[u8],
+) -> Result<(), CudaError> {
+    if words.len() != sizes.len() {
+        return Err(CudaError::Argument(format!(
+            "a qwen4 launch has {} argument words but {} sizes",
+            words.len(),
+            sizes.len()
+        )));
+    }
+    let count = i32::try_from(words.len())
+        .map_err(|_| CudaError::Argument("a qwen4 launch has too many arguments".to_string()))?;
+    entry!(
+        submission,
+        euhedral_cuda_qwen4_launch(
+            kernel,
+            grid[0],
+            grid[1],
+            grid[2],
+            block[0],
+            block[1],
+            block[2],
+            shared_bytes,
+            words.as_ptr(),
+            sizes.as_ptr(),
+            count,
+        )
+    )
+}
+
 /// NVFP4 linear on BF16 rows: one row on the decode kernel, 2 to 8 on its row twins, other shapes on the reference.
 pub fn linear_nvfp4_bf16(
     submission: &Submission<'_>,

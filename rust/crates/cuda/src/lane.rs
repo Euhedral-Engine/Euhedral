@@ -265,7 +265,8 @@ impl CudaLane {
         })
     }
 
-    pub(crate) fn library(&self) -> &Arc<CudaLibrary> {
+    /// The library the lane was created on.
+    pub fn library(&self) -> &Arc<CudaLibrary> {
         &self.library
     }
 

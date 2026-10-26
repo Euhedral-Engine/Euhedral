@@ -151,6 +151,33 @@ impl CudaLibrary {
         Some(unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned())
     }
 
+    /// Whether kernel `index` of the shared linear table runs on this device: the kernels of an
+    /// architecture-specific module (block-scaled FP8 on sm_12xa) are unavailable elsewhere.
+    pub fn linear_kernel_available(&self, index: usize) -> Result<bool, CudaError> {
+        let index = c_int::try_from(index).map_err(|_| CudaError::Argument(format!("linear kernel {index}")))?;
+        // SAFETY: the call takes an integer.
+        let status = unsafe { self.api.euhedral_cuda_linear_kernel_available(index) };
+        if status < 0 {
+            return Err(CudaError::Call {
+                call: "euhedral_cuda_linear_kernel_available",
+                status,
+            });
+        }
+        Ok(status == 1)
+    }
+
+    /// The name of the Flash-Next kernel table's kernel `index`, or `None` outside the table.
+    pub fn qwen4_kernel_name(&self, index: usize) -> Option<String> {
+        let index = c_int::try_from(index).ok()?;
+        // SAFETY: the call takes an integer; the library returns null or a NUL-terminated static name.
+        let name = unsafe { self.api.euhedral_cuda_qwen4_kernel_name(index) };
+        if name.is_null() {
+            return None;
+        }
+        // SAFETY: `name` is non-null and NUL-terminated, and the table's names live as long as the library.
+        Some(unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned())
+    }
+
     /// Blocks until all device work finishes. For startup, shutdown and tests; nothing on a hot path waits.
     #[allow(
         clippy::disallowed_methods,
