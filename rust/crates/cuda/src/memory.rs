@@ -6,16 +6,37 @@ use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
+use euhedral_graph::Marker;
+
 use crate::error::{CudaError, check};
 use crate::library::CudaLibrary;
-use crate::submission::Submission;
+use crate::retire::Retire;
+use crate::submission::{Submission, capture_selected};
 
 /// A device address, opaque to the host. Zero is null.
+///
+/// Safe code gets one from a [`DeviceBuffer`] (and offsets within it). Making one from a number is `unsafe`: an
+/// address into mapped host memory is host memory, and the safe operations would let a kernel write it behind Rust's
+/// references.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DevicePtr(pub u64);
+pub struct DevicePtr(u64);
 
 impl DevicePtr {
     pub const NULL: DevicePtr = DevicePtr(0);
+
+    /// A device pointer from its raw address.
+    ///
+    /// # Safety
+    /// `address` must be null, or an address of device memory the caller owns for as long as the pointer is used, or
+    /// mapped host memory under the contract of [`PinnedBuffer::device_address`].
+    pub unsafe fn from_raw(address: u64) -> DevicePtr {
+        DevicePtr(address)
+    }
+
+    /// The raw address.
+    pub fn get(self) -> u64 {
+        self.0
+    }
 
     /// The address `bytes` further on.
     pub fn offset(self, bytes: u64) -> DevicePtr {
@@ -43,14 +64,20 @@ pub struct AllocationId(pub u64);
 
 /// A device allocation, freed on drop.
 ///
-/// Dropping a buffer frees it with `cudaFree`, which waits for the device. Free long-lived buffers at shutdown;
-/// [`DeviceBuffer::free_async`] frees a stream-ordered buffer on its lane without waiting.
+/// A plain drop frees the buffer at once with `cudaFree`, which waits for the whole device under the driver's lock (and
+/// frees memory queued work may still use if the caller dropped it too early: nothing here tracks readers). That is for
+/// startup and shutdown only. To free on a running engine, allocate with [`DeviceBuffer::alloc_async`] and retire the
+/// buffer with the marker of its last use ([`RetireList`](crate::RetireList)), or free it in stream order with
+/// [`DeviceBuffer::free_async`]; both use `cudaFreeAsync` and never wait. A buffer from [`DeviceBuffer::alloc`] is not
+/// retirable.
 #[derive(Debug)]
 pub struct DeviceBuffer {
     library: Arc<CudaLibrary>,
     addr: u64,
     bytes: usize,
     generation: AllocationId,
+    /// Allocated with `cudaMallocAsync`: freed in stream order, so retirable without blocking.
+    stream_ordered: bool,
 }
 
 impl DeviceBuffer {
@@ -59,7 +86,7 @@ impl DeviceBuffer {
         let size = non_empty(bytes)?;
         // SAFETY: the call takes a size.
         let address = unsafe { library.api().euhedral_cuda_malloc(size) };
-        Self::wrap(library, "euhedral_cuda_malloc", address, bytes)
+        Self::wrap(library, "euhedral_cuda_malloc", address, bytes, false)
     }
 
     /// Allocates `bytes` in stream order on the submission's lane: the memory is usable by work queued after this
@@ -72,7 +99,7 @@ impl DeviceBuffer {
         let library = submission.lane().library();
         // SAFETY: the submission has selected its lane's stream, which the call allocates on.
         let address = unsafe { library.api().euhedral_cuda_malloc_async(size) };
-        Self::wrap(library, "euhedral_cuda_malloc_async", address, bytes)
+        Self::wrap(library, "euhedral_cuda_malloc_async", address, bytes, true)
     }
 
     fn wrap(
@@ -80,6 +107,7 @@ impl DeviceBuffer {
         call: &'static str,
         address: *mut c_void,
         bytes: usize,
+        stream_ordered: bool,
     ) -> Result<DeviceBuffer, CudaError> {
         if address.is_null() {
             return Err(CudaError::NullAllocation {
@@ -92,15 +120,20 @@ impl DeviceBuffer {
             addr: address.expose_provenance() as u64,
             bytes,
             generation: library.next_allocation(),
+            stream_ordered,
         })
     }
 
     /// Frees the buffer in stream order on the submission's lane: the memory returns to the pool once the lane
-    /// reaches this point, after every reader queued before it. A buffer allocated with [`DeviceBuffer::alloc`] is
-    /// freed in stream order too.
-    pub fn free_async(mut self, submission: &Submission<'_>) -> Result<(), CudaError> {
+    /// reaches this point, after every reader queued before it on that lane. `readers` are the markers of the last
+    /// uses on other lanes; the free waits for each on the device first, so a reader on another lane never sees
+    /// reused memory. Pass every lane that still reads the buffer.
+    pub fn free_async(mut self, submission: &Submission<'_>, readers: &[Marker]) -> Result<(), CudaError> {
         if submission.lane().is_capturing() {
             return Err(CudaError::Capturing("a stream-ordered free"));
+        }
+        for reader in readers {
+            submission.wait(*reader)?;
         }
         // SAFETY: the address is this buffer's live allocation, and the submission has selected a stream.
         let status = unsafe { self.library.api().euhedral_cuda_free_async(self.ptr().as_mut()) };
@@ -136,6 +169,9 @@ impl DeviceBuffer {
         reason = "no-wait, synchronous copy: documented as startup, shutdown and tests only"
     )]
     pub fn copy_from_host(&self, offset: usize, host: &[u8]) -> Result<(), CudaError> {
+        if capture_selected() {
+            return Err(CudaError::Capturing("a blocking host copy"));
+        }
         let destination = self.range(offset, host.len())?;
         // SAFETY: `destination` lies inside this allocation and `host` is a live slice of the stated length.
         let status = unsafe {
@@ -155,6 +191,9 @@ impl DeviceBuffer {
         reason = "no-wait, synchronous copy: documented as startup, shutdown and tests only"
     )]
     pub fn copy_to_host(&self, offset: usize, host: &mut [u8]) -> Result<(), CudaError> {
+        if capture_selected() {
+            return Err(CudaError::Capturing("a blocking host copy"));
+        }
         let source = self.range(offset, host.len())?;
         // SAFETY: `source` lies inside this allocation and `host` is a live exclusive slice of the stated length.
         let status = unsafe {
@@ -203,8 +242,9 @@ fn non_empty(bytes: usize) -> Result<u64, CudaError> {
 /// Page-locked host memory (`cudaHostAlloc`), freed on drop. Copies between it and the device run on the copy
 /// engines without staging, and the device can write a word in it (the lane completion word).
 ///
-/// It is owned exclusively: the pointer and length are fixed for the buffer's life. Freeing pinned memory waits for
-/// the device, so long-lived buffers are freed at shutdown.
+/// It is owned exclusively: the pointer and length are fixed for the buffer's life. A plain drop calls `cudaFreeHost`,
+/// which waits for the whole device under the driver's lock: startup and shutdown only. On a running engine take
+/// buffers from a [`PinnedPool`](crate::PinnedPool), which recycles them. A raw `PinnedBuffer` is not retirable.
 #[derive(Debug)]
 pub struct PinnedBuffer {
     library: Arc<CudaLibrary>,
@@ -281,7 +321,13 @@ impl PinnedBuffer {
     }
 
     /// The address at which the device reads and writes this memory.
-    pub fn device_address(&self) -> Result<DevicePtr, CudaError> {
+    ///
+    /// # Safety
+    /// Device work through the address races with the host's references to the same bytes ([`PinnedBuffer::as_slice`],
+    /// [`PinnedBuffer::as_mut_slice`] and the pointers). The caller must keep the buffer alive until that work has
+    /// retired, and touch the bytes the device accesses only through atomics ([`PinnedBuffer::word`]) or after the
+    /// work retires.
+    pub unsafe fn device_address(&self) -> Result<DevicePtr, CudaError> {
         device_address(&self.library, self.pointer.as_ptr().cast_const().cast())
     }
 }
@@ -299,7 +345,7 @@ impl Drop for PinnedBuffer {
 
 /// Pinned, huge-page-backed host memory for weights staged to the device on use (`host_weights_malloc`): 2 MiB
 /// aligned and mapped into the device's address space, so kernels read it in place. One arena per backing store; many
-/// per-tensor allocations fall to 4 KiB pages. Freed on drop.
+/// per-tensor allocations fall to 4 KiB pages. Freed on drop, which waits for the device (startup and shutdown only).
 #[derive(Debug)]
 pub struct HostWeightsArena {
     library: Arc<CudaLibrary>,
@@ -356,7 +402,12 @@ impl HostWeightsArena {
     }
 
     /// The address at which kernels read this memory in place.
-    pub fn device_address(&self) -> Result<DevicePtr, CudaError> {
+    ///
+    /// # Safety
+    /// Kernels read the arena through the address while the host may write it ([`HostWeightsArena::as_mut_slice`]).
+    /// The caller must keep the arena alive until every such kernel has retired, and not write bytes a pending kernel
+    /// reads.
+    pub unsafe fn device_address(&self) -> Result<DevicePtr, CudaError> {
         device_address(&self.library, self.pointer.as_ptr().cast_const().cast())
     }
 }
@@ -377,6 +428,8 @@ impl Drop for HostWeightsArena {
     }
 }
 
+/// The device address of registered host memory. Taking the address is harmless; the callers' `unsafe` is about what
+/// the device does through it.
 fn device_address(library: &CudaLibrary, host: *const c_void) -> Result<DevicePtr, CudaError> {
     let mut device = 0u64;
     // SAFETY: `host` is the start of a live registered allocation and `device` is a live local.
@@ -387,4 +440,22 @@ fn device_address(library: &CudaLibrary, host: *const c_void) -> Result<DevicePt
     };
     check("euhedral_cuda_host_weights_device_pointer", status)?;
     Ok(DevicePtr(device))
+}
+
+impl Retire for DeviceBuffer {
+    fn retirable(&self) -> Result<(), CudaError> {
+        if self.stream_ordered {
+            Ok(())
+        } else {
+            Err(CudaError::Argument(
+                "a buffer from DeviceBuffer::alloc is freed with cudaFree, which waits for the device; allocate with \
+                 alloc_async to retire it"
+                    .to_string(),
+            ))
+        }
+    }
+
+    fn release(self, submission: &Submission<'_>) -> Result<(), CudaError> {
+        self.free_async(submission, &[])
+    }
 }

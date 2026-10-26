@@ -22,9 +22,11 @@ use std::sync::atomic::Ordering;
 use euhedral_graph::{DeviceQueue, LaneId, LanePool, Marker};
 use euhedral_inference_cuda::{
     CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, GraphRecorder, HostWeightsArena, PinnedBuffer,
-    Submission, SubmitMode, ops,
+    PinnedPool, RetireList, Submission, SubmitMode, ops,
 };
 
+/// The loaded library. The tests run in parallel on one device: none calls CUDA's allocator, frees or synchronizes
+/// while a lane of its own is parked on a host flag, because a synchronizing call waits for every lane on the device.
 fn library() -> Option<Arc<CudaLibrary>> {
     let path = test_support::require_property("euhedral.cuda.library")?;
     Some(CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads"))
@@ -42,7 +44,8 @@ fn submit(lane: &CudaLane) -> Submission<'_> {
 fn flag(library: &Arc<CudaLibrary>) -> (PinnedBuffer, DevicePtr) {
     let buffer = PinnedBuffer::alloc(library, 64).expect("pinned flag");
     buffer.word(0).store(0, Ordering::Release);
-    let device = buffer.device_address().expect("the flag's device address");
+    // SAFETY: the tests touch the word only through its atomic and keep the buffer alive beside the address.
+    let device = unsafe { buffer.device_address() }.expect("the flag's device address");
     (buffer, device)
 }
 
@@ -81,7 +84,8 @@ fn alloc_copy_roundtrip() {
     let mut arena = HostWeightsArena::alloc(&library, 3 << 20).expect("host weights arena");
     arena.as_mut_slice()[..4].copy_from_slice(&[1, 2, 3, 4]);
     assert_eq!(arena.as_ptr() as usize % (2 << 20), 0, "2 MiB aligned");
-    assert_ne!(arena.device_address().expect("mapped").0, 0);
+    // SAFETY: no kernel reads the arena.
+    assert_ne!(unsafe { arena.device_address() }.expect("mapped").get(), 0);
 }
 
 #[test]
@@ -207,7 +211,9 @@ fn graph_capture_replays_same_result() {
 
     let recorder = GraphRecorder::begin(&lane).expect("capture begins");
     {
-        let submission = submit(&lane);
+        let submission = recorder
+            .submission(SubmitMode::default())
+            .expect("a capture submission");
         add(&submission);
         let other = Marker {
             lane: LaneId(1),
@@ -217,13 +223,36 @@ fn graph_capture_replays_same_result() {
             matches!(submission.wait(other), Err(CudaError::Capturing(_))),
             "no cross-lane waits in a capture"
         );
+        assert!(
+            matches!(submission.signal(1), Err(CudaError::Capturing(_))),
+            "no completion signals in a capture"
+        );
+        assert!(
+            matches!(copy.copy_from_host(0, &[0]), Err(CudaError::Capturing(_))),
+            "no blocking copies in a capture"
+        );
+        let mut one = [0u8];
+        assert!(
+            matches!(
+                ops::copy_device_to_host(&submission, &mut one, copy.ptr()),
+                Err(CudaError::Capturing(_))
+            ),
+            "no blocking copies in a capture"
+        );
     }
     assert!(
-        matches!(submit(&lane).finish(), Err(CudaError::Capturing(_))),
-        "no markers in a capture"
+        matches!(lane.synchronize(), Err(CudaError::Capturing(_))),
+        "no synchronization in a capture"
     );
     assert!(
-        GraphRecorder::begin(&lane).is_err(),
+        matches!(
+            Submission::begin(&lane, SubmitMode::default()),
+            Err(CudaError::LaneBusy(_))
+        ),
+        "the capture holds the lane"
+    );
+    assert!(
+        matches!(GraphRecorder::begin(&lane), Err(CudaError::LaneBusy(_))),
         "a lane captures one graph at a time"
     );
     let graph = recorder.end().expect("capture ends");
@@ -290,7 +319,7 @@ fn stream_ordered_buffers_follow_their_lane() {
     let submission = submit(&lane);
     let buffer = DeviceBuffer::alloc_async(&submission, 1 << 16).expect("stream-ordered allocation");
     ops::zero_device_memory(&submission, buffer.ptr(), 1 << 16).expect("zero");
-    buffer.free_async(&submission).expect("stream-ordered free");
+    buffer.free_async(&submission, &[]).expect("stream-ordered free");
     drop(submission);
     lane.synchronize().expect("lane");
     assert!(
@@ -310,4 +339,137 @@ fn exact_numerics_switch_returns_the_previous_selection() {
     let Some(library) = library() else { return };
     assert!(!library.exact_numerics_for_tests(true), "relaxed is the default");
     assert!(library.exact_numerics_for_tests(false));
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn a_second_submission_on_a_live_lane_is_busy() {
+    let Some(library) = library() else { return };
+    let lane = lane(&library, 0, 2);
+    let held = submit(&lane);
+    assert!(matches!(Submission::begin(&lane, SubmitMode::default()), Err(CudaError::LaneBusy(id)) if id == LaneId(0)));
+    assert!(matches!(GraphRecorder::begin(&lane), Err(CudaError::LaneBusy(_))));
+    drop(held);
+    // Given back on drop, and after a refused attempt too.
+    drop(submit(&lane));
+    drop(GraphRecorder::begin(&lane).expect("free again"));
+    drop(submit(&lane));
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn waits_on_stale_and_future_markers_are_refused() {
+    let Some(library) = library() else { return };
+    let (first, second) = (lane(&library, 0, 2), lane(&library, 1, 2));
+    let mut markers = Vec::new();
+    for _ in 0..3 {
+        markers.push(submit(&first).finish().expect("finish"));
+    }
+    let waiter = submit(&second);
+    assert!(
+        matches!(waiter.wait(markers[0]), Err(CudaError::StaleMarker { .. })),
+        "marker 1 shares marker 3's event"
+    );
+    waiter.wait(markers[1]).expect("a marker inside the ring");
+    waiter.wait(markers[2]).expect("the newest marker");
+    let future = Marker {
+        lane: LaneId(0),
+        value: 4,
+    };
+    assert!(matches!(waiter.wait(future), Err(CudaError::FutureMarker { .. })));
+    drop(waiter);
+    first.synchronize().expect("first");
+    second.synchronize().expect("second");
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn pinned_pool_reuses_released_buffers_even_past_its_limit() {
+    let Some(library) = library() else { return };
+    let pool = PinnedPool::new(&library, 1 << 20);
+    let first = pool.acquire(10_000).expect("a pooled buffer");
+    assert_eq!(first.len(), 10_000);
+    assert_eq!(first.buffer().len(), 16384, "the size class");
+    let address = first.buffer().as_ptr();
+    drop(first);
+    assert_eq!(pool.held_bytes(), 16384);
+    let second = pool.acquire(12_000).expect("the same class");
+    assert_eq!(second.buffer().as_ptr(), address, "a released buffer is reused");
+    assert_eq!(pool.held_bytes(), 0);
+    drop(second);
+
+    // Past the limit: the buffers stay in their classes and are reused; only trim frees them.
+    let tight_over = PinnedPool::new(&library, 8192);
+    let (a, b) = (
+        tight_over.acquire(5000).expect("a"),
+        tight_over.acquire(5000).expect("b"),
+    );
+    let addresses_over = [a.buffer().as_ptr(), b.buffer().as_ptr()];
+    drop((a, b));
+    assert_eq!(tight_over.over_limit_bytes(), 8192);
+    let (c, d) = (
+        tight_over.acquire(5000).expect("c"),
+        tight_over.acquire(5000).expect("d"),
+    );
+    let mut reused = [c.buffer().as_ptr(), d.buffer().as_ptr()];
+    reused.sort();
+    let mut expected = addresses_over;
+    expected.sort();
+    assert_eq!(
+        reused, expected,
+        "buffers released past the limit are reused by the next acquires"
+    );
+    drop((c, d));
+    assert_eq!(tight_over.trim(), 1, "trim frees down to the limit");
+    assert_eq!(tight_over.held_bytes(), 8192);
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn retired_buffers_are_released_after_their_marker_without_blocking() {
+    let Some(library) = library() else { return };
+    let (lane, reaper) = (lane(&library, 0, 2), lane(&library, 1, 2));
+    let lanes = LanePool::new(vec![
+        Arc::clone(&lane) as Arc<dyn DeviceQueue>,
+        Arc::clone(&reaper) as _,
+    ]);
+    let pool = PinnedPool::new(&library, 1 << 20);
+    let list = RetireList::new();
+    let (gate, gate_device) = flag(&library);
+
+    // Everything is allocated before the lane parks on its gate: nothing below calls into CUDA's allocator.
+    let pooled = pool.acquire(4096).expect("pooled buffer");
+    let device = {
+        let submission = submit(&lane);
+        DeviceBuffer::alloc_async(&submission, 1 << 16).expect("stream-ordered buffer")
+    };
+    let plain = DeviceBuffer::alloc(&library, 4096).expect("plain buffer");
+    let marker = {
+        let submission = submit(&lane);
+        ops::wait_host_flag(&submission, gate_device, 1).expect("wait");
+        ops::zero_device_memory(&submission, device.ptr(), 1 << 16).expect("zero");
+        submission.finish_signalled().expect("finish")
+    };
+
+    let (error, plain) = list.retire(plain, marker).unwrap_err();
+    assert!(error.to_string().contains("alloc_async"), "{error}");
+    list.retire(pooled, marker)
+        .map_err(|(error, _)| error)
+        .expect("a pooled buffer retires");
+    list.retire(device, marker)
+        .map_err(|(error, _)| error)
+        .expect("a stream-ordered buffer retires");
+    assert_eq!(list.pending(), 2);
+
+    let released = |list: &RetireList| {
+        let submission = submit(&reaper);
+        list.reap(|m| lanes.reached(m), &submission).expect("reap")
+    };
+    assert_eq!(released(&list), 0, "the lane is parked on its gate");
+    gate.word(0).store(1, Ordering::Release);
+    lane.synchronize().expect("lane");
+    assert_eq!(released(&list), 2);
+    reaper.synchronize().expect("the stream-ordered free retires");
+    assert_eq!(pool.held_bytes(), 4096, "the pooled buffer went back to its pool");
+    drop(plain);
 }

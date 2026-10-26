@@ -50,6 +50,7 @@ disallowed-methods = [
     { path = "euhedral_inference_cuda::CudaLane::synchronize", reason = "nothing waits on a stream: poll the lane's completion word (startup, shutdown and tests only)", allow-invalid = true },
     { path = "euhedral_inference_cuda::DeviceBuffer::copy_from_host", reason = "a synchronous copy waits for the device: queue ops::copy_upload_to_device on a lane", allow-invalid = true },
     { path = "euhedral_inference_cuda::DeviceBuffer::copy_to_host", reason = "a synchronous copy waits for the device: queue ops::copy_device_to_readback on a lane", allow-invalid = true },
+    { path = "euhedral_inference_cuda::PinnedPool::trim", reason = "freeing pinned memory waits for the device: trim at startup and shutdown only", allow-invalid = true },
     { path = "euhedral_inference_cuda::ops::copy_host_to_device", reason = "a synchronous copy waits for the device: queue ops::copy_upload_to_device on a lane", allow-invalid = true },
     { path = "euhedral_inference_cuda::ops::copy_device_to_host", reason = "a synchronous copy waits for the device: queue ops::copy_device_to_readback on a lane", allow-invalid = true },
     { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_synchronize", reason = "nothing waits on the device: poll the lane's completion word (startup, shutdown and tests only)", allow-invalid = true },
