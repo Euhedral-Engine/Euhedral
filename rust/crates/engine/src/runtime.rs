@@ -21,7 +21,7 @@ use euhedral_graph::{
     AsyncIo, Completions, DeviceQueue, Lake, LaneId, LanePool, LatchSetter, OwnedFile, RawFile, UnitGuard,
 };
 use euhedral_hardware_utils::util::CpuSet;
-use euhedral_inference_cuda::{CudaLane, CudaLibrary, PinnedPool};
+use euhedral_inference_cuda::{CudaLane, CudaLibrary, PinnedPool, RetireList};
 use euhedral_inference_settings::{Auto, Settings};
 
 use crate::error::EngineError;
@@ -53,6 +53,9 @@ pub(crate) struct Core {
     /// The transfer lanes (lane ids `0..`), one per upload chain; the first also zeroes the sequence state.
     pub(crate) transfer: Vec<Arc<CudaLane>>,
     pub(crate) pool: Arc<PinnedPool>,
+    /// Buffers waiting to be freed in stream order: the pages and page tables of the caches, once their last quantum
+    /// is gone. Whoever polls the lanes reaps it.
+    pub(crate) retire: Arc<RetireList>,
     /// Pinned host bytes the load may use.
     pub(crate) host_pinned_bytes: u64,
     /// The pinned pool's size (`memory.pinned-buffer-pool`, resolved): what it keeps, and the ring's budget.
@@ -367,6 +370,12 @@ impl EngineRuntime {
         &self.core.pool
     }
 
+    /// The buffers the sequence's caches freed in stream order when their last holder let go; the generation source
+    /// reaps it (`RetireList::reap`) when it polls the lanes.
+    pub fn retire_list(&self) -> &Arc<RetireList> {
+        &self.core.retire
+    }
+
     /// The lake of GPU submission frames.
     pub fn stages(&self) -> &Arc<Lake> {
         &self.core.stages
@@ -496,6 +505,7 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
         lanes,
         transfer,
         pool,
+        retire: Arc::new(RetireList::new()),
         host_pinned_bytes: startup::host_pinned_bytes(settings, &machine),
         pool_bytes,
         started,

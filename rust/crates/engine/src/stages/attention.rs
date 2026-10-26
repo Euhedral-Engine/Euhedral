@@ -5,6 +5,7 @@
 //! two to eight rows, the fused verifier) are made by the native library from the arguments given here; they are
 //! the same in both engines.
 
+use euhedral_graph::Marker;
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{CudaError, DevicePtr, Submission, ops};
 use euhedral_inference_settings::KvFormat;
@@ -142,6 +143,15 @@ impl KvAppend {
 }
 
 impl Launch for KvAppend {
+    fn waits(&self, quantum: &Quantum) -> Vec<Marker> {
+        quantum
+            .seq
+            .kv(self.source)
+            .and_then(KvView::ready)
+            .into_iter()
+            .collect()
+    }
+
     fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
         let config = &quantum.config;
         let cache = cache(quantum, self.source)?;
@@ -215,6 +225,15 @@ impl AttentionCausal {
 }
 
 impl Launch for AttentionCausal {
+    fn waits(&self, quantum: &Quantum) -> Vec<Marker> {
+        quantum
+            .seq
+            .kv(self.source)
+            .and_then(KvView::ready)
+            .into_iter()
+            .collect()
+    }
+
     fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
         let config = &quantum.config;
         let cache = cache(quantum, self.source)?;

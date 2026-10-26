@@ -107,6 +107,9 @@ impl Launch for RmsNormUnitOffset {
     }
 
     fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+        if self.idle(quantum) {
+            return Ok(());
+        }
         let hidden = quantum.config.hidden_size;
         let width = launch_u32(hidden, "the hidden size")?;
         let row_bytes = hidden as u64 * 2;

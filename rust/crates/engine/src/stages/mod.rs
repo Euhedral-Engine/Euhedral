@@ -28,7 +28,7 @@ pub mod sampling;
 use std::fmt::Display;
 use std::sync::Arc;
 
-use euhedral_graph::{LaneId, StageCx, StageError, Submitted};
+use euhedral_graph::{LaneId, Marker, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{AllocationId, CudaError, CudaLane, DevicePtr, Submission, SubmitMode};
 use thiserror::Error;
 
@@ -390,9 +390,18 @@ pub trait Launch: Send + Sync {
         false
     }
 
+    /// Markers, beyond those of its predecessors, that the stage's work must wait for on the device: the work that
+    /// allocated the pages it reads (`KvView::ready`), when that ran on another lane. Waits are not part of a
+    /// capture, so they are listed apart from [`Launch::launch`]; eager submission waits for them ([`run_eager`]).
+    fn waits(&self, quantum: &Quantum) -> Vec<Marker> {
+        let _ = quantum;
+        Vec::new()
+    }
+
     /// Queues the stage's kernel launches and copies on `submission`, for `quantum`. Nothing else: no wait for a
     /// marker, no marker, no completion signal, no synchronization, no allocation, so the launches can be captured
-    /// into a graph. It reads, and does not change, anything the quantum shares.
+    /// into a graph. It reads, and does not change, anything the quantum shares. A quantum for which the stage is
+    /// [`Launch::idle`] queues nothing: calling `launch` on it is allowed (a capture does not ask) and does nothing.
     fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError>;
 
     /// Whether the marker of this stage's work must also write the lane's completion word, so that a completion
@@ -423,8 +432,8 @@ pub fn run_eager<L: Launch>(stage: &L, quantum: &Quantum, cx: &StageCx<'_>) -> R
         Err(CudaError::LaneBusy(_)) => return Err(StageError::Retry),
         Err(error) => return Err(fatal(error)),
     };
-    for marker in cx.waits {
-        submission.wait(*marker).map_err(fatal)?;
+    for marker in cx.waits.iter().copied().chain(stage.waits(quantum)) {
+        submission.wait(marker).map_err(fatal)?;
     }
     stage.launch(quantum, &submission)?;
     let marker = if L::SIGNALLED {

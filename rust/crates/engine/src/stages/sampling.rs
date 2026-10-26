@@ -136,6 +136,9 @@ impl Launch for Argmax {
     }
 
     fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+        if self.idle(quantum) {
+            return Ok(());
+        }
         let logits_rows = quantum.logits_rows;
         let selection = quantum
             .selection

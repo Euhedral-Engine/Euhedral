@@ -6,7 +6,7 @@ pub mod kv;
 
 use std::sync::Arc;
 
-use euhedral_inference_cuda::{CudaError, CudaLibrary, PinnedPool, Submission};
+use euhedral_inference_cuda::{CudaError, CudaLibrary, PinnedPool, RetireList, Submission};
 
 use crate::error::EngineError;
 use crate::model::ModelConfig;
@@ -43,9 +43,11 @@ pub struct SequenceState {
 impl SequenceState {
     /// Allocates the state `plan` sized: the cache with its host pages, the GDN state (zeroed on `submission`'s lane
     /// before any quantum), the decode scratch and, for a drafting sequence, the draft buffers and the MTP layer's
-    /// cache. Waits on the allocators: startup only. The caller waits for the zeroing's marker.
+    /// cache. Pages and page tables are freed through `retire` when their last holder lets go. Waits on the allocators:
+    /// startup only. The caller waits for the zeroing's marker.
     pub fn allocate(
         library: &Arc<CudaLibrary>,
+        retire: &Arc<RetireList>,
         config: &ModelConfig,
         plan: &ResidencyPlan,
         submission: &Submission<'_>,
@@ -54,6 +56,7 @@ impl SequenceState {
         let verified_rows = if drafts { 1 + plan.draft_depth as u64 } else { 0 };
         let kv = KvCache::new(
             library,
+            retire,
             config.attention_layers(),
             config.kv_width() as u64,
             plan.kv_format,
@@ -65,6 +68,7 @@ impl SequenceState {
             Some(
                 KvCache::new(
                     library,
+                    retire,
                     1,
                     config.kv_width() as u64,
                     plan.kv_format,

@@ -83,6 +83,9 @@ impl Launch for Linear {
     }
 
     fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+        if self.idle(quantum) {
+            return Ok(());
+        }
         let rows = self.covered(quantum);
         let mode = LinearMode {
             row_exact: quantum.mode.row_exact,

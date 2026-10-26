@@ -39,7 +39,8 @@ use euhedral_graph::{
     Submitted,
 };
 use euhedral_inference_cuda::{
-    CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, GraphRecorder, PinnedPool, Submission, SubmitMode, ops,
+    CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, GraphRecorder, PinnedPool, RetireList, Submission,
+    SubmitMode, ops,
 };
 use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorDataType, WeightFormat, WeightLayout};
 use euhedral_inference_engine::formats::{LinearFormat, LinearMode, Q3Embedding, ScratchRegion};
@@ -59,7 +60,7 @@ use euhedral_inference_engine::stages::{
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvRetained};
-use euhedral_inference_engine::state::{SequenceDevice, SequenceState};
+use euhedral_inference_engine::state::{KvView, SequenceDevice, SequenceState};
 use euhedral_inference_engine::workspace::{BufferSlot, Workspace, WorkspaceRows};
 use euhedral_inference_settings::{KvFormat, ModelSettings, Settings};
 
@@ -126,6 +127,7 @@ struct Rig {
     lanes: LaneTable,
     pool: LanePool,
     pinned: Arc<PinnedPool>,
+    retire: Arc<RetireList>,
 }
 
 fn rig() -> Option<Rig> {
@@ -136,6 +138,7 @@ fn rig() -> Option<Rig> {
     Some(Rig {
         lanes: LaneTable::new(vec![Arc::clone(&lane)]).unwrap(),
         pinned: PinnedPool::new(&library, 64 << 20),
+        retire: Arc::new(RetireList::new()),
         library,
         lane,
         pool,
@@ -227,7 +230,7 @@ impl Rig {
     ) -> (SequenceState, KvRetained) {
         let submission = Submission::begin(&self.lane, SubmitMode::default()).unwrap();
         let gdn = GdnStates::allocate(&self.library, config, 8, &submission).unwrap();
-        let mut kv = KvCache::new(&self.library, kv_layers, 1024, format, kv_tokens, 0).unwrap();
+        let mut kv = KvCache::new(&self.library, &self.retire, kv_layers, 1024, format, kv_tokens, 0).unwrap();
         let mut retained = KvRetained::default();
         if kv_layers > 0 && kv_tokens > 0 {
             kv.reserve(&submission, &self.pinned, 0, kv_tokens, &mut retained)
@@ -2123,4 +2126,176 @@ impl<L: Launch> LaunchOnly for L {
 
 fn boxed<L: Launch + 'static>(stage: L) -> Box<dyn LaunchOnly> {
     Box::new(stage)
+}
+
+// The cache's views and the stages on an idle quantum.
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
+    let Some(rig) = rig() else { return };
+    let mut cache = KvCache::new(&rig.library, &rig.retire, 1, 1024, KvFormat::Bf16, 4096, 0).unwrap();
+    let plane = cache.plane_page_bytes();
+    let table_entries = |address: DevicePtr, entries: usize| -> Vec<u64> {
+        let mut bytes = vec![0u8; entries * 8];
+        rig.submit(|submission| ops::copy_device_to_host(submission, &mut bytes, address));
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|word| u64::from_ne_bytes(*word))
+            .collect()
+    };
+
+    // One page: a table of one slot per plane.
+    let mut retained = KvRetained::default();
+    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
+    cache.reserve(&submission, &rig.pinned, 0, 256, &mut retained).unwrap();
+    let marker = submission.finish_signalled().unwrap();
+    rig.sync();
+    let early = cache.view().ready_after(marker);
+    assert_eq!(early.ready(), Some(marker));
+    let (old_table, generation) = (early.key_table(0).unwrap(), early.table_generation(0).unwrap());
+    let first_page = cache.pages(0).next().unwrap();
+    assert_eq!(
+        table_entries(old_table, 2),
+        [first_page.get(), first_page.get() + plane]
+    );
+    assert_eq!(rig.retire.pending(), 0);
+
+    // The cache grows to four pages: a table of four slots replaces it. The early view still names the old one,
+    // and the old one is not handed to the retire list while the view holds it.
+    cache.appended(256).unwrap();
+    let mut grown = KvRetained::default();
+    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
+    cache.reserve(&submission, &rig.pinned, 256, 700, &mut grown).unwrap();
+    submission.finish_signalled().unwrap();
+    rig.sync();
+    let late = cache.view();
+    assert_ne!(late.key_table(0).unwrap(), old_table, "the cache moved to a new table");
+    assert_ne!(late.table_generation(0).unwrap(), generation);
+    assert_eq!(early.key_table(0), Some(old_table));
+    assert_eq!(early.table_generation(0), Some(generation));
+    assert_eq!(rig.retire.pending(), 0, "the early view holds the old table");
+    assert_eq!(
+        table_entries(old_table, 2),
+        [first_page.get(), first_page.get() + plane],
+        "the old table still reads"
+    );
+    let pages: Vec<u64> = cache.pages(0).map(DevicePtr::get).collect();
+    assert_eq!(pages.len(), 4);
+    assert_eq!(table_entries(late.key_table(0).unwrap(), 4)[..4], pages[..]);
+
+    // The last holder lets go: the table goes to the retire list, to be freed in stream order, not under a reader.
+    drop(early);
+    assert_eq!(rig.retire.pending(), 1);
+    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
+    assert_eq!(rig.retire.reap(|_| true, &submission).unwrap(), 1);
+    submission.finish().unwrap();
+    rig.sync();
+    drop(late);
+    assert_eq!(rig.retire.pending(), 0, "the cache still holds the new table");
+    drop(grown);
+    drop(retained);
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn the_cache_stages_wait_for_the_reservation_that_allocated_the_pages() {
+    let Some(rig) = rig() else { return };
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let workspace = rig.workspace(&config, 8, 8, &[]);
+    let sequence = rig.sequence(&config, 1, KvFormat::Nvfp4, 256).0;
+    // The marker of the submission that reserved the page (here, one that follows the reservation).
+    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
+    let marker = submission.finish_signalled().unwrap();
+    rig.sync();
+    let make = |view: KvView| {
+        Quantum::new(
+            QuantumKind::Decode,
+            1,
+            InputRecordRef::new(0),
+            Arc::clone(&workspace),
+            SequenceRefs::new(Arc::clone(&sequence.device)).with_kv(view),
+            SubmitMode::default(),
+            Arc::clone(&config),
+            rig.lanes.clone(),
+        )
+        .unwrap()
+    };
+    let (append, attend) = (attention_append(), attention_causal());
+    let ready = make(sequence.kv.view().ready_after(marker));
+    assert_eq!(append.waits(&ready), [marker]);
+    assert_eq!(attend.waits(&ready), [marker]);
+    // On the reserving lane the wait is a no-op, and the stages run.
+    assert!(rig.run(&append, &ready).is_some());
+    rig.sync();
+    let unmarked = make(sequence.kv.view());
+    assert!(append.waits(&unmarked).is_empty());
+    assert!(
+        RmsNormUnitOffset::new(
+            BufferSlot::HiddenState,
+            BufferSlot::InputNormalized,
+            DevicePtr::NULL,
+            NormRows::All
+        )
+        .waits(&ready)
+        .is_empty()
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn launching_a_stage_on_an_idle_quantum_queues_nothing_and_does_not_underflow() {
+    let Some(rig) = rig() else { return };
+    let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
+    let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
+    let workspace = rig.workspace(&config, 8, 8, &[]);
+    let selection = Arc::new(Selection::new(&rig.library, 8).unwrap());
+    // A prompt chunk that scores nothing, and a quantum of no rows: what an idle stage is idle for.
+    let silent = rig
+        .quantum(QuantumKind::Prefill, 4, 0, &workspace, &sequence, &config)
+        .with_logits_rows(0)
+        .unwrap()
+        .with_selection(selection);
+    let empty = rig.quantum(QuantumKind::Prefill, 0, 0, &workspace, &sequence, &config);
+    let format = Arc::new(StubFormat {
+        calls: AtomicUsize::new(0),
+        rows: AtomicUsize::new(0),
+        flags: AtomicUsize::new(0),
+        scratch_bytes: AtomicUsize::new(0),
+        scratch_needed: 0,
+    });
+    let argmax = Argmax::new(BufferSlot::Logits, VOCABULARY, SelectedRows::Last);
+    let each = Argmax::new(BufferSlot::Logits, VOCABULARY, SelectedRows::Each);
+    let embed = Embed::new(stub_weight(), BufferSlot::HiddenState);
+    let head = Linear::new(
+        Arc::clone(&format) as Arc<dyn LinearFormat>,
+        stub_weight(),
+        BufferSlot::FinalNormalized,
+        BufferSlot::Logits,
+        LinearRows::Logits,
+        None,
+    );
+    let final_norm = RmsNormUnitOffset::new(
+        BufferSlot::MixerHidden,
+        BufferSlot::FinalNormalized,
+        DevicePtr::NULL,
+        NormRows::Final,
+    );
+    let token = SelectedToken;
+    let launch = |stage: &dyn LaunchOnly, quantum: &Quantum| {
+        let submission = Submission::begin(&rig.lane, quantum.mode()).unwrap();
+        stage.launch_on(quantum, &submission).unwrap();
+        submission.finish().unwrap();
+        rig.sync();
+    };
+    for stage in [&argmax as &dyn LaunchOnly, &each, &head, &final_norm, &token] {
+        launch(stage, &silent);
+    }
+    launch(&embed, &empty);
+    assert_eq!(format.calls.load(Ordering::SeqCst), 0, "the head was not called");
+    // The eager stages queue nothing either, and leave no marker.
+    assert!(rig.run(&argmax, &silent).is_none());
+    assert!(rig.run(&embed, &empty).is_none());
 }

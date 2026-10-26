@@ -30,7 +30,14 @@ impl Embed {
 }
 
 impl Launch for Embed {
+    fn idle(&self, quantum: &Quantum) -> bool {
+        quantum.rows == 0
+    }
+
     fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+        if self.idle(quantum) {
+            return Ok(());
+        }
         if self.table.shape.get(1) != Some(&(quantum.config.hidden_size as u64)) {
             return Err(fatal(format!(
                 "{} is {:?} wide but the model's hidden size is {}",
