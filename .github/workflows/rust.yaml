@@ -1,0 +1,62 @@
+name: Rust workspace
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust/**"
+      - "native/include/**"
+      - "mise.toml"
+      - ".github/workflows/rust.yaml"
+  pull_request:
+    paths:
+      - "rust/**"
+      - "native/include/**"
+      - "mise.toml"
+      - ".github/workflows/rust.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ matrix.os }}
+      cancel-in-progress: true
+    env:
+      # Only Rust is installed; the shims must not install the Java and Zig toolchains on first use.
+      MISE_AUTO_INSTALL: "false"
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v5.0.0
+        with:
+          install: true
+          install_args: rust
+          cache: true
+      - name: Cache cargo registry, git checkouts and build output
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml', 'mise.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Check formatting
+        working-directory: rust
+        run: cargo fmt --all --check
+      - name: Lint
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        working-directory: rust
+        run: cargo test --workspace
