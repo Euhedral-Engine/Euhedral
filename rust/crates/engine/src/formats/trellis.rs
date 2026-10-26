@@ -217,6 +217,22 @@ impl TrellisLinear {
         block_fp8: bool,
         sink: &mut dyn FnMut(Launch) -> Result<(), CudaError>,
     ) -> Result<(), CudaError> {
+        self.plan_with(self.exact_numerics, shape, operands, rows, mode, block_fp8, sink)
+    }
+
+    /// [`TrellisLinear::plan`] with `exact` deciding whether the scalar reference runs: the format's own flag, or the
+    /// library's process-wide selection that Java's `gpu.exactNumerics()` reads.
+    #[allow(clippy::too_many_arguments, reason = "plan's arguments and the exact selection")]
+    fn plan_with(
+        &self,
+        exact: bool,
+        shape: &TrellisShape<'_>,
+        operands: &TrellisOperands,
+        rows: usize,
+        mode: LinearMode,
+        block_fp8: bool,
+        sink: &mut dyn FnMut(Launch) -> Result<(), CudaError>,
+    ) -> Result<(), CudaError> {
         let rows = rows as u64;
         if rows == 0 || rows > MAX_GRID_ROWS {
             return Err(argument(format!(
@@ -231,7 +247,7 @@ impl TrellisLinear {
             row_exact: mode.row_exact,
             block_fp8,
         };
-        if self.exact_numerics {
+        if exact {
             run.reference(sink)
         } else if mode.row_exact || rows <= self.tensor_core_max_rows {
             run.tensor_core(sink)
@@ -241,6 +257,11 @@ impl TrellisLinear {
     }
 
     /// Whether the device has the block-scaled FP8 kernels, asked of the library once.
+    ///
+    /// Java asks for the one kernel the launch would take (`TRELLIS_MMA_ROWS_FP8` below `wide-block-min-tokens`
+    /// rows, `TRELLIS_MMA_ROWS64_FP8` from there). Both live in the one architecture-specific module
+    /// (`trellis_fp8/kernels.cu`, sm_12xa), so a device has both or neither; asking for both makes the answer
+    /// independent of the rows and cacheable, and the two never differ.
     fn block_fp8(&self, library: &CudaLibrary) -> Result<bool, CudaError> {
         match self.fp8.load(Ordering::Relaxed) {
             1 => Ok(true),
@@ -304,8 +325,10 @@ impl LinearFormat for TrellisLinear {
             row_exact: mode.row_exact || submission.mode().row_exact,
             ..mode
         };
-        let block_fp8 = !self.exact_numerics && self.block_fp8(submission.lane().library())?;
-        self.plan(&shape, &operands, rows, mode, block_fp8, &mut |launch| {
+        let library = submission.lane().library();
+        let exact = self.exact_numerics || library.exact_numerics();
+        let block_fp8 = !exact && self.block_fp8(library)?;
+        self.plan_with(exact, &shape, &operands, rows, mode, block_fp8, &mut |launch| {
             if self.record {
                 ShapeRecorder::record(launch.line());
             }

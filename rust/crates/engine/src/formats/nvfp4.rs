@@ -82,7 +82,7 @@ pub fn route(
         && native_accepts(rows, in_features, sd4);
     if native {
         return Nvfp4Route::Native {
-            skinny: skinny_route(rows, in_features),
+            skinny: skinny_route(u64::from(rows), u64::from(in_features)),
         };
     }
     let qualified = rows <= 8 * DECODE_GROUPS_MAX && in_features.is_multiple_of(128) && out_features.is_multiple_of(16);
@@ -100,11 +100,11 @@ pub fn route(
 /// Whether the native route takes the shape: the skinny kernels any multiple of 256 inputs; the tile kernels' tensor
 /// maps need whole scale rows (`launch_native`).
 fn native_accepts(rows: u32, in_features: u32, sd4: bool) -> bool {
-    skinny_route(rows, in_features) || in_features.is_multiple_of(if sd4 { 512 } else { 256 })
+    skinny_route(u64::from(rows), u64::from(in_features)) || in_features.is_multiple_of(if sd4 { 512 } else { 256 })
 }
 
-fn skinny_route(rows: u32, in_features: u32) -> bool {
-    rows <= SKINNY_MAX_ROWS && in_features.is_multiple_of(256)
+fn skinny_route(rows: u64, in_features: u64) -> bool {
+    rows <= u64::from(SKINNY_MAX_ROWS) && in_features.is_multiple_of(256)
 }
 
 /// The decode tile of a shape: the 4-warp 32-row tile above 5120 inputs when the outputs allow it, else the 8-warp
@@ -139,7 +139,7 @@ fn activation_bytes(rows: u64, in_features: u64) -> u64 {
 /// skinny launch split over K, FP32 partials.
 pub fn nvfp4_native_scratch_bytes(rows: u64, in_features: u64, out_features: u64) -> u64 {
     let mut bytes = activation_bytes(rows, in_features);
-    if skinny_route(rows as u32, in_features as u32) && skinny_splits(in_features, out_features) > 1 {
+    if skinny_route(rows, in_features) && skinny_splits(in_features, out_features) > 1 {
         bytes = align256(bytes) + 4 * skinny_splits(in_features, out_features) * rows * out_features;
     }
     bytes
@@ -342,15 +342,25 @@ impl LinearFormat for Nvfp4Linear {
         )
     }
 
+    /// Enough for any launch of up to `rows` rows. The skinny kernels split over K and keep FP32 partials, which grow
+    /// with the rows up to 64 and are gone above it, so the tile route's scratch at 65 rows is smaller than the
+    /// skinny route's at 64: the answer is the larger of the two routes' at `rows`, and of the skinny route's at its
+    /// most rows. Below 9 rows no route takes scratch.
     fn scratch_bytes(&self, weight: &WeightRef, rows: usize, _mode: LinearMode) -> usize {
         let Ok((out_features, in_features)) = matrix(weight) else {
             return 0;
         };
-        if self.native_available && rows >= NATIVE_MIN_ROWS as usize {
-            nvfp4_native_scratch_bytes(rows as u64, u64::from(in_features), u64::from(out_features)) as usize
-        } else {
-            0
+        if !self.native_available || rows < NATIVE_MIN_ROWS as usize {
+            return 0;
         }
+        let (inputs, outputs) = (u64::from(in_features), u64::from(out_features));
+        let rows = rows as u64;
+        let bytes = nvfp4_native_scratch_bytes(rows, inputs, outputs).max(nvfp4_native_scratch_bytes(
+            rows.min(u64::from(SKINNY_MAX_ROWS)),
+            inputs,
+            outputs,
+        ));
+        usize::try_from(bytes).unwrap_or(usize::MAX)
     }
 }
 

@@ -77,13 +77,15 @@ var shapes = List.of(
         new Shape("mlp/gate_up", 34816, 5120, 40, new int[] {17408, 34816}),
         new Shape("mlp/down", 5120, 17408, 40, new int[] {5120}),
         new Shape("mlp/down-w56", 5120, 17408, 56, new int[] {5120}),
-        new Shape("attention/query_key", 7168, 5120, 64, new int[] {6144, 7168}));
+        new Shape("attention/query_key", 7168, 5120, 64, new int[] {6144, 7168}),
+        new Shape("attention/gate_value", 7168, 5120, 64, new int[] {6144, 7168}),
+        new Shape("attention/output", 5120, 6144, 40, new int[] {5120}));
 
 // (target blocks, tensor-core max rows, whole-K rows, wide rows, rows)
 var variants = List.of(
-        new int[][] {{560, 512, 64, 128}, {1, 2, 3, 8, 9, 32, 63, 64, 65, 127, 128, 512, 513, 1024}},
+        new int[][] {{560, 512, 64, 128}, {1, 2, 3, 5, 6, 8, 9, 20, 32, 63, 64, 65, 127, 128, 512, 513, 1024}},
         new int[][] {{384, 512, 64, 128}, {1, 8, 64, 128}},
-        new int[][] {{560, 16, 32, 64}, {8, 16, 17, 31, 32, 64, 100}},
+        new int[][] {{560, 16, 32, 64}, {5, 8, 16, 17, 20, 31, 32, 64, 100}},
         new int[][] {{1120, 512, 16, 32}, {4, 16, 32, 33}});
 
 var gpu = new RecordingGpu();

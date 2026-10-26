@@ -16,8 +16,8 @@
 #[path = "common/linear_gpu.rs"]
 mod linear_gpu;
 
-use euhedral_inference_engine::formats::{LinearMode, Nvfp4Linear};
-use linear_gpu::{Artifact, Random, activations, rig, upload, values};
+use euhedral_inference_engine::formats::{LinearMode, Nvfp4Linear, TrellisLinear};
+use linear_gpu::{Artifact, Random, activations, rig, synthetic_trellis, upload, values};
 
 const PLAIN: LinearMode = LinearMode {
     row_exact: false,
@@ -65,4 +65,34 @@ fn exact_numerics_run_every_nvfp4_launch_on_the_scalar_reference() {
     // Back off, the production kernels run again.
     let again = values(&rig.linear(&production, &weight, &x, 0, k, n, 8, PLAIN));
     assert_eq!(again, ordinary[1]);
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn exact_numerics_run_every_trellis_launch_on_the_scalar_reference() {
+    let Some(rig) = rig() else { return };
+    let mut random = Random::new(13);
+    let object = synthetic_trellis(&rig.library, &mut random, 512, 1024, 56, &[128, 512]);
+    let x = upload(&rig.library, &activations(&mut random, 8, 1024));
+    // A format that was not built for the reference follows the library's selection, as Java's does.
+    let production = TrellisLinear::new(140, 32, 128, 1024);
+    let oracle = TrellisLinear::new(140, 32, 128, 1024).with_exact_numerics();
+    let run = |format: &TrellisLinear| rig.linear(format, &object.weight, &x, 0, 1024, 512, 8, PLAIN);
+    let ordinary = run(&production);
+    let reference = run(&oracle);
+    assert_ne!(
+        ordinary, reference,
+        "the tensor-core route sums in another order than the reference"
+    );
+
+    assert!(!rig.library.exact_numerics_for_tests(true), "the switch starts off");
+    assert!(rig.library.exact_numerics());
+    let selected = run(&production);
+    assert!(rig.library.exact_numerics_for_tests(false), "and reports it was on");
+    assert!(!rig.library.exact_numerics());
+    assert_eq!(
+        selected, reference,
+        "under exact numerics the format runs the reference, bit for bit"
+    );
+    assert_eq!(run(&production), ordinary, "back off, the tensor-core route runs again");
 }
