@@ -1,7 +1,7 @@
 //! The embedding lookup of a quantum's token ids (`Stages.Embed`), and the passing of tokens between the quanta of an
 //! MTP step on the device.
 
-use euhedral_graph::{Stage, StageCx, StageError, Submitted};
+use euhedral_graph::{Marker, Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{Submission, ops};
 
 use super::{Launch, Quantum, eager, fatal};
@@ -32,6 +32,12 @@ impl Embed {
 impl Launch for Embed {
     fn idle(&self, quantum: &Quantum) -> bool {
         quantum.rows == 0
+    }
+
+    /// The upload of the quantum's input record ([`Quantum::prepare`]): every stage that follows reads the ids or the
+    /// positions of it, through this stage's marker.
+    fn waits(&self, quantum: &Quantum) -> Vec<Marker> {
+        quantum.prepared.into_iter().collect()
     }
 
     fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {

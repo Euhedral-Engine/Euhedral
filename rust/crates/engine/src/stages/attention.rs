@@ -191,7 +191,7 @@ impl Launch for KvAppend {
 /// Whether a quantum's attention runs on the decode scratch: one-row decode, a verification (row twins), and a
 /// small draft quantum, whose catch-up rows run on the twins as well (far more parallel over a long cache than a
 /// 32-row prefill tile, and drafts only propose tokens).
-fn takes_decode_scratch(kind: QuantumKind, rows: usize) -> bool {
+pub(crate) fn takes_decode_scratch(kind: QuantumKind, rows: usize) -> bool {
     rows == 1 || kind == QuantumKind::Verify || (kind == QuantumKind::Draft && rows as u64 <= DRAFT_TWIN_ROWS)
 }
 

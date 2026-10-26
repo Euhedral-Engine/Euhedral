@@ -29,7 +29,7 @@
 
 use std::sync::Arc;
 
-use euhedral_graph::{LaneId, Marker};
+use euhedral_graph::{LaneId, LanePool, Marker};
 use euhedral_inference_cuda::{
     AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena, PinnedPool, PooledPinned,
     RetireList, Submission, ops,
@@ -162,6 +162,10 @@ pub struct KvCache {
     host: Option<HostPages>,
     table_slots: u64,
     reserved: u64,
+    /// The rows that were reserved when the latest [`KvCache::reserve`] call began: what that call had to grow from.
+    reserved_before: u64,
+    /// How many times [`KvCache::reserve`] has been called: stamped into the views taken after it.
+    epoch: u64,
     submitted: u64,
     committed: u64,
 }
@@ -212,6 +216,8 @@ impl KvCache {
             host,
             table_slots: 0,
             reserved: 0,
+            reserved_before: 0,
+            epoch: 0,
             submitted: 0,
             committed: 0,
         })
@@ -311,6 +317,8 @@ impl KvCache {
                 submitted: self.submitted,
             });
         }
+        self.reserved_before = self.reserved;
+        self.epoch += 1;
         let required = start + rows;
         if required <= self.reserved {
             return Ok(());
@@ -466,6 +474,11 @@ impl KvCache {
             .map(|table| table.generation())
     }
 
+    /// The number of [`KvCache::reserve`] calls so far.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// The device region the host pages are read and written through, when the cache has host pages.
     pub fn host_region(&self) -> Option<&DeviceBuffer> {
         self.host.as_ref().map(|host| &*host.region)
@@ -505,6 +518,8 @@ impl KvCache {
             format: self.format,
             plane_page_bytes: self.plane_page_bytes,
             reserved: self.reserved,
+            reserved_before: self.reserved_before,
+            epoch: self.epoch,
             ready: None,
             tables: self
                 .store
@@ -539,6 +554,13 @@ impl KvCache {
     pub fn stage_out(&self, submission: &Submission<'_>, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
         self.view().stage_out(submission, layer, start, rows)
     }
+}
+
+/// The marker of the work that reserved a cache's rows is older than its lane's event ring and has not completed.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("the reservation's marker {} of lane {} is older than its lane's event ring and not reached", .marker.value, .marker.lane.0)]
+pub struct StaleReservation {
+    pub marker: Marker,
 }
 
 /// The page tables of one layer as a view holds them.
@@ -579,6 +601,8 @@ pub struct KvView {
     format: KvFormat,
     plane_page_bytes: u64,
     reserved: u64,
+    reserved_before: u64,
+    epoch: u64,
     ready: Option<Marker>,
     tables: Vec<Option<LayerTable>>,
     host: Option<HostView>,
@@ -602,9 +626,61 @@ impl KvView {
         self
     }
 
+    /// The view with the reserving submission's marker, if the marker can still be waited for. A wait refuses a marker
+    /// older than its lane's event ring (the lane's later markers have reused its event), so:
+    /// - a marker within the ring orders the view as [`KvView::ready_after`] does;
+    /// - an older marker whose work has completed (`lanes` has reached it) needs no ordering, and the view stays as it
+    ///   is;
+    /// - an older marker that has not been reached cannot be ordered behind at all: the owner holds the quantum back
+    ///   until it is, and asks again.
+    pub fn ordered_after(
+        self,
+        marker: Marker,
+        lanes: &LanePool,
+        library: &CudaLibrary,
+    ) -> Result<Self, StaleReservation> {
+        if library.marker_waitable(marker) {
+            Ok(self.ready_after(marker))
+        } else if lanes.reached(marker) {
+            Ok(self)
+        } else {
+            Err(StaleReservation { marker })
+        }
+    }
+
     /// Rows backed by pages when the view was taken.
     pub fn reserved(&self) -> u64 {
         self.reserved
+    }
+
+    /// The reservation this view followed: the number of [`KvCache::reserve`] calls the cache had had when the view
+    /// was taken. [`SequenceState::refs`](crate::state::SequenceState::refs) checks that exactly one call separates
+    /// the views of two quanta.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Whether the reservation that backed an append of `rows` rows at `start` had to allocate pages or upload a page
+    /// table: the latest [`KvCache::reserve`] before the view was taken began with fewer rows than the append needs.
+    /// A graph cannot repeat such a reservation, so the quantum runs stage by stage. Call `reserve` once for every
+    /// quantum, whether or not it grows.
+    pub fn grew_for(&self, start: u64, rows: u64) -> bool {
+        start + rows > self.reserved_before
+    }
+
+    /// The allocation serial of every page table of the view and of the device region host pages pass through, in
+    /// layer order: what a captured graph that reads them is keyed on.
+    pub fn generations(&self, out: &mut Vec<AllocationId>) {
+        out.extend(self.tables.iter().flatten().map(|table| table.generation));
+        if let Some(host) = &self.host {
+            out.push(host._region.generation());
+        }
+    }
+
+    /// Host pages the reserved rows reach: the pages `stage_in` and `stage_out` copy, which a graph captures the sizes
+    /// of.
+    pub fn reserved_host_pages(&self) -> u64 {
+        self.host.as_ref().map_or(0, |host| host.reserved_host_pages)
     }
 
     /// Whether appending `rows` rows at `start` fits the reserved pages.

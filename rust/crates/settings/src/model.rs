@@ -387,6 +387,22 @@ impl Default for HostSettings {
 pub struct KernelSettings {
     /// The trellis kernels.
     pub trellis: TrellisKernelSettings,
+    /// The CUDA graphs of captured quanta.
+    pub graphs: GraphKernelSettings,
+}
+
+/// The CUDA graphs of captured quanta (`kernels.graphs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphKernelSettings {
+    /// Graphs a sequence keeps for each view (decode, verification, draft) before the one admitted longest ago, or
+    /// the one whose attention geometry the sequence has passed, is released.
+    pub captures_per_view: u32,
+}
+
+impl Default for GraphKernelSettings {
+    fn default() -> Self {
+        Self { captures_per_view: 8 }
+    }
 }
 
 /// The fewest rows of a launch kept on the tensor-core route.

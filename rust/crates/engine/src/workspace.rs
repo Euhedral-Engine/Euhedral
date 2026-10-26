@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, DevicePtr};
+use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr};
 use thiserror::Error;
 
 use crate::model::ModelConfig;
@@ -249,6 +249,12 @@ impl Workspace {
     /// The expansion scratch region `region`, if the plan has one.
     pub fn scratch(&self, region: usize) -> Option<&DeviceBuffer> {
         self.scratch.get(region)
+    }
+
+    /// The allocation serial of every slot and scratch region, in slot order: what a captured graph that reads the
+    /// workspace is keyed on.
+    pub fn generations(&self) -> impl Iterator<Item = AllocationId> + '_ {
+        self.slots.iter().chain(&self.scratch).map(DeviceBuffer::generation)
     }
 
     /// The device bytes the workspace holds.

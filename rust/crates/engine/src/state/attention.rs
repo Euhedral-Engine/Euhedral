@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer};
+use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, DeviceBuffer};
 
 use crate::model::ModelConfig;
 use crate::residency::footprint::decode_scratch_bytes;
@@ -84,6 +84,18 @@ impl AttentionScratch {
     /// The drafting buffers, when the sequence drafts.
     pub fn draft(&self) -> Option<&DraftBuffers> {
         self.draft.as_ref()
+    }
+
+    /// The allocation serial of every buffer of the scratch, in a fixed order.
+    pub fn generations(&self, out: &mut Vec<AllocationId>) {
+        out.push(self.decode.generation());
+        if let Some(draft) = &self.draft {
+            out.extend([
+                draft.seed_rows.generation(),
+                draft.recursion_hidden.generation(),
+                draft.tokens.generation(),
+            ]);
+        }
     }
 
     /// The device bytes the scratch holds.

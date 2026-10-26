@@ -53,7 +53,7 @@ use euhedral_inference_engine::stages::gdn::{GdnConvolution, GdnGatedRmsNorm, Gd
 use euhedral_inference_engine::stages::linear::{Linear, LinearRows};
 use euhedral_inference_engine::stages::mtp::MtpStem;
 use euhedral_inference_engine::stages::norm::{NormRows, ResidualRmsNorm, RmsNormUnitOffset};
-use euhedral_inference_engine::stages::sampling::{Argmax, SelectedRows, SelectedToken, Selection};
+use euhedral_inference_engine::stages::sampling::{Argmax, SelectedRows, SelectedToken, Selection, SelectionPool};
 use euhedral_inference_engine::stages::{
     DraftSeed, DraftTokenWrite, InputRecordRef, LaneTable, Launch, Quantum, QuantumError, QuantumKind, SequenceRefs,
 };
@@ -240,11 +240,12 @@ impl Rig {
         self.sync();
         let scratch = AttentionScratch::allocate(&self.library, config, 8, true, 16).unwrap();
         (
-            SequenceState {
+            SequenceState::from_parts(
                 kv,
-                mtp_kv: None,
-                device: Arc::new(SequenceDevice { gdn, scratch }),
-            },
+                None,
+                Arc::new(SequenceDevice { gdn, scratch }),
+                SelectionPool::new(&self.library, 2, 8).unwrap(),
+            ),
             retained,
         )
     }
@@ -1318,7 +1319,8 @@ fn argmax_lowest_id_tie_break() {
         let drafting = rig
             .quantum(QuantumKind::Draft, 1, 0, &workspace, &sequence, &config)
             .with_selection(Arc::clone(&selection))
-            .with_draft_token_write(DraftTokenWrite { slot, ids: ids_ptr });
+            .with_draft_token_write(DraftTokenWrite { slot, ids: ids_ptr })
+            .unwrap();
         assert!(rig.run(&last, &drafting).is_some());
         assert!(rig.run(&pass, &drafting).is_some());
         rig.sync();
@@ -1381,7 +1383,8 @@ fn mtp_stem_concatenates_e_h() {
     // Seeded from rows at an address (a recursive draft's hidden).
     let draft = rig
         .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
-        .with_draft_seed(DraftSeed::Address(seed_buffer.ptr()));
+        .with_draft_seed(DraftSeed::Address(seed_buffer.ptr()))
+        .unwrap();
     assert!(rig.run(&stem, &draft).is_some());
     rig.sync();
     let packed = get(&workspace, BufferSlot::MtpPacked, 0, rows * 2 * hidden * 2);
@@ -1432,7 +1435,8 @@ fn mtp_stem_concatenates_e_h() {
     });
     let catch_up = rig
         .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
-        .with_draft_seed(DraftSeed::SeedRow(2));
+        .with_draft_seed(DraftSeed::SeedRow(2))
+        .unwrap();
     assert!(rig.run(&stem, &catch_up).is_some());
     rig.sync();
     assert!(get(&workspace, BufferSlot::MtpPacked, 0, rows * 2 * hidden * 2) == packed);
@@ -1449,7 +1453,7 @@ fn mtp_stem_concatenates_e_h() {
     let past = rig
         .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
         .with_draft_seed(DraftSeed::SeedRow(14));
-    assert!(stem.run(&past, &cx).is_err());
+    assert!(past.is_err(), "the builder refuses seed rows past the sequence's");
 }
 
 // The stages in a graph.
@@ -1862,7 +1866,9 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
     let quantum = rig
         .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
         .reading_draft_tokens(2)
-        .writing_current_token();
+        .unwrap()
+        .writing_current_token()
+        .unwrap();
     assert!(rig.run(&stage, &quantum).is_some());
     rig.sync();
     assert!(looked_up(rows) == reference(&step[2..5]), "ids from the step's tokens");
@@ -1878,13 +1884,7 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
     let past = rig
         .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
         .reading_draft_tokens(16);
-    let cx = StageCx {
-        stage: StageId(0),
-        lane: Some(LaneId(0)),
-        waits: &[],
-        lanes: &rig.pool,
-    };
-    assert!(stage.run(&past, &cx).is_err());
+    assert!(past.is_err(), "the builder refuses slots past the step's tokens");
 
     // Its launch records into a graph, and the replay does what the eager launch did.
     put(&workspace, BufferSlot::HiddenState, 0, &vec![0u8; rows * hidden * 2]);
@@ -1955,13 +1955,15 @@ fn every_stage_launches_inside_a_graph_capture_and_the_replay_selects() {
 
     // One decode quantum that selects, passes its token on and seeds drafting, with every stage of a layer's pass.
     let quantum = rig
-        .quantum(QuantumKind::Decode, 1, 0, &workspace, &sequence, &config)
+        .quantum(QuantumKind::Draft, 1, 0, &workspace, &sequence, &config)
         .with_selection(Arc::clone(&selection))
         .with_draft_seed(DraftSeed::Address(seed.ptr()))
+        .unwrap()
         .with_draft_token_write(DraftTokenWrite {
             slot: 1,
             ids: DevicePtr::NULL,
-        });
+        })
+        .unwrap();
     let stages: Vec<(&str, Box<dyn LaunchOnly>)> = vec![
         (
             "residual add",

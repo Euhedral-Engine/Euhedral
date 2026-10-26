@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 
 pub use loader::{SettingsError, SettingsErrors, known_keys, variable_name};
 pub use model::{
-    Auto, BatchingSettings, ContextSettings, CpuList, HostLayerCompute, HostLayersSettings, HostSettings,
-    KernelSettings, KvFormat, MIN_TENSOR_CORE_ROWS, MemorySettings, ModelSettings, PrefixCacheSettings,
+    Auto, BatchingSettings, ContextSettings, CpuList, GraphKernelSettings, HostLayerCompute, HostLayersSettings,
+    HostSettings, KernelSettings, KvFormat, MIN_TENSOR_CORE_ROWS, MemorySettings, ModelSettings, PrefixCacheSettings,
     RequestSettings, SamplingSettings, ServerSettings, Settings, TrellisKernelSettings, WeightStreamingSettings,
 };
 pub use retired::{key_message as retired_key_message, message as retired_message};

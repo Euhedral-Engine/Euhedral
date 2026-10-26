@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, Submission, ops};
+use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, DeviceBuffer, Submission, ops};
 
 use crate::model::{LayerKind, ModelConfig};
 use crate::residency::footprint::MINIMUM_VERIFY_ROWS;
@@ -145,5 +145,25 @@ impl GdnStates {
     /// The device bytes every layer holds.
     pub fn device_bytes(&self) -> u64 {
         self.layers.iter().flatten().map(GdnState::device_bytes).sum()
+    }
+
+    /// The allocation serial of every buffer of every layer, in layer order.
+    pub fn generations(&self, out: &mut Vec<AllocationId>) {
+        for state in self.layers.iter().flatten() {
+            out.push(state.convolution.generation());
+            out.push(state.recurrent.generation());
+            if let Some(buffers) = &state.speculative {
+                out.extend([
+                    buffers.recurrent_checkpoint.generation(),
+                    buffers.convolution_checkpoint.generation(),
+                    buffers.query_key_rows.generation(),
+                    buffers.value_z_rows.generation(),
+                    buffers.alpha_rows.generation(),
+                    buffers.beta_rows.generation(),
+                    buffers.replay_convolved.generation(),
+                    buffers.replay_output.generation(),
+                ]);
+            }
+        }
     }
 }

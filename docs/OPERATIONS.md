@@ -44,6 +44,7 @@ See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 | `host.task-parallelism` | 8 | Ingest sinks of each pool of ready host work: more spread the contention of the workers that publish and take frames. |
 | `host.max-batch-size` | auto | Most frames a lattice worker takes from its cache at once (auto is the runtime's default). `1` or `2` makes the workers poll their caches one frame at a time, so other workers can steal what waits behind a heavy frame. Read by the Rust engine; the Java engine checks the value and ignores it. |
 | `host.idle-release` | 1s | Idle time before the workers stop polling an idle pool of work; `0` never releases them. |
+| `kernels.graphs.captures-per-view` | 8 | CUDA graphs a sequence keeps for each of decode, verification and draft. Read by the Rust engine; the Java engine checks the value and ignores it. |
 | `kernels.trellis.*` | 512, auto, 64, 128 | Trellis kernel thresholds ([TRELLIS.md](quantization/TRELLIS.md#speed)): `tensor-core-max-tokens`, `target-blocks` (auto = 8 per streaming multiprocessor), `whole-k-min-tokens`, `wide-block-min-tokens`. |
 | `server.shutdown-timeout` | 10s | How long closing the engine waits for its workers to stop. |
 | `server.requests.default-max-tokens` | 4096 | Completion length when a request sets none. |

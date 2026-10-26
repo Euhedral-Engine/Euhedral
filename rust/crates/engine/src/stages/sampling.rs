@@ -5,12 +5,16 @@
 //! A key is 64 bits whose low word is `0xFFFFFFFF` minus the selected token id, so that among equal maxima the
 //! lowest id has the highest key; it is 0 when no logit is selectable (all NaN or negative infinity).
 
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use euhedral_graph::Marker;
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, DevicePtr, PinnedBuffer, Submission, ops};
+use euhedral_inference_cuda::{
+    AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, PinnedBuffer, Submission, ops,
+};
 
 use super::{Launch, Quantum, eager, fatal, launch_u32};
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
@@ -30,6 +34,9 @@ pub struct Selection {
     // Declared after the device words, which are freed first; freeing pinned memory waits for the device.
     readback: PinnedBuffer,
     capacity: usize,
+    /// Whether a quantum in flight fills the words ([`SelectionPool::acquire`]): until it is released, no other
+    /// quantum is given them.
+    held: AtomicBool,
 }
 
 impl Selection {
@@ -41,6 +48,7 @@ impl Selection {
             keys: DeviceBuffer::alloc(library, rows * KEY_BYTES)?,
             readback: PinnedBuffer::alloc(library, rows * KEY_BYTES)?,
             capacity: rows,
+            held: AtomicBool::new(false),
         })
     }
 
@@ -73,8 +81,101 @@ impl Selection {
         self.keys.ptr()
     }
 
+    /// The allocation serial of the device words, which a graph that writes them is keyed on.
+    pub fn generation(&self) -> AllocationId {
+        self.keys.generation()
+    }
+
     pub(crate) fn readback(&self) -> &PinnedBuffer {
         &self.readback
+    }
+}
+
+/// The selection words of one sequence: a few [`Selection`]s that quanta take in turn.
+///
+/// A quantum's argmax writes the device keys and copies them to the selection's pinned words; the host reads them once
+/// the quantum retired. A quantum admitted behind it on the device (the zero-gap chain) must not reach the same words
+/// before they were read, so a selection is leased to one quantum from its admission until the quantum is dropped,
+/// which the owner does after it read the keys (`HostLogits.admitted`). With every selection leased the owner holds
+/// the admission back.
+#[derive(Debug)]
+pub struct SelectionPool {
+    selections: Vec<Arc<Selection>>,
+}
+
+/// Every selection of the pool is leased to a quantum in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectionsBusy;
+
+impl fmt::Display for SelectionsBusy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("every selection of the sequence is held by a quantum in flight")
+    }
+}
+
+impl Error for SelectionsBusy {}
+
+impl SelectionPool {
+    /// `count` selections of up to `rows` rows each. The allocations wait: startup only.
+    pub fn new(library: &Arc<CudaLibrary>, count: usize, rows: usize) -> Result<SelectionPool, CudaError> {
+        let selections = (0..count.max(1))
+            .map(|_| Selection::new(library, rows).map(Arc::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SelectionPool { selections })
+    }
+
+    /// Selections in the pool.
+    pub fn len(&self) -> usize {
+        self.selections.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.selections.is_empty()
+    }
+
+    /// Selections leased to quanta in flight.
+    pub fn leased(&self) -> usize {
+        self.selections
+            .iter()
+            .filter(|selection| selection.held.load(Ordering::Acquire))
+            .count()
+    }
+
+    /// Leases a selection that no quantum holds, or refuses when every one is held. Called by the sequence's owner,
+    /// one admission at a time.
+    pub fn acquire(&self) -> Result<SelectionLease, SelectionsBusy> {
+        for selection in &self.selections {
+            if selection
+                .held
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(SelectionLease {
+                    selection: Arc::clone(selection),
+                });
+            }
+        }
+        Err(SelectionsBusy)
+    }
+}
+
+/// A selection leased to one quantum; dropping it (with the quantum, once its keys were read) returns the selection to
+/// its pool.
+#[derive(Debug)]
+pub struct SelectionLease {
+    selection: Arc<Selection>,
+}
+
+impl SelectionLease {
+    /// The leased selection.
+    pub fn selection(&self) -> &Arc<Selection> {
+        &self.selection
+    }
+}
+
+impl Drop for SelectionLease {
+    fn drop(&mut self) {
+        self.selection.held.store(false, Ordering::Release);
     }
 }
 
@@ -129,8 +230,6 @@ impl Argmax {
 }
 
 impl Launch for Argmax {
-    const SIGNALLED: bool = true;
-
     fn idle(&self, quantum: &Quantum) -> bool {
         quantum.logits_rows == 0
     }

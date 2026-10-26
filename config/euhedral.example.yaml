@@ -80,3 +80,5 @@ kernels:
     target-blocks: auto                       # optional, default auto: thread blocks the K split aims for (auto = 8 per streaming multiprocessor)
     whole-k-min-tokens: 64                    # optional, default 64: fewest rows for blocks that run every K split of their columns themselves
     wide-block-min-tokens: 128                # optional, default 128: fewest rows for blocks of 64 rows instead of 32
+  graphs:
+    captures-per-view: 8                      # optional, default 8: CUDA graphs a sequence keeps for each of decode, verification and draft before the one whose attention geometry has passed, or the one admitted longest ago, is released (read by the Rust engine; the Java engine checks the value and ignores it)

@@ -199,6 +199,45 @@ impl<'l> Submission<'l> {
     }
 }
 
+#[cfg(feature = "test-oracles")]
+impl<'l> Submission<'l> {
+    /// The test oracle of captured graphs: runs `work` with the calling thread in check mode, in which nothing is
+    /// submitted and every launch, copy and memset is hashed instead (function, launch geometry, dynamic shared
+    /// memory and parameter bytes; copy and memset addresses and sizes), and returns what `work` returned with the
+    /// hash. The selected stream is the thread's sink under capture: a call that bypasses the hashing is captured
+    /// there and never runs, and ends the check with an error. The hash of the submissions of a stage list that a
+    /// graph was captured from is the graph's identity; the same hash from the same stages at a later quantum says
+    /// the graph still repeats what they would submit.
+    pub fn hashed<T>(
+        lane: &'l CudaLane,
+        mode: SubmitMode,
+        work: impl FnOnce(&Submission<'_>) -> T,
+    ) -> Result<(T, u64), CudaError> {
+        let submission = Submission::begin(lane, mode)?;
+        let api = lane.library().api();
+        // SAFETY: the calls take no pointers; they set this thread's launch state, which the submission's drop clears.
+        let sink = unsafe { api.euhedral_cuda_submission_check_begin() };
+        if sink == 0 {
+            return Err(CudaError::Argument(
+                "the check mode's sink stream could not begin".to_string(),
+            ));
+        }
+        // SAFETY: as above; `sink` is the thread's live sink stream.
+        unsafe {
+            api.euhedral_cuda_stream_select(sink);
+            api.euhedral_cuda_submission_check();
+        }
+        let out = work(&submission);
+        // SAFETY: as above.
+        let (hash, ended) = unsafe {
+            let hash = api.euhedral_cuda_submission_finish();
+            (hash, api.euhedral_cuda_submission_check_end())
+        };
+        check("euhedral_cuda_submission_check_end", ended)?;
+        Ok((out, hash))
+    }
+}
+
 impl Drop for Submission<'_> {
     fn drop(&mut self) {
         let api = self.lane.library().api();
