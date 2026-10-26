@@ -238,6 +238,34 @@ fn the_stream_holds_back_a_split_character() {
 }
 
 #[test]
+fn settings_only_the_library_honours_are_refused() {
+    let load_with = |edit: &dyn Fn(&mut Value)| {
+        let mut json = tokenizer_json();
+        edit(&mut json);
+        load(&json, &config(), &special_tokens())
+    };
+    let refused = |edit: &dyn Fn(&mut Value)| {
+        let error = load_with(edit).unwrap_err();
+        assert!(matches!(error, TokenizerError::Unsupported(_)), "{error}");
+    };
+    refused(&|json| json["model"]["dropout"] = json!(0.1));
+    refused(&|json| json["model"]["ignore_merges"] = json!(true));
+    refused(&|json| json["model"]["continuing_subword_prefix"] = json!("##"));
+    refused(&|json| json["model"]["end_of_word_suffix"] = json!("</w>"));
+    refused(&|json| json["truncation"] = json!({"max_length": 8, "stride": 0}));
+    refused(&|json| json["padding"] = json!({"strategy": "BatchLongest"}));
+    for flag in ["lstrip", "rstrip", "single_word", "normalized"] {
+        refused(&|json| json["added_tokens"][1][flag] = json!(true));
+    }
+    // Unset spellings are accepted: null or empty affixes, false flags, null truncation and padding, no dropout.
+    assert!(load_with(&|json| json["model"]["continuing_subword_prefix"] = json!("")).is_ok());
+    assert!(load_with(&|json| json["model"]["end_of_word_suffix"] = json!("")).is_ok());
+    assert!(load_with(&|json| json["truncation"] = Value::Null).is_ok());
+    assert!(load_with(&|json| json["padding"] = Value::Null).is_ok());
+    assert!(load_with(&|json| json["model"]["dropout"] = Value::Null).is_ok());
+}
+
+#[test]
 fn a_tokenizer_that_is_not_byte_level_bpe_is_refused() {
     let refused = |edit: &dyn Fn(&mut Value)| {
         let mut json = tokenizer_json();

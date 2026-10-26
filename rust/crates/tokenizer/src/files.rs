@@ -2,6 +2,7 @@
 //! types skip the vocabulary and the merges and keep what is checked and what the decoder needs.
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::error::TokenizerError;
 
@@ -12,6 +13,8 @@ pub(crate) struct TokenizerJson {
     pub(crate) pre_tokenizer: Option<PreTokenizerJson>,
     pub(crate) model: ModelJson,
     pub(crate) added_tokens: Vec<AddedTokenJson>,
+    pub(crate) truncation: Option<Value>,
+    pub(crate) padding: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -24,6 +27,11 @@ pub(crate) struct Component {
 pub(crate) struct ModelJson {
     #[serde(rename = "type")]
     pub(crate) kind: String,
+    pub(crate) dropout: Option<f64>,
+    #[serde(default)]
+    pub(crate) ignore_merges: bool,
+    pub(crate) continuing_subword_prefix: Option<String>,
+    pub(crate) end_of_word_suffix: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +65,14 @@ pub(crate) struct AddedTokenJson {
     pub(crate) content: String,
     #[serde(default)]
     pub(crate) special: bool,
+    #[serde(default)]
+    pub(crate) lstrip: bool,
+    #[serde(default)]
+    pub(crate) rstrip: bool,
+    #[serde(default)]
+    pub(crate) single_word: bool,
+    #[serde(default)]
+    pub(crate) normalized: bool,
 }
 
 /// `tokenizer_config.json`.
@@ -134,6 +150,37 @@ impl TokenizerJson {
             return Err(TokenizerError::unsupported(
                 "byte-level encoding must not add a prefix space or apply its own expression",
             ));
+        }
+        self.check_library_only_settings()
+    }
+
+    /// The library honours settings that Java's loader ignores, so a file that sets one would encode differently.
+    fn check_library_only_settings(&self) -> Result<(), TokenizerError> {
+        let model = &self.model;
+        if model.dropout.is_some() {
+            return Err(TokenizerError::unsupported("the BPE model sets dropout"));
+        }
+        if model.ignore_merges {
+            return Err(TokenizerError::unsupported("the BPE model sets ignore_merges"));
+        }
+        let is_set = |affix: &Option<String>| affix.as_deref().is_some_and(|affix| !affix.is_empty());
+        if is_set(&model.continuing_subword_prefix) || is_set(&model.end_of_word_suffix) {
+            return Err(TokenizerError::unsupported(
+                "the BPE model sets a continuing subword prefix or an end-of-word suffix",
+            ));
+        }
+        if self.truncation.is_some() || self.padding.is_some() {
+            return Err(TokenizerError::unsupported("the file sets truncation or padding"));
+        }
+        if let Some(token) = self
+            .added_tokens
+            .iter()
+            .find(|token| token.lstrip || token.rstrip || token.single_word || token.normalized)
+        {
+            return Err(TokenizerError::unsupported(format!(
+                "added token {:?} sets lstrip, rstrip, single_word or normalized",
+                token.content
+            )));
         }
         Ok(())
     }
