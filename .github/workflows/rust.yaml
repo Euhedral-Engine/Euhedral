@@ -48,6 +48,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/bin/bindgen
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             rust/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml', 'mise.toml') }}
           restore-keys: |
@@ -56,7 +58,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y --no-install-recommends libclang-dev
-          command -v bindgen || cargo install bindgen-cli --version 0.72.1 --locked
+          cargo install bindgen-cli --version 0.72.1 --locked
       - name: Check the CUDA bindings are current
         if: runner.os == 'Linux'
         working-directory: rust
@@ -64,9 +66,7 @@ jobs:
       - name: Layers
         if: runner.os == 'Linux'
         working-directory: rust
-        run: |
-          scripts/check-layers.sh --self-test
-          scripts/check-layers.sh
+        run: scripts/check-layers.sh --self-test
       - name: Check formatting
         working-directory: rust
         run: cargo fmt --all --check

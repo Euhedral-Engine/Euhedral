@@ -3,7 +3,7 @@
 # the crates that own them, and the no-wait clippy rules apply to every library crate.
 #
 #   scripts/check-layers.sh              check the workspace (exit 1 on a violation)
-#   scripts/check-layers.sh --self-test  also prove the check fails on planted violations
+#   scripts/check-layers.sh --self-test  check the workspace, and prove the check fails on planted violations
 #
 # Part of the merge gate (mise task `rust-layers`, the `Layers` step of rust.yaml). Needs python3; reads
 # `cargo metadata` (no build). Crates in the table below that do not exist yet are ignored, so a rule is in force
@@ -19,6 +19,7 @@ fi
 
 python3 -I - "$@" "$metadata" <<'PY'
 import copy
+import fnmatch
 import json
 import os
 import sys
@@ -33,7 +34,10 @@ BENCH = "euhedral-inference-bench"
 TEST_SUPPORT = "test-support"
 XTASK = "xtask"
 
-# crate -> workspace crates it may depend on (normal and build dependencies; a crate may dev-depend on any).
+# Which dependencies count: normal and build dependencies, in every target section. Dev-dependencies are ignored by
+# every rule below, so a test may use any crate (test-support is a dev-dependency only, which this makes a rule).
+#
+# crate -> workspace crates it may depend on.
 ALLOWED = {
     SETTINGS: set(),
     EDRL: set(),
@@ -56,8 +60,16 @@ RUSTEE_OWNERS = {ENGINE, BENCH, CUDA}
 # Configuration is parsed in one place.
 YAML = "serde_yaml_ng"
 YAML_OWNERS = {SETTINGS}
-# crate -> the only external crates it may depend on (normal dependencies).
+# crate -> the only external crates it may depend on.
 EXTERNAL_ONLY = {CUDA: {"euhedral-graph", "libloading", "thiserror"}}
+# External crates no crate may depend on (glob patterns), with the rule each protects.
+DENIED = {
+    "level-zero*": "hardware agnosticism: no Intel iGPU-specific code; integrated-GPU compute goes through a "
+                   "vendor-neutral API chosen at run time",
+    "opencl3": "hardware agnosticism: no OpenCL; compute goes through CUDA or a vendor-neutral API",
+    "ocl": "hardware agnosticism: no OpenCL; compute goes through CUDA or a vendor-neutral API",
+    "core_affinity": "worker CPUs are never pinned or restricted; RustEE places the threads",
+}
 
 CANONICAL = "clippy-no-wait.toml"
 
@@ -70,8 +82,7 @@ def check(meta, clippy_texts):
         if name not in ALLOWED:
             errors.append(f"{name} is not in the layer table of scripts/check-layers.sh: place it")
             continue
-        edges = [(d["name"], d.get("kind")) for d in p["dependencies"]]
-        normal = {n for n, kind in edges if kind in (None, "build")}
+        normal = {d["name"] for d in p["dependencies"] if d.get("kind") in (None, "build")}
         local = {n for n in normal if n in names}
         external = {n for n in normal if n not in names}
 
@@ -81,10 +92,13 @@ def check(meta, clippy_texts):
         for dev_only in DEV_ONLY & local:
             errors.append(f"{name} depends on {dev_only}, which is a dev-dependency only")
 
-        if YAML in {n for n, _ in edges} and name not in YAML_OWNERS:
+        if YAML in normal and name not in YAML_OWNERS:
             errors.append(f"{name} may not depend on {YAML}: configuration is parsed in {SETTINGS} only")
         if (RUSTEE & external) and name not in RUSTEE_OWNERS:
             errors.append(f"{name} may not depend on {sorted(RUSTEE & external)}: only {sorted(RUSTEE_OWNERS)} do")
+        for pattern, why in DENIED.items():
+            for denied in sorted(n for n in external if fnmatch.fnmatchcase(n, pattern)):
+                errors.append(f"{name} may not depend on {denied}: {why}")
         if name in EXTERNAL_ONLY and external - EXTERNAL_ONLY[name]:
             errors.append(f"{name} may depend externally only on {sorted(EXTERNAL_ONLY[name])}, "
                           f"has {sorted(external - EXTERNAL_ONLY[name])}")
@@ -107,10 +121,10 @@ def clippy_for(meta):
     return texts
 
 
-def add_dependency(meta, crate, dependency, kind=None):
+def add_dependency(meta, crate, dependency, kind=None, target=None):
     for p in meta["packages"]:
         if p["name"] == crate:
-            p["dependencies"].append({"name": dependency, "kind": kind})
+            p["dependencies"].append({"name": dependency, "kind": kind, "target": target})
             return
     raise SystemExit(f"self-test: {crate} is missing from the workspace")
 
@@ -130,6 +144,12 @@ def self_test(meta, texts):
                 del planted_texts[crate]
         cases.append((description, planted, planted_texts, phrase))
 
+    plant("a build dependency outside the table", f"{EDRL} may not depend on ['{SETTINGS}']",
+          edge=(EDRL, SETTINGS, "build"))
+    plant("a target-specific dependency outside the table", f"{EDRL} may not depend on ['{CUDA}']",
+          edge=(EDRL, CUDA, None, "cfg(windows)"))
+    plant("a denied crate (level-zero)", "may not depend on level-zero-sys", edge=(EDRL, "level-zero-sys"))
+    plant("a denied crate (core_affinity)", "may not depend on core_affinity", edge=(SETTINGS, "core_affinity"))
     plant("a workspace edge outside the table", f"{EDRL} may not depend on", edge=(EDRL, CUDA))
     plant("a dependency on the cuda crate from settings", f"{SETTINGS} may not depend on", edge=(SETTINGS, CUDA))
     plant("test-support as a normal dependency", "dev-dependency only", edge=(EDRL, TEST_SUPPORT))
@@ -149,6 +169,13 @@ def self_test(meta, texts):
         found = check(planted, planted_texts)
         if not any(phrase in e for e in found):
             print(f"self-test: NOT caught: {description} (expected {phrase!r}, got {found})", file=sys.stderr)
+            ok = False
+    # Dev-dependencies are ignored: a test may use any crate, and test-support is a dev-dependency only.
+    for crate, dependency in ((EDRL, CUDA), (EDRL, TEST_SUPPORT), (SETTINGS, "serde_json"), (EDRL, "opencl3")):
+        planted = copy.deepcopy(meta)
+        add_dependency(planted, crate, dependency, "dev")
+        if check(planted, texts) != check(meta, texts):
+            print(f"self-test: a dev-dependency {crate} -> {dependency} changed the result", file=sys.stderr)
             ok = False
     # The unmodified workspace passes, and a table entry for an absent crate is ignored.
     if check(meta, texts):

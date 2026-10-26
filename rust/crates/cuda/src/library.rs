@@ -24,9 +24,12 @@ pub(crate) const MAX_LANES: usize = 64;
 /// directory, so its runtime and NVRTC load first too. Linux finds them through the library's `$ORIGIN`.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const RUNTIME: &[&str] = &["libnvrtc-builtins.so.13.1"];
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 const RUNTIME: &[&str] = &["cudart64_13.dll", "nvrtc-builtins64_131.dll", "nvrtc64_130_0.dll"];
-#[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), windows)))]
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+)))]
 const RUNTIME: &[&str] = &[];
 
 /// The loaded CUDA library: its entry points, the device it bound, and the event rings of the lanes created on it.
@@ -181,12 +184,22 @@ impl CudaLibrary {
         slot.set(ring).map_err(|ring| (CudaError::LaneInUse(id), ring))
     }
 
-    /// The event ring of lane `id`.
+    /// The event ring of lane `id`; its events live as long as the library.
     pub(crate) fn ring(&self, id: LaneId) -> Result<&EventRing, CudaError> {
         self.rings
             .get(usize::from(id.0))
             .and_then(OnceLock::get)
             .ok_or(CudaError::UnknownLane(id))
+    }
+}
+
+impl Drop for CudaLibrary {
+    fn drop(&mut self) {
+        // Lane ids are never reused, so no event is destroyed while a lane could still wait on it: they go together,
+        // here, before the library handle closes.
+        for ring in self.rings.iter().filter_map(OnceLock::get) {
+            ring.destroy(&self.api);
+        }
     }
 }
 
@@ -260,6 +273,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no-wait, blocking I/O: the test writes a fixture file"
+    )]
     fn a_library_without_its_runtime_beside_it_names_what_is_missing() {
         let product = tempfile::tempdir().unwrap();
         let lib = product.path().join("lib");

@@ -1,8 +1,10 @@
 //! Repository tasks.
 //!
 //! `cargo xtask bindings` regenerates `crates/cuda/src/sys.rs` from `native/include/euhedral_cuda.h` with the
-//! `bindgen` command (`cargo install bindgen-cli --version 0.72.1 --locked`; it needs libclang). With `--check` it
-//! regenerates into `target/` and fails when the checked-in file differs.
+//! `bindgen` command, which must be exactly version 0.72.1 (`cargo install bindgen-cli --version 0.72.1 --locked`) so
+//! the output does not drift. bindgen also needs libclang; its version is not pinned (the generated declarations do
+//! not depend on it for this header). With `--check` it regenerates into `target/` and fails when the checked-in file
+//! differs.
 
 // A build tool, not a library crate: it has no clippy.toml of the no-wait bans, and its output, its `expect` and its
 // exit are its interface.
@@ -22,6 +24,7 @@ const HEADER: &str = "native/include/euhedral_cuda.h";
 const OUTPUT: &str = "rust/crates/cuda/src/sys.rs";
 const CHECK_OUTPUT: &str = "rust/target/xtask/sys.rs";
 const LIBRARY_STRUCT: &str = "EuhedralCuda";
+const BINDGEN_VERSION: &str = "0.72.1";
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -82,6 +85,7 @@ fn bindings(check: bool) -> Result<(), String> {
 /// fails to load with the symbol's name. `euhedral_cuda_submission_stream` is declared for the library's own sources
 /// and is not exported.
 fn generate(root: &Path, output: &Path) -> Result<(), String> {
+    require_bindgen_version()?;
     let status = Command::new("bindgen")
         .current_dir(root)
         .arg(HEADER)
@@ -110,5 +114,23 @@ fn generate(root: &Path, output: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("bindgen failed: {status}"))
+    }
+}
+
+/// Fails unless `bindgen --version` reports [`BINDGEN_VERSION`].
+fn require_bindgen_version() -> Result<(), String> {
+    let install = format!("install it with `cargo install bindgen-cli --version {BINDGEN_VERSION} --locked`");
+    let output = Command::new("bindgen")
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("cannot run bindgen ({error}); {install}"))?;
+    let reported = String::from_utf8_lossy(&output.stdout);
+    let version = reported.split_whitespace().last().unwrap_or_default();
+    if version == BINDGEN_VERSION {
+        Ok(())
+    } else {
+        Err(format!(
+            "bindgen {BINDGEN_VERSION} is required, found {reported:?}; {install}"
+        ))
     }
 }
