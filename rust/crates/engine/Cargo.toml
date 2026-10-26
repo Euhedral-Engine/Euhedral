@@ -1,0 +1,27 @@
+[package]
+name = "euhedral-inference-engine"
+version = "0.1.0"
+description = "The Qwen3.8 engine on RustEE: the runtime, the residency planner, the weight loader, the workspace and the sequence state."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+euhedral-core.workspace = true
+euhedral-graph = { workspace = true, features = ["async-io"] }
+euhedral-hardware-utils.workspace = true
+euhedral-hashing.workspace = true
+euhedral-inference-cuda = { path = "../cuda" }
+euhedral-inference-edrl = { path = "../edrl" }
+euhedral-inference-settings = { path = "../settings" }
+log.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+euhedral-inference-cuda = { path = "../cuda", features = ["test-oracles"] }
+sha2.workspace = true
+tempfile.workspace = true
+test-support = { path = "../test-support" }
+
+[lints]
+workspace = true

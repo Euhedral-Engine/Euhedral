@@ -445,6 +445,9 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_qwen4_launch(int32_t kernel, uint32_t gri
 /// several modules; the launcher checks every argument's count and width against the compiled kernel.
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_kernel_count(void);
 EUHEDRAL_CUDA_EXPORT const char* euhedral_cuda_linear_kernel_name(int index);
+/// 1 when kernel `kernel` runs on this device, 0 when it does not (the kernels of an architecture-specific module are
+/// unavailable elsewhere), else a negative status.
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_kernel_available(int32_t kernel);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_launch(int32_t kernel, uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
         uint32_t block_x, uint32_t block_y, uint32_t block_z, uint32_t shared_bytes,
         const uint64_t* words, const uint8_t* sizes, int32_t count);

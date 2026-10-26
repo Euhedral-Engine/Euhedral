@@ -521,6 +521,9 @@ fn leaves() -> Vec<Leaf> {
             assign!(s.memory.gpu_limit, auto_or(t, |t| size(t, 1)))
         }),
         fixed("memory.gpu-reserve", |s, t| assign!(s.memory.gpu_reserve, size(t, 0))),
+        optional("memory.runtime-reserve", |s, t| {
+            assign!(s.memory.runtime_reserve, auto_or(t, |t| size(t, 0)))
+        }),
         optional("memory.pinned-buffer-pool", |s, t| {
             assign!(s.memory.pinned_buffer_pool, auto_or(t, |t| size(t, 0)))
         }),
@@ -551,6 +554,9 @@ fn leaves() -> Vec<Leaf> {
         }),
         fixed("host.idle-release", |s, t| {
             assign!(s.host.idle_release, duration(t, false))
+        }),
+        optional("host.max-batch-size", |s, t| {
+            assign!(s.host.max_batch_size, auto_or(t, |t| int(t, 1, COUNT_MAX)))
         }),
         optional("host.native-cache", |s, t| {
             assign!(s.host.native_cache, auto_or(t, |t| Ok(PathBuf::from(t))))

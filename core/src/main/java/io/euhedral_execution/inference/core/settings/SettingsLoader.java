@@ -330,6 +330,9 @@ public final class SettingsLoader {
         m.put("memory.gpu-limit", optional(size(1)));
         m.put("memory.gpu-reserve", fixed(size(0)));
         m.put("memory.pinned-buffer-pool", optional(size(0)));
+        // Read by the Rust engine, whose planner sizes the dense model's runtime reserve with it (Java uses 1280 MiB);
+        // this engine checks the value and does not use it.
+        m.put("memory.runtime-reserve", optional(size(0)));
         m.put("memory.weight-streaming.concurrent-reads", fixed(integer(1, Integer.MAX_VALUE)));
         m.put("memory.weight-streaming.read-split", fixed(integer(1, Integer.MAX_VALUE)));
         m.put("memory.weight-streaming.copy-streams", fixed(integer(1, Integer.MAX_VALUE)));
@@ -344,6 +347,9 @@ public final class SettingsLoader {
         m.put("host.task-parallelism", fixed(integer(1, Integer.MAX_VALUE)));
         m.put("host.idle-release", fixed(duration(false)));
         m.put("host.native-cache", optional(SettingsLoader::path));
+        // Read by the Rust engine, which sizes its lattice's batches with it; this engine checks the value and does not
+        // use it.
+        m.put("host.max-batch-size", optional(integer(1, Integer.MAX_VALUE)));
 
         m.put(
                 "kernels.trellis.tensor-core-max-tokens",

@@ -4,6 +4,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+use euhedral_graph::IoMemory;
+
 use crate::error::CudaError;
 use crate::library::CudaLibrary;
 use crate::memory::PinnedBuffer;
@@ -32,6 +35,7 @@ pub struct PinnedPool {
     library: Arc<CudaLibrary>,
     limit_bytes: u64,
     held_bytes: AtomicU64,
+    allocated_bytes: AtomicU64,
     classes: Box<[Stack<PinnedBuffer>]>,
 }
 
@@ -51,6 +55,7 @@ impl PinnedPool {
             library: Arc::clone(library),
             limit_bytes,
             held_bytes: AtomicU64::new(0),
+            allocated_bytes: AtomicU64::new(0),
             classes: (0..CLASSES).map(|_| Stack::new()).collect(),
         })
     }
@@ -67,13 +72,23 @@ impl PinnedPool {
                 self.held_bytes.fetch_sub(capacity as u64, Ordering::Relaxed);
                 buffer
             }
-            None => PinnedBuffer::alloc(&self.library, capacity)?,
+            None => {
+                let buffer = PinnedBuffer::alloc(&self.library, capacity)?;
+                self.allocated_bytes.fetch_add(capacity as u64, Ordering::Relaxed);
+                buffer
+            }
         };
         Ok(PooledPinned {
             pool: Arc::clone(self),
             buffer: Some(buffer),
             len: bytes,
         })
+    }
+
+    /// Bytes of pinned memory this pool has allocated and not freed: the buffers on loan and the released ones. An
+    /// `acquire` that has to allocate raises it, so a stretch of work that must not allocate leaves it where it was.
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes.load(Ordering::Relaxed)
     }
 
     /// Bytes of released buffers waiting for reuse.
@@ -94,6 +109,7 @@ impl PinnedPool {
             while self.over_limit_bytes() > 0 {
                 let Some(buffer) = self.classes[class].pop() else { break };
                 self.held_bytes.fetch_sub(buffer.len() as u64, Ordering::Relaxed);
+                self.allocated_bytes.fetch_sub(buffer.len() as u64, Ordering::Relaxed);
                 drop(buffer);
                 freed += 1;
             }
@@ -148,8 +164,51 @@ impl PooledPinned {
         self.len
     }
 
+    /// The bytes the loan can hold: its size class.
+    pub fn capacity(&self) -> usize {
+        self.buffer().len()
+    }
+
+    /// Sets the bytes the loan stands for, at most its [`capacity`](Self::capacity): a loan reused for a shorter
+    /// piece, or a longer one, without a new allocation.
+    pub fn set_len(&mut self, len: usize) -> Result<(), CudaError> {
+        if len == 0 || len > self.capacity() {
+            return Err(CudaError::Argument(format!(
+                "a loan of {} bytes cannot stand for {len} bytes",
+                self.capacity()
+            )));
+        }
+        self.len = len;
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+/// A loan is a region `AsyncIo::read_into` can fill: the first [`PooledPinned::len`] bytes of the pooled buffer. The
+/// loan comes back in the continuation, so dropping it there returns the buffer to the pool.
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+// SAFETY: the region is the first `len` bytes of the pooled `PinnedBuffer`, which `IoMemory for PinnedBuffer` covers:
+// live, valid for reads and writes, and in place when the loan moves (the loan holds the buffer, whose pointer is
+// raw). `len` is at most the buffer's size (`acquire` rounds the request up to a size class) and never changes. The
+// loan is exclusive, so nothing else refers to the region while the operation owns the loan. A loan the engine
+// leaks (a ring that broke) is never dropped, so its buffer never returns to the pool while the kernel may write it.
+unsafe impl IoMemory for PooledPinned {
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant: a loan holds its buffer until it is dropped"
+    )]
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.buffer
+            .as_mut()
+            .expect("a loan holds its buffer until dropped")
+            .as_mut_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.len
     }
 }
 

@@ -247,6 +247,9 @@ pub struct MemorySettings {
     pub gpu_limit: Auto<ByteSize>,
     /// Device memory left for other programs.
     pub gpu_reserve: ByteSize,
+    /// Device memory the dense model's plan keeps beside the weights and the cache for the first sequence's state, the
+    /// workspaces and the kernel modules; `auto` is 1280 MiB.
+    pub runtime_reserve: Auto<ByteSize>,
     /// Released pinned buffers kept for reuse.
     pub pinned_buffer_pool: Auto<ByteSize>,
     /// Streaming of weights from disk.
@@ -262,6 +265,7 @@ impl Default for MemorySettings {
             host_weights_limit: Auto::Auto,
             gpu_limit: Auto::Auto,
             gpu_reserve: ByteSize::mib(700),
+            runtime_reserve: Auto::Auto,
             pinned_buffer_pool: Auto::Auto,
             weight_streaming: WeightStreamingSettings::default(),
             host_layers: HostLayersSettings::default(),
@@ -359,6 +363,9 @@ pub struct HostSettings {
     pub task_parallelism: u32,
     /// Idle time before workers are released; zero never releases them.
     pub idle_release: Duration,
+    /// The most frames a lattice worker takes from its cache at once; `auto` is the runtime's default. 1 or 2 makes the
+    /// workers poll their caches one frame at a time, so that other workers can steal what waits behind a heavy frame.
+    pub max_batch_size: Auto<u32>,
     /// Where native files are unpacked; `auto` is the user's cache directory.
     pub native_cache: Auto<PathBuf>,
 }
@@ -369,6 +376,7 @@ impl Default for HostSettings {
             cpus: Auto::Auto,
             task_parallelism: 8,
             idle_release: Duration::from_secs(1),
+            max_batch_size: Auto::Auto,
             native_cache: Auto::Auto,
         }
     }

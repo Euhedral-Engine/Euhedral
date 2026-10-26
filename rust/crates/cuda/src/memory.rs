@@ -6,6 +6,8 @@ use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+use euhedral_graph::IoMemory;
 use euhedral_graph::Marker;
 
 use crate::error::{CudaError, check};
@@ -332,6 +334,25 @@ impl PinnedBuffer {
     }
 }
 
+/// A pinned buffer is a region `AsyncIo::read_into` can fill: the file's bytes land in page-locked memory, ready for
+/// a copy engine, with no staging copy in between.
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+// SAFETY: the pointer addresses `len` bytes of one live `cudaHostAlloc` allocation, valid for reads and writes, that
+// the buffer owns exclusively and that stays where it is when the value moves: the buffer holds a raw `NonNull`
+// pointer to memory outside Rust's allocator, so a move retags nothing. Every bit pattern is a valid byte, which is
+// all `initialized` can mean for memory a kernel overwrites (the same claim `as_slice` makes). The region is
+// exclusively the operation's from submission until the continuation gets the buffer back, because the operation owns
+// the value, and the value touches the region only through this pointer. `len` never changes.
+unsafe impl IoMemory for PinnedBuffer {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.pointer.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
 impl Drop for PinnedBuffer {
     #[allow(
         clippy::disallowed_methods,
@@ -380,6 +401,13 @@ impl HostWeightsArena {
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.pointer.as_ptr()
+    }
+
+    /// The start of the arena as a pointer the device may write through. The arena's owner promises not to read or
+    /// write the bytes a queued device copy writes until it has retired; this crate's copy operations are the only
+    /// callers.
+    pub(crate) fn device_writable_ptr(&self) -> *mut u8 {
         self.pointer.as_ptr()
     }
 

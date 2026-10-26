@@ -37,10 +37,12 @@ See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 | `memory.host-limit` | automatic | Host memory the engine may use (pinned weights, the expert tier): by default what the machine can spare (90% of the available memory, never closer than 4 GiB to exhaustion, less the runtime's own reserve). |
 | `memory.host-weights-limit` | the host limit's pinnable part | Pinned host memory for host-backed weights and the disk window. |
 | `memory.gpu-limit` | the free device memory | Device memory the residency plan may use, at most what is free. |
-| `memory.gpu-reserve` | 700MiB | Device memory a Flash-Next plan leaves free for other programs on the GPU. |
+| `memory.gpu-reserve` | 700MiB | Device memory a Flash-Next plan leaves free for other programs on the GPU. The dense Qwen3.8 plan does not use it: its budget is the free memory, at most `memory.gpu-limit`. |
+| `memory.runtime-reserve` | 1280MiB | Device memory the dense Qwen3.8 plan keeps beside the weights and the cache for the first sequence's GDN state, the execution workspaces, the shared scratch and the kernel modules loaded after the model. Read by the Rust engine; the Java engine checks the value and uses 1280MiB. |
 | `memory.pinned-buffer-pool` | 1/256 of the machine's memory, at least 64 MiB | Released pinned staging buffers kept for reuse. |
 | `memory.weight-streaming.*` | 8, 1, 4, 2 | Flash-Next expert streaming: `concurrent-reads` (records read from the artifact at once), `read-split` (parts one record read is split into), `copy-streams` (CUDA streams copying experts to the GPU), `gpu-streams` (device lanes a step spreads over). |
 | `host.task-parallelism` | 8 | Ingest sinks of each pool of ready host work: more spread the contention of the workers that publish and take frames. |
+| `host.max-batch-size` | auto | Most frames a lattice worker takes from its cache at once (auto is the runtime's default). `1` or `2` makes the workers poll their caches one frame at a time, so other workers can steal what waits behind a heavy frame. Read by the Rust engine; the Java engine checks the value and ignores it. |
 | `host.idle-release` | 1s | Idle time before the workers stop polling an idle pool of work; `0` never releases them. |
 | `kernels.trellis.*` | 512, auto, 64, 128 | Trellis kernel thresholds ([TRELLIS.md](quantization/TRELLIS.md#speed)): `tensor-core-max-tokens`, `target-blocks` (auto = 8 per streaming multiprocessor), `whole-k-min-tokens`, `wide-block-min-tokens`. |
 | `server.shutdown-timeout` | 10s | How long closing the engine waits for its workers to stop. |

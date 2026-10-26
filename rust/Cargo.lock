@@ -286,7 +286,7 @@ checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 [[package]]
 name = "euhedral-core"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=377201b2b7f617483b4f2e6c8d0f1060ea4f7d11#377201b2b7f617483b4f2e6c8d0f1060ea4f7d11"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=97fc2c49d0fd7fb99f5193a841d41998732134e4#97fc2c49d0fd7fb99f5193a841d41998732134e4"
 dependencies = [
  "euhedral-data-structures",
  "euhedral-hardware-utils",
@@ -297,21 +297,23 @@ dependencies = [
 [[package]]
 name = "euhedral-data-structures"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=377201b2b7f617483b4f2e6c8d0f1060ea4f7d11#377201b2b7f617483b4f2e6c8d0f1060ea4f7d11"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=97fc2c49d0fd7fb99f5193a841d41998732134e4#97fc2c49d0fd7fb99f5193a841d41998732134e4"
 
 [[package]]
 name = "euhedral-graph"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=377201b2b7f617483b4f2e6c8d0f1060ea4f7d11#377201b2b7f617483b4f2e6c8d0f1060ea4f7d11"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=97fc2c49d0fd7fb99f5193a841d41998732134e4#97fc2c49d0fd7fb99f5193a841d41998732134e4"
 dependencies = [
  "euhedral-core",
+ "io-uring",
  "libc",
+ "windows-sys",
 ]
 
 [[package]]
 name = "euhedral-hardware-utils"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=377201b2b7f617483b4f2e6c8d0f1060ea4f7d11#377201b2b7f617483b4f2e6c8d0f1060ea4f7d11"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=97fc2c49d0fd7fb99f5193a841d41998732134e4#97fc2c49d0fd7fb99f5193a841d41998732134e4"
 dependencies = [
  "libc",
  "log",
@@ -321,7 +323,7 @@ dependencies = [
 [[package]]
 name = "euhedral-hashing"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=377201b2b7f617483b4f2e6c8d0f1060ea4f7d11#377201b2b7f617483b4f2e6c8d0f1060ea4f7d11"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=97fc2c49d0fd7fb99f5193a841d41998732134e4#97fc2c49d0fd7fb99f5193a841d41998732134e4"
 
 [[package]]
 name = "euhedral-inference-bench"
@@ -351,6 +353,24 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "serde_json",
+ "test-support",
+ "thiserror",
+]
+
+[[package]]
+name = "euhedral-inference-engine"
+version = "0.1.0"
+dependencies = [
+ "euhedral-core",
+ "euhedral-graph",
+ "euhedral-hardware-utils",
+ "euhedral-hashing",
+ "euhedral-inference-cuda",
+ "euhedral-inference-edrl",
+ "euhedral-inference-settings",
+ "log",
+ "sha2",
+ "tempfile",
  "test-support",
  "thiserror",
 ]
@@ -456,6 +476,17 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed3bd0ecfbb87805f538bb7b32e5239ca0763890c623e349860ecba69469f2bb"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]

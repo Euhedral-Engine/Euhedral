@@ -15,7 +15,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::error::{CudaError, check};
-use crate::memory::{DevicePtr, PinnedBuffer};
+use crate::memory::{DevicePtr, HostWeightsArena, PinnedBuffer};
 use crate::submission::Submission;
 
 /// Calls the C entry point `$name` and turns its status into a `Result`.
@@ -119,6 +119,59 @@ pub unsafe fn copy_device_to_readback(
         submission,
         euhedral_cuda_copy_device_to_readback(start.cast(), source.as_const(), bytes as u64)
     )
+}
+
+/// Queues the copy of `bytes` bytes at `offset` of a host-weights arena to the device.
+///
+/// # Safety
+/// The copy runs after this call returns. `source` must stay alive, and its bytes in that range unmodified, until the
+/// lane's work up to this copy has retired.
+pub unsafe fn copy_host_weights_to_device(
+    submission: &Submission<'_>,
+    destination: DevicePtr,
+    source: &HostWeightsArena,
+    offset: usize,
+    bytes: usize,
+) -> Result<(), CudaError> {
+    let start = arena_range(source, offset, bytes)?;
+    // SAFETY: `start` is inside the arena, which the caller keeps alive and unmodified.
+    entry!(
+        submission,
+        euhedral_cuda_copy_upload_to_device(destination.as_mut(), start.cast_const().cast(), bytes as u64)
+    )
+}
+
+/// Queues the copy of `bytes` device bytes into a host-weights arena at `offset`.
+///
+/// # Safety
+/// The copy runs after this call returns. `destination` must stay alive, and its bytes in that range neither read
+/// nor written by the host, until the lane's work up to this copy has retired. No other copy may write the range
+/// meanwhile.
+pub unsafe fn copy_device_to_host_weights(
+    submission: &Submission<'_>,
+    destination: &HostWeightsArena,
+    offset: usize,
+    source: DevicePtr,
+    bytes: usize,
+) -> Result<(), CudaError> {
+    let start = arena_range(destination, offset, bytes)?;
+    // SAFETY: the range is inside the arena, which the caller keeps alive and unread.
+    entry!(
+        submission,
+        euhedral_cuda_copy_device_to_readback(start.cast(), source.as_const(), bytes as u64)
+    )
+}
+
+/// The address of `bytes` at `offset` of `arena`, refused when they leave it.
+fn arena_range(arena: &HostWeightsArena, offset: usize, bytes: usize) -> Result<*mut u8, CudaError> {
+    match offset.checked_add(bytes) {
+        // SAFETY: `offset` is within the arena.
+        Some(end) if end <= arena.len() => Ok(unsafe { arena.device_writable_ptr().add(offset) }),
+        _ => Err(CudaError::Argument(format!(
+            "{bytes} bytes at offset {offset} lie outside a {} byte host arena",
+            arena.len()
+        ))),
+    }
 }
 
 /// The address of `bytes` at `offset` of `buffer`, refused when they leave it.
@@ -259,6 +312,43 @@ pub fn linear_launch(
     entry!(
         submission,
         euhedral_cuda_linear_launch(
+            kernel,
+            grid[0],
+            grid[1],
+            grid[2],
+            block[0],
+            block[1],
+            block[2],
+            shared_bytes,
+            words.as_ptr(),
+            sizes.as_ptr(),
+            count,
+        )
+    )
+}
+
+/// Launches kernel `kernel` of the Flash-Next table, with the arguments laid out as [`linear_launch`] takes them.
+pub fn qwen4_launch(
+    submission: &Submission<'_>,
+    kernel: i32,
+    grid: [u32; 3],
+    block: [u32; 3],
+    shared_bytes: u32,
+    words: &[u64],
+    sizes: &[u8],
+) -> Result<(), CudaError> {
+    if words.len() != sizes.len() {
+        return Err(CudaError::Argument(format!(
+            "a qwen4 launch has {} argument words but {} sizes",
+            words.len(),
+            sizes.len()
+        )));
+    }
+    let count = i32::try_from(words.len())
+        .map_err(|_| CudaError::Argument("a qwen4 launch has too many arguments".to_string()))?;
+    entry!(
+        submission,
+        euhedral_cuda_qwen4_launch(
             kernel,
             grid[0],
             grid[1],
