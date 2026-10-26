@@ -2,13 +2,12 @@
 //!
 //! A graph of a chain needs one lane; a fan-out needs as many as the stages that can run at once. So the lane count is
 //! the width of the widest graph: the most stages no edge orders, which is the size of a largest antichain (Dilworth:
-//! the stage count less a largest matching of the ordering). The path policy (`StageGraph.markPaths`) then keeps a
-//! graph's critical chain on one lane and spreads the other branches of a fan-out.
+//! the stage count less a largest matching of the ordering). RustEE's `StageGraph` places the stages by the path
+//! policy (`StageGraph.markPaths`): it keeps a graph's critical chain on one lane and gives the other branches of a
+//! fan-out lanes of their own; [`path_predecessors`] is the same rule, which the plan reads to know where a chain of a
+//! lane ends.
 
 use std::collections::VecDeque;
-use std::mem;
-
-use euhedral_graph::LaneId;
 
 /// A set of node indices as words.
 fn words(len: usize) -> usize {
@@ -167,62 +166,16 @@ pub(crate) fn path_predecessors(edges: &[Vec<usize>]) -> Vec<Option<usize>> {
     path
 }
 
-/// The lane each stage runs on under the path policy (`LanePool.choose`), with `lanes` lanes: a root runs on the home
-/// lane (lane 0); a stage continues the lane of its path predecessor; a stage that continues no lane (a branch of a
-/// fan-out that is not the critical one) takes the next lane in turn, after the home lane. `edges[node]` lists the
-/// nodes before `node`.
-///
-/// RustEE's graph continues the lane of a stage's predecessor on the longest path from a root and spreads only the
-/// roots, so the plan states each stage's lane (`StageSpec::lanes` of one lane) and the graph keeps it.
-pub(crate) fn path_placement(edges: &[Vec<usize>], lanes: usize) -> Vec<LaneId> {
-    let lanes = lanes.max(1);
-    let path = path_predecessors(edges);
-    let mut placed: Vec<LaneId> = Vec::with_capacity(edges.len());
-    let mut turn = 0usize;
-    for (node, predecessors) in edges.iter().enumerate() {
-        let lane = match path[node] {
-            // The path predecessor comes first: edges point to earlier nodes.
-            Some(predecessor) => placed[predecessor],
-            None if predecessors.is_empty() => LaneId(0),
-            None if lanes == 1 => LaneId(0),
-            None => {
-                // The lanes after the home lane, in turn.
-                let lane = LaneId((1 + turn % (lanes - 1)) as u16);
-                turn += 1;
-                lane
-            }
-        };
-        placed.push(lane);
+/// Which stages end a chain of lane continuations: those no stage continues the lane of (`path[s]` names no later
+/// stage's predecessor). RustEE's graph puts a stage on the lane of its path predecessor and every other branch on a
+/// lane of its own, so a lane's last marker belongs to the end of a chain; those stages signal. `edges[node]` lists
+/// the nodes before `node`.
+pub(crate) fn chain_ends(edges: &[Vec<usize>]) -> Vec<bool> {
+    let mut continued = vec![false; edges.len()];
+    for predecessor in path_predecessors(edges).into_iter().flatten() {
+        continued[predecessor] = true;
     }
-    placed
-}
-
-/// Which stages end a lane: those with no descendant on their own lane. A graph's retirement boundary is the latest
-/// marker per lane, and the latest marker of a lane is that of one of these (two of them when no edge orders them).
-/// `edges[node]` lists the nodes before `node`; `lanes[node]` is the lane of `node`.
-pub(crate) fn lane_sinks(edges: &[Vec<usize>], lanes: &[LaneId]) -> Vec<bool> {
-    let count = edges.len();
-    // below[node]: the nodes after `node` by any chain, as bits.
-    let mut after: Vec<Vec<u64>> = vec![vec![0; words(count)]; count];
-    for node in (0..count).rev() {
-        let mut mine = mem::take(&mut after[node]);
-        // `node` precedes its successors, which are later: they are already complete.
-        for successor in node + 1..count {
-            if edges[successor].contains(&node) {
-                for (word, other) in mine.iter_mut().zip(&after[successor]) {
-                    *word |= other;
-                }
-                mine[successor / 64] |= 1 << (successor % 64);
-            }
-        }
-        after[node] = mine;
-    }
-    (0..count)
-        .map(|node| {
-            !(node + 1..count)
-                .any(|later| after[node][later / 64] >> (later % 64) & 1 == 1 && lanes[later] == lanes[node])
-        })
-        .collect()
+    continued.into_iter().map(|continued| !continued).collect()
 }
 
 #[cfg(test)]
@@ -293,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn the_critical_chain_keeps_one_lane_and_the_other_branches_take_lanes_in_turn() {
+    fn the_critical_successor_continues_the_lane_and_the_other_branches_are_left_to_take_lanes() {
         // 0 feeds 1, 2 and 3; 5 joins 4, 2 and 3. 1 -> 4 -> 5 is the longest path from 0.
         let edges = [vec![], vec![0], vec![0], vec![0], vec![1], vec![4, 2, 3]];
         let path = path_predecessors(&edges);
@@ -306,51 +259,30 @@ mod tests {
         assert_eq!(path[3], None);
         assert_eq!(path[4], Some(1));
         assert_eq!(path[5], Some(4));
-        let lanes = path_placement(&edges, 3);
-        assert_eq!(lanes[0], LaneId(0));
-        assert_eq!(lanes[1], LaneId(0), "the critical chain stays on the home lane");
-        assert_eq!(lanes[4], LaneId(0));
-        assert_eq!(lanes[5], LaneId(0));
+    }
+
+    #[test]
+    fn of_equal_heights_the_first_listed_and_into_a_join_the_last_visited() {
+        // 0 feeds 1 and 2 (equal heights): the first listed, 1, continues. 3 joins 1 and 2: both name it critical, and the
+        // one visited last continues it.
+        let edges = [vec![], vec![0], vec![0], vec![1, 2]];
+        let path = path_predecessors(&edges);
+        assert_eq!(path[1], Some(0));
+        assert_eq!(path[2], None);
         assert_eq!(
-            lanes[2],
-            LaneId(1),
-            "the first branch off the chain takes the next lane"
+            path[3],
+            Some(2),
+            "the join continues the last visited of the predecessors that name it"
         );
-        assert_eq!(lanes[3], LaneId(2));
     }
 
     #[test]
-    fn branches_take_the_lanes_after_the_home_lane_in_turn_and_never_the_home_lane() {
-        // Six branches off a root, joined: with 3 lanes they alternate between lanes 1 and 2.
-        let mut edges = vec![vec![]];
-        edges.extend((0..6).map(|_| vec![0]));
-        edges.push((1..=6).collect());
-        let lanes = path_placement(&edges, 3);
-        assert_eq!(lanes[1], LaneId(0), "the first branch is the critical chain");
-        let others: Vec<u16> = lanes[2..7].iter().map(|lane| lane.0).collect();
-        assert_eq!(others, vec![1, 2, 1, 2, 1]);
-        assert!(path_placement(&edges, 2)[2..7].iter().all(|lane| *lane == LaneId(1)));
-    }
-
-    #[test]
-    fn a_stage_signals_when_no_stage_after_it_runs_on_its_lane() {
-        // 0 -> 1 -> 3 and 0 -> 2 -> 3, with 2 on lane 1 and the rest on lane 0.
-        let edges = [vec![], vec![0], vec![0], vec![1, 2]];
-        let lanes = [LaneId(0), LaneId(0), LaneId(1), LaneId(0)];
-        assert_eq!(lane_sinks(&edges, &lanes), vec![false, false, true, true]);
-        // Two unordered stages that end the same lane both signal, and so does the only stage of another.
-        let edges = [vec![], vec![0], vec![0]];
-        let lanes = [LaneId(0), LaneId(1), LaneId(1)];
-        assert_eq!(lane_sinks(&edges, &lanes), vec![true, true, true]);
-        // A later stage on the lane reached through another lane's stage still covers the earlier one.
-        let edges = [vec![], vec![0], vec![1]];
-        let lanes = [LaneId(0), LaneId(1), LaneId(0)];
-        assert_eq!(lane_sinks(&edges, &lanes), vec![false, true, true]);
-    }
-
-    #[test]
-    fn with_one_lane_everything_runs_on_it() {
-        let edges = [vec![], vec![0], vec![0], vec![1, 2]];
-        assert!(path_placement(&edges, 1).iter().all(|lane| *lane == LaneId(0)));
+    fn a_chain_ends_where_no_stage_continues_its_lane() {
+        let edges = [vec![], vec![0], vec![0], vec![0], vec![1], vec![4, 2, 3]];
+        // 2 and 3 are branches that end at the join; 5 ends the main chain.
+        assert_eq!(chain_ends(&edges), vec![false, false, true, true, false, true]);
+        // The tie: 2 continues the join, so 1 ends its chain.
+        let tie = [vec![], vec![0], vec![0], vec![1, 2]];
+        assert_eq!(chain_ends(&tie), vec![false, true, false, true]);
     }
 }

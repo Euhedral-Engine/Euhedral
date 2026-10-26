@@ -11,16 +11,25 @@
 )]
 
 use std::collections::{BTreeSet, HashMap};
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-use euhedral_graph::LaneId;
+use euhedral_core::control_plane::ControlPlaneLattice;
+use euhedral_core::generics::{FrameSink, LatticeSource};
+use euhedral_graph::{
+    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, GraphRuntime, Join, Lake, LaneId, LanePool, Latch,
+    QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, Submitted,
+};
 use euhedral_inference_cuda::DevicePtr;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
+use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{LayerKind, ModelConfig, WeightRef, object_key};
 use euhedral_inference_engine::plan::{Formats, Plan, StageKind, View, WeightLookup};
 use euhedral_inference_engine::quantum::split_geometry;
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, plan as residency};
-use euhedral_inference_settings::TrellisKernelSettings;
+use euhedral_inference_settings::{ModelSettings, Settings, TrellisKernelSettings};
 
 mod common;
 
@@ -289,24 +298,25 @@ fn fan_out_width_is_plan_width() {
     .collect();
     assert_eq!(plan.fan_out_width(), *widths.iter().max().unwrap());
     assert!(plan.fan_out_width() >= 2, "a GDN layer fans out: {widths:?}");
-    // Every graph names lanes within the pool the width sizes, and runs its critical chain on the home lane.
+    assert_eq!(
+        plan.width(View::Decode),
+        Some(3),
+        "the joint projection, query/key and value/z run at once"
+    );
+    assert_eq!(plan.fan_out_width(), 3);
+    // Every graph names lanes within the pool the width sizes: the root only the home lane, the rest any of them.
     for view in [View::Decode, View::PrefillChunk, View::Draft { rows: 2 }] {
-        let lanes = plan.placement(view).unwrap();
-        assert!(lanes.iter().all(|lane| usize::from(lane.0) < plan.fan_out_width()));
-        assert_eq!(lanes[0], LaneId(0));
         let spec = plan.spec(view).unwrap();
-        assert_eq!(spec.stages().len(), lanes.len());
-        assert!(
-            spec.stages()
-                .iter()
-                .zip(lanes)
-                .all(|(stage, lane)| stage.lanes == vec![*lane])
-        );
         assert!(spec.validate().is_ok());
+        let stages = spec.stages();
+        assert_eq!(
+            stages[0].lanes,
+            vec![LaneId(0)],
+            "{view:?}: the root enters on the home lane"
+        );
+        let all: Vec<LaneId> = (0..plan.fan_out_width()).map(|lane| LaneId(lane as u16)).collect();
+        assert!(stages[1..].iter().all(|stage| stage.lanes == all), "{view:?}");
     }
-    // The branches of a layer's fan-out do not all share a lane.
-    let lanes = plan.placement(View::Decode).unwrap();
-    assert!(lanes[2..5].iter().any(|lane| *lane != lanes[2]), "{:?}", &lanes[..8]);
     // The selection is the one sink, and the embedding the one root.
     assert_eq!(plan.roots(View::Decode).unwrap(), vec![0]);
     assert_eq!(
@@ -403,32 +413,8 @@ fn every_stage_is_an_ancestor_of_the_sink_in_every_view() {
     }
 }
 
-/// The stages with no later stage on their lane that they precede, worked out from the edges by closure.
-fn lane_sinks(edges: &[Vec<usize>], lanes: &[LaneId]) -> Vec<bool> {
-    let count = edges.len();
-    let mut precedes = vec![vec![false; count]; count];
-    for (stage, producers) in edges.iter().enumerate() {
-        for &producer in producers {
-            precedes[producer][stage] = true;
-        }
-    }
-    for through in 0..count {
-        let onward = precedes[through].clone();
-        for row in precedes.iter_mut() {
-            if row[through] {
-                for (reached, via) in row.iter_mut().zip(&onward) {
-                    *reached |= *via;
-                }
-            }
-        }
-    }
-    (0..count)
-        .map(|stage| !(0..count).any(|later| precedes[stage][later] && lanes[later] == lanes[stage]))
-        .collect()
-}
-
 #[test]
-fn the_signalled_stages_are_exactly_the_sinks_of_their_lanes() {
+fn the_signalled_stages_are_the_ends_of_the_chains_of_lane_continuations() {
     let plan = &built().plan;
     for view in [
         View::Decode,
@@ -437,25 +423,146 @@ fn the_signalled_stages_are_exactly_the_sinks_of_their_lanes() {
         View::Draft { rows: 2 },
     ] {
         let signalled = plan.signalled(view).unwrap();
-        let wanted = lane_sinks(plan.edges(view).unwrap(), plan.placement(view).unwrap());
-        assert_eq!(signalled, wanted.as_slice(), "{view:?}");
-        let count = signalled.iter().filter(|signal| **signal).count();
-        let lanes = plan.placement(view).unwrap();
-        for lane in 0..plan.fan_out_width() {
-            let used = lanes.iter().any(|placed| usize::from(placed.0) == lane);
-            let ends = signalled
-                .iter()
-                .zip(lanes)
-                .filter(|(signal, placed)| **signal && usize::from(placed.0) == lane)
-                .count();
-            assert_eq!(
-                ends >= 1,
-                used,
-                "{view:?}: lane {lane} ends in a signalled stage when it has stages"
-            );
+        let path = plan.path_predecessors(view).unwrap();
+        // A stage ends its chain exactly when no stage continues its lane.
+        for (stage, signal) in signalled.iter().enumerate() {
+            let continued = path.contains(&Some(stage));
+            assert_eq!(*signal, !continued, "{view:?}: stage {stage}");
         }
-        // The selection ends its lane, and almost every other stage does not: a flag write per stage is not paid.
+        // The selection ends the main chain and signals; so does every branch that ends in a join.
         assert!(signalled[plan.sink(view).unwrap()]);
-        assert!(count <= 8, "{view:?}: {count} of {} stages signal", signalled.len());
+        let count = signalled.iter().filter(|signal| **signal).count();
+        assert!(
+            count * 3 < signalled.len(),
+            "{view:?}: {count} of {} stages signal",
+            signalled.len()
+        );
+    }
+}
+
+/// A stage that records the lane the graph gave it.
+struct Records {
+    index: usize,
+    lanes: Arc<Vec<AtomicU32>>,
+}
+
+impl Stage<()> for Records {
+    fn run(&self, _quantum: &(), cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+        self.lanes[self.index].store(u32::from(cx.lane.map_or(u16::MAX, |lane| lane.0)), Ordering::Release);
+        Ok(Submitted::done())
+    }
+}
+
+#[derive(Debug)]
+struct Idle;
+
+impl DeviceQueue for Idle {
+    fn completed(&self) -> u64 {
+        u64::MAX
+    }
+
+    fn name(&self) -> &str {
+        "idle"
+    }
+}
+
+/// The lane RustEE's graph gives each stage of the plan's graph of `view`, run on a lattice of its own over lanes that
+/// do nothing.
+fn placed_by_rustee(plan: &Plan, view: View) -> Vec<u16> {
+    let spec = plan.spec(view).unwrap();
+    let count = spec.stages().len();
+    let lanes = Arc::new((0..count).map(|_| AtomicU32::new(u32::MAX)).collect::<Vec<_>>());
+    let stages: Vec<Arc<dyn Stage<()>>> = (0..count)
+        .map(|index| {
+            Arc::new(Records {
+                index,
+                lanes: Arc::clone(&lanes),
+            }) as Arc<dyn Stage<()>>
+        })
+        .collect();
+    let settings = Settings::with_model(ModelSettings::default());
+    let lattice = ControlPlaneLattice::new(lattice_config(&settings)).unwrap();
+    let lake = Lake::new(
+        Arc::clone(&lattice),
+        NonZeroUsize::new(2).unwrap(),
+        Duration::from_secs(1),
+    );
+    let pool = Arc::new(LanePool::new(
+        (0..plan.fan_out_width())
+            .map(|_| Arc::new(Idle) as Arc<dyn DeviceQueue>)
+            .collect(),
+    ));
+    let completions = Completions::new(Arc::clone(&pool));
+    lattice
+        .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
+        .unwrap();
+    let (done, finished) = Latch::new();
+    let join = Join::new(1, move |mut parts: Vec<Option<QuantumOutcome>>| {
+        done.set(parts.remove(0).unwrap())
+    });
+    let graph = StageGraph::new(
+        spec,
+        stages,
+        GraphRuntime {
+            stages: Arc::clone(&lake) as Arc<dyn FrameSink>,
+            completions,
+            lanes: pool,
+            retries: Arc::new(RetryCounts::default()),
+            retry_backstop: DEFAULT_RETRY_BACKSTOP,
+        },
+        move |(), outcome| join.arrive(0, outcome),
+    )
+    .unwrap();
+    let unit = lake.admit().unwrap();
+    let _ = graph.start((), Arc::new(AtomicBool::new(false)), Vec::new());
+    assert_eq!(finished.wait(), QuantumOutcome::Completed);
+    drop(unit);
+    lake.complete_gracefully();
+    lattice.close();
+    lanes.iter().map(|lane| lane.load(Ordering::Acquire) as u16).collect()
+}
+
+#[test]
+fn rustee_places_the_stages_of_every_view_as_javas_path_policy_does() {
+    let plan = &built().plan;
+    for view in [
+        View::Decode,
+        View::Verify { rows: 5 },
+        View::PrefillChunk,
+        View::Draft { rows: 2 },
+        View::CatchUp { rows: 9 },
+    ] {
+        let placed = placed_by_rustee(plan, view);
+        let path = plan.path_predecessors(view).unwrap();
+        let width = plan.fan_out_width() as u16;
+        assert!(
+            placed.iter().all(|lane| *lane < width),
+            "{view:?}: every stage ran on a lane of the plan"
+        );
+        assert_eq!(placed[0], 0, "{view:?}: the root runs on the home lane");
+        let mut continued = 0;
+        let mut branches = 0;
+        for (stage, predecessor) in path.iter().enumerate() {
+            match predecessor {
+                // The critical successor continues the lane of the predecessor it is critical for.
+                Some(predecessor) => {
+                    continued += 1;
+                    assert_eq!(
+                        placed[stage], placed[*predecessor],
+                        "{view:?}: stage {stage} continues {predecessor}"
+                    );
+                }
+                None if stage > 0 => branches += 1,
+                None => {}
+            }
+        }
+        assert_eq!(continued + branches + 1, placed.len(), "{view:?}");
+        // The branches of the fan-outs are spread: the graph does not run on the lane of the main chain alone.
+        let used: BTreeSet<u16> = placed.iter().copied().collect();
+        // (The MTP layer has one fan-out of two branches, which may both take the main chain's lane.)
+        assert!(
+            used.len() > 1 || matches!(view, View::Draft { .. } | View::CatchUp { .. }),
+            "{view:?}: the branches of a fan-out took lanes of their own: {used:?}"
+        );
     }
 }

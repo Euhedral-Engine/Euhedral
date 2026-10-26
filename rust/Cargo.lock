@@ -286,7 +286,7 @@ checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 [[package]]
 name = "euhedral-core"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=97fc2c49d0fd7fb99f5193a841d41998732134e4#97fc2c49d0fd7fb99f5193a841d41998732134e4"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=8b0e85cf5187a8a0f8319077933554db24cda53d#8b0e85cf5187a8a0f8319077933554db24cda53d"
 dependencies = [
  "euhedral-data-structures",
  "euhedral-hardware-utils",
@@ -297,12 +297,12 @@ dependencies = [
 [[package]]
 name = "euhedral-data-structures"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=97fc2c49d0fd7fb99f5193a841d41998732134e4#97fc2c49d0fd7fb99f5193a841d41998732134e4"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=8b0e85cf5187a8a0f8319077933554db24cda53d#8b0e85cf5187a8a0f8319077933554db24cda53d"
 
 [[package]]
 name = "euhedral-graph"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=97fc2c49d0fd7fb99f5193a841d41998732134e4#97fc2c49d0fd7fb99f5193a841d41998732134e4"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=8b0e85cf5187a8a0f8319077933554db24cda53d#8b0e85cf5187a8a0f8319077933554db24cda53d"
 dependencies = [
  "euhedral-core",
  "io-uring",
@@ -313,7 +313,7 @@ dependencies = [
 [[package]]
 name = "euhedral-hardware-utils"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=97fc2c49d0fd7fb99f5193a841d41998732134e4#97fc2c49d0fd7fb99f5193a841d41998732134e4"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=8b0e85cf5187a8a0f8319077933554db24cda53d#8b0e85cf5187a8a0f8319077933554db24cda53d"
 dependencies = [
  "libc",
  "log",
@@ -323,7 +323,7 @@ dependencies = [
 [[package]]
 name = "euhedral-hashing"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=97fc2c49d0fd7fb99f5193a841d41998732134e4#97fc2c49d0fd7fb99f5193a841d41998732134e4"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=8b0e85cf5187a8a0f8319077933554db24cda53d#8b0e85cf5187a8a0f8319077933554db24cda53d"
 
 [[package]]
 name = "euhedral-inference-bench"

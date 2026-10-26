@@ -56,11 +56,11 @@ struct VariantPlan {
     /// The scratch region each stage takes.
     regions: Vec<Option<usize>>,
     entries: Vec<Entry>,
-    /// The lane each stage runs on.
-    lanes: Vec<LaneId>,
+    /// The predecessor whose lane each stage continues (RustEE's placement).
+    path: Vec<Option<usize>>,
     spec: StageGraphSpec,
     width: usize,
-    /// Whether each stage ends with a signalled marker: those with no descendant on their own lane.
+    /// Whether each stage ends with a signalled marker: the ends of the chains of lane continuations.
     signalled: Vec<bool>,
 }
 
@@ -196,15 +196,18 @@ impl Plan {
         self.variant(view.variant()).map(|plan| plan.regions.as_slice())
     }
 
-    /// The lane each stage of `view` runs on (the path policy over [`Plan::fan_out_width`] lanes): the critical chain
-    /// of the graph on the home lane, the branches of a fan-out on the lanes in turn.
-    pub fn placement(&self, view: View) -> Option<&[LaneId]> {
-        self.variant(view.variant()).map(|plan| plan.lanes.as_slice())
+    /// The predecessor whose lane each stage of `view` continues under the path policy: its critical predecessor, the one
+    /// for which the stage is the critical successor (the successor with the greatest height, the first listed on
+    /// ties; of several predecessors that name a join critical, the last visited). A stage with none, a root or a
+    /// branch of a fan-out, takes a lane in turn. RustEE's `StageGraph` places the stages by this rule.
+    pub fn path_predecessors(&self, view: View) -> Option<&[Option<usize>]> {
+        self.variant(view.variant()).map(|plan| plan.path.as_slice())
     }
 
-    /// Whether each stage of `view` ends with a signalled marker: the stages with no descendant on their own lane.
-    /// A graph retires when the latest marker of each lane it used is reached, and a lane's completion word reaches
-    /// only signalled markers, so these stages signal and the others do not.
+    /// Whether each stage of `view` ends with a signalled marker: the stages no other stage continues the lane of. A
+    /// graph retires when the latest marker of each lane it used is reached, and a lane's completion word reaches only
+    /// signalled markers; the last marker of a lane belongs to the end of a chain of continuations (two chains that
+    /// meet on one lane both end in a signalling stage), so these stages signal and the others do not.
     pub fn signalled(&self, view: View) -> Option<&[bool]> {
         self.variant(view.variant()).map(|plan| plan.signalled.as_slice())
     }
@@ -260,30 +263,37 @@ impl VariantPlan {
             edges,
             regions,
             entries,
-            lanes: Vec::new(),
+            path: Vec::new(),
             spec: StageGraphSpec::new(),
             width,
             signalled: Vec::new(),
         })
     }
 
-    /// Places the stages over `lanes` lanes and makes the graph.
+    /// Makes the graph over `lanes` lanes, and finds where its chains of lane continuations end.
     fn place(&mut self, lanes: usize) -> Result<(), PlanBuildError> {
-        self.lanes = placement::path_placement(&self.edges, lanes);
-        self.signalled = placement::lane_sinks(&self.edges, &self.lanes);
+        self.path = placement::path_predecessors(&self.edges);
+        self.signalled = placement::chain_ends(&self.edges);
         for (entry, signal) in self.entries.iter_mut().zip(&self.signalled) {
             entry.stage = Arc::new(Placed::new(Arc::clone(&entry.launch), *signal));
         }
+        // A root enters on the home lane, as Java's graph does; every other stage may run on any of the plan's lanes, and
+        // RustEE's graph puts it on the lane of its path predecessor or, as a branch, on the next lane in turn.
+        let compute: Vec<LaneId> = (0..lanes).map(|lane| LaneId(lane as u16)).collect();
         let mut spec = StageGraphSpec::new();
         let ids: Vec<_> = self
             .entries
             .iter()
-            .zip(&self.lanes)
-            .map(|(entry, lane)| {
+            .zip(&self.edges)
+            .map(|(entry, producers)| {
                 spec.stage(StageSpec {
                     name: entry.kind.name(),
                     ordered: None,
-                    lanes: vec![*lane],
+                    lanes: if producers.is_empty() {
+                        vec![LaneId(0)]
+                    } else {
+                        compute.clone()
+                    },
                 })
             })
             .collect();
