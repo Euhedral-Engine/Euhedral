@@ -57,6 +57,12 @@ jobs:
       - name: Lint
         working-directory: rust
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check the aarch64 kernels
+        if: runner.os == 'Linux'
+        working-directory: rust
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          cargo check --target aarch64-unknown-linux-gnu -p euhedral-inference-host-gemv
       - name: Test
         working-directory: rust
         run: cargo test --workspace
