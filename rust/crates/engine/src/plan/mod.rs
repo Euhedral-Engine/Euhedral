@@ -277,7 +277,10 @@ impl VariantPlan {
         for (entry, signal) in self.entries.iter_mut().zip(&self.signalled) {
             entry.stage = Arc::new(Placed::new(Arc::clone(&entry.launch), *signal));
         }
-        // A root enters on the home lane, as Java's graph does; every other stage may run on any of the plan's lanes, and
+        // A root enters on the home lane, as Java's graph does, so a quantum's entry (the wait for its input record and
+        // the embedding) has a fixed lane. That does not keep consecutive quanta on one lane: the chain of lane
+        // continuations breaks where a join continues another branch (the last visited of the predecessors that name
+        // it critical), so the lane a quantum ends on varies. Every other stage may run on any of the plan's lanes, and
         // RustEE's graph puts it on the lane of its path predecessor or, as a branch, on the next lane in turn.
         let compute: Vec<LaneId> = (0..lanes).map(|lane| LaneId(lane as u16)).collect();
         let mut spec = StageGraphSpec::new();

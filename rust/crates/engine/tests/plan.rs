@@ -540,6 +540,11 @@ fn rustee_places_the_stages_of_every_view_as_javas_path_policy_does() {
             "{view:?}: every stage ran on a lane of the plan"
         );
         assert_eq!(placed[0], 0, "{view:?}: the root runs on the home lane");
+        // Nothing is claimed of the lane the sink ends on: the chain of continuations breaks at a join, so it varies.
+        assert!(
+            placed[placed.len() - 1] < width,
+            "{view:?}: the sink runs on a lane of the plan"
+        );
         let mut continued = 0;
         let mut branches = 0;
         for (stage, predecessor) in path.iter().enumerate() {

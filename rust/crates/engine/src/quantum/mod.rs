@@ -268,6 +268,7 @@ impl Quantum {
         }
         let group = (self.config.num_attention_heads / self.config.num_key_value_heads.max(1)) as u64;
         let host_pages = |source| self.seq.kv(source).map_or(0, |view| view.reserved_host_pages());
+        let source = self.attention_source();
         let slot = |slot: usize| u8::try_from(slot).ok();
         Some(CaptureKey {
             view,
@@ -284,10 +285,44 @@ impl Quantum {
             writes_current_token: self.writes_current_token,
             row_exact: self.mode.row_exact,
             split_geometry: split_geometry(start, rows, group),
-            reserved_host_pages: [host_pages(KvSource::Base), host_pages(KvSource::Mtp)],
+            reserved_host_pages: keyed_host_pages(source, host_pages(KvSource::Base), host_pages(KvSource::Mtp)),
             replay_rows: capture_key::trimmed(self.seq.replay_layers()),
             buffer_generations: self.buffer_generations(),
         })
+    }
+}
+
+/// The host pages a key names, `[base, mtp]`: those of the cache the quantum's attention reads, since a graph copies only
+/// that cache's host pages. The other cache growing past a 256-token page must not re-key the quantum.
+fn keyed_host_pages(source: Option<KvSource>, base: u64, mtp: u64) -> [u64; 2] {
+    match source {
+        Some(KvSource::Base) => [base, 0],
+        Some(KvSource::Mtp) => [0, mtp],
+        None => [0, 0],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_key_names_the_host_pages_of_the_cache_the_quantum_reads_only() {
+        assert_eq!(keyed_host_pages(Some(KvSource::Base), 7, 3), [7, 0]);
+        assert_eq!(
+            keyed_host_pages(Some(KvSource::Mtp), 7, 3),
+            [0, 3],
+            "a draft is not re-keyed by the base cache"
+        );
+        assert_eq!(
+            keyed_host_pages(Some(KvSource::Mtp), 8, 3),
+            keyed_host_pages(Some(KvSource::Mtp), 7, 3)
+        );
+        assert_eq!(
+            keyed_host_pages(Some(KvSource::Base), 7, 4),
+            keyed_host_pages(Some(KvSource::Base), 7, 3)
+        );
+        assert_eq!(keyed_host_pages(None, 7, 3), [0, 0]);
     }
 }
 
