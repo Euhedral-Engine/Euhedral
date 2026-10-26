@@ -6,6 +6,7 @@ use euhedral_graph::Marker;
 
 use crate::error::{CudaError, check};
 use crate::lane::CudaLane;
+use crate::sys::EuhedralCuda;
 
 /// How a submission launches.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -154,7 +155,7 @@ impl<'l> Submission<'l> {
         self.lane.stream()
     }
 
-    pub(crate) fn api(&self) -> &crate::sys::EuhedralCuda {
+    pub(crate) fn api(&self) -> &EuhedralCuda {
         self.lane.library().api()
     }
 }

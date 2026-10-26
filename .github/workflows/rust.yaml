@@ -61,6 +61,12 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: rust
         run: cargo xtask bindings --check
+      - name: Layers
+        if: runner.os == 'Linux'
+        working-directory: rust
+        run: |
+          scripts/check-layers.sh --self-test
+          scripts/check-layers.sh
       - name: Check formatting
         working-directory: rust
         run: cargo fmt --all --check

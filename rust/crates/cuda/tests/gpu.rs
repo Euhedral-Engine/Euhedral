@@ -4,8 +4,16 @@
 //! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, or
 //! `gradle.properties`); a test skips with a message when it is absent.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test file: a failed unwrap is the failure"
+)]
+
+use std::iter;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use euhedral_graph::{DeviceQueue, LaneId, LanePool, Marker};
 use euhedral_inference_cuda::{
@@ -29,7 +37,7 @@ fn submit(lane: &CudaLane) -> Submission<'_> {
 /// A pinned flag word the device waits on, set to 0.
 fn flag(library: &Arc<CudaLibrary>) -> (PinnedBuffer, DevicePtr) {
     let buffer = PinnedBuffer::alloc(library, 64).expect("pinned flag");
-    buffer.word(0).store(0, std::sync::atomic::Ordering::Release);
+    buffer.word(0).store(0, Ordering::Release);
     let device = buffer.device_address().expect("the flag's device address");
     (buffer, device)
 }
@@ -90,7 +98,7 @@ fn lane_marker_reached_after_signal() {
     assert!(!pool.reached(marker), "the lane is held at the gate");
     assert_eq!(lane.completed(), 0);
 
-    gate.word(0).store(1, std::sync::atomic::Ordering::Release);
+    gate.word(0).store(1, Ordering::Release);
     lane.synchronize().expect("synchronize");
     assert!(pool.reached(marker));
     assert_eq!(lane.completed(), marker.value);
@@ -131,7 +139,7 @@ fn cross_lane_wait_orders_kernels() {
         submission.wait(marker).expect("wait for the marker");
         ops::copy_device_to_device(&submission, destination.ptr(), source.ptr(), bytes as u64).expect("copy");
     }
-    gate.word(0).store(1, std::sync::atomic::Ordering::Release);
+    gate.word(0).store(1, Ordering::Release);
     first.synchronize().expect("first lane");
     second.synchronize().expect("second lane");
     assert!(
@@ -147,7 +155,7 @@ const THREE: u16 = 0x4040;
 const FOUR: u16 = 0x4080;
 
 fn fill(buffer: &DeviceBuffer, value: u16) {
-    let bytes: Vec<u8> = std::iter::repeat_n(value.to_le_bytes(), buffer.bytes() / 2)
+    let bytes: Vec<u8> = iter::repeat_n(value.to_le_bytes(), buffer.bytes() / 2)
         .flatten()
         .collect();
     buffer.copy_from_host(0, &bytes).expect("fill");

@@ -1,8 +1,9 @@
 //! Loading the CUDA library and binding the device.
 
+use std::array;
 use std::ffi::{CStr, CString, c_int};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{self, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -58,7 +59,7 @@ impl CudaLibrary {
     /// against. Loading preloads the runtime libraries beside the library, sets that include directory and reads the
     /// device, which binds it.
     pub fn load(library: &Path) -> Result<Arc<CudaLibrary>, CudaError> {
-        let library = std::path::absolute(library).map_err(|_| CudaError::LibraryMissing(library.to_path_buf()))?;
+        let library = path::absolute(library).map_err(|_| CudaError::LibraryMissing(library.to_path_buf()))?;
         if !library.is_file() {
             return Err(CudaError::LibraryMissing(library));
         }
@@ -84,7 +85,7 @@ impl CudaLibrary {
             path: library,
             device,
             allocations: AtomicU64::new(0),
-            rings: std::array::from_fn(|_| OnceLock::new()),
+            rings: array::from_fn(|_| OnceLock::new()),
         }))
     }
 
@@ -143,6 +144,10 @@ impl CudaLibrary {
     }
 
     /// Blocks until all device work finishes. For startup, shutdown and tests; nothing on a hot path waits.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no-wait, waiting driver call: the device synchronizes only at startup, shutdown and in tests"
+    )]
     pub fn synchronize(&self) -> Result<(), CudaError> {
         // SAFETY: the call takes no arguments.
         check("euhedral_cuda_synchronize", unsafe {
@@ -240,6 +245,8 @@ fn read_device(api: &EuhedralCuda) -> Result<DeviceInfo, CudaError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{self, File};
+
     use super::*;
 
     #[test]
@@ -256,9 +263,9 @@ mod tests {
     fn a_library_without_its_runtime_beside_it_names_what_is_missing() {
         let product = tempfile::tempdir().unwrap();
         let lib = product.path().join("lib");
-        std::fs::create_dir(&lib).unwrap();
+        fs::create_dir(&lib).unwrap();
         let library = lib.join("libeuhedral_cuda.so");
-        std::fs::File::create(&library).unwrap();
+        File::create(&library).unwrap();
         let error = CudaLibrary::load(&library).unwrap_err();
         let message = error.to_string();
         if RUNTIME.is_empty() {

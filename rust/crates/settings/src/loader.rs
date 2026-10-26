@@ -190,8 +190,10 @@ pub(crate) fn load_optional(
     }
 }
 
-// The configuration file is read once at startup, before the lattice exists, and has no non-blocking form.
-#[allow(clippy::disallowed_methods)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: the configuration file is read once at startup, before the lattice exists"
+)]
 fn read_file(file: &Path, leaves: &[Leaf], raw: &mut HashMap<String, String>, problems: &mut Vec<SettingsError>) {
     if !fs::metadata(file).is_ok_and(|meta| meta.is_file()) {
         problems.push(SettingsError::new(format!(

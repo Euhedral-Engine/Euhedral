@@ -1,6 +1,7 @@
 //! Lanes: one CUDA stream, an event ring and a host-mapped completion word.
 
 use std::fmt;
+use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -162,7 +163,7 @@ impl CudaLane {
         let word = memory.word(0);
         word.store(0, Ordering::Release);
         // SAFETY: the word lies in `memory`, which the lane keeps for as long as it keeps `word`.
-        let word = unsafe { CompletionWord::over(std::ptr::from_ref(word)) };
+        let word = unsafe { CompletionWord::over(ptr::from_ref(word)) };
 
         let api = library.api();
         let mut handles = Vec::with_capacity(event_ring);
@@ -203,6 +204,10 @@ impl CudaLane {
     }
 
     /// Blocks until the lane's queued work finishes. For startup, shutdown and tests.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no-wait, waiting driver call: a lane synchronizes only at startup, shutdown and in tests"
+    )]
     pub fn synchronize(&self) -> Result<(), CudaError> {
         // SAFETY: the stream is this lane's live stream.
         check("euhedral_cuda_stream_synchronize", unsafe {
@@ -284,7 +289,7 @@ mod tests {
     fn fake(initial: u32) -> (Box<AtomicU32>, CompletionWord) {
         let mapped = Box::new(AtomicU32::new(initial));
         // SAFETY: the box outlives the returned word in every test (they drop together).
-        let word = unsafe { CompletionWord::over(std::ptr::from_ref(&*mapped)) };
+        let word = unsafe { CompletionWord::over(ptr::from_ref(&*mapped)) };
         (mapped, word)
     }
 

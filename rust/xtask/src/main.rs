@@ -4,8 +4,14 @@
 //! `bindgen` command (`cargo install bindgen-cli --version 0.72.1 --locked`; it needs libclang). With `--check` it
 //! regenerates into `target/` and fails when the checked-in file differs.
 
-// A build tool: running a child process and reading and writing files is its job, and it runs on one thread.
-#![allow(clippy::disallowed_methods)]
+// A build tool, not a library crate: it has no clippy.toml of the no-wait bans, and its output, its `expect` and its
+// exit are its interface.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::expect_used,
+    reason = "a binary: it reports on the terminal and may abort"
+)]
 
 use std::env;
 use std::fs;

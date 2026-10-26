@@ -2,6 +2,7 @@
 
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
+use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
@@ -130,6 +131,10 @@ impl DeviceBuffer {
 
     /// Copies `host` into the buffer at `offset` and returns when the copy is done. Startup, shutdown and tests: it
     /// blocks, and outside a submission it runs on the legacy stream, which does not order against lane work.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no-wait, synchronous copy: documented as startup, shutdown and tests only"
+    )]
     pub fn copy_from_host(&self, offset: usize, host: &[u8]) -> Result<(), CudaError> {
         let destination = self.range(offset, host.len())?;
         // SAFETY: `destination` lies inside this allocation and `host` is a live slice of the stated length.
@@ -145,6 +150,10 @@ impl DeviceBuffer {
 
     /// Copies `host.len()` bytes from the buffer at `offset` and returns when the copy is done. See
     /// [`DeviceBuffer::copy_from_host`].
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no-wait, synchronous copy: documented as startup, shutdown and tests only"
+    )]
     pub fn copy_to_host(&self, offset: usize, host: &mut [u8]) -> Result<(), CudaError> {
         let source = self.range(offset, host.len())?;
         // SAFETY: `source` lies inside this allocation and `host` is a live exclusive slice of the stated length.
@@ -171,6 +180,10 @@ impl DeviceBuffer {
 }
 
 impl Drop for DeviceBuffer {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no-wait, cudaFree waits for the device: long-lived buffers are freed at shutdown, stream-ordered ones with free_async"
+    )]
     fn drop(&mut self) {
         if self.addr == 0 {
             return;
@@ -244,13 +257,13 @@ impl PinnedBuffer {
     /// The bytes. Read memory a queued readback fills only after the lane's work has retired.
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: the allocation is `len` bytes, live and initialised by the allocator or by earlier writes.
-        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.len) }
+        unsafe { slice::from_raw_parts(self.pointer.as_ptr(), self.len) }
     }
 
     /// The bytes, for writing. Write memory a queued upload reads only after the lane's work has retired.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: as `as_slice`, and the borrow is exclusive.
-        unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.len) }
+        unsafe { slice::from_raw_parts_mut(self.pointer.as_ptr(), self.len) }
     }
 
     /// The 32-bit word `index` as an atomic, for words the device reads or writes (stream flags).
@@ -274,6 +287,10 @@ impl PinnedBuffer {
 }
 
 impl Drop for PinnedBuffer {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no-wait, freeing pinned memory waits for the device: pinned buffers are freed at shutdown"
+    )]
     fn drop(&mut self) {
         // SAFETY: the pointer is this buffer's live allocation, freed once. A failure leaves nothing to recover.
         let _ = unsafe { self.library.api().euhedral_cuda_host_free(self.pointer.as_ptr().cast()) };
@@ -330,12 +347,12 @@ impl HostWeightsArena {
 
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: the allocation is at least `len` bytes, live, and zero-filled by the allocator.
-        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.len) }
+        unsafe { slice::from_raw_parts(self.pointer.as_ptr(), self.len) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: as `as_slice`, and the borrow is exclusive.
-        unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.len) }
+        unsafe { slice::from_raw_parts_mut(self.pointer.as_ptr(), self.len) }
     }
 
     /// The address at which kernels read this memory in place.
@@ -345,6 +362,10 @@ impl HostWeightsArena {
 }
 
 impl Drop for HostWeightsArena {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no-wait, freeing pinned memory waits for the device: the arena is freed at shutdown"
+    )]
     fn drop(&mut self) {
         // SAFETY: the pointer is this arena's live allocation. A failed unregistration keeps the memory pinned and
         // the C side does not release it, so there is nothing more to do.

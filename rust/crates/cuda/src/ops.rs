@@ -29,6 +29,10 @@ macro_rules! entry {
 // Copies.
 
 /// Copies `source` to the device and returns when it is done: the selected stream is synchronized. Startup and tests.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, synchronous copy: documented as startup and tests only"
+)]
 pub fn copy_host_to_device(
     submission: &Submission<'_>,
     destination: DevicePtr,
@@ -42,6 +46,10 @@ pub fn copy_host_to_device(
 
 /// Copies device memory into `destination` and returns when it is done: the selected stream is synchronized.
 /// Startup and tests.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, synchronous copy: documented as startup and tests only"
+)]
 pub fn copy_device_to_host(
     submission: &Submission<'_>,
     destination: &mut [u8],

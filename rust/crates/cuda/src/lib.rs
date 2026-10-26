@@ -28,6 +28,7 @@ mod submission;
     missing_docs,
     dead_code,
     non_camel_case_types,
+    clippy::absolute_paths,
     clippy::all
 )]
 pub mod sys;
