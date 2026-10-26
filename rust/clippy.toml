@@ -32,6 +32,7 @@ disallowed-methods = [
     { path = "std::env::var", reason = "configuration is read in one place, the settings crate; binaries read the environment in main" },
     { path = "std::env::var_os", reason = "configuration is read in one place, the settings crate; binaries read the environment in main" },
     { path = "std::env::vars", reason = "configuration is read in one place, the settings crate; binaries read the environment in main" },
+    { path = "std::env::vars_os", reason = "configuration is read in one place, the settings crate; binaries read the environment in main" },
 ]
 disallowed-types = [
     { path = "std::sync::mpsc::Sender", reason = "no channels" },

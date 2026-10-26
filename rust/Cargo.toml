@@ -8,8 +8,10 @@ rust-version = "1.99.1"
 publish = false
 
 # The RustEE crates (euhedral-core, euhedral-graph, euhedral-hardware-utils, euhedral-hashing) join
-# [workspace.dependencies] as git dependencies pinned by `rev` when the first crate uses them.
+# [workspace.dependencies] as git dependencies on https://github.com/Euhedral-Engine/RustEE.git pinned by `rev`
+# when the first crate uses them.
 [workspace.dependencies]
+java-properties = "2"
 tempfile = "3.27"
 
 [workspace.lints.rust]

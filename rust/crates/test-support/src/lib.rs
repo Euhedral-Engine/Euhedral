@@ -24,7 +24,8 @@ pub fn gradle_property(key: &str) -> Option<String> {
 }
 
 /// Like [`gradle_property`], but prints a skip line and returns `None` when the key is absent, so a test can
-/// `let Some(path) = require_property(key) else { return };`.
+/// `let Some(path) = require_property(key) else { return };`. libtest captures the line from a passing test; run
+/// with `--nocapture` to see it.
 pub fn require_property(key: &str) -> Option<String> {
     let value = gradle_property(key);
     if value.is_none() {
@@ -66,14 +67,9 @@ fn gradle_user_home() -> Option<PathBuf> {
     Some(PathBuf::from(user).join(".gradle"))
 }
 
-/// The value of `key` in Java `.properties` text: `key=value` or `key:value`, `#` and `!` comment lines.
+/// The value of `key` in Java `.properties` text, unescaped the way Java reads it (`C:\\models` is `C:\models`).
 fn properties_value(text: &str, key: &str) -> Option<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#') && !line.starts_with('!'))
-        .filter_map(|line| line.split_once(['=', ':']))
-        .find(|(name, _)| name.trim() == key)
-        .map(|(_, value)| value.trim().to_owned())
+    java_properties::read(text.as_bytes()).ok()?.remove(key)
 }
 
 #[cfg(test)]
@@ -119,6 +115,13 @@ mod tests {
             None
         );
         assert_eq!(lookup("euhedral.qwen.artifact", no_env, None), None);
+    }
+
+    #[test]
+    fn properties_values_are_unescaped_like_java() {
+        let text = "euhedral.a=C:\\\\models\\\\q3\neuhedral.b=C\\:/models/q3\n";
+        assert_eq!(properties_value(text, "euhedral.a").as_deref(), Some("C:\\models\\q3"));
+        assert_eq!(properties_value(text, "euhedral.b").as_deref(), Some("C:/models/q3"));
     }
 
     #[test]

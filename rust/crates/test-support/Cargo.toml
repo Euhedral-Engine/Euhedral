@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+java-properties.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

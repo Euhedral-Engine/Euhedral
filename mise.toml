@@ -29,7 +29,7 @@ run = "cargo test --workspace"
 
 [tasks."rust-native"]
 description = "Build the Linux host CUDA product the Rust crates load."
-run = "./gradlew nativeBuildLinuxX64"
+depends = ["native-build"]
 
 [tasks.test]
 description = "Run all CPU Java tests."
