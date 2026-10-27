@@ -61,7 +61,6 @@ ARMS = ("java", "rust")
 
 JAVA_START_SCRIPT = REPO / "benchmark" / "build" / "install" / "euhedral-inference-benchmark" / "bin" / "euhedral-inference-benchmark"
 DEFAULT_KV_DEVICE_MINIMUM_TOKENS = 65536
-MAX_MEMORY_BYTES = 32 << 30
 
 
 def derived_config(path: Path, arm: str, output: Path, speculation: str) -> dict:
@@ -291,7 +290,7 @@ def main() -> int:
     parser.add_argument("--java-config", type=Path, required=True)
     parser.add_argument("--rust-config", type=Path, required=True)
     parser.add_argument("--forks", type=int, default=1)
-    parser.add_argument("--memory-max", default="24G", help="host memory cap of each arm (at most 32G)")
+    parser.add_argument("--memory-max", default="24G", help="host memory cap of each arm")
     parser.add_argument("--timeout", default="30m", help="time limit of each arm, as `timeout` reads it")
     parser.add_argument("--gpu-run", default=GPU_RUN, help="the GPU launcher: lock, memory cap, time limit")
     parser.add_argument("--out-dir", type=Path, help="default: benchmark-results/rust-gate-<time>")
@@ -302,8 +301,8 @@ def main() -> int:
     if args.forks < 1:
         parser.error("--forks must be at least 1")
     try:
-        if memory_bytes(args.memory_max) > MAX_MEMORY_BYTES:
-            parser.error("--memory-max must not be above 32G")
+        if memory_bytes(args.memory_max) <= 0:
+            parser.error("--memory-max must be positive")
     except ValueError as error:
         parser.error(str(error))
     if not args.dry_run and shutil.which(args.gpu_run) is None:
