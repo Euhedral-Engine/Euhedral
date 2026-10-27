@@ -78,7 +78,7 @@ impl DraftLength {
         if drafted >= self.most {
             return false;
         }
-        if drafted < self.least || (drafted - self.least) % self.step != 0 {
+        if drafted < self.least || !(drafted - self.least).is_multiple_of(self.step) {
             return true;
         }
         log_probability >= f64::from(self.threshold)

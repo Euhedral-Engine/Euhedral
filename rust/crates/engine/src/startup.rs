@@ -716,8 +716,10 @@ impl DraftIds {
             Ok(marker) => {
                 let frame = step(Kind::Startup, 0, move || {
                     let ids: Arc<[u32]> = loan.buffer().as_slice()[..bytes]
-                        .chunks_exact(4)
-                        .map(|word| u32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|word| u32::from_ne_bytes(*word))
                         .collect();
                     finish.run(Some(ids));
                 });

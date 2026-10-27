@@ -409,6 +409,12 @@ impl Owner {
         }
     }
 
+    /// The test hook: the owner records no graphs from now on, and runs every quantum stage by stage.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn disable_graphs(&mut self) {
+        self.cache = GraphCache::disabled();
+    }
+
     /// Starts a greedy request, or one that speculates with the artifact's draft layer.
     pub(crate) fn begin(&mut self, units: Units, request: GenerationRequest) -> Result<(), AdmissionError> {
         let mode = match request.speculation {

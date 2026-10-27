@@ -21,6 +21,7 @@
 //! The prompt is prefilled in chunks, each followed by its catch-up (the next chunk's seed rows overwrite its own); the
 //! last chunk's catch-up is the first step's, which waits for the first token. The output is greedy decode's.
 
+use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -107,7 +108,7 @@ impl Speculating {
 
     /// The rows each GDN layer replays first, by layer, leaving none pending.
     pub(super) fn take_replay(&mut self, config: &ModelConfig) -> Vec<u32> {
-        let rows = std::mem::take(&mut self.replay);
+        let rows = mem::take(&mut self.replay);
         if rows == 0 {
             return Vec::new();
         }
@@ -287,7 +288,7 @@ impl Owner {
         let Mode::Speculative { state, .. } = &mut run.mode else {
             return Err("a speculative step in a request that does not speculate".to_string());
         };
-        let catch_up = std::mem::take(&mut state.catch_up);
+        let catch_up = mem::take(&mut state.catch_up);
         if catch_up.is_empty() || state.mtp_position + catch_up.len() as u64 != base {
             return Err(format!(
                 "the catch-up of {} rows from MTP position {} does not end at the verification's position {base}",
@@ -402,7 +403,7 @@ impl Owner {
         let Some(keys) = keys else {
             return self.fail_step("a verification's keys are out of its selection".to_string());
         };
-        let drafts = std::mem::take(&mut state.drafts);
+        let drafts = mem::take(&mut state.drafts);
         if drafts.len() + 1 != flying.rows {
             return self.fail_step(format!(
                 "a verification of {} rows retired with {} drafts",

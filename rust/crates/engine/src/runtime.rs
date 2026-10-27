@@ -411,6 +411,13 @@ impl EngineRuntime {
         self.generation.settle_after_speculation(settle);
     }
 
+    /// A test hook: the engine records no graphs from now on, so every quantum runs stage by stage. `false` while a
+    /// request runs.
+    #[cfg(feature = "test-oracles")]
+    pub fn disable_graphs_for_tests(&self) -> bool {
+        self.generation.disable_graphs()
+    }
+
     /// Starts a teacher-forced run on the engine's sequence, as [`EngineRuntime::generate`] does: prefills `prefix`,
     /// then decodes the `forced` tokens one row at a time, and hands the logits row of each step to `sink`. Step `k`
     /// of the sink holds the model's prediction of `forced[k]`.

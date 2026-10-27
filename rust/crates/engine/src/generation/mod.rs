@@ -240,6 +240,19 @@ impl Generation {
         self.shared.settle_after_speculation.store(settle, Ordering::Release);
     }
 
+    /// The test hook: the engine records no graphs from now on. Only while no request runs.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn disable_graphs(&self) -> bool {
+        match self.home.take() {
+            Some(mut owner) => {
+                owner.disable_graphs();
+                self.home.put(owner);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Looks at the sequence while no request holds it.
     pub(crate) fn inspect<R>(&self, read: impl FnOnce(&SequenceState) -> R) -> Option<R> {
         let owner = self.home.take()?;
