@@ -4,7 +4,9 @@
 //!
 //! - `tokenization`: generate entry to prompt encoded.
 //! - `prefill`: admission of the first prefill quantum to retirement of the last; excludes tokenization and the first
-//!   token. Rate: prompt tokens prefilled.
+//!   token. Rate: prompt tokens prefilled. The engine selects the first token with a device argmax inside the last
+//!   prefill quantum, so this window includes that selection (and `firstTokenSample` is about 0); the Java session selects
+//!   on the host after its last prefill quantum, outside this window.
 //! - `firstTokenSample`: retirement of the last prefill quantum to the first token found.
 //! - `timeToFirstToken`: entry to the first token found (tokenization, prefill, selection).
 //! - `decode`: **the first token found to the last token found.** Excludes the first token (it comes from prefill) and

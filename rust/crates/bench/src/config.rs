@@ -213,7 +213,7 @@ pub struct Options {
     pub artifact: PathBuf,
     pub cuda_library: PathBuf,
     pub max_context_tokens: u32,
-    pub kv_device_minimum_tokens: Option<u32>,
+    pub kv_device_minimum_tokens: u32,
     pub scenarios: Vec<Scenario>,
     pub warmup: usize,
     pub iterations: usize,
@@ -353,11 +353,11 @@ impl Options {
             "off" => SpeculationMode::Off,
             _ => return invalid("speculation must be \"artifact\" or \"off\""),
         };
-        let kv_device_minimum_tokens = match raw.kv_device_minimum_tokens {
-            None => None,
-            Some(value) if value > 0 && value <= i64::from(u32::MAX) => Some(value as u32),
-            Some(_) => return invalid("kvDeviceMinimumTokens must be positive"),
-        };
+        let kv_device_minimum_tokens = positive(
+            raw.kv_device_minimum_tokens,
+            DEFAULT_KV_DEVICE_MINIMUM_TOKENS,
+            "kvDeviceMinimumTokens",
+        )?;
         let shutdown_timeout_seconds = positive(raw.shutdown_timeout_seconds, 10, "shutdownTimeoutSeconds")?;
         let overwrite = raw.overwrite.unwrap_or(false);
         let append = raw.append.unwrap_or(false);

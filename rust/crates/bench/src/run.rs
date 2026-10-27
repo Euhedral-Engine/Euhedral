@@ -304,7 +304,7 @@ impl Iteration<'_> {
         if outcome.status != result::FAILED && outcome.work.prompt_tokens != Some(prompt.ids.len()) {
             outcome.status = result::FAILED;
             outcome.reason = Some("prompt_token_count_mismatch".to_string());
-            outcome.timings = None;
+            // As Java keeps the timings of this failure; a failed row reports no rate.
             outcome.throughput = None;
         }
         let gpu_memory = before.map(|before| {

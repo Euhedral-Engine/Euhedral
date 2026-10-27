@@ -17,7 +17,7 @@
     reason = "a command-line binary: its output is the report"
 )]
 
-use std::env;
+use std::env::{self, consts};
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 use std::sync::Arc;
@@ -42,8 +42,12 @@ CONFIG.json is a Java benchmark configuration file (see benchmark/configs); it r
 Exit codes: 0 success, 1 a measured row failed or was ineligible, 2 usage or configuration, 3 the engine did not load.
 ";
 
-/// The library the Java configuration files name, relative to the repository root.
-const DEFAULT_CUDA_LIBRARY: &str = "build/native/linux-x64/lib/libeuhedral_cuda.so";
+/// The library the Java configuration files name, relative to the repository root, where the build puts it for this
+/// platform; other platforms name the library with `--cuda-library`.
+fn default_cuda_library() -> Option<PathBuf> {
+    (consts::OS == "linux" && consts::ARCH == "x86_64")
+        .then(|| PathBuf::from("build/native/linux-x64/lib/libeuhedral_cuda.so"))
+}
 
 fn main() -> ExitCode {
     let started = SystemTime::now();
@@ -219,9 +223,8 @@ fn settings_for(options: &Options) -> Result<Settings, Failure> {
     };
     settings.model = model;
     settings.context.max_tokens = options.max_context_tokens;
-    if let Some(tokens) = options.kv_device_minimum_tokens {
-        settings.context.kv_cache_on_gpu_tokens = tokens;
-    }
+    // Always assigned, as the Java benchmark always passes it (a settings file does not win over the configuration).
+    settings.context.kv_cache_on_gpu_tokens = options.kv_device_minimum_tokens;
     settings.prefix_cache.size = ByteSize::mib(0);
     Ok(settings)
 }
@@ -254,7 +257,9 @@ fn dump_command(args: &[String]) -> Result<u8, Failure> {
             "dump needs --artifact, --prefix, --steps and --out".to_string(),
         ));
     };
-    let library = library.unwrap_or_else(|| PathBuf::from(DEFAULT_CUDA_LIBRARY));
+    let Some(library) = library.or_else(default_cuda_library) else {
+        return Err(Failure::Usage("dump needs --cuda-library on this platform".to_string()));
+    };
 
     let tokenizer = load_tokenizer(&artifact)?;
     let (prefix_ids, forced) = split_document(&tokenizer, prefix, steps)?;
