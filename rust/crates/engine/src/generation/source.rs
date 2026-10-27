@@ -533,8 +533,15 @@ impl Owner {
         let Some(run) = self.run.as_mut() else { return };
         let vocabulary = self.shared.config.vocab_size;
         if let Mode::Forced { forced, sink } = &mut run.mode {
-            let bytes = &copied.loan.buffer().as_slice()[..vocabulary * 2];
+            let all = copied.loan.buffer().as_slice();
+            let bytes = &all[..vocabulary * 2];
             if let Some(next) = forced.get(copied.step) {
+                if sink.wants_hidden() {
+                    sink.hidden(
+                        copied.step,
+                        &all[vocabulary * 2..vocabulary * 2 + self.shared.config.hidden_size * 2],
+                    );
+                }
                 sink.row(copied.step, *next, bytes);
             }
         }
@@ -647,18 +654,23 @@ impl Owner {
             Mode::Forced { .. } => {
                 let step = run.generated;
                 run.waiting_logits = true;
-                if let Err(why) = self.copy_logits(step, quantum) {
+                if let Err(why) = self.copy_logits(step, quantum, flying.rows) {
                     self.fail(why);
                 }
             }
         }
     }
 
-    /// Queues the copy of the quantum's logits row to pinned memory and the message that says it has run.
-    fn copy_logits(&mut self, step: usize, quantum: &Quantum) -> Result<(), String> {
+    /// Queues the copy of the quantum's logits row to pinned memory, and of its last row's final hidden state when the
+    /// sink wants it, and the message that says they have run. `rows` is the quantum's row count.
+    fn copy_logits(&mut self, step: usize, quantum: &Quantum, rows: usize) -> Result<(), String> {
         let core = &self.shared.core;
         let bytes = self.shared.config.vocab_size * 2;
-        let mut loan = core.pool.acquire(bytes).map_err(why("the pinned row for the logits"))?;
+        let hidden_bytes = self.shared.config.hidden_size * 2;
+        let wants_hidden =
+            matches!(self.run.as_ref().map(|run| &run.mode), Some(Mode::Forced { sink, .. }) if sink.wants_hidden());
+        let total = if wants_hidden { bytes + hidden_bytes } else { bytes };
+        let mut loan = core.pool.acquire(total).map_err(why("the pinned row for the logits"))?;
         let marker = {
             let submission =
                 Submission::begin(core.owner_lane(), SubmitMode::default()).map_err(why("the owner's lane"))?;
@@ -674,6 +686,21 @@ impl Owner {
                 )
             }
             .map_err(why("queueing the logits row's copy"))?;
+            if wants_hidden {
+                // SAFETY: as above; the hidden row follows the logits row in the loan.
+                unsafe {
+                    ops::copy_device_to_readback(
+                        &submission,
+                        loan.buffer_mut(),
+                        bytes,
+                        quantum
+                            .slot(BufferSlot::FinalHiddenState)
+                            .offset(((rows.max(1) - 1) * hidden_bytes) as u64),
+                        hidden_bytes,
+                    )
+                }
+                .map_err(why("queueing the final hidden row's copy"))?;
+            }
             submission.finish_signalled().map_err(why("the logits row's copy"))?
         };
         let producer = self.shared.producer.clone();
