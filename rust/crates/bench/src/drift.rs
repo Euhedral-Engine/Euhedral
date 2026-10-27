@@ -254,7 +254,13 @@ pub fn summarize(metrics: &[StepMetrics]) -> PrefixSummary {
     let peak = metrics
         .chunks(WINDOW)
         .map(|window| average(window.iter().map(|step| step.hidden_relative)))
-        .fold(0.0, f64::max);
+        .fold(0.0f64, |peak, window| {
+            if peak.is_nan() || window.is_nan() {
+                f64::NAN
+            } else {
+                peak.max(window)
+            }
+        });
     let burn_in = BURN_IN.min(metrics.len() / 2);
     let settled = &metrics[burn_in..];
     let half = settled.len() / 2;
@@ -274,6 +280,11 @@ pub fn summarize(metrics: &[StepMetrics]) -> PrefixSummary {
     }
 }
 
+/// Whether `value` is at or above `limit`, or not a number: a run that measured nothing must not pass.
+fn exceeds(value: f64, limit: f64) -> bool {
+    value.is_nan() || value >= limit
+}
+
 fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
@@ -291,9 +302,9 @@ fn median(values: &[f64]) -> f64 {
 pub fn breaches(summaries: &[PrefixSummary], candidate: Candidate) -> Vec<String> {
     let mut breaches = Vec::new();
     for (index, summary) in summaries.iter().enumerate() {
-        if summary.mean_kl >= MAX_MEAN_KL {
+        if exceeds(summary.mean_kl, MAX_MEAN_KL) {
             breaches.push(format!(
-                "position {index}: mean KL {:.3e} is at or above {MAX_MEAN_KL:.0e}",
+                "position {index}: mean KL {:.3e} is at or above {MAX_MEAN_KL:.0e}, or not a number",
                 summary.mean_kl
             ));
         }
@@ -313,12 +324,12 @@ pub fn breaches(summaries: &[PrefixSummary], candidate: Candidate) -> Vec<String
     }
     let peak = median(&summaries.iter().map(|summary| summary.peak).collect::<Vec<_>>());
     let growth = median(&summaries.iter().map(|summary| summary.growth).collect::<Vec<_>>());
-    if peak >= MAX_PEAK {
+    if exceeds(peak, MAX_PEAK) {
         breaches.push(format!(
             "median peak window hidden error {peak:.4} is at or above {MAX_PEAK}"
         ));
     }
-    if growth > MAX_GROWTH {
+    if growth.is_nan() || growth > MAX_GROWTH {
         breaches.push(format!("median hidden error growth {growth:.3} is above {MAX_GROWTH}"));
     }
     breaches

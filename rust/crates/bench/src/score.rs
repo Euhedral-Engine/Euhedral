@@ -8,7 +8,7 @@
 //! has fetched ([`crate::rows`]): five values per step, in the order the `.values` file has them.
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use euhedral_graph::OwnedFile;
 use euhedral_inference_engine::EngineRuntime;
@@ -228,6 +228,9 @@ pub fn summary_lines(
     let rms = (dp.iter().map(|value| value * value).sum::<f64>() / n as f64).sqrt();
     let mean_nll = mean(&nll, 0, n);
     let reference_mean = mean(&reference_nll, 0, n);
+    // The Java scorer prints its timestamp to the second.
+    let seconds = when.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    let when = UNIX_EPOCH + Duration::from_secs(seconds);
     let mut text = format!(
         "# {name} {} artifact {artifact_path} reference {reference_path}\n",
         iso_instant(when)

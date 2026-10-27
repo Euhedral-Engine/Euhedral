@@ -169,3 +169,13 @@ fn a_summary_counts_windows_and_agreement() {
     );
     assert!((summary.peak - (0.06 * 31.0 + 0.06) / 32.0).abs() < 1e-12);
 }
+
+#[test]
+fn a_hidden_state_that_is_not_a_number_is_a_breach() {
+    // A hidden row of zeros gives 0 / 0: the run proved nothing, and it must not pass.
+    let mut metrics = passing();
+    metrics.iter_mut().for_each(|s| s.hidden_relative = f64::NAN);
+    let found = trips(&metrics, Candidate::HostTier);
+    assert!(found.iter().any(|b| b.contains("peak window")), "{found:?}");
+    assert!(found.iter().any(|b| b.contains("growth")), "{found:?}");
+}
