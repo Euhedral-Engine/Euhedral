@@ -41,7 +41,7 @@ use crate::plan::{MAX_CAPTURED_ROWS, Plan, Variant, View};
 use crate::stages::DraftSeed;
 use crate::stages::Quantum;
 use crate::stages::attention::{KvSource, takes_decode_scratch};
-use crate::stages::{QuantumError, QuantumKind, StageLaunch, fatal};
+use crate::stages::{QuantumError, QuantumKind, Settler, Settling, StageLaunch, fatal};
 use crate::workspace::BufferSlot;
 
 /// How a quantum runs.
@@ -486,6 +486,7 @@ impl Stage<Quantum> for ReplayStage {
         graph.launch(&submission).map_err(fatal)?;
         slot.launched();
         let marker = submission.finish_signalled().map_err(fatal)?;
+        quantum.ends.record(marker, true);
         Ok(Submitted::marker(marker))
     }
 }
@@ -550,6 +551,7 @@ impl Executor {
         retire: impl Fn(Quantum, QuantumOutcome) + Send + Sync + 'static,
     ) -> Result<Executor, GraphError> {
         let retire: Arc<dyn Fn(Quantum, QuantumOutcome) + Send + Sync> = Arc::new(retire);
+        let settler = Settler::new(runtime);
         let mut eager = Vec::with_capacity(Variant::ALL.len());
         let mut replay = Vec::with_capacity(Variant::ALL.len());
         for variant in Variant::ALL {
@@ -559,8 +561,13 @@ impl Executor {
                 replay.push(None);
                 continue;
             };
-            let mut stages: Vec<Arc<dyn Stage<Quantum>>> =
-                entries.iter().map(|entry| Arc::clone(&entry.stage)).collect();
+            // A quantum that is killed or fails part-way settles its lanes, so that it retires.
+            let mut stages: Vec<Arc<dyn Stage<Quantum>>> = entries
+                .iter()
+                .map(|entry| {
+                    Arc::new(Settling::new(Arc::clone(&entry.stage), Arc::clone(&settler))) as Arc<dyn Stage<Quantum>>
+                })
+                .collect();
             let launches: Arc<[Arc<dyn StageLaunch>]> = entries.iter().map(|entry| Arc::clone(&entry.launch)).collect();
             if view.capturable() {
                 spec.stage(StageSpec {
