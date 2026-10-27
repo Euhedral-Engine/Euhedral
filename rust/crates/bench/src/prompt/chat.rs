@@ -35,7 +35,7 @@ const STANDALONE_TASKS: [&str; TASKS] = [
 ];
 
 /// The frozen document, read from the Java benchmark's resources so the two engines quote the same text.
-const DOCUMENT: &str = include_str!(
+pub const DOCUMENT: &str = include_str!(
     "../../../../../benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md"
 );
 
