@@ -29,10 +29,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
+use euhedral_core::frames::Frame;
 use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, ExternalEdge, GraphRuntime, Lake, LaneId, LanePool,
-    Marker, QuantumOutcome, RetryCounts, Stage, StageGraph, StageGraphSpec, StageId, StageSpec, UnitGuard,
+    Marker, QuantumOutcome, RetryCounts, Stage, StageError, StageGraph, StageGraphSpec, StageId, StageSpec, UnitGuard,
 };
 use euhedral_inference_cuda::{
     CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, PinnedPool, RetireList, Submission, SubmitMode, ops,
@@ -297,7 +298,7 @@ impl StageLaunch for Probe {
         Vec::new()
     }
 
-    fn launch(&self, _quantum: &Quantum, _submission: &Submission<'_>) -> Result<(), euhedral_graph::StageError> {
+    fn launch(&self, _quantum: &Quantum, _submission: &Submission<'_>) -> Result<(), StageError> {
         self.ran[self.index].fetch_add(1, Ordering::AcqRel);
         match &self.act {
             Act::Nothing => Ok(()),
@@ -305,7 +306,7 @@ impl StageLaunch for Probe {
                 kill.store(true, Ordering::Release);
                 Ok(())
             }
-            Act::Fail => Err(euhedral_graph::StageError::Fatal("the probe refuses".to_string())),
+            Act::Fail => Err(StageError::Fatal("the probe refuses".to_string())),
             Act::Panic => panic!("the probe panics"),
         }
     }
@@ -656,6 +657,108 @@ fn quanta_that_complete_are_killed_and_fail_on_shared_lanes_all_retire() {
         }
     }
     world.close();
+}
+
+/// Settles a quantum whose lane 0 ends unsignalled while another submission holds the lane, driving the completions by
+/// hand on this thread (they are attached to no lattice): the frame finds the lane held, publishes itself again, and
+/// goes out again only once a lane has progressed or `backstop` has passed.
+fn settle_behind_a_held_lane(backstop: Duration) {
+    let Some(world) = World::open(2) else { return };
+    let lane = &world.lanes[0];
+    let pool = Arc::clone(&world.runtime.lanes);
+    let completions = Completions::new(Arc::clone(&pool));
+    let runtime = GraphRuntime {
+        stages: Arc::clone(&world.runtime.stages),
+        completions: Arc::clone(&completions),
+        lanes: pool,
+        retries: Arc::new(RetryCounts::default()),
+        retry_backstop: backstop,
+    };
+    let frames_out = |completions: &Completions| {
+        let mut frames: Vec<Box<dyn Frame>> = Vec::new();
+        completions.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
+        frames
+    };
+    // The quantum's last marker on lane 0 is unsignalled.
+    let mut sequence = world.sequence(1024);
+    let quantum = world.quantum(&mut sequence, 0);
+    let submission = Submission::begin(lane, SubmitMode::default()).unwrap();
+    let unsignalled = submission.finish().unwrap();
+    quantum.lane_ends().record(unsignalled, false);
+    let stage = Settling::new(
+        Arc::new(Placed::new(
+            Arc::new(Probe {
+                act: Act::Nothing,
+                ran: Arc::new(vec![AtomicUsize::new(0)]),
+                index: 0,
+            }),
+            true,
+        )),
+        Settler::new(&runtime),
+    );
+
+    let held = Submission::begin(lane, SubmitMode::default()).unwrap();
+    stage.abandoned(&quantum);
+    assert_eq!(completions.pending(), 1, "the abandoned stage publishes one settling");
+    let mut first = frames_out(&completions);
+    assert_eq!(first.len(), 1, "the settling is ready at once");
+    let mut frame = first.pop().unwrap();
+    frame.execute().unwrap();
+    Frame::do_finally(frame);
+    assert_eq!(
+        completions.pending(),
+        1,
+        "the lane was held, so the settling is published again"
+    );
+    assert!(quantum.lane_ends().unsignalled(LaneId(0)), "nothing was signalled yet");
+    if backstop > Duration::from_secs(60) {
+        assert!(
+            frames_out(&completions).is_empty(),
+            "no lane has progressed and the backstop is far off, so the settling waits"
+        );
+    }
+
+    // The holder lets go, and the lane progresses: the settling goes out again and signals.
+    let released = held.finish_signalled().unwrap();
+    let begun = Instant::now();
+    let mut again = Vec::new();
+    while again.is_empty() {
+        assert!(begun.elapsed() < DEADLINE, "the settling was never published again");
+        again = frames_out(&completions);
+        thread::sleep(Duration::from_millis(1));
+    }
+    if backstop > Duration::from_secs(60) {
+        assert!(
+            lane.completed() >= released.value,
+            "the settling was published again by the lane's progress"
+        );
+    }
+    let mut frame = again.pop().unwrap();
+    frame.execute().unwrap();
+    Frame::do_finally(frame);
+    assert_eq!(completions.pending(), 0, "the settling is done");
+    assert!(quantum.lane_ends().unsignalled_lanes().is_empty());
+    let begun = Instant::now();
+    while lane.completed() < unsignalled.value {
+        assert!(
+            begun.elapsed() < DEADLINE,
+            "the lane never reached the quantum's marker"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    world.close();
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn a_settling_that_finds_its_lane_held_is_published_again_behind_the_lane_s_progress() {
+    settle_behind_a_held_lane(Duration::from_secs(3600));
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn a_settling_that_finds_its_lane_held_is_published_again_at_the_backstop() {
+    settle_behind_a_held_lane(Duration::ZERO);
 }
 
 // The plan's graphs, with a captured quantum.
