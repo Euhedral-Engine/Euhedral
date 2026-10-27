@@ -38,7 +38,8 @@ const JAVA_KV_131072: u64 = 2_415_919_104;
 const JAVA_KV_32768: u64 = 603_979_776;
 const JAVA_PAGE_BYTES: u64 = 294_912;
 const JAVA_TRELLIS_SCRATCH_512: u64 = 160_669_696;
-const JAVA_WORKSPACE_512: u64 = 172_140_552;
+/// The Java workspace at 512 rows, which holds one input record; this engine holds two (`INPUT_RECORDS`).
+const WORKSPACE_512: u64 = 172_140_552 + (512 * 4 + 8);
 
 fn inputs(device_free: u64) -> PlanInputs {
     PlanInputs {
@@ -75,7 +76,7 @@ fn rco_fits_resident_at_131072_on_16_gib() {
     assert_eq!(plan.kv_device_bytes, JAVA_KV_131072);
     assert_eq!(plan.kv_host_bytes, 0);
     assert_eq!(plan.scratch_bytes, JAVA_TRELLIS_SCRATCH_512);
-    assert_eq!(plan.workspace_bytes, JAVA_WORKSPACE_512);
+    assert_eq!(plan.workspace_bytes, WORKSPACE_512);
     assert_eq!(plan.kv_format, KvFormat::Nvfp4);
     assert_eq!(plan.draft_depth, 4);
     // Java's device need is the weights, the cache, the reserve and the scratch; the arena aligns each object.
@@ -246,7 +247,7 @@ fn workspace_sized_for_prefill_chunk() {
         rows: 512,
         logits_rows: 8,
     };
-    assert_eq!(workspace_bytes(&config, rows), JAVA_WORKSPACE_512);
+    assert_eq!(workspace_bytes(&config, rows), WORKSPACE_512);
     assert_eq!(slot_bytes(&config, BufferSlot::GateUp, rows), 512 * 2 * 17_408 * 2);
     assert_eq!(slot_bytes(&config, BufferSlot::GdnAlpha, rows), 512 * 48 * 4);
     assert_eq!(slot_bytes(&config, BufferSlot::Logits, rows), 8 * 248_320 * 2);
@@ -266,7 +267,7 @@ fn workspace_sized_for_prefill_chunk() {
             }
         )
     );
-    assert!(plan.workspace_bytes < JAVA_WORKSPACE_512);
+    assert!(plan.workspace_bytes < WORKSPACE_512);
     // A quantum larger than the workspace is refused, and so is one that scores more rows than the logits hold.
     assert_eq!(rows.check(512), Ok(()));
     assert_eq!(

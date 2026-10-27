@@ -38,7 +38,7 @@ use crate::model::ModelConfig;
 use crate::quantum::Disposition;
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
 use crate::state::{FlightGuard, KvView, SequenceDevice, StaleReservation};
-use crate::workspace::{BufferSlot, Workspace, WorkspaceError};
+use crate::workspace::{BufferSlot, INPUT_RECORDS, Workspace, WorkspaceError};
 use attention::KvSource;
 use sampling::{Selection, SelectionLease};
 
@@ -275,6 +275,11 @@ pub struct Quantum {
     pub(crate) draft_token_read: Option<usize>,
     /// Whether the quantum writes its last input token to slot 0 of the step's tokens as the step's current token.
     pub(crate) writes_current_token: bool,
+    /// The input record the quantum's ids and start position are uploaded to (0 or 1; the workspace holds two).
+    pub(crate) record: usize,
+    /// The selection of the quantum before it in a chain: the quantum's one row reads its token id from that
+    /// selection's keys on the device, behind the quantum that wrote them ([`Quantum::token_from`]).
+    pub(crate) token_from: Option<Arc<Selection>>,
     /// The device words and the pinned readback the quantum's argmax fills.
     pub(crate) selection: Option<Arc<Selection>>,
     /// The lease on `selection` when it came from the sequence's pool: the words are the quantum's until it is
@@ -333,6 +338,8 @@ impl Quantum {
             config,
             lanes,
             logits_rows,
+            record: 0,
+            token_from: None,
             seeds_draft: false,
             draft_seed: None,
             draft_token_write: None,
@@ -443,6 +450,30 @@ impl Quantum {
         }
     }
 
+    /// The input record the quantum's ids and start position go to: 0 or 1, and the other one for the quantum admitted
+    /// next in a chain.
+    pub fn with_input_record(mut self, record: usize) -> Self {
+        self.record = record % INPUT_RECORDS as usize;
+        self
+    }
+
+    /// The quantum's one row reads its token id from the keys of `selection`, the selection of the quantum before it in
+    /// the chain, on the device: no id is uploaded, and the host need not have read the token. The quantum's first
+    /// stage runs behind the earlier quantum's last (the chain's edge), which has written the keys.
+    pub fn token_from(mut self, selection: Arc<Selection>) -> Result<Self, QuantumError> {
+        if self.rows != 1 || self.draft_token_read.is_some() {
+            return Err(QuantumError::Invalid {
+                what: format!(
+                    "a token chained from the quantum before is one row, read from the selection and not from the \
+                     step's tokens; this quantum has {} rows",
+                    self.rows
+                ),
+            });
+        }
+        self.token_from = Some(selection);
+        Ok(self)
+    }
+
     /// The device words and readback the quantum's argmax fills.
     pub fn with_selection(mut self, selection: Arc<Selection>) -> Self {
         self.selection = Some(selection);
@@ -513,8 +544,11 @@ impl Quantum {
         self.selection.as_ref()
     }
 
-    /// The device address of `slot`.
+    /// The device address of `slot`; for the input record, the one this quantum uploads to.
     pub(crate) fn slot(&self, slot: BufferSlot) -> DevicePtr {
+        if slot == BufferSlot::TokenIds {
+            return self.workspace.input_record(self.record);
+        }
         self.workspace.buffer(slot).ptr()
     }
 

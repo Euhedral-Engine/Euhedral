@@ -283,6 +283,26 @@ fn the_trellis_value_projection_has_a_scratch_region_of_its_own_in_decode_type_v
 }
 
 #[test]
+fn the_stage_bound_covers_every_view_of_the_real_plan() {
+    let built = built();
+    let bound = Plan::stage_bound();
+    let counts: Vec<usize> = [
+        View::Decode,
+        View::Verify { rows: 9 },
+        View::PrefillChunk,
+        View::Draft { rows: 1 },
+        View::CatchUp { rows: 9 },
+    ]
+    .iter()
+    .map(|view| built.plan.stages(*view).unwrap().len())
+    .collect();
+    let largest = *counts.iter().max().unwrap();
+    assert!(largest <= bound, "{counts:?} against {bound}");
+    // The bound takes the kind of layer with more stages for all 64, so it is above the mixed model's count but near it.
+    assert!(bound < 2 * largest, "{counts:?} against {bound}");
+}
+
+#[test]
 fn fan_out_width_is_plan_width() {
     let built = built();
     let plan = &built.plan;
@@ -304,6 +324,11 @@ fn fan_out_width_is_plan_width() {
         "the joint projection, query/key and value/z run at once"
     );
     assert_eq!(plan.fan_out_width(), 3);
+    assert_eq!(
+        Plan::lane_width(),
+        plan.fan_out_width(),
+        "the lanes a runtime makes before it knows the model are the width of the model's plan"
+    );
     // Every graph names lanes within the pool the width sizes: the root only the home lane, the rest any of them.
     for view in [View::Decode, View::PrefillChunk, View::Draft { rows: 2 }] {
         let spec = plan.spec(view).unwrap();

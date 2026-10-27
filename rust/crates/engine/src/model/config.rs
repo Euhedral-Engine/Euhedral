@@ -79,11 +79,17 @@ impl From<&ModelMetadata> for ModelConfig {
 }
 
 impl ModelConfig {
+    /// The decoder layers of the one model the engine runs (`check_supported`).
+    pub const SUPPORTED_LAYERS: usize = 64;
+
     /// Refuses a geometry the engine does not run: the dense Qwen text model with 64 layers and at most one MTP
     /// layer (`CompactWeightLoader.validateConfig`), and the attention and GDN geometry `ExecutionPlan` checks.
     pub fn check_supported(&self) -> Result<(), PlanError> {
         let unsupported = |why: String| Err(PlanError::Unsupported(why));
-        if self.layer_kinds.len() != 64 || self.num_hidden_layers != 64 || self.mtp_layer_count > 1 {
+        if self.layer_kinds.len() != Self::SUPPORTED_LAYERS
+            || self.num_hidden_layers != Self::SUPPORTED_LAYERS
+            || self.mtp_layer_count > 1
+        {
             return unsupported("the engine runs a 64-layer model with at most one MTP layer".to_string());
         }
         if self.num_experts != 0 {

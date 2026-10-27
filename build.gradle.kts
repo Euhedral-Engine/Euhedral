@@ -120,6 +120,9 @@ subprojects {
             // Teacher-forced quality measurement (TeacherForcedQualityCudaIntegrationTest).
             for (name in listOf("report", "artifact", "prefix", "steps", "host-mib", "tokens", "rows", "kv-cache"))
                 providers.gradleProperty("euhedral.quality.$name").orNull?.let { systemProperty("euhedral.quality.$name", it) }
+            // Greedy reference for the Rust engine (GreedyReferenceCudaIntegrationTest).
+            for (name in listOf("report", "artifact", "tokens", "host-mib", "kv-cache"))
+                providers.gradleProperty("euhedral.greedy.$name").orNull?.let { systemProperty("euhedral.greedy.$name", it) }
             // MTP drafting-confidence report and draft-length screen (MtpDraftConfidence/MtpDraftLengthScreen tests).
             for (name in listOf("prompts", "report", "drafts", "context", "arms", "rounds"))
                 providers.gradleProperty("euhedral.mtp.$name").orNull?.let { systemProperty("euhedral.mtp.$name", it) }

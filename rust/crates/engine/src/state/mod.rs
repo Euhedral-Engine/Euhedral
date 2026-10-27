@@ -4,6 +4,8 @@ pub mod attention;
 pub mod gdn;
 pub mod kv;
 
+use std::fmt::Display;
+use std::iter;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -222,6 +224,24 @@ impl SequenceState {
             refs = refs.with_mtp_kv(mtp.view());
         }
         Ok(refs)
+    }
+
+    /// Makes the sequence one that has seen no token: the caches are empty (their pages stay reserved) and the GDN
+    /// state is zeroed on `submission`'s lane. The owner calls it between requests, with no quantum in flight, and
+    /// orders the sequence's next quantum behind the submission's marker.
+    pub fn reset(&mut self, submission: &Submission<'_>) -> Result<(), EngineError> {
+        if self.in_flight() > 0 {
+            return Err(EngineError::Runtime(format!(
+                "a sequence with {} quanta in flight cannot be reset",
+                self.in_flight()
+            )));
+        }
+        let fail = |error: &dyn Display| EngineError::Runtime(format!("resetting the sequence: {error}"));
+        for cache in iter::once(&mut self.kv).chain(self.mtp_kv.as_mut()) {
+            cache.discard();
+            cache.truncate(0).map_err(|error| fail(&error))?;
+        }
+        self.device.gdn.zero(submission).map_err(|error| fail(&error))
     }
 
     /// Ends the sequence: frees its caches, the one place their blocking frees may happen. Refused, giving the state
