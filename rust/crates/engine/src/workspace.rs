@@ -177,8 +177,9 @@ pub fn input_record_bytes(rows: u64) -> u64 {
     (rows * 4).div_ceil(8) * 8 + 8
 }
 
-/// Input records the workspace holds. A quantum admitted behind the one that runs uploads its record while that one
-/// still reads its own, so consecutive quanta of a chain take the records in turn.
+/// Input records a workspace holds at least. A quantum admitted behind the one that runs uploads its record while that
+/// one still reads its own, so consecutive quanta of a chain take the records in turn. A drafting sequence admits a
+/// step's quanta together, one record each (`Workspace::allocate_with_records`).
 pub const INPUT_RECORDS: u64 = 2;
 
 /// Bytes of `slot` in a workspace of `rows`.
@@ -201,13 +202,13 @@ pub fn slot_bytes(config: &ModelConfig, slot: BufferSlot, rows: WorkspaceRows) -
 pub fn workspace_bytes(config: &ModelConfig, rows: WorkspaceRows) -> u64 {
     BufferSlot::ALL
         .iter()
-        .map(|slot| copies(*slot) * slot_bytes(config, *slot, rows))
+        .map(|slot| copies(*slot, INPUT_RECORDS) * slot_bytes(config, *slot, rows))
         .sum()
 }
 
-/// How many times the workspace holds `slot`.
-fn copies(slot: BufferSlot) -> u64 {
-    if slot == BufferSlot::TokenIds { INPUT_RECORDS } else { 1 }
+/// How many times a workspace of `records` input records holds `slot`.
+fn copies(slot: BufferSlot, records: u64) -> u64 {
+    if slot == BufferSlot::TokenIds { records } else { 1 }
 }
 
 /// A quantum asked for more than the workspace was sized for.
@@ -223,6 +224,7 @@ pub enum WorkspaceError {
 #[derive(Debug)]
 pub struct Workspace {
     rows: WorkspaceRows,
+    records: u64,
     slots: Vec<DeviceBuffer>,
     /// The expansion scratch regions of the linear routes.
     scratch: Vec<DeviceBuffer>,
@@ -237,18 +239,41 @@ impl Workspace {
         rows: WorkspaceRows,
         scratch_bytes: &[u64],
     ) -> Result<Workspace, CudaError> {
+        Self::allocate_with_records(library, config, rows, scratch_bytes, INPUT_RECORDS)
+    }
+
+    /// As [`Workspace::allocate`], holding `records` input records (at least [`INPUT_RECORDS`]): the quanta of a
+    /// speculative step are admitted together and each reads its own record.
+    pub fn allocate_with_records(
+        library: &Arc<CudaLibrary>,
+        config: &ModelConfig,
+        rows: WorkspaceRows,
+        scratch_bytes: &[u64],
+        records: u64,
+    ) -> Result<Workspace, CudaError> {
+        let records = records.max(INPUT_RECORDS);
         let mut slots = Vec::with_capacity(BufferSlot::ALL.len());
         for slot in BufferSlot::ALL {
             slots.push(DeviceBuffer::alloc(
                 library,
-                (copies(slot) * slot_bytes(config, slot, rows)) as usize,
+                (copies(slot, records) * slot_bytes(config, slot, rows)) as usize,
             )?);
         }
         let mut scratch = Vec::with_capacity(scratch_bytes.len());
         for bytes in scratch_bytes.iter().copied().filter(|bytes| *bytes > 0) {
             scratch.push(DeviceBuffer::alloc(library, bytes as usize)?);
         }
-        Ok(Workspace { rows, slots, scratch })
+        Ok(Workspace {
+            rows,
+            records,
+            slots,
+            scratch,
+        })
+    }
+
+    /// The input records the workspace holds.
+    pub fn records(&self) -> usize {
+        self.records as usize
     }
 
     /// The rows the workspace was sized for.
@@ -282,18 +307,18 @@ impl Workspace {
             .sum()
     }
 
-    /// The buffer of `slot`. The input record's holds [`INPUT_RECORDS`] records, one after the other.
+    /// The buffer of `slot`. The input record's holds [`Workspace::records`] records, one after the other.
     pub fn buffer(&self, slot: BufferSlot) -> &DeviceBuffer {
         &self.slots[slot.index()]
     }
 
-    /// The device address of input record `record` (0 or 1): the records follow one another, each at the size the
-    /// workspace's rows give it.
+    /// The device address of input record `record` (counted modulo the records the workspace holds): the records follow
+    /// one another, each at the size the workspace's rows give it.
     pub fn input_record(&self, record: usize) -> DevicePtr {
         let stride = input_record_bytes(self.rows.rows);
         self.slots[BufferSlot::TokenIds.index()]
             .ptr()
-            .offset((record as u64 % INPUT_RECORDS) * stride)
+            .offset((record as u64 % self.records) * stride)
     }
 }
 

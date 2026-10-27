@@ -6,8 +6,11 @@
 //! that publishes the frames of the sequence's owner into the `stages` lake; the caller is told through its listener or
 //! sink, on a worker, and waits on a latch of its own.
 
+mod acceptance;
 mod baton;
+mod draft_length;
 mod listener;
+mod mtp;
 mod request;
 mod source;
 mod teacher_forced;
@@ -15,7 +18,7 @@ mod teacher_forced;
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 #[cfg(feature = "test-oracles")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use euhedral_core::generics::FrameSink;
 use euhedral_core::generics::LatticeSource;
@@ -25,18 +28,22 @@ use euhedral_inference_cuda::CudaLibrary;
 
 use crate::error::EngineError;
 use crate::formats::{Nvfp4Linear, TrellisLinear};
-use crate::model::{ModelConfig, Weights};
+use crate::model::{LayerIndex, ModelConfig, Role, Weights};
 use crate::plan::{Formats, Plan, View};
 use crate::quantum::{Executor, GraphCache};
 use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
 use crate::state::SequenceState;
 use crate::workspace::Workspace;
+pub use acceptance::{Accepted, accept};
 use baton::Baton;
+pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
 pub use listener::GenerationListener;
-pub use request::{AdmissionError, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation};
+pub use request::{
+    AdmissionError, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
+};
 pub(crate) use source::GREEDY_DEPTH;
-use source::{GenerationSource, Message, Owner, Retired, Shared};
+use source::{Drafts, GenerationSource, Message, Owner, Retired, Shared};
 pub use teacher_forced::LogitsSink;
 
 /// What the engine keeps for generating: the plan's graphs on the runtime's lanes, and the owner of the sequence.
@@ -54,7 +61,8 @@ impl fmt::Debug for Generation {
 
 impl Generation {
     /// Builds the plan of the loaded model and the graphs of its views, and makes `sequence` their owner's. A refused
-    /// plan gives the sequence back.
+    /// plan gives the sequence back. `draft_ids` are the token ids of the draft head's rows, which an artifact with a
+    /// draft layer needs to speculate.
     pub(crate) fn new(
         core: &Arc<Core>,
         config: &Arc<ModelConfig>,
@@ -62,6 +70,7 @@ impl Generation {
         weights: &Weights,
         workspace: &Arc<Workspace>,
         sequence: SequenceState,
+        draft_ids: Option<Arc<[u32]>>,
     ) -> Result<Generation, Box<(EngineError, SequenceState)>> {
         let capacity = sequence.kv.planned_rows().min(residency.max_context_tokens as u64);
         // An unbounded queue, whose chunk holds the messages the protocol has in flight: the quanta in flight retire into
@@ -72,6 +81,14 @@ impl Generation {
             Ok(executor) => executor,
             Err(error) => return Err(Box::new((error, sequence))),
         };
+        let drafts = match (draft_ids, weights.get(LayerIndex::GLOBAL, Role::DraftTokenIds)) {
+            (Some(token_ids), Some(device)) if residency.draft_depth > 0 && sequence.mtp_kv.is_some() => Some(Drafts {
+                token_ids,
+                device_token_ids: device.ptr,
+                depth: residency.draft_depth.min(MAX_VERIFIED),
+            }),
+            _ => None,
+        };
         let shared = Arc::new(Shared {
             core: Arc::clone(core),
             config: Arc::clone(config),
@@ -80,8 +97,11 @@ impl Generation {
             producer,
             chunk: residency.rows.rows as usize,
             capacity,
+            drafts,
             #[cfg(feature = "test-oracles")]
             panic_after_admissions: AtomicU64::new(u64::MAX),
+            #[cfg(feature = "test-oracles")]
+            settle_after_speculation: AtomicBool::new(false),
         });
         let cache = GraphCache::with_capacity(core.settings.kernels.graphs.captures_per_view as usize);
         let home = Arc::new(Baton::new());
@@ -114,20 +134,32 @@ impl Generation {
                 core.compute_lanes()
             )));
         }
-        let stages = [
+        let stages_of = |view: View| plan.stages(view).map_or(0, <[_]>::len);
+        let biggest = [
             View::Decode,
             View::PrefillChunk,
             View::Verify { rows: 2 },
             View::Draft { rows: 1 },
         ]
-        .iter()
-        .filter_map(|view| plan.stages(*view).map(<[_]>::len))
+        .into_iter()
+        .map(stages_of)
         .max()
         .unwrap_or(0);
-        if stages * STAGE_RING_QUANTA > core.stage_ring {
+        // A greedy request keeps a few quanta in flight; a speculative step keeps its catch-up, drafts and verification,
+        // and the owner prepares one more behind them.
+        let step = if plan.drafts() {
+            stages_of(View::Verify {
+                rows: plan.verified_rows(),
+            }) + stages_of(View::Draft { rows: 1 }) * plan.verified_rows()
+                + biggest
+        } else {
+            0
+        };
+        let needed = (biggest * STAGE_RING_QUANTA).max(step);
+        if needed > core.stage_ring {
             return Err(EngineError::Runtime(format!(
-                "a quantum of {stages} stages records a marker per stage and the lanes' rings of {} events \
-                 do not hold the markers of {STAGE_RING_QUANTA} quanta",
+                "the quanta in flight record {needed} markers on a lane and the lanes' rings of {} events do not hold \
+                 them",
                 core.stage_ring
             )));
         }
@@ -200,6 +232,12 @@ impl Generation {
     #[cfg(feature = "test-oracles")]
     pub(crate) fn panic_after_admissions(&self, quanta: u64) {
         self.shared.panic_after_admissions.store(quanta, Ordering::Release);
+    }
+
+    /// The test hook: a speculative request ends with a decode quantum that feeds its last token.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn settle_after_speculation(&self, settle: bool) {
+        self.shared.settle_after_speculation.store(settle, Ordering::Release);
     }
 
     /// Looks at the sequence while no request holds it.

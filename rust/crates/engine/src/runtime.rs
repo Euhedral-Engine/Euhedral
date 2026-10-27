@@ -403,6 +403,14 @@ impl EngineRuntime {
         self.generation.panic_after_admissions(quanta);
     }
 
+    /// A test hook: with `settle`, a speculative request that ends at its token budget ends with one decode quantum that
+    /// feeds its last token, so that the sequence holds what greedy decode of one more token leaves (the replay of the
+    /// last verification has run).
+    #[cfg(feature = "test-oracles")]
+    pub fn settle_after_speculation_for_tests(&self, settle: bool) {
+        self.generation.settle_after_speculation(settle);
+    }
+
     /// Starts a teacher-forced run on the engine's sequence, as [`EngineRuntime::generate`] does: prefills `prefix`,
     /// then decodes the `forced` tokens one row at a time, and hands the logits row of each step to `sink`. Step `k`
     /// of the sink holds the model's prediction of `forced[k]`.
