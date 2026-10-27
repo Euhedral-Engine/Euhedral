@@ -25,6 +25,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 euhedral-inference-engine = { path = ".", features = ["test-oracles"] }
+euhedral-inference-bench = { path = "../bench" }
 euhedral-inference-cuda = { path = "../cuda", features = ["test-oracles"] }
 euhedral-inference-tokenizer = { path = "../tokenizer" }
 sha2.workspace = true
