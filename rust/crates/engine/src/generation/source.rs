@@ -18,21 +18,31 @@
 //! device (the graph's external edge waits for its sink), and takes its token id from the selection the earlier one
 //! wrote ([`Quantum::token_from`]), so the host need not have read it: there is no gap between the end of one step and
 //! the start of the next. The cost is one quantum that may run for nothing, the one that follows a stop token or a
-//! failure. It runs to its end and its rows never become part of the sequence (`discard`). It is not stopped with its
-//! kill switch: a quantum killed while its stages are being submitted leaves a last marker on a lane that no signalled
-//! marker follows (only the ends of the lanes' chains signal), the lane's completion word never reaches the quantum's
-//! retirement boundary, and the quantum never retires, which would keep the request from ending.
+//! failure. When the request stops, the quanta in flight are told to stop (their kill switches are set): a quantum
+//! that stopped part-way settles the lanes whose last marker it left unsignalled, so that it retires, and its rows
+//! never become part of the sequence (`discard`).
 //!
 //! **The records.** The owner reserves a quantum's cache rows and uploads its input record on its own lane
-//! when it admits it. Consecutive quanta use the two input records in turn, so the upload of the quantum behind never
-//! overwrites what the quantum ahead is still reading.
+//! when it admits it. Each quantum in flight reads a record of its own: a greedy request alternates between two, so the
+//! upload of the quantum behind never overwrites what the quantum ahead is still reading, and the quanta of a
+//! speculative step take the workspace's records (one more than the draft depth) in order.
+//!
+//! **Speculation.** With the artifact's draft layer ([`Speculation::Artifact`]) the owner runs the prompt's chunks, each
+//! followed by the MTP catch-up of its rows, and then steps (`mtp.rs`): the catch-up over the rows the last
+//! verification committed, the recursive drafts and the verification of the current token and the drafts, admitted
+//! together as one chain. The drafts pass their tokens to each other and to the verification on the device, so the
+//! host reads nothing until the verification retires; it then reads the drafts and the verifier's tokens, accepts the
+//! drafts that equal them, commits that many rows and tells the listener. Each quantum of a step reads an input record
+//! of its own.
 
 use std::any::Any;
 use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter};
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "test-oracles")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 
@@ -40,10 +50,11 @@ use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_core::generics::{LatticeReceiver, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, Multi, Producer};
 use euhedral_graph::{Lake, QuantumOutcome};
-use euhedral_inference_cuda::{PooledPinned, Submission, SubmitMode, ops};
+use euhedral_inference_cuda::{DevicePtr, PooledPinned, Submission, SubmitMode, ops};
 
 use super::baton::Baton;
 use super::listener::GenerationListener;
+use super::mtp::Speculating;
 use super::request::{AdmissionError, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation};
 use super::teacher_forced::LogitsSink;
 use crate::frames::{Kind, id_hash, step};
@@ -52,17 +63,21 @@ use crate::quantum::{Executor, GraphCache, Started};
 use crate::runtime::{Core, Units};
 use crate::stages::attention::KvSource;
 use crate::stages::sampling::Selection;
-use crate::stages::{InputRecordRef, Quantum, QuantumKind};
+use crate::stages::{InputRecordRef, Quantum, QuantumError, QuantumKind};
 use crate::state::SequenceState;
 use crate::state::kv::KvRetained;
 use crate::workspace::{BufferSlot, Workspace};
 
 /// Decode quanta that start below this position overlap their launches with the quantum before them
 /// (`Quantum.OVERLAP_MAX_START_POSITION`).
-const OVERLAP_MAX_START_POSITION: u64 = 1024;
+pub(super) const OVERLAP_MAX_START_POSITION: u64 = 1024;
 
 /// Quanta of a greedy request in flight at once: the one running, and the one admitted behind it.
 pub(crate) const GREEDY_DEPTH: usize = 2;
+
+/// The input records a greedy or teacher-forced request alternates between (a speculative one gives each quantum of a
+/// step its own).
+const ALTERNATING_RECORDS: u64 = 2;
 
 /// What an owner is told.
 pub(crate) enum Message {
@@ -104,24 +119,57 @@ pub(crate) struct Shared {
     pub(crate) chunk: usize,
     /// Rows the context holds.
     pub(crate) capacity: u64,
+    /// What speculation needs of the artifact; `None` for an artifact without the draft layer.
+    pub(crate) drafts: Option<Drafts>,
     /// A test hook: the owner panics at the end of the turn in which it has admitted this many quanta.
     #[cfg(feature = "test-oracles")]
     pub(crate) panic_after_admissions: AtomicU64,
+    /// A test hook: a speculative request ends with one decode quantum that feeds its last token, so that the state of
+    /// the sequence is the state greedy decode leaves after the same tokens (the replay of the last verification
+    /// runs).
+    #[cfg(feature = "test-oracles")]
+    pub(crate) settle_after_speculation: AtomicBool,
+}
+
+/// What speculation needs of the artifact's draft layer.
+pub(crate) struct Drafts {
+    /// The token of each row of the draft head (`text/draft_head_token_ids`).
+    pub(crate) token_ids: Arc<[u32]>,
+    /// The same ids on the device, which a draft's selection maps its row through.
+    pub(crate) device_token_ids: DevicePtr,
+    /// Drafts a step makes and its verification checks.
+    pub(crate) depth: usize,
 }
 
 /// A step of a request.
 #[derive(Clone, Copy, Debug)]
-enum Step {
+pub(super) enum Step {
     /// `rows` prompt rows; `last` ends the prompt.
     Prefill { rows: usize, last: bool },
     /// One row of the sequence.
     Decode,
+    /// The MTP catch-up of the `rows` prompt rows just prefilled.
+    PromptCatchUp { rows: usize },
+    /// A speculative step of `drafts` drafts: the catch-up (which makes the first), the recursive drafts and the
+    /// verification of the current token and the drafts.
+    Speculate { drafts: usize },
+    /// The decode that feeds the last token of a speculative request (a test hook).
+    #[cfg_attr(
+        not(feature = "test-oracles"),
+        allow(dead_code, reason = "only the test hook asks for it")
+    )]
+    Settle,
 }
 
 /// What a request does with the rows it computes.
-enum Mode {
+pub(super) enum Mode {
     /// Selects each token on the device and reports it.
     Greedy { listener: Box<dyn GenerationListener> },
+    /// Drafts with the artifact's draft layer, verifies the drafts and reports the tokens it commits.
+    Speculative {
+        listener: Box<dyn GenerationListener>,
+        state: Box<Speculating>,
+    },
     /// Feeds the given tokens and hands each step's logits row to a sink.
     Forced {
         forced: Vec<u32>,
@@ -129,18 +177,42 @@ enum Mode {
     },
 }
 
+/// What a quantum of the request is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Role {
+    /// A prompt chunk; `last` ends the prompt.
+    Prefill { last: bool },
+    /// One row of the sequence.
+    Decode,
+    /// The MTP catch-up of a prompt chunk.
+    PromptCatchUp,
+    /// The catch-up of a step, which makes its first draft.
+    CatchUp,
+    /// A recursive draft of a step.
+    Draft,
+    /// The verification of a step.
+    Verify,
+    /// The decode that feeds the last token of a speculative request.
+    Settle,
+}
+
 /// A quantum admitted and not yet concluded.
-struct Flying {
-    kind: QuantumKind,
-    start: u64,
-    rows: usize,
-    last_chunk: bool,
-    selection: Option<Arc<Selection>>,
-    retained: KvRetained,
-    admitted: Instant,
-    replayed: bool,
-    recorded: bool,
-    retired: Option<(Quantum, QuantumOutcome)>,
+pub(super) struct Flying {
+    pub(super) role: Role,
+    pub(super) kind: QuantumKind,
+    pub(super) start: u64,
+    pub(super) rows: usize,
+    pub(super) last_chunk: bool,
+    pub(super) selection: Option<Arc<Selection>>,
+    pub(super) retained: KvRetained,
+    pub(super) admitted: Instant,
+    pub(super) replayed: bool,
+    pub(super) recorded: bool,
+    /// Set to stop the quantum when the request stops while it is in flight.
+    pub(super) kill: Arc<AtomicBool>,
+    /// When the owner found it retired.
+    pub(super) retired_at: Option<Instant>,
+    pub(super) retired: Option<(Quantum, QuantumOutcome)>,
 }
 
 /// A retired quantum the owner keeps until the work it queued on its own lane has run: a quantum that was stopped before
@@ -152,51 +224,51 @@ struct Parked {
 }
 
 /// The state of one request.
-struct Run {
-    mode: Mode,
-    prompt: Vec<u32>,
+pub(super) struct Run {
+    pub(super) mode: Mode,
+    pub(super) prompt: Vec<u32>,
     /// The tokens or rows the request produces: `max_tokens`, or the forced tokens.
-    wanted: usize,
-    stop_tokens: Vec<u32>,
+    pub(super) wanted: usize,
+    pub(super) stop_tokens: Vec<u32>,
     /// Prompt tokens admitted.
-    offset: usize,
+    pub(super) offset: usize,
     /// The position the next quantum starts at.
-    position: u64,
-    /// Quanta admitted: the input record of the next is `admitted % 2`.
-    admitted: u64,
+    pub(super) position: u64,
+    /// Quanta admitted: the input record of the next of a greedy request is `admitted % 2`.
+    pub(super) admitted: u64,
+    /// Quanta admitted since the request last had none in flight: the input record of the next of a speculative one.
+    pub(super) cursor: usize,
+    /// Quanta the request keeps in flight at most.
+    pub(super) depth: usize,
     /// Decode quanta admitted.
-    decodes: usize,
+    pub(super) decodes: usize,
     /// Tokens selected and reported, or rows handed to the sink.
-    generated: usize,
-    in_flight: VecDeque<Flying>,
+    pub(super) generated: usize,
+    pub(super) in_flight: VecDeque<Flying>,
     /// The last quantum admitted, which the next one is chained behind. Held only while another quantum may follow:
     /// a quantum retires only when its reference is dropped.
-    chain: Option<Started>,
+    pub(super) chain: Option<Started>,
     /// The selection of the latest quantum that selects.
-    previous: Option<Arc<Selection>>,
-    stopping: Option<FinishReason>,
+    pub(super) previous: Option<Arc<Selection>>,
+    pub(super) stopping: Option<FinishReason>,
     /// A teacher-forced step's logits row is being copied.
-    waiting_logits: bool,
+    pub(super) waiting_logits: bool,
     /// Turns of the owner that panicked during this request.
-    panics: u32,
-    began: Instant,
+    pub(super) panics: u32,
+    pub(super) began: Instant,
     /// Rows the context holds.
-    capacity: u64,
+    pub(super) capacity: u64,
     _units: Units,
 }
 
 impl Run {
-    fn depth(&self) -> usize {
-        match self.mode {
-            Mode::Greedy { .. } => GREEDY_DEPTH,
-            Mode::Forced { .. } => 1,
-        }
-    }
-
     /// The next step to admit, or `None` once the request has no more (or has been told to stop).
-    fn next_step(&self, chunk: usize) -> Option<Step> {
+    pub(super) fn next_step(&self, chunk: usize) -> Option<Step> {
         if self.stopping.is_some() {
             return None;
+        }
+        if let Mode::Speculative { state, .. } = &self.mode {
+            return state.next_step(self, chunk);
         }
         if self.offset < self.prompt.len() {
             let rows = chunk.min(self.prompt.len() - self.offset);
@@ -213,18 +285,32 @@ impl Run {
         }
     }
 
-    /// Whether `step` selects a token, and so takes one of the sequence's selections.
-    fn selects(&self, step: Step) -> bool {
+    /// The selections `step` takes, one for each quantum of it that selects a token.
+    pub(super) fn selections(&self, step: Step) -> usize {
         match step {
-            Step::Prefill { last, .. } => last && self.wanted > 0,
-            Step::Decode => true,
+            Step::Prefill { last, .. } => usize::from(last && self.wanted > 0),
+            Step::Decode => 1,
+            Step::PromptCatchUp { .. } | Step::Settle => 0,
+            Step::Speculate { drafts } => drafts + 1,
         }
     }
 
-    /// Ends the request with `reason` unless it already ends: no more steps. The quanta in flight run to their end and are discarded: see the module documentation.
-    fn stop(&mut self, reason: FinishReason) {
+    /// The listener of a generation that reports tokens.
+    pub(super) fn listener(&mut self) -> Option<&mut dyn GenerationListener> {
+        match &mut self.mode {
+            Mode::Greedy { listener } | Mode::Speculative { listener, .. } => Some(listener.as_mut()),
+            Mode::Forced { .. } => None,
+        }
+    }
+
+    /// Ends the request with `reason` unless it already ends: no more steps. The quanta in flight are told to stop and
+    /// are discarded when they retire: see the module documentation.
+    pub(super) fn stop(&mut self, reason: FinishReason) {
         if self.stopping.is_none() {
             self.stopping = Some(reason);
+            for flying in &self.in_flight {
+                flying.kill.store(true, Ordering::Release);
+            }
         }
         self.chain = None;
     }
@@ -245,15 +331,36 @@ impl Finished {
     }
 }
 
+/// What the owner decides about a quantum before it is built (`Owner::admit_quantum`).
+pub(super) struct Admission {
+    pub(super) role: Role,
+    pub(super) kind: QuantumKind,
+    pub(super) rows: usize,
+    /// The position of the quantum's first row in the cache it appends to.
+    pub(super) start: u64,
+    /// The cache the quantum appends to.
+    pub(super) source: KvSource,
+    /// Whether its launches overlap with the quantum before it (programmatic dependent launch).
+    pub(super) pdl: bool,
+    /// The logits rows it scores; a quantum that scores any takes a selection.
+    pub(super) logits: usize,
+    /// The rows each GDN layer replays from its checkpoint before the quantum's own rows.
+    pub(super) replay: Vec<u32>,
+    /// Whether it ends the prompt.
+    pub(super) last_chunk: bool,
+    /// Whether another quantum is admitted behind it before it may retire.
+    pub(super) more: bool,
+}
+
 /// The owner of the engine's sequence. See the module documentation.
 pub(crate) struct Owner {
-    shared: Arc<Shared>,
-    sequence: SequenceState,
+    pub(super) shared: Arc<Shared>,
+    pub(super) sequence: SequenceState,
     cache: GraphCache,
     inbox: Consumer<Message, Multi>,
     /// Whether the sequence holds the state of a request that ended: the next request starts with a reset.
     used: bool,
-    run: Option<Run>,
+    pub(super) run: Option<Run>,
     parked: Vec<Parked>,
     finished: Option<Finished>,
 }
@@ -265,7 +372,7 @@ impl fmt::Debug for Owner {
 }
 
 /// Maps an error of a step to the text a failed request carries.
-fn why<E: Display>(what: &'static str) -> impl Fn(E) -> String {
+pub(super) fn why<E: Display>(what: &'static str) -> impl Fn(E) -> String {
     move |error| format!("{what}: {error}")
 }
 
@@ -308,13 +415,32 @@ impl Owner {
         }
     }
 
-    /// Starts a greedy request.
+    /// The test hook: the owner records no graphs from now on, and runs every quantum stage by stage.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn disable_graphs(&mut self) {
+        self.cache = GraphCache::disabled();
+    }
+
+    /// Starts a greedy request, or one that speculates with the artifact's draft layer.
     pub(crate) fn begin(&mut self, units: Units, request: GenerationRequest) -> Result<(), AdmissionError> {
-        if request.speculation == Speculation::Artifact {
-            return Err(AdmissionError::SpeculationUnavailable);
-        }
-        let mode = Mode::Greedy {
-            listener: request.listener,
+        let mode = match request.speculation {
+            Speculation::Off => Mode::Greedy {
+                listener: request.listener,
+            },
+            Speculation::Artifact => {
+                let Some(drafts) = self.shared.drafts.as_ref() else {
+                    return Err(AdmissionError::SpeculationUnavailable);
+                };
+                Mode::Speculative {
+                    listener: request.listener,
+                    state: Box::new(Speculating::new(
+                        drafts.depth,
+                        self.shared.capacity,
+                        request.prompt.len(),
+                        request.max_tokens as usize,
+                    )),
+                }
+            }
         };
         self.start_run(
             units,
@@ -385,6 +511,11 @@ impl Owner {
                 capacity: capacity as usize,
             });
         }
+        let depth = match mode {
+            Mode::Greedy { .. } => GREEDY_DEPTH,
+            Mode::Speculative { .. } => self.shared.workspace.records(),
+            Mode::Forced { .. } => 1,
+        };
         self.run = Some(Run {
             mode,
             prompt,
@@ -393,6 +524,8 @@ impl Owner {
             offset: 0,
             position: 0,
             admitted: 0,
+            cursor: 0,
+            depth,
             decodes: 0,
             generated: 0,
             in_flight: VecDeque::new(),
@@ -408,20 +541,30 @@ impl Owner {
         Ok(())
     }
 
-    /// Whether the sequence has a selection no quantum holds. A step that selects waits for one: the quanta in flight
-    /// retire, and are dropped, and then a selection is free.
-    fn selection_free(&self) -> bool {
-        self.sequence.selections.leased() < self.sequence.selections.len()
+    /// The selections no quantum holds. A step that selects waits for them: the quanta in flight retire, and are
+    /// dropped, and then they are free.
+    fn selections_free(&self) -> usize {
+        self.sequence.selections.len() - self.sequence.selections.leased()
     }
 
-    /// The next step the request can admit now: it has room for one and, when the step selects, a selection to give it.
+    /// The next step the request can admit now: it has room for one and, when the step selects, the selections to give
+    /// it. A step that needs the host to know a token (a decode in a speculative request, a speculative step) waits for
+    /// the quanta in flight.
     fn admissible(&self) -> Option<Step> {
         let run = self.run.as_ref()?;
-        if run.waiting_logits || run.in_flight.len() >= run.depth() {
+        if run.waiting_logits || run.in_flight.len() >= run.depth {
             return None;
         }
-        let next = run.next_step(self.shared.chunk)?;
-        (!run.selects(next) || self.selection_free()).then_some(next)
+        let next = match run.next_step(self.shared.chunk) {
+            Some(next) => next,
+            None => self.settle_step()?,
+        };
+        let alone = matches!(next, Step::Speculate { .. } | Step::Settle)
+            || matches!((&run.mode, next), (Mode::Speculative { .. }, Step::Decode));
+        if alone && !run.in_flight.is_empty() {
+            return None;
+        }
+        (run.selections(next) <= self.selections_free()).then_some(next)
     }
 
     /// Whether the owner has something to do: a message to take in, a quantum to admit, an ending to make, or parked
@@ -436,7 +579,8 @@ impl Owner {
         let admits = self.admissible().is_some();
         let ends = run.in_flight.is_empty()
             && !run.waiting_logits
-            && (run.stopping.is_some() || run.next_step(self.shared.chunk).is_none());
+            && (run.stopping.is_some() || run.next_step(self.shared.chunk).is_none())
+            && self.settle_step().is_none();
         admits || ends
     }
 
@@ -495,7 +639,7 @@ impl Owner {
             elapsed: run.began.elapsed(),
         };
         self.finished = Some(match run.mode {
-            Mode::Greedy { listener } => Finished::Greedy(listener, outcome),
+            Mode::Greedy { listener } | Mode::Speculative { listener, .. } => Finished::Greedy(listener, outcome),
             Mode::Forced { sink, .. } => Finished::Forced(sink, outcome),
         });
     }
@@ -513,7 +657,10 @@ impl Owner {
                     })
                 });
                 match waiting {
-                    Some(flying) => flying.retired = Some((quantum, outcome)),
+                    Some(flying) => {
+                        flying.retired_at = Some(Instant::now());
+                        flying.retired = Some((quantum, outcome));
+                    }
                     None => {
                         log::error!(
                             "a {:?} quantum at {} retired that the owner did not admit",
@@ -580,7 +727,8 @@ impl Owner {
             let Some((quantum, outcome)) = flying.retired.take() else {
                 return;
             };
-            let live = run.stopping.is_none();
+            // The quantum that feeds the last token of a speculative request runs after the request ended.
+            let live = run.stopping.is_none() || flying.role == Role::Settle;
             match outcome {
                 QuantumOutcome::Completed if live => self.completed(&flying, &quantum),
                 // Behind the quantum that ended the request: its rows never become part of the sequence.
@@ -603,7 +751,17 @@ impl Owner {
     /// A quantum of the live request completed.
     fn completed(&mut self, flying: &Flying, quantum: &Quantum) {
         let now = Instant::now();
-        if let Err(error) = self.sequence.kv.commit(flying.rows as u64) {
+        // The rows of a quantum become part of its cache; a verification's accepted prefix does, once it is known.
+        let rows = flying.rows as u64;
+        let committed = match flying.role {
+            Role::Verify => Ok(()),
+            Role::PromptCatchUp | Role::CatchUp | Role::Draft => match self.sequence.mtp_kv.as_mut() {
+                Some(cache) => cache.commit(rows),
+                None => return self.fail("a draft quantum retired on a sequence with no MTP cache".to_string()),
+            },
+            Role::Prefill { .. } | Role::Decode | Role::Settle => self.sequence.kv.commit(rows),
+        };
+        if let Err(error) = committed {
             return self.fail(format!("committing the quantum's rows: {error}"));
         }
         let Some(run) = self.run.as_mut() else { return };
@@ -612,15 +770,24 @@ impl Owner {
             rows: flying.rows,
             start_position: flying.start,
             admitted: flying.admitted,
-            retired: now,
+            retired: flying.retired_at.unwrap_or(now),
             replayed: flying.replayed,
             recorded: flying.recorded,
         };
-        if let Mode::Greedy { listener } = &mut run.mode {
+        if flying.role != Role::Settle
+            && let Some(listener) = run.listener()
+        {
             listener.quantum(event);
             if flying.last_chunk {
                 listener.prefill_done(now);
             }
+        }
+        match flying.role {
+            Role::Settle => return,
+            Role::PromptCatchUp => return,
+            Role::CatchUp | Role::Draft => return self.drafted(flying),
+            Role::Verify => return self.verified(flying),
+            Role::Prefill { .. } | Role::Decode => {}
         }
         if run.wanted == 0 || flying.selection.is_none() {
             // A prompt with nothing to generate, or a chunk that is not the last.
@@ -629,28 +796,29 @@ impl Owner {
             }
             return;
         }
-        match &mut run.mode {
-            Mode::Greedy { listener } => {
-                let token = flying.selection.as_ref().and_then(|selection| selection.token(0));
-                let Some(token) = token else {
-                    return self
-                        .fail("the head selected no token: every logit was NaN or negative infinity".to_string());
-                };
-                run.generated += 1;
-                listener.token(token, now);
-                if run.stop_tokens.contains(&token) {
-                    run.stop(FinishReason::Stop);
-                } else if run.generated >= run.wanted {
-                    run.stop(FinishReason::Length);
-                }
+        if let Mode::Forced { .. } = run.mode {
+            let step = run.generated;
+            run.waiting_logits = true;
+            if let Err(why) = self.copy_logits(step, quantum) {
+                self.fail(why);
             }
-            Mode::Forced { .. } => {
-                let step = run.generated;
-                run.waiting_logits = true;
-                if let Err(why) = self.copy_logits(step, quantum) {
-                    self.fail(why);
-                }
-            }
+            return;
+        }
+        let token = flying.selection.as_ref().and_then(|selection| selection.token(0));
+        let Some(token) = token else {
+            return self.fail("the head selected no token: every logit was NaN or negative infinity".to_string());
+        };
+        run.generated += 1;
+        if let Some(listener) = run.listener() {
+            listener.token(token, now);
+        }
+        if run.stop_tokens.contains(&token) {
+            run.stop(FinishReason::Stop);
+        } else if run.generated >= run.wanted {
+            run.stop(FinishReason::Length);
+        } else if let (Mode::Speculative { state, .. }, Role::Prefill { last: true }) = (&mut run.mode, flying.role) {
+            // The prompt's last chunk selected the first token: the speculative steps go on from it.
+            state.first_token(token, &run.prompt);
         }
     }
 
@@ -701,16 +869,124 @@ impl Owner {
         }
     }
 
-    /// Admits one quantum: reserves its rows, uploads its input record, and starts it behind the one before.
+    /// Admits the quantum or quanta of `next`.
     fn admit(&mut self, next: Step) -> Result<(), String> {
+        match next {
+            Step::Prefill { .. } | Step::Decode => self.admit_row(next),
+            Step::PromptCatchUp { rows } => self.admit_prompt_catch_up(rows),
+            Step::Speculate { drafts } => self.admit_speculation(drafts),
+            Step::Settle => self.admit_settle(),
+        }
+    }
+
+    /// Admits a prompt chunk or a decode row of the request's own tokens.
+    fn admit_row(&mut self, next: Step) -> Result<(), String> {
+        let Some(run) = self.run.as_mut() else { return Ok(()) };
+        let start = run.position;
+        let speculative = matches!(run.mode, Mode::Speculative { .. });
+        let drafting = matches!(&run.mode, Mode::Speculative { state, .. } if state.drafting());
+        let admission = match next {
+            Step::Prefill { rows, last } => Admission {
+                role: Role::Prefill { last },
+                kind: QuantumKind::Prefill,
+                rows,
+                start,
+                source: KvSource::Base,
+                pdl: false,
+                logits: usize::from(last && run.wanted > 0),
+                replay: Vec::new(),
+                last_chunk: last,
+                // A greedy request chains the next row behind the prompt; a speculative one chains the next chunk (or the
+                // catch-up of this one) and waits for the first token after the last chunk.
+                more: if speculative { !last } else { run.depth > 1 },
+            },
+            Step::Decode => Admission {
+                role: Role::Decode,
+                kind: QuantumKind::Decode,
+                rows: 1,
+                start,
+                source: KvSource::Base,
+                pdl: start < OVERLAP_MAX_START_POSITION,
+                logits: 1,
+                replay: match &mut run.mode {
+                    Mode::Speculative { state, .. } => state.take_replay(&self.shared.config),
+                    _ => Vec::new(),
+                },
+                last_chunk: false,
+                more: !speculative && run.depth > 1,
+            },
+            _ => return Ok(()),
+        };
+        let tokens: Vec<u32> = match next {
+            Step::Prefill { rows, .. } => run.prompt[run.offset..run.offset + rows].to_vec(),
+            _ => match &run.mode {
+                Mode::Forced { forced, .. } => vec![forced[run.decodes]],
+                Mode::Speculative { state, .. } => vec![state.current().ok_or("a decode has no token to feed")?],
+                Mode::Greedy { .. } => Vec::new(),
+            },
+        };
+        let chained = match (&run.mode, next) {
+            (Mode::Greedy { .. }, Step::Decode) => Some(
+                run.previous
+                    .clone()
+                    .ok_or_else(|| "a decode quantum has no selection before it".to_string())?,
+            ),
+            _ => None,
+        };
+        self.admit_quantum(admission, move |quantum| {
+            let quantum = match chained {
+                Some(previous) => quantum.token_from(previous)?,
+                None => quantum.with_tokens(tokens)?,
+            };
+            if drafting && matches!(next, Step::Prefill { .. }) {
+                quantum.seeding_draft()
+            } else {
+                Ok(quantum)
+            }
+        })?;
+        let Some(run) = self.run.as_mut() else { return Ok(()) };
+        run.position += match next {
+            Step::Prefill { rows, .. } => rows as u64,
+            _ => 1,
+        };
+        match next {
+            Step::Prefill { rows, last } => {
+                run.offset += rows;
+                if let (Mode::Speculative { state, .. }, true) = (&mut run.mode, drafting && !last) {
+                    state.prefilled(rows);
+                }
+            }
+            _ => run.decodes += 1,
+        }
+        Ok(())
+    }
+
+    /// Admits one quantum: reserves its rows, uploads its input record, and starts it behind the one before (the
+    /// chain). `shape` sets what the quantum's role needs of it (its tokens, the rows that seed it, where its token
+    /// goes); the owner's own bookkeeping of the request is the caller's.
+    pub(super) fn admit_quantum(
+        &mut self,
+        admission: Admission,
+        shape: impl FnOnce(Quantum) -> Result<Quantum, QuantumError>,
+    ) -> Result<(), String> {
         let shared = Arc::clone(&self.shared);
         let core = &shared.core;
         let Some(run) = self.run.as_mut() else { return Ok(()) };
-        let (kind, rows) = match next {
-            Step::Prefill { rows, .. } => (QuantumKind::Prefill, rows),
-            Step::Decode => (QuantumKind::Decode, 1),
-        };
-        let start = run.position;
+        let Admission {
+            role,
+            kind,
+            rows,
+            start,
+            source,
+            pdl,
+            logits,
+            replay,
+            last_chunk,
+            more,
+        } = admission;
+        if run.in_flight.is_empty() {
+            run.cursor = 0;
+        }
 
         // The reservation (and, for the first quantum of a request after another, the reset of the sequence) on the
         // owner's lane. Its marker orders the quantum's stages behind it.
@@ -724,25 +1000,34 @@ impl Owner {
                     .map_err(why("resetting the sequence"))?;
                 self.used = false;
             }
-            self.sequence
-                .kv
+            let cache = match source {
+                KvSource::Base => &mut self.sequence.kv,
+                KvSource::Mtp => self
+                    .sequence
+                    .mtp_kv
+                    .as_mut()
+                    .ok_or_else(|| "the sequence has no MTP cache".to_string())?,
+            };
+            cache
                 .reserve(&submission, &core.pool, start, rows as u64, &mut retained)
                 .map_err(why("reserving the cache's rows"))?;
-            self.sequence
-                .kv
-                .appended(rows as u64)
-                .map_err(why("the cache's frontier"))?;
+            cache.appended(rows as u64).map_err(why("the cache's frontier"))?;
             submission.finish_signalled().map_err(why("the reservation"))?
         };
         let refs = self
             .sequence
-            .refs(KvSource::Base)
+            .refs(source)
             .map_err(why("the sequence's references"))?
             .ordered_after(reserved, &core.lanes, &core.library)
-            .map_err(why("ordering the quantum behind its reservation"))?;
+            .map_err(why("ordering the quantum behind its reservation"))?
+            .with_replay_rows(replay);
         let mode = SubmitMode {
-            pdl: kind == QuantumKind::Decode && start < OVERLAP_MAX_START_POSITION,
-            row_exact: false,
+            pdl,
+            row_exact: kind == QuantumKind::Verify,
+        };
+        let record = match run.mode {
+            Mode::Speculative { .. } => run.cursor,
+            _ => (run.admitted % ALTERNATING_RECORDS) as usize,
         };
         let mut quantum = Quantum::new(
             kind,
@@ -755,35 +1040,12 @@ impl Owner {
             core.lane_table.clone(),
         )
         .map_err(why("the quantum"))?
-        .with_input_record(run.admitted as usize);
-
-        let selects = match next {
-            Step::Prefill { rows, last } => {
-                quantum = quantum
-                    .with_tokens(run.prompt[run.offset..run.offset + rows].to_vec())
-                    .map_err(why("the prompt's rows"))?;
-                last && run.wanted > 0
-            }
-            Step::Decode => {
-                quantum = match &run.mode {
-                    Mode::Greedy { .. } => {
-                        let previous = run
-                            .previous
-                            .clone()
-                            .ok_or_else(|| "a decode quantum has no selection before it".to_string())?;
-                        quantum.token_from(previous).map_err(why("the chained token"))?
-                    }
-                    Mode::Forced { forced, .. } => quantum
-                        .with_tokens(vec![forced[run.decodes]])
-                        .map_err(why("the forced token"))?,
-                };
-                true
-            }
-        };
+        .with_input_record(record);
+        quantum = shape(quantum).map_err(why("the quantum's inputs"))?;
         quantum = quantum
-            .with_logits_rows(usize::from(selects))
+            .with_logits_rows(logits)
             .map_err(why("the quantum's logits rows"))?;
-        if selects {
+        if logits > 0 {
             quantum = quantum.with_selection_lease(self.sequence.selections.acquire().map_err(why("the selection"))?);
         }
         // Everything the executor would refuse is refused before the record is queued for upload: a quantum dropped
@@ -802,37 +1064,35 @@ impl Owner {
         quantum.prepared_after(prepared);
 
         let selection = quantum.selection().cloned();
-        // A kill switch that is never set: see the module documentation.
         let kill = Arc::new(AtomicBool::new(false));
         let admitted = Instant::now();
         let started = shared
             .executor
-            .start(&mut self.cache, quantum, kill, run.chain.as_ref())
+            .start(&mut self.cache, quantum, Arc::clone(&kill), run.chain.as_ref())
             .map_err(why("starting the quantum"))?;
 
         run.in_flight.push_back(Flying {
+            role,
             kind,
             start,
             rows,
-            last_chunk: matches!(next, Step::Prefill { last: true, .. }),
+            last_chunk,
             selection: selection.clone(),
             retained,
             admitted,
             replayed: started.replayed,
             recorded: started.recording,
+            kill,
+            retired_at: None,
             retired: None,
         });
         if selection.is_some() {
             run.previous = selection;
         }
-        // A request with one quantum in flight has nothing to chain: it would never retire while its reference is held.
-        run.chain = (run.depth() > 1).then_some(started);
-        run.position += rows as u64;
+        // A quantum with nothing admitted behind it would never retire while its reference is held.
+        run.chain = more.then_some(started);
         run.admitted += 1;
-        match next {
-            Step::Prefill { rows, .. } => run.offset += rows,
-            Step::Decode => run.decodes += 1,
-        }
+        run.cursor += 1;
         Ok(())
     }
 
@@ -867,7 +1127,7 @@ impl Owner {
             elapsed: run.began.elapsed(),
         };
         self.finished = Some(match run.mode {
-            Mode::Greedy { listener } => Finished::Greedy(listener, outcome),
+            Mode::Greedy { listener } | Mode::Speculative { listener, .. } => Finished::Greedy(listener, outcome),
             Mode::Forced { sink, .. } => Finished::Forced(sink, outcome),
         });
     }

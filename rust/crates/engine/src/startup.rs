@@ -17,13 +17,14 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
+use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use euhedral_core::frames::Frame;
 use euhedral_graph::{IoBuf, IoDone, Join, Lake, LatchSetter, OpenSpec, OwnedFile};
-use euhedral_inference_cuda::{DeviceBuffer, PooledPinned, Submission, SubmitMode};
+use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, PooledPinned, Submission, SubmitMode, ops};
 use euhedral_inference_edrl::{
     HEADER_BYTES, Header, Metadata, ReadPlan, Region, TensorTable, TokenizerFooter, TrellisCompanions, WeightFormat,
     WeightLayout, content_end,
@@ -43,7 +44,7 @@ use crate::residency::planner::{Placement, PlanInputs, ResidencyPlan, plan_with}
 use crate::runtime::{Core, EngineRuntime, StartupReport, Units, raw_file};
 use crate::state::SequenceState;
 use crate::warmup;
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, input_records};
 
 /// The transfer lanes a startup makes: `host.task-parallelism`, the workers that take host work at once, at least 2
 /// and at most half of the library's lanes, which leaves the other half to the stage graphs.
@@ -490,7 +491,10 @@ fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: Has
             .max()
             .unwrap_or(0);
         let regions = [plan.scratch_bytes.max(nvfp4_native), plan.decode_scratch_bytes];
-        let workspace = Workspace::allocate(&core.library, &artifact.config, plan.rows, &regions)?;
+        // A drafting sequence admits the quanta of a step together, each reading a record of its own.
+        let records = input_records(plan.draft_depth);
+        let workspace =
+            Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
         let lane = &core.transfer[0];
         let submission = Submission::begin(lane, SubmitMode::default())?;
         let sequence = SequenceState::allocate(&core.library, &core.retire, &artifact.config, &plan, &submission)?;
@@ -578,6 +582,15 @@ fn assemble(
     // pinned memory, which waits for the device, so it is a frame of its own, after the load.
     startup.then(device, move |startup| {
         trim_pool(&startup.core);
+        // The draft head's token ids come back to the host once, in this frame (the pool may allocate here): a drafted
+        // token is a row of the head, and the verifier's tokens are the model's.
+        let ids = match draft_ids_loan(&startup.core, &plan, &weights) {
+            Ok(ids) => ids,
+            Err(error) => {
+                drop((weights, workspace, sequence));
+                return startup.fail(error);
+            }
+        };
         let (warmed, marker) = warmup::run(&startup.core, &artifact.config, &weights, &workspace);
         let core = Arc::clone(&startup.core);
         let (completions, stages) = (Arc::clone(&core.completions), Arc::clone(&core.stages));
@@ -604,20 +617,18 @@ fn assemble(
             };
             let config = Arc::new(artifact.config);
             let workspace = Arc::new(workspace);
-            match Generation::new(&core, &config, &plan, &weights, &workspace, sequence) {
-                Ok(generation) => {
-                    let runtime = EngineRuntime::assemble(core, plan, config, weights, workspace, generation, report);
-                    startup.succeed(runtime);
-                }
-                // The plan is refused: what is on the device is freed in a frame of the stages lake, which may wait.
-                Err(refused) => {
-                    let (error, sequence) = *refused;
-                    let stages = Arc::clone(&core.stages);
-                    let _ = stages.offer(step(Kind::Startup, 0, move || {
-                        drop((weights, workspace, sequence));
-                        startup.fail(error);
-                    }));
-                }
+            let finish = Finish {
+                startup,
+                plan,
+                config,
+                weights,
+                workspace,
+                sequence,
+                report,
+            };
+            match ids {
+                None => finish.run(None),
+                Some(ids) => ids.copy(&core, finish),
             }
         });
         match marker {
@@ -627,6 +638,132 @@ fn assemble(
             }
         }
     });
+}
+
+/// The last step of the startup: builds the generation over the model and sets the latch.
+struct Finish {
+    startup: Startup,
+    plan: ResidencyPlan,
+    config: Arc<ModelConfig>,
+    weights: Weights,
+    workspace: Arc<Workspace>,
+    sequence: SequenceState,
+    report: StartupReport,
+}
+
+impl Finish {
+    fn run(self, draft_ids: Option<Arc<[u32]>>) {
+        let Finish {
+            startup,
+            plan,
+            config,
+            weights,
+            workspace,
+            sequence,
+            report,
+        } = self;
+        let core = Arc::clone(&startup.core);
+        match Generation::new(&core, &config, &plan, &weights, &workspace, sequence, draft_ids) {
+            Ok(generation) => {
+                let runtime = EngineRuntime::assemble(core, plan, config, weights, workspace, generation, report);
+                startup.succeed(runtime);
+            }
+            // The plan is refused: what is on the device is freed in a frame of the stages lake, which may wait.
+            Err(refused) => {
+                let (error, sequence) = *refused;
+                let stages = Arc::clone(&core.stages);
+                let _ = stages.offer(step(Kind::Startup, 0, move || {
+                    drop((weights, workspace, sequence));
+                    startup.fail(error);
+                }));
+            }
+        }
+    }
+
+    /// Ends the startup with `error`, freeing what is on the device in a frame of the stages lake, which may wait.
+    fn fail(self, error: EngineError) {
+        let Finish {
+            startup,
+            weights,
+            workspace,
+            sequence,
+            ..
+        } = self;
+        let stages = Arc::clone(&startup.core.stages);
+        let _ = stages.offer(step(Kind::Startup, 0, move || {
+            drop((weights, workspace, sequence));
+            startup.fail(error);
+        }));
+    }
+}
+
+/// A pinned buffer that will hold the draft head's token ids, and where they are on the device.
+struct DraftIds {
+    loan: PooledPinned,
+    source: DevicePtr,
+    bytes: usize,
+}
+
+impl DraftIds {
+    /// Copies the ids to the host on the owner's lane and finishes the startup when the lane has reached the copy.
+    fn copy(self, core: &Arc<Core>, finish: Finish) {
+        let DraftIds {
+            mut loan,
+            source,
+            bytes,
+        } = self;
+        let queued = (|| {
+            let submission = Submission::begin(core.owner_lane(), SubmitMode::default())?;
+            // SAFETY: the loan is held by the frame that follows the copy, which runs once the lane has reached the
+            // marker; nothing reads or writes the bytes before.
+            unsafe { ops::copy_device_to_readback(&submission, loan.buffer_mut(), 0, source, bytes) }?;
+            submission.finish_signalled()
+        })();
+        match queued {
+            Ok(marker) => {
+                let frame = step(Kind::Startup, 0, move || {
+                    let ids: Arc<[u32]> = loan.buffer().as_slice()[..bytes]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|word| u32::from_ne_bytes(*word))
+                        .collect();
+                    finish.run(Some(ids));
+                });
+                core.completions.after_marker(marker, frame);
+            }
+            Err(error) => {
+                // The copy may have been queued before the call failed: the lane may still write the buffer, so it is
+                // not given back to the pool.
+                log::error!("the draft head's token ids could not be copied to the host: {error}");
+                mem::forget(loan);
+                finish.fail(EngineError::from(error));
+            }
+        }
+    }
+}
+
+/// The pinned buffer for the draft head's token ids, when the plan drafts. A plan that drafts and cannot have them is
+/// an error: speculation is not silently left off.
+fn draft_ids_loan(core: &Core, plan: &ResidencyPlan, weights: &Weights) -> Result<Option<DraftIds>, EngineError> {
+    if plan.draft_depth == 0 {
+        return Ok(None);
+    }
+    let ids = weights
+        .get(LayerIndex::GLOBAL, Role::DraftTokenIds)
+        .ok_or_else(|| EngineError::Runtime("the artifact drafts and has no draft head token ids".to_string()))?;
+    let bytes = ids
+        .shape
+        .first()
+        .and_then(|rows| usize::try_from(*rows).ok())
+        .and_then(|rows| rows.checked_mul(4))
+        .ok_or_else(|| EngineError::Runtime(format!("the draft head's token ids have the shape {:?}", ids.shape)))?;
+    let loan = core.pool.acquire(bytes)?;
+    Ok(Some(DraftIds {
+        loan,
+        source: ids.ptr,
+        bytes,
+    }))
 }
 
 #[allow(

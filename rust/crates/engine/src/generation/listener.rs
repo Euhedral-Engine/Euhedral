@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use super::request::{GenerationOutcome, QuantumEvent};
+use super::request::{GenerationOutcome, QuantumEvent, Verification};
 
 /// What a generation tells its caller. Every method runs on a worker of the engine's lattice, one call at a time and in
 /// the order of the events, and must not wait: hand the event on (set a latch, offer a frame) and return.
@@ -15,6 +15,12 @@ pub trait GenerationListener: Send {
 
     /// A quantum of the generation retired.
     fn quantum(&mut self, event: QuantumEvent);
+
+    /// A speculative step's verification retired and its tokens were reported (right after the last of them). Not
+    /// called by a generation that does not speculate.
+    fn verification(&mut self, event: Verification) {
+        let _ = event;
+    }
 
     /// The generation ended. This is the last call, made after the engine's sequence can take another generation.
     fn finished(&mut self, outcome: GenerationOutcome);

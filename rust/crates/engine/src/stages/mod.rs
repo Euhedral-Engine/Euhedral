@@ -39,7 +39,7 @@ use crate::model::ModelConfig;
 use crate::quantum::Disposition;
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
 use crate::state::{FlightGuard, KvView, SequenceDevice, StaleReservation};
-use crate::workspace::{BufferSlot, INPUT_RECORDS, Workspace, WorkspaceError};
+use crate::workspace::{BufferSlot, Workspace, WorkspaceError};
 use attention::KvSource;
 use sampling::{Selection, SelectionLease};
 pub use settle::{LaneEnds, Settled, Settler, Settling};
@@ -290,7 +290,7 @@ pub struct Quantum {
     pub(crate) draft_token_read: Option<usize>,
     /// Whether the quantum writes its last input token to slot 0 of the step's tokens as the step's current token.
     pub(crate) writes_current_token: bool,
-    /// The input record the quantum's ids and start position are uploaded to (0 or 1; the workspace holds two).
+    /// The input record the quantum's ids and start position are uploaded to (one of the workspace's records).
     pub(crate) record: usize,
     /// The selection of the quantum before it in a chain: the quantum's one row reads its token id from that
     /// selection's keys on the device, behind the quantum that wrote them ([`Quantum::token_from`]).
@@ -466,10 +466,10 @@ impl Quantum {
         }
     }
 
-    /// The input record the quantum's ids and start position go to: 0 or 1, and the other one for the quantum admitted
-    /// next in a chain.
+    /// The input record the quantum's ids and start position go to (counted modulo the records the workspace holds):
+    /// each quantum in flight reads a record of its own.
     pub fn with_input_record(mut self, record: usize) -> Self {
-        self.record = record % INPUT_RECORDS as usize;
+        self.record = record % self.workspace.records();
         self
     }
 
