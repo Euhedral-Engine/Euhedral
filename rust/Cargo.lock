@@ -329,7 +329,9 @@ source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=8b0e85cf5187a8a0
 name = "euhedral-inference-bench"
 version = "0.1.0"
 dependencies = [
+ "euhedral-core",
  "euhedral-graph",
+ "euhedral-hashing",
  "euhedral-inference-edrl",
  "euhedral-inference-engine",
  "euhedral-inference-settings",

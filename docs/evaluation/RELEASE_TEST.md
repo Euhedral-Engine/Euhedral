@@ -96,6 +96,12 @@ quality table is the overall column):
 | dNLL | change in likelihood of the observed tokens |
 | Paired KL difference against the baseline, 95% interval | specialization or regression by domain |
 
+`--engine` chooses the scorer: `java` (the default, `quantization score`) or `rust` (`euhedral-bench score`, with
+`--rust-bench` naming the binary). Both read the same frozen reference, write the same `.values` format (a header of
+three little-endian int32, then float64 NLL, reference NLL, KL, top-1 agreement and probability difference per scored
+token) and are checked against each other on non-held-out text before either is used on this set. Candidates that are
+compared with each other are scored by one engine in one run.
+
 The interval is a bootstrap over chunks (each one conversation or document), resampled within each domain. Expected
 resolution: overall differences of a few percent; per domain, at 16 chunks, about 10%.
 

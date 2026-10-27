@@ -74,6 +74,25 @@ over the library: the library prints and exits nowhere, and its few blocking fil
 carries the print exceptions and starts, then waits for, each request. The decode rate runs from the first token found to
 the last token found.
 
+### Quality tools
+
+```text
+euhedral-bench score --artifact FILE --results FILE (--reference R.kld --name NAME)... [--values DIR] [--config YAML]
+euhedral-bench drift --artifact FILE --prefix N --steps N --candidate host-tier|exact [--config YAML]
+```
+
+`score` forces each chunk of a llama.cpp reference (`.kld`) on a fresh sequence: a prefill of N / 2 + 1 tokens, then the
+rest teacher-forced one row at a time (the rows a verification of up to 8 tokens gives). Each logits row is copied,
+its reference record is read with `AsyncIo`, and the row is scored in a frame of the `host` lake: NLL, reference NLL, KL over the reference entries above the -16 floor, top-1 agreement and the
+probability difference. The summary lines are the Java scorer's, appended to `--results`; `--values DIR` writes
+`DIR/NAME.values` in the format `tools/t5/run.py` reads (`--engine rust --rust-bench PATH`).
+
+`drift` decodes `PREFIX + STEPS` forced tokens of the corpus document twice and compares the second run's final hidden
+state and logits row with the first's at every step: the first on the default settings (all layers on the GPU), the
+second on `--config` (`host-tier`, which needs it) or on the same settings (`exact`, which must agree bitwise). It
+exits 1 when the mean KL reaches 1e-2, when more than 2% of the steps flip top-1 with a lead above 0.25, when the
+median peak 32-step hidden error reaches 12%, or when the median late/early hidden error is above 1.5.
+
 `tools/rust_gate.py` runs the Java and the Rust benchmark alternately, one process each per fork, each through the GPU
 launcher (`gpu-run`: exclusive lock, memory cap, time limit), with the prefix cache off, and prints a per-row table of the
 output hashes of the two engines and the absolute medians of each.

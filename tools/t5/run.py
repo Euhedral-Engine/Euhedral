@@ -1,10 +1,12 @@
 """Scores candidate artifacts on the frozen evaluation set and prints aggregate and per-domain numbers only.
 
 Usage (from the repository root): python3 tools/t5/run.py STORE --baseline NAME NAME=ARTIFACT...
-                                  [--gradle ./gradlew] [--resamples 10000]
+                                  [--engine java|rust] [--gradle ./gradlew] [--rust-bench PATH]
+                                  [--cuda-library PATH] [--resamples 10000]
 
 The runner refuses a store whose files differ from STORE/frozen/manifest.json, scores every artifact with
-`quantization score --values` into a private directory under STORE/runs, prints the report, and deletes the per-token
+`quantization score --values` (`--engine java`, the default) or `euhedral-bench score --values` (`--engine rust`, with
+`--rust-bench` naming the binary) into a private directory under STORE/runs, prints the report, and deletes the per-token
 values: nothing per token, per chunk or per prompt leaves the runner.
 
 Per domain and overall: mean KL(reference || candidate) over scored tokens, top-1 agreement, KL p95 and p99, dNLL
@@ -44,6 +46,20 @@ def read_values(path: Path) -> list[list[tuple[float, ...]]]:
         raise ValueError(f"{path}: {fields} values per token, expected {len(FIELDS)}")
     flat = struct.unpack_from(f"<{chunks * steps * fields}d", data, 12)
     return [[flat[(c * steps + s) * fields:(c * steps + s + 1) * fields] for s in range(steps)] for c in range(chunks)]
+
+
+def score_command(args: argparse.Namespace, name: str, artifact: str, private: Path) -> list[str]:
+    """The command that scores one artifact with the chosen engine; both write DIR/NAME.values and the same summary."""
+    reference = args.store / "frozen" / "reference.kld"
+    if args.engine == "rust":
+        command = [str(args.rust_bench), "score", "--artifact", artifact, "--results", str(private / "score.txt"),
+                   "--reference", str(reference), "--name", name, "--values", str(private)]
+        if args.cuda_library is not None:
+            command += ["--cuda-library", str(args.cuda_library)]
+        return command
+    return [args.gradle, "--no-daemon", "-q", ":quantization:run",
+            f"--args=score --artifact {artifact} --results {private / 'score.txt'} "
+            f"--reference {reference} --name {name} --values {private}"]
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -121,12 +137,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("store", type=Path)
     parser.add_argument("--baseline", required=True, help="the NAME the others are compared with")
     parser.add_argument("artifacts", nargs="+", help="NAME=ARTIFACT")
-    parser.add_argument("--gradle", default="./gradlew")
+    parser.add_argument("--engine", choices=("java", "rust"), default="java",
+                        help="the engine that scores the candidates (default java)")
+    parser.add_argument("--gradle", default="./gradlew", help="the Gradle wrapper of --engine java")
+    parser.add_argument("--rust-bench", type=Path, help="the euhedral-bench binary of --engine rust")
+    parser.add_argument("--cuda-library", type=Path, help="the CUDA library of --engine rust, when not at its default")
     parser.add_argument("--resamples", type=int, default=10000)
     args = parser.parse_args(argv)
     artifacts = dict(item.split("=", 1) for item in args.artifacts)
     if args.baseline not in artifacts:
         raise SystemExit("error: the baseline must be one of the artifacts")
+    if args.engine == "rust" and (args.rust_bench is None or not args.rust_bench.is_file()):
+        raise SystemExit("error: --engine rust needs --rust-bench, the path of the euhedral-bench binary")
     check_store(args.store)
     started = datetime.datetime.now().astimezone()
     runs = args.store / "runs"
@@ -135,9 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         scored = {}
         for name, path in artifacts.items():
-            subprocess.run([args.gradle, "--no-daemon", "-q", ":quantization:run",
-                            f"--args=score --artifact {path} --results {private / 'score.txt'} "
-                            f"--reference {args.store / 'frozen' / 'reference.kld'} --name {name} --values {private}"],
+            subprocess.run(score_command(args, name, path, private),
                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             scored[name] = read_values(private / f"{name}.values")
         domains = [json.loads(line)["domain"]

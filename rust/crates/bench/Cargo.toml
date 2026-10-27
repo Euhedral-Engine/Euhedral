@@ -11,7 +11,9 @@ name = "euhedral-bench"
 path = "src/main.rs"
 
 [dependencies]
+euhedral-core.workspace = true
 euhedral-graph.workspace = true
+euhedral-hashing.workspace = true
 euhedral-inference-edrl = { path = "../edrl" }
 euhedral-inference-engine = { path = "../engine" }
 euhedral-inference-settings = { path = "../settings" }
