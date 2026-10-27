@@ -191,8 +191,31 @@ impl Reference {
                 need: need as usize,
             });
         }
-        Ok((reference, OwnedFile::from(file)))
+        let records = records_file(path, file).map_err(|error| io("cannot open for asynchronous reads", error))?;
+        Ok((reference, records))
     }
+}
+
+/// The file `AsyncIo` reads the records from: the same file on Unix.
+#[cfg(unix)]
+fn records_file(_path: &Path, file: File) -> io::Result<OwnedFile> {
+    Ok(OwnedFile::from(file))
+}
+
+/// The file `AsyncIo` reads the records from: on Windows a second handle opened for overlapped I/O, which `AsyncIo`
+/// requires and the synchronous header reads cannot use.
+#[cfg(windows)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: opened once, on the main thread, before the run"
+)]
+fn records_file(path: &Path, _file: File) -> io::Result<OwnedFile> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    let file = OpenOptions::new().read(true).custom_flags(FILE_FLAG_OVERLAPPED).open(path)?;
+    Ok(OwnedFile::from(file))
 }
 
 /// One record: the reference's log-probabilities of a step.
