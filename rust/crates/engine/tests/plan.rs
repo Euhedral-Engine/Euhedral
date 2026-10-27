@@ -19,7 +19,7 @@ use std::time::Duration;
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, GraphRuntime, Join, Lake, LaneId, LanePool, Latch,
+    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, GraphRuntime, Join, Lake, LaneId, LanePool, Latch, Marker,
     QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, Submitted,
 };
 use euhedral_inference_cuda::DevicePtr;
@@ -29,6 +29,7 @@ use euhedral_inference_engine::model::{LayerKind, ModelConfig, WeightRef, object
 use euhedral_inference_engine::plan::{Formats, Plan, StageKind, View, WeightLookup};
 use euhedral_inference_engine::quantum::split_geometry;
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, plan as residency};
+use euhedral_inference_engine::stages::LaneEnds;
 use euhedral_inference_settings::{ModelSettings, Settings, TrellisKernelSettings};
 
 mod common;
@@ -461,6 +462,115 @@ fn the_signalled_stages_are_the_ends_of_the_chains_of_lane_continuations() {
             count * 3 < signalled.len(),
             "{view:?}: {count} of {} stages signal",
             signalled.len()
+        );
+    }
+}
+
+/// A random order the stages of `edges` can be submitted in: each stage after the stages it depends on.
+fn random_submission_order(edges: &[Vec<usize>], seed: u64) -> Vec<usize> {
+    let mut state = seed | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut pending: Vec<usize> = edges.iter().map(Vec::len).collect();
+    let mut ready: Vec<usize> = (0..edges.len()).filter(|stage| pending[*stage] == 0).collect();
+    let mut order = Vec::with_capacity(edges.len());
+    while !ready.is_empty() {
+        let stage = ready.swap_remove((next() % ready.len() as u64) as usize);
+        order.push(stage);
+        for (successor, predecessors) in edges.iter().enumerate() {
+            if predecessors.contains(&stage) {
+                pending[successor] -= 1;
+                if pending[successor] == 0 {
+                    ready.push(successor);
+                }
+            }
+        }
+    }
+    order
+}
+
+/// The record of a quantum that submitted `order[..count]`: each stage a marker on the lane the plan gave it,
+/// signalled as the plan says.
+fn submitted(plan: &Plan, view: View, order: &[usize], count: usize) -> LaneEnds {
+    let spec = plan.spec(view).unwrap();
+    let signalled = plan.signalled(view).unwrap();
+    let ends = LaneEnds::new(plan.fan_out_width() + 2);
+    let mut values = vec![0u64; plan.fan_out_width() + 2];
+    for &stage in &order[..count] {
+        let lane = spec.stages()[stage].lanes[0];
+        values[usize::from(lane.0)] += 1;
+        ends.record(
+            Marker {
+                lane,
+                value: values[usize::from(lane.0)],
+            },
+            signalled[stage],
+        );
+    }
+    ends
+}
+
+#[test]
+fn a_quantum_that_submitted_every_stage_has_no_lane_whose_last_marker_is_unsignalled_in_any_submission_order() {
+    let plan = &built().plan;
+    for view in [
+        View::Decode,
+        View::Verify { rows: 5 },
+        View::Verify { rows: 9 },
+        View::PrefillChunk,
+        View::Draft { rows: 2 },
+        View::CatchUp { rows: 9 },
+    ] {
+        let edges = plan.edges(view).unwrap();
+        for seed in 1..=12 {
+            let order = random_submission_order(edges, seed);
+            assert_eq!(order.len(), edges.len(), "{view:?}");
+            let ends = submitted(plan, view, &order, order.len());
+            assert!(
+                ends.unsignalled_lanes().is_empty(),
+                "{view:?}, order {seed}: lanes {:?} end unsignalled, so the quantum would never retire",
+                ends.unsignalled_lanes()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_quantum_that_stops_part_way_leaves_the_lane_of_a_stage_that_does_not_end_its_chain_unsignalled() {
+    let plan = &built().plan;
+    for view in [View::Decode, View::PrefillChunk, View::Draft { rows: 2 }] {
+        let edges = plan.edges(view).unwrap();
+        let spec = plan.spec(view).unwrap();
+        let signalled = plan.signalled(view).unwrap();
+        let order = random_submission_order(edges, 7);
+        let mut unsignalled_prefixes = 0;
+        for count in 1..order.len() {
+            let ends = submitted(plan, view, &order, count);
+            // Independently: a lane is unsignalled when the last stage submitted on it does not signal.
+            let last_on = |lane: LaneId| {
+                order[..count]
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|stage| spec.stages()[*stage].lanes[0] == lane)
+            };
+            for lane in (0..plan.fan_out_width() + 2).map(|lane| LaneId(lane as u16)) {
+                assert_eq!(
+                    ends.unsignalled(lane),
+                    last_on(lane).is_some_and(|stage| !signalled[stage]),
+                    "{view:?}, after {count} stages, lane {}",
+                    lane.0
+                );
+            }
+            unsignalled_prefixes += usize::from(!ends.unsignalled_lanes().is_empty());
+        }
+        assert!(
+            unsignalled_prefixes > 0,
+            "{view:?}: stopping part-way never leaves a lane unsignalled, so the settling would never be needed"
         );
     }
 }

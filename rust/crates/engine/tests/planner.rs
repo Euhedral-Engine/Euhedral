@@ -22,7 +22,9 @@ use euhedral_inference_engine::model::{ArtifactProfile, Quantization, Speculatio
 use euhedral_inference_engine::residency::planner::{
     ARENA_ALIGNMENT, DEFAULT_RUNTIME_RESERVE_BYTES, PlacementSource, PlanInputs, plan, plan_with,
 };
-use euhedral_inference_engine::workspace::{BufferSlot, WorkspaceError, WorkspaceRows, slot_bytes, workspace_bytes};
+use euhedral_inference_engine::workspace::{
+    BufferSlot, WorkspaceError, WorkspaceRows, input_records, slot_bytes, workspace_bytes, workspace_bytes_with_records,
+};
 use euhedral_inference_settings::{Auto, ByteSize, KvFormat};
 
 mod common;
@@ -40,6 +42,8 @@ const JAVA_PAGE_BYTES: u64 = 294_912;
 const JAVA_TRELLIS_SCRATCH_512: u64 = 160_669_696;
 /// The Java workspace at 512 rows, which holds one input record; this engine holds two (`INPUT_RECORDS`).
 const WORKSPACE_512: u64 = 172_140_552 + (512 * 4 + 8);
+/// The same for a sequence that drafts 4 tokens a step: each quantum of a step reads a record, 5 in all.
+const WORKSPACE_512_MTP4: u64 = WORKSPACE_512 + 3 * (512 * 4 + 8);
 
 fn inputs(device_free: u64) -> PlanInputs {
     PlanInputs {
@@ -76,7 +80,7 @@ fn rco_fits_resident_at_131072_on_16_gib() {
     assert_eq!(plan.kv_device_bytes, JAVA_KV_131072);
     assert_eq!(plan.kv_host_bytes, 0);
     assert_eq!(plan.scratch_bytes, JAVA_TRELLIS_SCRATCH_512);
-    assert_eq!(plan.workspace_bytes, WORKSPACE_512);
+    assert_eq!(plan.workspace_bytes, WORKSPACE_512_MTP4);
     assert_eq!(plan.kv_format, KvFormat::Nvfp4);
     assert_eq!(plan.draft_depth, 4);
     // Java's device need is the weights, the cache, the reserve and the scratch; the arena aligns each object.
@@ -259,15 +263,19 @@ fn workspace_sized_for_prefill_chunk() {
     assert_eq!(plan.rows.rows, 256);
     assert_eq!(
         plan.workspace_bytes,
-        workspace_bytes(
+        workspace_bytes_with_records(
             &config,
             WorkspaceRows {
                 rows: 256,
                 logits_rows: plan.rows.logits_rows
-            }
+            },
+            input_records(4)
         )
     );
-    assert!(plan.workspace_bytes < WORKSPACE_512);
+    assert!(plan.workspace_bytes < WORKSPACE_512_MTP4);
+    assert_eq!(input_records(0), 2);
+    assert_eq!(input_records(1), 2);
+    assert_eq!(input_records(4), 5);
     // A quantum larger than the workspace is refused, and so is one that scores more rows than the logits hold.
     assert_eq!(rows.check(512), Ok(()));
     assert_eq!(

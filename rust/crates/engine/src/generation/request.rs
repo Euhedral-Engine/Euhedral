@@ -11,7 +11,8 @@ use crate::stages::QuantumKind;
 /// Whether the generation drafts tokens with the artifact's draft layer and verifies them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Speculation {
-    /// Draft with the artifact's MTP layer when it has one.
+    /// Draft with the artifact's MTP layer, as deep as the artifact states, and verify: the tokens are the ones
+    /// `Off` selects. Refused for an artifact without the layer.
     Artifact,
     /// One row at a time.
     Off,
@@ -52,7 +53,7 @@ pub enum AdmissionError {
     PromptTooLong { tokens: usize, capacity: usize },
     #[error("token {id} at position {index} is outside the vocabulary of {vocabulary}")]
     TokenOutsideVocabulary { id: u32, index: usize, vocabulary: usize },
-    #[error("generation with the artifact's draft layer is not available: the engine decodes one row at a time")]
+    #[error("the artifact has no draft layer to speculate with")]
     SpeculationUnavailable,
     #[error("{0}")]
     Engine(String),
@@ -96,4 +97,22 @@ pub struct QuantumEvent {
     pub replayed: bool,
     /// Whether the launches of its stages were recorded into a graph beside it.
     pub recorded: bool,
+}
+
+/// One verification of a speculative step: what the step drafted, how much of it held, and what it cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Verification {
+    /// Drafts the verifier confirmed, before any end-token or budget cut: 0 to `drafted`.
+    pub accepted: usize,
+    /// Drafts the verification checked.
+    pub drafted: usize,
+    /// Tokens the step committed to the output: the confirmed drafts and the verifier's token, cut after an end token
+    /// and at the budget.
+    pub committed: usize,
+    /// From the retirement of the step's last draft quantum to the verification's: the verification's own time (the
+    /// whole step when it drafted nothing).
+    pub verify_nanos: u64,
+    /// From the admission of the step to the retirement of its last draft quantum: the catch-up and the recursive
+    /// drafts.
+    pub draft_nanos: u64,
 }
