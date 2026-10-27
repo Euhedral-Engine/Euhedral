@@ -72,7 +72,10 @@ A configuration that asks for what the engine does not do is refused with the re
 `cpus` other than `all`, `excludeCpus` / `excludeCores`, and `generation.mode` `sample`. The binary is a thin `main.rs`
 over the library: the library prints and exits nowhere, and its few blocking file calls are scoped exceptions; `main.rs`
 carries the print exceptions and starts, then waits for, each request. The decode rate runs from the first token found to
-the last token found.
+the last token found. With `speculation: artifact` each verification the engine reports becomes a step of the row's
+`speculative` block (the accepted-drafts histogram, committed tokens, verification time) and its draft quanta are
+counted by phase (`prompt-catch-up`, `catch-up`, `recursion`) under `draftPhases`; the engine reports no shortlist
+rejections, so both rejection counts are 0.
 
 `tools/rust_gate.py` runs the Java and the Rust benchmark alternately, one process each per fork, each through the GPU
 launcher (`gpu-run`: exclusive lock, memory cap, time limit), with the prefix cache off, and prints a per-row table of the

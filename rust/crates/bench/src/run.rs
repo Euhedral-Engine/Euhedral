@@ -9,12 +9,12 @@
 use std::collections::HashMap;
 use std::env::consts;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use euhedral_graph::{Latch, LatchSetter};
 use euhedral_inference_engine::EngineRuntime;
 use euhedral_inference_engine::generation::{
-    FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
+    FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_tokenizer::Tokenizer;
@@ -97,10 +97,38 @@ pub fn run_id(started: SystemTime, pid: u32) -> String {
 struct Probe {
     recorder: Option<Recorder>,
     done: Option<LatchSetter<Recorder>>,
+    drafting: Drafting,
 }
 
+impl Probe {
+    fn new(recorder: Recorder, done: Option<LatchSetter<Recorder>>) -> Probe {
+        Probe {
+            recorder: Some(recorder),
+            done,
+            drafting: Drafting::default(),
+        }
+    }
+}
+
+/// Where the speculative step that the next draft quantum belongs to stands.
+#[derive(Debug, Default)]
+struct Drafting {
+    /// The step's catch-up has retired, so a draft quantum that follows is a recursive draft.
+    caught_up: bool,
+    /// The step's recursive drafts were counted as a phase.
+    recursing: bool,
+    /// When the step's last draft quantum retired.
+    last_retired: Option<Instant>,
+}
+
+/// The drafting phases, named as the Java decoder names them.
+const PROMPT_CATCH_UP: &str = "prompt-catch-up";
+const CATCH_UP: &str = "catch-up";
+const RECURSION: &str = "recursion";
+
 /// The kind of a quantum for the benchmark. Every field access of a [`QuantumEvent`] is in this function and
-/// [`step_of`], so a change of the event is a change here.
+/// [`draft_phase_of`], and every field access of a [`Verification`] in [`step_of`], so a change of the events is a
+/// change here.
 fn phase_of(event: &QuantumEvent) -> Phase {
     match event.kind {
         QuantumKind::Prefill => Phase::Prefill,
@@ -109,11 +137,48 @@ fn phase_of(event: &QuantumEvent) -> Phase {
     }
 }
 
-/// The speculative step a quantum event reports, if it reports one. The event of a verification step carries no draft
-/// statistics yet (accepted drafts, committed tokens, draft time), so no step is reported and a row's `speculative`
-/// block stays null; the speculative decoder's event fills it here.
-fn step_of(_event: &QuantumEvent) -> Option<Step> {
-    None
+/// The drafting phase of a draft quantum and the time it adds to that phase, or `None` for a quantum that does not
+/// draft. A prompt catch-up's rows end before the prompt's last token (its tokens are the prompt's next ones); the
+/// first draft quantum of a step after that is the step's catch-up, the ones after it its recursive drafts. As in the
+/// Java decoder, each phase counts once per step: a catch-up from its admission to its retirement, the recursive
+/// drafts from the catch-up's retirement to the last draft's.
+fn draft_phase_of(
+    event: &QuantumEvent,
+    prompt_tokens: usize,
+    drafting: &mut Drafting,
+) -> Option<(&'static str, u64, Duration)> {
+    if event.kind != QuantumKind::Draft {
+        return None;
+    }
+    let time = event.retired.saturating_duration_since(event.admitted);
+    if event.start_position + (event.rows as u64) < prompt_tokens as u64 {
+        return Some((PROMPT_CATCH_UP, 1, time));
+    }
+    let previous = drafting.last_retired.replace(event.retired);
+    if !drafting.caught_up {
+        drafting.caught_up = true;
+        return Some((CATCH_UP, 1, time));
+    }
+    let count = u64::from(!drafting.recursing);
+    drafting.recursing = true;
+    let since = previous.map_or(time, |previous| event.retired.saturating_duration_since(previous));
+    Some((RECURSION, count, since))
+}
+
+/// The speculative step a verification reports, whose last token was found at `executed`. The engine reports no
+/// shortlist rejection, so the step carries none (-1); the verification starts `verify_nanos` before `executed`, after
+/// the step's drafts.
+fn step_of(verification: &Verification, executed: Instant) -> Step {
+    let start = executed
+        .checked_sub(Duration::from_nanos(verification.verify_nanos))
+        .unwrap_or(executed);
+    Step {
+        start,
+        executed,
+        outputs: verification.committed,
+        accepted: verification.accepted,
+        rejection: -1,
+    }
 }
 
 impl GenerationListener for Probe {
@@ -133,10 +198,22 @@ impl GenerationListener for Probe {
                 admitted: event.admitted,
                 retired: event.retired,
             });
-            if let Some(step) = step_of(&event) {
-                recorder.steps.push(step);
+            let prompt_tokens = recorder.encoded.map_or(0, |(_, count)| count);
+            if let Some((phase, count, time)) = draft_phase_of(&event, prompt_tokens, &mut self.drafting) {
+                let entry = recorder.draft_phases.entry(phase.to_string()).or_default();
+                entry.0 += count;
+                entry.1 += time;
             }
         }
+    }
+
+    fn verification(&mut self, event: Verification) {
+        if let Some(recorder) = &mut self.recorder {
+            // The engine reports the step's tokens, then the verification: its last token is the step's end.
+            let executed = recorder.tokens.last().map_or_else(Instant::now, |(_, at)| *at);
+            recorder.steps.push(step_of(&event, executed));
+        }
+        self.drafting = Drafting::default();
     }
 
     fn finished(&mut self, outcome: GenerationOutcome) {
@@ -272,10 +349,7 @@ impl Iteration<'_> {
                 SpeculationMode::Artifact => Speculation::Artifact,
                 SpeculationMode::Off => Speculation::Off,
             },
-            listener: Box::new(Probe {
-                recorder: Some(recorder),
-                done: Some(done),
-            }),
+            listener: Box::new(Probe::new(recorder, Some(done))),
         };
         let recorder = match self.runtime.generate(request) {
             Ok(()) => waiting.wait(),
@@ -358,5 +432,163 @@ pub fn provenance(command_line: String) -> Provenance {
         source: None,
         source_sha256: None,
         note: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ScenarioKind;
+
+    const PROMPT: usize = 10;
+
+    fn event(kind: QuantumKind, rows: usize, start_position: u64, admitted: Instant, retired: Instant) -> QuantumEvent {
+        QuantumEvent {
+            kind,
+            rows,
+            start_position,
+            admitted,
+            retired,
+            replayed: false,
+            recorded: false,
+        }
+    }
+
+    /// A probe fed the way the engine feeds a speculative request of a 10-token prompt: two prefill chunks each followed
+    /// by its MTP catch-up (the last one retires after the first token), then steps of a catch-up, recursive drafts and
+    /// a verification whose tokens come before its report.
+    fn speculative_probe() -> (Probe, Instant) {
+        let entry = Instant::now();
+        let ms = |n: u64| entry + Duration::from_millis(n);
+        let mut recorder = Recorder::new(entry);
+        recorder.encoded = Some((entry, PROMPT));
+        let mut probe = Probe::new(recorder, None);
+
+        probe.quantum(event(QuantumKind::Prefill, 6, 0, ms(1), ms(2)));
+        probe.quantum(event(QuantumKind::Draft, 5, 0, ms(1), ms(3)));
+        probe.quantum(event(QuantumKind::Prefill, 4, 6, ms(2), ms(4)));
+        probe.token(100, ms(4));
+        probe.quantum(event(QuantumKind::Draft, 4, 5, ms(3), ms(5)));
+
+        // Step 1 at position 10: catch-up of the first token, 3 recursive drafts, all 3 drafts accepted, 4 tokens.
+        probe.quantum(event(QuantumKind::Draft, 1, 9, ms(5), ms(6)));
+        probe.quantum(event(QuantumKind::Draft, 1, 10, ms(5), ms(7)));
+        probe.quantum(event(QuantumKind::Draft, 1, 11, ms(5), ms(8)));
+        probe.quantum(event(QuantumKind::Draft, 1, 12, ms(5), ms(9)));
+        probe.quantum(event(QuantumKind::Verify, 4, 10, ms(5), ms(12)));
+        for (index, id) in [101, 102, 103, 104].into_iter().enumerate() {
+            probe.token(id, ms(13) + Duration::from_micros(index as u64));
+        }
+        probe.verification(Verification {
+            accepted: 3,
+            drafted: 3,
+            committed: 4,
+            verify_nanos: 3_000_000,
+            draft_nanos: 4_000_000,
+        });
+
+        // Step 2 at position 14: catch-up of 4 rows, one recursive draft, no draft accepted, 1 token.
+        probe.quantum(event(QuantumKind::Draft, 4, 10, ms(14), ms(16)));
+        probe.quantum(event(QuantumKind::Draft, 1, 14, ms(14), ms(17)));
+        probe.quantum(event(QuantumKind::Verify, 3, 14, ms(14), ms(20)));
+        probe.token(105, ms(21));
+        probe.verification(Verification {
+            accepted: 0,
+            drafted: 2,
+            committed: 1,
+            verify_nanos: 3_000_000,
+            draft_nanos: 3_000_000,
+        });
+        (probe, entry)
+    }
+
+    #[test]
+    fn verifications_become_steps_ending_at_their_last_token() {
+        let (probe, entry) = speculative_probe();
+        let recorder = probe.recorder.unwrap();
+        let ms = |n: u64| entry + Duration::from_millis(n);
+        let steps: Vec<(Instant, Instant, usize, usize, i32)> = recorder
+            .steps
+            .iter()
+            .map(|step| (step.start, step.executed, step.outputs, step.accepted, step.rejection))
+            .collect();
+        let last_of_first = ms(13) + Duration::from_micros(3);
+        assert_eq!(
+            steps,
+            vec![
+                (last_of_first - Duration::from_millis(3), last_of_first, 4, 3, -1),
+                (ms(18), ms(21), 1, 0, -1),
+            ]
+        );
+    }
+
+    #[test]
+    fn draft_quanta_are_counted_by_phase_once_per_step() {
+        let (probe, _) = speculative_probe();
+        let recorder = probe.recorder.unwrap();
+        let phases: Vec<(String, (u64, Duration))> = recorder.draft_phases.into_iter().collect();
+        let ms = Duration::from_millis;
+        assert_eq!(
+            phases,
+            vec![
+                // Step 1: the catch-up 1 ms, recursion from its retirement (6 ms) to the last draft's (9 ms); step 2:
+                // the catch-up 2 ms, recursion 1 ms.
+                (CATCH_UP.to_string(), (2, ms(3))),
+                // Both prompt chunks' catch-ups, the second one after the first token.
+                (PROMPT_CATCH_UP.to_string(), (2, ms(4))),
+                (RECURSION.to_string(), (2, ms(4))),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_speculative_request_fills_the_row_block_in_the_java_schema() {
+        let (probe, entry) = speculative_probe();
+        let mut recorder = probe.recorder.unwrap();
+        recorder.finished = Some((entry + Duration::from_millis(22), Ending::Completed));
+        let scenario = Scenario::new(ScenarioKind::PromptToN, PROMPT, 6).unwrap();
+        let outcome = metrics::evaluate(&scenario, &recorder, |_| false);
+        assert_eq!(outcome.status, result::SUCCESS);
+        let speculative = outcome.work.speculative.unwrap();
+        assert_eq!(speculative.verifications, 2);
+        assert_eq!(speculative.accepted_drafts, vec![1, 0, 0, 1]);
+        assert_eq!(speculative.committed_tokens, 5);
+        assert_eq!(speculative.verify_nanos, 6_000_000);
+        assert_eq!(
+            (
+                speculative.rejections_in_shortlist,
+                speculative.rejections_outside_shortlist
+            ),
+            (0, 0)
+        );
+        assert_eq!(speculative.draft_phases["catch-up"].quanta, 2);
+        assert_eq!(speculative.draft_phases["recursion"].quanta, 2);
+        assert_eq!(speculative.draft_phases["prompt-catch-up"].quanta, 2);
+        assert_eq!(outcome.work.generated_tokens, Some(6));
+        assert_eq!(outcome.work.decode_sampled_tokens, Some(5));
+        // The window runs from the first token (4 ms) to the last step's last token (21 ms).
+        assert_eq!(outcome.timings.unwrap().decode, Some(17_000_000));
+        assert_eq!(outcome.timings.unwrap().time_to_last_token, Some(21_000_000));
+    }
+
+    #[test]
+    fn a_greedy_request_has_no_steps_or_draft_phases() {
+        let entry = Instant::now();
+        let mut recorder = Recorder::new(entry);
+        recorder.encoded = Some((entry, PROMPT));
+        let mut probe = Probe::new(recorder, None);
+        let at = entry + Duration::from_millis(1);
+        probe.quantum(event(QuantumKind::Prefill, PROMPT, 0, entry, at));
+        probe.token(1, at);
+        probe.quantum(event(
+            QuantumKind::Decode,
+            1,
+            PROMPT as u64,
+            at,
+            at + Duration::from_millis(1),
+        ));
+        let recorder = probe.recorder.unwrap();
+        assert!(recorder.steps.is_empty());
+        assert!(recorder.draft_phases.is_empty());
     }
 }
