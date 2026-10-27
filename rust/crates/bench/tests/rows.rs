@@ -171,3 +171,47 @@ fn a_row_past_the_run_or_a_short_reference_record_fails_the_run_with_the_reason(
     io.complete();
     lattice.close();
 }
+
+/// A task whose computation panics at one step.
+struct PanicsAt(usize);
+
+impl RowTask for PanicsAt {
+    fn fields(&self) -> usize {
+        1
+    }
+
+    fn compute(&self, input: &RowInput, out: &mut [f64]) {
+        assert!(input.step != self.0, "the task fails at step {}", self.0);
+        out[0] = 1.0;
+    }
+}
+
+#[test]
+fn a_panic_while_scoring_a_row_fails_the_run_naming_the_step_and_never_records_zeros() {
+    let settings = Settings::with_model(ModelSettings::default());
+    let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
+    let io = AsyncIo::open().expect("the asynchronous I/O opens");
+    lattice
+        .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
+        .expect("the lattice takes the I/O");
+    let host = Lake::new(
+        Arc::clone(&lattice),
+        NonZeroUsize::new(2).unwrap(),
+        Duration::from_secs(1),
+    );
+
+    let (mut sink, _engine, values) =
+        RowSink::new(Arc::clone(&io), Arc::clone(&host), Arc::new(PanicsAt(3)), 6).unwrap();
+    for step in 0..6 {
+        sink.row(step, 1, &logits(step));
+    }
+    drop(sink);
+    let why = values
+        .wait()
+        .expect_err("the run fails instead of reporting a zero for step 3");
+    assert!(why.contains("step 3 has no values"), "{why}");
+
+    host.complete_gracefully();
+    io.complete();
+    lattice.close();
+}

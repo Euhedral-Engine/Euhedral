@@ -8,6 +8,7 @@
 
 use std::time::{Duration, UNIX_EPOCH};
 
+use euhedral_inference_bench::config::ConfigError;
 use euhedral_inference_bench::kld::{self, Reference, Row};
 use euhedral_inference_bench::score::{FIELDS, percentile, score_row, standard_error, summary_lines, values_bytes};
 
@@ -181,4 +182,29 @@ fn the_summary_has_the_scorers_lines() {
     // top-1 agreement: 4 of 6 steps
     assert_eq!(columns[7], "0.6667");
     assert_eq!(columns.len(), 17);
+}
+
+#[test]
+fn a_reference_token_outside_the_vocabulary_is_refused_naming_the_chunk_and_position() {
+    use euhedral_inference_bench::score::check_tokens;
+
+    let mut tokens: Vec<Vec<u32>> = vec![(0..8).collect(); 3];
+    let bytes = kld::encode(8, 10, &tokens, |_, _| (1.0, 0.0, vec![0; 10]));
+    let reference = Reference::parse(&bytes).unwrap();
+    assert!(check_tokens(&reference, 10).is_ok());
+    // The engine's vocabulary is smaller than the reference's: token 7 of chunk 0 is outside 7.
+    let ConfigError::Invalid(message) = check_tokens(&reference, 7).unwrap_err();
+    assert!(
+        message.contains("chunk 0") && message.contains("token 7 at position 7"),
+        "{message}"
+    );
+
+    tokens[2][6] = 4000;
+    let bytes = kld::encode(8, 5000, &tokens, |_, _| (1.0, 0.0, vec![0; 5000]));
+    let reference = Reference::parse(&bytes).unwrap();
+    let ConfigError::Invalid(message) = check_tokens(&reference, 3000).unwrap_err();
+    assert!(
+        message.contains("chunk 2") && message.contains("token 4000 at position 6"),
+        "{message}"
+    );
 }

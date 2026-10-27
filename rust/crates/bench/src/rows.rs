@@ -10,7 +10,7 @@
 
 use std::fmt;
 use std::mem;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
@@ -72,6 +72,8 @@ struct Run {
     host: Arc<Lake>,
     fields: usize,
     slots: Vec<AtomicU64>,
+    /// Which steps stored their values: a frame that panics or is dropped leaves its step unset.
+    computed: Vec<AtomicBool>,
     fault: OnceLock<String>,
     done: Option<LatchSetter<RunValues>>,
     /// Held until the run ends: the host lake takes frames only while a unit is admitted.
@@ -87,9 +89,16 @@ impl Run {
 impl Drop for Run {
     fn drop(&mut self) {
         if let Some(done) = self.done.take() {
-            let result = match self.fault.take() {
-                Some(why) => Err(why),
-                None => Ok(self
+            let missing = self
+                .computed
+                .iter()
+                .position(|computed| !computed.load(Ordering::Acquire));
+            let result = match (self.fault.take(), missing) {
+                (Some(why), _) => Err(why),
+                (None, Some(step)) => Err(format!(
+                    "step {step} has no values: its row never arrived, or its computation panicked or was dropped"
+                )),
+                (None, None) => Ok(self
                     .slots
                     .iter()
                     .map(|slot| f64::from_bits(slot.load(Ordering::Relaxed)))
@@ -166,6 +175,7 @@ fn compute(run: &Run, input: &RowInput) {
     for (slot, value) in run.slots[input.step * run.fields..].iter().zip(out) {
         slot.store(value.to_bits(), Ordering::Relaxed);
     }
+    run.computed[input.step].store(true, Ordering::Release);
 }
 
 /// The sink of one run. The engine calls it on workers, one call at a time.
@@ -204,6 +214,7 @@ impl RowSink {
             host,
             fields,
             slots: (0..steps * fields).map(|_| AtomicU64::new(0)).collect(),
+            computed: (0..steps).map(|_| AtomicBool::new(false)).collect(),
             fault: OnceLock::new(),
             done: Some(done),
             _unit: unit,

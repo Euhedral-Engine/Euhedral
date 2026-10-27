@@ -77,14 +77,13 @@ the last token found.
 ### Quality tools
 
 ```text
-euhedral-bench score --artifact FILE --results FILE (--reference R.kld --name NAME)... [--values DIR] [--rows R] [--config YAML]
+euhedral-bench score --artifact FILE --results FILE (--reference R.kld --name NAME)... [--values DIR] [--config YAML]
 euhedral-bench drift --artifact FILE --prefix N --steps N --candidate host-tier|exact [--config YAML]
 ```
 
 `score` forces each chunk of a llama.cpp reference (`.kld`) on a fresh sequence: a prefill of N / 2 + 1 tokens, then the
-rest teacher-forced one row at a time (the rows a verification of up to 8 tokens gives, so `--rows` only checks its
-range). Each logits row is copied, its reference record is read with `AsyncIo`, and the row is scored in a frame of
-the `host` lake: NLL, reference NLL, KL over the reference entries above the -16 floor, top-1 agreement and the
+rest teacher-forced one row at a time (the rows a verification of up to 8 tokens gives). Each logits row is copied,
+its reference record is read with `AsyncIo`, and the row is scored in a frame of the `host` lake: NLL, reference NLL, KL over the reference entries above the -16 floor, top-1 agreement and the
 probability difference. The summary lines are the Java scorer's, appended to `--results`; `--values DIR` writes
 `DIR/NAME.values` in the format `tools/t5/run.py` reads (`--engine rust --rust-bench PATH`).
 

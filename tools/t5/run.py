@@ -52,8 +52,6 @@ def score_command(args: argparse.Namespace, name: str, artifact: str, private: P
     """The command that scores one artifact with the chosen engine; both write DIR/NAME.values and the same summary."""
     reference = args.store / "frozen" / "reference.kld"
     if args.engine == "rust":
-        if args.rust_bench is None:
-            raise SystemExit("error: --engine rust needs --rust-bench, the path of the euhedral-bench binary")
         command = [str(args.rust_bench), "score", "--artifact", artifact, "--results", str(private / "score.txt"),
                    "--reference", str(reference), "--name", name, "--values", str(private)]
         if args.cuda_library is not None:
@@ -149,6 +147,8 @@ def main(argv: list[str] | None = None) -> int:
     artifacts = dict(item.split("=", 1) for item in args.artifacts)
     if args.baseline not in artifacts:
         raise SystemExit("error: the baseline must be one of the artifacts")
+    if args.engine == "rust" and (args.rust_bench is None or not args.rust_bench.is_file()):
+        raise SystemExit("error: --engine rust needs --rust-bench, the path of the euhedral-bench binary")
     check_store(args.store)
     started = datetime.datetime.now().astimezone()
     runs = args.store / "runs"

@@ -4,7 +4,7 @@
 //! ```text
 //! run CONFIG.json [--fork-id ID] [--validate-only]
 //! dump --artifact FILE --prefix N --steps N --out FILE [--cuda-library FILE]
-//! score --artifact FILE --results FILE (--reference R.kld --name NAME)... [--values DIR] [--rows R] [--config YAML]
+//! score --artifact FILE --results FILE (--reference R.kld --name NAME)... [--values DIR] [--config YAML]
 //!       [--cuda-library FILE]
 //! drift --artifact FILE --prefix N --steps N --candidate host-tier|exact [--config YAML] [--cuda-library FILE]
 //! ```
@@ -42,7 +42,7 @@ use euhedral_inference_settings::{ByteSize, ModelSettings, Settings, load_file, 
 const USAGE: &str = "usage:
   run CONFIG.json [--fork-id ID] [--validate-only]
   dump --artifact FILE --prefix N --steps N --out FILE [--cuda-library FILE]
-  score --artifact FILE --results FILE (--reference R.kld --name NAME)... [--values DIR] [--rows R] [--config YAML]
+  score --artifact FILE --results FILE (--reference R.kld --name NAME)... [--values DIR] [--config YAML]
         [--cuda-library FILE]
   drift --artifact FILE --prefix N --steps N --candidate host-tier|exact [--config YAML] [--cuda-library FILE]
 
@@ -50,8 +50,8 @@ CONFIG.json is a Java benchmark configuration file (see benchmark/configs); it r
 --fork-id labels this process as one externally launched fork.
 --validate-only checks the configuration and the prompts, prints the plan, and exits without touching the GPU.
 score appends each reference's summary to the results file and, with --values, writes DIR/NAME.values (header of three
-little-endian i32, then float64 nll, reference nll, kl, agree, probability difference per forced token). --rows is the
-Java scorer's verification width (1 to 8); the engine decodes one row at a time, which gives the same rows.
+little-endian i32, then float64 nll, reference nll, kl, agree, probability difference per forced token). The engine
+decodes the forced tokens one row at a time, which gives the rows a verification of up to 8 tokens gives.
 drift decodes PREFIX + STEPS forced tokens of the corpus document twice and compares the runs: the first on the
 engine's default settings (all layers on the GPU), the second on --config (required for host-tier; the same settings
 again for exact, which must agree bitwise). It exits 1 on a breach: mean KL >= 1e-2; more than 2% of steps flip top-1
@@ -331,7 +331,6 @@ fn shutdown(owner: RuntimeOwner, runtime: Arc<EngineRuntime>) {
 fn score_command(args: &[String]) -> Result<u8, Failure> {
     let (mut artifact, mut results, mut values, mut config, mut library) = (None, None, None, None, None);
     let (mut references, mut names) = (Vec::new(), Vec::new());
-    let mut rows = 8usize;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         let mut value = |name: &str| {
@@ -347,11 +346,6 @@ fn score_command(args: &[String]) -> Result<u8, Failure> {
             "--cuda-library" => library = Some(PathBuf::from(value("--cuda-library")?)),
             "--reference" => references.push(PathBuf::from(value("--reference")?)),
             "--name" => names.push(value("--name")?),
-            "--rows" => {
-                rows = value("--rows")?
-                    .parse()
-                    .map_err(|_| Failure::Usage("--rows needs a whole number".to_string()))?;
-            }
             other => return Err(Failure::Usage(format!("unknown score option {other}"))),
         }
     }
@@ -360,9 +354,6 @@ fn score_command(args: &[String]) -> Result<u8, Failure> {
     };
     if references.is_empty() || references.len() != names.len() {
         return Err(Failure::Usage("give each --reference a --name".to_string()));
-    }
-    if !(1..=8).contains(&rows) {
-        return Err(Failure::Usage("--rows must be at least 1 and at most 8".to_string()));
     }
     let Some(library) = library.or_else(default_cuda_library) else {
         return Err(Failure::Usage(

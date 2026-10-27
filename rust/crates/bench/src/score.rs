@@ -3,8 +3,7 @@
 //!
 //! Each chunk of N reference tokens is forced on a fresh sequence: a prefill of N / 2 + 1 tokens, then the forced
 //! tokens one row at a time, so that step k's logits row predicts the token the reference's record k does. The rows
-//! the engine decodes one at a time are the rows its verification of up to 8 tokens produces (row-exact), so the scheme
-//! needs no row count. Every row is scored on the CPU, in a frame of the `host` lake, against the reference record a read
+//! the engine decodes one at a time are the rows its verification of up to 8 tokens produces (row-exact). Every row is scored on the CPU, in a frame of the `host` lake, against the reference record a read
 //! has fetched ([`crate::rows`]): five values per step, in the order the `.values` file has them.
 
 use std::sync::Arc;
@@ -97,8 +96,30 @@ pub struct Scored {
     pub seconds: f64,
 }
 
+fn in_chunk(chunk: usize, error: ConfigError) -> ConfigError {
+    let ConfigError::Invalid(message) = error;
+    ConfigError::Invalid(format!("chunk {chunk}: {message}"))
+}
+
 fn finished(values: RunValues) -> Result<Vec<f64>, ConfigError> {
     values.map_err(|why| ConfigError::Invalid(format!("scoring failed: {why}")))
+}
+
+/// Fails when a token of `reference` is outside the vocabulary: the engine would be handed it, and the scorer would
+/// index a logits row with it.
+pub fn check_tokens(reference: &Reference, vocabulary: usize) -> Result<(), ConfigError> {
+    for (chunk, tokens) in reference.tokens.iter().enumerate() {
+        if let Some((position, token)) = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| **token as usize >= vocabulary)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "the reference's chunk {chunk} has token {token} at position {position}, outside the vocabulary of {vocabulary}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Scores every chunk of `reference` (whose records `file` holds) on `runtime`: a chunk is forced while the previous
@@ -115,6 +136,7 @@ pub fn score(
             reference.vocabulary
         )));
     }
+    check_tokens(reference, vocabulary)?;
     let started = Instant::now();
     let records = reference.records();
     let mut values = Vec::with_capacity(reference.chunks());
@@ -145,11 +167,11 @@ pub fn score(
         // The engine is free: the next chunk starts while this one's last rows are scored. The chunk before it is
         // waited for first, so that no more than two chunks of rows are ever held.
         if let Some(before) = previous.replace(scored) {
-            values.push(finished(before.wait())?);
+            values.push(finished(before.wait()).map_err(|error| in_chunk(chunk - 1, error))?);
         }
     }
     if let Some(last) = previous {
-        values.push(finished(last.wait())?);
+        values.push(finished(last.wait()).map_err(|error| in_chunk(reference.chunks() - 1, error))?);
     }
     Ok(Scored {
         values,
