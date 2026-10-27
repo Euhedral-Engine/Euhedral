@@ -24,6 +24,7 @@ pub mod linear;
 pub mod mtp;
 pub mod norm;
 pub mod sampling;
+pub mod settle;
 
 use std::fmt::{self, Display};
 use std::sync::Arc;
@@ -41,6 +42,7 @@ use crate::state::{FlightGuard, KvView, SequenceDevice, StaleReservation};
 use crate::workspace::{BufferSlot, Workspace, WorkspaceError};
 use attention::KvSource;
 use sampling::{Selection, SelectionLease};
+pub use settle::{LaneEnds, Settled, Settler, Settling};
 
 /// What a quantum is, which sets the routes of its stages (`Quantum.ExecutionKind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -125,6 +127,16 @@ impl LaneTable {
     /// The lane `id`.
     pub fn get(&self, id: LaneId) -> Option<&CudaLane> {
         self.lanes.get(usize::from(id.0)).map(|lane| &**lane)
+    }
+
+    /// The number of lanes.
+    pub fn len(&self) -> usize {
+        self.lanes.len()
+    }
+
+    /// Whether the table has no lane.
+    pub fn is_empty(&self) -> bool {
+        self.lanes.is_empty()
     }
 }
 
@@ -265,6 +277,9 @@ pub struct Quantum {
     pub(crate) mode: SubmitMode,
     pub(crate) config: Arc<ModelConfig>,
     pub(crate) lanes: LaneTable,
+    /// The latest marker the quantum submitted on each lane and the latest it signalled, which says whether it can
+    /// retire if it ends early (see [`settle`]).
+    pub(crate) ends: Arc<LaneEnds>,
     /// Logits rows the quantum scores: the rows of its final norm, its head and its selection.
     pub(crate) logits_rows: usize,
     /// Whether the base rows' post-final-norm hidden also seed the sequence's drafting.
@@ -336,6 +351,7 @@ impl Quantum {
             seq,
             mode,
             config,
+            ends: Arc::new(LaneEnds::new(lanes.len())),
             lanes,
             logits_rows,
             record: 0,
@@ -516,6 +532,11 @@ impl Quantum {
         self.kind
     }
 
+    /// The latest marker the quantum submitted on each lane, and the latest it signalled.
+    pub fn lane_ends(&self) -> &Arc<LaneEnds> {
+        &self.ends
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
     }
@@ -643,7 +664,8 @@ pub fn run_eager<L: Launch>(stage: &L, quantum: &Quantum, cx: &StageCx<'_>) -> R
 /// A signalled marker also writes the lane's completion word, which is how the host finds that the marker is reached
 /// ([`DeviceQueue::completed`](euhedral_graph::DeviceQueue::completed)). A graph's retirement boundary is the latest
 /// marker of every lane the quantum used, so the last stage of each lane must signal, and the others need not: the
-/// plan computes which those are ([`Plan::signalled`](crate::plan::Plan::signalled)). A stage that has nothing to
+/// plan computes which those are ([`Plan::signalled`](crate::plan::Plan::signalled)). A quantum that ends before its
+/// chains' ends have run is settled by [`Settling`]. A stage that has nothing to
 /// launch for the quantum but is to signal still ends a submission on its lane, behind the markers it waits for, with
 /// a signalled marker and no launch, so the lane's last marker is reachable whatever the quantum skips.
 pub fn run_stage<L: StageLaunch + ?Sized>(
@@ -688,6 +710,7 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
         submission.finish()
     }
     .map_err(fatal)?;
+    quantum.ends.record(marker, signal);
     Ok(Submitted::marker(marker))
 }
 
