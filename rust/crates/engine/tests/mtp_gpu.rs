@@ -220,12 +220,16 @@ struct Snapshot {
     gdn: Vec<Vec<u8>>,
 }
 
-fn snapshot(runtime: &EngineRuntime) -> Snapshot {
+/// A lane of the test's own, for the copies of a snapshot (a lane id exists once per library).
+fn snapshot_lane(runtime: &EngineRuntime) -> Arc<CudaLane> {
     let library = runtime.library();
-    let lane = CudaLane::new(library, LaneId((library.max_lanes() - 1) as u16), 4).unwrap();
+    CudaLane::new(library, LaneId((library.max_lanes() - 1) as u16), 4).unwrap()
+}
+
+fn snapshot(runtime: &EngineRuntime, lane: &CudaLane) -> Snapshot {
     let download = |ptr, bytes: usize| {
         let mut host = vec![0u8; bytes];
-        let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
+        let submission = Submission::begin(lane, SubmitMode::default()).unwrap();
         ops::copy_device_to_host(&submission, &mut host, ptr).unwrap();
         drop(submission);
         lane.synchronize().unwrap();
@@ -333,11 +337,12 @@ fn mtp_kv_and_gdn_state_equal_greedy_after_run() {
     // ends with the decode that feeds its last token (the replay of its last verification runs in it).
     let greedy = generate(&runtime, &prompt, wanted + 1, &[], Speculation::Off);
     let greedy_state = sequence_state(&runtime);
-    let wanted_snapshot = snapshot(&runtime);
+    let lane = snapshot_lane(&runtime);
+    let wanted_snapshot = snapshot(&runtime, &lane);
     runtime.settle_after_speculation_for_tests(true);
     let speculative = generate(&runtime, &prompt, wanted, &[], Speculation::Artifact);
     let state = sequence_state(&runtime);
-    let got = snapshot(&runtime);
+    let got = snapshot(&runtime, &lane);
 
     assert_eq!(speculative.outcome.reason, FinishReason::Length);
     assert_eq!(speculative.tokens, greedy.tokens[..wanted as usize]);
@@ -367,8 +372,9 @@ fn mtp_kv_and_gdn_state_equal_greedy_after_run() {
     // A second speculative run gives the same MTP rows: they are a function of the committed tokens.
     let again = generate(&runtime, &prompt, wanted, &[], Speculation::Artifact);
     assert_eq!(again.tokens, speculative.tokens);
-    let second = snapshot(&runtime);
+    let second = snapshot(&runtime, &lane);
     assert!(second.mtp_pages == got.mtp_pages, "the MTP cache is the same again");
+    drop(lane);
     owner.shutdown(runtime).unwrap();
 }
 
@@ -475,7 +481,9 @@ fn long_run(machine: &Machine, prompt: &[u32], graphs: bool) -> LongRun {
     let warm = generate(&runtime, prompt, 256, &[], Speculation::Artifact);
     let recording = generate(&runtime, prompt, 256, &[], Speculation::Artifact);
     assert_eq!(recording.tokens, warm.tokens);
-    let snapshot = snapshot(&runtime);
+    let lane = snapshot_lane(&runtime);
+    let snapshot = snapshot(&runtime, &lane);
+    drop(lane);
     owner.shutdown(runtime).unwrap();
     LongRun { recording, snapshot }
 }

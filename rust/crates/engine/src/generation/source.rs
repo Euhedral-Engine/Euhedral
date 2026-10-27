@@ -890,9 +890,9 @@ impl Owner {
                 logits: usize::from(last && run.wanted > 0),
                 replay: Vec::new(),
                 last_chunk: last,
-                // A greedy request chains the next row behind the prompt; a speculative one catches up the chunk first
-                // and waits for the first token after the last.
-                more: if speculative { drafting && !last } else { run.depth > 1 },
+                // A greedy request chains the next row behind the prompt; a speculative one chains the next chunk (or the
+                // catch-up of this one) and waits for the first token after the last chunk.
+                more: if speculative { !last } else { run.depth > 1 },
             },
             Step::Decode => Admission {
                 role: Role::Decode,
