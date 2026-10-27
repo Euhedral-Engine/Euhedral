@@ -56,3 +56,25 @@ fn read_file(file: &Path) { /* ... */ }
   row in the table of `scripts/check-layers.sh`. A new binary is added to `BINARIES` there.
 - A layer or external-dependency exception is a change to the table in `scripts/check-layers.sh`, reviewed as a change
   to the architecture.
+
+## Benchmark
+
+`euhedral-bench` (crate `euhedral-inference-bench`) measures the Rust engine with the Java benchmark's configuration
+files (`benchmark/configs`) and writes rows in its result schema (`euhedral-inference.benchmark-result` version 1,
+`implementation` `rust`):
+
+```text
+cargo run --release -p euhedral-inference-bench -- run CONFIG.json [--fork-id ID] [--validate-only]
+cargo run --release -p euhedral-inference-bench -- dump --artifact FILE --prefix N --steps N --out FILE
+```
+
+A configuration that asks for what the engine does not do is refused with the reason: `prefixCacheBytes` above 0,
+`cpus` other than `all`, `excludeCpus` / `excludeCores`, and `generation.mode` `sample`. The binary is a thin `main.rs`
+over the library: the library prints and exits nowhere, and its few blocking file calls are scoped exceptions; `main.rs`
+carries the print exceptions and starts, then waits for, each request. The decode rate runs from the first token found to
+the last token found.
+
+`tools/rust_gate.py` runs the Java and the Rust benchmark alternately, one process each per fork, each through the GPU
+launcher (`gpu-run`: exclusive lock, memory cap, time limit), with the prefix cache off, and prints a per-row table of the
+output hashes of the two engines and the absolute medians of each.
+

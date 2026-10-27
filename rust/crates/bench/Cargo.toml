@@ -1,18 +1,28 @@
 [package]
 name = "euhedral-inference-bench"
 version = "0.1.0"
-description = "The benchmark harness: deterministic prompt corpora and, later, the scenario runner."
+description = "The benchmark binary: the Java benchmark's configs and result rows, the prompt corpora and the scenario runner."
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "euhedral-bench"
+path = "src/main.rs"
+
 [dependencies]
+euhedral-graph.workspace = true
+euhedral-inference-edrl = { path = "../edrl" }
+euhedral-inference-engine = { path = "../engine" }
+euhedral-inference-settings = { path = "../settings" }
 euhedral-inference-tokenizer = { path = "../tokenizer" }
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-euhedral-inference-edrl = { path = "../edrl" }
+tempfile.workspace = true
 test-support = { path = "../test-support" }
 
 [lints]
