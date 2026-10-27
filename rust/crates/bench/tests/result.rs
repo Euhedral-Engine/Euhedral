@@ -210,9 +210,10 @@ fn instants_print_as_java_prints_them() {
         iso_instant(UNIX_EPOCH + Duration::new(1_790_424_000, 120_500_000)),
         "2026-09-26T12:00:00.120500Z"
     );
+    // 700 ns: a system clock with 100 ns ticks (Windows) holds it exactly.
     assert_eq!(
-        iso_instant(UNIX_EPOCH + Duration::new(1_790_424_000, 7)),
-        "2026-09-26T12:00:00.000000007Z"
+        iso_instant(UNIX_EPOCH + Duration::new(1_790_424_000, 700)),
+        "2026-09-26T12:00:00.000000700Z"
     );
 }
 
