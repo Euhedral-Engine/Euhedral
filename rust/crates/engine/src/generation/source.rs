@@ -23,8 +23,9 @@
 //! never become part of the sequence (`discard`).
 //!
 //! **The records.** The owner reserves a quantum's cache rows and uploads its input record on its own lane
-//! when it admits it. Consecutive quanta use the two input records in turn, so the upload of the quantum behind never
-//! overwrites what the quantum ahead is still reading.
+//! when it admits it. Each quantum in flight reads a record of its own: a greedy request alternates between two, so the
+//! upload of the quantum behind never overwrites what the quantum ahead is still reading, and the quanta of a
+//! speculative step take the workspace's records (one more than the draft depth) in order.
 //!
 //! **Speculation.** With the artifact's draft layer ([`Speculation::Artifact`]) the owner runs the prompt's chunks, each
 //! followed by the MTP catch-up of its rows, and then steps (`mtp.rs`): the catch-up over the rows the last

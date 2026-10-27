@@ -280,6 +280,18 @@ fn mtp_output_equals_greedy() {
     let (runtime, owner) = start(&machine, 4096);
     let depth = runtime.plan().draft_depth;
     assert!(depth > 0, "the artifact drafts");
+    // Each quantum of a step reads its own input record, and the record index wraps over the records the workspace holds.
+    let workspace = runtime.workspace();
+    let records = workspace.records();
+    assert_eq!(records as u64, (depth as u64 + 1).max(2));
+    for record in 0..records {
+        assert_eq!(workspace.input_record(record + records), workspace.input_record(record));
+        assert_ne!(
+            workspace.input_record(record),
+            workspace.input_record(record + 1),
+            "records are distinct"
+        );
+    }
     let mut total = vec![0u64; depth + 1];
     for target in [128, 2000] {
         for (index, prompt) in chat_prompts(&tokenizer, target).iter().enumerate() {
@@ -331,7 +343,15 @@ fn mtp_kv_and_gdn_state_equal_greedy_after_run() {
     let prompt = chat_prompts(&tokenizer, 2000).swap_remove(0);
     let (runtime, owner) = start(&machine, 4096);
     let depth = runtime.plan().draft_depth as u64;
-    let wanted = 100u32;
+    // The request ends on a page boundary of the cache, so that every generated row is in a whole page and compared.
+    let ends = (prompt.len() as u64).div_ceil(PAGE) * PAGE;
+    let wanted = u32::try_from(if ends - prompt.len() as u64 >= 20 {
+        ends - prompt.len() as u64
+    } else {
+        ends + PAGE - prompt.len() as u64
+    })
+    .unwrap();
+    assert_eq!((prompt.len() as u64 + u64::from(wanted)) % PAGE, 0);
 
     // Greedy decode of one token more feeds the `wanted` tokens the speculative request commits; the speculative one
     // ends with the decode that feeds its last token (the replay of its last verification runs in it).
@@ -470,10 +490,13 @@ fn mtp_stops_at_context_capacity() {
 struct LongRun {
     recording: Recording,
     snapshot: Snapshot,
+    /// Drafts a step makes, from the artifact.
+    depth: usize,
 }
 
 fn long_run(machine: &Machine, prompt: &[u32], graphs: bool) -> LongRun {
     let (runtime, owner) = start(machine, 4096);
+    let depth = runtime.plan().draft_depth;
     if !graphs {
         assert!(runtime.disable_graphs_for_tests());
     }
@@ -485,7 +508,11 @@ fn long_run(machine: &Machine, prompt: &[u32], graphs: bool) -> LongRun {
     let snapshot = snapshot(&runtime, &lane);
     drop(lane);
     owner.shutdown(runtime).unwrap();
-    LongRun { recording, snapshot }
+    LongRun {
+        recording,
+        snapshot,
+        depth,
+    }
 }
 
 #[test]
@@ -527,7 +554,8 @@ fn captured_mtp_equals_uncaptured() {
         "the generation crosses the key switch at 2048 rows"
     );
     assert_eq!(captured.recording.tokens, plain.recording.tokens);
-    let depth = 4;
+    let depth = captured.depth;
+    assert_eq!(depth, plain.depth);
     assert_eq!(
         histogram(&captured.recording, depth),
         histogram(&plain.recording, depth),

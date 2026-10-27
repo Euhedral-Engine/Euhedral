@@ -290,7 +290,7 @@ pub struct Quantum {
     pub(crate) draft_token_read: Option<usize>,
     /// Whether the quantum writes its last input token to slot 0 of the step's tokens as the step's current token.
     pub(crate) writes_current_token: bool,
-    /// The input record the quantum's ids and start position are uploaded to (0 or 1; the workspace holds two).
+    /// The input record the quantum's ids and start position are uploaded to (one of the workspace's records).
     pub(crate) record: usize,
     /// The selection of the quantum before it in a chain: the quantum's one row reads its token id from that
     /// selection's keys on the device, behind the quantum that wrote them ([`Quantum::token_from`]).

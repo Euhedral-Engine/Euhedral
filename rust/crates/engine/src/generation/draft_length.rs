@@ -24,6 +24,10 @@ pub enum DraftLengthError {
 }
 
 /// How many tokens an MTP step drafts.
+///
+/// The engine runs the fixed length of the artifact's depth ([`DraftLength::fixed`]), which its chained step admits
+/// whole. A gated length (`least < most`) needs the host between the drafts and the draft head's log-probabilities;
+/// it is ported here and not wired into the engine yet.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DraftLength {
     least: usize,

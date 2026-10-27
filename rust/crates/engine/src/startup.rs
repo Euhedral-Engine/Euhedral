@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
+use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -43,7 +44,7 @@ use crate::residency::planner::{Placement, PlanInputs, ResidencyPlan, plan_with}
 use crate::runtime::{Core, EngineRuntime, StartupReport, Units, raw_file};
 use crate::state::SequenceState;
 use crate::warmup;
-use crate::workspace::{INPUT_RECORDS, Workspace};
+use crate::workspace::{Workspace, input_records};
 
 /// The transfer lanes a startup makes: `host.task-parallelism`, the workers that take host work at once, at least 2
 /// and at most half of the library's lanes, which leaves the other half to the stage graphs.
@@ -491,7 +492,7 @@ fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: Has
             .unwrap_or(0);
         let regions = [plan.scratch_bytes.max(nvfp4_native), plan.decode_scratch_bytes];
         // A drafting sequence admits the quanta of a step together, each reading a record of its own.
-        let records = (plan.draft_depth as u64 + 1).max(INPUT_RECORDS);
+        let records = input_records(plan.draft_depth);
         let workspace =
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
         let lane = &core.transfer[0];
@@ -583,7 +584,13 @@ fn assemble(
         trim_pool(&startup.core);
         // The draft head's token ids come back to the host once, in this frame (the pool may allocate here): a drafted
         // token is a row of the head, and the verifier's tokens are the model's.
-        let ids = draft_ids_loan(&startup.core, &plan, &weights);
+        let ids = match draft_ids_loan(&startup.core, &plan, &weights) {
+            Ok(ids) => ids,
+            Err(error) => {
+                drop((weights, workspace, sequence));
+                return startup.fail(error);
+            }
+        };
         let (warmed, marker) = warmup::run(&startup.core, &artifact.config, &weights, &workspace);
         let core = Arc::clone(&startup.core);
         let (completions, stages) = (Arc::clone(&core.completions), Arc::clone(&core.stages));
@@ -725,24 +732,38 @@ impl DraftIds {
                 });
                 core.completions.after_marker(marker, frame);
             }
-            Err(error) => finish.fail(EngineError::from(error)),
+            Err(error) => {
+                // The copy may have been queued before the call failed: the lane may still write the buffer, so it is
+                // not given back to the pool.
+                log::error!("the draft head's token ids could not be copied to the host: {error}");
+                mem::forget(loan);
+                finish.fail(EngineError::from(error));
+            }
         }
     }
 }
 
-/// The pinned buffer for the draft head's token ids, when the plan drafts.
-fn draft_ids_loan(core: &Core, plan: &ResidencyPlan, weights: &Weights) -> Option<DraftIds> {
+/// The pinned buffer for the draft head's token ids, when the plan drafts. A plan that drafts and cannot have them is
+/// an error: speculation is not silently left off.
+fn draft_ids_loan(core: &Core, plan: &ResidencyPlan, weights: &Weights) -> Result<Option<DraftIds>, EngineError> {
     if plan.draft_depth == 0 {
-        return None;
+        return Ok(None);
     }
-    let ids = weights.get(LayerIndex::GLOBAL, Role::DraftTokenIds)?;
-    let bytes = usize::try_from(ids.shape.first().copied()?).ok()?.checked_mul(4)?;
-    let loan = core.pool.acquire(bytes).ok()?;
-    Some(DraftIds {
+    let ids = weights
+        .get(LayerIndex::GLOBAL, Role::DraftTokenIds)
+        .ok_or_else(|| EngineError::Runtime("the artifact drafts and has no draft head token ids".to_string()))?;
+    let bytes = ids
+        .shape
+        .first()
+        .and_then(|rows| usize::try_from(*rows).ok())
+        .and_then(|rows| rows.checked_mul(4))
+        .ok_or_else(|| EngineError::Runtime(format!("the draft head's token ids have the shape {:?}", ids.shape)))?;
+    let loan = core.pool.acquire(bytes)?;
+    Ok(Some(DraftIds {
         loan,
         source: ids.ptr,
         bytes,
-    })
+    }))
 }
 
 #[allow(

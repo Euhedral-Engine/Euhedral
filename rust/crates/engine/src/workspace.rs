@@ -197,12 +197,24 @@ pub fn slot_bytes(config: &ModelConfig, slot: BufferSlot, rows: WorkspaceRows) -
     }
 }
 
+/// The input records a workspace holds for a sequence that drafts `draft_depth` tokens a step (0: none): each quantum of
+/// a step reads a record of its own, and at least [`INPUT_RECORDS`].
+pub fn input_records(draft_depth: usize) -> u64 {
+    (draft_depth as u64 + 1).max(INPUT_RECORDS)
+}
+
 /// Bytes of the whole workspace for `rows` (without the expansion scratch): every slot once, and the input record
 /// [`INPUT_RECORDS`] times.
 pub fn workspace_bytes(config: &ModelConfig, rows: WorkspaceRows) -> u64 {
+    workspace_bytes_with_records(config, rows, INPUT_RECORDS)
+}
+
+/// As [`workspace_bytes`] for a workspace of `records` input records ([`Workspace::allocate_with_records`]).
+pub fn workspace_bytes_with_records(config: &ModelConfig, rows: WorkspaceRows, records: u64) -> u64 {
+    let records = records.max(INPUT_RECORDS);
     BufferSlot::ALL
         .iter()
-        .map(|slot| copies(*slot, INPUT_RECORDS) * slot_bytes(config, *slot, rows))
+        .map(|slot| copies(*slot, records) * slot_bytes(config, *slot, rows))
         .sum()
 }
 
