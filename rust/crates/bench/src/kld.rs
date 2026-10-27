@@ -214,7 +214,10 @@ fn records_file(path: &Path, _file: File) -> io::Result<OwnedFile> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
-    let file = OpenOptions::new().read(true).custom_flags(FILE_FLAG_OVERLAPPED).open(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OVERLAPPED)
+        .open(path)?;
     Ok(OwnedFile::from(file))
 }
 
