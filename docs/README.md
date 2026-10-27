@@ -29,6 +29,7 @@ Start with the repository [quick start](../README.md#quick-start) to convert a c
 | [Kernels](kernels/README.md) | Attention, tensor-core prefill, native FP4 and CUDA graphs |
 | [Flash-Next](flash-next/README.md) | Model execution, artifacts, storage tiers, expert caching and performance |
 | [NVIDIA hardware](nvidia/README.md) | Hardware measurements and the microbenchmark harness |
+| [Rust engine](rust/ENGINE.md) | Building and running the Rust engine, its architecture, exactness checks and measured speed |
 | [Design specs](superpowers/specs/) | Dated design specifications |
 | [Implementation plans](superpowers/plans/) | Dated implementation plans |
 
