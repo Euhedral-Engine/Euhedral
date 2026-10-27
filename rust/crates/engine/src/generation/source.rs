@@ -18,10 +18,9 @@
 //! device (the graph's external edge waits for its sink), and takes its token id from the selection the earlier one
 //! wrote ([`Quantum::token_from`]), so the host need not have read it: there is no gap between the end of one step and
 //! the start of the next. The cost is one quantum that may run for nothing, the one that follows a stop token or a
-//! failure. It runs to its end and its rows never become part of the sequence (`discard`). It is not stopped with its
-//! kill switch: a quantum killed while its stages are being submitted leaves a last marker on a lane that no signalled
-//! marker follows (only the ends of the lanes' chains signal), the lane's completion word never reaches the quantum's
-//! retirement boundary, and the quantum never retires, which would keep the request from ending.
+//! failure. When the request stops, the quanta in flight are told to stop (their kill switches are set): a quantum
+//! that stopped part-way settles the lanes whose last marker it left unsignalled, so that it retires, and its rows
+//! never become part of the sequence (`discard`).
 //!
 //! **The records.** The owner reserves a quantum's cache rows and uploads its input record on its own lane
 //! when it admits it. Consecutive quanta use the two input records in turn, so the upload of the quantum behind never
@@ -208,6 +207,8 @@ pub(super) struct Flying {
     pub(super) admitted: Instant,
     pub(super) replayed: bool,
     pub(super) recorded: bool,
+    /// Set to stop the quantum when the request stops while it is in flight.
+    pub(super) kill: Arc<AtomicBool>,
     /// When the owner found it retired.
     pub(super) retired_at: Option<Instant>,
     pub(super) retired: Option<(Quantum, QuantumOutcome)>,
@@ -301,10 +302,14 @@ impl Run {
         }
     }
 
-    /// Ends the request with `reason` unless it already ends: no more steps. The quanta in flight run to their end and are discarded: see the module documentation.
+    /// Ends the request with `reason` unless it already ends: no more steps. The quanta in flight are told to stop and
+    /// are discarded when they retire: see the module documentation.
     pub(super) fn stop(&mut self, reason: FinishReason) {
         if self.stopping.is_none() {
             self.stopping = Some(reason);
+            for flying in &self.in_flight {
+                flying.kill.store(true, Ordering::Release);
+            }
         }
         self.chain = None;
     }
@@ -1058,12 +1063,11 @@ impl Owner {
         quantum.prepared_after(prepared);
 
         let selection = quantum.selection().cloned();
-        // A kill switch that is never set: see the module documentation.
         let kill = Arc::new(AtomicBool::new(false));
         let admitted = Instant::now();
         let started = shared
             .executor
-            .start(&mut self.cache, quantum, kill, run.chain.as_ref())
+            .start(&mut self.cache, quantum, Arc::clone(&kill), run.chain.as_ref())
             .map_err(why("starting the quantum"))?;
 
         run.in_flight.push_back(Flying {
@@ -1077,6 +1081,7 @@ impl Owner {
             admitted,
             replayed: started.replayed,
             recorded: started.recording,
+            kill,
             retired_at: None,
             retired: None,
         });
