@@ -5,7 +5,7 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use euhedral_graph::{DeviceQueue, LaneId, Marker};
+use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 
 use crate::error::{CudaError, check};
 use crate::library::CudaLibrary;
@@ -152,6 +152,8 @@ fn widen(previous: u64, word: u32) -> u64 {
 pub struct CudaLane {
     library: Arc<CudaLibrary>,
     id: LaneId,
+    /// The identity this lane stamps on its markers.
+    queue: QueueId,
     name: String,
     stream: u64,
     /// Whether a submission or a capture holds the lane.
@@ -235,6 +237,7 @@ impl CudaLane {
         Ok(Arc::new(CudaLane {
             library: Arc::clone(library),
             id,
+            queue: QueueId::next(),
             name: format!("cuda lane {}", id.0),
             stream,
             owned: AtomicBool::new(false),
@@ -247,6 +250,11 @@ impl CudaLane {
 
     pub fn id(&self) -> LaneId {
         self.id
+    }
+
+    /// The queue identity this lane stamps on its markers.
+    pub fn queue_id(&self) -> QueueId {
+        self.queue
     }
 
     /// Blocks until the lane's queued work finishes. For startup, shutdown and tests.
@@ -314,6 +322,10 @@ impl DeviceQueue for CudaLane {
     fn name(&self) -> &str {
         &self.name
     }
+
+    fn id(&self) -> QueueId {
+        self.queue
+    }
 }
 
 impl Drop for CudaLane {
@@ -370,7 +382,8 @@ mod tests {
     #[test]
     fn a_wait_is_refused_for_a_marker_not_issued_or_older_than_the_ring() {
         let ring = EventRing::new(vec![10, 11, 12]);
-        let marker = |value| Marker { lane: LaneId(0), value };
+        let queue = QueueId::next();
+        let marker = |value| Marker::new(queue, LaneId(0), value);
         assert!(matches!(
             ring.waitable(marker(1)),
             Err(CudaError::FutureMarker { issued: 0, .. })

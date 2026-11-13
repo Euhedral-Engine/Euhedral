@@ -14,7 +14,8 @@ test-oracles = ["euhedral-inference-cuda/test-oracles"]
 [dependencies]
 euhedral-core.workspace = true
 euhedral-data-structures.workspace = true
-euhedral-graph = { workspace = true, features = ["async-io"] }
+euhedral-graph.workspace = true
+euhedral-io.workspace = true
 euhedral-hardware-utils.workspace = true
 euhedral-hashing.workspace = true
 euhedral-inference-cuda = { path = "../cuda" }

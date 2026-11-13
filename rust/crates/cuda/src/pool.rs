@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
-use euhedral_graph::IoMemory;
+use euhedral_io::IoMemory;
 
 use crate::error::CudaError;
 use crate::library::CudaLibrary;

@@ -55,13 +55,13 @@ BINARIES = {BENCH, XTASK}
 DEV_ONLY = {TEST_SUPPORT}
 
 # external crate -> crates that may depend on it.
-RUSTEE = {"euhedral-core", "euhedral-graph"}
+RUSTEE = {"euhedral-core", "euhedral-graph", "euhedral-io"}
 RUSTEE_OWNERS = {ENGINE, BENCH, CUDA}
 # Configuration is parsed in one place.
 YAML = "serde_yaml_ng"
 YAML_OWNERS = {SETTINGS}
 # crate -> the only external crates it may depend on.
-EXTERNAL_ONLY = {CUDA: {"euhedral-graph", "libloading", "thiserror"}}
+EXTERNAL_ONLY = {CUDA: {"euhedral-graph", "euhedral-io", "libloading", "thiserror"}}
 # External crates no crate may depend on (glob patterns), with the rule each protects.
 DENIED = {
     "level-zero*": "hardware agnosticism: no Intel iGPU-specific code; integrated-GPU compute goes through a "

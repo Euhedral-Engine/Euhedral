@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
-use euhedral_graph::IoMemory;
+use euhedral_io::IoMemory;
 use euhedral_graph::Marker;
 
 use crate::error::{CudaError, check};
