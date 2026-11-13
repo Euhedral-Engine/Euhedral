@@ -71,7 +71,7 @@ pub enum Verdict {
         native: u8,
         rustee: u8,
     },
-    /// The plan has a launch that cannot run at the pinned RustEE revision (the kernel names and why); nothing ran.
+    /// The plan has a launch that cannot run (the kernel names and why); nothing ran.
     Skipped(Vec<String>),
 }
 

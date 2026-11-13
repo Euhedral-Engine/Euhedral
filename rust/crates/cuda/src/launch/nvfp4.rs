@@ -5,13 +5,14 @@
 //! The functions are pure: shapes and addresses in, a [`Nvfp4Plan`] (at most three launches, no allocation) or a
 //! [`PlanError`] out. A refusal is a status the C entry point returns before it launches anything.
 //!
-//! The native tile kernel takes three tensor maps by value as its leading arguments. A plan carries the parameters
-//! each map is built from ([`TensorMapPlan`], what the C code passes to `cuTensorMapEncodeTiled`) and the launch's own
-//! arguments start after the maps; the launcher encodes the maps and puts them in front.
+//! The native tile kernel takes three tensor maps by value as its leading arguments. Its launch carries the parameters
+//! each map is built from ([`TensorMapPlan`], what the C code passes to `cuTensorMapEncodeTiled`) in its
+//! [`Arguments`], in front of the words; the queue encodes them when it enqueues the launch.
 
 use crate::DevicePtr;
 use crate::launch::PlanError;
 use crate::launch::catalog::{Arguments, KernelId, Launch, find_const};
+pub use crate::launch::catalog::{TensorMapPlan, TensorMapSwizzle};
 
 /// The most rows of the decode kernels (`EUHEDRAL_DECODE_MAX_ROWS`, `decode_shapes.h`).
 pub const DECODE_MAX_ROWS: u32 = 8;
@@ -73,48 +74,6 @@ pub struct Nvfp4Operands {
     pub weights_byte_size: u64,
 }
 
-/// The parameters of one tensor map, as the C code passes them to `cuTensorMapEncodeTiled` (`byte_map`,
-/// `nvfp4_linear.c`). Every map is over bytes (`UINT8`) with unit element strides, no interleave, 128-byte L2
-/// promotion and no out-of-bounds fill; those do not vary and are not fields.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TensorMapPlan {
-    /// The global address (`CUdeviceptr`).
-    pub address: u64,
-    /// The rank (2 or 3): how many of `dims` and `box_dims`, and one fewer of `strides`, are used.
-    pub rank: u32,
-    /// Extents in elements (bytes), innermost first.
-    pub dims: [u64; 3],
-    /// Byte strides of dimensions 1 and up.
-    pub strides: [u64; 2],
-    /// Box extents in elements.
-    pub box_dims: [u32; 3],
-    pub swizzle: TensorMapSwizzle,
-}
-
-/// The swizzle of a tensor map (`CUtensorMapSwizzle`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TensorMapSwizzle {
-    None,
-    B64,
-}
-
-impl TensorMapPlan {
-    /// The extents in use.
-    pub fn dims(&self) -> &[u64] {
-        &self.dims[..self.rank as usize]
-    }
-
-    /// The strides in use.
-    pub fn strides(&self) -> &[u64] {
-        &self.strides[..self.rank as usize - 1]
-    }
-
-    /// The box extents in use.
-    pub fn box_dims(&self) -> &[u32] {
-        &self.box_dims[..self.rank as usize]
-    }
-}
-
 /// The launches of one linear, in order (at most three), and the tensor maps of the last one when it is a tile launch.
 #[derive(Clone, Debug)]
 pub struct Nvfp4Plan {
@@ -146,14 +105,13 @@ impl Nvfp4Plan {
         self.len += 1;
     }
 
-    /// The launches, in the order to issue them. The tile kernel's launch takes the maps of [`Self::tensor_maps`] as
-    /// its leading arguments: they must be placed in front of the arguments the launch carries.
+    /// The launches, in the order to issue them; each is complete (the tile kernel's launch carries its maps).
     pub fn launches(&self) -> &[Launch] {
         &self.launches[..self.len]
     }
 
-    /// The tensor maps (activation codes, weight codes, weight scales) the last launch takes as its three leading
-    /// arguments, before the arguments it carries; `None` for every launch but the tile kernel's.
+    /// The tensor maps (activation codes, weight codes, weight scales) the last launch carries as its three leading
+    /// arguments; `None` for every launch but the tile kernel's.
     pub fn tensor_maps(&self) -> Option<&[TensorMapPlan; 3]> {
         self.maps.as_ref()
     }
@@ -465,7 +423,7 @@ fn native_launches(rows: u32, in_features: u32, out_features: u32, layout: Nvfp4
     let row_scales = inputs / if layout == Nvfp4Layout::Sd4 { 32 } else { 16 };
     let scale_offset = align256(outputs * row_bytes);
     let b_rows = 128;
-    plan.maps = Some([
+    let maps = [
         TensorMapPlan {
             address: scratch.get(),
             rank: 3,
@@ -490,14 +448,16 @@ fn native_launches(rows: u32, in_features: u32, out_features: u32, layout: Nvfp4
             box_dims: [16, b_rows, 0],
             swizzle: TensorMapSwizzle::None,
         },
-    ]);
+    ];
+    plan.maps = Some(maps);
     let grid = rows64.div_ceil(128) * outputs.div_ceil(128);
     plan.push(Launch::new(
         TILE[layout.index()],
         [grid as u32, 1, 1],
         [NATIVE_TILE_THREADS, 1, 1],
         NATIVE_SHARED_BYTES,
-        Arguments::new()
+        maps.iter()
+            .fold(Arguments::new(), |args, map| args.tensor_map(*map))
             .pointer(scratch)
             .pointer(at.weights)
             .pointer(at.output)

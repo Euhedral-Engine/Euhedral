@@ -76,10 +76,7 @@ fn elementwise_outputs_equal_the_native_library_bit_for_bit() {
         let id = lookup(name).expect("a catalog kernel");
         if let Slot::Unavailable(reason) = twin.table().get(id) {
             assert!(
-                matches!(
-                    reason,
-                    Unavailable::ArchitectureSpecificTarget | Unavailable::TensorMapArguments
-                ),
+                matches!(reason, Unavailable::ArchitectureSpecificTarget),
                 "{name}: {reason}"
             );
         }
