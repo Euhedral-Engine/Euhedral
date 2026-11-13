@@ -122,6 +122,12 @@ const fn fused_from(rows: u32) -> u32 {
     if rows < 9 { FROM[rows as usize] } else { u32::MAX }
 }
 
+/// `pointer + bytes` as C computes it: wrapping, never a panic.
+fn advance(pointer: DevicePtr, bytes: u64) -> DevicePtr {
+    // SAFETY: the address is only carried into a launch's arguments, never dereferenced on the host.
+    unsafe { DevicePtr::from_raw(pointer.get().wrapping_add(bytes)) }
+}
+
 fn launch(kernel: KernelId, grid: [u32; 3], block: u32, shared_bytes: u32, args: Arguments) -> Launch {
     Launch::new(kernel, grid, [block, 1, 1], shared_bytes, args)
 }
@@ -221,15 +227,15 @@ fn plan_rope(
     {
         let width = (u64::from(s.query_heads) + u64::from(s.key_value_heads)) * u64::from(s.head_dim) * 2;
         for row in 0..s.rows {
-            let step = u64::from(row) * width;
+            let step = u64::from(row).wrapping_mul(width);
             let one = RopeShape {
-                query_key: s.query_key.offset(step),
-                output: s.output.offset(step),
+                query_key: advance(s.query_key, step),
+                output: advance(s.output, step),
                 rows: 1,
-                start_position: s.start_position + u64::from(row),
+                start_position: s.start_position.wrapping_add(u64::from(row)),
                 ..*s
             };
-            plan_rope(&one, position_offset + u64::from(row), row_exact, sink)?;
+            plan_rope(&one, position_offset.wrapping_add(u64::from(row)), row_exact, sink)?;
         }
         return Ok(());
     }
@@ -351,14 +357,14 @@ fn plan_causal_at(
         let out = u64::from(s.query_heads) * u64::from(s.head_dim) * 2;
         for row in 0..rows {
             let one = CausalShape {
-                query_key: s.query_key.offset(u64::from(row) * width),
-                gate: s.gate.offset(u64::from(row) * width),
-                output: s.output.offset(u64::from(row) * out),
+                query_key: advance(s.query_key, u64::from(row).wrapping_mul(width)),
+                gate: advance(s.gate, u64::from(row).wrapping_mul(width)),
+                output: advance(s.output, u64::from(row).wrapping_mul(out)),
                 rows: 1,
-                start: s.start + u64::from(row),
+                start: s.start.wrapping_add(u64::from(row)),
                 ..*s
             };
-            plan_causal_at(kernels, &one, position_offset + u64::from(row), modes, sink)?;
+            plan_causal_at(kernels, &one, position_offset.wrapping_add(u64::from(row)), modes, sink)?;
         }
         return Ok(());
     }
@@ -522,7 +528,8 @@ fn plan_prefill(kernels: &Kernels, s: &CausalShape, grid: u32, exact: bool, sink
 fn plan_decode(kernels: &Kernels, s: &CausalShape, position_offset: u64, exact: bool, sink: &mut impl FnMut(Launch)) {
     // :780-782: each CTA scans about 48 keys.
     let length = (s.start as u32).wrapping_add(1);
-    let mut splits = (length.wrapping_add(47) / 48).min(64);
+    // The sums are u64 in C (:781, :798), so the count does not wrap near u32::MAX keys.
+    let mut splits = (u64::from(length) + 47).div_euclid(48).min(64) as u32;
     // :791-792
     let mut decode = if exact { kernels.decode_exact } else { kernels.decode };
     let mut grid = s.query_heads.wrapping_mul(splits);
@@ -530,7 +537,7 @@ fn plan_decode(kernels: &Kernels, s: &CausalShape, position_offset: u64, exact: 
     // :796-803: relaxed numerics from 2048 keys: one three-warp tensor-core CTA per (KV head, 32-key split).
     let group = s.query_heads / s.key_heads;
     if !exact && length >= 2048 && group <= 8 {
-        splits = (length.wrapping_add(31) / 32).min(64);
+        splits = (u64::from(length) + 31).div_euclid(32).min(64) as u32;
         decode = kernels.decode_gqa;
         grid = s.key_heads.wrapping_mul(splits);
         block = 96;
@@ -1207,6 +1214,32 @@ mod tests {
             ]
         );
         assert_eq!(plan[0].grid, [24 * 2, 64, 1]); // last 74 -> ceil(74 / 48) = 2
+    }
+
+    #[test]
+    fn decode_split_counts_do_not_wrap_near_the_key_limit() {
+        // C sums in u64 (:781, :798): length = 4294967294 (start 4294967293) gives (length + 47) / 48 and
+        // (length + 31) / 32, both far above 64, so 64 splits. Group 6 and relaxed: GQA, grid 4 * 64.
+        let mut s = shape(1, 4_294_967_293);
+        s.cache_length = 4_294_967_294;
+        let gqa = nvfp4(&s, RELAXED);
+        assert_eq!(gqa[0].grid, [256, 1, 1]);
+        assert_eq!(*gqa[0].args.words().last().unwrap(), 64);
+        assert_eq!(*gqa[1].args.words().last().unwrap(), 64);
+        // 48-key path: exact numerics, grid query_heads * 64.
+        let per_head = nvfp4(&s, EXACT);
+        assert_eq!(per_head[0].grid, [24 * 64, 1, 1]);
+        assert_eq!(*per_head[0].args.words().last().unwrap(), 64);
+        assert_eq!(*per_head[1].args.words().last().unwrap(), 64);
+    }
+
+    #[test]
+    fn plans_never_panic_on_pointer_wrap() {
+        // C's pointer arithmetic wraps; so does the plan.
+        let mut s = shape(65, 10);
+        s.query_key = ptr(u64::MAX - 100);
+        s.cache_length = 200;
+        assert!(causal(CacheFormat::Nvfp4, &s, ROW_EXACT).is_ok());
     }
 
     // ---- KV append (qwen_layer_ops.c:552-582) ----
