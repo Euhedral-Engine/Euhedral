@@ -36,7 +36,7 @@ use euhedral_graph::{
     Marker, QuantumOutcome, RetryCounts, Stage, StageError, StageGraph, StageGraphSpec, StageId, StageSpec, UnitGuard,
 };
 use euhedral_inference_cuda::{
-    CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, PinnedPool, RetireList, Submission, SubmitMode, ops,
+    CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, PinnedPool, RetireList, Submission, SubmitMode, ops,
 };
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
@@ -220,7 +220,7 @@ impl World {
 
     fn sequence(&self, kv_tokens: u64) -> SequenceState {
         let submission = Submission::begin(self.owner(), SubmitMode::default()).unwrap();
-        let gdn = GdnStates::allocate(&self.library, &self.config, 8, &submission).unwrap();
+        let gdn = GdnStates::allocate(&self.library, &self.config, 8, &mut &submission).unwrap();
         submission.finish_signalled().unwrap();
         self.owner().synchronize().unwrap();
         let kv = KvCache::new(
@@ -298,7 +298,7 @@ impl StageLaunch for Probe {
         Vec::new()
     }
 
-    fn launch(&self, _quantum: &Quantum, _submission: &Submission<'_>) -> Result<(), StageError> {
+    fn launch(&self, _quantum: &Quantum, _kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         self.ran[self.index].fetch_add(1, Ordering::AcqRel);
         match &self.act {
             Act::Nothing => Ok(()),

@@ -2,7 +2,7 @@
 //!
 //! A stage is built once with what does not change from quantum to quantum (its weights, the buffer slots it reads
 //! and writes, its layer). Its work is its [`Launch::launch`]: the kernel launches and copies of one quantum on a
-//! submission it is given, and nothing else (no begin, no finish, no waits, no marker, no signal), so that a graph
+//! [`KernelOps`](euhedral_inference_cuda::KernelOps) it is given, and nothing else (no begin, no finish, no waits, no marker, no signal), so that a graph
 //! capture can record it. The one generic [`run_eager`] is the stage for eager submission: it takes the lane the
 //! graph chose, orders itself behind the markers of its predecessors on other lanes, calls `launch`, and returns the
 //! marker of that work. It never waits.
@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use euhedral_graph::{LaneId, LanePool, Marker, Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{
-    AllocationId, CudaError, CudaLane, CudaLibrary, DevicePtr, PooledPinned, Submission, SubmitMode,
+    AllocationId, CudaError, CudaLane, CudaLibrary, DevicePtr, KernelOps, PooledPinned, Submission, SubmitMode,
 };
 use thiserror::Error;
 
@@ -617,18 +617,18 @@ pub trait Launch: Send + Sync {
         Vec::new()
     }
 
-    /// Queues the stage's kernel launches and copies on `submission`, for `quantum`. Nothing else: no wait for a
+    /// Queues the stage's kernel launches and copies on `kernels`, for `quantum`. Nothing else: no wait for a
     /// marker, no marker, no completion signal, no synchronization, no allocation, so the launches can be captured
     /// into a graph. It reads, and does not change, anything the quantum shares. A quantum for which the stage is
     /// [`Launch::idle`] queues nothing: calling `launch` on it is allowed (a capture does not ask) and does nothing.
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError>;
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError>;
 }
 
 /// [`Launch`] without its generics, for the stages a plan keeps as a list: what a graph capture calls, in order.
 pub trait StageLaunch: Send + Sync {
     fn idle(&self, quantum: &Quantum) -> bool;
     fn waits(&self, quantum: &Quantum) -> Vec<Marker>;
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError>;
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError>;
 }
 
 impl<L: Launch> StageLaunch for L {
@@ -640,8 +640,8 @@ impl<L: Launch> StageLaunch for L {
         Launch::waits(self, quantum)
     }
 
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
-        Launch::launch(self, quantum, submission)
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
+        Launch::launch(self, quantum, kernels)
     }
 }
 
@@ -702,7 +702,8 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
         for marker in own.chain(stage.waits(quantum)) {
             submission.wait(marker).map_err(fatal)?;
         }
-        stage.launch(quantum, &submission)?;
+        let mut kernels = &submission;
+        stage.launch(quantum, &mut kernels)?;
     }
     let marker = if signal {
         submission.finish_signalled()

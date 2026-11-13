@@ -9,7 +9,7 @@ mod nvfp4;
 pub mod shapes;
 mod trellis;
 
-use euhedral_inference_cuda::{CudaError, DevicePtr, Submission};
+use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps};
 
 use crate::model::WeightRef;
 
@@ -53,7 +53,7 @@ pub trait LinearFormat: Send + Sync {
     )]
     fn submit(
         &self,
-        submission: &Submission<'_>,
+        kernels: &mut dyn KernelOps,
         weight: &WeightRef,
         x: DevicePtr,
         y: DevicePtr,

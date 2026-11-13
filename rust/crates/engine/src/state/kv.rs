@@ -31,8 +31,8 @@ use std::sync::Arc;
 
 use euhedral_graph::{LanePool, Marker};
 use euhedral_inference_cuda::{
-    AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena, PinnedPool, PooledPinned,
-    RetireList, Submission, ops,
+    AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena, KernelOps, PinnedPool,
+    PooledPinned, RetireList, Submission, ops,
 };
 use euhedral_inference_settings::KvFormat;
 use thiserror::Error;
@@ -547,13 +547,13 @@ impl KvCache {
     }
 
     /// As [`KvView::stage_in`], for the cache as it is now.
-    pub fn stage_in(&self, submission: &Submission<'_>, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
-        self.view().stage_in(submission, layer, start, rows)
+    pub fn stage_in(&self, kernels: &mut dyn KernelOps, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
+        self.view().stage_in(kernels, layer, start, rows)
     }
 
     /// As [`KvView::stage_out`], for the cache as it is now.
-    pub fn stage_out(&self, submission: &Submission<'_>, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
-        self.view().stage_out(submission, layer, start, rows)
+    pub fn stage_out(&self, kernels: &mut dyn KernelOps, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
+        self.view().stage_out(kernels, layer, start, rows)
     }
 }
 
@@ -708,7 +708,7 @@ impl KvView {
     /// and the attention after it read into the device region: every reserved one for a quantum of at most
     /// [`STAGED_TAIL_ROWS`] rows, otherwise those holding the rows before `start + rows`. Nothing without host
     /// pages.
-    pub fn stage_in(&self, submission: &Submission<'_>, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
+    pub fn stage_in(&self, kernels: &mut dyn KernelOps, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
         let Some(host) = &self.host else { return Ok(()) };
         let reserved = host.reserved_host_pages;
         if reserved == 0 {
@@ -726,8 +726,7 @@ impl KvView {
         // SAFETY: the arena lives as long as the view (it is shared); the host pages of a layer are written only by
         // the copy `stage_out` queues on the same lane, which the lane orders before this one.
         unsafe {
-            ops::copy_host_weights_to_device(
-                submission,
+            kernels.copy_host_weights_to_device(
                 host.region,
                 &host.arena,
                 offset as usize,
@@ -740,7 +739,7 @@ impl KvView {
     /// Queues on `submission`'s lane the copy back to host memory of the host pages that an append of `rows` rows at
     /// `start` wrote: the last two reserved ones for a quantum of at most [`STAGED_TAIL_ROWS`] rows (an append at the
     /// end of the reservation touches no other), otherwise exactly those holding its rows.
-    pub fn stage_out(&self, submission: &Submission<'_>, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
+    pub fn stage_out(&self, kernels: &mut dyn KernelOps, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
         let Some(host) = &self.host else { return Ok(()) };
         let reserved = host.reserved_host_pages;
         if reserved == 0 {
@@ -761,8 +760,7 @@ impl KvView {
         let offset = layer as u64 * host.layer_bytes + first * page;
         // SAFETY: as `stage_in`: the arena outlives the copy, and no other copy writes these pages meanwhile.
         unsafe {
-            ops::copy_device_to_host_weights(
-                submission,
+            kernels.copy_device_to_host_weights(
                 &host.arena,
                 offset as usize,
                 host.region.offset(first * page),

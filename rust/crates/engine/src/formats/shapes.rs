@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::fmt::Write;
 
-use euhedral_inference_cuda::{CudaError, DevicePtr, Submission, ops};
+use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps};
 
 /// The most arguments one launch takes: the native launcher's limit (`EUHEDRAL_KERNEL_TABLE_MAX_PARAMETERS`).
 pub const MAX_ARGUMENTS: usize = 32;
@@ -96,7 +96,7 @@ pub struct Launch {
 impl Launch {
     /// Queues the launch on the submission's lane. The library checks the argument count and widths against the
     /// compiled kernel.
-    pub fn queue(&self, submission: &Submission<'_>) -> Result<(), CudaError> {
+    pub fn queue(&self, kernels: &mut dyn KernelOps) -> Result<(), CudaError> {
         if self.args.count > MAX_ARGUMENTS {
             return Err(CudaError::Argument(format!(
                 "{} takes at most {MAX_ARGUMENTS} arguments, not {}",
@@ -107,24 +107,8 @@ impl Launch {
         let words = &self.args.words[..count];
         let sizes = &self.args.sizes[..count];
         match self.table {
-            Table::Linear => ops::linear_launch(
-                submission,
-                self.kernel,
-                self.grid,
-                self.block,
-                self.shared_bytes,
-                words,
-                sizes,
-            ),
-            Table::Qwen4 => ops::qwen4_launch(
-                submission,
-                self.kernel,
-                self.grid,
-                self.block,
-                self.shared_bytes,
-                words,
-                sizes,
-            ),
+            Table::Linear => kernels.linear_launch(self.kernel, self.grid, self.block, self.shared_bytes, words, sizes),
+            Table::Qwen4 => kernels.qwen4_launch(self.kernel, self.grid, self.block, self.shared_bytes, words, sizes),
         }
     }
 

@@ -329,7 +329,7 @@ impl World {
         let config = &self.config;
         let gdn = self.on_owner(|submission| {
             let verified = (1 + self.residency.draft_depth) as u64;
-            GdnStates::allocate(&self.library, config, verified, submission).unwrap()
+            GdnStates::allocate(&self.library, config, verified, &mut &*submission).unwrap()
         });
         let kv = |layers: usize| {
             KvCache::new(
@@ -975,7 +975,7 @@ fn light() -> Option<Light> {
 impl Light {
     fn sequence(&self, kv_tokens: u64, layers: usize) -> SequenceState {
         let submission = Submission::begin(&self.lane, SubmitMode::default()).unwrap();
-        let gdn = GdnStates::allocate(&self.library, &self.config, 8, &submission).unwrap();
+        let gdn = GdnStates::allocate(&self.library, &self.config, 8, &mut &submission).unwrap();
         submission.finish_signalled().unwrap();
         self.lane.synchronize().unwrap();
         let kv = KvCache::new(

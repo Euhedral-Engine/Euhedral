@@ -371,11 +371,12 @@ impl RecordStage {
     /// Records the launches of every stage that has work, in the order of the view, on `lane`.
     fn record(&self, quantum: &Quantum, lane: &CudaLane, mode: SubmitMode) -> Result<GraphExec, RecordFailure> {
         graph_cache::record_on(lane, mode, |submission| {
+            let mut kernels = submission;
             for launch in self.launches.iter() {
                 if launch.idle(quantum) {
                     continue;
                 }
-                launch.launch(quantum, submission).map_err(RecordFailure::Stage)?;
+                launch.launch(quantum, &mut kernels).map_err(RecordFailure::Stage)?;
             }
             Ok(())
         })
@@ -385,11 +386,12 @@ impl RecordStage {
     #[cfg(feature = "test-oracles")]
     fn hash(&self, quantum: &Quantum, lane: &CudaLane, mode: SubmitMode) -> Result<u64, RecordFailure> {
         let (outcome, hash) = Submission::hashed(lane, mode, |submission| {
+            let mut kernels = submission;
             for launch in self.launches.iter() {
                 if launch.idle(quantum) {
                     continue;
                 }
-                launch.launch(quantum, submission)?;
+                launch.launch(quantum, &mut kernels)?;
             }
             Ok::<(), StageError>(())
         })?;
@@ -680,9 +682,10 @@ impl Executor {
             row_exact: quantum.mode.row_exact,
         };
         let (outcome, hash) = Submission::hashed(lane, mode, |submission| {
+            let mut kernels = submission;
             for entry in entries {
                 if !entry.launch.idle(quantum) {
-                    entry.launch.launch(quantum, submission)?;
+                    entry.launch.launch(quantum, &mut kernels)?;
                 }
             }
             Ok::<(), StageError>(())

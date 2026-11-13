@@ -60,7 +60,7 @@ fn a_quantum_is_never_captured_under_exact_numerics() {
         .unwrap(),
     );
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-    let gdn = GdnStates::allocate(&library, &config, 8, &submission).unwrap();
+    let gdn = GdnStates::allocate(&library, &config, 8, &mut &submission).unwrap();
     submission.finish_signalled().unwrap();
     lane.synchronize().unwrap();
     let kv = KvCache::new(&library, &retire, 1, config.kv_width() as u64, KvFormat::Nvfp4, 1024, 0).unwrap();
