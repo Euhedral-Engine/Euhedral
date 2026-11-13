@@ -23,7 +23,7 @@ use euhedral_inference_cuda::launch::nvfp4::{
 };
 use euhedral_inference_cuda::{CudaLibrary, DevicePtr, ops};
 
-use common::twin::{Case, Random, Tally, Twin, watchdog};
+use common::twin::{Case, Rng, Tally, Twin, watchdog};
 
 const ROWS: [u32; 9] = [1, 2, 8, 9, 32, 64, 65, 128, 512];
 /// (inputs, outputs, layouts): 512 inputs one skinny split; 2048 several; 40 outputs the reference; 5376 the wide
@@ -42,7 +42,7 @@ fn library() -> Option<Arc<CudaLibrary>> {
 }
 
 /// A weight of `out_features` rows: random codes, small E4M3 scales, a global scale of one.
-fn weights(random: &mut Random, in_features: u32, out_features: u32, layout: Nvfp4Layout) -> Vec<u8> {
+fn weights(random: &mut Rng, in_features: u32, out_features: u32, layout: Nvfp4Layout) -> Vec<u8> {
     let total = nvfp4_byte_size(out_features, in_features, layout) as usize;
     let k = (in_features as usize).div_ceil(128) * 128;
     let codes = (out_features as usize * k / 2).div_ceil(256) * 256;
@@ -81,7 +81,7 @@ fn nvfp4_linear_plans_match_the_native_wrappers() {
     }
     let done = watchdog(360);
     let mut twin = Twin::open(&library).expect("both sides open on one device");
-    let mut random = Random(0x11ea);
+    let mut random = Rng(0x11ea);
     let mut tally = Tally::default();
     let probe = DevicePtr::NULL.offset(0x1000);
     for exact in [false, true] {
@@ -99,9 +99,9 @@ fn nvfp4_linear_plans_match_the_native_wrappers() {
                         format!("{layout:?} rows {rows} in {in_features} out {out_features} exact_numerics {exact}");
                     let scratch_bytes =
                         nvfp4_native_scratch_bytes(u64::from(rows), u64::from(in_features), u64::from(out_features));
-                    let make = |random: &mut Random, scratch: usize| {
+                    let make = |random: &mut Rng, scratch: usize| {
                         vec![
-                            random.bf16(rows as usize * in_features as usize),
+                            random.bf16_tiled(rows as usize * in_features as usize),
                             weight.clone(),
                             vec![0; rows as usize * out_features as usize * 2],
                             vec![0; scratch],

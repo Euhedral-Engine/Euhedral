@@ -82,7 +82,7 @@ pub enum Verdict {
         native: u8,
         rustee: u8,
     },
-    /// The plan has a launch that cannot run at the pinned RustEE revision (the kernel names and why); nothing ran.
+    /// The plan has a launch that cannot run (the kernel names and why); nothing ran.
     Skipped(Vec<String>),
 }
 
@@ -253,91 +253,6 @@ fn download(buffer: &DeviceBuffer) -> Result<Vec<u8>, Failure> {
     Ok(bytes)
 }
 
-/// Cases are unavailable for these reasons at the pinned RustEE revision; any other reason is a failure.
-const EXPECTED_SKIPS: [(&str, &str); 3] = [
-    (
-        "architecture-specific compile target",
-        "needs the architecture-specific compile target",
-    ),
-    ("tensor-map arguments", "takes tensor-map arguments"),
-    ("dynamic shared memory", "dynamic shared memory"),
-];
-
-/// What a sweep came to, per planner: cases compared, cases the planner refused, cases skipped by reason.
-#[derive(Default)]
-pub struct Tally {
-    planners: BTreeMap<String, Counts>,
-    failures: Vec<String>,
-}
-
-#[derive(Default)]
-struct Counts {
-    compared: usize,
-    refused: usize,
-    skipped: BTreeMap<String, usize>,
-}
-
-impl Tally {
-    pub fn refused(&mut self, planner: &str) {
-        self.planners.entry(planner.to_string()).or_default().refused += 1;
-    }
-
-    /// Records a verdict; a difference or an unexpected unavailability is a failure, reported at the end.
-    pub fn record(&mut self, planner: &str, shape: &str, verdict: Verdict) {
-        let counts = self.planners.entry(planner.to_string()).or_default();
-        match verdict {
-            Verdict::Identical { .. } => counts.compared += 1,
-            Verdict::Differs {
-                buffer,
-                offset,
-                native,
-                rustee,
-            } => {
-                let line = format!(
-                    "MISMATCH {planner} {shape}: buffer {buffer} first differs at byte {offset}: native {native:#04x}, rustee {rustee:#04x}"
-                );
-                println!("{line}");
-                self.failures.push(line);
-            }
-            Verdict::Skipped(reasons) => {
-                // A case counts once for each reason it is skipped for.
-                let mut names = Vec::new();
-                for reason in reasons {
-                    match EXPECTED_SKIPS.iter().find(|(_, text)| reason.contains(text)) {
-                        Some((name, _)) => {
-                            if !names.contains(name) {
-                                names.push(*name);
-                                *counts.skipped.entry((*name).to_string()).or_default() += 1;
-                            }
-                        }
-                        None => {
-                            let line = format!("UNAVAILABLE {planner} {shape}: {reason}");
-                            println!("{line}");
-                            self.failures.push(line);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Prints the totals and fails when anything mismatched or was unavailable for an unexpected reason.
-    pub fn finish(self) {
-        for (planner, counts) in &self.planners {
-            println!(
-                "{planner}: {} compared, {} refused by the planner, skipped: {:?}",
-                counts.compared, counts.refused, counts.skipped
-            );
-        }
-        assert!(
-            self.failures.is_empty(),
-            "{} failures, first: {}",
-            self.failures.len(),
-            self.failures[0]
-        );
-    }
-}
-
 /// Aborts the process when the test is still running after `seconds`, so a hung device call fails fast.
 pub fn watchdog(seconds: u64) -> Arc<AtomicBool> {
     let done = Arc::new(AtomicBool::new(false));
@@ -355,11 +270,11 @@ pub fn watchdog(seconds: u64) -> Arc<AtomicBool> {
     done
 }
 
-/// A fixed-seed generator (splitmix64) of the test's input bytes.
-pub struct Random(pub u64);
+/// A fixed-seed generator (splitmix64) for the cases' inputs.
+pub struct Rng(pub u64);
 
-impl Random {
-    pub fn word(&mut self) -> u64 {
+impl Rng {
+    pub fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -367,13 +282,33 @@ impl Random {
         z ^ (z >> 31)
     }
 
-    /// `count` BF16 values in about [-1, 1): finite, never NaN.
-    pub fn bf16(&mut self, count: usize) -> Vec<u8> {
+    /// A BF16 mix: mostly moderate values, some zeros, negative zeros, large and tiny magnitudes (never NaN or
+    /// infinity).
+    pub fn bf16(&mut self) -> u16 {
+        let bits = self.next();
+        let sign = ((bits >> 40) & 1) as u16;
+        let mantissa = ((bits >> 32) & 0x7f) as u16;
+        let exponent = |low: u16, span: u16| low + ((bits >> 16) as u16) % span;
+        let (exponent, mantissa) = match bits % 20 {
+            0 | 1 => (0, 0),
+            2 => return 0x8000,
+            3 => (exponent(0x8c, 0x10), mantissa),
+            4 | 5 => (exponent(0, 0x30), mantissa),
+            _ => (exponent(0x74, 0x10), mantissa),
+        };
+        sign << 15 | exponent << 7 | mantissa
+    }
+
+    pub fn bf16_bytes(&mut self, count: usize) -> Vec<u8> {
+        (0..count).flat_map(|_| self.bf16().to_le_bytes()).collect()
+    }
+
+    /// `count` BF16 values in about [-1, 1): finite, never NaN. A large buffer repeats a block of 64 Ki values: the
+    /// data is only to be varied, and cheap to make.
+    pub fn bf16_tiled(&mut self, count: usize) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(count * 2);
-        // A large buffer repeats a block of 64 Ki values: the data is only to be varied, and cheap to make.
-        let block = count.min(1 << 16);
-        for _ in 0..block {
-            let r = self.word();
+        for _ in 0..count.min(1 << 16) {
+            let r = self.next();
             // sign, exponent 0x74..0x7f (values 2^-11 to 1), a random mantissa.
             let exponent = 0x74 + (r >> 8) % 12;
             let value = (((r >> 20) & 1) << 15) | (exponent << 7) | (r & 0x7f);
@@ -388,11 +323,110 @@ impl Random {
 
     /// `count` raw bytes.
     pub fn bytes(&mut self, count: usize) -> Vec<u8> {
-        let mut bytes: Vec<u8> = (0..count.min(1 << 17)).map(|_| self.word() as u8).collect();
+        let mut bytes: Vec<u8> = (0..count.min(1 << 17)).map(|_| self.next() as u8).collect();
         while bytes.len() < count {
             let more = (count - bytes.len()).min(bytes.len());
             bytes.extend_from_within(..more);
         }
         bytes
+    }
+
+    /// Floats uniform in `[low, high)`.
+    pub fn f32_bytes(&mut self, count: usize, low: f32, high: f32) -> Vec<u8> {
+        (0..count)
+            .flat_map(|_| {
+                let unit = (self.next() >> 40) as f32 / (1u64 << 24) as f32;
+                (low + (high - low) * unit).to_le_bytes()
+            })
+            .collect()
+    }
+}
+
+/// The counts a test family ends with: per planner, cases compared, skipped and mismatched, and the skip reasons.
+#[derive(Default)]
+pub struct Tally {
+    planners: BTreeMap<String, [usize; 3]>,
+    refused: BTreeMap<String, usize>,
+    skipped: BTreeMap<String, usize>,
+    failures: Vec<String>,
+}
+
+/// Skips a device may legitimately cause: an architecture-specific module on a device without the target, and
+/// dynamic shared memory above what the device grants. Any other reason is a failure.
+const EXPECTED_SKIPS: [(&str, &str); 2] = [
+    ("architecture-specific compile target", "architecture-specific"),
+    ("dynamic shared memory", "dynamic shared memory"),
+];
+
+impl Tally {
+    /// Runs the case and records what it came to; a mismatch prints where it is.
+    pub fn run(&mut self, twin: &mut Twin, planner: &str, shape: &str, case: &Case<'_>) {
+        let verdict = twin
+            .run(case)
+            .unwrap_or_else(|error| panic!("{planner} {shape}: {error}"));
+        self.record(planner, shape, verdict);
+    }
+
+    /// Counts a case the planner itself refused.
+    pub fn refused(&mut self, planner: &str) {
+        *self.refused.entry(planner.to_string()).or_default() += 1;
+    }
+
+    /// Records a verdict; a mismatch prints where it is.
+    pub fn record(&mut self, planner: &str, shape: &str, verdict: Verdict) {
+        let counts = self.planners.entry(planner.to_string()).or_default();
+        match verdict {
+            Verdict::Identical { .. } => counts[0] += 1,
+            Verdict::Skipped(reasons) => {
+                counts[1] += 1;
+                let mut names: Vec<&str> = Vec::new();
+                for reason in reasons {
+                    match EXPECTED_SKIPS.iter().find(|(_, text)| reason.contains(text)) {
+                        // A case counts once for each reason it is skipped for.
+                        Some((name, _)) => {
+                            if !names.contains(name) {
+                                names.push(name);
+                                *self.skipped.entry((*name).to_string()).or_default() += 1;
+                            }
+                        }
+                        None => {
+                            let line = format!("UNAVAILABLE {planner} {shape}: {reason}");
+                            println!("{line}");
+                            self.failures.push(line);
+                        }
+                    }
+                }
+            }
+            Verdict::Differs {
+                buffer,
+                offset,
+                native,
+                rustee,
+            } => {
+                counts[2] += 1;
+                let message = format!(
+                    "{planner} {shape}: buffer {buffer} differs at byte {offset}: native {native:#04x}, RustEE {rustee:#04x}"
+                );
+                println!("MISMATCH {message}");
+                self.failures.push(message);
+            }
+        }
+    }
+
+    /// Prints the counts and fails if anything mismatched or was unexpectedly unavailable.
+    pub fn finish(self) {
+        let mut compared = 0;
+        for (planner, [identical, skipped, mismatched]) in &self.planners {
+            let refused = self.refused.get(planner).copied().unwrap_or(0);
+            println!(
+                "{planner}: compared {identical}, skipped {skipped}, mismatched {mismatched}, refused by the planner {refused}"
+            );
+            compared += identical;
+        }
+        println!("cases compared: {compared}");
+        for (reason, count) in &self.skipped {
+            println!("skipped {count}: {reason}");
+        }
+        assert!(self.failures.is_empty(), "{}", self.failures.join("\n"));
     }
 }

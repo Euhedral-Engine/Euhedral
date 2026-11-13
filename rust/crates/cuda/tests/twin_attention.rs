@@ -27,7 +27,7 @@ use euhedral_inference_cuda::launch::catalog::Launch;
 use euhedral_inference_cuda::launch::load::KernelSources;
 use euhedral_inference_cuda::{CudaLibrary, DevicePtr, ops};
 
-use common::twin::{Case, Random, Tally, Twin, watchdog};
+use common::twin::{Case, Rng, Tally, Twin, watchdog};
 
 const QUERY_HEADS: u32 = 24;
 const KEY_HEADS: u32 = 4;
@@ -73,7 +73,7 @@ fn format_name(format: CacheFormat) -> &'static str {
 }
 
 /// The buffers of a case for `rows` rows at `start`; `history` makes the earlier tokens' source rows too.
-fn buffers(random: &mut Random, format: CacheFormat, rows: u32, start: u64, history: bool) -> (Vec<Vec<u8>>, usize) {
+fn buffers(random: &mut Rng, format: CacheFormat, rows: u32, start: u64, history: bool) -> (Vec<Vec<u8>>, usize) {
     let total = start as usize + rows as usize;
     let pages = total.div_ceil(PAGE_TOKENS);
     let row_bytes = match format {
@@ -91,24 +91,24 @@ fn buffers(random: &mut Random, format: CacheFormat, rows: u32, start: u64, hist
     } else {
         0
     };
-    let norm = |random: &mut Random| {
+    let norm = |random: &mut Rng| {
         // Positive weights of about 1.
         random
-            .bf16(HEAD_DIM as usize)
+            .bf16_tiled(HEAD_DIM as usize)
             .chunks(2)
             .flat_map(|v| [v[0], v[1] & 0x7f])
             .collect::<Vec<u8>>()
     };
     let scratch_rows = if rows <= 64 { rows as usize } else { 1 };
     let mut all = vec![
-        random.bf16(rows as usize * ROW),
-        random.bf16(rows as usize * ROW),
+        random.bf16_tiled(rows as usize * ROW),
+        random.bf16_tiled(rows as usize * ROW),
         vec![0; rows as usize * ROW * 2],
         norm(random),
         norm(random),
         start.to_le_bytes().to_vec(),
-        random.bf16(history_rows.max(1) * ROW),
-        random.bf16(history_rows.max(1) * ROW),
+        random.bf16_tiled(history_rows.max(1) * ROW),
+        random.bf16_tiled(history_rows.max(1) * ROW),
         (0..chunks as u64)
             .flat_map(|chunk| (chunk * PAGE_TOKENS as u64).to_le_bytes())
             .collect(),
@@ -254,7 +254,7 @@ fn causal_shape(p: &[DevicePtr], rows: u32, start: u64) -> CausalShape {
 /// append, and the attention itself is the pair under test.
 fn causal_case<'a>(
     name: &'a str,
-    random: &mut Random,
+    random: &mut Rng,
     format: CacheFormat,
     rows: u32,
     start: u64,
@@ -332,7 +332,7 @@ fn causal_case<'a>(
 /// compared.
 fn append_case<'a>(
     name: &'a str,
-    random: &mut Random,
+    random: &mut Rng,
     format: CacheFormat,
     rows: u32,
     start: u64,
@@ -386,7 +386,7 @@ fn attention_plans_match_the_native_wrappers() {
     }
     let done = watchdog(360);
     let mut twin = Twin::open(&library).expect("both sides open on one device");
-    let mut random = Random(0x5eed);
+    let mut random = Rng(0x5eed);
     let mut tally = Tally::default();
     let began = Instant::now();
     let probe = DevicePtr::NULL.offset(0x1000);

@@ -93,8 +93,8 @@ pub struct KernelSpec {
 }
 
 impl KernelSpec {
-    /// Whether the kernel takes tensor maps (128-byte `__grid_constant__` parameters), which [`Arguments`] cannot carry:
-    /// the native NVFP4 linear kernels.
+    /// Whether the kernel takes tensor maps (128-byte `__grid_constant__` parameters, carried by [`Arguments`]): the
+    /// native NVFP4 linear kernels.
     pub fn tensor_map_arguments(&self) -> bool {
         self.module == Module::Nvfp4Native
             && (self.name.starts_with("euhedral_nvfp4n_linear_")
@@ -1020,9 +1020,60 @@ const SPECS: [KernelSpec; 148] = [
     ),
 ];
 
-/// One launch argument: a 64-bit word and the byte size (4 or 8) the kernel declares for it.
+/// The parameters of one tensor map, as the C code passes them to `cuTensorMapEncodeTiled` (`byte_map`,
+/// `nvfp4_linear.c`). Every map is over bytes (`UINT8`) with unit element strides, no interleave, 128-byte L2
+/// promotion and no out-of-bounds fill; those do not vary and are not fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TensorMapPlan {
+    /// The global address (`CUdeviceptr`).
+    pub address: u64,
+    /// The rank (2 or 3): how many of `dims` and `box_dims`, and one fewer of `strides`, are used.
+    pub rank: u32,
+    /// Extents in elements (bytes), innermost first.
+    pub dims: [u64; 3],
+    /// Byte strides of dimensions 1 and up.
+    pub strides: [u64; 2],
+    /// Box extents in elements.
+    pub box_dims: [u32; 3],
+    pub swizzle: TensorMapSwizzle,
+}
+
+/// The swizzle of a tensor map (`CUtensorMapSwizzle`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TensorMapSwizzle {
+    None,
+    B64,
+}
+
+impl TensorMapPlan {
+    /// The extents in use.
+    pub fn dims(&self) -> &[u64] {
+        &self.dims[..self.rank as usize]
+    }
+
+    /// The strides in use.
+    pub fn strides(&self) -> &[u64] {
+        &self.strides[..self.rank as usize - 1]
+    }
+
+    /// The box extents in use.
+    pub fn box_dims(&self) -> &[u32] {
+        &self.box_dims[..self.rank as usize]
+    }
+}
+
+/// The most tensor maps one launch takes (the native tile kernels take three).
+pub const MAX_TENSOR_MAPS: usize = 3;
+
+/// The byte size of a tensor-map parameter (`CUtensorMap`).
+pub const TENSOR_MAP_BYTES: u8 = 128;
+
+/// The arguments of one launch: tensor maps by value, then words, each word with the byte size (4 or 8) the kernel
+/// declares for it. The maps are the kernel's leading parameters, in the order they were added.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Arguments {
+    maps: [Option<TensorMapPlan>; MAX_TENSOR_MAPS],
+    map_count: usize,
     words: [u64; MAX_ARGUMENTS],
     sizes: [u8; MAX_ARGUMENTS],
     count: usize,
@@ -1037,10 +1088,22 @@ impl Default for Arguments {
 impl Arguments {
     pub const fn new() -> Self {
         Self {
+            maps: [None; MAX_TENSOR_MAPS],
+            map_count: 0,
             words: [0; MAX_ARGUMENTS],
             sizes: [0; MAX_ARGUMENTS],
             count: 0,
         }
+    }
+
+    /// A tensor map, passed by value in front of the words. More than [`MAX_TENSOR_MAPS`] are counted and not stored, as
+    /// words past the limit are.
+    pub fn tensor_map(mut self, map: TensorMapPlan) -> Self {
+        if self.map_count < MAX_TENSOR_MAPS {
+            self.maps[self.map_count] = Some(map);
+        }
+        self.map_count += 1;
+        self
     }
 
     /// A device address.
@@ -1079,7 +1142,17 @@ impl Arguments {
         self
     }
 
-    /// How many arguments were added (more than [`MAX_ARGUMENTS`] means the launch is invalid).
+    /// How many tensor maps were added (more than [`MAX_TENSOR_MAPS`] means the launch is invalid).
+    pub const fn map_count(&self) -> usize {
+        self.map_count
+    }
+
+    /// The stored tensor maps, in order.
+    pub fn maps(&self) -> impl Iterator<Item = &TensorMapPlan> {
+        self.maps.iter().flatten()
+    }
+
+    /// How many words were added (more than [`MAX_ARGUMENTS`] means the launch is invalid).
     pub const fn count(&self) -> usize {
         self.count
     }
@@ -1122,8 +1195,10 @@ pub struct Launch {
     /// Dynamic shared bytes.
     pub shared_bytes: u32,
     pub args: Arguments,
-    /// Whether the launch may overlap its predecessor (programmatic dependent launch): true only for a kernel the
-    /// native library registers for it, and when the plan's caller allows it.
+    /// Whether the launch is a programmatic dependent launch (it may overlap its predecessor's tail): true for every
+    /// kernel the native library registers for it. The queue launches every flagged launch so; the native library does
+    /// so only while the kernel is among its first 64 registrations and the thread selected it. Output is the same,
+    /// because each such kernel begins by waiting on its predecessor; only the overlap timing can differ.
     pub programmatic: bool,
 }
 

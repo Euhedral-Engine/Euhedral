@@ -28,7 +28,7 @@ use euhedral_inference_cuda::launch::load::KernelSources;
 use euhedral_inference_cuda::launch::table::{Geometry, Table, plan_table_launch};
 use euhedral_inference_cuda::{CudaLibrary, DevicePtr, ops};
 
-use common::twin::{Case, Random, Tally, Twin, watchdog};
+use common::twin::{Case, Rng, Tally, Twin, watchdog};
 
 const FIXTURE: &str = include_str!("../../engine/tests/fixtures/linear_launches.txt");
 
@@ -217,13 +217,13 @@ fn row_exact(name: &str, rows: u32, k: u32, n: u32, split: bool) -> Recorded {
 }
 
 /// Buffers for a replayed case: one per address base (seven), sized to hold what the case describes.
-fn table_buffers(random: &mut Random, case: &Recorded) -> Vec<Vec<u8>> {
+fn table_buffers(random: &mut Rng, case: &Recorded) -> Vec<Vec<u8>> {
     // The trellis codes take about 2.5 bytes a weight; the others are activations, outputs and small tables.
     let small = (case.rows * case.n.max(case.k) * 4).max(4 << 20) as usize;
     let mut sizes = vec![small; 6];
     sizes[1] = (case.n * case.k * 3) as usize;
     sizes.push((case.scratch as usize).max(small));
-    let mut buffers: Vec<Vec<u8>> = sizes.into_iter().map(|size| random.bf16(size / 2)).collect();
+    let mut buffers: Vec<Vec<u8>> = sizes.into_iter().map(|size| random.bf16_tiled(size / 2)).collect();
     for (slot, end) in buffers[4].as_chunks_mut::<4>().0.iter_mut().zip(&case.ends) {
         *slot = end.to_le_bytes();
     }
@@ -248,7 +248,7 @@ fn table_and_embedding_plans_match_the_native_wrappers() {
     }
     let done = watchdog(360);
     let mut twin = Twin::open(&library).expect("both sides open on one device");
-    let mut random = Random(0x7ab1e);
+    let mut random = Rng(0x7ab1e);
     let mut tally = Tally::default();
 
     let mut cases = smallest_per_sequence(recorded());
@@ -258,8 +258,8 @@ fn table_and_embedding_plans_match_the_native_wrappers() {
         let buffers = if case.scratch == 0 {
             // The hand-made GEMMs: input, weights, output.
             vec![
-                random.bf16((case.rows * case.k) as usize),
-                random.bf16((case.n * case.k) as usize),
+                random.bf16_tiled((case.rows * case.k) as usize),
+                random.bf16_tiled((case.n * case.k) as usize),
                 vec![0; (case.rows * case.n * 2) as usize],
             ]
         } else {
@@ -338,9 +338,9 @@ fn table_and_embedding_plans_match_the_native_wrappers() {
     embeddings.push(("p2e2", 9, 8, 1024, most));
     for (kind, tokens, vocabulary, hidden, bytes) in embeddings {
         let ids: Vec<u8> = (0..tokens)
-            .flat_map(|_| ((random.word() % u64::from(vocabulary)) as i32).to_le_bytes())
+            .flat_map(|_| ((random.next() % u64::from(vocabulary)) as i32).to_le_bytes())
             .collect();
-        let mut table = random.bf16(bytes as usize / 2 + 1);
+        let mut table = random.bf16_tiled(bytes as usize / 2 + 1);
         table.truncate(bytes as usize);
         if kind == "p2e2" {
             // Two-bit codes of 0 to 2: a code of 3 escapes into the payload's extra words, which a random table
@@ -352,7 +352,7 @@ fn table_and_embedding_plans_match_the_native_wrappers() {
             for byte in &mut table[..codes] {
                 let mut value = 0u8;
                 for field in 0..4 {
-                    value |= ((random.word() % 3) as u8) << (2 * field);
+                    value |= ((random.next() % 3) as u8) << (2 * field);
                 }
                 *byte = value;
             }
