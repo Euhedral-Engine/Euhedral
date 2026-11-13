@@ -15,8 +15,10 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::error::{CudaError, check};
+use crate::library::CudaLibrary;
 use crate::memory::{DevicePtr, HostWeightsArena, PinnedBuffer};
 use crate::submission::Submission;
+use std::sync::Arc;
 
 /// Calls the C entry point `$name` and turns its status into a `Result`.
 macro_rules! entry {
@@ -772,6 +774,29 @@ pub fn residual_rms_norm_bf16(
     )
 }
 
+/// `output = rms_norm(input) * weight`, the weight used as it is.
+pub fn rms_norm_bf16(
+    submission: &Submission<'_>,
+    input: DevicePtr,
+    weight: DevicePtr,
+    output: DevicePtr,
+    rows: u32,
+    width: u32,
+    epsilon: f32,
+) -> Result<(), CudaError> {
+    entry!(
+        submission,
+        euhedral_cuda_rms_norm_bf16(
+            input.as_const(),
+            weight.as_const(),
+            output.as_mut(),
+            rows,
+            width,
+            epsilon
+        )
+    )
+}
+
 pub fn rms_norm_unit_offset_bf16(
     submission: &Submission<'_>,
     input: DevicePtr,
@@ -862,4 +887,761 @@ pub fn selected_token(
         submission,
         euhedral_cuda_selected_token(key.as_const(), ids.as_const(), token.as_mut())
     )
+}
+
+/// The operations the stages queue, as a trait, so a stage does not name the submission it runs on: the stages take a
+/// `&mut dyn KernelOps`. [`Submission`] (and a shared reference to one) implements it by the functions of this module,
+/// which keep their meaning and their documentation; each method here has the parameters of the function of the same
+/// name, minus the submission.
+pub trait KernelOps {
+    fn copy_device_to_device(&mut self, destination: DevicePtr, source: DevicePtr, bytes: u64)
+    -> Result<(), CudaError>;
+    fn copy_device_to_device_2d(
+        &mut self,
+        destination: DevicePtr,
+        destination_pitch: u64,
+        source: DevicePtr,
+        source_pitch: u64,
+        row_bytes: u64,
+        rows: u64,
+    ) -> Result<(), CudaError>;
+    fn zero_device_memory(&mut self, address: DevicePtr, bytes: u64) -> Result<(), CudaError>;
+    fn embed_q3(
+        &mut self,
+        token_ids: DevicePtr,
+        embedding: DevicePtr,
+        hidden: DevicePtr,
+        token_count: u32,
+        vocabulary_size: u32,
+        hidden_size: u32,
+        embedding_bytes: u64,
+    ) -> Result<(), CudaError>;
+    fn embed_q3_p2e2(
+        &mut self,
+        token_ids: DevicePtr,
+        embedding: DevicePtr,
+        hidden: DevicePtr,
+        token_count: u32,
+        vocabulary_size: u32,
+        hidden_size: u32,
+        embedding_bytes: u64,
+    ) -> Result<(), CudaError>;
+    fn linear_launch(
+        &mut self,
+        kernel: i32,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_bytes: u32,
+        words: &[u64],
+        sizes: &[u8],
+    ) -> Result<(), CudaError>;
+    fn qwen4_launch(
+        &mut self,
+        kernel: i32,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_bytes: u32,
+        words: &[u64],
+        sizes: &[u8],
+    ) -> Result<(), CudaError>;
+    fn linear_nvfp4_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+    ) -> Result<(), CudaError>;
+    fn linear_nvfp4_native_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        scratch: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+        scratch_bytes: u64,
+    ) -> Result<(), CudaError>;
+    fn attention_qk_norm_rope_bf16(
+        &mut self,
+        query_key: DevicePtr,
+        query_norm: DevicePtr,
+        key_norm: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        query_heads: u32,
+        key_value_heads: u32,
+        head_dim: u32,
+        rotary_dim: u32,
+        start_position: u64,
+        position: DevicePtr,
+        epsilon: f32,
+        rope_theta: f64,
+    ) -> Result<(), CudaError>;
+    fn attention_kv_append_nvfp4(
+        &mut self,
+        query_key: DevicePtr,
+        gate: DevicePtr,
+        keys: DevicePtr,
+        values: DevicePtr,
+        rows: u32,
+        query_width: u32,
+        key_width: u32,
+        start: u64,
+        position: DevicePtr,
+    ) -> Result<(), CudaError>;
+    fn attention_kv_append_bf16(
+        &mut self,
+        query_key: DevicePtr,
+        gate: DevicePtr,
+        keys: DevicePtr,
+        values: DevicePtr,
+        rows: u32,
+        query_width: u32,
+        key_width: u32,
+        start: u64,
+        position: DevicePtr,
+    ) -> Result<(), CudaError>;
+    fn attention_causal_nvfp4(
+        &mut self,
+        query_key: DevicePtr,
+        gate: DevicePtr,
+        keys: DevicePtr,
+        values: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        query_heads: u32,
+        key_heads: u32,
+        head_dim: u32,
+        cache_length: u32,
+        start: u64,
+        position: DevicePtr,
+        scratch: DevicePtr,
+    ) -> Result<(), CudaError>;
+    fn attention_causal_bf16(
+        &mut self,
+        query_key: DevicePtr,
+        gate: DevicePtr,
+        keys: DevicePtr,
+        values: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        query_heads: u32,
+        key_heads: u32,
+        head_dim: u32,
+        cache_length: u32,
+        start: u64,
+        position: DevicePtr,
+        scratch: DevicePtr,
+    ) -> Result<(), CudaError>;
+    fn gdn_project_control_fp32(
+        &mut self,
+        input: DevicePtr,
+        a_weight: DevicePtr,
+        b_weight: DevicePtr,
+        a_log: DevicePtr,
+        dt_bias: DevicePtr,
+        alpha: DevicePtr,
+        beta: DevicePtr,
+        rows: u32,
+        width: u32,
+        heads: u32,
+    ) -> Result<(), CudaError>;
+    fn gdn_convolution_bf16(
+        &mut self,
+        query_key: DevicePtr,
+        value_z: DevicePtr,
+        convolution_weights: DevicePtr,
+        convolution_state: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        query_key_width: u32,
+        value_width: u32,
+        convolution_width: u32,
+        kernel_size: u32,
+    ) -> Result<(), CudaError>;
+    fn gdn_recurrence_bf16(
+        &mut self,
+        convolved: DevicePtr,
+        alpha: DevicePtr,
+        beta: DevicePtr,
+        recurrent_state: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        key_heads: u32,
+        value_heads: u32,
+        key_head_dim: u32,
+        value_head_dim: u32,
+        output_scale: f32,
+    ) -> Result<(), CudaError>;
+    fn gdn_gated_rms_norm_bf16(
+        &mut self,
+        recurrent: DevicePtr,
+        value_z: DevicePtr,
+        norm_weight: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        value_heads: u32,
+        head_dim: u32,
+        epsilon: f32,
+    ) -> Result<(), CudaError>;
+    fn residual_rms_norm_bf16(
+        &mut self,
+        residual: DevicePtr,
+        delta: DevicePtr,
+        weight: DevicePtr,
+        hidden: DevicePtr,
+        normalized: DevicePtr,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+    ) -> Result<(), CudaError>;
+    fn rms_norm_unit_offset_bf16(
+        &mut self,
+        input: DevicePtr,
+        weight: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+    ) -> Result<(), CudaError>;
+    fn swiglu_bf16(
+        &mut self,
+        gate_up: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        intermediate_size: u32,
+    ) -> Result<(), CudaError>;
+    fn residual_add_bf16(
+        &mut self,
+        residual: DevicePtr,
+        delta: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), CudaError>;
+    fn argmax_bf16(&mut self, logits: DevicePtr, count: u32, result: DevicePtr) -> Result<(), CudaError>;
+    fn argmax_logprob_bf16(&mut self, logits: DevicePtr, count: u32, result: DevicePtr) -> Result<(), CudaError>;
+    fn selected_token(&mut self, key: DevicePtr, ids: DevicePtr, token: DevicePtr) -> Result<(), CudaError>;
+
+    /// Selects row-exact execution for the launches queued after this call: [`select_row_exact`].
+    fn set_row_exact(&mut self, enabled: bool);
+
+    /// Whether the submission began in row-exact mode ([`SubmitMode::row_exact`](crate::SubmitMode)). It does not
+    /// follow [`KernelOps::set_row_exact`], which selects around part of a stage and leaves this answer alone: a
+    /// format that asks reads the mode of the quantum, not the selection of the moment.
+    fn row_exact(&self) -> bool;
+
+    /// The library the launches run in, for the stages' decisions that depend on what it was built with.
+    fn library(&self) -> &Arc<CudaLibrary>;
+
+    /// Queues the copy of `bytes` device bytes into a pinned buffer at `offset`, for a buffer the host shares by `&`
+    /// ([`copy_device_to_readback_shared`]).
+    ///
+    /// # Safety
+    /// The copy runs after this call returns. `destination` must stay alive until the lane's work up to this copy has
+    /// retired, and the host must not access its bytes in that range, other than through [`PinnedBuffer::word`],
+    /// before then. No other copy may write the range meanwhile.
+    unsafe fn copy_device_to_readback_shared(
+        &mut self,
+        destination: &PinnedBuffer,
+        offset: usize,
+        source: DevicePtr,
+        bytes: usize,
+    ) -> Result<(), CudaError>;
+
+    /// Queues the copy of `bytes` bytes at `offset` of a host-weights arena to the device
+    /// ([`copy_host_weights_to_device`]).
+    ///
+    /// # Safety
+    /// The copy runs after this call returns. `source` must stay alive, and its bytes in that range unmodified, until
+    /// the lane's work up to this copy has retired.
+    unsafe fn copy_host_weights_to_device(
+        &mut self,
+        destination: DevicePtr,
+        source: &HostWeightsArena,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), CudaError>;
+
+    /// Queues the copy of `bytes` device bytes into a host-weights arena at `offset`
+    /// ([`copy_device_to_host_weights`]).
+    ///
+    /// # Safety
+    /// The copy runs after this call returns. `destination` must stay alive, and its bytes in that range neither read
+    /// nor written by the host, until the lane's work up to this copy has retired. No other copy may write the range
+    /// meanwhile.
+    unsafe fn copy_device_to_host_weights(
+        &mut self,
+        destination: &HostWeightsArena,
+        offset: usize,
+        source: DevicePtr,
+        bytes: usize,
+    ) -> Result<(), CudaError>;
+}
+
+/// Implements [`KernelOps`] for a type that dereferences to a [`Submission`], each method calling the function of the
+/// same name.
+macro_rules! submission_ops {
+    ($target:ty; $($name:ident($($argument:ident: $kind:ty),*);)*) => {
+        impl KernelOps for $target {
+            $(
+                fn $name(&mut self, $($argument: $kind),*) -> Result<(), CudaError> {
+                    let submission: &Submission<'_> = self;
+                    $name(submission, $($argument),*)
+                }
+            )*
+
+            fn set_row_exact(&mut self, enabled: bool) {
+                let submission: &Submission<'_> = self;
+                select_row_exact(submission, enabled);
+            }
+
+            fn row_exact(&self) -> bool {
+                let submission: &Submission<'_> = self;
+                submission.mode().row_exact
+            }
+
+            fn library(&self) -> &Arc<CudaLibrary> {
+                let submission: &Submission<'_> = self;
+                submission.lane().library()
+            }
+
+            unsafe fn copy_device_to_readback_shared(
+                &mut self,
+                destination: &PinnedBuffer,
+                offset: usize,
+                source: DevicePtr,
+                bytes: usize,
+            ) -> Result<(), CudaError> {
+                let submission: &Submission<'_> = self;
+                // SAFETY: the caller's contract is the function's.
+                unsafe { copy_device_to_readback_shared(submission, destination, offset, source, bytes) }
+            }
+
+            unsafe fn copy_host_weights_to_device(
+                &mut self,
+                destination: DevicePtr,
+                source: &HostWeightsArena,
+                offset: usize,
+                bytes: usize,
+            ) -> Result<(), CudaError> {
+                let submission: &Submission<'_> = self;
+                // SAFETY: the caller's contract is the function's.
+                unsafe { copy_host_weights_to_device(submission, destination, source, offset, bytes) }
+            }
+
+            unsafe fn copy_device_to_host_weights(
+                &mut self,
+                destination: &HostWeightsArena,
+                offset: usize,
+                source: DevicePtr,
+                bytes: usize,
+            ) -> Result<(), CudaError> {
+                let submission: &Submission<'_> = self;
+                // SAFETY: the caller's contract is the function's.
+                unsafe { copy_device_to_host_weights(submission, destination, offset, source, bytes) }
+            }
+        }
+    };
+}
+
+/// Applies `$apply` to a target type and the list of operations: the one list both implementations are built from.
+macro_rules! operations {
+    ($apply:ident, $target:ty) => {
+        $apply! {
+            $target;
+        copy_device_to_device(destination: DevicePtr, source: DevicePtr, bytes: u64);
+        copy_device_to_device_2d(destination: DevicePtr, destination_pitch: u64, source: DevicePtr, source_pitch: u64, row_bytes: u64, rows: u64);
+        zero_device_memory(address: DevicePtr, bytes: u64);
+        embed_q3(token_ids: DevicePtr, embedding: DevicePtr, hidden: DevicePtr, token_count: u32, vocabulary_size: u32, hidden_size: u32, embedding_bytes: u64);
+        embed_q3_p2e2(token_ids: DevicePtr, embedding: DevicePtr, hidden: DevicePtr, token_count: u32, vocabulary_size: u32, hidden_size: u32, embedding_bytes: u64);
+        linear_launch(kernel: i32, grid: [u32; 3], block: [u32; 3], shared_bytes: u32, words: &[u64], sizes: &[u8]);
+        qwen4_launch(kernel: i32, grid: [u32; 3], block: [u32; 3], shared_bytes: u32, words: &[u64], sizes: &[u8]);
+        linear_nvfp4_bf16(input: DevicePtr, weights: DevicePtr, output: DevicePtr, rows: u32, in_features: u32, out_features: u32, weights_bytes: u64);
+        linear_nvfp4_native_bf16(input: DevicePtr, weights: DevicePtr, output: DevicePtr, scratch: DevicePtr, rows: u32, in_features: u32, out_features: u32, weights_bytes: u64, scratch_bytes: u64);
+        attention_qk_norm_rope_bf16(query_key: DevicePtr, query_norm: DevicePtr, key_norm: DevicePtr, output: DevicePtr, rows: u32, query_heads: u32, key_value_heads: u32, head_dim: u32, rotary_dim: u32, start_position: u64, position: DevicePtr, epsilon: f32, rope_theta: f64);
+        attention_kv_append_nvfp4(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, rows: u32, query_width: u32, key_width: u32, start: u64, position: DevicePtr);
+        attention_kv_append_bf16(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, rows: u32, query_width: u32, key_width: u32, start: u64, position: DevicePtr);
+        attention_causal_nvfp4(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, output: DevicePtr, rows: u32, query_heads: u32, key_heads: u32, head_dim: u32, cache_length: u32, start: u64, position: DevicePtr, scratch: DevicePtr);
+        attention_causal_bf16(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, output: DevicePtr, rows: u32, query_heads: u32, key_heads: u32, head_dim: u32, cache_length: u32, start: u64, position: DevicePtr, scratch: DevicePtr);
+        gdn_project_control_fp32(input: DevicePtr, a_weight: DevicePtr, b_weight: DevicePtr, a_log: DevicePtr, dt_bias: DevicePtr, alpha: DevicePtr, beta: DevicePtr, rows: u32, width: u32, heads: u32);
+        gdn_convolution_bf16(query_key: DevicePtr, value_z: DevicePtr, convolution_weights: DevicePtr, convolution_state: DevicePtr, output: DevicePtr, rows: u32, query_key_width: u32, value_width: u32, convolution_width: u32, kernel_size: u32);
+        gdn_recurrence_bf16(convolved: DevicePtr, alpha: DevicePtr, beta: DevicePtr, recurrent_state: DevicePtr, output: DevicePtr, rows: u32, key_heads: u32, value_heads: u32, key_head_dim: u32, value_head_dim: u32, output_scale: f32);
+        gdn_gated_rms_norm_bf16(recurrent: DevicePtr, value_z: DevicePtr, norm_weight: DevicePtr, output: DevicePtr, rows: u32, value_heads: u32, head_dim: u32, epsilon: f32);
+        residual_rms_norm_bf16(residual: DevicePtr, delta: DevicePtr, weight: DevicePtr, hidden: DevicePtr, normalized: DevicePtr, rows: u32, width: u32, epsilon: f32);
+        rms_norm_unit_offset_bf16(input: DevicePtr, weight: DevicePtr, output: DevicePtr, rows: u32, width: u32, epsilon: f32);
+        swiglu_bf16(gate_up: DevicePtr, output: DevicePtr, rows: u32, intermediate_size: u32);
+        residual_add_bf16(residual: DevicePtr, delta: DevicePtr, output: DevicePtr, rows: u32, width: u32);
+        argmax_bf16(logits: DevicePtr, count: u32, result: DevicePtr);
+        argmax_logprob_bf16(logits: DevicePtr, count: u32, result: DevicePtr);
+        selected_token(key: DevicePtr, ids: DevicePtr, token: DevicePtr);
+        }
+    };
+}
+
+operations!(submission_ops, Submission<'_>);
+operations!(submission_ops, &Submission<'_>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records the names of the operations it is given, and queues nothing.
+    #[derive(Default)]
+    struct Recorder {
+        calls: Vec<&'static str>,
+        began_row_exact: bool,
+        selected_row_exact: bool,
+    }
+
+    impl KernelOps for Recorder {
+        fn copy_device_to_device(&mut self, _: DevicePtr, _: DevicePtr, _: u64) -> Result<(), CudaError> {
+            self.calls.push("copy");
+            Ok(())
+        }
+        fn copy_device_to_device_2d(
+            &mut self,
+            _: DevicePtr,
+            _: u64,
+            _: DevicePtr,
+            _: u64,
+            _: u64,
+            _: u64,
+        ) -> Result<(), CudaError> {
+            self.calls.push("copy2d");
+            Ok(())
+        }
+        fn zero_device_memory(&mut self, _: DevicePtr, _: u64) -> Result<(), CudaError> {
+            self.calls.push("zero");
+            Ok(())
+        }
+        fn embed_q3(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u64,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn embed_q3_p2e2(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u64,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn linear_launch(
+            &mut self,
+            _: i32,
+            _: [u32; 3],
+            _: [u32; 3],
+            _: u32,
+            _: &[u64],
+            _: &[u8],
+        ) -> Result<(), CudaError> {
+            self.calls.push("linear");
+            Ok(())
+        }
+        fn qwen4_launch(
+            &mut self,
+            _: i32,
+            _: [u32; 3],
+            _: [u32; 3],
+            _: u32,
+            _: &[u64],
+            _: &[u8],
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn linear_nvfp4_bf16(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u64,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn linear_nvfp4_native_bf16(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u64,
+            _: u64,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn attention_qk_norm_rope_bf16(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u64,
+            _: DevicePtr,
+            _: f32,
+            _: f64,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn attention_kv_append_nvfp4(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u64,
+            _: DevicePtr,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn attention_kv_append_bf16(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u64,
+            _: DevicePtr,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn attention_causal_nvfp4(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u64,
+            _: DevicePtr,
+            _: DevicePtr,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn attention_causal_bf16(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u64,
+            _: DevicePtr,
+            _: DevicePtr,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn gdn_project_control_fp32(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn gdn_convolution_bf16(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn gdn_recurrence_bf16(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: f32,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn gdn_gated_rms_norm_bf16(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: f32,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn residual_rms_norm_bf16(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: f32,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn rms_norm_unit_offset_bf16(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: f32,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn swiglu_bf16(&mut self, _: DevicePtr, _: DevicePtr, _: u32, _: u32) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn residual_add_bf16(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn argmax_bf16(&mut self, _: DevicePtr, _: u32, _: DevicePtr) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn argmax_logprob_bf16(&mut self, _: DevicePtr, _: u32, _: DevicePtr) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn selected_token(&mut self, _: DevicePtr, _: DevicePtr, _: DevicePtr) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn set_row_exact(&mut self, enabled: bool) {
+            self.selected_row_exact = enabled;
+        }
+        unsafe fn copy_device_to_readback_shared(
+            &mut self,
+            _: &PinnedBuffer,
+            _: usize,
+            _: DevicePtr,
+            _: usize,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        unsafe fn copy_host_weights_to_device(
+            &mut self,
+            _: DevicePtr,
+            _: &HostWeightsArena,
+            _: usize,
+            _: usize,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        unsafe fn copy_device_to_host_weights(
+            &mut self,
+            _: &HostWeightsArena,
+            _: usize,
+            _: DevicePtr,
+            _: usize,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn row_exact(&self) -> bool {
+            self.began_row_exact
+        }
+        fn library(&self) -> &Arc<CudaLibrary> {
+            unreachable!("the recorder has no library")
+        }
+    }
+
+    /// Code written the way a stage is: against `&mut dyn KernelOps`.
+    fn stage(ops: &mut dyn KernelOps) -> Result<(), CudaError> {
+        ops.set_row_exact(true);
+        ops.zero_device_memory(DevicePtr::NULL, 8)?;
+        ops.copy_device_to_device(DevicePtr::NULL, DevicePtr::NULL, 8)?;
+        ops.linear_launch(0, [1; 3], [1; 3], 0, &[], &[])
+    }
+
+    #[test]
+    fn a_recording_implementation_serves_code_written_against_the_trait_object() {
+        let mut recorder = Recorder::default();
+        stage(&mut recorder).unwrap();
+        assert_eq!(recorder.calls, ["zero", "copy", "linear"]);
+        assert!(recorder.selected_row_exact);
+        // The selection does not change the mode the submission began with.
+        assert!(!recorder.row_exact());
+    }
+
+    /// Both the submission and a shared reference to one serve a stage; building one needs a card, so the forwarding
+    /// itself is proved by the device tests.
+    #[test]
+    fn a_submission_and_a_reference_to_one_implement_the_trait() {
+        fn serves<T: KernelOps>() {}
+        serves::<Submission<'_>>();
+        serves::<&Submission<'_>>();
+    }
 }

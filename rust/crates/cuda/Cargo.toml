@@ -16,7 +16,12 @@ euhedral-io.workspace = true
 libloading.workspace = true
 thiserror.workspace = true
 
+euhedral-gpu = { workspace = true, features = ["cuda"] }
+
 [dev-dependencies]
+euhedral-gpu = { workspace = true, features = ["fake"] }
+# The device tests switch the process-wide exact numerics.
+euhedral-inference-cuda = { path = ".", features = ["test-oracles"] }
 tempfile.workspace = true
 test-support = { path = "../test-support" }
 

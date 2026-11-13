@@ -3,19 +3,22 @@
 
 Usage:
   tools/rust_gate.py --java-config CONFIG.json --rust-config CONFIG.json --forks N [--memory-max 24G] [--timeout 30m]
-                     [--gpu-run PATH] [--out-dir DIR] [--speculation config|off] [--no-build] [--dry-run]
+                     [--est 600] [--who rust-gate] [--launcher PATH] [--out-dir DIR] [--speculation config|off]
+                     [--no-build] [--dry-run]
 
 Each fork runs one process of each engine; the order alternates per fork (Java first on odd forks, Rust first on even
-ones), so slow drift of the machine falls on both. Every process goes through the shared GPU launcher, which takes the
-exclusive GPU lock, caps host memory in its own scope and kills the job at the time limit:
+ones), so slow drift of the machine falls on both. Every process goes through the system launcher (`system-run`), which
+waits for a fair grant of the exclusive GPU and of the exclusive CPU, runs the job in its own scope capped at the memory
+limit, and `timeout` ends the job at the time limit inside that grant:
 
-  gpu-run -m <memory-max> -t <timeout> -- <command>
+  system-run --gpu exclusive --cpu exclusive --mem <memory-max> --est <est> --who <who> -- timeout <timeout> <command>
 
-(--gpu-run names the launcher; it is looked up on PATH by default. The lock belongs to the launcher.)
+This script is a timing run, the one case that takes the card exclusively, so each arm holds the GPU and all CPUs while it runs.
+(--launcher names the launcher; it is looked up on PATH by default. The grant belongs to the launcher.)
 
 The Java arm is the benchmark's start script (`:benchmark:installDist`, built once before the forks, outside the lock;
 BENCHMARKING.md documents it), which `exec`s a single JVM, so the memory cap and the time limit bind the benchmark itself
-and Gradle never runs under the GPU lock. The Rust arm is the release binary `euhedral-bench run CONFIG --fork-id ID`
+and Gradle never runs under the grant. The Rust arm is the release binary `euhedral-bench run CONFIG --fork-id ID`
 (built once before the forks).
 
 Both arms read a derived copy of their configuration, written next to the results:
@@ -55,7 +58,8 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-GPU_RUN = "gpu-run"
+LAUNCHER = "system-run"
+MAX_EST_SECONDS = 600  # the arbiter accepts at most this estimate
 ARMS = ("java", "rust")
 
 
@@ -116,8 +120,11 @@ def arm_command(arm: str, config: Path, fork: int, launchers: dict[str, Path]) -
     return [str(launchers[arm]), "run", str(config), "--fork-id", str(fork)]
 
 
-def scoped(command: list[str], gpu_run: str, memory_max: str, timeout: str) -> list[str]:
-    return [gpu_run, "-m", memory_max, "-t", timeout, "--", *command]
+def scoped(command: list[str], launcher: str, memory_max: str, timeout: str, est_seconds: int, who: str) -> list[str]:
+    return [
+        launcher, "--gpu", "exclusive", "--cpu", "exclusive", "--mem", memory_max,
+        "--est", str(est_seconds), "--who", who, "--", "timeout", timeout, *command,
+    ]
 
 
 def memory_bytes(text: str) -> int:
@@ -290,9 +297,12 @@ def main() -> int:
     parser.add_argument("--java-config", type=Path, required=True)
     parser.add_argument("--rust-config", type=Path, required=True)
     parser.add_argument("--forks", type=int, default=1)
-    parser.add_argument("--memory-max", default="24G", help="host memory cap of each arm")
-    parser.add_argument("--timeout", default="30m", help="time limit of each arm, as `timeout` reads it")
-    parser.add_argument("--gpu-run", default=GPU_RUN, help="the GPU launcher: lock, memory cap, time limit")
+    parser.add_argument("--memory-max", default="24G", help="host memory cap of each arm (system-run --mem)")
+    parser.add_argument("--timeout", default="30m", help="time limit of each arm, as `timeout` reads it, enforced inside the grant")
+    parser.add_argument("--est", type=int, default=MAX_EST_SECONDS, help="seconds the arbiter is told each arm takes (at most 600)")
+    parser.add_argument("--who", default="rust-gate", help="the name given to the arbiter")
+    parser.add_argument("--launcher", default=LAUNCHER, help="the system launcher: the exclusive grant, memory cap, time limit")
+    parser.add_argument("--gpu-run", dest="launcher", default=argparse.SUPPRESS, help=argparse.SUPPRESS)  # older spelling of --launcher
     parser.add_argument("--out-dir", type=Path, help="default: benchmark-results/rust-gate-<time>")
     parser.add_argument("--speculation", choices=("config", "off"), default="config")
     parser.add_argument("--no-build", action="store_true", help="use the release binary and the installed Java script as they are")
@@ -300,13 +310,15 @@ def main() -> int:
     args = parser.parse_args()
     if args.forks < 1:
         parser.error("--forks must be at least 1")
+    if not 1 <= args.est <= MAX_EST_SECONDS:
+        parser.error(f"--est must be between 1 and {MAX_EST_SECONDS} seconds")
     try:
         if memory_bytes(args.memory_max) <= 0:
             parser.error("--memory-max must be positive")
     except ValueError as error:
         parser.error(str(error))
-    if not args.dry_run and shutil.which(args.gpu_run) is None:
-        parser.error(f"the GPU launcher {args.gpu_run!r} is not found: give its path with --gpu-run")
+    if not args.dry_run and shutil.which(args.launcher) is None:
+        parser.error(f"the system launcher {args.launcher!r} is not found: give its path with --launcher")
 
     out_dir = (args.out_dir or REPO / "benchmark-results" / time.strftime("rust-gate-%Y%m%dT%H%M%S")).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -323,7 +335,9 @@ def main() -> int:
             output = out_dir / f"{arm}-fork{fork}.jsonl"
             config = out_dir / f"{arm}-fork{fork}.json"
             config.write_text(json.dumps(derived_config(sources[arm], arm, output, args.speculation), indent=2) + "\n")
-            command = scoped(arm_command(arm, config, fork, launchers), args.gpu_run, args.memory_max, args.timeout)
+            command = scoped(
+                arm_command(arm, config, fork, launchers), args.launcher, args.memory_max, args.timeout, args.est, args.who
+            )
             if args.dry_run:
                 print(shlex.join(command))
                 continue
@@ -332,7 +346,7 @@ def main() -> int:
             print(f"fork {fork} {arm}: running (log {log})", flush=True)
             started = time.monotonic()
             with log.open("w") as handle:
-                result = subprocess.run(command, cwd=REPO, stdout=handle, stderr=subprocess.STDOUT)  # gpu-run bounds the wait and the run
+                result = subprocess.run(command, cwd=REPO, stdout=handle, stderr=subprocess.STDOUT)  # system-run waits for the grant and caps memory; timeout inside it ends the run at the time limit
             took = time.monotonic() - started
             # 1: some measured row failed or was ineligible (the rows are still written and compared below).
             print(f"fork {fork} {arm}: exit {result.returncode} after {took:.0f} s", flush=True)

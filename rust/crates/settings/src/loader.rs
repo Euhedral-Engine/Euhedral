@@ -576,6 +576,9 @@ fn leaves() -> Vec<Leaf> {
         fixed("kernels.trellis.wide-block-min-tokens", |s, t| {
             assign!(s.kernels.trellis.wide_block_min_tokens, int(t, 1, COUNT_MAX))
         }),
+        fixed("kernels.compile.stack", |s, t| {
+            assign!(s.kernels.compile.stack, size(t, 1 << 20))
+        }),
         fixed("kernels.graphs.captures-per-view", |s, t| {
             assign!(s.kernels.graphs.captures_per_view, int(t, 1, COUNT_MAX))
         }),

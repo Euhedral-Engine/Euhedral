@@ -40,8 +40,8 @@ use euhedral_graph::{
     QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
 use euhedral_inference_cuda::{
-    CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, GraphRecorder, PinnedPool, RetireList, Submission,
-    SubmitMode, ops,
+    CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, GraphRecorder, KernelOps, PinnedPool, RetireList,
+    Submission, SubmitMode, ops,
 };
 use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorDataType, WeightFormat, WeightLayout};
 use euhedral_inference_engine::Handoff;
@@ -327,7 +327,7 @@ impl Rig {
         kv_tokens: u64,
     ) -> (SequenceState, KvRetained) {
         let submission = Submission::begin(&self.lane, SubmitMode::default()).unwrap();
-        let gdn = GdnStates::allocate(&self.library, config, 8, &submission).unwrap();
+        let gdn = GdnStates::allocate(&self.library, config, 8, &mut &submission).unwrap();
         let mut kv = KvCache::new(&self.library, &self.retire, kv_layers, 1024, format, kv_tokens, 0).unwrap();
         let mut retained = KvRetained::default();
         if kv_layers > 0 && kv_tokens > 0 {
@@ -568,7 +568,7 @@ struct StubFormat {
 impl LinearFormat for StubFormat {
     fn submit(
         &self,
-        submission: &Submission<'_>,
+        kernels: &mut dyn KernelOps,
         weight: &WeightRef,
         x: DevicePtr,
         y: DevicePtr,
@@ -585,7 +585,7 @@ impl LinearFormat for StubFormat {
         self.scratch_bytes.store(scratch.bytes, Ordering::SeqCst);
         assert_eq!(weight.name, "stub");
         // Four BF16 values per row.
-        ops::copy_device_to_device(submission, y, x, (rows * 8) as u64)
+        kernels.copy_device_to_device(y, x, (rows * 8) as u64)
     }
 
     fn scratch_bytes(&self, _weight: &WeightRef, _rows: usize, _mode: LinearMode) -> usize {
@@ -1928,7 +1928,7 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
     let reference = |ids: &[i32]| -> Vec<u8> {
         let input = upload(&rig.library, &id_bytes(ids));
         let output = DeviceBuffer::alloc(&rig.library, ids.len() * hidden * 2).unwrap();
-        rig.submit(|submission| Q3Embedding.submit(submission, &weight, input.ptr(), output.ptr(), ids.len()));
+        rig.submit(|submission| Q3Embedding.submit(&mut &*submission, &weight, input.ptr(), output.ptr(), ids.len()));
         download(&output)
     };
     let looked_up = |rows: usize| get(&workspace, BufferSlot::HiddenState, 0, rows * hidden * 2);
@@ -1980,7 +1980,7 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
     let recorder = GraphRecorder::begin(&rig.lane).unwrap();
     {
         let submission = recorder.submission(quantum.mode()).unwrap();
-        stage.launch(&quantum, &submission).unwrap();
+        stage.launch(&quantum, &mut &submission).unwrap();
     }
     let graph = recorder.end().unwrap();
     let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
@@ -2175,7 +2175,7 @@ fn every_stage_launches_inside_a_graph_capture_and_the_replay_selects() {
     for (name, stage) in &stages {
         let submission = Submission::begin(&rig.lane, quantum.mode()).unwrap();
         stage
-            .launch_on(&quantum, &submission)
+            .launch_on(&quantum, &mut &submission)
             .unwrap_or_else(|error| panic!("{name}: {error:?}"));
         submission.finish().unwrap();
         rig.sync();
@@ -2187,7 +2187,7 @@ fn every_stage_launches_inside_a_graph_capture_and_the_replay_selects() {
         let submission = recorder.submission(quantum.mode()).unwrap();
         for (name, stage) in &stages {
             stage
-                .launch_on(&quantum, &submission)
+                .launch_on(&quantum, &mut &submission)
                 .unwrap_or_else(|error| panic!("{name} in a capture: {error:?}"));
         }
     }
@@ -2206,12 +2206,12 @@ fn every_stage_launches_inside_a_graph_capture_and_the_replay_selects() {
 
 /// A stage as the capture test holds it: only its launches.
 trait LaunchOnly {
-    fn launch_on(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError>;
+    fn launch_on(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError>;
 }
 
 impl<L: Launch> LaunchOnly for L {
-    fn launch_on(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
-        self.launch(quantum, submission)
+    fn launch_on(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
+        self.launch(quantum, kernels)
     }
 }
 
@@ -2377,7 +2377,7 @@ fn launching_a_stage_on_an_idle_quantum_queues_nothing_and_does_not_underflow() 
     let token = SelectedToken;
     let launch = |stage: &dyn LaunchOnly, quantum: &Quantum| {
         let submission = Submission::begin(&rig.lane, quantum.mode()).unwrap();
-        stage.launch_on(quantum, &submission).unwrap();
+        stage.launch_on(quantum, &mut &submission).unwrap();
         submission.finish().unwrap();
         rig.sync();
     };

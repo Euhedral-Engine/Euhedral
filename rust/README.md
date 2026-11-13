@@ -31,7 +31,7 @@ The rules are enforced by the compiler toolchain, not by review. Each is checked
 | Every `unsafe` block states why it is sound | `undocumented_unsafe_blocks` lint |
 | Dependencies point one way (settings, edrl, host-gemv, test-support: none; tokenizer: edrl; cuda: none; engine: all of them; bench: engine and the leaves) | layer check |
 | Configuration is parsed in one place: only the settings crate depends on `serde_yaml_ng` | layer check |
-| Only the engine, bench and cuda depend on `euhedral-core` or `euhedral-graph`; cuda depends on nothing of ours and externally only on `euhedral-graph`, `libloading` and `thiserror` | layer check |
+| Only the engine, bench and cuda depend on `euhedral-core` or `euhedral-graph`; cuda depends on nothing of ours and externally only on `euhedral-gpu`, `euhedral-graph`, `libloading` and `thiserror` | layer check |
 | No crate depends on `level-zero*`, `opencl3`, `ocl` (hardware agnosticism) or `core_affinity` (worker CPUs are never pinned) | layer check |
 | `test-support` is a dev-dependency only | layer check |
 | Every library crate's `clippy.toml` equals `clippy-no-wait.toml` | layer check |
@@ -56,6 +56,26 @@ fn read_file(file: &Path) { /* ... */ }
   row in the table of `scripts/check-layers.sh`. A new binary is added to `BINARIES` there.
 - A layer or external-dependency exception is a change to the table in `scripts/check-layers.sh`, reviewed as a change
   to the architecture.
+
+## Kernel launches through RustEE
+
+`crates/cuda/src/launch/` holds the engine's kernel launches as data. `catalog.rs` lists every kernel the engine launches
+(name, source module, architecture-specific target, shared-memory opt-in, programmatic dependent launch) and the
+planned launch the family files produce. Two files turn a plan into work on a RustEE lane:
+
+- `load.rs` compiles the kernel modules the catalog names through `euhedral-gpu`'s NVRTC path, from the sources the
+  native library installs (`share/euhedral_cuda`), with the native loader's options, the bundled NVRTC and the native
+  loader's include paths, in the device's own machine code (a PTX-only compiler is refused). `load` returns a
+  `KernelTable` indexed like the catalog: each kernel is a RustEE kernel handle (the architecture-specific modules
+  compile for the architecture-specific target, and each kernel is opted in to the dynamic shared memory the catalog
+  records), or unavailable with a typed reason.
+- `queue.rs` enqueues a planned launch on any `LaneEnqueue`, writing its tensor maps (encoded by the driver) and the
+  sized argument words into one argument buffer per thread that is reused in place, with the launch's programmatic flag.
+
+The device tests `kernels_gpu` (ignored by default) check that every catalog kernel resolves with parameters a
+plan can pass, print the module compile and load times, and run the twin harness (`tests/common/twin.rs`): a case runs
+once through the native C wrapper on a `CudaLane` and once as a planned launch on a RustEE lane, in the one primary
+context of the device, and the outputs are compared byte for byte.
 
 ## Benchmark
 
@@ -93,7 +113,8 @@ second on `--config` (`host-tier`, which needs it) or on the same settings (`exa
 exits 1 when the mean KL reaches 1e-2, when more than 2% of the steps flip top-1 with a lead above 0.25, when the
 median peak 32-step hidden error reaches 12%, or when the median late/early hidden error is above 1.5.
 
-`tools/rust_gate.py` runs the Java and the Rust benchmark alternately, one process each per fork, each through the GPU
-launcher (`gpu-run`: exclusive lock, memory cap, time limit), with the prefix cache off, and prints a per-row table of the
-output hashes of the two engines and the absolute medians of each.
+`tools/rust_gate.py` runs the Java and the Rust benchmark alternately, one process each per fork, each through the system
+launcher (`system-run --gpu exclusive --cpu exclusive`: exclusive GPU and CPU grant, memory cap, with `timeout` for the
+time limit inside the grant), with the prefix cache off, and prints a per-row table of the output hashes of the two
+engines and the absolute medians of each. It is a timing run, so it takes the card exclusively.
 

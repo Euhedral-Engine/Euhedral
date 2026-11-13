@@ -11,12 +11,13 @@ publish = false
 # every one pinned to the same `rev`.
 [workspace.dependencies]
 crc32fast = "1.5"
-euhedral-core = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "046737f66e3e467729c67c6f4b30ce2bcc5d0bac" }
-euhedral-data-structures = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "046737f66e3e467729c67c6f4b30ce2bcc5d0bac" }
-euhedral-graph = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "046737f66e3e467729c67c6f4b30ce2bcc5d0bac", default-features = false }
-euhedral-hardware-utils = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "046737f66e3e467729c67c6f4b30ce2bcc5d0bac" }
-euhedral-io = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "046737f66e3e467729c67c6f4b30ce2bcc5d0bac" }
-euhedral-hashing = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "046737f66e3e467729c67c6f4b30ce2bcc5d0bac" }
+euhedral-core = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "3a5a1d651f962c95c71f46327a810bf036adcd8e" }
+euhedral-data-structures = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "3a5a1d651f962c95c71f46327a810bf036adcd8e" }
+euhedral-gpu = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "3a5a1d651f962c95c71f46327a810bf036adcd8e", default-features = false }
+euhedral-graph = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "3a5a1d651f962c95c71f46327a810bf036adcd8e", default-features = false }
+euhedral-hardware-utils = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "3a5a1d651f962c95c71f46327a810bf036adcd8e" }
+euhedral-io = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "3a5a1d651f962c95c71f46327a810bf036adcd8e" }
+euhedral-hashing = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "3a5a1d651f962c95c71f46327a810bf036adcd8e" }
 java-properties = "2"
 libloading = "0.8"
 log = "0.4"

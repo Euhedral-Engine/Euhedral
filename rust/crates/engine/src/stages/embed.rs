@@ -2,7 +2,7 @@
 //! MTP step on the device.
 
 use euhedral_graph::{Marker, Stage, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::{DevicePtr, Submission, ops};
+use euhedral_inference_cuda::{DevicePtr, KernelOps};
 
 use super::{Launch, Quantum, eager, fatal};
 use crate::formats::Q3Embedding;
@@ -40,7 +40,7 @@ impl Launch for Embed {
         quantum.prepared.into_iter().collect()
     }
 
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         if self.idle(quantum) {
             return Ok(());
         }
@@ -70,18 +70,22 @@ impl Launch for Embed {
                     slot + rows
                 )));
             }
-            ops::copy_device_to_device(submission, ids, step_tokens()?.offset(4 * slot as u64), 4 * rows as u64)
+            kernels
+                .copy_device_to_device(ids, step_tokens()?.offset(4 * slot as u64), 4 * rows as u64)
                 .map_err(fatal)?;
         }
         if let Some(previous) = &quantum.token_from {
             // The token the quantum before selected: the row of the key is the token, the head has no ids.
-            ops::selected_token(submission, previous.device_keys(), DevicePtr::NULL, ids).map_err(fatal)?;
+            kernels
+                .selected_token(previous.device_keys(), DevicePtr::NULL, ids)
+                .map_err(fatal)?;
         }
         Q3Embedding
-            .submit(submission, &self.table, ids, quantum.slot(self.output), rows)
+            .submit(kernels, &self.table, ids, quantum.slot(self.output), rows)
             .map_err(fatal)?;
         if quantum.writes_current_token {
-            ops::copy_device_to_device(submission, step_tokens()?, ids.offset(4 * (rows as u64 - 1)), 4)
+            kernels
+                .copy_device_to_device(step_tokens()?, ids.offset(4 * (rows as u64 - 1)), 4)
                 .map_err(fatal)?;
         }
         Ok(())
