@@ -20,20 +20,22 @@ use std::io;
 use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use euhedral_core::frames::Frame;
-use euhedral_graph::{IoBuf, IoDone, Join, Lake, LatchSetter, OpenSpec, OwnedFile};
+use euhedral_graph::Lake;
 use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, PooledPinned, Submission, SubmitMode, ops};
 use euhedral_inference_edrl::{
     HEADER_BYTES, Header, Metadata, ReadPlan, Region, TensorTable, TokenizerFooter, TrellisCompanions, WeightFormat,
     WeightLayout, content_end,
 };
 use euhedral_inference_settings::Settings;
+use euhedral_io::{IoBuf, IoDone, OpenSpec, OwnedFile};
 
 use crate::error::EngineError;
 use crate::frames::{Kind, step};
 use crate::generation::Generation;
+use crate::handoff::Handoff;
 use crate::model::{
     LayerIndex, MTP_ATTENTION_PACK, ModelConfig, Role, TrellisParts, WeightRef, Weights, companion_name,
     trellis_logical, validate_inventory,
@@ -127,10 +129,10 @@ pub(crate) fn read_machine() -> Machine {
     Machine::default()
 }
 
-/// The startup in flight: the shared parts, the latch to set, and the units that keep the lakes open.
+/// The startup in flight: the shared parts, the hand-off to send, and the units that keep the lakes open.
 struct Startup {
     core: Arc<Core>,
-    ready: Option<LatchSetter<Result<Arc<EngineRuntime>, EngineError>>>,
+    ready: Option<Arc<Handoff<Result<Arc<EngineRuntime>, EngineError>>>>,
     _units: Units,
 }
 
@@ -138,7 +140,7 @@ impl Startup {
     /// Ends the startup with `error`.
     fn fail(mut self, error: EngineError) {
         if let Some(ready) = self.ready.take() {
-            ready.set(Err(error));
+            ready.send(Err(error));
         }
     }
 
@@ -149,7 +151,7 @@ impl Startup {
             .device_bytes
             .store(runtime.report().allocated_bytes, Ordering::Release);
         if let Some(ready) = self.ready.take() {
-            ready.set(Ok(Arc::new(runtime)));
+            ready.send(Ok(Arc::new(runtime)));
         }
     }
 
@@ -164,9 +166,9 @@ impl Startup {
 impl Drop for Startup {
     fn drop(&mut self) {
         // A frame dropped before it ran (a closed lake, a lattice that is shutting down) must not leave the main
-        // thread waiting on the latch.
+        // thread waiting on the hand-off.
         if let Some(ready) = self.ready.take() {
-            ready.set(Err(EngineError::Runtime(
+            ready.send(Err(EngineError::Runtime(
                 "the startup was abandoned: a frame was dropped before it ran".to_string(),
             )));
         }
@@ -189,10 +191,10 @@ fn device(core: &Core) -> &Arc<Lake> {
 }
 
 /// Begins the startup: the rest runs as frames.
-pub(crate) fn run(core: Arc<Core>, ready: LatchSetter<Result<Arc<EngineRuntime>, EngineError>>) {
+pub(crate) fn run(core: Arc<Core>, ready: Arc<Handoff<Result<Arc<EngineRuntime>, EngineError>>>) {
     let units = match core.admit() {
         Ok(units) => units,
-        Err(error) => return ready.set(Err(error)),
+        Err(error) => return ready.send(Err(error)),
     };
     let startup = Startup {
         core,
@@ -373,7 +375,7 @@ fn parse(startup: Startup, file: Arc<OwnedFile>, header: Header, end: u64, metad
         .iter()
         .map(|(name, n, rows, _)| (name.clone(), *n, *rows))
         .collect();
-    let join = Join::new(objects.len(), move |parts: Vec<Option<io::Result<Vec<u8>>>>| {
+    let reads = SegmentReads::new(objects.len(), move |parts| {
         let checked = check_segments(&names, parts);
         startup.then(host, move |startup| match checked {
             Ok(ends) => plan(startup, artifact, ends),
@@ -382,23 +384,81 @@ fn parse(startup: Startup, file: Arc<OwnedFile>, header: Header, end: u64, metad
     });
     for (part, (_, _, _, range)) in objects.into_iter().enumerate() {
         let length = (range.end - range.start) as usize;
-        let arriving = Arc::clone(&join);
+        let arrival = Arrival::new(&reads, part);
         let then = Box::new(move |done: IoDone| -> Box<dyn Frame> {
             step(Kind::Segments, part, move || {
-                let bytes = done.result.map(|read| {
+                arrival.arrive(done.result.map(|read| {
                     let mut bytes = done.buf.bytes;
                     bytes.truncate(read);
                     bytes
-                });
-                arriving.arrive(part, bytes);
+                }));
             })
         });
         let buf = IoBuf {
             bytes: vec![0; length],
             filled: 0,
         };
-        if core.io.read(raw_file(&reader), range.start, buf, then).is_err() {
-            join.abandon(part);
+        // A refused read drops `then` and its arrival without running them, which counts the part as arrived.
+        let _ = core.io.read(raw_file(&reader), range.start, buf, then);
+    }
+}
+
+/// What the continuation of the segment reads gets: each part's bytes or failure, `None` for a part that never ran.
+type SegmentParts = Vec<Option<io::Result<Vec<u8>>>>;
+
+/// The fan-in of the segment reads: a count of the parts still to arrive and one slot per part. The part that brings
+/// the count to zero runs the continuation, once.
+struct SegmentReads {
+    pending: AtomicU32,
+    parts: Box<[Handoff<io::Result<Vec<u8>>>]>,
+    then: Handoff<Box<dyn FnOnce(SegmentParts) + Send>>,
+}
+
+impl SegmentReads {
+    /// Reads of `count` parts, which `then` follows. Store the count before any arrival is published.
+    fn new(count: usize, then: impl FnOnce(SegmentParts) + Send + 'static) -> Arc<SegmentReads> {
+        let continuation = Handoff::empty();
+        continuation.send(Box::new(then) as Box<dyn FnOnce(SegmentParts) + Send>);
+        Arc::new(SegmentReads {
+            pending: AtomicU32::new(u32::try_from(count).expect("a model has far fewer than 2^32 trellis objects")),
+            parts: (0..count).map(|_| Handoff::empty()).collect(),
+            then: continuation,
+        })
+    }
+}
+
+/// One part's way into [`SegmentReads`]. It counts as arrived when dropped, with its bytes if the part ran and with
+/// none if the read was refused or its frame was dropped unrun.
+struct Arrival {
+    reads: Arc<SegmentReads>,
+    part: usize,
+    bytes: Option<io::Result<Vec<u8>>>,
+}
+
+impl Arrival {
+    fn new(reads: &Arc<SegmentReads>, part: usize) -> Arrival {
+        Arrival {
+            reads: Arc::clone(reads),
+            part,
+            bytes: None,
+        }
+    }
+
+    /// Records the part's result; the part counts when the arrival is dropped, at the end of its frame.
+    fn arrive(mut self, bytes: io::Result<Vec<u8>>) {
+        self.bytes = Some(bytes);
+    }
+}
+
+impl Drop for Arrival {
+    fn drop(&mut self) {
+        if let Some(bytes) = self.bytes.take() {
+            self.reads.parts[self.part].send(bytes);
+        }
+        if self.reads.pending.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some(then) = self.reads.then.take()
+        {
+            then(self.reads.parts.iter().map(Handoff::take).collect());
         }
     }
 }

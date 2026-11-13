@@ -29,7 +29,7 @@
 
 use std::sync::Arc;
 
-use euhedral_graph::{LaneId, LanePool, Marker};
+use euhedral_graph::{LanePool, Marker};
 use euhedral_inference_cuda::{
     AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena, PinnedPool, PooledPinned,
     RetireList, Submission, ops,
@@ -84,13 +84,18 @@ impl KvRetained {
 pub struct SharedBuffer {
     buffer: Option<DeviceBuffer>,
     retire: Arc<RetireList>,
+    /// The marker the buffer retires behind: value 0 of the lane that allocated it, which any pool holding that lane
+    /// has always reached.
+    always_reached: Marker,
 }
 
 impl SharedBuffer {
-    fn new(buffer: DeviceBuffer, retire: &Arc<RetireList>) -> Arc<SharedBuffer> {
+    fn new(buffer: DeviceBuffer, retire: &Arc<RetireList>, submission: &Submission<'_>) -> Arc<SharedBuffer> {
+        let lane = submission.lane();
         Arc::new(SharedBuffer {
             buffer: Some(buffer),
             retire: Arc::clone(retire),
+            always_reached: Marker::new(lane.queue_id(), lane.id(), 0),
         })
     }
 
@@ -115,13 +120,7 @@ impl Drop for SharedBuffer {
         if let Some(buffer) = self.buffer.take() {
             // A buffer that is not stream-ordered comes back with the reason, and dropping it is the blocking free;
             // every buffer made here is stream-ordered.
-            let _ = self.retire.retire(
-                buffer,
-                Marker {
-                    lane: LaneId(0),
-                    value: 0,
-                },
-            );
+            let _ = self.retire.retire(buffer, self.always_reached);
         }
     }
 }
@@ -345,6 +344,7 @@ impl KvCache {
                 layer.pages.push(SharedBuffer::new(
                     DeviceBuffer::alloc_async(submission, (2 * plane) as usize)?,
                     &self.retire,
+                    submission,
                 ));
             }
             let next = if slots == self.table_slots {
@@ -353,6 +353,7 @@ impl KvCache {
                 Some(SharedBuffer::new(
                     DeviceBuffer::alloc_async(submission, table_bytes as usize)?,
                     &self.retire,
+                    submission,
                 ))
             };
             let mut staging = pool.acquire(table_bytes as usize)?;

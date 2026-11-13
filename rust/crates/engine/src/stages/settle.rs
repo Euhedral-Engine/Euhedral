@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-use euhedral_graph::{GraphRuntime, LaneId, LanePool, Marker, Ready, Stage, StageCx, StageError, Submitted};
+use euhedral_graph::{
+    DeviceQueue, GraphRuntime, LaneId, LanePool, Marker, Ready, Stage, StageCx, StageError, Submitted,
+};
 use euhedral_inference_cuda::{CudaError, CudaLane, Submission, SubmitMode};
 
 use super::{LaneTable, Quantum};
@@ -265,8 +267,8 @@ impl Stage<Quantum> for Settling {
         }
     }
 
-    fn abandoned(&self, quantum: &Quantum) {
-        self.stage.abandoned(quantum);
+    fn abandoned(&self, quantum: &Quantum, home: &(dyn DeviceQueue + 'static)) {
+        self.stage.abandoned(quantum, home);
         if quantum.ends.first_abandoned() {
             self.settler.settle(quantum);
         }

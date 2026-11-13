@@ -27,8 +27,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use euhedral_graph::{
-    EdgeKind, ExternalEdge, GraphError, GraphRuntime, LaneId, Marker, QuantumOutcome, QuantumRef, Stage, StageCx,
-    StageError, StageGraph, StageGraphSpec, StageId, StageSpec, Submitted,
+    DeviceQueue, EdgeKind, ExternalEdge, GraphError, GraphRuntime, LaneId, Marker, QuantumOutcome, QuantumRef, Stage,
+    StageCx, StageError, StageGraph, StageGraphSpec, StageId, StageSpec, Submitted,
 };
 use euhedral_inference_cuda::{AllocationId, CudaError, CudaLane, GraphExec, PinnedPool, Submission, SubmitMode, ops};
 use thiserror::Error;
@@ -438,7 +438,7 @@ impl Stage<Quantum> for RecordStage {
         Ok(Submitted::done())
     }
 
-    fn abandoned(&self, quantum: &Quantum) {
+    fn abandoned(&self, quantum: &Quantum, _home: &(dyn DeviceQueue + 'static)) {
         if let Disposition::Record(slot) = &quantum.disposition {
             slot.release();
         }
@@ -636,15 +636,12 @@ impl Executor {
                 }
                 _ => (eager, false, false, stage_by_stage),
             };
-        let external = after
-            .map(|previous| ExternalEdge {
-                from: previous.reference.clone(),
-                from_stage: previous.sink,
-                to_stage: StageId(0),
-                kind: EdgeKind::Submission,
-            })
-            .into_iter()
-            .collect();
+        let external = after.map(|previous| ExternalEdge {
+            from: previous.reference.clone(),
+            from_stage: previous.sink,
+            to_stage: StageId(0),
+            kind: EdgeKind::Submission,
+        });
         let reference = graph.start(quantum, kill, external);
         Ok(Started {
             reference,

@@ -6,9 +6,9 @@ use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
+use euhedral_graph::Marker;
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
 use euhedral_io::IoMemory;
-use euhedral_graph::Marker;
 
 use crate::error::{CudaError, check};
 use crate::library::CudaLibrary;

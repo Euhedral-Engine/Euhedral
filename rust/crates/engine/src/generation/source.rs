@@ -749,6 +749,12 @@ impl Owner {
                         ));
                     }
                 }
+                // The device failed under the quantum, at no stage of its own: the same failure as a stage's.
+                QuantumOutcome::DeviceFailed { cause } => {
+                    if live {
+                        self.fail(format!("the device failed under a {:?} quantum: {cause}", flying.kind));
+                    }
+                }
                 QuantumOutcome::Completed => {}
             }
             self.park(quantum, flying.retained);
