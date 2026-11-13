@@ -3,7 +3,7 @@
 //! quantum (the base hidden rows for a catch-up, the previous MTP hidden for a recursive row).
 
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::{DevicePtr, Submission, ops};
+use euhedral_inference_cuda::{DevicePtr, KernelOps};
 
 use super::{DraftSeed, Launch, Quantum, eager, fatal, launch_u32};
 use crate::workspace::BufferSlot;
@@ -46,7 +46,7 @@ impl MtpStem {
 }
 
 impl Launch for MtpStem {
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let hidden = quantum.config.hidden_size;
         let rows = quantum.rows_u32()?;
         let width = launch_u32(hidden, "the hidden size")?;
@@ -78,18 +78,19 @@ impl Launch for MtpStem {
             (quantum.slot(self.embedding), self.embedding_norm, embedding_half),
             (seed, self.hidden_norm, hidden_half),
         ] {
-            ops::rms_norm_unit_offset_bf16(submission, input, weight, normalized, rows, width, epsilon)
+            kernels
+                .rms_norm_unit_offset_bf16(input, weight, normalized, rows, width, epsilon)
                 .map_err(fatal)?;
-            ops::copy_device_to_device_2d(
-                submission,
-                packed.offset(half),
-                2 * row_bytes,
-                normalized,
-                row_bytes,
-                row_bytes,
-                u64::from(rows),
-            )
-            .map_err(fatal)?;
+            kernels
+                .copy_device_to_device_2d(
+                    packed.offset(half),
+                    2 * row_bytes,
+                    normalized,
+                    row_bytes,
+                    row_bytes,
+                    u64::from(rows),
+                )
+                .map_err(fatal)?;
         }
         Ok(())
     }

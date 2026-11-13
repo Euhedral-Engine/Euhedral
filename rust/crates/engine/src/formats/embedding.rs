@@ -4,7 +4,7 @@
 //! directly, and the P2E2 layout decodes the entropy-coded rows of the ids it is asked for. An id outside the
 //! vocabulary leaves its output row as it was.
 
-use euhedral_inference_cuda::{CudaError, DevicePtr, Submission, ops};
+use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 
 use crate::model::WeightRef;
@@ -18,7 +18,7 @@ impl Q3Embedding {
     /// `output`. Nothing waits.
     pub fn submit(
         &self,
-        submission: &Submission<'_>,
+        kernels: &mut dyn KernelOps,
         table: &WeightRef,
         token_ids: DevicePtr,
         output: DevicePtr,
@@ -48,26 +48,10 @@ impl Q3Embedding {
         };
         let (rows, vocabulary, hidden) = (narrow(rows as u64)?, narrow(vocabulary)?, narrow(hidden)?);
         match table.layout {
-            WeightLayout::RowSplitP2e2V1 => ops::embed_q3_p2e2(
-                submission,
-                token_ids,
-                table.ptr,
-                output,
-                rows,
-                vocabulary,
-                hidden,
-                table.bytes,
-            ),
-            _ => ops::embed_q3(
-                submission,
-                token_ids,
-                table.ptr,
-                output,
-                rows,
-                vocabulary,
-                hidden,
-                table.bytes,
-            ),
+            WeightLayout::RowSplitP2e2V1 => {
+                kernels.embed_q3_p2e2(token_ids, table.ptr, output, rows, vocabulary, hidden, table.bytes)
+            }
+            _ => kernels.embed_q3(token_ids, table.ptr, output, rows, vocabulary, hidden, table.bytes),
         }
     }
 }

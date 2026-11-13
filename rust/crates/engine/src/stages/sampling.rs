@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use euhedral_graph::Marker;
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{
-    AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, PinnedBuffer, Submission, ops,
+    AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, PinnedBuffer, Submission,
 };
 
 use super::{Launch, Quantum, eager, fatal, launch_u32};
@@ -234,7 +234,7 @@ impl Launch for Argmax {
         quantum.logits_rows == 0
     }
 
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         if self.idle(quantum) {
             return Ok(());
         }
@@ -264,25 +264,19 @@ impl Launch for Argmax {
         let row_bytes = quantum.config.vocab_size as u64 * 2;
         let logits = quantum.slot(self.logits);
         for row in 0..count {
-            ops::argmax_bf16(
-                submission,
-                logits.offset((first + row) as u64 * row_bytes),
-                entries,
-                selection.device_keys().offset((row * KEY_BYTES) as u64),
-            )
-            .map_err(fatal)?;
+            kernels
+                .argmax_bf16(
+                    logits.offset((first + row) as u64 * row_bytes),
+                    entries,
+                    selection.device_keys().offset((row * KEY_BYTES) as u64),
+                )
+                .map_err(fatal)?;
         }
         // SAFETY: the selection is held by the quantum (an `Arc`), which retires only after the marker that follows
         // this launch is reached; the host reads the keys through atomic words, and only once that marker has been
         // reached.
         unsafe {
-            ops::copy_device_to_readback_shared(
-                submission,
-                selection.readback(),
-                0,
-                selection.device_keys(),
-                count * KEY_BYTES,
-            )
+            kernels.copy_device_to_readback_shared(selection.readback(), 0, selection.device_keys(), count * KEY_BYTES)
         }
         .map_err(fatal)
     }
@@ -299,7 +293,7 @@ impl Launch for SelectedToken {
         quantum.draft_token_write.is_none()
     }
 
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let Some(write) = quantum.draft_token_write else {
             return Ok(());
         };
@@ -319,13 +313,13 @@ impl Launch for SelectedToken {
                 write.slot
             )));
         }
-        ops::selected_token(
-            submission,
-            selection.device_keys(),
-            write.ids,
-            draft.tokens.ptr().offset(4 * write.slot as u64),
-        )
-        .map_err(fatal)
+        kernels
+            .selected_token(
+                selection.device_keys(),
+                write.ids,
+                draft.tokens.ptr().offset(4 * write.slot as u64),
+            )
+            .map_err(fatal)
     }
 }
 

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, DeviceBuffer, Submission, ops};
+use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, DeviceBuffer, KernelOps};
 
 use crate::model::{LayerKind, ModelConfig};
 use crate::residency::footprint::MINIMUM_VERIFY_ROWS;
@@ -84,12 +84,12 @@ pub struct GdnStates {
 impl GdnStates {
     /// Allocates and zeroes the state of every GDN layer, with speculative buffers for `verified_rows` rows (at
     /// least [`MINIMUM_VERIFY_ROWS`], as `GdnState.speculative` allocates); 0 allocates none. The allocations wait
-    /// (startup only); the zeroing is queued on `submission`'s lane, and the caller waits for its marker.
+    /// (startup only); the zeroing is queued on `kernels`, and the caller waits for its marker.
     pub fn allocate(
         library: &Arc<CudaLibrary>,
         config: &ModelConfig,
         verified_rows: u64,
-        submission: &Submission<'_>,
+        kernels: &mut dyn KernelOps,
     ) -> Result<GdnStates, CudaError> {
         let channels = config.gdn_convolution_channels() as u64;
         let heads = config.linear_num_value_heads as u64;
@@ -106,8 +106,8 @@ impl GdnStates {
             }
             let convolution = alloc(convolution_bytes)?;
             let recurrent = alloc(recurrent_bytes)?;
-            ops::zero_device_memory(submission, convolution.ptr(), convolution_bytes)?;
-            ops::zero_device_memory(submission, recurrent.ptr(), recurrent_bytes)?;
+            kernels.zero_device_memory(convolution.ptr(), convolution_bytes)?;
+            kernels.zero_device_memory(recurrent.ptr(), recurrent_bytes)?;
             let speculative = if verified_rows == 0 {
                 None
             } else {
@@ -132,12 +132,12 @@ impl GdnStates {
         Ok(GdnStates { layers })
     }
 
-    /// Queues the zeroing of every layer's convolution and recurrent state on `submission`: the state of a sequence
+    /// Queues the zeroing of every layer's convolution and recurrent state on `kernels`: the state of a sequence
     /// that has seen no token. The speculative buffers hold nothing a quantum reads before it writes it.
-    pub fn zero(&self, submission: &Submission<'_>) -> Result<(), CudaError> {
+    pub fn zero(&self, kernels: &mut dyn KernelOps) -> Result<(), CudaError> {
         for state in self.layers.iter().flatten() {
-            ops::zero_device_memory(submission, state.convolution.ptr(), state.convolution.bytes() as u64)?;
-            ops::zero_device_memory(submission, state.recurrent.ptr(), state.recurrent.bytes() as u64)?;
+            kernels.zero_device_memory(state.convolution.ptr(), state.convolution.bytes() as u64)?;
+            kernels.zero_device_memory(state.recurrent.ptr(), state.recurrent.bytes() as u64)?;
         }
         Ok(())
     }

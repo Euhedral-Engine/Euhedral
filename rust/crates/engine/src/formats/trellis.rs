@@ -16,7 +16,7 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use euhedral_inference_cuda::{CudaError, CudaLibrary, DevicePtr, Submission};
+use euhedral_inference_cuda::{CudaError, CudaLibrary, DevicePtr, KernelOps};
 use euhedral_inference_edrl::WeightFormat;
 use euhedral_inference_settings::{Auto, TrellisKernelSettings};
 
@@ -311,7 +311,7 @@ fn parts<'w>(
 impl LinearFormat for TrellisLinear {
     fn submit(
         &self,
-        submission: &Submission<'_>,
+        kernels: &mut dyn KernelOps,
         weight: &WeightRef,
         x: DevicePtr,
         y: DevicePtr,
@@ -322,17 +322,17 @@ impl LinearFormat for TrellisLinear {
         let (shape, operands) = parts(weight, x, y, scratch)?;
         // A verification may be selected on the lane as well as asked for by the stage.
         let mode = LinearMode {
-            row_exact: mode.row_exact || submission.mode().row_exact,
+            row_exact: mode.row_exact || kernels.row_exact(),
             ..mode
         };
-        let library = submission.lane().library();
+        let library = kernels.library();
         let exact = self.exact_numerics || library.exact_numerics();
         let block_fp8 = !exact && self.block_fp8(library)?;
         self.plan_with(exact, &shape, &operands, rows, mode, block_fp8, &mut |launch| {
             if self.record {
                 ShapeRecorder::record(launch.line());
             }
-            launch.queue(submission)
+            launch.queue(kernels)
         })
     }
 

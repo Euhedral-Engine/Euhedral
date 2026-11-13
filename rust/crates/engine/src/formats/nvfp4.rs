@@ -13,7 +13,7 @@
 //!   the device, a tile kernel beyond. The native route declines shapes it has no kernel for.
 //! - **Anything else**, and every launch under exact numerics: the scalar reference.
 
-use euhedral_inference_cuda::{CudaError, CudaLibrary, DevicePtr, Submission, ops};
+use euhedral_inference_cuda::{CudaError, CudaLibrary, DevicePtr, KernelOps};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 
 use crate::formats::shapes::ShapeRecorder;
@@ -276,7 +276,7 @@ impl Nvfp4Linear {
 impl LinearFormat for Nvfp4Linear {
     fn submit(
         &self,
-        submission: &Submission<'_>,
+        kernels: &mut dyn KernelOps,
         weight: &WeightRef,
         x: DevicePtr,
         y: DevicePtr,
@@ -290,7 +290,7 @@ impl LinearFormat for Nvfp4Linear {
             .filter(|rows| *rows > 0)
             .ok_or_else(|| CudaError::Argument(format!("an NVFP4 launch takes at least one row, not {rows}")))?;
         // A verification may be selected on the lane as well as asked for by the stage.
-        let row_exact = mode.row_exact || submission.mode().row_exact;
+        let row_exact = mode.row_exact || kernels.row_exact();
         let sd4 = weight.layout == WeightLayout::RowSplitK128Sd4V1;
         // Exact numerics are the library's selection: its native route declines under them and the dispatch below
         // runs the reference, so the route is predicted without them.
@@ -309,8 +309,7 @@ impl LinearFormat for Nvfp4Linear {
             }
         }
         if matches!(route, Nvfp4Route::Native { .. }) {
-            let native = ops::linear_nvfp4_native_bf16(
-                submission,
+            let native = kernels.linear_nvfp4_native_bf16(
                 x,
                 weight.ptr,
                 y,
@@ -330,16 +329,7 @@ impl LinearFormat for Nvfp4Linear {
                 other => return other,
             }
         }
-        ops::linear_nvfp4_bf16(
-            submission,
-            x,
-            weight.ptr,
-            y,
-            rows,
-            in_features,
-            out_features,
-            weight.bytes,
-        )
+        kernels.linear_nvfp4_bf16(x, weight.ptr, y, rows, in_features, out_features, weight.bytes)
     }
 
     /// Enough for any launch of up to `rows` rows. The skinny kernels split over K and keep FP32 partials, which grow

@@ -416,7 +416,7 @@ fn q3_embedding_looks_up_token_rows() {
     let output = upload(&rig.library, &sentinel.repeat(ids.len() * hidden));
     let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
     Q3Embedding
-        .submit(&submission, &weight, tokens.ptr(), output.ptr(), ids.len())
+        .submit(&mut &submission, &weight, tokens.ptr(), output.ptr(), ids.len())
         .unwrap();
     submission.finish().unwrap();
     rig.lane.synchronize().unwrap();
@@ -451,7 +451,7 @@ fn q3_embedding_looks_up_token_rows() {
     let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
     assert!(
         Q3Embedding
-            .submit(&submission, &refused, tokens.ptr(), output.ptr(), 1)
+            .submit(&mut &submission, &refused, tokens.ptr(), output.ptr(), 1)
             .is_err()
     );
 }
