@@ -1157,6 +1157,32 @@ pub trait KernelOps {
         bytes: usize,
     ) -> Result<(), CudaError>;
 
+    /// Queues the copy of `bytes` bytes at `offset` of a pinned buffer to the device ([`copy_upload_to_device`]).
+    ///
+    /// # Safety
+    /// The copy runs after this call returns. `source` must stay alive, and its bytes in that range unmodified, until
+    /// the lane's work up to this copy has retired.
+    unsafe fn copy_upload_to_device(
+        &mut self,
+        destination: DevicePtr,
+        source: &PinnedBuffer,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), CudaError>;
+
+    /// Queues the copy of `bytes` device bytes into a pinned buffer at `offset` ([`copy_device_to_readback`]).
+    ///
+    /// # Safety
+    /// The copy runs after this call returns. `destination` must stay alive, and its bytes in that range unread,
+    /// until the lane's work up to this copy has retired.
+    unsafe fn copy_device_to_readback(
+        &mut self,
+        destination: &mut PinnedBuffer,
+        offset: usize,
+        source: DevicePtr,
+        bytes: usize,
+    ) -> Result<(), CudaError>;
+
     /// Queues the copy of `bytes` bytes at `offset` of a host-weights arena to the device
     /// ([`copy_host_weights_to_device`]).
     ///
@@ -1229,6 +1255,30 @@ macro_rules! submission_ops {
                 let submission: &Submission<'_> = self;
                 // SAFETY: the caller's contract is the function's.
                 unsafe { copy_device_to_readback_shared(submission, destination, offset, source, bytes) }
+            }
+
+            unsafe fn copy_upload_to_device(
+                &mut self,
+                destination: DevicePtr,
+                source: &PinnedBuffer,
+                offset: usize,
+                bytes: usize,
+            ) -> Result<(), CudaError> {
+                let submission: &Submission<'_> = self;
+                // SAFETY: the caller's contract is the function's.
+                unsafe { copy_upload_to_device(submission, destination, source, offset, bytes) }
+            }
+
+            unsafe fn copy_device_to_readback(
+                &mut self,
+                destination: &mut PinnedBuffer,
+                offset: usize,
+                source: DevicePtr,
+                bytes: usize,
+            ) -> Result<(), CudaError> {
+                let submission: &Submission<'_> = self;
+                // SAFETY: the caller's contract is the function's.
+                unsafe { copy_device_to_readback(submission, destination, offset, source, bytes) }
             }
 
             unsafe fn copy_host_weights_to_device(
@@ -1594,6 +1644,24 @@ mod tests {
         unsafe fn copy_device_to_readback_shared(
             &mut self,
             _: &PinnedBuffer,
+            _: usize,
+            _: DevicePtr,
+            _: usize,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        unsafe fn copy_upload_to_device(
+            &mut self,
+            _: DevicePtr,
+            _: &PinnedBuffer,
+            _: usize,
+            _: usize,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        unsafe fn copy_device_to_readback(
+            &mut self,
+            _: &mut PinnedBuffer,
             _: usize,
             _: DevicePtr,
             _: usize,

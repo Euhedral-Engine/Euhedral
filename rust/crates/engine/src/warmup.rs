@@ -13,7 +13,7 @@
 //! stages that own those launches warm them.
 
 use euhedral_graph::Marker;
-use euhedral_inference_cuda::{CudaError, CudaLane, Submission, SubmitMode, ops};
+use euhedral_inference_cuda::{CudaError, CudaLane, KernelOps, Submission, SubmitMode};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 
 use crate::model::{LayerIndex, ModelConfig, NormKind, Role, WeightRef, Weights};
@@ -38,9 +38,10 @@ struct Launcher<'a> {
 }
 
 impl Launcher<'_> {
-    fn launch(&mut self, module: &'static str, work: impl FnOnce(&Submission<'_>) -> Result<(), CudaError>) {
+    fn launch(&mut self, module: &'static str, work: impl FnOnce(&mut dyn KernelOps) -> Result<(), CudaError>) {
         let result = Submission::begin(self.lane, SubmitMode::default()).and_then(|submission| {
-            work(&submission)?;
+            let mut kernels = &submission;
+            work(&mut kernels)?;
             submission.finish_signalled()
         });
         match result {
@@ -81,16 +82,15 @@ pub(crate) fn run(
         BufferSlot::TokenIds,
     ] {
         let buffer = workspace.buffer(input);
-        launcher.launch("zero", |submission| {
-            ops::zero_device_memory(submission, buffer.ptr(), buffer.bytes() as u64)
+        launcher.launch("zero", |kernels| {
+            kernels.zero_device_memory(buffer.ptr(), buffer.bytes() as u64)
         });
     }
 
     if let Some(norm) = weights.get(LayerIndex::GLOBAL, Role::Norm(NormKind::Final)) {
         let epsilon = config.rms_norm_epsilon as f32;
-        launcher.launch("norm", |submission| {
-            ops::rms_norm_unit_offset_bf16(
-                submission,
+        launcher.launch("norm", |kernels| {
+            kernels.rms_norm_unit_offset_bf16(
                 slot(BufferSlot::HiddenState),
                 norm.ptr,
                 slot(BufferSlot::InputNormalized),
@@ -100,26 +100,18 @@ pub(crate) fn run(
             )
         });
     }
-    launcher.launch("elementwise", |submission| {
-        ops::residual_add_bf16(
-            submission,
+    launcher.launch("elementwise", |kernels| {
+        kernels.residual_add_bf16(
             slot(BufferSlot::HiddenState),
             slot(BufferSlot::MixerDelta),
             slot(BufferSlot::HiddenState),
             1,
             hidden,
         )?;
-        ops::swiglu_bf16(
-            submission,
-            slot(BufferSlot::GateUp),
-            slot(BufferSlot::Swiglu),
-            1,
-            intermediate,
-        )
+        kernels.swiglu_bf16(slot(BufferSlot::GateUp), slot(BufferSlot::Swiglu), 1, intermediate)
     });
-    launcher.launch("sampling", |submission| {
-        ops::argmax_bf16(
-            submission,
+    launcher.launch("sampling", |kernels| {
+        kernels.argmax_bf16(
             slot(BufferSlot::Logits),
             config.vocab_size as u32,
             slot(BufferSlot::FinalNormalized),
@@ -129,9 +121,8 @@ pub(crate) fn run(
         .get(LayerIndex::GLOBAL, Role::Embedding)
         .filter(|weight| weight.format == WeightFormat::Q3G64Fp16 && weight.layout == WeightLayout::RowSplitK128V1)
     {
-        launcher.launch("embedding", |submission| {
-            ops::embed_q3(
-                submission,
+        launcher.launch("embedding", |kernels| {
+            kernels.embed_q3(
                 slot(BufferSlot::TokenIds),
                 embedding.ptr,
                 slot(BufferSlot::HiddenState),
@@ -148,9 +139,8 @@ pub(crate) fn run(
     if let Some(head) = head
         && let Some((out, input)) = matrix(head)
     {
-        launcher.launch("nvfp4", |submission| {
-            ops::linear_nvfp4_bf16(
-                submission,
+        launcher.launch("nvfp4", |kernels| {
+            kernels.linear_nvfp4_bf16(
                 slot(BufferSlot::InputNormalized),
                 head.ptr,
                 slot(BufferSlot::Logits),
@@ -178,9 +168,8 @@ pub(crate) fn run(
                 if needed > scratch.bytes() as u64 {
                     continue;
                 }
-                launcher.launch(module, |submission| {
-                    ops::linear_nvfp4_native_bf16(
-                        submission,
+                launcher.launch(module, |kernels| {
+                    kernels.linear_nvfp4_native_bf16(
                         slot(BufferSlot::Swiglu),
                         down.ptr,
                         slot(BufferSlot::FfnDelta),

@@ -143,6 +143,34 @@ where
         planned.map_err(|error| refused(call, error))
     }
 
+    /// Enqueues the copy of `bytes` bytes at `start` to the device, refused as the native upload is: nothing to copy, or
+    /// no destination.
+    ///
+    /// # Safety
+    /// `start` addresses `bytes` readable host bytes that stay alive and unmodified until the lane's work has retired.
+    unsafe fn upload(&mut self, destination: DevicePtr, start: *const u8, bytes: usize) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_copy_upload_to_device";
+        if bytes == 0 || destination.is_null() {
+            return Err(rejected(CALL));
+        }
+        // SAFETY: the caller's contract.
+        unsafe { self.queue.copy_to_device(destination.get(), start, bytes) }.map_err(|error| lane_error(CALL, &error))
+    }
+
+    /// Enqueues the copy of `bytes` device bytes to `start`, refused as the native readback is: nothing to copy, or no
+    /// source.
+    ///
+    /// # Safety
+    /// `start` addresses `bytes` writable host bytes that stay alive and unread until the lane's work has retired.
+    unsafe fn download(&mut self, start: *mut u8, source: DevicePtr, bytes: usize) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_copy_device_to_readback";
+        if bytes == 0 || source.is_null() {
+            return Err(rejected(CALL));
+        }
+        // SAFETY: the caller's contract.
+        unsafe { self.queue.copy_to_host(start, source.get(), bytes) }.map_err(|error| lane_error(CALL, &error))
+    }
+
     fn append(&mut self, call: &'static str, format: CacheFormat, shape: AppendShape) -> Result<(), CudaError> {
         self.planned(call, |sink| plan_kv_append(format, &shape, &mut |launch| sink(launch)))
     }
@@ -777,15 +805,38 @@ where
         source: DevicePtr,
         bytes: usize,
     ) -> Result<(), CudaError> {
-        const CALL: &str = "euhedral_cuda_copy_device_to_readback";
         let start = pinned_range(destination, offset, bytes)?;
-        if bytes == 0 || source.is_null() {
-            return Err(rejected(CALL));
-        }
         // SAFETY: the range is inside the pinned buffer; the caller's contract keeps it alive and the host's accesses
         // atomic until the copy has retired.
-        unsafe { self.queue.copy_to_host(start.cast_mut(), source.get(), bytes) }
-            .map_err(|error| lane_error(CALL, &error))
+        unsafe { self.download(start.cast_mut(), source, bytes) }
+    }
+
+    unsafe fn copy_upload_to_device(
+        &mut self,
+        destination: DevicePtr,
+        source: &PinnedBuffer,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), CudaError> {
+        let start = pinned_range(source, offset, bytes)?;
+        // SAFETY: the range is inside the pinned buffer, which the caller keeps alive and unmodified until the copy has
+        // retired.
+        unsafe { self.upload(destination, start, bytes) }
+    }
+
+    unsafe fn copy_device_to_readback(
+        &mut self,
+        destination: &mut PinnedBuffer,
+        offset: usize,
+        source: DevicePtr,
+        bytes: usize,
+    ) -> Result<(), CudaError> {
+        pinned_range(destination, offset, bytes)?;
+        // SAFETY: the range is inside the pinned buffer, which the caller keeps alive and unread until the copy has
+        // retired.
+        let start = unsafe { destination.as_mut_ptr().add(offset) };
+        // SAFETY: as above.
+        unsafe { self.download(start, source, bytes) }
     }
 
     unsafe fn copy_host_weights_to_device(
@@ -795,14 +846,9 @@ where
         offset: usize,
         bytes: usize,
     ) -> Result<(), CudaError> {
-        const CALL: &str = "euhedral_cuda_copy_upload_to_device";
         let start = arena_range(source, offset, bytes)?;
-        if bytes == 0 || destination.is_null() {
-            return Err(rejected(CALL));
-        }
         // SAFETY: the range is inside the arena, which the caller keeps alive and unmodified until the copy has retired.
-        unsafe { self.queue.copy_to_device(destination.get(), start.cast_const(), bytes) }
-            .map_err(|error| lane_error(CALL, &error))
+        unsafe { self.upload(destination, start.cast_const(), bytes) }
     }
 
     unsafe fn copy_device_to_host_weights(
@@ -812,13 +858,9 @@ where
         source: DevicePtr,
         bytes: usize,
     ) -> Result<(), CudaError> {
-        const CALL: &str = "euhedral_cuda_copy_device_to_readback";
         let start = arena_range(destination, offset, bytes)?;
-        if bytes == 0 || source.is_null() {
-            return Err(rejected(CALL));
-        }
         // SAFETY: the range is inside the arena, which the caller keeps alive and unread until the copy has retired.
-        unsafe { self.queue.copy_to_host(start, source.get(), bytes) }.map_err(|error| lane_error(CALL, &error))
+        unsafe { self.download(start, source, bytes) }
     }
 }
 

@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use euhedral_core::frames::Frame;
 use euhedral_data_structures::queues::{Consumer, Single};
 use euhedral_graph::QuantumOutcome;
-use euhedral_inference_cuda::{DevicePtr, PooledPinned, Submission, SubmitMode, ops};
+use euhedral_inference_cuda::{DevicePtr, KernelOps, PooledPinned, Submission, SubmitMode};
 
 use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
@@ -924,23 +924,15 @@ impl Owner {
         let marker = {
             let submission =
                 Submission::begin(core.owner_lane(), SubmitMode::default()).map_err(why("the owner's lane"))?;
+            let mut kernels = &submission;
             // SAFETY: the loan is held by the message that follows the copy, which is offered only once the lane has
             // reached the marker; nothing reads or writes the bytes before.
-            unsafe {
-                ops::copy_device_to_readback(
-                    &submission,
-                    loan.buffer_mut(),
-                    0,
-                    quantum.slot(BufferSlot::Logits),
-                    bytes,
-                )
-            }
-            .map_err(why("queueing the logits row's copy"))?;
+            unsafe { kernels.copy_device_to_readback(loan.buffer_mut(), 0, quantum.slot(BufferSlot::Logits), bytes) }
+                .map_err(why("queueing the logits row's copy"))?;
             if wants_hidden {
                 // SAFETY: as above; the hidden row follows the logits row in the loan.
                 unsafe {
-                    ops::copy_device_to_readback(
-                        &submission,
+                    kernels.copy_device_to_readback(
                         loan.buffer_mut(),
                         bytes,
                         quantum
@@ -1113,8 +1105,9 @@ impl Owner {
                     .as_mut()
                     .ok_or_else(|| "the sequence has no MTP cache".to_string())?,
             };
+            let mut kernels = &submission;
             cache
-                .reserve(&submission, &core.pool, start, rows as u64, &mut retained)
+                .reserve_with(&submission, &mut kernels, &core.pool, start, rows as u64, &mut retained)
                 .map_err(why("reserving the cache's rows"))?;
             cache.appended(rows as u64).map_err(why("the cache's frontier"))?;
             submission.finish_signalled().map_err(why("the reservation"))?

@@ -7,6 +7,8 @@ use super::*;
 enum Call {
     Copy { to: u64, from: u64, bytes: usize },
     Memset { at: u64, value: u8, bytes: usize },
+    ToDevice { to: u64, from: usize, bytes: usize },
+    ToHost { to: usize, from: u64, bytes: usize },
 }
 
 #[derive(Default)]
@@ -21,12 +23,22 @@ impl LaneEnqueue for Recording {
         panic!("no kernel is available in these tests, so nothing launches");
     }
 
-    unsafe fn copy_to_device(&mut self, _: u64, _: *const u8, _: usize) -> Result<(), GpuError> {
-        panic!("not under test");
+    unsafe fn copy_to_device(&mut self, dst: u64, src: *const u8, bytes: usize) -> Result<(), GpuError> {
+        self.calls.push(Call::ToDevice {
+            to: dst,
+            from: src as usize,
+            bytes,
+        });
+        Ok(())
     }
 
-    unsafe fn copy_to_host(&mut self, _: *mut u8, _: u64, _: usize) -> Result<(), GpuError> {
-        panic!("not under test");
+    unsafe fn copy_to_host(&mut self, dst: *mut u8, src: u64, bytes: usize) -> Result<(), GpuError> {
+        self.calls.push(Call::ToHost {
+            to: dst as usize,
+            from: src,
+            bytes,
+        });
+        Ok(())
     }
 
     unsafe fn copy_on_device(&mut self, dst: u64, src: u64, bytes: usize) -> Result<(), GpuError> {
@@ -226,5 +238,61 @@ fn a_copy_the_native_wrapper_refuses_is_refused() {
         status(ops.copy_device_to_device_2d(ptr(256), u64::MAX / 2, ptr(512), u64::MAX / 2, 8, 4)),
         SIZE_OVERFLOW
     );
+    assert!(queue.calls.is_empty());
+}
+
+#[test]
+fn an_upload_and_a_readback_are_one_lane_copy_each_in_call_order() {
+    let table = KernelTable::all_unavailable(false);
+    let mut queue = Recording::default();
+    {
+        let mut ops = RusteeOps::new(&mut queue, &table, Modes::default());
+        // SAFETY: the recording queue never dereferences the host addresses.
+        unsafe {
+            ops.upload(ptr(0x1000), 0x7000 as *const u8, 48).unwrap();
+            ops.download(0x8000 as *mut u8, ptr(0x2000), 16).unwrap();
+        }
+    }
+    assert_eq!(
+        queue.calls,
+        vec![
+            Call::ToDevice {
+                to: 0x1000,
+                from: 0x7000,
+                bytes: 48
+            },
+            Call::ToHost {
+                to: 0x8000,
+                from: 0x2000,
+                bytes: 16
+            },
+        ]
+    );
+}
+
+#[test]
+fn an_upload_or_a_readback_the_native_wrapper_refuses_queues_nothing() {
+    let table = KernelTable::all_unavailable(false);
+    let mut queue = Recording::default();
+    let mut ops = RusteeOps::new(&mut queue, &table, Modes::default());
+    // SAFETY: the recording queue never dereferences the host addresses, and nothing is queued.
+    unsafe {
+        assert_eq!(
+            status(ops.upload(DevicePtr::NULL, 0x7000 as *const u8, 8)),
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            status(ops.upload(ptr(0x1000), 0x7000 as *const u8, 0)),
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            status(ops.download(0x8000 as *mut u8, DevicePtr::NULL, 8)),
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            status(ops.download(0x8000 as *mut u8, ptr(0x2000), 0)),
+            INVALID_ARGUMENT
+        );
+    }
     assert!(queue.calls.is_empty());
 }
