@@ -379,6 +379,7 @@ version = "0.1.0"
 dependencies = [
  "euhedral-gpu",
  "euhedral-graph",
+ "euhedral-inference-cuda",
  "euhedral-io",
  "libloading",
  "tempfile",
