@@ -187,7 +187,7 @@ pub unsafe fn copy_device_to_host_weights(
 }
 
 /// The address of `bytes` at `offset` of `arena`, refused when they leave it.
-fn arena_range(arena: &HostWeightsArena, offset: usize, bytes: usize) -> Result<*mut u8, CudaError> {
+pub(crate) fn arena_range(arena: &HostWeightsArena, offset: usize, bytes: usize) -> Result<*mut u8, CudaError> {
     match offset.checked_add(bytes) {
         // SAFETY: `offset` is within the arena.
         Some(end) if end <= arena.len() => Ok(unsafe { arena.device_writable_ptr().add(offset) }),
@@ -199,7 +199,7 @@ fn arena_range(arena: &HostWeightsArena, offset: usize, bytes: usize) -> Result<
 }
 
 /// The address of `bytes` at `offset` of `buffer`, refused when they leave it.
-fn pinned_range(buffer: &PinnedBuffer, offset: usize, bytes: usize) -> Result<*const u8, CudaError> {
+pub(crate) fn pinned_range(buffer: &PinnedBuffer, offset: usize, bytes: usize) -> Result<*const u8, CudaError> {
     match offset.checked_add(bytes) {
         // SAFETY: `offset` is within the buffer.
         Some(end) if end <= buffer.len() => Ok(unsafe { buffer.as_ptr().add(offset) }),

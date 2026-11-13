@@ -6,6 +6,7 @@ pub mod formats;
 mod frames;
 pub mod generation;
 pub mod handoff;
+pub mod kernels;
 pub mod model;
 pub mod plan;
 pub mod quantum;

@@ -110,11 +110,30 @@ pub struct ModuleTiming {
 pub struct KernelTable {
     slots: Vec<Slot>,
     timings: Vec<ModuleTiming>,
+    architecture_target: bool,
 }
 
 impl KernelTable {
     pub fn get(&self, kernel: KernelId) -> &Slot {
         &self.slots[kernel.index()]
+    }
+
+    /// A table in which no kernel is available.
+    #[cfg(test)]
+    pub(crate) fn all_unavailable(architecture_target: bool) -> Self {
+        Self {
+            slots: KERNELS
+                .iter()
+                .map(|_| Slot::Unavailable(Unavailable::SymbolMissing))
+                .collect(),
+            timings: Vec::new(),
+            architecture_target,
+        }
+    }
+
+    /// Whether the device compiled the architecture-specific modules (the `architecture_target` the table planners take).
+    pub fn architecture_target(&self) -> bool {
+        self.architecture_target
     }
 
     /// The kernel's handle, when it is ready.
@@ -392,7 +411,11 @@ pub fn load(gpu: &Arc<CudaGpu>, sources: &KernelSources) -> Result<KernelTable, 
         };
         slots.push(slot);
     }
-    Ok(KernelTable { slots, timings })
+    Ok(KernelTable {
+        slots,
+        timings,
+        architecture_target,
+    })
 }
 
 /// What a failed kernel lookup means: a missing symbol or a refused shared-memory opt-in make that kernel unavailable (the
@@ -617,6 +640,7 @@ mod tests {
                 .map(|_| Slot::Unavailable(Unavailable::SymbolMissing))
                 .collect(),
             timings: Vec::new(),
+            architecture_target: false,
         };
         assert_eq!(table.iter().count(), KERNELS.len());
         assert!(table.iter().enumerate().all(|(index, (id, _))| id.index() == index));

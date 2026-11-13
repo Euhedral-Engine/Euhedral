@@ -1,0 +1,230 @@
+use euhedral_gpu::{Args, GpuError, Launch as Geometry};
+
+use super::*;
+
+/// What the recording queue was asked, in order.
+#[derive(Debug, PartialEq, Eq)]
+enum Call {
+    Copy { to: u64, from: u64, bytes: usize },
+    Memset { at: u64, value: u8, bytes: usize },
+}
+
+#[derive(Default)]
+struct Recording {
+    calls: Vec<Call>,
+}
+
+impl LaneEnqueue for Recording {
+    type Kernel = CudaKernel;
+
+    unsafe fn launch(&mut self, _: &CudaKernel, _: Geometry, _: &Args) -> Result<(), GpuError> {
+        panic!("no kernel is available in these tests, so nothing launches");
+    }
+
+    unsafe fn copy_to_device(&mut self, _: u64, _: *const u8, _: usize) -> Result<(), GpuError> {
+        panic!("not under test");
+    }
+
+    unsafe fn copy_to_host(&mut self, _: *mut u8, _: u64, _: usize) -> Result<(), GpuError> {
+        panic!("not under test");
+    }
+
+    unsafe fn copy_on_device(&mut self, dst: u64, src: u64, bytes: usize) -> Result<(), GpuError> {
+        self.calls.push(Call::Copy {
+            to: dst,
+            from: src,
+            bytes,
+        });
+        Ok(())
+    }
+
+    unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError> {
+        self.calls.push(Call::Memset { at: dst, value, bytes });
+        Ok(())
+    }
+}
+
+fn ptr(address: u64) -> DevicePtr {
+    // SAFETY: nothing here dereferences an address.
+    unsafe { DevicePtr::from_raw(address) }
+}
+
+fn status(result: Result<(), CudaError>) -> i32 {
+    match result {
+        Err(CudaError::Call { status, .. }) => status,
+        other => panic!("expected a refusal with a status, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_row_exact_selection_changes_later_plans_and_not_the_mode_the_quantum_began_in() {
+    let table = KernelTable::all_unavailable(false);
+    let mut queue = Recording::default();
+    let mut ops = RusteeOps::new(&mut queue, &table, Modes::default());
+    assert!(!ops.row_exact());
+    ops.set_row_exact(true);
+    assert!(ops.modes().row_exact);
+    assert!(!ops.row_exact(), "the quantum's own mode does not follow the selection");
+    ops.set_row_exact(false);
+    assert!(!ops.modes().row_exact);
+
+    let mut ops = RusteeOps::new(
+        &mut queue,
+        &table,
+        Modes {
+            row_exact: true,
+            exact_numerics: true,
+        },
+    );
+    assert!(ops.row_exact() && ops.exact_numerics());
+    ops.set_row_exact(false);
+    assert!(ops.row_exact(), "it began row-exact");
+    assert!(!ops.modes().row_exact);
+}
+
+#[test]
+fn a_planner_refusal_is_the_status_the_native_wrapper_returns() {
+    let table = KernelTable::all_unavailable(false);
+    let mut queue = Recording::default();
+    let mut ops = RusteeOps::new(&mut queue, &table, Modes::default());
+    // A null operand: invalid argument.
+    assert_eq!(
+        status(ops.residual_add_bf16(DevicePtr::NULL, ptr(256), ptr(512), 1, 8)),
+        INVALID_ARGUMENT
+    );
+    assert_eq!(status(ops.argmax_bf16(ptr(256), 0, ptr(512))), INVALID_ARGUMENT);
+    // The native NVFP4 route declines a width that is not a multiple of 128: the caller takes the other route.
+    assert_eq!(
+        status(ops.linear_nvfp4_native_bf16(ptr(256), ptr(512), ptr(768), ptr(1024), 16, 64, 64, 1 << 20, 1 << 20)),
+        ROUTE_UNAVAILABLE
+    );
+    // A table kernel that is out of range.
+    assert_eq!(
+        status(ops.linear_launch(99, [1, 1, 1], [32, 1, 1], 0, &[], &[])),
+        INVALID_ARGUMENT
+    );
+    // The native route also declines under exact numerics.
+    let mut exact = RusteeOps::new(
+        &mut queue,
+        &table,
+        Modes {
+            row_exact: false,
+            exact_numerics: true,
+        },
+    );
+    assert_eq!(
+        status(exact.linear_nvfp4_native_bf16(ptr(256), ptr(512), ptr(768), ptr(1024), 16, 128, 128, 1 << 20, 1 << 20)),
+        ROUTE_UNAVAILABLE
+    );
+    assert!(queue.calls.is_empty(), "a refused call queued nothing");
+}
+
+#[test]
+fn a_kernel_the_device_lacks_is_an_error_naming_it_and_queues_nothing() {
+    let table = KernelTable::all_unavailable(false);
+    let mut queue = Recording::default();
+    let mut ops = RusteeOps::new(&mut queue, &table, Modes::default());
+    let error = ops
+        .residual_add_bf16(ptr(256), ptr(512), ptr(768), 2, 64)
+        .expect_err("no kernel is loaded");
+    let CudaError::Argument(message) = error else {
+        panic!("expected the reason, got {error:?}");
+    };
+    assert!(message.contains("euhedral_residual_add_bf16"), "{message}");
+    assert!(message.contains("unavailable"), "{message}");
+    assert!(queue.calls.is_empty());
+}
+
+#[test]
+fn the_architecture_specific_table_kernels_answer_route_unavailable_without_the_target() {
+    let table = KernelTable::all_unavailable(false);
+    let mut queue = Recording::default();
+    let mut ops = RusteeOps::new(&mut queue, &table, Modes::default());
+    // Entry 9 of the shared linear table is the block-scaled FP8 kernel, of an architecture-specific module.
+    assert_eq!(
+        status(ops.linear_launch(9, [1, 1, 1], [32, 1, 1], 0, &[], &[])),
+        ROUTE_UNAVAILABLE
+    );
+    assert!(!ops.linear_kernel_available(9).unwrap());
+    assert!(ops.linear_kernel_available(11).is_err(), "the table has 11 entries");
+}
+
+#[test]
+fn copies_and_the_memset_are_the_lanes_own_operations_in_call_order() {
+    let table = KernelTable::all_unavailable(false);
+    let mut queue = Recording::default();
+    {
+        let mut ops = RusteeOps::new(&mut queue, &table, Modes::default());
+        ops.copy_device_to_device(ptr(0x1000), ptr(0x2000), 64).unwrap();
+        ops.zero_device_memory(ptr(0x3000), 32).unwrap();
+        // Pitched: one copy per row, at each row's own offsets.
+        ops.copy_device_to_device_2d(ptr(0x4000), 256, ptr(0x5000), 128, 100, 3)
+            .unwrap();
+        // Contiguous rows are one copy.
+        ops.copy_device_to_device_2d(ptr(0x6000), 100, ptr(0x7000), 100, 100, 3)
+            .unwrap();
+        // Nothing to copy is not an error, as the native wrappers have it.
+        ops.copy_device_to_device(ptr(0x8000), ptr(0x9000), 0).unwrap();
+        ops.copy_device_to_device_2d(ptr(0x8000), 8, ptr(0x9000), 8, 8, 0)
+            .unwrap();
+    }
+    assert_eq!(
+        queue.calls,
+        vec![
+            Call::Copy {
+                to: 0x1000,
+                from: 0x2000,
+                bytes: 64
+            },
+            Call::Memset {
+                at: 0x3000,
+                value: 0,
+                bytes: 32
+            },
+            Call::Copy {
+                to: 0x4000,
+                from: 0x5000,
+                bytes: 100
+            },
+            Call::Copy {
+                to: 0x4100,
+                from: 0x5080,
+                bytes: 100
+            },
+            Call::Copy {
+                to: 0x4200,
+                from: 0x5100,
+                bytes: 100
+            },
+            Call::Copy {
+                to: 0x6000,
+                from: 0x7000,
+                bytes: 300
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_copy_the_native_wrapper_refuses_is_refused() {
+    let table = KernelTable::all_unavailable(false);
+    let mut queue = Recording::default();
+    let mut ops = RusteeOps::new(&mut queue, &table, Modes::default());
+    assert_eq!(
+        status(ops.copy_device_to_device(DevicePtr::NULL, ptr(256), 8)),
+        INVALID_ARGUMENT
+    );
+    assert_eq!(status(ops.zero_device_memory(ptr(256), 0)), INVALID_ARGUMENT);
+    assert_eq!(status(ops.zero_device_memory(DevicePtr::NULL, 8)), INVALID_ARGUMENT);
+    // A pitch below the row.
+    assert_eq!(
+        status(ops.copy_device_to_device_2d(ptr(256), 4, ptr(512), 8, 8, 2)),
+        INVALID_ARGUMENT
+    );
+    // Rows whose extent overflows 64 bits.
+    assert_eq!(
+        status(ops.copy_device_to_device_2d(ptr(256), u64::MAX / 2, ptr(512), u64::MAX / 2, 8, 4)),
+        SIZE_OVERFLOW
+    );
+    assert!(queue.calls.is_empty());
+}

@@ -7,6 +7,7 @@ pub mod embedding;
 pub mod gdn;
 pub mod load;
 pub mod nvfp4;
+pub mod ops;
 pub mod queue;
 pub mod table;
 
