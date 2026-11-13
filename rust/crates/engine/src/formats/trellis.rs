@@ -16,7 +16,7 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use euhedral_inference_cuda::{CudaError, CudaLibrary, DevicePtr, KernelOps};
+use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps};
 use euhedral_inference_edrl::WeightFormat;
 use euhedral_inference_settings::{Auto, TrellisKernelSettings};
 
@@ -262,13 +262,13 @@ impl TrellisLinear {
     /// rows, `TRELLIS_MMA_ROWS64_FP8` from there). Both live in the one architecture-specific module
     /// (`trellis_fp8/kernels.cu`, sm_12xa), so a device has both or neither; asking for both makes the answer
     /// independent of the rows and cacheable, and the two never differ.
-    fn block_fp8(&self, library: &CudaLibrary) -> Result<bool, CudaError> {
+    fn block_fp8(&self, kernels: &dyn KernelOps) -> Result<bool, CudaError> {
         match self.fp8.load(Ordering::Relaxed) {
             1 => Ok(true),
             2 => Ok(false),
             _ => {
-                let available = library.linear_kernel_available(LinearKernel::TrellisMmaRowsFp8.index())?
-                    && library.linear_kernel_available(LinearKernel::TrellisMmaRows64Fp8.index())?;
+                let available = kernels.linear_kernel_available(LinearKernel::TrellisMmaRowsFp8.index())?
+                    && kernels.linear_kernel_available(LinearKernel::TrellisMmaRows64Fp8.index())?;
                 self.fp8.store(if available { 1 } else { 2 }, Ordering::Relaxed);
                 Ok(available)
             }
@@ -325,9 +325,8 @@ impl LinearFormat for TrellisLinear {
             row_exact: mode.row_exact || kernels.row_exact(),
             ..mode
         };
-        let library = kernels.library();
-        let exact = self.exact_numerics || library.exact_numerics();
-        let block_fp8 = !exact && self.block_fp8(library)?;
+        let exact = self.exact_numerics || kernels.exact_numerics();
+        let block_fp8 = !exact && self.block_fp8(kernels)?;
         self.plan_with(exact, &shape, &operands, rows, mode, block_fp8, &mut |launch| {
             if self.record {
                 ShapeRecorder::record(launch.line());
