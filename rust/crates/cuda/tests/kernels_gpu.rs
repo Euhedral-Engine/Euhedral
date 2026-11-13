@@ -214,6 +214,9 @@ fn the_twin_harness_compares_a_wrapper_with_its_plan_bit_for_bit() {
         }),
         plan: Box::new(move |pointers| planned(pointers, delta_index)),
         outputs: vec![2],
+        row_exact: false,
+        tables: Vec::new(),
+        scratch: Vec::new(),
     };
     let verdict = twin.run(&case(1)).expect("the case runs");
     println!("residual add: {verdict:?}");

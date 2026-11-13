@@ -176,6 +176,9 @@ fn gdn_outputs_equal_the_native_library_bit_for_bit() {
                     vec![0; (rows * heads) as usize * 4],
                 ];
                 let case = Case {
+                    row_exact: false,
+                    tables: Vec::new(),
+                    scratch: Vec::new(),
                     name: "project control",
                     buffers,
                     prepare: None,
@@ -229,6 +232,9 @@ fn gdn_outputs_equal_the_native_library_bit_for_bit() {
                     vec![0; (rows * channels) as usize * 2],
                 ];
                 let case = Case {
+                    row_exact: false,
+                    tables: Vec::new(),
+                    scratch: Vec::new(),
                     name: "convolution",
                     buffers,
                     prepare: None,
@@ -265,6 +271,9 @@ fn gdn_outputs_equal_the_native_library_bit_for_bit() {
                 let heads = Heads { key, value };
                 let buffers = recurrence_buffers(&mut rng, rows, heads);
                 let case = Case {
+                    row_exact: false,
+                    tables: Vec::new(),
+                    scratch: Vec::new(),
                     name: "recurrence",
                     buffers,
                     prepare: None,
@@ -296,6 +305,9 @@ fn gdn_outputs_equal_the_native_library_bit_for_bit() {
                 vec![0; rows as usize * width * 2],
             ];
             let case = Case {
+                row_exact: false,
+                tables: Vec::new(),
+                scratch: Vec::new(),
                 name: "gated rms norm",
                 buffers,
                 prepare: None,
@@ -362,6 +374,9 @@ fn gdn_outputs_equal_the_native_library_bit_for_bit() {
                 ..modes
             };
             let case = Case {
+                row_exact: false,
+                tables: Vec::new(),
+                scratch: Vec::new(),
                 name: "stage",
                 buffers,
                 prepare: None,

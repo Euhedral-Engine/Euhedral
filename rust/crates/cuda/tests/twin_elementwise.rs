@@ -95,6 +95,9 @@ fn elementwise_outputs_equal_the_native_library_bit_for_bit() {
             let shape = format!("rows={rows} width={width}");
             let buffers = vec![rng.bf16_bytes(count), rng.bf16_bytes(count), vec![0; count * 2]];
             let case = Case {
+                row_exact: false,
+                tables: Vec::new(),
+                scratch: Vec::new(),
                 name: "residual add",
                 buffers,
                 prepare: None,
@@ -121,6 +124,9 @@ fn elementwise_outputs_equal_the_native_library_bit_for_bit() {
 
             let buffers = vec![rng.bf16_bytes(count * 2), vec![0; count * 2]];
             let case = Case {
+                row_exact: false,
+                tables: Vec::new(),
+                scratch: Vec::new(),
                 name: "swiglu",
                 buffers,
                 prepare: None,
@@ -166,6 +172,9 @@ fn elementwise_outputs_equal_the_native_library_bit_for_bit() {
                     vec![0; count * 2],
                 ];
                 let case = Case {
+                    row_exact: false,
+                    tables: Vec::new(),
+                    scratch: Vec::new(),
                     name: "residual rms norm",
                     buffers,
                     prepare: None,
@@ -206,6 +215,9 @@ fn elementwise_outputs_equal_the_native_library_bit_for_bit() {
                         vec![0; count * 2],
                     ];
                     let case = Case {
+                        row_exact: false,
+                        tables: Vec::new(),
+                        scratch: Vec::new(),
                         name: "rms norm",
                         buffers,
                         prepare: None,
@@ -262,6 +274,9 @@ fn elementwise_outputs_equal_the_native_library_bit_for_bit() {
             let shape = format!("count={count} tied={tied}");
             for with_logprob in [false, true] {
                 let case = Case {
+                    row_exact: false,
+                    tables: Vec::new(),
+                    scratch: Vec::new(),
                     name: "argmax",
                     buffers: vec![logits.clone(), vec![0; 16]],
                     prepare: None,
@@ -296,6 +311,9 @@ fn elementwise_outputs_equal_the_native_library_bit_for_bit() {
                     .flat_map(|_| ((rng.next() >> 40) as i32).to_le_bytes())
                     .collect();
                 let case = Case {
+                    row_exact: false,
+                    tables: Vec::new(),
+                    scratch: Vec::new(),
                     name: "selected token",
                     buffers: vec![logits.clone(), vec![0; 16], ids, vec![0xa5; 4]],
                     prepare: Some(Box::new(move |submission, p| {
