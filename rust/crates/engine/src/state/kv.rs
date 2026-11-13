@@ -315,7 +315,9 @@ impl KvCache {
     }
 
     /// As [`reserve`](Self::reserve), with the table upload queued through `kernels`, which must queue on the lane of
-    /// `submission`, where the pages are allocated.
+    /// `submission`. The pages and the table are allocated stream-ordered on `submission`'s lane; an upload queued on
+    /// another stream can run before that allocation has completed, and write the table before it exists. Nothing in
+    /// [`KernelOps`] names the lane it queues on, so this is not checked.
     pub fn reserve_with(
         &mut self,
         submission: &Submission<'_>,

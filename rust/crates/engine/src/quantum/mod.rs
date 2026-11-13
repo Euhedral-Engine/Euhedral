@@ -30,7 +30,9 @@ use euhedral_graph::{
     DeviceQueue, EdgeKind, ExternalEdge, GraphError, GraphRuntime, LaneId, Marker, QuantumOutcome, QuantumRef, Stage,
     StageCx, StageError, StageGraph, StageGraphSpec, StageId, StageSpec, Submitted,
 };
-use euhedral_inference_cuda::{AllocationId, CudaError, CudaLane, GraphExec, PinnedPool, Submission, SubmitMode, ops};
+use euhedral_inference_cuda::{
+    AllocationId, CudaError, CudaLane, GraphExec, KernelOps, PinnedPool, Submission, SubmitMode,
+};
 use thiserror::Error;
 
 pub use capture_key::{CaptureKey, split_geometry};
@@ -87,6 +89,12 @@ impl Quantum {
     /// quantum reads ([`SequenceState::refs`](crate::state::SequenceState::refs)); that reservation is not part of
     /// the quantum.
     pub fn prepare(&mut self, pool: &Arc<PinnedPool>, submission: &Submission<'_>) -> Result<(), PrepareError> {
+        let mut kernels = submission;
+        self.prepare_with(pool, &mut kernels)
+    }
+
+    /// As [`prepare`](Self::prepare), with the upload queued through `kernels`.
+    pub fn prepare_with(&mut self, pool: &Arc<PinnedPool>, kernels: &mut dyn KernelOps) -> Result<(), PrepareError> {
         let zeros;
         let ids: &[u32] = if self.tokens.len() == self.rows {
             &self.tokens
@@ -101,15 +109,7 @@ impl Quantum {
         loan.buffer_mut().as_mut_slice()[..record.len()].copy_from_slice(&record);
         // SAFETY: the loan is held by the quantum, which is dropped only after its device work retired, and nothing
         // writes it again.
-        unsafe {
-            ops::copy_upload_to_device(
-                submission,
-                self.slot(BufferSlot::TokenIds),
-                loan.buffer(),
-                0,
-                record.len(),
-            )
-        }?;
+        unsafe { kernels.copy_upload_to_device(self.slot(BufferSlot::TokenIds), loan.buffer(), 0, record.len()) }?;
         self.staging = Some(loan);
         self.uploaded = true;
         self.prepared = None;

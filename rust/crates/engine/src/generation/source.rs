@@ -1152,8 +1152,9 @@ impl Owner {
         let prepared = {
             let submission =
                 Submission::begin(core.owner_lane(), SubmitMode::default()).map_err(why("the owner's lane"))?;
+            let mut kernels = &submission;
             quantum
-                .prepare(&core.pool, &submission)
+                .prepare_with(&core.pool, &mut kernels)
                 .map_err(why("the input record"))?;
             submission
                 .finish_signalled()

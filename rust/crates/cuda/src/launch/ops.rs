@@ -8,8 +8,7 @@
 //! still can); a kernel the device lacks, or a launch RustEE refuses, is [`CudaError::Argument`] with the reason. Neither
 //! falls back to the native library.
 //!
-//! Copies and the memset are the lane's own operations. RustEE has no pitched copy at this revision, so the 2D copy is
-//! one copy per row (a single copy when both pitches equal the row).
+//! Copies and the memset are the lane's own operations. A pitched 2D copy is RustEE's pitched copy on the lane (a single copy when both pitches equal the row).
 
 use std::fmt;
 
@@ -37,7 +36,7 @@ use crate::launch::queue::{EnqueueError, enqueue};
 use crate::launch::table::{Geometry, plan_linear_launch, plan_qwen4_launch};
 use crate::launch::{Modes, PlanError};
 use crate::memory::{DevicePtr, HostWeightsArena, PinnedBuffer};
-use crate::ops::{KernelOps, arena_range, pinned_range};
+use crate::ops::{KernelOps, range_start};
 use crate::sys::{
     EUHEDRAL_CUDA_FORMAT_MISMATCH as FORMAT_MISMATCH, EUHEDRAL_CUDA_INVALID_ARGUMENT as INVALID_ARGUMENT,
     EUHEDRAL_CUDA_ROUTE_UNAVAILABLE as ROUTE_UNAVAILABLE, EUHEDRAL_CUDA_SIZE_OVERFLOW as SIZE_OVERFLOW,
@@ -53,6 +52,10 @@ fn refused(call: &'static str, error: PlanError) -> CudaError {
     };
     CudaError::Call { call, status }
 }
+
+/// What a refused host range names.
+const PINNED: &str = "pinned buffer";
+const ARENA: &str = "host arena";
 
 fn rejected(call: &'static str) -> CudaError {
     CudaError::Call {
@@ -143,31 +146,48 @@ where
         planned.map_err(|error| refused(call, error))
     }
 
-    /// Enqueues the copy of `bytes` bytes at `start` to the device, refused as the native upload is: nothing to copy, or
-    /// no destination.
+    /// Enqueues the copy of `bytes` bytes at `offset` of the `len` host bytes at `base` to the device, refused as the
+    /// native upload is: a range outside the host bytes, nothing to copy, or no destination.
     ///
     /// # Safety
-    /// `start` addresses `bytes` readable host bytes that stay alive and unmodified until the lane's work has retired.
-    unsafe fn upload(&mut self, destination: DevicePtr, start: *const u8, bytes: usize) -> Result<(), CudaError> {
+    /// `base` addresses `len` readable host bytes that stay alive and unmodified until the lane's work has retired.
+    unsafe fn upload(
+        &mut self,
+        destination: DevicePtr,
+        (base, len): (*mut u8, usize),
+        offset: usize,
+        bytes: usize,
+        what: &str,
+    ) -> Result<(), CudaError> {
         const CALL: &str = "euhedral_cuda_copy_upload_to_device";
+        let start = range_start(base, len, offset, bytes, what)?;
         if bytes == 0 || destination.is_null() {
             return Err(rejected(CALL));
         }
-        // SAFETY: the caller's contract.
-        unsafe { self.queue.copy_to_device(destination.get(), start, bytes) }.map_err(|error| lane_error(CALL, &error))
+        // SAFETY: the range is inside the host bytes, which the caller's contract keeps.
+        unsafe { self.queue.copy_to_device(destination.get(), start.cast_const(), bytes) }
+            .map_err(|error| lane_error(CALL, &error))
     }
 
-    /// Enqueues the copy of `bytes` device bytes to `start`, refused as the native readback is: nothing to copy, or no
-    /// source.
+    /// Enqueues the copy of `bytes` device bytes to `offset` of the `len` host bytes at `base`, refused as the native
+    /// readback is: a range outside the host bytes, nothing to copy, or no source.
     ///
     /// # Safety
-    /// `start` addresses `bytes` writable host bytes that stay alive and unread until the lane's work has retired.
-    unsafe fn download(&mut self, start: *mut u8, source: DevicePtr, bytes: usize) -> Result<(), CudaError> {
+    /// `base` addresses `len` writable host bytes that stay alive and unread until the lane's work has retired.
+    unsafe fn download(
+        &mut self,
+        (base, len): (*mut u8, usize),
+        offset: usize,
+        source: DevicePtr,
+        bytes: usize,
+        what: &str,
+    ) -> Result<(), CudaError> {
         const CALL: &str = "euhedral_cuda_copy_device_to_readback";
+        let start = range_start(base, len, offset, bytes, what)?;
         if bytes == 0 || source.is_null() {
             return Err(rejected(CALL));
         }
-        // SAFETY: the caller's contract.
+        // SAFETY: the range is inside the host bytes, which the caller's contract keeps.
         unsafe { self.queue.copy_to_host(start, source.get(), bytes) }.map_err(|error| lane_error(CALL, &error))
     }
 
@@ -797,10 +817,9 @@ where
         source: DevicePtr,
         bytes: usize,
     ) -> Result<(), CudaError> {
-        let start = pinned_range(destination, offset, bytes)?;
-        // SAFETY: the range is inside the pinned buffer; the caller's contract keeps it alive and the host's accesses
-        // atomic until the copy has retired.
-        unsafe { self.download(start.cast_mut(), source, bytes) }
+        let whole = (destination.as_ptr().cast_mut(), destination.len());
+        // SAFETY: the caller's contract keeps the buffer alive and the host's accesses atomic until the copy retires.
+        unsafe { self.download(whole, offset, source, bytes, PINNED) }
     }
 
     unsafe fn copy_upload_to_device(
@@ -810,10 +829,9 @@ where
         offset: usize,
         bytes: usize,
     ) -> Result<(), CudaError> {
-        let start = pinned_range(source, offset, bytes)?;
-        // SAFETY: the range is inside the pinned buffer, which the caller keeps alive and unmodified until the copy has
-        // retired.
-        unsafe { self.upload(destination, start, bytes) }
+        let whole = (source.as_ptr().cast_mut(), source.len());
+        // SAFETY: the caller keeps the buffer alive and unmodified until the copy has retired.
+        unsafe { self.upload(destination, whole, offset, bytes, PINNED) }
     }
 
     unsafe fn copy_device_to_readback(
@@ -823,12 +841,9 @@ where
         source: DevicePtr,
         bytes: usize,
     ) -> Result<(), CudaError> {
-        pinned_range(destination, offset, bytes)?;
-        // SAFETY: the range is inside the pinned buffer, which the caller keeps alive and unread until the copy has
-        // retired.
-        let start = unsafe { destination.as_mut_ptr().add(offset) };
-        // SAFETY: as above.
-        unsafe { self.download(start, source, bytes) }
+        let whole = (destination.as_mut_ptr(), destination.len());
+        // SAFETY: the caller keeps the buffer alive and unread until the copy has retired.
+        unsafe { self.download(whole, offset, source, bytes, PINNED) }
     }
 
     unsafe fn copy_host_weights_to_device(
@@ -838,9 +853,9 @@ where
         offset: usize,
         bytes: usize,
     ) -> Result<(), CudaError> {
-        let start = arena_range(source, offset, bytes)?;
-        // SAFETY: the range is inside the arena, which the caller keeps alive and unmodified until the copy has retired.
-        unsafe { self.upload(destination, start.cast_const(), bytes) }
+        let whole = (source.device_writable_ptr(), source.len());
+        // SAFETY: the caller keeps the arena alive and unmodified until the copy has retired.
+        unsafe { self.upload(destination, whole, offset, bytes, ARENA) }
     }
 
     unsafe fn copy_device_to_host_weights(
@@ -850,9 +865,9 @@ where
         source: DevicePtr,
         bytes: usize,
     ) -> Result<(), CudaError> {
-        let start = arena_range(destination, offset, bytes)?;
-        // SAFETY: the range is inside the arena, which the caller keeps alive and unread until the copy has retired.
-        unsafe { self.download(start, source, bytes) }
+        let whole = (destination.device_writable_ptr(), destination.len());
+        // SAFETY: the caller keeps the arena alive and unread until the copy has retired.
+        unsafe { self.download(whole, offset, source, bytes, ARENA) }
     }
 }
 
