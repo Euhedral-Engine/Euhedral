@@ -31,7 +31,8 @@ use crate::launch::catalog::{KERNELS, KernelId, Module, ids};
 pub const DEFAULT_DYNAMIC_SHARED_BYTES: u32 = 48 * 1024;
 
 /// The stack of the thread that compiles a module, in bytes unless the caller sets another: the native loader's own
-/// (256 MiB), because NVRTC recurses deeply on the largest modules. The engine passes `kernels.compile.stack`.
+/// (256 MiB), because NVRTC recurses deeply on the largest modules. The engine is to pass `kernels.compile.stack` when it loads its kernels through
+/// RustEE, which it does not do yet.
 pub const DEFAULT_COMPILE_STACK_BYTES: usize = 256 << 20;
 
 /// The NVRTC library files of the bundled compiler start with this. This is the one place that names the platform's
@@ -40,8 +41,7 @@ pub const DEFAULT_COMPILE_STACK_BYTES: usize = 256 << 20;
 const COMPILER_FILE_PREFIX: &str = "libnvrtc.so";
 
 /// What the pinned RustEE revision lacks. Each constant is `false` at this revision; a later revision that provides
-/// the capability flips it here, and the code that reads it (this file for the first two, `queue.rs` for the third)
-/// has its one marked branch to fill in. Nothing else in the crate knows.
+/// the capability flips it here, and the code that reads it (this file and `queue.rs`) has its one marked branch to fill in. Nothing else in the crate knows.
 pub mod pin {
     /// Compiling for an architecture-specific target (`sm_XYa`). While `false`, every module of
     /// [`Module::architecture_specific`](crate::launch::catalog::Module::architecture_specific) is unavailable.

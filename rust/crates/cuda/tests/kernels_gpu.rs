@@ -2,8 +2,8 @@
 //! `cargo test -p euhedral-inference-cuda --test kernels_gpu -- --ignored --test-threads=1 --nocapture`.
 //!
 //! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY`); a test skips with a
-//! message when it is absent, or when NVRTC cannot be found (`EUHEDRAL_NVRTC`, with its directory on
-//! `LD_LIBRARY_PATH`).
+//! message when it is absent, or when the bundled NVRTC is not beside it (the compiler `load`
+//! requires; its directory is on `LD_LIBRARY_PATH` for the builtins library).
 #![cfg(target_os = "linux")]
 #![allow(
     clippy::unwrap_used,
@@ -14,7 +14,6 @@
 
 mod common;
 
-use std::env::var_os;
 use std::fs::create_dir_all;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,14 +32,12 @@ fn library() -> Option<Arc<CudaLibrary>> {
     Some(CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads"))
 }
 
-/// Whether a compiler can be found at all; a test that compiles skips without one.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "a test reads the variable RustEE's compiler search reads"
-)]
+/// Whether the bundled compiler `load` requires is beside the library; a test that compiles skips without it.
 fn compiler_available(library: &CudaLibrary) -> bool {
-    let sources = KernelSources::beside(library).expect("the product directory");
-    sources.compiler().is_some() || var_os("EUHEDRAL_NVRTC").is_some()
+    KernelSources::beside(library)
+        .expect("the product directory")
+        .compiler()
+        .is_some()
 }
 
 fn millis(duration: Duration) -> f64 {
@@ -52,7 +49,7 @@ fn millis(duration: Duration) -> f64 {
 fn every_available_catalog_kernel_resolves_with_word_sized_parameters() {
     let Some(library) = library() else { return };
     if !compiler_available(&library) {
-        println!("skipped: no NVRTC beside the library and EUHEDRAL_NVRTC is not set");
+        println!("skipped: no bundled NVRTC beside the library");
         return;
     }
     let gpu = CudaGpu::open(0).expect("the device opens through RustEE");
@@ -157,7 +154,7 @@ fn every_available_catalog_kernel_resolves_with_word_sized_parameters() {
 fn the_twin_harness_compares_a_wrapper_with_its_plan_bit_for_bit() {
     let Some(library) = library() else { return };
     if !compiler_available(&library) {
-        println!("skipped: no NVRTC beside the library and EUHEDRAL_NVRTC is not set");
+        println!("skipped: no bundled NVRTC beside the library");
         return;
     }
     let mut twin = Twin::open(&library).expect("both sides open on one device");
