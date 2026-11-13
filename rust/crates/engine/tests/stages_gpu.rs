@@ -27,6 +27,7 @@ use std::cell::RefCell;
 use std::mem;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::process::abort;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -209,6 +210,10 @@ impl Rig {
     /// Runs `stage` as the only stage of a graph on the rig's lane, for the context RustEE builds around a stage (it
     /// builds no other), and returns what the stage answered. The graph is told the stage submitted nothing, so it
     /// retires at once; the test synchronizes the lane for the work itself.
+    #[allow(
+        clippy::print_stderr,
+        reason = "the process aborts on a timeout; nothing else can report it"
+    )]
     fn try_run(&self, stage: &dyn Stage<Quantum>, quantum: &Quantum) -> Result<Option<Marker>, StageError> {
         let answer = Handoff::new();
         let retired = Handoff::new();
@@ -240,9 +245,11 @@ impl Rig {
         .unwrap();
         let unit = self.lake.admit().unwrap();
         let _ = graph.start(Borrowed(quantum), Arc::new(AtomicBool::new(false)), Vec::new());
-        let outcome = retired
-            .wait(Duration::from_secs(60))
-            .expect("the graph retires the quantum");
+        let Ok(outcome) = retired.wait(Duration::from_secs(60)) else {
+            // Unwinding would free the stage and the quantum while graph frames may still use them: abort instead.
+            eprintln!("the graph did not retire the quantum in time");
+            abort();
+        };
         drop(unit);
         assert_eq!(
             outcome,

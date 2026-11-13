@@ -163,6 +163,28 @@ impl GenerationListener for Recorder {
     }
 }
 
+impl Drop for Recorder {
+    /// A listener dropped before its generation finished reports it as failed, so the test fails at once.
+    fn drop(&mut self) {
+        if let Some(done) = self.done.take() {
+            let now = Instant::now();
+            done.send(Recording {
+                tokens: mem::take(&mut self.tokens),
+                events: mem::take(&mut self.events),
+                verifications: mem::take(&mut self.verifications),
+                outcome: GenerationOutcome {
+                    reason: FinishReason::Failed("the listener was dropped before the generation finished".to_string()),
+                    prompt_tokens: 0,
+                    generated: 0,
+                    elapsed: Duration::ZERO,
+                },
+                first_token: self.first.unwrap_or(now),
+                last_token: self.last.unwrap_or(now),
+            });
+        }
+    }
+}
+
 fn generate(
     runtime: &EngineRuntime,
     prompt: &[u32],

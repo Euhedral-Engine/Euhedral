@@ -202,7 +202,32 @@ impl GenerationListener for Recorder {
     }
 }
 
-/// Runs a greedy generation and waits for its listener's latch.
+impl Drop for Recorder {
+    /// A listener dropped before its generation finished reports it as failed, so the test fails at once.
+    fn drop(&mut self) {
+        if let Some(done) = self.done.take() {
+            done.send(Recording {
+                tokens: mem::take(&mut self.tokens),
+                token_times: mem::take(&mut self.token_times),
+                events: mem::take(&mut self.events),
+                prefill_done: self.prefill_done,
+                outcome: dropped_outcome(),
+                began: self.began,
+            });
+        }
+    }
+}
+
+fn dropped_outcome() -> GenerationOutcome {
+    GenerationOutcome {
+        reason: FinishReason::Failed("the listener was dropped before the generation finished".to_string()),
+        prompt_tokens: 0,
+        generated: 0,
+        elapsed: Duration::ZERO,
+    }
+}
+
+/// Runs a greedy generation and waits for its listener's hand-off.
 fn generate(runtime: &EngineRuntime, prompt: &[u32], max_tokens: u32, stop_tokens: &[u32]) -> Recording {
     let done = Handoff::new();
     let waiting = Arc::clone(&done);
