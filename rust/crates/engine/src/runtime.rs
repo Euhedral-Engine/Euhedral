@@ -17,16 +17,16 @@ use euhedral_core::config::{FragmentConfig, LatticeConfig};
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::LatticeSource;
 use euhedral_core::impls::{BaseCloneableObject, DefaultExecutor};
-use euhedral_graph::{
-    AsyncIo, Completions, DeviceQueue, Lake, LaneId, LanePool, LatchSetter, OwnedFile, RawFile, UnitGuard,
-};
+use euhedral_graph::{Completions, DeviceQueue, Lake, LaneId, LanePool, UnitGuard};
 use euhedral_hardware_utils::util::CpuSet;
 use euhedral_inference_cuda::{CudaLane, CudaLibrary, PinnedPool, RetireList};
 use euhedral_inference_settings::{Auto, Settings};
+use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
 use crate::error::EngineError;
 use crate::generation::GREEDY_DEPTH;
 use crate::generation::{AdmissionError, Generation, GenerationRequest, LogitsSink};
+use crate::handoff::Handoff;
 use crate::model::{ModelConfig, Weights};
 use crate::plan::Plan;
 use crate::residency::planner::ResidencyPlan;
@@ -297,6 +297,9 @@ struct DeviceState {
     workspace: Arc<Workspace>,
 }
 
+/// What [`EngineRuntime::start`] hands over: the running engine, or why it did not start.
+pub type ReadyHandoff = Arc<Handoff<Result<Arc<EngineRuntime>, EngineError>>>;
+
 /// A started engine: the model on the device and the machinery that runs it.
 pub struct EngineRuntime {
     core: Arc<Core>,
@@ -320,26 +323,24 @@ impl fmt::Debug for EngineRuntime {
 
 impl EngineRuntime {
     /// Starts the engine of `settings` on the CUDA library at `library`, and returns at once: the rest of the startup
-    /// runs as frames on the lattice built here. `ready` is set with the runtime when the model is on the device and
-    /// the modules are warm, or with the error that stopped the startup, before anything was allocated on the device
-    /// when the artifact or the plan is what failed.
+    /// runs as frames on the lattice built here. The returned hand-off gets the runtime when the model is on the
+    /// device and the modules are warm, or the error that stopped the startup, before anything was allocated on the
+    /// device when the artifact or the plan is what failed.
     ///
-    /// Call it from the main thread, then wait on the latch. Keep the returned [`RuntimeOwner`] until the engine is
-    /// done (see its contract): it closes the lattice and frees the device memory, on the calling thread.
-    pub fn start(
-        settings: &Settings,
-        library: &Path,
-        ready: LatchSetter<Result<Arc<EngineRuntime>, EngineError>>,
-    ) -> RuntimeOwner {
+    /// Call it from the main thread, then [`wait`](Handoff::wait) on the hand-off. Keep the returned [`RuntimeOwner`]
+    /// until the engine is done (see its contract): it closes the lattice and frees the device memory, on the calling
+    /// thread.
+    pub fn start(settings: &Settings, library: &Path) -> (RuntimeOwner, ReadyHandoff) {
+        let ready = Handoff::new();
         match build(settings, library) {
             Ok(core) => {
                 let owner = RuntimeOwner::over(Arc::clone(&core.teardown));
-                startup::run(core, ready);
-                owner
+                startup::run(core, Arc::clone(&ready));
+                (owner, ready)
             }
             Err(error) => {
-                ready.set(Err(error));
-                RuntimeOwner { teardown: None }
+                ready.send(Err(error));
+                (RuntimeOwner { teardown: None }, ready)
             }
         }
     }

@@ -7,7 +7,7 @@
 )]
 #![allow(
     clippy::disallowed_methods,
-    reason = "no-wait, waiting call: a test thread waits on the latch for the frames it published"
+    reason = "no-wait, waiting call: a test thread waits on the hand-off for the frames it published"
 )]
 
 use std::num::NonZeroUsize;
@@ -18,15 +18,20 @@ use std::time::Duration;
 use euhedral_core::config::FragmentConfig;
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
-use euhedral_graph::{Join, Lake, Latch};
-use euhedral_inference_engine::{RuntimeOwner, Teardown, fragment_config, lattice_config};
+use euhedral_graph::Lake;
+use euhedral_inference_engine::{Handoff, RuntimeOwner, Teardown, fragment_config, lattice_config};
 use euhedral_inference_settings::{Auto, ModelSettings, Settings};
+
+/// The longest a test waits for its frames; past it the test fails, never hangs.
+const WAIT: Duration = Duration::from_secs(60);
 
 struct Counted {
     header: FrameHeader,
     ran: Arc<AtomicUsize>,
-    join: Arc<Join<usize>>,
-    part: usize,
+    /// Frames still to run; the one that brings it to zero sends `total` to `done`.
+    pending: Arc<AtomicUsize>,
+    total: usize,
+    done: Arc<Handoff<usize>>,
 }
 
 impl Frame for Counted {
@@ -40,7 +45,9 @@ impl Frame for Counted {
 
     fn execute(&mut self) -> Result<(), FrameError> {
         self.ran.fetch_add(1, Ordering::AcqRel);
-        self.join.arrive(self.part, self.part);
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.done.send(self.total);
+        }
         Ok(())
     }
 }
@@ -54,19 +61,20 @@ fn run_frames(settings: &Settings, frames: usize) -> usize {
         Duration::from_secs(1),
     );
     let unit = lake.admit().unwrap();
-    let (done, finished) = Latch::new();
+    let finished = Handoff::new();
     let ran = Arc::new(AtomicUsize::new(0));
-    let join = Join::new(frames, move |parts| done.set(parts.len()));
+    let pending = Arc::new(AtomicUsize::new(frames));
     for part in 0..frames {
         let frame = Counted {
             header: FrameHeader::new(part as u64 + 1),
             ran: Arc::clone(&ran),
-            join: Arc::clone(&join),
-            part,
+            pending: Arc::clone(&pending),
+            total: frames,
+            done: Arc::clone(&finished),
         };
         assert!(lake.offer(Box::new(frame)).is_ok());
     }
-    assert_eq!(finished.wait(), frames);
+    assert_eq!(finished.wait(WAIT), Ok(frames));
     drop(unit);
     lake.complete_gracefully();
     lattice.close();
@@ -121,16 +129,16 @@ fn dropping_the_owner_closes_the_lakes_and_the_lattice_whatever_handles_are_aliv
 
     // The engine is working: a frame has run on the lattice.
     let unit = lakes[0].admit().unwrap();
-    let (done, finished) = Latch::new();
-    let join = Join::new(1, move |parts: Vec<Option<usize>>| done.set(parts.len()));
+    let finished = Handoff::new();
     let frame = Counted {
         header: FrameHeader::new(1),
         ran: Arc::new(AtomicUsize::new(0)),
-        join,
-        part: 0,
+        pending: Arc::new(AtomicUsize::new(1)),
+        total: 1,
+        done: Arc::clone(&finished),
     };
     assert!(lakes[0].offer(Box::new(frame)).is_ok());
-    assert_eq!(finished.wait(), 1);
+    assert_eq!(finished.wait(WAIT), Ok(1));
     drop(unit);
 
     // `teardown` stands for a handle a frame still holds (the runtime's, in an engine): the drop closes anyway.

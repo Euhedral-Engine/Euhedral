@@ -11,7 +11,7 @@
 //!
 //! Exit codes: 0 success, 1 a measured row failed or was ineligible, 2 usage or configuration, 3 the engine did not load.
 //!
-//! The main thread loads the settings, starts the runtime, starts each request and waits for its latch; the work runs on
+//! The main thread loads the settings, starts the runtime, starts each request and waits for its hand-off; the work runs on
 //! the engine's lattice. This file is the binary's edge: it prints, and it is the only reader of the environment.
 
 #![allow(
@@ -26,8 +26,8 @@ use std::process::{self, ExitCode};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use euhedral_graph::Latch;
 use euhedral_inference_bench::artifact::load_tokenizer;
+use euhedral_inference_bench::await_value;
 use euhedral_inference_bench::config::{ConfigError, Options};
 use euhedral_inference_bench::drift::{self, Candidate, RowStore};
 use euhedral_inference_bench::dump::{split_document, teacher_forced_report, write_report};
@@ -167,9 +167,8 @@ fn run_command(args: &[String], command_line: &str, started: SystemTime) -> Resu
     }
 
     let settings = settings_for(&options)?;
-    let (ready, waiting) = Latch::new();
-    let owner = EngineRuntime::start(&settings, &options.cuda_library, ready);
-    let runtime = match waiting.wait() {
+    let (owner, waiting) = EngineRuntime::start(&settings, &options.cuda_library);
+    let runtime = match await_value(&waiting) {
         Ok(runtime) => runtime,
         Err(error) => return Err(Failure::NotLoaded(error.to_string())),
     };
@@ -296,9 +295,8 @@ fn dump_command(args: &[String]) -> Result<u8, Failure> {
     settings.context.max_tokens = ((prefix + steps) as u32).next_multiple_of(512);
     settings.prefix_cache.size = ByteSize::mib(0);
 
-    let (ready, waiting) = Latch::new();
-    let owner = EngineRuntime::start(&settings, &library, ready);
-    let runtime: Arc<EngineRuntime> = match waiting.wait() {
+    let (owner, waiting) = EngineRuntime::start(&settings, &library);
+    let runtime: Arc<EngineRuntime> = match await_value(&waiting) {
         Ok(runtime) => runtime,
         Err(error) => return Err(Failure::NotLoaded(error.to_string())),
     };
@@ -314,9 +312,8 @@ fn dump_command(args: &[String]) -> Result<u8, Failure> {
 
 /// Starts the engine of `settings` and waits for it.
 fn start_engine(settings: &Settings, library: &Path) -> Result<(Arc<EngineRuntime>, RuntimeOwner), Failure> {
-    let (ready, waiting) = Latch::new();
-    let owner = EngineRuntime::start(settings, library, ready);
-    match waiting.wait() {
+    let (owner, waiting) = EngineRuntime::start(settings, library);
+    match await_value(&waiting) {
         Ok(runtime) => Ok((runtime, owner)),
         Err(error) => Err(Failure::NotLoaded(error.to_string())),
     }

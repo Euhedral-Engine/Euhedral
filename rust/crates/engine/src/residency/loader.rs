@@ -25,9 +25,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
-use euhedral_graph::{IoDoneOwned, OwnedFile};
 use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, PooledPinned, Submission, SubmitMode, ops};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
+use euhedral_io::{IoDoneOwned, OwnedFile};
 
 use crate::error::EngineError;
 use crate::frames::{Kind, step};

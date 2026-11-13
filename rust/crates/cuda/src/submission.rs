@@ -165,10 +165,7 @@ impl<'l> Submission<'l> {
                 .euhedral_cuda_completion_event_record(event, self.lane.stream())
         };
         check("euhedral_cuda_completion_event_record", status)?;
-        Ok(Marker {
-            lane: self.lane.id(),
-            value,
-        })
+        Ok(Marker::new(self.lane.queue_id(), self.lane.id(), value))
     }
 
     /// Queues a write of `value` (its low 32 bits) to the lane's host-mapped completion word, after the work queued

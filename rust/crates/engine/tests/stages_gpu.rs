@@ -24,8 +24,10 @@
 mod linear_gpu;
 
 use std::cell::RefCell;
+use std::mem;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::process::abort;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -34,15 +36,15 @@ use std::time::Duration;
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, GraphRuntime, Join, Lake, LaneId, LanePool, Latch,
-    Marker, QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageId, StageSpec,
-    Submitted,
+    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, GraphRuntime, Lake, LaneId, LanePool, Marker,
+    QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
 use euhedral_inference_cuda::{
     CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, GraphRecorder, PinnedPool, RetireList, Submission,
     SubmitMode, ops,
 };
 use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorDataType, WeightFormat, WeightLayout};
+use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{LinearFormat, LinearMode, Q3Embedding, ScratchRegion};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{ModelConfig, WeightRef};
@@ -125,7 +127,11 @@ struct Rig {
     library: Arc<CudaLibrary>,
     lane: Arc<CudaLane>,
     lanes: LaneTable,
-    pool: LanePool,
+    /// The pool of the one lane, and the lattice that runs a stage under test in a one-stage graph.
+    pool: Arc<LanePool>,
+    completions: Arc<Completions>,
+    lake: Arc<Lake>,
+    lattice: Arc<ControlPlaneLattice>,
     pinned: Arc<PinnedPool>,
     retire: Arc<RetireList>,
 }
@@ -134,8 +140,22 @@ fn rig() -> Option<Rig> {
     let library = library()?;
     let lane = CudaLane::new(&library, LaneId(0), 256).unwrap();
     LANE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&lane)));
-    let pool = LanePool::new(vec![Arc::clone(&lane) as Arc<dyn DeviceQueue>]);
+    let pool = Arc::new(LanePool::new(vec![Arc::clone(&lane) as Arc<dyn DeviceQueue>]));
+    let settings = Settings::with_model(ModelSettings::default());
+    let lattice = ControlPlaneLattice::new(lattice_config(&settings)).unwrap();
+    let lake = Lake::new(
+        Arc::clone(&lattice),
+        NonZeroUsize::new(2).unwrap(),
+        Duration::from_secs(1),
+    );
+    let completions = Completions::new(Arc::clone(&pool));
+    lattice
+        .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
+        .unwrap();
     Some(Rig {
+        completions,
+        lake,
+        lattice,
         lanes: LaneTable::new(vec![Arc::clone(&lane)]).unwrap(),
         pinned: PinnedPool::new(&library, 64 << 20),
         retire: Arc::new(RetireList::new()),
@@ -145,6 +165,38 @@ fn rig() -> Option<Rig> {
     })
 }
 
+impl Drop for Rig {
+    fn drop(&mut self) {
+        self.lake.complete_gracefully();
+        self.lattice.close();
+    }
+}
+
+/// The quantum a stage under test runs for, borrowed for the length of [`Rig::try_run`].
+struct Borrowed(*const Quantum);
+
+// SAFETY: `try_run` waits for the graph to retire before it returns, so the pointer is valid wherever the graph's
+// frames run, and the stage under test only reads the quantum, as a stage does.
+unsafe impl Send for Borrowed {}
+// SAFETY: as above.
+unsafe impl Sync for Borrowed {}
+
+/// Runs a stage of the engine inside a graph of one stage, and hands over its answer.
+struct UnderTest {
+    stage: &'static dyn Stage<Quantum>,
+    answer: Arc<Handoff<Result<Option<Marker>, StageError>>>,
+}
+
+impl Stage<Borrowed> for UnderTest {
+    fn run(&self, quantum: &Borrowed, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+        // SAFETY: see `Borrowed`.
+        let quantum = unsafe { &*quantum.0 };
+        self.answer
+            .send(self.stage.run(quantum, cx).map(|submitted| submitted.marker));
+        Ok(Submitted::done())
+    }
+}
+
 impl Rig {
     fn workspace(&self, config: &ModelConfig, rows: u64, logits_rows: u64, scratch: &[u64]) -> Arc<Workspace> {
         Arc::new(Workspace::allocate(&self.library, config, WorkspaceRows { rows, logits_rows }, scratch).unwrap())
@@ -152,13 +204,59 @@ impl Rig {
 
     /// Runs `stage` on the rig's lane for `quantum` and returns its marker, if it queued work.
     fn run(&self, stage: &dyn Stage<Quantum>, quantum: &Quantum) -> Option<Marker> {
-        let cx = StageCx {
-            stage: StageId(0),
-            lane: Some(LaneId(0)),
-            waits: &[],
-            lanes: &self.pool,
+        self.try_run(stage, quantum).unwrap()
+    }
+
+    /// Runs `stage` as the only stage of a graph on the rig's lane, for the context RustEE builds around a stage (it
+    /// builds no other), and returns what the stage answered. The graph is told the stage submitted nothing, so it
+    /// retires at once; the test synchronizes the lane for the work itself.
+    #[allow(
+        clippy::print_stderr,
+        reason = "the process aborts on a timeout; nothing else can report it"
+    )]
+    fn try_run(&self, stage: &dyn Stage<Quantum>, quantum: &Quantum) -> Result<Option<Marker>, StageError> {
+        let answer = Handoff::new();
+        let retired = Handoff::new();
+        let under_test = Arc::new(UnderTest {
+            // SAFETY: the stage outlives the graph's quantum: this call returns only after the graph retired it (or
+            // the wait failed, which fails the test), and nothing else keeps the reference.
+            stage: unsafe { mem::transmute::<&dyn Stage<Quantum>, &'static dyn Stage<Quantum>>(stage) },
+            answer: Arc::clone(&answer),
+        });
+        let mut spec = StageGraphSpec::new();
+        spec.stage(StageSpec {
+            name: "under test",
+            ordered: None,
+            lanes: vec![LaneId(0)],
+        });
+        let done = Arc::clone(&retired);
+        let graph = StageGraph::new(
+            spec,
+            vec![under_test as Arc<dyn Stage<Borrowed>>],
+            GraphRuntime {
+                stages: Arc::clone(&self.lake) as Arc<dyn FrameSink>,
+                completions: Arc::clone(&self.completions),
+                lanes: Arc::clone(&self.pool),
+                retries: Arc::new(RetryCounts::default()),
+                retry_backstop: DEFAULT_RETRY_BACKSTOP,
+            },
+            move |_borrowed, outcome| done.send(outcome),
+        )
+        .unwrap();
+        let unit = self.lake.admit().unwrap();
+        let _ = graph.start(Borrowed(quantum), Arc::new(AtomicBool::new(false)), Vec::new());
+        let Ok(outcome) = retired.wait(Duration::from_secs(60)) else {
+            // Unwinding would free the stage and the quantum while graph frames may still use them: abort instead.
+            eprintln!("the graph did not retire the quantum in time");
+            abort();
         };
-        stage.run(quantum, &cx).unwrap().marker
+        drop(unit);
+        assert_eq!(
+            outcome,
+            QuantumOutcome::Completed,
+            "the stage under test did not fail the graph"
+        );
+        answer.take().expect("the stage answered")
     }
 
     fn sync(&self) {
@@ -576,13 +674,7 @@ fn the_linear_stage_hands_its_format_the_geometry_the_mode_and_the_scratch() {
         LinearRows::All,
         None,
     );
-    let cx = StageCx {
-        stage: StageId(0),
-        lane: Some(LaneId(0)),
-        waits: &[],
-        lanes: &rig.pool,
-    };
-    let refused = all.run(&verify, &cx).unwrap_err();
+    let refused = rig.try_run(&all, &verify).unwrap_err();
     assert!(format!("{refused:?}").contains("scratch"), "{refused:?}");
     assert_eq!(format.calls.load(Ordering::SeqCst), 2, "the format was not called");
 }
@@ -1443,13 +1535,7 @@ fn mtp_stem_concatenates_e_h() {
 
     // A stem with no rows to seed it, or seeded past the rows the sequence holds, is refused.
     let unseeded = rig.quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config);
-    let cx = StageCx {
-        stage: StageId(0),
-        lane: Some(LaneId(0)),
-        waits: &[],
-        lanes: &rig.pool,
-    };
-    assert!(stem.run(&unseeded, &cx).is_err());
+    assert!(rig.try_run(&stem, &unseeded).is_err());
     let past = rig
         .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
         .with_draft_seed(DraftSeed::SeedRow(14));
@@ -1460,13 +1546,13 @@ fn mtp_stem_concatenates_e_h() {
 
 /// A host stage behind the argmax by a completion edge: it reads the selection the argmax wrote.
 struct ReadSelection {
-    seen: Arc<Join<u64>>,
+    seen: Arc<Handoff<u64>>,
 }
 
 impl Stage<Quantum> for ReadSelection {
     fn run(&self, quantum: &Quantum, _cx: &StageCx<'_>) -> Result<Submitted, StageError> {
         let selection = quantum.selection().expect("the quantum selects");
-        self.seen.arrive(0, selection.key(0).unwrap());
+        self.seen.send(selection.key(0).unwrap());
         Ok(Submitted::done())
     }
 }
@@ -1500,10 +1586,10 @@ fn a_completion_edge_after_the_argmax_finds_its_keys_on_the_host() {
     lattice
         .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
         .unwrap();
-    let (done, finished) = Latch::new();
-    // Part 0 is the key the host stage read, part 1 the retirement of the quantum.
-    let join = Join::new(2, move |parts: Vec<Option<u64>>| done.set(parts));
-    let retired = Arc::clone(&join);
+    // The key the host stage read, and whether the quantum completed when it retired.
+    let seen = Handoff::new();
+    let completed = Handoff::new();
+    let retired = Arc::clone(&completed);
     let mut spec = StageGraphSpec::new();
     let argmax = spec.stage(StageSpec {
         name: "argmax",
@@ -1520,7 +1606,9 @@ fn a_completion_edge_after_the_argmax_finds_its_keys_on_the_host() {
         spec,
         vec![
             Arc::new(Argmax::new(BufferSlot::Logits, VOCABULARY, SelectedRows::Last)),
-            Arc::new(ReadSelection { seen: join }),
+            Arc::new(ReadSelection {
+                seen: Arc::clone(&seen),
+            }),
         ],
         GraphRuntime {
             stages: Arc::clone(&lake) as Arc<dyn FrameSink>,
@@ -1529,17 +1617,18 @@ fn a_completion_edge_after_the_argmax_finds_its_keys_on_the_host() {
             retries: Arc::new(RetryCounts::default()),
             retry_backstop: DEFAULT_RETRY_BACKSTOP,
         },
-        move |_quantum, outcome| retired.arrive(1, u64::from(outcome == QuantumOutcome::Completed)),
+        move |_quantum, outcome| retired.send(outcome == QuantumOutcome::Completed),
     )
     .unwrap();
     let unit = lake.admit().unwrap();
     let _ = graph.start(quantum, Arc::new(AtomicBool::new(false)), Vec::new());
-    let parts = finished.wait();
+    let wait = Duration::from_secs(60);
+    let (key, completed) = (seen.wait(wait), completed.wait(wait));
     drop(unit);
     lake.complete_gracefully();
     lattice.close();
-    assert_eq!(parts[1], Some(1), "the quantum completed");
-    assert_eq!(parts[0].map(|key| key & 0xFFFF_FFFF), Some(0xFFFF_FFFF - 4242));
+    assert_eq!(completed, Ok(true), "the quantum completed");
+    assert_eq!(key.map(|key| key & 0xFFFF_FFFF), Ok(0xFFFF_FFFF - 4242));
 }
 
 // Independent references for the GDN convolution and recurrence and for the Q/K norm with RoPE, at the model's

@@ -749,6 +749,12 @@ impl Owner {
                         ));
                     }
                 }
+                // The device failed under the quantum, at no stage of its own: the same failure as a stage's.
+                QuantumOutcome::DeviceFailed { cause } => {
+                    if live {
+                        self.fail(format!("the device failed under a {:?} quantum: {cause}", flying.kind));
+                    }
+                }
                 QuantumOutcome::Completed => {}
             }
             self.park(quantum, flying.retained);
@@ -1234,8 +1240,8 @@ impl LatticeSource for GenerationSource {
         _stop: &mut dyn FnMut(&dyn Frame) -> bool,
         _demand: u64,
     ) -> u64 {
-        // The frames go to the lake, not to this puller.
-        self.poll_arc();
+        // The frames go to the lake, not to this puller, and a pull must not offer them: the lattice's workers
+        // request the source whenever a cycle found nothing, and that request polls.
         0
     }
 

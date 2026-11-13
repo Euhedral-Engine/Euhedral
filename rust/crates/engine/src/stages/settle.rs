@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-use euhedral_graph::{GraphRuntime, LaneId, LanePool, Marker, Ready, Stage, StageCx, StageError, Submitted};
+use euhedral_graph::{
+    DeviceQueue, GraphRuntime, LaneId, LanePool, Marker, Ready, Stage, StageCx, StageError, Submitted,
+};
 use euhedral_inference_cuda::{CudaError, CudaLane, Submission, SubmitMode};
 
 use super::{LaneTable, Quantum};
@@ -265,8 +267,8 @@ impl Stage<Quantum> for Settling {
         }
     }
 
-    fn abandoned(&self, quantum: &Quantum) {
-        self.stage.abandoned(quantum);
+    fn abandoned(&self, quantum: &Quantum, home: &(dyn DeviceQueue + 'static)) {
+        self.stage.abandoned(quantum, home);
         if quantum.ends.first_abandoned() {
             self.settler.settle(quantum);
         }
@@ -275,13 +277,12 @@ impl Stage<Quantum> for Settling {
 
 #[cfg(test)]
 mod tests {
+    use euhedral_graph::QueueId;
+
     use super::*;
 
     fn marker(lane: u16, value: u64) -> Marker {
-        Marker {
-            lane: LaneId(lane),
-            value,
-        }
+        Marker::new(QueueId::next(), LaneId(lane), value)
     }
 
     #[test]
@@ -339,5 +340,21 @@ mod tests {
         assert!(!ends.first_abandoned());
         assert!(ends.first_failed(), "a failure is counted apart from the abandonments");
         assert!(!ends.first_failed());
+    }
+
+    #[test]
+    fn a_stage_that_fails_and_is_then_abandoned_settles_a_lane_once() {
+        // Both paths ask for the lanes still unsignalled: once the first settled a lane, the second finds none.
+        let ends = LaneEnds::new(2);
+        ends.record(marker(0, 3), false);
+        ends.record(marker(1, 1), true);
+        assert!(ends.first_failed());
+        assert_eq!(ends.unsignalled_lanes(), vec![LaneId(0)]);
+        ends.record(marker(0, 4), true);
+        assert!(ends.first_abandoned());
+        assert!(
+            ends.unsignalled_lanes().is_empty(),
+            "the second settle has nothing left to publish"
+        );
     }
 }

@@ -215,10 +215,7 @@ fn graph_capture_replays_same_result() {
             .submission(SubmitMode::default())
             .expect("a capture submission");
         add(&submission);
-        let other = Marker {
-            lane: LaneId(1),
-            value: 1,
-        };
+        let other = Marker::new(lane.queue_id(), LaneId(1), 1);
         assert!(
             matches!(submission.wait(other), Err(CudaError::Capturing(_))),
             "no cross-lane waits in a capture"
@@ -372,10 +369,7 @@ fn waits_on_stale_and_future_markers_are_refused() {
     );
     waiter.wait(markers[1]).expect("a marker inside the ring");
     waiter.wait(markers[2]).expect("the newest marker");
-    let future = Marker {
-        lane: LaneId(0),
-        value: 4,
-    };
+    let future = Marker::new(first.queue_id(), LaneId(0), 4);
     assert!(matches!(waiter.wait(future), Err(CudaError::FutureMarker { .. })));
     drop(waiter);
     first.synchronize().expect("first");

@@ -124,7 +124,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    use euhedral_graph::LaneId;
+    use euhedral_graph::{LaneId, QueueId};
 
     use super::*;
 
@@ -151,7 +151,7 @@ mod tests {
     }
 
     fn marker(value: u64) -> Marker {
-        Marker { lane: LaneId(0), value }
+        Marker::new(QueueId::next(), LaneId(0), value)
     }
 
     fn reap(list: &RetireList, limit: u64) -> usize {

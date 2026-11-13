@@ -9,10 +9,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use euhedral_graph::OwnedFile;
 use euhedral_inference_engine::EngineRuntime;
 use euhedral_inference_engine::generation::FinishReason;
+use euhedral_io::OwnedFile;
 
+use crate::await_value;
 use crate::config::ConfigError;
 use crate::kld::{FLOOR, Reference, Row};
 use crate::result::iso_instant;
@@ -156,9 +157,9 @@ pub fn score(
             reference.forced(chunk).to_vec(),
             task,
         )?;
-        let outcome = engine.wait();
+        let outcome = await_value(&engine);
         if outcome.reason != FinishReason::Length || outcome.generated != records {
-            let _ = scored.wait();
+            let _ = await_value(&scored);
             return Err(ConfigError::Invalid(format!(
                 "chunk {chunk} ended with {:?} after {} of {records} steps",
                 outcome.reason, outcome.generated
@@ -167,11 +168,11 @@ pub fn score(
         // The engine is free: the next chunk starts while this one's last rows are scored. The chunk before it is
         // waited for first, so that no more than two chunks of rows are ever held.
         if let Some(before) = previous.replace(scored) {
-            values.push(finished(before.wait()).map_err(|error| in_chunk(chunk - 1, error))?);
+            values.push(finished(await_value(&before)).map_err(|error| in_chunk(chunk - 1, error))?);
         }
     }
     if let Some(last) = previous {
-        values.push(finished(last.wait()).map_err(|error| in_chunk(reference.chunks() - 1, error))?);
+        values.push(finished(await_value(&last)).map_err(|error| in_chunk(reference.chunks() - 1, error))?);
     }
     Ok(Scored {
         values,
