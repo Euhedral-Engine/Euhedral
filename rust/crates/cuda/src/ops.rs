@@ -1108,17 +1108,21 @@ pub trait KernelOps {
     /// Selects row-exact execution for the launches queued after this call: [`select_row_exact`].
     fn set_row_exact(&mut self, enabled: bool);
 
-    /// Whether the launches queued now run row-exact: the mode the submission began with, or what
-    /// [`KernelOps::set_row_exact`] selected since.
+    /// Whether the submission began in row-exact mode ([`SubmitMode::row_exact`](crate::SubmitMode)). It does not
+    /// follow [`KernelOps::set_row_exact`], which selects around part of a stage and leaves this answer alone: a
+    /// format that asks reads the mode of the quantum, not the selection of the moment.
     fn row_exact(&self) -> bool;
 
     /// The library the launches run in, for the stages' decisions that depend on what it was built with.
     fn library(&self) -> &Arc<CudaLibrary>;
 
-    /// [`copy_device_to_readback_shared`].
+    /// Queues the copy of `bytes` device bytes into a pinned buffer at `offset`, for a buffer the host shares by `&`
+    /// ([`copy_device_to_readback_shared`]).
     ///
     /// # Safety
-    /// As [`copy_device_to_readback_shared`].
+    /// The copy runs after this call returns. `destination` must stay alive until the lane's work up to this copy has
+    /// retired, and the host must not access its bytes in that range, other than through [`PinnedBuffer::word`],
+    /// before then. No other copy may write the range meanwhile.
     unsafe fn copy_device_to_readback_shared(
         &mut self,
         destination: &PinnedBuffer,
@@ -1127,10 +1131,12 @@ pub trait KernelOps {
         bytes: usize,
     ) -> Result<(), CudaError>;
 
-    /// [`copy_host_weights_to_device`].
+    /// Queues the copy of `bytes` bytes at `offset` of a host-weights arena to the device
+    /// ([`copy_host_weights_to_device`]).
     ///
     /// # Safety
-    /// As [`copy_host_weights_to_device`].
+    /// The copy runs after this call returns. `source` must stay alive, and its bytes in that range unmodified, until
+    /// the lane's work up to this copy has retired.
     unsafe fn copy_host_weights_to_device(
         &mut self,
         destination: DevicePtr,
@@ -1139,10 +1145,13 @@ pub trait KernelOps {
         bytes: usize,
     ) -> Result<(), CudaError>;
 
-    /// [`copy_device_to_host_weights`].
+    /// Queues the copy of `bytes` device bytes into a host-weights arena at `offset`
+    /// ([`copy_device_to_host_weights`]).
     ///
     /// # Safety
-    /// As [`copy_device_to_host_weights`].
+    /// The copy runs after this call returns. `destination` must stay alive, and its bytes in that range neither read
+    /// nor written by the host, until the lane's work up to this copy has retired. No other copy may write the range
+    /// meanwhile.
     unsafe fn copy_device_to_host_weights(
         &mut self,
         destination: &HostWeightsArena,
@@ -1218,63 +1227,42 @@ macro_rules! submission_ops {
     };
 }
 
-submission_ops! {
-    Submission<'_>;
-    copy_device_to_device(destination: DevicePtr, source: DevicePtr, bytes: u64);
-    copy_device_to_device_2d(destination: DevicePtr, destination_pitch: u64, source: DevicePtr, source_pitch: u64, row_bytes: u64, rows: u64);
-    zero_device_memory(address: DevicePtr, bytes: u64);
-    embed_q3(token_ids: DevicePtr, embedding: DevicePtr, hidden: DevicePtr, token_count: u32, vocabulary_size: u32, hidden_size: u32, embedding_bytes: u64);
-    embed_q3_p2e2(token_ids: DevicePtr, embedding: DevicePtr, hidden: DevicePtr, token_count: u32, vocabulary_size: u32, hidden_size: u32, embedding_bytes: u64);
-    linear_launch(kernel: i32, grid: [u32; 3], block: [u32; 3], shared_bytes: u32, words: &[u64], sizes: &[u8]);
-    qwen4_launch(kernel: i32, grid: [u32; 3], block: [u32; 3], shared_bytes: u32, words: &[u64], sizes: &[u8]);
-    linear_nvfp4_bf16(input: DevicePtr, weights: DevicePtr, output: DevicePtr, rows: u32, in_features: u32, out_features: u32, weights_bytes: u64);
-    linear_nvfp4_native_bf16(input: DevicePtr, weights: DevicePtr, output: DevicePtr, scratch: DevicePtr, rows: u32, in_features: u32, out_features: u32, weights_bytes: u64, scratch_bytes: u64);
-    attention_qk_norm_rope_bf16(query_key: DevicePtr, query_norm: DevicePtr, key_norm: DevicePtr, output: DevicePtr, rows: u32, query_heads: u32, key_value_heads: u32, head_dim: u32, rotary_dim: u32, start_position: u64, position: DevicePtr, epsilon: f32, rope_theta: f64);
-    attention_kv_append_nvfp4(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, rows: u32, query_width: u32, key_width: u32, start: u64, position: DevicePtr);
-    attention_kv_append_bf16(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, rows: u32, query_width: u32, key_width: u32, start: u64, position: DevicePtr);
-    attention_causal_nvfp4(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, output: DevicePtr, rows: u32, query_heads: u32, key_heads: u32, head_dim: u32, cache_length: u32, start: u64, position: DevicePtr, scratch: DevicePtr);
-    attention_causal_bf16(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, output: DevicePtr, rows: u32, query_heads: u32, key_heads: u32, head_dim: u32, cache_length: u32, start: u64, position: DevicePtr, scratch: DevicePtr);
-    gdn_project_control_fp32(input: DevicePtr, a_weight: DevicePtr, b_weight: DevicePtr, a_log: DevicePtr, dt_bias: DevicePtr, alpha: DevicePtr, beta: DevicePtr, rows: u32, width: u32, heads: u32);
-    gdn_convolution_bf16(query_key: DevicePtr, value_z: DevicePtr, convolution_weights: DevicePtr, convolution_state: DevicePtr, output: DevicePtr, rows: u32, query_key_width: u32, value_width: u32, convolution_width: u32, kernel_size: u32);
-    gdn_recurrence_bf16(convolved: DevicePtr, alpha: DevicePtr, beta: DevicePtr, recurrent_state: DevicePtr, output: DevicePtr, rows: u32, key_heads: u32, value_heads: u32, key_head_dim: u32, value_head_dim: u32, output_scale: f32);
-    gdn_gated_rms_norm_bf16(recurrent: DevicePtr, value_z: DevicePtr, norm_weight: DevicePtr, output: DevicePtr, rows: u32, value_heads: u32, head_dim: u32, epsilon: f32);
-    residual_rms_norm_bf16(residual: DevicePtr, delta: DevicePtr, weight: DevicePtr, hidden: DevicePtr, normalized: DevicePtr, rows: u32, width: u32, epsilon: f32);
-    rms_norm_unit_offset_bf16(input: DevicePtr, weight: DevicePtr, output: DevicePtr, rows: u32, width: u32, epsilon: f32);
-    swiglu_bf16(gate_up: DevicePtr, output: DevicePtr, rows: u32, intermediate_size: u32);
-    residual_add_bf16(residual: DevicePtr, delta: DevicePtr, output: DevicePtr, rows: u32, width: u32);
-    argmax_bf16(logits: DevicePtr, count: u32, result: DevicePtr);
-    argmax_logprob_bf16(logits: DevicePtr, count: u32, result: DevicePtr);
-    selected_token(key: DevicePtr, ids: DevicePtr, token: DevicePtr);
+/// Applies `$apply` to a target type and the list of operations: the one list both implementations are built from.
+macro_rules! operations {
+    ($apply:ident, $target:ty) => {
+        $apply! {
+            $target;
+        copy_device_to_device(destination: DevicePtr, source: DevicePtr, bytes: u64);
+        copy_device_to_device_2d(destination: DevicePtr, destination_pitch: u64, source: DevicePtr, source_pitch: u64, row_bytes: u64, rows: u64);
+        zero_device_memory(address: DevicePtr, bytes: u64);
+        embed_q3(token_ids: DevicePtr, embedding: DevicePtr, hidden: DevicePtr, token_count: u32, vocabulary_size: u32, hidden_size: u32, embedding_bytes: u64);
+        embed_q3_p2e2(token_ids: DevicePtr, embedding: DevicePtr, hidden: DevicePtr, token_count: u32, vocabulary_size: u32, hidden_size: u32, embedding_bytes: u64);
+        linear_launch(kernel: i32, grid: [u32; 3], block: [u32; 3], shared_bytes: u32, words: &[u64], sizes: &[u8]);
+        qwen4_launch(kernel: i32, grid: [u32; 3], block: [u32; 3], shared_bytes: u32, words: &[u64], sizes: &[u8]);
+        linear_nvfp4_bf16(input: DevicePtr, weights: DevicePtr, output: DevicePtr, rows: u32, in_features: u32, out_features: u32, weights_bytes: u64);
+        linear_nvfp4_native_bf16(input: DevicePtr, weights: DevicePtr, output: DevicePtr, scratch: DevicePtr, rows: u32, in_features: u32, out_features: u32, weights_bytes: u64, scratch_bytes: u64);
+        attention_qk_norm_rope_bf16(query_key: DevicePtr, query_norm: DevicePtr, key_norm: DevicePtr, output: DevicePtr, rows: u32, query_heads: u32, key_value_heads: u32, head_dim: u32, rotary_dim: u32, start_position: u64, position: DevicePtr, epsilon: f32, rope_theta: f64);
+        attention_kv_append_nvfp4(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, rows: u32, query_width: u32, key_width: u32, start: u64, position: DevicePtr);
+        attention_kv_append_bf16(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, rows: u32, query_width: u32, key_width: u32, start: u64, position: DevicePtr);
+        attention_causal_nvfp4(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, output: DevicePtr, rows: u32, query_heads: u32, key_heads: u32, head_dim: u32, cache_length: u32, start: u64, position: DevicePtr, scratch: DevicePtr);
+        attention_causal_bf16(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, output: DevicePtr, rows: u32, query_heads: u32, key_heads: u32, head_dim: u32, cache_length: u32, start: u64, position: DevicePtr, scratch: DevicePtr);
+        gdn_project_control_fp32(input: DevicePtr, a_weight: DevicePtr, b_weight: DevicePtr, a_log: DevicePtr, dt_bias: DevicePtr, alpha: DevicePtr, beta: DevicePtr, rows: u32, width: u32, heads: u32);
+        gdn_convolution_bf16(query_key: DevicePtr, value_z: DevicePtr, convolution_weights: DevicePtr, convolution_state: DevicePtr, output: DevicePtr, rows: u32, query_key_width: u32, value_width: u32, convolution_width: u32, kernel_size: u32);
+        gdn_recurrence_bf16(convolved: DevicePtr, alpha: DevicePtr, beta: DevicePtr, recurrent_state: DevicePtr, output: DevicePtr, rows: u32, key_heads: u32, value_heads: u32, key_head_dim: u32, value_head_dim: u32, output_scale: f32);
+        gdn_gated_rms_norm_bf16(recurrent: DevicePtr, value_z: DevicePtr, norm_weight: DevicePtr, output: DevicePtr, rows: u32, value_heads: u32, head_dim: u32, epsilon: f32);
+        residual_rms_norm_bf16(residual: DevicePtr, delta: DevicePtr, weight: DevicePtr, hidden: DevicePtr, normalized: DevicePtr, rows: u32, width: u32, epsilon: f32);
+        rms_norm_unit_offset_bf16(input: DevicePtr, weight: DevicePtr, output: DevicePtr, rows: u32, width: u32, epsilon: f32);
+        swiglu_bf16(gate_up: DevicePtr, output: DevicePtr, rows: u32, intermediate_size: u32);
+        residual_add_bf16(residual: DevicePtr, delta: DevicePtr, output: DevicePtr, rows: u32, width: u32);
+        argmax_bf16(logits: DevicePtr, count: u32, result: DevicePtr);
+        argmax_logprob_bf16(logits: DevicePtr, count: u32, result: DevicePtr);
+        selected_token(key: DevicePtr, ids: DevicePtr, token: DevicePtr);
+        }
+    };
 }
 
-submission_ops! {
-    &Submission<'_>;
-    copy_device_to_device(destination: DevicePtr, source: DevicePtr, bytes: u64);
-    copy_device_to_device_2d(destination: DevicePtr, destination_pitch: u64, source: DevicePtr, source_pitch: u64, row_bytes: u64, rows: u64);
-    zero_device_memory(address: DevicePtr, bytes: u64);
-    embed_q3(token_ids: DevicePtr, embedding: DevicePtr, hidden: DevicePtr, token_count: u32, vocabulary_size: u32, hidden_size: u32, embedding_bytes: u64);
-    embed_q3_p2e2(token_ids: DevicePtr, embedding: DevicePtr, hidden: DevicePtr, token_count: u32, vocabulary_size: u32, hidden_size: u32, embedding_bytes: u64);
-    linear_launch(kernel: i32, grid: [u32; 3], block: [u32; 3], shared_bytes: u32, words: &[u64], sizes: &[u8]);
-    qwen4_launch(kernel: i32, grid: [u32; 3], block: [u32; 3], shared_bytes: u32, words: &[u64], sizes: &[u8]);
-    linear_nvfp4_bf16(input: DevicePtr, weights: DevicePtr, output: DevicePtr, rows: u32, in_features: u32, out_features: u32, weights_bytes: u64);
-    linear_nvfp4_native_bf16(input: DevicePtr, weights: DevicePtr, output: DevicePtr, scratch: DevicePtr, rows: u32, in_features: u32, out_features: u32, weights_bytes: u64, scratch_bytes: u64);
-    attention_qk_norm_rope_bf16(query_key: DevicePtr, query_norm: DevicePtr, key_norm: DevicePtr, output: DevicePtr, rows: u32, query_heads: u32, key_value_heads: u32, head_dim: u32, rotary_dim: u32, start_position: u64, position: DevicePtr, epsilon: f32, rope_theta: f64);
-    attention_kv_append_nvfp4(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, rows: u32, query_width: u32, key_width: u32, start: u64, position: DevicePtr);
-    attention_kv_append_bf16(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, rows: u32, query_width: u32, key_width: u32, start: u64, position: DevicePtr);
-    attention_causal_nvfp4(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, output: DevicePtr, rows: u32, query_heads: u32, key_heads: u32, head_dim: u32, cache_length: u32, start: u64, position: DevicePtr, scratch: DevicePtr);
-    attention_causal_bf16(query_key: DevicePtr, gate: DevicePtr, keys: DevicePtr, values: DevicePtr, output: DevicePtr, rows: u32, query_heads: u32, key_heads: u32, head_dim: u32, cache_length: u32, start: u64, position: DevicePtr, scratch: DevicePtr);
-    gdn_project_control_fp32(input: DevicePtr, a_weight: DevicePtr, b_weight: DevicePtr, a_log: DevicePtr, dt_bias: DevicePtr, alpha: DevicePtr, beta: DevicePtr, rows: u32, width: u32, heads: u32);
-    gdn_convolution_bf16(query_key: DevicePtr, value_z: DevicePtr, convolution_weights: DevicePtr, convolution_state: DevicePtr, output: DevicePtr, rows: u32, query_key_width: u32, value_width: u32, convolution_width: u32, kernel_size: u32);
-    gdn_recurrence_bf16(convolved: DevicePtr, alpha: DevicePtr, beta: DevicePtr, recurrent_state: DevicePtr, output: DevicePtr, rows: u32, key_heads: u32, value_heads: u32, key_head_dim: u32, value_head_dim: u32, output_scale: f32);
-    gdn_gated_rms_norm_bf16(recurrent: DevicePtr, value_z: DevicePtr, norm_weight: DevicePtr, output: DevicePtr, rows: u32, value_heads: u32, head_dim: u32, epsilon: f32);
-    residual_rms_norm_bf16(residual: DevicePtr, delta: DevicePtr, weight: DevicePtr, hidden: DevicePtr, normalized: DevicePtr, rows: u32, width: u32, epsilon: f32);
-    rms_norm_unit_offset_bf16(input: DevicePtr, weight: DevicePtr, output: DevicePtr, rows: u32, width: u32, epsilon: f32);
-    swiglu_bf16(gate_up: DevicePtr, output: DevicePtr, rows: u32, intermediate_size: u32);
-    residual_add_bf16(residual: DevicePtr, delta: DevicePtr, output: DevicePtr, rows: u32, width: u32);
-    argmax_bf16(logits: DevicePtr, count: u32, result: DevicePtr);
-    argmax_logprob_bf16(logits: DevicePtr, count: u32, result: DevicePtr);
-    selected_token(key: DevicePtr, ids: DevicePtr, token: DevicePtr);
-}
+operations!(submission_ops, Submission<'_>);
+operations!(submission_ops, &Submission<'_>);
 
 #[cfg(test)]
 mod tests {
@@ -1284,7 +1272,8 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         calls: Vec<&'static str>,
-        row_exact: bool,
+        began_row_exact: bool,
+        selected_row_exact: bool,
     }
 
     impl KernelOps for Recorder {
@@ -1569,7 +1558,7 @@ mod tests {
             Ok(())
         }
         fn set_row_exact(&mut self, enabled: bool) {
-            self.row_exact = enabled;
+            self.selected_row_exact = enabled;
         }
         unsafe fn copy_device_to_readback_shared(
             &mut self,
@@ -1599,7 +1588,7 @@ mod tests {
             Ok(())
         }
         fn row_exact(&self) -> bool {
-            self.row_exact
+            self.began_row_exact
         }
         fn library(&self) -> &Arc<CudaLibrary> {
             unreachable!("the recorder has no library")
@@ -1619,6 +1608,17 @@ mod tests {
         let mut recorder = Recorder::default();
         stage(&mut recorder).unwrap();
         assert_eq!(recorder.calls, ["zero", "copy", "linear"]);
-        assert!(recorder.row_exact());
+        assert!(recorder.selected_row_exact);
+        // The selection does not change the mode the submission began with.
+        assert!(!recorder.row_exact());
+    }
+
+    /// Both the submission and a shared reference to one serve a stage; building one needs a card, so the forwarding
+    /// itself is proved by the device tests.
+    #[test]
+    fn a_submission_and_a_reference_to_one_implement_the_trait() {
+        fn serves<T: KernelOps>() {}
+        serves::<Submission<'_>>();
+        serves::<&Submission<'_>>();
     }
 }

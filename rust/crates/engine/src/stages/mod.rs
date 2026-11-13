@@ -1,9 +1,9 @@
 //! The stages of a quantum: one `Stage<Quantum>` per layer operation (`model/qwen38/Stages.java`).
 //!
 //! A stage is built once with what does not change from quantum to quantum (its weights, the buffer slots it reads
-//! and writes, its layer). Its work is its [`Launch::launch`]: the kernel launches and copies of one quantum on a
-//! [`KernelOps`](euhedral_inference_cuda::KernelOps) it is given, and nothing else (no begin, no finish, no waits, no marker, no signal), so that a graph
-//! capture can record it. The one generic [`run_eager`] is the stage for eager submission: it takes the lane the
+//! and writes, its layer). Its work is its [`Launch::launch`]: the kernel launches and copies of one quantum on the
+//! [`KernelOps`] it is given, and nothing else (no begin, no finish, no waits, no marker, no signal), so that a
+//! graph capture can record it. The one generic [`run_eager`] is the stage for eager submission: it takes the lane the
 //! graph chose, orders itself behind the markers of its predecessors on other lanes, calls `launch`, and returns the
 //! marker of that work. It never waits.
 //!
@@ -688,7 +688,7 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
         .lanes
         .get(id)
         .ok_or_else(|| fatal(format!("lane {} is not in the lane table", id.0)))?;
-    let submission = match Submission::begin(lane, quantum.mode) {
+    let mut submission = match Submission::begin(lane, quantum.mode) {
         Ok(submission) => submission,
         Err(CudaError::LaneBusy(_)) => return Err(StageError::Retry),
         Err(error) => return Err(fatal(error)),
@@ -702,8 +702,7 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
         for marker in own.chain(stage.waits(quantum)) {
             submission.wait(marker).map_err(fatal)?;
         }
-        let mut kernels = &submission;
-        stage.launch(quantum, &mut kernels)?;
+        stage.launch(quantum, &mut submission)?;
     }
     let marker = if signal {
         submission.finish_signalled()

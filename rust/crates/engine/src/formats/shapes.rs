@@ -94,7 +94,7 @@ pub struct Launch {
 }
 
 impl Launch {
-    /// Queues the launch on the submission's lane. The library checks the argument count and widths against the
+    /// Queues the launch on `kernels`. The library checks the argument count and widths against the
     /// compiled kernel.
     pub fn queue(&self, kernels: &mut dyn KernelOps) -> Result<(), CudaError> {
         if self.args.count > MAX_ARGUMENTS {

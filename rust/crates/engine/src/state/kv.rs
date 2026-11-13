@@ -704,7 +704,7 @@ impl KvView {
         self.tables.get(layer)?.as_ref().map(|table| table.generation)
     }
 
-    /// Queues on `submission`'s lane the copy of layer `layer`'s host pages that an append of `rows` rows at `start`
+    /// Queues on `kernels` the copy of layer `layer`'s host pages that an append of `rows` rows at `start`
     /// and the attention after it read into the device region: every reserved one for a quantum of at most
     /// [`STAGED_TAIL_ROWS`] rows, otherwise those holding the rows before `start + rows`. Nothing without host
     /// pages.
@@ -736,7 +736,7 @@ impl KvView {
         Ok(())
     }
 
-    /// Queues on `submission`'s lane the copy back to host memory of the host pages that an append of `rows` rows at
+    /// Queues on `kernels` the copy back to host memory of the host pages that an append of `rows` rows at
     /// `start` wrote: the last two reserved ones for a quantum of at most [`STAGED_TAIL_ROWS`] rows (an append at the
     /// end of the reservation touches no other), otherwise exactly those holding its rows.
     pub fn stage_out(&self, kernels: &mut dyn KernelOps, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {

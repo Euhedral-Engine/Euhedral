@@ -84,7 +84,7 @@ pub struct GdnStates {
 impl GdnStates {
     /// Allocates and zeroes the state of every GDN layer, with speculative buffers for `verified_rows` rows (at
     /// least [`MINIMUM_VERIFY_ROWS`], as `GdnState.speculative` allocates); 0 allocates none. The allocations wait
-    /// (startup only); the zeroing is queued on `submission`'s lane, and the caller waits for its marker.
+    /// (startup only); the zeroing is queued on `kernels`, and the caller waits for its marker.
     pub fn allocate(
         library: &Arc<CudaLibrary>,
         config: &ModelConfig,
@@ -132,7 +132,7 @@ impl GdnStates {
         Ok(GdnStates { layers })
     }
 
-    /// Queues the zeroing of every layer's convolution and recurrent state on `submission`: the state of a sequence
+    /// Queues the zeroing of every layer's convolution and recurrent state on `kernels`: the state of a sequence
     /// that has seen no token. The speculative buffers hold nothing a quantum reads before it writes it.
     pub fn zero(&self, kernels: &mut dyn KernelOps) -> Result<(), CudaError> {
         for state in self.layers.iter().flatten() {
