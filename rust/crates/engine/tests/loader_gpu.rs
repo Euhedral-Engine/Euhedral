@@ -17,7 +17,7 @@
 )]
 #![allow(
     clippy::disallowed_methods,
-    reason = "no-wait, blocking I/O and waiting calls: a test reads files, copies device memory and waits on the latch"
+    reason = "no-wait, blocking I/O and waiting calls: a test reads files, copies device memory and waits on the hand-off"
 )]
 
 use std::fs::{self, File};
@@ -25,8 +25,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
+use std::time::Duration;
 
-use euhedral_graph::{LaneId, Latch};
+use euhedral_graph::LaneId;
 use euhedral_inference_cuda::{CudaLane, CudaLibrary, DevicePtr, Submission, SubmitMode, ops};
 use euhedral_inference_edrl::WeightFormat;
 use euhedral_inference_engine::error::{EngineError, PlanError};
@@ -35,6 +36,9 @@ use euhedral_inference_engine::residency::loader::pieces;
 use euhedral_inference_engine::residency::planner::{DEFAULT_RUNTIME_RESERVE_BYTES, nvfp4};
 use euhedral_inference_engine::workspace::BufferSlot;
 use euhedral_inference_engine::{EngineRuntime, RuntimeOwner};
+
+/// The longest a device test waits for one hand-off; past it the test fails.
+const WAIT: Duration = Duration::from_secs(20 * 60);
 use euhedral_inference_settings::{ByteSize, ModelSettings, Settings};
 use sha2::{Digest, Sha256};
 
@@ -62,11 +66,10 @@ fn settings(artifact: &Path, max_tokens: u32) -> Settings {
     settings
 }
 
-/// Starts the engine and waits for the latch, as `main` does.
+/// Starts the engine and waits for the hand-off, as `main` does.
 fn start(settings: &Settings, library: &Path) -> (Result<Arc<EngineRuntime>, EngineError>, RuntimeOwner) {
-    let (ready, waiting) = Latch::new();
-    let guard = EngineRuntime::start(settings, library, ready);
-    (waiting.wait(), guard)
+    let (guard, ready) = EngineRuntime::start(settings, library);
+    (ready.wait(WAIT).expect("the engine reports"), guard)
 }
 
 fn read_file(path: &Path, offset: u64, length: usize) -> Vec<u8> {

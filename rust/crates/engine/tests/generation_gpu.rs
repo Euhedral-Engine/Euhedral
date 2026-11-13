@@ -32,7 +32,7 @@
 )]
 #![allow(
     clippy::disallowed_methods,
-    reason = "no-wait, blocking I/O and waiting calls: a test reads files, runs the comparison script and waits on latches"
+    reason = "no-wait, blocking I/O and waiting calls: a test reads files, runs the comparison script and waits on hand-offs"
 )]
 
 use std::fs::{self, File};
@@ -44,14 +44,16 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use euhedral_graph::{Latch, LatchSetter};
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
 use euhedral_inference_engine::generation::{
     AdmissionError, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, LogitsSink, QuantumEvent,
     Speculation,
 };
 use euhedral_inference_engine::stages::QuantumKind;
-use euhedral_inference_engine::{EngineRuntime, RuntimeOwner};
+use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
+
+/// The longest a device test waits for one hand-off; past it the test fails.
+const WAIT: Duration = Duration::from_secs(20 * 60);
 use euhedral_inference_settings::{ModelSettings, Settings};
 use euhedral_inference_tokenizer::Tokenizer;
 
@@ -91,9 +93,14 @@ fn settings(artifact: &Path, max_tokens: u32) -> Settings {
 
 /// Starts the engine and waits for the latch, as `main` does.
 fn start(machine: &Machine, max_tokens: u32) -> (Arc<EngineRuntime>, RuntimeOwner) {
-    let (ready, waiting) = Latch::new();
-    let owner = EngineRuntime::start(&settings(&machine.artifact, max_tokens), &machine.library, ready);
-    (waiting.wait().expect("the engine starts"), owner)
+    let (owner, ready) = EngineRuntime::start(&settings(&machine.artifact, max_tokens), &machine.library);
+    (
+        ready
+            .wait(WAIT)
+            .expect("the engine reports")
+            .expect("the engine starts"),
+        owner,
+    )
 }
 
 fn read_range(file: &mut File, range: Range<u64>) -> Vec<u8> {
@@ -165,7 +172,7 @@ struct Recorder {
     events: Vec<QuantumEvent>,
     prefill_done: Option<Instant>,
     began: Instant,
-    done: Option<LatchSetter<Recording>>,
+    done: Option<Arc<Handoff<Recording>>>,
 }
 
 impl GenerationListener for Recorder {
@@ -184,7 +191,7 @@ impl GenerationListener for Recorder {
 
     fn finished(&mut self, outcome: GenerationOutcome) {
         let done = self.done.take().expect("a generation finishes once");
-        done.set(Recording {
+        done.send(Recording {
             tokens: mem::take(&mut self.tokens),
             token_times: mem::take(&mut self.token_times),
             events: mem::take(&mut self.events),
@@ -197,7 +204,8 @@ impl GenerationListener for Recorder {
 
 /// Runs a greedy generation and waits for its listener's latch.
 fn generate(runtime: &EngineRuntime, prompt: &[u32], max_tokens: u32, stop_tokens: &[u32]) -> Recording {
-    let (done, waiting) = Latch::new();
+    let done = Handoff::new();
+    let waiting = Arc::clone(&done);
     let began = Instant::now();
     runtime
         .generate(GenerationRequest {
@@ -215,7 +223,7 @@ fn generate(runtime: &EngineRuntime, prompt: &[u32], max_tokens: u32, stop_token
             }),
         })
         .expect("the request is admitted");
-    waiting.wait()
+    waiting.wait(WAIT).expect("the generation reports")
 }
 
 fn micros(duration: Duration) -> f64 {
@@ -399,11 +407,14 @@ fn context_end_stops_cleanly() {
     owner.shutdown(runtime).unwrap();
 }
 
+/// The rows of a run and how it ended.
+type Delivered = (Vec<u8>, GenerationOutcome);
+
 /// Collects the rows of a teacher-forced run in the Java report's format.
 struct Report {
     bytes: Vec<u8>,
     steps: usize,
-    done: Option<LatchSetter<(Vec<u8>, GenerationOutcome)>>,
+    done: Option<Arc<Handoff<Delivered>>>,
 }
 
 impl LogitsSink for Report {
@@ -416,7 +427,7 @@ impl LogitsSink for Report {
 
     fn finished(&mut self, outcome: GenerationOutcome) {
         let done = self.done.take().expect("a run finishes once");
-        done.set((mem::take(&mut self.bytes), outcome));
+        done.send((mem::take(&mut self.bytes), outcome));
     }
 }
 
@@ -453,7 +464,8 @@ fn teacher_forced_logits_bitwise_equal_java_report() {
     }
 
     let (runtime, owner) = start(&machine, 4096);
-    let (done, waiting) = Latch::new();
+    let done = Handoff::new();
+    let waiting = Arc::clone(&done);
     let mut bytes = Vec::with_capacity(java_bytes.len());
     bytes.extend_from_slice(&(steps as i32).to_le_bytes());
     bytes.extend_from_slice(&(vocabulary as i32).to_le_bytes());
@@ -469,7 +481,7 @@ fn teacher_forced_logits_bitwise_equal_java_report() {
             }),
         )
         .expect("the run is admitted");
-    let (rust_bytes, outcome) = waiting.wait();
+    let (rust_bytes, outcome) = waiting.wait(WAIT).expect("the run reports");
     println!(
         "{steps} teacher-forced steps after a {prefix}-token prefix in {:.2} s",
         began.elapsed().as_secs_f64()

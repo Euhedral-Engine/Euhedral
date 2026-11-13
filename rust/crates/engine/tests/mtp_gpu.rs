@@ -17,7 +17,7 @@
 )]
 #![allow(
     clippy::disallowed_methods,
-    reason = "no-wait, blocking I/O and waiting calls: a test reads files and waits on latches and the device"
+    reason = "no-wait, blocking I/O and waiting calls: a test reads files and waits on hand-offs and the device"
 )]
 
 use std::fs::File;
@@ -26,9 +26,9 @@ use std::mem;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use euhedral_graph::{LaneId, Latch, LatchSetter};
+use euhedral_graph::LaneId;
 use euhedral_inference_bench::prompt::PromptCorpus;
 use euhedral_inference_bench::prompt::words::DEFAULT_SEED;
 use euhedral_inference_cuda::{CudaLane, Submission, SubmitMode, ops};
@@ -37,7 +37,10 @@ use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
 use euhedral_inference_engine::stages::QuantumKind;
-use euhedral_inference_engine::{EngineRuntime, RuntimeOwner};
+use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
+
+/// The longest a device test waits for one hand-off; past it the test fails.
+const WAIT: Duration = Duration::from_secs(20 * 60);
 use euhedral_inference_settings::{ModelSettings, Settings};
 use euhedral_inference_tokenizer::Tokenizer;
 
@@ -65,9 +68,14 @@ fn start(machine: &Machine, max_tokens: u32) -> (Arc<EngineRuntime>, RuntimeOwne
         name: "test".to_string(),
     });
     settings.context.max_tokens = max_tokens;
-    let (ready, waiting) = Latch::new();
-    let owner = EngineRuntime::start(&settings, &machine.library, ready);
-    (waiting.wait().expect("the engine starts"), owner)
+    let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
+    (
+        ready
+            .wait(WAIT)
+            .expect("the engine reports")
+            .expect("the engine starts"),
+        owner,
+    )
 }
 
 fn read_range(file: &mut File, range: Range<u64>) -> Vec<u8> {
@@ -121,7 +129,7 @@ struct Recorder {
     verifications: Vec<Verification>,
     first: Option<Instant>,
     last: Option<Instant>,
-    done: Option<LatchSetter<Recording>>,
+    done: Option<Arc<Handoff<Recording>>>,
 }
 
 impl GenerationListener for Recorder {
@@ -144,7 +152,7 @@ impl GenerationListener for Recorder {
     fn finished(&mut self, outcome: GenerationOutcome) {
         let done = self.done.take().expect("a generation finishes once");
         let now = Instant::now();
-        done.set(Recording {
+        done.send(Recording {
             tokens: mem::take(&mut self.tokens),
             events: mem::take(&mut self.events),
             verifications: mem::take(&mut self.verifications),
@@ -162,7 +170,8 @@ fn generate(
     stop_tokens: &[u32],
     speculation: Speculation,
 ) -> Recording {
-    let (done, waiting) = Latch::new();
+    let done = Handoff::new();
+    let waiting = Arc::clone(&done);
     runtime
         .generate(GenerationRequest {
             prompt: prompt.to_vec(),
@@ -179,7 +188,7 @@ fn generate(
             }),
         })
         .expect("the request is admitted");
-    waiting.wait()
+    waiting.wait(WAIT).expect("the generation reports")
 }
 
 /// Committed rows of the base and MTP caches, quanta in flight and selections leased after a generation.

@@ -36,6 +36,10 @@ const LONGEST_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 /// # Panics
 ///
 /// When nothing was sent within a day.
+#[allow(
+    clippy::expect_used,
+    reason = "a bench binary or test with a lost sender has nothing to continue with"
+)]
 pub fn await_value<T>(handoff: &Handoff<T>) -> T {
     handoff
         .wait(LONGEST_WAIT)

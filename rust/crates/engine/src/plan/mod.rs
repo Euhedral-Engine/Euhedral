@@ -293,7 +293,7 @@ impl Plan {
     /// The predecessor whose lane each stage of `view` continues under the path policy: its critical predecessor, the one
     /// for which the stage is the critical successor (the successor with the greatest height, the first listed on
     /// ties; of several predecessors that name a join critical, the last visited). A stage with none, a root or a
-    /// branch of a fan-out, takes a lane in turn. RustEE's `StageGraph` places the stages by this rule.
+    /// branch of a fan-out, takes a lane `StageGraph` picks at random (RustEE's default placement); the rest follow this rule.
     pub fn path_predecessors(&self, view: View) -> Option<&[Option<usize>]> {
         self.variant(view.variant()).map(|plan| plan.path.as_slice())
     }
@@ -375,7 +375,7 @@ impl VariantPlan {
         // the embedding) has a fixed lane. That does not keep consecutive quanta on one lane: the chain of lane
         // continuations breaks where a join continues another branch (the last visited of the predecessors that name
         // it critical), so the lane a quantum ends on varies. Every other stage may run on any of the plan's lanes, and
-        // RustEE's graph puts it on the lane of its path predecessor or, as a branch, on the next lane in turn.
+        // RustEE's graph puts it on the lane of its path predecessor or, as a branch, on a lane the graph picks at random.
         let compute: Vec<LaneId> = (0..lanes).map(|lane| LaneId(lane as u16)).collect();
         let mut spec = StageGraphSpec::new();
         let ids: Vec<_> = self

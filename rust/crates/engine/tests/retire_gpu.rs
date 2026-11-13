@@ -95,7 +95,7 @@ impl Retirements {
     fn retire(&self, quantum: &Quantum, outcome: &QuantumOutcome) {
         let code = match outcome {
             QuantumOutcome::Completed => COMPLETED,
-            QuantumOutcome::Failed { .. } => FAILED,
+            QuantumOutcome::Failed { .. } | QuantumOutcome::DeviceFailed { .. } => FAILED,
             QuantumOutcome::Killed => KILLED,
         };
         self.0[quantum.start_position() as usize].store(code, Ordering::Release);
@@ -676,6 +676,7 @@ fn settle_behind_a_held_lane(backstop: Duration) {
     };
     let frames_out = |completions: &Completions| {
         let mut frames: Vec<Box<dyn Frame>> = Vec::new();
+        completions.reap();
         completions.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
         frames
     };
@@ -698,7 +699,7 @@ fn settle_behind_a_held_lane(backstop: Duration) {
     );
 
     let held = Submission::begin(lane, SubmitMode::default()).unwrap();
-    stage.abandoned(&quantum);
+    stage.abandoned(&quantum, lane.as_ref());
     assert_eq!(completions.pending(), 1, "the abandoned stage publishes one settling");
     let mut first = frames_out(&completions);
     assert_eq!(first.len(), 1, "the settling is ready at once");

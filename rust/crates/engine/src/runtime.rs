@@ -297,6 +297,9 @@ struct DeviceState {
     workspace: Arc<Workspace>,
 }
 
+/// What [`EngineRuntime::start`] hands over: the running engine, or why it did not start.
+pub type ReadyHandoff = Arc<Handoff<Result<Arc<EngineRuntime>, EngineError>>>;
+
 /// A started engine: the model on the device and the machinery that runs it.
 pub struct EngineRuntime {
     core: Arc<Core>,
@@ -327,10 +330,7 @@ impl EngineRuntime {
     /// Call it from the main thread, then [`wait`](Handoff::wait) on the hand-off. Keep the returned [`RuntimeOwner`]
     /// until the engine is done (see its contract): it closes the lattice and frees the device memory, on the calling
     /// thread.
-    pub fn start(
-        settings: &Settings,
-        library: &Path,
-    ) -> (RuntimeOwner, Arc<Handoff<Result<Arc<EngineRuntime>, EngineError>>>) {
+    pub fn start(settings: &Settings, library: &Path) -> (RuntimeOwner, ReadyHandoff) {
         let ready = Handoff::new();
         match build(settings, library) {
             Ok(core) => {

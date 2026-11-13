@@ -43,7 +43,7 @@ use crate::model::{
 use crate::residency::budget::{self, HostBudget};
 use crate::residency::loader::{self, LoadOutcome, Ring};
 use crate::residency::planner::{Placement, PlanInputs, ResidencyPlan, plan_with};
-use crate::runtime::{Core, EngineRuntime, StartupReport, Units, raw_file};
+use crate::runtime::{Core, EngineRuntime, ReadyHandoff, StartupReport, Units, raw_file};
 use crate::state::SequenceState;
 use crate::warmup;
 use crate::workspace::{Workspace, input_records};
@@ -132,7 +132,7 @@ pub(crate) fn read_machine() -> Machine {
 /// The startup in flight: the shared parts, the hand-off to send, and the units that keep the lakes open.
 struct Startup {
     core: Arc<Core>,
-    ready: Option<Arc<Handoff<Result<Arc<EngineRuntime>, EngineError>>>>,
+    ready: Option<ReadyHandoff>,
     _units: Units,
 }
 
@@ -191,7 +191,7 @@ fn device(core: &Core) -> &Arc<Lake> {
 }
 
 /// Begins the startup: the rest runs as frames.
-pub(crate) fn run(core: Arc<Core>, ready: Arc<Handoff<Result<Arc<EngineRuntime>, EngineError>>>) {
+pub(crate) fn run(core: Arc<Core>, ready: ReadyHandoff) {
     let units = match core.admit() {
         Ok(units) => units,
         Err(error) => return ready.send(Err(error)),
@@ -420,7 +420,7 @@ impl SegmentReads {
         let continuation = Handoff::empty();
         continuation.send(Box::new(then) as Box<dyn FnOnce(SegmentParts) + Send>);
         Arc::new(SegmentReads {
-            pending: AtomicU32::new(u32::try_from(count).expect("a model has far fewer than 2^32 trellis objects")),
+            pending: AtomicU32::new(u32::try_from(count).unwrap_or(u32::MAX)),
             parts: (0..count).map(|_| Handoff::empty()).collect(),
             then: continuation,
         })
@@ -876,4 +876,79 @@ fn tensors(
         );
     }
     tensors
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the tests start threads to race senders, and join them"
+)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A fan-in of `count` parts whose continuation hands over what it was given and counts its runs.
+    fn fan_in(count: usize) -> (Arc<SegmentReads>, Arc<Handoff<SegmentParts>>, Arc<AtomicUsize>) {
+        let seen = Handoff::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let reads = SegmentReads::new(count, {
+            let (seen, runs) = (Arc::clone(&seen), Arc::clone(&runs));
+            move |parts| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                seen.send(parts);
+            }
+        });
+        (reads, seen, runs)
+    }
+
+    #[test]
+    fn the_continuation_runs_once_when_every_part_arrived() {
+        let (reads, seen, runs) = fan_in(3);
+        for part in 0..3 {
+            assert_eq!(runs.load(Ordering::SeqCst), 0, "not before the last part");
+            Arrival::new(&reads, part).arrive(Ok(vec![part as u8]));
+        }
+        let parts = seen.wait(Duration::from_secs(5)).expect("the continuation ran");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        for (part, bytes) in parts.into_iter().enumerate() {
+            assert_eq!(bytes.unwrap().unwrap(), vec![part as u8]);
+        }
+    }
+
+    #[test]
+    fn a_part_dropped_unrun_still_counts_and_reaches_the_continuation_empty() {
+        let (reads, seen, runs) = fan_in(2);
+        Arrival::new(&reads, 0).arrive(Ok(vec![7]));
+        drop(Arrival::new(&reads, 1));
+        let parts = seen.wait(Duration::from_secs(5)).expect("the continuation ran");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(matches!(&parts[0], Some(Ok(bytes)) if bytes == &[7]));
+        assert!(parts[1].is_none(), "a part that never ran is told apart");
+    }
+
+    #[test]
+    fn parts_arriving_from_many_threads_run_the_continuation_once() {
+        const PARTS: usize = 8;
+        for _ in 0..200 {
+            let (reads, seen, runs) = fan_in(PARTS);
+            let arrivals: Vec<Arrival> = (0..PARTS).map(|part| Arrival::new(&reads, part)).collect();
+            let threads: Vec<_> = arrivals
+                .into_iter()
+                .enumerate()
+                .map(|(part, arrival)| thread::spawn(move || arrival.arrive(Ok(vec![part as u8]))))
+                .collect();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            let parts = seen.wait(Duration::from_secs(5)).expect("the continuation ran");
+            assert_eq!(runs.load(Ordering::SeqCst), 1);
+            assert!(
+                parts.iter().all(Option::is_some),
+                "every part's bytes arrived before the continuation"
+            );
+        }
+    }
 }

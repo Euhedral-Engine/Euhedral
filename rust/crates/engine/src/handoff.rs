@@ -4,10 +4,13 @@
 //! value, set once and taken once. The thread that waits is a caller's own (the binary's `main`, a test), never a
 //! worker; every holder of a sending end must send in its `Drop` when it has not sent, or the waiter never ends.
 
+use std::error::Error;
 use std::fmt;
+use std::marker::PhantomData;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use euhedral_data_structures::sync::HotScope;
@@ -26,12 +29,18 @@ impl fmt::Display for TimedOut {
     }
 }
 
-impl std::error::Error for TimedOut {}
+impl Error for TimedOut {}
 
 /// A cell that takes one value from any thread and gives it to one.
 pub struct Handoff<T> {
     value: AtomicPtr<T>,
+    /// The cell owns a `T` that crosses threads: `Send` only when `T` is.
+    owns: PhantomData<T>,
 }
+
+// SAFETY: a value goes in by a release store of a pointer to a box nothing else holds and out by an acquire swap that
+// gives the box to one thread, so the cell only moves `T`s between threads, which `T: Send` allows.
+unsafe impl<T: Send> Sync for Handoff<T> {}
 
 impl<T> fmt::Debug for Handoff<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -49,6 +58,7 @@ impl<T> Handoff<T> {
     pub fn empty() -> Handoff<T> {
         Handoff {
             value: AtomicPtr::new(ptr::null_mut()),
+            owns: PhantomData,
         }
     }
 
@@ -102,7 +112,7 @@ impl<T> Handoff<T> {
             if left.is_zero() {
                 return Err(TimedOut);
             }
-            std::thread::sleep(pause.min(left));
+            thread::sleep(pause.min(left));
             pause = (pause * 2).min(LONGEST_PAUSE);
         }
     }
@@ -115,6 +125,10 @@ impl<T> Drop for Handoff<T> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the tests start threads to race senders, and join them"
+)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::thread;

@@ -15,7 +15,7 @@
 )]
 #![allow(
     clippy::disallowed_methods,
-    reason = "no-wait, waiting calls: the test thread waits on latches and copies device memory to check results"
+    reason = "no-wait, waiting calls: the test thread waits on hand-offs and copies device memory to check results"
 )]
 #![allow(clippy::print_stdout, reason = "a test reports what it measured")]
 
@@ -35,12 +35,13 @@ use std::time::{Duration, Instant};
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, GraphRuntime, Join, Lake, LaneId, LanePool, Latch, Marker,
-    QuantumOutcome, RetryCounts, UnitGuard,
+    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, GraphRuntime, Lake, LaneId, LanePool, Marker, QuantumOutcome,
+    RetryCounts, UnitGuard,
 };
 use euhedral_inference_cuda::{
     CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, PinnedPool, RetireList, Submission, SubmitMode, ops,
 };
+use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{
@@ -355,9 +356,12 @@ impl World {
 /// A retired quantum and how it ended.
 type Retired = (Quantum, QuantumOutcome);
 
+/// The longest a device test waits for one retirement; past it the test fails.
+const WAIT: Duration = Duration::from_secs(20 * 60);
+
 /// Where the retirements of one executor are handed to the test thread: step `i` waits on join `i`.
 struct Steps {
-    joins: Vec<OnceLock<Arc<Join<Retired>>>>,
+    joins: Vec<OnceLock<Arc<Handoff<Retired>>>>,
     retired: AtomicUsize,
 }
 
@@ -370,12 +374,9 @@ impl Steps {
     }
 
     /// Arms step `index` and returns what waits for its retirement.
-    fn arm(&self, index: usize) -> euhedral_graph::LatchWaiter<Retired> {
-        let (done, waiting) = Latch::new();
-        let join = Join::new(1, move |mut parts: Vec<Option<Retired>>| {
-            done.set(parts.remove(0).unwrap())
-        });
-        assert!(self.joins[index].set(join).is_ok());
+    fn arm(&self, index: usize) -> Arc<Handoff<Retired>> {
+        let waiting = Handoff::new();
+        assert!(self.joins[index].set(Arc::clone(&waiting)).is_ok());
         waiting
     }
 }
@@ -449,7 +450,7 @@ impl Run {
             capture_lane(world),
             move |quantum, outcome| {
                 let index = again.retired.fetch_add(1, Ordering::AcqRel);
-                again.joins[index].get().expect("armed").arrive(0, (quantum, outcome));
+                again.joins[index].get().expect("armed").send((quantum, outcome));
             },
         )
         .unwrap();
@@ -627,7 +628,7 @@ impl Run {
         self.recorded += usize::from(started.recording);
         // Nothing is chained to this quantum: its reference is not held, or it would never retire.
         drop(started);
-        let (quantum, outcome) = waiting.wait();
+        let (quantum, outcome) = waiting.wait(WAIT).expect("the quantum retires");
         assert_eq!(outcome, QuantumOutcome::Completed, "{step:?} at {start}");
 
         let keys: Vec<u64> = (0..logits_rows)

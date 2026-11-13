@@ -5,7 +5,7 @@ use std::time::Instant;
 use super::request::{GenerationOutcome, QuantumEvent, Verification};
 
 /// What a generation tells its caller. Every method runs on a worker of the engine's lattice, one call at a time and in
-/// the order of the events, and must not wait: hand the event on (set a latch, offer a frame) and return.
+/// the order of the events, and must not wait: hand the event on (send a hand-off, offer a frame) and return.
 pub trait GenerationListener: Send {
     /// The last prompt chunk has retired, at `at`; the first token is read next.
     fn prefill_done(&mut self, at: Instant);

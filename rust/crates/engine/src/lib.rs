@@ -18,5 +18,7 @@ mod warmup;
 pub mod workspace;
 
 pub use handoff::{Handoff, TimedOut};
-pub use runtime::{EngineRuntime, RuntimeOwner, StartupReport, Teardown, fragment_config, lattice_config};
+pub use runtime::{
+    EngineRuntime, ReadyHandoff, RuntimeOwner, StartupReport, Teardown, fragment_config, lattice_config,
+};
 pub use warmup::Warmed;

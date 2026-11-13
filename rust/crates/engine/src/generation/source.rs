@@ -1240,8 +1240,8 @@ impl LatticeSource for GenerationSource {
         _stop: &mut dyn FnMut(&dyn Frame) -> bool,
         _demand: u64,
     ) -> u64 {
-        // The frames go to the lake, not to this puller.
-        self.poll_arc();
+        // The frames go to the lake, not to this puller, and a pull must not offer them: the lattice's workers
+        // request the source whenever a cycle found nothing, and that request polls.
         0
     }
 

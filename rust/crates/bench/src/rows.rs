@@ -180,6 +180,12 @@ fn compute(run: &Run, input: &RowInput) {
     run.computed[input.step].store(true, Ordering::Release);
 }
 
+/// What a run's engine side hands over: the outcome of the generation.
+pub type EngineHandoff = Arc<Handoff<GenerationOutcome>>;
+
+/// What a run's sink hands over: the values it collected.
+pub type ValuesHandoff = Arc<Handoff<RunValues>>;
+
 /// The sink of one run. The engine calls it on workers, one call at a time.
 pub struct RowSink {
     run: Arc<Run>,
@@ -203,7 +209,7 @@ impl RowSink {
         host: Arc<Lake>,
         task: Arc<dyn RowTask>,
         steps: usize,
-    ) -> Result<(RowSink, Arc<Handoff<GenerationOutcome>>, Arc<Handoff<RunValues>>), ConfigError> {
+    ) -> Result<(RowSink, EngineHandoff, ValuesHandoff), ConfigError> {
         let unit = host
             .admit()
             .map_err(|error| ConfigError::Invalid(format!("the host lake would not take work: {error}")))?;
@@ -323,7 +329,7 @@ pub fn start(
     prefix: Vec<u32>,
     forced: Vec<u32>,
     task: Arc<dyn RowTask>,
-) -> Result<(Arc<Handoff<GenerationOutcome>>, Arc<Handoff<RunValues>>), ConfigError> {
+) -> Result<(EngineHandoff, ValuesHandoff), ConfigError> {
     let (sink, engine, values) =
         RowSink::new(Arc::clone(runtime.io()), Arc::clone(runtime.host()), task, forced.len())?;
     runtime

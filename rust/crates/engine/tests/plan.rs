@@ -19,10 +19,11 @@ use std::time::Duration;
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, GraphRuntime, Join, Lake, LaneId, LanePool, Latch, Marker,
-    QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, Submitted,
+    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, GraphRuntime, Lake, LaneId, LanePool, Marker, QuantumOutcome,
+    QueueId, RetryCounts, Stage, StageCx, StageError, StageGraph, Submitted,
 };
 use euhedral_inference_cuda::DevicePtr;
+use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{LayerKind, ModelConfig, WeightRef, object_key};
@@ -499,17 +500,12 @@ fn submitted(plan: &Plan, view: View, order: &[usize], count: usize) -> LaneEnds
     let spec = plan.spec(view).unwrap();
     let signalled = plan.signalled(view).unwrap();
     let ends = LaneEnds::new(plan.fan_out_width() + 2);
+    let queue = QueueId::next();
     let mut values = vec![0u64; plan.fan_out_width() + 2];
     for &stage in &order[..count] {
         let lane = spec.stages()[stage].lanes[0];
         values[usize::from(lane.0)] += 1;
-        ends.record(
-            Marker {
-                lane,
-                value: values[usize::from(lane.0)],
-            },
-            signalled[stage],
-        );
+        ends.record(Marker::new(queue, lane, values[usize::from(lane.0)]), signalled[stage]);
     }
     ends
 }
@@ -589,7 +585,7 @@ impl Stage<()> for Records {
 }
 
 #[derive(Debug)]
-struct Idle;
+struct Idle(QueueId);
 
 impl DeviceQueue for Idle {
     fn completed(&self) -> u64 {
@@ -598,6 +594,10 @@ impl DeviceQueue for Idle {
 
     fn name(&self) -> &str {
         "idle"
+    }
+
+    fn id(&self) -> QueueId {
+        self.0
     }
 }
 
@@ -624,17 +624,15 @@ fn placed_by_rustee(plan: &Plan, view: View) -> Vec<u16> {
     );
     let pool = Arc::new(LanePool::new(
         (0..plan.fan_out_width())
-            .map(|_| Arc::new(Idle) as Arc<dyn DeviceQueue>)
+            .map(|_| Arc::new(Idle(QueueId::next())) as Arc<dyn DeviceQueue>)
             .collect(),
     ));
     let completions = Completions::new(Arc::clone(&pool));
     lattice
         .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
         .unwrap();
-    let (done, finished) = Latch::new();
-    let join = Join::new(1, move |mut parts: Vec<Option<QuantumOutcome>>| {
-        done.set(parts.remove(0).unwrap())
-    });
+    let finished = Handoff::new();
+    let done = Arc::clone(&finished);
     let graph = StageGraph::new(
         spec,
         stages,
@@ -645,12 +643,12 @@ fn placed_by_rustee(plan: &Plan, view: View) -> Vec<u16> {
             retries: Arc::new(RetryCounts::default()),
             retry_backstop: DEFAULT_RETRY_BACKSTOP,
         },
-        move |(), outcome| join.arrive(0, outcome),
+        move |(), outcome| done.send(outcome),
     )
     .unwrap();
     let unit = lake.admit().unwrap();
     let _ = graph.start((), Arc::new(AtomicBool::new(false)), Vec::new());
-    assert_eq!(finished.wait(), QuantumOutcome::Completed);
+    assert_eq!(finished.wait(Duration::from_secs(60)), Ok(QuantumOutcome::Completed));
     drop(unit);
     lake.complete_gracefully();
     lattice.close();
