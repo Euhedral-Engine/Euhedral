@@ -774,6 +774,29 @@ pub fn residual_rms_norm_bf16(
     )
 }
 
+/// `output = rms_norm(input) * weight`, the weight used as it is.
+pub fn rms_norm_bf16(
+    submission: &Submission<'_>,
+    input: DevicePtr,
+    weight: DevicePtr,
+    output: DevicePtr,
+    rows: u32,
+    width: u32,
+    epsilon: f32,
+) -> Result<(), CudaError> {
+    entry!(
+        submission,
+        euhedral_cuda_rms_norm_bf16(
+            input.as_const(),
+            weight.as_const(),
+            output.as_mut(),
+            rows,
+            width,
+            epsilon
+        )
+    )
+}
+
 pub fn rms_norm_unit_offset_bf16(
     submission: &Submission<'_>,
     input: DevicePtr,
