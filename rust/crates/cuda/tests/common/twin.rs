@@ -24,8 +24,13 @@
 )]
 #![allow(dead_code, reason = "each test binary uses a part of the harness")]
 
+use std::collections::BTreeMap;
 use std::error::Error;
+use std::process::abort;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use euhedral_gpu::cuda::{CudaGpu, CudaStream};
 use euhedral_gpu::{Gpu, GpuError, Stream, StreamOptions};
@@ -56,6 +61,13 @@ pub struct Case<'a> {
     pub plan: Plan<'a>,
     /// The buffers compared.
     pub outputs: Vec<usize>,
+    /// Whether both sides run row-exact (the native submission's mode; the plan's modes are the planner's own).
+    pub row_exact: bool,
+    /// Device tables of page addresses: the buffer that is the table, and the buffers it lists. Each set gets a table
+    /// of its own pages, and a table is never copied between sets.
+    pub tables: Vec<(usize, Vec<usize>)>,
+    /// Buffers that are only allocated: scratch the kernels write before they read, too large to be worth filling.
+    pub scratch: Vec<usize>,
 }
 
 /// What a case came to.
@@ -119,10 +131,19 @@ impl Twin {
     }
 
     pub fn run(&mut self, case: &Case<'_>) -> Result<Verdict, Failure> {
-        let native = self.upload(&case.buffers)?;
-        let twin = self.upload(&case.buffers)?;
+        let native = self.upload(&case.buffers, &case.scratch)?;
+        let twin = self.upload(&case.buffers, &case.scratch)?;
         let native_ptrs: Vec<DevicePtr> = native.iter().map(DeviceBuffer::ptr).collect();
         let twin_ptrs: Vec<DevicePtr> = twin.iter().map(DeviceBuffer::ptr).collect();
+        for (set, pointers) in [(&native, &native_ptrs), (&twin, &twin_ptrs)] {
+            for (table, pages) in &case.tables {
+                let bytes: Vec<u8> = pages
+                    .iter()
+                    .flat_map(|&page| pointers[page].get().to_le_bytes())
+                    .collect();
+                set[*table].copy_from_host(0, &bytes)?;
+            }
+        }
 
         let plan = (case.plan)(&twin_ptrs);
         let refused: Vec<String> = plan
@@ -142,17 +163,21 @@ impl Twin {
         }
 
         if let Some(prepare) = &case.prepare {
-            self.run_native(prepare, &native_ptrs)?;
-            for (made, copy) in native.iter().zip(&twin) {
+            self.run_native(prepare, &native_ptrs, case.row_exact)?;
+            for (index, (made, copy)) in native.iter().zip(&twin).enumerate() {
+                if case.scratch.contains(&index) || case.tables.iter().any(|(table, _)| *table == index) {
+                    continue;
+                }
                 let mut bytes = vec![0u8; made.bytes()];
                 made.copy_to_host(0, &mut bytes)?;
                 copy.copy_from_host(0, &bytes)?;
             }
         }
-        self.run_native(&case.native, &native_ptrs)?;
+        self.run_native(&case.native, &native_ptrs, case.row_exact)?;
         self.run_rustee(&plan)?;
 
         let mut compared = 0;
+        let mut written = false;
         for &index in &case.outputs {
             let (left, right) = (download(&native[index])?, download(&twin[index])?);
             if let Some(offset) = left.iter().zip(&right).position(|(a, b)| a != b) {
@@ -164,16 +189,27 @@ impl Twin {
                 });
             }
             compared += left.len();
+            written |= left.iter().any(|&byte| byte != 0);
+        }
+        if !written {
+            return Err(format!(
+                "{}: every compared buffer is zero, so the case proves nothing",
+                case.name
+            )
+            .into());
         }
         Ok(Verdict::Identical { bytes: compared })
     }
 
-    fn upload(&self, buffers: &[Vec<u8>]) -> Result<Vec<DeviceBuffer>, Failure> {
+    fn upload(&self, buffers: &[Vec<u8>], scratch: &[usize]) -> Result<Vec<DeviceBuffer>, Failure> {
         buffers
             .iter()
-            .map(|bytes| {
+            .enumerate()
+            .map(|(index, bytes)| {
                 let buffer = DeviceBuffer::alloc(&self.library, bytes.len())?;
-                buffer.copy_from_host(0, bytes)?;
+                if !scratch.contains(&index) {
+                    buffer.copy_from_host(0, bytes)?;
+                }
                 Ok(buffer)
             })
             .collect::<Result<Vec<_>, Failure>>()
@@ -183,8 +219,14 @@ impl Twin {
             })
     }
 
-    fn run_native(&self, step: &Native<'_>, pointers: &[DevicePtr]) -> Result<(), Failure> {
-        let submission = Submission::begin(&self.lane, SubmitMode::default())?;
+    fn run_native(&self, step: &Native<'_>, pointers: &[DevicePtr], row_exact: bool) -> Result<(), Failure> {
+        let submission = Submission::begin(
+            &self.lane,
+            SubmitMode {
+                row_exact,
+                ..SubmitMode::default()
+            },
+        )?;
         step(&submission, pointers)?;
         submission.finish()?;
         self.lane.synchronize()?;
@@ -209,4 +251,148 @@ fn download(buffer: &DeviceBuffer) -> Result<Vec<u8>, Failure> {
     let mut bytes = vec![0u8; buffer.bytes()];
     buffer.copy_to_host(0, &mut bytes)?;
     Ok(bytes)
+}
+
+/// Cases are unavailable for these reasons at the pinned RustEE revision; any other reason is a failure.
+const EXPECTED_SKIPS: [(&str, &str); 3] = [
+    (
+        "architecture-specific compile target",
+        "needs the architecture-specific compile target",
+    ),
+    ("tensor-map arguments", "takes tensor-map arguments"),
+    ("dynamic shared memory", "dynamic shared memory"),
+];
+
+/// What a sweep came to, per planner: cases compared, cases the planner refused, cases skipped by reason.
+#[derive(Default)]
+pub struct Tally {
+    planners: BTreeMap<String, Counts>,
+    failures: Vec<String>,
+}
+
+#[derive(Default)]
+struct Counts {
+    compared: usize,
+    refused: usize,
+    skipped: BTreeMap<String, usize>,
+}
+
+impl Tally {
+    pub fn refused(&mut self, planner: &str) {
+        self.planners.entry(planner.to_string()).or_default().refused += 1;
+    }
+
+    /// Records a verdict; a difference or an unexpected unavailability is a failure, reported at the end.
+    pub fn record(&mut self, planner: &str, shape: &str, verdict: Verdict) {
+        let counts = self.planners.entry(planner.to_string()).or_default();
+        match verdict {
+            Verdict::Identical { .. } => counts.compared += 1,
+            Verdict::Differs {
+                buffer,
+                offset,
+                native,
+                rustee,
+            } => {
+                let line = format!(
+                    "MISMATCH {planner} {shape}: buffer {buffer} first differs at byte {offset}: native {native:#04x}, rustee {rustee:#04x}"
+                );
+                println!("{line}");
+                self.failures.push(line);
+            }
+            Verdict::Skipped(reasons) => {
+                // A case counts once for each reason it is skipped for.
+                let mut names = Vec::new();
+                for reason in reasons {
+                    match EXPECTED_SKIPS.iter().find(|(_, text)| reason.contains(text)) {
+                        Some((name, _)) => {
+                            if !names.contains(name) {
+                                names.push(*name);
+                                *counts.skipped.entry((*name).to_string()).or_default() += 1;
+                            }
+                        }
+                        None => {
+                            let line = format!("UNAVAILABLE {planner} {shape}: {reason}");
+                            println!("{line}");
+                            self.failures.push(line);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prints the totals and fails when anything mismatched or was unavailable for an unexpected reason.
+    pub fn finish(self) {
+        for (planner, counts) in &self.planners {
+            println!(
+                "{planner}: {} compared, {} refused by the planner, skipped: {:?}",
+                counts.compared, counts.refused, counts.skipped
+            );
+        }
+        assert!(
+            self.failures.is_empty(),
+            "{} failures, first: {}",
+            self.failures.len(),
+            self.failures[0]
+        );
+    }
+}
+
+/// Aborts the process when the test is still running after `seconds`, so a hung device call fails fast.
+pub fn watchdog(seconds: u64) -> Arc<AtomicBool> {
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&done);
+    thread::spawn(move || {
+        for _ in 0..seconds {
+            thread::sleep(Duration::from_secs(1));
+            if flag.load(Ordering::Relaxed) {
+                return;
+            }
+        }
+        println!("watchdog: the test did not finish in {seconds} s");
+        abort();
+    });
+    done
+}
+
+/// A fixed-seed generator (splitmix64) of the test's input bytes.
+pub struct Random(pub u64);
+
+impl Random {
+    pub fn word(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// `count` BF16 values in about [-1, 1): finite, never NaN.
+    pub fn bf16(&mut self, count: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(count * 2);
+        // A large buffer repeats a block of 64 Ki values: the data is only to be varied, and cheap to make.
+        let block = count.min(1 << 16);
+        for _ in 0..block {
+            let r = self.word();
+            // sign, exponent 0x74..0x7f (values 2^-11 to 1), a random mantissa.
+            let exponent = 0x74 + (r >> 8) % 12;
+            let value = (((r >> 20) & 1) << 15) | (exponent << 7) | (r & 0x7f);
+            bytes.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        while bytes.len() < count * 2 {
+            let more = (count * 2 - bytes.len()).min(bytes.len());
+            bytes.extend_from_within(..more);
+        }
+        bytes
+    }
+
+    /// `count` raw bytes.
+    pub fn bytes(&mut self, count: usize) -> Vec<u8> {
+        let mut bytes: Vec<u8> = (0..count.min(1 << 17)).map(|_| self.word() as u8).collect();
+        while bytes.len() < count {
+            let more = (count - bytes.len()).min(bytes.len());
+            bytes.extend_from_within(..more);
+        }
+        bytes
+    }
 }

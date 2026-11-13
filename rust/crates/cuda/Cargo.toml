@@ -21,6 +21,8 @@ thiserror.workspace = true
 euhedral-gpu = { workspace = true, features = ["cuda"] }
 
 [dev-dependencies]
+# The twin tests switch exact numerics, which only the test oracle can.
+euhedral-inference-cuda = { path = ".", features = ["test-oracles"] }
 tempfile.workspace = true
 test-support = { path = "../test-support" }
 
