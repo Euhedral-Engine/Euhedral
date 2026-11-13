@@ -17,11 +17,11 @@ const RECURRENCE: KernelId = kernel!("euhedral_gdn_recurrence_bf16");
 const RECURRENCE_C8: KernelId = kernel!("euhedral_gdn_recurrence_c8_bf16");
 const GATED_RMS_NORM: KernelId = kernel!("euhedral_gdn_gated_rms_norm_bf16");
 
-/// The fewest rows at which the 8-row by 4-head kernel runs (`qwen_layer_ops.c:431`, machine-measured: 9.8 against
-/// 19.6 us at 8 rows, 23.2 against 21.2 at 48).
+/// The fewest rows at which the 8-row by 4-head kernel runs (`euhedral_cuda_gdn_project_control_fp32` in `qwen_layer_ops.c`). Below it
+/// the per-row kernel's one block per row and head fills the device better.
 const TILED_FROM_ROWS: u32 = 48;
 
-/// The shape of `euhedral_cuda_gdn_project_control_fp32` (`qwen_layer_ops.c:412`).
+/// The shape of `euhedral_cuda_gdn_project_control_fp32` (`qwen_layer_ops.c`).
 #[derive(Clone, Copy, Debug)]
 pub struct ProjectControlShape {
     pub input: DevicePtr,
@@ -36,7 +36,7 @@ pub struct ProjectControlShape {
     pub heads: u32,
 }
 
-/// `euhedral_cuda_gdn_project_control_fp32`, `qwen_layer_ops.c:412-434`: one launch, the tiled kernel from 48 rows when
+/// `euhedral_cuda_gdn_project_control_fp32`, `qwen_layer_ops.c`: one launch, the tiled kernel from 48 rows when
 /// the heads divide by 4.
 pub fn plan_project_control(shape: &ProjectControlShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
@@ -68,7 +68,7 @@ pub fn plan_project_control(shape: &ProjectControlShape, sink: &mut impl FnMut(L
         .u32(s.rows)
         .u32(s.width)
         .u32(s.heads);
-    // qwen_layer_ops.c:431-433.
+    // euhedral_cuda_gdn_project_control_fp32 in qwen_layer_ops.c.
     if s.rows >= TILED_FROM_ROWS && s.heads.is_multiple_of(4) {
         let blocks = s.rows.wrapping_add(7) / 8 * (s.heads / 4);
         sink(Launch::new(PROJECT_CONTROL_TILED, [blocks, 1, 1], [128, 1, 1], 0, args));
@@ -78,7 +78,7 @@ pub fn plan_project_control(shape: &ProjectControlShape, sink: &mut impl FnMut(L
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_gdn_convolution_bf16` (`qwen_layer_ops.c:290`).
+/// The shape of `euhedral_cuda_gdn_convolution_bf16` (`qwen_layer_ops.c`).
 #[derive(Clone, Copy, Debug)]
 pub struct ConvolutionShape {
     pub query_key: DevicePtr,
@@ -93,10 +93,10 @@ pub struct ConvolutionShape {
     pub kernel_size: u32,
 }
 
-/// `euhedral_cuda_gdn_convolution_bf16`, `qwen_layer_ops.c:290-312`: one launch of (channels / 128, rows / 32) blocks.
+/// `euhedral_cuda_gdn_convolution_bf16`, `qwen_layer_ops.c`: one launch of (channels / 128, rows / 32) blocks.
 pub fn plan_convolution(shape: &ConvolutionShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
-    // qwen_layer_ops.c:293-296: the sum of the two widths is a u32 sum and wraps.
+    // euhedral_cuda_gdn_convolution_bf16 in qwen_layer_ops.c: the sum of the two widths is a u32 sum and wraps.
     if s.query_key.is_null()
         || s.value_z.is_null()
         || s.weights.is_null()
@@ -122,7 +122,7 @@ pub fn plan_convolution(shape: &ConvolutionShape, sink: &mut impl FnMut(Launch))
         .u32(s.value_width)
         .u32(s.convolution_width)
         .u32(s.kernel_size);
-    // qwen_layer_ops.c:310: 32-row blocks (QWEN_GDN_CONV_ROWS), 128 channels per block; u32 arithmetic.
+    // euhedral_cuda_gdn_convolution_bf16 in qwen_layer_ops.c: 32-row blocks (QWEN_GDN_CONV_ROWS), 128 channels per block; u32 arithmetic.
     let grid = [
         s.convolution_width.wrapping_add(127) / 128,
         s.rows.wrapping_add(31) / 32,
@@ -132,7 +132,7 @@ pub fn plan_convolution(shape: &ConvolutionShape, sink: &mut impl FnMut(Launch))
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_gdn_recurrence_bf16` (`qwen_layer_ops.c:314`).
+/// The shape of `euhedral_cuda_gdn_recurrence_bf16` (`qwen_layer_ops.c`).
 #[derive(Clone, Copy, Debug)]
 pub struct RecurrenceShape {
     pub convolved: DevicePtr,
@@ -148,9 +148,9 @@ pub struct RecurrenceShape {
     pub output_scale: f32,
 }
 
-/// `euhedral_cuda_gdn_recurrence_bf16`, `qwen_layer_ops.c:314-348`: one launch of `value_heads * 128 / 8` blocks of 32
+/// `euhedral_cuda_gdn_recurrence_bf16`, `qwen_layer_ops.c`: one launch of `value_heads * 128 / 8` blocks of 32
 /// threads. The column-owned kernel (c8) runs for two or more rows, not row-exact, not exact, when the convolved and
-/// state pointers are 16-byte aligned (`:343-345`); the warp kernel runs otherwise.
+/// state pointers are 16-byte aligned (`euhedral_cuda_gdn_recurrence_bf16`); the warp kernel runs otherwise.
 pub fn plan_recurrence(shape: &RecurrenceShape, modes: Modes, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
     if s.convolved.is_null()
@@ -169,7 +169,7 @@ pub fn plan_recurrence(shape: &RecurrenceShape, modes: Modes, sink: &mut impl Fn
     {
         return Err(PlanError::InvalidArgument);
     }
-    // qwen_layer_ops.c:321.
+    // euhedral_cuda_gdn_recurrence_bf16 in qwen_layer_ops.c.
     let rows_count = u64::from(s.value_heads) * u64::from(s.value_head_dim);
     if rows_count > u64::from(u32::MAX) {
         return Err(PlanError::SizeOverflow);
@@ -186,7 +186,7 @@ pub fn plan_recurrence(shape: &RecurrenceShape, modes: Modes, sink: &mut impl Fn
         .u32(s.key_head_dim)
         .u32(s.value_head_dim)
         .f32(s.output_scale);
-    // qwen_layer_ops.c:343-347.
+    // euhedral_cuda_gdn_recurrence_bf16 in qwen_layer_ops.c.
     let aligned = (s.convolved.get() | s.recurrent_state.get()) & 15 == 0;
     let kernel = if !modes.exact_numerics && aligned && s.rows > 1 && !modes.row_exact {
         RECURRENCE_C8
@@ -203,7 +203,7 @@ pub fn plan_recurrence(shape: &RecurrenceShape, modes: Modes, sink: &mut impl Fn
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_gdn_gated_rms_norm_bf16` (`qwen_layer_ops.c:350`).
+/// The shape of `euhedral_cuda_gdn_gated_rms_norm_bf16` (`qwen_layer_ops.c`).
 #[derive(Clone, Copy, Debug)]
 pub struct GatedRmsNormShape {
     pub recurrent: DevicePtr,
@@ -216,7 +216,7 @@ pub struct GatedRmsNormShape {
     pub epsilon: f32,
 }
 
-/// `euhedral_cuda_gdn_gated_rms_norm_bf16`, `qwen_layer_ops.c:350-369`: one launch of `rows * value_heads` blocks.
+/// `euhedral_cuda_gdn_gated_rms_norm_bf16`, `qwen_layer_ops.c`: one launch of `rows * value_heads` blocks.
 pub fn plan_gated_rms_norm(shape: &GatedRmsNormShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
     if s.recurrent.is_null()
@@ -285,17 +285,17 @@ mod tests {
 
     #[test]
     fn project_control_tiles_from_48_rows_and_four_heads() {
-        // qwen_layer_ops.c:431: rows >= 48 && heads % 4 == 0.
+        // euhedral_cuda_gdn_project_control_fp32 in qwen_layer_ops.c: rows >= 48 && heads % 4 == 0.
         let (result, launches) = plan_control(&control(47, 48));
         let below = one(result, launches);
         assert_eq!(below.kernel, kernel!("euhedral_gdn_project_control_fp32"));
-        // :433: rows * heads blocks of 128.
+        // euhedral_cuda_gdn_project_control_fp32 in qwen_layer_ops.c: rows * heads blocks of 128.
         assert_eq!((below.grid, below.block), ([47 * 48, 1, 1], [128, 1, 1]));
         assert!(below.programmatic);
         let (result, launches) = plan_control(&control(48, 48));
         let at = one(result, launches);
         assert_eq!(at.kernel, kernel!("euhedral_gdn_project_control_8x4_fp32"));
-        // :432: (48 + 7) / 8 = 6 row tiles times 48 / 4 = 12 head tiles.
+        // euhedral_cuda_gdn_project_control_fp32 in qwen_layer_ops.c: (48 + 7) / 8 = 6 row tiles times 48 / 4 = 12 head tiles.
         assert_eq!((at.grid, at.block), ([72, 1, 1], [128, 1, 1]));
         assert!(!at.programmatic);
         let (result, launches) = plan_control(&control(49, 48));
@@ -320,13 +320,13 @@ mod tests {
     #[test]
     fn project_control_arguments_and_errors() {
         let (_, launches) = plan_control(&control(48, 48));
-        // qwen_layer_ops.c:430: seven pointers, rows, width, heads.
+        // euhedral_cuda_gdn_project_control_fp32 in qwen_layer_ops.c: seven pointers, rows, width, heads.
         assert_eq!(
             launches[0].args.words(),
             &[0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 48, 5120, 48]
         );
         assert_eq!(launches[0].args.sizes(), &[8, 8, 8, 8, 8, 8, 8, 4, 4, 4]);
-        // :421: rows * heads is checked against i32::MAX, which 2^31 - 1 meets and 2^31 exceeds.
+        // euhedral_cuda_gdn_project_control_fp32 in qwen_layer_ops.c: rows * heads is checked against i32::MAX, which 2^31 - 1 meets and 2^31 exceeds.
         let (result, launches) = plan_control(&control(1, i32::MAX as u32));
         assert_eq!(result, Ok(()));
         assert_eq!(launches[0].kernel, kernel!("euhedral_gdn_project_control_fp32"));
@@ -385,7 +385,7 @@ mod tests {
             rows,
             query_key_width: qk,
             value_width: value,
-            convolution_width: qk + value,
+            convolution_width: qk.wrapping_add(value),
             kernel_size: 4,
         }
     }
@@ -396,8 +396,28 @@ mod tests {
     }
 
     #[test]
+    fn convolution_grid_wraps_in_u32_like_c() {
+        // The C grid is `(rows + 31) / 32` in u32: the last 31 row counts wrap to a grid of zero rows.
+        for (rows, grid_y) in [
+            (u32::MAX - 31, 134_217_727),
+            (u32::MAX - 30, 0),
+            (u32::MAX, 0),
+            (u32::MAX - 32, 134_217_727),
+        ] {
+            let (result, launches) = plan_conv(&conv(rows, 127, 1));
+            assert_eq!(one(result, launches).grid, [1, grid_y, 1], "rows {rows}");
+        }
+        // The same for the channel count: `(channels + 127) / 128`.
+        let (result, launches) = plan_conv(&conv(1, u32::MAX - 6, 1));
+        assert_eq!(one(result, launches).grid, [0, 1, 1]);
+        // The two widths add in u32: a pair that wraps matches a convolution width that wrapped.
+        let (result, launches) = plan_conv(&conv(1, u32::MAX - 10, 20));
+        assert_eq!(one(result, launches).grid, [1, 1, 1]);
+    }
+
+    #[test]
     fn convolution_grid_is_channels_by_row_blocks() {
-        // qwen_layer_ops.c:310: ((channels + 127) / 128, (rows + 31) / 32) of 128 threads.
+        // euhedral_cuda_gdn_convolution_bf16 in qwen_layer_ops.c: ((channels + 127) / 128, (rows + 31) / 32) of 128 threads.
         for (rows, channels, grid) in [
             (1, 128, [1, 1]),
             (32, 129, [2, 1]),
@@ -413,7 +433,7 @@ mod tests {
             assert!(launch.programmatic);
         }
         let (_, launches) = plan_conv(&conv(7, 2048, 6144));
-        // :309: five pointers, rows, the three widths, the kernel size.
+        // euhedral_cuda_gdn_convolution_bf16 in qwen_layer_ops.c: five pointers, rows, the three widths, the kernel size.
         assert_eq!(
             launches[0].args.words(),
             &[0x100, 0x200, 0x300, 0x400, 0x500, 7, 2048, 6144, 8192, 4]
@@ -539,7 +559,7 @@ mod tests {
             let (result, launches) = plan_rec(shape, row_exact, exact);
             one(result, launches).kernel
         };
-        // qwen_layer_ops.c:343-344: not exact, aligned, rows > 1, not row-exact: all four give c8.
+        // euhedral_cuda_gdn_recurrence_bf16 in qwen_layer_ops.c: not exact, aligned, rows > 1, not row-exact: all four give c8.
         assert_eq!(kernel_of(&recurrence(2), false, false), C8);
         assert_eq!(kernel_of(&recurrence(1000), false, false), C8);
         // Each flipped alone gives the warp kernel.
@@ -565,10 +585,10 @@ mod tests {
     fn recurrence_grid_arguments_and_errors() {
         let (result, launches) = plan_rec(&recurrence(2), false, false);
         let launch = one(result, launches);
-        // qwen_layer_ops.c:346: 48 * 128 / 8 = 768 blocks of 32 threads.
+        // euhedral_cuda_gdn_recurrence_bf16 in qwen_layer_ops.c: 48 * 128 / 8 = 768 blocks of 32 threads.
         assert_eq!((launch.grid, launch.block), ([768, 1, 1], [32, 1, 1]));
         assert!(launch.programmatic);
-        // :338-339: five pointers, five u32, the output scale's bits.
+        // euhedral_cuda_gdn_recurrence_bf16 in qwen_layer_ops.c: five pointers, five u32, the output scale's bits.
         assert_eq!(
             launch.args.words()[..10],
             [0x1000, 0x2008, 0x3008, 0x4000, 0x5008, 2, 16, 48, 128, 128]
@@ -579,7 +599,7 @@ mod tests {
         // The warp kernel has the same grid and arguments.
         let (_, warp) = plan_rec(&recurrence(1), false, false);
         assert_eq!(warp[0].grid, [768, 1, 1]);
-        // :321: value_heads * 128 must fit in u32: 2^25 heads is 2^32, 2^25 - 8 is not.
+        // euhedral_cuda_gdn_recurrence_bf16 in qwen_layer_ops.c: value_heads * 128 must fit in u32: 2^25 heads is 2^32, 2^25 - 8 is not.
         let heads = (1u32 << 25) - 8;
         let (result, launches) = plan_rec(
             &RecurrenceShape {
@@ -687,10 +707,10 @@ mod tests {
     fn gated_rms_norm_grid_arguments_and_errors() {
         let (result, launches) = plan_gated(&gated(5, 48));
         let launch = one(result, launches);
-        // qwen_layer_ops.c:368: rows * heads blocks of 128.
+        // euhedral_cuda_gdn_gated_rms_norm_bf16 in qwen_layer_ops.c: rows * heads blocks of 128.
         assert_eq!(launch.kernel, kernel!("euhedral_gdn_gated_rms_norm_bf16"));
         assert_eq!((launch.grid, launch.block), ([240, 1, 1], [128, 1, 1]));
-        // :367: four pointers, rows, heads, dim, epsilon's bits.
+        // euhedral_cuda_gdn_gated_rms_norm_bf16 in qwen_layer_ops.c: four pointers, rows, heads, dim, epsilon's bits.
         assert_eq!(
             launch.args.words(),
             &[0x100, 0x200, 0x300, 0x400, 5, 48, 128, u64::from(1e-6f32.to_bits())]

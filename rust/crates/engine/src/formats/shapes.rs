@@ -11,8 +11,8 @@
 use std::cell::RefCell;
 use std::fmt::Write;
 
-use euhedral_inference_cuda::launch::catalog::{Arguments, Launch as PlannedLaunch};
 use euhedral_inference_cuda::launch::PlanError;
+use euhedral_inference_cuda::launch::catalog::{Arguments, Launch as PlannedLaunch};
 use euhedral_inference_cuda::launch::table::{Geometry, plan_table_launch};
 use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps};
 
@@ -104,7 +104,7 @@ impl Launch {
     }
 
     /// The launch as the catalog plans it: the table entry's kernel with the words typed by their sizes. The host-side
-    /// refusals of the table launcher apply.
+    /// refusals of the table launcher apply, for a device that has every kernel.
     pub fn planned(&self) -> Result<PlannedLaunch, PlanError> {
         if self.args.count() > MAX_ARGUMENTS {
             return Err(PlanError::InvalidArgument);
@@ -121,6 +121,9 @@ impl Launch {
             geometry,
             self.args.0.words(),
             self.args.0.sizes(),
+            // A launch is planned before it is queued and without a device, so the planner assumes the kernel is
+            // loaded; the queue refuses a kernel the device lacks.
+            true,
             &mut |launch| planned = Some(launch),
         )?;
         planned.ok_or(PlanError::InvalidArgument)

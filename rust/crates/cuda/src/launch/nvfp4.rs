@@ -3,13 +3,14 @@
 //! block, dynamic shared bytes and argument words.
 //!
 //! The functions are pure: shapes and addresses in, a [`Nvfp4Plan`] (at most three launches, no allocation) or a
-//! [`Nvfp4Refusal`] out. A refusal is a status the C entry point returns before it launches anything.
+//! [`PlanError`] out. A refusal is a status the C entry point returns before it launches anything.
 //!
 //! The native tile kernel takes three tensor maps by value as its leading arguments. A plan carries the parameters
 //! each map is built from ([`TensorMapPlan`], what the C code passes to `cuTensorMapEncodeTiled`) and the launch's own
 //! arguments start after the maps; the launcher encodes the maps and puts them in front.
 
 use crate::DevicePtr;
+use crate::launch::PlanError;
 use crate::launch::catalog::{Arguments, KernelId, Launch, find_const};
 
 /// The most rows of the decode kernels (`EUHEDRAL_DECODE_MAX_ROWS`, `decode_shapes.h`).
@@ -57,20 +58,6 @@ impl Nvfp4Layout {
     const fn index(self) -> usize {
         matches!(self, Nvfp4Layout::Sd4) as usize
     }
-}
-
-/// Why a plan is refused: the status the C entry point returns without launching.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Nvfp4Refusal {
-    /// `EUHEDRAL_CUDA_INVALID_ARGUMENT`: a null operand, a zero extent, an operand not 16-byte aligned, an input width
-    /// that is not a multiple of 32, or a scratch that is too small.
-    InvalidArgument,
-    /// `EUHEDRAL_CUDA_FORMAT_MISMATCH`: the weight's byte size is neither layout's.
-    FormatMismatch,
-    /// `EUHEDRAL_CUDA_ROUTE_UNAVAILABLE`: the native route has no kernel for the shape (or exact numerics are on).
-    RouteUnavailable,
-    /// `EUHEDRAL_CUDA_SIZE_OVERFLOW`: a grid or a count does not fit.
-    SizeOverflow,
 }
 
 /// The shape of one linear and the addresses it works on.
@@ -522,7 +509,7 @@ fn native_launches(rows: u32, in_features: u32, out_features: u32, layout: Nvfp4
 }
 
 /// The checks every NVFP4 entry point makes first (`prepare`, `nvfp4_linear.c`), up to the layout.
-fn prepare(operands: &Nvfp4Operands) -> Result<Nvfp4Layout, Nvfp4Refusal> {
+fn prepare(operands: &Nvfp4Operands) -> Result<Nvfp4Layout, PlanError> {
     let Nvfp4Operands {
         input,
         weights,
@@ -539,18 +526,18 @@ fn prepare(operands: &Nvfp4Operands) -> Result<Nvfp4Layout, Nvfp4Refusal> {
         || in_features == 0
         || out_features == 0
     {
-        return Err(Nvfp4Refusal::InvalidArgument);
+        return Err(PlanError::InvalidArgument);
     }
-    let layout = nvfp4_layout(out_features, in_features, weights_byte_size).ok_or(Nvfp4Refusal::FormatMismatch)?;
+    let layout = nvfp4_layout(out_features, in_features, weights_byte_size).ok_or(PlanError::FormatMismatch)?;
     if !in_features.is_multiple_of(32) || !input.get().is_multiple_of(16) || !weights.get().is_multiple_of(16) {
-        return Err(Nvfp4Refusal::InvalidArgument);
+        return Err(PlanError::InvalidArgument);
     }
     Ok(layout)
 }
 
 /// The launch of `euhedral_cuda_linear_nvfp4_bf16` (`nvfp4_linear.c`): 1 to 8 rows on the decode kernels, 9
 /// to 32 on their grouped twins, and under exact numerics or for a shape they do not take, the scalar reference.
-pub fn plan_linear(operands: &Nvfp4Operands, exact_numerics: bool) -> Result<Nvfp4Plan, Nvfp4Refusal> {
+pub fn plan_linear(operands: &Nvfp4Operands, exact_numerics: bool) -> Result<Nvfp4Plan, PlanError> {
     let layout = prepare(operands)?;
     let Nvfp4Operands {
         input,
@@ -579,13 +566,13 @@ pub fn plan_linear(operands: &Nvfp4Operands, exact_numerics: bool) -> Result<Nvf
 /// activations into `scratch`, then the skinny kernel (and its finish when split over K) or the tile kernel.
 ///
 /// `scratch_byte_size` is the scratch's size. Where the C entry point declines, the refusal is
-/// [`Nvfp4Refusal::RouteUnavailable`] and the caller runs [`plan_linear`] instead.
+/// [`PlanError::RouteUnavailable`] and the caller runs [`plan_linear`] instead.
 pub fn plan_native(
     operands: &Nvfp4Operands,
     scratch: DevicePtr,
     scratch_byte_size: u64,
     exact_numerics: bool,
-) -> Result<Nvfp4Plan, Nvfp4Refusal> {
+) -> Result<Nvfp4Plan, PlanError> {
     let Nvfp4Operands {
         input,
         weights,
@@ -597,7 +584,7 @@ pub fn plan_native(
     } = *operands;
     // Activations are quantized, so exact numerics keep the scalar reference.
     if !in_features.is_multiple_of(128) || exact_numerics {
-        return Err(Nvfp4Refusal::RouteUnavailable);
+        return Err(PlanError::RouteUnavailable);
     }
     let layout = prepare(operands)?;
     let (rows64, inputs, outputs) = (u64::from(rows), u64::from(in_features), u64::from(out_features));
@@ -605,7 +592,7 @@ pub fn plan_native(
     // The tile kernels' maps need 16-byte strides: the scale rows and an aligned scratch.
     let scale_unit = if layout == Nvfp4Layout::Sd4 { 512 } else { 256 };
     if !skinny && (!in_features.is_multiple_of(scale_unit) || !scratch.get().is_multiple_of(16)) {
-        return Err(Nvfp4Refusal::RouteUnavailable);
+        return Err(PlanError::RouteUnavailable);
     }
     let needed = if skinny {
         nvfp4_native_scratch_bytes(rows64, inputs, outputs)
@@ -613,10 +600,10 @@ pub fn plan_native(
         activation_bytes(rows64, inputs)
     };
     if scratch == DevicePtr::NULL || scratch_byte_size < needed {
-        return Err(Nvfp4Refusal::InvalidArgument);
+        return Err(PlanError::InvalidArgument);
     }
     if rows64.div_ceil(128) * outputs.div_ceil(128) > MAX_GRID {
-        return Err(Nvfp4Refusal::SizeOverflow);
+        return Err(PlanError::SizeOverflow);
     }
     let at = Pointers {
         input,

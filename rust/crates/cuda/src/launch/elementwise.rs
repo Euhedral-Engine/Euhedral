@@ -8,7 +8,7 @@
 use crate::DevicePtr;
 use crate::kernel;
 use crate::launch::catalog::{Arguments, KernelId, Launch};
-use crate::launch::{Modes, PlanError};
+use crate::launch::{Modes, PlanError, advance};
 
 const RESIDUAL_ADD: KernelId = kernel!("euhedral_residual_add_bf16");
 const SWIGLU: KernelId = kernel!("euhedral_swiglu_bf16");
@@ -19,7 +19,7 @@ const ARGMAX: KernelId = kernel!("euhedral_argmax_bf16");
 const ARGMAX_LOGPROB: KernelId = kernel!("euhedral_argmax_logprob_bf16");
 const SELECTED_TOKEN: KernelId = kernel!("euhedral_selected_token");
 
-/// The shape of `euhedral_cuda_residual_add_bf16` (`qwen_layer_ops.c:432`).
+/// The shape of `euhedral_cuda_residual_add_bf16` (`qwen_layer_ops.c`).
 #[derive(Clone, Copy, Debug)]
 pub struct ResidualAddShape {
     pub residual: DevicePtr,
@@ -29,7 +29,7 @@ pub struct ResidualAddShape {
     pub width: u32,
 }
 
-/// `euhedral_cuda_residual_add_bf16`, `qwen_layer_ops.c:432-451`: one launch.
+/// `euhedral_cuda_residual_add_bf16`, `qwen_layer_ops.c`: one launch.
 pub fn plan_residual_add(shape: &ResidualAddShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
     if s.residual.is_null() || s.delta.is_null() || s.output.is_null() || s.rows == 0 || s.width == 0 {
@@ -44,7 +44,7 @@ pub fn plan_residual_add(shape: &ResidualAddShape, sink: &mut impl FnMut(Launch)
         .pointer(s.delta)
         .pointer(s.output)
         .u32(count as u32);
-    // qwen_layer_ops.c:449.
+    // euhedral_cuda_residual_add_bf16 in qwen_layer_ops.c.
     sink(Launch::new(
         RESIDUAL_ADD,
         [count.div_ceil(256) as u32, 1, 1],
@@ -55,7 +55,7 @@ pub fn plan_residual_add(shape: &ResidualAddShape, sink: &mut impl FnMut(Launch)
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_swiglu_bf16` (`qwen_layer_ops.c:487`).
+/// The shape of `euhedral_cuda_swiglu_bf16` (`qwen_layer_ops.c`).
 #[derive(Clone, Copy, Debug)]
 pub struct SwigluShape {
     pub gate_up: DevicePtr,
@@ -64,7 +64,7 @@ pub struct SwigluShape {
     pub intermediate_size: u32,
 }
 
-/// `euhedral_cuda_swiglu_bf16`, `qwen_layer_ops.c:487-501`: one launch.
+/// `euhedral_cuda_swiglu_bf16`, `qwen_layer_ops.c`: one launch.
 pub fn plan_swiglu(shape: &SwigluShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
     if s.gate_up.is_null() || s.output.is_null() || s.rows == 0 || s.intermediate_size == 0 {
@@ -79,7 +79,7 @@ pub fn plan_swiglu(shape: &SwigluShape, sink: &mut impl FnMut(Launch)) -> Result
         .pointer(s.output)
         .u32(s.rows)
         .u32(s.intermediate_size);
-    // qwen_layer_ops.c:499.
+    // euhedral_cuda_swiglu_bf16 in qwen_layer_ops.c.
     sink(Launch::new(
         SWIGLU,
         [count.div_ceil(256) as u32, 1, 1],
@@ -90,7 +90,7 @@ pub fn plan_swiglu(shape: &SwigluShape, sink: &mut impl FnMut(Launch)) -> Result
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_residual_rms_norm_bf16` (`qwen_layer_ops.c:371`).
+/// The shape of `euhedral_cuda_residual_rms_norm_bf16` (`qwen_layer_ops.c`).
 #[derive(Clone, Copy, Debug)]
 pub struct ResidualRmsNormShape {
     pub residual: DevicePtr,
@@ -103,7 +103,7 @@ pub struct ResidualRmsNormShape {
     pub epsilon: f32,
 }
 
-/// `euhedral_cuda_residual_rms_norm_bf16`, `qwen_layer_ops.c:371-410`.
+/// `euhedral_cuda_residual_rms_norm_bf16`, `qwen_layer_ops.c`.
 ///
 /// One row, or row-exact rows, on 16-byte aligned pointers with a width of a multiple of 8 up to 8192 and relaxed
 /// numerics run the row kernel (one CTA per row); other row-exact rows run one launch per row; the rest run the
@@ -114,9 +114,9 @@ pub fn plan_residual_rms_norm(
     sink: &mut impl FnMut(Launch),
 ) -> Result<(), PlanError> {
     let s = shape;
-    // qwen_layer_ops.c:374.
+    // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c.
     let row_exact = s.rows > 1 && modes.row_exact;
-    // qwen_layer_ops.c:375-377.
+    // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c.
     let row_kernel = !s.residual.is_null()
         && !s.delta.is_null()
         && !s.weight.is_null()
@@ -126,7 +126,7 @@ pub fn plan_residual_rms_norm(
         && s.width <= 8192
         && !modes.exact_numerics
         && (s.residual.get() | s.delta.get() | s.weight.get() | s.hidden.get() | s.normalized.get()) & 15 == 0;
-    // qwen_layer_ops.c:378-388: the recursion runs before the checks below, and each row call runs them.
+    // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c: the recursion runs before the checks below, and each row call runs them.
     if row_exact
         && !row_kernel
         && !s.residual.is_null()
@@ -134,9 +134,14 @@ pub fn plan_residual_rms_norm(
         && !s.hidden.is_null()
         && !s.normalized.is_null()
     {
+        // C runs the recursion before its `rows > INT32_MAX` check, so 2^31 rows would emit 2^31 launches and fail
+        // only in the arithmetic of the last ones. A plan that long is never a real batch: refuse it up front.
+        if s.rows > i32::MAX as u32 {
+            return Err(PlanError::InvalidArgument);
+        }
         return plan_rows(s, modes, sink);
     }
-    // qwen_layer_ops.c:389-392.
+    // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c.
     if s.residual.is_null()
         || s.delta.is_null()
         || s.weight.is_null()
@@ -149,7 +154,7 @@ pub fn plan_residual_rms_norm(
     {
         return Err(PlanError::InvalidArgument);
     }
-    // qwen_layer_ops.c:393.
+    // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c.
     if s.rows > i32::MAX as u32 || u64::from(s.rows) * u64::from(s.width) > u64::from(u32::MAX) {
         return Err(PlanError::SizeOverflow);
     }
@@ -162,7 +167,7 @@ pub fn plan_residual_rms_norm(
         .u32(s.rows)
         .u32(s.width)
         .f32(s.epsilon);
-    // qwen_layer_ops.c:399-400.
+    // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c.
     if (s.rows == 1 || row_exact) && row_kernel {
         let block = (s.width / 8).div_ceil(32) * 32;
         sink(Launch::new(
@@ -174,25 +179,25 @@ pub fn plan_residual_rms_norm(
         ));
         return Ok(());
     }
-    // qwen_layer_ops.c:401-409.
+    // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c.
     if row_exact {
         return plan_rows(s, modes, sink);
     }
-    // qwen_layer_ops.c:410.
+    // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c.
     sink(Launch::new(RESIDUAL_RMS_NORM, [s.rows, 1, 1], [128, 1, 1], 0, args));
     Ok(())
 }
 
-/// The per-row recursion (`qwen_layer_ops.c:380-388`, `:400-408`): each row is a call of its own on the row's slice.
+/// The per-row recursion of `euhedral_cuda_residual_rms_norm_bf16` (`qwen_layer_ops.c`): each row is a call of its own on the row's slice.
 fn plan_rows(s: &ResidualRmsNormShape, modes: Modes, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let stride = u64::from(s.width) * 2;
     for row in 0..s.rows {
-        let step = u64::from(row) * stride;
+        let step = u64::from(row).wrapping_mul(stride);
         let one = ResidualRmsNormShape {
-            residual: s.residual.offset(step),
-            delta: s.delta.offset(step),
-            hidden: s.hidden.offset(step),
-            normalized: s.normalized.offset(step),
+            residual: advance(s.residual, step),
+            delta: advance(s.delta, step),
+            hidden: advance(s.hidden, step),
+            normalized: advance(s.normalized, step),
             rows: 1,
             ..*s
         };
@@ -201,7 +206,7 @@ fn plan_rows(s: &ResidualRmsNormShape, modes: Modes, sink: &mut impl FnMut(Launc
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_rms_norm_bf16` and `…_unit_offset_bf16` (`rms_norm_bf16.c:57,62`).
+/// The shape of `euhedral_cuda_rms_norm_bf16` and `…_unit_offset_bf16` (`rms_norm_bf16.c`).
 #[derive(Clone, Copy, Debug)]
 pub struct RmsNormShape {
     pub input: DevicePtr,
@@ -212,17 +217,17 @@ pub struct RmsNormShape {
     pub epsilon: f32,
 }
 
-/// `euhedral_cuda_rms_norm_bf16`, `rms_norm_bf16.c:57`: the weight is used as it is (offset 0).
+/// `euhedral_cuda_rms_norm_bf16`, `rms_norm_bf16.c`: the weight is used as it is (offset 0).
 pub fn plan_rms_norm(shape: &RmsNormShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     plan_rms_norm_with_offset(shape, 0.0, sink)
 }
 
-/// `euhedral_cuda_rms_norm_unit_offset_bf16`, `rms_norm_bf16.c:62`: the weight plus one (offset 1).
+/// `euhedral_cuda_rms_norm_unit_offset_bf16`, `rms_norm_bf16.c`: the weight plus one (offset 1).
 pub fn plan_rms_norm_unit_offset(shape: &RmsNormShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     plan_rms_norm_with_offset(shape, 1.0, sink)
 }
 
-/// `rms_norm_bf16_with_offset`, `rms_norm_bf16.c:32-55`: one launch.
+/// `rms_norm_bf16_with_offset`, `rms_norm_bf16.c`: one launch.
 fn plan_rms_norm_with_offset(
     shape: &RmsNormShape,
     weight_offset: f32,
@@ -247,13 +252,13 @@ fn plan_rms_norm_with_offset(
         .u32(s.width)
         .f32(s.epsilon)
         .f32(weight_offset);
-    // rms_norm_bf16.c:46-47: a single row (decode) spreads its output pass over 40 slices.
+    // rms_norm_bf16_with_offset in rms_norm_bf16.c: a single row (decode) spreads its output pass over 40 slices.
     let slices = if s.rows == 1 { 40 } else { 1 };
     sink(Launch::new(RMS_NORM, [s.rows, slices, 1], [128, 1, 1], 0, args));
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_argmax_bf16` and `…_argmax_logprob_bf16` (`qwen_layer_ops.c:450,462`).
+/// The shape of `euhedral_cuda_argmax_bf16` and `…_argmax_logprob_bf16` (`qwen_layer_ops.c`).
 #[derive(Clone, Copy, Debug)]
 pub struct ArgmaxShape {
     pub logits: DevicePtr,
@@ -261,12 +266,12 @@ pub struct ArgmaxShape {
     pub result: DevicePtr,
 }
 
-/// `euhedral_cuda_argmax_bf16`, `qwen_layer_ops.c:450-460`: one launch.
+/// `euhedral_cuda_argmax_bf16`, `qwen_layer_ops.c`: one launch.
 pub fn plan_argmax(shape: &ArgmaxShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     plan_argmax_with(ARGMAX, shape, sink)
 }
 
-/// `euhedral_cuda_argmax_logprob_bf16`, `qwen_layer_ops.c:462-472`: one launch.
+/// `euhedral_cuda_argmax_logprob_bf16`, `qwen_layer_ops.c`: one launch.
 pub fn plan_argmax_logprob(shape: &ArgmaxShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     plan_argmax_with(ARGMAX_LOGPROB, shape, sink)
 }
@@ -283,7 +288,7 @@ fn plan_argmax_with(kernel: KernelId, shape: &ArgmaxShape, sink: &mut impl FnMut
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_selected_token` (`qwen_layer_ops.c:474`).
+/// The shape of `euhedral_cuda_selected_token` (`qwen_layer_ops.c`).
 #[derive(Clone, Copy, Debug)]
 pub struct SelectedTokenShape {
     pub key: DevicePtr,
@@ -292,7 +297,7 @@ pub struct SelectedTokenShape {
     pub token: DevicePtr,
 }
 
-/// `euhedral_cuda_selected_token`, `qwen_layer_ops.c:474-485`: one launch of one thread.
+/// `euhedral_cuda_selected_token`, `qwen_layer_ops.c`: one launch of one thread.
 pub fn plan_selected_token(shape: &SelectedTokenShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     if shape.key.is_null() || shape.token.is_null() {
         return Err(PlanError::InvalidArgument);
@@ -305,7 +310,7 @@ pub fn plan_selected_token(shape: &SelectedTokenShape, sink: &mut impl FnMut(Lau
     Ok(())
 }
 
-/// The check of `euhedral_cuda_zero_device_memory` (`qwen_layer_ops.c:504-507`). The zeroing is a memset of
+/// The check of `euhedral_cuda_zero_device_memory` (`qwen_layer_ops.c`). The zeroing is a memset of
 /// `byte_size` bytes at `address`, not a kernel launch, so it plans no [`Launch`].
 pub fn check_zero_device_memory(address: DevicePtr, byte_size: u64) -> Result<(), PlanError> {
     if address.is_null() || byte_size == 0 {
@@ -360,7 +365,7 @@ mod tests {
 
     #[test]
     fn residual_add_grid_rounds_up_by_256() {
-        // qwen_layer_ops.c:449: (count + 255) / 256 blocks of 256.
+        // euhedral_cuda_residual_add_bf16 in qwen_layer_ops.c: (count + 255) / 256 blocks of 256.
         for (rows, width, grid) in [(1, 256, 1), (1, 257, 2), (3, 1000, 12), (1, 1, 1), (2, 128, 1)] {
             let (launches, result) = plan_add(&add(rows, width));
             assert_eq!(result, Ok(()));
@@ -376,7 +381,7 @@ mod tests {
     #[test]
     fn residual_add_arguments_and_limits() {
         let (launches, _) = plan_add(&add(3, 1000));
-        // qwen_layer_ops.c:447-448: three pointers and the element count as u32.
+        // euhedral_cuda_residual_add_bf16 in qwen_layer_ops.c: three pointers and the element count as u32.
         assert_eq!(launches[0].args.words(), &[0x1000, 0x2000, 0x3000, 3000]);
         assert_eq!(launches[0].args.sizes(), &[8, 8, 8, 4]);
         // 65536 x 65535 = 2^32 - 65536 elements fit; the block count is (2^32 - 65536 + 255) / 256 = 16776960.
@@ -417,7 +422,7 @@ mod tests {
         };
         let (launches, result) = collect(|sink| plan_swiglu(&shape, &mut |l| sink(l)));
         assert_eq!(result, Ok(()));
-        // qwen_layer_ops.c:499: 15360 elements are 60 blocks of 256; arguments are rows and width, not the count.
+        // euhedral_cuda_swiglu_bf16 in qwen_layer_ops.c: 15360 elements are 60 blocks of 256; arguments are rows and width, not the count.
         assert_eq!(launches.len(), 1);
         assert_eq!(launches[0].kernel, kernel!("euhedral_swiglu_bf16"));
         assert_eq!(launches[0].grid, [60, 1, 1]);
@@ -484,7 +489,7 @@ mod tests {
 
     #[test]
     fn residual_rms_norm_one_row_takes_the_row_kernel_with_a_block_of_whole_warps() {
-        // qwen_layer_ops.c:399-400: block (width / 8 + 31) / 32 * 32.
+        // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c: block (width / 8 + 31) / 32 * 32.
         for (width, block) in [(8, 32), (256, 32), (264, 64), (5120, 640), (8192, 1024), (2048, 256)] {
             let (launches, result) = plan_norm(&norm(1, width), RELAXED);
             assert_eq!(result, Ok(()));
@@ -495,7 +500,7 @@ mod tests {
             assert!(launches[0].programmatic);
         }
         let (launches, _) = plan_norm(&norm(1, 5120), RELAXED);
-        // qwen_layer_ops.c:394: five pointers, rows, width and epsilon's bits.
+        // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c: five pointers, rows, width and epsilon's bits.
         assert_eq!(
             launches[0].args.words(),
             &[
@@ -515,7 +520,7 @@ mod tests {
 
     #[test]
     fn residual_rms_norm_row_kernel_conditions_each_flipped_alone() {
-        // qwen_layer_ops.c:375-377: width % 8, width <= 8192, every pointer 16-byte aligned, not exact.
+        // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c: width % 8, width <= 8192, every pointer 16-byte aligned, not exact.
         let wide_width = |width| plan_norm(&norm(1, width), RELAXED).0[0].kernel;
         assert_eq!(wide_width(8192), ROW);
         assert_eq!(wide_width(8200), WIDE);
@@ -545,7 +550,7 @@ mod tests {
 
     #[test]
     fn residual_rms_norm_many_rows_relaxed_is_one_wide_launch() {
-        // qwen_layer_ops.c:410: rows blocks of 128, whatever the width.
+        // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c: rows blocks of 128, whatever the width.
         let (launches, result) = plan_norm(&norm(7, 4096), RELAXED);
         assert_eq!(result, Ok(()));
         assert_eq!(launches.len(), 1);
@@ -564,7 +569,7 @@ mod tests {
 
     #[test]
     fn residual_rms_norm_row_exact_with_the_row_kernel_is_one_launch_of_rows_blocks() {
-        // qwen_layer_ops.c:399: (rows == 1 || row_exact) && row_kernel.
+        // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c: (rows == 1 || row_exact) && row_kernel.
         let (launches, result) = plan_norm(&norm(9, 5120), ROW_EXACT);
         assert_eq!(result, Ok(()));
         assert_eq!(launches.len(), 1);
@@ -575,7 +580,7 @@ mod tests {
 
     #[test]
     fn residual_rms_norm_row_exact_without_the_row_kernel_recurses_per_row() {
-        // qwen_layer_ops.c:378-388, :400-408: one one-row call per row, each slice width * 2 bytes on.
+        // euhedral_cuda_residual_rms_norm_bf16: one one-row call per row, each slice width * 2 bytes on.
         for rows in [1u32, 2, 3, 1000] {
             // width 8200 is too wide for the row kernel; one row is not a recursion (row-exact needs rows > 1).
             let (launches, result) = plan_norm(&norm(rows, 8200), ROW_EXACT);
@@ -604,8 +609,46 @@ mod tests {
     }
 
     #[test]
+    fn residual_rms_norm_recursion_advances_pointers_with_wrapping_like_c() {
+        let shape = ResidualRmsNormShape {
+            residual: ptr(0xffff_ffff_ffff_fff0),
+            ..norm(2, 16)
+        };
+        let exact_rows = Modes {
+            row_exact: true,
+            exact_numerics: true,
+        };
+        let (launches, result) = plan_norm(&shape, exact_rows);
+        assert_eq!(result, Ok(()));
+        assert_eq!(launches.len(), 2);
+        assert_eq!(launches[0].args.words()[0], 0xffff_ffff_ffff_fff0);
+        assert_eq!(launches[1].args.words()[0], 0x10);
+        assert_eq!(launches[1].args.words()[1], 0x2000 + 32);
+    }
+
+    #[test]
+    fn residual_rms_norm_recursion_refuses_more_rows_than_i32_max_before_it_starts() {
+        // C runs the recursion first and so would emit 2^31 launches; the plan refuses at once and emits none.
+        let too_many = norm(1 << 31, 8200);
+        assert_eq!(
+            plan_norm(&too_many, ROW_EXACT),
+            (vec![], Err(PlanError::InvalidArgument))
+        );
+        // The largest count the C check accepts still recurses: with a null weight its first call fails, so the
+        // test does not walk the rows.
+        let largest = ResidualRmsNormShape {
+            weight: DevicePtr::NULL,
+            ..norm(i32::MAX as u32, 8200)
+        };
+        assert_eq!(
+            plan_norm(&largest, ROW_EXACT),
+            (vec![], Err(PlanError::InvalidArgument))
+        );
+    }
+
+    #[test]
     fn residual_rms_norm_recursion_checks_each_call() {
-        // A null weight still recurses (qwen_layer_ops.c:378 does not test it); the first row's call refuses it.
+        // A null weight still recurses (euhedral_cuda_residual_rms_norm_bf16 does not test it); the first row's call refuses it.
         let no_weight = ResidualRmsNormShape {
             weight: DevicePtr::NULL,
             ..norm(3, 8200)
@@ -678,7 +721,7 @@ mod tests {
             .1,
             Ok(())
         );
-        // qwen_layer_ops.c:393: more rows than i32::MAX, or rows * width past u32::MAX.
+        // euhedral_cuda_residual_rms_norm_bf16 in qwen_layer_ops.c: more rows than i32::MAX, or rows * width past u32::MAX.
         assert_eq!(
             plan_norm(&norm(1 << 31, 1), RELAXED),
             (vec![], Err(PlanError::SizeOverflow))
@@ -705,7 +748,7 @@ mod tests {
 
     #[test]
     fn rms_norm_slices_one_row_over_forty() {
-        // rms_norm_bf16.c:46-47.
+        // rms_norm_bf16_with_offset in rms_norm_bf16.c.
         for (rows, grid) in [(1, [1, 40, 1]), (2, [2, 1, 1]), (3, [3, 1, 1]), (100, [100, 1, 1])] {
             let (launches, result) = collect(|sink| plan_rms_norm(&rms(rows), &mut |l| sink(l)));
             assert_eq!(result, Ok(()));
@@ -720,7 +763,7 @@ mod tests {
     fn rms_norm_offset_is_a_float_word_of_zero_or_one() {
         let (plain, _) = collect(|sink| plan_rms_norm(&rms(2), &mut |l| sink(l)));
         let (unit, _) = collect(|sink| plan_rms_norm_unit_offset(&rms(2), &mut |l| sink(l)));
-        // rms_norm_bf16.c:44: input, weight, output, rows, width, epsilon, weight offset.
+        // rms_norm_bf16_with_offset in rms_norm_bf16.c: input, weight, output, rows, width, epsilon, weight offset.
         assert_eq!(
             plain[0].args.words()[..6],
             [0x1000, 0x2000, 0x3000, 2, 128, u64::from(1e-6f32.to_bits())]
@@ -775,7 +818,7 @@ mod tests {
         assert_eq!(plan(&shape, &mut launches), Ok(()));
         assert_eq!(launches.len(), 1);
         assert_eq!(launches[0].kernel.name(), name);
-        // qwen_layer_ops.c:458: one block of 1024; logits, count, result.
+        // euhedral_cuda_argmax_bf16 in qwen_layer_ops.c: one block of 1024; logits, count, result.
         assert_eq!((launches[0].grid, launches[0].block), ([1, 1, 1], [1024, 1, 1]));
         assert_eq!(launches[0].args.words(), &[0x1000, 248_320, 0x2000]);
         assert_eq!(launches[0].args.sizes(), &[8, 4, 8]);
@@ -809,7 +852,7 @@ mod tests {
         };
         let (launches, result) = collect(|sink| plan_selected_token(&token, &mut |l| sink(l)));
         assert_eq!(result, Ok(()));
-        // qwen_layer_ops.c:483: one thread; the ids pointer may be null.
+        // euhedral_cuda_selected_token in qwen_layer_ops.c: one thread; the ids pointer may be null.
         assert_eq!((launches[0].grid, launches[0].block), ([1, 1, 1], [1, 1, 1]));
         assert_eq!(launches[0].args.words(), &[0x1000, 0, 0x3000]);
         assert_eq!(launches[0].args.sizes(), &[8, 8, 8]);
@@ -832,7 +875,7 @@ mod tests {
 
     #[test]
     fn zero_device_memory_checks() {
-        // qwen_layer_ops.c:504-505.
+        // euhedral_cuda_zero_device_memory in qwen_layer_ops.c.
         assert_eq!(check_zero_device_memory(ptr(0x1000), 1), Ok(()));
         assert_eq!(
             check_zero_device_memory(DevicePtr::NULL, 1),

@@ -10,10 +10,10 @@ use crate::launch::catalog::{Arguments, KernelId, Launch};
 const EMBEDDING: KernelId = kernel!("euhedral_q3_embedding");
 const EMBEDDING_P2E2: KernelId = kernel!("euhedral_q3_p2e2_embedding");
 
-/// The grid limit of both wrappers (`q3_embedding.c:140,242`).
+/// The grid limit of both wrappers (`euhedral_cuda_embed_q3` and `euhedral_cuda_embed_q3_p2e2` in `q3_embedding.c`).
 const MAX_GRID: u64 = 2_147_483_647;
 
-/// The shape of `euhedral_cuda_embed_q3` and `euhedral_cuda_embed_q3_p2e2` (`q3_embedding.c:102,227`).
+/// The shape of `euhedral_cuda_embed_q3` and `euhedral_cuda_embed_q3_p2e2` (`q3_embedding.c`).
 #[derive(Clone, Copy, Debug)]
 pub struct EmbedShape {
     pub token_ids: DevicePtr,
@@ -26,7 +26,7 @@ pub struct EmbedShape {
     pub embedding_bytes: u64,
 }
 
-/// `q3_embedding_geometry`, `q3_embedding.c:82-100`: the offset of the scale plane and the expected byte size, or
+/// `q3_embedding_geometry`, `q3_embedding.c`: the offset of the scale plane and the expected byte size, or
 /// `None` when a product overflows 64 bits.
 fn q3_geometry(vocabulary_size: u32, hidden_size: u32) -> Option<(u64, u64)> {
     let padded_hidden = u64::from(hidden_size).div_ceil(128) * 128;
@@ -44,7 +44,7 @@ fn q3_geometry(vocabulary_size: u32, hidden_size: u32) -> Option<(u64, u64)> {
     Some((scale_offset, scale_offset + scale_byte_size))
 }
 
-/// `euhedral_cuda_embed_q3`, `q3_embedding.c:102-168`: one launch of `tokens * ceil(hidden / 64 / 4)` blocks of 128.
+/// `euhedral_cuda_embed_q3`, `q3_embedding.c`: one launch of `tokens * ceil(hidden / 64 / 4)` blocks of 128.
 pub fn plan_embed_q3(shape: &EmbedShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
     if s.token_ids.is_null()
@@ -63,7 +63,7 @@ pub fn plan_embed_q3(shape: &EmbedShape, sink: &mut impl FnMut(Launch)) -> Resul
     if s.embedding_bytes != expected_bytes {
         return Err(PlanError::FormatMismatch);
     }
-    // q3_embedding.c:136-141.
+    // euhedral_cuda_embed_q3 in q3_embedding.c.
     let groups_per_token = u64::from(s.hidden_size) / 64;
     let groups_per_block = groups_per_token.div_ceil(4);
     let grid_size = u64::from(s.token_count) * groups_per_block;
@@ -82,16 +82,16 @@ pub fn plan_embed_q3(shape: &EmbedShape, sink: &mut impl FnMut(Launch)) -> Resul
     Ok(())
 }
 
-/// The P2E2 tensor slice (`EUHEDRAL_Q3_P2E2_SLICE`, `q3_p2e2_geometry.h:10`).
+/// The P2E2 tensor slice (`EUHEDRAL_Q3_P2E2_SLICE`, `q3_p2e2_geometry.h`).
 const P2E2_SLICE: u32 = 1024;
-/// `EUHEDRAL_Q3_P2E2_PAD_WORDS`, `q3_p2e2_geometry.h:11`.
+/// `EUHEDRAL_Q3_P2E2_PAD_WORDS`, `q3_p2e2_geometry.h`.
 const P2E2_PAD_WORDS: u64 = 80;
 
 const fn align256(value: u64) -> u64 {
     (value + 255) & !255u64
 }
 
-/// `euhedral_q3_p2e2_geometry`, `q3_p2e2_geometry.h:24-32`: a byte size is valid between an empty and a full payload.
+/// `euhedral_q3_p2e2_geometry`, `q3_p2e2_geometry.h`: a byte size is valid between an empty and a full payload.
 fn p2e2_geometry(rows: u32, in_features: u32, byte_size: u64) -> Result<(), PlanError> {
     if rows == 0 || in_features == 0 {
         return Err(PlanError::InvalidArgument);
@@ -99,7 +99,7 @@ fn p2e2_geometry(rows: u32, in_features: u32, byte_size: u64) -> Result<(), Plan
     if !in_features.is_multiple_of(P2E2_SLICE) {
         return Err(PlanError::FormatMismatch);
     }
-    // q3_p2e2_geometry.h:17-22.
+    // q3_p2e2_geometry.h.
     let codes = u64::from(rows) * u64::from(in_features);
     let base = align256(codes / 4);
     let scale = align256(base + 4 * u64::from(rows));
@@ -112,7 +112,7 @@ fn p2e2_geometry(rows: u32, in_features: u32, byte_size: u64) -> Result<(), Plan
     Ok(())
 }
 
-/// `euhedral_cuda_embed_q3_p2e2`, `q3_embedding.c:227-269`: one launch of `ceil(tokens / 4)` blocks of 128.
+/// `euhedral_cuda_embed_q3_p2e2`, `q3_embedding.c`: one launch of `ceil(tokens / 4)` blocks of 128.
 pub fn plan_embed_q3_p2e2(shape: &EmbedShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
     if s.token_ids.is_null()
@@ -127,7 +127,7 @@ pub fn plan_embed_q3_p2e2(shape: &EmbedShape, sink: &mut impl FnMut(Launch)) -> 
         return Err(PlanError::InvalidArgument);
     }
     p2e2_geometry(s.vocabulary_size, s.hidden_size, s.embedding_bytes)?;
-    // q3_embedding.c:241-244.
+    // euhedral_cuda_embed_q3_p2e2 in q3_embedding.c.
     let grid_size = u64::from(s.token_count).div_ceil(4);
     if grid_size > MAX_GRID {
         return Err(PlanError::SizeOverflow);
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(launches[0].kernel, kernel!("euhedral_q3_embedding"));
         assert_eq!((launches[0].grid, launches[0].block), ([5, 1, 1], [128, 1, 1]));
         assert!(!launches[0].programmatic);
-        // q3_embedding.c:158: three pointers, three u32, the scale offset as u64.
+        // euhedral_cuda_embed_q3 in q3_embedding.c: three pointers, three u32, the scale offset as u64.
         assert_eq!(launches[0].args.words(), &[0x100, 0x200, 0x300, 5, 1000, 192, 96_000]);
         assert_eq!(launches[0].args.sizes(), &[8, 8, 8, 4, 4, 4, 8]);
         // hidden 256: 4 groups, 1 block; hidden 320: 5 groups, 2 blocks; hidden 5120: 80 groups, 20 blocks.
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn embed_p2e2_geometry_range_and_grid() {
-        // q3_p2e2_geometry.h:24-32: valid from payload + pad (1536 + 320 = 1856) to full (2880), in steps of 4.
+        // q3_p2e2_geometry.h: valid from payload + pad (1536 + 320 = 1856) to full (2880), in steps of 4.
         for (bytes, ok) in [
             (1855, false),
             (1856, true),
@@ -299,7 +299,7 @@ mod tests {
                 assert_eq!((result, launches.len()), (Err(PlanError::FormatMismatch), 0));
             }
         }
-        // q3_embedding.c:243: ceil(tokens / 4) blocks of 128.
+        // euhedral_cuda_embed_q3_p2e2 in q3_embedding.c: ceil(tokens / 4) blocks of 128.
         for (tokens, grid) in [(1, 1), (4, 1), (5, 2), (8, 2), (9, 3), (1000, 250)] {
             let (result, launches) = plan_p2e2(&p2e2(tokens, 2000));
             assert_eq!(result, Ok(()));
@@ -309,7 +309,7 @@ mod tests {
             assert!(!launches[0].programmatic);
         }
         let (_, launches) = plan_p2e2(&p2e2(9, 2000));
-        // q3_embedding.c:263: three pointers, three u32; no scale offset.
+        // euhedral_cuda_embed_q3_p2e2 in q3_embedding.c: three pointers, three u32; no scale offset.
         assert_eq!(launches[0].args.words(), &[0x100, 0x200, 0x300, 9, 4, 1024]);
         assert_eq!(launches[0].args.sizes(), &[8, 8, 8, 4, 4, 4]);
         // A hidden size that is not a multiple of 1024 is a format mismatch; zero rows is invalid.
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn embed_p2e2_alignment_and_nulls() {
-        // q3_embedding.c:231-233: the hidden and embedding pointers must be 16-byte aligned; token ids need not be.
+        // euhedral_cuda_embed_q3_p2e2 in q3_embedding.c: the hidden and embedding pointers must be 16-byte aligned; token ids need not be.
         let base = p2e2(1, 2000);
         assert_eq!(
             plan_p2e2(&EmbedShape {

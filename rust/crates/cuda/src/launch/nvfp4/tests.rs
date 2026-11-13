@@ -157,14 +157,14 @@ fn refusals_before_any_launch() {
         change(&mut changed);
         plan_linear(&changed, false).unwrap_err()
     };
-    assert_eq!(refused(&|o| o.input = DevicePtr::NULL), Nvfp4Refusal::InvalidArgument);
-    assert_eq!(refused(&|o| o.rows = 0), Nvfp4Refusal::InvalidArgument);
-    assert_eq!(refused(&|o| o.weights_byte_size += 4), Nvfp4Refusal::FormatMismatch);
-    assert_eq!(refused(&|o| o.input = at(INPUT + 8)), Nvfp4Refusal::InvalidArgument);
-    assert_eq!(refused(&|o| o.weights = at(WEIGHTS + 4)), Nvfp4Refusal::InvalidArgument);
+    assert_eq!(refused(&|o| o.input = DevicePtr::NULL), PlanError::InvalidArgument);
+    assert_eq!(refused(&|o| o.rows = 0), PlanError::InvalidArgument);
+    assert_eq!(refused(&|o| o.weights_byte_size += 4), PlanError::FormatMismatch);
+    assert_eq!(refused(&|o| o.input = at(INPUT + 8)), PlanError::InvalidArgument);
+    assert_eq!(refused(&|o| o.weights = at(WEIGHTS + 4)), PlanError::InvalidArgument);
     // 48 inputs: a valid size for the shape, but not a multiple of 32.
     let narrow = operands(1, 48, 16, Nvfp4Layout::Plain);
-    assert_eq!(plan_linear(&narrow, false).unwrap_err(), Nvfp4Refusal::InvalidArgument);
+    assert_eq!(plan_linear(&narrow, false).unwrap_err(), PlanError::InvalidArgument);
 }
 
 #[test]
@@ -243,7 +243,7 @@ fn native_skinny_without_a_split_has_no_finish_and_null_partials() {
     assert!(plan_native(&operands, at(SCRATCH), 8256, false).is_ok());
     assert_eq!(
         plan_native(&operands, at(SCRATCH), 8255, false).unwrap_err(),
-        Nvfp4Refusal::InvalidArgument
+        PlanError::InvalidArgument
     );
 }
 
@@ -329,34 +329,34 @@ fn native_declines_and_refuses() {
     let scratch = |size: u64| plan_native(&tile, at(SCRATCH), size, false);
     // The tile kernel's scratch is the activations alone: 41732 bytes.
     assert!(scratch(41_732).is_ok());
-    assert_eq!(scratch(41_731).unwrap_err(), Nvfp4Refusal::InvalidArgument);
+    assert_eq!(scratch(41_731).unwrap_err(), PlanError::InvalidArgument);
     assert_eq!(
         plan_native(&tile, DevicePtr::NULL, u64::MAX, false).unwrap_err(),
-        Nvfp4Refusal::InvalidArgument
+        PlanError::InvalidArgument
     );
     // A scratch off 16 bytes declines a tile launch but not a skinny one.
     assert_eq!(
         plan_native(&tile, at(SCRATCH + 8), u64::MAX, false).unwrap_err(),
-        Nvfp4Refusal::RouteUnavailable
+        PlanError::RouteUnavailable
     );
     let skinny = operands(16, 256, 4096, Nvfp4Layout::Plain);
     assert!(plan_native(&skinny, at(SCRATCH + 8), u64::MAX, false).is_ok());
     // Exact numerics, a width that is not a multiple of 128.
     assert_eq!(
         plan_native(&tile, at(SCRATCH), u64::MAX, true).unwrap_err(),
-        Nvfp4Refusal::RouteUnavailable
+        PlanError::RouteUnavailable
     );
     let odd = operands(16, 192, 4096, Nvfp4Layout::Plain);
     assert_eq!(
         plan_native(&odd, at(SCRATCH), u64::MAX, false).unwrap_err(),
-        Nvfp4Refusal::RouteUnavailable
+        PlanError::RouteUnavailable
     );
     // The tile kernels need 256 inputs (plain) or 512 (SD4): 128 inputs with 65 rows, or SD4 with 256, decline.
     for (in_features, layout) in [(128, Nvfp4Layout::Plain), (256, Nvfp4Layout::Sd4)] {
         let shape = operands(65, in_features, 256, layout);
         assert_eq!(
             plan_native(&shape, at(SCRATCH), u64::MAX, false).unwrap_err(),
-            Nvfp4Refusal::RouteUnavailable
+            PlanError::RouteUnavailable
         );
     }
     // 256 inputs, plain, 65 rows: accepted.
@@ -374,13 +374,13 @@ fn native_declines_and_refuses() {
     wrong.weights_byte_size += 1;
     assert_eq!(
         plan_native(&wrong, at(SCRATCH), u64::MAX, false).unwrap_err(),
-        Nvfp4Refusal::FormatMismatch
+        PlanError::FormatMismatch
     );
     // 2^31 rows over 65536 outputs: 2^24 * 2^9 tiles = 2^33 blocks.
     let huge = operands(1 << 31, 512, 1 << 16, Nvfp4Layout::Plain);
     assert_eq!(
         plan_native(&huge, at(SCRATCH), u64::MAX, false).unwrap_err(),
-        Nvfp4Refusal::SizeOverflow
+        PlanError::SizeOverflow
     );
 }
 

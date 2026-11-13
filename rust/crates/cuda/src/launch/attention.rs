@@ -12,24 +12,7 @@
 use crate::DevicePtr;
 use crate::kernel;
 use crate::launch::catalog::{Arguments, KernelId, Launch};
-
-/// What the native wrapper rejects.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PlanError {
-    /// `EUHEDRAL_CUDA_INVALID_ARGUMENT`.
-    InvalidArgument,
-    /// `EUHEDRAL_CUDA_SIZE_OVERFLOW`.
-    SizeOverflow,
-}
-
-/// The thread-local modes the C wrappers read (`euhedral_cuda_row_exact`, `euhedral_cuda_exact_numerics`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Modes {
-    /// Every row computes as a one-row launch would.
-    pub row_exact: bool,
-    /// The key-ordered softmax sum and the per-element decode kernel.
-    pub exact_numerics: bool,
-}
+use crate::launch::{Modes, PlanError, advance};
 
 /// The format of the KV cache pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,12 +105,6 @@ const fn fused_from(rows: u32) -> u32 {
     if rows < 9 { FROM[rows as usize] } else { u32::MAX }
 }
 
-/// `pointer + bytes` as C computes it: wrapping, never a panic.
-fn advance(pointer: DevicePtr, bytes: u64) -> DevicePtr {
-    // SAFETY: the address is only carried into a launch's arguments, never dereferenced on the host.
-    unsafe { DevicePtr::from_raw(pointer.get().wrapping_add(bytes)) }
-}
-
 fn launch(kernel: KernelId, grid: [u32; 3], block: u32, shared_bytes: u32, args: Arguments) -> Launch {
     Launch::new(kernel, grid, [block, 1, 1], shared_bytes, args)
 }
@@ -206,18 +183,19 @@ pub struct RopeShape {
     pub rope_theta: f64,
 }
 
-/// `qk_norm_rope`, `qwen_layer_ops.c:609-654`. `row_exact` is the thread's row-exact mode.
-pub fn plan_qk_norm_rope(shape: &RopeShape, row_exact: bool, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
-    plan_rope(shape, 0, row_exact, sink)
+/// `qk_norm_rope`, `qwen_layer_ops.c:609-654`. The thread's modes are `modes`.
+pub fn plan_qk_norm_rope(shape: &RopeShape, modes: Modes, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
+    plan_rope(shape, 0, modes, sink)
 }
 
 fn plan_rope(
     shape: &RopeShape,
     position_offset: u64,
-    row_exact: bool,
+    modes: Modes,
     sink: &mut impl FnMut(Launch),
 ) -> Result<(), PlanError> {
     let s = shape;
+    let row_exact = modes.row_exact;
     let row_exact_heads = s.rows > 1 && row_exact;
     // qwen_layer_ops.c:617-627: past u32 blocks, one row at a time.
     if row_exact_heads
@@ -235,7 +213,7 @@ fn plan_rope(
                 start_position: s.start_position.wrapping_add(u64::from(row)),
                 ..*s
             };
-            plan_rope(&one, position_offset.wrapping_add(u64::from(row)), row_exact, sink)?;
+            plan_rope(&one, position_offset.wrapping_add(u64::from(row)), modes, sink)?;
         }
         return Ok(());
     }
@@ -1369,7 +1347,11 @@ mod tests {
 
     fn rope(s: &RopeShape, row_exact: bool) -> Result<Vec<Launch>, PlanError> {
         let mut out = Vec::new();
-        plan_qk_norm_rope(s, row_exact, &mut |l| out.push(l))?;
+        let modes = Modes {
+            row_exact,
+            exact_numerics: false,
+        };
+        plan_qk_norm_rope(s, modes, &mut |l| out.push(l))?;
         Ok(out)
     }
 
