@@ -15,10 +15,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::error::{CudaError, check};
-use crate::library::CudaLibrary;
 use crate::memory::{DevicePtr, HostWeightsArena, PinnedBuffer};
 use crate::submission::Submission;
-use std::sync::Arc;
 
 /// Calls the C entry point `$name` and turns its status into a `Result`.
 macro_rules! entry {
@@ -1136,8 +1134,13 @@ pub trait KernelOps {
     /// format that asks reads the mode of the quantum, not the selection of the moment.
     fn row_exact(&self) -> bool;
 
-    /// The library the launches run in, for the stages' decisions that depend on what it was built with.
-    fn library(&self) -> &Arc<CudaLibrary>;
+    /// Whether the launches run on the exact-numerics kernels (every quantized linear on its scalar reference, every
+    /// relaxed-order operator on its exact twin): the decision of a format that picks its route by it.
+    fn exact_numerics(&self) -> bool;
+
+    /// Whether kernel `index` of the shared linear table runs on this device: the kernels of an
+    /// architecture-specific module are unavailable elsewhere ([`CudaLibrary::linear_kernel_available`](crate::CudaLibrary::linear_kernel_available)).
+    fn linear_kernel_available(&self, index: usize) -> Result<bool, CudaError>;
 
     /// Queues the copy of `bytes` device bytes into a pinned buffer at `offset`, for a buffer the host shares by `&`
     /// ([`copy_device_to_readback_shared`]).
@@ -1206,9 +1209,14 @@ macro_rules! submission_ops {
                 submission.mode().row_exact
             }
 
-            fn library(&self) -> &Arc<CudaLibrary> {
+            fn exact_numerics(&self) -> bool {
                 let submission: &Submission<'_> = self;
-                submission.lane().library()
+                submission.lane().library().exact_numerics()
+            }
+
+            fn linear_kernel_available(&self, index: usize) -> Result<bool, CudaError> {
+                let submission: &Submission<'_> = self;
+                submission.lane().library().linear_kernel_available(index)
             }
 
             unsafe fn copy_device_to_readback_shared(
@@ -1613,8 +1621,11 @@ mod tests {
         fn row_exact(&self) -> bool {
             self.began_row_exact
         }
-        fn library(&self) -> &Arc<CudaLibrary> {
-            unreachable!("the recorder has no library")
+        fn exact_numerics(&self) -> bool {
+            false
+        }
+        fn linear_kernel_available(&self, _: usize) -> Result<bool, CudaError> {
+            Ok(false)
         }
     }
 
