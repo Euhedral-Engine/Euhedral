@@ -24,6 +24,7 @@
 )]
 #![allow(dead_code, reason = "each test binary uses a part of the harness")]
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -209,4 +210,107 @@ fn download(buffer: &DeviceBuffer) -> Result<Vec<u8>, Failure> {
     let mut bytes = vec![0u8; buffer.bytes()];
     buffer.copy_to_host(0, &mut bytes)?;
     Ok(bytes)
+}
+
+/// A fixed-seed generator (splitmix64) for the cases' inputs.
+pub struct Rng(pub u64);
+
+impl Rng {
+    pub fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// A BF16 mix: mostly moderate values, some zeros, negative zeros, large and tiny magnitudes (never NaN or
+    /// infinity).
+    pub fn bf16(&mut self) -> u16 {
+        let bits = self.next();
+        let sign = ((bits >> 40) & 1) as u16;
+        let mantissa = ((bits >> 32) & 0x7f) as u16;
+        let exponent = |low: u16, span: u16| low + ((bits >> 16) as u16) % span;
+        let (exponent, mantissa) = match bits % 20 {
+            0 | 1 => (0, 0),
+            2 => return 0x8000,
+            3 => (exponent(0x8c, 0x10), mantissa),
+            4 | 5 => (exponent(0, 0x30), mantissa),
+            _ => (exponent(0x74, 0x10), mantissa),
+        };
+        sign << 15 | exponent << 7 | mantissa
+    }
+
+    pub fn bf16_bytes(&mut self, count: usize) -> Vec<u8> {
+        (0..count).flat_map(|_| self.bf16().to_le_bytes()).collect()
+    }
+
+    /// Floats uniform in `[low, high)`.
+    pub fn f32_bytes(&mut self, count: usize, low: f32, high: f32) -> Vec<u8> {
+        (0..count)
+            .flat_map(|_| {
+                let unit = (self.next() >> 40) as f32 / (1u64 << 24) as f32;
+                (low + (high - low) * unit).to_le_bytes()
+            })
+            .collect()
+    }
+}
+
+/// The counts a test family ends with: per planner, cases compared, skipped and mismatched, and the skip reasons.
+#[derive(Default)]
+pub struct Tally {
+    planners: BTreeMap<String, [usize; 3]>,
+    skipped: BTreeMap<String, usize>,
+    failures: Vec<String>,
+}
+
+impl Tally {
+    /// Runs the case and records what it came to; a mismatch prints where it is.
+    pub fn run(&mut self, twin: &mut Twin, planner: &str, shape: &str, case: &Case<'_>) {
+        let counts = self.planners.entry(planner.to_string()).or_default();
+        match twin
+            .run(case)
+            .unwrap_or_else(|error| panic!("{planner} {shape}: {error}"))
+        {
+            Verdict::Identical { .. } => counts[0] += 1,
+            Verdict::Skipped(reasons) => {
+                counts[1] += 1;
+                for reason in reasons {
+                    // Only the targets the pinned RustEE cannot make and the tensor-map arguments are expected.
+                    if !reason.contains("architecture-specific") && !reason.contains("tensor-map") {
+                        self.failures
+                            .push(format!("{planner} {shape}: unexpectedly unavailable: {reason}"));
+                    }
+                    *self.skipped.entry(reason).or_default() += 1;
+                }
+            }
+            Verdict::Differs {
+                buffer,
+                offset,
+                native,
+                rustee,
+            } => {
+                counts[2] += 1;
+                let message = format!(
+                    "{planner} {shape}: buffer {buffer} differs at byte {offset}: native {native:#04x}, RustEE {rustee:#04x}"
+                );
+                println!("MISMATCH {message}");
+                self.failures.push(message);
+            }
+        }
+    }
+
+    /// Prints the counts and fails if anything mismatched or was unexpectedly unavailable.
+    pub fn finish(self) {
+        let mut compared = 0;
+        for (planner, [identical, skipped, mismatched]) in &self.planners {
+            println!("{planner}: compared {identical}, skipped {skipped}, mismatched {mismatched}");
+            compared += identical;
+        }
+        println!("cases compared: {compared}");
+        for (reason, count) in &self.skipped {
+            println!("skipped {count}: {reason}");
+        }
+        assert!(self.failures.is_empty(), "{}", self.failures.join("\n"));
+    }
 }

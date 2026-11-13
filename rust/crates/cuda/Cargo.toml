@@ -21,6 +21,8 @@ thiserror.workspace = true
 euhedral-gpu = { workspace = true, features = ["cuda"] }
 
 [dev-dependencies]
+# The device tests switch the process-wide exact numerics.
+euhedral-inference-cuda = { path = ".", features = ["test-oracles"] }
 tempfile.workspace = true
 test-support = { path = "../test-support" }
 
