@@ -265,5 +265,11 @@ fn a_copy_the_native_wrapper_refuses_is_refused() {
         status(ops.copy_device_to_device_2d(DevicePtr::NULL, 8, ptr(512), 8, 8, 2)),
         INVALID_ARGUMENT
     );
+    assert_eq!(
+        status(ops.copy_device_to_device_2d(ptr(256), 8, DevicePtr::NULL, 8, 8, 2)),
+        INVALID_ARGUMENT
+    );
+    // Zero bytes per row with rows to go is nothing to copy, not an error.
+    ops.copy_device_to_device_2d(ptr(256), 8, ptr(512), 8, 0, 2).unwrap();
     assert!(queue.calls.is_empty());
 }
