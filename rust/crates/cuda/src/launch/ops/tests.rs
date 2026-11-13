@@ -5,8 +5,24 @@ use super::*;
 /// What the recording queue was asked, in order.
 #[derive(Debug, PartialEq, Eq)]
 enum Call {
-    Copy { to: u64, from: u64, bytes: usize },
-    Memset { at: u64, value: u8, bytes: usize },
+    Copy {
+        to: u64,
+        from: u64,
+        bytes: usize,
+    },
+    Pitched {
+        to: u64,
+        to_pitch: usize,
+        from: u64,
+        from_pitch: usize,
+        row_bytes: usize,
+        rows: usize,
+    },
+    Memset {
+        at: u64,
+        value: u8,
+        bytes: usize,
+    },
 }
 
 #[derive(Default)]
@@ -34,6 +50,30 @@ impl LaneEnqueue for Recording {
             to: dst,
             from: src,
             bytes,
+        });
+        Ok(())
+    }
+
+    unsafe fn copy_pitched_on_device(
+        &mut self,
+        dst: u64,
+        dst_pitch: usize,
+        src: u64,
+        src_pitch: usize,
+        row_bytes: usize,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        // The lane's own refusal, which the engine side no longer repeats.
+        if dst_pitch < row_bytes || src_pitch < row_bytes {
+            return Err(GpuError::Invalid("pitch below the row".into()));
+        }
+        self.calls.push(Call::Pitched {
+            to: dst,
+            to_pitch: dst_pitch,
+            from: src,
+            from_pitch: src_pitch,
+            row_bytes,
+            rows,
         });
         Ok(())
     }
@@ -157,10 +197,10 @@ fn copies_and_the_memset_are_the_lanes_own_operations_in_call_order() {
         let mut ops = RusteeOps::new(&mut queue, &table, Modes::default());
         ops.copy_device_to_device(ptr(0x1000), ptr(0x2000), 64).unwrap();
         ops.zero_device_memory(ptr(0x3000), 32).unwrap();
-        // Pitched: one copy per row, at each row's own offsets.
+        // Pitched: one copy, the destination's pitch first.
         ops.copy_device_to_device_2d(ptr(0x4000), 256, ptr(0x5000), 128, 100, 3)
             .unwrap();
-        // Contiguous rows are one copy.
+        // Equal pitches are the lane's to fold into one plain copy.
         ops.copy_device_to_device_2d(ptr(0x6000), 100, ptr(0x7000), 100, 100, 3)
             .unwrap();
         // Nothing to copy is not an error, as the native wrappers have it.
@@ -181,25 +221,21 @@ fn copies_and_the_memset_are_the_lanes_own_operations_in_call_order() {
                 value: 0,
                 bytes: 32
             },
-            Call::Copy {
+            Call::Pitched {
                 to: 0x4000,
+                to_pitch: 256,
                 from: 0x5000,
-                bytes: 100
+                from_pitch: 128,
+                row_bytes: 100,
+                rows: 3
             },
-            Call::Copy {
-                to: 0x4100,
-                from: 0x5080,
-                bytes: 100
-            },
-            Call::Copy {
-                to: 0x4200,
-                from: 0x5100,
-                bytes: 100
-            },
-            Call::Copy {
+            Call::Pitched {
                 to: 0x6000,
+                to_pitch: 100,
                 from: 0x7000,
-                bytes: 300
+                from_pitch: 100,
+                row_bytes: 100,
+                rows: 3
             },
         ]
     );
@@ -216,15 +252,24 @@ fn a_copy_the_native_wrapper_refuses_is_refused() {
     );
     assert_eq!(status(ops.zero_device_memory(ptr(256), 0)), INVALID_ARGUMENT);
     assert_eq!(status(ops.zero_device_memory(DevicePtr::NULL, 8)), INVALID_ARGUMENT);
-    // A pitch below the row.
+    // A pitch below the row is the lane's refusal, passed on with nothing queued.
+    assert!(matches!(
+        ops.copy_device_to_device_2d(ptr(256), 4, ptr(512), 8, 8, 2),
+        Err(CudaError::Argument(_))
+    ));
+    assert!(matches!(
+        ops.copy_device_to_device_2d(ptr(256), 8, ptr(512), 4, 8, 2),
+        Err(CudaError::Argument(_))
+    ));
     assert_eq!(
-        status(ops.copy_device_to_device_2d(ptr(256), 4, ptr(512), 8, 8, 2)),
+        status(ops.copy_device_to_device_2d(DevicePtr::NULL, 8, ptr(512), 8, 8, 2)),
         INVALID_ARGUMENT
     );
-    // Rows whose extent overflows 64 bits.
     assert_eq!(
-        status(ops.copy_device_to_device_2d(ptr(256), u64::MAX / 2, ptr(512), u64::MAX / 2, 8, 4)),
-        SIZE_OVERFLOW
+        status(ops.copy_device_to_device_2d(ptr(256), 8, DevicePtr::NULL, 8, 8, 2)),
+        INVALID_ARGUMENT
     );
+    // Zero bytes per row with rows to go is nothing to copy, not an error.
+    ops.copy_device_to_device_2d(ptr(256), 8, ptr(512), 8, 0, 2).unwrap();
     assert!(queue.calls.is_empty());
 }

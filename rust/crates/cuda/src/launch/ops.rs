@@ -35,7 +35,7 @@ use crate::launch::load::KernelTable;
 use crate::launch::nvfp4::{Nvfp4Operands, plan_linear, plan_native};
 use crate::launch::queue::{EnqueueError, enqueue};
 use crate::launch::table::{Geometry, plan_linear_launch, plan_qwen4_launch};
-use crate::launch::{Modes, PlanError, advance};
+use crate::launch::{Modes, PlanError};
 use crate::memory::{DevicePtr, HostWeightsArena, PinnedBuffer};
 use crate::ops::{KernelOps, arena_range, pinned_range};
 use crate::sys::{
@@ -191,32 +191,24 @@ where
         if row_bytes == 0 || rows == 0 {
             return Ok(());
         }
-        if destination.is_null() || source.is_null() || destination_pitch < row_bytes || source_pitch < row_bytes {
+        if destination.is_null() || source.is_null() {
             return Err(rejected(CALL));
         }
-        let row = usize::try_from(row_bytes).map_err(|_| refused(CALL, PlanError::SizeOverflow))?;
-        if destination_pitch == row_bytes && source_pitch == row_bytes {
-            let total = row_bytes
-                .checked_mul(rows)
-                .ok_or_else(|| refused(CALL, PlanError::SizeOverflow))?;
-            return self.copy_device_to_device(destination, source, total);
+        let size = |value: u64| usize::try_from(value).map_err(|_| refused(CALL, PlanError::SizeOverflow));
+        let (destination_pitch, source_pitch) = (size(destination_pitch)?, size(source_pitch)?);
+        let (row_bytes, rows) = (size(row_bytes)?, size(rows)?);
+        // SAFETY: as in `copy_device_to_device`. The lane refuses a pitch below the row and a range that overflows.
+        unsafe {
+            self.queue.copy_pitched_on_device(
+                destination.get(),
+                destination_pitch,
+                source.get(),
+                source_pitch,
+                row_bytes,
+                rows,
+            )
         }
-        let end = |pitch: u64| {
-            pitch
-                .checked_mul(rows - 1)
-                .and_then(|last| last.checked_add(row_bytes))
-                .ok_or_else(|| refused(CALL, PlanError::SizeOverflow))
-        };
-        end(destination_pitch)?;
-        end(source_pitch)?;
-        for index in 0..rows {
-            let to = advance(destination, index * destination_pitch);
-            let from = advance(source, index * source_pitch);
-            // SAFETY: as in `copy_device_to_device`.
-            unsafe { self.queue.copy_on_device(to.get(), from.get(), row) }
-                .map_err(|error| lane_error(CALL, &error))?;
-        }
-        Ok(())
+        .map_err(|error| lane_error(CALL, &error))
     }
 
     fn zero_device_memory(&mut self, address: DevicePtr, bytes: u64) -> Result<(), CudaError> {
