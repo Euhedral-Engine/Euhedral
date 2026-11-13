@@ -54,6 +54,7 @@ pub use graph::{GraphExec, GraphRecorder};
 pub use lane::CudaLane;
 pub use library::CudaLibrary;
 pub use memory::{AllocationId, DeviceBuffer, DevicePtr, HostWeightsArena, PinnedBuffer};
+pub use ops::KernelOps;
 pub use pool::{PinnedPool, PooledPinned};
 pub use retire::{Retire, RetireList};
 pub use submission::{Submission, SubmitMode};

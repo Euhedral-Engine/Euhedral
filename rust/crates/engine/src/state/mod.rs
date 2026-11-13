@@ -156,7 +156,7 @@ impl SequenceState {
         } else {
             None
         };
-        let gdn = GdnStates::allocate(library, config, verified_rows, submission)?;
+        let gdn = GdnStates::allocate(library, config, verified_rows, &mut { submission })?;
         // A drafting sequence's catch-up runs up to the decode row twins' rows on the same scratch.
         let decode_rows = if drafts { verified_rows.max(DRAFT_TWIN_ROWS) } else { 1 };
         let scratch = AttentionScratch::allocate(
@@ -241,7 +241,7 @@ impl SequenceState {
             cache.discard();
             cache.truncate(0).map_err(|error| fail(&error))?;
         }
-        self.device.gdn.zero(submission).map_err(|error| fail(&error))
+        self.device.gdn.zero(&mut { submission }).map_err(|error| fail(&error))
     }
 
     /// Ends the sequence: frees its caches, the one place their blocking frees may happen. Refused, giving the state

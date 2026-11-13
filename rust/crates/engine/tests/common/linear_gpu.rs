@@ -320,7 +320,7 @@ impl Rig {
         let submission = Submission::begin(&self.lane, SubmitMode::default()).unwrap();
         format
             .submit(
-                &submission,
+                &mut &submission,
                 weight,
                 input,
                 y.ptr(),

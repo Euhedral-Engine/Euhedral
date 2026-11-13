@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::Submission;
+use euhedral_inference_cuda::KernelOps;
 
 use super::{Launch, Quantum, QuantumKind, eager, fatal};
 use crate::formats::{LinearFormat, LinearMode, ScratchRegion};
@@ -82,7 +82,7 @@ impl Launch for Linear {
         self.covered(quantum) == 0
     }
 
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         if self.idle(quantum) {
             return Ok(());
         }
@@ -108,7 +108,7 @@ impl Launch for Linear {
         };
         self.format
             .submit(
-                submission,
+                kernels,
                 &self.weight,
                 quantum.slot(self.input),
                 quantum.slot(self.output),

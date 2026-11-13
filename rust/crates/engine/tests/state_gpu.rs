@@ -246,7 +246,7 @@ fn host_pages_are_read_and_written_through_the_device_region() {
         *byte = (index % 251) as u8;
     }
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-    cache.stage_in(&submission, 0, 520, 80).unwrap();
+    cache.stage_in(&mut &submission, 0, 520, 80).unwrap();
     submission.finish().unwrap();
     lane.synchronize().unwrap();
     let mut seen = vec![0u8; 2 * page as usize];
@@ -261,7 +261,7 @@ fn host_pages_are_read_and_written_through_the_device_region() {
     let written: Vec<u8> = (0..2 * page as usize).map(|index| (index % 13) as u8).collect();
     cache.host_region().unwrap().copy_from_host(0, &written).unwrap();
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-    cache.stage_out(&submission, 0, 596, 4).unwrap();
+    cache.stage_out(&mut &submission, 0, 596, 4).unwrap();
     submission.finish().unwrap();
     lane.synchronize().unwrap();
     let arena = cache.host_arena_mut().unwrap();
@@ -276,7 +276,7 @@ fn gdn_state_is_zeroed_and_as_large_as_the_planner_says() {
     let config = config();
     let before = library.free_bytes().unwrap();
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-    let states = GdnStates::allocate(&library, &config, 5, &submission).unwrap();
+    let states = GdnStates::allocate(&library, &config, 5, &mut &submission).unwrap();
     submission.finish().unwrap();
     lane.synchronize().unwrap();
     assert_eq!(states.device_bytes(), footprint::gdn_bytes(&config, 5));
@@ -297,7 +297,7 @@ fn gdn_state_is_zeroed_and_as_large_as_the_planner_says() {
     assert!(used >= states.device_bytes(), "{used} < {}", states.device_bytes());
 
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-    let plain = GdnStates::allocate(&library, &config, 0, &submission).unwrap();
+    let plain = GdnStates::allocate(&library, &config, 0, &mut &submission).unwrap();
     drop(submission);
     let state = plain.layer(0).unwrap();
     assert!(state.speculative().is_none());
