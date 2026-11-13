@@ -1,3 +1,5 @@
+//! Temporary: removed together with the native launch path, once the kernels run through RustEE.
+//!
 //! The twin harness: one kernel family's case run twice in one CUDA context, once through the native C library and
 //! once through a planned launch on a RustEE lane, and the outputs compared byte for byte.
 //!
@@ -81,10 +83,21 @@ pub struct Twin {
 }
 
 impl Twin {
-    /// Opens device `ordinal` through RustEE (the device the native library bound), loads the kernel modules and opens
-    /// a lane on each side.
-    pub fn open(library: &Arc<CudaLibrary>, ordinal: i32) -> Result<Twin, Failure> {
-        let gpu = CudaGpu::open(ordinal)?;
+    /// Opens the device the native library bound through RustEE, loads the kernel modules and opens a lane on each
+    /// side. The library reports the device's properties and not its ordinal, so the device is the first whose
+    /// compute capability is the library's.
+    pub fn open(library: &Arc<CudaLibrary>) -> Result<Twin, Failure> {
+        let (major, minor) = library.device().compute_capability;
+        let wanted = (i32::try_from(major)?, i32::try_from(minor)?);
+        let mut gpu = None;
+        for ordinal in 0..16 {
+            let Ok(candidate) = CudaGpu::open(ordinal) else { break };
+            if candidate.arch() == wanted {
+                gpu = Some(candidate);
+                break;
+            }
+        }
+        let gpu = gpu.ok_or("RustEE found no device of the library's compute capability")?;
         let table = load(&gpu, &KernelSources::beside(library)?)?;
         let lane = CudaLane::new(library, LaneId(0), 4)?;
         let mut streams = gpu.open_lanes_at(LaneId(1), &["twin"], &[StreamOptions::default()])?;
@@ -163,7 +176,11 @@ impl Twin {
                 buffer.copy_from_host(0, bytes)?;
                 Ok(buffer)
             })
-            .collect()
+            .collect::<Result<Vec<_>, Failure>>()
+            .and_then(|buffers| {
+                self.lane.synchronize()?;
+                Ok(buffers)
+            })
     }
 
     fn run_native(&self, step: &Native<'_>, pointers: &[DevicePtr]) -> Result<(), Failure> {

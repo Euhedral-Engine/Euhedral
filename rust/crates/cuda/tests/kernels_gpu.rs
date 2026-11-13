@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use euhedral_gpu::cuda::CudaGpu;
 use euhedral_inference_cuda::CudaLibrary;
 use euhedral_inference_cuda::launch::catalog::{Arguments, KERNELS, Launch, MAX_ARGUMENTS};
-use euhedral_inference_cuda::launch::load::{DEFAULT_DYNAMIC_SHARED_BYTES, KernelSources, Slot, load};
+use euhedral_inference_cuda::launch::load::{DEFAULT_DYNAMIC_SHARED_BYTES, KernelSources, Slot, Unavailable, load};
 use euhedral_inference_cuda::{DevicePtr, kernel, ops};
 
 use common::twin::{Case, Twin, Verdict};
@@ -49,7 +49,7 @@ fn millis(duration: Duration) -> f64 {
 
 #[test]
 #[ignore = "needs a GPU, the native library and NVRTC"]
-fn every_catalog_kernel_resolves_with_the_parameter_sizes_its_plans_pass() {
+fn every_available_catalog_kernel_resolves_with_word_sized_parameters() {
     let Some(library) = library() else { return };
     if !compiler_available(&library) {
         println!("skipped: no NVRTC beside the library and EUHEDRAL_NVRTC is not set");
@@ -68,7 +68,7 @@ fn every_catalog_kernel_resolves_with_the_parameter_sizes_its_plans_pass() {
     let table = load(&gpu, &sources).expect("every module the pinned RustEE can compile compiles and loads");
     let cold = total.elapsed();
     println!(
-        "modules compiled and loaded without a cache: {:.0} ms in total, on a test thread (2 MiB stack)",
+        "modules compiled and loaded without a cache: {:.0} ms in total, on the compile thread (the largest module included)",
         millis(cold)
     );
     for timing in table.timings() {
@@ -99,6 +99,9 @@ fn every_catalog_kernel_resolves_with_the_parameter_sizes_its_plans_pass() {
     let mut failures = Vec::new();
     for (id, slot) in table.iter() {
         match slot {
+            Slot::Unavailable(reason @ Unavailable::Compile { .. }) => {
+                failures.push(format!("{}: {reason}", id.name()));
+            }
             Slot::Unavailable(reason) => unavailable.push(format!("{}: {reason}", id.name())),
             Slot::Ready(resolved) => {
                 ready += 1;
@@ -157,7 +160,7 @@ fn the_twin_harness_compares_a_wrapper_with_its_plan_bit_for_bit() {
         println!("skipped: no NVRTC beside the library and EUHEDRAL_NVRTC is not set");
         return;
     }
-    let mut twin = Twin::open(&library, 0).expect("both sides open on one device");
+    let mut twin = Twin::open(&library).expect("both sides open on one device");
     let count: u32 = 1000;
     // bf16 values from a fixed pattern (any bit pattern is a value or a NaN, and both sides compute it the same way).
     let pattern = |seed: u32| -> Vec<u8> {

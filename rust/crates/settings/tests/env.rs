@@ -95,6 +95,16 @@ fn the_graphs_kept_for_each_view_default_to_eight_and_follow_the_file_and_the_en
 }
 
 #[test]
+fn the_kernel_compile_stack_defaults_to_the_native_size_and_follows_the_file_and_the_environment() {
+    assert_eq!(load_with(MODEL, &[]).unwrap().kernels.compile.stack, ByteSize::mib(256));
+    let settings = load_with(&format!("{MODEL}kernels:\n  compile:\n    stack: 64MiB\n"), &[]).unwrap();
+    assert_eq!(settings.kernels.compile.stack, ByteSize::mib(64));
+    let settings = load_with(MODEL, &[("EUHEDRAL_KERNELS_COMPILE_STACK", "512MiB")]).unwrap();
+    assert_eq!(settings.kernels.compile.stack, ByteSize::mib(512));
+    assert!(load_with(MODEL, &[("EUHEDRAL_KERNELS_COMPILE_STACK", "1KiB")]).is_err());
+}
+
+#[test]
 fn variable_auto_clears_file_value() {
     let settings = load_with(
         &format!("{MODEL}memory:\n  gpu-limit: 1GiB\n"),
