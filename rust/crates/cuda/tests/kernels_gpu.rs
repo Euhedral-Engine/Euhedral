@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use euhedral_gpu::cuda::CudaGpu;
 use euhedral_inference_cuda::CudaLibrary;
-use euhedral_inference_cuda::launch::catalog::{Arguments, KERNELS, Launch, MAX_ARGUMENTS};
-use euhedral_inference_cuda::launch::load::{DEFAULT_DYNAMIC_SHARED_BYTES, KernelSources, Slot, Unavailable, load};
+use euhedral_inference_cuda::launch::catalog::{Arguments, KERNELS, Launch, MAX_ARGUMENTS, MAX_TENSOR_MAPS};
+use euhedral_inference_cuda::launch::load::{KernelSources, Slot, Unavailable, load};
 use euhedral_inference_cuda::{DevicePtr, kernel, ops};
 
 use common::twin::{Case, Twin, Verdict};
@@ -46,7 +46,7 @@ fn millis(duration: Duration) -> f64 {
 
 #[test]
 #[ignore = "needs a GPU, the native library and NVRTC"]
-fn every_available_catalog_kernel_resolves_with_word_sized_parameters() {
+fn every_catalog_kernel_resolves_with_the_parameters_a_plan_passes() {
     let Some(library) = library() else { return };
     if !compiler_available(&library) {
         println!("skipped: no bundled NVRTC beside the library");
@@ -62,7 +62,7 @@ fn every_available_catalog_kernel_resolves_with_word_sized_parameters() {
     // Cold: no cache.
     let sources = KernelSources::beside(&library).expect("the product directory");
     let total = Instant::now();
-    let table = load(&gpu, &sources).expect("every module the pinned RustEE can compile compiles and loads");
+    let table = load(&gpu, &sources).expect("every module compiles and loads");
     let cold = total.elapsed();
     println!(
         "modules compiled and loaded without a cache: {:.0} ms in total, on the compile thread (the largest module included)",
@@ -89,9 +89,11 @@ fn every_available_catalog_kernel_resolves_with_word_sized_parameters() {
         println!("with the module cache: skipped, set euhedral.kernel.cache to a directory for it");
     }
 
-    // Every kernel the pinned RustEE can compile resolves, and its declared parameters are what a plan can pass.
+    // Every catalog kernel resolves (the architecture-specific modules on a compute capability 12.x device only, as in
+    // the native loader), opted in to the dynamic shared memory its plans need, and its declared parameters are what a
+    // plan can pass.
     let mut unavailable = Vec::new();
-    let mut limited = Vec::new();
+    let mut unexpected = Vec::new();
     let mut ready = 0;
     let mut failures = Vec::new();
     for (id, slot) in table.iter() {
@@ -99,30 +101,52 @@ fn every_available_catalog_kernel_resolves_with_word_sized_parameters() {
             Slot::Unavailable(reason @ Unavailable::Compile { .. }) => {
                 failures.push(format!("{}: {reason}", id.name()));
             }
-            Slot::Unavailable(reason) => unavailable.push(format!("{}: {reason}", id.name())),
+            Slot::Unavailable(reason) => {
+                unavailable.push(format!("{}: {reason}", id.name()));
+                if !(matches!(reason, Unavailable::ArchitectureSpecificTarget)
+                    && id.spec().architecture_specific()
+                    && gpu.arch().0 != 12)
+                {
+                    unexpected.push(format!("{}: {reason}", id.name()));
+                }
+            }
             Slot::Ready(resolved) => {
                 ready += 1;
-                if resolved.needs_shared_opt_in() {
-                    limited.push(format!(
-                        "{}: launches above {} bytes of dynamic shared memory need the opt-in (the kernel declares {})",
-                        id.name(),
-                        DEFAULT_DYNAMIC_SHARED_BYTES,
-                        resolved.shared_opt_in_bytes()
-                    ));
+                let needed = id.spec().shared_opt_in_bytes;
+                match resolved.kernel().max_dynamic_shared_bytes() {
+                    Some(limit) if limit >= needed => {}
+                    other => failures.push(format!(
+                        "{}: the plans need {needed} bytes of dynamic shared memory, the kernel's limit is {other:?}",
+                        id.name()
+                    )),
                 }
                 let Some(sizes) = resolved.parameter_sizes() else {
                     failures.push(format!("{}: the driver reports no parameter sizes", id.name()));
                     continue;
                 };
-                // A plan's arguments are words of 4 or 8 bytes, at most MAX_ARGUMENTS of them.
-                if sizes.len() > MAX_ARGUMENTS {
+                // A plan's arguments are its tensor maps (128 bytes, in front), then words of 4 or 8 bytes, at most
+                // MAX_ARGUMENTS of them.
+                let maps = if id.spec().tensor_map_arguments() {
+                    MAX_TENSOR_MAPS
+                } else {
+                    0
+                };
+                if sizes.len() > maps + MAX_ARGUMENTS {
                     failures.push(format!(
-                        "{}: {} parameters, a plan passes at most 32",
+                        "{}: {} parameters, a plan passes at most {}",
                         id.name(),
-                        sizes.len()
+                        sizes.len(),
+                        maps + MAX_ARGUMENTS
                     ));
                 }
-                if let Some(size) = sizes.iter().find(|&&size| size != 4 && size != 8) {
+                if sizes.len() < maps || sizes[..maps].iter().any(|&size| size != 128) {
+                    failures.push(format!(
+                        "{}: the leading {maps} parameters are not tensor maps: {sizes:?}",
+                        id.name()
+                    ));
+                    continue;
+                }
+                if let Some(size) = sizes[maps..].iter().find(|&&size| size != 4 && size != 8) {
                     failures.push(format!(
                         "{}: a parameter of {size} bytes, a plan passes 4 or 8",
                         id.name()
@@ -136,15 +160,17 @@ fn every_available_catalog_kernel_resolves_with_word_sized_parameters() {
     for line in &unavailable {
         println!("  {line}");
     }
-    println!(
-        "resolved, with launches above the default dynamic shared memory unavailable ({}):",
-        limited.len()
-    );
-    for line in &limited {
-        println!("  {line}");
-    }
     assert!(failures.is_empty(), "parameter mismatches:\n{}", failures.join("\n"));
+    assert!(
+        unexpected.is_empty(),
+        "kernels that should resolve and do not:\n{}",
+        unexpected.join("\n")
+    );
     assert_eq!(ready + unavailable.len(), KERNELS.len());
+    // On this machine's class of device (compute capability 12.x) nothing is unavailable.
+    if gpu.arch().0 == 12 {
+        assert_eq!(ready, KERNELS.len());
+    }
 }
 
 /// The harness itself, end to end on one real kernel: the C wrapper and the planned launch agree bit for bit, and a

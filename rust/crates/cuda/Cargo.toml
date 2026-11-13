@@ -16,11 +16,10 @@ euhedral-io.workspace = true
 libloading.workspace = true
 thiserror.workspace = true
 
-# RustEE's CUDA backend runs on Linux only (it loads the driver with `dlopen` and shares the primary context).
-[target.'cfg(target_os = "linux")'.dependencies]
 euhedral-gpu = { workspace = true, features = ["cuda"] }
 
 [dev-dependencies]
+euhedral-gpu = { workspace = true, features = ["fake"] }
 tempfile.workspace = true
 test-support = { path = "../test-support" }
 

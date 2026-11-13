@@ -3,14 +3,13 @@
 //! The kernel sources are the ones the native library installs unchanged beside itself, `<product>/share/euhedral_cuda`
 //! (`<domain>/kernels.cu` and their headers), so the native library and this loader compile the identical files with
 //! the identical compiler and options: the bundled NVRTC (`<product>/lib`), `--std=c++14`, the device's own
-//! architecture as machine code, and the include paths `<product>/cuda/include`, the source's directory and the kernel
+//! architecture as machine code (the architecture-specific variant for the modules that need it), and the include paths `<product>/cuda/include`, the source's directory and the kernel
 //! root, in the native loader's order. A module is compiled once, at startup, by [`load`]; the result is a
 //! [`KernelTable`] indexed like the catalog.
 //!
 //! RustEE opens the primary context of the device the native library bound (one driver library, one context), so a
 //! handle resolved here launches in the context the native library's buffers live in.
 //!
-//! What the pinned RustEE revision cannot do is named in [`pin`], the one place to edit when a later revision can.
 
 use std::fmt;
 use std::fs::{read, read_dir, read_to_string};
@@ -21,47 +20,22 @@ use std::thread::{Builder, scope};
 use std::time::{Duration, Instant};
 
 use euhedral_gpu::cuda::{CudaGpu, CudaKernel, CudaModule, Nvrtc, Target};
-use euhedral_gpu::{CompileOptions, GpuError, Kernel, Module as _};
+use euhedral_gpu::{CompileOptions, GpuError, Kernel, KernelOptions, Module as _, TensorMap, TiledMap};
 use thiserror::Error;
 
 use crate::CudaLibrary;
 use crate::launch::catalog::{KERNELS, KernelId, Module, ids};
-
-/// The dynamic shared memory a launch may use without an opt-in, in bytes (the driver's default per-block limit).
-pub const DEFAULT_DYNAMIC_SHARED_BYTES: u32 = 48 * 1024;
 
 /// The stack of the thread that compiles a module, in bytes unless the caller sets another: the native loader's own
 /// (256 MiB), because NVRTC recurses deeply on the largest modules. The engine is to pass `kernels.compile.stack` when it loads its kernels through
 /// RustEE, which it does not do yet.
 pub const DEFAULT_COMPILE_STACK_BYTES: usize = 256 << 20;
 
-/// The NVRTC library files of the bundled compiler start with this. This is the one place that names the platform's
-/// library file name; remove the condition when the RustEE pin moves to a revision that loads on Windows.
-#[cfg(target_os = "linux")]
-const COMPILER_FILE_PREFIX: &str = "libnvrtc.so";
-
-/// What the pinned RustEE revision lacks. Each constant is `false` at this revision; a later revision that provides
-/// the capability flips it here, and the code that reads it (this file and `queue.rs`) has its one marked branch to fill in. Nothing else in the crate knows.
-pub mod pin {
-    /// Compiling for an architecture-specific target (`sm_XYa`). While `false`, every module of
-    /// [`Module::architecture_specific`](crate::launch::catalog::Module::architecture_specific) is unavailable.
-    pub const ARCHITECTURE_SPECIFIC_TARGET: bool = false;
-    /// Raising a kernel's maximum dynamic shared memory above the default. While `false`, a launch that needs more than
-    /// [`DEFAULT_DYNAMIC_SHARED_BYTES`](super::DEFAULT_DYNAMIC_SHARED_BYTES) is refused.
-    pub const DYNAMIC_SHARED_OPT_IN: bool = false;
-    /// Programmatic dependent launch. While `false`, a planned launch's `programmatic` flag is not honoured.
-    pub const PROGRAMMATIC_LAUNCH: bool = false;
-    /// Kernel arguments of 128 bytes (tensor maps). While `false`, the kernels that take them are unavailable.
-    pub const TENSOR_MAP_ARGUMENTS: bool = false;
-}
-
 /// Why a kernel cannot be launched at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Unavailable {
-    /// The module compiles only for the architecture-specific target, which the pinned RustEE revision cannot make.
+    /// The module compiles only for the architecture-specific target, which exists on compute capability 12.x only.
     ArchitectureSpecificTarget,
-    /// The kernel takes tensor maps (128-byte parameters), which `Arguments` cannot carry yet.
-    TensorMapArguments,
     /// The module does not compile; the module's name and the compiler's log.
     Compile { module: &'static str, log: String },
     /// The module compiled and does not contain the kernel's symbol.
@@ -72,7 +46,6 @@ impl fmt::Display for Unavailable {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Unavailable::ArchitectureSpecificTarget => "needs the architecture-specific compile target (sm_XYa)",
-            Unavailable::TensorMapArguments => "takes tensor-map arguments, which the planned arguments cannot carry",
             Unavailable::Compile { module, log } => {
                 return write!(formatter, "module {module} does not compile: {log}");
             }
@@ -85,7 +58,7 @@ impl fmt::Display for Unavailable {
 #[derive(Clone, Debug)]
 pub struct Resolved {
     kernel: CudaKernel,
-    shared_opt_in_bytes: u32,
+    gpu: Arc<CudaGpu>,
 }
 
 impl Resolved {
@@ -98,28 +71,15 @@ impl Resolved {
         self.kernel.parameter_sizes()
     }
 
-    /// The dynamic shared bytes the native library sets as this kernel's maximum (the catalog's record of the need).
-    pub fn shared_opt_in_bytes(&self) -> u32 {
-        self.shared_opt_in_bytes
-    }
-
-    /// Whether launches of this kernel can need more than the default limit, which needs the opt-in.
-    pub fn needs_shared_opt_in(&self) -> bool {
-        self.shared_opt_in_bytes > DEFAULT_DYNAMIC_SHARED_BYTES
-    }
-
-    /// The most dynamic shared bytes a launch of this kernel may use at the pinned RustEE revision.
+    /// The most dynamic shared bytes a launch of this kernel may use: the limit the kernel was opted in to, or the
+    /// driver's own. `u32::MAX` when the driver reports none, which leaves the check to the driver at the launch.
     pub fn max_shared_bytes(&self) -> u32 {
-        // Seam: with the capability, the opt-in is raised to `shared_opt_in_bytes` where the kernel is resolved.
-        const _: () = assert!(
-            !pin::DYNAMIC_SHARED_OPT_IN,
-            "fill the shared-memory opt-in seam, then remove this"
-        );
-        if pin::DYNAMIC_SHARED_OPT_IN {
-            self.shared_opt_in_bytes.max(DEFAULT_DYNAMIC_SHARED_BYTES)
-        } else {
-            DEFAULT_DYNAMIC_SHARED_BYTES
-        }
+        self.kernel.max_dynamic_shared_bytes().unwrap_or(u32::MAX)
+    }
+
+    /// Encodes a tensor map of the kernel's device.
+    pub fn tensor_map(&self, description: &TiledMap) -> Result<TensorMap, GpuError> {
+        TensorMap::tiled(&self.gpu, description)
     }
 }
 
@@ -279,7 +239,7 @@ impl KernelSources {
             headers: Vec::new(),
             cache_dir: self.cache_path(),
             compiler: self.compiler.clone(),
-            arch_specific: false,
+            arch_specific: module.architecture_specific(),
         }
     }
 }
@@ -311,7 +271,7 @@ fn bundled_compiler(lib: &Path) -> Option<PathBuf> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(COMPILER_FILE_PREFIX) && !name.contains("builtins"))
+                .is_some_and(platform::is_compiler_file)
         })
         .collect();
     found.sort();
@@ -324,7 +284,7 @@ enum Compiled {
     Unavailable(Unavailable),
 }
 
-/// The `major.minor` the bundled builtins library's file name carries (`libnvrtc-builtins.so.13.1`).
+/// The `major.minor` the bundled builtins library's file name carries.
 #[allow(
     clippy::disallowed_methods,
     reason = "startup: the bundled compiler's version is read from a directory listing once, before any frame runs"
@@ -332,13 +292,42 @@ enum Compiled {
 fn bundled_version(compiler: &Path) -> Option<(i32, i32)> {
     read_dir(compiler.parent()?).ok()?.find_map(|entry| {
         let name = entry.ok()?.file_name().into_string().ok()?;
-        let version = name.strip_prefix("libnvrtc-builtins.so.")?;
-        let mut parts = version.split('.');
-        Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+        platform::builtins_version(&name)
     })
 }
 
-/// Compiles every module the catalog names that the pinned RustEE revision can, loads it, and resolves every catalog
+/// The names of the bundled NVRTC files: the one place that knows a platform's library file names.
+mod platform {
+    /// Whether `name` is the NVRTC library (not its builtins library): `libnvrtc.so.13.1`.
+    #[cfg(not(windows))]
+    pub(super) fn is_compiler_file(name: &str) -> bool {
+        name.starts_with("libnvrtc.so")
+    }
+
+    /// The `major.minor` of a builtins library file name: `libnvrtc-builtins.so.13.1`.
+    #[cfg(not(windows))]
+    pub(super) fn builtins_version(name: &str) -> Option<(i32, i32)> {
+        let version = name.strip_prefix("libnvrtc-builtins.so.")?;
+        let mut parts = version.split('.');
+        Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+    }
+
+    /// Whether `name` is the NVRTC library (not its builtins library): `nvrtc64_130_0.dll`.
+    #[cfg(windows)]
+    pub(super) fn is_compiler_file(name: &str) -> bool {
+        name.starts_with("nvrtc64_") && name.ends_with(".dll")
+    }
+
+    /// The `major.minor` of a builtins library file name, digits of `major * 10 + minor`: `nvrtc-builtins64_131.dll`.
+    #[cfg(windows)]
+    pub(super) fn builtins_version(name: &str) -> Option<(i32, i32)> {
+        let digits = name.strip_prefix("nvrtc-builtins64_")?.strip_suffix(".dll")?;
+        let number: i32 = digits.parse().ok()?;
+        Some((number / 10, number % 10))
+    }
+}
+
+/// Compiles every module the catalog names, loads it, and resolves every catalog
 /// kernel. A module that does not compile makes only its own kernels unavailable. Blocking: it is a startup call
 /// (compiling reads files and runs NVRTC), and the compiling runs on a thread of its own with the stack
 /// [`KernelSources::with_compile_stack`] gives it.
@@ -365,23 +354,24 @@ pub fn load(gpu: &Arc<CudaGpu>, sources: &KernelSources) -> Result<KernelTable, 
     let (modules, timings) = compile_all(gpu, sources)?;
     let mut slots = Vec::with_capacity(KERNELS.len());
     for spec in &KERNELS {
-        if spec.tensor_map_arguments() && !pin::TENSOR_MAP_ARGUMENTS {
-            // Seam: with tensor-map arguments in RustEE's `Args`, the kernel resolves like any other.
-            const _: () = assert!(!pin::TENSOR_MAP_ARGUMENTS, "fill the tensor-map seam, then remove this");
-            slots.push(Slot::Unavailable(Unavailable::TensorMapArguments));
-            continue;
-        }
         let compiled = modules
             .iter()
             .find(|(module, _)| *module == spec.module)
             .map(|(_, compiled)| compiled);
         let slot = match compiled {
-            Some(Compiled::Module(module)) => match module.kernel(spec.name) {
+            // The native library sets each kernel's dynamic shared maximum to the catalog's figure, which the plans' launches
+            // need; RustEE raises the driver's limit to it (0 leaves the default).
+            Some(Compiled::Module(module)) => match module.kernel_with(
+                spec.name,
+                KernelOptions {
+                    max_dynamic_shared_bytes: spec.shared_opt_in_bytes,
+                },
+            ) {
                 Ok(kernel) => {
                     debug_assert_eq!(kernel.name(), spec.name);
                     Slot::Ready(Resolved {
                         kernel,
-                        shared_opt_in_bytes: spec.shared_opt_in_bytes,
+                        gpu: Arc::clone(gpu),
                     })
                 }
                 Err(GpuError::NotFound(_)) => Slot::Unavailable(Unavailable::SymbolMissing),
@@ -445,13 +435,9 @@ fn compile_all(gpu: &Arc<CudaGpu>, sources: &KernelSources) -> Result<Compilatio
     reason = "startup: the kernel source is read once, before any frame runs"
 )]
 fn compile(gpu: &Arc<CudaGpu>, sources: &KernelSources, module: Module) -> Result<Compiled, LoadError> {
-    // Seam: with the capability, compile for `sm_XYa` here (the device must be compute capability 12.x; on another
-    // device the module stays unavailable) by setting the architecture-specific field of the options below.
-    const _: () = assert!(
-        !pin::ARCHITECTURE_SPECIFIC_TARGET,
-        "fill the architecture-specific seam, then remove this"
-    );
-    if module.architecture_specific() && !pin::ARCHITECTURE_SPECIFIC_TARGET {
+    // The architecture-specific variant exists for compute capability 12.x (block-scaled FP4 `mma.sync`), as in the
+    // native loader; on another device the module stays unavailable, as there.
+    if module.architecture_specific() && gpu.arch().0 != 12 {
         return Ok(Compiled::Unavailable(Unavailable::ArchitectureSpecificTarget));
     }
     let path = sources.share.join(module.root());
@@ -494,6 +480,41 @@ mod tests {
             ]
         );
         assert_eq!(options.name, root);
+        assert!(!options.arch_specific);
+    }
+
+    #[test]
+    fn the_architecture_specific_modules_compile_for_the_architecture_specific_target() {
+        // The native loader gives these `--gpu-architecture=sm_XYa` in the same place of the same options.
+        for module in [Module::Nvfp4Native, Module::TrellisFp8] {
+            let options = sources().options(module);
+            assert!(options.arch_specific, "{}", module.root());
+            assert_eq!(options.options, ["--std=c++14"]);
+            assert_eq!(options.include_paths.len(), 3);
+        }
+        assert!(
+            KERNELS
+                .iter()
+                .all(|spec| sources().options(spec.module).arch_specific == spec.module.architecture_specific())
+        );
+    }
+
+    #[test]
+    fn the_compiler_files_are_told_from_the_builtins_library() {
+        #[cfg(not(windows))]
+        {
+            assert!(platform::is_compiler_file("libnvrtc.so.13.1"));
+            assert!(!platform::is_compiler_file("libnvrtc-builtins.so.13.1"));
+            assert_eq!(platform::builtins_version("libnvrtc-builtins.so.13.1"), Some((13, 1)));
+            assert_eq!(platform::builtins_version("libnvrtc.so.13.1"), None);
+        }
+        #[cfg(windows)]
+        {
+            assert!(platform::is_compiler_file("nvrtc64_130_0.dll"));
+            assert!(!platform::is_compiler_file("nvrtc-builtins64_131.dll"));
+            assert_eq!(platform::builtins_version("nvrtc-builtins64_131.dll"), Some((13, 1)));
+            assert_eq!(platform::builtins_version("nvrtc64_130_0.dll"), None);
+        }
     }
 
     #[test]

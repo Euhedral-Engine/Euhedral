@@ -61,18 +61,18 @@ fn read_file(file: &Path) { /* ... */ }
 
 `crates/cuda/src/launch/` holds the engine's kernel launches as data. `catalog.rs` lists every kernel the engine launches
 (name, source module, architecture-specific target, shared-memory opt-in, programmatic dependent launch) and the
-planned launch the family files produce. Two Linux-only files turn a plan into work on a RustEE lane:
+planned launch the family files produce. Two files turn a plan into work on a RustEE lane:
 
 - `load.rs` compiles the kernel modules the catalog names through `euhedral-gpu`'s NVRTC path, from the sources the
   native library installs (`share/euhedral_cuda`), with the native loader's options, the bundled NVRTC and the native
   loader's include paths, in the device's own machine code (a PTX-only compiler is refused). `load` returns a
-  `KernelTable` indexed like the catalog: each kernel is a RustEE kernel handle, or unavailable with a typed reason. What
-  the pinned RustEE revision cannot do is three constants in `load::pin` (architecture-specific compile target, dynamic
-  shared memory above the default limit, programmatic launch); a later revision flips them where marked.
-- `queue.rs` enqueues a planned launch on any `LaneEnqueue`, writing the sized argument words into one argument buffer
-  per thread that is reused in place.
+  `KernelTable` indexed like the catalog: each kernel is a RustEE kernel handle (the architecture-specific modules
+  compile for the architecture-specific target, and each kernel is opted in to the dynamic shared memory the catalog
+  records), or unavailable with a typed reason.
+- `queue.rs` enqueues a planned launch on any `LaneEnqueue`, writing its tensor maps (encoded by the driver) and the
+  sized argument words into one argument buffer per thread that is reused in place, with the launch's programmatic flag.
 
-The device tests `kernels_gpu` (ignored by default) check that every available catalog kernel resolves with parameters a
+The device tests `kernels_gpu` (ignored by default) check that every catalog kernel resolves with parameters a
 plan can pass, print the module compile and load times, and run the twin harness (`tests/common/twin.rs`): a case runs
 once through the native C wrapper on a `CudaLane` and once as a planned launch on a RustEE lane, in the one primary
 context of the device, and the outputs are compared byte for byte.

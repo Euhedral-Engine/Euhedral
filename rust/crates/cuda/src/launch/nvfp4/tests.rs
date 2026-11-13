@@ -293,7 +293,9 @@ fn native_tile_plan_and_its_tensor_maps() {
         (tile.grid, tile.block, tile.shared_bytes),
         ([2, 1, 1], [288, 1, 1], 85040)
     );
-    // The maps are not among the arguments: scratch, weights, output, then the three extents.
+    // The launch carries its three maps in front of the words: scratch, weights, output, then the three extents.
+    assert_eq!(tile.args.map_count(), 3);
+    assert!(tile.args.maps().eq(plan.tensor_maps().unwrap()));
     assert_eq!(tile.args.words(), [SCRATCH, WEIGHTS, OUTPUT, 65, 512, 256]);
     assert_eq!(tile.args.sizes(), [8, 8, 8, 4, 4, 4]);
     // row_bytes = 256, row_scales = 512 / 16 = 32, scale_offset = align256(256 * 256) = 65536.
