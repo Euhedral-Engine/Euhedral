@@ -170,13 +170,27 @@ pub(crate) struct Rejected {
 }
 
 impl Rejected {
-    fn new(error: AdmissionError, audience: Audience) -> Rejected {
+    pub(crate) fn new(error: AdmissionError, audience: Audience) -> Rejected {
         Rejected { error, audience }
+    }
+
+    /// The outcome that tells the audience the request was refused.
+    pub(crate) fn into_finished(self) -> Finished {
+        let outcome = GenerationOutcome {
+            reason: FinishReason::Failed(format!("the request was refused: {}", self.error)),
+            prompt_tokens: 0,
+            generated: 0,
+            elapsed: Duration::ZERO,
+        };
+        match self.audience {
+            Audience::Greedy(listener) => Finished::Greedy(listener, outcome),
+            Audience::Forced(sink) => Finished::Forced(sink, outcome),
+        }
     }
 }
 
 /// The listener or sink of a request.
-enum Audience {
+pub(crate) enum Audience {
     Greedy(Box<dyn GenerationListener>),
     Forced(Box<dyn LogitsSink>),
 }
@@ -547,17 +561,7 @@ impl Owner {
     /// Ends a request that was refused after the caller was told it was accepted (it was posted while a turn held the
     /// claim): its audience hears a failure, after the claim is released, like any request that ended.
     pub(crate) fn reject(&mut self, rejected: Rejected) {
-        let Rejected { error, audience } = rejected;
-        let outcome = GenerationOutcome {
-            reason: FinishReason::Failed(format!("the request was refused: {error}")),
-            prompt_tokens: 0,
-            generated: 0,
-            elapsed: Duration::ZERO,
-        };
-        self.finished.push_back(match audience {
-            Audience::Greedy(listener) => Finished::Greedy(listener, outcome),
-            Audience::Forced(sink) => Finished::Forced(sink, outcome),
-        });
+        self.finished.push_back(rejected.into_finished());
     }
 
     fn start_run(

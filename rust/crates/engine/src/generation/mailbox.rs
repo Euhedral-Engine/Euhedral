@@ -92,9 +92,13 @@ pub(crate) trait Turn: Send + 'static {
     fn idle(&self) -> bool;
 }
 
+/// What a posted closure does: with the owner, or with `None` when the owner is closed by the time it runs (the closure
+/// then answers its caller without the owner; what it returns is told to its audience, as an outcome is).
+type Work<O> = Box<dyn FnOnce(Option<&mut O>) -> Vec<<O as Turn>::Finished> + Send>;
+
 /// A closure over the owner, or the owner's end, posted by a thread that found the claim held.
-enum Operation<O> {
-    Run(Box<dyn FnOnce(&mut O) + Send>),
+enum Operation<O: Turn> {
+    Run(Work<O>),
     /// Takes the owner out if it is idle and replies with it.
     Close(Reply<Option<O>>),
 }
@@ -204,16 +208,27 @@ impl<O: Turn> Mailbox<O> {
     /// Runs up to [`TURNS_PER_DRIVE`] turns of the owner while the claim is free and messages wait; hands the rest to
     /// a worker. A caller that finds the claim held returns: the holder looks at `pending` after it releases the claim.
     pub(crate) fn drive(self: &Arc<Self>) {
+        if self.drive_turns() {
+            self.hand_on();
+        }
+    }
+
+    /// Runs the turns of one drive. `true` when they are used and a message still waits.
+    fn drive_turns(self: &Arc<Self>) -> bool {
         for _ in 0..TURNS_PER_DRIVE {
             let Some(mut claim) = self.owner.try_claim() else {
-                return;
+                return false;
             };
             let state = &mut *claim;
             let Some(owner) = state.owner.as_mut() else {
-                // Closed: nothing will ever take a turn again, and an operation posted now is dropped, which tells its
-                // waiter.
-                Self::run_operations(state);
-                return;
+                // Closed: nothing will ever take a turn again. An operation posted now is answered without the owner.
+                let mut refused = Vec::new();
+                Self::run_operations(state, &mut refused);
+                claim.release_seq_cst();
+                if let Some(payload) = Self::deliver_all(refused) {
+                    resume_unwind(payload);
+                }
+                return false;
             };
             self.pending.swap(false, Ordering::SeqCst);
             let turned = catch_unwind(AssertUnwindSafe(|| {
@@ -238,11 +253,11 @@ impl<O: Turn> Mailbox<O> {
                 resume_unwind(payload);
             }
             if !self.waiting() {
-                return;
+                return false;
             }
         }
         // The turns of this frame are used and a message still waits.
-        self.hand_on();
+        true
     }
 
     /// Whether a message waits, loaded after a release (see the module documentation).
@@ -257,22 +272,26 @@ impl<O: Turn> Mailbox<O> {
     /// Gives a waiting message to a worker, for a thread that must not run the turn itself. When no worker will take
     /// it the thread runs it: nothing is left waiting for a worker that will not come.
     fn hand_on(self: &Arc<Self>) {
-        if self.waiting() && !self.nudge() {
-            self.drive();
+        // A loop, not a recursion: each round runs the turns of one drive and ends when nothing waits (or the claim is
+        // held, or the owner is closed), however long the workers keep refusing.
+        while self.waiting() && !self.nudge() {
+            if !self.drive_turns() {
+                return;
+            }
         }
     }
 
     /// Runs the operations posted while the claim was held, in the order posted.
-    fn run_operations(state: &mut State<O>) -> bool {
+    fn run_operations(state: &mut State<O>, refused: &mut Vec<O::Finished>) -> bool {
         let mut ran = false;
         while let Some(operation) = state.operations.poll() {
             ran = true;
             match operation {
                 Operation::Run(work) => {
-                    if let Some(owner) = state.owner.as_mut()
-                        && catch_unwind(AssertUnwindSafe(|| work(owner))).is_err()
-                    {
-                        log::error!("an operation posted to the owner panicked");
+                    let owner = state.owner.as_mut();
+                    match catch_unwind(AssertUnwindSafe(|| work(owner))) {
+                        Ok(told) => refused.extend(told),
+                        Err(_) => log::error!("an operation posted to the owner panicked"),
                     }
                 }
                 Operation::Close(reply) => {
@@ -287,14 +306,16 @@ impl<O: Turn> Mailbox<O> {
     /// Runs the operations posted meanwhile, and returns the outcomes they left to tell. An operation may have begun a
     /// request, which needs a turn: `pending` says so, before the claim is released.
     fn settle_operations(&self, state: &mut State<O>) -> Vec<O::Finished> {
-        if !Self::run_operations(state) {
-            return Vec::new();
+        let mut finished = Vec::new();
+        if !Self::run_operations(state, &mut finished) {
+            return finished;
         }
         let Some(owner) = state.owner.as_mut() else {
-            return Vec::new();
+            return finished;
         };
         self.pending.store(true, Ordering::SeqCst);
-        catch_unwind(AssertUnwindSafe(|| owner.take_finished())).unwrap_or_default()
+        finished.extend(catch_unwind(AssertUnwindSafe(|| owner.take_finished())).unwrap_or_default());
+        finished
     }
 
     /// Tells each outcome's audience; the first panic of a listener is returned once all were told.
@@ -359,15 +380,21 @@ impl<O: Turn> Mailbox<O> {
     }
 
     /// Posts `work` to run on the owner, whoever holds the claim, and returns. A request it begins gets its first turn.
-    /// Dropped unrun when the owner is closed.
-    pub(crate) fn defer(self: &Arc<Self>, work: impl FnOnce(&mut O) + Send + 'static) {
+    /// When the owner is closed by the time it runs, `work` gets `None` and answers for itself; the outcomes it returns
+    /// are told to their audience once the claim is released.
+    pub(crate) fn defer(self: &Arc<Self>, work: impl FnOnce(Option<&mut O>) -> Vec<O::Finished> + Send + 'static) {
         self.post_operation(Operation::Run(Box::new(work)));
     }
 
     /// Runs `work` on the owner now if the claim is free, else posts it ([`defer`](Self::defer)). Never waits.
     pub(crate) fn tell(self: &Arc<Self>, work: impl FnOnce(&mut O) + Send + 'static) {
         if let Err(work) = self.claimed(false, work) {
-            self.defer(work);
+            self.defer(move |owner| {
+                if let Some(owner) = owner {
+                    work(owner);
+                }
+                Vec::new()
+            });
         }
     }
 
@@ -386,11 +413,15 @@ impl<O: Turn> Mailbox<O> {
         };
         let (reply, cell) = Reply::new();
         self.post_operation(Operation::Run(Box::new(move |owner| {
-            reply.answer(if idle_only && !owner.idle() {
-                None
-            } else {
-                Some(work(owner))
-            });
+            // A closed owner drops the reply unanswered, which tells the waiter at once.
+            if let Some(owner) = owner {
+                reply.answer(if idle_only && !owner.idle() {
+                    None
+                } else {
+                    Some(work(owner))
+                });
+            }
+            Vec::new()
         })));
         cell.wait(OPERATION_BOUND).ok().flatten().flatten()
     }
@@ -917,7 +948,7 @@ mod tests {
 
     /// The next frame handed to a worker, within the bound.
     fn next_frame(handoffs: &mut Consumer<Work, Single>) -> Work {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + BOUND;
         loop {
             if let Some(frame) = handoffs.poll() {
                 return frame;
@@ -973,7 +1004,12 @@ mod tests {
         mailbox
             .with(move |_| match held.try_with(begin) {
                 Ok(_) => panic!("the claim was not held"),
-                Err(begin) => held.defer(move |probe| answer.send(begin(probe))),
+                Err(begin) => held.defer(move |probe| {
+                    if let Some(probe) = probe {
+                        answer.send(begin(probe));
+                    }
+                    Vec::new()
+                }),
             })
             .expect("free");
         run_frames(&mut handoffs);
@@ -986,7 +1022,12 @@ mod tests {
         // A request that finds one running is refused: by the owner's state.
         let refused = Handoff::<bool>::new();
         let answer = Arc::clone(&refused);
-        mailbox.defer(move |probe| answer.send(begin(probe)));
+        mailbox.defer(move |probe| {
+            if let Some(probe) = probe {
+                answer.send(begin(probe));
+            }
+            Vec::new()
+        });
         run_frames(&mut handoffs);
         assert_eq!(refused.wait(BOUND), Ok(false));
     }
@@ -1047,7 +1088,12 @@ mod tests {
             Some((false, vec![5]))
         );
         // A post that finds the claim free and no worker is run by the poster.
-        mailbox.defer(|probe| probe.busy = true);
+        mailbox.defer(|probe| {
+            if let Some(probe) = probe {
+                probe.busy = true;
+            }
+            Vec::new()
+        });
         assert_eq!(mailbox.with(|probe| probe.busy), Some(true));
     }
 
@@ -1072,5 +1118,77 @@ mod tests {
             Ok(true),
             "the listener was not told, or the claim was still held when it was"
         );
+    }
+
+    #[test]
+    fn a_request_posted_to_a_closed_mailbox_tells_its_listener_once() {
+        let (mailbox, address, mut handoffs) = queued(Probe::new);
+        assert!(mailbox.close().is_some());
+        let admitted = Handoff::new();
+        let told = Arc::new(Done {
+            address: Arc::clone(&address),
+            admitted: Arc::clone(&admitted),
+            panics: false,
+        });
+        // The claim is held (by a turn) when the request is posted, and the owner is closed when it is run.
+        let claim = mailbox.owner.try_claim().expect("free");
+        mailbox.defer(move |owner| {
+            assert!(owner.is_none(), "the owner was not closed");
+            vec![told]
+        });
+        drop(claim);
+        run_frames(&mut handoffs);
+        assert!(
+            admitted.wait(BOUND).is_ok(),
+            "the listener of a refused request was not told"
+        );
+        assert!(admitted.take().is_none(), "the listener was told twice");
+        run_frames(&mut handoffs);
+        assert!(admitted.take().is_none(), "the listener was told twice");
+    }
+
+    #[test]
+    fn an_ask_after_a_close_answers_at_once() {
+        let (mailbox, _address, mut handoffs) = queued(Probe::new);
+        assert!(mailbox.close().is_some());
+        let start = Instant::now();
+        assert_eq!(mailbox.ask(true, |probe| probe.busy), None);
+        assert!(start.elapsed() < BOUND, "the asker waited for the bound");
+        // The owner is closed while the claim is held: the posted operation is dropped by the next drive, which answers.
+        let claim = mailbox.owner.try_claim().expect("free");
+        let asked = Arc::clone(&mailbox);
+        let asker = thread::spawn(move || {
+            let start = Instant::now();
+            (asked.ask(true, |probe| probe.busy), start.elapsed())
+        });
+        let frame = next_frame(&mut handoffs);
+        drop(claim);
+        frame();
+        let (answer, waited) = asker.join().expect("the asker returned");
+        assert_eq!(answer, None);
+        assert!(waited < BOUND, "the asker waited for the bound");
+        assert!(mailbox.close().is_none());
+    }
+
+    #[test]
+    fn a_hand_off_no_worker_takes_runs_every_waiting_turn_without_recursing() {
+        let (mailbox, address) = mailbox_of(Probe::new, Box::new(|_| false));
+        let turns = mailbox
+            .with(|probe| {
+                probe.address = Some(Arc::clone(&address));
+                probe.repost = 100;
+                Arc::clone(&probe.turns)
+            })
+            .expect("free");
+        mailbox.post(1);
+        assert_eq!(turns.load(Ordering::SeqCst), 101, "a waiting turn was left");
+        // With the claim held, several messages wait for the release to find no worker.
+        let held = Arc::clone(&mailbox);
+        mailbox
+            .with(move |_| (2..7).for_each(|message| held.post(message)))
+            .expect("free");
+        assert_eq!(mailbox.with(|probe| probe.handled.len()), Some(101 + 5));
+        // Nothing waits: a hand-off finds nothing to do and returns.
+        mailbox.hand_on();
     }
 }

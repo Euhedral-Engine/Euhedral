@@ -45,12 +45,22 @@ pub use request::{
     AdmissionError, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
 pub(crate) use source::GREEDY_DEPTH;
-use source::{Drafts, Message, Owner, Rejected, Retired, Shared};
+use source::{Audience, Drafts, Message, Owner, Rejected, Retired, Shared};
 pub use teacher_forced::LogitsSink;
 
 /// The engine's admission of a request, as the answer `Owner::begin` takes.
 fn admit(core: &Core) -> Result<Units, AdmissionError> {
     core.admit().map_err(|error| AdmissionError::Engine(error.to_string()))
+}
+
+/// Why a request is refused once the owner is closed.
+fn closed_error() -> AdmissionError {
+    AdmissionError::Engine("the engine is closed".to_string())
+}
+
+/// A request that found the owner closed.
+fn closed(audience: Audience) -> Rejected {
+    Rejected::new(closed_error(), audience)
 }
 
 /// What the engine keeps for generating: the plan's graphs on the runtime's lanes, and the owner of the sequence.
@@ -208,7 +218,10 @@ impl Generation {
     /// Starts `request` on the engine's sequence.
     pub(crate) fn generate(&self, request: GenerationRequest) -> Result<(), AdmissionError> {
         let core = Arc::clone(&self.shared.core);
-        self.start(move |owner| owner.begin(admit(&core), request))
+        self.start(move |owner| match owner {
+            Some(owner) => owner.begin(admit(&core), request),
+            None => Err(closed(Audience::Greedy(request.listener))),
+        })
     }
 
     /// Starts a teacher-forced run on the engine's sequence.
@@ -219,7 +232,10 @@ impl Generation {
         sink: Box<dyn LogitsSink>,
     ) -> Result<(), AdmissionError> {
         let core = Arc::clone(&self.shared.core);
-        self.start(move |owner| owner.begin_forced(admit(&core), prefix, forced, sink))
+        self.start(move |owner| match owner {
+            Some(owner) => owner.begin_forced(admit(&core), prefix, forced, sink),
+            None => Err(closed(Audience::Forced(sink))),
+        })
     }
 
     /// Starts the request `begin` makes. Whether it is admitted depends on the owner's state alone: `Busy` means a
@@ -229,9 +245,13 @@ impl Generation {
     /// refuses has its listener or sink told, as a failed outcome, after the claim is released.
     fn start(
         &self,
-        begin: impl FnOnce(&mut Owner) -> Result<(), Rejected> + Send + 'static,
+        begin: impl FnOnce(Option<&mut Owner>) -> Result<(), Rejected> + Send + 'static,
     ) -> Result<(), AdmissionError> {
-        match self.mailbox.try_with(begin) {
+        let mut begin = Some(begin);
+        let inline = self
+            .mailbox
+            .try_with(|owner| begin.take().map_or(Ok(()), |begin| begin(Some(owner))));
+        match inline {
             Ok(Some(started)) => {
                 let started = started.map_err(|rejected| rejected.error);
                 if started.is_ok() && !self.mailbox.nudge() {
@@ -242,12 +262,21 @@ impl Generation {
                 }
                 started
             }
-            Ok(None) => Err(AdmissionError::Engine("the engine is shut down".to_string())),
-            Err(begin) => {
-                self.mailbox.defer(move |owner| {
-                    if let Err(rejected) = begin(owner) {
-                        owner.reject(rejected);
+            // The owner is closed: the caller learns from the error.
+            Ok(None) => Err(closed_error()),
+            Err(_) => {
+                let Some(begin) = begin else {
+                    return Err(closed_error());
+                };
+                self.mailbox.defer(move |owner| match owner {
+                    Some(owner) => {
+                        if let Err(rejected) = begin(Some(owner)) {
+                            owner.reject(rejected);
+                        }
+                        Vec::new()
                     }
+                    // Closed while the request waited: its audience is told, once, with the other outcomes.
+                    None => begin(None).err().map(Rejected::into_finished).into_iter().collect(),
                 });
                 Ok(())
             }
