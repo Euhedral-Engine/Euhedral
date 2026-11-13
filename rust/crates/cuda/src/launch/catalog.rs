@@ -93,6 +93,14 @@ pub struct KernelSpec {
 }
 
 impl KernelSpec {
+    /// Whether the kernel takes tensor maps (128-byte `__grid_constant__` parameters), which [`Arguments`] cannot carry:
+    /// the native NVFP4 linear kernels.
+    pub fn tensor_map_arguments(&self) -> bool {
+        self.module == Module::Nvfp4Native
+            && (self.name.starts_with("euhedral_nvfp4n_linear_")
+                || self.name.starts_with("euhedral_nvfp4n_gate_up_swiglu_"))
+    }
+
     /// Whether the kernel's module needs the architecture-specific compile target.
     pub const fn architecture_specific(&self) -> bool {
         self.module.architecture_specific()
@@ -182,6 +190,11 @@ pub const fn lookup(name: &str) -> Option<KernelId> {
         index += 1;
     }
     None
+}
+
+/// Every catalog kernel, in catalog order.
+pub fn ids() -> impl Iterator<Item = KernelId> {
+    (0..SPECS.len()).map(|index| KernelId(index as u16))
 }
 
 /// The entries of the shared linear table, in the table's order (the position is the table index).
@@ -1138,6 +1151,17 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn the_kernels_that_take_tensor_maps_are_the_native_nvfp4_linears() {
+        let names: BTreeSet<&str> = KERNELS
+            .iter()
+            .filter(|kernel| kernel.tensor_map_arguments())
+            .map(|kernel| kernel.name)
+            .collect();
+        let expected = BTreeSet::from(["euhedral_nvfp4n_linear_128x128", "euhedral_nvfp4n_linear_128x128_sd4"]);
+        assert_eq!(names, expected);
+    }
 
     #[test]
     fn every_kernel_is_listed_once() {

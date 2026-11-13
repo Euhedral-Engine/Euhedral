@@ -313,6 +313,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "euhedral-gpu"
+version = "0.1.0"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=046737f66e3e467729c67c6f4b30ce2bcc5d0bac#046737f66e3e467729c67c6f4b30ce2bcc5d0bac"
+dependencies = [
+ "euhedral-core",
+ "euhedral-data-structures",
+ "euhedral-graph",
+ "euhedral-hashing",
+ "euhedral-memory",
+ "libc",
+ "loom",
+]
+
+[[package]]
 name = "euhedral-graph"
 version = "0.1.0"
 source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=046737f66e3e467729c67c6f4b30ce2bcc5d0bac#046737f66e3e467729c67c6f4b30ce2bcc5d0bac"
@@ -364,6 +378,7 @@ dependencies = [
 name = "euhedral-inference-cuda"
 version = "0.1.0"
 dependencies = [
+ "euhedral-gpu",
  "euhedral-graph",
  "euhedral-io",
  "libloading",
@@ -440,6 +455,18 @@ dependencies = [
  "io-uring",
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "euhedral-memory"
+version = "0.1.0"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=046737f66e3e467729c67c6f4b30ce2bcc5d0bac#046737f66e3e467729c67c6f4b30ce2bcc5d0bac"
+dependencies = [
+ "euhedral-core",
+ "euhedral-data-structures",
+ "euhedral-graph",
+ "euhedral-hashing",
+ "libc",
 ]
 
 [[package]]

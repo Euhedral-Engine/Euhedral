@@ -5,7 +5,11 @@ pub mod catalog;
 pub mod elementwise;
 pub mod embedding;
 pub mod gdn;
+#[cfg(target_os = "linux")]
+pub mod load;
 pub mod nvfp4;
+#[cfg(target_os = "linux")]
+pub mod queue;
 pub mod table;
 
 use crate::DevicePtr;

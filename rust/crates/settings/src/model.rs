@@ -389,6 +389,23 @@ pub struct KernelSettings {
     pub trellis: TrellisKernelSettings,
     /// The CUDA graphs of captured quanta.
     pub graphs: GraphKernelSettings,
+    /// The runtime compilation of kernel sources.
+    pub compile: CompileKernelSettings,
+}
+
+/// The runtime compilation of kernel sources (`kernels.compile`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompileKernelSettings {
+    /// Stack of the thread that compiles a kernel module; the compiler recurses deeply on the largest modules.
+    pub stack: ByteSize,
+}
+
+impl Default for CompileKernelSettings {
+    fn default() -> Self {
+        Self {
+            stack: ByteSize::mib(256),
+        }
+    }
 }
 
 /// The CUDA graphs of captured quanta (`kernels.graphs`).
