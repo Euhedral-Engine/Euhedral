@@ -93,7 +93,8 @@ second on `--config` (`host-tier`, which needs it) or on the same settings (`exa
 exits 1 when the mean KL reaches 1e-2, when more than 2% of the steps flip top-1 with a lead above 0.25, when the
 median peak 32-step hidden error reaches 12%, or when the median late/early hidden error is above 1.5.
 
-`tools/rust_gate.py` runs the Java and the Rust benchmark alternately, one process each per fork, each through the GPU
-launcher (`gpu-run`: exclusive lock, memory cap, time limit), with the prefix cache off, and prints a per-row table of the
-output hashes of the two engines and the absolute medians of each.
+`tools/rust_gate.py` runs the Java and the Rust benchmark alternately, one process each per fork, each through the system
+launcher (`system-run --gpu exclusive --cpu exclusive`: exclusive GPU and CPU grant, memory cap, with `timeout` for the
+time limit inside the grant), with the prefix cache off, and prints a per-row table of the output hashes of the two
+engines and the absolute medians of each. It is a timing run, so it takes the card exclusively.
 
