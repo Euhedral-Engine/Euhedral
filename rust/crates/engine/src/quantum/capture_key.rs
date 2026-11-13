@@ -7,6 +7,7 @@
 //! what the Rust engine bakes in beyond it: the allocation serials of the page tables (a table the cache outgrew is
 //! another allocation), the host pages the staging copies span, and the rows each GDN layer replays first.
 
+use euhedral_hashing::hasher_api::hash_bytes_with_seed;
 use euhedral_inference_cuda::AllocationId;
 
 use crate::plan::View;
@@ -68,6 +69,100 @@ impl CaptureKey {
             && self.replay_rows == other.replay_rows
             && self.buffer_generations == other.buffer_generations
     }
+    /// A 128-bit digest of every field of the key, for a cache that replays a hit without checking the body.
+    ///
+    /// The key is destructured without `..`, so a field added to it does not compile until it is hashed here. Each
+    /// field is written at a fixed width, enums with a tag and options with a presence byte, and each variable-length
+    /// part with its length first, so no two keys differ in their bytes without differing in the digest's input. The
+    /// digest is built from two xxHash64 passes (`euhedral-hashing` has no 128-bit hash) over those bytes with two different
+    /// fixed seeds, the first in the high half and the second in the low half. xxHash64 is fixed by value and does not depend on the
+    /// process, the platform's endianness or the hasher's random state: it is stable across processes and runs. Equal
+    /// keys give equal digests; distinct keys collide only by chance of a 128-bit hash.
+    pub fn digest(&self) -> u128 {
+        let CaptureKey {
+            view,
+            kind,
+            rows,
+            logits,
+            selects,
+            seeds_draft,
+            draft_seed,
+            draft_read,
+            draft_write,
+            writes_current_token,
+            input_record,
+            token_from,
+            row_exact,
+            split_geometry,
+            reserved_host_pages,
+            replay_rows,
+            buffer_generations,
+        } = self;
+        let mut bytes = Vec::with_capacity(160 + 4 * replay_rows.len() + 8 * buffer_generations.len());
+        let (view_tag, view_rows) = match *view {
+            View::PrefillChunk => (0u8, 0),
+            View::Decode => (1, 0),
+            View::Verify { rows } => (2, rows),
+            View::Draft { rows } => (3, rows),
+            View::CatchUp { rows } => (4, rows),
+        };
+        bytes.push(view_tag);
+        bytes.extend_from_slice(&(view_rows as u64).to_le_bytes());
+        bytes.push(match kind {
+            QuantumKind::Prefill => 0,
+            QuantumKind::Decode => 1,
+            QuantumKind::Verify => 2,
+            QuantumKind::Draft => 3,
+        });
+        bytes.extend_from_slice(&(*rows as u64).to_le_bytes());
+        bytes.extend_from_slice(&(*logits as u64).to_le_bytes());
+        bytes.push(u8::from(*selects));
+        bytes.push(u8::from(*seeds_draft));
+        push_option(&mut bytes, draft_seed.map(u64::to_le_bytes));
+        push_option(&mut bytes, draft_read.map(|slot| [slot]));
+        match draft_write {
+            Some((slot, address)) => {
+                bytes.push(1);
+                bytes.push(*slot);
+                bytes.extend_from_slice(&address.to_le_bytes());
+            }
+            None => bytes.push(0),
+        }
+        bytes.push(u8::from(*writes_current_token));
+        bytes.push(*input_record);
+        push_option(&mut bytes, token_from.map(|id| id.0.to_le_bytes()));
+        bytes.push(u8::from(*row_exact));
+        bytes.extend_from_slice(&split_geometry.to_le_bytes());
+        for pages in reserved_host_pages {
+            bytes.extend_from_slice(&pages.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(replay_rows.len() as u64).to_le_bytes());
+        for rows in replay_rows {
+            bytes.extend_from_slice(&rows.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(buffer_generations.len() as u64).to_le_bytes());
+        for id in buffer_generations {
+            bytes.extend_from_slice(&id.0.to_le_bytes());
+        }
+        let high = hash_bytes_with_seed(&bytes, HIGH_SEED);
+        let low = hash_bytes_with_seed(&bytes, LOW_SEED);
+        u128::from(high) << 64 | u128::from(low)
+    }
+}
+
+/// The seeds of the two passes of [`CaptureKey::digest`].
+const HIGH_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+const LOW_SEED: u64 = 0xc2b2_ae3d_27d4_eb4f;
+
+/// Writes an option as a presence byte and, when present, its bytes.
+fn push_option<const N: usize>(bytes: &mut Vec<u8>, value: Option<[u8; N]>) {
+    match value {
+        Some(value) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&value);
+        }
+        None => bytes.push(0),
+    }
 }
 
 /// The fewest keys at which the fused verifier kernel serves rows of a verification or draft, by rows
@@ -128,7 +223,90 @@ pub(crate) fn trimmed(replay: &[u32]) -> Vec<u32> {
 mod tests {
     use super::*;
 
+    type Change = (&'static str, fn(&mut CaptureKey));
+
     const GROUP: u64 = 6;
+
+    fn key() -> CaptureKey {
+        CaptureKey {
+            view: View::Verify { rows: 4 },
+            kind: QuantumKind::Verify,
+            rows: 4,
+            logits: 4,
+            selects: true,
+            seeds_draft: false,
+            draft_seed: Some(0x10),
+            draft_read: Some(1),
+            draft_write: Some((2, 0x20)),
+            writes_current_token: false,
+            input_record: 1,
+            token_from: Some(AllocationId(7)),
+            row_exact: true,
+            split_geometry: 64,
+            reserved_host_pages: [3, 5],
+            replay_rows: vec![0, 2],
+            buffer_generations: vec![AllocationId(1), AllocationId(2)],
+        }
+    }
+
+    #[test]
+    fn the_two_halves_of_the_digest_differ() {
+        let digest = key().digest();
+        assert_ne!(digest >> 64, digest & u128::from(u64::MAX));
+    }
+
+    #[test]
+    fn equal_keys_have_equal_digests() {
+        assert_eq!(key().digest(), key().clone().digest());
+    }
+
+    #[test]
+    fn changing_any_one_field_changes_the_digest() {
+        let base = key().digest();
+        let changes: Vec<Change> = vec![
+            ("view", |k| k.view = View::Draft { rows: 4 }),
+            ("view rows", |k| k.view = View::Verify { rows: 5 }),
+            ("kind", |k| k.kind = QuantumKind::Draft),
+            ("rows", |k| k.rows = 5),
+            ("logits", |k| k.logits = 5),
+            ("selects", |k| k.selects = false),
+            ("seeds_draft", |k| k.seeds_draft = true),
+            ("draft_seed", |k| k.draft_seed = Some(0x11)),
+            ("draft_seed absent", |k| k.draft_seed = None),
+            ("draft_read", |k| k.draft_read = Some(2)),
+            ("draft_write slot", |k| k.draft_write = Some((3, 0x20))),
+            ("draft_write address", |k| k.draft_write = Some((2, 0x21))),
+            ("draft_write absent", |k| k.draft_write = None),
+            ("writes_current_token", |k| k.writes_current_token = true),
+            ("input_record", |k| k.input_record = 0),
+            ("token_from", |k| k.token_from = Some(AllocationId(8))),
+            ("token_from absent", |k| k.token_from = None),
+            ("row_exact", |k| k.row_exact = false),
+            ("split_geometry", |k| k.split_geometry = 65),
+            ("reserved_host_pages first", |k| k.reserved_host_pages = [4, 5]),
+            ("reserved_host_pages second", |k| k.reserved_host_pages = [3, 6]),
+            ("replay_rows", |k| k.replay_rows = vec![0, 3]),
+            ("buffer_generations", |k| {
+                k.buffer_generations = vec![AllocationId(1), AllocationId(3)]
+            }),
+        ];
+        for (name, change) in changes {
+            let mut other = key();
+            change(&mut other);
+            assert_ne!(other.digest(), base, "{name}");
+        }
+    }
+
+    #[test]
+    fn variable_length_parts_do_not_run_into_each_other() {
+        let mut a = key();
+        a.replay_rows = vec![1, 2];
+        a.buffer_generations = vec![AllocationId(3)];
+        let mut b = key();
+        b.replay_rows = vec![1];
+        b.buffer_generations = vec![AllocationId(2), AllocationId(3)];
+        assert_ne!(a.digest(), b.digest());
+    }
 
     #[test]
     fn the_split_counts_change_every_48_positions_below_2048_keys() {
