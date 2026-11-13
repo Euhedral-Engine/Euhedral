@@ -26,6 +26,7 @@ mod device;
 mod error;
 mod graph;
 mod lane;
+pub mod launch;
 mod library;
 mod memory;
 pub mod ops;
