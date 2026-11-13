@@ -33,8 +33,8 @@
 //! order posted. A thread that takes the claim itself first runs the operations posted before it. [`tell`](Mailbox::tell)
 //! posts and returns; [`ask`](Mailbox::ask) and [`close`](Mailbox::close) wait, at most [`OPERATION_BOUND`], on a
 //! one-shot reply, and are for threads outside the lattice (a wait inside a hot scope panics in a debug build). An
-//! operation that began a request leaves a turn to run; one that panics ends the owner's work as a panicking turn does, so
-//! that the audience of a request it began is told it failed. A thread that holds the claim (inside a turn or an
+//! operation that began a request leaves a turn to run; one that panics after it began a request on an idle owner ends
+//! that request's work as a panicking turn does, so that its audience is told it failed. A thread that holds the claim (inside a turn or an
 //! operation) gets `None` from `ask` and `close` at once: nobody else could run what it posted.
 //!
 //! Every thread that claims the owner and gives it back (`with`, `ask`, `close`) loads `pending` after
@@ -42,7 +42,7 @@
 //! panic is caught, the hand-off made, and the panic resumed.
 
 use std::any::Any;
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::fmt::{self, Formatter};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, Ordering, fence};
@@ -150,29 +150,30 @@ struct State<O: Turn> {
 type Payload = Box<dyn Any + Send>;
 
 thread_local! {
-    /// How many claims on a mailbox's owner this thread holds now.
-    static HELD: Cell<usize> = const { Cell::new(0) };
+    /// The mailboxes (by address) whose claim this thread holds now.
+    static HELD: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Marks the thread as holding a claim, until dropped: a thread that holds the claim must not wait for an operation
-/// that only it could run.
+/// Marks the thread as holding a mailbox's claim, until dropped: a thread that holds the claim must not wait for an
+/// operation that only it could run.
 struct Holding;
 
 impl Holding {
-    fn mark() -> Holding {
-        HELD.with(|held| held.set(held.get() + 1));
+    fn mark(mailbox: usize) -> Holding {
+        HELD.with(|held| held.borrow_mut().push(mailbox));
         Holding
     }
 
-    /// Whether this thread holds a claim, so that waiting for another thread to run an operation would wait on itself.
-    fn by_this_thread() -> bool {
-        HELD.with(|held| held.get() > 0)
+    /// Whether this thread holds the claim on `mailbox`, so that waiting for another thread to run an operation on it
+    /// would wait on itself.
+    fn by_this_thread(mailbox: usize) -> bool {
+        HELD.with(|held| held.borrow().contains(&mailbox))
     }
 }
 
 impl Drop for Holding {
     fn drop(&mut self) {
-        HELD.with(|held| held.set(held.get() - 1));
+        HELD.with(|held| held.borrow_mut().pop());
     }
 }
 
@@ -255,7 +256,7 @@ impl<O: Turn> Mailbox<O> {
             let Some(mut claim) = self.owner.try_claim() else {
                 return false;
             };
-            let held = Holding::mark();
+            let held = Holding::mark(Arc::as_ptr(self).addr());
             let state = &mut *claim;
             let Some(owner) = state.owner.as_mut() else {
                 // Closed: nothing will ever take a turn again. An operation posted now is answered without the owner.
@@ -339,12 +340,14 @@ impl<O: Turn> Mailbox<O> {
             match operation {
                 Operation::Run(work) => {
                     let owner = state.owner.as_mut();
+                    let was_idle = owner.as_deref().is_some_and(O::idle);
                     match catch_unwind(AssertUnwindSafe(|| work(owner))) {
                         Ok(told) => refused.extend(told),
                         Err(_) => {
                             log::error!("an operation posted to the owner panicked");
-                            // A request it began is told it failed, once; the owner ends its work, as for a turn.
-                            if let Some(owner) = state.owner.as_mut() {
+                            // A request it began is told it failed, once; the owner ends its work, as for a turn. A
+                            // request that was running before is not its victim.
+                            if let Some(owner) = state.owner.as_mut().filter(|owner| was_idle && !owner.idle()) {
                                 let abandoned = catch_unwind(AssertUnwindSafe(|| {
                                     owner.abandon("an operation on the owner panicked")
                                 }));
@@ -409,7 +412,7 @@ impl<O: Turn> Mailbox<O> {
         let Some(mut claim) = self.owner.try_claim() else {
             return Err(work);
         };
-        let held = Holding::mark();
+        let held = Holding::mark(Arc::as_ptr(self).addr());
         let state = &mut *claim;
         let finished = self.settle_operations(state);
         let outcome = match state.owner.as_mut() {
@@ -468,7 +471,7 @@ impl<O: Turn> Mailbox<O> {
         idle_only: bool,
         work: impl FnOnce(&mut O) -> R + Send + 'static,
     ) -> Option<R> {
-        if Holding::by_this_thread() {
+        if Holding::by_this_thread(Arc::as_ptr(self).addr()) {
             // Called from inside a turn or an operation: the operation could only be run by this thread, after it.
             return None;
         }
@@ -495,7 +498,7 @@ impl<O: Turn> Mailbox<O> {
     /// next to take the claim ran the request. `None` when a request is in flight, it is taken already, or
     /// [`OPERATION_BOUND`] passed; the mailbox is closed from here on. For threads outside the lattice.
     pub(crate) fn close(self: &Arc<Self>) -> Option<O> {
-        if Holding::by_this_thread() {
+        if Holding::by_this_thread(Arc::as_ptr(self).addr()) {
             return None;
         }
         let Some(mut claim) = self.owner.try_claim() else {
@@ -503,7 +506,7 @@ impl<O: Turn> Mailbox<O> {
             self.post_operation(Operation::Close(reply));
             return cell.wait(OPERATION_BOUND).ok().flatten().flatten();
         };
-        let held = Holding::mark();
+        let held = Holding::mark(Arc::as_ptr(self).addr());
         let state = &mut *claim;
         let finished = self.settle_operations(state);
         let owner = if state.owner.as_ref().is_some_and(O::idle) {
@@ -614,6 +617,8 @@ mod tests {
         /// Finish (ending the owner's work) when this message is handled.
         last: Option<usize>,
         done: Option<Arc<Done>>,
+        /// The listener of a request in flight: told only when the owner abandons it.
+        flying: Option<Arc<Done>>,
         address: Option<Arc<Address<Probe>>>,
         /// What a claim from inside the turn got.
         claimed_inside: Option<Arc<AtomicBool>>,
@@ -647,6 +652,7 @@ mod tests {
                 linger: 0,
                 last: None,
                 done: None,
+                flying: None,
                 address: None,
                 claimed_inside: None,
                 asked_inside: None,
@@ -711,7 +717,8 @@ mod tests {
         }
 
         fn abandon(&mut self, _why: &str) -> Vec<Arc<Done>> {
-            self.done.take().into_iter().collect()
+            self.busy = false;
+            self.done.take().into_iter().chain(self.flying.take()).collect()
         }
 
         fn deliver(finished: Arc<Done>) {
@@ -1339,11 +1346,12 @@ mod tests {
             .with(move |_| (held.ask(false, |_| ()), held.close()))
             .expect("free");
         assert!(inside.0.is_none() && inside.1.is_none());
+        assert!(start.elapsed() < BOUND, "the operation waited for itself");
         assert_eq!(mailbox.ask(false, |_| 7), Some(7));
     }
 
     #[test]
-    fn an_operation_that_panics_tells_the_listener_it_failed_once() {
+    fn an_operation_that_panics_after_it_began_a_request_tells_the_listener_it_failed_once() {
         let (mailbox, address, mut handoffs) = queued(Probe::new);
         let admitted = Handoff::new();
         let done = Arc::new(Done {
@@ -1355,7 +1363,9 @@ mod tests {
         let claim = mailbox.owner.try_claim().expect("free");
         mailbox.defer(move |owner| {
             // A begin that took in its request and then panicked.
-            owner.expect("open").done = Some(done);
+            let owner = owner.expect("open");
+            owner.busy = true;
+            owner.flying = Some(done);
             panic!("the begin panicked");
         });
         drop(claim);
@@ -1364,6 +1374,43 @@ mod tests {
         assert!(admitted.take().is_none(), "the listener was told twice");
         run_frames(&mut handoffs);
         assert!(admitted.take().is_none(), "the listener was told twice");
+    }
+
+    #[test]
+    fn an_operation_that_panics_does_not_abandon_the_request_in_flight() {
+        let (mailbox, address, mut handoffs) = queued(Probe::new);
+        let admitted = Handoff::new();
+        mailbox
+            .with(|probe| {
+                probe.busy = true;
+                probe.flying = Some(Arc::new(Done {
+                    address: Arc::clone(&address),
+                    admitted: Arc::clone(&admitted),
+                    panics: false,
+                }));
+            })
+            .expect("free");
+        let claim = mailbox.owner.try_claim().expect("free");
+        mailbox.defer(|_| panic!("a begin that was refused panicked"));
+        drop(claim);
+        run_frames(&mut handoffs);
+        assert!(admitted.take().is_none(), "the request in flight was told it failed");
+        assert_eq!(
+            mailbox.with(|probe| (probe.busy, probe.flying.is_some())),
+            Some((true, true)),
+            "the request in flight was abandoned"
+        );
+    }
+
+    #[test]
+    fn a_claim_on_one_mailbox_does_not_refuse_an_ask_on_another() {
+        let (first, _first_address, _first_handoffs) = queued(Probe::new);
+        let (second, _second_address, _second_handoffs) = queued(Probe::new);
+        let other = Arc::clone(&second);
+        let answers = first
+            .with(move |_| (other.ask(false, |_| 7), other.close().is_some()))
+            .expect("free");
+        assert_eq!(answers, (Some(7), true));
     }
 
     #[test]
