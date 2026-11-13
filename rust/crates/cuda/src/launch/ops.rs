@@ -13,8 +13,8 @@
 
 use std::fmt;
 
-use euhedral_gpu::LaneEnqueue;
 use euhedral_gpu::cuda::CudaKernel;
+use euhedral_gpu::{GpuError, LaneEnqueue};
 
 use crate::error::CudaError;
 use crate::launch::attention::{
@@ -38,12 +38,10 @@ use crate::launch::table::{Geometry, plan_linear_launch, plan_qwen4_launch};
 use crate::launch::{Modes, PlanError, advance};
 use crate::memory::{DevicePtr, HostWeightsArena, PinnedBuffer};
 use crate::ops::{KernelOps, arena_range, pinned_range};
-
-/// The statuses of the C library, which a refusal is reported as.
-const INVALID_ARGUMENT: i32 = -1;
-const SIZE_OVERFLOW: i32 = -2;
-const FORMAT_MISMATCH: i32 = -3;
-const ROUTE_UNAVAILABLE: i32 = -5;
+use crate::sys::{
+    EUHEDRAL_CUDA_FORMAT_MISMATCH as FORMAT_MISMATCH, EUHEDRAL_CUDA_INVALID_ARGUMENT as INVALID_ARGUMENT,
+    EUHEDRAL_CUDA_ROUTE_UNAVAILABLE as ROUTE_UNAVAILABLE, EUHEDRAL_CUDA_SIZE_OVERFLOW as SIZE_OVERFLOW,
+};
 
 /// The error of a planner's refusal: the call it refused and the library's status for it.
 fn refused(call: &'static str, error: PlanError) -> CudaError {
@@ -68,7 +66,7 @@ fn not_enqueued(error: &EnqueueError) -> CudaError {
     CudaError::Argument(error.to_string())
 }
 
-fn lane_error(call: &'static str, error: &euhedral_gpu::GpuError) -> CudaError {
+fn lane_error(call: &'static str, error: &GpuError) -> CudaError {
     CudaError::Argument(format!("{call}: {error}"))
 }
 

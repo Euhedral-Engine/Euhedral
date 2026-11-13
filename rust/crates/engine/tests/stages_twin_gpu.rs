@@ -656,6 +656,8 @@ struct Case {
     /// Run only the stages named here (all when empty).
     only: &'static [&'static str],
     draft: bool,
+    /// The case takes the native tile route: its linear must have quantized into the scratch.
+    tile: bool,
 }
 
 #[test]
@@ -684,6 +686,7 @@ fn a_decode_and_a_verify_quantum_through_rustee_ops_equal_the_native_path_bit_fo
             selected: SelectedRows::Last,
             only: &[],
             draft: false,
+            tile: false,
         },
         Case {
             name: "verify",
@@ -693,6 +696,7 @@ fn a_decode_and_a_verify_quantum_through_rustee_ops_equal_the_native_path_bit_fo
             selected: SelectedRows::Each,
             only: &[],
             draft: false,
+            tile: false,
         },
         Case {
             name: "draft",
@@ -702,19 +706,27 @@ fn a_decode_and_a_verify_quantum_through_rustee_ops_equal_the_native_path_bit_fo
             selected: SelectedRows::Last,
             only: &[],
             draft: true,
+            tile: false,
         },
     ];
     if tile_route {
         // Non-skinny rows: the native tile route, with the scratch it takes.
-        cases.push(Case {
-            name: "prefill tile route",
-            kind: QuantumKind::Prefill,
-            rows: 72,
-            logits_rows: 1,
-            selected: SelectedRows::Last,
-            only: &["residual add", "fused norm", "norm", "swiglu", "nvfp4 linear"],
-            draft: false,
-        });
+        assert!(
+            !library.exact_numerics(),
+            "exact numerics make both sides refuse the native route"
+        );
+        for (name, rows, tile) in [("prefill tile route", 72, true), ("skinny route, 32 rows", 32, false)] {
+            cases.push(Case {
+                name,
+                kind: QuantumKind::Prefill,
+                rows,
+                logits_rows: 1,
+                selected: SelectedRows::Last,
+                only: &["residual add", "fused norm", "norm", "swiglu", "nvfp4 linear"],
+                draft: false,
+                tile,
+            });
+        }
     } else {
         println!(
             "SKIPPED the NVFP4 native tile-route quantum: the device has no native NVFP4 route (needs compute capability 12.x)"
@@ -790,6 +802,13 @@ fn a_decode_and_a_verify_quantum_through_rustee_ops_equal_the_native_path_bit_fo
                     failures.push(message);
                     break 'stages;
                 }
+            }
+            if case.tile && *name == "nvfp4 linear" {
+                let scratch = twin.get(native.workspace.scratch(0).unwrap());
+                assert!(
+                    scratch.iter().any(|byte| *byte != 0),
+                    "the tile route quantizes into the scratch: the native side took another route"
+                );
             }
             match twin.compare(&native, &rustee) {
                 Ok(bytes) => compared = bytes,
