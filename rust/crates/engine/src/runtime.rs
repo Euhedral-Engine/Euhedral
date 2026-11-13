@@ -385,8 +385,12 @@ impl EngineRuntime {
     }
 
     /// Reads the device state of the one sequence the engine holds, when no generation is running on it: `None` while
-    /// one is.
-    pub fn inspect_sequence<R>(&self, read: impl FnOnce(&SequenceState) -> R) -> Option<R> {
+    /// one is. Not for a lattice worker: when a turn of the owner holds the sequence at the moment, the read waits for
+    /// it (a bounded wait).
+    pub fn inspect_sequence<R: Send + 'static>(
+        &self,
+        read: impl FnOnce(&SequenceState) -> R + Send + 'static,
+    ) -> Option<R> {
         self.generation.inspect(read)
     }
 

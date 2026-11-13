@@ -257,10 +257,12 @@ fn snapshot_lane(runtime: &EngineRuntime) -> Arc<CudaLane> {
     CudaLane::new(library, LaneId((library.max_lanes() - 1) as u16), 4).unwrap()
 }
 
-fn snapshot(runtime: &EngineRuntime, lane: &CudaLane) -> Snapshot {
-    let download = |ptr, bytes: usize| {
+fn snapshot(runtime: &EngineRuntime, lane: &Arc<CudaLane>) -> Snapshot {
+    // The read runs on the sequence's owner, which may be another thread: it owns what it uses.
+    let lane = Arc::clone(lane);
+    let download = move |ptr, bytes: usize| {
         let mut host = vec![0u8; bytes];
-        let submission = Submission::begin(lane, SubmitMode::default()).unwrap();
+        let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
         ops::copy_device_to_host(&submission, &mut host, ptr).unwrap();
         drop(submission);
         lane.synchronize().unwrap();
@@ -268,7 +270,7 @@ fn snapshot(runtime: &EngineRuntime, lane: &CudaLane) -> Snapshot {
     };
     let layers = runtime.config().layer_kinds.len();
     runtime
-        .inspect_sequence(|sequence| {
+        .inspect_sequence(move |sequence| {
             let full = (sequence.kv.committed() / PAGE) as usize;
             let page_bytes = 2 * sequence.kv.plane_page_bytes() as usize;
             let base_pages = (0..sequence.kv.layers())

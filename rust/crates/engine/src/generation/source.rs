@@ -43,7 +43,7 @@ use std::sync::Arc;
 #[cfg(feature = "test-oracles")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
 use euhedral_data_structures::queues::{Consumer, Single};
@@ -161,6 +161,34 @@ pub(super) enum Step {
         allow(dead_code, reason = "only the test hook asks for it")
     )]
     Settle,
+}
+
+/// Whom a request that never started is told, and why it did not.
+pub(crate) struct Rejected {
+    pub(crate) error: AdmissionError,
+    audience: Audience,
+}
+
+impl Rejected {
+    fn new(error: AdmissionError, audience: Audience) -> Rejected {
+        Rejected { error, audience }
+    }
+}
+
+/// The listener or sink of a request.
+enum Audience {
+    Greedy(Box<dyn GenerationListener>),
+    Forced(Box<dyn LogitsSink>),
+}
+
+impl Mode {
+    /// The request's listener or sink, for a request that did not start.
+    fn into_audience(self) -> Audience {
+        match self {
+            Mode::Greedy { listener } | Mode::Speculative { listener, .. } => Audience::Greedy(listener),
+            Mode::Forced { sink, .. } => Audience::Forced(sink),
+        }
+    }
 }
 
 /// What a request does with the rows it computes.
@@ -364,7 +392,8 @@ pub(crate) struct Owner {
     used: bool,
     pub(super) run: Option<Run>,
     parked: Vec<Parked>,
-    finished: Option<Finished>,
+    /// Outcomes to tell once the claim is released: a request's end, and the refusals of requests posted meanwhile.
+    finished: VecDeque<Finished>,
 }
 
 impl fmt::Debug for Owner {
@@ -393,7 +422,7 @@ impl Owner {
             used: false,
             run: None,
             parked: Vec::new(),
-            finished: None,
+            finished: VecDeque::new(),
         }
     }
 
@@ -437,65 +466,98 @@ impl Owner {
         self.cache = GraphCache::disabled();
     }
 
-    /// Starts a greedy request, or one that speculates with the artifact's draft layer.
-    pub(crate) fn begin(&mut self, units: Units, request: GenerationRequest) -> Result<(), AdmissionError> {
-        let mode = match request.speculation {
-            Speculation::Off => Mode::Greedy {
-                listener: request.listener,
-            },
+    /// Starts a greedy request, or one that speculates with the artifact's draft layer. `units` is what the engine's
+    /// admission answered. A refused request gives its listener back.
+    pub(crate) fn begin(
+        &mut self,
+        units: Result<Units, AdmissionError>,
+        request: GenerationRequest,
+    ) -> Result<(), Rejected> {
+        let GenerationRequest {
+            prompt,
+            max_tokens,
+            stop_tokens,
+            speculation,
+            listener,
+        } = request;
+        let units = match units {
+            Ok(units) => units,
+            Err(error) => return Err(Rejected::new(error, Audience::Greedy(listener))),
+        };
+        let mode = match speculation {
+            Speculation::Off => Mode::Greedy { listener },
             Speculation::Artifact => {
                 let Some(drafts) = self.shared.drafts.as_ref() else {
-                    return Err(AdmissionError::SpeculationUnavailable);
+                    return Err(Rejected::new(
+                        AdmissionError::SpeculationUnavailable,
+                        Audience::Greedy(listener),
+                    ));
                 };
                 Mode::Speculative {
-                    listener: request.listener,
+                    listener,
                     state: Box::new(Speculating::new(
                         drafts.depth,
                         self.shared.capacity,
-                        request.prompt.len(),
-                        request.max_tokens as usize,
+                        prompt.len(),
+                        max_tokens as usize,
                     )),
                 }
             }
         };
-        self.start_run(
-            units,
-            mode,
-            request.prompt,
-            request.max_tokens as usize,
-            request.stop_tokens,
-        )
+        self.start_run(units, mode, prompt, max_tokens as usize, stop_tokens)
     }
 
-    /// Starts a teacher-forced run.
+    /// Starts a teacher-forced run. A refused run gives its sink back.
     pub(crate) fn begin_forced(
         &mut self,
-        units: Units,
+        units: Result<Units, AdmissionError>,
         prefix: Vec<u32>,
         forced: Vec<u32>,
         sink: Box<dyn LogitsSink>,
-    ) -> Result<(), AdmissionError> {
+    ) -> Result<(), Rejected> {
+        let units = match units {
+            Ok(units) => units,
+            Err(error) => return Err(Rejected::new(error, Audience::Forced(sink))),
+        };
         let vocabulary = self.shared.config.vocab_size;
         if let Some((index, id)) = forced.iter().enumerate().find(|(_, id)| **id as usize >= vocabulary) {
-            return Err(AdmissionError::TokenOutsideVocabulary {
+            let error = AdmissionError::TokenOutsideVocabulary {
                 id: *id,
                 index: prefix.len() + index,
                 vocabulary,
-            });
+            };
+            return Err(Rejected::new(error, Audience::Forced(sink)));
         }
         // The last forced token is only predicted, never fed: the rows end one before.
         let rows = (prefix.len() + forced.len()).saturating_sub(1);
         if rows as u64 > self.shared.capacity {
-            return Err(AdmissionError::PromptTooLong {
+            let error = AdmissionError::PromptTooLong {
                 tokens: rows,
                 capacity: self.shared.capacity as usize,
-            });
+            };
+            return Err(Rejected::new(error, Audience::Forced(sink)));
         }
         let wanted = forced.len();
         if wanted == 0 {
-            return Err(AdmissionError::EmptyPrompt);
+            return Err(Rejected::new(AdmissionError::EmptyPrompt, Audience::Forced(sink)));
         }
         self.start_run(units, Mode::Forced { forced, sink }, prefix, wanted, Vec::new())
+    }
+
+    /// Ends a request that was refused after the caller was told it was accepted (it was posted while a turn held the
+    /// claim): its audience hears a failure, after the claim is released, like any request that ended.
+    pub(crate) fn reject(&mut self, rejected: Rejected) {
+        let Rejected { error, audience } = rejected;
+        let outcome = GenerationOutcome {
+            reason: FinishReason::Failed(format!("the request was refused: {error}")),
+            prompt_tokens: 0,
+            generated: 0,
+            elapsed: Duration::ZERO,
+        };
+        self.finished.push_back(match audience {
+            Audience::Greedy(listener) => Finished::Greedy(listener, outcome),
+            Audience::Forced(sink) => Finished::Forced(sink, outcome),
+        });
     }
 
     fn start_run(
@@ -505,27 +567,30 @@ impl Owner {
         prompt: Vec<u32>,
         wanted: usize,
         stop_tokens: Vec<u32>,
-    ) -> Result<(), AdmissionError> {
-        if self.run.is_some() || self.finished.is_some() {
-            return Err(AdmissionError::Busy);
+    ) -> Result<(), Rejected> {
+        // Busy means a request is running: an outcome that waits to be told does not hold the sequence.
+        if self.run.is_some() {
+            return Err(Rejected::new(AdmissionError::Busy, mode.into_audience()));
         }
         if prompt.is_empty() {
-            return Err(AdmissionError::EmptyPrompt);
+            return Err(Rejected::new(AdmissionError::EmptyPrompt, mode.into_audience()));
         }
         let vocabulary = self.shared.config.vocab_size;
         if let Some((index, id)) = prompt.iter().enumerate().find(|(_, id)| **id as usize >= vocabulary) {
-            return Err(AdmissionError::TokenOutsideVocabulary {
+            let error = AdmissionError::TokenOutsideVocabulary {
                 id: *id,
                 index,
                 vocabulary,
-            });
+            };
+            return Err(Rejected::new(error, mode.into_audience()));
         }
         let capacity = self.shared.capacity;
         if prompt.len() as u64 > capacity {
-            return Err(AdmissionError::PromptTooLong {
+            let error = AdmissionError::PromptTooLong {
                 tokens: prompt.len(),
                 capacity: capacity as usize,
-            });
+            };
+            return Err(Rejected::new(error, mode.into_audience()));
         }
         let depth = match mode {
             Mode::Greedy { .. } => GREEDY_DEPTH,
@@ -633,7 +698,7 @@ impl Owner {
             generated: run.generated,
             elapsed: run.began.elapsed(),
         };
-        self.finished = Some(match run.mode {
+        self.finished.push_back(match run.mode {
             Mode::Greedy { listener } | Mode::Speculative { listener, .. } => Finished::Greedy(listener, outcome),
             Mode::Forced { sink, .. } => Finished::Forced(sink, outcome),
         });
@@ -1162,7 +1227,7 @@ impl Owner {
             generated: run.generated,
             elapsed: run.began.elapsed(),
         };
-        self.finished = Some(match run.mode {
+        self.finished.push_back(match run.mode {
             Mode::Greedy { listener } | Mode::Speculative { listener, .. } => Finished::Greedy(listener, outcome),
             Mode::Forced { sink, .. } => Finished::Forced(sink, outcome),
         });
@@ -1184,15 +1249,23 @@ impl Turn for Owner {
         }
     }
 
-    fn take_finished(&mut self) -> Option<Finished> {
-        self.finished.take()
+    fn take_finished(&mut self) -> Vec<Finished> {
+        self.finished.drain(..).collect()
     }
 
     fn deliver(finished: Finished) {
         finished.deliver();
     }
 
+    fn abandon(&mut self, why: &str) -> Vec<Finished> {
+        // Two panics end a request at once, leaving what was in flight.
+        let message = why.to_string();
+        self.panicked(&message);
+        self.panicked(&message);
+        self.finished.drain(..).collect()
+    }
+
     fn idle(&self) -> bool {
-        self.run.is_none() && self.parked.is_empty() && self.finished.is_none()
+        self.run.is_none() && self.parked.is_empty() && self.finished.is_empty()
     }
 }

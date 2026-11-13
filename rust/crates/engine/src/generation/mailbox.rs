@@ -22,25 +22,46 @@
 //!
 //! **Bounded work.** A frame runs at most [`TURNS_PER_DRIVE`] turns; if messages still wait it hands the rest to a
 //! worker through the mailbox's [`Spawn`] (a frame offered to the `stages` lake), so no frame carries unbounded work and
-//! a producer that keeps posting cannot hold one worker. The same hand-off serves a thread that is not a worker: it
-//! claims with [`with`](Mailbox::with), and the turn it provokes runs on a worker.
+//! a producer that keeps posting cannot hold one worker. The same hand-off serves a thread that is not a worker. A
+//! hand-off no worker takes (the engine is shutting down) is run on the thread that made it, so no message waits for
+//! a worker that will not come.
 //!
-//! Every thread that claims the owner and gives it back (`with`, `with_idle`, `close`) loads `pending` after
+//! **Operations from outside.** Whether a request is admitted, and what the sequence looks like, depend on the owner's
+//! state and never on whether a turn happens to hold the claim. A thread that wants the owner and finds the claim held
+//! therefore does not fail: it posts its operation (a closure over the owner) to a second queue and hands a frame to a
+//! worker, and whoever holds or next takes the claim runs it, after its turn and before it gives the claim back, in the
+//! order posted. A thread that takes the claim itself first runs the operations posted before it. [`tell`](Mailbox::tell)
+//! posts and returns; [`ask`](Mailbox::ask) and [`close`](Mailbox::close) wait, at most [`OPERATION_BOUND`], on a
+//! one-shot reply, and are for threads outside the lattice (a wait inside a hot scope panics in a debug build). An
+//! operation that began a request leaves a turn to run.
+//!
+//! Every thread that claims the owner and gives it back (`with`, `ask`, `close`) loads `pending` after
 //! `release_seq_cst` and hands a waiting message to a worker, also when its work or a listener it told panicked: the
 //! panic is caught, the hand-off made, and the panic resumed.
 
+use std::any::Any;
 use std::fmt::{self, Formatter};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, Ordering, fence};
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::Duration;
 
-use euhedral_data_structures::queues::{Multi, Producer};
+use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
 use euhedral_data_structures::sync::ClaimCell;
+
+use crate::handoff::Handoff;
 
 /// Turns one drive runs before it hands the rest to a worker. A turn admits quanta and concludes retired ones: host
 /// work of tens of microseconds. Four keep a burst of retirements on one worker without letting a producer that never
 /// stops posting pin it.
 pub(crate) const TURNS_PER_DRIVE: usize = 4;
+
+/// How long a thread outside waits for an operation it posted. A turn that holds the claim lasts microseconds; the
+/// bound only keeps a caller from waiting for ever when nothing will run the operation (the owner is gone).
+pub(crate) const OPERATION_BOUND: Duration = Duration::from_secs(10);
+
+/// Slots in a chunk of the operations queue. Operations are rare; the queue is unbounded.
+const OPERATIONS_PER_CHUNK: usize = 4;
 
 /// Runs a closure on a worker, later, unordered; `false` when no worker will (the engine is shutting down).
 pub(crate) type Spawn = Box<dyn Fn(Box<dyn FnOnce() + Send>) -> bool + Send + Sync>;
@@ -55,8 +76,13 @@ pub(crate) trait Turn: Send + 'static {
     /// Takes in what arrived and does what follows from it.
     fn turn(&mut self);
 
-    /// The outcome the last turn left, if it ended the owner's work.
-    fn take_finished(&mut self) -> Option<Self::Finished>;
+    /// The outcomes waiting to be told: the last turn's, if it ended the owner's work, and the refusals of requests
+    /// begun by operations posted while the claim was held.
+    fn take_finished(&mut self) -> Vec<Self::Finished>;
+
+    /// A turn panicked past the owner's own handling: ends the owner's work, so that its audience is told it failed
+    /// (`why` says so) and the next request finds the owner free.
+    fn abandon(&mut self, why: &str) -> Vec<Self::Finished>;
 
     /// Tells `finished`'s audience. The claim is free: a listener may start the next request from here.
     fn deliver(finished: Self::Finished);
@@ -66,12 +92,64 @@ pub(crate) trait Turn: Send + 'static {
     fn idle(&self) -> bool;
 }
 
+/// A closure over the owner, or the owner's end, posted by a thread that found the claim held.
+enum Operation<O> {
+    Run(Box<dyn FnOnce(&mut O) + Send>),
+    /// Takes the owner out if it is idle and replies with it.
+    Close(Reply<Option<O>>),
+}
+
+/// The answering end of a one-shot reply. Dropped unanswered (the operation never ran: the owner is gone, or the
+/// operation panicked), it tells the waiter so.
+struct Reply<R> {
+    cell: Arc<Handoff<Option<R>>>,
+    answered: bool,
+}
+
+impl<R> Reply<R> {
+    /// A reply, and the cell its waiter waits on.
+    fn new() -> (Reply<R>, Arc<Handoff<Option<R>>>) {
+        let cell = Handoff::new();
+        (
+            Reply {
+                cell: Arc::clone(&cell),
+                answered: false,
+            },
+            cell,
+        )
+    }
+
+    fn answer(mut self, value: R) {
+        self.answered = true;
+        self.cell.send(Some(value));
+    }
+}
+
+impl<R> Drop for Reply<R> {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.cell.send(None);
+        }
+    }
+}
+
+/// What the claim guards: the owner, until it is taken, and the consuming end of the operations posted to it.
+struct State<O: Turn> {
+    owner: Option<O>,
+    operations: Consumer<Operation<O>, Single>,
+}
+
+/// A panic's payload.
+type Payload = Box<dyn Any + Send>;
+
 /// The inbox of an owner and the claim on its state.
 pub(crate) struct Mailbox<O: Turn> {
     /// The owner, until [`close`](Self::close) takes it.
-    owner: ClaimCell<Option<O>>,
+    owner: ClaimCell<State<O>>,
     /// The producing end of the owner's inbox; the consuming end lives inside the owner.
     inbox: Producer<O::Message, Multi>,
+    /// The producing end of the operations posted by threads that found the claim held.
+    operations: Producer<Operation<O>, Multi>,
     /// Set by every post after its offer, cleared by the holder before its turn.
     pending: AtomicBool,
     spawn: Spawn,
@@ -89,9 +167,15 @@ impl<O: Turn> fmt::Debug for Mailbox<O> {
 impl<O: Turn> Mailbox<O> {
     /// A mailbox over `owner`, whose inbox's producing end is `inbox`; `spawn` runs a frame on a worker.
     pub(crate) fn new(owner: O, inbox: Producer<O::Message, Multi>, spawn: Spawn) -> Mailbox<O> {
+        let queue = MpscQueue::<Operation<O>>::new(OPERATIONS_PER_CHUNK);
+        let operations = queue.producer();
         Mailbox {
-            owner: ClaimCell::new(Some(owner)),
+            owner: ClaimCell::new(State {
+                owner: Some(owner),
+                operations: queue.consumer(),
+            }),
             inbox,
+            operations,
             pending: AtomicBool::new(false),
             spawn,
             #[cfg(test)]
@@ -124,8 +208,11 @@ impl<O: Turn> Mailbox<O> {
             let Some(mut claim) = self.owner.try_claim() else {
                 return;
             };
-            let Some(owner) = claim.as_mut() else {
-                // Closed: nothing will ever take a turn again.
+            let state = &mut *claim;
+            let Some(owner) = state.owner.as_mut() else {
+                // Closed: nothing will ever take a turn again, and an operation posted now is dropped, which tells its
+                // waiter.
+                Self::run_operations(state);
                 return;
             };
             self.pending.swap(false, Ordering::SeqCst);
@@ -133,18 +220,20 @@ impl<O: Turn> Mailbox<O> {
                 owner.turn();
                 owner.take_finished()
             }));
+            let (mut finished, failure) = match turned {
+                Ok(finished) => (finished, None),
+                Err(payload) => {
+                    // The outcome the turn would have left is lost with it: the audience is told the request failed.
+                    let abandoned = catch_unwind(AssertUnwindSafe(|| owner.abandon("the owner's turn panicked")));
+                    (abandoned.unwrap_or_default(), Some(payload))
+                }
+            };
+            finished.extend(self.settle_operations(state));
             // The claim goes back before `pending` is loaded, and before anyone is told: a listener that starts the
             // next request from `finished` finds the owner free.
             claim.release_seq_cst();
-            let finished = match turned {
-                Ok(finished) => finished,
-                Err(payload) => {
-                    self.hand_on();
-                    resume_unwind(payload);
-                }
-            };
-            if let Some(Err(payload)) = finished.map(|finished| catch_unwind(AssertUnwindSafe(|| O::deliver(finished))))
-            {
+            let delivered = Self::deliver_all(finished);
+            if let Some(payload) = failure.or(delivered) {
                 self.hand_on();
                 resume_unwind(payload);
             }
@@ -165,48 +254,169 @@ impl<O: Turn> Mailbox<O> {
         self.pending.load(Ordering::SeqCst)
     }
 
-    /// Gives a waiting message to a worker, for a thread that must not run the turn itself.
+    /// Gives a waiting message to a worker, for a thread that must not run the turn itself. When no worker will take
+    /// it the thread runs it: nothing is left waiting for a worker that will not come.
     fn hand_on(self: &Arc<Self>) {
         if self.waiting() && !self.nudge() {
-            log::error!("a message waits for the owner and no worker will take it");
+            self.drive();
         }
     }
 
-    /// Claims the owner, runs `work` and gives it back; a message that arrived meanwhile goes to a worker.
-    fn claimed<R>(self: &Arc<Self>, idle_only: bool, work: impl FnOnce(&mut O) -> R) -> Option<R> {
-        let mut claim = self.owner.try_claim()?;
-        let outcome = match claim.as_mut() {
+    /// Runs the operations posted while the claim was held, in the order posted.
+    fn run_operations(state: &mut State<O>) -> bool {
+        let mut ran = false;
+        while let Some(operation) = state.operations.poll() {
+            ran = true;
+            match operation {
+                Operation::Run(work) => {
+                    if let Some(owner) = state.owner.as_mut()
+                        && catch_unwind(AssertUnwindSafe(|| work(owner))).is_err()
+                    {
+                        log::error!("an operation posted to the owner panicked");
+                    }
+                }
+                Operation::Close(reply) => {
+                    let idle = state.owner.as_ref().is_some_and(O::idle);
+                    reply.answer(if idle { state.owner.take() } else { None });
+                }
+            }
+        }
+        ran
+    }
+
+    /// Runs the operations posted meanwhile, and returns the outcomes they left to tell. An operation may have begun a
+    /// request, which needs a turn: `pending` says so, before the claim is released.
+    fn settle_operations(&self, state: &mut State<O>) -> Vec<O::Finished> {
+        if !Self::run_operations(state) {
+            return Vec::new();
+        }
+        let Some(owner) = state.owner.as_mut() else {
+            return Vec::new();
+        };
+        self.pending.store(true, Ordering::SeqCst);
+        catch_unwind(AssertUnwindSafe(|| owner.take_finished())).unwrap_or_default()
+    }
+
+    /// Tells each outcome's audience; the first panic of a listener is returned once all were told.
+    fn deliver_all(finished: Vec<O::Finished>) -> Option<Payload> {
+        let mut first = None;
+        for finished in finished {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| O::deliver(finished))) {
+                first.get_or_insert(payload);
+            }
+        }
+        first
+    }
+
+    /// Posts an operation and makes sure a frame will run it: to a worker, or to this thread when none will take it.
+    fn post_operation(self: &Arc<Self>, operation: Operation<O>) {
+        if self.operations.offer(operation).is_err() {
+            log::error!("the owner's operations queue refused an operation");
+            return;
+        }
+        // As a message: written before the claim is tried.
+        self.pending.store(true, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        if !self.nudge() {
+            self.drive();
+        }
+    }
+
+    /// Claims the owner, runs `work` and gives it back; a message that arrived meanwhile goes to a worker. The
+    /// operations posted before run first. `Err` gives `work` back when another holds the claim; `Ok(None)` when the
+    /// owner is closed, or `idle_only` and a request is in flight.
+    fn claimed<R, W: FnOnce(&mut O) -> R>(self: &Arc<Self>, idle_only: bool, work: W) -> Result<Option<R>, W> {
+        let Some(mut claim) = self.owner.try_claim() else {
+            return Err(work);
+        };
+        let state = &mut *claim;
+        let finished = self.settle_operations(state);
+        let outcome = match state.owner.as_mut() {
             None => Ok(None),
             Some(owner) if idle_only && !owner.idle() => Ok(None),
             Some(owner) => catch_unwind(AssertUnwindSafe(|| work(owner))).map(Some),
         };
         claim.release_seq_cst();
+        let delivered = Self::deliver_all(finished);
         self.hand_on();
-        match outcome {
-            Ok(out) => out,
-            Err(payload) => resume_unwind(payload),
+        match (outcome, delivered) {
+            (Err(payload), _) | (Ok(_), Some(payload)) => resume_unwind(payload),
+            (Ok(out), None) => Ok(out),
         }
     }
 
-    /// Runs `work` on the owner if the claim is free, for a thread that is not a frame (it starts a request). `None`
-    /// when another holds the claim, or the owner is closed. The caller that began a request offers the first turn
-    /// itself ([`nudge`](Self::nudge)); a message that arrived while `work` held the claim goes to a worker here.
+    /// Runs `work` on the owner if the claim is free, for a thread that must not wait. `None` when another holds the
+    /// claim, or the owner is closed. A message that arrived while `work` held the claim goes to a worker here.
+    #[cfg(test)]
     pub(crate) fn with<R>(self: &Arc<Self>, work: impl FnOnce(&mut O) -> R) -> Option<R> {
+        self.claimed(false, work).ok().flatten()
+    }
+
+    /// Runs `work` on the owner now if the claim is free, and gives it back if not: the caller then answers for itself
+    /// (see [`defer`](Self::defer)). `Ok(None)` when the owner is closed.
+    pub(crate) fn try_with<R, W: FnOnce(&mut O) -> R>(self: &Arc<Self>, work: W) -> Result<Option<R>, W> {
         self.claimed(false, work)
     }
 
-    /// As [`with`](Self::with), and only while the owner is idle.
-    pub(crate) fn with_idle<R>(self: &Arc<Self>, work: impl FnOnce(&mut O) -> R) -> Option<R> {
-        self.claimed(true, work)
+    /// Posts `work` to run on the owner, whoever holds the claim, and returns. A request it begins gets its first turn.
+    /// Dropped unrun when the owner is closed.
+    pub(crate) fn defer(self: &Arc<Self>, work: impl FnOnce(&mut O) + Send + 'static) {
+        self.post_operation(Operation::Run(Box::new(work)));
     }
 
-    /// Takes the owner out, for its teardown, while it is idle. `None` when another holds the claim, a request is in
-    /// flight or it is taken already; the mailbox is closed from here on.
+    /// Runs `work` on the owner now if the claim is free, else posts it ([`defer`](Self::defer)). Never waits.
+    pub(crate) fn tell(self: &Arc<Self>, work: impl FnOnce(&mut O) + Send + 'static) {
+        if let Err(work) = self.claimed(false, work) {
+            self.defer(work);
+        }
+    }
+
+    /// Runs `work` on the owner (only while it is idle, if `idle_only`) and returns what it answered: now if the claim
+    /// is free, else once the holder or the next to take the claim ran it. `None` when the owner is closed, a request
+    /// is in flight and `idle_only`, `work` panicked, or [`OPERATION_BOUND`] passed. For threads outside the lattice:
+    /// the wait is on a one-shot reply and no frame calls this.
+    pub(crate) fn ask<R: Send + 'static>(
+        self: &Arc<Self>,
+        idle_only: bool,
+        work: impl FnOnce(&mut O) -> R + Send + 'static,
+    ) -> Option<R> {
+        let work = match self.claimed(idle_only, work) {
+            Ok(answer) => return answer,
+            Err(work) => work,
+        };
+        let (reply, cell) = Reply::new();
+        self.post_operation(Operation::Run(Box::new(move |owner| {
+            reply.answer(if idle_only && !owner.idle() {
+                None
+            } else {
+                Some(work(owner))
+            });
+        })));
+        cell.wait(OPERATION_BOUND).ok().flatten().flatten()
+    }
+
+    /// Takes the owner out, for its teardown, while it is idle: now if the claim is free, else once the holder or the
+    /// next to take the claim ran the request. `None` when a request is in flight, it is taken already, or
+    /// [`OPERATION_BOUND`] passed; the mailbox is closed from here on. For threads outside the lattice.
     pub(crate) fn close(self: &Arc<Self>) -> Option<O> {
-        let mut claim = self.owner.try_claim()?;
-        let owner = claim.take_if(|owner| owner.idle());
+        let Some(mut claim) = self.owner.try_claim() else {
+            let (reply, cell) = Reply::new();
+            self.post_operation(Operation::Close(reply));
+            return cell.wait(OPERATION_BOUND).ok().flatten().flatten();
+        };
+        let state = &mut *claim;
+        let finished = self.settle_operations(state);
+        let owner = if state.owner.as_ref().is_some_and(O::idle) {
+            state.owner.take()
+        } else {
+            None
+        };
         claim.release_seq_cst();
+        let delivered = Self::deliver_all(finished);
         self.hand_on();
+        if let Some(payload) = delivered {
+            resume_unwind(payload);
+        }
         owner
     }
 
@@ -265,9 +475,9 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
-    use std::time::Duration;
+    use std::time::Instant;
 
-    use euhedral_data_structures::queues::{Consumer, MpscQueue, Single};
+    use euhedral_data_structures::queues::MpscQueue;
 
     use crate::handoff::Handoff;
 
@@ -304,6 +514,8 @@ mod tests {
         busy: bool,
         /// Turns that post a message to the owner from inside the turn, which they are the holder of.
         repost: usize,
+        /// The turn panics, after it took in what arrived.
+        panics: bool,
     }
 
     struct Done {
@@ -330,6 +542,7 @@ mod tests {
                 claimed_inside: None,
                 busy: false,
                 repost: 0,
+                panics: false,
             }
         }
     }
@@ -368,6 +581,7 @@ mod tests {
                     address.post(1_000_000);
                 }
             }
+            assert!(!self.panics, "the turn panicked");
             if ended {
                 self.last = None;
             } else {
@@ -376,8 +590,12 @@ mod tests {
             self.inside.store(false, Ordering::SeqCst);
         }
 
-        fn take_finished(&mut self) -> Option<Arc<Done>> {
-            self.done.take()
+        fn take_finished(&mut self) -> Vec<Arc<Done>> {
+            self.done.take().into_iter().collect()
+        }
+
+        fn abandon(&mut self, _why: &str) -> Vec<Arc<Done>> {
+            self.done.take().into_iter().collect()
         }
 
         fn deliver(finished: Arc<Done>) {
@@ -458,10 +676,15 @@ mod tests {
         assert_eq!(overlaps.load(Ordering::SeqCst), 0, "two turns overlapped");
         assert_eq!(total.load(Ordering::SeqCst), POSTERS * EACH);
         // The last handled message's turn may still be running on a poster: the claim is taken when it ends.
+        let deadline = Instant::now() + Duration::from_secs(10);
         let mut handled = loop {
             if let Some(handled) = mailbox.with(|probe| mem::take(&mut probe.handled)) {
                 break handled;
             }
+            assert!(
+                Instant::now() < deadline,
+                "the claim was never given back after the last turn"
+            );
         };
         handled.sort_unstable();
         assert!(
@@ -645,12 +868,12 @@ mod tests {
     fn a_thread_outside_is_refused_while_a_request_is_in_flight_and_admitted_when_idle() {
         let (mailbox, _address, _handoffs) = queued(Probe::new);
         mailbox.with(|probe| probe.busy = true).expect("free");
-        assert!(mailbox.with_idle(|_| ()).is_none(), "looked at the owner mid-request");
+        assert!(mailbox.ask(true, |_| ()).is_none(), "looked at the owner mid-request");
         assert!(mailbox.close().is_none(), "ended the owner mid-request");
         mailbox
             .with(|probe| probe.busy = false)
             .expect("the refusals gave the claim back");
-        assert!(mailbox.with_idle(|_| ()).is_some());
+        assert!(mailbox.ask(true, |_| ()).is_some());
         assert!(mailbox.close().is_some());
     }
 
@@ -681,16 +904,173 @@ mod tests {
                 }
             });
         }
-        // The claim is busy while a post runs a turn: ask again until the owner is taken.
-        let owner = loop {
-            if let Some(owner) = mailbox.close() {
-                break owner;
-            }
-        };
+        // The claim may be held by a post's turn: the close is posted to the owner and answered after that turn.
+        let owner = mailbox
+            .close()
+            .expect("the close was applied although a turn held the claim");
         assert!(owner.idle());
         assert!(
             ended.wait(Duration::from_secs(10)).is_ok(),
             "a post did not return after the close"
+        );
+    }
+
+    /// The next frame handed to a worker, within the bound.
+    fn next_frame(handoffs: &mut Consumer<Work, Single>) -> Work {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(frame) = handoffs.poll() {
+                return frame;
+            }
+            assert!(Instant::now() < deadline, "no frame was handed to a worker");
+            thread::yield_now();
+        }
+    }
+
+    /// Runs every frame handed to a worker, and those they hand on.
+    fn run_frames(handoffs: &mut Consumer<Work, Single>) {
+        while let Some(frame) = handoffs.poll() {
+            frame();
+        }
+    }
+
+    /// A thread outside makes `call` while a stray turn holds the claim (the claim is held by this thread, which stands
+    /// for the turn), the turn ends, and a worker runs what the caller posted. Returns what `call` returned.
+    fn while_held<T: Send + 'static>(
+        mailbox: &Arc<Mailbox<Probe>>,
+        handoffs: &mut Consumer<Work, Single>,
+        call: impl FnOnce(Arc<Mailbox<Probe>>) -> T + Send + 'static,
+    ) -> T {
+        let mut caller = None;
+        let mut frame = None;
+        let held = Arc::clone(mailbox);
+        mailbox
+            .with(|_| {
+                assert!(held.with(|_| ()).is_none(), "the claim is held");
+                let mailbox = Arc::clone(&held);
+                caller = Some(thread::spawn(move || call(mailbox)));
+                // The caller's frame arrives while the claim is held: it found it held and posted.
+                frame = Some(next_frame(handoffs));
+            })
+            .expect("free");
+        frame.expect("a frame")();
+        run_frames(handoffs);
+        caller.expect("a caller").join().expect("the caller returned")
+    }
+
+    #[test]
+    fn a_request_begun_while_a_stray_turn_holds_the_claim_is_admitted() {
+        let (mailbox, _address, mut handoffs) = queued(Probe::new);
+        let admitted = Handoff::<bool>::new();
+        let answer = Arc::clone(&admitted);
+        // The listener of a request that just ended starts the next one while a stray turn holds the claim.
+        let begin = |probe: &mut Probe| {
+            let free = !probe.busy;
+            probe.busy = true;
+            free
+        };
+        let held = Arc::clone(&mailbox);
+        mailbox
+            .with(move |_| match held.try_with(begin) {
+                Ok(_) => panic!("the claim was not held"),
+                Err(begin) => held.defer(move |probe| answer.send(begin(probe))),
+            })
+            .expect("free");
+        run_frames(&mut handoffs);
+        assert_eq!(
+            admitted.wait(BOUND),
+            Ok(true),
+            "the request was refused for a held claim"
+        );
+        assert_eq!(mailbox.with(|probe| probe.busy), Some(true));
+        // A request that finds one running is refused: by the owner's state.
+        let refused = Handoff::<bool>::new();
+        let answer = Arc::clone(&refused);
+        mailbox.defer(move |probe| answer.send(begin(probe)));
+        run_frames(&mut handoffs);
+        assert_eq!(refused.wait(BOUND), Ok(false));
+    }
+
+    #[test]
+    fn an_inspection_while_a_stray_turn_holds_the_claim_sees_the_state() {
+        let (mailbox, _address, mut handoffs) = queued(Probe::new);
+        mailbox.with(|probe| probe.handled.push(42)).expect("free");
+        let idle = while_held(&mailbox, &mut handoffs, |mailbox| {
+            mailbox.ask(true, |probe| probe.handled.clone())
+        });
+        assert_eq!(idle, Some(vec![42]), "an idle owner was not looked at");
+        mailbox.with(|probe| probe.busy = true).expect("free");
+        let busy = while_held(&mailbox, &mut handoffs, |mailbox| {
+            mailbox.ask(true, |probe| probe.handled.clone())
+        });
+        assert_eq!(busy, None, "a running request was looked at");
+    }
+
+    #[test]
+    fn a_close_while_a_stray_turn_holds_the_claim_takes_the_owner() {
+        let (mailbox, _address, mut handoffs) = queued(Probe::new);
+        let owner = while_held(&mailbox, &mut handoffs, |mailbox| mailbox.close());
+        assert!(owner.is_some(), "the close was dropped");
+        assert!(mailbox.with(|_| ()).is_none(), "the mailbox is closed");
+    }
+
+    #[test]
+    fn a_withdrawal_while_the_claim_is_held_is_applied() {
+        let (mailbox, _address, mut handoffs) = queued(Probe::new);
+        mailbox.with(|probe| probe.busy = true).expect("free");
+        let held = Arc::clone(&mailbox);
+        mailbox
+            .with(move |_| held.tell(|probe| probe.busy = false))
+            .expect("free");
+        run_frames(&mut handoffs);
+        assert_eq!(
+            mailbox.with(|probe| probe.busy),
+            Some(false),
+            "the withdrawal was dropped"
+        );
+    }
+
+    #[test]
+    fn a_hand_off_no_worker_takes_strands_nothing() {
+        let (mailbox, _address) = mailbox_of(Probe::new, Box::new(|_| false));
+        mailbox.with(|probe| probe.busy = true).expect("free");
+        let held = Arc::clone(&mailbox);
+        // An operation and a message arrive while the claim is held: the release finds no worker and runs them itself.
+        mailbox
+            .with(move |_| {
+                held.tell(|probe| probe.busy = false);
+                held.post(5);
+            })
+            .expect("free");
+        assert_eq!(
+            mailbox.with(|probe| (probe.busy, probe.handled.clone())),
+            Some((false, vec![5]))
+        );
+        // A post that finds the claim free and no worker is run by the poster.
+        mailbox.defer(|probe| probe.busy = true);
+        assert_eq!(mailbox.with(|probe| probe.busy), Some(true));
+    }
+
+    #[test]
+    fn a_panic_past_the_owners_handling_tells_the_listener_and_frees_the_claim() {
+        let (mailbox, address, _handoffs) = queued(Probe::new);
+        let admitted = Handoff::new();
+        mailbox
+            .with(|probe| {
+                probe.panics = true;
+                probe.done = Some(Arc::new(Done {
+                    address: Arc::clone(&address),
+                    admitted: Arc::clone(&admitted),
+                    panics: false,
+                }));
+            })
+            .expect("free");
+        let result = panic::catch_unwind(AssertUnwindSafe(|| mailbox.post(1)));
+        assert!(result.is_err(), "the panic was swallowed");
+        assert_eq!(
+            admitted.wait(BOUND),
+            Ok(true),
+            "the listener was not told, or the claim was still held when it was"
         );
     }
 }

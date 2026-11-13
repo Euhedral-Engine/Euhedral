@@ -45,8 +45,13 @@ pub use request::{
     AdmissionError, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
 pub(crate) use source::GREEDY_DEPTH;
-use source::{Drafts, Message, Owner, Retired, Shared};
+use source::{Drafts, Message, Owner, Rejected, Retired, Shared};
 pub use teacher_forced::LogitsSink;
+
+/// The engine's admission of a request, as the answer `Owner::begin` takes.
+fn admit(core: &Core) -> Result<Units, AdmissionError> {
+    core.admit().map_err(|error| AdmissionError::Engine(error.to_string()))
+}
 
 /// What the engine keeps for generating: the plan's graphs on the runtime's lanes, and the owner of the sequence.
 pub(crate) struct Generation {
@@ -202,7 +207,8 @@ impl Generation {
 
     /// Starts `request` on the engine's sequence.
     pub(crate) fn generate(&self, request: GenerationRequest) -> Result<(), AdmissionError> {
-        self.run(|owner, units| owner.begin(units, request))
+        let core = Arc::clone(&self.shared.core);
+        self.start(move |owner| owner.begin(admit(&core), request))
     }
 
     /// Starts a teacher-forced run on the engine's sequence.
@@ -212,28 +218,40 @@ impl Generation {
         forced: Vec<u32>,
         sink: Box<dyn LogitsSink>,
     ) -> Result<(), AdmissionError> {
-        self.run(|owner, units| owner.begin_forced(units, prefix, forced, sink))
+        let core = Arc::clone(&self.shared.core);
+        self.start(move |owner| owner.begin_forced(admit(&core), prefix, forced, sink))
     }
 
-    /// Claims the owner, if no turn or other claim holds it, and starts the request `begin` makes. The first turn runs
-    /// on a worker, never on the caller's thread.
-    fn run(&self, begin: impl FnOnce(&mut Owner, Units) -> Result<(), AdmissionError>) -> Result<(), AdmissionError> {
-        let core = &self.shared.core;
-        let started = self
-            .mailbox
-            .with(|owner| {
-                let units = core
-                    .admit()
-                    .map_err(|error| AdmissionError::Engine(error.to_string()))?;
-                begin(owner, units)
-            })
-            .ok_or(AdmissionError::Busy)?;
-        if started.is_ok() && !self.mailbox.nudge() {
-            // No worker will take frames: the request would never run. Give it up.
-            self.mailbox.with(Owner::withdraw);
-            return Err(AdmissionError::Engine("the engine is shutting down".to_string()));
+    /// Starts the request `begin` makes. Whether it is admitted depends on the owner's state alone: `Busy` means a
+    /// request is running, never that a turn holds the claim. With the claim free the answer is the return value, and
+    /// the first turn runs on a worker, never on the caller's thread. With the claim held the request is posted to the
+    /// owner and this returns `Ok` at once (no wait: a listener calls this from a worker); a request the owner then
+    /// refuses has its listener or sink told, as a failed outcome, after the claim is released.
+    fn start(
+        &self,
+        begin: impl FnOnce(&mut Owner) -> Result<(), Rejected> + Send + 'static,
+    ) -> Result<(), AdmissionError> {
+        match self.mailbox.try_with(begin) {
+            Ok(Some(started)) => {
+                let started = started.map_err(|rejected| rejected.error);
+                if started.is_ok() && !self.mailbox.nudge() {
+                    // No worker will take frames: the request would never run. Give it up; applied whoever holds the
+                    // claim.
+                    self.mailbox.tell(Owner::withdraw);
+                    return Err(AdmissionError::Engine("the engine is shutting down".to_string()));
+                }
+                started
+            }
+            Ok(None) => Err(AdmissionError::Engine("the engine is shut down".to_string())),
+            Err(begin) => {
+                self.mailbox.defer(move |owner| {
+                    if let Err(rejected) = begin(owner) {
+                        owner.reject(rejected);
+                    }
+                });
+                Ok(())
+            }
         }
-        started
     }
 
     /// The test hook: the owner panics at the end of the turn in which a request has admitted `quanta` quanta.
@@ -251,12 +269,16 @@ impl Generation {
     /// The test hook: the engine records no graphs from now on. Only while no request runs.
     #[cfg(feature = "test-oracles")]
     pub(crate) fn disable_graphs(&self) -> bool {
-        self.mailbox.with_idle(Owner::disable_graphs).is_some()
+        self.mailbox.ask(true, Owner::disable_graphs).is_some()
     }
 
-    /// Looks at the sequence while no request holds it.
-    pub(crate) fn inspect<R>(&self, read: impl FnOnce(&SequenceState) -> R) -> Option<R> {
-        self.mailbox.with_idle(|owner| read(owner.sequence()))
+    /// Looks at the sequence while no request holds it: `None` only while one does (or the engine is closed), never
+    /// because a turn holds the claim at the moment. Waits at most the mailbox's bound: not for a lattice worker.
+    pub(crate) fn inspect<R: Send + 'static>(
+        &self,
+        read: impl FnOnce(&SequenceState) -> R + Send + 'static,
+    ) -> Option<R> {
+        self.mailbox.ask(true, move |owner| read(owner.sequence()))
     }
 
     /// Ends the sequence. Nothing may be running: with a request in flight the sequence stays allocated, and says so.
