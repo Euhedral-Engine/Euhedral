@@ -34,8 +34,10 @@ pub const DEFAULT_COMPILE_STACK_BYTES: usize = 256 << 20;
 /// Why a kernel cannot be launched at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Unavailable {
-    /// The module compiles only for the architecture-specific target, which exists on compute capability 12.x only.
+    /// The module compiles only for the architecture-specific target, which this device or the bundled compiler does not have.
     ArchitectureSpecificTarget,
+    /// The device refused the dynamic shared memory the kernel's launches need; the reason.
+    SharedOptInRefused(String),
     /// The module does not compile; the module's name and the compiler's log.
     Compile { module: &'static str, log: String },
     /// The module compiled and does not contain the kernel's symbol.
@@ -48,6 +50,12 @@ impl fmt::Display for Unavailable {
             Unavailable::ArchitectureSpecificTarget => "needs the architecture-specific compile target (sm_XYa)",
             Unavailable::Compile { module, log } => {
                 return write!(formatter, "module {module} does not compile: {log}");
+            }
+            Unavailable::SharedOptInRefused(reason) => {
+                return write!(
+                    formatter,
+                    "the device refused the dynamic shared memory opt-in: {reason}"
+                );
             }
             Unavailable::SymbolMissing => "the compiled module has no such symbol",
         })
@@ -351,7 +359,10 @@ pub fn load(gpu: &Arc<CudaGpu>, sources: &KernelSources) -> Result<KernelTable, 
     if !matches!(nvrtc.target_for(gpu.arch())?, Target::Cubin(_)) {
         return Err(LoadError::NoMachineCode);
     }
-    let (modules, timings) = compile_all(gpu, sources)?;
+    // The architecture-specific modules need a compute capability 12.x device (block-scaled FP4 `mma.sync`) and a compiler
+    // that lists its `sm_XYa` target; without either only those modules are unavailable, as in the native loader.
+    let architecture_target = gpu.arch().0 == 12 && nvrtc.arch_specific_target_for(gpu.arch()).is_ok();
+    let (modules, timings) = compile_all(gpu, sources, architecture_target)?;
     let mut slots = Vec::with_capacity(KERNELS.len());
     for spec in &KERNELS {
         let compiled = modules
@@ -374,8 +385,7 @@ pub fn load(gpu: &Arc<CudaGpu>, sources: &KernelSources) -> Result<KernelTable, 
                         gpu: Arc::clone(gpu),
                     })
                 }
-                Err(GpuError::NotFound(_)) => Slot::Unavailable(Unavailable::SymbolMissing),
-                Err(other) => return Err(LoadError::Gpu(other)),
+                Err(error) => Slot::Unavailable(lookup_failure(error)?),
             },
             Some(Compiled::Unavailable(reason)) => Slot::Unavailable(reason.clone()),
             None => Slot::Unavailable(Unavailable::SymbolMissing),
@@ -385,6 +395,21 @@ pub fn load(gpu: &Arc<CudaGpu>, sources: &KernelSources) -> Result<KernelTable, 
     Ok(KernelTable { slots, timings })
 }
 
+/// What a failed kernel lookup means: a missing symbol or a refused shared-memory opt-in make that kernel unavailable (the
+/// native library makes only that family unavailable); anything else, a device fault included, fails the load.
+fn lookup_failure(error: GpuError) -> Result<Unavailable, LoadError> {
+    match error {
+        GpuError::NotFound(_) => Ok(Unavailable::SymbolMissing),
+        GpuError::Invalid(reason) => Ok(Unavailable::SharedOptInRefused(reason)),
+        other => Err(LoadError::Gpu(other)),
+    }
+}
+
+/// Why `module` cannot be built on this device, when it cannot.
+fn module_gate(module: Module, architecture_target: bool) -> Option<Unavailable> {
+    (module.architecture_specific() && !architecture_target).then_some(Unavailable::ArchitectureSpecificTarget)
+}
+
 type Compilations = (Vec<(Module, Compiled)>, Vec<ModuleTiming>);
 
 /// Compiles each distinct module, in first-appearance order, on a thread with the configured stack.
@@ -392,7 +417,11 @@ type Compilations = (Vec<(Module, Compiled)>, Vec<ModuleTiming>);
     clippy::disallowed_methods,
     reason = "startup: NVRTC needs a deep stack the caller's thread may not have, and loading waits for the compile by nature"
 )]
-fn compile_all(gpu: &Arc<CudaGpu>, sources: &KernelSources) -> Result<Compilations, LoadError> {
+fn compile_all(
+    gpu: &Arc<CudaGpu>,
+    sources: &KernelSources,
+    architecture_target: bool,
+) -> Result<Compilations, LoadError> {
     scope(|scope| {
         let worker = Builder::new()
             .name("kernel-compile".to_owned())
@@ -405,7 +434,7 @@ fn compile_all(gpu: &Arc<CudaGpu>, sources: &KernelSources) -> Result<Compilatio
                         continue;
                     }
                     let started = Instant::now();
-                    let compiled = compile(gpu, sources, spec.module)?;
+                    let compiled = compile(gpu, sources, spec.module, architecture_target)?;
                     if matches!(compiled, Compiled::Module(_)) {
                         timings.push(ModuleTiming {
                             module: spec.module,
@@ -434,11 +463,14 @@ fn compile_all(gpu: &Arc<CudaGpu>, sources: &KernelSources) -> Result<Compilatio
     clippy::disallowed_methods,
     reason = "startup: the kernel source is read once, before any frame runs"
 )]
-fn compile(gpu: &Arc<CudaGpu>, sources: &KernelSources, module: Module) -> Result<Compiled, LoadError> {
-    // The architecture-specific variant exists for compute capability 12.x (block-scaled FP4 `mma.sync`), as in the
-    // native loader; on another device the module stays unavailable, as there.
-    if module.architecture_specific() && gpu.arch().0 != 12 {
-        return Ok(Compiled::Unavailable(Unavailable::ArchitectureSpecificTarget));
+fn compile(
+    gpu: &Arc<CudaGpu>,
+    sources: &KernelSources,
+    module: Module,
+    architecture_target: bool,
+) -> Result<Compiled, LoadError> {
+    if let Some(reason) = module_gate(module, architecture_target) {
+        return Ok(Compiled::Unavailable(reason));
     }
     let path = sources.share.join(module.root());
     let text = read_to_string(&path).map_err(|source| LoadError::Source { path, source })?;
@@ -497,6 +529,38 @@ mod tests {
                 .iter()
                 .all(|spec| sources().options(spec.module).arch_specific == spec.module.architecture_specific())
         );
+    }
+
+    #[test]
+    fn an_architecture_specific_module_is_unavailable_without_the_target_and_no_other_is() {
+        for module in [Module::Nvfp4Native, Module::TrellisFp8] {
+            assert_eq!(
+                module_gate(module, false),
+                Some(Unavailable::ArchitectureSpecificTarget)
+            );
+            assert_eq!(module_gate(module, true), None);
+        }
+        for module in [Module::Gdn, Module::Attention, Module::Trellis] {
+            assert_eq!(module_gate(module, false), None);
+        }
+    }
+
+    #[test]
+    fn a_refused_opt_in_or_missing_symbol_loses_one_kernel_and_a_fault_loses_the_load() {
+        assert_eq!(
+            lookup_failure(GpuError::NotFound("k".into())).unwrap(),
+            Unavailable::SymbolMissing
+        );
+        assert_eq!(
+            lookup_failure(GpuError::Invalid("k: the device refused".into())).unwrap(),
+            Unavailable::SharedOptInRefused("k: the device refused".into())
+        );
+        let fault = GpuError::Fault {
+            call: "cuFuncSetAttribute",
+            code: 700,
+            name: "fault".into(),
+        };
+        assert!(matches!(lookup_failure(fault), Err(LoadError::Gpu(_))));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::iter::repeat_n;
 use euhedral_gpu::cuda::CudaKernel;
 use euhedral_gpu::{
     Args, Dim3, GpuError, Interleave, L2Promotion, LaneEnqueue, Launch as Geometry, MAX_RANK, MapDataType, OobFill,
-    Swizzle, TiledMap,
+    Swizzle, TensorMap, TiledMap,
 };
 use thiserror::Error;
 
@@ -99,32 +99,45 @@ where
         launch.args.sizes(),
         resolved.parameter_sizes(),
     )?;
-    let geometry = Geometry {
-        grid: dim(launch.grid),
-        block: dim(launch.block),
-        shared_bytes: launch.shared_bytes,
-        programmatic: launch.programmatic,
-    };
+    let geometry = geometry(launch);
     ARGUMENTS.with_borrow_mut(|arguments| {
-        arguments.clear();
-        // The maps are the kernel's leading parameters; the driver encodes each for the launch, as the native wrapper does.
-        for map in launch.args.maps() {
-            let encoded = resolved
-                .tensor_map(&tiled_map(map))
-                .map_err(|source| EnqueueError::Gpu { name, source })?;
-            arguments.push(encoded);
-        }
-        for (index, (&word, &size)) in launch.args.words().iter().zip(launch.args.sizes()).enumerate() {
-            match size {
-                4 => arguments.push(word as u32),
-                8 => arguments.push(word),
-                size => return Err(EnqueueError::WordSize { name, index, size }),
-            };
-        }
+        fill_arguments(arguments, launch, |map| resolved.tensor_map(&tiled_map(map)))?;
         // SAFETY: the caller's contract; the arguments were checked against the kernel's parameter sizes above.
         unsafe { queue.launch(resolved.kernel(), geometry, arguments) }
             .map_err(|source| EnqueueError::Gpu { name, source })
     })
+}
+
+/// The launch's geometry; every launch the catalog marks is programmatic (it may overlap its predecessor's tail).
+fn geometry(launch: &Launch) -> Geometry {
+    Geometry {
+        grid: dim(launch.grid),
+        block: dim(launch.block),
+        shared_bytes: launch.shared_bytes,
+        programmatic: launch.programmatic,
+    }
+}
+
+/// Rewrites `arguments` as the launch's: the tensor maps first (the kernel's leading parameters, each encoded by
+/// `encode`, as the native wrapper has the driver encode them for each launch), then the words.
+fn fill_arguments(
+    arguments: &mut Args,
+    launch: &Launch,
+    mut encode: impl FnMut(&TensorMapPlan) -> Result<TensorMap, GpuError>,
+) -> Result<(), EnqueueError> {
+    let name = launch.kernel.name();
+    arguments.clear();
+    for map in launch.args.maps() {
+        arguments.push(encode(map).map_err(|source| EnqueueError::Gpu { name, source })?);
+    }
+    for (index, (&word, &size)) in launch.args.words().iter().zip(launch.args.sizes()).enumerate() {
+        match size {
+            4 => arguments.push(word as u32),
+            8 => arguments.push(word),
+            size => return Err(EnqueueError::WordSize { name, index, size }),
+        };
+    }
+    Ok(())
 }
 
 /// The description the native wrapper passes to `cuTensorMapEncodeTiled` for a planned map (`byte_map`,
@@ -188,10 +201,10 @@ fn check_parameter_sizes(
 
 #[cfg(test)]
 mod tests {
-    use euhedral_gpu::TensorMap;
-
     use super::*;
     use crate::DevicePtr;
+    use crate::kernel;
+    use crate::launch::catalog::Arguments;
     use crate::launch::nvfp4::{Nvfp4Layout, Nvfp4Operands, nvfp4_byte_size, plan_native};
 
     #[test]
@@ -320,5 +333,61 @@ mod tests {
                 Err(EnqueueError::ParameterSizes { .. })
             ));
         }
+    }
+
+    fn tile_launch() -> Launch {
+        let (rows, in_features, out_features) = (65, 512, 256);
+        // SAFETY: the plan only does arithmetic on the address and never dereferences it.
+        let at = |address: u64| unsafe { DevicePtr::from_raw(address) };
+        let operands = Nvfp4Operands {
+            input: at(0x1000),
+            weights: at(0x2000),
+            output: at(0x3000),
+            rows,
+            in_features,
+            out_features,
+            weights_byte_size: nvfp4_byte_size(out_features, in_features, Nvfp4Layout::Plain),
+        };
+        *plan_native(&operands, at(0x4000), u64::MAX, false)
+            .unwrap()
+            .launches()
+            .last()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_tensor_maps_are_pushed_before_the_words() {
+        let launch = tile_launch();
+        let mut arguments = Args::new();
+        let mut encoded = Vec::new();
+        fill_arguments(&mut arguments, &launch, |map| {
+            let map = TensorMap::fake(&tiled_map(map))?;
+            encoded.push(map);
+            Ok(map)
+        })
+        .unwrap();
+        // Three 128-byte maps, then scratch, weights, output and the three extents.
+        assert_eq!(arguments.len(), 9);
+        assert_eq!(arguments.sizes().take(3).collect::<Vec<_>>(), [128, 128, 128]);
+        for (index, map) in encoded.iter().enumerate() {
+            assert_eq!(arguments.read::<TensorMap>(index), Some(*map));
+        }
+        assert_eq!(arguments.read::<u64>(3), Some(0x4000));
+        assert_eq!(arguments.read::<u64>(4), Some(0x2000));
+        assert_eq!(arguments.read::<u32>(6), Some(65));
+        // The buffer is rewritten, not appended to.
+        fill_arguments(&mut arguments, &launch, |map| TensorMap::fake(&tiled_map(map))).unwrap();
+        assert_eq!(arguments.len(), 9);
+    }
+
+    #[test]
+    fn a_launch_the_catalog_marks_is_programmatic_and_one_it_does_not_is_not() {
+        let launch = |kernel| Launch::new(kernel, [1, 1, 1], [32, 1, 1], 0, Arguments::new());
+        let marked = launch(kernel!("euhedral_residual_add_bf16"));
+        assert!(marked.programmatic);
+        assert!(geometry(&marked).programmatic);
+        let unmarked = launch(kernel!("euhedral_nvfp4n_quantize_rows"));
+        assert!(!unmarked.programmatic);
+        assert!(!geometry(&unmarked).programmatic);
     }
 }

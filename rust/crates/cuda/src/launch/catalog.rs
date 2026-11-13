@@ -1195,8 +1195,10 @@ pub struct Launch {
     /// Dynamic shared bytes.
     pub shared_bytes: u32,
     pub args: Arguments,
-    /// Whether the launch may overlap its predecessor (programmatic dependent launch): true only for a kernel the
-    /// native library registers for it, and when the plan's caller allows it.
+    /// Whether the launch is a programmatic dependent launch (it may overlap its predecessor's tail): true for every
+    /// kernel the native library registers for it. The queue launches every flagged launch so; the native library does
+    /// so only while the kernel is among its first 64 registrations and the thread selected it. Output is the same,
+    /// because each such kernel begins by waiting on its predecessor; only the overlap timing can differ.
     pub programmatic: bool,
 }
 
