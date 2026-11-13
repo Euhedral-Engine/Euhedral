@@ -1,7 +1,7 @@
 //! The runner: prepares each scenario's prompts once, then runs its warmup iterations and its measured iterations on a
 //! started engine, one request at a time, and turns each into a row.
 //!
-//! The runner is called by the binary's main thread, which starts a request and waits for its latch; nothing else
+//! The runner is called by the binary's main thread, which starts a request and waits for its hand-off; nothing else
 //! waits. The measurement is taken by the [`Probe`], the request's listener: it stamps the engine's events on the
 //! worker that finds them and hands the whole [`Recorder`] to the main thread when the request ends, so no clock is
 //! read, and nothing is allocated for the record, in the timed path of the engine beyond the events themselves.
@@ -11,16 +11,16 @@ use std::env::consts;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
-use euhedral_graph::{Latch, LatchSetter};
-use euhedral_inference_engine::EngineRuntime;
 use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
 use euhedral_inference_engine::stages::QuantumKind;
+use euhedral_inference_engine::{EngineRuntime, Handoff};
 use euhedral_inference_tokenizer::Tokenizer;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::await_value;
 use crate::config::{ConfigError, Options, Scenario, SpeculationMode};
 use crate::metrics::{self, Ending, Phase, QuantumRecord, Recorder, Step};
 use crate::prompt::Prompt;
@@ -96,7 +96,7 @@ pub fn run_id(started: SystemTime, pid: u32) -> String {
 /// Hands the events of one request to a [`Recorder`] and the recorder to the waiting main thread.
 struct Probe {
     recorder: Option<Recorder>,
-    done: Option<LatchSetter<Recorder>>,
+    done: Option<Arc<Handoff<Recorder>>>,
 }
 
 /// The kind of a quantum for the benchmark. Every field access of a [`QuantumEvent`] is in this function and
@@ -114,6 +114,20 @@ fn phase_of(event: &QuantumEvent) -> Phase {
 /// block stays null; the speculative decoder's event fills it here.
 fn step_of(_event: &QuantumEvent) -> Option<Step> {
     None
+}
+
+impl Drop for Probe {
+    /// A probe dropped before its request finished hands over what it has, as a failed run, so `main` never waits for
+    /// a request that ended without a word.
+    fn drop(&mut self) {
+        if let (Some(mut recorder), Some(done)) = (self.recorder.take(), self.done.take()) {
+            recorder.finished = Some((
+                Instant::now(),
+                Ending::Failed("the listener was dropped before the request finished".to_string()),
+            ));
+            done.send(recorder);
+        }
+    }
 }
 
 impl GenerationListener for Probe {
@@ -149,7 +163,7 @@ impl GenerationListener for Probe {
             FinishReason::Length | FinishReason::Stop | FinishReason::ContextFull => Ending::Completed,
         };
         recorder.finished = Some((at, ending));
-        done.set(recorder);
+        done.send(recorder);
     }
 }
 
@@ -247,7 +261,8 @@ impl Iteration<'_> {
     /// One generation of `prompt` in a fresh sequence, measured.
     fn run(&self, scenario: &Scenario, prompt: &Prompt, warmup: bool, index: usize) -> Row {
         let before = self.gpu_free();
-        let (done, waiting) = Latch::new();
+        let done = Handoff::new();
+        let waiting = Arc::clone(&done);
         let requested = scenario.requested_new_tokens;
         let entry = Instant::now();
         let mut recorder = Recorder::new(entry);
@@ -278,7 +293,7 @@ impl Iteration<'_> {
             }),
         };
         let recorder = match self.runtime.generate(request) {
-            Ok(()) => waiting.wait(),
+            Ok(()) => await_value(&waiting),
             Err(error) => {
                 // The refused request took the probe and its recorder with it.
                 let mut refused = Recorder::new(entry);

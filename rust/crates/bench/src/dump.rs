@@ -11,12 +11,13 @@ use std::fs;
 use std::mem;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
-use euhedral_graph::{Latch, LatchSetter};
-use euhedral_inference_engine::EngineRuntime;
 use euhedral_inference_engine::generation::{FinishReason, GenerationOutcome, LogitsSink};
+use euhedral_inference_engine::{EngineRuntime, Handoff};
 use euhedral_inference_tokenizer::Tokenizer;
 
+use crate::await_value;
 use crate::config::ConfigError;
 use crate::prompt::chat;
 
@@ -51,17 +52,38 @@ struct Report {
     row_bytes: usize,
     steps: usize,
     fault: Option<String>,
-    done: Option<LatchSetter<Delivered>>,
+    done: Option<Arc<Handoff<Delivered>>>,
 }
 
 impl Report {
-    fn new(bytes: Vec<u8>, row_bytes: usize, done: LatchSetter<Delivered>) -> Report {
+    fn new(bytes: Vec<u8>, row_bytes: usize, done: Arc<Handoff<Delivered>>) -> Report {
         Report {
             bytes,
             row_bytes,
             steps: 0,
             fault: None,
             done: Some(done),
+        }
+    }
+}
+
+impl Drop for Report {
+    /// A report dropped before its run finished is delivered as a fault, so `main` never waits for a run that ended
+    /// without a word.
+    fn drop(&mut self) {
+        if let Some(done) = self.done.take() {
+            let outcome = GenerationOutcome {
+                reason: FinishReason::Failed("the report was dropped before the run finished".to_string()),
+                prompt_tokens: 0,
+                generated: 0,
+                elapsed: Duration::ZERO,
+            };
+            done.send((
+                mem::take(&mut self.bytes),
+                self.steps,
+                Some("the report was dropped before the run finished".to_string()),
+                outcome,
+            ));
         }
     }
 }
@@ -88,7 +110,7 @@ impl LogitsSink for Report {
 
     fn finished(&mut self, outcome: GenerationOutcome) {
         if let Some(done) = self.done.take() {
-            done.set((mem::take(&mut self.bytes), self.steps, self.fault.take(), outcome));
+            done.send((mem::take(&mut self.bytes), self.steps, self.fault.take(), outcome));
         }
     }
 }
@@ -126,11 +148,12 @@ pub fn teacher_forced_report(
     let mut bytes = Vec::with_capacity(8 + steps * (4 + 2 * vocabulary));
     bytes.extend_from_slice(&(steps as i32).to_le_bytes());
     bytes.extend_from_slice(&(vocabulary as i32).to_le_bytes());
-    let (done, waiting) = Latch::new();
+    let done = Handoff::new();
+    let waiting = Arc::clone(&done);
     runtime
         .teacher_forced(prefix, forced, Box::new(Report::new(bytes, 2 * vocabulary, done)))
         .or_else(|error| invalid(format!("the run was refused: {error}")))?;
-    accept(waiting.wait(), steps)
+    accept(await_value(&waiting), steps)
 }
 
 /// Writes the report.
@@ -162,13 +185,14 @@ mod tests {
 
     /// Drives a report with `rows` as `(step, logits bytes)` and returns what `teacher_forced_report` would decide.
     fn run(rows: &[(usize, usize)], steps: usize, generated: usize) -> Result<Vec<u8>, ConfigError> {
-        let (done, waiting) = Latch::new();
+        let done = Handoff::new();
+        let waiting = Arc::clone(&done);
         let mut report = Report::new(Vec::new(), 4, done);
         for (step, width) in rows {
             report.row(*step, 7, &vec![0u8; *width]);
         }
         report.finished(outcome(generated));
-        accept(waiting.wait(), steps)
+        accept(await_value(&waiting), steps)
     }
 
     fn message(result: Result<Vec<u8>, ConfigError>) -> String {

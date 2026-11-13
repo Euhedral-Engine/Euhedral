@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
-use euhedral_graph::OwnedFile;
+use euhedral_io::OwnedFile;
 use thiserror::Error;
 
 /// The first bytes of the file.

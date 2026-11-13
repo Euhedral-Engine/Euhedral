@@ -6,18 +6,20 @@
 //! its own id hash, so the steps spread over the CPUs. Each frame stores its step's values in its own slots of the
 //! run's shared state. Nothing waits and nothing locks: the state is read-only to the frames except for the atomic
 //! slots, and the run ends when the last frame lets go of it. Its `Drop` hands the values (or the first fault) to the
-//! latch the caller waits on, wherever that frame ran.
+//! hand-off the caller waits on, wherever that frame ran.
 
 use std::fmt;
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
-use euhedral_graph::{AsyncIo, IoDoneOwned, Lake, Latch, LatchSetter, LatchWaiter, OwnedFile, RawFile, UnitGuard};
+use euhedral_graph::{Lake, UnitGuard};
 use euhedral_hashing::hasher_api;
-use euhedral_inference_engine::EngineRuntime;
-use euhedral_inference_engine::generation::{GenerationOutcome, LogitsSink};
+use euhedral_inference_engine::generation::{FinishReason, GenerationOutcome, LogitsSink};
+use euhedral_inference_engine::{EngineRuntime, Handoff};
+use euhedral_io::{AsyncIo, IoDoneOwned, OwnedFile, RawFile};
 
 use crate::config::ConfigError;
 
@@ -75,7 +77,7 @@ struct Run {
     /// Which steps stored their values: a frame that panics or is dropped leaves its step unset.
     computed: Vec<AtomicBool>,
     fault: OnceLock<String>,
-    done: Option<LatchSetter<RunValues>>,
+    done: Option<Arc<Handoff<RunValues>>>,
     /// Held until the run ends: the host lake takes frames only while a unit is admitted.
     _unit: UnitGuard,
 }
@@ -104,7 +106,7 @@ impl Drop for Run {
                     .map(|slot| f64::from_bits(slot.load(Ordering::Relaxed)))
                     .collect()),
             };
-            done.set(result);
+            done.send(result);
         }
     }
 }
@@ -183,7 +185,7 @@ pub struct RowSink {
     run: Arc<Run>,
     hidden: Vec<u8>,
     steps: usize,
-    finished: Option<LatchSetter<GenerationOutcome>>,
+    finished: Option<Arc<Handoff<GenerationOutcome>>>,
 }
 
 impl fmt::Debug for RowSink {
@@ -194,20 +196,20 @@ impl fmt::Debug for RowSink {
 
 impl RowSink {
     /// A sink for a run of `steps` steps of `task`. `io` reads the task's reference records; the steps' work runs in
-    /// `host`. The first latch is set with the engine's outcome when its run ends, the second with the values once every
+    /// `host`. The first hand-off is sent with the engine's outcome when its run ends, the second with the values once every
     /// step has been computed. Admits a unit on `host` for the run.
     pub fn new(
         io: Arc<AsyncIo>,
         host: Arc<Lake>,
         task: Arc<dyn RowTask>,
         steps: usize,
-    ) -> Result<(RowSink, LatchWaiter<GenerationOutcome>, LatchWaiter<RunValues>), ConfigError> {
+    ) -> Result<(RowSink, Arc<Handoff<GenerationOutcome>>, Arc<Handoff<RunValues>>), ConfigError> {
         let unit = host
             .admit()
             .map_err(|error| ConfigError::Invalid(format!("the host lake would not take work: {error}")))?;
         let fields = task.fields();
-        let (finished, engine) = Latch::new();
-        let (done, values) = Latch::new();
+        let (finished, done) = (Handoff::new(), Handoff::new());
+        let (engine, values) = (Arc::clone(&finished), Arc::clone(&done));
         let run = Arc::new(Run {
             task,
             io,
@@ -240,6 +242,20 @@ fn offer(run: Arc<Run>, input: RowInput) {
     let work = frame(Kind::Computed, step, move || compute(&held, &input));
     if host.offer(work).is_err() {
         run.fail(format!("the host lake refused the work of step {step}"));
+    }
+}
+
+impl Drop for RowSink {
+    /// A sink dropped before the engine finished its run reports the run as failed, so the caller never waits for it.
+    fn drop(&mut self) {
+        if let Some(finished) = self.finished.take() {
+            finished.send(GenerationOutcome {
+                reason: FinishReason::Failed("the sink was dropped before the run finished".to_string()),
+                prompt_tokens: 0,
+                generated: 0,
+                elapsed: Duration::ZERO,
+            });
+        }
     }
 }
 
@@ -295,19 +311,19 @@ impl LogitsSink for RowSink {
 
     fn finished(&mut self, outcome: GenerationOutcome) {
         if let Some(finished) = self.finished.take() {
-            finished.set(outcome);
+            finished.send(outcome);
         }
     }
 }
 
-/// Starts a teacher-forced run of `task` on `runtime`. Returns the latch of the engine's outcome and the latch of the
+/// Starts a teacher-forced run of `task` on `runtime`. Returns the hand-off of the engine's outcome and the hand-off of the
 /// values, which is set once the engine has finished and every step is computed. The caller waits for them.
 pub fn start(
     runtime: &Arc<EngineRuntime>,
     prefix: Vec<u32>,
     forced: Vec<u32>,
     task: Arc<dyn RowTask>,
-) -> Result<(LatchWaiter<GenerationOutcome>, LatchWaiter<RunValues>), ConfigError> {
+) -> Result<(Arc<Handoff<GenerationOutcome>>, Arc<Handoff<RunValues>>), ConfigError> {
     let (sink, engine, values) =
         RowSink::new(Arc::clone(runtime.io()), Arc::clone(runtime.host()), task, forced.len())?;
     runtime
