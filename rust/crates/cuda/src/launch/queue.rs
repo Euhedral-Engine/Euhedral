@@ -108,6 +108,7 @@ where
         grid: dim(launch.grid),
         block: dim(launch.block),
         shared_bytes: launch.shared_bytes,
+        programmatic: false,
     };
     ARGUMENTS.with_borrow_mut(|arguments| {
         arguments.clear();

@@ -279,6 +279,7 @@ impl KernelSources {
             headers: Vec::new(),
             cache_dir: self.cache_path(),
             compiler: self.compiler.clone(),
+            arch_specific: false,
         }
     }
 }
