@@ -446,8 +446,8 @@ impl EngineRuntime {
         &self.core.pool
     }
 
-    /// The buffers the sequence's caches freed in stream order when their last holder let go; the generation source
-    /// reaps it (`RetireList::reap`) when it polls the lanes.
+    /// The buffers the sequence's caches freed in stream order when their last holder let go. Whoever holds the list
+    /// reaps it (`RetireList::reap`); the engine's own generation does not.
     pub fn retire_list(&self) -> &Arc<RetireList> {
         &self.core.retire
     }

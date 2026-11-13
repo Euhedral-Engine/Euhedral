@@ -397,6 +397,20 @@ impl Owner {
         }
     }
 
+    /// Gives up a request that began and whose first turn will not run, because no worker takes frames: nothing was
+    /// admitted yet, so dropping it leaves nothing on the device. The listener hears nothing: the caller learns from
+    /// the error it is given.
+    pub(crate) fn withdraw(&mut self) {
+        match self.run.take() {
+            Some(run) if run.in_flight.is_empty() => {}
+            Some(run) => {
+                log::error!("a request with quanta in flight cannot be withdrawn");
+                self.run = Some(run);
+            }
+            None => {}
+        }
+    }
+
     /// The sequence, for a look at its state between requests.
     pub(crate) fn sequence(&self) -> &SequenceState {
         &self.sequence
@@ -690,23 +704,21 @@ impl Owner {
     }
 
     /// Keeps `quantum` until the work queued on the owner's lane for it has run. A frame posts to the owner when it
-    /// has, so that the turn that follows lets it go (and a request that waits for it ends).
+    /// has, so that the turn that follows lets it go (and a request that waits for it ends). The marker is looked at
+    /// once: reached, the quantum goes now; not, the frame is registered, and it fires even if the marker is reached
+    /// the next instant.
     fn park(&mut self, quantum: Quantum, retained: KvRetained) {
-        let marker = quantum.prepared;
+        let core = &self.shared.core;
+        let Some(marker) = quantum.prepared.filter(|marker| !core.lanes.reached(*marker)) else {
+            return;
+        };
         self.parked.push(Parked {
             quantum,
             _retained: retained,
         });
-        self.reap();
-        if let Some(marker) = marker
-            && !self.shared.core.lanes.reached(marker)
-        {
-            let address = Arc::clone(&self.shared.address);
-            self.shared
-                .core
-                .completions
-                .after_marker(marker, step_frame(move || address.post(Message::Reaped)));
-        }
+        let address = Arc::clone(&self.shared.address);
+        core.completions
+            .after_marker(marker, step(Kind::Reaped, 0, move || address.post(Message::Reaped)));
     }
 
     /// Ends the request with a failure.
@@ -1178,5 +1190,9 @@ impl Turn for Owner {
 
     fn deliver(finished: Finished) {
         finished.deliver();
+    }
+
+    fn idle(&self) -> bool {
+        self.run.is_none() && self.parked.is_empty() && self.finished.is_none()
     }
 }

@@ -40,7 +40,7 @@ use crate::workspace::Workspace;
 pub use acceptance::{Accepted, accept};
 pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
 pub use listener::GenerationListener;
-use mailbox::{Address, Mailbox};
+use mailbox::{Address, Mailbox, Spawn};
 pub use request::{
     AdmissionError, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
@@ -53,8 +53,6 @@ pub(crate) struct Generation {
     shared: Arc<Shared>,
     /// The owner, and the messages posted to it.
     mailbox: Arc<Mailbox<Owner>>,
-    /// Routes the frames that start the owner's first turn over the lake's sinks.
-    nudges: AtomicU64,
 }
 
 impl fmt::Debug for Generation {
@@ -110,16 +108,22 @@ impl Generation {
             settle_after_speculation: AtomicBool::new(false),
         });
         let cache = GraphCache::with_capacity(core.settings.kernels.graphs.captures_per_view as usize);
+        // A frame that drives the owner from a thread that must not run its turn, or after a frame's turns are used:
+        // unordered, so that it may run on any worker.
+        let stages = Arc::clone(&core.stages);
+        let seeds = AtomicU64::new(0);
+        let spawn: Spawn = Box::new(move |work| {
+            let mut frame = step(Kind::Owner, 0, work);
+            frame.header_mut().randomize_hash(seeds.fetch_add(1, Ordering::Relaxed));
+            stages.offer(frame).is_ok()
+        });
         let mailbox = Arc::new(Mailbox::new(
             Owner::new(Arc::clone(&shared), sequence, cache, inbox),
             producer,
+            spawn,
         ));
         address.set(&mailbox);
-        Ok(Generation {
-            shared,
-            mailbox,
-            nudges: AtomicU64::new(0),
-        })
+        Ok(Generation { shared, mailbox })
     }
 
     /// The stage graphs of the model's plan, whose quanta retire into the owner's mailbox.
@@ -215,7 +219,7 @@ impl Generation {
     /// on a worker, never on the caller's thread.
     fn run(&self, begin: impl FnOnce(&mut Owner, Units) -> Result<(), AdmissionError>) -> Result<(), AdmissionError> {
         let core = &self.shared.core;
-        let (started, waiting) = self
+        let started = self
             .mailbox
             .with(|owner| {
                 let units = core
@@ -224,24 +228,12 @@ impl Generation {
                 begin(owner, units)
             })
             .ok_or(AdmissionError::Busy)?;
-        if started.is_ok() || waiting {
-            self.nudge()?;
+        if started.is_ok() && !self.mailbox.nudge() {
+            // No worker will take frames: the request would never run. Give it up.
+            self.mailbox.with(Owner::withdraw);
+            return Err(AdmissionError::Engine("the engine is shutting down".to_string()));
         }
         started
-    }
-
-    /// Offers the lake a frame that drives the owner, for a thread that is not a worker: the turn runs on a worker.
-    /// Unordered, so that it may run on any.
-    fn nudge(&self) -> Result<(), AdmissionError> {
-        let mailbox = Arc::clone(&self.mailbox);
-        let mut frame = step(Kind::Owner, 0, move || mailbox.drive());
-        frame
-            .header_mut()
-            .randomize_hash(self.nudges.fetch_add(1, Ordering::Relaxed));
-        self.shared.core.stages.offer(frame).map_err(|_| {
-            log::error!("the stages lake took no frame to run the owner's turn");
-            AdmissionError::Engine("the engine is shutting down".to_string())
-        })
     }
 
     /// The test hook: the owner panics at the end of the turn in which a request has admitted `quanta` quanta.
@@ -259,22 +251,12 @@ impl Generation {
     /// The test hook: the engine records no graphs from now on. Only while no request runs.
     #[cfg(feature = "test-oracles")]
     pub(crate) fn disable_graphs(&self) -> bool {
-        self.claimed(Owner::disable_graphs).is_some()
+        self.mailbox.with_idle(Owner::disable_graphs).is_some()
     }
 
     /// Looks at the sequence while no request holds it.
     pub(crate) fn inspect<R>(&self, read: impl FnOnce(&SequenceState) -> R) -> Option<R> {
-        self.claimed(|owner| read(owner.sequence()))
-    }
-
-    /// Runs `work` on the owner while no turn or other claim holds it; a message that arrived meanwhile gets its turn
-    /// on a worker.
-    fn claimed<R>(&self, work: impl FnOnce(&mut Owner) -> R) -> Option<R> {
-        let (out, waiting) = self.mailbox.with(work)?;
-        if waiting && self.nudge().is_err() {
-            log::error!("a message waits for the owner and no worker will take it");
-        }
-        Some(out)
+        self.mailbox.with_idle(|owner| read(owner.sequence()))
     }
 
     /// Ends the sequence. Nothing may be running: with a request in flight the sequence stays allocated, and says so.
