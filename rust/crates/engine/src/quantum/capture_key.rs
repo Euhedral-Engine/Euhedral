@@ -7,7 +7,7 @@
 //! what the Rust engine bakes in beyond it: the allocation serials of the page tables (a table the cache outgrew is
 //! another allocation), the host pages the staging copies span, and the rows each GDN layer replays first.
 
-use euhedral_hashing::hasher_api::hash_bytes;
+use euhedral_hashing::hasher_api::hash_bytes_with_seed;
 use euhedral_inference_cuda::AllocationId;
 
 use crate::plan::View;
@@ -69,15 +69,16 @@ impl CaptureKey {
             && self.replay_rows == other.replay_rows
             && self.buffer_generations == other.buffer_generations
     }
-    /// A 64-bit digest of every field of the key, for a cache keyed by a fixed-width integer.
+    /// A 128-bit digest of every field of the key, for a cache that replays a hit without checking the body.
     ///
     /// The key is destructured without `..`, so a field added to it does not compile until it is hashed here. Each
     /// field is written at a fixed width, enums with a tag and options with a presence byte, and each variable-length
     /// part with its length first, so no two keys differ in their bytes without differing in the digest's input. The
-    /// digest is xxHash64 of those bytes (`euhedral-hashing`), which is fixed by value and does not depend on the
+    /// digest is built from two xxHash64 passes (`euhedral-hashing` has no 128-bit hash) over those bytes with two different
+    /// fixed seeds, the first in the high half and the second in the low half. xxHash64 is fixed by value and does not depend on the
     /// process, the platform's endianness or the hasher's random state: it is stable across processes and runs. Equal
-    /// keys give equal digests; distinct keys collide only by chance of a 64-bit hash.
-    pub fn digest(&self) -> u64 {
+    /// keys give equal digests; distinct keys collide only by chance of a 128-bit hash.
+    pub fn digest(&self) -> u128 {
         let CaptureKey {
             view,
             kind,
@@ -143,9 +144,15 @@ impl CaptureKey {
         for id in buffer_generations {
             bytes.extend_from_slice(&id.0.to_le_bytes());
         }
-        hash_bytes(&bytes)
+        let high = hash_bytes_with_seed(&bytes, HIGH_SEED);
+        let low = hash_bytes_with_seed(&bytes, LOW_SEED);
+        u128::from(high) << 64 | u128::from(low)
     }
 }
+
+/// The seeds of the two passes of [`CaptureKey::digest`].
+const HIGH_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+const LOW_SEED: u64 = 0xc2b2_ae3d_27d4_eb4f;
 
 /// Writes an option as a presence byte and, when present, its bytes.
 fn push_option<const N: usize>(bytes: &mut Vec<u8>, value: Option<[u8; N]>) {
@@ -240,6 +247,12 @@ mod tests {
             replay_rows: vec![0, 2],
             buffer_generations: vec![AllocationId(1), AllocationId(2)],
         }
+    }
+
+    #[test]
+    fn the_two_halves_of_the_digest_differ() {
+        let digest = key().digest();
+        assert_ne!(digest >> 64, digest & u128::from(u64::MAX));
     }
 
     #[test]
