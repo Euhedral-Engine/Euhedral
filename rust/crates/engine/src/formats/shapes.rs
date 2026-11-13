@@ -11,74 +11,46 @@
 use std::cell::RefCell;
 use std::fmt::Write;
 
+use euhedral_inference_cuda::launch::PlanError;
+use euhedral_inference_cuda::launch::catalog::{Arguments, Launch as PlannedLaunch};
+use euhedral_inference_cuda::launch::table::{Geometry, plan_table_launch};
 use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps};
 
-/// The most arguments one launch takes: the native launcher's limit (`EUHEDRAL_KERNEL_TABLE_MAX_PARAMETERS`).
-pub const MAX_ARGUMENTS: usize = 32;
+pub use euhedral_inference_cuda::launch::catalog::MAX_ARGUMENTS;
+pub use euhedral_inference_cuda::launch::table::Table;
 
-/// The arguments of one launch: each a 64-bit word and the byte size (4 or 8) the kernel declares for it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KernelArguments {
-    words: [u64; MAX_ARGUMENTS],
-    sizes: [u8; MAX_ARGUMENTS],
-    count: usize,
-}
-
-impl Default for KernelArguments {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// The arguments of one launch: each a 64-bit word and the byte size (4 or 8) the kernel declares for it. The words
+/// are the catalog's [`Arguments`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelArguments(Arguments);
 
 impl KernelArguments {
     pub const fn new() -> Self {
-        Self {
-            words: [0; MAX_ARGUMENTS],
-            sizes: [0; MAX_ARGUMENTS],
-            count: 0,
-        }
+        Self(Arguments::new())
     }
 
     /// A device address.
     pub fn pointer(self, address: DevicePtr) -> Self {
-        self.add(address.get(), 8)
+        Self(self.0.pointer(address))
     }
 
     /// A 32-bit value.
     pub fn int32(self, value: u32) -> Self {
-        self.add(u64::from(value), 4)
-    }
-
-    fn add(mut self, word: u64, size: u8) -> Self {
-        // An argument past the limit is counted and not stored; `Launch::queue` refuses the launch.
-        if self.count < MAX_ARGUMENTS {
-            self.words[self.count] = word;
-            self.sizes[self.count] = size;
-        }
-        self.count += 1;
-        self
+        Self(self.0.u32(value))
     }
 
     /// How many arguments were added.
     pub fn count(&self) -> usize {
-        self.count
+        self.0.count()
     }
 
-    fn stored(&self) -> usize {
-        self.count.min(MAX_ARGUMENTS)
+    /// The arguments as the catalog's.
+    pub fn arguments(&self) -> Arguments {
+        self.0
     }
 }
 
-/// The kernel tables a launch can go to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Table {
-    /// The shared linear table (`euhedral_cuda_linear_launch`).
-    Linear,
-    /// The Flash-Next table (`euhedral_cuda_qwen4_launch`), which holds the row-exact BF16 GEMMs.
-    Qwen4,
-}
-
-/// One kernel launch.
+/// One kernel launch of a table, as the formats build it. [`Launch::planned`] is the same launch as the catalog's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Launch {
     pub table: Table,
@@ -97,15 +69,15 @@ impl Launch {
     /// Queues the launch on `kernels`. The library checks the argument count and widths against the
     /// compiled kernel.
     pub fn queue(&self, kernels: &mut dyn KernelOps) -> Result<(), CudaError> {
-        if self.args.count > MAX_ARGUMENTS {
+        if self.args.count() > MAX_ARGUMENTS {
             return Err(CudaError::Argument(format!(
                 "{} takes at most {MAX_ARGUMENTS} arguments, not {}",
-                self.symbol, self.args.count
+                self.symbol,
+                self.args.count()
             )));
         }
-        let count = self.args.stored();
-        let words = &self.args.words[..count];
-        let sizes = &self.args.sizes[..count];
+        let words = self.args.0.words();
+        let sizes = self.args.0.sizes();
         match self.table {
             Table::Linear => kernels.linear_launch(self.kernel, self.grid, self.block, self.shared_bytes, words, sizes),
             Table::Qwen4 => kernels.qwen4_launch(self.kernel, self.grid, self.block, self.shared_bytes, words, sizes),
@@ -116,19 +88,45 @@ impl Launch {
     pub fn line(&self) -> String {
         let mut line = self.geometry();
         line.push_str(" args=");
-        for index in 0..self.args.stored() {
+        let (words, sizes) = (self.args.0.words(), self.args.0.sizes());
+        for (index, (&word, &size)) in words.iter().zip(sizes).enumerate() {
             if index > 0 {
                 line.push(',');
             }
-            let word = self.args.words[index];
             // Writing to a String cannot fail.
-            let _ = if self.args.sizes[index] == 8 {
+            let _ = if size == 8 {
                 write!(line, "p{word:x}")
             } else {
                 write!(line, "i{word}")
             };
         }
         line
+    }
+
+    /// The launch as the catalog plans it: the table entry's kernel with the words typed by their sizes. The host-side
+    /// refusals of the table launcher apply, for a device that has every kernel.
+    pub fn planned(&self) -> Result<PlannedLaunch, PlanError> {
+        if self.args.count() > MAX_ARGUMENTS {
+            return Err(PlanError::InvalidArgument);
+        }
+        let mut planned = None;
+        let geometry = Geometry {
+            grid: self.grid,
+            block: self.block,
+            shared_bytes: self.shared_bytes,
+        };
+        plan_table_launch(
+            self.table,
+            self.kernel,
+            geometry,
+            self.args.0.words(),
+            self.args.0.sizes(),
+            // A launch is planned before it is queued and without a device, so the planner assumes the kernel is
+            // loaded; the queue refuses a kernel the device lacks.
+            true,
+            &mut |launch| planned = Some(launch),
+        )?;
+        planned.ok_or(PlanError::InvalidArgument)
     }
 
     /// The launch as a line without its arguments (the launches the recorder sees only by route).
@@ -232,5 +230,55 @@ impl LinearKernel {
             shared_bytes,
             args,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pointer(address: u64) -> DevicePtr {
+        // SAFETY: the tests never dereference it.
+        unsafe { DevicePtr::from_raw(address) }
+    }
+
+    #[test]
+    fn a_launch_is_the_catalogs_launch_of_the_same_table_entry() {
+        let args = KernelArguments::new().pointer(pointer(0xabc0)).int32(7);
+        let launch = LinearKernel::TrellisEpilogue.launch([3, 2, 1], [128, 1, 1], 64, args);
+        let planned = launch.planned().unwrap();
+        assert_eq!(planned.kernel.name(), launch.symbol);
+        assert_eq!(
+            (planned.grid, planned.block, planned.shared_bytes),
+            ([3, 2, 1], [128, 1, 1], 64)
+        );
+        assert_eq!(planned.args.words(), &[0xabc0, 7]);
+        assert_eq!(planned.args.sizes(), &[8, 4]);
+        // The recorded line is the Java side's: pointers as p<hex>, 32-bit values as i<decimal>.
+        assert_eq!(
+            launch.line(),
+            "euhedral_trellis_epilogue grid=3,2,1 block=128,1,1 smem=64 args=pabc0,i7"
+        );
+    }
+
+    #[test]
+    fn every_linear_kernel_names_the_catalogs_entry() {
+        for kernel in LinearKernel::ALL {
+            let planned = kernel
+                .launch([1, 1, 1], [1, 1, 1], 0, KernelArguments::new())
+                .planned()
+                .unwrap();
+            assert_eq!(planned.kernel.name(), kernel.symbol());
+        }
+    }
+
+    #[test]
+    fn too_many_arguments_do_not_plan() {
+        let mut args = KernelArguments::new();
+        for _ in 0..=MAX_ARGUMENTS {
+            args = args.int32(1);
+        }
+        let launch = LinearKernel::TrellisPrepass.launch([1, 1, 1], [1, 1, 1], 0, args);
+        assert_eq!(launch.planned(), Err(PlanError::InvalidArgument));
     }
 }
