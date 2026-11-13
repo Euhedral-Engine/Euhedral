@@ -134,12 +134,34 @@ const fn spec(
     }
 }
 
-/// The kernel called `name`; in a constant it fails the build when there is none.
-pub const fn find(name: &str) -> KernelId {
+/// The kernel called `name`, failing the build when evaluated in a constant and there is none. Not for direct use:
+/// name a kernel by literal with [`kernel!`], which forces the evaluation at build time.
+#[doc(hidden)]
+pub const fn find_const(name: &str) -> KernelId {
     match lookup(name) {
         Some(id) => id,
         None => panic!("no kernel of this name in the catalog"),
     }
+}
+
+/// The [`KernelId`] of the kernel called by the literal, checked at build time: a name the catalog does not list is a
+/// compile error. This is the only way to name a kernel by literal; [`lookup`] is for names that are not literals.
+///
+/// ```
+/// use euhedral_inference_cuda::kernel;
+/// let id = kernel!("euhedral_residual_add_bf16");
+/// assert_eq!(id.name(), "euhedral_residual_add_bf16");
+/// ```
+///
+/// ```compile_fail
+/// use euhedral_inference_cuda::kernel;
+/// let id = kernel!("euhedral_residual_ad_bf16");
+/// ```
+#[macro_export]
+macro_rules! kernel {
+    ($name:literal) => {
+        const { $crate::launch::catalog::find_const($name) }
+    };
 }
 
 /// The kernel called `name`, if there is one.
@@ -1218,10 +1240,17 @@ mod tests {
         assert_eq!(table, names);
         assert!(linear_table().iter().all(|kernel| kernel.family == Family::LinearTable));
         // :18 the reference's opt-in, :20-21 the FP8 module.
-        assert_eq!(find("euhedral_trellis_reference").spec().shared_opt_in_bytes, 4 * 17408);
-        assert!(find("euhedral_trellis_mma_rows_fp8").spec().architecture_specific());
-        assert!(find("euhedral_trellis_mma_rows64_fp8").spec().architecture_specific());
-        assert!(!find("euhedral_trellis_mma").spec().architecture_specific());
+        assert_eq!(
+            kernel!("euhedral_trellis_reference").spec().shared_opt_in_bytes,
+            4 * 17408
+        );
+        assert!(kernel!("euhedral_trellis_mma_rows_fp8").spec().architecture_specific());
+        assert!(
+            kernel!("euhedral_trellis_mma_rows64_fp8")
+                .spec()
+                .architecture_specific()
+        );
+        assert!(!kernel!("euhedral_trellis_mma").spec().architecture_specific());
     }
 
     #[test]
@@ -1274,7 +1303,7 @@ mod tests {
             assert!(!kernel.pdl_registered);
         }
         // :32, one unit's three warps.
-        assert_eq!(find("euhedral_q4_qsa_attention").spec().shared_opt_in_bytes, 28224);
+        assert_eq!(kernel!("euhedral_q4_qsa_attention").spec().shared_opt_in_bytes, 28224);
     }
 
     #[test]
@@ -1294,31 +1323,41 @@ mod tests {
     fn the_opt_in_shared_bytes_are_the_native_ones() {
         // qwen_layer_ops.c:50 and :101.
         assert_eq!(
-            find("euhedral_attention_prefill_fa2_nvfp4").spec().shared_opt_in_bytes,
+            kernel!("euhedral_attention_prefill_fa2_nvfp4")
+                .spec()
+                .shared_opt_in_bytes,
             67584
         );
         assert_eq!(
-            find("euhedral_attention_prefill_fa2_bf16").spec().shared_opt_in_bytes,
+            kernel!("euhedral_attention_prefill_fa2_bf16")
+                .spec()
+                .shared_opt_in_bytes,
             67584
         );
         // qwen_layer_ops.c:61-63 (`fused_shared_bytes`) for 2 and 6 tiles, set at :110.
         assert_eq!(
-            find("euhedral_attention_decode_gqa_nvfp4_fused2")
+            kernel!("euhedral_attention_decode_gqa_nvfp4_fused2")
                 .spec()
                 .shared_opt_in_bytes,
             40096
         );
         assert_eq!(
-            find("euhedral_attention_decode_gqa_nvfp4_fused6")
+            kernel!("euhedral_attention_decode_gqa_nvfp4_fused6")
                 .spec()
                 .shared_opt_in_bytes,
             47392
         );
         // nvfp4_linear.c:152 (`NATIVE_SHARED_BYTES`) and `skinny_shared_bytes` (:159-162, set at :208-209) for 16, 32 and 64 rows with two terms.
-        assert_eq!(find("euhedral_nvfp4n_linear_128x128").spec().shared_opt_in_bytes, 85040);
-        assert_eq!(find("euhedral_nvfp4n_skinny_16").spec().shared_opt_in_bytes, 61440);
-        assert_eq!(find("euhedral_nvfp4n_skinny_32_sd4").spec().shared_opt_in_bytes, 81920);
-        assert_eq!(find("euhedral_nvfp4n_skinny_64").spec().shared_opt_in_bytes, 92160);
+        assert_eq!(
+            kernel!("euhedral_nvfp4n_linear_128x128").spec().shared_opt_in_bytes,
+            85040
+        );
+        assert_eq!(kernel!("euhedral_nvfp4n_skinny_16").spec().shared_opt_in_bytes, 61440);
+        assert_eq!(
+            kernel!("euhedral_nvfp4n_skinny_32_sd4").spec().shared_opt_in_bytes,
+            81920
+        );
+        assert_eq!(kernel!("euhedral_nvfp4n_skinny_64").spec().shared_opt_in_bytes, 92160);
         // Everything else sets none.
         let with: usize = KERNELS.iter().filter(|kernel| kernel.shared_opt_in_bytes != 0).count();
         assert_eq!(with, 1 + 1 + 2 + 5 + 2 + 6);
@@ -1351,7 +1390,7 @@ mod tests {
     #[test]
     fn a_launch_is_eligible_for_overlap_exactly_when_the_kernel_is_registered() {
         let add = Launch::new(
-            find("euhedral_residual_add_bf16"),
+            kernel!("euhedral_residual_add_bf16"),
             [1, 1, 1],
             [256, 1, 1],
             0,
@@ -1359,7 +1398,7 @@ mod tests {
         );
         assert!(add.programmatic);
         let prefill = Launch::new(
-            find("euhedral_attention_prefill32_bf16"),
+            kernel!("euhedral_attention_prefill32_bf16"),
             [1, 1, 1],
             [128, 1, 1],
             0,
