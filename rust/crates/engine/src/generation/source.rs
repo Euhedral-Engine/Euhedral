@@ -1,18 +1,17 @@
-//! The generation source: the owner of the engine's sequence, polled by the lattice.
+//! The owner of the engine's sequence, driven by the messages posted to its mailbox.
 //!
 //! One [`Owner`] holds everything a sequence changes between quanta: its caches' frontiers, the graphs it has recorded,
-//! the quanta in flight and what the request has produced. It is a baton ([`Baton`]): whoever takes it is its only
-//! user, and it goes back when they are done. Three things take it:
+//! the quanta in flight and what the request has produced. It sits in a [`Mailbox`](super::mailbox::Mailbox), whose
+//! claim one thread at a time holds. A frame that tells the owner something posts the message and then drives the
+//! mailbox: it runs [`Owner::work`] (a turn) on the thread it is on if the claim is free, and the holder of the claim
+//! sees the message if it is not. No source polls the owner. A turn takes in what arrived, concludes the quanta that
+//! retired, admits the next ones and ends the request; the outcome is told to its caller after the claim is released.
+//! [`Generation::generate`](super::Generation::generate) claims the owner to start a request, and offers one frame to
+//! the `stages` lake for the first turn to run on a worker.
 //!
-//! - [`GenerationSource`], a `LatticeSource` the lattice's workers poll while a request runs. A poll takes the baton,
-//!   asks whether the owner has anything to do (a message in its inbox, a quantum to admit, an ending), and if it has,
-//!   publishes an [`OwnerFrame`] that carries the owner into the `stages` lake. It does no other work.
-//! - The [`OwnerFrame`], which runs [`Owner::work`] on a worker: it takes in what arrived, concludes the quanta that
-//!   retired, admits the next ones and ends the request, then hands the baton back.
-//! - [`Generation::generate`](super::Generation::generate), which takes the baton to start a request.
-//!
-//! What arrives is a [`Message`] in the owner's inbox: a quantum that retired (any worker's retirement frame offers it),
-//! and, for a teacher-forced run, the copy of a logits row to pinned memory. Nothing waits for them.
+//! What arrives is a [`Message`] in the owner's inbox: a quantum that retired (the executor's retirement callback posts
+//! it), the copy of a logits row to pinned memory (a teacher-forced run), and the running of the work a parked quantum
+//! waited for on the owner's lane. Nothing waits for them.
 //!
 //! **The chain.** A greedy request keeps two quanta in flight. The one admitted behind another runs behind it on the
 //! device (the graph's external edge waits for its sink), and takes its token id from the selection the earlier one
@@ -40,24 +39,23 @@ use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter};
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::Arc;
 #[cfg(feature = "test-oracles")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use euhedral_core::frames::{Frame, FrameError, FrameHeader};
-use euhedral_core::generics::{LatticeReceiver, LatticeSource};
-use euhedral_data_structures::queues::{Consumer, Multi, Producer};
-use euhedral_graph::{Lake, QuantumOutcome};
+use euhedral_core::frames::Frame;
+use euhedral_data_structures::queues::{Consumer, Single};
+use euhedral_graph::QuantumOutcome;
 use euhedral_inference_cuda::{DevicePtr, PooledPinned, Submission, SubmitMode, ops};
 
-use super::baton::Baton;
 use super::listener::GenerationListener;
+use super::mailbox::{Address, Turn};
 use super::mtp::Speculating;
 use super::request::{AdmissionError, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation};
 use super::teacher_forced::LogitsSink;
-use crate::frames::{Kind, id_hash, step};
+use crate::frames::{Kind, step};
 use crate::model::ModelConfig;
 use crate::quantum::{Executor, GraphCache, Started};
 use crate::runtime::{Core, Units};
@@ -85,6 +83,8 @@ pub(crate) enum Message {
     Retired(Box<Retired>),
     /// The logits row of a teacher-forced step reached pinned memory.
     Logits(LogitsCopied),
+    /// The work a parked quantum waited for on the owner's lane has run: the turn lets the quantum go.
+    Reaped,
 }
 
 impl fmt::Debug for Message {
@@ -92,6 +92,7 @@ impl fmt::Debug for Message {
         match self {
             Message::Retired(_) => formatter.write_str("Message::Retired"),
             Message::Logits(copied) => write!(formatter, "Message::Logits(step {})", copied.step),
+            Message::Reaped => formatter.write_str("Message::Reaped"),
         }
     }
 }
@@ -114,7 +115,8 @@ pub(crate) struct Shared {
     pub(crate) config: Arc<ModelConfig>,
     pub(crate) workspace: Arc<Workspace>,
     pub(crate) executor: Executor,
-    pub(crate) producer: Producer<Message, Multi>,
+    /// Where frames that tell the owner something post it.
+    pub(crate) address: Arc<Address<Owner>>,
     /// Rows of the longest prompt chunk.
     pub(crate) chunk: usize,
     /// Rows the context holds.
@@ -159,6 +161,48 @@ pub(super) enum Step {
         allow(dead_code, reason = "only the test hook asks for it")
     )]
     Settle,
+}
+
+/// Whom a request that never started is told, and why it did not.
+pub(crate) struct Rejected {
+    pub(crate) error: AdmissionError,
+    audience: Audience,
+}
+
+impl Rejected {
+    pub(crate) fn new(error: AdmissionError, audience: Audience) -> Rejected {
+        Rejected { error, audience }
+    }
+
+    /// The outcome that tells the audience the request was refused.
+    pub(crate) fn into_finished(self) -> Finished {
+        let outcome = GenerationOutcome {
+            reason: FinishReason::Failed(format!("the request was refused: {}", self.error)),
+            prompt_tokens: 0,
+            generated: 0,
+            elapsed: Duration::ZERO,
+        };
+        match self.audience {
+            Audience::Greedy(listener) => Finished::Greedy(listener, outcome),
+            Audience::Forced(sink) => Finished::Forced(sink, outcome),
+        }
+    }
+}
+
+/// The listener or sink of a request.
+pub(crate) enum Audience {
+    Greedy(Box<dyn GenerationListener>),
+    Forced(Box<dyn LogitsSink>),
+}
+
+impl Mode {
+    /// The request's listener or sink, for a request that did not start.
+    fn into_audience(self) -> Audience {
+        match self {
+            Mode::Greedy { listener } | Mode::Speculative { listener, .. } => Audience::Greedy(listener),
+            Mode::Forced { sink, .. } => Audience::Forced(sink),
+        }
+    }
 }
 
 /// What a request does with the rows it computes.
@@ -357,12 +401,13 @@ pub(crate) struct Owner {
     pub(super) shared: Arc<Shared>,
     pub(super) sequence: SequenceState,
     cache: GraphCache,
-    inbox: Consumer<Message, Multi>,
+    inbox: Consumer<Message, Single>,
     /// Whether the sequence holds the state of a request that ended: the next request starts with a reset.
     used: bool,
     pub(super) run: Option<Run>,
     parked: Vec<Parked>,
-    finished: Option<Finished>,
+    /// Outcomes to tell once the claim is released: a request's end, and the refusals of requests posted meanwhile.
+    finished: VecDeque<Finished>,
 }
 
 impl fmt::Debug for Owner {
@@ -381,7 +426,7 @@ impl Owner {
         shared: Arc<Shared>,
         sequence: SequenceState,
         cache: GraphCache,
-        inbox: Consumer<Message, Multi>,
+        inbox: Consumer<Message, Single>,
     ) -> Owner {
         Owner {
             shared,
@@ -391,7 +436,21 @@ impl Owner {
             used: false,
             run: None,
             parked: Vec::new(),
-            finished: None,
+            finished: VecDeque::new(),
+        }
+    }
+
+    /// Gives up a request that began and whose first turn will not run, because no worker takes frames: nothing was
+    /// admitted yet, so dropping it leaves nothing on the device. The listener hears nothing: the caller learns from
+    /// the error it is given.
+    pub(crate) fn withdraw(&mut self) {
+        match self.run.take() {
+            Some(run) if run.in_flight.is_empty() => {}
+            Some(run) => {
+                log::error!("a request with quanta in flight cannot be withdrawn");
+                self.run = Some(run);
+            }
+            None => {}
         }
     }
 
@@ -421,65 +480,88 @@ impl Owner {
         self.cache = GraphCache::disabled();
     }
 
-    /// Starts a greedy request, or one that speculates with the artifact's draft layer.
-    pub(crate) fn begin(&mut self, units: Units, request: GenerationRequest) -> Result<(), AdmissionError> {
-        let mode = match request.speculation {
-            Speculation::Off => Mode::Greedy {
-                listener: request.listener,
-            },
+    /// Starts a greedy request, or one that speculates with the artifact's draft layer. `units` is what the engine's
+    /// admission answered. A refused request gives its listener back.
+    pub(crate) fn begin(
+        &mut self,
+        units: Result<Units, AdmissionError>,
+        request: GenerationRequest,
+    ) -> Result<(), Rejected> {
+        let GenerationRequest {
+            prompt,
+            max_tokens,
+            stop_tokens,
+            speculation,
+            listener,
+        } = request;
+        let units = match units {
+            Ok(units) => units,
+            Err(error) => return Err(Rejected::new(error, Audience::Greedy(listener))),
+        };
+        let mode = match speculation {
+            Speculation::Off => Mode::Greedy { listener },
             Speculation::Artifact => {
                 let Some(drafts) = self.shared.drafts.as_ref() else {
-                    return Err(AdmissionError::SpeculationUnavailable);
+                    return Err(Rejected::new(
+                        AdmissionError::SpeculationUnavailable,
+                        Audience::Greedy(listener),
+                    ));
                 };
                 Mode::Speculative {
-                    listener: request.listener,
+                    listener,
                     state: Box::new(Speculating::new(
                         drafts.depth,
                         self.shared.capacity,
-                        request.prompt.len(),
-                        request.max_tokens as usize,
+                        prompt.len(),
+                        max_tokens as usize,
                     )),
                 }
             }
         };
-        self.start_run(
-            units,
-            mode,
-            request.prompt,
-            request.max_tokens as usize,
-            request.stop_tokens,
-        )
+        self.start_run(units, mode, prompt, max_tokens as usize, stop_tokens)
     }
 
-    /// Starts a teacher-forced run.
+    /// Starts a teacher-forced run. A refused run gives its sink back.
     pub(crate) fn begin_forced(
         &mut self,
-        units: Units,
+        units: Result<Units, AdmissionError>,
         prefix: Vec<u32>,
         forced: Vec<u32>,
         sink: Box<dyn LogitsSink>,
-    ) -> Result<(), AdmissionError> {
+    ) -> Result<(), Rejected> {
+        let units = match units {
+            Ok(units) => units,
+            Err(error) => return Err(Rejected::new(error, Audience::Forced(sink))),
+        };
         let vocabulary = self.shared.config.vocab_size;
         if let Some((index, id)) = forced.iter().enumerate().find(|(_, id)| **id as usize >= vocabulary) {
-            return Err(AdmissionError::TokenOutsideVocabulary {
+            let error = AdmissionError::TokenOutsideVocabulary {
                 id: *id,
                 index: prefix.len() + index,
                 vocabulary,
-            });
+            };
+            return Err(Rejected::new(error, Audience::Forced(sink)));
         }
         // The last forced token is only predicted, never fed: the rows end one before.
         let rows = (prefix.len() + forced.len()).saturating_sub(1);
         if rows as u64 > self.shared.capacity {
-            return Err(AdmissionError::PromptTooLong {
+            let error = AdmissionError::PromptTooLong {
                 tokens: rows,
                 capacity: self.shared.capacity as usize,
-            });
+            };
+            return Err(Rejected::new(error, Audience::Forced(sink)));
         }
         let wanted = forced.len();
         if wanted == 0 {
-            return Err(AdmissionError::EmptyPrompt);
+            return Err(Rejected::new(AdmissionError::EmptyPrompt, Audience::Forced(sink)));
         }
         self.start_run(units, Mode::Forced { forced, sink }, prefix, wanted, Vec::new())
+    }
+
+    /// Ends a request that was refused after the caller was told it was accepted (it was posted while a turn held the
+    /// claim): its audience hears a failure, after the claim is released, like any request that ended.
+    pub(crate) fn reject(&mut self, rejected: Rejected) {
+        self.finished.push_back(rejected.into_finished());
     }
 
     fn start_run(
@@ -489,27 +571,30 @@ impl Owner {
         prompt: Vec<u32>,
         wanted: usize,
         stop_tokens: Vec<u32>,
-    ) -> Result<(), AdmissionError> {
-        if self.run.is_some() || self.finished.is_some() {
-            return Err(AdmissionError::Busy);
+    ) -> Result<(), Rejected> {
+        // Busy means a request is running: an outcome that waits to be told does not hold the sequence.
+        if self.run.is_some() {
+            return Err(Rejected::new(AdmissionError::Busy, mode.into_audience()));
         }
         if prompt.is_empty() {
-            return Err(AdmissionError::EmptyPrompt);
+            return Err(Rejected::new(AdmissionError::EmptyPrompt, mode.into_audience()));
         }
         let vocabulary = self.shared.config.vocab_size;
         if let Some((index, id)) = prompt.iter().enumerate().find(|(_, id)| **id as usize >= vocabulary) {
-            return Err(AdmissionError::TokenOutsideVocabulary {
+            let error = AdmissionError::TokenOutsideVocabulary {
                 id: *id,
                 index,
                 vocabulary,
-            });
+            };
+            return Err(Rejected::new(error, mode.into_audience()));
         }
         let capacity = self.shared.capacity;
         if prompt.len() as u64 > capacity {
-            return Err(AdmissionError::PromptTooLong {
+            let error = AdmissionError::PromptTooLong {
                 tokens: prompt.len(),
                 capacity: capacity as usize,
-            });
+            };
+            return Err(Rejected::new(error, mode.into_audience()));
         }
         let depth = match mode {
             Mode::Greedy { .. } => GREEDY_DEPTH,
@@ -567,33 +652,12 @@ impl Owner {
         (run.selections(next) <= self.selections_free()).then_some(next)
     }
 
-    /// Whether the owner has something to do: a message to take in, a quantum to admit, an ending to make, or parked
-    /// quanta whose work on the owner's lane may have run.
-    pub(crate) fn needs_attention(&self) -> bool {
-        if !self.inbox.is_empty() || !self.parked.is_empty() {
-            return true;
-        }
-        let Some(run) = &self.run else {
-            return false;
-        };
-        let admits = self.admissible().is_some();
-        let ends = run.in_flight.is_empty()
-            && !run.waiting_logits
-            && (run.stopping.is_some() || run.next_step(self.shared.chunk).is_none())
-            && self.settle_step().is_none();
-        admits || ends
-    }
-
-    /// Takes the outcome of a request that ended, for its caller to be told once the owner is back with the engine.
-    pub(crate) fn take_finished(&mut self) -> Option<Finished> {
-        self.finished.take()
-    }
-
-    /// One turn of the owner, on a worker: takes in what arrived, concludes the quanta that retired in order, admits
-    /// the next ones and ends the request when nothing is left.
+    /// One turn of the owner: takes in what arrived, concludes the quanta that retired in order, admits the next ones
+    /// and ends the request when nothing is left.
     pub(crate) fn work(&mut self) {
-        let inbox = self.inbox.clone();
-        inbox.drain_all(|message| self.receive(message));
+        while let Some(message) = self.inbox.poll() {
+            self.receive(message);
+        }
         self.reap();
         self.conclude();
         self.admit_ready();
@@ -638,7 +702,7 @@ impl Owner {
             generated: run.generated,
             elapsed: run.began.elapsed(),
         };
-        self.finished = Some(match run.mode {
+        self.finished.push_back(match run.mode {
             Mode::Greedy { listener } | Mode::Speculative { listener, .. } => Finished::Greedy(listener, outcome),
             Mode::Forced { sink, .. } => Finished::Forced(sink, outcome),
         });
@@ -672,6 +736,8 @@ impl Owner {
                 }
             }
             Message::Logits(copied) => self.deliver_row(copied),
+            // The turn's `reap` is what the message is for.
+            Message::Reaped => {}
         }
     }
 
@@ -706,12 +772,22 @@ impl Owner {
             .retain(|parked| parked.quantum.prepared.is_some_and(|marker| !lanes.reached(marker)));
     }
 
+    /// Keeps `quantum` until the work queued on the owner's lane for it has run. A frame posts to the owner when it
+    /// has, so that the turn that follows lets it go (and a request that waits for it ends). The marker is looked at
+    /// once: reached, the quantum goes now; not, the frame is registered, and it fires even if the marker is reached
+    /// the next instant.
     fn park(&mut self, quantum: Quantum, retained: KvRetained) {
+        let core = &self.shared.core;
+        let Some(marker) = quantum.prepared.filter(|marker| !core.lanes.reached(*marker)) else {
+            return;
+        };
         self.parked.push(Parked {
             quantum,
             _retained: retained,
         });
-        self.reap();
+        let address = Arc::clone(&self.shared.address);
+        core.completions
+            .after_marker(marker, step(Kind::Reaped, 0, move || address.post(Message::Reaped)));
     }
 
     /// Ends the request with a failure.
@@ -877,12 +953,8 @@ impl Owner {
             }
             submission.finish_signalled().map_err(why("the logits row's copy"))?
         };
-        let producer = self.shared.producer.clone();
-        let frame = step_frame(move || {
-            if producer.offer(Message::Logits(LogitsCopied { step, loan })).is_err() {
-                log::error!("the owner's inbox refused a logits row");
-            }
-        });
+        let address = Arc::clone(&self.shared.address);
+        let frame = step_frame(move || address.post(Message::Logits(LogitsCopied { step, loan })));
         core.completions.after_marker(marker, frame);
         Ok(())
     }
@@ -1159,7 +1231,7 @@ impl Owner {
             generated: run.generated,
             elapsed: run.began.elapsed(),
         };
-        self.finished = Some(match run.mode {
+        self.finished.push_back(match run.mode {
             Mode::Greedy { listener } | Mode::Speculative { listener, .. } => Finished::Greedy(listener, outcome),
             Mode::Forced { sink, .. } => Finished::Forced(sink, outcome),
         });
@@ -1171,145 +1243,33 @@ fn step_frame(work: impl FnOnce() + Send + 'static) -> Box<dyn Frame> {
     step(Kind::Logits, 0, work)
 }
 
-/// The lattice source of a request: a worker that polls it takes the owner and, if the owner has something to do,
-/// publishes the frame that does it.
-pub(crate) struct GenerationSource {
-    /// The owner, while no frame holds it.
-    baton: Baton<Box<Owner>>,
-    /// Where the owner goes when the request has ended.
-    home: Arc<Baton<Box<Owner>>>,
-    stages: Arc<Lake>,
-    downstream: OnceLock<Arc<dyn LatticeReceiver>>,
-    complete: AtomicBool,
-    this: Weak<GenerationSource>,
-}
+impl Turn for Owner {
+    type Message = Message;
+    type Finished = Finished;
 
-impl GenerationSource {
-    /// A source over `owner`, which returns to `home` when its request has ended.
-    pub(crate) fn new(owner: Box<Owner>, home: Arc<Baton<Box<Owner>>>, stages: Arc<Lake>) -> Arc<GenerationSource> {
-        let baton = Baton::new();
-        baton.put(owner);
-        Arc::new_cyclic(|this| GenerationSource {
-            baton,
-            home,
-            stages,
-            downstream: OnceLock::new(),
-            complete: AtomicBool::new(false),
-            this: this.clone(),
-        })
-    }
-
-    /// Takes the owner back from a source that was not attached.
-    pub(crate) fn take_owner(&self) -> Option<Box<Owner>> {
-        self.baton.take()
-    }
-
-    /// The poll: nothing here waits or computes.
-    fn poll(self: &Arc<Self>) {
-        if self.complete.load(Ordering::Acquire) {
-            return;
-        }
-        let Some(owner) = self.baton.take() else { return };
-        if !owner.needs_attention() {
-            self.baton.put(owner);
-            return;
-        }
-        let frame = OwnerFrame {
-            header: FrameHeader::new(id_hash(Kind::Owner, 0)),
-            source: Arc::clone(self),
-            owner: Some(owner),
-        };
-        // A lake that takes no frame drops it, and the frame's drop gives the owner back.
-        let _ = self.stages.offer(Box::new(frame));
-    }
-}
-
-impl LatticeSource for GenerationSource {
-    fn add_downstream(self: Arc<Self>, downstream: Arc<dyn LatticeReceiver>) {
-        if self.complete.load(Ordering::Acquire) {
-            downstream.on_complete();
-            return;
-        }
-        let _ = self.downstream.set(Arc::clone(&downstream));
-        downstream.add_upstream(self);
-    }
-
-    fn pull(
-        &self,
-        _consumer: &mut dyn FnMut(Box<dyn Frame>),
-        _stop: &mut dyn FnMut(&dyn Frame) -> bool,
-        _demand: u64,
-    ) -> u64 {
-        // The frames go to the lake, not to this puller, and a pull must not offer them: the lattice's workers
-        // request the source whenever a cycle found nothing, and that request polls.
-        0
-    }
-
-    fn request(&self, demand: u64) {
-        if demand > 0 {
-            self.poll_arc();
+    fn turn(&mut self) {
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| self.work())) {
+            self.panicked(payload.as_ref());
         }
     }
 
-    fn complete(&self) {
-        if !self.complete.swap(true, Ordering::AcqRel)
-            && let Some(downstream) = self.downstream.get()
-        {
-            downstream.on_complete();
-        }
+    fn take_finished(&mut self) -> Vec<Finished> {
+        self.finished.drain(..).collect()
     }
 
-    fn is_complete(&self) -> bool {
-        self.complete.load(Ordering::Acquire)
-    }
-}
-
-impl GenerationSource {
-    /// The poll from a `&self`: the frames it publishes hold the source, which a `Weak` upgrade provides.
-    fn poll_arc(&self) {
-        if let Some(this) = self.this.upgrade() {
-            this.poll();
-        }
-    }
-}
-
-/// The owner on its way to do one turn of work in the `stages` lake.
-struct OwnerFrame {
-    header: FrameHeader,
-    source: Arc<GenerationSource>,
-    owner: Option<Box<Owner>>,
-}
-
-impl Frame for OwnerFrame {
-    fn header(&self) -> &FrameHeader {
-        &self.header
+    fn deliver(finished: Finished) {
+        finished.deliver();
     }
 
-    fn header_mut(&mut self) -> &mut FrameHeader {
-        &mut self.header
+    fn abandon(&mut self, why: &str) -> Vec<Finished> {
+        // Two panics end a request at once, leaving what was in flight.
+        let message = why.to_string();
+        self.panicked(&message);
+        self.panicked(&message);
+        self.finished.drain(..).collect()
     }
 
-    fn execute(&mut self) -> Result<(), FrameError> {
-        if let Some(owner) = self.owner.as_mut()
-            && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| owner.work()))
-        {
-            owner.panicked(payload.as_ref());
-        }
-        Ok(())
-    }
-}
-
-impl Drop for OwnerFrame {
-    fn drop(&mut self) {
-        let Some(mut owner) = self.owner.take() else { return };
-        match owner.take_finished() {
-            None => self.source.baton.put(owner),
-            Some(finished) => {
-                // The sequence is free again before its caller is told, so that the caller may start the next request.
-                self.source.home.put(owner);
-                self.source.complete();
-                finished.deliver();
-            }
-        }
+    fn idle(&self) -> bool {
+        self.run.is_none() && self.parked.is_empty() && self.finished.is_empty()
     }
 }

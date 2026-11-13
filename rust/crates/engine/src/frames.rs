@@ -28,6 +28,8 @@ pub(crate) enum Kind {
     Owner,
     /// The arrival of a teacher-forced step's logits row.
     Logits,
+    /// The running of the work a parked quantum waited for on the owner's lane.
+    Reaped,
     /// The settling of one lane of a quantum that ended before its last stage.
     Settle,
 }
