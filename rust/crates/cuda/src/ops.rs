@@ -186,27 +186,59 @@ pub unsafe fn copy_device_to_host_weights(
     )
 }
 
-/// The address of `bytes` at `offset` of `arena`, refused when they leave it.
-pub(crate) fn arena_range(arena: &HostWeightsArena, offset: usize, bytes: usize) -> Result<*mut u8, CudaError> {
+/// The address of `bytes` at `offset` of the `len` bytes at `base`, refused when they leave them.
+pub(crate) fn range_start(
+    base: *mut u8,
+    len: usize,
+    offset: usize,
+    bytes: usize,
+    what: &str,
+) -> Result<*mut u8, CudaError> {
     match offset.checked_add(bytes) {
-        // SAFETY: `offset` is within the arena.
-        Some(end) if end <= arena.len() => Ok(unsafe { arena.device_writable_ptr().add(offset) }),
+        Some(end) if end <= len => Ok(base.wrapping_add(offset)),
         _ => Err(CudaError::Argument(format!(
-            "{bytes} bytes at offset {offset} lie outside a {} byte host arena",
-            arena.len()
+            "{bytes} bytes at offset {offset} lie outside a {len} byte {what}"
         ))),
     }
 }
 
+/// The address of `bytes` at `offset` of `arena`, refused when they leave it.
+pub(crate) fn arena_range(arena: &HostWeightsArena, offset: usize, bytes: usize) -> Result<*mut u8, CudaError> {
+    range_start(arena.device_writable_ptr(), arena.len(), offset, bytes, "host arena")
+}
+
 /// The address of `bytes` at `offset` of `buffer`, refused when they leave it.
 pub(crate) fn pinned_range(buffer: &PinnedBuffer, offset: usize, bytes: usize) -> Result<*const u8, CudaError> {
-    match offset.checked_add(bytes) {
-        // SAFETY: `offset` is within the buffer.
-        Some(end) if end <= buffer.len() => Ok(unsafe { buffer.as_ptr().add(offset) }),
-        _ => Err(CudaError::Argument(format!(
-            "{bytes} bytes at offset {offset} lie outside a {} byte pinned buffer",
-            buffer.len()
-        ))),
+    range_start(buffer.as_ptr().cast_mut(), buffer.len(), offset, bytes, "pinned buffer").map(<*mut u8>::cast_const)
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    #[test]
+    fn a_range_starts_at_its_offset_and_may_end_at_the_end() {
+        let base = 0x1000 as *mut u8;
+        assert_eq!(range_start(base, 64, 0, 64, "buffer").unwrap() as usize, 0x1000);
+        assert_eq!(range_start(base, 64, 16, 48, "buffer").unwrap() as usize, 0x1010);
+        assert_eq!(range_start(base, 64, 64, 0, "buffer").unwrap() as usize, 0x1040);
+    }
+
+    #[test]
+    fn a_range_past_the_end_or_overflowing_is_refused() {
+        let base = 0x1000 as *mut u8;
+        assert!(matches!(
+            range_start(base, 64, 16, 49, "buffer"),
+            Err(CudaError::Argument(_))
+        ));
+        assert!(matches!(
+            range_start(base, 64, 65, 0, "buffer"),
+            Err(CudaError::Argument(_))
+        ));
+        assert!(matches!(
+            range_start(base, 64, usize::MAX, 2, "buffer"),
+            Err(CudaError::Argument(_))
+        ));
     }
 }
 
@@ -1157,6 +1189,32 @@ pub trait KernelOps {
         bytes: usize,
     ) -> Result<(), CudaError>;
 
+    /// Queues the copy of `bytes` bytes at `offset` of a pinned buffer to the device ([`copy_upload_to_device`]).
+    ///
+    /// # Safety
+    /// The copy runs after this call returns. `source` must stay alive, and its bytes in that range unmodified, until
+    /// the lane's work up to this copy has retired.
+    unsafe fn copy_upload_to_device(
+        &mut self,
+        destination: DevicePtr,
+        source: &PinnedBuffer,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), CudaError>;
+
+    /// Queues the copy of `bytes` device bytes into a pinned buffer at `offset` ([`copy_device_to_readback`]).
+    ///
+    /// # Safety
+    /// The copy runs after this call returns. `destination` must stay alive, and its bytes in that range unread,
+    /// until the lane's work up to this copy has retired.
+    unsafe fn copy_device_to_readback(
+        &mut self,
+        destination: &mut PinnedBuffer,
+        offset: usize,
+        source: DevicePtr,
+        bytes: usize,
+    ) -> Result<(), CudaError>;
+
     /// Queues the copy of `bytes` bytes at `offset` of a host-weights arena to the device
     /// ([`copy_host_weights_to_device`]).
     ///
@@ -1229,6 +1287,30 @@ macro_rules! submission_ops {
                 let submission: &Submission<'_> = self;
                 // SAFETY: the caller's contract is the function's.
                 unsafe { copy_device_to_readback_shared(submission, destination, offset, source, bytes) }
+            }
+
+            unsafe fn copy_upload_to_device(
+                &mut self,
+                destination: DevicePtr,
+                source: &PinnedBuffer,
+                offset: usize,
+                bytes: usize,
+            ) -> Result<(), CudaError> {
+                let submission: &Submission<'_> = self;
+                // SAFETY: the caller's contract is the function's.
+                unsafe { copy_upload_to_device(submission, destination, source, offset, bytes) }
+            }
+
+            unsafe fn copy_device_to_readback(
+                &mut self,
+                destination: &mut PinnedBuffer,
+                offset: usize,
+                source: DevicePtr,
+                bytes: usize,
+            ) -> Result<(), CudaError> {
+                let submission: &Submission<'_> = self;
+                // SAFETY: the caller's contract is the function's.
+                unsafe { copy_device_to_readback(submission, destination, offset, source, bytes) }
             }
 
             unsafe fn copy_host_weights_to_device(
@@ -1594,6 +1676,24 @@ mod tests {
         unsafe fn copy_device_to_readback_shared(
             &mut self,
             _: &PinnedBuffer,
+            _: usize,
+            _: DevicePtr,
+            _: usize,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        unsafe fn copy_upload_to_device(
+            &mut self,
+            _: DevicePtr,
+            _: &PinnedBuffer,
+            _: usize,
+            _: usize,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        unsafe fn copy_device_to_readback(
+            &mut self,
+            _: &mut PinnedBuffer,
             _: usize,
             _: DevicePtr,
             _: usize,

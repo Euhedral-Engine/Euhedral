@@ -32,7 +32,7 @@ use std::sync::Arc;
 use euhedral_graph::{LanePool, Marker};
 use euhedral_inference_cuda::{
     AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena, KernelOps, PinnedPool,
-    PooledPinned, RetireList, Submission, ops,
+    PooledPinned, RetireList, Submission,
 };
 use euhedral_inference_settings::KvFormat;
 use thiserror::Error;
@@ -310,6 +310,23 @@ impl KvCache {
         rows: u64,
         retained: &mut KvRetained,
     ) -> Result<(), KvError> {
+        let mut kernels = submission;
+        self.reserve_with(submission, &mut kernels, pool, start, rows, retained)
+    }
+
+    /// As [`reserve`](Self::reserve), with the table upload queued through `kernels`, which must queue on the lane of
+    /// `submission`. The pages and the table are allocated stream-ordered on `submission`'s lane; an upload queued on
+    /// another stream can run before that allocation has completed, and write the table before it exists. Nothing in
+    /// [`KernelOps`] names the lane it queues on, so this is not checked.
+    pub fn reserve_with(
+        &mut self,
+        submission: &Submission<'_>,
+        kernels: &mut dyn KernelOps,
+        pool: &Arc<PinnedPool>,
+        start: u64,
+        rows: u64,
+        retained: &mut KvRetained,
+    ) -> Result<(), KvError> {
         if start != self.submitted || rows == 0 {
             return Err(KvError::NotContiguous {
                 start,
@@ -379,7 +396,7 @@ impl KvCache {
             let staged = retained.staging[retained.staging.len() - 1].buffer();
             // SAFETY: the staging stays alive and unmodified in `retained` until the caller retires it behind the
             // lane's marker, which is after the copy has run.
-            unsafe { ops::copy_upload_to_device(submission, target, staged, 0, table_bytes as usize) }?;
+            unsafe { kernels.copy_upload_to_device(target, staged, 0, table_bytes as usize) }?;
             if let Some(next) = next {
                 // The table it replaces stays with the views that hold it.
                 layer.table = Some(next);

@@ -23,6 +23,16 @@ enum Call {
         value: u8,
         bytes: usize,
     },
+    ToDevice {
+        to: u64,
+        from: usize,
+        bytes: usize,
+    },
+    ToHost {
+        to: usize,
+        from: u64,
+        bytes: usize,
+    },
 }
 
 #[derive(Default)]
@@ -37,12 +47,22 @@ impl LaneEnqueue for Recording {
         panic!("no kernel is available in these tests, so nothing launches");
     }
 
-    unsafe fn copy_to_device(&mut self, _: u64, _: *const u8, _: usize) -> Result<(), GpuError> {
-        panic!("not under test");
+    unsafe fn copy_to_device(&mut self, dst: u64, src: *const u8, bytes: usize) -> Result<(), GpuError> {
+        self.calls.push(Call::ToDevice {
+            to: dst,
+            from: src as usize,
+            bytes,
+        });
+        Ok(())
     }
 
-    unsafe fn copy_to_host(&mut self, _: *mut u8, _: u64, _: usize) -> Result<(), GpuError> {
-        panic!("not under test");
+    unsafe fn copy_to_host(&mut self, dst: *mut u8, src: u64, bytes: usize) -> Result<(), GpuError> {
+        self.calls.push(Call::ToHost {
+            to: dst as usize,
+            from: src,
+            bytes,
+        });
+        Ok(())
     }
 
     unsafe fn copy_on_device(&mut self, dst: u64, src: u64, bytes: usize) -> Result<(), GpuError> {
@@ -271,5 +291,69 @@ fn a_copy_the_native_wrapper_refuses_is_refused() {
     );
     // Zero bytes per row with rows to go is nothing to copy, not an error.
     ops.copy_device_to_device_2d(ptr(256), 8, ptr(512), 8, 0, 2).unwrap();
+    assert!(queue.calls.is_empty());
+}
+
+#[test]
+fn an_upload_and_a_readback_start_at_their_offset_in_the_host_bytes() {
+    let table = KernelTable::all_unavailable(false);
+    let mut queue = Recording::default();
+    {
+        let mut ops = RusteeOps::new(&mut queue, &table, Modes::default());
+        let whole = (0x7000 as *mut u8, 64);
+        // SAFETY: the recording queue never dereferences the host addresses.
+        unsafe {
+            ops.upload(ptr(0x1000), whole, 16, 48, "buffer").unwrap();
+            ops.download(whole, 8, ptr(0x2000), 16, "buffer").unwrap();
+        }
+    }
+    assert_eq!(
+        queue.calls,
+        vec![
+            Call::ToDevice {
+                to: 0x1000,
+                from: 0x7010,
+                bytes: 48
+            },
+            Call::ToHost {
+                to: 0x7008,
+                from: 0x2000,
+                bytes: 16
+            },
+        ]
+    );
+}
+
+#[test]
+fn an_upload_or_a_readback_the_native_wrapper_refuses_queues_nothing() {
+    let table = KernelTable::all_unavailable(false);
+    let mut queue = Recording::default();
+    let mut ops = RusteeOps::new(&mut queue, &table, Modes::default());
+    let whole = (0x7000 as *mut u8, 64);
+    // SAFETY: the recording queue never dereferences the host addresses, and nothing is queued.
+    unsafe {
+        assert_eq!(
+            status(ops.upload(DevicePtr::NULL, whole, 0, 8, "buffer")),
+            INVALID_ARGUMENT
+        );
+        assert_eq!(status(ops.upload(ptr(0x1000), whole, 0, 0, "buffer")), INVALID_ARGUMENT);
+        assert_eq!(
+            status(ops.download(whole, 0, DevicePtr::NULL, 8, "buffer")),
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            status(ops.download(whole, 0, ptr(0x2000), 0, "buffer")),
+            INVALID_ARGUMENT
+        );
+        // Outside the host bytes: one byte past the end, and an offset that overflows.
+        assert!(matches!(
+            ops.upload(ptr(0x1000), whole, 1, 64, "buffer"),
+            Err(CudaError::Argument(_))
+        ));
+        assert!(matches!(
+            ops.download(whole, usize::MAX, ptr(0x2000), 2, "buffer"),
+            Err(CudaError::Argument(_))
+        ));
+    }
     assert!(queue.calls.is_empty());
 }

@@ -25,7 +25,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
-use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, PooledPinned, Submission, SubmitMode, ops};
+use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, KernelOps, PooledPinned, Submission, SubmitMode};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use euhedral_io::{IoDoneOwned, OwnedFile};
 
@@ -467,10 +467,10 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
             Err(error) => return shared.fail(EngineError::Cuda(error)),
         };
         let destination = shared.base.offset(piece.arena_offset);
+        let mut kernels = &submission;
         // SAFETY: the loan stays alive, and its bytes unmodified, in the frame the completion registers below,
         // which runs only once the lane has reached the marker, after the copy has run.
-        if let Err(error) = unsafe { ops::copy_upload_to_device(&submission, destination, loan.buffer(), 0, piece.len) }
-        {
+        if let Err(error) = unsafe { kernels.copy_upload_to_device(destination, loan.buffer(), 0, piece.len) } {
             return shared.fail(EngineError::Cuda(error));
         }
         let marker = match submission.finish_signalled() {

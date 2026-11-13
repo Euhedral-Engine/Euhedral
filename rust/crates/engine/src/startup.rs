@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use euhedral_core::frames::Frame;
 use euhedral_graph::Lake;
-use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, PooledPinned, Submission, SubmitMode, ops};
+use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, KernelOps, PooledPinned, Submission, SubmitMode};
 use euhedral_inference_edrl::{
     HEADER_BYTES, Header, Metadata, ReadPlan, Region, TensorTable, TokenizerFooter, TrellisCompanions, WeightFormat,
     WeightLayout, content_end,
@@ -774,9 +774,10 @@ impl DraftIds {
         } = self;
         let queued = (|| {
             let submission = Submission::begin(core.owner_lane(), SubmitMode::default())?;
+            let mut kernels = &submission;
             // SAFETY: the loan is held by the frame that follows the copy, which runs once the lane has reached the
             // marker; nothing reads or writes the bytes before.
-            unsafe { ops::copy_device_to_readback(&submission, loan.buffer_mut(), 0, source, bytes) }?;
+            unsafe { kernels.copy_device_to_readback(loan.buffer_mut(), 0, source, bytes) }?;
             submission.finish_signalled()
         })();
         match queued {
