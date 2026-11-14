@@ -25,7 +25,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
-use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, KernelOps, PooledPinned, Submission, SubmitMode};
+use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, PooledPinned};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use euhedral_io::{IoDoneOwned, OwnedFile};
 
@@ -461,25 +461,22 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
     let stages = Arc::clone(&shared.core.stages);
     let frame = step(Kind::UploadCopy, chain, move || {
         let piece = shared.pieces[index];
-        let lane = &shared.core.transfer[chain];
-        let submission = match Submission::begin(lane, SubmitMode::default()) {
-            Ok(submission) => submission,
-            Err(error) => return shared.fail(EngineError::Cuda(error)),
-        };
         let destination = shared.base.offset(piece.arena_offset);
-        let mut kernels = &submission;
-        // SAFETY: the loan stays alive, and its bytes unmodified, in the frame the completion registers below,
-        // which runs only once the lane has reached the marker, after the copy has run.
-        if let Err(error) = unsafe { kernels.copy_upload_to_device(destination, loan.buffer(), 0, piece.len) } {
-            return shared.fail(EngineError::Cuda(error));
-        }
-        let marker = match submission.finish_signalled() {
-            Ok(marker) => marker,
+        let queued = shared
+            .core
+            .lane_table
+            .submit_ops(shared.core.transfer_lane(chain), false, |kernels| {
+                // SAFETY: the loan stays alive, and its bytes unmodified, in the frame the completion registers
+                // below, which runs only once the lane has reached the marker, after the copy has run.
+                unsafe { kernels.copy_upload_to_device(destination, loan.buffer(), 0, piece.len) }
+            });
+        let marker = match queued {
+            Ok(((), marker)) => marker,
             Err(error) => {
-                // The copy is queued and no marker will say when it ran: the loan must not return to the pool while
-                // the device may still read it. It is leaked; the load has failed and ends the startup.
+                // The copy may be queued and no marker will say when it ran: the loan must not return to the pool
+                // while the device may still read it. It is leaked; the load has failed and ends the startup.
                 mem::forget(loan);
-                return shared.fail(EngineError::Cuda(error));
+                return shared.fail(EngineError::from(error));
             }
         };
         let completions = Arc::clone(&shared.core.completions);

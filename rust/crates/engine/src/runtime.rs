@@ -17,9 +17,12 @@ use euhedral_core::config::{FragmentConfig, LatticeConfig};
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::LatticeSource;
 use euhedral_core::impls::{BaseCloneableObject, DefaultExecutor};
+use euhedral_gpu::cuda::{CudaGpu, CudaQueue};
+use euhedral_gpu::{Gpu, GpuError, Stream, StreamOptions, open_shared_lanes};
 use euhedral_graph::{Completions, DeviceQueue, Lake, LaneId, LanePool, UnitGuard};
 use euhedral_hardware_utils::util::CpuSet;
-use euhedral_inference_cuda::{CudaLane, CudaLibrary, PinnedPool, RetireList};
+use euhedral_inference_cuda::launch::load::load;
+use euhedral_inference_cuda::{CudaLibrary, PinnedPool, RetireList};
 use euhedral_inference_settings::{Auto, Settings};
 use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
@@ -27,6 +30,7 @@ use crate::error::EngineError;
 use crate::generation::GREEDY_DEPTH;
 use crate::generation::{AdmissionError, Generation, GenerationRequest, LogitsSink};
 use crate::handoff::Handoff;
+use crate::kernels::kernel_sources;
 use crate::model::{ModelConfig, Weights};
 use crate::plan::Plan;
 use crate::residency::planner::ResidencyPlan;
@@ -36,9 +40,9 @@ use crate::state::SequenceState;
 use crate::warmup::Warmed;
 use crate::workspace::Workspace;
 
-/// The events a transfer lane's ring holds: its markers are found by the completion word, not by waits on events, so
-/// the ring only has to exist.
-const TRANSFER_RING: usize = 2;
+/// The markers a transfer lane's ring holds: a chain has two copies in flight, and the next waits for the completion of
+/// one of them, so the ring has room beyond them.
+const TRANSFER_RING: usize = 4;
 
 /// The quanta whose markers a stage lane's ring must hold: those in flight, and the one the owner prepares behind them.
 pub(crate) const STAGE_RING_QUANTA: usize = GREEDY_DEPTH + 1;
@@ -65,17 +69,19 @@ pub(crate) struct Core {
     pub(crate) control: Arc<Lake>,
     pub(crate) io: Arc<AsyncIo>,
     pub(crate) completions: Arc<Completions>,
+    /// The device RustEE's lanes and kernels are on, kept for as long as they are.
+    _gpu: Arc<CudaGpu>,
+    /// The lanes as query queues, which the completions and the graph runtime poll. Its owner and transfer lanes are
+    /// reserved: no graph run is homed on them.
     pub(crate) lanes: Arc<LanePool>,
     /// The lanes the stage graphs run on, by lane id: the plan's compute lanes (`0..` [`Plan::lane_width`]), the lane
-    /// the recording of graphs captures on, and the owner's lane (reservations and input records).
-    pub(crate) stage_lanes: Vec<Arc<CudaLane>>,
+    /// the recording of graphs captures on, the owner's lane (reservations and input records), then the transfer
+    /// lanes, one per upload chain, the first of which also zeroes the sequence state.
+    pub(crate) lane_table: LaneTable,
     /// The events in the ring of each stage lane ([`stage_ring`]).
     pub(crate) stage_ring: usize,
-    /// Every lane of the pool in lane id order: the stage lanes, then the transfer lanes.
-    pub(crate) lane_table: LaneTable,
-    /// The transfer lanes, one per upload chain, with the ids after the stage lanes; the first also zeroes the
-    /// sequence state.
-    pub(crate) transfer: Vec<Arc<CudaLane>>,
+    /// The plan's compute lanes.
+    pub(crate) compute: usize,
     pub(crate) pool: Arc<PinnedPool>,
     /// Buffers waiting to be freed in stream order: the pages and page tables of the caches, once their last quantum
     /// is gone. Whoever polls the lanes reaps it.
@@ -122,17 +128,34 @@ pub(crate) struct Units {
 impl Core {
     /// The lane recordings of graphs capture on.
     pub(crate) fn capture_lane(&self) -> LaneId {
-        LaneId((self.stage_lanes.len() - 2) as u16)
+        LaneId(self.compute as u16)
     }
 
     /// The owner's lane: the sequence's reservations and its quanta's input records.
-    pub(crate) fn owner_lane(&self) -> &Arc<CudaLane> {
-        &self.stage_lanes[self.stage_lanes.len() - 1]
+    pub(crate) fn owner_lane(&self) -> &Arc<CudaQueue> {
+        self.lane(LaneId(self.compute as u16 + 1))
+    }
+
+    /// The transfer lane of upload chain `chain`.
+    pub(crate) fn transfer_lane(&self, chain: usize) -> &Arc<CudaQueue> {
+        self.lane(LaneId((self.compute + 2 + chain) as u16))
+    }
+
+    /// The number of transfer lanes.
+    pub(crate) fn transfer_lanes(&self) -> usize {
+        self.lane_table.len() - self.compute - 2
+    }
+
+    fn lane(&self, id: LaneId) -> &Arc<CudaQueue> {
+        match self.lane_table.get(id) {
+            Some(lane) => lane,
+            None => unreachable!("the runtime opened lane {} and the table holds it", id.0),
+        }
     }
 
     /// The lanes the plan's graphs run on.
     pub(crate) fn compute_lanes(&self) -> usize {
-        self.stage_lanes.len() - 2
+        self.compute
     }
 
     /// Admits a unit on every lake.
@@ -537,6 +560,74 @@ pub fn lattice_config(settings: &Settings) -> LatticeConfig {
     config
 }
 
+/// The most lanes one RustEE pool holds.
+const MAX_LANES: usize = 64;
+
+/// The device the native library bound, opened through RustEE. The library reports the device's properties and not its
+/// ordinal, so the device is the first whose compute capability is the library's.
+pub fn open_device(library: &CudaLibrary) -> Result<Arc<CudaGpu>, EngineError> {
+    let (major, minor) = library.device().compute_capability;
+    let wanted = (i32::try_from(major).unwrap_or(0), i32::try_from(minor).unwrap_or(0));
+    for ordinal in 0..MAX_LANES as i32 {
+        let Ok(candidate) = CudaGpu::open(ordinal) else { break };
+        if candidate.arch() == wanted {
+            return Ok(candidate);
+        }
+    }
+    Err(EngineError::Runtime(
+        "RustEE found no device of the library's compute capability".into(),
+    ))
+}
+
+/// The lanes of an engine, typed for the engine's own submissions and as queues for the graph runtime and the
+/// completions.
+#[derive(Debug)]
+pub struct LaneSet<L: DeviceQueue> {
+    /// The lanes as the engine submits on them.
+    pub typed: Arc<LanePool<L>>,
+    /// The lanes as queues.
+    pub queues: Arc<LanePool>,
+}
+
+/// Opens the lanes of an engine on shared RustEE lanes: `compute` lanes for the stage graphs (ids `0..`), the lane
+/// graphs are captured on, the owner's lane, then `transfers` transfer lanes. The lanes after the compute lanes are
+/// reserved in both pools, so no run of a graph is ever homed on them.
+pub fn open_lane_set<G: Gpu>(
+    gpu: &Arc<G>,
+    compute: usize,
+    ring: usize,
+    transfers: usize,
+) -> Result<LaneSet<<G::Stream as Stream>::Lane>, GpuError> {
+    let stage = StreamOptions {
+        markers: ring as u32,
+        spans: 0,
+        ..StreamOptions::default()
+    };
+    let transfer = StreamOptions {
+        markers: TRANSFER_RING as u32,
+        spans: 0,
+        ..StreamOptions::default()
+    };
+    let mut specs: Vec<(&str, StreamOptions)> = Vec::with_capacity(compute + 2 + transfers);
+    specs.extend((0..compute + 2).map(|_| ("stage", stage)));
+    specs.extend((0..transfers).map(|_| ("transfer", transfer)));
+    let shared = open_shared_lanes(gpu, &specs)?;
+    let reserved: Vec<LaneId> = (compute..compute + 2 + transfers)
+        .map(|lane| LaneId(lane as u16))
+        .collect();
+    let solely = || GpuError::Invalid("the lane pools are shared before they are reserved".into());
+    let typed = Arc::try_unwrap(shared.pool)
+        .map_err(|_| solely())?
+        .with_reserved_lanes(&reserved);
+    let queues = Arc::try_unwrap(shared.queues)
+        .map_err(|_| solely())?
+        .with_reserved_lanes(&reserved);
+    Ok(LaneSet {
+        typed: Arc::new(typed),
+        queues: Arc::new(queues),
+    })
+}
+
 /// Builds the lattice, the lakes, the lanes and the pools of a startup, on the calling thread.
 fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineError> {
     let started = Instant::now();
@@ -554,31 +645,26 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
 
     let io = AsyncIo::open().map_err(|error| EngineError::io("the asynchronous file I/O would not open", error))?;
 
+    // The device RustEE's lanes and kernels are on: the one the native library bound.
+    let gpu = open_device(&library)?;
+    let loading = Instant::now();
+    let sources = kernel_sources(&library, settings).map_err(|error| runtime("the kernels would not load", &error))?;
+    let kernels = Arc::new(load(&gpu, &sources).map_err(|error| runtime("the kernels would not compile", &error))?);
+    log::info!(
+        "the kernels compiled and loaded in {:.2} s",
+        loading.elapsed().as_secs_f64()
+    );
+
     // The stage graphs' lanes first, so that their ids are the plan's (`0..`), then one transfer lane per upload chain,
     // the most the settings allow; the startup uses as many as its ring needs.
     let machine = startup::read_machine();
-    let chains = startup::transfer_lanes(settings, library.max_lanes().saturating_sub(Plan::lane_width() + 2));
     let compute = Plan::lane_width();
+    let chains = startup::transfer_lanes(settings, MAX_LANES.saturating_sub(compute + 2));
     let ring = stage_ring();
-    let mut stage_lanes = Vec::with_capacity(compute + 2);
-    for lane in 0..compute + 2 {
-        stage_lanes.push(CudaLane::new(&library, LaneId(lane as u16), ring)?);
-    }
-    let mut transfer = Vec::with_capacity(chains);
-    for lane in 0..chains {
-        transfer.push(CudaLane::new(
-            &library,
-            LaneId((compute + 2 + lane) as u16),
-            TRANSFER_RING,
-        )?);
-    }
-    let every: Vec<Arc<CudaLane>> = stage_lanes.iter().chain(&transfer).cloned().collect();
-    let lane_table = LaneTable::new(every.clone())?;
-    let queues: Vec<Arc<dyn DeviceQueue>> = every
-        .iter()
-        .map(|lane| Arc::clone(lane) as Arc<dyn DeviceQueue>)
-        .collect();
-    let lanes = Arc::new(LanePool::new(queues));
+    let set =
+        open_lane_set(&gpu, compute, ring, chains).map_err(|error| runtime("the lanes would not open", &error))?;
+    let lanes = set.queues;
+    let lane_table = LaneTable::new(set.typed, Arc::clone(&kernels), Arc::clone(&library));
     let completions = Completions::new(Arc::clone(&lanes));
     lattice
         .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
@@ -601,11 +687,11 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
         control,
         io,
         completions,
+        _gpu: gpu,
         lanes,
-        stage_lanes,
-        stage_ring: ring,
         lane_table,
-        transfer,
+        stage_ring: ring,
+        compute,
         pool,
         retire: Arc::new(RetireList::new()),
         host_pinned_bytes: startup::host_pinned_bytes(settings, &machine),

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use thiserror::Error;
 
-use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, PinnedPool, RetireList, Submission};
+use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, KernelOps, PinnedPool, RetireList};
 
 use crate::error::EngineError;
 use crate::model::ModelConfig;
@@ -117,7 +117,7 @@ pub struct SequenceState {
 }
 
 impl SequenceState {
-    /// Allocates the state `plan` sized: the cache with its host pages, the GDN state (zeroed on `submission`'s lane
+    /// Allocates the state `plan` sized: the cache with its host pages, the GDN state (zeroed through `kernels`, on the owner's lane
     /// before any quantum), the decode scratch and, for a drafting sequence, the draft buffers and the MTP layer's
     /// cache. Pages and page tables are freed through `retire` when their last holder lets go. Waits on the allocators:
     /// startup only. The caller waits for the zeroing's marker.
@@ -126,7 +126,7 @@ impl SequenceState {
         retire: &Arc<RetireList>,
         config: &ModelConfig,
         plan: &ResidencyPlan,
-        submission: &Submission<'_>,
+        kernels: &mut dyn KernelOps,
     ) -> Result<SequenceState, EngineError> {
         let drafts = plan.draft_depth > 0;
         let verified_rows = if drafts { 1 + plan.draft_depth as u64 } else { 0 };
@@ -156,7 +156,7 @@ impl SequenceState {
         } else {
             None
         };
-        let gdn = GdnStates::allocate(library, config, verified_rows, &mut { submission })?;
+        let gdn = GdnStates::allocate(library, config, verified_rows, kernels)?;
         // A drafting sequence's catch-up runs up to the decode row twins' rows on the same scratch.
         let decode_rows = if drafts { verified_rows.max(DRAFT_TWIN_ROWS) } else { 1 };
         let scratch = AttentionScratch::allocate(
@@ -227,9 +227,9 @@ impl SequenceState {
     }
 
     /// Makes the sequence one that has seen no token: the caches are empty (their pages stay reserved) and the GDN
-    /// state is zeroed on `submission`'s lane. The owner calls it between requests, with no quantum in flight, and
-    /// orders the sequence's next quantum behind the submission's marker.
-    pub fn reset(&mut self, submission: &Submission<'_>) -> Result<(), EngineError> {
+    /// state is zeroed through `kernels`, on the owner's lane. The owner calls it between requests, with no quantum in flight, and
+    /// orders the sequence's next quantum behind the marker of the work that queued it.
+    pub fn reset(&mut self, kernels: &mut dyn KernelOps) -> Result<(), EngineError> {
         if self.in_flight() > 0 {
             return Err(EngineError::Runtime(format!(
                 "a sequence with {} quanta in flight cannot be reset",
@@ -241,7 +241,7 @@ impl SequenceState {
             cache.discard();
             cache.truncate(0).map_err(|error| fail(&error))?;
         }
-        self.device.gdn.zero(&mut { submission }).map_err(|error| fail(&error))
+        self.device.gdn.zero(kernels).map_err(|error| fail(&error))
     }
 
     /// Ends the sequence: frees its caches, the one place their blocking frees may happen. Refused, giving the state

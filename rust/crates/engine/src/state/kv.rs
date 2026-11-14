@@ -31,8 +31,8 @@ use std::sync::Arc;
 
 use euhedral_graph::{LanePool, Marker};
 use euhedral_inference_cuda::{
-    AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena, KernelOps, PinnedPool,
-    PooledPinned, RetireList, Submission,
+    AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena, KernelOps, LaneOps, PinnedPool,
+    PooledPinned, RetireList,
 };
 use euhedral_inference_settings::KvFormat;
 use thiserror::Error;
@@ -90,12 +90,11 @@ pub struct SharedBuffer {
 }
 
 impl SharedBuffer {
-    fn new(buffer: DeviceBuffer, retire: &Arc<RetireList>, submission: &Submission<'_>) -> Arc<SharedBuffer> {
-        let lane = submission.lane();
+    fn new(buffer: DeviceBuffer, retire: &Arc<RetireList>, home: Marker) -> Arc<SharedBuffer> {
         Arc::new(SharedBuffer {
             buffer: Some(buffer),
             retire: Arc::clone(retire),
-            always_reached: Marker::new(lane.queue_id(), lane.id(), 0),
+            always_reached: home,
         })
     }
 
@@ -300,28 +299,15 @@ impl KvCache {
     }
 
     /// Reserves `rows` contiguous append rows at `start`, without publishing them. The rows continue the submitted
-    /// frontier. This queues stream-ordered allocations and a table upload on `submission`'s lane and waits for
-    /// nothing; what the upload reads, and the tables it replaced, are added to `retained`.
+    /// frontier. This queues stream-ordered allocations and a table upload on `lane` and waits for nothing; what the
+    /// upload reads, and the tables it replaced, are added to `retained`.
+    ///
+    /// The pages and the table are allocated in stream order on `lane`, and the upload is queued through the same
+    /// `lane`: an upload queued on another stream could run before that allocation has completed, and write the table
+    /// before it exists. One [`LaneOps`] does both, so they cannot differ.
     pub fn reserve(
         &mut self,
-        submission: &Submission<'_>,
-        pool: &Arc<PinnedPool>,
-        start: u64,
-        rows: u64,
-        retained: &mut KvRetained,
-    ) -> Result<(), KvError> {
-        let mut kernels = submission;
-        self.reserve_with(submission, &mut kernels, pool, start, rows, retained)
-    }
-
-    /// As [`reserve`](Self::reserve), with the table upload queued through `kernels`, which must queue on the lane of
-    /// `submission`. The pages and the table are allocated stream-ordered on `submission`'s lane; an upload queued on
-    /// another stream can run before that allocation has completed, and write the table before it exists. Nothing in
-    /// [`KernelOps`] names the lane it queues on, so this is not checked.
-    pub fn reserve_with(
-        &mut self,
-        submission: &Submission<'_>,
-        kernels: &mut dyn KernelOps,
+        lane: &mut dyn LaneOps,
         pool: &Arc<PinnedPool>,
         start: u64,
         rows: u64,
@@ -359,18 +345,18 @@ impl KvCache {
         for layer in &mut store.layers {
             while (layer.pages.len() as u64) < device {
                 layer.pages.push(SharedBuffer::new(
-                    DeviceBuffer::alloc_async(submission, (2 * plane) as usize)?,
+                    lane.alloc_async((2 * plane) as usize)?,
                     &self.retire,
-                    submission,
+                    lane.home()?,
                 ));
             }
             let next = if slots == self.table_slots {
                 None
             } else {
                 Some(SharedBuffer::new(
-                    DeviceBuffer::alloc_async(submission, table_bytes as usize)?,
+                    lane.alloc_async(table_bytes as usize)?,
                     &self.retire,
-                    submission,
+                    lane.home()?,
                 ))
             };
             let mut staging = pool.acquire(table_bytes as usize)?;
@@ -396,7 +382,7 @@ impl KvCache {
             let staged = retained.staging[retained.staging.len() - 1].buffer();
             // SAFETY: the staging stays alive and unmodified in `retained` until the caller retires it behind the
             // lane's marker, which is after the copy has run.
-            unsafe { kernels.copy_upload_to_device(target, staged, 0, table_bytes as usize) }?;
+            unsafe { lane.copy_upload_to_device(target, staged, 0, table_bytes as usize) }?;
             if let Some(next) = next {
                 // The table it replaces stays with the views that hold it.
                 layer.table = Some(next);

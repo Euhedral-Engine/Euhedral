@@ -457,7 +457,7 @@ fn retired_buffers_are_released_after_their_marker_without_blocking() {
 
     let released = |list: &RetireList| {
         let submission = submit(&reaper);
-        list.reap(|m| lanes.reached(m), &submission).expect("reap")
+        list.reap(|m| lanes.reached(m), &mut &submission).expect("reap")
     };
     assert_eq!(released(&list), 0, "the lane is parked on its gate");
     gate.word(0).store(1, Ordering::Release);

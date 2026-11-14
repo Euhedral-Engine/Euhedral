@@ -14,6 +14,7 @@ test-oracles = ["euhedral-inference-cuda/test-oracles"]
 [dependencies]
 euhedral-core.workspace = true
 euhedral-data-structures.workspace = true
+euhedral-gpu = { workspace = true, features = ["cuda"] }
 euhedral-graph.workspace = true
 euhedral-io.workspace = true
 euhedral-hardware-utils.workspace = true
@@ -26,7 +27,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 euhedral-inference-engine = { path = ".", features = ["test-oracles"] }
-euhedral-gpu = { workspace = true, features = ["cuda"] }
+euhedral-gpu = { workspace = true, features = ["cuda", "fake"] }
 euhedral-inference-bench = { path = "../bench" }
 euhedral-inference-cuda = { path = "../cuda", features = ["test-oracles"] }
 euhedral-inference-tokenizer = { path = "../tokenizer" }

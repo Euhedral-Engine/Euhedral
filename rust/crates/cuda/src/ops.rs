@@ -14,8 +14,10 @@
 // Each function mirrors one C entry point's parameter list.
 #![allow(clippy::too_many_arguments)]
 
+use euhedral_graph::Marker;
+
 use crate::error::{CudaError, check};
-use crate::memory::{DevicePtr, HostWeightsArena, PinnedBuffer};
+use crate::memory::{DeviceBuffer, DevicePtr, HostWeightsArena, PinnedBuffer};
 use crate::submission::Submission;
 
 /// Calls the C entry point `$name` and turns its status into a `Result`.
@@ -1243,6 +1245,36 @@ pub trait KernelOps {
         source: DevicePtr,
         bytes: usize,
     ) -> Result<(), CudaError>;
+}
+
+/// [`KernelOps`] on a lane that also allocates and frees device memory in stream order, on the same lane the kernels
+/// run on: what the owner's work on a sequence (its cache's pages, its state) needs, where an allocation and the copy
+/// or launch that first uses it must be ordered on one stream.
+pub trait LaneOps: KernelOps {
+    /// The marker of value 0 of this lane: reached before any work, and naming the lane that allocations here are
+    /// ordered on.
+    fn home(&self) -> Result<Marker, CudaError>;
+
+    /// Allocates `bytes` in stream order on this lane: usable by the work queued after this call on it.
+    fn alloc_async(&mut self, bytes: usize) -> Result<DeviceBuffer, CudaError>;
+
+    /// Frees `buffer` in stream order on this lane, after the work queued before this call on it.
+    fn free_async(&mut self, buffer: DeviceBuffer) -> Result<(), CudaError>;
+}
+
+impl LaneOps for &Submission<'_> {
+    fn home(&self) -> Result<Marker, CudaError> {
+        let lane = self.lane();
+        Ok(Marker::new(lane.queue_id(), lane.id(), 0))
+    }
+
+    fn alloc_async(&mut self, bytes: usize) -> Result<DeviceBuffer, CudaError> {
+        DeviceBuffer::alloc_async(self, bytes)
+    }
+
+    fn free_async(&mut self, buffer: DeviceBuffer) -> Result<(), CudaError> {
+        buffer.free_async(self, &[])
+    }
 }
 
 /// Implements [`KernelOps`] for a type that dereferences to a [`Submission`], each method calling the function of the

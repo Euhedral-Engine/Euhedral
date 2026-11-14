@@ -13,7 +13,7 @@
 //! stages that own those launches warm them.
 
 use euhedral_graph::Marker;
-use euhedral_inference_cuda::{CudaError, CudaLane, KernelOps, Submission, SubmitMode};
+use euhedral_inference_cuda::{CudaError, KernelOps};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 
 use crate::model::{LayerIndex, ModelConfig, NormKind, Role, WeightRef, Weights};
@@ -31,7 +31,7 @@ pub struct Warmed {
 
 /// The launches queued so far on the warm-up lane.
 struct Launcher<'a> {
-    lane: &'a CudaLane,
+    core: &'a Core,
     warmed: Warmed,
     /// The marker of the last launch queued: the lane reaches it when every launch has run.
     last: Option<Marker>,
@@ -39,13 +39,12 @@ struct Launcher<'a> {
 
 impl Launcher<'_> {
     fn launch(&mut self, module: &'static str, work: impl FnOnce(&mut dyn KernelOps) -> Result<(), CudaError>) {
-        let result = Submission::begin(self.lane, SubmitMode::default()).and_then(|submission| {
-            let mut kernels = &submission;
-            work(&mut kernels)?;
-            submission.finish_signalled()
-        });
+        let result = self
+            .core
+            .lane_table
+            .submit_ops(self.core.transfer_lane(0), false, |kernels| work(kernels));
         match result {
-            Ok(marker) => {
+            Ok(((), marker)) => {
                 self.warmed.modules.push(module);
                 self.last = Some(marker);
             }
@@ -61,9 +60,8 @@ pub(crate) fn run(
     weights: &Weights,
     workspace: &Workspace,
 ) -> (Warmed, Option<Marker>) {
-    let lane = &core.transfer[0];
     let mut launcher = Launcher {
-        lane,
+        core,
         warmed: Warmed::default(),
         last: None,
     };

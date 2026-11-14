@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use euhedral_graph::Marker;
 
 use crate::error::CudaError;
+use crate::ops::LaneOps;
 use crate::stack::Stack;
-use crate::submission::Submission;
 
 /// Something the retire list can release without blocking.
 ///
@@ -23,18 +23,18 @@ pub trait Retire: Send + 'static {
         Ok(())
     }
 
-    /// Releases the item. `submission` is the lane a stream-ordered free is queued on.
-    fn release(self, submission: &Submission<'_>) -> Result<(), CudaError>;
+    /// Releases the item. `ops` is the lane a stream-ordered free is queued on.
+    fn release(self, ops: &mut dyn LaneOps) -> Result<(), CudaError>;
 }
 
 /// The object-safe form of [`Retire`].
 trait Boxed: Send {
-    fn release_boxed(self: Box<Self>, submission: &Submission<'_>) -> Result<(), CudaError>;
+    fn release_boxed(self: Box<Self>, ops: &mut dyn LaneOps) -> Result<(), CudaError>;
 }
 
 impl<T: Retire> Boxed for T {
-    fn release_boxed(self: Box<Self>, submission: &Submission<'_>) -> Result<(), CudaError> {
-        (*self).release(submission)
+    fn release_boxed(self: Box<Self>, ops: &mut dyn LaneOps) -> Result<(), CudaError> {
+        (*self).release(ops)
     }
 }
 
@@ -86,11 +86,11 @@ impl RetireList {
         Ok(())
     }
 
-    /// Releases every item whose marker `reached` accepts (`|marker| pool.reached(marker)`) on `submission`'s lane,
+    /// Releases every item whose marker `reached` accepts (`|marker| pool.reached(marker)`) on `ops`' lane,
     /// and returns how many; the rest stay. Nothing blocks. Every ready item is released even when one fails; the
     /// first failure is returned.
-    pub fn reap(&self, reached: impl Fn(Marker) -> bool, submission: &Submission<'_>) -> Result<usize, CudaError> {
-        self.reap_with(reached, |item| item.release_boxed(submission))
+    pub fn reap(&self, reached: impl Fn(Marker) -> bool, ops: &mut dyn LaneOps) -> Result<usize, CudaError> {
+        self.reap_with(reached, |item| item.release_boxed(ops))
     }
 
     fn reap_with(
@@ -145,7 +145,7 @@ mod tests {
             }
         }
 
-        fn release(self, _submission: &Submission<'_>) -> Result<(), CudaError> {
+        fn release(self, _ops: &mut dyn LaneOps) -> Result<(), CudaError> {
             Ok(())
         }
     }

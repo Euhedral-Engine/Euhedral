@@ -100,7 +100,7 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
     // 300 rows need two pages and a table of two slots per plane.
     let mut retained = KvRetained::default();
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-    cache.reserve(&submission, &pool, 0, 300, &mut retained).unwrap();
+    cache.reserve(&mut &submission, &pool, 0, 300, &mut retained).unwrap();
     assert_eq!((cache.reserved(), cache.submitted(), cache.committed()), (512, 0, 0));
     assert!(cache.reserves(0, 512) && !cache.reserves(0, 513));
     let marker = submission.finish_signalled().unwrap();
@@ -153,7 +153,7 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
     let mut retained = KvRetained::default();
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
     assert!(matches!(
-        cache.reserve(&submission, &pool, 100, 10, &mut retained),
+        cache.reserve(&mut &submission, &pool, 100, 10, &mut retained),
         Err(KvError::NotContiguous {
             start: 100,
             submitted: 240
@@ -161,7 +161,7 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
     ));
     // Growing past two pages doubles the table. No view holds the old tables, so the cache's let-go is their last:
     // they are handed to the retire list for the stream-ordered free.
-    cache.reserve(&submission, &pool, 240, 300, &mut retained).unwrap();
+    cache.reserve(&mut &submission, &pool, 240, 300, &mut retained).unwrap();
     assert_eq!(cache.reserved(), 768);
     assert_eq!(
         retire.pending(),
@@ -181,7 +181,7 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
     // The staging goes back to the pool once the lane reached the marker; the outgrown tables are freed on a lane.
     let reached = |marker: Marker| lane.completed() >= marker.value;
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-    assert_eq!(retire.reap(reached, &submission).unwrap(), 6);
+    assert_eq!(retire.reap(reached, &mut &submission).unwrap(), 6);
     submission.finish().unwrap();
     lane.synchronize().unwrap();
     assert_eq!(retire.pending(), 0);
@@ -190,7 +190,7 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
     let mut retained = KvRetained::default();
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
     assert!(matches!(
-        cache.reserve(&submission, &pool, 240, 4000, &mut retained),
+        cache.reserve(&mut &submission, &pool, 240, 4000, &mut retained),
         Err(KvError::TooLong {
             required: 4240,
             planned: 4096
@@ -221,7 +221,7 @@ fn host_pages_are_read_and_written_through_the_device_region() {
     assert_eq!(cache.planned_rows(), 768);
     let mut retained = KvRetained::default();
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-    cache.reserve(&submission, &pool, 0, 600, &mut retained).unwrap();
+    cache.reserve(&mut &submission, &pool, 0, 600, &mut retained).unwrap();
     submission.finish().unwrap();
     lane.synchronize().unwrap();
     assert_eq!(cache.device_pages(), 1);
@@ -370,7 +370,7 @@ fn primed_staging_means_a_reservation_allocates_nothing() {
     let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
     for page in 0..32u64 {
         cache
-            .reserve(&submission, &pool, page * 256, 256, &mut retained)
+            .reserve(&mut &submission, &pool, page * 256, 256, &mut retained)
             .unwrap();
         cache.appended(256).unwrap();
         // The caller retires the staging behind the lane's marker; here the sets in flight are the two primed.

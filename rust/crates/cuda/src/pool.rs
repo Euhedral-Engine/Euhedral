@@ -10,9 +10,9 @@ use euhedral_io::IoMemory;
 use crate::error::CudaError;
 use crate::library::CudaLibrary;
 use crate::memory::PinnedBuffer;
+use crate::ops::LaneOps;
 use crate::retire::Retire;
 use crate::stack::Stack;
-use crate::submission::Submission;
 
 /// The smallest size class: one page.
 const MIN_CLASS_BYTES: usize = 4096;
@@ -221,7 +221,7 @@ impl Drop for PooledPinned {
 }
 
 impl Retire for PooledPinned {
-    fn release(self, _submission: &Submission<'_>) -> Result<(), CudaError> {
+    fn release(self, _ops: &mut dyn LaneOps) -> Result<(), CudaError> {
         drop(self);
         Ok(())
     }

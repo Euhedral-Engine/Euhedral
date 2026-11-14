@@ -23,10 +23,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+use euhedral_gpu::{GpuError, Lane};
 use euhedral_graph::{
     DeviceQueue, GraphRuntime, LaneId, LanePool, Marker, Ready, Stage, StageCx, StageError, Submitted,
 };
-use euhedral_inference_cuda::{CudaError, CudaLane, Submission, SubmitMode};
 
 use super::{LaneTable, Quantum};
 use crate::frames::{self, Kind};
@@ -105,24 +105,18 @@ impl LaneEnds {
         !self.failed.swap(true, Ordering::AcqRel)
     }
 
-    /// Ends `lane` with a signalled marker if the quantum's latest marker on it is not signalled: an empty submission,
-    /// queued behind the lane's work, that writes its marker to the completion word. Never waits: a held lane answers
-    /// [`Settled::Busy`].
-    pub fn settle(&self, lane: &CudaLane) -> Result<Settled, CudaError> {
-        let id = lane.id();
+    /// Ends `lane` with a marker if the quantum's latest marker on it is unsignalled: an empty submission, queued
+    /// behind the lane's work. Never waits: a lane whose marker ring is full answers [`Settled::Busy`].
+    pub fn settle<L: Lane>(&self, lane: &L) -> Result<Settled, GpuError> {
+        let id = lane.lane();
         if !self.unsignalled(id) {
             return Ok(Settled::Clean);
         }
-        let submission = match Submission::begin(lane, SubmitMode::default()) {
-            Ok(submission) => submission,
-            Err(CudaError::LaneBusy(_)) => return Ok(Settled::Busy),
+        let marker = match lane.mark() {
+            Ok(marker) => marker,
+            Err(GpuError::Busy) => return Ok(Settled::Busy),
             Err(error) => return Err(error),
         };
-        // The stage that held the lane before may have signalled in the meantime.
-        if !self.unsignalled(id) {
-            return Ok(Settled::Clean);
-        }
-        let marker = submission.finish_signalled()?;
         self.record(marker, true);
         Ok(Settled::Signalled)
     }
@@ -171,7 +165,7 @@ impl Settler {
             );
             return;
         };
-        match ends.settle(device) {
+        match ends.settle(&**device) {
             Ok(Settled::Busy) => {
                 let progress = Progress::new(&self.runtime);
                 self.publish(lane, ends, table, Box::new(progress));

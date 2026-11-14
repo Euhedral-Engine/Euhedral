@@ -26,9 +26,14 @@
     reason = "no-wait, waiting calls: a test synchronizes both lanes and copies synchronously to compare results"
 )]
 
+#[path = "common/typed.rs"]
+mod typed;
+
 use std::mem::replace;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use typed::Typed;
 
 use euhedral_gpu::cuda::{CudaGpu, CudaStream};
 use euhedral_gpu::{Gpu, GpuError, Stream, StreamOptions};
@@ -171,7 +176,7 @@ impl Twin {
         Some(Twin {
             library: Arc::clone(library),
             table,
-            lanes: LaneTable::new(vec![Arc::clone(&lane)]).unwrap(),
+            lanes: Typed::plain(library, 1, 256).table.with_native(vec![Arc::clone(&lane)]),
             lane,
             stream,
             retire: Arc::new(RetireList::new()),
@@ -242,7 +247,8 @@ impl Twin {
         let mut kv = KvCache::new(&self.library, &self.retire, kv_layers, 1024, KvFormat::Nvfp4, 256, 0).unwrap();
         let mut retained = KvRetained::default();
         if kv_layers > 0 {
-            kv.reserve(&submission, &self.pinned, 0, 256, &mut retained).unwrap();
+            kv.reserve(&mut &submission, &self.pinned, 0, 256, &mut retained)
+                .unwrap();
         }
         gdn.zero(&mut &submission).unwrap();
         submission.finish_signalled().unwrap();

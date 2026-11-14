@@ -10,12 +10,15 @@
 //!
 //! Copies and the memset are the lane's own operations. A pitched 2D copy is RustEE's pitched copy on the lane (a single copy when both pitches equal the row).
 
+use std::ffi::c_void;
 use std::fmt;
+use std::sync::Arc;
 
 use euhedral_gpu::cuda::CudaKernel;
-use euhedral_gpu::{GpuError, LaneEnqueue};
+use euhedral_gpu::{GpuError, LaneEnqueue, LaneStream};
+use euhedral_graph::Marker;
 
-use crate::error::CudaError;
+use crate::error::{CudaError, check};
 use crate::launch::attention::{
     AppendShape, CacheFormat, CausalShape, RopeShape, plan_causal, plan_kv_append, plan_qk_norm_rope,
 };
@@ -35,8 +38,9 @@ use crate::launch::nvfp4::{Nvfp4Operands, plan_linear, plan_native};
 use crate::launch::queue::{EnqueueError, enqueue};
 use crate::launch::table::{Geometry, plan_linear_launch, plan_qwen4_launch};
 use crate::launch::{Modes, PlanError};
-use crate::memory::{DevicePtr, HostWeightsArena, PinnedBuffer};
-use crate::ops::{KernelOps, range_start};
+use crate::library::CudaLibrary;
+use crate::memory::{DeviceBuffer, DevicePtr, HostWeightsArena, PinnedBuffer};
+use crate::ops::{KernelOps, LaneOps, range_start};
 use crate::sys::{
     EUHEDRAL_CUDA_FORMAT_MISMATCH as FORMAT_MISMATCH, EUHEDRAL_CUDA_INVALID_ARGUMENT as INVALID_ARGUMENT,
     EUHEDRAL_CUDA_ROUTE_UNAVAILABLE as ROUTE_UNAVAILABLE, EUHEDRAL_CUDA_SIZE_OVERFLOW as SIZE_OVERFLOW,
@@ -79,6 +83,9 @@ pub struct RusteeOps<'a, Q> {
     table: &'a KernelTable,
     modes: Modes,
     began_row_exact: bool,
+    /// The C library and the lane's value-0 marker, for the allocations the owner makes on this lane
+    /// ([`RusteeOps::on_lane`]).
+    lane: Option<(&'a Arc<CudaLibrary>, Marker)>,
 }
 
 impl<Q> fmt::Debug for RusteeOps<'_, Q> {
@@ -103,7 +110,16 @@ where
             table,
             modes,
             began_row_exact: modes.row_exact,
+            lane: None,
         }
+    }
+
+    /// The same, for work that also allocates and frees in stream order ([`LaneOps`]): `library` is the C library whose
+    /// stream-ordered allocator is used on the lane's stream, and `home` the lane's marker of value 0.
+    #[must_use]
+    pub fn on_lane(mut self, library: &'a Arc<CudaLibrary>, home: Marker) -> Self {
+        self.lane = Some((library, home));
+        self
     }
 
     /// The modes later launches are planned in.
@@ -873,3 +889,54 @@ where
 
 #[cfg(test)]
 mod tests;
+
+impl<Q> RusteeOps<'_, Q>
+where
+    Q: LaneEnqueue<Kernel = CudaKernel> + LaneStream<Raw = *mut c_void>,
+{
+    /// Runs `call` with the C library's stream selected for the calling thread to the stream the lane lends, and clears
+    /// the selection after. The lent stream is private to the submission and the operations enqueued after the lend go
+    /// to it too, so the call is ordered with everything enqueued before it and after it.
+    pub fn on_lent_stream<R>(&self, call: impl FnOnce(&Arc<CudaLibrary>) -> R) -> Result<R, CudaError> {
+        let Some((library, _)) = self.lane else {
+            return Err(CudaError::Argument(
+                "the operations were made without a lane's library: use `on_lane`".to_string(),
+            ));
+        };
+        let stream = self
+            .queue
+            .raw_stream()
+            .ok_or_else(|| CudaError::Argument("the lane lent no stream".to_string()))?
+            .as_raw();
+        // SAFETY: the stream is live for this submission; the selection is cleared before the lent stream can end.
+        let status = unsafe {
+            library
+                .api()
+                .euhedral_cuda_stream_select(stream.expose_provenance() as u64)
+        };
+        check("euhedral_cuda_stream_select", status)?;
+        let out = call(library);
+        // SAFETY: clears this thread's selection.
+        unsafe { library.api().euhedral_cuda_stream_clear() };
+        Ok(out)
+    }
+}
+
+impl<Q> LaneOps for RusteeOps<'_, Q>
+where
+    Q: LaneEnqueue<Kernel = CudaKernel> + LaneStream<Raw = *mut c_void>,
+{
+    fn home(&self) -> Result<Marker, CudaError> {
+        self.lane
+            .map(|(_, home)| home)
+            .ok_or_else(|| CudaError::Argument("the operations were made without a lane: use `on_lane`".to_string()))
+    }
+
+    fn alloc_async(&mut self, bytes: usize) -> Result<DeviceBuffer, CudaError> {
+        self.on_lent_stream(|library| DeviceBuffer::alloc_on_selected(library, bytes))?
+    }
+
+    fn free_async(&mut self, buffer: DeviceBuffer) -> Result<(), CudaError> {
+        self.on_lent_stream(|_| buffer.free_on_selected())?
+    }
+}

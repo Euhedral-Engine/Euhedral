@@ -46,6 +46,13 @@ use crate::stages::attention::{KvSource, takes_decode_scratch};
 use crate::stages::{QuantumError, QuantumKind, Settler, Settling, StageLaunch, fatal};
 use crate::workspace::BufferSlot;
 
+/// Whether quanta are recorded into graphs and replayed. They are not: the stages run on RustEE's shared lanes, which
+/// the record and replay stages below (written against the native library's lanes and captures) cannot use, so every
+/// quantum runs stage by stage. The stages, the graph cache and the capture keys stay in the tree for the capture on
+/// RustEE's graph cache that replaces them: with this off, no record stage is added to a view's graph, no replay graph is
+/// made, and [`Executor::start`] never asks the cache.
+pub const CAPTURES: bool = false;
+
 /// How a quantum runs.
 #[derive(Clone, Debug, Default)]
 pub enum Disposition {
@@ -80,21 +87,15 @@ impl Quantum {
 
     /// Writes the quantum's input record (its token ids as 32-bit values, then its start position as a 64-bit value
     /// at the next 8-byte boundary) into pinned memory from `pool`, and queues its upload to the workspace's input
-    /// slot on `submission`. The pinned copy is held until the quantum is dropped. Finish the submission, and record
-    /// its marker with [`Quantum::prepared_after`]: the quantum's first stage waits for it on the device. Rows that
+    /// slot through `kernels`. The pinned copy is held until the quantum is dropped. Record the marker of the submission
+    /// that carried it with [`Quantum::prepared_after`]: the quantum's first stage waits for it on the device. Rows that
     /// read their ids from the step's tokens (`reading_draft_tokens`) or from the selection of the quantum before them
     /// ([`Quantum::token_from`]) need no ids; the record then carries zeros.
     ///
     /// The owner reserves the cache's rows (`KvCache::reserve`, which needs the cache) before it takes the views the
     /// quantum reads ([`SequenceState::refs`](crate::state::SequenceState::refs)); that reservation is not part of
     /// the quantum.
-    pub fn prepare(&mut self, pool: &Arc<PinnedPool>, submission: &Submission<'_>) -> Result<(), PrepareError> {
-        let mut kernels = submission;
-        self.prepare_with(pool, &mut kernels)
-    }
-
-    /// As [`prepare`](Self::prepare), with the upload queued through `kernels`.
-    pub fn prepare_with(&mut self, pool: &Arc<PinnedPool>, kernels: &mut dyn KernelOps) -> Result<(), PrepareError> {
+    pub fn prepare(&mut self, pool: &Arc<PinnedPool>, kernels: &mut dyn KernelOps) -> Result<(), PrepareError> {
         let zeros;
         let ids: &[u32] = if self.tokens.len() == self.rows {
             &self.tokens
@@ -247,7 +248,7 @@ impl Quantum {
         if !view.capturable() || self.rows > MAX_CAPTURED_ROWS {
             return None;
         }
-        if self.lanes.get(LaneId(0))?.library().exact_numerics() {
+        if self.lanes.library().exact_numerics() {
             return None;
         }
         let draft_seed = match self.draft_seed {
@@ -405,7 +406,7 @@ impl Stage<Quantum> for RecordStage {
         let Disposition::Record(slot) = &quantum.disposition else {
             return Ok(Submitted::done());
         };
-        let Some(lane) = quantum.lanes.get(self.lane) else {
+        let Some(lane) = quantum.lanes.native(self.lane) else {
             slot.release();
             return Err(fatal(format!(
                 "the capture lane {} is not in the lane table",
@@ -467,8 +468,8 @@ impl Stage<Quantum> for ReplayStage {
         let id = cx.lane.ok_or_else(|| fatal("the graph launch was given no lane"))?;
         let lane = quantum
             .lanes
-            .get(id)
-            .ok_or_else(|| fatal(format!("lane {} is not in the lane table", id.0)))?;
+            .native(id)
+            .ok_or_else(|| fatal(format!("native lane {} is not in the lane table", id.0)))?;
         // A graph does not wait: the markers the quantum depends on are waited for before it launches.
         let waits = latest_per_lane(
             cx.waits
@@ -571,7 +572,7 @@ impl Executor {
                 })
                 .collect();
             let launches: Arc<[Arc<dyn StageLaunch>]> = entries.iter().map(|entry| Arc::clone(&entry.launch)).collect();
-            if view.capturable() {
+            if CAPTURES && view.capturable() {
                 spec.stage(StageSpec {
                     name: "record",
                     ordered: None,
@@ -589,7 +590,7 @@ impl Executor {
                 runtime.clone(),
                 move |quantum, outcome| again(quantum, outcome),
             )?));
-            replay.push(if view.capturable() {
+            replay.push(if CAPTURES && view.capturable() {
                 let again = Arc::clone(&retire);
                 Some(StageGraph::new(
                     replay_spec(),
@@ -626,18 +627,22 @@ impl Executor {
         let eager = self.eager[variant.index()].as_ref().ok_or(StartError::NoView(view))?;
         let stages = self.plan.stages(view).map_or(0, <[_]>::len);
         let stage_by_stage = StageId((stages - 1) as u16);
-        let (graph, replayed, recording, sink) =
-            match (cache.admit(quantum.capture_key()), &self.replay[variant.index()]) {
-                (Admission::Replay(slot), Some(graph)) => {
-                    quantum.disposition = Disposition::Replay(slot);
-                    (graph, true, false, StageId(0))
-                }
-                (Admission::Record(slot), _) => {
-                    quantum.disposition = Disposition::Record(slot);
-                    (eager, false, true, stage_by_stage)
-                }
-                _ => (eager, false, false, stage_by_stage),
-            };
+        let admission = if CAPTURES {
+            cache.admit(quantum.capture_key())
+        } else {
+            Admission::Eager
+        };
+        let (graph, replayed, recording, sink) = match (admission, &self.replay[variant.index()]) {
+            (Admission::Replay(slot), Some(graph)) => {
+                quantum.disposition = Disposition::Replay(slot);
+                (graph, true, false, StageId(0))
+            }
+            (Admission::Record(slot), _) => {
+                quantum.disposition = Disposition::Record(slot);
+                (eager, false, true, stage_by_stage)
+            }
+            _ => (eager, false, false, stage_by_stage),
+        };
         let external = after.map(|previous| ExternalEdge {
             from: previous.reference.clone(),
             from_stage: previous.sink,

@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use euhedral_core::frames::Frame;
 use euhedral_graph::Lake;
-use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, KernelOps, PooledPinned, Submission, SubmitMode};
+use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, PooledPinned};
 use euhedral_inference_edrl::{
     HEADER_BYTES, Header, Metadata, ReadPlan, Region, TensorTable, TokenizerFooter, TrellisCompanions, WeightFormat,
     WeightLayout, content_end,
@@ -527,7 +527,7 @@ fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: Has
             core.settings.host.task_parallelism,
             core.pool_bytes,
             core.host_pinned_bytes,
-            core.transfer.len(),
+            core.transfer_lanes(),
         );
         let arena = DeviceBuffer::alloc(&core.library, plan.arena_bytes as usize)?;
         // Every pinned allocation of the startup happens here: the ring of the upload, and the staging the cache's
@@ -555,11 +555,11 @@ fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: Has
         let records = input_records(plan.draft_depth);
         let workspace =
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
-        let lane = &core.transfer[0];
-        let submission = Submission::begin(lane, SubmitMode::default())?;
-        let sequence = SequenceState::allocate(&core.library, &core.retire, &artifact.config, &plan, &submission)?;
-        sequence.prime_staging(&core.pool)?;
-        let marker = submission.finish_signalled()?;
+        let (sequence, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {
+            let sequence = SequenceState::allocate(&core.library, &core.retire, &artifact.config, &plan, kernels)?;
+            sequence.prime_staging(&core.pool)?;
+            Ok::<_, EngineError>(sequence)
+        })?;
         Ok::<_, EngineError>((ring, arena, loans, workspace, sequence, marker))
     })();
     match allocated {
@@ -772,16 +772,13 @@ impl DraftIds {
             source,
             bytes,
         } = self;
-        let queued = (|| {
-            let submission = Submission::begin(core.owner_lane(), SubmitMode::default())?;
-            let mut kernels = &submission;
+        let queued = core.lane_table.submit_ops(core.owner_lane(), false, |kernels| {
             // SAFETY: the loan is held by the frame that follows the copy, which runs once the lane has reached the
             // marker; nothing reads or writes the bytes before.
-            unsafe { kernels.copy_device_to_readback(loan.buffer_mut(), 0, source, bytes) }?;
-            submission.finish_signalled()
-        })();
+            unsafe { kernels.copy_device_to_readback(loan.buffer_mut(), 0, source, bytes) }
+        });
         match queued {
-            Ok(marker) => {
+            Ok(((), marker)) => {
                 let frame = step(Kind::Startup, 0, move || {
                     let ids: Arc<[u32]> = loan.buffer().as_slice()[..bytes]
                         .as_chunks::<4>()
