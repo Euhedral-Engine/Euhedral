@@ -27,7 +27,7 @@ use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{LayerKind, ModelConfig, WeightRef, object_key};
-use euhedral_inference_engine::plan::{Formats, Plan, StageKind, View, WeightLookup};
+use euhedral_inference_engine::plan::{DECODE_MAX_ROWS, Formats, Plan, StageKind, View, WeightLookup};
 use euhedral_inference_engine::quantum::split_geometry;
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, plan as residency};
 use euhedral_inference_engine::stages::LaneEnds;
@@ -331,7 +331,7 @@ fn fan_out_width_is_plan_width() {
         plan.fan_out_width(),
         "the lanes a runtime makes before it knows the model are the width of the model's plan"
     );
-    // Every graph names lanes within the pool the width sizes: the root only the home lane, the rest any of them.
+    // Every graph names lanes within the pool the width sizes: the root the home lane, each other stage the one lane of its chain.
     for view in [View::Decode, View::PrefillChunk, View::Draft { rows: 2 }] {
         let spec = plan.spec(view).unwrap();
         assert!(spec.validate().is_ok());
@@ -341,8 +341,13 @@ fn fan_out_width_is_plan_width() {
             vec![LaneId(0)],
             "{view:?}: the root enters on the home lane"
         );
-        let all: Vec<LaneId> = (0..plan.fan_out_width()).map(|lane| LaneId(lane as u16)).collect();
-        assert!(stages[1..].iter().all(|stage| stage.lanes == all), "{view:?}");
+        let pool = plan.fan_out_width() as u16;
+        assert!(
+            stages[1..]
+                .iter()
+                .all(|stage| matches!(stage.lanes.as_slice(), [LaneId(lane)] if *lane < pool)),
+            "{view:?}"
+        );
     }
     // The selection is the one sink, and the embedding the one root.
     assert_eq!(plan.roots(View::Decode).unwrap(), vec![0]);
@@ -655,52 +660,103 @@ fn placed_by_rustee(plan: &Plan, view: View) -> Vec<u16> {
     lanes.iter().map(|lane| lane.load(Ordering::Acquire) as u16).collect()
 }
 
+const VIEWS: [View; 6] = [
+    View::Decode,
+    View::Verify { rows: 5 },
+    View::Verify {
+        rows: DECODE_MAX_ROWS + 1,
+    },
+    View::PrefillChunk,
+    View::Draft { rows: 2 },
+    View::CatchUp { rows: 9 },
+];
+
 #[test]
-fn rustee_places_the_stages_of_every_view_as_javas_path_policy_does() {
+fn rustee_places_every_fan_out_on_distinct_lanes_and_every_stage_on_its_chain() {
     let plan = &built().plan;
-    for view in [
-        View::Decode,
-        View::Verify { rows: 5 },
-        View::PrefillChunk,
-        View::Draft { rows: 2 },
-        View::CatchUp { rows: 9 },
-    ] {
+    for view in VIEWS {
         let placed = placed_by_rustee(plan, view);
         let path = plan.path_predecessors(view).unwrap();
-        let width = plan.fan_out_width() as u16;
-        assert!(
-            placed.iter().all(|lane| *lane < width),
-            "{view:?}: every stage ran on a lane of the plan"
-        );
+        let edges = plan.edges(view).unwrap();
         assert_eq!(placed[0], 0, "{view:?}: the root runs on the home lane");
-        // Nothing is claimed of the lane the sink ends on: the chain of continuations breaks at a join, so it varies.
-        assert!(
-            placed[placed.len() - 1] < width,
-            "{view:?}: the sink runs on a lane of the plan"
-        );
-        let mut continued = 0;
-        let mut branches = 0;
         for (stage, predecessor) in path.iter().enumerate() {
-            match predecessor {
-                // The critical successor continues the lane of the predecessor it is critical for.
-                Some(predecessor) => {
-                    continued += 1;
-                    assert_eq!(
-                        placed[stage], placed[*predecessor],
-                        "{view:?}: stage {stage} continues {predecessor}"
-                    );
-                }
-                None if stage > 0 => branches += 1,
-                None => {}
+            if let Some(predecessor) = predecessor {
+                assert_eq!(
+                    placed[stage], placed[*predecessor],
+                    "{view:?}: stage {stage} continues {predecessor}"
+                );
             }
         }
-        assert_eq!(continued + branches + 1, placed.len(), "{view:?}");
-        // The branches of the fan-outs are spread: the graph does not run on the lane of the main chain alone.
-        let used: BTreeSet<u16> = placed.iter().copied().collect();
-        // (The MTP layer has one fan-out of two branches, which may both take the main chain's lane.)
+        // The successors of a stage that no edge orders among themselves run on lanes of their own.
+        let mut siblings_seen = 0;
+        for (producer, _) in edges.iter().enumerate() {
+            let successors: Vec<usize> = (0..edges.len()).filter(|&s| edges[s].contains(&producer)).collect();
+            for (i, &a) in successors.iter().enumerate() {
+                for &b in &successors[i + 1..] {
+                    if !reaches(edges, a, b) && !reaches(edges, b, a) {
+                        siblings_seen += 1;
+                        assert_ne!(
+                            placed[a], placed[b],
+                            "{view:?}: siblings {a} and {b} of {producer} share a lane"
+                        );
+                    }
+                }
+            }
+        }
         assert!(
-            used.len() > 1 || matches!(view, View::Draft { .. } | View::CatchUp { .. }),
-            "{view:?}: the branches of a fan-out took lanes of their own: {used:?}"
+            siblings_seen > 0 || matches!(view, View::PrefillChunk),
+            "{view:?}: no fan-out found"
         );
+    }
+}
+
+#[test]
+fn no_view_reaches_the_fallback_that_makes_two_stages_that_can_overlap_share_a_lane() {
+    let plan = &built().plan;
+    for view in VIEWS {
+        let placed = placed_by_rustee(plan, view);
+        let edges = plan.edges(view).unwrap();
+        for a in 0..edges.len() {
+            for b in a + 1..edges.len() {
+                if !reaches(edges, a, b) {
+                    assert_ne!(
+                        placed[a], placed[b],
+                        "{view:?}: stages {a} and {b} can overlap and share a lane"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Whether `from` comes before `to` by a chain of `edges` (`edges[node]` lists the nodes before it).
+fn reaches(edges: &[Vec<usize>], from: usize, to: usize) -> bool {
+    let mut stack = vec![to];
+    let mut seen = vec![false; edges.len()];
+    while let Some(node) = stack.pop() {
+        for &before in &edges[node] {
+            if before == from {
+                return true;
+            }
+            if !seen[before] {
+                seen[before] = true;
+                stack.push(before);
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn no_view_uses_more_lanes_than_the_fan_out_width_and_placement_is_the_same_every_call() {
+    let plan = &built().plan;
+    for view in VIEWS {
+        let width = plan.fan_out_width() as u16;
+        let first = placed_by_rustee(plan, view);
+        let used: BTreeSet<u16> = first.iter().copied().collect();
+        assert!(used.iter().all(|lane| *lane < width), "{view:?}: {used:?} of {width}");
+        for _ in 0..5 {
+            assert_eq!(placed_by_rustee(plan, view), first, "{view:?}: placement varied");
+        }
     }
 }
