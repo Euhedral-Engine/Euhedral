@@ -409,18 +409,12 @@ impl Default for CompileKernelSettings {
 }
 
 /// The CUDA graphs of captured quanta (`kernels.graphs`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GraphKernelSettings {
     /// Graphs a sequence keeps for each capturable view (decode, verification, draft), counted together: the sequence's
     /// cache holds this many times the number of views, and when it is full the graph used least recently is
-    /// released, whichever view it belongs to. 0 captures nothing: every quantum runs stage by stage.
+    /// released, whichever view it belongs to. The default 0 captures nothing: every quantum runs stage by stage.
     pub captures_per_view: u32,
-}
-
-impl Default for GraphKernelSettings {
-    fn default() -> Self {
-        Self { captures_per_view: 8 }
-    }
 }
 
 /// The fewest rows of a launch kept on the tensor-core route.

@@ -68,6 +68,7 @@ fn start(machine: &Machine, max_tokens: u32) -> (Arc<EngineRuntime>, RuntimeOwne
         name: "test".to_string(),
     });
     settings.context.max_tokens = max_tokens;
+    settings.kernels.graphs.captures_per_view = 8;
     let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
     (
         ready

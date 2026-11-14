@@ -88,6 +88,7 @@ fn settings(artifact: &Path, max_tokens: u32) -> Settings {
         name: "test".to_string(),
     });
     settings.context.max_tokens = max_tokens;
+    settings.kernels.graphs.captures_per_view = 8;
     settings
 }
 

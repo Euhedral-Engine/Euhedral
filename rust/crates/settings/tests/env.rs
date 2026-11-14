@@ -85,8 +85,8 @@ fn variable_overrides_file_and_creates_missing_sections() {
 }
 
 #[test]
-fn the_graphs_kept_for_each_view_default_to_eight_and_follow_the_file_and_the_environment() {
-    assert_eq!(load_with(MODEL, &[]).unwrap().kernels.graphs.captures_per_view, 8);
+fn the_graphs_kept_for_each_view_default_to_none_and_follow_the_file_and_the_environment() {
+    assert_eq!(load_with(MODEL, &[]).unwrap().kernels.graphs.captures_per_view, 0);
     let settings = load_with(&format!("{MODEL}kernels:\n  graphs:\n    captures-per-view: 3\n"), &[]).unwrap();
     assert_eq!(settings.kernels.graphs.captures_per_view, 3);
     let settings = load_with(MODEL, &[("EUHEDRAL_KERNELS_GRAPHS_CAPTURES_PER_VIEW", "16")]).unwrap();
