@@ -568,16 +568,16 @@ impl Executor {
         let mut replay = Vec::with_capacity(Variant::ALL.len());
         for variant in Variant::ALL {
             let view = variant.representative();
-            let Some(entries) = plan.stages(view) else {
+            let (Some(entries), Some(units)) = (plan.stages(view), plan.unit_stages(view)) else {
                 eager.push(Vec::new());
                 replay.push(None);
                 continue;
             };
             // A quantum that is killed or fails part-way settles its lanes, so that it retires.
-            let mut stages: Vec<Arc<dyn Stage<Quantum>>> = entries
+            let mut stages: Vec<Arc<dyn Stage<Quantum>>> = units
                 .iter()
-                .map(|entry| {
-                    Arc::new(Settling::new(Arc::clone(&entry.stage), Arc::clone(&settler))) as Arc<dyn Stage<Quantum>>
+                .map(|stage| {
+                    Arc::new(Settling::new(Arc::clone(stage), Arc::clone(&settler))) as Arc<dyn Stage<Quantum>>
                 })
                 .collect();
             let launches: Arc<[Arc<dyn StageLaunch>]> = entries.iter().map(|entry| Arc::clone(&entry.launch)).collect();
@@ -659,7 +659,7 @@ impl Executor {
         let eager = homes
             .get(home::home_of(quantum.id(), self.clock(), self.stage_lanes))
             .ok_or(StartError::NoView(view))?;
-        let stages = self.plan.stages(view).map_or(0, <[_]>::len);
+        let stages = self.plan.unit_stages(view).map_or(0, <[_]>::len);
         let stage_by_stage = StageId((stages - 1) as u16);
         let admission = if CAPTURES {
             cache.admit(quantum.capture_key())

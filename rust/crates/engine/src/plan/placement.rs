@@ -250,9 +250,81 @@ pub(crate) fn chain_ends(edges: &[Vec<usize>]) -> Vec<bool> {
     continued.into_iter().map(|continued| !continued).collect()
 }
 
+/// The stages that run in one frame: each is a list of consecutive stages (by index) of which every one but the first
+/// has the one before it as its only predecessor that no other predecessor already follows, and which the one before
+/// it has as its only such successor, on the same lane. An edge from a stage that another predecessor of the same stage
+/// follows orders nothing the other does not (the residual stream's join with the layer's start). Such a stage can only
+/// start once the one before it was submitted, and nothing else waits for the one before it, so running them one after
+/// the other as one submission changes no ordering and gives no worker a hand-off to make. A stage with several
+/// successors or predecessors that nothing else orders (a fan-out, a join), or whose neighbour is on another lane,
+/// starts a unit of its own. `edges[node]` lists the nodes before `node`; `lanes[node]` is its lane.
+pub(crate) fn fused_units(edges: &[Vec<usize>], lanes: &[u16]) -> Vec<Vec<usize>> {
+    let below = ordering(edges);
+    let follows = |later: usize, earlier: usize| below[later][earlier / 64] >> (earlier % 64) & 1 == 1;
+    let needed: Vec<Vec<usize>> = edges
+        .iter()
+        .map(|predecessors| {
+            predecessors
+                .iter()
+                .copied()
+                .filter(|&predecessor| {
+                    !predecessors
+                        .iter()
+                        .any(|&other| other != predecessor && follows(other, predecessor))
+                })
+                .collect()
+        })
+        .collect();
+    let mut successors = vec![0usize; edges.len()];
+    for predecessors in &needed {
+        for &predecessor in predecessors {
+            successors[predecessor] += 1;
+        }
+    }
+    let mut units: Vec<Vec<usize>> = Vec::new();
+    let mut unit_of = vec![0usize; edges.len()];
+    for (node, predecessors) in needed.iter().enumerate() {
+        match predecessors.as_slice() {
+            [only] if successors[*only] == 1 && lanes[*only] == lanes[node] => {
+                unit_of[node] = unit_of[*only];
+                units[unit_of[node]].push(node);
+            }
+            _ => {
+                unit_of[node] = units.len();
+                units.push(vec![node]);
+            }
+        }
+    }
+    units
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chain_of_single_links_on_one_lane_is_one_unit_and_a_fan_out_or_a_join_is_not() {
+        // 0 -> 1 -> 2, then 2 fans out to 3 and 4, which 5 joins, then 5 -> 6.
+        let edges = [vec![], vec![0], vec![1], vec![2], vec![2], vec![3, 4], vec![5]];
+        let lanes = [0, 0, 0, 0, 1, 0, 0];
+        assert_eq!(
+            fused_units(&edges, &lanes),
+            vec![vec![0, 1, 2], vec![3], vec![4], vec![5, 6]]
+        );
+    }
+
+    #[test]
+    fn an_edge_another_predecessor_already_follows_does_not_keep_a_stage_from_its_chain() {
+        // 2 also follows 0 directly, as a layer's residual add follows the stream it adds to.
+        let edges = [vec![], vec![0], vec![0, 1], vec![2]];
+        assert_eq!(fused_units(&edges, &[0, 0, 0, 0]), vec![vec![0, 1, 2, 3]]);
+    }
+
+    #[test]
+    fn a_link_to_another_lane_is_not_fused() {
+        let edges = [vec![], vec![0], vec![1]];
+        assert_eq!(fused_units(&edges, &[0, 0, 1]), vec![vec![0, 1], vec![2]]);
+    }
 
     #[test]
     fn a_chain_is_one_wide_and_a_fan_out_is_as_wide_as_its_branches() {

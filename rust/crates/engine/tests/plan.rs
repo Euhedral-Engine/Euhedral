@@ -760,3 +760,43 @@ fn no_view_uses_more_lanes_than_the_fan_out_width_and_placement_is_the_same_ever
         }
     }
 }
+
+#[test]
+fn a_run_of_stages_that_each_wait_only_for_the_one_before_is_one_stage_of_the_graph_a_quantum_runs() {
+    let plan = &built().plan;
+    for view in [
+        View::Decode,
+        View::Verify { rows: 5 },
+        View::PrefillChunk,
+        View::Draft { rows: 2 },
+    ] {
+        let nodes = plan.stages(view).unwrap().len();
+        let units = plan.unit_stages(view).unwrap().len();
+        let width = plan.fan_out_width();
+        let spec = plan.spec_homed(view, 0, width).unwrap().unwrap();
+        assert!(spec.validate().is_ok(), "{view:?}");
+        assert_eq!(
+            spec.stages().len(),
+            units,
+            "{view:?}: one stage of the graph for each unit"
+        );
+        assert!(units < nodes, "{view:?}: some stages are fused");
+        let home_spec = plan.spec(view).unwrap();
+        assert_eq!(home_spec.stages().len(), nodes);
+        assert_eq!(
+            spec.stages()[0].lanes,
+            vec![LaneId(0)],
+            "{view:?}: the root stays on the home lane"
+        );
+        let sink = spec.stages().len() - 1;
+        assert!(
+            spec.stages()[sink].lanes == home_spec.stages()[nodes - 1].lanes,
+            "{view:?}: the selection ends the last unit, on its lane"
+        );
+    }
+    // The decode view of the RCO artifact: 757 stages in 289 units. Each gated delta-net layer keeps its fan-out (the
+    // control projection and the two linears) and its joins (the convolution, then the recurrence with everything
+    // after it up to the next layer's norm) as separate stages.
+    assert_eq!(plan.stages(View::Decode).unwrap().len(), 757);
+    assert_eq!(plan.unit_stages(View::Decode).unwrap().len(), 289);
+}

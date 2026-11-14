@@ -849,6 +849,53 @@ pub fn submit_on<L: Lane>(
     }
 }
 
+/// Stages that run one after the other as one: the launches of each in order, in one submission.
+///
+/// Its work is the work of the stages alone in the same order on the same lane: a stage queues nothing of the quantum
+/// it is idle for, and the markers a stage waits for are what the quantum holds, so they do not depend on what an
+/// earlier stage of the chain did. The unit is idle when every stage is.
+pub struct Chain {
+    launches: Vec<Arc<dyn StageLaunch>>,
+}
+
+impl fmt::Debug for Chain {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Chain")
+            .field("stages", &self.launches.len())
+            .finish()
+    }
+}
+
+impl Chain {
+    /// The stages `launches`, in order.
+    pub fn new(launches: Vec<Arc<dyn StageLaunch>>) -> Self {
+        Self { launches }
+    }
+}
+
+impl StageLaunch for Chain {
+    fn idle(&self, quantum: &Quantum) -> bool {
+        self.launches.iter().all(|launch| launch.idle(quantum))
+    }
+
+    fn waits(&self, quantum: &Quantum) -> Vec<Marker> {
+        let mut waits: Vec<Marker> = Vec::new();
+        for marker in self.launches.iter().flat_map(|launch| launch.waits(quantum)) {
+            if !waits.contains(&marker) {
+                waits.push(marker);
+            }
+        }
+        waits
+    }
+
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
+        self.launches
+            .iter()
+            .try_for_each(|launch| launch.launch(quantum, kernels))
+    }
+}
+
 /// A stage of a plan's graph: runs as [`run_stage`] with the signalling the plan gave it.
 pub struct Placed {
     launch: Arc<dyn StageLaunch>,
