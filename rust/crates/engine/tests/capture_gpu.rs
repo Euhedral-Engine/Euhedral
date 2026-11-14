@@ -1162,10 +1162,18 @@ fn a_reservation_marker_is_kept_until_reached_and_then_dropped() {
         })
         .unwrap();
     let view = sequence.kv.view();
-    let kept = view.clone().ordered_after(reserved, &light.pool);
-    if !light.pool.reached(reserved) {
-        assert_eq!(kept.ready(), Some(reserved), "work not yet reached is waited for");
-    }
+    light.typed.sync();
+    assert!(light.pool.reached(reserved), "the reservation has run");
+    let unreached = Marker {
+        value: reserved.value + 1,
+        ..reserved
+    };
+    assert!(
+        !light.pool.reached(unreached),
+        "nothing has been submitted past the reservation"
+    );
+    let kept = view.clone().ordered_after(unreached, &light.pool);
+    assert_eq!(kept.ready(), Some(unreached), "work not yet reached is waited for");
     let ((), marker) = light.on_lane(|_| Ok::<(), CudaError>(()));
     assert!(light.pool.reached(marker));
     let done = view.ordered_after(reserved, &light.pool);
