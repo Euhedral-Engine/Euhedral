@@ -1378,11 +1378,11 @@ fn argmax_lowest_id_tie_break() {
     let verify = rig
         .quantum(QuantumKind::Verify, 5, 0, &workspace, &sequence, &config)
         .with_selection(Arc::clone(&selection));
-    let marker = rig.run(&every, &verify).expect("a marker for the completion edge");
+    let marker = rig.run(&every, &verify).expect("a marker for the argmax stage");
     rig.sync();
     assert!(
         DeviceQueue::completed(&**rig.typed.lane(0)) >= marker.value,
-        "the lane's completion word reaches the argmax stage's marker"
+        "the lane has completed the argmax stage's marker"
     );
     let selected: Vec<Option<u32>> = (0..5).map(|row| selection.token(row)).collect();
     assert_eq!(selected, expected);

@@ -1,5 +1,5 @@
 //! The engine's lane submission on RustEE's shared lanes, on the fake backend: no GPU and no wall clock. A stage's wait
-//! and its marked submission (`submit_on`, which `run_stage` is), the lanes a startup opens, and a graph of two branches
+//! and its marked submission (`submit_on`, which `run_stage` is, and what it keeps of a failed submission), the lanes a startup opens, and a graph of two branches
 //! run by several workers. Every wait is bounded, so a mutant that hangs fails fast.
 
 #![allow(
@@ -10,6 +10,7 @@
     reason = "a test file: a failed unwrap is the failure, and the test locks its records and waits, bounded"
 )]
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -24,13 +25,13 @@ use euhedral_gpu::{
     open_shared_lanes,
 };
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneId, QuantumOutcome, Stage, StageCx, StageError,
-    StageGraph, StageGraphSpec, StageSpec, Submitted,
+    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, GraphRuntime, LaneId, QuantumOutcome, Stage, StageCx,
+    StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
 use euhedral_inference_engine::quantum::home::{home_of, lane_for};
 use euhedral_inference_engine::quantum::whole::{Launches, Site, run_cached};
 use euhedral_inference_engine::runtime::open_lane_set;
-use euhedral_inference_engine::stages::{LaneEnds, Lanes, Settled, Settler, submit_on};
+use euhedral_inference_engine::stages::{Unmarked, submit_on};
 
 /// The longest any wait in this file takes.
 const BOUND: Duration = Duration::from_secs(20);
@@ -128,6 +129,11 @@ struct Combine {
     submitted: Arc<AtomicUsize>,
 }
 
+/// The record a stage that has no quantum to keep it in gives `submit_on`.
+fn nothing() -> Unmarked {
+    Unmarked::new(8)
+}
+
 impl Stage<Batch, FakeQueue> for Combine {
     fn run(&self, batch: &Batch, cx: &StageCx<'_, FakeQueue>) -> Result<Submitted, StageError> {
         let lane = cx.lane_handle().expect("a stage with a lane");
@@ -136,7 +142,7 @@ impl Stage<Batch, FakeQueue> for Combine {
             batch.words[self.inputs.1],
             batch.words[self.out],
         ];
-        let made = submit_on(&**lane, cx.waits.iter().copied(), |queue| {
+        let made = submit_on(&**lane, cx.waits.iter().copied(), &nothing(), |queue| {
             combine(queue, &self.kernel, words, self.op)
         });
         if matches!(made, Err(StageError::Retry)) {
@@ -366,10 +372,10 @@ fn a_busy_lane_makes_the_stage_retry_and_submits_nothing() {
     .unwrap();
     let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
     // Two markers fill the ring: the device has run neither.
-    let first = submit_on(&*lane, [], |_| Ok(())).unwrap();
-    submit_on(&*lane, [], |_| Ok(())).unwrap();
+    let first = submit_on(&*lane, [], &nothing(), |_| Ok(())).unwrap();
+    submit_on(&*lane, [], &nothing(), |_| Ok(())).unwrap();
     let launched = AtomicUsize::new(0);
-    let busy = submit_on(&*lane, [], |_| {
+    let busy = submit_on(&*lane, [], &nothing(), |_| {
         launched.fetch_add(1, Ordering::SeqCst);
         Ok(())
     });
@@ -378,7 +384,7 @@ fn a_busy_lane_makes_the_stage_retry_and_submits_nothing() {
     // The device runs what the two markers queued and nothing else: the refused call enqueued neither work nor a mark.
     assert_eq!(gpu.run_until_idle(), 2, "nothing was submitted");
     // A marker of the lane's own is never waited for, and once the device has run the work, the stage goes through.
-    let marker = submit_on(&*lane, [first], |_| {
+    let marker = submit_on(&*lane, [first], &nothing(), |_| {
         launched.fetch_add(1, Ordering::SeqCst);
         Ok(())
     })
@@ -387,27 +393,159 @@ fn a_busy_lane_makes_the_stage_retry_and_submits_nothing() {
     assert!(marker.value > first.value);
 }
 
-/// A launch that fails gives its marker up: the stage's error comes back, and the ring has room again.
+/// A launch that fails still publishes its marker, keeps it in the quantum's record, and the stage's error comes back:
+/// the kernels it queued before failing are behind that marker.
 #[test]
-fn a_refused_launch_gives_its_marker_up_and_returns_the_stages_error() {
+fn a_refused_launch_publishes_its_marker_keeps_it_and_returns_the_stages_error() {
+    let gpu = gpu();
+    let kernel = kernel(&gpu);
+    let words = [gpu.alloc(4), gpu.alloc(4), gpu.alloc(4)];
+    let lanes = open_shared_lanes(&gpu, &[("a", StreamOptions::default())]).unwrap();
+    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
+    let unmarked = Unmarked::new(1);
+    assert_eq!(unmarked.latest(LaneId(0)), None);
+    let refused = submit_on(&*lane, [], &unmarked, |queue| {
+        combine(queue, &kernel, words, 2)?;
+        Err(StageError::Corrupt("a bad packet".into()))
+    });
+    assert!(matches!(refused, Err(StageError::Corrupt(_))), "{refused:?}");
+    let kept = unmarked
+        .latest(LaneId(0))
+        .expect("the failed submission's marker is kept");
+    // The marker is on the device queue after the kernel, so a lane ordered behind it is ordered behind the kernel.
+    gpu.run_until_idle();
+    let log = gpu.log();
+    let kernel_at = log.iter().position(|op| matches!(op, FakeOp::Launch { .. })).unwrap();
+    let mark_at = log
+        .iter()
+        .position(|op| *op == FakeOp::Mark { lane: 0, value: kept })
+        .expect("the marker was made");
+    assert!(kernel_at < mark_at, "{log:?}");
+    // A succeeding submission keeps nothing.
+    let clean = Unmarked::new(1);
+    submit_on(&*lane, [], &clean, |_| Ok(())).unwrap();
+    assert_eq!(clean.latest(LaneId(0)), None);
+}
+
+/// A launch that panics after it queued work publishes its marker and keeps it, and the panic goes on.
+#[test]
+fn a_panicking_launch_publishes_its_marker_keeps_it_and_resumes_the_panic() {
+    let gpu = gpu();
+    let kernel = kernel(&gpu);
+    let words = [gpu.alloc(4), gpu.alloc(4), gpu.alloc(4)];
+    let lanes = open_shared_lanes(&gpu, &[("a", StreamOptions::default())]).unwrap();
+    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
+    let unmarked = Unmarked::new(1);
+    let caught = catch_unwind(AssertUnwindSafe(|| {
+        let _ = submit_on(&*lane, [], &unmarked, |queue| {
+            combine(queue, &kernel, words, 2)?;
+            panic!("the launch panicked");
+        });
+    }));
+    assert!(caught.is_err(), "the panic is resumed");
+    let kept = unmarked.latest(LaneId(0)).expect("the marker is kept");
+    gpu.run_until_idle();
+    assert!(gpu.log().contains(&FakeOp::Mark { lane: 0, value: kept }));
+    // The lane is whole: the next submission goes through, behind the kept marker.
+    let next = submit_on(&*lane, [], &Unmarked::new(1), |_| Ok(())).unwrap();
+    assert!(next.value > kept);
+}
+
+/// A failed submission on a lane other than the home lane: abandonment orders the home lane behind its marker, on the
+/// device, after the kernels the failed submission queued, and nothing is left kept.
+#[test]
+fn abandonment_orders_the_home_lane_behind_the_marker_of_a_failed_submission_on_another_lane() {
+    let gpu = gpu();
+    let kernel = kernel(&gpu);
+    let words = [gpu.alloc(4), gpu.alloc(4), gpu.alloc(4)];
+    let lanes = open_shared_lanes(
+        &gpu,
+        &[("a", StreamOptions::default()), ("b", StreamOptions::default())],
+    )
+    .unwrap();
+    let home = Arc::clone(lanes.pool.lane(LaneId(0)));
+    let other = Arc::clone(lanes.pool.lane(LaneId(1)));
+    let unmarked = Unmarked::new(2);
+    let failed = submit_on(&*other, [], &unmarked, |queue| {
+        combine(queue, &kernel, words, 2)?;
+        Err(StageError::Fatal("the second stage refused".into()))
+    });
+    assert!(matches!(failed, Err(StageError::Fatal(_))), "{failed:?}");
+    let kept = unmarked.latest(LaneId(1)).unwrap();
+    let queue_of = |lane: LaneId| Some(lanes.pool.lane(lane).id());
+    unmarked.await_on(&*home, queue_of);
+    assert_eq!(unmarked.latest(LaneId(1)), None, "an awaited marker is not kept");
+    gpu.run_until_idle();
+    let log = gpu.log();
+    let mark_at = log
+        .iter()
+        .position(|op| *op == FakeOp::Mark { lane: 1, value: kept })
+        .unwrap();
+    let await_at = log
+        .iter()
+        .position(|op| *op == FakeOp::Await { lane: 0, value: kept })
+        .expect("the home lane waits for the marker of the failed submission");
+    assert!(mark_at < await_at, "{log:?}");
+    // A second abandonment orders nothing more.
+    unmarked.await_on(&*home, queue_of);
+    gpu.run_until_idle();
+    let awaits = gpu
+        .log()
+        .iter()
+        .filter(|op| matches!(op, FakeOp::Await { lane: 0, .. }))
+        .count();
+    assert_eq!(awaits, 1);
+}
+
+/// Failures on several lanes: each lane's latest marker is kept and awaited; a failure on the home lane needs no wait.
+#[test]
+fn abandonment_awaits_the_latest_failed_marker_of_every_other_lane() {
     let gpu = gpu();
     let lanes = open_shared_lanes(
         &gpu,
-        &[(
-            "a",
-            StreamOptions {
-                markers: 2,
-                ..StreamOptions::default()
-            },
-        )],
+        &[
+            ("a", StreamOptions::default()),
+            ("b", StreamOptions::default()),
+            ("c", StreamOptions::default()),
+        ],
     )
     .unwrap();
-    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
-    for _ in 0..4 {
-        let refused = submit_on(&*lane, [], |_| Err(StageError::Corrupt("a bad packet".into())));
-        assert!(matches!(refused, Err(StageError::Corrupt(_))), "{refused:?}");
-    }
-    assert!(submit_on(&*lane, [], |_| Ok(())).is_ok(), "the ring was not used up");
+    let lane = |index: u16| Arc::clone(lanes.pool.lane(LaneId(index)));
+    let unmarked = Unmarked::new(3);
+    let fail = |lane: &Arc<_>| {
+        let _ = submit_on(&**lane, [], &unmarked, |_| Err(StageError::Fatal("refused".into())));
+    };
+    let (home, one, two) = (lane(0), lane(1), lane(2));
+    fail(&home);
+    fail(&one);
+    fail(&one);
+    fail(&two);
+    let (latest_one, latest_two) = (unmarked.latest(LaneId(1)).unwrap(), unmarked.latest(LaneId(2)).unwrap());
+    unmarked.await_on(&*home, |lane| Some(lanes.pool.lane(lane).id()));
+    gpu.run_until_idle();
+    let awaited: Vec<FakeOp> = gpu
+        .log()
+        .into_iter()
+        .filter(|op| matches!(op, FakeOp::Await { .. }))
+        .collect();
+    assert_eq!(
+        awaited,
+        vec![
+            FakeOp::Await {
+                lane: 0,
+                value: latest_one
+            },
+            FakeOp::Await {
+                lane: 0,
+                value: latest_two
+            },
+        ]
+    );
+    assert_eq!(
+        unmarked.latest(LaneId(0)),
+        None,
+        "the home lane's own work needs no wait"
+    );
 }
 
 /// The owner's lane and the transfer lanes are never the home of a run, in either pool.
@@ -428,195 +566,25 @@ fn the_owner_and_transfer_lanes_are_never_a_runs_home() {
     assert_eq!(seen, [true; 3], "every compute lane is a home in turn");
 }
 
-/// A settling that finds the lane's ring full answers `Busy` and leaves the lane unsignalled; once the device has run
-/// work it signals, and a settled lane is left alone.
-#[test]
-fn settling_a_lane_with_a_full_ring_is_busy_then_signals() {
-    let gpu = gpu();
-    let lanes = open_shared_lanes(
-        &gpu,
-        &[(
-            "a",
-            StreamOptions {
-                markers: 2,
-                ..StreamOptions::default()
-            },
-        )],
-    )
-    .unwrap();
-    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
-    let ends = LaneEnds::new(1);
-    let unsignalled = submit_on(&*lane, [], |_| Ok(())).unwrap();
-    ends.record(unsignalled, false);
-    submit_on(&*lane, [], |_| Ok(())).unwrap();
-    assert_eq!(
-        ends.settle(&*lane).unwrap(),
-        Settled::Busy,
-        "a full ring is not waited for"
-    );
-    assert!(ends.unsignalled(LaneId(0)));
-    gpu.run_until_idle();
-    assert_eq!(ends.settle(&*lane).unwrap(), Settled::Signalled);
-    assert_eq!(ends.settle(&*lane).unwrap(), Settled::Clean);
-}
-
-/// A launch that fails in the second stage of a fused unit leaves the first stage's kernels on the lane with no marker
-/// of the quantum. The lane must then be settled whatever its last marker's state (here the quantum recorded none), and
-/// the settling marker must come after those kernels.
-#[test]
-fn a_failure_after_the_first_stage_of_a_unit_leaves_the_lane_for_the_settle() {
-    let gpu = gpu();
-    let kernel = kernel(&gpu);
-    let words = [gpu.alloc(4), gpu.alloc(4), gpu.alloc(4)];
-    let lanes = open_shared_lanes(&gpu, &[("a", StreamOptions::default())]).unwrap();
-    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
-    let ends = LaneEnds::new(1);
-    let failed = ends.submit(&*lane, [], false, |queue| {
-        // The unit's first stage queues its kernel; the second fails.
-        combine(queue, &kernel, words, 2)?;
-        Err(StageError::Fatal("the second stage refused".into()))
-    });
-    assert!(matches!(failed, Err(StageError::Fatal(_))), "{failed:?}");
-    assert!(
-        ends.unsignalled(LaneId(0)),
-        "the first stage's kernels have no marker: the lane is to be settled"
-    );
-    assert_eq!(ends.unsignalled_lanes(), vec![LaneId(0)]);
-    assert_eq!(ends.settle(&*lane).unwrap(), Settled::Signalled);
-    assert_eq!(
-        gpu.run_until_idle(),
-        2,
-        "the kernel, then the settling marker behind it"
-    );
-    assert!(!ends.unsignalled(LaneId(0)));
-    assert_eq!(ends.settle(&*lane).unwrap(), Settled::Clean);
-}
-
-/// A refusal because the lane is held queued nothing, and settles nothing.
-#[test]
-fn a_retry_leaves_the_lane_unflagged() {
-    let gpu = gpu();
-    let lanes = open_shared_lanes(
-        &gpu,
-        &[(
-            "a",
-            StreamOptions {
-                markers: 1,
-                ..StreamOptions::default()
-            },
-        )],
-    )
-    .unwrap();
-    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
-    let ends = LaneEnds::new(1);
-    ends.submit(&*lane, [], true, |_| Ok(())).unwrap();
-    let busy = ends.submit(&*lane, [], false, |_| Ok(()));
-    assert!(matches!(busy, Err(StageError::Retry)), "{busy:?}");
-    assert!(!ends.unsignalled(LaneId(0)));
-}
-
 /// Stages run as one submission of a lane end in one marker, and the launches before it queue in order.
 #[test]
-fn several_launches_in_one_submission_end_in_one_marker_signalled_once() {
+fn several_launches_in_one_submission_end_in_one_marker() {
     let gpu = gpu();
     let kernel = kernel(&gpu);
     let words = [gpu.alloc(4), gpu.alloc(4), gpu.alloc(4)];
     let lanes = open_shared_lanes(&gpu, &[("a", StreamOptions::default())]).unwrap();
     let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
-    let ends = LaneEnds::new(1);
-    let first = ends.submit(&*lane, [], true, |_| Ok(())).unwrap();
-    let marker = ends
-        .submit(&*lane, [], true, |queue| {
-            // out = a + 1 three times over the same word: x = 0 -> 1 -> 2 -> 3 only if run in order.
-            combine(queue, &kernel, [words[2], words[1], words[2]], 2)?;
-            combine(queue, &kernel, [words[2], words[1], words[2]], 2)?;
-            combine(queue, &kernel, [words[2], words[1], words[2]], 2)
-        })
-        .unwrap();
+    let first = submit_on(&*lane, [], &nothing(), |_| Ok(())).unwrap();
+    let marker = submit_on(&*lane, [], &nothing(), |queue| {
+        // out = a + 1 three times over the same word: x = 0 -> 1 -> 2 -> 3 only if run in order.
+        combine(queue, &kernel, [words[2], words[1], words[2]], 2)?;
+        combine(queue, &kernel, [words[2], words[1], words[2]], 2)?;
+        combine(queue, &kernel, [words[2], words[1], words[2]], 2)
+    })
+    .unwrap();
     assert_eq!(marker.value, first.value + 1, "one marker for the three launches");
     assert_eq!(gpu.run_until_idle(), 5, "two markers and three kernels");
     assert_eq!(word(&gpu, words[2]), 3);
-    assert!(!ends.unsignalled(LaneId(0)));
-}
-
-/// A settling that finds the lane's ring full is published again behind the lane's progress, and the second try, once
-/// the device has run the work, ends the lane with a signalled marker: the settler never waits, and does not drop the
-/// quantum.
-#[test]
-fn the_settler_publishes_a_busy_settling_again_behind_progress() {
-    let gpu = gpu();
-    let lanes = open_shared_lanes(
-        &gpu,
-        &[(
-            "a",
-            StreamOptions {
-                markers: 2,
-                ..StreamOptions::default()
-            },
-        )],
-    )
-    .unwrap();
-    let completions = Completions::new(lanes.queues.clone());
-    let queue = MpmcQueue::<Box<dyn Frame>>::bounded(16);
-    let runtime = GraphRuntime {
-        stages: Arc::new(Sink(queue.producer())),
-        completions: Arc::clone(&completions),
-        lanes: Arc::clone(&lanes.queues),
-        retries: Arc::default(),
-        retry_backstop: Duration::from_secs(3600),
-    };
-    let settler = Settler::new(&runtime);
-    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
-    let ends = Arc::new(LaneEnds::new(1));
-    // The quantum's last marker is unsignalled, and another submission holds the ring's other marker.
-    ends.record(submit_on(&*lane, [], |_| Ok(())).unwrap(), false);
-    submit_on(&*lane, [], |_| Ok(())).unwrap();
-    let found = Arc::clone(&lane);
-    let find: Arc<Lanes<_>> = Arc::new(move |id: LaneId| (id == LaneId(0)).then(|| Arc::clone(&found)));
-    settler.settle_lanes(&ends, &find);
-
-    // The first frame goes out at once and finds the ring full: it publishes the settling again and signals nothing.
-    let published = AtomicUsize::new(0);
-    let pull = || {
-        completions.reap();
-        completions.pull(
-            &mut |frame| {
-                published.fetch_add(1, Ordering::SeqCst);
-                run_frame(frame);
-            },
-            &mut |_| false,
-            1,
-        );
-    };
-    pull();
-    assert_eq!(published.load(Ordering::SeqCst), 1, "the settling went out");
-    assert!(ends.unsignalled(LaneId(0)), "the full ring was not waited for");
-    // Nothing has progressed: the republished frame is not ready, however often the completions are pulled.
-    for _ in 0..4 {
-        pull();
-    }
-    assert_eq!(
-        published.load(Ordering::SeqCst),
-        1,
-        "the settling waits for the lane's progress, and does not spin"
-    );
-    // The device runs the two markers: progress, and the second try ends the lane with a signalled marker.
-    gpu.run_until_idle();
-    let deadline = Instant::now() + BOUND;
-    while published.load(Ordering::SeqCst) < 2 {
-        assert!(Instant::now() < deadline, "the settling was not published again");
-        pull();
-    }
-    assert!(!ends.unsignalled(LaneId(0)), "the second try signalled the lane");
-    gpu.run_until_idle();
-    assert_eq!(
-        gpu.log()
-            .iter()
-            .filter(|op| matches!(op, FakeOp::Mark { lane: 0, .. }))
-            .count(),
-        3,
-        "two markers of the quantum and the settling's"
-    );
 }
 
 /// A fixed start time for the quantum with `id`, so the tests do not depend on a clock.
@@ -704,10 +672,10 @@ impl Launches<FakeGpu> for Words {
     }
 }
 
-/// A quantum run as a graph body records its marker in the quantum's lane ends, signalled, whether the cache ran it
-/// directly, recorded it or replayed it, and every run computes from the words as they are then.
+/// A quantum run as a graph body is one marked submission on its lane, whether the cache ran it directly, recorded it
+/// or replayed it, and every run computes from the words as they are then.
 #[test]
-fn a_quantum_run_as_a_graph_body_records_its_marker_in_the_lane_ends() {
+fn a_quantum_run_as_a_graph_body_is_one_marked_submission_each_time() {
     let gpu = gpu();
     let words = [gpu.alloc(4), gpu.alloc(4), gpu.alloc(4)];
     let lanes = open_shared_lanes(&gpu, &[("a", StreamOptions::default())]).unwrap();
@@ -723,14 +691,12 @@ fn a_quantum_run_as_a_graph_body_records_its_marker_in_the_lane_ends() {
     let mut last = None;
     for input in [10u32, 20, 30, 40] {
         gpu.write(words[0], &input.to_le_bytes());
-        let ends = LaneEnds::new(1);
         let mut hold = GraphHold::new();
         let (made, marker) = run_cached(
             &Site {
                 gpu: &*gpu,
                 lane: &*lane,
                 waits: &[],
-                ends: &ends,
             },
             &cache,
             7,
@@ -739,7 +705,6 @@ fn a_quantum_run_as_a_graph_body_records_its_marker_in_the_lane_ends() {
         )
         .unwrap();
         assert_eq!(marker.lane, LaneId(0));
-        assert!(!ends.unsignalled(LaneId(0)), "the marker is recorded, signalled");
         gpu.run_until_idle();
         assert_eq!(
             word(&gpu, words[2]),
@@ -758,10 +723,10 @@ fn a_quantum_run_as_a_graph_body_records_its_marker_in_the_lane_ends() {
     assert_eq!((stats.directs, stats.records, stats.replays), (1, 1, 2), "{stats:?}");
 }
 
-/// A body that fails after queueing work leaves the lane flagged for settling (that work has no marker), and the
-/// quantum's stage answers the body's own error; a lane with no free marker answers a retry and flags nothing.
+/// A body that fails after queueing work answers the body's own error (the lane is the home lane, which RustEE's
+/// retirement covers); a lane with no free marker answers a retry and queues nothing.
 #[test]
-fn a_failure_in_a_graph_body_flags_the_lane_and_a_busy_lane_retries() {
+fn a_failure_in_a_graph_body_answers_its_error_and_a_busy_lane_retries() {
     let gpu = gpu();
     let words = [gpu.alloc(4), gpu.alloc(4), gpu.alloc(4)];
     let lanes = open_shared_lanes(
@@ -783,14 +748,12 @@ fn a_failure_in_a_graph_body_flags_the_lane_and_a_busy_lane_retries() {
         words,
         refuse: true,
     };
-    let ends = LaneEnds::new(1);
     let mut hold = GraphHold::new();
     let failed = run_cached(
         &Site {
             gpu: &*gpu,
             lane: &*lane,
             waits: &[],
-            ends: &ends,
         },
         &cache,
         1,
@@ -801,19 +764,12 @@ fn a_failure_in_a_graph_body_flags_the_lane_and_a_busy_lane_retries() {
         matches!(&failed, Err(StageError::Fatal(message)) if message == "the second stage refused"),
         "{failed:?}"
     );
-    assert!(
-        ends.unsignalled(LaneId(0)),
-        "the queued kernel has no marker: the lane is to be settled"
-    );
-    assert_eq!(ends.settle(&*lane).unwrap(), Settled::Signalled);
     gpu.run_until_idle();
-    assert!(!ends.unsignalled(LaneId(0)));
 
     // Both markers of the lane are held by submissions that have not run: the body is not queued.
-    let busy = LaneEnds::new(1);
     launches.refuse = false;
     for _ in 0..2 {
-        busy.submit(&*lane, [], true, |_| Ok(())).unwrap();
+        submit_on(&*lane, [], &nothing(), |_| Ok(())).unwrap();
     }
     let mut hold = GraphHold::new();
     let retried = run_cached(
@@ -821,7 +777,6 @@ fn a_failure_in_a_graph_body_flags_the_lane_and_a_busy_lane_retries() {
             gpu: &*gpu,
             lane: &*lane,
             waits: &[],
-            ends: &busy,
         },
         &cache,
         2,
@@ -829,5 +784,4 @@ fn a_failure_in_a_graph_body_flags_the_lane_and_a_busy_lane_retries() {
         &mut hold,
     );
     assert!(matches!(retried, Err(StageError::Retry)), "{retried:?}");
-    assert!(!busy.unsignalled(LaneId(0)), "a retry queued nothing and flags nothing");
 }

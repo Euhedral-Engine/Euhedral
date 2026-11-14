@@ -6,7 +6,7 @@
 //! path predecessor (`StageGraph.markPaths`: the critical chain of a graph keeps one lane) and, left alone, puts every
 //! other branch of a fan-out on a random allowed lane. The plan therefore fixes the lane of each chain of
 //! continuations ([`chain_lanes`]) and allows each stage only that lane; [`path_predecessors`] is the rule that forms
-//! the chains, which the plan also reads to know where a chain of a lane ends.
+//! the chains.
 
 use std::collections::VecDeque;
 
@@ -238,18 +238,6 @@ pub(crate) fn chain_lanes(edges: &[Vec<usize>], width: usize) -> Vec<u16> {
     chain_of.iter().map(|&chain| chain_lane[chain].unwrap_or(0)).collect()
 }
 
-/// Which stages end a chain of lane continuations: those no stage continues the lane of (`path[s]` names no later
-/// stage's predecessor). RustEE's graph puts a stage on the lane of its path predecessor and every other branch on a
-/// lane of its own, so a lane's last marker belongs to the end of a chain; those stages signal. `edges[node]` lists
-/// the nodes before `node`.
-pub(crate) fn chain_ends(edges: &[Vec<usize>]) -> Vec<bool> {
-    let mut continued = vec![false; edges.len()];
-    for predecessor in path_predecessors(edges).into_iter().flatten() {
-        continued[predecessor] = true;
-    }
-    continued.into_iter().map(|continued| !continued).collect()
-}
-
 /// The stages that run in one frame: each is a list of consecutive stages (by index) of which every one but the first
 /// has the one before it as its only predecessor that no other predecessor already follows, and which the one before
 /// it has as its only such successor, on the same lane. An edge from a stage that another predecessor of the same stage
@@ -441,15 +429,5 @@ mod tests {
         assert_ne!(lanes[0], lanes[1]);
         assert_eq!(lanes[2], lanes[0]);
         assert_eq!(lanes[3], lanes[1]);
-    }
-
-    #[test]
-    fn a_chain_ends_where_no_stage_continues_its_lane() {
-        let edges = [vec![], vec![0], vec![0], vec![0], vec![1], vec![4, 2, 3]];
-        // 2 and 3 are branches that end at the join; 5 ends the main chain.
-        assert_eq!(chain_ends(&edges), vec![false, false, true, true, false, true]);
-        // The tie: 2 continues the join, so 1 ends its chain.
-        let tie = [vec![], vec![0], vec![0], vec![1, 2]];
-        assert_eq!(chain_ends(&tie), vec![false, true, false, true]);
     }
 }

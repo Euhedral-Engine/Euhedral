@@ -77,8 +77,6 @@ struct VariantPlan {
     /// What a graph runs for each unit.
     unit_stages: Vec<Arc<dyn Stage<Quantum>>>,
     width: usize,
-    /// Whether each stage ends with a signalled marker: the ends of the chains of lane continuations.
-    signalled: Vec<bool>,
     /// The lane offset of each stage from its quantum's home lane.
     offsets: Vec<u16>,
 }
@@ -336,14 +334,6 @@ impl Plan {
         self.variant(view.variant()).map(|plan| plan.path.as_slice())
     }
 
-    /// Whether each stage of `view` ends with a signalled marker: the stages no other stage continues the lane of. A
-    /// graph retires when the latest marker of each lane it used is reached, and a lane's completion word reaches only
-    /// signalled markers; the last marker of a lane belongs to the end of a chain of continuations (two chains that
-    /// meet on one lane both end in a signalling stage), so these stages signal and the others do not.
-    pub fn signalled(&self, view: View) -> Option<&[bool]> {
-        self.variant(view.variant()).map(|plan| plan.signalled.as_slice())
-    }
-
     /// The stages with no predecessor in the graph of `view`: where a quantum enters, and what the previous quantum
     /// of the chain must be ordered before.
     pub fn roots(&self, view: View) -> Option<Vec<usize>> {
@@ -401,17 +391,15 @@ impl VariantPlan {
             unit_edges: Vec::new(),
             unit_stages: Vec::new(),
             width,
-            signalled: Vec::new(),
             offsets: Vec::new(),
         })
     }
 
-    /// Makes the graph over as many lanes as the view is wide, and finds where its chains of lane continuations end.
+    /// Makes the graph over as many lanes as the view is wide, and its stages.
     fn place(&mut self) -> Result<(), PlanBuildError> {
         self.path = placement::path_predecessors(&self.edges);
-        self.signalled = placement::chain_ends(&self.edges);
-        for (entry, signal) in self.entries.iter_mut().zip(&self.signalled) {
-            entry.stage = Arc::new(Placed::new(Arc::clone(&entry.launch), *signal));
+        for entry in &mut self.entries {
+            entry.stage = Arc::new(Placed::new(Arc::clone(&entry.launch)));
         }
         // Each chain of lane continuations has one lane offset, fixed here, so the one lane a stage is allowed is the
         // lane RustEE's graph puts it on: it never picks a branch's lane at random, and the branches of a fan-out do
@@ -449,9 +437,7 @@ impl VariantPlan {
                         .iter()
                         .map(|&node| Arc::clone(&self.entries[node].launch))
                         .collect();
-                    let last = nodes[nodes.len() - 1];
-                    Arc::new(Placed::new(Arc::new(Chain::new(launches)), self.signalled[last]))
-                        as Arc<dyn Stage<Quantum>>
+                    Arc::new(Placed::new(Arc::new(Chain::new(launches)))) as Arc<dyn Stage<Quantum>>
                 }
             })
             .collect();

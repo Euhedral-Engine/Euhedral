@@ -30,8 +30,6 @@ pub(crate) enum Kind {
     Logits,
     /// The running of the work a parked quantum waited for on the owner's lane.
     Reaped,
-    /// The settling of one lane of a quantum that ended before its last stage.
-    Settle,
 }
 
 /// The id hash of a frame of `kind` on chain `chain`: distinct per kind and chain, mixed so that the chains spread

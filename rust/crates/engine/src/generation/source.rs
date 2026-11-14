@@ -18,8 +18,8 @@
 //! wrote ([`Quantum::token_from`]), so the host need not have read it: there is no gap between the end of one step and
 //! the start of the next. The cost is one quantum that may run for nothing, the one that follows a stop token or a
 //! failure. When the request stops, the quanta in flight are told to stop (their kill switches are set): a quantum
-//! that stopped part-way settles the lanes whose last marker it left unsignalled, so that it retires, and its rows
-//! never become part of the sequence (`discard`).
+//! that stopped part-way retires behind the work it queued, and its rows never become part of the sequence
+//! (`discard`).
 //!
 //! **The records.** The owner reserves a quantum's cache rows and uploads its input record on its own lane
 //! when it admits it. Each quantum in flight reads a record of its own: a greedy request alternates between two, so the
