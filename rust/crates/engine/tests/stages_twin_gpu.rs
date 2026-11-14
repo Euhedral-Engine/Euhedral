@@ -176,7 +176,7 @@ impl Twin {
         Some(Twin {
             library: Arc::clone(library),
             table,
-            lanes: Typed::plain(library, 1, 256).table.with_native(vec![Arc::clone(&lane)]),
+            lanes: Typed::plain(library, 1, 256).table,
             lane,
             stream,
             retire: Arc::new(RetireList::new()),

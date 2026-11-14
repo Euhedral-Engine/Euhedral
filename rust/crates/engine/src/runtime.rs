@@ -70,12 +70,12 @@ pub(crate) struct Core {
     pub(crate) io: Arc<AsyncIo>,
     pub(crate) completions: Arc<Completions>,
     /// The device RustEE's lanes and kernels are on, kept for as long as they are.
-    _gpu: Arc<CudaGpu>,
+    pub(crate) gpu: Arc<CudaGpu>,
     /// The lanes as query queues, which the completions and the graph runtime poll. Its owner and transfer lanes are
     /// reserved: no graph run is homed on them.
     pub(crate) lanes: Arc<LanePool>,
-    /// The lanes the stage graphs run on, by lane id: the plan's compute lanes (`0..` [`Plan::lane_width`]), the lane
-    /// the recording of graphs captures on, the owner's lane (reservations and input records), then the transfer
+    /// The lanes the stage graphs run on, by lane id: the plan's compute lanes (`0..` [`Plan::lane_width`]), the
+    /// owner's lane (reservations and input records), then the transfer
     /// lanes, one per upload chain, the first of which also zeroes the sequence state.
     pub(crate) lane_table: LaneTable,
     /// The events in the ring of each stage lane ([`stage_ring`]).
@@ -126,24 +126,19 @@ pub(crate) struct Units {
 }
 
 impl Core {
-    /// The lane recordings of graphs capture on.
-    pub(crate) fn capture_lane(&self) -> LaneId {
-        LaneId(self.compute as u16)
-    }
-
     /// The owner's lane: the sequence's reservations and its quanta's input records.
     pub(crate) fn owner_lane(&self) -> &Arc<CudaQueue> {
-        self.lane(LaneId(self.compute as u16 + 1))
+        self.lane(LaneId(self.compute as u16))
     }
 
     /// The transfer lane of upload chain `chain`.
     pub(crate) fn transfer_lane(&self, chain: usize) -> &Arc<CudaQueue> {
-        self.lane(LaneId((self.compute + 2 + chain) as u16))
+        self.lane(LaneId((self.compute + 1 + chain) as u16))
     }
 
     /// The number of transfer lanes.
     pub(crate) fn transfer_lanes(&self) -> usize {
-        self.lane_table.len() - self.compute - 2
+        self.lane_table.len() - self.compute - 1
     }
 
     fn lane(&self, id: LaneId) -> &Arc<CudaQueue> {
@@ -599,8 +594,8 @@ pub struct LaneSet<L: DeviceQueue> {
     pub queues: Arc<LanePool>,
 }
 
-/// Opens the lanes of an engine on shared RustEE lanes: `compute` lanes for the stage graphs (ids `0..`), the lane
-/// graphs are captured on, the owner's lane, then `transfers` transfer lanes. The lanes after the compute lanes are
+/// Opens the lanes of an engine on shared RustEE lanes: `compute` lanes for the stage graphs (ids `0..`), the
+/// owner's lane, then `transfers` transfer lanes. The lanes after the compute lanes are
 /// reserved in both pools, so no run of a graph is ever homed on them.
 pub fn open_lane_set<G: Gpu>(
     gpu: &Arc<G>,
@@ -618,11 +613,11 @@ pub fn open_lane_set<G: Gpu>(
         spans: 0,
         ..StreamOptions::default()
     };
-    let mut specs: Vec<(&str, StreamOptions)> = Vec::with_capacity(compute + 2 + transfers);
-    specs.extend((0..compute + 2).map(|_| ("stage", stage)));
+    let mut specs: Vec<(&str, StreamOptions)> = Vec::with_capacity(compute + 1 + transfers);
+    specs.extend((0..compute + 1).map(|_| ("stage", stage)));
     specs.extend((0..transfers).map(|_| ("transfer", transfer)));
     let shared = open_shared_lanes(gpu, &specs)?;
-    let reserved: Vec<LaneId> = (compute..compute + 2 + transfers)
+    let reserved: Vec<LaneId> = (compute..compute + 1 + transfers)
         .map(|lane| LaneId(lane as u16))
         .collect();
     let solely = || GpuError::Invalid("the lane pools are shared before they are reserved".into());
@@ -669,7 +664,7 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
     // the most the settings allow; the startup uses as many as its ring needs.
     let machine = startup::read_machine();
     let compute = Plan::lane_width();
-    let chains = startup::transfer_lanes(settings, MAX_LANES.saturating_sub(compute + 2));
+    let chains = startup::transfer_lanes(settings, MAX_LANES.saturating_sub(compute + 1));
     let ring = stage_ring();
     let set =
         open_lane_set(&gpu, compute, ring, chains).map_err(|error| runtime("the lanes would not open", &error))?;
@@ -697,7 +692,7 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
         control,
         io,
         completions,
-        _gpu: gpu,
+        gpu,
         lanes,
         lane_table,
         stage_ring: ring,

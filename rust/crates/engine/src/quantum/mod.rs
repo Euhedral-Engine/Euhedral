@@ -1,44 +1,45 @@
-//! Quanta: their input records, their capture keys, and how they run (stage by stage, or as a captured graph).
+//! Quanta: their input records, their capture keys, and how they run (stage by stage, or as one graph body).
 //!
 //! The sequence's owner builds a [`Quantum`](crate::stages::Quantum) for each step, reserves its cache rows, uploads
 //! its input record ([`Quantum::prepare`]) and starts it on an [`Executor`], which picks the graph it runs:
 //!
 //! - **Stage by stage**: the view's stage graph, each stage on the lane the plan placed it on, ordered behind its
-//!   predecessors by markers. Prefill, a quantum whose reservation allocated pages, the first sight of a key, and
-//!   anything a graph cannot repeat run so.
-//! - **Recording**, on the second sight of a key: the quantum runs stage by stage, and a record stage beside its
-//!   stages captures the same launches on a lane of its own (relaxed capture, nothing is submitted twice), instantiates
-//!   the graph and keeps it in the sequence's [`GraphCache`]. The device never waits for a capture or an
-//!   instantiation.
-//! - **Replay**: from the next sight after the recording has finished, a quantum with the key is one graph launch on
-//!   the home lane, behind the input record's upload and the reservation that backs its cache rows.
+//!   predecessors by markers. Prefill, a quantum whose reservation allocated pages, a quantum that cannot be keyed
+//!   (see [`Quantum::capture_key`]), and every quantum when `kernels.graphs.captures-per-view` is 0 run so.
+//! - **One graph body**: a quantum with a capture key is one stage on its home lane that runs every launch of the view
+//!   in order as a body of the sequence's [`SharedGraphCache`], behind the input record's upload and the reservation
+//!   that backs its cache rows. The cache follows RustEE's model: the first sight of a key runs the body as direct
+//!   launches, the second records it as a graph, and every sight after replays the recording as it is (the key covers
+//!   every argument, so a replay needs no checking pass; a build with debug assertions still runs one and names a key
+//!   that forgot a field). Its marker is recorded in the quantum's [`LaneEnds`](crate::stages::LaneEnds) like a
+//!   stage's, so settling and retirement are the same, and what the run keeps alive for the device is held by the
+//!   quantum until it is dropped, after it retired.
 //!
 //! The host side effects of a quantum (the input record's upload, the KV reservation, the frontiers, the logits
-//! bookkeeping) are the owner's, before the graph is launched and after it retires, so a replay needs no checking
-//! pass. A test-only oracle (`Executor::check_replay_for_tests`) runs the stages in the C library's check mode and
-//! compares what they would submit with what the graph was recorded from.
+//! bookkeeping) are the owner's, before the body runs and after the quantum retires, so a replay does none of them.
 
 mod capture_key;
-mod graph_cache;
 pub mod home;
 mod input_record;
+pub mod whole;
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use euhedral_gpu::cuda::{CudaGpu, CudaKernel};
+use euhedral_gpu::{Enqueue, GraphHold, GraphStats, Ran, SharedGraphCache};
 use euhedral_graph::{
-    DeviceQueue, EdgeKind, ExternalEdge, GraphError, GraphRuntime, LaneId, Marker, QuantumOutcome, QuantumRef, Stage,
-    StageCx, StageError, StageGraph, StageGraphSpec, StageId, StageSpec, Submitted,
+    EdgeKind, ExternalEdge, GraphError, GraphRuntime, LaneId, Marker, QuantumOutcome, QuantumRef, Stage, StageCx,
+    StageError, StageGraph, StageGraphSpec, StageId, StageSpec, Submitted,
 };
-use euhedral_inference_cuda::{
-    AllocationId, CudaError, CudaLane, GraphExec, KernelOps, PinnedPool, Submission, SubmitMode,
-};
+use euhedral_inference_cuda::launch::ops::RusteeOps;
+use euhedral_inference_cuda::{AllocationId, CudaError, KernelOps, PinnedPool};
 use thiserror::Error;
 
 pub use capture_key::{CaptureKey, split_geometry};
-pub use graph_cache::{Admission, GraphCache, GraphSlot, Sighting};
 pub use input_record::{encode as encode_input_record, encode_into as encode_input_record_into};
 
 use crate::plan::{MAX_CAPTURED_ROWS, Plan, Variant, View};
@@ -47,24 +48,25 @@ use crate::stages::Quantum;
 use crate::stages::attention::{KvSource, takes_decode_scratch};
 use crate::stages::{QuantumError, QuantumKind, Settler, Settling, StageLaunch, fatal};
 use crate::workspace::BufferSlot;
+use whole::{Launches, Site, run_cached};
 
-/// Whether quanta are recorded into graphs and replayed. They are not: the stages run on RustEE's shared lanes, which
-/// the record and replay stages below (written against the native library's lanes and captures) cannot use, so every
-/// quantum runs stage by stage. The stages, the graph cache and the capture keys stay in the tree for the capture on
-/// RustEE's graph cache that replaces them: with this off, no record stage is added to a view's graph, no replay graph is
-/// made, and [`Executor::start`] never asks the cache.
-pub const CAPTURES: bool = false;
+/// What a quantum that runs as a graph body carries: its key, what the run holds for the device, and how it ran.
+#[derive(Debug)]
+pub(crate) struct Capture {
+    key: u128,
+    /// What the run keeps alive for the device; dropped with the quantum, which the owner drops after it retired.
+    hold: OnceLock<GraphHold>,
+    ran: OnceLock<Ran>,
+}
 
-/// How a quantum runs.
-#[derive(Clone, Debug, Default)]
-pub enum Disposition {
-    /// Stage by stage, through the view's stage graph.
-    #[default]
-    Eager,
-    /// Stage by stage, and the record stage captures the same launches into the slot's graph.
-    Record(Arc<GraphSlot>),
-    /// One launch of the slot's recorded graph.
-    Replay(Arc<GraphSlot>),
+impl Capture {
+    fn new(key: u128) -> Self {
+        Self {
+            key,
+            hold: OnceLock::new(),
+            ran: OnceLock::new(),
+        }
+    }
 }
 
 /// Why a quantum's input record could not be uploaded.
@@ -82,9 +84,10 @@ impl Quantum {
         View::of(self.kind, self.rows)
     }
 
-    /// How the quantum runs; set by the [`Executor`] that starts it.
-    pub fn disposition(&self) -> &Disposition {
-        &self.disposition
+    /// How the quantum's graph body ran, once it has run: `None` for a quantum that runs stage by stage (and until its
+    /// body has run). Set by the [`Executor`] that starts it.
+    pub fn graph_run(&self) -> Option<Ran> {
+        self.capture.as_ref()?.ran.get().copied()
     }
 
     /// Writes the quantum's input record (its token ids as 32-bit values, then its start position as a 64-bit value
@@ -290,6 +293,7 @@ impl Quantum {
             input_record: self.record as u8,
             token_from: self.token_from.as_ref().map(|selection| selection.generation()),
             row_exact: self.mode.row_exact,
+            programmatic: self.mode.pdl,
             split_geometry: split_geometry(start, rows, group),
             reserved_host_pages: keyed_host_pages(source, host_pages(KvSource::Base), host_pages(KvSource::Mtp)),
             replay_rows: capture_key::trimmed(self.seq.replay_layers()),
@@ -347,162 +351,83 @@ fn latest_per_lane(markers: impl IntoIterator<Item = Marker>, own: Option<LaneId
     latest
 }
 
-/// The record stage of a quantum that records: beside the quantum's stages it captures the same launches on the capture
-/// lane, in the order of the view, and keeps the graph in the quantum's slot. It has no edge to a stage: the capture
-/// submits nothing, so it neither waits for the quantum's device work nor delays it, and the quantum stays alive until
-/// it is done. Other quanta record nothing.
-struct RecordStage {
-    launches: Arc<[Arc<dyn StageLaunch>]>,
-    lane: LaneId,
+/// The launches of a quantum's view as a graph body: each stage with work, in the order of the view.
+struct QuantumLaunches<'a> {
+    quantum: &'a Quantum,
+    launches: &'a [Arc<dyn StageLaunch>],
 }
 
-/// Why a recording failed.
-enum RecordFailure {
-    /// A stage refused the quantum.
-    Stage(StageError),
-    /// The device could not capture or instantiate.
-    Cuda(CudaError),
-}
-
-impl From<CudaError> for RecordFailure {
-    fn from(error: CudaError) -> Self {
-        RecordFailure::Cuda(error)
-    }
-}
-
-impl RecordStage {
-    /// Records the launches of every stage that has work, in the order of the view, on `lane`.
-    fn record(&self, quantum: &Quantum, lane: &CudaLane, mode: SubmitMode) -> Result<GraphExec, RecordFailure> {
-        graph_cache::record_on(lane, mode, |submission| {
-            let mut kernels = submission;
-            for launch in self.launches.iter() {
-                if launch.idle(quantum) {
-                    continue;
-                }
-                launch.launch(quantum, &mut kernels).map_err(RecordFailure::Stage)?;
-            }
-            Ok(())
-        })
-    }
-
-    /// The hash the stages of `quantum` submit in check mode.
-    #[cfg(feature = "test-oracles")]
-    fn hash(&self, quantum: &Quantum, lane: &CudaLane, mode: SubmitMode) -> Result<u64, RecordFailure> {
-        let (outcome, hash) = Submission::hashed(lane, mode, |submission| {
-            let mut kernels = submission;
-            for launch in self.launches.iter() {
-                if launch.idle(quantum) {
-                    continue;
-                }
-                launch.launch(quantum, &mut kernels)?;
-            }
-            Ok::<(), StageError>(())
-        })?;
-        outcome.map_err(RecordFailure::Stage)?;
-        Ok(hash)
-    }
-}
-
-impl Stage<Quantum> for RecordStage {
-    fn run(&self, quantum: &Quantum, _cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        let Disposition::Record(slot) = &quantum.disposition else {
-            return Ok(Submitted::done());
-        };
-        let Some(lane) = quantum.lanes.native(self.lane) else {
-            slot.release();
-            return Err(fatal(format!(
-                "the capture lane {} is not in the lane table",
-                self.lane.0
-            )));
-        };
-        let mode = SubmitMode {
-            // The graph's launches overlap at every position (programmatic dependent launch).
-            pdl: true,
-            row_exact: quantum.mode.row_exact,
-        };
-        match self.record(quantum, lane, mode) {
-            Ok(graph) => {
-                #[cfg(feature = "test-oracles")]
-                if let Ok(hash) = self.hash(quantum, lane, mode) {
-                    slot.set_recorded_hash(hash);
-                }
-                slot.publish(graph);
-            }
-            // The quantum runs its stages whatever the recording does; a stage that refuses it fails the quantum there.
-            Err(RecordFailure::Stage(error)) => {
-                log::warn!("a quantum's graph was not recorded, a stage refused it: {error:?}");
-                slot.release();
-            }
-            // The lane is held by another recording: this key is tried again at its next sight.
-            Err(RecordFailure::Cuda(CudaError::LaneBusy(_))) => slot.release(),
-            Err(RecordFailure::Cuda(error)) => {
-                log::warn!("a quantum's graph could not be recorded, its key runs stage by stage: {error}");
-                slot.abandon();
-            }
+impl Launches<CudaGpu> for QuantumLaunches<'_> {
+    fn launch<E: Enqueue<Kernel = CudaKernel>>(&mut self, enq: &mut E) -> Result<(), StageError> {
+        let quantum = self.quantum;
+        let modes = quantum.lanes.modes(quantum.mode.row_exact);
+        let mut ops = RusteeOps::new(enq, quantum.lanes.kernels(), modes).with_pdl(quantum.mode.pdl);
+        let kernels: &mut dyn KernelOps = &mut ops;
+        for launch in self.launches.iter().filter(|launch| !launch.idle(quantum)) {
+            launch.launch(quantum, kernels)?;
         }
-        Ok(Submitted::done())
-    }
-
-    fn abandoned(&self, quantum: &Quantum, _home: &(dyn DeviceQueue + 'static)) {
-        if let Disposition::Record(slot) = &quantum.disposition {
-            slot.release();
-        }
+        Ok(())
     }
 }
 
-/// The one stage of a replayed quantum's graph: it launches the quantum's recorded graph on the home lane and ends
-/// with a signalled marker.
-struct ReplayStage {
+/// The one stage of a quantum that runs as a graph body: it runs the quantum's launches on its home lane through the
+/// sequence's graph cache.
+struct Whole {
     launches: Arc<[Arc<dyn StageLaunch>]>,
+    cache: Arc<SharedGraphCache<CudaGpu, u128>>,
+    gpu: Arc<CudaGpu>,
 }
 
-impl Stage<Quantum> for ReplayStage {
+impl Stage<Quantum> for Whole {
     fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        let Disposition::Replay(slot) = &quantum.disposition else {
-            return Err(fatal(
-                "a replay stage was started with a quantum that has no recorded graph",
-            ));
-        };
-        let Some(graph) = slot.graph() else {
-            return Err(fatal("a replayed quantum's graph is gone"));
+        let Some(capture) = &quantum.capture else {
+            return Err(fatal("a graph body was started with a quantum that has no capture key"));
         };
         quantum.check_prepared()?;
-        let id = cx.lane.ok_or_else(|| fatal("the graph launch was given no lane"))?;
+        let id = cx.lane.ok_or_else(|| fatal("the graph body was given no lane"))?;
         let lane = quantum
             .lanes
-            .native(id)
-            .ok_or_else(|| fatal(format!("native lane {} is not in the lane table", id.0)))?;
-        // A graph does not wait: the markers the quantum depends on are waited for before it launches.
+            .get(id)
+            .ok_or_else(|| fatal(format!("lane {} is not in the lane table", id.0)))?;
+        // The markers the quantum depends on are made before the body runs: by a replay on its private stream, else on
+        // the lane.
+        let busy = self.launches.iter().filter(|launch| !launch.idle(quantum));
         let waits = latest_per_lane(
             cx.waits
                 .iter()
                 .copied()
-                .chain(self.launches.iter().flat_map(|launch| launch.waits(quantum))),
+                .chain(busy.flat_map(|launch| launch.waits(quantum))),
             Some(id),
         );
-        let submission = match Submission::begin(lane, quantum.mode) {
-            Ok(submission) => submission,
-            Err(CudaError::LaneBusy(_)) => return Err(StageError::Retry),
-            Err(error) => return Err(fatal(error)),
+        let mut hold = GraphHold::new();
+        let mut launches = QuantumLaunches {
+            quantum,
+            launches: &self.launches,
         };
-        for marker in waits {
-            submission.wait(marker).map_err(fatal)?;
+        let site = Site {
+            gpu: &*self.gpu,
+            lane: &**lane,
+            waits: &waits,
+            ends: &quantum.ends,
+        };
+        let made = run_cached(&site, &self.cache, capture.key, &mut launches, &mut hold);
+        // A run that did not start keeps nothing; one that failed may have queued work that reads what it kept.
+        if !matches!(made, Err(StageError::Retry)) {
+            let _ = capture.hold.set(hold);
         }
-        graph.launch(&submission).map_err(fatal)?;
-        slot.launched();
-        let marker = submission.finish_signalled().map_err(fatal)?;
-        quantum.ends.record(marker, true);
+        let (ran, marker) = made?;
+        let _ = capture.ran.set(ran);
         Ok(Submitted::marker(marker))
     }
 }
 
-/// The stage graph of a replayed quantum: one stage on the home lane.
-fn replay_spec() -> StageGraphSpec {
+/// The stage graph of a quantum that runs as a graph body, homed on lane `home`: one stage.
+fn whole_spec(home: usize) -> StageGraphSpec {
     let mut spec = StageGraphSpec::new();
     spec.stage(StageSpec {
         name: "graph",
         ordered: None,
-        lanes: vec![LaneId(0)],
+        lanes: vec![LaneId(home as u16)],
     });
     spec
 }
@@ -516,10 +441,6 @@ pub struct Started {
     pub root: StageId,
     /// The stage whose marker covers the quantum's device work.
     pub sink: StageId,
-    /// Whether the quantum is one launch of a recorded graph.
-    pub replayed: bool,
-    /// Whether the quantum's launches are being recorded beside its stages.
-    pub recording: bool,
 }
 
 /// What stops a quantum from starting.
@@ -531,16 +452,22 @@ pub enum StartError {
     NoView(View),
 }
 
-/// The stage graphs of a plan on a runtime, and the choice of the graph a quantum runs.
+/// The stage graphs of a plan on a runtime, the sequence's graph cache, and the choice of the graph a quantum runs.
 pub struct Executor {
     plan: Arc<Plan>,
     /// The lanes the stage graphs run on; a quantum's home is one of them.
     stage_lanes: usize,
     /// The reading of the monotonic clock the home hash is seeded with is the time since this instant.
     origin: Instant,
-    /// By variant, the eager graph for each home lane.
+    /// By variant, the stage-by-stage graph for each home lane.
     eager: Vec<Vec<Arc<StageGraph<Quantum>>>>,
-    replay: Vec<Option<Arc<StageGraph<Quantum>>>>,
+    /// By variant, the one-stage graph of a graph body for each home lane; none for a variant that is not captured, and
+    /// none at all when captures are off.
+    whole: Vec<Vec<Arc<StageGraph<Quantum>>>>,
+    /// The graphs the sequence's quanta recorded, by capture key.
+    cache: Arc<SharedGraphCache<CudaGpu, u128>>,
+    /// Whether quanta that can be keyed run as graph bodies.
+    captures: AtomicBool,
 }
 
 impl fmt::Debug for Executor {
@@ -550,84 +477,87 @@ impl fmt::Debug for Executor {
 }
 
 impl Executor {
-    /// The graphs of every view of `plan`, run on `runtime` (whose lane pool has the plan's
-    /// [`Plan::lane_width`] or more stage lanes, then `capture`, a lane that only recordings use, and lanes the owner uses). The
-    /// graphs of the views that are captured have a record stage on `capture`. `retire` receives each quantum, with
-    /// its outcome, once its device work has completed.
+    /// The graphs of every view of `plan`, run on `runtime` (whose lane pool has `stage_lanes`, at least the plan's
+    /// [`Plan::lane_width`], stage lanes first, then lanes the owner uses). The sequence keeps `captures_per_view`
+    /// graphs for each view that is captured, recorded on `gpu`; with 0, no quantum is captured. `retire` receives
+    /// each quantum, with its outcome, once its device work has completed.
     pub fn new(
         plan: Arc<Plan>,
         runtime: &GraphRuntime,
-        capture: LaneId,
+        stage_lanes: usize,
+        gpu: Arc<CudaGpu>,
+        captures_per_view: usize,
         retire: impl Fn(Quantum, QuantumOutcome) + Send + Sync + 'static,
     ) -> Result<Executor, GraphError> {
         let retire: Arc<dyn Fn(Quantum, QuantumOutcome) + Send + Sync> = Arc::new(retire);
-        // The stage lanes are the lanes before `capture`.
-        let stage_lanes = usize::from(capture.0).max(1);
+        let stage_lanes = stage_lanes.max(1);
         let settler = Settler::new(runtime);
+        let captured = |variant: Variant| captures_per_view > 0 && variant.representative().capturable();
+        let views = Variant::ALL
+            .into_iter()
+            .filter(|&variant| captured(variant) && plan.stages(variant.representative()).is_some())
+            .count();
+        let cache = Arc::new(SharedGraphCache::with_capacity((captures_per_view * views).max(1)));
+        cache.set_replay_as_recorded(true);
         let mut eager = Vec::with_capacity(Variant::ALL.len());
-        let mut replay = Vec::with_capacity(Variant::ALL.len());
+        let mut whole = Vec::with_capacity(Variant::ALL.len());
         for variant in Variant::ALL {
             let view = variant.representative();
             let (Some(entries), Some(units)) = (plan.stages(view), plan.unit_stages(view)) else {
                 eager.push(Vec::new());
-                replay.push(None);
+                whole.push(Vec::new());
                 continue;
             };
             // A quantum that is killed or fails part-way settles its lanes, so that it retires.
-            let mut stages: Vec<Arc<dyn Stage<Quantum>>> = units
-                .iter()
-                .map(|stage| {
-                    Arc::new(Settling::new(Arc::clone(stage), Arc::clone(&settler))) as Arc<dyn Stage<Quantum>>
-                })
-                .collect();
-            let launches: Arc<[Arc<dyn StageLaunch>]> = entries.iter().map(|entry| Arc::clone(&entry.launch)).collect();
-            if CAPTURES && view.capturable() {
-                stages.push(Arc::new(RecordStage {
-                    launches: Arc::clone(&launches),
-                    lane: capture,
-                }));
-            }
+            let settling = |stage: &Arc<dyn Stage<Quantum>>| {
+                Arc::new(Settling::new(Arc::clone(stage), Arc::clone(&settler))) as Arc<dyn Stage<Quantum>>
+            };
+            let stages: Vec<Arc<dyn Stage<Quantum>>> = units.iter().map(settling).collect();
             // One copy of the graph for each home lane: a quantum runs on the copy of its own home.
             let mut homed = Vec::with_capacity(stage_lanes);
             for home in 0..stage_lanes {
                 let Some(spec) = plan.spec_homed(view, home, stage_lanes) else {
                     break;
                 };
-                let mut spec = spec?;
-                if CAPTURES && view.capturable() {
-                    spec.stage(StageSpec {
-                        name: "record",
-                        ordered: None,
-                        lanes: vec![capture],
-                    });
-                }
                 let again = Arc::clone(&retire);
                 homed.push(StageGraph::new(
-                    spec,
+                    spec?,
                     stages.clone(),
                     runtime.clone(),
                     move |quantum, outcome| again(quantum, outcome),
                 )?);
             }
             eager.push(homed);
-            replay.push(if CAPTURES && view.capturable() {
-                let again = Arc::clone(&retire);
-                Some(StageGraph::new(
-                    replay_spec(),
-                    vec![Arc::new(ReplayStage { launches }) as Arc<dyn Stage<Quantum>>],
-                    runtime.clone(),
-                    move |quantum, outcome| again(quantum, outcome),
-                )?)
-            } else {
-                None
-            });
+            let mut bodies = Vec::new();
+            if captured(variant) {
+                let launches: Arc<[Arc<dyn StageLaunch>]> =
+                    entries.iter().map(|entry| Arc::clone(&entry.launch)).collect();
+                let body: Arc<dyn Stage<Quantum>> = Arc::new(Whole {
+                    launches,
+                    cache: Arc::clone(&cache),
+                    gpu: Arc::clone(&gpu),
+                });
+                let body = settling(&body);
+                for home in 0..stage_lanes {
+                    let again = Arc::clone(&retire);
+                    bodies.push(StageGraph::new(
+                        whole_spec(home),
+                        vec![Arc::clone(&body)],
+                        runtime.clone(),
+                        move |quantum, outcome| again(quantum, outcome),
+                    )?);
+                }
+            }
+            whole.push(bodies);
         }
         Ok(Executor {
             plan,
             stage_lanes,
             origin: Instant::now(),
             eager,
-            replay,
+            whole,
+            cache,
+            captures: AtomicBool::new(captures_per_view > 0),
         })
     }
 
@@ -641,13 +571,39 @@ impl Executor {
         &self.plan
     }
 
-    /// Starts `quantum`: validates it, asks `cache` whether to record or replay it, and runs it on the graph that
-    /// follows. With `after`, the previous quantum of the chain, the new quantum's root waits on the device for the
+    /// What the sequence's graph cache counted: how its quanta ran as graph bodies.
+    pub fn graph_stats(&self) -> GraphStats {
+        self.cache.stats()
+    }
+
+    /// The graphs the sequence's cache holds, and the most it keeps.
+    pub fn graphs(&self) -> (usize, usize) {
+        (self.cache.len(), self.cache.capacity())
+    }
+
+    /// Whether `key` ([`CaptureKey::digest`]) has a recorded graph.
+    pub fn has_graph(&self, key: u128) -> bool {
+        self.cache.contains(&key)
+    }
+
+    /// Drops every graph the cache holds that no quantum runs (the sequence's end, after its quanta retired).
+    pub fn clear_graphs(&self) {
+        self.cache.retain(|_| false);
+    }
+
+    /// Whether quanta that can be keyed run as graph bodies from now on, or stage by stage. Quanta already started keep
+    /// their way; an executor made with no captures cannot capture.
+    pub fn set_captures(&self, on: bool) {
+        self.captures
+            .store(on && !self.whole.iter().all(Vec::is_empty), Ordering::Release);
+    }
+
+    /// Starts `quantum`: validates it, and runs it as one body of the graph cache when it has a capture key, else stage
+    /// by stage. With `after`, the previous quantum of the chain, the new quantum's root waits on the device for the
     /// previous one's sink (the chain's token passes from one quantum's selection to the next's embedding, so nothing
     /// of the next could overlap it). Keep the previous [`Started`] until this call returns, then drop it.
     pub fn start(
         &self,
-        cache: &mut GraphCache,
         mut quantum: Quantum,
         kill: Arc<AtomicBool>,
         after: Option<&Started>,
@@ -655,27 +611,21 @@ impl Executor {
         quantum.validate()?;
         let view = quantum.view();
         let variant = view.variant();
-        let homes = &self.eager[variant.index()];
-        let eager = homes
-            .get(home::home_of(quantum.id(), self.clock(), self.stage_lanes))
-            .ok_or(StartError::NoView(view))?;
+        let home = home::home_of(quantum.id(), self.clock(), self.stage_lanes);
+        let eager = self.eager[variant.index()].get(home).ok_or(StartError::NoView(view))?;
         let stages = self.plan.unit_stages(view).map_or(0, <[_]>::len);
-        let stage_by_stage = StageId((stages - 1) as u16);
-        let admission = if CAPTURES {
-            cache.admit(quantum.capture_key())
-        } else {
-            Admission::Eager
-        };
-        let (graph, replayed, recording, sink) = match (admission, &self.replay[variant.index()]) {
-            (Admission::Replay(slot), Some(graph)) => {
-                quantum.disposition = Disposition::Replay(slot);
-                (graph, true, false, StageId(0))
+        let keyed = self
+            .captures
+            .load(Ordering::Acquire)
+            .then(|| quantum.capture_key())
+            .flatten();
+        let body = keyed.and_then(|key| self.whole[variant.index()].get(home).map(|graph| (key, graph)));
+        let (graph, sink) = match body {
+            Some((key, graph)) => {
+                quantum.capture = Some(Capture::new(key.digest()));
+                (graph, StageId(0))
             }
-            (Admission::Record(slot), _) => {
-                quantum.disposition = Disposition::Record(slot);
-                (eager, false, true, stage_by_stage)
-            }
-            _ => (eager, false, false, stage_by_stage),
+            None => (eager, StageId((stages - 1) as u16)),
         };
         let external = after.map(|previous| ExternalEdge {
             from: previous.reference.clone(),
@@ -688,74 +638,6 @@ impl Executor {
             reference,
             root: StageId(0),
             sink,
-            replayed,
-            recording,
         })
-    }
-
-    /// The test oracle: runs the stages of `quantum` in the C library's check mode on `lane` (nothing is submitted;
-    /// every launch and copy is hashed) and returns the hash with the one the quantum's graph was recorded from.
-    /// They are equal when the graph still repeats what the stages would submit now; a key that omitted something a
-    /// launch bakes in shows here as a difference. The quantum must have been admitted to a recorded graph.
-    #[cfg(feature = "test-oracles")]
-    pub fn check_replay_for_tests(&self, quantum: &Quantum, lane: &CudaLane) -> Result<ReplayCheck, StartError> {
-        let (Disposition::Record(slot) | Disposition::Replay(slot)) = &quantum.disposition else {
-            return Err(StartError::Quantum(QuantumError::Invalid {
-                what: "the quantum was not admitted to a graph".to_string(),
-            }));
-        };
-        Ok(ReplayCheck {
-            recorded: slot.recorded_hash(),
-            now: self.stages_hash_for_tests(quantum, lane)?,
-        })
-    }
-
-    /// The hash of what the stages of `quantum` would submit, in the C library's check mode on `lane`: nothing is
-    /// submitted.
-    #[cfg(feature = "test-oracles")]
-    pub fn stages_hash_for_tests(&self, quantum: &Quantum, lane: &CudaLane) -> Result<u64, StartError> {
-        let view = quantum.view();
-        let entries = self.plan.stages(view).ok_or(StartError::NoView(view))?;
-        let mode = SubmitMode {
-            pdl: true,
-            row_exact: quantum.mode.row_exact,
-        };
-        let (outcome, hash) = Submission::hashed(lane, mode, |submission| {
-            let mut kernels = submission;
-            for entry in entries {
-                if !entry.launch.idle(quantum) {
-                    entry.launch.launch(quantum, &mut kernels)?;
-                }
-            }
-            Ok::<(), StageError>(())
-        })
-        .map_err(|error| {
-            StartError::Quantum(QuantumError::Invalid {
-                what: error.to_string(),
-            })
-        })?;
-        outcome.map_err(|error| {
-            StartError::Quantum(QuantumError::Invalid {
-                what: format!("{error:?}"),
-            })
-        })?;
-        Ok(hash)
-    }
-}
-
-/// The two hashes of [`Executor::check_replay_for_tests`].
-#[cfg(feature = "test-oracles")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReplayCheck {
-    /// What the graph was recorded from.
-    pub recorded: u64,
-    /// What the stages would submit for the quantum now.
-    pub now: u64,
-}
-
-#[cfg(feature = "test-oracles")]
-impl ReplayCheck {
-    pub fn matches(&self) -> bool {
-        self.recorded != 0 && self.recorded == self.now
     }
 }

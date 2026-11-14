@@ -36,7 +36,6 @@ use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSectio
 use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
-use euhedral_inference_engine::quantum::CAPTURES;
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
 
@@ -581,12 +580,7 @@ fn captured_mtp_equals_uncaptured() {
         kinds(QuantumKind::Draft),
         captured.recording.events.iter().filter(|event| event.recorded).count()
     );
-    // With captures off no quantum replays, and the two runs are the same run: the equalities below still hold.
-    if CAPTURES {
-        assert!(replayed >= 100, "at least 100 replayed quanta, saw {replayed}");
-    } else {
-        assert_eq!(replayed, 0, "no graph is replayed while captures are off");
-    }
+    assert!(replayed >= 100, "at least 100 replayed quanta, saw {replayed}");
     assert_eq!(
         plain.recording.events.iter().filter(|event| event.replayed).count(),
         0,

@@ -19,12 +19,16 @@ use euhedral_core::frames::{Frame, FrameError};
 use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use euhedral_gpu::fake::{FakeGpu, FakeKernel, FakeModule, FakeOp, FakeQueue};
-use euhedral_gpu::{Args, CompileOptions, LaneEnqueue, Launch, Module, StreamOptions, open_shared_lanes};
+use euhedral_gpu::{
+    Args, CompileOptions, Enqueue, GraphHold, LaneEnqueue, Launch, Module, Ran, SharedGraphCache, StreamOptions,
+    open_shared_lanes,
+};
 use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneId, QuantumOutcome, Stage, StageCx, StageError,
     StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
 use euhedral_inference_engine::quantum::home::{home_of, lane_for};
+use euhedral_inference_engine::quantum::whole::{Launches, Site, run_cached};
 use euhedral_inference_engine::runtime::open_lane_set;
 use euhedral_inference_engine::stages::{LaneEnds, Lanes, Settled, Settler, submit_on};
 
@@ -406,14 +410,14 @@ fn a_refused_launch_gives_its_marker_up_and_returns_the_stages_error() {
     assert!(submit_on(&*lane, [], |_| Ok(())).is_ok(), "the ring was not used up");
 }
 
-/// The owner's lane, the capture lane and the transfer lanes are never the home of a run, in either pool.
+/// The owner's lane and the transfer lanes are never the home of a run, in either pool.
 #[test]
 fn the_owner_and_transfer_lanes_are_never_a_runs_home() {
     let gpu = FakeGpu::new();
     let (compute, transfers) = (3, 4);
     let set = open_lane_set(&gpu, compute, 8, transfers).unwrap();
-    assert_eq!(set.typed.len(), compute + 2 + transfers);
-    assert_eq!(set.queues.len(), compute + 2 + transfers);
+    assert_eq!(set.typed.len(), compute + 1 + transfers);
+    assert_eq!(set.queues.len(), compute + 1 + transfers);
     let mut seen = [false; 3];
     for _ in 0..200 {
         for home in [set.typed.next_home(), set.queues.next_home()] {
@@ -649,7 +653,7 @@ fn quanta_with_different_ids_have_different_homes() {
 
 /// A quantum's stages run on `(home + offset) mod stage_lanes`: a chain (one offset) keeps its lane, the branches of a
 /// fan-out (different offsets, no more than the stage lanes) are on different lanes whatever the home, and no lane
-/// outside the stage lanes (the owner's, the capture lane, the transfer lanes) is ever chosen.
+/// outside the stage lanes (the owner's, the transfer lanes) is ever chosen.
 #[test]
 fn a_chain_keeps_its_lane_branches_stay_distinct_and_reserved_lanes_are_never_chosen() {
     let (compute, transfers) = (4, 3);
@@ -680,5 +684,150 @@ fn a_chain_keeps_its_lane_branches_stay_distinct_and_reserved_lanes_are_never_ch
     // RustEE's own rotation (it homes each run's retirement) is limited to the same lanes.
     let gpu = FakeGpu::new();
     let set = open_lane_set(&gpu, compute, 8, transfers).unwrap();
-    assert_eq!(set.typed.len(), compute + 2 + transfers);
+    assert_eq!(set.typed.len(), compute + 1 + transfers);
+}
+
+/// A quantum's launches as a graph body: one kernel writing `words[2] = words[0] + 1`, then, when `refuse`, a refusal.
+struct Words {
+    kernel: FakeKernel,
+    words: [u64; 3],
+    refuse: bool,
+}
+
+impl Launches<FakeGpu> for Words {
+    fn launch<E: Enqueue<Kernel = FakeKernel>>(&mut self, enq: &mut E) -> Result<(), StageError> {
+        combine(enq, &self.kernel, self.words, 2)?;
+        if self.refuse {
+            return Err(StageError::Fatal("the second stage refused".into()));
+        }
+        Ok(())
+    }
+}
+
+/// A quantum run as a graph body records its marker in the quantum's lane ends, signalled, whether the cache ran it
+/// directly, recorded it or replayed it, and every run computes from the words as they are then.
+#[test]
+fn a_quantum_run_as_a_graph_body_records_its_marker_in_the_lane_ends() {
+    let gpu = gpu();
+    let words = [gpu.alloc(4), gpu.alloc(4), gpu.alloc(4)];
+    let lanes = open_shared_lanes(&gpu, &[("a", StreamOptions::default())]).unwrap();
+    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
+    let cache = SharedGraphCache::<FakeGpu, u128>::with_capacity(4);
+    cache.set_replay_as_recorded(true);
+    let mut launches = Words {
+        kernel: kernel(&gpu),
+        words,
+        refuse: false,
+    };
+    let mut ran = Vec::new();
+    let mut last = None;
+    for input in [10u32, 20, 30, 40] {
+        gpu.write(words[0], &input.to_le_bytes());
+        let ends = LaneEnds::new(1);
+        let mut hold = GraphHold::new();
+        let (made, marker) = run_cached(
+            &Site {
+                gpu: &*gpu,
+                lane: &*lane,
+                waits: &[],
+                ends: &ends,
+            },
+            &cache,
+            7,
+            &mut launches,
+            &mut hold,
+        )
+        .unwrap();
+        assert_eq!(marker.lane, LaneId(0));
+        assert!(!ends.unsignalled(LaneId(0)), "the marker is recorded, signalled");
+        gpu.run_until_idle();
+        assert_eq!(
+            word(&gpu, words[2]),
+            input + 1,
+            "{made:?}: the run computed from the current words"
+        );
+        if let Some(previous) = last.replace(marker) {
+            assert!(marker.value > previous.value, "each run is a submission of its own");
+        }
+        ran.push(made);
+    }
+    assert_eq!(ran[0], Ran::Direct, "the first sight of a key runs directly");
+    assert_eq!(ran[1], Ran::Recorded, "the second records");
+    assert_eq!(&ran[2..], &[Ran::Replayed; 2], "then it replays");
+    let stats = cache.stats();
+    assert_eq!((stats.directs, stats.records, stats.replays), (1, 1, 2), "{stats:?}");
+}
+
+/// A body that fails after queueing work leaves the lane flagged for settling (that work has no marker), and the
+/// quantum's stage answers the body's own error; a lane with no free marker answers a retry and flags nothing.
+#[test]
+fn a_failure_in_a_graph_body_flags_the_lane_and_a_busy_lane_retries() {
+    let gpu = gpu();
+    let words = [gpu.alloc(4), gpu.alloc(4), gpu.alloc(4)];
+    let lanes = open_shared_lanes(
+        &gpu,
+        &[(
+            "a",
+            StreamOptions {
+                markers: 2,
+                ..StreamOptions::default()
+            },
+        )],
+    )
+    .unwrap();
+    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
+    let cache = SharedGraphCache::<FakeGpu, u128>::with_capacity(4);
+    cache.set_replay_as_recorded(true);
+    let mut launches = Words {
+        kernel: kernel(&gpu),
+        words,
+        refuse: true,
+    };
+    let ends = LaneEnds::new(1);
+    let mut hold = GraphHold::new();
+    let failed = run_cached(
+        &Site {
+            gpu: &*gpu,
+            lane: &*lane,
+            waits: &[],
+            ends: &ends,
+        },
+        &cache,
+        1,
+        &mut launches,
+        &mut hold,
+    );
+    assert!(
+        matches!(&failed, Err(StageError::Fatal(message)) if message == "the second stage refused"),
+        "{failed:?}"
+    );
+    assert!(
+        ends.unsignalled(LaneId(0)),
+        "the queued kernel has no marker: the lane is to be settled"
+    );
+    assert_eq!(ends.settle(&*lane).unwrap(), Settled::Signalled);
+    gpu.run_until_idle();
+    assert!(!ends.unsignalled(LaneId(0)));
+
+    // Both markers of the lane are held by submissions that have not run: the body is not queued.
+    let busy = LaneEnds::new(1);
+    launches.refuse = false;
+    for _ in 0..2 {
+        busy.submit(&*lane, [], true, |_| Ok(())).unwrap();
+    }
+    let mut hold = GraphHold::new();
+    let retried = run_cached(
+        &Site {
+            gpu: &*gpu,
+            lane: &*lane,
+            waits: &[],
+            ends: &busy,
+        },
+        &cache,
+        2,
+        &mut launches,
+        &mut hold,
+    );
+    assert!(matches!(retried, Err(StageError::Retry)), "{retried:?}");
+    assert!(!busy.unsignalled(LaneId(0)), "a retry queued nothing and flags nothing");
 }

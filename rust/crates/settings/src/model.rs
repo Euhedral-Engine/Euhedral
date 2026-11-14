@@ -411,8 +411,8 @@ impl Default for CompileKernelSettings {
 /// The CUDA graphs of captured quanta (`kernels.graphs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GraphKernelSettings {
-    /// Graphs a sequence keeps for each view (decode, verification, draft) before the one admitted longest ago, or
-    /// the one whose attention geometry the sequence has passed, is released.
+    /// Graphs a sequence keeps for each view (decode, verification, draft) before the one used least recently is
+    /// released. 0 captures nothing: every quantum runs stage by stage.
     pub captures_per_view: u32,
 }
 

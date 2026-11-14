@@ -36,14 +36,12 @@ use euhedral_graph::{DeviceQueue, LaneId, LanePool, Marker, Stage, StageCx, Stag
 use euhedral_inference_cuda::launch::Modes;
 use euhedral_inference_cuda::launch::load::KernelTable;
 use euhedral_inference_cuda::launch::ops::RusteeOps;
-use euhedral_inference_cuda::{
-    AllocationId, CudaLane, CudaLibrary, DevicePtr, KernelOps, LaneOps, PooledPinned, SubmitMode,
-};
+use euhedral_inference_cuda::{AllocationId, CudaLibrary, DevicePtr, KernelOps, LaneOps, PooledPinned, SubmitMode};
 use thiserror::Error;
 
 use crate::error::EngineError;
 use crate::model::ModelConfig;
-use crate::quantum::Disposition;
+use crate::quantum::Capture;
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
 use crate::state::{FlightGuard, KvView, SequenceDevice};
 use crate::workspace::{BufferSlot, Workspace, WorkspaceError};
@@ -118,8 +116,6 @@ pub struct LaneTable {
     lanes: Arc<LanePool<CudaQueue>>,
     kernels: Arc<KernelTable>,
     library: Arc<CudaLibrary>,
-    /// The native library's lanes, which only the retained capture code uses ([`LaneTable::native`]); none in a runtime.
-    native: Arc<[Arc<CudaLane>]>,
 }
 
 impl LaneTable {
@@ -129,21 +125,7 @@ impl LaneTable {
             lanes,
             kernels,
             library,
-            native: Arc::from(Vec::new()),
         }
-    }
-
-    /// The same table with the native library's lanes, in lane id order: what the retained graph capture code records
-    /// and replays on. A runtime has none.
-    #[must_use]
-    pub fn with_native(mut self, lanes: Vec<Arc<CudaLane>>) -> Self {
-        self.native = lanes.into();
-        self
-    }
-
-    /// The native lane `id`, if the table has native lanes.
-    pub fn native(&self, id: LaneId) -> Option<&CudaLane> {
-        self.native.get(usize::from(id.0)).map(|lane| &**lane)
     }
 
     /// The lane `id`.
@@ -410,8 +392,9 @@ pub struct Quantum {
     pub(crate) uploaded: bool,
     /// The marker of the work that uploaded the input record: the quantum's first stage waits for it on the device.
     pub(crate) prepared: Option<Marker>,
-    /// How the quantum runs: stage by stage, recording a graph, or replaying one.
-    pub(crate) disposition: Disposition,
+    /// Set by the executor when the quantum runs as one body of the graph cache: its key, what its run holds, and how
+    /// it ran.
+    pub(crate) capture: Option<Capture>,
 }
 
 /// The next quantum's id.
@@ -477,7 +460,7 @@ impl Quantum {
             staging: None,
             uploaded: false,
             prepared: None,
-            disposition: Disposition::Eager,
+            capture: None,
         })
     }
 

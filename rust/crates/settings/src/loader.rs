@@ -580,7 +580,7 @@ fn leaves() -> Vec<Leaf> {
             assign!(s.kernels.compile.stack, size(t, 1 << 20))
         }),
         fixed("kernels.graphs.captures-per-view", |s, t| {
-            assign!(s.kernels.graphs.captures_per_view, int(t, 1, COUNT_MAX))
+            assign!(s.kernels.graphs.captures_per_view, int(t, 0, COUNT_MAX))
         }),
     ]
 }

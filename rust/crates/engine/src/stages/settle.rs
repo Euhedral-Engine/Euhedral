@@ -111,17 +111,29 @@ impl LaneEnds {
         signal: bool,
         launch: impl FnOnce(&mut L::Enqueue<'_>) -> Result<(), StageError>,
     ) -> Result<Marker, StageError> {
-        match submit_on(lane, waits, launch) {
-            Ok(marker) => {
+        let made = submit_on(lane, waits, launch).map(|marker| ((), marker));
+        self.ended(lane.lane(), signal, made).map(|((), marker)| marker)
+    }
+
+    /// Records the end of a submission of the quantum on `lane` that the caller made itself (a graph's run, which is
+    /// one marked submission of its own): its marker, signalled or not, or, when it failed, the lane's flag.
+    pub fn ended<T>(
+        &self,
+        lane: LaneId,
+        signal: bool,
+        made: Result<(T, Marker), StageError>,
+    ) -> Result<(T, Marker), StageError> {
+        match made {
+            Ok((value, marker)) => {
                 self.record(marker, signal);
-                Ok(marker)
+                Ok((value, marker))
             }
             // Nothing was queued: the lane is held, and the stage runs again.
             Err(StageError::Retry) => Err(StageError::Retry),
             // A unit of several stages may have queued the kernels of its earlier stages before the failure, and the
             // submission gave its marker up: those kernels are behind no marker of the quantum.
             Err(error) => {
-                if let Some(end) = self.lanes.get(usize::from(lane.lane().0)) {
+                if let Some(end) = self.lanes.get(usize::from(lane.0)) {
                     end.queued_unmarked.store(true, Ordering::Release);
                 }
                 Err(error)

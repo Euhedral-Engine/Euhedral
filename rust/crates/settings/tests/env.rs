@@ -91,7 +91,10 @@ fn the_graphs_kept_for_each_view_default_to_eight_and_follow_the_file_and_the_en
     assert_eq!(settings.kernels.graphs.captures_per_view, 3);
     let settings = load_with(MODEL, &[("EUHEDRAL_KERNELS_GRAPHS_CAPTURES_PER_VIEW", "16")]).unwrap();
     assert_eq!(settings.kernels.graphs.captures_per_view, 16);
-    assert!(load_with(MODEL, &[("EUHEDRAL_KERNELS_GRAPHS_CAPTURES_PER_VIEW", "0")]).is_err());
+    // 0 keeps none: no quantum is captured.
+    let settings = load_with(MODEL, &[("EUHEDRAL_KERNELS_GRAPHS_CAPTURES_PER_VIEW", "0")]).unwrap();
+    assert_eq!(settings.kernels.graphs.captures_per_view, 0);
+    assert!(load_with(MODEL, &[("EUHEDRAL_KERNELS_GRAPHS_CAPTURES_PER_VIEW", "-1")]).is_err());
 }
 
 #[test]
