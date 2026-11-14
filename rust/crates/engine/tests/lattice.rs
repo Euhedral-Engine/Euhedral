@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use euhedral_core::config::FragmentConfig;
+use euhedral_core::config::{FragmentConfig, IdlePolicy};
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_graph::Lake;
@@ -87,15 +87,25 @@ fn settings(max_batch_size: Auto<u32>) -> Settings {
     settings
 }
 
-/// A worker that sits out cycles parks while frames wait in its cache and nothing wakes it; the engine's workers enter a
-/// handle in every cycle, and keep RustEE's other timings.
+/// The engine's workers idle on fixed timing: the park and half-life are RustEE's defaults whatever a worker's history,
+/// and the other timings are RustEE's.
 #[test]
-fn workers_never_sit_out_a_cycle() {
+fn workers_idle_on_fixed_timing() {
     let policy = fragment_config(&settings(Auto::Auto)).idle_policy().clone();
-    let default = FragmentConfig::default().idle_policy().clone();
-    assert!(policy.probe_interval().is_zero());
-    assert_eq!(policy.idle_park(), default.idle_park());
-    assert_eq!(policy.unproductive_park(), default.unproductive_park());
+    let default = IdlePolicy::default();
+    assert_eq!(policy.idle_park(), IdlePolicy::DEFAULT_IDLE_PARK);
+    assert_eq!(policy.contention_half_life(), IdlePolicy::DEFAULT_CONTENTION_HALF_LIFE);
+    assert_eq!(policy.probe_interval(), IdlePolicy::DEFAULT_PROBE_INTERVAL);
+    assert_eq!(policy.unproductive_park(), IdlePolicy::DEFAULT_UNPRODUCTIVE_PARK);
+    assert_eq!(policy.probe_interval(), default.probe_interval());
+    for (contention, productive, body) in [(0.0, 1.0, 1.0e3), (0.9, 0.1, 5.0e6)] {
+        let park = policy.function().park(contention, productive, body, policy.idle_park());
+        let half_life = policy
+            .function()
+            .half_life(contention, productive, body, policy.contention_half_life());
+        assert_eq!(park, IdlePolicy::DEFAULT_IDLE_PARK);
+        assert_eq!(half_life, IdlePolicy::DEFAULT_CONTENTION_HALF_LIFE);
+    }
 }
 
 #[test]

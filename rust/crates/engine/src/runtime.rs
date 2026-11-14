@@ -534,15 +534,20 @@ impl EngineRuntime {
     }
 }
 
-/// The fragment configuration of the engine's lattice: RustEE's default, except that no worker sits out a cycle (the
-/// idle policy's probe interval is zero), and with the most frames a worker takes at once from `host.max-batch-size`
-/// when that is stated. A decode quantum hands a frame from one stage to the next some 170 times, and nothing wakes a
-/// worker for a frame offered to its cache. Once the lattice has timed enough frames to have a body-cost estimate, its
-/// workers other than the first ranked sit out while few handles are productive, parked for up to most of a
-/// millisecond; the hand-offs then wait for a worker that runs, and a long decode lost more than half its speed within
-/// seconds. A worker that enters a handle every cycle keeps the stages' hand-offs running side by side.
+/// The fragment configuration of the engine's lattice: RustEE's default, except that the idle policy has fixed timing,
+/// and with the most frames a worker takes at once from `host.max-batch-size` when that is stated. The policy parks a
+/// worker that sits out for [`IdlePolicy::DEFAULT_IDLE_PARK`] (15 us) and keeps the contention history for
+/// [`IdlePolicy::DEFAULT_CONTENTION_HALF_LIFE`] (1 ms) whatever the worker's history; the unproductive park and the
+/// probe interval stay RustEE's. A decode quantum hands a frame from one stage to the next some 170 times, and nothing
+/// wakes a worker for a frame offered to its cache, so a hand-off waits for a worker to come round. The adaptive timing
+/// derives a park of up to 0.8 ms from each worker's history once the lattice has a body-cost estimate; with that, every
+/// hand-off of a frame-by-frame quantum waits out such a park, and a long decode lost more than half its speed within
+/// seconds. A short fixed park keeps every hand-off within tens of microseconds.
 pub fn fragment_config(settings: &Settings) -> FragmentConfig {
-    let policy = IdlePolicy::default().with_probe_interval(Duration::ZERO);
+    let policy = match IdlePolicy::fixed(IdlePolicy::DEFAULT_IDLE_PARK, IdlePolicy::DEFAULT_CONTENTION_HALF_LIFE) {
+        Ok(policy) => policy,
+        Err(_) => unreachable!("the default contention half-life is not zero"),
+    };
     let fragment = FragmentConfig::default().with_idle_policy(policy);
     let stated = match settings.host.max_batch_size {
         Auto::Value(size) => NonZeroU64::new(u64::from(size)),
