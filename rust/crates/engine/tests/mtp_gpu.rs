@@ -36,6 +36,7 @@ use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSectio
 use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
+use euhedral_inference_engine::quantum::CAPTURES;
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
 
@@ -536,7 +537,11 @@ fn long_run(machine: &Machine, prompt: &[u32], graphs: bool) -> LongRun {
     // A first round records the graphs of the keys it sees twice; the second is the one measured.
     let warm = generate(&runtime, prompt, 256, &[], Speculation::Artifact);
     let recording = generate(&runtime, prompt, 256, &[], Speculation::Artifact);
-    assert_eq!(recording.tokens, warm.tokens);
+    assert_eq!(
+        recording.tokens, warm.tokens,
+        "{:?} then {:?}",
+        warm.outcome, recording.outcome
+    );
     let lane = snapshot_lane(&runtime);
     let snapshot = snapshot(&runtime, &lane);
     drop(lane);
@@ -576,7 +581,12 @@ fn captured_mtp_equals_uncaptured() {
         kinds(QuantumKind::Draft),
         captured.recording.events.iter().filter(|event| event.recorded).count()
     );
-    assert!(replayed >= 100, "at least 100 replayed quanta, saw {replayed}");
+    // With captures off no quantum replays, and the two runs are the same run: the equalities below still hold.
+    if CAPTURES {
+        assert!(replayed >= 100, "at least 100 replayed quanta, saw {replayed}");
+    } else {
+        assert_eq!(replayed, 0, "no graph is replayed while captures are off");
+    }
     assert_eq!(
         plain.recording.events.iter().filter(|event| event.replayed).count(),
         0,

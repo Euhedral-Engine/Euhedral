@@ -68,6 +68,24 @@ pub unsafe fn enqueue<Q>(queue: &mut Q, table: &KernelTable, launch: &Launch) ->
 where
     Q: LaneEnqueue<Kernel = CudaKernel>,
 {
+    // SAFETY: the caller's contract.
+    unsafe { enqueue_overlapping(queue, table, launch, launch.programmatic) }
+}
+
+/// Enqueues `launch` on `queue`, as a programmatic dependent launch only when `programmatic` says so: a submission
+/// that does not overlap its launches passes false for kernels the catalog marks.
+///
+/// # Safety
+/// As [`enqueue`].
+pub unsafe fn enqueue_overlapping<Q>(
+    queue: &mut Q,
+    table: &KernelTable,
+    launch: &Launch,
+    programmatic: bool,
+) -> Result<(), EnqueueError>
+where
+    Q: LaneEnqueue<Kernel = CudaKernel>,
+{
     let name = launch.kernel.name();
     let resolved = match table.get(launch.kernel) {
         Slot::Ready(resolved) => resolved,
@@ -99,7 +117,10 @@ where
         launch.args.sizes(),
         resolved.parameter_sizes(),
     )?;
-    let geometry = geometry(launch);
+    let geometry = Geometry {
+        programmatic,
+        ..geometry(launch)
+    };
     ARGUMENTS.with_borrow_mut(|arguments| {
         fill_arguments(arguments, launch, |map| resolved.tensor_map(&tiled_map(map)))?;
         // SAFETY: the caller's contract; the arguments were checked against the kernel's parameter sizes above.

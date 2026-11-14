@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use euhedral_core::frames::Frame;
 use euhedral_data_structures::queues::{Consumer, Single};
 use euhedral_graph::QuantumOutcome;
-use euhedral_inference_cuda::{DevicePtr, KernelOps, PooledPinned, Submission, SubmitMode};
+use euhedral_inference_cuda::{DevicePtr, PooledPinned, SubmitMode};
 
 use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
@@ -61,7 +61,7 @@ use crate::quantum::{Executor, GraphCache, Started};
 use crate::runtime::{Core, Units};
 use crate::stages::attention::KvSource;
 use crate::stages::sampling::Selection;
-use crate::stages::{InputRecordRef, Quantum, QuantumError, QuantumKind};
+use crate::stages::{InputRecordRef, Quantum, QuantumError, QuantumKind, SubmitError};
 use crate::state::SequenceState;
 use crate::state::kv::KvRetained;
 use crate::workspace::{BufferSlot, Workspace};
@@ -659,6 +659,7 @@ impl Owner {
             self.receive(message);
         }
         self.reap();
+        self.free_retired();
         self.conclude();
         self.admit_ready();
         #[cfg(feature = "test-oracles")]
@@ -762,6 +763,25 @@ impl Owner {
         run.generated += 1;
         if run.generated >= run.wanted {
             run.stop(FinishReason::Length);
+        }
+    }
+
+    /// Frees, in stream order on the owner's lane, the buffers the sequence's caches let go of: pages that a request
+    /// discarded and tables a longer one replaced. A buffer reaches the list only when its last holder is gone, and
+    /// every holder was a quantum that retired, so the device is done with it; the free is queued behind the lane's
+    /// work and nothing waits. A lane with no free marker is tried again on the next turn.
+    fn free_retired(&mut self) {
+        let core = &self.shared.core;
+        if core.retire.pending() == 0 {
+            return;
+        }
+        let lanes = &core.lanes;
+        let freed = core.lane_table.submit_ops(core.owner_lane(), false, |ops| {
+            core.retire.reap(|marker| lanes.reached(marker), ops)
+        });
+        match freed {
+            Ok(_) | Err(SubmitError::Busy) => {}
+            Err(error) => self.fail(format!("freeing the released buffers: {error}")),
         }
     }
 
@@ -921,30 +941,32 @@ impl Owner {
             matches!(self.run.as_ref().map(|run| &run.mode), Some(Mode::Forced { sink, .. }) if sink.wants_hidden());
         let total = if wants_hidden { bytes + hidden_bytes } else { bytes };
         let mut loan = core.pool.acquire(total).map_err(why("the pinned row for the logits"))?;
-        let marker = {
-            let submission =
-                Submission::begin(core.owner_lane(), SubmitMode::default()).map_err(why("the owner's lane"))?;
-            let mut kernels = &submission;
-            // SAFETY: the loan is held by the message that follows the copy, which is offered only once the lane has
-            // reached the marker; nothing reads or writes the bytes before.
-            unsafe { kernels.copy_device_to_readback(loan.buffer_mut(), 0, quantum.slot(BufferSlot::Logits), bytes) }
-                .map_err(why("queueing the logits row's copy"))?;
-            if wants_hidden {
-                // SAFETY: as above; the hidden row follows the logits row in the loan.
+        let (_, marker) = core
+            .lane_table
+            .submit_ops(core.owner_lane(), false, |kernels| {
+                // SAFETY: the loan is held by the message that follows the copy, which is offered only once the lane
+                // has reached the marker; nothing reads or writes the bytes before.
                 unsafe {
-                    kernels.copy_device_to_readback(
-                        loan.buffer_mut(),
-                        bytes,
-                        quantum
-                            .slot(BufferSlot::FinalHiddenState)
-                            .offset(((rows.max(1) - 1) * hidden_bytes) as u64),
-                        hidden_bytes,
-                    )
+                    kernels.copy_device_to_readback(loan.buffer_mut(), 0, quantum.slot(BufferSlot::Logits), bytes)
                 }
-                .map_err(why("queueing the final hidden row's copy"))?;
-            }
-            submission.finish_signalled().map_err(why("the logits row's copy"))?
-        };
+                .map_err(why("queueing the logits row's copy"))?;
+                if wants_hidden {
+                    // SAFETY: as above; the hidden row follows the logits row in the loan.
+                    unsafe {
+                        kernels.copy_device_to_readback(
+                            loan.buffer_mut(),
+                            bytes,
+                            quantum
+                                .slot(BufferSlot::FinalHiddenState)
+                                .offset(((rows.max(1) - 1) * hidden_bytes) as u64),
+                            hidden_bytes,
+                        )
+                    }
+                    .map_err(why("queueing the final hidden row's copy"))?;
+                }
+                Ok::<(), String>(())
+            })
+            .map_err(why("the logits row's copy"))?;
         let address = Arc::clone(&self.shared.address);
         let frame = step_frame(move || address.post(Message::Logits(LogitsCopied { step, loan })));
         core.completions.after_marker(marker, frame);
@@ -1088,36 +1110,32 @@ impl Owner {
         // The reservation (and, for the first quantum of a request after another, the reset of the sequence) on the
         // owner's lane. Its marker orders the quantum's stages behind it.
         let mut retained = KvRetained::default();
-        let reserved = {
-            let submission =
-                Submission::begin(core.owner_lane(), SubmitMode::default()).map_err(why("the owner's lane"))?;
-            if run.admitted == 0 && self.used {
-                self.sequence
-                    .reset(&submission)
-                    .map_err(why("resetting the sequence"))?;
-                self.used = false;
-            }
-            let cache = match source {
-                KvSource::Base => &mut self.sequence.kv,
-                KvSource::Mtp => self
-                    .sequence
-                    .mtp_kv
-                    .as_mut()
-                    .ok_or_else(|| "the sequence has no MTP cache".to_string())?,
-            };
-            let mut kernels = &submission;
-            cache
-                .reserve_with(&submission, &mut kernels, &core.pool, start, rows as u64, &mut retained)
-                .map_err(why("reserving the cache's rows"))?;
-            cache.appended(rows as u64).map_err(why("the cache's frontier"))?;
-            submission.finish_signalled().map_err(why("the reservation"))?
-        };
+        let (_, reserved) = core
+            .lane_table
+            .submit_ops(core.owner_lane(), false, |lane| {
+                if run.admitted == 0 && self.used {
+                    self.sequence.reset(lane).map_err(why("resetting the sequence"))?;
+                    self.used = false;
+                }
+                let cache = match source {
+                    KvSource::Base => &mut self.sequence.kv,
+                    KvSource::Mtp => match self.sequence.mtp_kv.as_mut() {
+                        Some(cache) => cache,
+                        None => return Err("the sequence has no MTP cache".to_string()),
+                    },
+                };
+                cache
+                    .reserve(lane, &core.pool, start, rows as u64, &mut retained)
+                    .map_err(why("reserving the cache's rows"))?;
+                cache.appended(rows as u64).map_err(why("the cache's frontier"))?;
+                Ok(())
+            })
+            .map_err(why("the reservation"))?;
         let refs = self
             .sequence
             .refs(source)
             .map_err(why("the sequence's references"))?
-            .ordered_after(reserved, &core.lanes, &core.library)
-            .map_err(why("ordering the quantum behind its reservation"))?
+            .ordered_after(reserved, &core.lanes)
             .with_replay_rows(replay);
         let mode = SubmitMode {
             pdl,
@@ -1149,17 +1167,12 @@ impl Owner {
         // Everything the executor would refuse is refused before the record is queued for upload: a quantum dropped
         // after that would free the pinned record under the copy.
         quantum.validate().map_err(why("the quantum"))?;
-        let prepared = {
-            let submission =
-                Submission::begin(core.owner_lane(), SubmitMode::default()).map_err(why("the owner's lane"))?;
-            let mut kernels = &submission;
-            quantum
-                .prepare_with(&core.pool, &mut kernels)
-                .map_err(why("the input record"))?;
-            submission
-                .finish_signalled()
-                .map_err(why("the input record's upload"))?
-        };
+        let (_, prepared) = core
+            .lane_table
+            .submit_ops(core.owner_lane(), false, |kernels| {
+                quantum.prepare(&core.pool, kernels).map_err(why("the input record"))
+            })
+            .map_err(why("the input record's upload"))?;
         quantum.prepared_after(prepared);
 
         let selection = quantum.selection().cloned();

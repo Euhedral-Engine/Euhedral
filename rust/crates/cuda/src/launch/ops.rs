@@ -10,12 +10,15 @@
 //!
 //! Copies and the memset are the lane's own operations. A pitched 2D copy is RustEE's pitched copy on the lane (a single copy when both pitches equal the row).
 
+use std::ffi::c_void;
 use std::fmt;
+use std::sync::Arc;
 
 use euhedral_gpu::cuda::CudaKernel;
-use euhedral_gpu::{GpuError, LaneEnqueue};
+use euhedral_gpu::{GpuError, LaneEnqueue, LaneStream};
+use euhedral_graph::Marker;
 
-use crate::error::CudaError;
+use crate::error::{CudaError, check};
 use crate::launch::attention::{
     AppendShape, CacheFormat, CausalShape, RopeShape, plan_causal, plan_kv_append, plan_qk_norm_rope,
 };
@@ -32,11 +35,12 @@ use crate::launch::gdn::{
 };
 use crate::launch::load::KernelTable;
 use crate::launch::nvfp4::{Nvfp4Operands, plan_linear, plan_native};
-use crate::launch::queue::{EnqueueError, enqueue};
+use crate::launch::queue::{EnqueueError, enqueue_overlapping};
 use crate::launch::table::{Geometry, plan_linear_launch, plan_qwen4_launch};
 use crate::launch::{Modes, PlanError};
-use crate::memory::{DevicePtr, HostWeightsArena, PinnedBuffer};
-use crate::ops::{KernelOps, range_start};
+use crate::library::CudaLibrary;
+use crate::memory::{DeviceBuffer, DevicePtr, HostWeightsArena, PinnedBuffer};
+use crate::ops::{KernelOps, LaneOps, range_start};
 use crate::sys::{
     EUHEDRAL_CUDA_FORMAT_MISMATCH as FORMAT_MISMATCH, EUHEDRAL_CUDA_INVALID_ARGUMENT as INVALID_ARGUMENT,
     EUHEDRAL_CUDA_ROUTE_UNAVAILABLE as ROUTE_UNAVAILABLE, EUHEDRAL_CUDA_SIZE_OVERFLOW as SIZE_OVERFLOW,
@@ -78,7 +82,12 @@ pub struct RusteeOps<'a, Q> {
     queue: &'a mut Q,
     table: &'a KernelTable,
     modes: Modes,
+    /// Whether the launches the catalog marks may overlap their predecessors (programmatic dependent launch).
+    pdl: bool,
     began_row_exact: bool,
+    /// The C library and the lane's value-0 marker, for the allocations the owner makes on this lane
+    /// ([`RusteeOps::on_lane`]).
+    lane: Option<(&'a Arc<CudaLibrary>, Marker)>,
 }
 
 impl<Q> fmt::Debug for RusteeOps<'_, Q> {
@@ -102,13 +111,38 @@ where
             queue,
             table,
             modes,
+            pdl: true,
             began_row_exact: modes.row_exact,
+            lane: None,
         }
+    }
+
+    /// The same, for work that also allocates and frees in stream order ([`LaneOps`]): `library` is the C library whose
+    /// stream-ordered allocator is used on the lane's stream, and `home` the lane's marker of value 0.
+    #[must_use]
+    pub fn on_lane(mut self, library: &'a Arc<CudaLibrary>, home: Marker) -> Self {
+        self.lane = Some((library, home));
+        self
+    }
+
+    /// Sets whether the launches the catalog marks overlap their predecessors (programmatic dependent launch): a
+    /// kernel is launched so when it is registered for it and this is true, which it is until set. A quantum's
+    /// [`SubmitMode`](crate::submission::SubmitMode) says it.
+    #[must_use]
+    pub fn with_pdl(mut self, pdl: bool) -> Self {
+        self.pdl = pdl;
+        self
     }
 
     /// The modes later launches are planned in.
     pub fn modes(&self) -> Modes {
         self.modes
+    }
+
+    /// Whether `launch` is enqueued as a programmatic dependent launch: the catalog marks it and the submission
+    /// overlaps its launches.
+    fn overlaps(&self, launch: &Launch) -> bool {
+        launch.programmatic && self.pdl
     }
 
     /// Enqueues `launches` in order.
@@ -117,7 +151,8 @@ where
             // SAFETY: the contract of `KernelOps`, as for the native wrappers: the addresses a stage names stay valid
             // for the kernels' accesses until the lane's work has retired. The plan's argument sizes are checked
             // against the kernel's parameters by `enqueue`.
-            unsafe { enqueue(self.queue, self.table, launch) }.map_err(|error| not_enqueued(&error))?;
+            unsafe { enqueue_overlapping(self.queue, self.table, launch, self.overlaps(launch)) }
+                .map_err(|error| not_enqueued(&error))?;
         }
         Ok(())
     }
@@ -130,12 +165,12 @@ where
         call: &'static str,
         plan: impl FnOnce(&mut dyn FnMut(Launch)) -> Result<(), PlanError>,
     ) -> Result<(), CudaError> {
-        let (queue, table) = (&mut *self.queue, self.table);
+        let (queue, table, pdl) = (&mut *self.queue, self.table, self.pdl);
         let mut failure = None;
         let planned = plan(&mut |launch| {
             if failure.is_none() {
                 // SAFETY: as in `enqueue_all`.
-                if let Err(error) = unsafe { enqueue(queue, table, &launch) } {
+                if let Err(error) = unsafe { enqueue_overlapping(queue, table, &launch, launch.programmatic && pdl) } {
                     failure = Some(error);
                 }
             }
@@ -873,3 +908,63 @@ where
 
 #[cfg(test)]
 mod tests;
+
+impl<Q> RusteeOps<'_, Q>
+where
+    Q: LaneEnqueue<Kernel = CudaKernel> + LaneStream<Raw = *mut c_void>,
+{
+    /// Runs `call` with the C library's stream selected for the calling thread to the stream the lane lends, and clears
+    /// the selection after. The lent stream is private to the submission and the operations enqueued after the lend go
+    /// to it too, so the call is ordered with everything enqueued before it and after it.
+    pub fn on_lent_stream<R>(&self, call: impl FnOnce(&Arc<CudaLibrary>) -> R) -> Result<R, CudaError> {
+        let Some((library, _)) = self.lane else {
+            return Err(CudaError::Argument(
+                "the operations were made without a lane's library: use `on_lane`".to_string(),
+            ));
+        };
+        let stream = self
+            .queue
+            .raw_stream()
+            .ok_or_else(|| CudaError::Argument("the lane lent no stream".to_string()))?
+            .as_raw();
+        // SAFETY: the stream is live for this submission; the selection is cleared before the lent stream can end.
+        let status = unsafe {
+            library
+                .api()
+                .euhedral_cuda_stream_select(stream.expose_provenance() as u64)
+        };
+        check("euhedral_cuda_stream_select", status)?;
+        // The selection is cleared when the call returns or panics.
+        let _selection = SelectedStream(library);
+        Ok(call(library))
+    }
+}
+
+/// The calling thread's stream selection, cleared when dropped.
+struct SelectedStream<'a>(&'a Arc<CudaLibrary>);
+
+impl Drop for SelectedStream<'_> {
+    fn drop(&mut self) {
+        // SAFETY: clears this thread's selection.
+        unsafe { self.0.api().euhedral_cuda_stream_clear() };
+    }
+}
+
+impl<Q> LaneOps for RusteeOps<'_, Q>
+where
+    Q: LaneEnqueue<Kernel = CudaKernel> + LaneStream<Raw = *mut c_void>,
+{
+    fn home(&self) -> Result<Marker, CudaError> {
+        self.lane
+            .map(|(_, home)| home)
+            .ok_or_else(|| CudaError::Argument("the operations were made without a lane: use `on_lane`".to_string()))
+    }
+
+    fn alloc_async(&mut self, bytes: usize) -> Result<DeviceBuffer, CudaError> {
+        self.on_lent_stream(|library| DeviceBuffer::alloc_on_selected(library, bytes))?
+    }
+
+    fn free_async(&mut self, buffer: DeviceBuffer) -> Result<(), CudaError> {
+        self.on_lent_stream(|_| buffer.free_on_selected())?
+    }
+}

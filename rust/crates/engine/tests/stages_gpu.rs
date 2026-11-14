@@ -22,8 +22,11 @@
 
 #[path = "common/linear_gpu.rs"]
 mod linear_gpu;
+#[path = "common/typed.rs"]
+mod typed;
 
 use std::cell::RefCell;
+use std::fmt::Display;
 use std::mem;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -35,13 +38,14 @@ use std::time::Duration;
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::{FrameSink, LatticeSource};
+use euhedral_gpu::cuda::CudaQueue;
 use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, GraphRuntime, Lake, LaneId, LanePool, Marker,
     QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
 use euhedral_inference_cuda::{
-    CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, GraphRecorder, KernelOps, PinnedPool, RetireList,
-    Submission, SubmitMode, ops,
+    CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, GraphRecorder, KernelOps, LaneOps, PinnedPool,
+    RetireList, Submission, SubmitMode, ops,
 };
 use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorDataType, WeightFormat, WeightLayout};
 use euhedral_inference_engine::Handoff;
@@ -106,25 +110,25 @@ fn config(kinds: Vec<LayerType>) -> Arc<ModelConfig> {
 }
 
 thread_local! {
-    /// The lane of the rig made on this thread: the host copies of the helpers run on it.
-    static LANE: RefCell<Option<Arc<CudaLane>>> = const { RefCell::new(None) };
+    /// The lane of the rig made on this thread, with its table: the host copies of the helpers run on it.
+    static LANE: RefCell<Option<(LaneTable, Arc<CudaQueue>)>> = const { RefCell::new(None) };
 }
 
 /// Runs `copy` (a blocking host copy) on the rig's lane. Outside a submission such a copy runs on the legacy stream,
 /// which does not order against the lane's work: a kernel could start before the copy's DMA completed, or a read
 /// could see a kernel's results half written. In a submission the copy is queued on the lane and waits for it.
 fn on_lane<T>(copy: impl FnOnce() -> T) -> T {
-    let lane = LANE
+    let (table, lane) = LANE
         .with(|lane| lane.borrow().clone())
         .expect("a rig was made on this thread");
-    let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-    let out = copy();
-    drop(submission);
-    out
+    table.submit_host(&lane, copy).unwrap().0
 }
 
 struct Rig {
     library: Arc<CudaLibrary>,
+    /// RustEE's lanes, the ones the stages run on.
+    typed: typed::Typed,
+    /// A native lane, for the tests that record a graph by hand.
     lane: Arc<CudaLane>,
     lanes: LaneTable,
     /// The pool of the one lane, and the lattice that runs a stage under test in a one-stage graph.
@@ -139,8 +143,9 @@ struct Rig {
 fn rig() -> Option<Rig> {
     let library = library()?;
     let lane = CudaLane::new(&library, LaneId(0), 256).unwrap();
-    LANE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&lane)));
-    let pool = Arc::new(LanePool::new(vec![Arc::clone(&lane) as Arc<dyn DeviceQueue>]));
+    let typed = typed::Typed::open(&library, 1, 256);
+    LANE.with(|slot| *slot.borrow_mut() = Some((typed.table.clone(), Arc::clone(typed.lane(0)))));
+    let pool = Arc::clone(&typed.queues);
     let settings = Settings::with_model(ModelSettings::default());
     let lattice = ControlPlaneLattice::new(lattice_config(&settings)).unwrap();
     let lake = Lake::new(
@@ -156,7 +161,8 @@ fn rig() -> Option<Rig> {
         completions,
         lake,
         lattice,
-        lanes: LaneTable::new(vec![Arc::clone(&lane)]).unwrap(),
+        lanes: typed.table.clone().with_native(vec![Arc::clone(&lane)]),
+        typed,
         pinned: PinnedPool::new(&library, 64 << 20),
         retire: Arc::new(RetireList::new()),
         library,
@@ -261,6 +267,12 @@ impl Rig {
 
     fn sync(&self) {
         self.lane.synchronize().unwrap();
+        self.typed.sync();
+    }
+
+    /// Queues `work` as one submission of the rig's RustEE lane and returns its marker.
+    fn ops<E: Display>(&self, work: impl FnOnce(&mut dyn LaneOps) -> Result<(), E>) -> Marker {
+        self.lanes.submit_ops(self.typed.lane(0), false, work).unwrap().1
     }
 
     /// Queues `work` in a submission of the rig's lane and waits for it.
@@ -326,15 +338,18 @@ impl Rig {
         format: KvFormat,
         kv_tokens: u64,
     ) -> (SequenceState, KvRetained) {
-        let submission = Submission::begin(&self.lane, SubmitMode::default()).unwrap();
-        let gdn = GdnStates::allocate(&self.library, config, 8, &mut &submission).unwrap();
         let mut kv = KvCache::new(&self.library, &self.retire, kv_layers, 1024, format, kv_tokens, 0).unwrap();
         let mut retained = KvRetained::default();
-        if kv_layers > 0 && kv_tokens > 0 {
-            kv.reserve(&submission, &self.pinned, 0, kv_tokens, &mut retained)
-                .unwrap();
-        }
-        submission.finish_signalled().unwrap();
+        let mut gdn = None;
+        self.ops(|lane| {
+            gdn = Some(GdnStates::allocate(&self.library, config, 8, lane)?);
+            if kv_layers > 0 && kv_tokens > 0 {
+                kv.reserve(lane, &self.pinned, 0, kv_tokens, &mut retained)
+                    .map_err(|error| CudaError::Argument(error.to_string()))?;
+            }
+            Ok::<(), CudaError>(())
+        });
+        let gdn = gdn.unwrap();
         self.sync();
         let scratch = AttentionScratch::allocate(&self.library, config, 8, true, 16).unwrap();
         (
@@ -1375,7 +1390,7 @@ fn argmax_lowest_id_tie_break() {
     let marker = rig.run(&every, &verify).expect("a marker for the completion edge");
     rig.sync();
     assert!(
-        rig.lane.completed() >= marker.value,
+        DeviceQueue::completed(&**rig.typed.lane(0)) >= marker.value,
         "the lane's completion word reaches the argmax stage's marker"
     );
     let selected: Vec<Option<u32>> = (0..5).map(|row| selection.token(row)).collect();
@@ -1581,7 +1596,7 @@ fn a_completion_edge_after_the_argmax_finds_its_keys_on_the_host() {
         NonZeroUsize::new(2).unwrap(),
         Duration::from_secs(1),
     );
-    let lanes = Arc::new(LanePool::new(vec![Arc::clone(&rig.lane) as Arc<dyn DeviceQueue>]));
+    let lanes = Arc::clone(&rig.typed.queues);
     let completions = Completions::new(Arc::clone(&lanes));
     lattice
         .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
@@ -2240,9 +2255,7 @@ fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
 
     // One page: a table of one slot per plane.
     let mut retained = KvRetained::default();
-    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
-    cache.reserve(&submission, &rig.pinned, 0, 256, &mut retained).unwrap();
-    let marker = submission.finish_signalled().unwrap();
+    let marker = rig.ops(|lane| cache.reserve(lane, &rig.pinned, 0, 256, &mut retained));
     rig.sync();
     let early = cache.view().ready_after(marker);
     assert_eq!(early.ready(), Some(marker));
@@ -2258,9 +2271,7 @@ fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
     // and the old one is not handed to the retire list while the view holds it.
     cache.appended(256).unwrap();
     let mut grown = KvRetained::default();
-    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
-    cache.reserve(&submission, &rig.pinned, 256, 700, &mut grown).unwrap();
-    submission.finish_signalled().unwrap();
+    rig.ops(|lane| cache.reserve(lane, &rig.pinned, 256, 700, &mut grown));
     rig.sync();
     let late = cache.view();
     assert_ne!(late.key_table(0).unwrap(), old_table, "the cache moved to a new table");
@@ -2280,9 +2291,10 @@ fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
     // The last holder lets go: the table goes to the retire list, to be freed in stream order, not under a reader.
     drop(early);
     assert_eq!(rig.retire.pending(), 1);
-    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
-    assert_eq!(rig.retire.reap(|_| true, &submission).unwrap(), 1);
-    submission.finish().unwrap();
+    rig.ops(|lane| {
+        assert_eq!(rig.retire.reap(|_| true, lane)?, 1);
+        Ok::<(), CudaError>(())
+    });
     rig.sync();
     drop(late);
     assert_eq!(rig.retire.pending(), 0, "the cache still holds the new table");
@@ -2298,8 +2310,7 @@ fn the_cache_stages_wait_for_the_reservation_that_allocated_the_pages() {
     let workspace = rig.workspace(&config, 8, 8, &[]);
     let sequence = rig.sequence(&config, 1, KvFormat::Nvfp4, 256).0;
     // The marker of the submission that reserved the page (here, one that follows the reservation).
-    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
-    let marker = submission.finish_signalled().unwrap();
+    let marker = rig.ops(|_| Ok::<(), CudaError>(()));
     rig.sync();
     let make = |view: KvView| {
         Quantum::new(

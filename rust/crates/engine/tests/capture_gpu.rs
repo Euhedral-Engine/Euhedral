@@ -8,6 +8,7 @@
 //! the sequence's owner: it reserves the cache rows, uploads the input record, starts a quantum, waits for its
 //! retirement and reads the results.
 
+#![allow(clippy::print_stderr, reason = "a test reports what it skipped")]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -21,6 +22,10 @@
 
 #[path = "common/linear_gpu.rs"]
 mod linear_gpu;
+#[path = "common/typed.rs"]
+mod typed;
+
+use typed::Typed;
 
 mod common;
 
@@ -48,7 +53,7 @@ use euhedral_inference_engine::model::{
     LayerIndex, LayerKind, MTP_ATTENTION_PACK, ModelConfig, Role, WeightRef, object_key,
 };
 use euhedral_inference_engine::plan::{Formats, Plan, View, WeightLookup};
-use euhedral_inference_engine::quantum::{Admission, CaptureKey, Executor, GraphCache};
+use euhedral_inference_engine::quantum::{Admission, CAPTURES, CaptureKey, Executor, GraphCache};
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, nvfp4, plan as residency_plan};
 use euhedral_inference_engine::stages::attention::KvSource;
 use euhedral_inference_engine::stages::sampling::SelectionPool;
@@ -212,6 +217,8 @@ struct World {
     plan: Arc<Plan>,
     /// The lane of the owner's own submissions: the reservations and the input records.
     owner: Arc<CudaLane>,
+    /// The RustEE lanes the stages run on.
+    _typed: Typed,
     table: LaneTable,
     pool: Arc<LanePool>,
     runtime: GraphRuntime,
@@ -225,6 +232,10 @@ struct World {
 
 impl World {
     fn open() -> Option<World> {
+        if !CAPTURES {
+            eprintln!("skipped: graph captures are off in production");
+            return None;
+        }
         let model = shared_model()?;
         let library = library()?;
         let config = reduced_config();
@@ -243,13 +254,9 @@ impl World {
             .map(|id| CudaLane::new(&library, LaneId(id as u16), 8192).unwrap())
             .collect();
         let owner = Arc::clone(&lanes[width + 1]);
-        let table = LaneTable::new(lanes.clone()).unwrap();
-        let pool = Arc::new(LanePool::new(
-            lanes
-                .iter()
-                .map(|lane| Arc::clone(lane) as Arc<dyn DeviceQueue>)
-                .collect(),
-        ));
+        let typed = Typed::plain(&library, width + 2, 8192);
+        let table = typed.table.clone().with_native(lanes.clone());
+        let pool = Arc::clone(&typed.queues);
         let settings = Settings::with_model(ModelSettings::default());
         let lattice = ControlPlaneLattice::new(lattice_config(&settings)).unwrap();
         let lake = Lake::new(
@@ -294,6 +301,7 @@ impl World {
             residency,
             plan,
             owner,
+            _typed: typed,
             table,
             pool,
             runtime,
@@ -484,7 +492,7 @@ impl Run {
             let cache = &mut self.sequence.kv;
             let start = cache.submitted();
             cache
-                .reserve(submission, &world.pinned, start, position - start, &mut retained)
+                .reserve(&mut &*submission, &world.pinned, start, position - start, &mut retained)
                 .unwrap();
             cache.appended(position - start).unwrap();
             cache.commit(position - start).unwrap();
@@ -516,7 +524,7 @@ impl Run {
                 &mut self.sequence.kv
             };
             cache
-                .reserve(&submission, &world.pinned, start, rows as u64, &mut retained)
+                .reserve(&mut &submission, &world.pinned, start, rows as u64, &mut retained)
                 .unwrap();
             cache.appended(rows as u64).unwrap();
             submission.finish_signalled().unwrap()
@@ -531,8 +539,7 @@ impl Run {
             .sequence
             .refs(source)
             .unwrap()
-            .ordered_after(marker, &world.pool, &world.library)
-            .unwrap()
+            .ordered_after(marker, &world.pool)
             .with_replay_rows(replay);
         let mode = SubmitMode {
             pdl: matches!(kind, QuantumKind::Decode | QuantumKind::Verify) && start < 1024,
@@ -579,7 +586,7 @@ impl Run {
         // The input record's upload, ahead of the quantum's first stage.
         let prepared = {
             let submission = Submission::begin(&world.owner, SubmitMode::default()).unwrap();
-            quantum.prepare(&world.pinned, &submission).unwrap();
+            quantum.prepare(&world.pinned, &mut &submission).unwrap();
             submission.finish_signalled().unwrap()
         };
         quantum.prepared_after(prepared);
@@ -961,7 +968,7 @@ fn light() -> Option<Light> {
         .unwrap(),
     );
     Some(Light {
-        table: LaneTable::new(vec![Arc::clone(&lane)]).unwrap(),
+        table: Typed::plain(&library, 1, 4).table.with_native(vec![Arc::clone(&lane)]),
         pool: LanePool::new(vec![Arc::clone(&lane) as Arc<dyn DeviceQueue>]),
         pinned: PinnedPool::new(&library, 16 << 20),
         retire: Arc::new(RetireList::new()),
@@ -1010,7 +1017,7 @@ impl Light {
         let submission = Submission::begin(&self.lane, SubmitMode::default()).unwrap();
         sequence
             .kv
-            .reserve(&submission, &self.pinned, start, rows as u64, &mut retained)
+            .reserve(&mut &submission, &self.pinned, start, rows as u64, &mut retained)
             .unwrap();
         sequence.kv.appended(rows as u64).unwrap();
         drop(submission);
@@ -1147,45 +1154,26 @@ fn a_selection_is_held_by_its_quantum_until_the_quantum_is_dropped() {
 
 #[test]
 #[ignore = "needs a GPU and the native library"]
-fn a_reservation_marker_is_kept_in_the_ring_and_dropped_when_reached() {
+fn a_reservation_marker_is_kept_until_reached_and_then_dropped() {
     let Some(light) = light() else { return };
     let mut sequence = light.sequence(1024, 1);
     let mut retained = KvRetained::default();
     let submission = Submission::begin(&light.lane, SubmitMode::default()).unwrap();
     sequence
         .kv
-        .reserve(&submission, &light.pinned, 0, 8, &mut retained)
+        .reserve(&mut &submission, &light.pinned, 0, 8, &mut retained)
         .unwrap();
     let reserved = submission.finish().unwrap();
-    // The ring holds 4 events: the reservation's marker is stale after 4 more.
-    for _ in 0..3 {
-        Submission::begin(&light.lane, SubmitMode::default())
-            .unwrap()
-            .finish()
-            .unwrap();
-    }
     let view = sequence.kv.view();
-    let kept = view.clone().ordered_after(reserved, &light.pool, &light.library);
-    assert_eq!(kept.unwrap().ready(), Some(reserved), "within the ring");
-    for _ in 0..2 {
-        Submission::begin(&light.lane, SubmitMode::default())
-            .unwrap()
-            .finish()
-            .unwrap();
-    }
-    assert!(!light.library.marker_waitable(reserved));
-    let refused = view.clone().ordered_after(reserved, &light.pool, &light.library);
-    assert!(
-        refused.is_err(),
-        "older than the ring and not reached: the owner holds the quantum back"
-    );
+    let kept = view.clone().ordered_after(reserved, &light.pool);
+    assert_eq!(kept.ready(), Some(reserved), "work not yet reached is waited for");
     let marker: Marker = Submission::begin(&light.lane, SubmitMode::default())
         .unwrap()
         .finish_signalled()
         .unwrap();
     light.lane.synchronize().unwrap();
     assert!(light.pool.reached(marker));
-    let done = view.ordered_after(reserved, &light.pool, &light.library).unwrap();
+    let done = view.ordered_after(reserved, &light.pool);
     assert_eq!(done.ready(), None, "reached work needs no ordering");
 }
 
@@ -1207,7 +1195,7 @@ fn a_cache_reserved_twice_or_not_at_all_for_a_quantum_is_refused_its_references(
         let submission = Submission::begin(&light.lane, SubmitMode::default()).unwrap();
         sequence
             .kv
-            .reserve(&submission, &light.pinned, start, 1, retained)
+            .reserve(&mut &submission, &light.pinned, start, 1, retained)
             .unwrap();
         sequence.kv.appended(1).unwrap();
         drop(submission);
@@ -1237,7 +1225,7 @@ fn a_sequence_closes_only_when_no_quantum_is_in_flight() {
     let submission = Submission::begin(&light.lane, SubmitMode::default()).unwrap();
     sequence
         .kv
-        .reserve(&submission, &light.pinned, 0, 1, &mut retained)
+        .reserve(&mut &submission, &light.pinned, 0, 1, &mut retained)
         .unwrap();
     drop(submission);
     light.lane.synchronize().unwrap();
@@ -1276,7 +1264,7 @@ fn growing_a_cache_after_a_view_was_taken_costs_one_handle_copy_per_page() {
     let submission = Submission::begin(&light.lane, SubmitMode::default()).unwrap();
     // Reserve all but the pages the rounds grow into.
     let almost = 131_072 - (2 * ROUNDS as u64 + 2) * 256;
-    kv.reserve(&submission, &light.pinned, 0, almost, &mut retained)
+    kv.reserve(&mut &submission, &light.pinned, 0, almost, &mut retained)
         .unwrap();
     kv.appended(almost).unwrap();
     drop(submission);
@@ -1286,7 +1274,8 @@ fn growing_a_cache_after_a_view_was_taken_costs_one_handle_copy_per_page() {
         let start = kv.submitted();
         let submission = Submission::begin(&light.lane, SubmitMode::default()).unwrap();
         let begun = Instant::now();
-        kv.reserve(&submission, &light.pinned, start, 256, retained).unwrap();
+        kv.reserve(&mut &submission, &light.pinned, start, 256, retained)
+            .unwrap();
         let took = begun.elapsed();
         kv.appended(256).unwrap();
         drop(submission);

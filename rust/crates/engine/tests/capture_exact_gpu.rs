@@ -13,6 +13,8 @@
 )]
 
 mod common;
+#[path = "common/typed.rs"]
+mod typed;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,7 +26,7 @@ use euhedral_inference_cuda::{CudaLane, CudaLibrary, Submission, SubmitMode};
 use euhedral_inference_engine::model::{LayerKind, ModelConfig};
 use euhedral_inference_engine::stages::attention::KvSource;
 use euhedral_inference_engine::stages::sampling::SelectionPool;
-use euhedral_inference_engine::stages::{InputRecordRef, LaneTable, Quantum, QuantumKind};
+use euhedral_inference_engine::stages::{InputRecordRef, Quantum, QuantumKind};
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvRetained};
@@ -44,7 +46,9 @@ fn a_quantum_is_never_captured_under_exact_numerics() {
     config.num_hidden_layers = 2;
     let config: Arc<ModelConfig> = Arc::new(config);
     let lane = CudaLane::new(&library, LaneId(0), 16).unwrap();
-    let table = LaneTable::new(vec![Arc::clone(&lane)]).unwrap();
+    let table = typed::Typed::open(&library, 1, 16)
+        .table
+        .with_native(vec![Arc::clone(&lane)]);
     let retire = Arc::new(RetireList::new());
     let pinned = PinnedPool::new(&library, 16 << 20);
     let workspace = Arc::new(
@@ -77,7 +81,7 @@ fn a_quantum_is_never_captured_under_exact_numerics() {
         let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
         sequence
             .kv
-            .reserve(&submission, &pinned, start, 1, &mut retained)
+            .reserve(&mut &submission, &pinned, start, 1, &mut retained)
             .unwrap();
         sequence.kv.appended(1).unwrap();
         drop(submission);

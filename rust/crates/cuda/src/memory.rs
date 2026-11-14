@@ -12,6 +12,7 @@ use euhedral_io::IoMemory;
 
 use crate::error::{CudaError, check};
 use crate::library::CudaLibrary;
+use crate::ops::LaneOps;
 use crate::retire::Retire;
 use crate::submission::{Submission, capture_selected};
 
@@ -97,11 +98,24 @@ impl DeviceBuffer {
         if submission.lane().is_capturing() {
             return Err(CudaError::Capturing("a stream-ordered allocation"));
         }
+        Self::alloc_on_selected(submission.lane().library(), bytes)
+    }
+
+    /// Allocates `bytes` in stream order on the stream the calling thread has selected in the C library.
+    pub(crate) fn alloc_on_selected(library: &Arc<CudaLibrary>, bytes: usize) -> Result<DeviceBuffer, CudaError> {
         let size = non_empty(bytes)?;
-        let library = submission.lane().library();
-        // SAFETY: the submission has selected its lane's stream, which the call allocates on.
+        // SAFETY: the caller has selected a live stream, which the call allocates on.
         let address = unsafe { library.api().euhedral_cuda_malloc_async(size) };
         Self::wrap(library, "euhedral_cuda_malloc_async", address, bytes, true)
+    }
+
+    /// Frees the buffer in stream order on the stream the calling thread has selected in the C library.
+    pub(crate) fn free_on_selected(mut self) -> Result<(), CudaError> {
+        // SAFETY: the address is this buffer's live allocation, and the caller has selected a live stream.
+        let status = unsafe { self.library.api().euhedral_cuda_free_async(self.ptr().as_mut()) };
+        // The allocation is gone either way: a failed stream-ordered free must not become a second free on drop.
+        self.addr = 0;
+        check("euhedral_cuda_free_async", status)
     }
 
     fn wrap(
@@ -130,18 +144,14 @@ impl DeviceBuffer {
     /// reaches this point, after every reader queued before it on that lane. `readers` are the markers of the last
     /// uses on other lanes; the free waits for each on the device first, so a reader on another lane never sees
     /// reused memory. Pass every lane that still reads the buffer.
-    pub fn free_async(mut self, submission: &Submission<'_>, readers: &[Marker]) -> Result<(), CudaError> {
+    pub fn free_async(self, submission: &Submission<'_>, readers: &[Marker]) -> Result<(), CudaError> {
         if submission.lane().is_capturing() {
             return Err(CudaError::Capturing("a stream-ordered free"));
         }
         for reader in readers {
             submission.wait(*reader)?;
         }
-        // SAFETY: the address is this buffer's live allocation, and the submission has selected a stream.
-        let status = unsafe { self.library.api().euhedral_cuda_free_async(self.ptr().as_mut()) };
-        // The allocation is gone either way: a failed stream-ordered free must not become a second free on drop.
-        self.addr = 0;
-        check("euhedral_cuda_free_async", status)
+        self.free_on_selected()
     }
 
     /// The device address.
@@ -483,7 +493,7 @@ impl Retire for DeviceBuffer {
         }
     }
 
-    fn release(self, submission: &Submission<'_>) -> Result<(), CudaError> {
-        self.free_async(submission, &[])
+    fn release(self, ops: &mut dyn LaneOps) -> Result<(), CudaError> {
+        ops.free_async(self)
     }
 }

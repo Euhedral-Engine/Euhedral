@@ -17,15 +17,16 @@ pub mod views;
 use std::fmt;
 use std::sync::Arc;
 
-use euhedral_graph::{EdgeKind, GraphError, LaneId, StageGraphSpec, StageSpec};
+use euhedral_graph::{EdgeKind, GraphError, LaneId, Stage, StageGraphSpec, StageSpec};
 use euhedral_inference_cuda::DevicePtr;
 use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
 use thiserror::Error;
 
 use crate::model::Speculation;
 use crate::model::{LayerIndex, LayerKind, ModelConfig, Role, WeightRef};
+use crate::quantum::home::lane_for;
 use crate::residency::planner::ResidencyPlan;
-use crate::stages::Placed;
+use crate::stages::{Chain, Placed, Quantum};
 use buffers::Access;
 pub use builder::{Entry, Formats, StageKind, WeightLookup};
 use builder::{Node, base_nodes, mtp_nodes};
@@ -69,9 +70,17 @@ struct VariantPlan {
     /// The predecessor whose lane each stage continues (RustEE's placement).
     path: Vec<Option<usize>>,
     spec: StageGraphSpec,
+    /// The stages that run in one frame, each a list of consecutive stages ([`placement::fused_units`]).
+    units: Vec<Vec<usize>>,
+    /// The edges between the units: for each, the units before it.
+    unit_edges: Vec<Vec<usize>>,
+    /// What a graph runs for each unit.
+    unit_stages: Vec<Arc<dyn Stage<Quantum>>>,
     width: usize,
     /// Whether each stage ends with a signalled marker: the ends of the chains of lane continuations.
     signalled: Vec<bool>,
+    /// The lane offset of each stage from its quantum's home lane.
+    offsets: Vec<u16>,
 }
 
 /// The execution plan of a loaded model.
@@ -262,9 +271,38 @@ impl Plan {
         self.variant(view.variant()).map(|plan| plan.spec.clone())
     }
 
+    /// The graph of `view` for a quantum homed on lane `home` of `stage_lanes` stage lanes: its fused stages
+    /// ([`Plan::unit_stages`]), each on `(home + offset) mod stage_lanes`. `stage_lanes` must be at least the plan's [`Plan::lane_width`].
+    pub fn spec_homed(
+        &self,
+        view: View,
+        home: usize,
+        stage_lanes: usize,
+    ) -> Option<Result<StageGraphSpec, GraphError>> {
+        self.variant(view.variant())
+            .map(|plan| plan.spec_homed(home, stage_lanes))
+    }
+
     /// The stages of `view`, in the order of its graph.
     pub fn stages(&self, view: View) -> Option<&[Entry]> {
         self.variant(view.variant()).map(|plan| plan.entries.as_slice())
+    }
+
+    /// What a graph runs for `view`: its stages with each run of single links on one lane fused into one stage, in
+    /// the order of the graph [`Plan::spec_homed`] gives.
+    pub fn unit_stages(&self, view: View) -> Option<&[Arc<dyn Stage<Quantum>>]> {
+        self.variant(view.variant()).map(|plan| plan.unit_stages.as_slice())
+    }
+
+    /// The stages of `view` that run as one stage of the graph, each a list of consecutive stages (indices into
+    /// [`Plan::stages`]), in the order of the graph.
+    pub fn units(&self, view: View) -> Option<&[Vec<usize>]> {
+        self.variant(view.variant()).map(|plan| plan.units.as_slice())
+    }
+
+    /// The units that must complete before each unit of `view` ([`Plan::units`]).
+    pub fn unit_edges(&self, view: View) -> Option<&[Vec<usize>]> {
+        self.variant(view.variant()).map(|plan| plan.unit_edges.as_slice())
     }
 
     /// The kinds of the stages of `view`, in order.
@@ -359,8 +397,12 @@ impl VariantPlan {
             entries,
             path: Vec::new(),
             spec: StageGraphSpec::new(),
+            units: Vec::new(),
+            unit_edges: Vec::new(),
+            unit_stages: Vec::new(),
             width,
             signalled: Vec::new(),
+            offsets: Vec::new(),
         })
     }
 
@@ -371,30 +413,99 @@ impl VariantPlan {
         for (entry, signal) in self.entries.iter_mut().zip(&self.signalled) {
             entry.stage = Arc::new(Placed::new(Arc::clone(&entry.launch), *signal));
         }
-        // Each chain of lane continuations has one lane, fixed here, so the one lane a stage is allowed is the lane
-        // RustEE's graph puts it on: it never picks a branch's lane at random, and the branches of a fan-out do not
-        // share one. A root is on the home lane, as Java's graph does.
-        let lane_of = placement::chain_lanes(&self.edges, self.width);
-        let mut spec = StageGraphSpec::new();
-        let ids: Vec<_> = self
-            .entries
+        // Each chain of lane continuations has one lane offset, fixed here, so the one lane a stage is allowed is the
+        // lane RustEE's graph puts it on: it never picks a branch's lane at random, and the branches of a fan-out do
+        // not share one. A root is at offset 0, the quantum's home lane, as Java's graph does.
+        self.offsets = placement::chain_lanes(&self.edges, self.width);
+        self.units = placement::fused_units(&self.edges, &self.offsets);
+        let mut unit_of = vec![0usize; self.entries.len()];
+        for (unit, nodes) in self.units.iter().enumerate() {
+            for &node in nodes {
+                unit_of[node] = unit;
+            }
+        }
+        self.unit_edges = self
+            .units
             .iter()
-            .zip(&lane_of)
-            .map(|(entry, &lane)| {
+            .enumerate()
+            .map(|(unit, nodes)| {
+                let mut before: Vec<usize> = Vec::new();
+                for &node in &self.edges[nodes[0]] {
+                    let other = unit_of[node];
+                    if other != unit && !before.contains(&other) {
+                        before.push(other);
+                    }
+                }
+                before
+            })
+            .collect();
+        self.unit_stages = self
+            .units
+            .iter()
+            .map(|nodes| match nodes.as_slice() {
+                [only] => Arc::clone(&self.entries[*only].stage),
+                _ => {
+                    let launches = nodes
+                        .iter()
+                        .map(|&node| Arc::clone(&self.entries[node].launch))
+                        .collect();
+                    let last = nodes[nodes.len() - 1];
+                    Arc::new(Placed::new(Arc::new(Chain::new(launches)), self.signalled[last]))
+                        as Arc<dyn Stage<Quantum>>
+                }
+            })
+            .collect();
+        let spec = self.node_spec_homed(0, self.width.max(1))?;
+        self.spec = spec;
+        Ok(())
+    }
+
+    /// The graph with every stage alone, each on lane `(home + offset) mod stage_lanes`.
+    fn node_spec_homed(&self, home: usize, stage_lanes: usize) -> Result<StageGraphSpec, GraphError> {
+        let names: Vec<_> = self.entries.iter().map(|entry| entry.kind.name()).collect();
+        self.graph(home, stage_lanes, &names, self.entries.len(), &self.edges, |node| node)
+    }
+
+    /// The graph a quantum runs: the units, each on the lane `(home + offset) mod stage_lanes` of its stages.
+    fn spec_homed(&self, home: usize, stage_lanes: usize) -> Result<StageGraphSpec, GraphError> {
+        let names: Vec<_> = self
+            .units
+            .iter()
+            .map(|nodes| self.entries[nodes[0]].kind.name())
+            .collect();
+        self.graph(home, stage_lanes, &names, self.units.len(), &self.unit_edges, |unit| {
+            self.units[unit][0]
+        })
+    }
+
+    /// A graph of `count` stages named `names` over `edges` (the stages before each), the lane of each that of
+    /// the node `node_of` gives. Every edge is a submission edge.
+    fn graph(
+        &self,
+        home: usize,
+        stage_lanes: usize,
+        names: &[&'static str],
+        count: usize,
+        edges: &[Vec<usize>],
+        node_of: impl Fn(usize) -> usize,
+    ) -> Result<StageGraphSpec, GraphError> {
+        let mut spec = StageGraphSpec::new();
+        let ids: Vec<_> = (0..count)
+            .map(|stage| {
+                let lane = lane_for(home, usize::from(self.offsets[node_of(stage)]), stage_lanes);
                 spec.stage(StageSpec {
-                    name: entry.kind.name(),
+                    name: names[stage],
                     ordered: None,
-                    lanes: vec![LaneId(lane)],
+                    lanes: vec![LaneId(lane as u16)],
                 })
             })
             .collect();
-        for (stage, producers) in self.edges.iter().enumerate() {
+        for (stage, producers) in edges.iter().enumerate() {
             for &producer in producers {
                 spec.edge(ids[producer], ids[stage], EdgeKind::Submission);
             }
         }
         spec.validate()?;
-        self.spec = spec;
-        Ok(())
+        Ok(spec)
     }
 }

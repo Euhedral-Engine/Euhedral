@@ -760,3 +760,113 @@ fn no_view_uses_more_lanes_than_the_fan_out_width_and_placement_is_the_same_ever
         }
     }
 }
+
+#[test]
+fn a_run_of_stages_that_each_wait_only_for_the_one_before_is_one_stage_of_the_graph_a_quantum_runs() {
+    let plan = &built().plan;
+    for view in [
+        View::Decode,
+        View::Verify { rows: 5 },
+        View::PrefillChunk,
+        View::Draft { rows: 2 },
+    ] {
+        let nodes = plan.stages(view).unwrap().len();
+        let units = plan.unit_stages(view).unwrap().len();
+        let width = plan.fan_out_width();
+        let spec = plan.spec_homed(view, 0, width).unwrap().unwrap();
+        assert!(spec.validate().is_ok(), "{view:?}");
+        assert_eq!(
+            spec.stages().len(),
+            units,
+            "{view:?}: one stage of the graph for each unit"
+        );
+        assert!(units < nodes, "{view:?}: some stages are fused");
+        let home_spec = plan.spec(view).unwrap();
+        assert_eq!(home_spec.stages().len(), nodes);
+        assert_eq!(
+            spec.stages()[0].lanes,
+            vec![LaneId(0)],
+            "{view:?}: the root stays on the home lane"
+        );
+        let sink = spec.stages().len() - 1;
+        assert!(
+            spec.stages()[sink].lanes == home_spec.stages()[nodes - 1].lanes,
+            "{view:?}: the selection ends the last unit, on its lane"
+        );
+    }
+    // The decode view of the RCO artifact: 757 stages in 289 units. Each gated delta-net layer keeps its fan-out (the
+    // control projection and the two linears) and its joins (the convolution, then the recurrence with everything
+    // after it up to the next layer's norm) as separate stages.
+    assert_eq!(plan.stages(View::Decode).unwrap().len(), 757);
+    assert_eq!(plan.unit_stages(View::Decode).unwrap().len(), 289);
+}
+
+/// Every pair of stages one of which is ordered before the other by the stage edges is still ordered when the stages
+/// are fused: in one unit in that order, or in units the unit edges order.
+#[test]
+fn fusing_stages_into_units_keeps_every_ordering_of_the_decode_view() {
+    let plan = &built().plan;
+    for view in [View::Decode, View::Verify { rows: 5 }, View::PrefillChunk] {
+        let edges = plan.edges(view).unwrap();
+        let units = plan.units(view).unwrap();
+        let unit_edges = plan.unit_edges(view).unwrap();
+        let mut unit_of = vec![usize::MAX; edges.len()];
+        let mut position = vec![0usize; edges.len()];
+        for (unit, nodes) in units.iter().enumerate() {
+            assert!(
+                nodes.windows(2).all(|pair| pair[0] < pair[1]),
+                "{view:?}: a unit runs in order"
+            );
+            for (at, &node) in nodes.iter().enumerate() {
+                assert_eq!(unit_of[node], usize::MAX, "{view:?}: stage {node} is in two units");
+                unit_of[node] = unit;
+                position[node] = at;
+            }
+        }
+        assert!(
+            unit_of.iter().all(|&unit| unit != usize::MAX),
+            "{view:?}: every stage is in a unit"
+        );
+        // The units before each unit, by any chain of unit edges.
+        let mut before: Vec<Vec<bool>> = Vec::with_capacity(units.len());
+        for (unit, predecessors) in unit_edges.iter().enumerate() {
+            let mut reach = vec![false; units.len()];
+            for &predecessor in predecessors {
+                assert!(predecessor < unit, "{view:?}: unit edges point to earlier units");
+                reach[predecessor] = true;
+                for (flag, &other) in reach.iter_mut().zip(&before[predecessor]) {
+                    *flag |= other;
+                }
+            }
+            before.push(reach);
+        }
+        // The stages before each stage, by any chain of stage edges.
+        let mut below: Vec<Vec<bool>> = Vec::with_capacity(edges.len());
+        for predecessors in edges {
+            let mut reach = vec![false; edges.len()];
+            for &predecessor in predecessors {
+                reach[predecessor] = true;
+                for (flag, &other) in reach.iter_mut().zip(&below[predecessor]) {
+                    *flag |= other;
+                }
+            }
+            below.push(reach);
+        }
+        for (later, reach) in below.iter().enumerate() {
+            for (earlier, _) in reach.iter().enumerate().filter(|&(_, &ordered)| ordered) {
+                let (a, b) = (unit_of[earlier], unit_of[later]);
+                if a == b {
+                    assert!(
+                        position[earlier] < position[later],
+                        "{view:?}: {earlier} before {later}"
+                    );
+                } else {
+                    assert!(
+                        before[b][a],
+                        "{view:?}: stage {earlier} is no longer before stage {later}"
+                    );
+                }
+            }
+        }
+    }
+}

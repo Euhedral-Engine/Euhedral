@@ -11,9 +11,13 @@
 //! ([`LaneEnds`]). When its stages are abandoned, or a stage fails or panics, the lanes whose last marker is
 //! unsignalled are *settled*: an empty submission on the lane ends with a signalled marker, which the lane reaches
 //! only after everything queued before it, the quantum's unsignalled marker included. The settling is a frame published
-//! through the completions ([`Settler`]); a lane held by another submission answers `LaneBusy`, and the frame is
+//! through the completions ([`Settler`]); a lane held by another submission answers [`Settled::Busy`], and the frame is
 //! published again behind the progress of any lane, so nothing waits. The graph's retirement boundary needs no change:
 //! it names the quantum's own last marker, and the settling marker is a later value on the same lane.
+//!
+//! A launch that fails after earlier stages of its fused unit queued their kernels leaves those kernels behind no
+//! marker of the quantum, and the lane's last marker may be signalled or absent. The failure flags the lane
+//! ([`LaneEnds::submit`]) and settling then ends it with a marker whatever its last marker's state.
 //!
 //! Quanta that run to their end signal as before and settle nothing.
 
@@ -23,12 +27,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+use euhedral_gpu::{GpuError, Lane};
 use euhedral_graph::{
     DeviceQueue, GraphRuntime, LaneId, LanePool, Marker, Ready, Stage, StageCx, StageError, Submitted,
 };
-use euhedral_inference_cuda::{CudaError, CudaLane, Submission, SubmitMode};
 
-use super::{LaneTable, Quantum};
+use super::{Quantum, submit_on};
 use crate::frames::{self, Kind};
 
 /// What settling a lane found.
@@ -56,6 +60,9 @@ pub struct LaneEnds {
 struct LaneEnd {
     submitted: AtomicU64,
     signalled: AtomicU64,
+    /// Set when a submission on the lane failed after it may have queued work: that work has no marker, so the lane
+    /// is settled whatever its last marker's state.
+    queued_unmarked: AtomicBool,
 }
 
 impl LaneEnds {
@@ -79,20 +86,47 @@ impl LaneEnds {
         }
     }
 
-    /// Whether the quantum's latest marker on `lane` is unsignalled: the lane's completion word will not reach it until
-    /// a signalled marker follows.
+    /// Whether `lane` is to be settled: the quantum's latest marker on it is unsignalled (the lane's completion word
+    /// will not reach it until a signalled marker follows), or a failed submission left work on it with no marker.
     pub fn unsignalled(&self, lane: LaneId) -> bool {
-        self.lanes
-            .get(usize::from(lane.0))
-            .is_some_and(|lane| lane.submitted.load(Ordering::Acquire) > lane.signalled.load(Ordering::Acquire))
+        self.lanes.get(usize::from(lane.0)).is_some_and(|lane| {
+            lane.submitted.load(Ordering::Acquire) > lane.signalled.load(Ordering::Acquire)
+                || lane.queued_unmarked.load(Ordering::Acquire)
+        })
     }
 
-    /// The lanes whose latest marker of the quantum is unsignalled.
+    /// The lanes whose latest marker of the quantum is unsignalled, or that hold work no marker of the quantum covers.
     pub fn unsignalled_lanes(&self) -> Vec<LaneId> {
         (0..self.lanes.len())
             .filter_map(|lane| u16::try_from(lane).ok().map(LaneId))
             .filter(|&lane| self.unsignalled(lane))
             .collect()
+    }
+
+    /// Runs one submission of the quantum on `lane` ([`submit_on`]) and records its marker, signalled or not.
+    pub fn submit<L: Lane>(
+        &self,
+        lane: &L,
+        waits: impl IntoIterator<Item = Marker>,
+        signal: bool,
+        launch: impl FnOnce(&mut L::Enqueue<'_>) -> Result<(), StageError>,
+    ) -> Result<Marker, StageError> {
+        match submit_on(lane, waits, launch) {
+            Ok(marker) => {
+                self.record(marker, signal);
+                Ok(marker)
+            }
+            // Nothing was queued: the lane is held, and the stage runs again.
+            Err(StageError::Retry) => Err(StageError::Retry),
+            // A unit of several stages may have queued the kernels of its earlier stages before the failure, and the
+            // submission gave its marker up: those kernels are behind no marker of the quantum.
+            Err(error) => {
+                if let Some(end) = self.lanes.get(usize::from(lane.lane().0)) {
+                    end.queued_unmarked.store(true, Ordering::Release);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Whether this is the first abandoned stage of the quantum (the one that settles).
@@ -105,25 +139,22 @@ impl LaneEnds {
         !self.failed.swap(true, Ordering::AcqRel)
     }
 
-    /// Ends `lane` with a signalled marker if the quantum's latest marker on it is not signalled: an empty submission,
-    /// queued behind the lane's work, that writes its marker to the completion word. Never waits: a held lane answers
-    /// [`Settled::Busy`].
-    pub fn settle(&self, lane: &CudaLane) -> Result<Settled, CudaError> {
-        let id = lane.id();
+    /// Ends `lane` with a marker if it is to be settled ([`LaneEnds::unsignalled`]): an empty submission, queued
+    /// behind the lane's work. Never waits: a lane whose marker ring is full answers [`Settled::Busy`].
+    pub fn settle<L: Lane>(&self, lane: &L) -> Result<Settled, GpuError> {
+        let id = lane.lane();
         if !self.unsignalled(id) {
             return Ok(Settled::Clean);
         }
-        let submission = match Submission::begin(lane, SubmitMode::default()) {
-            Ok(submission) => submission,
-            Err(CudaError::LaneBusy(_)) => return Ok(Settled::Busy),
+        let marker = match lane.mark() {
+            Ok(marker) => marker,
+            Err(GpuError::Busy) => return Ok(Settled::Busy),
             Err(error) => return Err(error),
         };
-        // The stage that held the lane before may have signalled in the meantime.
-        if !self.unsignalled(id) {
-            return Ok(Settled::Clean);
-        }
-        let marker = submission.finish_signalled()?;
         self.record(marker, true);
+        if let Some(end) = self.lanes.get(usize::from(id.0)) {
+            end.queued_unmarked.store(false, Ordering::Release);
+        }
         Ok(Settled::Signalled)
     }
 }
@@ -149,32 +180,55 @@ impl Settler {
 
     /// Settles every lane of `quantum` whose latest marker is unsignalled, each in a frame of its own.
     fn settle(self: &Arc<Self>, quantum: &Quantum) {
-        for lane in quantum.ends.unsignalled_lanes() {
-            self.publish(lane, Arc::clone(&quantum.ends), quantum.lanes.clone(), Box::new(Now));
+        let table = quantum.lanes.clone();
+        let lanes: Arc<Lanes<_>> = Arc::new(move |id| table.get(id).cloned());
+        self.settle_lanes(&quantum.ends, &lanes);
+    }
+
+    /// Settles every lane of `ends` whose latest marker is unsignalled, each in a frame of its own, on the lanes
+    /// `lanes` finds.
+    pub fn settle_lanes<L: Lane + Send + Sync + 'static>(
+        self: &Arc<Self>,
+        ends: &Arc<LaneEnds>,
+        lanes: &Arc<Lanes<L>>,
+    ) {
+        for lane in ends.unsignalled_lanes() {
+            self.publish(lane, Arc::clone(ends), Arc::clone(lanes), Box::new(Now));
         }
     }
 
-    fn publish(self: &Arc<Self>, lane: LaneId, ends: Arc<LaneEnds>, table: LaneTable, ready: Box<dyn Ready>) {
+    fn publish<L: Lane + Send + Sync + 'static>(
+        self: &Arc<Self>,
+        lane: LaneId,
+        ends: Arc<LaneEnds>,
+        lanes: Arc<Lanes<L>>,
+        ready: Box<dyn Ready>,
+    ) {
         let settler = Arc::clone(self);
         let frame = frames::step(Kind::Settle, usize::from(lane.0), move || {
-            settler.attempt(lane, ends, table);
+            settler.attempt(lane, ends, lanes);
         });
         self.runtime.completions.after(ready, frame);
     }
 
     /// One try at settling `lane`; a held lane is tried again once any lane has made progress.
-    fn attempt(self: &Arc<Self>, lane: LaneId, ends: Arc<LaneEnds>, table: LaneTable) {
-        let Some(device) = table.get(lane) else {
+    fn attempt<L: Lane + Send + Sync + 'static>(
+        self: &Arc<Self>,
+        lane: LaneId,
+        ends: Arc<LaneEnds>,
+        lanes: Arc<Lanes<L>>,
+    ) {
+        let Some(device) = lanes(lane) else {
             log::error!(
                 "lane {} of a quantum that ended early is not in its lane table; the quantum cannot retire",
                 lane.0
             );
             return;
         };
-        match ends.settle(device) {
+        match ends.settle(&*device) {
             Ok(Settled::Busy) => {
                 let progress = Progress::new(&self.runtime);
-                self.publish(lane, ends, table, Box::new(progress));
+                self.publish(lane, ends, lanes, Box::new(progress));
             }
             Ok(Settled::Clean | Settled::Signalled) => {}
             Err(error) => log::error!(
@@ -184,6 +238,9 @@ impl Settler {
         }
     }
 }
+
+/// How the settler finds a lane of a quantum by its id.
+pub type Lanes<L> = dyn Fn(LaneId) -> Option<Arc<L>> + Send + Sync;
 
 /// Ready at once: the frame goes out at the next poll.
 struct Now;

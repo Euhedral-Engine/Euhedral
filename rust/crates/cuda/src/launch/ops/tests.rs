@@ -357,3 +357,28 @@ fn an_upload_or_a_readback_the_native_wrapper_refuses_queues_nothing() {
     }
     assert!(queue.calls.is_empty());
 }
+
+/// A submission whose mode does not overlap launches (a prefill, or a decode past the overlap limit) launches a
+/// kernel the catalog marks as an ordinary launch; one that does, launches it programmatically; and a kernel the
+/// catalog does not mark never does.
+#[test]
+fn a_mode_without_pdl_launches_a_registered_kernel_without_overlap() {
+    use crate::kernel;
+    use crate::launch::catalog::Arguments;
+
+    let table = KernelTable::all_unavailable(false);
+    let mut queue = Recording::default();
+    let launch = |kernel| Launch::new(kernel, [1, 1, 1], [32, 1, 1], 0, Arguments::new());
+    let registered = launch(kernel!("euhedral_residual_add_bf16"));
+    let unregistered = launch(kernel!("euhedral_nvfp4n_quantize_rows"));
+    assert!(registered.programmatic && !unregistered.programmatic);
+
+    let ops = RusteeOps::new(&mut queue, &table, Modes::default());
+    assert!(ops.overlaps(&registered), "overlap is on until a mode turns it off");
+    assert!(!ops.overlaps(&unregistered));
+    let ops = ops.with_pdl(false);
+    assert!(!ops.overlaps(&registered), "pdl false: not programmatic");
+    assert!(!ops.overlaps(&unregistered));
+    let ops = ops.with_pdl(true);
+    assert!(ops.overlaps(&registered));
+}

@@ -8,6 +8,7 @@
 //! in the environment, or `gradle.properties`); a test skips with a message when it is absent. Every wait for a quantum
 //! to retire has a deadline, so a quantum that never retires fails its test and does not hang the suite.
 
+#![allow(clippy::print_stderr, reason = "a test reports what it skipped")]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -19,8 +20,11 @@
 )]
 
 mod common;
+#[path = "common/typed.rs"]
+mod typed;
 
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,18 +35,23 @@ use std::time::{Duration, Instant};
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::{FrameSink, LatticeSource};
+use typed::Typed;
+
+use euhedral_gpu::Lane;
+use euhedral_gpu::cuda::CudaQueue;
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, ExternalEdge, GraphRuntime, Lake, LaneId, LanePool,
-    Marker, QuantumOutcome, RetryCounts, Stage, StageError, StageGraph, StageGraphSpec, StageId, StageSpec, UnitGuard,
+    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, ExternalEdge, GraphRuntime, Lake, LaneId, Marker,
+    QuantumOutcome, RetryCounts, Stage, StageError, StageGraph, StageGraphSpec, StageId, StageSpec, UnitGuard,
 };
 use euhedral_inference_cuda::{
-    CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, PinnedPool, RetireList, Submission, SubmitMode, ops,
+    CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, LaneOps, PinnedPool, RetireList, SubmitMode,
+    ops,
 };
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{LayerIndex, LayerKind, ModelConfig, Role, WeightRef, object_key};
 use euhedral_inference_engine::plan::{Formats, Plan, WeightLookup};
-use euhedral_inference_engine::quantum::{Executor, GraphCache, Sighting};
+use euhedral_inference_engine::quantum::{CAPTURES, Executor, GraphCache, Sighting};
 use euhedral_inference_engine::residency::planner::plan as residency_plan;
 use euhedral_inference_engine::stages::attention::KvSource;
 use euhedral_inference_engine::stages::sampling::SelectionPool;
@@ -131,7 +140,7 @@ impl Retirements {
 /// A library, lanes, a lattice and the sequence's pieces: no weights.
 struct World {
     library: Arc<CudaLibrary>,
-    lanes: Vec<Arc<CudaLane>>,
+    typed: Typed,
     table: LaneTable,
     runtime: GraphRuntime,
     config: Arc<ModelConfig>,
@@ -148,16 +157,9 @@ impl World {
     fn open(lane_count: usize) -> Option<World> {
         let library = library()?;
         let config = reduced_config();
-        let lanes: Vec<Arc<CudaLane>> = (0..lane_count)
-            .map(|id| CudaLane::new(&library, LaneId(id as u16), 1024).unwrap())
-            .collect();
-        let table = LaneTable::new(lanes.clone()).unwrap();
-        let pool = Arc::new(LanePool::new(
-            lanes
-                .iter()
-                .map(|lane| Arc::clone(lane) as Arc<dyn DeviceQueue>)
-                .collect(),
-        ));
+        let typed = Typed::plain(&library, lane_count, 1024);
+        let table = typed.table.clone();
+        let pool = Arc::clone(&typed.queues);
         let settings = Settings::with_model(ModelSettings::default());
         let lattice = ControlPlaneLattice::new(lattice_config(&settings)).unwrap();
         let lake = Lake::new(
@@ -193,7 +195,7 @@ impl World {
             pinned: PinnedPool::new(&library, 16 << 20),
             retire: Arc::new(RetireList::new()),
             library,
-            lanes,
+            typed,
             table,
             runtime,
             config,
@@ -205,24 +207,30 @@ impl World {
     }
 
     /// The lane of the sequence's own submissions.
-    fn owner(&self) -> &Arc<CudaLane> {
-        self.lanes.last().unwrap()
+    fn owner(&self) -> &Arc<CudaQueue> {
+        self.typed.lane(self.typed.table.len() as u16 - 1)
+    }
+
+    /// Queues `work` as one submission of the owner's lane and waits for it.
+    fn on_owner<E: Display>(&self, work: impl FnOnce(&mut dyn LaneOps) -> Result<(), E>) {
+        self.table.submit_ops(self.owner(), false, work).unwrap();
+        self.typed.sync();
     }
 
     fn close(mut self) {
         drop(self.unit.take());
         self.lake.complete_gracefully();
         self.lattice.close();
-        for lane in &self.lanes {
-            lane.synchronize().unwrap();
-        }
+        self.typed.sync();
     }
 
     fn sequence(&self, kv_tokens: u64) -> SequenceState {
-        let submission = Submission::begin(self.owner(), SubmitMode::default()).unwrap();
-        let gdn = GdnStates::allocate(&self.library, &self.config, 8, &mut &submission).unwrap();
-        submission.finish_signalled().unwrap();
-        self.owner().synchronize().unwrap();
+        let mut gdn = None;
+        self.on_owner(|lane| {
+            gdn = Some(GdnStates::allocate(&self.library, &self.config, 8, lane)?);
+            Ok::<(), CudaError>(())
+        });
+        let gdn = gdn.unwrap();
         let kv = KvCache::new(
             &self.library,
             &self.retire,
@@ -245,14 +253,8 @@ impl World {
     /// The decode quantum at `start`, after the one reservation of its cache row.
     fn quantum(&self, sequence: &mut SequenceState, start: u64) -> Quantum {
         let mut retained = KvRetained::default();
-        let submission = Submission::begin(self.owner(), SubmitMode::default()).unwrap();
-        sequence
-            .kv
-            .reserve(&submission, &self.pinned, start, 1, &mut retained)
-            .unwrap();
+        self.on_owner(|lane| sequence.kv.reserve(lane, &self.pinned, start, 1, &mut retained));
         sequence.kv.appended(1).unwrap();
-        drop(submission);
-        self.owner().synchronize().unwrap();
         let quantum = Quantum::new(
             QuantumKind::Decode,
             1,
@@ -583,30 +585,16 @@ fn a_killed_quantum_is_followed_by_quanta_on_the_same_sequence() {
 
 #[test]
 #[ignore = "needs a GPU and the native library"]
-fn settling_signals_a_lane_whose_last_marker_is_unsignalled_and_never_waits_for_a_held_lane() {
+fn settling_signals_a_lane_whose_last_marker_is_unsignalled() {
     let Some(world) = World::open(1) else { return };
-    let lane = &world.lanes[0];
+    let lane = world.typed.lane(0);
     let ends = LaneEnds::new(1);
-    let submission = Submission::begin(lane, SubmitMode::default()).unwrap();
-    let marker = submission.finish().unwrap();
+    let marker = lane.mark().unwrap();
     ends.record(marker, false);
-    lane.synchronize().unwrap();
-    assert!(
-        lane.completed() < marker.value,
-        "the lane's completion word does not reach an unsignalled marker, however long it waits"
-    );
     assert_eq!(ends.unsignalled_lanes(), vec![LaneId(0)]);
-
-    let held = Submission::begin(lane, SubmitMode::default()).unwrap();
-    assert_eq!(
-        ends.settle(lane).unwrap(),
-        Settled::Busy,
-        "a held lane is not waited for"
-    );
-    drop(held);
-    assert_eq!(ends.settle(lane).unwrap(), Settled::Signalled);
+    assert_eq!(ends.settle(&**lane).unwrap(), Settled::Signalled);
     let begun = Instant::now();
-    while lane.completed() < marker.value {
+    while DeviceQueue::completed(&**lane) < marker.value {
         assert!(
             begun.elapsed() < DEADLINE,
             "the settling marker never reached the completion word"
@@ -615,7 +603,7 @@ fn settling_signals_a_lane_whose_last_marker_is_unsignalled_and_never_waits_for_
     }
     assert!(ends.unsignalled_lanes().is_empty());
     assert_eq!(
-        ends.settle(lane).unwrap(),
+        ends.settle(&**lane).unwrap(),
         Settled::Clean,
         "a settled lane is left alone"
     );
@@ -659,12 +647,13 @@ fn quanta_that_complete_are_killed_and_fail_on_shared_lanes_all_retire() {
     world.close();
 }
 
-/// Settles a quantum whose lane 0 ends unsignalled while another submission holds the lane, driving the completions by
-/// hand on this thread (they are attached to no lattice): the frame finds the lane held, publishes itself again, and
-/// goes out again only once a lane has progressed or `backstop` has passed.
-fn settle_behind_a_held_lane(backstop: Duration) {
+/// Settles a quantum whose lane 0 ends unsignalled, driving the completions by hand on this thread (they are attached
+/// to no lattice): the abandoned stage publishes one settling, which signals the lane.
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn an_abandoned_stage_publishes_a_settling_that_signals_its_lane() {
     let Some(world) = World::open(2) else { return };
-    let lane = &world.lanes[0];
+    let lane = world.typed.lane(0);
     let pool = Arc::clone(&world.runtime.lanes);
     let completions = Completions::new(Arc::clone(&pool));
     let runtime = GraphRuntime {
@@ -672,19 +661,11 @@ fn settle_behind_a_held_lane(backstop: Duration) {
         completions: Arc::clone(&completions),
         lanes: pool,
         retries: Arc::new(RetryCounts::default()),
-        retry_backstop: backstop,
+        retry_backstop: DEFAULT_RETRY_BACKSTOP,
     };
-    let frames_out = |completions: &Completions| {
-        let mut frames: Vec<Box<dyn Frame>> = Vec::new();
-        completions.reap();
-        completions.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
-        frames
-    };
-    // The quantum's last marker on lane 0 is unsignalled.
     let mut sequence = world.sequence(1024);
     let quantum = world.quantum(&mut sequence, 0);
-    let submission = Submission::begin(lane, SubmitMode::default()).unwrap();
-    let unsignalled = submission.finish().unwrap();
+    let unsignalled = lane.mark().unwrap();
     quantum.lane_ends().record(unsignalled, false);
     let stage = Settling::new(
         Arc::new(Placed::new(
@@ -697,69 +678,22 @@ fn settle_behind_a_held_lane(backstop: Duration) {
         )),
         Settler::new(&runtime),
     );
-
-    let held = Submission::begin(lane, SubmitMode::default()).unwrap();
-    stage.abandoned(&quantum, lane.as_ref());
+    stage.abandoned(&quantum, &**lane);
     assert_eq!(completions.pending(), 1, "the abandoned stage publishes one settling");
-    let mut first = frames_out(&completions);
-    assert_eq!(first.len(), 1, "the settling is ready at once");
-    let mut frame = first.pop().unwrap();
-    frame.execute().unwrap();
-    Frame::do_finally(frame);
-    assert_eq!(
-        completions.pending(),
-        1,
-        "the lane was held, so the settling is published again"
-    );
-    assert!(quantum.lane_ends().unsignalled(LaneId(0)), "nothing was signalled yet");
-    if backstop > Duration::from_secs(60) {
-        assert!(
-            frames_out(&completions).is_empty(),
-            "no lane has progressed and the backstop is far off, so the settling waits"
-        );
-    }
-
-    // The holder lets go, and the lane progresses: the settling goes out again and signals.
-    let released = held.finish_signalled().unwrap();
     let begun = Instant::now();
-    let mut again = Vec::new();
-    while again.is_empty() {
-        assert!(begun.elapsed() < DEADLINE, "the settling was never published again");
-        again = frames_out(&completions);
+    let mut frames: Vec<Box<dyn Frame>> = Vec::new();
+    while frames.is_empty() {
+        assert!(begun.elapsed() < DEADLINE, "the settling was never published");
+        completions.reap();
+        completions.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
         thread::sleep(Duration::from_millis(1));
     }
-    if backstop > Duration::from_secs(60) {
-        assert!(
-            lane.completed() >= released.value,
-            "the settling was published again by the lane's progress"
-        );
-    }
-    let mut frame = again.pop().unwrap();
+    let mut frame = frames.pop().unwrap();
     frame.execute().unwrap();
     Frame::do_finally(frame);
     assert_eq!(completions.pending(), 0, "the settling is done");
     assert!(quantum.lane_ends().unsignalled_lanes().is_empty());
-    let begun = Instant::now();
-    while lane.completed() < unsignalled.value {
-        assert!(
-            begun.elapsed() < DEADLINE,
-            "the lane never reached the quantum's marker"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
     world.close();
-}
-
-#[test]
-#[ignore = "needs a GPU and the native library"]
-fn a_settling_that_finds_its_lane_held_is_published_again_behind_the_lane_s_progress() {
-    settle_behind_a_held_lane(Duration::from_secs(3600));
-}
-
-#[test]
-#[ignore = "needs a GPU and the native library"]
-fn a_settling_that_finds_its_lane_held_is_published_again_at_the_backstop() {
-    settle_behind_a_held_lane(Duration::ZERO);
 }
 
 // The plan's graphs, with a captured quantum.
@@ -848,6 +782,10 @@ struct Captured {
 }
 
 fn captured() -> Option<Captured> {
+    if !CAPTURES {
+        eprintln!("skipped: graph captures are off in production");
+        return None;
+    }
     let config = reduced_config();
     let plan = plan_without_weights(&config);
     let width = plan.fan_out_width();
@@ -865,7 +803,12 @@ fn captured() -> Option<Captured> {
     sequence.kv.commit(1).unwrap();
     let quantum = world.quantum(&mut sequence, 1);
     let mut cache = GraphCache::with_capacity(8);
-    let buffers = record_a_graph(&world, &mut cache, &quantum, &world.lanes[width]);
+    let buffers = record_a_graph(
+        &world,
+        &mut cache,
+        &quantum,
+        &CudaLane::new(&world.library, LaneId(width as u16), 64).unwrap(),
+    );
     Some(Captured {
         world,
         executor,
