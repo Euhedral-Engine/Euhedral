@@ -1980,11 +1980,11 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
     assert!(past.is_err(), "the builder refuses slots past the step's tokens");
 }
 
-// Capture.
+// Every stage on a lane.
 
 #[test]
 #[ignore = "needs a GPU and the native library"]
-fn every_stage_launches_inside_a_graph_capture_and_the_replay_selects() {
+fn every_stage_launches_eagerly_on_a_lane_and_the_selection_is_made() {
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 1, KvFormat::Nvfp4, 256);
@@ -2173,7 +2173,7 @@ fn every_stage_launches_inside_a_graph_capture_and_the_replay_selects() {
     assert_eq!(tokens[4..8], 31_337i32.to_ne_bytes(), "the drafted token was passed on");
 }
 
-/// A stage as the capture test holds it: only its launches.
+/// A stage as the all-stages test holds it: only its launches.
 trait LaunchOnly {
     fn launch_on(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError>;
 }

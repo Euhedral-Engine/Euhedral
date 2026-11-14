@@ -6,8 +6,7 @@
 //! the driver (or faults the kernel), not by the host's memory model, so the operations on device memory are safe.
 //! Host memory is different. The two asynchronous host copies read or write host memory after they return and are
 //! `unsafe`; so is taking the device address of mapped host memory
-//! ([`PinnedBuffer::device_address`](crate::PinnedBuffer::device_address)), which is how a kernel or a flag operation
-//! (`wait_host_flag`, `write_host_flag`) gets to host bytes. The host's side of that contract is stated there.
+//! ([`PinnedBuffer::device_address`](crate::PinnedBuffer::device_address)), which is how a kernel gets to host bytes. The host's side of that contract is stated there.
 //!
 //! Every operation mirrors the parameter list of its C entry point (`native/include/euhedral_cuda.h`), which documents
 //! the shapes, alignments and routes.

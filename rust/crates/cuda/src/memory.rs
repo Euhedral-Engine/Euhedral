@@ -67,9 +67,9 @@ pub struct AllocationId(pub u64);
 ///
 /// A plain drop frees the buffer at once with `cudaFree`, which waits for the whole device under the driver's lock (and
 /// frees memory queued work may still use if the caller dropped it too early: nothing here tracks readers). That is for
-/// startup and shutdown only. To free on a running engine, allocate with [`DeviceBuffer::alloc_async`] and retire the
+/// startup and shutdown only. To free on a running engine, allocate with [`LaneOps::alloc_async`](crate::LaneOps::alloc_async) and retire the
 /// buffer with the marker of its last use ([`RetireList`](crate::RetireList)), or free it in stream order with
-/// [`DeviceBuffer::free_async`]; both use `cudaFreeAsync` and never wait. A buffer from [`DeviceBuffer::alloc`] is not
+/// [`LaneOps::free_async`](crate::LaneOps::free_async); both use `cudaFreeAsync` and never wait. A buffer from [`DeviceBuffer::alloc`] is not
 /// retirable.
 #[derive(Debug)]
 pub struct DeviceBuffer {
@@ -150,7 +150,7 @@ impl DeviceBuffer {
     }
 
     /// Copies `host` into the buffer at `offset` and returns when the copy is done. Startup, shutdown and tests: it
-    /// blocks, and it runs on the legacy stream, which does not order against lane work.
+    /// blocks, and unless it runs inside a lane's lent stream (`LaneTable::submit_host`) it runs on the legacy stream, which does not order against lane work.
     #[allow(
         clippy::disallowed_methods,
         reason = "no-wait, synchronous copy: documented as startup, shutdown and tests only"

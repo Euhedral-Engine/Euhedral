@@ -1,4 +1,4 @@
-//! Device tests of the kernel loader and the planned-launch queue. `#[ignore]`d like the crate's other device tests:
+//! Device test of the kernel loader. `#[ignore]`d like the crate's other device tests:
 //! `cargo test -p euhedral-inference-cuda --test kernels_gpu -- --ignored --test-threads=1 --nocapture`.
 //!
 //! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY`); a test skips with a
