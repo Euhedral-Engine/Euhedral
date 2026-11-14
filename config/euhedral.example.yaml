@@ -83,4 +83,4 @@ kernels:
   compile:
     stack: 256MiB                             # optional, default 256MiB: stack of the thread that compiles a kernel module at load (applies when the Rust engine loads its kernels through RustEE, which it does not do yet; the Java engine checks the value and ignores it)
   graphs:
-    captures-per-view: 8                      # optional, default 8: CUDA graphs a sequence keeps for each of decode, verification and draft before the one whose attention geometry has passed, or the one admitted longest ago, is released (read by the Rust engine; the Java engine checks the value and ignores it)
+    captures-per-view: 0                      # optional, default 0: CUDA graphs a sequence keeps for each of decode, verification and draft, counted together (the cache holds this many times the number of views, and releases the graph used least recently, of any view, when it is full); the default 0 captures nothing and every quantum runs stage by stage, a positive value (8 is a usual choice) turns captures on (read by the Rust engine; the Java engine checks the value and ignores it)

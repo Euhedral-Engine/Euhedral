@@ -37,6 +37,9 @@ pub struct CaptureKey {
     pub token_from: Option<AllocationId>,
     /// Whether the quantum runs row-exact (a verification): the Linear stages take other routes.
     pub row_exact: bool,
+    /// Whether the launches the catalog marks overlap their predecessors (programmatic dependent launch): a recording
+    /// bakes the launch attribute.
+    pub programmatic: bool,
     /// The split counts of decode attention and whether the fused verifier serves the rows ([`split_geometry`]).
     pub split_geometry: u64,
     /// Host pages the reserved rows of the base cache and the MTP cache reach: the sizes of the staging copies.
@@ -49,26 +52,6 @@ pub struct CaptureKey {
 }
 
 impl CaptureKey {
-    /// Whether `other` is the key of the same quantum at another point of the sequence: equal in everything but the
-    /// attention geometry.
-    pub fn same_but_geometry(&self, other: &CaptureKey) -> bool {
-        self.view == other.view
-            && self.kind == other.kind
-            && self.rows == other.rows
-            && self.logits == other.logits
-            && self.selects == other.selects
-            && self.seeds_draft == other.seeds_draft
-            && self.draft_seed == other.draft_seed
-            && self.draft_read == other.draft_read
-            && self.draft_write == other.draft_write
-            && self.writes_current_token == other.writes_current_token
-            && self.input_record == other.input_record
-            && self.token_from == other.token_from
-            && self.row_exact == other.row_exact
-            && self.reserved_host_pages == other.reserved_host_pages
-            && self.replay_rows == other.replay_rows
-            && self.buffer_generations == other.buffer_generations
-    }
     /// A 128-bit digest of every field of the key, for a cache that replays a hit without checking the body.
     ///
     /// The key is destructured without `..`, so a field added to it does not compile until it is hashed here. Each
@@ -93,6 +76,7 @@ impl CaptureKey {
             input_record,
             token_from,
             row_exact,
+            programmatic,
             split_geometry,
             reserved_host_pages,
             replay_rows,
@@ -132,6 +116,7 @@ impl CaptureKey {
         bytes.push(*input_record);
         push_option(&mut bytes, token_from.map(|id| id.0.to_le_bytes()));
         bytes.push(u8::from(*row_exact));
+        bytes.push(u8::from(*programmatic));
         bytes.extend_from_slice(&split_geometry.to_le_bytes());
         for pages in reserved_host_pages {
             bytes.extend_from_slice(&pages.to_le_bytes());
@@ -201,18 +186,6 @@ pub fn split_geometry(start: u64, rows: u64, group: u64) -> u64 {
     u64::from(fused) << 16 | below << 8 | above
 }
 
-/// How far a sequence has come through the geometries of one view: a geometry of a lower rank is one the sequence has
-/// passed. The split counts below 2048 keys rise with the position, then the quanta that cross 2048 keys carry both,
-/// and from there the counts are constant (the fused verifier comes in at its own thresholds).
-pub fn geometry_rank(geometry: u64) -> u64 {
-    let (fused, below, above) = (geometry >> 16, geometry >> 8 & 0xff, geometry & 0xff);
-    if below == 0 {
-        1 << 24 | fused << 16 | above
-    } else {
-        below << 8 | above
-    }
-}
-
 /// The rows each layer replays, without the trailing layers that replay none.
 pub(crate) fn trimmed(replay: &[u32]) -> Vec<u32> {
     let keep = replay.iter().rposition(|rows| *rows > 0).map_or(0, |last| last + 1);
@@ -242,6 +215,7 @@ mod tests {
             input_record: 1,
             token_from: Some(AllocationId(7)),
             row_exact: true,
+            programmatic: true,
             split_geometry: 64,
             reserved_host_pages: [3, 5],
             replay_rows: vec![0, 2],
@@ -282,6 +256,7 @@ mod tests {
             ("token_from", |k| k.token_from = Some(AllocationId(8))),
             ("token_from absent", |k| k.token_from = None),
             ("row_exact", |k| k.row_exact = false),
+            ("programmatic", |k| k.programmatic = false),
             ("split_geometry", |k| k.split_geometry = 65),
             ("reserved_host_pages first", |k| k.reserved_host_pages = [4, 5]),
             ("reserved_host_pages second", |k| k.reserved_host_pages = [3, 6]),
@@ -382,17 +357,6 @@ mod tests {
         // One row has no fused verifier, and a group of more than 8 has no GQA kernel at all.
         assert_eq!(split_geometry(60_000, 1, GROUP) >> 16, 0);
         assert_eq!(split_geometry(60_000, 4, 9) >> 16, 0);
-    }
-
-    #[test]
-    fn the_rank_orders_a_sequence_through_its_geometries() {
-        let mut previous = 0;
-        for start in 0..70_000u64 {
-            let rank = geometry_rank(split_geometry(start, 5, GROUP));
-            assert!(rank >= previous, "{start}");
-            previous = rank;
-        }
-        assert!(geometry_rank(split_geometry(0, 1, GROUP)) < geometry_rank(split_geometry(2047, 1, GROUP)));
     }
 
     #[test]

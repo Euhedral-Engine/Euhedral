@@ -19,7 +19,7 @@ use euhedral_inference_engine::runtime::{open_device, open_lane_set};
 use euhedral_inference_engine::stages::LaneTable;
 use euhedral_inference_settings::{ModelSettings, Settings};
 
-/// The lanes of a test: `compute` lanes with ids from 0, then the capture and the owner's lanes, which graphs are not
+/// The lanes of a test: `compute` lanes with ids from 0, then the owner's lane, which graphs are not
 /// homed on, and the kernels loaded on the device.
 pub struct Typed {
     pub gpu: Arc<CudaGpu>,

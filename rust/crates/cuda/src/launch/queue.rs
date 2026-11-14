@@ -10,8 +10,8 @@ use std::iter::repeat_n;
 
 use euhedral_gpu::cuda::CudaKernel;
 use euhedral_gpu::{
-    Args, Dim3, GpuError, Interleave, L2Promotion, LaneEnqueue, Launch as Geometry, MAX_RANK, MapDataType, OobFill,
-    Swizzle, TensorMap, TiledMap,
+    Args, Dim3, GpuError, Interleave, L2Promotion, LaneEnqueue, Launch as Geometry, MAX_ALIGN, MAX_RANK, MapDataType,
+    OobFill, Swizzle, TensorMap, TiledMap,
 };
 use thiserror::Error;
 
@@ -139,6 +139,22 @@ fn geometry(launch: &Launch) -> Geometry {
     }
 }
 
+/// Empties `arguments` with the bytes the launch will occupy set to zero, in the storage it already has.
+///
+/// Argument equality compares the bytes between arguments as well, and a reused buffer keeps the previous launch's
+/// there. Writing zero words over the extent the launch can reach and forgetting them again leaves the gaps
+/// deterministic; nothing allocates once the storage has held as much.
+fn zero_gaps(arguments: &mut Args, launch: &Launch) {
+    let words = launch.args.words().len();
+    let maps = launch.args.maps().count();
+    let reach = words * 2 * size_of::<u64>() + maps * (usize::from(TENSOR_MAP_BYTES) + 2 * MAX_ALIGN);
+    arguments.clear();
+    for _ in 0..reach.div_ceil(size_of::<u64>()) {
+        arguments.push(0u64);
+    }
+    arguments.clear();
+}
+
 /// Rewrites `arguments` as the launch's: the tensor maps first (the kernel's leading parameters, each encoded by
 /// `encode`, as the native wrapper has the driver encode them for each launch), then the words.
 fn fill_arguments(
@@ -147,7 +163,7 @@ fn fill_arguments(
     mut encode: impl FnMut(&TensorMapPlan) -> Result<TensorMap, GpuError>,
 ) -> Result<(), EnqueueError> {
     let name = launch.kernel.name();
-    arguments.clear();
+    zero_gaps(arguments, launch);
     for map in launch.args.maps() {
         arguments.push(encode(map).map_err(|source| EnqueueError::Gpu { name, source })?);
     }
@@ -227,6 +243,68 @@ mod tests {
     use crate::kernel;
     use crate::launch::catalog::Arguments;
     use crate::launch::nvfp4::{Nvfp4Layout, Nvfp4Operands, nvfp4_byte_size, plan_native};
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Allocations (and growths) made by this thread.
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The system allocator, counting each thread's allocations so a test can show a path allocates nothing.
+    struct Counting;
+
+    // SAFETY: every call is the system allocator's; the count is a thread-local cell.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCATIONS.with(|count| count.set(count.get() + 1));
+            // SAFETY: the caller's contract is passed on unchanged.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: the caller's contract is passed on unchanged.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            ALLOCATIONS.with(|count| count.set(count.get() + 1));
+            // SAFETY: the caller's contract is passed on unchanged.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    #[test]
+    fn the_same_launch_filled_again_compares_equal_whatever_the_buffer_held_and_allocates_nothing() {
+        let kernel = kernel!("euhedral_residual_add_bf16");
+        let launch = |args: Arguments| Launch::new(kernel, [1, 1, 1], [32, 1, 1], 0, args);
+        let gapped = launch(Arguments::new().u32(7).u64(9));
+        let wide = launch(Arguments::new().u64(u64::MAX).u64(u64::MAX).u64(u64::MAX).u64(u64::MAX));
+        let encode = |_: &TensorMapPlan| -> Result<TensorMap, GpuError> { unreachable!("no maps") };
+        let mut reused = Args::new();
+        fill_arguments(&mut reused, &wide, encode).unwrap();
+        fill_arguments(&mut reused, &gapped, encode).unwrap();
+        let mut fresh = Args::new();
+        fill_arguments(&mut fresh, &gapped, encode).unwrap();
+        assert_eq!(
+            reused, fresh,
+            "the bytes between arguments do not depend on the launch before"
+        );
+        let before = ALLOCATIONS.with(Cell::get);
+        for _ in 0..3 {
+            fill_arguments(&mut reused, &wide, encode).unwrap();
+            fill_arguments(&mut reused, &gapped, encode).unwrap();
+        }
+        assert_eq!(
+            ALLOCATIONS.with(Cell::get),
+            before,
+            "the storage is reused, nothing allocates"
+        );
+        assert_eq!(reused, fresh);
+    }
 
     #[test]
     fn matching_sizes_pass() {

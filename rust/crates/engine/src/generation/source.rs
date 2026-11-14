@@ -47,6 +47,7 @@ use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
 use euhedral_data_structures::queues::{Consumer, Single};
+use euhedral_gpu::Ran;
 use euhedral_graph::QuantumOutcome;
 use euhedral_inference_cuda::{DevicePtr, PooledPinned, SubmitMode};
 
@@ -57,7 +58,7 @@ use super::request::{AdmissionError, FinishReason, GenerationOutcome, Generation
 use super::teacher_forced::LogitsSink;
 use crate::frames::{Kind, step};
 use crate::model::ModelConfig;
-use crate::quantum::{Executor, GraphCache, Started};
+use crate::quantum::{Executor, Started};
 use crate::runtime::{Core, Units};
 use crate::stages::attention::KvSource;
 use crate::stages::sampling::Selection;
@@ -250,8 +251,6 @@ pub(super) struct Flying {
     pub(super) selection: Option<Arc<Selection>>,
     pub(super) retained: KvRetained,
     pub(super) admitted: Instant,
-    pub(super) replayed: bool,
-    pub(super) recorded: bool,
     /// Set to stop the quantum when the request stops while it is in flight.
     pub(super) kill: Arc<AtomicBool>,
     /// When the owner found it retired.
@@ -400,7 +399,6 @@ pub(super) struct Admission {
 pub(crate) struct Owner {
     pub(super) shared: Arc<Shared>,
     pub(super) sequence: SequenceState,
-    cache: GraphCache,
     inbox: Consumer<Message, Single>,
     /// Whether the sequence holds the state of a request that ended: the next request starts with a reset.
     used: bool,
@@ -422,16 +420,10 @@ pub(super) fn why<E: Display>(what: &'static str) -> impl Fn(E) -> String {
 }
 
 impl Owner {
-    pub(crate) fn new(
-        shared: Arc<Shared>,
-        sequence: SequenceState,
-        cache: GraphCache,
-        inbox: Consumer<Message, Single>,
-    ) -> Owner {
+    pub(crate) fn new(shared: Arc<Shared>, sequence: SequenceState, inbox: Consumer<Message, Single>) -> Owner {
         Owner {
             shared,
             sequence,
-            cache,
             inbox,
             used: false,
             run: None,
@@ -462,8 +454,8 @@ impl Owner {
     /// Ends the sequence: frees its caches and the graphs recorded against them. The last release of the pinned host
     /// arena waits for the device, so this is the owner's teardown, after the last quantum retired.
     pub(crate) fn close(self) {
-        let Owner { sequence, cache, .. } = self;
-        drop(cache);
+        let Owner { shared, sequence, .. } = self;
+        shared.executor.clear_graphs();
         if let Err(busy) = sequence.close() {
             log::error!(
                 "the sequence still has {} quanta in flight at shutdown: its device memory stays allocated until the \
@@ -477,7 +469,7 @@ impl Owner {
     /// The test hook: the owner records no graphs from now on, and runs every quantum stage by stage.
     #[cfg(feature = "test-oracles")]
     pub(crate) fn disable_graphs(&mut self) {
-        self.cache = GraphCache::disabled();
+        self.shared.executor.set_captures(false);
     }
 
     /// Starts a greedy request, or one that speculates with the artifact's draft layer. `units` is what the engine's
@@ -874,14 +866,15 @@ impl Owner {
             return self.fail(format!("committing the quantum's rows: {error}"));
         }
         let Some(run) = self.run.as_mut() else { return };
+        let ran = quantum.graph_run();
         let event = QuantumEvent {
             kind: flying.kind,
             rows: flying.rows,
             start_position: flying.start,
             admitted: flying.admitted,
             retired: flying.retired_at.unwrap_or(now),
-            replayed: flying.replayed,
-            recorded: flying.recorded,
+            replayed: ran == Some(Ran::Replayed),
+            recorded: matches!(ran, Some(Ran::Recorded | Ran::Rerecorded)),
         };
         if flying.role != Role::Settle
             && let Some(listener) = run.listener()
@@ -1180,7 +1173,7 @@ impl Owner {
         let admitted = Instant::now();
         let started = shared
             .executor
-            .start(&mut self.cache, quantum, Arc::clone(&kill), run.chain.as_ref())
+            .start(quantum, Arc::clone(&kill), run.chain.as_ref())
             .map_err(why("starting the quantum"))?;
 
         run.in_flight.push_back(Flying {
@@ -1192,8 +1185,6 @@ impl Owner {
             selection: selection.clone(),
             retained,
             admitted,
-            replayed: started.replayed,
-            recorded: started.recording,
             kill,
             retired_at: None,
             retired: None,

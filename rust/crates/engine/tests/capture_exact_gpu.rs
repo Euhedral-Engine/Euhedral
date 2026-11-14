@@ -46,9 +46,7 @@ fn a_quantum_is_never_captured_under_exact_numerics() {
     config.num_hidden_layers = 2;
     let config: Arc<ModelConfig> = Arc::new(config);
     let lane = CudaLane::new(&library, LaneId(0), 16).unwrap();
-    let table = typed::Typed::open(&library, 1, 16)
-        .table
-        .with_native(vec![Arc::clone(&lane)]);
+    let table = typed::Typed::open(&library, 1, 16).table;
     let retire = Arc::new(RetireList::new());
     let pinned = PinnedPool::new(&library, 16 << 20);
     let workspace = Arc::new(

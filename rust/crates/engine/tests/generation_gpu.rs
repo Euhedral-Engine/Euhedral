@@ -49,7 +49,6 @@ use euhedral_inference_engine::generation::{
     AdmissionError, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, LogitsSink, QuantumEvent,
     Speculation,
 };
-use euhedral_inference_engine::quantum::CAPTURES;
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
 
@@ -89,6 +88,7 @@ fn settings(artifact: &Path, max_tokens: u32) -> Settings {
         name: "test".to_string(),
     });
     settings.context.max_tokens = max_tokens;
+    settings.kernels.graphs.captures_per_view = 8;
     settings
 }
 
@@ -304,11 +304,7 @@ fn greedy_tokens_match_java_for_short_prompt() {
             1
         );
         let replayed = decodes.iter().filter(|event| event.replayed).count();
-        if CAPTURES {
-            assert!(replayed >= 100, "the decode quanta replay graphs");
-        } else {
-            assert_eq!(replayed, 0, "no graph is replayed while captures are off");
-        }
+        assert!(replayed >= 100, "the decode quanta replay graphs, saw {replayed}");
         // The sequence holds the prompt and the 127 rows decoded; the last token was selected, not fed.
         assert_eq!(
             sequence_state(&runtime),

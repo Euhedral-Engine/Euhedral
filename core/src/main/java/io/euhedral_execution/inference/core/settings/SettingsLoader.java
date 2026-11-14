@@ -361,7 +361,7 @@ public final class SettingsLoader {
         m.put("kernels.compile.stack", fixed(size(1L << 20)));
         // Read by the Rust engine, which bounds its captured graphs per view with it; this engine checks the value and
         // does not use it.
-        m.put("kernels.graphs.captures-per-view", fixed(integer(1, Integer.MAX_VALUE)));
+        m.put("kernels.graphs.captures-per-view", fixed(integer(0, Integer.MAX_VALUE)));
         return m;
     }
 

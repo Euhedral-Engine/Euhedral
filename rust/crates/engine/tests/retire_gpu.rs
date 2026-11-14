@@ -37,21 +37,20 @@ use euhedral_core::frames::Frame;
 use euhedral_core::generics::{FrameSink, LatticeSource};
 use typed::Typed;
 
-use euhedral_gpu::Lane;
 use euhedral_gpu::cuda::CudaQueue;
+use euhedral_gpu::{GraphStats, Lane};
 use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, ExternalEdge, GraphRuntime, Lake, LaneId, Marker,
     QuantumOutcome, RetryCounts, Stage, StageError, StageGraph, StageGraphSpec, StageId, StageSpec, UnitGuard,
 };
 use euhedral_inference_cuda::{
-    CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, LaneOps, PinnedPool, RetireList, SubmitMode,
-    ops,
+    CudaError, CudaLibrary, DevicePtr, KernelOps, LaneOps, PinnedPool, RetireList, SubmitMode,
 };
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{LayerIndex, LayerKind, ModelConfig, Role, WeightRef, object_key};
 use euhedral_inference_engine::plan::{Formats, Plan, WeightLookup};
-use euhedral_inference_engine::quantum::{CAPTURES, Executor, GraphCache, Sighting};
+use euhedral_inference_engine::quantum::Executor;
 use euhedral_inference_engine::residency::planner::plan as residency_plan;
 use euhedral_inference_engine::stages::attention::KvSource;
 use euhedral_inference_engine::stages::sampling::SelectionPool;
@@ -744,82 +743,51 @@ fn plan_without_weights(config: &Arc<ModelConfig>) -> Arc<Plan> {
     Arc::new(Plan::build(config, &weights, &residency, &formats).unwrap())
 }
 
-/// A captured graph for the quantum's key, recorded from a copy of eight bytes, and the buffers it copies.
-fn record_a_graph(
-    world: &World,
-    cache: &mut GraphCache,
-    quantum: &Quantum,
-    capture: &CudaLane,
-) -> (DeviceBuffer, DeviceBuffer) {
-    let (from, to) = (
-        DeviceBuffer::alloc(&world.library, 256).unwrap(),
-        DeviceBuffer::alloc(&world.library, 256).unwrap(),
-    );
-    let key = quantum.capture_key().expect("the quantum has a key");
-    let mut recorded = false;
-    for _ in 0..2 {
-        let sighting = cache
-            .get_or_record(key.clone(), capture, SubmitMode::default(), |submission| {
-                ops::copy_device_to_device(submission, to.ptr(), from.ptr(), 8)
-            })
-            .unwrap();
-        recorded = matches!(sighting, Sighting::Graph(_));
-    }
-    assert!(recorded, "the second sight of a key records its graph");
-    (from, to)
-}
-
-/// A world with the plan's lanes, the capture lane, and the owner's, an executor on it, and a cache holding the
-/// graph of a decode quantum at position 1.
+/// A world with the plan's lanes and the owner's, an executor on it that captures, and a decode quantum at position 1,
+/// which has a capture key.
 struct Captured {
     world: World,
     executor: Executor,
-    cache: GraphCache,
     sequence: SequenceState,
     retirements: Arc<Retirements>,
-    _buffers: (DeviceBuffer, DeviceBuffer),
     quantum: Option<Quantum>,
 }
 
 fn captured() -> Option<Captured> {
-    if !CAPTURES {
-        eprintln!("skipped: graph captures are off in production");
-        return None;
-    }
     let config = reduced_config();
     let plan = plan_without_weights(&config);
     let width = plan.fan_out_width();
-    // The plan's lanes, then the capture lane, then the owner's.
-    let world = World::open(width + 2)?;
+    // The plan's lanes, then the owner's.
+    let world = World::open(width + 1)?;
     let retirements = Retirements::new();
     let sink = Arc::clone(&retirements);
-    let executor = Executor::new(plan, &world.runtime, LaneId(width as u16), move |quantum, outcome| {
-        sink.retire(&quantum, &outcome);
-    })
+    let executor = Executor::new(
+        plan,
+        &world.runtime,
+        width,
+        Arc::clone(&world.typed.gpu),
+        8,
+        move |quantum, outcome| {
+            sink.retire(&quantum, &outcome);
+        },
+    )
     .unwrap();
     let mut sequence = world.sequence(1024);
     // The first reservation allocates and so has no key; the quantum behind it fits the reserved rows and has one.
     drop(world.quantum(&mut sequence, 0));
     sequence.kv.commit(1).unwrap();
     let quantum = world.quantum(&mut sequence, 1);
-    let mut cache = GraphCache::with_capacity(8);
-    let buffers = record_a_graph(
-        &world,
-        &mut cache,
-        &quantum,
-        &CudaLane::new(&world.library, LaneId(width as u16), 64).unwrap(),
-    );
+    assert!(quantum.capture_key().is_some(), "the quantum has a key");
     Some(Captured {
         world,
         executor,
-        cache,
         sequence,
         retirements,
-        _buffers: buffers,
         quantum: Some(quantum),
     })
 }
 
+/// The plan has no weights here, so a captured quantum's body is never launched: only the paths that end before it.
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_captured_quantum_killed_before_its_launch_retires() {
@@ -827,30 +795,18 @@ fn a_captured_quantum_killed_before_its_launch_retires() {
     let quantum = captured.quantum.take().unwrap();
     let started = captured
         .executor
-        .start(&mut captured.cache, quantum, Arc::new(AtomicBool::new(true)), None)
+        .start(quantum, Arc::new(AtomicBool::new(true)), None)
         .unwrap();
-    assert!(started.replayed, "the quantum replays the recorded graph");
     // The reference pins the quantum: it retires only once nothing depends on it.
     drop(started);
     captured
         .retirements
         .assert_outcome(1, KILLED, "a captured quantum killed before its launch");
+    assert_eq!(
+        captured.executor.graph_stats(),
+        GraphStats::default(),
+        "the killed quantum's body never reached the cache"
+    );
     let _ = &captured.sequence;
-    captured.world.close();
-}
-
-#[test]
-#[ignore = "needs a GPU and the native library"]
-fn a_captured_quantum_that_is_not_killed_launches_its_graph_and_retires_completed() {
-    let Some(mut captured) = captured() else { return };
-    let quantum = captured.quantum.take().unwrap();
-    let started = captured
-        .executor
-        .start(&mut captured.cache, quantum, not_killed(), None)
-        .unwrap();
-    assert!(started.replayed, "the quantum replays the recorded graph");
-    // The reference pins the quantum: it retires only once nothing depends on it.
-    drop(started);
-    captured.retirements.assert_outcome(1, COMPLETED, "a captured quantum");
     captured.world.close();
 }

@@ -32,7 +32,7 @@ use crate::formats::{Nvfp4Linear, TrellisLinear};
 use crate::frames::{Kind, step};
 use crate::model::{LayerIndex, ModelConfig, Role, Weights};
 use crate::plan::{Formats, Plan, View};
-use crate::quantum::{Executor, GraphCache};
+use crate::quantum::Executor;
 use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
 use crate::state::SequenceState;
@@ -122,7 +122,6 @@ impl Generation {
             #[cfg(feature = "test-oracles")]
             settle_after_speculation: AtomicBool::new(false),
         });
-        let cache = GraphCache::with_capacity(core.settings.kernels.graphs.captures_per_view as usize);
         // A frame that drives the owner from a thread that must not run its turn, or after a frame's turns are used:
         // unordered, so that it may run on any worker.
         let stages = Arc::clone(&core.stages);
@@ -133,7 +132,7 @@ impl Generation {
             stages.offer(frame).is_ok()
         });
         let mailbox = Arc::new(Mailbox::new(
-            Owner::new(Arc::clone(&shared), sequence, cache, inbox),
+            Owner::new(Arc::clone(&shared), sequence, inbox),
             producer,
             spawn,
         ));
@@ -206,7 +205,9 @@ impl Generation {
         Executor::new(
             Arc::new(plan),
             &runtime,
-            core.capture_lane(),
+            core.compute_lanes(),
+            Arc::clone(&core.gpu),
+            core.settings.kernels.graphs.captures_per_view as usize,
             move |quantum, outcome| {
                 // Runs the owner's turn on this worker when no other turn runs.
                 retiring.post(Message::Retired(Box::new(Retired { quantum, outcome })));

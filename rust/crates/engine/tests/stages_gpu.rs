@@ -161,7 +161,7 @@ fn rig() -> Option<Rig> {
         completions,
         lake,
         lattice,
-        lanes: typed.table.clone().with_native(vec![Arc::clone(&lane)]),
+        lanes: typed.table.clone(),
         typed,
         pinned: PinnedPool::new(&library, 64 << 20),
         retire: Arc::new(RetireList::new()),
