@@ -294,6 +294,17 @@ impl Plan {
         self.variant(view.variant()).map(|plan| plan.unit_stages.as_slice())
     }
 
+    /// The stages of `view` that run as one stage of the graph, each a list of consecutive stages (indices into
+    /// [`Plan::stages`]), in the order of the graph.
+    pub fn units(&self, view: View) -> Option<&[Vec<usize>]> {
+        self.variant(view.variant()).map(|plan| plan.units.as_slice())
+    }
+
+    /// The units that must complete before each unit of `view` ([`Plan::units`]).
+    pub fn unit_edges(&self, view: View) -> Option<&[Vec<usize>]> {
+        self.variant(view.variant()).map(|plan| plan.unit_edges.as_slice())
+    }
+
     /// The kinds of the stages of `view`, in order.
     pub fn kinds(&self, view: View) -> Option<Vec<StageKind>> {
         self.stages(view)

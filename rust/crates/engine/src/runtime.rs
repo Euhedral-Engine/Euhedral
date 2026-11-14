@@ -474,7 +474,7 @@ impl EngineRuntime {
     }
 
     /// The buffers the sequence's caches freed in stream order when their last holder let go. Whoever holds the list
-    /// reaps it (`RetireList::reap`); the engine's own generation does not.
+    /// reaps it (`RetireList::reap`); the engine's own generation reaps it and frees what it finds on each turn of a sequence's owner.
     pub fn retire_list(&self) -> &Arc<RetireList> {
         &self.core.retire
     }
@@ -538,11 +538,11 @@ impl EngineRuntime {
 /// and with the most frames a worker takes at once from `host.max-batch-size` when that is stated. The policy parks a
 /// worker that sits out for [`IdlePolicy::DEFAULT_IDLE_PARK`] (15 us) and keeps the contention history for
 /// [`IdlePolicy::DEFAULT_CONTENTION_HALF_LIFE`] (1 ms) whatever the worker's history; the unproductive park and the
-/// probe interval stay RustEE's. A decode quantum hands a frame from one stage to the next some 170 times, and nothing
-/// wakes a worker for a frame offered to its cache, so a hand-off waits for a worker to come round. The adaptive timing
-/// derives a park of up to 0.8 ms from each worker's history once the lattice has a body-cost estimate; with that, every
-/// hand-off of a frame-by-frame quantum waits out such a park, and a long decode lost more than half its speed within
-/// seconds. A short fixed park keeps every hand-off within tens of microseconds.
+/// probe interval stay RustEE's. A decode quantum is a graph of some 290 stages, each a frame handed on once the one
+/// before it completes, and nothing wakes a worker for a frame offered to its cache, so each hand-off waits for a worker
+/// to come round. The adaptive timing derives a park of up to 0.8 ms from each worker's history once the lattice has a
+/// body-cost estimate, and every hand-off then waits out such a park. The fixed park bounds each hand-off by the
+/// 15 us park.
 pub fn fragment_config(settings: &Settings) -> FragmentConfig {
     let policy = match IdlePolicy::fixed(IdlePolicy::DEFAULT_IDLE_PARK, IdlePolicy::DEFAULT_CONTENTION_HALF_LIFE) {
         Ok(policy) => policy,
