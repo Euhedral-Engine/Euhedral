@@ -61,7 +61,7 @@ use crate::quantum::{Executor, GraphCache, Started};
 use crate::runtime::{Core, Units};
 use crate::stages::attention::KvSource;
 use crate::stages::sampling::Selection;
-use crate::stages::{InputRecordRef, Quantum, QuantumError, QuantumKind};
+use crate::stages::{InputRecordRef, Quantum, QuantumError, QuantumKind, SubmitError};
 use crate::state::SequenceState;
 use crate::state::kv::KvRetained;
 use crate::workspace::{BufferSlot, Workspace};
@@ -659,6 +659,7 @@ impl Owner {
             self.receive(message);
         }
         self.reap();
+        self.free_retired();
         self.conclude();
         self.admit_ready();
         #[cfg(feature = "test-oracles")]
@@ -762,6 +763,25 @@ impl Owner {
         run.generated += 1;
         if run.generated >= run.wanted {
             run.stop(FinishReason::Length);
+        }
+    }
+
+    /// Frees, in stream order on the owner's lane, the buffers the sequence's caches let go of: pages that a request
+    /// discarded and tables a longer one replaced. A buffer reaches the list only when its last holder is gone, and
+    /// every holder was a quantum that retired, so the device is done with it; the free is queued behind the lane's
+    /// work and nothing waits. A lane with no free marker is tried again on the next turn.
+    fn free_retired(&mut self) {
+        let core = &self.shared.core;
+        if core.retire.pending() == 0 {
+            return;
+        }
+        let lanes = &core.lanes;
+        let freed = core.lane_table.submit_ops(core.owner_lane(), false, |ops| {
+            core.retire.reap(|marker| lanes.reached(marker), ops)
+        });
+        match freed {
+            Ok(_) | Err(SubmitError::Busy) => {}
+            Err(error) => self.fail(format!("freeing the released buffers: {error}")),
         }
     }
 

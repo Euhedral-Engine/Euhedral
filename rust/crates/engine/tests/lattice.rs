@@ -87,6 +87,17 @@ fn settings(max_batch_size: Auto<u32>) -> Settings {
     settings
 }
 
+/// A worker that parks between the stages of a quantum wakes later the longer the process runs; the engine's workers
+/// yield instead, and keep RustEE's other timings.
+#[test]
+fn workers_with_nothing_to_run_yield_instead_of_parking() {
+    let policy = fragment_config(&settings(Auto::Auto)).idle_policy().clone();
+    let default = FragmentConfig::default().idle_policy().clone();
+    assert!(policy.unproductive_park().is_zero());
+    assert_eq!(policy.idle_park(), default.idle_park());
+    assert_eq!(policy.probe_interval(), default.probe_interval());
+}
+
 #[test]
 fn the_batch_size_follows_the_settings_and_defaults_to_the_runtimes() {
     let default = fragment_config(&settings(Auto::Auto));
