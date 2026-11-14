@@ -147,7 +147,19 @@ fn fill_arguments(
     mut encode: impl FnMut(&TensorMapPlan) -> Result<TensorMap, GpuError>,
 ) -> Result<(), EnqueueError> {
     let name = launch.kernel.name();
-    arguments.clear();
+    // Argument equality compares the bytes between arguments too, and a reused buffer keeps the previous launch's
+    // there: a launch that leaves such a gap (a 4-byte word before an 8-byte one, or a map) starts from fresh storage.
+    let sizes = launch.args.sizes();
+    let gap = launch.args.maps().next().is_some()
+        || sizes
+            .iter()
+            .position(|&size| size == 4)
+            .is_some_and(|first| sizes[first..].contains(&8));
+    if gap {
+        *arguments = Args::new();
+    } else {
+        arguments.clear();
+    }
     for map in launch.args.maps() {
         arguments.push(encode(map).map_err(|source| EnqueueError::Gpu { name, source })?);
     }
