@@ -556,7 +556,7 @@ fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: Has
         let workspace =
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
         let (sequence, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {
-            let sequence = SequenceState::allocate(&core.library, &core.retire, &artifact.config, &plan, kernels)?;
+            let sequence = SequenceState::allocate(&core.library, &core.released, &artifact.config, &plan, kernels)?;
             sequence.prime_staging(&core.pool)?;
             Ok::<_, EngineError>(sequence)
         })?;

@@ -5,17 +5,17 @@
 //! device array of raw page addresses (the K planes, then the V planes), grown by doubling; the attention kernels
 //! read the pages through it. Reservation runs inside the owning quantum on its lane: it allocates pages in stream
 //! order and uploads a rewritten table from pinned staging by a queued copy, so it never waits for the device.
-//! The staging is handed back in a [`KvRetained`] for the caller to retire once the lane has reached the quantum's
+//! The staging is handed back in a [`KvRetained`] for the caller to keep until the lane has reached the quantum's
 //! marker.
 //!
 //! Pages and tables are shared with the quanta that read them. A quantum takes a [`KvView`] at admission, which holds
 //! the cache's pages and page tables of that moment (a [`PageStore`] behind an `Arc`); growing the cache after that
 //! makes a copy of the store, so the view keeps the old tables and pages alive. A page or a table is freed when the
 //! last holder lets go, a quantum after its retirement or the cache itself: its [`SharedBuffer`] hands the buffer to
-//! the cache's [`RetireList`] (value-0 marker, always reached) for the stream-ordered free, never the synchronizing
-//! one. Whoever polls the list reaps it. The host region and arena are allocated at startup and freed with the cache
-//! (the owner drops the cache after its last quantum has retired); a view holds them too, so they are never freed
-//! under a reader.
+//! the cache's [`ReleasedBuffers`] for the stream-ordered free, never the synchronizing one; the generation's owner
+//! frees what has been handed over on each of its turns. The host region and arena are allocated at startup and freed
+//! with the cache (the owner drops the cache after its last quantum has retired); a view holds them too, so they are
+//! never freed under a reader.
 //!
 //! Rows move through three frontiers. `reserved` rows are backed by pages. `submitted` rows are written by work
 //! queued on the owning quantum's lane; later stages of that quantum may read them, because the lane's order puts
@@ -32,11 +32,12 @@ use std::sync::Arc;
 use euhedral_graph::{LanePool, Marker};
 use euhedral_inference_cuda::{
     AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena, KernelOps, LaneOps, PinnedPool,
-    PooledPinned, RetireList,
+    PooledPinned,
 };
 use euhedral_inference_settings::KvFormat;
 use thiserror::Error;
 
+use super::released::ReleasedBuffers;
 use crate::residency::footprint::{PAGE_TOKENS, plane_page_bytes};
 
 /// Rows of the quanta whose host page copies depend only on the reservation: decode, verification and draft quanta,
@@ -61,9 +62,10 @@ pub enum KvError {
     Cuda(#[from] CudaError),
 }
 
-/// What a reservation leaves for the caller: pinned staging that a queued table upload reads. Retire it with the
-/// marker of the lane work that queued the reservation (`RetireList::retire`), whether the reservation succeeded or
-/// failed. (Outgrown tables are not here: a quantum that reads one holds it, and it is freed with its last holder.)
+/// What a reservation leaves for the caller: pinned staging that a queued table upload reads. Keep it until the lane
+/// work that queued the reservation has run, whether the reservation succeeded or failed; dropping it then returns
+/// it to the pool. (Outgrown tables are not here: a quantum that reads one holds it, and it is freed with its last
+/// holder.)
 #[derive(Debug, Default)]
 pub struct KvRetained {
     pub staging: Vec<PooledPinned>,
@@ -77,24 +79,20 @@ impl KvRetained {
 }
 
 /// A stream-ordered device buffer (a page or a page table) shared by the cache and the views of the quanta that
-/// read it. The last holder to let go hands it to the retire list, to be freed in stream order when the list is
-/// reaped; it is never freed by the synchronizing `cudaFree`. By then every quantum that held it has retired, so no
-/// reader is left: the list's marker is the one that is always reached.
+/// read it. The last holder to let go hands it to the cache's [`ReleasedBuffers`], to be freed in stream order by the
+/// generation's owner; it is never freed by the synchronizing `cudaFree`. By then every quantum that held it has
+/// retired, so no reader is left.
 #[derive(Debug)]
 pub struct SharedBuffer {
     buffer: Option<DeviceBuffer>,
-    retire: Arc<RetireList>,
-    /// The marker the buffer retires behind: value 0 of the lane that allocated it, which any pool holding that lane
-    /// has always reached.
-    always_reached: Marker,
+    released: Arc<ReleasedBuffers>,
 }
 
 impl SharedBuffer {
-    fn new(buffer: DeviceBuffer, retire: &Arc<RetireList>, home: Marker) -> Arc<SharedBuffer> {
+    fn new(buffer: DeviceBuffer, released: &Arc<ReleasedBuffers>) -> Arc<SharedBuffer> {
         Arc::new(SharedBuffer {
             buffer: Some(buffer),
-            retire: Arc::clone(retire),
-            always_reached: home,
+            released: Arc::clone(released),
         })
     }
 
@@ -117,9 +115,7 @@ impl SharedBuffer {
 impl Drop for SharedBuffer {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
-            // A buffer that is not stream-ordered comes back with the reason, and dropping it is the blocking free;
-            // every buffer made here is stream-ordered.
-            let _ = self.retire.retire(buffer, self.always_reached);
+            self.released.give(buffer);
         }
     }
 }
@@ -156,7 +152,7 @@ pub struct KvCache {
     /// Pages a layer may hold, device and host.
     max_pages: u64,
     store: Arc<PageStore>,
-    retire: Arc<RetireList>,
+    released: Arc<ReleasedBuffers>,
     host: Option<HostPages>,
     table_slots: u64,
     reserved: u64,
@@ -172,10 +168,10 @@ impl KvCache {
     /// A cache of `layers` layers of rows `kv_width` wide, for up to `device_tokens + host_tokens` positions. The
     /// tokens past `device_tokens` live in pinned host memory (`host_tokens` of 0: every page on the device). This
     /// allocates the host arena and the device region with the waiting allocators: startup only. Pages and tables
-    /// are allocated on demand, by [`KvCache::reserve`], and freed through `retire` when their last holder lets go.
+    /// are allocated on demand, by [`KvCache::reserve`], and freed through `released` when their last holder lets go.
     pub fn new(
         library: &Arc<CudaLibrary>,
-        retire: &Arc<RetireList>,
+        released: &Arc<ReleasedBuffers>,
         layers: usize,
         kv_width: u64,
         format: KvFormat,
@@ -210,7 +206,7 @@ impl KvCache {
             store: Arc::new(PageStore {
                 layers: (0..layers).map(|_| LayerPages::default()).collect(),
             }),
-            retire: Arc::clone(retire),
+            released: Arc::clone(released),
             host,
             table_slots: 0,
             reserved: 0,
@@ -346,8 +342,7 @@ impl KvCache {
             while (layer.pages.len() as u64) < device {
                 layer.pages.push(SharedBuffer::new(
                     lane.alloc_async((2 * plane) as usize)?,
-                    &self.retire,
-                    lane.home()?,
+                    &self.released,
                 ));
             }
             let next = if slots == self.table_slots {
@@ -355,8 +350,7 @@ impl KvCache {
             } else {
                 Some(SharedBuffer::new(
                     lane.alloc_async(table_bytes as usize)?,
-                    &self.retire,
-                    lane.home()?,
+                    &self.released,
                 ))
             };
             let mut staging = pool.acquire(table_bytes as usize)?;
@@ -586,7 +580,7 @@ struct HostView {
 ///
 /// The view keeps alive what it names: the pages and page tables of that moment (a [`PageStore`] behind an `Arc`),
 /// and the host arena and region. A page table the cache outgrows afterwards is freed only when the last view that
-/// holds it is dropped, through the cache's retire list (see [`SharedBuffer`]). Drop a quantum, and so its view,
+/// holds it is dropped, through the cache's released buffers (see [`SharedBuffer`]). Drop a quantum, and so its view,
 /// only after its device work has retired.
 ///
 /// Pages are allocated in stream order on the lane that reserved them. A stage on another lane must be ordered

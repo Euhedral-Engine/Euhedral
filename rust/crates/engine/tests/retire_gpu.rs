@@ -45,9 +45,7 @@ use euhedral_graph::{
     QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageId, StageSpec, Submitted,
     UnitGuard,
 };
-use euhedral_inference_cuda::{
-    CudaError, CudaLibrary, DevicePtr, KernelOps, LaneOps, PinnedPool, RetireList, SubmitMode,
-};
+use euhedral_inference_cuda::{CudaError, CudaLibrary, DevicePtr, KernelOps, LaneOps, PinnedPool, SubmitMode};
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::kernels::kernel_sources;
 use euhedral_inference_engine::lattice_config;
@@ -63,6 +61,7 @@ use euhedral_inference_engine::stages::{
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvRetained};
+use euhedral_inference_engine::state::released::ReleasedBuffers;
 use euhedral_inference_engine::state::{SequenceDevice, SequenceState};
 use euhedral_inference_engine::workspace::{Workspace, WorkspaceRows};
 use euhedral_inference_settings::{KvFormat, ModelSettings, Settings, TrellisKernelSettings};
@@ -148,7 +147,7 @@ struct World {
     config: Arc<ModelConfig>,
     workspace: Arc<Workspace>,
     pinned: Arc<PinnedPool>,
-    retire: Arc<RetireList>,
+    released: Arc<ReleasedBuffers>,
     lattice: Arc<ControlPlaneLattice>,
     lake: Arc<Lake>,
     unit: Option<UnitGuard>,
@@ -195,7 +194,7 @@ impl World {
         let unit = lake.admit().unwrap();
         Some(World {
             pinned: PinnedPool::new(&library, 16 << 20),
-            retire: Arc::new(RetireList::new()),
+            released: Arc::new(ReleasedBuffers::new()),
             library,
             typed,
             table,
@@ -235,7 +234,7 @@ impl World {
         let gdn = gdn.unwrap();
         let kv = KvCache::new(
             &self.library,
-            &self.retire,
+            &self.released,
             1,
             self.config.kv_width() as u64,
             KvFormat::Nvfp4,

@@ -22,7 +22,7 @@ use euhedral_gpu::{Gpu, GpuError, Stream, StreamOptions, open_shared_lanes};
 use euhedral_graph::{Completions, DeviceQueue, Lake, LaneId, LanePool, UnitGuard};
 use euhedral_hardware_utils::util::CpuSet;
 use euhedral_inference_cuda::launch::load::load;
-use euhedral_inference_cuda::{CudaLibrary, PinnedPool, RetireList};
+use euhedral_inference_cuda::{CudaLibrary, PinnedPool};
 use euhedral_inference_settings::{Auto, Settings};
 use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
@@ -37,6 +37,7 @@ use crate::residency::planner::ResidencyPlan;
 use crate::stages::LaneTable;
 use crate::startup;
 use crate::state::SequenceState;
+use crate::state::released::ReleasedBuffers;
 use crate::warmup::Warmed;
 use crate::workspace::Workspace;
 
@@ -84,8 +85,8 @@ pub(crate) struct Core {
     pub(crate) compute: usize,
     pub(crate) pool: Arc<PinnedPool>,
     /// Buffers waiting to be freed in stream order: the pages and page tables of the caches, once their last quantum
-    /// is gone. Whoever polls the lanes reaps it.
-    pub(crate) retire: Arc<RetireList>,
+    /// is gone. The generation's owner frees them on its lane.
+    pub(crate) released: Arc<ReleasedBuffers>,
     /// Pinned host bytes the load may use.
     pub(crate) host_pinned_bytes: u64,
     /// The pinned pool's size (`memory.pinned-buffer-pool`, resolved): what it keeps, and the ring's budget.
@@ -468,10 +469,10 @@ impl EngineRuntime {
         &self.core.pool
     }
 
-    /// The buffers the sequence's caches freed in stream order when their last holder let go. Whoever holds the list
-    /// reaps it (`RetireList::reap`); the engine's own generation reaps it and frees what it finds on each turn of a sequence's owner.
-    pub fn retire_list(&self) -> &Arc<RetireList> {
-        &self.core.retire
+    /// The buffers the sequence's caches gave up when their last holder let go. The engine's own generation frees
+    /// them in stream order on each turn of a sequence's owner.
+    pub fn released_buffers(&self) -> &Arc<ReleasedBuffers> {
+        &self.core.released
     }
 
     /// The lake of GPU submission frames.
@@ -518,12 +519,20 @@ impl EngineRuntime {
 impl EngineRuntime {
     /// Frees the device memory. Waits for the device.
     fn release(self) {
-        let Self { device, generation, .. } = self;
+        let Self {
+            device,
+            generation,
+            core,
+            ..
+        } = self;
         let DeviceState { weights, workspace } = ManuallyDrop::into_inner(device);
         // The sequence goes first, by `close`, which refuses while a quantum is in flight. The lattice is closed by
         // now, so a quantum still counted will never be dropped: the caches are left allocated (the process is
         // ending) rather than freed under it.
         generation.close();
+        // What the caches gave up and the owner had not yet freed. A queued buffer has no holder left, and the plain
+        // free waits for the device, so nothing is freed under queued work.
+        core.released.drain(drop);
         drop(workspace);
         drop(weights);
     }
@@ -698,7 +707,7 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
         stage_ring: ring,
         compute,
         pool,
-        retire: Arc::new(RetireList::new()),
+        released: Arc::new(ReleasedBuffers::new()),
         host_pinned_bytes: startup::host_pinned_bytes(settings, &machine),
         pool_bytes,
         started,
