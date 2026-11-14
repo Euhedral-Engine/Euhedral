@@ -158,7 +158,7 @@ mod tests {
         list.reap_with(|m| m.value <= limit, drop_boxed).unwrap()
     }
 
-    /// Stands in for `release_boxed`, which needs a submission: dropping runs the flag's `Drop`.
+    /// Stands in for `release_boxed`, which needs a lane: dropping runs the flag's `Drop`.
     fn drop_boxed(item: Box<dyn Boxed>) -> Result<(), CudaError> {
         drop(item);
         Ok(())
