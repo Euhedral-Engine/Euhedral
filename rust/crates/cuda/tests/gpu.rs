@@ -17,8 +17,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use euhedral_graph::{LaneId, Marker, QueueId};
-use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, HostWeightsArena, PinnedBuffer, PinnedPool, RetireList};
+use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, HostWeightsArena, PinnedBuffer, PinnedPool};
 
 /// The loaded library. The tests run in parallel on one device.
 fn library() -> Option<Arc<CudaLibrary>> {
@@ -114,25 +113,4 @@ fn pinned_pool_reuses_released_buffers_even_past_its_limit() {
     drop((c, d));
     assert_eq!(tight_over.trim(), 1, "trim frees down to the limit");
     assert_eq!(tight_over.held_bytes(), 8192);
-}
-
-#[test]
-#[ignore = "needs a GPU and the native library"]
-fn only_buffers_with_a_non_blocking_release_retire() {
-    let Some(library) = library() else { return };
-    let pool = PinnedPool::new(&library, 1 << 20);
-    let list = RetireList::new();
-    let marker = Marker::new(QueueId::next(), LaneId(0), 1);
-
-    let pooled = pool.acquire(4096).expect("pooled buffer");
-    let plain = DeviceBuffer::alloc(&library, 4096).expect("plain buffer");
-
-    let (error, plain) = list.retire(plain, marker).unwrap_err();
-    assert!(error.to_string().contains("alloc_async"), "{error}");
-    assert_eq!(list.pending(), 0);
-    list.retire(pooled, marker)
-        .map_err(|(error, _)| error)
-        .expect("a pooled buffer retires");
-    assert_eq!(list.pending(), 1);
-    drop(plain);
 }

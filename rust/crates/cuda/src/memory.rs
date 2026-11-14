@@ -11,8 +11,6 @@ use euhedral_io::IoMemory;
 
 use crate::error::{CudaError, check};
 use crate::library::CudaLibrary;
-use crate::ops::LaneOps;
-use crate::retire::Retire;
 
 /// A device address, opaque to the host. Zero is null.
 ///
@@ -67,10 +65,9 @@ pub struct AllocationId(pub u64);
 ///
 /// A plain drop frees the buffer at once with `cudaFree`, which waits for the whole device under the driver's lock (and
 /// frees memory queued work may still use if the caller dropped it too early: nothing here tracks readers). That is for
-/// startup and shutdown only. To free on a running engine, allocate with [`LaneOps::alloc_async`](crate::LaneOps::alloc_async) and retire the
-/// buffer with the marker of its last use ([`RetireList`](crate::RetireList)), or free it in stream order with
-/// [`LaneOps::free_async`](crate::LaneOps::free_async); both use `cudaFreeAsync` and never wait. A buffer from [`DeviceBuffer::alloc`] is not
-/// retirable.
+/// startup and shutdown only. To free on a running engine, allocate with [`LaneOps::alloc_async`](crate::LaneOps::alloc_async) and free it in stream
+/// order with [`LaneOps::free_async`](crate::LaneOps::free_async), which uses `cudaFreeAsync` and never waits. A buffer
+/// from [`DeviceBuffer::alloc`] cannot be freed that way ([`DeviceBuffer::is_stream_ordered`]).
 #[derive(Debug)]
 pub struct DeviceBuffer {
     library: Arc<CudaLibrary>,
@@ -142,6 +139,11 @@ impl DeviceBuffer {
     /// The size in bytes.
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Whether the buffer was allocated stream-ordered, so that it can be freed in stream order without waiting.
+    pub fn is_stream_ordered(&self) -> bool {
+        self.stream_ordered
     }
 
     /// The allocation's serial.
@@ -447,22 +449,4 @@ fn device_address(library: &CudaLibrary, host: *const c_void) -> Result<DevicePt
     };
     check("euhedral_cuda_host_weights_device_pointer", status)?;
     Ok(DevicePtr(device))
-}
-
-impl Retire for DeviceBuffer {
-    fn retirable(&self) -> Result<(), CudaError> {
-        if self.stream_ordered {
-            Ok(())
-        } else {
-            Err(CudaError::Argument(
-                "a buffer from DeviceBuffer::alloc is freed with cudaFree, which waits for the device; allocate with \
-                 alloc_async to retire it"
-                    .to_string(),
-            ))
-        }
-    }
-
-    fn release(self, ops: &mut dyn LaneOps) -> Result<(), CudaError> {
-        ops.free_async(self)
-    }
 }

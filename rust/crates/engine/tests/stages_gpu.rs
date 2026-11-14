@@ -44,7 +44,7 @@ use euhedral_graph::{
     QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
 use euhedral_inference_cuda::{
-    CudaError, CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, LaneOps, PinnedPool, RetireList, SubmitMode,
+    CudaError, CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, LaneOps, PinnedPool, SubmitMode,
 };
 use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorDataType, WeightFormat, WeightLayout};
 use euhedral_inference_engine::Handoff;
@@ -65,6 +65,7 @@ use euhedral_inference_engine::stages::{
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvRetained};
+use euhedral_inference_engine::state::released::ReleasedBuffers;
 use euhedral_inference_engine::state::{KvView, SequenceDevice, SequenceState};
 use euhedral_inference_engine::workspace::{BufferSlot, Workspace, WorkspaceRows};
 use euhedral_inference_settings::{KvFormat, ModelSettings, Settings};
@@ -134,7 +135,7 @@ struct Rig {
     lake: Arc<Lake>,
     lattice: Arc<ControlPlaneLattice>,
     pinned: Arc<PinnedPool>,
-    retire: Arc<RetireList>,
+    released: Arc<ReleasedBuffers>,
 }
 
 fn rig() -> Option<Rig> {
@@ -160,7 +161,7 @@ fn rig() -> Option<Rig> {
         lanes: typed.table.clone(),
         typed,
         pinned: PinnedPool::new(&library, 64 << 20),
-        retire: Arc::new(RetireList::new()),
+        released: Arc::new(ReleasedBuffers::new()),
         library,
         pool,
     })
@@ -330,7 +331,7 @@ impl Rig {
         format: KvFormat,
         kv_tokens: u64,
     ) -> (SequenceState, KvRetained) {
-        let mut kv = KvCache::new(&self.library, &self.retire, kv_layers, 1024, format, kv_tokens, 0).unwrap();
+        let mut kv = KvCache::new(&self.library, &self.released, kv_layers, 1024, format, kv_tokens, 0).unwrap();
         let mut retained = KvRetained::default();
         let mut gdn = None;
         self.ops(|lane| {
@@ -2194,7 +2195,7 @@ fn boxed<L: Launch + 'static>(stage: L) -> Box<dyn LaunchOnly> {
 #[ignore = "needs a GPU and the native library"]
 fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
     let Some(rig) = rig() else { return };
-    let mut cache = KvCache::new(&rig.library, &rig.retire, 1, 1024, KvFormat::Bf16, 4096, 0).unwrap();
+    let mut cache = KvCache::new(&rig.library, &rig.released, 1, 1024, KvFormat::Bf16, 4096, 0).unwrap();
     let plane = cache.plane_page_bytes();
     let table_entries = |address: DevicePtr, entries: usize| -> Vec<u64> {
         let bytes = rig.typed.download(address, entries * 8);
@@ -2218,10 +2219,10 @@ fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
         table_entries(old_table, 2),
         [first_page.get(), first_page.get() + plane]
     );
-    assert_eq!(rig.retire.pending(), 0);
+    assert_eq!(rig.released.waiting(), 0);
 
     // The cache grows to four pages: a table of four slots replaces it. The early view still names the old one,
-    // and the old one is not handed to the retire list while the view holds it.
+    // and the old one is not handed to the released buffers while the view holds it.
     cache.appended(256).unwrap();
     let mut grown = KvRetained::default();
     rig.ops(|lane| cache.reserve(lane, &rig.pinned, 256, 700, &mut grown));
@@ -2231,7 +2232,7 @@ fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
     assert_ne!(late.table_generation(0).unwrap(), generation);
     assert_eq!(early.key_table(0), Some(old_table));
     assert_eq!(early.table_generation(0), Some(generation));
-    assert_eq!(rig.retire.pending(), 0, "the early view holds the old table");
+    assert_eq!(rig.released.waiting(), 0, "the early view holds the old table");
     assert_eq!(
         table_entries(old_table, 2),
         [first_page.get(), first_page.get() + plane],
@@ -2241,16 +2242,21 @@ fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
     assert_eq!(pages.len(), 4);
     assert_eq!(table_entries(late.key_table(0).unwrap(), 4)[..4], pages[..]);
 
-    // The last holder lets go: the table goes to the retire list, to be freed in stream order, not under a reader.
+    // The last holder lets go: the table is handed over, to be freed in stream order, not under a reader.
     drop(early);
-    assert_eq!(rig.retire.pending(), 1);
+    assert_eq!(rig.released.waiting(), 1);
     rig.ops(|lane| {
-        assert_eq!(rig.retire.reap(|_| true, lane)?, 1);
+        let mut freed = 0;
+        rig.released.drain(|buffer| {
+            lane.free_async(buffer).unwrap();
+            freed += 1;
+        });
+        assert_eq!(freed, 1);
         Ok::<(), CudaError>(())
     });
     rig.sync();
     drop(late);
-    assert_eq!(rig.retire.pending(), 0, "the cache still holds the new table");
+    assert_eq!(rig.released.waiting(), 0, "the cache still holds the new table");
     drop(grown);
     drop(retained);
 }

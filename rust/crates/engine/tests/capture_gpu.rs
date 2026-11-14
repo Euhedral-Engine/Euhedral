@@ -45,7 +45,7 @@ use euhedral_gpu::{GraphStats, Ran};
 use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, GraphRuntime, Lake, LanePool, Marker, QuantumOutcome, RetryCounts, UnitGuard,
 };
-use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, LaneOps, PinnedPool, RetireList, SubmitMode};
+use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, LaneOps, PinnedPool, SubmitMode};
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
@@ -63,6 +63,7 @@ use euhedral_inference_engine::stages::{
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvRetained};
+use euhedral_inference_engine::state::released::ReleasedBuffers;
 use euhedral_inference_engine::state::{ReserveEpochError, SequenceDevice, SequenceState};
 use euhedral_inference_engine::workspace::{BufferSlot, Workspace, WorkspaceRows};
 use euhedral_inference_settings::{KvFormat, ModelSettings, Settings, TrellisKernelSettings};
@@ -219,7 +220,7 @@ struct World {
     runtime: GraphRuntime,
     workspace: Arc<Workspace>,
     pinned: Arc<PinnedPool>,
-    retire: Arc<RetireList>,
+    released: Arc<ReleasedBuffers>,
     lattice: Arc<ControlPlaneLattice>,
     lake: Arc<Lake>,
     unit: Option<UnitGuard>,
@@ -282,7 +283,7 @@ impl World {
         let unit = lake.admit().unwrap();
         Some(World {
             pinned: PinnedPool::new(&library, 64 << 20),
-            retire: Arc::new(RetireList::new()),
+            released: Arc::new(ReleasedBuffers::new()),
             library,
             config,
             residency,
@@ -345,7 +346,7 @@ impl World {
         let kv = |layers: usize| {
             KvCache::new(
                 &self.library,
-                &self.retire,
+                &self.released,
                 layers,
                 config.kv_width() as u64,
                 KvFormat::Nvfp4,
@@ -991,7 +992,7 @@ struct Light {
     pool: Arc<LanePool>,
     table: LaneTable,
     pinned: Arc<PinnedPool>,
-    retire: Arc<RetireList>,
+    released: Arc<ReleasedBuffers>,
     config: Arc<ModelConfig>,
     workspace: Arc<Workspace>,
 }
@@ -1016,7 +1017,7 @@ fn light() -> Option<Light> {
         table: typed.table.clone(),
         pool: Arc::clone(&typed.queues),
         pinned: PinnedPool::new(&library, 16 << 20),
-        retire: Arc::new(RetireList::new()),
+        released: Arc::new(ReleasedBuffers::new()),
         library,
         typed,
         config,
@@ -1036,7 +1037,7 @@ impl Light {
         let (gdn, _) = self.on_lane(|lane| GdnStates::allocate(&self.library, &self.config, 8, lane));
         let kv = KvCache::new(
             &self.library,
-            &self.retire,
+            &self.released,
             layers,
             self.config.kv_width() as u64,
             KvFormat::Nvfp4,
@@ -1293,7 +1294,7 @@ fn growing_a_cache_after_a_view_was_taken_costs_one_handle_copy_per_page() {
     let layers = 16;
     let mut kv = KvCache::new(
         &light.library,
-        &light.retire,
+        &light.released,
         layers,
         light.config.kv_width() as u64,
         KvFormat::Nvfp4,

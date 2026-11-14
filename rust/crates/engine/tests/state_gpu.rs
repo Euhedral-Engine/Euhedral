@@ -21,13 +21,14 @@ use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use euhedral_graph::{DeviceQueue, Marker};
-use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, LaneOps, PinnedPool, RetireList};
+use euhedral_graph::Marker;
+use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, LaneOps, PinnedPool};
 use euhedral_inference_edrl::{LayerType, ModelMetadata};
 use euhedral_inference_engine::model::ModelConfig;
 use euhedral_inference_engine::residency::footprint;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvError, KvRetained};
+use euhedral_inference_engine::state::released::ReleasedBuffers;
 use euhedral_inference_engine::workspace::{BufferSlot, Workspace, WorkspaceError, WorkspaceRows, workspace_bytes};
 use euhedral_inference_settings::KvFormat;
 use typed::Typed;
@@ -103,14 +104,14 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
     let Some(library) = library() else { return };
     let lane = lane(&library);
     let pool = PinnedPool::new(&library, 64 << 20);
-    let retire = Arc::new(RetireList::new());
-    let mut cache = KvCache::new(&library, &retire, 2, 1024, KvFormat::Nvfp4, 4096, 0).unwrap();
+    let released = Arc::new(ReleasedBuffers::new());
+    let mut cache = KvCache::new(&library, &released, 2, 1024, KvFormat::Nvfp4, 4096, 0).unwrap();
     let plane = cache.plane_page_bytes();
     assert_eq!(plane, 256 * 144 * 4);
 
     // 300 rows need two pages and a table of two slots per plane.
     let mut retained = KvRetained::default();
-    let ((), marker) = run(&lane, |ops| cache.reserve(ops, &pool, 0, 300, &mut retained));
+    run(&lane, |ops| cache.reserve(ops, &pool, 0, 300, &mut retained));
     assert_eq!((cache.reserved(), cache.submitted(), cache.committed()), (512, 0, 0));
     assert!(cache.reserves(0, 512) && !cache.reserves(0, 513));
     for layer in 0..2 {
@@ -132,11 +133,10 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
         assert_eq!(entries[3], pages[1] + plane);
         assert_eq!(cache.value_table(layer).unwrap().get(), key.get() + 2 * 8);
     }
-    assert_eq!(retire.pending(), 0, "the first table replaces nothing");
+    assert!(released.is_empty(), "the first table replaces nothing");
     assert_eq!(retained.staging.len(), 2);
-    for staging in retained.staging.drain(..) {
-        retire.retire(staging, marker).ok().unwrap();
-    }
+    // The lane has run the upload (the run waited for it), so the staging may go back to the pool.
+    retained.staging.clear();
 
     // Frontiers: the writes were queued, then the quantum retired.
     cache.appended(300).unwrap();
@@ -167,27 +167,27 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
         Ok::<(), KvError>(())
     });
     // Growing past two pages doubles the table. No view holds the old tables, so the cache's let-go is their last:
-    // they are handed to the retire list for the stream-ordered free.
-    let ((), marker) = run(&lane, |ops| cache.reserve(ops, &pool, 240, 300, &mut retained));
+    // they are handed over for the stream-ordered free.
+    run(&lane, |ops| cache.reserve(ops, &pool, 240, 300, &mut retained));
     assert_eq!(cache.reserved(), 768);
-    assert_eq!(
-        retire.pending(),
-        4,
-        "two staging buffers retired earlier, and the two old tables"
-    );
+    assert_eq!(released.waiting(), 2, "the two old tables");
     assert_eq!(retained.staging.len(), 2);
     assert_eq!(
         cache.value_table(0).unwrap().get(),
         cache.key_table(0).unwrap().get() + 4 * 8
     );
-    for staging in retained.staging.drain(..) {
-        retire.retire(staging, marker).ok().unwrap();
-    }
-    // The staging goes back to the pool once the lane reached the marker; the outgrown tables are freed on a lane.
-    let reached = |marker: Marker| DeviceQueue::completed(&**lane.lane(0)) >= marker.value;
-    let (released, _) = run(&lane, |ops| retire.reap(reached, ops));
-    assert_eq!(released, 6);
-    assert_eq!(retire.pending(), 0);
+    retained.staging.clear();
+    // The outgrown tables are freed in stream order on a lane.
+    let (freed, _) = run(&lane, |ops| {
+        let mut freed = 0;
+        released.drain(|buffer| {
+            ops.free_async(buffer).unwrap();
+            freed += 1;
+        });
+        Ok::<usize, CudaError>(freed)
+    });
+    assert_eq!(freed, 2);
+    assert!(released.is_empty());
 
     // Past the planned rows is refused.
     let mut retained = KvRetained::default();
@@ -205,51 +205,6 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
 
 #[test]
 #[ignore = "needs a GPU and the native library"]
-fn a_retired_buffer_is_released_only_after_its_marker_and_a_pooled_one_returns_to_its_pool() {
-    let Some(library) = library() else { return };
-    let lane = lane(&library);
-    let pool = PinnedPool::new(&library, 1 << 20);
-    let list = RetireList::new();
-    let reached = |marker: Marker| DeviceQueue::completed(&**lane.lane(0)) >= marker.value;
-
-    let pooled = pool.acquire(4096).expect("pooled buffer");
-    let size = pooled.capacity() as u64;
-    let plain = DeviceBuffer::alloc(&library, 4096).expect("plain buffer");
-    let ((), marker) = run(&lane, |_| Ok::<(), String>(()));
-    // A plain allocation has no non-blocking release: it is handed back, not retired.
-    let (error, plain) = list.retire(plain, marker).unwrap_err();
-    assert!(error.to_string().contains("alloc_async"), "{error}");
-    assert_eq!(list.pending(), 0);
-    drop(plain);
-
-    // A marker the lane never reaches: the reap releases nothing, and the buffer is not back in the pool.
-    let ahead = Marker {
-        value: marker.value + 1_000_000,
-        ..marker
-    };
-    list.retire(pooled, ahead)
-        .map_err(|(error, _)| error)
-        .expect("a pooled buffer retires");
-    assert_eq!(list.pending(), 1);
-    let (released, _) = run(&lane, |ops| list.reap(reached, ops));
-    assert_eq!(released, 0);
-    assert_eq!(list.pending(), 1);
-    assert_eq!(pool.held_bytes(), 0);
-
-    // One whose marker the lane reached: the reap releases it, and the pool holds the buffer again.
-    let pooled = pool.acquire(4096).expect("a second pooled buffer");
-    list.retire(pooled, marker)
-        .map_err(|(error, _)| error)
-        .expect("a pooled buffer retires");
-    assert_eq!(list.pending(), 2);
-    let (released, _) = run(&lane, |ops| list.reap(reached, ops));
-    assert_eq!(released, 1);
-    assert_eq!(list.pending(), 1);
-    assert_eq!(pool.held_bytes(), size);
-}
-
-#[test]
-#[ignore = "needs a GPU and the native library"]
 fn host_pages_are_read_and_written_through_the_device_region() {
     let Some(library) = library() else { return };
     let lane = lane(&library);
@@ -257,7 +212,7 @@ fn host_pages_are_read_and_written_through_the_device_region() {
     // One page on the device, two in host memory.
     let mut cache = KvCache::new(
         &library,
-        &Arc::new(RetireList::new()),
+        &Arc::new(ReleasedBuffers::new()),
         1,
         1024,
         KvFormat::Nvfp4,
@@ -385,7 +340,7 @@ fn primed_staging_means_a_reservation_allocates_nothing() {
     let pool = PinnedPool::new(&library, 64 << 20);
     let mut cache = KvCache::new(
         &library,
-        &Arc::new(RetireList::new()),
+        &Arc::new(ReleasedBuffers::new()),
         2,
         1024,
         KvFormat::Nvfp4,

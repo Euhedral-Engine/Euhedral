@@ -10,8 +10,6 @@ use euhedral_io::IoMemory;
 use crate::error::CudaError;
 use crate::library::CudaLibrary;
 use crate::memory::PinnedBuffer;
-use crate::ops::LaneOps;
-use crate::retire::Retire;
 use crate::stack::Stack;
 
 /// The smallest size class: one page.
@@ -124,8 +122,8 @@ impl PinnedPool {
 }
 
 /// A pinned buffer on loan from a [`PinnedPool`]; dropping it returns the buffer to the pool, and does not free it
-/// or wait. Retire it with a [`RetireList`](crate::RetireList) while a queued copy still uses it: retiring returns it
-/// to the pool once the marker is reached.
+/// or wait. Keep it while a queued copy still uses it: the pool may hand the buffer out again as soon as it is
+/// dropped.
 pub struct PooledPinned {
     pool: Arc<PinnedPool>,
     buffer: Option<PinnedBuffer>,
@@ -217,12 +215,5 @@ impl Drop for PooledPinned {
         if let Some(buffer) = self.buffer.take() {
             self.pool.release(buffer);
         }
-    }
-}
-
-impl Retire for PooledPinned {
-    fn release(self, _ops: &mut dyn LaneOps) -> Result<(), CudaError> {
-        drop(self);
-        Ok(())
     }
 }

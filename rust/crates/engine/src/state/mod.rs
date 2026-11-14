@@ -3,6 +3,7 @@
 pub mod attention;
 pub mod gdn;
 pub mod kv;
+pub mod released;
 
 use std::fmt::Display;
 use std::iter;
@@ -11,7 +12,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use thiserror::Error;
 
-use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, KernelOps, PinnedPool, RetireList};
+use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, KernelOps, PinnedPool};
 
 use crate::error::EngineError;
 use crate::model::ModelConfig;
@@ -24,6 +25,7 @@ use attention::AttentionScratch;
 use gdn::GdnStates;
 use kv::KvCache;
 pub use kv::KvView;
+use released::ReleasedBuffers;
 
 /// What the stages of a quantum read of a sequence: its GDN state and its attention scratch. Allocated once, at
 /// full size, and shared by every quantum of the sequence; nothing about it changes while quanta run, except the
@@ -119,11 +121,11 @@ pub struct SequenceState {
 impl SequenceState {
     /// Allocates the state `plan` sized: the cache with its host pages, the GDN state (zeroed through `kernels`, on the owner's lane
     /// before any quantum), the decode scratch and, for a drafting sequence, the draft buffers and the MTP layer's
-    /// cache. Pages and page tables are freed through `retire` when their last holder lets go. Waits on the allocators:
+    /// cache. Pages and page tables are freed through `released` when their last holder lets go. Waits on the allocators:
     /// startup only. The caller waits for the zeroing's marker.
     pub fn allocate(
         library: &Arc<CudaLibrary>,
-        retire: &Arc<RetireList>,
+        released: &Arc<ReleasedBuffers>,
         config: &ModelConfig,
         plan: &ResidencyPlan,
         kernels: &mut dyn KernelOps,
@@ -132,7 +134,7 @@ impl SequenceState {
         let verified_rows = if drafts { 1 + plan.draft_depth as u64 } else { 0 };
         let kv = KvCache::new(
             library,
-            retire,
+            released,
             config.attention_layers(),
             config.kv_width() as u64,
             plan.kv_format,
@@ -144,7 +146,7 @@ impl SequenceState {
             Some(
                 KvCache::new(
                     library,
-                    retire,
+                    released,
                     1,
                     config.kv_width() as u64,
                     plan.kv_format,

@@ -49,7 +49,7 @@ use euhedral_core::frames::Frame;
 use euhedral_data_structures::queues::{Consumer, Single};
 use euhedral_gpu::Ran;
 use euhedral_graph::QuantumOutcome;
-use euhedral_inference_cuda::{DevicePtr, PooledPinned, SubmitMode};
+use euhedral_inference_cuda::{CudaError, DevicePtr, PooledPinned, SubmitMode};
 
 use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
@@ -759,17 +759,33 @@ impl Owner {
     }
 
     /// Frees, in stream order on the owner's lane, the buffers the sequence's caches let go of: pages that a request
-    /// discarded and tables a longer one replaced. A buffer reaches the list only when its last holder is gone, and
+    /// discarded and tables a longer one replaced. A buffer is handed over only when its last holder is gone, and
     /// every holder was a quantum that retired, so the device is done with it; the free is queued behind the lane's
-    /// work and nothing waits. A lane with no free marker is tried again on the next turn.
+    /// work and nothing waits. A lane with no free marker is tried again on the next turn, with the buffers still
+    /// queued.
     fn free_retired(&mut self) {
         let core = &self.shared.core;
-        if core.retire.pending() == 0 {
+        if core.released.is_empty() {
             return;
         }
-        let lanes = &core.lanes;
         let freed = core.lane_table.submit_ops(core.owner_lane(), false, |ops| {
-            core.retire.reap(|marker| lanes.reached(marker), ops)
+            let mut first_error = None;
+            core.released.drain(|buffer| {
+                // Every buffer a cache hands over is stream-ordered; a plain one is dropped here, the blocking free,
+                // and reported.
+                let freed = if buffer.is_stream_ordered() {
+                    ops.free_async(buffer)
+                } else {
+                    Err(CudaError::Argument(
+                        "a buffer from DeviceBuffer::alloc was handed over; it needs alloc_async to be freed in stream order"
+                            .to_string(),
+                    ))
+                };
+                if let Err(error) = freed {
+                    first_error.get_or_insert(error);
+                }
+            });
+            first_error.map_or(Ok(()), Err)
         });
         match freed {
             Ok(_) | Err(SubmitError::Busy) => {}

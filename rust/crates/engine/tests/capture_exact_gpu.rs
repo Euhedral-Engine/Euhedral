@@ -20,7 +20,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use euhedral_inference_cuda::PinnedPool;
-use euhedral_inference_cuda::RetireList;
 use euhedral_inference_cuda::{CudaLibrary, SubmitMode};
 use euhedral_inference_engine::model::{LayerKind, ModelConfig};
 use euhedral_inference_engine::stages::attention::KvSource;
@@ -29,6 +28,7 @@ use euhedral_inference_engine::stages::{InputRecordRef, Quantum, QuantumKind};
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvRetained};
+use euhedral_inference_engine::state::released::ReleasedBuffers;
 use euhedral_inference_engine::state::{SequenceDevice, SequenceState};
 use euhedral_inference_engine::workspace::{Workspace, WorkspaceRows};
 use euhedral_inference_settings::KvFormat;
@@ -46,7 +46,7 @@ fn a_quantum_is_never_captured_under_exact_numerics() {
     let config: Arc<ModelConfig> = Arc::new(config);
     let typed = typed::Typed::open(&library, 1, 16);
     let table = typed.table.clone();
-    let retire = Arc::new(RetireList::new());
+    let retire = Arc::new(ReleasedBuffers::new());
     let pinned = PinnedPool::new(&library, 16 << 20);
     let workspace = Arc::new(
         Workspace::allocate(
