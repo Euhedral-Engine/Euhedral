@@ -965,6 +965,14 @@ where
     }
 
     fn free_async(&mut self, buffer: DeviceBuffer) -> Result<(), CudaError> {
+        if !buffer.is_stream_ordered() {
+            // Dropped here: the plain free, which waits for the device. Freeing it with `cudaFreeAsync` would be wrong.
+            return Err(CudaError::Argument(
+                "a buffer from DeviceBuffer::alloc is freed with cudaFree, which waits for the device; allocate with \
+                 alloc_async to free it in stream order"
+                    .to_string(),
+            ));
+        }
         self.on_lent_stream(|_| buffer.free_on_selected())?
     }
 }

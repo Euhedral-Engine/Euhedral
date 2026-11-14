@@ -408,7 +408,8 @@ pub trait LaneOps: KernelOps {
     /// Allocates `bytes` in stream order on this lane: usable by the work queued after this call on it.
     fn alloc_async(&mut self, bytes: usize) -> Result<DeviceBuffer, CudaError>;
 
-    /// Frees `buffer` in stream order on this lane, after the work queued before this call on it.
+    /// Frees `buffer` in stream order on this lane, after the work queued before this call on it. A buffer that was
+    /// not allocated stream-ordered is refused with an error, and dropped (the plain, waiting free).
     fn free_async(&mut self, buffer: DeviceBuffer) -> Result<(), CudaError>;
 }
 

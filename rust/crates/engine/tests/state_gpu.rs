@@ -205,6 +205,18 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
 
 #[test]
 #[ignore = "needs a GPU and the native library"]
+fn a_buffer_that_is_not_stream_ordered_is_refused_by_the_stream_ordered_free() {
+    let Some(library) = library() else { return };
+    let lane = lane(&library);
+    let plain = DeviceBuffer::alloc(&library, 4096).unwrap();
+    let (refusal, _) = run(&lane, |ops| {
+        Ok::<_, String>(ops.free_async(plain).unwrap_err().to_string())
+    });
+    assert!(refusal.contains("alloc_async"), "{refusal}");
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
 fn host_pages_are_read_and_written_through_the_device_region() {
     let Some(library) = library() else { return };
     let lane = lane(&library);

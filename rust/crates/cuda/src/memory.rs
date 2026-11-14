@@ -74,7 +74,7 @@ pub struct DeviceBuffer {
     addr: u64,
     bytes: usize,
     generation: AllocationId,
-    /// Allocated with `cudaMallocAsync`: freed in stream order, so retirable without blocking.
+    /// Allocated with `cudaMallocAsync`: freed in stream order, so it can be freed without blocking.
     stream_ordered: bool,
 }
 
@@ -227,7 +227,7 @@ fn non_empty(bytes: usize) -> Result<u64, CudaError> {
 ///
 /// It is owned exclusively: the pointer and length are fixed for the buffer's life. A plain drop calls `cudaFreeHost`,
 /// which waits for the whole device under the driver's lock: startup and shutdown only. On a running engine take
-/// buffers from a [`PinnedPool`](crate::PinnedPool), which recycles them. A raw `PinnedBuffer` is not retirable.
+/// buffers from a [`PinnedPool`](crate::PinnedPool), which recycles them. A raw `PinnedBuffer` is never freed on a running engine.
 #[derive(Debug)]
 pub struct PinnedBuffer {
     library: Arc<CudaLibrary>,

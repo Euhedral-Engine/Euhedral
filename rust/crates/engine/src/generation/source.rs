@@ -49,7 +49,7 @@ use euhedral_core::frames::Frame;
 use euhedral_data_structures::queues::{Consumer, Single};
 use euhedral_gpu::Ran;
 use euhedral_graph::QuantumOutcome;
-use euhedral_inference_cuda::{CudaError, DevicePtr, PooledPinned, SubmitMode};
+use euhedral_inference_cuda::{DevicePtr, PooledPinned, SubmitMode};
 
 use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
@@ -771,17 +771,7 @@ impl Owner {
         let freed = core.lane_table.submit_ops(core.owner_lane(), false, |ops| {
             let mut first_error = None;
             core.released.drain(|buffer| {
-                // Every buffer a cache hands over is stream-ordered; a plain one is dropped here, the blocking free,
-                // and reported.
-                let freed = if buffer.is_stream_ordered() {
-                    ops.free_async(buffer)
-                } else {
-                    Err(CudaError::Argument(
-                        "a buffer from DeviceBuffer::alloc was handed over; it needs alloc_async to be freed in stream order"
-                            .to_string(),
-                    ))
-                };
-                if let Err(error) = freed {
+                if let Err(error) = ops.free_async(buffer) {
                     first_error.get_or_insert(error);
                 }
             });

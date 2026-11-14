@@ -44,10 +44,11 @@ impl<T> Released<T> {
         }
     }
 
-    /// Hands `item` over. Any thread may call it.
+    /// Hands `item` over. Any thread may call it. The queue is unbounded, so the offer is always taken; a refusal
+    /// would be a defect in the queue, and is caught in debug builds (the item is dropped in release builds).
     pub fn give(&self, item: T) {
-        // The queue is unbounded: an offer is always taken.
-        let _ = self.producer.offer(item);
+        let offered = self.producer.offer(item);
+        debug_assert!(offered.is_ok(), "an unbounded queue refused an item");
     }
 
     /// Items handed over and not yet taken.
@@ -106,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn items_given_while_draining_are_taken_by_a_later_drain() {
+    fn items_given_between_two_drains_are_taken_by_the_second() {
         let released = Released::<u32>::new();
         released.give(1);
         released.give(2);

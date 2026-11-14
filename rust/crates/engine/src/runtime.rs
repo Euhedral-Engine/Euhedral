@@ -530,8 +530,8 @@ impl EngineRuntime {
         // now, so a quantum still counted will never be dropped: the caches are left allocated (the process is
         // ending) rather than freed under it.
         generation.close();
-        // What the caches gave up and the owner had not yet freed. The device is idle (the lattice is closed and every
-        // quantum retired), and the plain free waits for it, so nothing is freed under queued work.
+        // What the caches gave up and the owner had not yet freed. A queued buffer has no holder left, and the plain
+        // free waits for the device, so nothing is freed under queued work.
         core.released.drain(drop);
         drop(workspace);
         drop(weights);

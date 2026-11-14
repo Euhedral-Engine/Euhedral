@@ -12,10 +12,10 @@
 //! the cache's pages and page tables of that moment (a [`PageStore`] behind an `Arc`); growing the cache after that
 //! makes a copy of the store, so the view keeps the old tables and pages alive. A page or a table is freed when the
 //! last holder lets go, a quantum after its retirement or the cache itself: its [`SharedBuffer`] hands the buffer to
-//! the cache's [`ReleasedBuffers`] for the stream-ordered free, never the synchronizing
-//! one; the generation's owner frees what has been handed over on each of its turns. The host region and arena are allocated at startup and freed with the cache
-//! (the owner drops the cache after its last quantum has retired); a view holds them too, so they are never freed
-//! under a reader.
+//! the cache's [`ReleasedBuffers`] for the stream-ordered free, never the synchronizing one; the generation's owner
+//! frees what has been handed over on each of its turns. The host region and arena are allocated at startup and freed
+//! with the cache (the owner drops the cache after its last quantum has retired); a view holds them too, so they are
+//! never freed under a reader.
 //!
 //! Rows move through three frontiers. `reserved` rows are backed by pages. `submitted` rows are written by work
 //! queued on the owning quantum's lane; later stages of that quantum may read them, because the lane's order puts
@@ -64,7 +64,8 @@ pub enum KvError {
 
 /// What a reservation leaves for the caller: pinned staging that a queued table upload reads. Keep it until the lane
 /// work that queued the reservation has run, whether the reservation succeeded or failed; dropping it then returns
-/// it to the pool. (Outgrown tables are not here: a quantum that reads one holds it, and it is freed with its last holder.)
+/// it to the pool. (Outgrown tables are not here: a quantum that reads one holds it, and it is freed with its last
+/// holder.)
 #[derive(Debug, Default)]
 pub struct KvRetained {
     pub staging: Vec<PooledPinned>,
