@@ -443,6 +443,8 @@ struct Run {
     recorded: usize,
     /// Quanta that had a capture key.
     keyed: usize,
+    /// Whether decode and verification quanta launch their kernels programmatically (the setting `quantum.mode.pdl`).
+    pdl: bool,
 }
 
 impl Run {
@@ -480,6 +482,7 @@ impl Run {
             replayed: [0; 3],
             recorded: 0,
             keyed: 0,
+            pdl: true,
         }
     }
 
@@ -543,7 +546,7 @@ impl Run {
             .ordered_after(marker, &world.pool)
             .with_replay_rows(replay);
         let mode = SubmitMode {
-            pdl: matches!(kind, QuantumKind::Decode | QuantumKind::Verify) && start < 1024,
+            pdl: self.pdl && matches!(kind, QuantumKind::Decode | QuantumKind::Verify) && start < 1024,
             row_exact: kind == QuantumKind::Verify,
         };
         let tokens: Vec<u32> = (0..rows as u64).map(|row| token(start + row)).collect();
@@ -836,6 +839,59 @@ fn replay_equals_stage_by_stage_for_a_verification_twin_the_fused_verifier_and_d
     );
     captured.close(&world);
     reference.close(&world);
+    world.close();
+}
+
+/// Runs `steps` on a stage-by-stage run with programmatic launch `pdl`; returns what every step selected and left in the
+/// logits, and the GDN states at the end.
+fn trace(world: &World, pdl: bool, steps: &[Step]) -> (Vec<Outcome>, Vec<Vec<u8>>) {
+    let mut run = Run::new(world, 0);
+    run.pdl = pdl;
+    let outcomes: Vec<Outcome> = steps.iter().map(|step| run.step(world, *step)).collect();
+    let states = run.gdn_state(world);
+    run.close(world);
+    (outcomes, states)
+}
+
+/// A kernel that overlaps its predecessor without waiting for it reads stale data on some runs: twenty runs with
+/// programmatic launch and twenty without must leave bit-for-bit the same keys, logits and states.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn decode_with_programmatic_launch_equals_without_bit_for_bit() {
+    const RUNS: usize = 20;
+    let Some(world) = World::open() else { return };
+    let steps = scenario();
+    let (wanted, wanted_states) = trace(&world, false, &steps);
+    for (index, step) in steps.iter().enumerate() {
+        if !matches!(step, Step::Prefill(_)) {
+            assert!(
+                wanted[index].keys.iter().all(|key| *key != 0),
+                "step {index} {step:?}: the reference selected nothing"
+            );
+        }
+    }
+    for (pdl, name) in [(false, "without"), (true, "with")] {
+        for run in 0..RUNS {
+            if !pdl && run == 0 {
+                continue;
+            }
+            let (actual, states) = trace(&world, pdl, &steps);
+            for (index, step) in steps.iter().enumerate() {
+                assert_eq!(
+                    actual[index].keys, wanted[index].keys,
+                    "{name} programmatic launch, run {run}, step {index} {step:?}: the selected tokens"
+                );
+                assert!(
+                    actual[index].logits == wanted[index].logits,
+                    "{name} programmatic launch, run {run}, step {index} {step:?}: the logits are bitwise equal"
+                );
+            }
+            assert!(
+                states == wanted_states,
+                "{name} programmatic launch, run {run}: the GDN states are bitwise equal"
+            );
+        }
+    }
     world.close();
 }
 
