@@ -45,8 +45,9 @@ impl Unmarked {
     }
 
     /// Orders `home` behind the kept markers of the other lanes, on the device: nothing waits. `queue_of` names the
-    /// queue of a lane. A marker whose await was refused stays kept, and the next call tries it again; a home lane
-    /// that cannot order anything (a query-only lane) leaves them all.
+    /// queue of a lane. A marker whose await is refused (only a poisoned device or an invalid marker does that) is
+    /// logged and stays kept, and retirement proceeds without it; a home lane that cannot order anything (a query-only
+    /// lane) leaves them all.
     pub fn await_on(&self, home: &dyn DeviceQueue, queue_of: impl Fn(LaneId) -> Option<QueueId>) {
         let Some(control) = home.control() else {
             return;

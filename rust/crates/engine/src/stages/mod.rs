@@ -760,6 +760,8 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
     cx: &StageCx<'_>,
 ) -> Result<Submitted, StageError> {
     if stage.idle(quantum) {
+        // An idle stage queues nothing, so there is nothing to mark. A completion edge from it would fire at once; the
+        // plan has only submission edges, which pass the stage's inputs through.
         return Ok(Submitted::done());
     }
     quantum.check_prepared()?;
@@ -794,7 +796,8 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
 /// A launch that fails (or panics) has queued part of its work already, and RustEE records the marker of a failed
 /// stage nowhere, so the marked submission is given an `Ok` that carries the launch's result and always publishes its
 /// marker. When the launch failed the marker goes to `unmarked`, which orders the quantum's home lane behind it when the
-/// quantum is abandoned, and the launch's error is the stage's; a panic is resumed once the marker is kept.
+/// quantum is abandoned, and the launch's error is the stage's; a panic is resumed once the marker is kept. If the submission itself fails after the launch ran, the launch's own
+/// error (or panic) is still the stage's and only otherwise is the submission's error.
 pub fn submit_on<L: Lane>(
     lane: &L,
     waits: impl IntoIterator<Item = Marker>,
@@ -807,19 +810,27 @@ pub fn submit_on<L: Lane>(
             lane.await_marker(marker).map_err(fatal)?;
         }
     }
-    let made = lane.submit_marked(|queue| Ok(catch_unwind(AssertUnwindSafe(|| launch(queue)))));
-    match made {
-        Ok((Ok(Ok(())), marker)) => Ok(marker),
-        Ok((Ok(Err(error)), marker)) => {
+    let mut ran = None;
+    let made = lane.submit_marked(|queue| {
+        ran = Some(catch_unwind(AssertUnwindSafe(|| launch(queue))));
+        Ok(())
+    });
+    match (made, ran) {
+        (Ok((_, marker)), Some(Ok(Ok(())))) => Ok(marker),
+        (Ok((_, marker)), Some(Ok(Err(error)))) => {
             unmarked.record(marker);
             Err(error)
         }
-        Ok((Err(panic), marker)) => {
+        (Ok((_, marker)), Some(Err(panic))) => {
             unmarked.record(marker);
             resume_unwind(panic)
         }
-        Err(GpuError::Busy) => Err(StageError::Retry),
-        Err(error) => Err(fatal(error)),
+        (Err(GpuError::Busy), None) => Err(StageError::Retry),
+        // The submission itself failed after the launch ran: the launch's own result is the stage's.
+        (Err(_), Some(Ok(Err(error)))) => Err(error),
+        (Err(_), Some(Err(panic))) => resume_unwind(panic),
+        (Err(error), _) => Err(fatal(error)),
+        (Ok(_), _) => Err(fatal("a marked submission finished without running its launch")),
     }
 }
 

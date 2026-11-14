@@ -1373,7 +1373,7 @@ fn argmax_lowest_id_tie_break() {
         [Some(12_345), Some(77), None, Some(9), Some(VOCABULARY as u32 - 1)]
     );
 
-    // A verification selects every row, and the stage's marker is signalled for the continuation that follows it.
+    // A verification selects every row, and the stage publishes its marker for the continuation that follows it.
     let every = Argmax::new(BufferSlot::Logits, VOCABULARY, SelectedRows::Each);
     let verify = rig
         .quantum(QuantumKind::Verify, 5, 0, &workspace, &sequence, &config)

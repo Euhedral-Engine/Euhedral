@@ -28,7 +28,7 @@ use std::fmt::Display;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -640,6 +640,81 @@ impl Stage<Quantum> for SpinThenFail {
     fn abandoned(&self, quantum: &Quantum, home: &(dyn DeviceQueue + 'static)) {
         self.placed.abandoned(quantum, home);
     }
+}
+
+/// A stage placed on another lane whose launch fails, run through the plan's own submission ([`Placed`]); it reports
+/// the marker the quantum kept for the lane when the quantum is abandoned, before the abandonment orders anything.
+struct Watch {
+    placed: Placed,
+    lane: LaneId,
+    kept: Arc<AtomicU64>,
+}
+
+impl Stage<Quantum> for Watch {
+    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+        self.placed.run(quantum, cx)
+    }
+
+    fn abandoned(&self, quantum: &Quantum, home: &(dyn DeviceQueue + 'static)) {
+        self.kept
+            .store(quantum.unmarked().latest(self.lane).unwrap_or(0), Ordering::Release);
+        self.placed.abandoned(quantum, home);
+    }
+}
+
+/// A launch that fails on a lane other than the home lane, in a stage's own submission, leaves the marker of that
+/// submission in the quantum for the abandonment to await, and the abandonment then orders the home lane behind it.
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn a_stage_that_fails_through_its_own_submission_keeps_its_marker_for_the_abandonment() {
+    let Some(world) = World::open(3) else { return };
+    let retirements = Retirements::new();
+    let ran: Arc<Vec<AtomicUsize>> = Arc::new(vec![AtomicUsize::new(0)]);
+    let mut spec = StageGraphSpec::new();
+    let first = spec.stage(StageSpec {
+        name: "home",
+        ordered: None,
+        lanes: vec![LaneId(0)],
+    });
+    let second = spec.stage(StageSpec {
+        name: "fails",
+        ordered: None,
+        lanes: vec![LaneId(1)],
+    });
+    spec.edge(first, second, EdgeKind::Submission);
+    let home: Arc<dyn Stage<Quantum>> = Arc::new(Placed::new(Arc::new(Probe {
+        act: Act::Nothing,
+        ran: Arc::clone(&ran),
+        index: 0,
+    })));
+    let kept = Arc::new(AtomicU64::new(0));
+    let fails: Arc<dyn Stage<Quantum>> = Arc::new(Watch {
+        placed: Placed::new(Arc::new(Probe {
+            act: Act::Fail,
+            ran: Arc::clone(&ran),
+            index: 0,
+        })),
+        lane: LaneId(1),
+        kept: Arc::clone(&kept),
+    });
+    let log = Arc::clone(&retirements);
+    let graph = StageGraph::new(
+        spec,
+        vec![home, fails],
+        world.runtime.clone(),
+        move |quantum, outcome| log.retire(&quantum, &outcome),
+    )
+    .unwrap();
+    let mut sequence = world.sequence(1024);
+    let quantum = world.quantum(&mut sequence, 0);
+    let _ = graph.start(quantum, not_killed(), Vec::new());
+    retirements.assert_outcome(0, FAILED, "the stage on the other lane failed");
+    assert_ne!(
+        kept.load(Ordering::Acquire),
+        0,
+        "the failed submission's marker was not kept in the quantum"
+    );
+    world.close();
 }
 
 /// A stage on lane 1, not the home lane 0, queues a kernel that runs for 600 ms and then fails its submission. RustEE
