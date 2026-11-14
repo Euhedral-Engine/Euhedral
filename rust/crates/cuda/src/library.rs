@@ -3,8 +3,8 @@
 use std::ffi::{CStr, CString, c_int};
 use std::fmt;
 use std::path::{self, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use libloading::Library;
 

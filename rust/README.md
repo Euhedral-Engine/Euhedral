@@ -23,7 +23,7 @@ The rules are enforced by the compiler toolchain, not by review. Each is checked
 | No channels: no `mpsc` (`channel`, `sync_channel`, `Sender`, `SyncSender`, `Receiver`) | clippy ban |
 | No locks: no `Mutex` or `RwLock`; state is owned by a sink or a source and polled one frame at a time | clippy ban |
 | No blocking I/O: no `std::fs::{read, read_to_string, write, copy, read_dir, metadata}`, `File::open`, `File::create`, `OpenOptions::open`, `io::stdin`, `TcpStream`, `TcpListener::accept` | clippy ban |
-| No waiting CUDA calls: the public wrappers (`CudaLibrary::synchronize`, `CudaLane::synchronize`, `DeviceBuffer::copy_from_host` and `copy_to_host`, `PinnedPool::trim`, `ops::copy_host_to_device` and `copy_device_to_host`) in every crate that links cuda, and inside cuda the generated `EuhedralCuda` methods behind them (synchronize, synchronous copies, `cudaFree`-style frees). A call through a generated function-pointer field is invisible to clippy: give it the same scoped allow | clippy ban (`allow-invalid`: active where the cuda crate is linked) |
+| No waiting CUDA calls: the public wrappers (`CudaLibrary::synchronize`, `DeviceBuffer::copy_from_host` and `copy_to_host`, `PinnedPool::trim`) in every crate that links cuda, and inside cuda the generated `EuhedralCuda` methods behind them (synchronize, synchronous copies, `cudaFree`-style frees). A call through a generated function-pointer field is invisible to clippy: give it the same scoped allow | clippy ban (`allow-invalid`: active where the cuda crate is linked) |
 | The environment is read in one place: no `std::env::var`, `var_os`, `vars`, `vars_os` outside the settings crate and a binary's `main` | clippy ban |
 | No fully qualified names: import the type (`use std::mem;` then `mem::swap(&mut a, &mut b)`, not `std::mem::swap(..)`); a path of more than two segments from a crate root is flagged | `absolute_paths` lint, `absolute-paths-max-segments = 2` in `clippy.toml` (`use` items are not checked) |
 | Libraries do not print | `print_stdout`, `print_stderr` lints |
@@ -73,9 +73,7 @@ planned launch the family files produce. Two files turn a plan into work on a Ru
   sized argument words into one argument buffer per thread that is reused in place, with the launch's programmatic flag.
 
 The device tests `kernels_gpu` (ignored by default) check that every catalog kernel resolves with parameters a
-plan can pass, print the module compile and load times, and run the twin harness (`tests/common/twin.rs`): a case runs
-once through the native C wrapper on a `CudaLane` and once as a planned launch on a RustEE lane, in the one primary
-context of the device, and the outputs are compared byte for byte.
+plan can pass and print the module compile and load times.
 
 ## Benchmark
 

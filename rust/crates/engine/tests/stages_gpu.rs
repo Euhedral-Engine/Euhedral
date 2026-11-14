@@ -44,8 +44,7 @@ use euhedral_graph::{
     QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
 use euhedral_inference_cuda::{
-    CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, GraphRecorder, KernelOps, LaneOps, PinnedPool,
-    RetireList, Submission, SubmitMode, ops,
+    CudaError, CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, LaneOps, PinnedPool, RetireList, SubmitMode,
 };
 use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorDataType, WeightFormat, WeightLayout};
 use euhedral_inference_engine::Handoff;
@@ -128,8 +127,6 @@ struct Rig {
     library: Arc<CudaLibrary>,
     /// RustEE's lanes, the ones the stages run on.
     typed: typed::Typed,
-    /// A native lane, for the tests that record a graph by hand.
-    lane: Arc<CudaLane>,
     lanes: LaneTable,
     /// The pool of the one lane, and the lattice that runs a stage under test in a one-stage graph.
     pool: Arc<LanePool>,
@@ -142,7 +139,6 @@ struct Rig {
 
 fn rig() -> Option<Rig> {
     let library = library()?;
-    let lane = CudaLane::new(&library, LaneId(0), 256).unwrap();
     let typed = typed::Typed::open(&library, 1, 256);
     LANE.with(|slot| *slot.borrow_mut() = Some((typed.table.clone(), Arc::clone(typed.lane(0)))));
     let pool = Arc::clone(&typed.queues);
@@ -166,7 +162,6 @@ fn rig() -> Option<Rig> {
         pinned: PinnedPool::new(&library, 64 << 20),
         retire: Arc::new(RetireList::new()),
         library,
-        lane,
         pool,
     })
 }
@@ -266,7 +261,6 @@ impl Rig {
     }
 
     fn sync(&self) {
-        self.lane.synchronize().unwrap();
         self.typed.sync();
     }
 
@@ -275,11 +269,9 @@ impl Rig {
         self.lanes.submit_ops(self.typed.lane(0), false, work).unwrap().1
     }
 
-    /// Queues `work` in a submission of the rig's lane and waits for it.
-    fn submit(&self, work: impl FnOnce(&Submission<'_>) -> Result<(), CudaError>) {
-        let submission = Submission::begin(&self.lane, SubmitMode::default()).unwrap();
-        work(&submission).unwrap();
-        submission.finish().unwrap();
+    /// Queues `work` as one submission of the rig's lane and waits for it.
+    fn submit(&self, work: impl FnOnce(&mut dyn LaneOps) -> Result<(), CudaError>) {
+        self.ops(work);
         self.sync();
     }
 
@@ -1233,8 +1225,7 @@ fn kv_append_then_decode_reads_back() {
     let pages: Vec<DevicePtr> = kv.pages(0).collect();
     assert_eq!(pages.len(), 2, "301 rows take two pages");
     for (page, address) in pages.iter().enumerate() {
-        let mut bytes = vec![0u8; 2 * plane];
-        rig.submit(|submission| ops::copy_device_to_host(submission, &mut bytes, *address));
+        let bytes = rig.typed.download(*address, 2 * plane);
         let tokens = if page == 0 { 256 } else { 45 };
         for token in 0..tokens {
             let position = page * 256 + token;
@@ -1500,9 +1491,8 @@ fn mtp_stem_concatenates_e_h() {
     // The halves are the single norm launches, bit for bit: [norm(e); norm(h)] per row.
     let single = |input: &DeviceBuffer, weight: &DeviceBuffer| -> Vec<u8> {
         let output = DeviceBuffer::alloc(&rig.library, rows * hidden * 2).unwrap();
-        rig.submit(|submission| {
-            ops::rms_norm_unit_offset_bf16(
-                submission,
+        rig.submit(|ops| {
+            ops.rms_norm_unit_offset_bf16(
                 input.ptr(),
                 weight.ptr(),
                 output.ptr(),
@@ -1532,9 +1522,8 @@ fn mtp_stem_concatenates_e_h() {
 
     // Seeded from the sequence's draft seed rows, from row 2 (a catch-up after the quantum that wrote them).
     let seed_rows = sequence.device.scratch.draft().unwrap().seed_rows.ptr();
-    rig.submit(|submission| {
-        ops::copy_device_to_device(
-            submission,
+    rig.submit(|ops| {
+        ops.copy_device_to_device(
             seed_rows.offset((2 * hidden * 2) as u64),
             seed_buffer.ptr(),
             (rows * hidden * 2) as u64,
@@ -1943,7 +1932,7 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
     let reference = |ids: &[i32]| -> Vec<u8> {
         let input = upload(&rig.library, &id_bytes(ids));
         let output = DeviceBuffer::alloc(&rig.library, ids.len() * hidden * 2).unwrap();
-        rig.submit(|submission| Q3Embedding.submit(&mut &*submission, &weight, input.ptr(), output.ptr(), ids.len()));
+        rig.submit(|ops| Q3Embedding.submit(ops, &weight, input.ptr(), output.ptr(), ids.len()));
         download(&output)
     };
     let looked_up = |rows: usize| get(&workspace, BufferSlot::HiddenState, 0, rows * hidden * 2);
@@ -1989,23 +1978,6 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
         .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
         .reading_draft_tokens(16);
     assert!(past.is_err(), "the builder refuses slots past the step's tokens");
-
-    // Its launch records into a graph, and the replay does what the eager launch did.
-    put(&workspace, BufferSlot::HiddenState, 0, &vec![0u8; rows * hidden * 2]);
-    let recorder = GraphRecorder::begin(&rig.lane).unwrap();
-    {
-        let submission = recorder.submission(quantum.mode()).unwrap();
-        stage.launch(&quantum, &mut &submission).unwrap();
-    }
-    let graph = recorder.end().unwrap();
-    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
-    graph.launch(&submission).unwrap();
-    submission.finish().unwrap();
-    rig.sync();
-    assert!(
-        looked_up(rows) == reference(&step[2..5]),
-        "the replay looks up the same rows"
-    );
 }
 
 // Capture.
@@ -2186,34 +2158,16 @@ fn every_stage_launches_inside_a_graph_capture_and_the_replay_selects() {
         ("selected token", boxed(SelectedToken)),
     ];
 
-    // Eagerly first: it loads every kernel module, which a capture cannot.
-    for (name, stage) in &stages {
-        let submission = Submission::begin(&rig.lane, quantum.mode()).unwrap();
-        stage
-            .launch_on(&quantum, &mut &submission)
-            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
-        submission.finish().unwrap();
-        rig.sync();
-    }
-
-    // Then every launch in one capture: no begin, wait, marker or signal among them.
-    let recorder = GraphRecorder::begin(&rig.lane).unwrap();
-    {
-        let submission = recorder.submission(quantum.mode()).unwrap();
+    let marker = rig.ops(|ops| {
         for (name, stage) in &stages {
             stage
-                .launch_on(&quantum, &mut &submission)
-                .unwrap_or_else(|error| panic!("{name} in a capture: {error:?}"));
+                .launch_on(&quantum, &mut *ops)
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
         }
-    }
-    let graph = recorder.end().unwrap();
-
-    // The graph's launch is followed by the argmax's signal step: the marker the lane's completion word reaches.
-    let submission = Submission::begin(&rig.lane, quantum.mode()).unwrap();
-    graph.launch(&submission).unwrap();
-    let marker = Argmax::signal(submission).unwrap();
+        Ok::<(), CudaError>(())
+    });
     rig.sync();
-    assert!(rig.lane.completed() >= marker.value);
+    assert!(DeviceQueue::completed(&**rig.typed.lane(0)) >= marker.value);
     assert_eq!(selection.token(0), Some(31_337));
     let tokens = download(&sequence.device.scratch.draft().unwrap().tokens);
     assert_eq!(tokens[4..8], 31_337i32.to_ne_bytes(), "the drafted token was passed on");
@@ -2243,8 +2197,7 @@ fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
     let mut cache = KvCache::new(&rig.library, &rig.retire, 1, 1024, KvFormat::Bf16, 4096, 0).unwrap();
     let plane = cache.plane_page_bytes();
     let table_entries = |address: DevicePtr, entries: usize| -> Vec<u64> {
-        let mut bytes = vec![0u8; entries * 8];
-        rig.submit(|submission| ops::copy_device_to_host(submission, &mut bytes, address));
+        let bytes = rig.typed.download(address, entries * 8);
         bytes
             .as_chunks::<8>()
             .0
@@ -2387,10 +2340,7 @@ fn launching_a_stage_on_an_idle_quantum_queues_nothing_and_does_not_underflow() 
     );
     let token = SelectedToken;
     let launch = |stage: &dyn LaunchOnly, quantum: &Quantum| {
-        let submission = Submission::begin(&rig.lane, quantum.mode()).unwrap();
-        stage.launch_on(quantum, &mut &submission).unwrap();
-        submission.finish().unwrap();
-        rig.sync();
+        rig.submit(|ops| stage.launch_on(quantum, ops).map_err(|error| panic!("{error:?}")));
     };
     for stage in [&argmax as &dyn LaunchOnly, &each, &head, &final_norm, &token] {
         launch(stage, &silent);

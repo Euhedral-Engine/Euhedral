@@ -30,8 +30,6 @@ pub struct SubmitMode {
     pub row_exact: bool,
 }
 
-
-
 /// The address of `bytes` at `offset` of the `len` bytes at `base`, refused when they leave them.
 pub(crate) fn range_start(
     base: *mut u8,
@@ -332,8 +330,7 @@ pub trait KernelOps {
     /// architecture-specific module are unavailable elsewhere ([`CudaLibrary::linear_kernel_available`](crate::CudaLibrary::linear_kernel_available)).
     fn linear_kernel_available(&self, index: usize) -> Result<bool, CudaError>;
 
-    /// Queues the copy of `bytes` device bytes into a pinned buffer at `offset`, for a buffer the host shares by `&`
-    /// ([`copy_device_to_readback_shared`]).
+    /// Queues the copy of `bytes` device bytes into a pinned buffer at `offset`, for a buffer the host shares by `&`.
     ///
     /// # Safety
     /// The copy runs after this call returns. `destination` must stay alive until the lane's work up to this copy has
@@ -347,7 +344,7 @@ pub trait KernelOps {
         bytes: usize,
     ) -> Result<(), CudaError>;
 
-    /// Queues the copy of `bytes` bytes at `offset` of a pinned buffer to the device ([`copy_upload_to_device`]).
+    /// Queues the copy of `bytes` bytes at `offset` of a pinned buffer to the device.
     ///
     /// # Safety
     /// The copy runs after this call returns. `source` must stay alive, and its bytes in that range unmodified, until
@@ -360,7 +357,7 @@ pub trait KernelOps {
         bytes: usize,
     ) -> Result<(), CudaError>;
 
-    /// Queues the copy of `bytes` device bytes into a pinned buffer at `offset` ([`copy_device_to_readback`]).
+    /// Queues the copy of `bytes` device bytes into a pinned buffer at `offset`.
     ///
     /// # Safety
     /// The copy runs after this call returns. `destination` must stay alive, and its bytes in that range unread,
@@ -373,8 +370,7 @@ pub trait KernelOps {
         bytes: usize,
     ) -> Result<(), CudaError>;
 
-    /// Queues the copy of `bytes` bytes at `offset` of a host-weights arena to the device
-    /// ([`copy_host_weights_to_device`]).
+    /// Queues the copy of `bytes` bytes at `offset` of a host-weights arena to the device.
     ///
     /// # Safety
     /// The copy runs after this call returns. `source` must stay alive, and its bytes in that range unmodified, until
@@ -387,8 +383,7 @@ pub trait KernelOps {
         bytes: usize,
     ) -> Result<(), CudaError>;
 
-    /// Queues the copy of `bytes` device bytes into a host-weights arena at `offset`
-    /// ([`copy_device_to_host_weights`]).
+    /// Queues the copy of `bytes` device bytes into a host-weights arena at `offset`.
     ///
     /// # Safety
     /// The copy runs after this call returns. `destination` must stay alive, and its bytes in that range neither read

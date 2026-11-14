@@ -20,6 +20,9 @@
     reason = "no-wait, blocking I/O and waiting calls: a test reads files and waits on hand-offs and the device"
 )]
 
+#[path = "common/typed.rs"]
+mod typed;
+
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::mem;
@@ -28,16 +31,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use euhedral_graph::LaneId;
 use euhedral_inference_bench::prompt::PromptCorpus;
 use euhedral_inference_bench::prompt::words::DEFAULT_SEED;
-use euhedral_inference_cuda::{CudaLane, Submission, SubmitMode, ops};
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
 use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
+use typed::Typed;
 
 /// The longest a device test waits for one hand-off; past it the test fails.
 const WAIT: Duration = Duration::from_secs(20 * 60);
@@ -252,23 +254,15 @@ struct Snapshot {
     gdn: Vec<Vec<u8>>,
 }
 
-/// A lane of the test's own, for the copies of a snapshot (a lane id exists once per library).
-fn snapshot_lane(runtime: &EngineRuntime) -> Arc<CudaLane> {
-    let library = runtime.library();
-    CudaLane::new(library, LaneId((library.max_lanes() - 1) as u16), 4).unwrap()
+/// A lane of the test's own, for the copies of a snapshot.
+fn snapshot_lane(runtime: &EngineRuntime) -> Arc<Typed> {
+    Arc::new(Typed::plain(runtime.library(), 1, 4))
 }
 
-fn snapshot(runtime: &EngineRuntime, lane: &Arc<CudaLane>) -> Snapshot {
+fn snapshot(runtime: &EngineRuntime, lane: &Arc<Typed>) -> Snapshot {
     // The read runs on the sequence's owner, which may be another thread: it owns what it uses.
     let lane = Arc::clone(lane);
-    let download = move |ptr, bytes: usize| {
-        let mut host = vec![0u8; bytes];
-        let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-        ops::copy_device_to_host(&submission, &mut host, ptr).unwrap();
-        drop(submission);
-        lane.synchronize().unwrap();
-        host
-    };
+    let download = move |ptr, bytes: usize| lane.download(ptr, bytes);
     let layers = runtime.config().layer_kinds.len();
     runtime
         .inspect_sequence(move |sequence| {

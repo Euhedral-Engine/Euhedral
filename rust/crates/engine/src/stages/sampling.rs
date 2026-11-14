@@ -10,11 +10,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use euhedral_graph::Marker;
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::{
-    AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, PinnedBuffer, Submission,
-};
+use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, PinnedBuffer};
 
 use super::{Launch, Quantum, eager, fatal, launch_u32};
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
@@ -216,16 +213,6 @@ impl Argmax {
             vocabulary,
             rows,
         }
-    }
-}
-
-impl Argmax {
-    /// The signal step of a selection that was launched in a graph: finishes `submission`, on which the graph was
-    /// launched, with a marker whose completion word is written. Eager submission does the same after
-    /// [`Launch::launch`]; a graph capture cannot hold the marker or the signal, so the launch of the graph is
-    /// followed by this.
-    pub fn signal(submission: Submission<'_>) -> Result<Marker, CudaError> {
-        submission.finish_signalled()
     }
 }
 
