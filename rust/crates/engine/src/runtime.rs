@@ -534,14 +534,15 @@ impl EngineRuntime {
     }
 }
 
-/// The fragment configuration of the engine's lattice: RustEE's default, except that a worker with nothing to run
-/// yields instead of parking for a few microseconds (the unproductive park is off), and with the most frames a worker
-/// takes at once from `host.max-batch-size` when that is stated. A decode quantum hands a frame from one stage to the
-/// next some 170 times; a parked worker wakes late, and the wake grows later the longer the process runs, so a long
-/// decode lost more than half its speed within seconds. A size of 1 or 2 makes the workers poll their caches one frame at
-/// a time (`FragmentConfig::polls`), so that other workers can steal what waits behind a heavy frame.
+/// The fragment configuration of the engine's lattice: RustEE's default, except that no worker sits out a cycle (the
+/// idle policy's probe interval is zero), and with the most frames a worker takes at once from `host.max-batch-size`
+/// when that is stated. A decode quantum hands a frame from one stage to the next some 170 times, and nothing wakes a
+/// worker for a frame offered to its cache. Once the lattice has timed enough frames to have a body-cost estimate, its
+/// workers other than the first ranked sit out while few handles are productive, parked for up to most of a
+/// millisecond; the hand-offs then wait for a worker that runs, and a long decode lost more than half its speed within
+/// seconds. A worker that enters a handle every cycle keeps the stages' hand-offs running side by side.
 pub fn fragment_config(settings: &Settings) -> FragmentConfig {
-    let policy = IdlePolicy::default().with_unproductive_park(Duration::ZERO);
+    let policy = IdlePolicy::default().with_probe_interval(Duration::ZERO);
     let fragment = FragmentConfig::default().with_idle_policy(policy);
     let stated = match settings.host.max_batch_size {
         Auto::Value(size) => NonZeroU64::new(u64::from(size)),

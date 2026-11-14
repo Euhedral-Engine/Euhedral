@@ -87,15 +87,15 @@ fn settings(max_batch_size: Auto<u32>) -> Settings {
     settings
 }
 
-/// A worker that parks between the stages of a quantum wakes later the longer the process runs; the engine's workers
-/// yield instead, and keep RustEE's other timings.
+/// A worker that sits out cycles parks while frames wait in its cache and nothing wakes it; the engine's workers enter a
+/// handle in every cycle, and keep RustEE's other timings.
 #[test]
-fn workers_with_nothing_to_run_yield_instead_of_parking() {
+fn workers_never_sit_out_a_cycle() {
     let policy = fragment_config(&settings(Auto::Auto)).idle_policy().clone();
     let default = FragmentConfig::default().idle_policy().clone();
-    assert!(policy.unproductive_park().is_zero());
+    assert!(policy.probe_interval().is_zero());
     assert_eq!(policy.idle_park(), default.idle_park());
-    assert_eq!(policy.probe_interval(), default.probe_interval());
+    assert_eq!(policy.unproductive_park(), default.unproductive_park());
 }
 
 #[test]
