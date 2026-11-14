@@ -1,7 +1,7 @@
 //! Retiring a quantum that ended before its stages did.
 //!
 //! A quantum retires when every lane it used has reached the quantum's latest marker on it, and a lane reaches only
-//! the markers that were signalled (`Submission::finish_signalled`): the plan signals the ends of the lanes' chains and
+//! the markers that were signalled: the plan signals the ends of the lanes' chains and
 //! no other stage, so a completed quantum's last marker on each lane is signalled. A quantum that stops early (its kill
 //! switch was set, or a stage failed) can have submitted a stage that is not a chain's end and then never submitted
 //! the stage that would have signalled behind it; its last marker on that lane is unsignalled, the lane's completion

@@ -20,6 +20,9 @@
     reason = "no-wait, blocking I/O and waiting calls: a test reads files, copies device memory and waits on the hand-off"
 )]
 
+#[path = "common/typed.rs"]
+mod typed;
+
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -27,8 +30,7 @@ use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 
-use euhedral_graph::LaneId;
-use euhedral_inference_cuda::{CudaLane, CudaLibrary, DevicePtr, Submission, SubmitMode, ops};
+use euhedral_inference_cuda::{CudaLibrary, DevicePtr};
 use euhedral_inference_edrl::WeightFormat;
 use euhedral_inference_engine::error::{EngineError, PlanError};
 use euhedral_inference_engine::model::{LayerIndex, NormKind, Role};
@@ -36,6 +38,7 @@ use euhedral_inference_engine::residency::loader::pieces;
 use euhedral_inference_engine::residency::planner::{DEFAULT_RUNTIME_RESERVE_BYTES, nvfp4};
 use euhedral_inference_engine::workspace::BufferSlot;
 use euhedral_inference_engine::{EngineRuntime, RuntimeOwner};
+use typed::Typed;
 
 /// The longest a device test waits for one hand-off; past it the test fails.
 const WAIT: Duration = Duration::from_secs(20 * 60);
@@ -82,16 +85,6 @@ fn read_file(path: &Path, offset: u64, length: usize) -> Vec<u8> {
 
 fn sha(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// `bytes` bytes at `ptr`, copied to the host on a lane of the test's own.
-fn download(library: &Arc<CudaLibrary>, lane: &CudaLane, ptr: DevicePtr, bytes: usize) -> Vec<u8> {
-    let submission = Submission::begin(lane, SubmitMode::default()).unwrap();
-    let mut host = vec![0; bytes];
-    ops::copy_device_to_host(&submission, &mut host, ptr).unwrap();
-    drop(submission);
-    let _ = library;
-    host
 }
 
 #[test]
@@ -224,7 +217,7 @@ fn uploaded_bytes_match_file_sha() {
     let (runtime, owner) = start(&settings, &machine.library);
     let runtime = runtime.expect("the engine starts");
     let library = Arc::clone(runtime.library());
-    let lane = CudaLane::new(&library, LaneId(48), 4).unwrap();
+    let typed = Typed::plain(&library, 1, 4);
     let plan = runtime.plan();
     let base = runtime.weights().get(LayerIndex(10), Role::Down).unwrap().ptr.get()
         - plan.placement("text/layers/10/mlp/down").unwrap().offset;
@@ -238,9 +231,7 @@ fn uploaded_bytes_match_file_sha() {
         "text/layers/0/gdn/convolution",
     ] {
         let placement = plan.placement(name).unwrap();
-        let on_device = download(
-            &library,
-            &lane,
+        let on_device = typed.download(
             DevicePtr::NULL.offset(base + placement.offset),
             placement.bytes as usize,
         );
@@ -267,12 +258,7 @@ fn uploaded_bytes_match_file_sha() {
         let placement = plan.placement(name).unwrap();
         assert_eq!(placement.bytes, nvfp4::byte_size(half, k, layout).unwrap());
         let device = |offset: u64, bytes: u64| {
-            download(
-                &library,
-                &lane,
-                DevicePtr::NULL.offset(base + placement.offset + offset),
-                bytes as usize,
-            )
+            typed.download(DevicePtr::NULL.offset(base + placement.offset + offset), bytes as usize)
         };
         let file = |offset: u64, bytes: u64| read_file(&source, pack_offset + offset, bytes as usize);
         assert_eq!(
@@ -295,8 +281,7 @@ fn uploaded_bytes_match_file_sha() {
         );
     }
     let _ = pack;
-    lane.synchronize().unwrap();
-    drop(lane);
+    drop(typed);
     owner.shutdown(runtime).unwrap();
 }
 

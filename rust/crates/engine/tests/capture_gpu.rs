@@ -43,12 +43,9 @@ use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_gpu::cuda::CudaQueue;
 use euhedral_gpu::{GraphStats, Ran};
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, GraphRuntime, Lake, LaneId, LanePool, Marker, QuantumOutcome, RetryCounts,
-    UnitGuard,
+    Completions, DEFAULT_RETRY_BACKSTOP, GraphRuntime, Lake, LanePool, Marker, QuantumOutcome, RetryCounts, UnitGuard,
 };
-use euhedral_inference_cuda::{
-    CudaError, CudaLane, CudaLibrary, DeviceBuffer, LaneOps, PinnedPool, RetireList, Submission, SubmitMode,
-};
+use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, LaneOps, PinnedPool, RetireList, SubmitMode};
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
@@ -109,16 +106,14 @@ struct Model {
     _trellis: Vec<linear_gpu::Trellis>,
 }
 
-fn upload(library: &Arc<CudaLibrary>, lane: &CudaLane, bytes: &[u8]) -> DeviceBuffer {
+fn upload(library: &Arc<CudaLibrary>, bytes: &[u8]) -> DeviceBuffer {
     let buffer = DeviceBuffer::alloc(library, bytes.len().max(256)).unwrap();
-    let submission = Submission::begin(lane, SubmitMode::default()).unwrap();
     buffer.copy_from_host(0, bytes).unwrap();
-    drop(submission);
     buffer
 }
 
 /// Loads the objects of the first `LAYERS` layers, the globals and the MTP layer from the artifact.
-fn load_model(artifact: &mut Artifact, library: &Arc<CudaLibrary>, lane: &CudaLane) -> Model {
+fn load_model(artifact: &mut Artifact, library: &Arc<CudaLibrary>) -> Model {
     let names: Vec<String> = artifact
         .table()
         .entries()
@@ -159,7 +154,7 @@ fn load_model(artifact: &mut Artifact, library: &Arc<CudaLibrary>, lane: &CudaLa
                 let from = nvfp4::trailer_offset(rows, k, layout).unwrap() as usize;
                 let to = nvfp4::trailer_offset(half, k, layout).unwrap() as usize;
                 out[to..to + trailer].copy_from_slice(&bytes[from..from + trailer]);
-                let buffer = upload(library, lane, &out);
+                let buffer = upload(library, &out);
                 let key = object_key(half_name, LAYERS).unwrap();
                 weights.insert(
                     key,
@@ -206,8 +201,7 @@ fn shared_model() -> Option<&'static Model> {
         .get_or_init(|| {
             let library = library()?;
             let mut artifact = Artifact::open()?;
-            let loader = CudaLane::new(&library, LaneId(63), 16).unwrap();
-            Some(load_model(&mut artifact, &library, &loader))
+            Some(load_model(&mut artifact, &library))
         })
         .as_ref()
 }

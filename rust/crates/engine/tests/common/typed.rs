@@ -12,8 +12,8 @@ use std::sync::Arc;
 use euhedral_gpu::cuda::{CudaGpu, CudaQueue};
 use euhedral_gpu::{StreamOptions, open_shared_lanes};
 use euhedral_graph::{LaneId, LanePool};
-use euhedral_inference_cuda::CudaLibrary;
 use euhedral_inference_cuda::launch::load::load;
+use euhedral_inference_cuda::{CudaLibrary, DevicePtr, PinnedBuffer};
 use euhedral_inference_engine::kernels::kernel_sources;
 use euhedral_inference_engine::runtime::{open_device, open_lane_set};
 use euhedral_inference_engine::stages::LaneTable;
@@ -74,5 +74,20 @@ impl Typed {
     /// Waits for all the work queued on the device.
     pub fn sync(&self) {
         self.library.synchronize().unwrap();
+    }
+}
+
+impl Typed {
+    /// `bytes` bytes at `ptr`, read back on lane 0 and waited for.
+    pub fn download(&self, ptr: DevicePtr, bytes: usize) -> Vec<u8> {
+        let mut pinned = PinnedBuffer::alloc(&self.library, bytes.max(1)).unwrap();
+        self.table
+            .submit_ops(self.lane(0), false, |ops| {
+                // SAFETY: `pinned` outlives the copy (the device is waited for below) and is not read before.
+                unsafe { ops.copy_device_to_readback(&mut pinned, 0, ptr, bytes) }
+            })
+            .unwrap();
+        self.sync();
+        pinned.as_slice()[..bytes].to_vec()
     }
 }

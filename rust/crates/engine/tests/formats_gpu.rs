@@ -27,10 +27,12 @@
 
 #[path = "common/linear_gpu.rs"]
 mod linear_gpu;
+#[path = "common/typed.rs"]
+mod typed;
 
 use std::collections::HashMap;
 
-use euhedral_inference_cuda::{DeviceBuffer, Submission, SubmitMode};
+use euhedral_inference_cuda::DeviceBuffer;
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use euhedral_inference_engine::formats::{
     LinearFormat, LinearKernel, LinearMode, Nvfp4Linear, Q3Embedding, ROW_EXACT_KERNELS, ShapeRecorder, TrellisLinear,
@@ -414,12 +416,7 @@ fn q3_embedding_looks_up_token_rows() {
     let tokens = upload(&rig.library, &id_bytes);
     let sentinel = bf16(123.0).to_le_bytes();
     let output = upload(&rig.library, &sentinel.repeat(ids.len() * hidden));
-    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
-    Q3Embedding
-        .submit(&mut &submission, &weight, tokens.ptr(), output.ptr(), ids.len())
-        .unwrap();
-    submission.finish().unwrap();
-    rig.lane.synchronize().unwrap();
+    rig.run(|ops| Q3Embedding.submit(ops, &weight, tokens.ptr(), output.ptr(), ids.len()));
     let mut host = vec![0u8; ids.len() * hidden * 2];
     output.copy_to_host(0, &mut host).unwrap();
     let rows: Vec<Vec<f32>> = host
@@ -448,12 +445,11 @@ fn q3_embedding_looks_up_token_rows() {
     // A weight that is not a Q3 table is refused before any launch.
     let mut refused = weight.clone();
     refused.format = WeightFormat::Nvfp4;
-    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
-    assert!(
-        Q3Embedding
-            .submit(&mut &submission, &refused, tokens.ptr(), output.ptr(), 1)
-            .is_err()
-    );
+    let made = rig.typed.table.submit_ops(rig.typed.lane(0), false, |ops| {
+        Q3Embedding.submit(ops, &refused, tokens.ptr(), output.ptr(), 1)
+    });
+    rig.typed.sync();
+    assert!(made.is_err());
 }
 
 #[test]

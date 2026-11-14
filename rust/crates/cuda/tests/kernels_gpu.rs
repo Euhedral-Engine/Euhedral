@@ -1,4 +1,4 @@
-//! Device tests of the kernel loader and the planned-launch queue. `#[ignore]`d like the crate's other device tests:
+//! Device test of the kernel loader. `#[ignore]`d like the crate's other device tests:
 //! `cargo test -p euhedral-inference-cuda --test kernels_gpu -- --ignored --test-threads=1 --nocapture`.
 //!
 //! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY`); a test skips with a
@@ -12,8 +12,6 @@
 )]
 #![allow(clippy::print_stdout, reason = "the measurements are the test's output")]
 
-mod common;
-
 use std::fs::create_dir_all;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,11 +19,8 @@ use std::time::{Duration, Instant};
 
 use euhedral_gpu::cuda::CudaGpu;
 use euhedral_inference_cuda::CudaLibrary;
-use euhedral_inference_cuda::launch::catalog::{Arguments, KERNELS, Launch, MAX_ARGUMENTS, MAX_TENSOR_MAPS};
+use euhedral_inference_cuda::launch::catalog::{KERNELS, MAX_ARGUMENTS, MAX_TENSOR_MAPS};
 use euhedral_inference_cuda::launch::load::{KernelSources, Slot, Unavailable, load};
-use euhedral_inference_cuda::{DevicePtr, kernel, ops};
-
-use common::twin::{Case, Twin, Verdict};
 
 fn library() -> Option<Arc<CudaLibrary>> {
     let path = test_support::require_property("euhedral.cuda.library")?;
@@ -171,58 +166,4 @@ fn every_catalog_kernel_resolves_with_the_parameters_a_plan_passes() {
     if gpu.arch().0 == 12 {
         assert_eq!(ready, KERNELS.len());
     }
-}
-
-/// The harness itself, end to end on one real kernel: the C wrapper and the planned launch agree bit for bit, and a
-/// plan that differs is told apart.
-#[test]
-#[ignore = "needs a GPU, the native library and NVRTC"]
-fn the_twin_harness_compares_a_wrapper_with_its_plan_bit_for_bit() {
-    let Some(library) = library() else { return };
-    if !compiler_available(&library) {
-        println!("skipped: no bundled NVRTC beside the library");
-        return;
-    }
-    let mut twin = Twin::open(&library).expect("both sides open on one device");
-    let count: u32 = 1000;
-    // bf16 values from a fixed pattern (any bit pattern is a value or a NaN, and both sides compute it the same way).
-    let pattern = |seed: u32| -> Vec<u8> {
-        (0..count)
-            .flat_map(|index| (0x3c00u16 + (index.wrapping_mul(seed) % 0x300) as u16).to_le_bytes())
-            .collect()
-    };
-    let bytes = count as usize * 2;
-    let planned = |pointers: &[DevicePtr], delta_index: usize| {
-        vec![Launch::new(
-            kernel!("euhedral_residual_add_bf16"),
-            [count.div_ceil(256), 1, 1],
-            [256, 1, 1],
-            0,
-            Arguments::new()
-                .pointer(pointers[0])
-                .pointer(pointers[delta_index])
-                .pointer(pointers[2])
-                .u32(count),
-        )]
-    };
-    let case = |delta_index: usize| Case {
-        name: "residual add",
-        buffers: vec![pattern(7), pattern(13), vec![0; bytes]],
-        prepare: None,
-        native: Box::new(move |submission, pointers| {
-            ops::residual_add_bf16(submission, pointers[0], pointers[1], pointers[2], 1, count)
-        }),
-        plan: Box::new(move |pointers| planned(pointers, delta_index)),
-        outputs: vec![2],
-        row_exact: false,
-        tables: Vec::new(),
-        scratch: Vec::new(),
-    };
-    let verdict = twin.run(&case(1)).expect("the case runs");
-    println!("residual add: {verdict:?}");
-    assert_eq!(verdict, Verdict::Identical { bytes });
-    // The plan adds the wrong operand: the harness must report a difference, not equality.
-    let verdict = twin.run(&case(0)).expect("the case runs");
-    assert!(matches!(verdict, Verdict::Differs { buffer: 2, .. }), "{verdict:?}");
-    assert_eq!(case(1).name, "residual add");
 }

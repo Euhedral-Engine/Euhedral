@@ -6,7 +6,6 @@ use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
-use euhedral_graph::Marker;
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
 use euhedral_io::IoMemory;
 
@@ -14,7 +13,6 @@ use crate::error::{CudaError, check};
 use crate::library::CudaLibrary;
 use crate::ops::LaneOps;
 use crate::retire::Retire;
-use crate::submission::{Submission, capture_selected};
 
 /// A device address, opaque to the host. Zero is null.
 ///
@@ -69,9 +67,9 @@ pub struct AllocationId(pub u64);
 ///
 /// A plain drop frees the buffer at once with `cudaFree`, which waits for the whole device under the driver's lock (and
 /// frees memory queued work may still use if the caller dropped it too early: nothing here tracks readers). That is for
-/// startup and shutdown only. To free on a running engine, allocate with [`DeviceBuffer::alloc_async`] and retire the
+/// startup and shutdown only. To free on a running engine, allocate with [`LaneOps::alloc_async`](crate::LaneOps::alloc_async) and retire the
 /// buffer with the marker of its last use ([`RetireList`](crate::RetireList)), or free it in stream order with
-/// [`DeviceBuffer::free_async`]; both use `cudaFreeAsync` and never wait. A buffer from [`DeviceBuffer::alloc`] is not
+/// [`LaneOps::free_async`](crate::LaneOps::free_async); both use `cudaFreeAsync` and never wait. A buffer from [`DeviceBuffer::alloc`] is not
 /// retirable.
 #[derive(Debug)]
 pub struct DeviceBuffer {
@@ -90,15 +88,6 @@ impl DeviceBuffer {
         // SAFETY: the call takes a size.
         let address = unsafe { library.api().euhedral_cuda_malloc(size) };
         Self::wrap(library, "euhedral_cuda_malloc", address, bytes, false)
-    }
-
-    /// Allocates `bytes` in stream order on the submission's lane: the memory is usable by work queued after this
-    /// call on that lane, and the host never waits. Not allowed while the lane is captured into a graph.
-    pub fn alloc_async(submission: &Submission<'_>, bytes: usize) -> Result<DeviceBuffer, CudaError> {
-        if submission.lane().is_capturing() {
-            return Err(CudaError::Capturing("a stream-ordered allocation"));
-        }
-        Self::alloc_on_selected(submission.lane().library(), bytes)
     }
 
     /// Allocates `bytes` in stream order on the stream the calling thread has selected in the C library.
@@ -140,20 +129,6 @@ impl DeviceBuffer {
         })
     }
 
-    /// Frees the buffer in stream order on the submission's lane: the memory returns to the pool once the lane
-    /// reaches this point, after every reader queued before it on that lane. `readers` are the markers of the last
-    /// uses on other lanes; the free waits for each on the device first, so a reader on another lane never sees
-    /// reused memory. Pass every lane that still reads the buffer.
-    pub fn free_async(self, submission: &Submission<'_>, readers: &[Marker]) -> Result<(), CudaError> {
-        if submission.lane().is_capturing() {
-            return Err(CudaError::Capturing("a stream-ordered free"));
-        }
-        for reader in readers {
-            submission.wait(*reader)?;
-        }
-        self.free_on_selected()
-    }
-
     /// The device address.
     pub fn addr(&self) -> u64 {
         self.addr
@@ -175,15 +150,12 @@ impl DeviceBuffer {
     }
 
     /// Copies `host` into the buffer at `offset` and returns when the copy is done. Startup, shutdown and tests: it
-    /// blocks, and outside a submission it runs on the legacy stream, which does not order against lane work.
+    /// blocks, and unless it runs inside a lane's lent stream (`LaneTable::submit_host`) it runs on the legacy stream, which does not order against lane work.
     #[allow(
         clippy::disallowed_methods,
         reason = "no-wait, synchronous copy: documented as startup, shutdown and tests only"
     )]
     pub fn copy_from_host(&self, offset: usize, host: &[u8]) -> Result<(), CudaError> {
-        if capture_selected() {
-            return Err(CudaError::Capturing("a blocking host copy"));
-        }
         let destination = self.range(offset, host.len())?;
         // SAFETY: `destination` lies inside this allocation and `host` is a live slice of the stated length.
         let status = unsafe {
@@ -203,9 +175,6 @@ impl DeviceBuffer {
         reason = "no-wait, synchronous copy: documented as startup, shutdown and tests only"
     )]
     pub fn copy_to_host(&self, offset: usize, host: &mut [u8]) -> Result<(), CudaError> {
-        if capture_selected() {
-            return Err(CudaError::Capturing("a blocking host copy"));
-        }
         let source = self.range(offset, host.len())?;
         // SAFETY: `source` lies inside this allocation and `host` is a live exclusive slice of the stated length.
         let status = unsafe {

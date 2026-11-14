@@ -5,13 +5,10 @@
 //! - [`DeviceBuffer`], [`PinnedBuffer`] and [`HostWeightsArena`] own device, page-locked and host-weight memory.
 //! - [`PinnedPool`] recycles pinned buffers; [`RetireList`] frees a buffer once the lane work that last used it has
 //!   retired.
-//! - [`CudaLane`] is one stream with an event ring and a host-mapped completion word, and implements
-//!   `DeviceQueue`: `completed()` is one atomic read.
-//! - [`Submission`] takes a lane (one at a time; a second `begin` returns `LaneBusy`) and selects it for the calling
-//!   thread; [`ops`] holds the operations, each taking one.
-//! - [`GraphRecorder`] and [`GraphExec`] capture a lane's submissions and replay them.
+//! - [`KernelOps`] and [`LaneOps`] are the operations the stages queue; [`launch`] plans and enqueues them on RustEE
+//!   lanes ([`RusteeOps`](launch::ops::RusteeOps)).
 //!
-//! The device waits are the ones documented as blocking: `synchronize` (library and lane), the host copies, and every
+//! The device waits are the ones documented as blocking: `synchronize` (the library's), the host copies, and every
 //! plain drop that frees device or pinned memory (`cudaFree` and `cudaFreeHost` wait for the whole device under the
 //! driver's lock, which can deadlock against a lane parked on a host flag). Those are for startup, shutdown and tests;
 //! on a running engine pinned buffers come from the pool and stream-ordered device buffers go through the retire list
@@ -24,8 +21,6 @@
 
 mod device;
 mod error;
-mod graph;
-mod lane;
 pub mod launch;
 mod library;
 mod memory;
@@ -33,7 +28,6 @@ pub mod ops;
 mod pool;
 mod retire;
 mod stack;
-mod submission;
 
 /// The generated declarations of the C ABI (`cargo xtask bindings` rewrites this file).
 #[rustfmt::skip]
@@ -50,11 +44,8 @@ pub mod sys;
 
 pub use device::DeviceInfo;
 pub use error::CudaError;
-pub use graph::{GraphExec, GraphRecorder};
-pub use lane::CudaLane;
 pub use library::CudaLibrary;
 pub use memory::{AllocationId, DeviceBuffer, DevicePtr, HostWeightsArena, PinnedBuffer};
-pub use ops::{KernelOps, LaneOps};
+pub use ops::{KernelOps, LaneOps, SubmitMode};
 pub use pool::{PinnedPool, PooledPinned};
 pub use retire::{Retire, RetireList};
-pub use submission::{Submission, SubmitMode};

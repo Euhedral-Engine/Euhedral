@@ -127,7 +127,7 @@ where
 
     /// Sets whether the launches the catalog marks overlap their predecessors (programmatic dependent launch): a
     /// kernel is launched so when it is registered for it and this is true, which it is until set. A quantum's
-    /// [`SubmitMode`](crate::submission::SubmitMode) says it.
+    /// [`SubmitMode`](crate::SubmitMode) says it.
     #[must_use]
     pub fn with_pdl(mut self, pdl: bool) -> Self {
         self.pdl = pdl;
