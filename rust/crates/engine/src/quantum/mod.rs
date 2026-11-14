@@ -11,9 +11,9 @@
 //!   that backs its cache rows. The cache follows RustEE's model: the first sight of a key runs the body as direct
 //!   launches, the second records it as a graph, and every sight after replays the recording as it is (the key covers
 //!   every argument, so a replay needs no checking pass; a build with debug assertions still runs one and names a key
-//!   that forgot a field). Its marker is recorded in the quantum's [`LaneEnds`](crate::stages::LaneEnds) like a
-//!   stage's, so settling and retirement are the same, and what the run keeps alive for the device is held by the
-//!   quantum until it is dropped, after it retired.
+//!   that forgot a field). It runs on the quantum's home lane, which RustEE's retirement covers whether the run
+//!   succeeded or not, and what the run keeps alive for the device is held by the quantum until it is dropped, after
+//!   it retired.
 //!
 //! The host side effects of a quantum (the input record's upload, the KV reservation, the frontiers, the logits
 //! bookkeeping) are the owner's, before the body runs and after the quantum retires, so a replay does none of them.
@@ -46,7 +46,7 @@ use crate::plan::{MAX_CAPTURED_ROWS, Plan, Variant, View};
 use crate::stages::DraftSeed;
 use crate::stages::Quantum;
 use crate::stages::attention::{KvSource, takes_decode_scratch};
-use crate::stages::{QuantumError, QuantumKind, Settler, Settling, StageLaunch, fatal};
+use crate::stages::{QuantumError, QuantumKind, StageLaunch, fatal};
 use crate::workspace::BufferSlot;
 use whole::{Launches, Site, run_cached};
 
@@ -408,7 +408,6 @@ impl Stage<Quantum> for Whole {
             gpu: &*self.gpu,
             lane: &**lane,
             waits: &waits,
-            ends: &quantum.ends,
         };
         let made = run_cached(&site, &self.cache, capture.key, &mut launches, &mut hold);
         // A run that did not start keeps nothing; one that failed may have queued work that reads what it kept.
@@ -491,7 +490,6 @@ impl Executor {
     ) -> Result<Executor, GraphError> {
         let retire: Arc<dyn Fn(Quantum, QuantumOutcome) + Send + Sync> = Arc::new(retire);
         let stage_lanes = stage_lanes.max(1);
-        let settler = Settler::new(runtime);
         let captured = |variant: Variant| captures_per_view > 0 && variant.representative().capturable();
         let views = Variant::ALL
             .into_iter()
@@ -508,11 +506,7 @@ impl Executor {
                 whole.push(Vec::new());
                 continue;
             };
-            // A quantum that is killed or fails part-way settles its lanes, so that it retires.
-            let settling = |stage: &Arc<dyn Stage<Quantum>>| {
-                Arc::new(Settling::new(Arc::clone(stage), Arc::clone(&settler))) as Arc<dyn Stage<Quantum>>
-            };
-            let stages: Vec<Arc<dyn Stage<Quantum>>> = units.iter().map(settling).collect();
+            let stages: Vec<Arc<dyn Stage<Quantum>>> = units.to_vec();
             // One copy of the graph for each home lane: a quantum runs on the copy of its own home.
             let mut homed = Vec::with_capacity(stage_lanes);
             for home in 0..stage_lanes {
@@ -537,7 +531,6 @@ impl Executor {
                     cache: Arc::clone(&cache),
                     gpu: Arc::clone(&gpu),
                 });
-                let body = settling(&body);
                 for home in 0..stage_lanes {
                     let again = Arc::clone(&retire);
                     bodies.push(StageGraph::new(

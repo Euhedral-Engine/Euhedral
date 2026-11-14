@@ -22,9 +22,8 @@ const KEY_BYTES: usize = 8;
 
 /// The words a quantum's argmax writes on the device and the pinned memory their copy lands in.
 ///
-/// The host reads a key only after the marker of the [`Argmax`] stage that wrote it has been reached (a completion
-/// edge, or the lane's completion word): the stage finishes with a signalled marker, so the lane's completion word
-/// reaches the marker once the copy has retired.
+/// The host reads a key only after the quantum that wrote it has retired, which is after the marker of the [`Argmax`]
+/// stage's work has been reached.
 #[derive(Debug)]
 pub struct Selection {
     keys: DeviceBuffer,
@@ -196,8 +195,7 @@ pub enum SelectedRows {
 
 /// The greedy selection over the quantum's logits, and the copy of its keys to pinned memory.
 ///
-/// The stage's marker is signalled, so that a completion edge to the stage that follows it (the sequence's
-/// continuation) is found by the lane's completion word.
+/// The quantum's retirement is behind the stage's marker, so the keys are readable once the quantum retired.
 #[derive(Clone, Debug)]
 pub struct Argmax {
     logits: BufferSlot,

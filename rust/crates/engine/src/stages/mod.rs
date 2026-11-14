@@ -24,9 +24,10 @@ pub mod linear;
 pub mod mtp;
 pub mod norm;
 pub mod sampling;
-pub mod settle;
+pub mod unmarked;
 
 use std::fmt::{self, Display};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -47,7 +48,7 @@ use crate::state::{FlightGuard, KvView, SequenceDevice};
 use crate::workspace::{BufferSlot, Workspace, WorkspaceError};
 use attention::KvSource;
 use sampling::{Selection, SelectionLease};
-pub use settle::{LaneEnds, Lanes, Settled, Settler, Settling};
+pub use unmarked::Unmarked;
 
 /// What a quantum is, which sets the routes of its stages (`Quantum.ExecutionKind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -360,9 +361,9 @@ pub struct Quantum {
     pub(crate) mode: SubmitMode,
     pub(crate) config: Arc<ModelConfig>,
     pub(crate) lanes: LaneTable,
-    /// The latest marker the quantum submitted on each lane and the latest it signalled, which says whether it can
-    /// retire if it ends early (see [`settle`]).
-    pub(crate) ends: Arc<LaneEnds>,
+    /// The latest marker of a failed submission on each lane: work with no marker of the quantum's recorded work
+    /// behind it, which the home lane is ordered behind when the quantum is abandoned (see [`unmarked`]).
+    pub(crate) unmarked: Unmarked,
     /// Logits rows the quantum scores: the rows of its final norm, its head and its selection.
     pub(crate) logits_rows: usize,
     /// Whether the base rows' post-final-norm hidden also seed the sequence's drafting.
@@ -444,7 +445,7 @@ impl Quantum {
             seq,
             mode,
             config,
-            ends: Arc::new(LaneEnds::new(lanes.len())),
+            unmarked: Unmarked::new(lanes.len()),
             lanes,
             logits_rows,
             record: 0,
@@ -625,9 +626,9 @@ impl Quantum {
         self.kind
     }
 
-    /// The latest marker the quantum submitted on each lane, and the latest it signalled.
-    pub fn lane_ends(&self) -> &Arc<LaneEnds> {
-        &self.ends
+    /// The markers of the quantum's failed submissions, which its home lane is ordered behind on abandonment.
+    pub fn unmarked(&self) -> &Unmarked {
+        &self.unmarked
     }
 
     pub fn rows(&self) -> usize {
@@ -740,40 +741,30 @@ impl<L: Launch> StageLaunch for L {
 
 /// The stage for eager submission, standing alone: begins a submission of the quantum's mode on the lane the graph
 /// chose, waits for the markers of the predecessors on other lanes, calls [`Launch::launch`], and finishes with the
-/// marker of the work, signalled ([`run_stage`]).
+/// marker of the work ([`run_stage`]).
 ///
 /// A lane held by another submission answers [`StageError::Retry`], before anything was queued; every other failure
 /// is fatal to the quantum.
 pub fn run_eager<L: Launch>(stage: &L, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-    // Standing alone, a stage has no lane to end: with nothing to launch it queues nothing.
-    if stage.idle(quantum) {
-        return Ok(Submitted::done());
-    }
-    run_stage(stage, quantum, cx, true)
+    run_stage(stage, quantum, cx)
 }
 
-/// Runs a stage as [`run_eager`] does, with its marker signalled or not.
+/// Runs a stage as [`run_eager`] does.
 ///
-/// Every submission ends with a marker of its own on the lane ([`submit_on`]); `signal` says whether it is the end of
-/// a chain of continuations, which [`Quantum::lane_ends`] records so that a quantum that stops early can tell whether its
-/// last marker on a lane can retire. A graph's retirement boundary is the latest marker of every lane the quantum
-/// used, so the last stage of each lane must signal, and the others need not: the plan computes which those are ([`Plan::signalled`](crate::plan::Plan::signalled)). A quantum that ends before its
-/// chains' ends have run is settled by [`Settling`]. A stage that has nothing to
-/// launch for the quantum but is to signal still ends a submission on its lane, behind the markers it waits for, with
-/// a signalled marker and no launch, so the lane's last marker is reachable whatever the quantum skips.
+/// Every submission ends with a marker of its own on the lane ([`submit_on`]), which RustEE's stage graph records, so
+/// that the quantum retires behind the latest marker of each lane it used. A stage with nothing to launch for the
+/// quantum queues nothing and leaves no marker: the markers of its predecessors pass through it.
 pub fn run_stage<L: StageLaunch + ?Sized>(
     stage: &L,
     quantum: &Quantum,
     cx: &StageCx<'_>,
-    signal: bool,
 ) -> Result<Submitted, StageError> {
-    let idle = stage.idle(quantum);
-    if idle && !signal {
+    if stage.idle(quantum) {
+        // An idle stage queues nothing, so there is nothing to mark. A completion edge from it would fire at once; the
+        // plan has only submission edges, which pass the stage's inputs through.
         return Ok(Submitted::done());
     }
-    if !idle {
-        quantum.check_prepared()?;
-    }
+    quantum.check_prepared()?;
     let id = cx
         .lane
         .ok_or_else(|| fatal("a stage with device work was given no lane"))?;
@@ -783,19 +774,13 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
         .ok_or_else(|| fatal(format!("lane {} is not in the lane table", id.0)))?;
     let modes = quantum.lanes.modes(quantum.mode.row_exact);
     let table = quantum.lanes.kernels();
-    let marker = if idle {
-        quantum
-            .ends
-            .submit(&**lane, cx.waits.iter().copied(), signal, |_| Ok(()))?
-    } else {
-        let waits = cx.waits.iter().copied().chain(stage.waits(quantum));
-        quantum.ends.submit(&**lane, waits, signal, |queue| {
-            stage.launch(
-                quantum,
-                &mut RusteeOps::new(queue, table, modes).with_pdl(quantum.mode.pdl),
-            )
-        })?
-    };
+    let waits = cx.waits.iter().copied().chain(stage.waits(quantum));
+    let marker = submit_on(&**lane, waits, &quantum.unmarked, |queue| {
+        stage.launch(
+            quantum,
+            &mut RusteeOps::new(queue, table, modes).with_pdl(quantum.mode.pdl),
+        )
+    })?;
     Ok(Submitted::marker(marker))
 }
 
@@ -806,11 +791,17 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
 /// lane's waits before the claim. Nothing blocks: a lane whose marker ring is full of markers that have not completed
 /// (or whose next slot an awaiter on another lane holds) answers [`StageError::Retry`], and then `launch` has not
 /// run and no marker was made; the waits that were already enqueued stay, and the retry enqueues them again, which
-/// orders the lane behind the same markers twice and changes nothing. A launch that fails gives its marker up, and
-/// its error is the stage's.
+/// orders the lane behind the same markers twice and changes nothing.
+///
+/// A launch that fails (or panics) has queued part of its work already, and RustEE records the marker of a failed
+/// stage nowhere, so the marked submission is given an `Ok` that carries the launch's result and always publishes its
+/// marker. When the launch failed the marker goes to `unmarked`, which orders the quantum's home lane behind it when the
+/// quantum is abandoned, and the launch's error is the stage's; a panic is resumed once the marker is kept. If the submission itself fails after the launch ran, the launch's own
+/// error (or panic) is still the stage's and only otherwise is the submission's error.
 pub fn submit_on<L: Lane>(
     lane: &L,
     waits: impl IntoIterator<Item = Marker>,
+    unmarked: &Unmarked,
     launch: impl FnOnce(&mut L::Enqueue<'_>) -> Result<(), StageError>,
 ) -> Result<Marker, StageError> {
     let own = lane.lane();
@@ -819,17 +810,27 @@ pub fn submit_on<L: Lane>(
             lane.await_marker(marker).map_err(fatal)?;
         }
     }
-    let mut refused = None;
+    let mut ran = None;
     let made = lane.submit_marked(|queue| {
-        launch(queue).map_err(|error| {
-            refused = Some(error);
-            GpuError::Invalid("a stage refused its quantum".to_string())
-        })
+        ran = Some(catch_unwind(AssertUnwindSafe(|| launch(queue))));
+        Ok(())
     });
-    match made {
-        Ok(((), marker)) => Ok(marker),
-        Err(GpuError::Busy) => Err(StageError::Retry),
-        Err(error) => Err(refused.take().unwrap_or_else(|| fatal(error))),
+    match (made, ran) {
+        (Ok((_, marker)), Some(Ok(Ok(())))) => Ok(marker),
+        (Ok((_, marker)), Some(Ok(Err(error)))) => {
+            unmarked.record(marker);
+            Err(error)
+        }
+        (Ok((_, marker)), Some(Err(panic))) => {
+            unmarked.record(marker);
+            resume_unwind(panic)
+        }
+        (Err(GpuError::Busy), None) => Err(StageError::Retry),
+        // The submission itself failed after the launch ran: the launch's own result is the stage's.
+        (Err(_), Some(Ok(Err(error)))) => Err(error),
+        (Err(_), Some(Err(panic))) => resume_unwind(panic),
+        (Err(error), _) => Err(fatal(error)),
+        (Ok(_), _) => Err(fatal("a marked submission finished without running its launch")),
     }
 }
 
@@ -898,31 +899,34 @@ fn for_each_busy<S: ?Sized>(
     Ok(())
 }
 
-/// A stage of a plan's graph: runs as [`run_stage`] with the signalling the plan gave it.
+/// A stage of a plan's graph: runs as [`run_stage`], and when its quantum is abandoned orders the home lane behind the
+/// work that failed submissions of the quantum left on other lanes ([`Unmarked`]).
 pub struct Placed {
     launch: Arc<dyn StageLaunch>,
-    signal: bool,
 }
 
 impl Placed {
-    /// The stage `launch`, whose marker is signalled when `signal`.
-    pub fn new(launch: Arc<dyn StageLaunch>, signal: bool) -> Self {
-        Self { launch, signal }
+    /// The stage `launch`.
+    pub fn new(launch: Arc<dyn StageLaunch>) -> Self {
+        Self { launch }
     }
 }
 
 impl fmt::Debug for Placed {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Placed")
-            .field("signal", &self.signal)
-            .finish_non_exhaustive()
+        formatter.debug_struct("Placed").finish_non_exhaustive()
     }
 }
 
 impl Stage<Quantum> for Placed {
     fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        run_stage(&*self.launch, quantum, cx, self.signal)
+        run_stage(&*self.launch, quantum, cx)
+    }
+
+    fn abandoned(&self, quantum: &Quantum, home: &(dyn DeviceQueue + 'static)) {
+        quantum
+            .unmarked
+            .await_on(home, |lane| quantum.lanes.get(lane).map(|queue| queue.id()));
     }
 }
 

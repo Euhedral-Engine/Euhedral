@@ -1373,16 +1373,16 @@ fn argmax_lowest_id_tie_break() {
         [Some(12_345), Some(77), None, Some(9), Some(VOCABULARY as u32 - 1)]
     );
 
-    // A verification selects every row, and the stage's marker is signalled for the continuation that follows it.
+    // A verification selects every row, and the stage publishes its marker for the continuation that follows it.
     let every = Argmax::new(BufferSlot::Logits, VOCABULARY, SelectedRows::Each);
     let verify = rig
         .quantum(QuantumKind::Verify, 5, 0, &workspace, &sequence, &config)
         .with_selection(Arc::clone(&selection));
-    let marker = rig.run(&every, &verify).expect("a marker for the completion edge");
+    let marker = rig.run(&every, &verify).expect("a marker for the argmax stage");
     rig.sync();
     assert!(
         DeviceQueue::completed(&**rig.typed.lane(0)) >= marker.value,
-        "the lane's completion word reaches the argmax stage's marker"
+        "the lane has completed the argmax stage's marker"
     );
     let selected: Vec<Option<u32>> = (0..5).map(|row| selection.token(row)).collect();
     assert_eq!(selected, expected);

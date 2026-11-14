@@ -26,27 +26,30 @@ mod typed;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
-use euhedral_core::frames::Frame;
 use euhedral_core::generics::{FrameSink, LatticeSource};
 use typed::Typed;
 
+use euhedral_gpu::cuda::CudaKernel;
+use euhedral_gpu::cuda::CudaModule;
 use euhedral_gpu::cuda::CudaQueue;
-use euhedral_gpu::{GraphStats, Lane};
+use euhedral_gpu::{Args, CompileOptions, GraphStats, LaneEnqueue, Launch, Module};
 use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, ExternalEdge, GraphRuntime, Lake, LaneId, Marker,
-    QuantumOutcome, RetryCounts, Stage, StageError, StageGraph, StageGraphSpec, StageId, StageSpec, UnitGuard,
+    QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageId, StageSpec, Submitted,
+    UnitGuard,
 };
 use euhedral_inference_cuda::{
     CudaError, CudaLibrary, DevicePtr, KernelOps, LaneOps, PinnedPool, RetireList, SubmitMode,
 };
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
+use euhedral_inference_engine::kernels::kernel_sources;
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{LayerIndex, LayerKind, ModelConfig, Role, WeightRef, object_key};
 use euhedral_inference_engine::plan::{Formats, Plan, WeightLookup};
@@ -55,7 +58,7 @@ use euhedral_inference_engine::residency::planner::plan as residency_plan;
 use euhedral_inference_engine::stages::attention::KvSource;
 use euhedral_inference_engine::stages::sampling::SelectionPool;
 use euhedral_inference_engine::stages::{
-    InputRecordRef, LaneEnds, LaneTable, Placed, Quantum, QuantumKind, Settled, Settler, Settling, StageLaunch,
+    InputRecordRef, LaneTable, Placed, Quantum, QuantumKind, StageLaunch, submit_on,
 };
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
@@ -313,15 +316,14 @@ impl StageLaunch for Probe {
     }
 }
 
-/// One stage of a chain: the lane it is pinned to, whether the plan would have it signal, and what it does.
+/// One stage of a chain: the lane it is pinned to, and what it does.
 struct Link {
     lane: u16,
-    signal: bool,
     act: Act,
 }
 
-fn link(lane: u16, signal: bool, act: Act) -> Link {
-    Link { lane, signal, act }
+fn link(lane: u16, act: Act) -> Link {
+    Link { lane, act }
 }
 
 /// A chain of stages, each behind the one before it, and how many of them ran.
@@ -330,7 +332,6 @@ fn chain(
     links: Vec<Link>,
     retirements: &Arc<Retirements>,
 ) -> (Arc<StageGraph<Quantum>>, Arc<Vec<AtomicUsize>>) {
-    let settler = Settler::new(&world.runtime);
     let ran: Arc<Vec<AtomicUsize>> = Arc::new((0..links.len()).map(|_| AtomicUsize::new(0)).collect());
     let mut spec = StageGraphSpec::new();
     let mut stages: Vec<Arc<dyn Stage<Quantum>>> = Vec::new();
@@ -350,10 +351,7 @@ fn chain(
             ran: Arc::clone(&ran),
             index,
         });
-        stages.push(Arc::new(Settling::new(
-            Arc::new(Placed::new(launch, link.signal)),
-            Arc::clone(&settler),
-        )));
+        stages.push(Arc::new(Placed::new(launch)));
     }
     let retirements = Arc::clone(retirements);
     let graph = StageGraph::new(spec, stages, world.runtime.clone(), move |quantum, outcome| {
@@ -377,14 +375,13 @@ fn a_quantum_killed_after_its_first_stage_retires() {
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let kill = not_killed();
-    // The first stage submits an unsignalled marker and sets the kill switch; the stage that would have signalled behind
-    // it never runs.
+    // The first stage submits its marker and sets the kill switch; the stages behind it never run.
     let (graph, ran) = chain(
         &world,
         vec![
-            link(0, false, Act::Kill(Arc::clone(&kill))),
-            link(0, false, Act::Nothing),
-            link(0, true, Act::Nothing),
+            link(0, Act::Kill(Arc::clone(&kill))),
+            link(0, Act::Nothing),
+            link(0, Act::Nothing),
         ],
         &retirements,
     );
@@ -398,25 +395,25 @@ fn a_quantum_killed_after_its_first_stage_retires() {
 
 #[test]
 #[ignore = "needs a GPU and the native library"]
-fn a_quantum_killed_with_unsignalled_markers_on_two_lanes_retires() {
+fn a_quantum_killed_with_markers_on_two_lanes_retires() {
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let kill = not_killed();
-    // Lane 0 holds the first stage's marker and lane 1 the second's, both unsignalled when the second sets the switch.
+    // Lane 0 holds the first stage's marker and lane 1 the second's when the second sets the switch.
     let (graph, ran) = chain(
         &world,
         vec![
-            link(0, false, Act::Nothing),
-            link(1, false, Act::Kill(Arc::clone(&kill))),
-            link(0, true, Act::Nothing),
-            link(1, true, Act::Nothing),
+            link(0, Act::Nothing),
+            link(1, Act::Kill(Arc::clone(&kill))),
+            link(0, Act::Nothing),
+            link(1, Act::Nothing),
         ],
         &retirements,
     );
     let mut sequence = world.sequence(1024);
     let quantum = world.quantum(&mut sequence, 0);
     let _ = graph.start(quantum, kill, Vec::new());
-    retirements.assert_outcome(0, KILLED, "killed with two lanes unsignalled");
+    retirements.assert_outcome(0, KILLED, "killed with markers on two lanes");
     assert_eq!(ran_stages(&ran), vec![1, 1, 0, 0]);
     world.close();
 }
@@ -426,11 +423,7 @@ fn a_quantum_killed_with_unsignalled_markers_on_two_lanes_retires() {
 fn a_quantum_killed_before_its_first_stage_retires() {
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
-    let (graph, ran) = chain(
-        &world,
-        vec![link(0, false, Act::Nothing), link(0, true, Act::Nothing)],
-        &retirements,
-    );
+    let (graph, ran) = chain(&world, vec![link(0, Act::Nothing), link(0, Act::Nothing)], &retirements);
     let mut sequence = world.sequence(1024);
     let quantum = world.quantum(&mut sequence, 0);
     let _ = graph.start(quantum, Arc::new(AtomicBool::new(true)), Vec::new());
@@ -446,11 +439,7 @@ fn a_quantum_whose_middle_stage_fails_retires() {
     let retirements = Retirements::new();
     let (graph, ran) = chain(
         &world,
-        vec![
-            link(0, false, Act::Nothing),
-            link(0, false, Act::Fail),
-            link(0, true, Act::Nothing),
-        ],
+        vec![link(0, Act::Nothing), link(0, Act::Fail), link(0, Act::Nothing)],
         &retirements,
     );
     let mut sequence = world.sequence(1024);
@@ -470,14 +459,14 @@ fn a_quantum_whose_middle_stage_fails_retires() {
 fn a_quantum_whose_last_stage_fails_retires() {
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
-    // No stage is left to be abandoned: the failing stage settles the lane its earlier, unsignalled stage left.
+    // No stage is left to be abandoned: the quantum retires behind the markers of the stages that ran.
     let (graph, ran) = chain(
         &world,
         vec![
-            link(0, false, Act::Nothing),
-            link(1, false, Act::Nothing),
-            link(0, true, Act::Nothing),
-            link(1, true, Act::Fail),
+            link(0, Act::Nothing),
+            link(1, Act::Nothing),
+            link(0, Act::Nothing),
+            link(1, Act::Fail),
         ],
         &retirements,
     );
@@ -496,11 +485,7 @@ fn a_quantum_whose_last_stage_panics_retires() {
     let retirements = Retirements::new();
     let (graph, _ran) = chain(
         &world,
-        vec![
-            link(0, false, Act::Nothing),
-            link(0, false, Act::Nothing),
-            link(0, true, Act::Panic),
-        ],
+        vec![link(0, Act::Nothing), link(0, Act::Nothing), link(0, Act::Panic)],
         &retirements,
     );
     let mut sequence = world.sequence(1024);
@@ -512,29 +497,24 @@ fn a_quantum_whose_last_stage_panics_retires() {
 
 #[test]
 #[ignore = "needs a GPU and the native library"]
-fn a_quantum_that_runs_to_its_end_settles_nothing_and_retires_completed() {
+fn a_quantum_that_runs_to_its_end_retires_completed() {
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let (graph, ran) = chain(
         &world,
         vec![
-            link(0, false, Act::Nothing),
-            link(1, false, Act::Nothing),
-            link(0, true, Act::Nothing),
-            link(1, true, Act::Nothing),
+            link(0, Act::Nothing),
+            link(1, Act::Nothing),
+            link(0, Act::Nothing),
+            link(1, Act::Nothing),
         ],
         &retirements,
     );
     let mut sequence = world.sequence(1024);
     let quantum = world.quantum(&mut sequence, 0);
-    let ends = Arc::clone(quantum.lane_ends());
     let _ = graph.start(quantum, not_killed(), Vec::new());
     retirements.assert_outcome(0, COMPLETED, "ran to its end");
     assert_eq!(ran_stages(&ran), vec![1, 1, 1, 1]);
-    assert!(
-        ends.unsignalled_lanes().is_empty(),
-        "every lane ended with a signalled marker of the plan's own"
-    );
     world.close();
 }
 
@@ -545,15 +525,15 @@ fn a_killed_quantum_is_followed_by_quanta_on_the_same_sequence() {
     let retirements = Retirements::new();
     let shape = |kill: Act| {
         vec![
-            link(0, false, Act::Nothing),
-            link(1, false, kill),
-            link(0, true, Act::Nothing),
-            link(1, true, Act::Nothing),
+            link(0, Act::Nothing),
+            link(1, kill),
+            link(0, Act::Nothing),
+            link(1, Act::Nothing),
         ]
     };
     let mut sequence = world.sequence(1024);
 
-    // A killed quantum retires by itself, with nothing behind it to signal for it; the next one runs to its end.
+    // A killed quantum retires by itself, and the next one runs to its end.
     let kill = not_killed();
     let (killed, _) = chain(&world, shape(Act::Kill(Arc::clone(&kill))), &retirements);
     let _ = killed.start(world.quantum(&mut sequence, 0), kill, Vec::new());
@@ -584,47 +564,20 @@ fn a_killed_quantum_is_followed_by_quanta_on_the_same_sequence() {
 
 #[test]
 #[ignore = "needs a GPU and the native library"]
-fn settling_signals_a_lane_whose_last_marker_is_unsignalled() {
-    let Some(world) = World::open(1) else { return };
-    let lane = world.typed.lane(0);
-    let ends = LaneEnds::new(1);
-    let marker = lane.mark().unwrap();
-    ends.record(marker, false);
-    assert_eq!(ends.unsignalled_lanes(), vec![LaneId(0)]);
-    assert_eq!(ends.settle(&**lane).unwrap(), Settled::Signalled);
-    let begun = Instant::now();
-    while DeviceQueue::completed(&**lane) < marker.value {
-        assert!(
-            begun.elapsed() < DEADLINE,
-            "the settling marker never reached the completion word"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert!(ends.unsignalled_lanes().is_empty());
-    assert_eq!(
-        ends.settle(&**lane).unwrap(),
-        Settled::Clean,
-        "a settled lane is left alone"
-    );
-    world.close();
-}
-
-#[test]
-#[ignore = "needs a GPU and the native library"]
 fn quanta_that_complete_are_killed_and_fail_on_shared_lanes_all_retire() {
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let mut sequence = world.sequence(1024);
     let shape = |act: Act| {
         vec![
-            link(0, false, Act::Nothing),
-            link(1, false, act),
-            link(0, false, Act::Nothing),
-            link(1, true, Act::Nothing),
-            link(0, true, Act::Nothing),
+            link(0, Act::Nothing),
+            link(1, act),
+            link(0, Act::Nothing),
+            link(1, Act::Nothing),
+            link(0, Act::Nothing),
         ]
     };
-    // Three quanta at a time on two lanes, so that stages and settlings meet held lanes.
+    // Three quanta at a time on two lanes, so that stages meet held lanes.
     for round in 0..10usize {
         let mut expected = Vec::new();
         for slot in 0..3usize {
@@ -646,55 +599,189 @@ fn quanta_that_complete_are_killed_and_fail_on_shared_lanes_all_retire() {
     world.close();
 }
 
-/// Settles a quantum whose lane 0 ends unsignalled, driving the completions by hand on this thread (they are attached
-/// to no lattice): the abandoned stage publishes one settling, which signals the lane.
+/// The spin kernel's source: one thread that waits `ns` nanoseconds of the device's global timer.
+const SPIN: &str = r#"
+extern "C" __global__ void spin(unsigned long long ns) {
+    unsigned long long start, now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+    do {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    } while (now - start < ns);
+}
+"#;
+
+/// How long the spin kernel runs.
+const SPIN_NS: u64 = 600_000_000;
+
+/// A stage on a lane other than the home lane that queues a long kernel and then fails: the work a failed submission
+/// leaves behind a marker RustEE never records. Its abandonment is a plan stage's.
+struct SpinThenFail {
+    kernel: CudaKernel,
+    lanes: LaneTable,
+    placed: Placed,
+}
+
+fn refused(why: impl Display) -> StageError {
+    StageError::Fatal(why.to_string())
+}
+
+impl Stage<Quantum> for SpinThenFail {
+    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+        let id = cx.lane.ok_or_else(|| refused("no lane"))?;
+        let lane = self.lanes.get(id).ok_or_else(|| refused("no such lane"))?;
+        let marker = submit_on(&**lane, cx.waits.iter().copied(), quantum.unmarked(), |queue| {
+            // SAFETY: the kernel's one argument is the spin time, and it touches no memory.
+            unsafe { queue.launch(&self.kernel, Launch::linear(1, 1), &Args::new().arg(SPIN_NS)) }.map_err(refused)?;
+            Err(refused("the stage refuses after it queued the kernel"))
+        })?;
+        Ok(Submitted::marker(marker))
+    }
+
+    fn abandoned(&self, quantum: &Quantum, home: &(dyn DeviceQueue + 'static)) {
+        self.placed.abandoned(quantum, home);
+    }
+}
+
+/// A stage placed on another lane whose launch fails, run through the plan's own submission ([`Placed`]); it reports
+/// the marker the quantum kept for the lane when the quantum is abandoned, before the abandonment orders anything.
+struct Watch {
+    placed: Placed,
+    lane: LaneId,
+    kept: Arc<AtomicU64>,
+}
+
+impl Stage<Quantum> for Watch {
+    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+        self.placed.run(quantum, cx)
+    }
+
+    fn abandoned(&self, quantum: &Quantum, home: &(dyn DeviceQueue + 'static)) {
+        self.kept
+            .store(quantum.unmarked().latest(self.lane).unwrap_or(0), Ordering::Release);
+        self.placed.abandoned(quantum, home);
+    }
+}
+
+/// A launch that fails on a lane other than the home lane, in a stage's own submission, leaves the marker of that
+/// submission in the quantum for the abandonment to await, and the abandonment then orders the home lane behind it.
 #[test]
 #[ignore = "needs a GPU and the native library"]
-fn an_abandoned_stage_publishes_a_settling_that_signals_its_lane() {
-    let Some(world) = World::open(2) else { return };
-    let lane = world.typed.lane(0);
-    let pool = Arc::clone(&world.runtime.lanes);
-    let completions = Completions::new(Arc::clone(&pool));
-    let runtime = GraphRuntime {
-        stages: Arc::clone(&world.runtime.stages),
-        completions: Arc::clone(&completions),
-        lanes: pool,
-        retries: Arc::new(RetryCounts::default()),
-        retry_backstop: DEFAULT_RETRY_BACKSTOP,
-    };
+fn a_stage_that_fails_through_its_own_submission_keeps_its_marker_for_the_abandonment() {
+    let Some(world) = World::open(3) else { return };
+    let retirements = Retirements::new();
+    let ran: Arc<Vec<AtomicUsize>> = Arc::new(vec![AtomicUsize::new(0)]);
+    let mut spec = StageGraphSpec::new();
+    let first = spec.stage(StageSpec {
+        name: "home",
+        ordered: None,
+        lanes: vec![LaneId(0)],
+    });
+    let second = spec.stage(StageSpec {
+        name: "fails",
+        ordered: None,
+        lanes: vec![LaneId(1)],
+    });
+    spec.edge(first, second, EdgeKind::Submission);
+    let home: Arc<dyn Stage<Quantum>> = Arc::new(Placed::new(Arc::new(Probe {
+        act: Act::Nothing,
+        ran: Arc::clone(&ran),
+        index: 0,
+    })));
+    let kept = Arc::new(AtomicU64::new(0));
+    let fails: Arc<dyn Stage<Quantum>> = Arc::new(Watch {
+        placed: Placed::new(Arc::new(Probe {
+            act: Act::Fail,
+            ran: Arc::clone(&ran),
+            index: 0,
+        })),
+        lane: LaneId(1),
+        kept: Arc::clone(&kept),
+    });
+    let log = Arc::clone(&retirements);
+    let graph = StageGraph::new(
+        spec,
+        vec![home, fails],
+        world.runtime.clone(),
+        move |quantum, outcome| log.retire(&quantum, &outcome),
+    )
+    .unwrap();
     let mut sequence = world.sequence(1024);
     let quantum = world.quantum(&mut sequence, 0);
-    let unsignalled = lane.mark().unwrap();
-    quantum.lane_ends().record(unsignalled, false);
-    let stage = Settling::new(
-        Arc::new(Placed::new(
-            Arc::new(Probe {
-                act: Act::Nothing,
-                ran: Arc::new(vec![AtomicUsize::new(0)]),
-                index: 0,
-            }),
-            true,
-        )),
-        Settler::new(&runtime),
+    let _ = graph.start(quantum, not_killed(), Vec::new());
+    retirements.assert_outcome(0, FAILED, "the stage on the other lane failed");
+    assert_ne!(
+        kept.load(Ordering::Acquire),
+        0,
+        "the failed submission's marker was not kept in the quantum"
     );
-    stage.abandoned(&quantum, &**lane);
-    assert_eq!(completions.pending(), 1, "the abandoned stage publishes one settling");
-    let begun = Instant::now();
-    let mut frames: Vec<Box<dyn Frame>> = Vec::new();
-    while frames.is_empty() {
-        assert!(begun.elapsed() < DEADLINE, "the settling was never published");
-        completions.reap();
-        completions.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
-        thread::sleep(Duration::from_millis(1));
-    }
-    let mut frame = frames.pop().unwrap();
-    frame.execute().unwrap();
-    Frame::do_finally(frame);
-    assert_eq!(completions.pending(), 0, "the settling is done");
-    assert!(quantum.lane_ends().unsignalled_lanes().is_empty());
     world.close();
 }
 
+/// A stage on lane 1, not the home lane 0, queues a kernel that runs for 600 ms and then fails its submission. RustEE
+/// records no marker of a failed stage, so nothing but the engine's own record of the failed submission orders the
+/// quantum's retirement behind the kernel: the quantum must retire only after the kernel ended.
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn a_failed_submission_on_another_lane_retires_only_after_its_kernel_ended() {
+    let Some(world) = World::open(3) else { return };
+    let retirements = Retirements::new();
+    let settings = Settings::with_model(ModelSettings::default());
+    let sources = kernel_sources(&world.library, &settings).unwrap();
+    let options = CompileOptions {
+        compiler: sources.compiler().map(Path::to_path_buf),
+        ..CompileOptions::default()
+    };
+    let kernel = CudaModule::from_source(&world.typed.gpu, SPIN, &options)
+        .unwrap()
+        .kernel("spin")
+        .unwrap();
+    let ran: Arc<Vec<AtomicUsize>> = Arc::new(vec![AtomicUsize::new(0)]);
+    let mut spec = StageGraphSpec::new();
+    let first = spec.stage(StageSpec {
+        name: "home",
+        ordered: None,
+        lanes: vec![LaneId(0)],
+    });
+    let second = spec.stage(StageSpec {
+        name: "spin",
+        ordered: None,
+        lanes: vec![LaneId(1)],
+    });
+    spec.edge(first, second, EdgeKind::Submission);
+    let home: Arc<dyn Stage<Quantum>> = Arc::new(Placed::new(Arc::new(Probe {
+        act: Act::Nothing,
+        ran: Arc::clone(&ran),
+        index: 0,
+    })));
+    let spin: Arc<dyn Stage<Quantum>> = Arc::new(SpinThenFail {
+        kernel,
+        lanes: world.table.clone(),
+        placed: Placed::new(Arc::new(Probe {
+            act: Act::Nothing,
+            ran: Arc::clone(&ran),
+            index: 0,
+        })),
+    });
+    let log = Arc::clone(&retirements);
+    let graph = StageGraph::new(
+        spec,
+        vec![home, spin],
+        world.runtime.clone(),
+        move |quantum, outcome| log.retire(&quantum, &outcome),
+    )
+    .unwrap();
+    let mut sequence = world.sequence(1024);
+    let quantum = world.quantum(&mut sequence, 0);
+    let begun = Instant::now();
+    let _ = graph.start(quantum, not_killed(), Vec::new());
+    retirements.assert_outcome(0, FAILED, "the stage on the other lane failed");
+    let elapsed = begun.elapsed();
+    assert!(
+        elapsed >= Duration::from_nanos(SPIN_NS) * 3 / 4,
+        "the quantum retired after {elapsed:?}, while the kernel it queued runs for {SPIN_NS} ns"
+    );
+    world.close();
+}
 // The plan's graphs, with a captured quantum.
 
 struct Described(HashMap<(LayerIndex, Role), WeightRef>);
