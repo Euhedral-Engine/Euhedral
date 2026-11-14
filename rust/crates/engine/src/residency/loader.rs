@@ -33,6 +33,7 @@ use crate::error::EngineError;
 use crate::frames::{Kind, step};
 use crate::residency::planner::{Placement, PlacementSource, ResidencyPlan, nvfp4};
 use crate::runtime::{Core, raw_file};
+use crate::stages::SubmitError;
 
 /// What a piece's bytes must satisfy before they are copied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -472,6 +473,11 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
             });
         let marker = match queued {
             Ok(((), marker)) => marker,
+            Err(SubmitError::Busy) => {
+                // The lane's ring is full of markers that have not completed: nothing was queued, so the loan is
+                // still the copy's and the copy is tried again behind the other work.
+                return copy(shared, chain, index, loan);
+            }
             Err(error) => {
                 // The copy may be queued and no marker will say when it ran: the loan must not return to the pool
                 // while the device may still read it. It is leaked; the load has failed and ends the startup.

@@ -35,7 +35,7 @@ use crate::launch::gdn::{
 };
 use crate::launch::load::KernelTable;
 use crate::launch::nvfp4::{Nvfp4Operands, plan_linear, plan_native};
-use crate::launch::queue::{EnqueueError, enqueue};
+use crate::launch::queue::{EnqueueError, enqueue_overlapping};
 use crate::launch::table::{Geometry, plan_linear_launch, plan_qwen4_launch};
 use crate::launch::{Modes, PlanError};
 use crate::library::CudaLibrary;
@@ -82,6 +82,8 @@ pub struct RusteeOps<'a, Q> {
     queue: &'a mut Q,
     table: &'a KernelTable,
     modes: Modes,
+    /// Whether the launches the catalog marks may overlap their predecessors (programmatic dependent launch).
+    pdl: bool,
     began_row_exact: bool,
     /// The C library and the lane's value-0 marker, for the allocations the owner makes on this lane
     /// ([`RusteeOps::on_lane`]).
@@ -109,6 +111,7 @@ where
             queue,
             table,
             modes,
+            pdl: true,
             began_row_exact: modes.row_exact,
             lane: None,
         }
@@ -122,9 +125,24 @@ where
         self
     }
 
+    /// Sets whether the launches the catalog marks overlap their predecessors (programmatic dependent launch): a
+    /// kernel is launched so when it is registered for it and this is true, which it is until set. A quantum's
+    /// [`SubmitMode`](crate::submission::SubmitMode) says it.
+    #[must_use]
+    pub fn with_pdl(mut self, pdl: bool) -> Self {
+        self.pdl = pdl;
+        self
+    }
+
     /// The modes later launches are planned in.
     pub fn modes(&self) -> Modes {
         self.modes
+    }
+
+    /// Whether `launch` is enqueued as a programmatic dependent launch: the catalog marks it and the submission
+    /// overlaps its launches.
+    fn overlaps(&self, launch: &Launch) -> bool {
+        launch.programmatic && self.pdl
     }
 
     /// Enqueues `launches` in order.
@@ -133,7 +151,8 @@ where
             // SAFETY: the contract of `KernelOps`, as for the native wrappers: the addresses a stage names stay valid
             // for the kernels' accesses until the lane's work has retired. The plan's argument sizes are checked
             // against the kernel's parameters by `enqueue`.
-            unsafe { enqueue(self.queue, self.table, launch) }.map_err(|error| not_enqueued(&error))?;
+            unsafe { enqueue_overlapping(self.queue, self.table, launch, self.overlaps(launch)) }
+                .map_err(|error| not_enqueued(&error))?;
         }
         Ok(())
     }
@@ -146,12 +165,12 @@ where
         call: &'static str,
         plan: impl FnOnce(&mut dyn FnMut(Launch)) -> Result<(), PlanError>,
     ) -> Result<(), CudaError> {
-        let (queue, table) = (&mut *self.queue, self.table);
+        let (queue, table, pdl) = (&mut *self.queue, self.table, self.pdl);
         let mut failure = None;
         let planned = plan(&mut |launch| {
             if failure.is_none() {
                 // SAFETY: as in `enqueue_all`.
-                if let Err(error) = unsafe { enqueue(queue, table, &launch) } {
+                if let Err(error) = unsafe { enqueue_overlapping(queue, table, &launch, launch.programmatic && pdl) } {
                     failure = Some(error);
                 }
             }
@@ -915,10 +934,19 @@ where
                 .euhedral_cuda_stream_select(stream.expose_provenance() as u64)
         };
         check("euhedral_cuda_stream_select", status)?;
-        let out = call(library);
+        // The selection is cleared when the call returns or panics.
+        let _selection = SelectedStream(library);
+        Ok(call(library))
+    }
+}
+
+/// The calling thread's stream selection, cleared when dropped.
+struct SelectedStream<'a>(&'a Arc<CudaLibrary>);
+
+impl Drop for SelectedStream<'_> {
+    fn drop(&mut self) {
         // SAFETY: clears this thread's selection.
-        unsafe { library.api().euhedral_cuda_stream_clear() };
-        Ok(out)
+        unsafe { self.0.api().euhedral_cuda_stream_clear() };
     }
 }
 

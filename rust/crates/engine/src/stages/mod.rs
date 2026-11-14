@@ -28,6 +28,7 @@ pub mod settle;
 
 use std::fmt::{self, Display};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use euhedral_gpu::cuda::CudaQueue;
 use euhedral_gpu::{GpuError, Lane};
@@ -48,7 +49,7 @@ use crate::state::{FlightGuard, KvView, SequenceDevice};
 use crate::workspace::{BufferSlot, Workspace, WorkspaceError};
 use attention::KvSource;
 use sampling::{Selection, SelectionLease};
-pub use settle::{LaneEnds, Settled, Settler, Settling};
+pub use settle::{LaneEnds, Lanes, Settled, Settler, Settling};
 
 /// What a quantum is, which sets the routes of its stages (`Quantum.ExecutionKind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -366,6 +367,8 @@ pub enum QuantumError {
 /// planning that builds quanta can add to them without breaking the stages.
 #[derive(Debug)]
 pub struct Quantum {
+    /// The quantum's own number, from which its home lane is taken ([`crate::quantum::home`]).
+    pub(crate) id: u64,
     pub(crate) kind: QuantumKind,
     pub(crate) rows: usize,
     pub(crate) input: InputRecordRef,
@@ -411,7 +414,15 @@ pub struct Quantum {
     pub(crate) disposition: Disposition,
 }
 
+/// The next quantum's id.
+static NEXT_QUANTUM: AtomicU64 = AtomicU64::new(0);
+
 impl Quantum {
+    /// The quantum's own number, distinct for every quantum made.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// A quantum of `rows` rows of `kind` starting at `input`'s position, over `workspace` and `seq`, whose stages
     /// submit with `mode` on the lanes of `lanes`. It scores one row (decode, and the last row of a prefill); see
     /// [`Quantum::with_logits_rows`]. A verification is row-exact and nothing else is (as `Quantum` in Java): `mode`
@@ -442,6 +453,7 @@ impl Quantum {
         let logits_rows = if kind == QuantumKind::Verify { rows } else { 1 };
         workspace.rows().check_logits(logits_rows as u64)?;
         Ok(Self {
+            id: NEXT_QUANTUM.fetch_add(1, Ordering::Relaxed),
             kind,
             rows,
             input,
@@ -759,10 +771,10 @@ pub fn run_eager<L: Launch>(stage: &L, quantum: &Quantum, cx: &StageCx<'_>) -> R
 
 /// Runs a stage as [`run_eager`] does, with its marker signalled or not.
 ///
-/// A signalled marker also writes the lane's completion word, which is how the host finds that the marker is reached
-/// ([`DeviceQueue::completed`](euhedral_graph::DeviceQueue::completed)). A graph's retirement boundary is the latest
-/// marker of every lane the quantum used, so the last stage of each lane must signal, and the others need not: the
-/// plan computes which those are ([`Plan::signalled`](crate::plan::Plan::signalled)). A quantum that ends before its
+/// Every submission ends with a marker of its own on the lane ([`submit_on`]); `signal` says whether it is the end of
+/// a chain of continuations, which [`Quantum::lane_ends`] records so that a quantum that stops early can tell whether its
+/// last marker on a lane can retire. A graph's retirement boundary is the latest marker of every lane the quantum
+/// used, so the last stage of each lane must signal, and the others need not: the plan computes which those are ([`Plan::signalled`](crate::plan::Plan::signalled)). A quantum that ends before its
 /// chains' ends have run is settled by [`Settling`]. A stage that has nothing to
 /// launch for the quantum but is to signal still ends a submission on its lane, behind the markers it waits for, with
 /// a signalled marker and no launch, so the lane's last marker is reachable whatever the quantum skips.
@@ -793,7 +805,10 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
     } else {
         let waits = cx.waits.iter().copied().chain(stage.waits(quantum));
         submit_on(&**lane, waits, |queue| {
-            stage.launch(quantum, &mut RusteeOps::new(queue, table, modes))
+            stage.launch(
+                quantum,
+                &mut RusteeOps::new(queue, table, modes).with_pdl(quantum.mode.pdl),
+            )
         })?
     };
     quantum.ends.record(marker, signal);
@@ -803,9 +818,12 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
 /// Orders `lane` behind each of `waits` that another lane made, then runs `launch` on the lane in a submission that
 /// ends with a marker of its own, which it returns.
 ///
-/// Nothing waits: a lane whose marker ring is full of markers that have not completed (or whose next slot an awaiter on
-/// another lane holds) answers [`StageError::Retry`], and then `launch` has not run and nothing was submitted. A launch
-/// that fails gives its marker up, and its error is the stage's.
+/// The waits are enqueued first, because RustEE's marked submission claims its marker only when it begins and takes the
+/// lane's waits before the claim. Nothing blocks: a lane whose marker ring is full of markers that have not completed
+/// (or whose next slot an awaiter on another lane holds) answers [`StageError::Retry`], and then `launch` has not
+/// run and no marker was made; the waits that were already enqueued stay, and the retry enqueues them again, which
+/// orders the lane behind the same markers twice and changes nothing. A launch that fails gives its marker up, and
+/// its error is the stage's.
 pub fn submit_on<L: Lane>(
     lane: &L,
     waits: impl IntoIterator<Item = Marker>,

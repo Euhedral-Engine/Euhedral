@@ -24,6 +24,7 @@ use thiserror::Error;
 
 use crate::model::Speculation;
 use crate::model::{LayerIndex, LayerKind, ModelConfig, Role, WeightRef};
+use crate::quantum::home::lane_for;
 use crate::residency::planner::ResidencyPlan;
 use crate::stages::Placed;
 use buffers::Access;
@@ -72,6 +73,8 @@ struct VariantPlan {
     width: usize,
     /// Whether each stage ends with a signalled marker: the ends of the chains of lane continuations.
     signalled: Vec<bool>,
+    /// The lane offset of each stage from its quantum's home lane.
+    offsets: Vec<u16>,
 }
 
 /// The execution plan of a loaded model.
@@ -262,6 +265,18 @@ impl Plan {
         self.variant(view.variant()).map(|plan| plan.spec.clone())
     }
 
+    /// The graph of `view` for a quantum homed on lane `home` of `stage_lanes` stage lanes: each stage on
+    /// `(home + offset) mod stage_lanes`. `stage_lanes` must be at least the plan's [`Plan::lane_width`].
+    pub fn spec_homed(
+        &self,
+        view: View,
+        home: usize,
+        stage_lanes: usize,
+    ) -> Option<Result<StageGraphSpec, GraphError>> {
+        self.variant(view.variant())
+            .map(|plan| plan.spec_homed(home, stage_lanes))
+    }
+
     /// The stages of `view`, in the order of its graph.
     pub fn stages(&self, view: View) -> Option<&[Entry]> {
         self.variant(view.variant()).map(|plan| plan.entries.as_slice())
@@ -361,6 +376,7 @@ impl VariantPlan {
             spec: StageGraphSpec::new(),
             width,
             signalled: Vec::new(),
+            offsets: Vec::new(),
         })
     }
 
@@ -371,20 +387,28 @@ impl VariantPlan {
         for (entry, signal) in self.entries.iter_mut().zip(&self.signalled) {
             entry.stage = Arc::new(Placed::new(Arc::clone(&entry.launch), *signal));
         }
-        // Each chain of lane continuations has one lane, fixed here, so the one lane a stage is allowed is the lane
-        // RustEE's graph puts it on: it never picks a branch's lane at random, and the branches of a fan-out do not
-        // share one. A root is on the home lane, as Java's graph does.
-        let lane_of = placement::chain_lanes(&self.edges, self.width);
+        // Each chain of lane continuations has one lane offset, fixed here, so the one lane a stage is allowed is the
+        // lane RustEE's graph puts it on: it never picks a branch's lane at random, and the branches of a fan-out do
+        // not share one. A root is at offset 0, the quantum's home lane, as Java's graph does.
+        self.offsets = placement::chain_lanes(&self.edges, self.width);
+        let spec = self.spec_homed(0, self.width.max(1))?;
+        self.spec = spec;
+        Ok(())
+    }
+
+    /// The graph with each stage on lane `(home + offset) mod stage_lanes`.
+    fn spec_homed(&self, home: usize, stage_lanes: usize) -> Result<StageGraphSpec, GraphError> {
         let mut spec = StageGraphSpec::new();
         let ids: Vec<_> = self
             .entries
             .iter()
-            .zip(&lane_of)
-            .map(|(entry, &lane)| {
+            .zip(&self.offsets)
+            .map(|(entry, &offset)| {
+                let lane = lane_for(home, usize::from(offset), stage_lanes);
                 spec.stage(StageSpec {
                     name: entry.kind.name(),
                     ordered: None,
-                    lanes: vec![LaneId(lane)],
+                    lanes: vec![LaneId(lane as u16)],
                 })
             })
             .collect();
@@ -394,7 +418,6 @@ impl VariantPlan {
             }
         }
         spec.validate()?;
-        self.spec = spec;
-        Ok(())
+        Ok(spec)
     }
 }

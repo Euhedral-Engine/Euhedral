@@ -11,7 +11,7 @@
 //! ([`LaneEnds`]). When its stages are abandoned, or a stage fails or panics, the lanes whose last marker is
 //! unsignalled are *settled*: an empty submission on the lane ends with a signalled marker, which the lane reaches
 //! only after everything queued before it, the quantum's unsignalled marker included. The settling is a frame published
-//! through the completions ([`Settler`]); a lane held by another submission answers `LaneBusy`, and the frame is
+//! through the completions ([`Settler`]); a lane held by another submission answers [`Settled::Busy`], and the frame is
 //! published again behind the progress of any lane, so nothing waits. The graph's retirement boundary needs no change:
 //! it names the quantum's own last marker, and the settling marker is a later value on the same lane.
 //!
@@ -28,7 +28,7 @@ use euhedral_graph::{
     DeviceQueue, GraphRuntime, LaneId, LanePool, Marker, Ready, Stage, StageCx, StageError, Submitted,
 };
 
-use super::{LaneTable, Quantum};
+use super::Quantum;
 use crate::frames::{self, Kind};
 
 /// What settling a lane found.
@@ -143,32 +143,55 @@ impl Settler {
 
     /// Settles every lane of `quantum` whose latest marker is unsignalled, each in a frame of its own.
     fn settle(self: &Arc<Self>, quantum: &Quantum) {
-        for lane in quantum.ends.unsignalled_lanes() {
-            self.publish(lane, Arc::clone(&quantum.ends), quantum.lanes.clone(), Box::new(Now));
+        let table = quantum.lanes.clone();
+        let lanes: Arc<Lanes<_>> = Arc::new(move |id| table.get(id).cloned());
+        self.settle_lanes(&quantum.ends, &lanes);
+    }
+
+    /// Settles every lane of `ends` whose latest marker is unsignalled, each in a frame of its own, on the lanes
+    /// `lanes` finds.
+    pub fn settle_lanes<L: Lane + Send + Sync + 'static>(
+        self: &Arc<Self>,
+        ends: &Arc<LaneEnds>,
+        lanes: &Arc<Lanes<L>>,
+    ) {
+        for lane in ends.unsignalled_lanes() {
+            self.publish(lane, Arc::clone(ends), Arc::clone(lanes), Box::new(Now));
         }
     }
 
-    fn publish(self: &Arc<Self>, lane: LaneId, ends: Arc<LaneEnds>, table: LaneTable, ready: Box<dyn Ready>) {
+    fn publish<L: Lane + Send + Sync + 'static>(
+        self: &Arc<Self>,
+        lane: LaneId,
+        ends: Arc<LaneEnds>,
+        lanes: Arc<Lanes<L>>,
+        ready: Box<dyn Ready>,
+    ) {
         let settler = Arc::clone(self);
         let frame = frames::step(Kind::Settle, usize::from(lane.0), move || {
-            settler.attempt(lane, ends, table);
+            settler.attempt(lane, ends, lanes);
         });
         self.runtime.completions.after(ready, frame);
     }
 
     /// One try at settling `lane`; a held lane is tried again once any lane has made progress.
-    fn attempt(self: &Arc<Self>, lane: LaneId, ends: Arc<LaneEnds>, table: LaneTable) {
-        let Some(device) = table.get(lane) else {
+    fn attempt<L: Lane + Send + Sync + 'static>(
+        self: &Arc<Self>,
+        lane: LaneId,
+        ends: Arc<LaneEnds>,
+        lanes: Arc<Lanes<L>>,
+    ) {
+        let Some(device) = lanes(lane) else {
             log::error!(
                 "lane {} of a quantum that ended early is not in its lane table; the quantum cannot retire",
                 lane.0
             );
             return;
         };
-        match ends.settle(&**device) {
+        match ends.settle(&*device) {
             Ok(Settled::Busy) => {
                 let progress = Progress::new(&self.runtime);
-                self.publish(lane, ends, table, Box::new(progress));
+                self.publish(lane, ends, lanes, Box::new(progress));
             }
             Ok(Settled::Clean | Settled::Signalled) => {}
             Err(error) => log::error!(
@@ -178,6 +201,9 @@ impl Settler {
         }
     }
 }
+
+/// How the settler finds a lane of a quantum by its id.
+pub type Lanes<L> = dyn Fn(LaneId) -> Option<Arc<L>> + Send + Sync;
 
 /// Ready at once: the frame goes out at the next poll.
 struct Now;

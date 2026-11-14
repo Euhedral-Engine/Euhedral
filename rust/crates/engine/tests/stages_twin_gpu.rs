@@ -336,7 +336,7 @@ impl Twin {
         let mut failure = None;
         self.stream
             .submit(|queue| {
-                let mut ops = RusteeOps::new(queue, table, modes);
+                let mut ops = RusteeOps::new(queue, table, modes).with_pdl(side.quantum.mode().pdl);
                 if let Err(error) = stage.launch_on(&side.quantum, &mut ops) {
                     failure = Some(format!("{error:?}"));
                 }

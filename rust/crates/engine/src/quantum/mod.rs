@@ -20,6 +20,7 @@
 
 mod capture_key;
 mod graph_cache;
+pub mod home;
 mod input_record;
 
 use std::fmt;
@@ -532,7 +533,10 @@ pub enum StartError {
 /// The stage graphs of a plan on a runtime, and the choice of the graph a quantum runs.
 pub struct Executor {
     plan: Arc<Plan>,
-    eager: Vec<Option<Arc<StageGraph<Quantum>>>>,
+    /// The lanes the stage graphs run on; a quantum's home is one of them.
+    stage_lanes: usize,
+    /// By variant, the eager graph for each home lane.
+    eager: Vec<Vec<Arc<StageGraph<Quantum>>>>,
     replay: Vec<Option<Arc<StageGraph<Quantum>>>>,
 }
 
@@ -544,7 +548,7 @@ impl fmt::Debug for Executor {
 
 impl Executor {
     /// The graphs of every view of `plan`, run on `runtime` (whose lane pool has the plan's
-    /// [`Plan::fan_out_width`] lanes, then `capture`, a lane that only recordings use, and lanes the owner uses). The
+    /// [`Plan::lane_width`] or more stage lanes, then `capture`, a lane that only recordings use, and lanes the owner uses). The
     /// graphs of the views that are captured have a record stage on `capture`. `retire` receives each quantum, with
     /// its outcome, once its device work has completed.
     pub fn new(
@@ -554,13 +558,15 @@ impl Executor {
         retire: impl Fn(Quantum, QuantumOutcome) + Send + Sync + 'static,
     ) -> Result<Executor, GraphError> {
         let retire: Arc<dyn Fn(Quantum, QuantumOutcome) + Send + Sync> = Arc::new(retire);
+        // The stage lanes are the lanes before `capture`.
+        let stage_lanes = usize::from(capture.0).max(1);
         let settler = Settler::new(runtime);
         let mut eager = Vec::with_capacity(Variant::ALL.len());
         let mut replay = Vec::with_capacity(Variant::ALL.len());
         for variant in Variant::ALL {
             let view = variant.representative();
-            let (Some(mut spec), Some(entries)) = (plan.spec(view), plan.stages(view)) else {
-                eager.push(None);
+            let Some(entries) = plan.stages(view) else {
+                eager.push(Vec::new());
                 replay.push(None);
                 continue;
             };
@@ -573,23 +579,34 @@ impl Executor {
                 .collect();
             let launches: Arc<[Arc<dyn StageLaunch>]> = entries.iter().map(|entry| Arc::clone(&entry.launch)).collect();
             if CAPTURES && view.capturable() {
-                spec.stage(StageSpec {
-                    name: "record",
-                    ordered: None,
-                    lanes: vec![capture],
-                });
                 stages.push(Arc::new(RecordStage {
                     launches: Arc::clone(&launches),
                     lane: capture,
                 }));
             }
-            let again = Arc::clone(&retire);
-            eager.push(Some(StageGraph::new(
-                spec,
-                stages,
-                runtime.clone(),
-                move |quantum, outcome| again(quantum, outcome),
-            )?));
+            // One copy of the graph for each home lane: a quantum runs on the copy of its own home.
+            let mut homed = Vec::with_capacity(stage_lanes);
+            for home in 0..stage_lanes {
+                let Some(spec) = plan.spec_homed(view, home, stage_lanes) else {
+                    break;
+                };
+                let mut spec = spec?;
+                if CAPTURES && view.capturable() {
+                    spec.stage(StageSpec {
+                        name: "record",
+                        ordered: None,
+                        lanes: vec![capture],
+                    });
+                }
+                let again = Arc::clone(&retire);
+                homed.push(StageGraph::new(
+                    spec,
+                    stages.clone(),
+                    runtime.clone(),
+                    move |quantum, outcome| again(quantum, outcome),
+                )?);
+            }
+            eager.push(homed);
             replay.push(if CAPTURES && view.capturable() {
                 let again = Arc::clone(&retire);
                 Some(StageGraph::new(
@@ -602,7 +619,12 @@ impl Executor {
                 None
             });
         }
-        Ok(Executor { plan, eager, replay })
+        Ok(Executor {
+            plan,
+            stage_lanes,
+            eager,
+            replay,
+        })
     }
 
     /// The plan the executor runs.
@@ -624,7 +646,10 @@ impl Executor {
         quantum.validate()?;
         let view = quantum.view();
         let variant = view.variant();
-        let eager = self.eager[variant.index()].as_ref().ok_or(StartError::NoView(view))?;
+        let homes = &self.eager[variant.index()];
+        let eager = homes
+            .get(home::home_of(quantum.id(), self.stage_lanes))
+            .ok_or(StartError::NoView(view))?;
         let stages = self.plan.stages(view).map_or(0, <[_]>::len);
         let stage_by_stage = StageId((stages - 1) as u16);
         let admission = if CAPTURES {
