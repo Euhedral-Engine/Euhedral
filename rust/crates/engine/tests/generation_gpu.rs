@@ -49,6 +49,7 @@ use euhedral_inference_engine::generation::{
     AdmissionError, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, LogitsSink, QuantumEvent,
     Speculation,
 };
+use euhedral_inference_engine::quantum::CAPTURES;
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
 
@@ -302,10 +303,12 @@ fn greedy_tokens_match_java_for_short_prompt() {
                 .count(),
             1
         );
-        assert!(
-            decodes.iter().filter(|event| event.replayed).count() >= 100,
-            "the decode quanta replay graphs"
-        );
+        let replayed = decodes.iter().filter(|event| event.replayed).count();
+        if CAPTURES {
+            assert!(replayed >= 100, "the decode quanta replay graphs");
+        } else {
+            assert_eq!(replayed, 0, "no graph is replayed while captures are off");
+        }
         // The sequence holds the prompt and the 127 rows decoded; the last token was selected, not fed.
         assert_eq!(
             sequence_state(&runtime),

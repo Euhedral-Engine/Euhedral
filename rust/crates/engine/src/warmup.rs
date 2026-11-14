@@ -29,41 +29,57 @@ pub struct Warmed {
     pub failed: Vec<String>,
 }
 
-/// The launches queued so far on the warm-up lane.
+/// The launches made so far in the warm-up's one submission.
 struct Launcher<'a> {
-    core: &'a Core,
+    kernels: &'a mut dyn KernelOps,
     warmed: Warmed,
-    /// The marker of the last launch queued: the lane reaches it when every launch has run.
-    last: Option<Marker>,
 }
 
 impl Launcher<'_> {
     fn launch(&mut self, module: &'static str, work: impl FnOnce(&mut dyn KernelOps) -> Result<(), CudaError>) {
-        let result = self
-            .core
-            .lane_table
-            .submit_ops(self.core.transfer_lane(0), false, |kernels| work(kernels));
-        match result {
-            Ok(((), marker)) => {
-                self.warmed.modules.push(module);
-                self.last = Some(marker);
-            }
+        match work(&mut *self.kernels) {
+            Ok(()) => self.warmed.modules.push(module),
             Err(error) => self.warmed.failed.push(format!("{module}: {error}")),
         }
     }
 }
 
-/// Warms the modules the engine's loaded model can launch with only its own buffers.
+/// Warms the modules the engine's loaded model can launch with only its own buffers: every launch is made in one
+/// submission on the first transfer lane, so the lane's ring holds one marker for all of them. Returns the marker the
+/// lane reaches when they have all run (none if the lane refused the submission, which then warmed nothing).
 pub(crate) fn run(
     core: &Core,
     config: &ModelConfig,
     weights: &Weights,
     workspace: &Workspace,
 ) -> (Warmed, Option<Marker>) {
+    let mut warmed = Warmed::default();
+    let submitted = core.lane_table.submit_ops(core.transfer_lane(0), false, |lane| {
+        warmed = warm(core, config, weights, workspace, lane);
+        Ok::<(), CudaError>(())
+    });
+    match submitted {
+        Ok(((), marker)) => (warmed, Some(marker)),
+        Err(error) => (
+            Warmed {
+                modules: Vec::new(),
+                failed: vec![format!("warm-up: {error}")],
+            },
+            None,
+        ),
+    }
+}
+
+fn warm(
+    core: &Core,
+    config: &ModelConfig,
+    weights: &Weights,
+    workspace: &Workspace,
+    kernels: &mut dyn KernelOps,
+) -> Warmed {
     let mut launcher = Launcher {
-        core,
+        kernels,
         warmed: Warmed::default(),
-        last: None,
     };
     let hidden = config.hidden_size as u32;
     let intermediate = config.intermediate_size as u32;
@@ -182,7 +198,7 @@ pub(crate) fn run(
             }
         }
     }
-    (launcher.warmed, launcher.last)
+    launcher.warmed
 }
 
 /// `(rows, columns)` of a two-dimensional tensor, as the launches take them.

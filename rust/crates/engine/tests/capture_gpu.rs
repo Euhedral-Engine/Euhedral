@@ -539,8 +539,7 @@ impl Run {
             .sequence
             .refs(source)
             .unwrap()
-            .ordered_after(marker, &world.pool, &world.library)
-            .unwrap()
+            .ordered_after(marker, &world.pool)
             .with_replay_rows(replay);
         let mode = SubmitMode {
             pdl: matches!(kind, QuantumKind::Decode | QuantumKind::Verify) && start < 1024,
@@ -1155,7 +1154,7 @@ fn a_selection_is_held_by_its_quantum_until_the_quantum_is_dropped() {
 
 #[test]
 #[ignore = "needs a GPU and the native library"]
-fn a_reservation_marker_is_kept_in_the_ring_and_dropped_when_reached() {
+fn a_reservation_marker_is_kept_until_reached_and_then_dropped() {
     let Some(light) = light() else { return };
     let mut sequence = light.sequence(1024, 1);
     let mut retained = KvRetained::default();
@@ -1165,35 +1164,16 @@ fn a_reservation_marker_is_kept_in_the_ring_and_dropped_when_reached() {
         .reserve(&mut &submission, &light.pinned, 0, 8, &mut retained)
         .unwrap();
     let reserved = submission.finish().unwrap();
-    // The ring holds 4 events: the reservation's marker is stale after 4 more.
-    for _ in 0..3 {
-        Submission::begin(&light.lane, SubmitMode::default())
-            .unwrap()
-            .finish()
-            .unwrap();
-    }
     let view = sequence.kv.view();
-    let kept = view.clone().ordered_after(reserved, &light.pool, &light.library);
-    assert_eq!(kept.unwrap().ready(), Some(reserved), "within the ring");
-    for _ in 0..2 {
-        Submission::begin(&light.lane, SubmitMode::default())
-            .unwrap()
-            .finish()
-            .unwrap();
-    }
-    assert!(!light.library.marker_waitable(reserved));
-    let refused = view.clone().ordered_after(reserved, &light.pool, &light.library);
-    assert!(
-        refused.is_err(),
-        "older than the ring and not reached: the owner holds the quantum back"
-    );
+    let kept = view.clone().ordered_after(reserved, &light.pool);
+    assert_eq!(kept.ready(), Some(reserved), "work not yet reached is waited for");
     let marker: Marker = Submission::begin(&light.lane, SubmitMode::default())
         .unwrap()
         .finish_signalled()
         .unwrap();
     light.lane.synchronize().unwrap();
     assert!(light.pool.reached(marker));
-    let done = view.ordered_after(reserved, &light.pool, &light.library).unwrap();
+    let done = view.ordered_after(reserved, &light.pool);
     assert_eq!(done.ready(), None, "reached work needs no ordering");
 }
 

@@ -44,7 +44,7 @@ use crate::error::EngineError;
 use crate::model::ModelConfig;
 use crate::quantum::Disposition;
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
-use crate::state::{FlightGuard, KvView, SequenceDevice, StaleReservation};
+use crate::state::{FlightGuard, KvView, SequenceDevice};
 use crate::workspace::{BufferSlot, Workspace, WorkspaceError};
 use attention::KvSource;
 use sampling::{Selection, SelectionLease};
@@ -301,21 +301,15 @@ impl SequenceRefs {
     }
 
     /// Orders the quantum's stages that read a cache behind the work that reserved its rows, `marker`, for the views
-    /// of both caches ([`KvView::ordered_after`]): the marker is kept while its lane's event ring holds it, dropped
-    /// when its work has completed, and refused when it is older than the ring and not reached.
-    pub fn ordered_after(
-        mut self,
-        marker: Marker,
-        lanes: &LanePool,
-        library: &CudaLibrary,
-    ) -> Result<Self, StaleReservation> {
+    /// of both caches ([`KvView::ordered_after`]): the marker is kept until its work has completed.
+    pub fn ordered_after(mut self, marker: Marker, lanes: &LanePool) -> Self {
         if let Some(view) = self.kv.take() {
-            self.kv = Some(view.ordered_after(marker, lanes, library)?);
+            self.kv = Some(view.ordered_after(marker, lanes));
         }
         if let Some(view) = self.mtp_kv.take() {
-            self.mtp_kv = Some(view.ordered_after(marker, lanes, library)?);
+            self.mtp_kv = Some(view.ordered_after(marker, lanes));
         }
-        Ok(self)
+        self
     }
 
     /// The rows each GDN layer replays, by model layer.

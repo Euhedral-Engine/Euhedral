@@ -23,7 +23,7 @@ use crate::stages::sampling::SelectionPool;
 use attention::AttentionScratch;
 use gdn::GdnStates;
 use kv::KvCache;
-pub use kv::{KvView, StaleReservation};
+pub use kv::KvView;
 
 /// What the stages of a quantum read of a sequence: its GDN state and its attention scratch. Allocated once, at
 /// full size, and shared by every quantum of the sequence; nothing about it changes while quanta run, except the

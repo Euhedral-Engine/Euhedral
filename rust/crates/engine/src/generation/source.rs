@@ -1115,8 +1115,7 @@ impl Owner {
             .sequence
             .refs(source)
             .map_err(why("the sequence's references"))?
-            .ordered_after(reserved, &core.lanes, &core.library)
-            .map_err(why("ordering the quantum behind its reservation"))?
+            .ordered_after(reserved, &core.lanes)
             .with_replay_rows(replay);
         let mode = SubmitMode {
             pdl,

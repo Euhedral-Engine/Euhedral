@@ -560,13 +560,6 @@ impl KvCache {
     }
 }
 
-/// The marker of the work that reserved a cache's rows is older than its lane's event ring and has not completed.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("the reservation's marker {} of lane {} is older than its lane's event ring and not reached", .marker.value, .marker.lane.0)]
-pub struct StaleReservation {
-    pub marker: Marker,
-}
-
 /// The page tables of one layer as a view holds them.
 #[derive(Clone, Copy, Debug)]
 struct LayerTable {
@@ -599,7 +592,7 @@ struct HostView {
 /// Pages are allocated in stream order on the lane that reserved them. A stage on another lane must be ordered
 /// behind that allocation: the owner passes the marker of the reserving submission with
 /// [`KvView::ready_after`], and the cache stages wait for it on the device (`Launch::waits`). The owner passes it
-/// only while the reservation is recent: a marker older than its lane's event ring is refused by the wait.
+/// as long as the reservation has not completed.
 #[derive(Clone, Debug)]
 pub struct KvView {
     format: KvFormat,
@@ -630,25 +623,14 @@ impl KvView {
         self
     }
 
-    /// The view with the reserving submission's marker, if the marker can still be waited for. A wait refuses a marker
-    /// older than its lane's event ring (the lane's later markers have reused its event), so:
-    /// - a marker within the ring orders the view as [`KvView::ready_after`] does;
-    /// - an older marker whose work has completed (`lanes` has reached it) needs no ordering, and the view stays as it
-    ///   is;
-    /// - an older marker that has not been reached cannot be ordered behind at all: the owner holds the quantum back
-    ///   until it is, and asks again.
-    pub fn ordered_after(
-        self,
-        marker: Marker,
-        lanes: &LanePool,
-        library: &CudaLibrary,
-    ) -> Result<Self, StaleReservation> {
-        if library.marker_waitable(marker) {
-            Ok(self.ready_after(marker))
-        } else if lanes.reached(marker) {
-            Ok(self)
+    /// The view with the reserving submission's marker, unless its work has completed (`lanes` has reached it): then
+    /// nothing needs ordering and the view stays as it is. A marker older than its lane's ring is safe to wait for: the
+    /// lanes treat it as done.
+    pub fn ordered_after(self, marker: Marker, lanes: &LanePool) -> Self {
+        if lanes.reached(marker) {
+            self
         } else {
-            Err(StaleReservation { marker })
+            self.ready_after(marker)
         }
     }
 
