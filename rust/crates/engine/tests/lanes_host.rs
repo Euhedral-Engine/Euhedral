@@ -456,6 +456,85 @@ fn settling_a_lane_with_a_full_ring_is_busy_then_signals() {
     assert_eq!(ends.settle(&*lane).unwrap(), Settled::Clean);
 }
 
+/// A launch that fails in the second stage of a fused unit leaves the first stage's kernels on the lane with no marker
+/// of the quantum. The lane must then be settled whatever its last marker's state (here the quantum recorded none), and
+/// the settling marker must come after those kernels.
+#[test]
+fn a_failure_after_the_first_stage_of_a_unit_leaves_the_lane_for_the_settle() {
+    let gpu = gpu();
+    let kernel = kernel(&gpu);
+    let words = [gpu.alloc(4), gpu.alloc(4), gpu.alloc(4)];
+    let lanes = open_shared_lanes(&gpu, &[("a", StreamOptions::default())]).unwrap();
+    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
+    let ends = LaneEnds::new(1);
+    let failed = ends.submit(&*lane, [], false, |queue| {
+        // The unit's first stage queues its kernel; the second fails.
+        combine(queue, &kernel, words, 2)?;
+        Err(StageError::Fatal("the second stage refused".into()))
+    });
+    assert!(matches!(failed, Err(StageError::Fatal(_))), "{failed:?}");
+    assert!(
+        ends.unsignalled(LaneId(0)),
+        "the first stage's kernels have no marker: the lane is to be settled"
+    );
+    assert_eq!(ends.unsignalled_lanes(), vec![LaneId(0)]);
+    assert_eq!(ends.settle(&*lane).unwrap(), Settled::Signalled);
+    assert_eq!(
+        gpu.run_until_idle(),
+        2,
+        "the kernel, then the settling marker behind it"
+    );
+    assert!(!ends.unsignalled(LaneId(0)));
+    assert_eq!(ends.settle(&*lane).unwrap(), Settled::Clean);
+}
+
+/// A refusal because the lane is held queued nothing, and settles nothing.
+#[test]
+fn a_retry_leaves_the_lane_unflagged() {
+    let gpu = gpu();
+    let lanes = open_shared_lanes(
+        &gpu,
+        &[(
+            "a",
+            StreamOptions {
+                markers: 1,
+                ..StreamOptions::default()
+            },
+        )],
+    )
+    .unwrap();
+    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
+    let ends = LaneEnds::new(1);
+    ends.submit(&*lane, [], true, |_| Ok(())).unwrap();
+    let busy = ends.submit(&*lane, [], false, |_| Ok(()));
+    assert!(matches!(busy, Err(StageError::Retry)), "{busy:?}");
+    assert!(!ends.unsignalled(LaneId(0)));
+}
+
+/// Stages run as one submission of a lane end in one marker, and the launches before it queue in order.
+#[test]
+fn several_launches_in_one_submission_end_in_one_marker_signalled_once() {
+    let gpu = gpu();
+    let kernel = kernel(&gpu);
+    let words = [gpu.alloc(4), gpu.alloc(4), gpu.alloc(4)];
+    let lanes = open_shared_lanes(&gpu, &[("a", StreamOptions::default())]).unwrap();
+    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
+    let ends = LaneEnds::new(1);
+    let first = ends.submit(&*lane, [], true, |_| Ok(())).unwrap();
+    let marker = ends
+        .submit(&*lane, [], true, |queue| {
+            // out = a + 1 three times over the same word: x = 0 -> 1 -> 2 -> 3 only if run in order.
+            combine(queue, &kernel, [words[2], words[1], words[2]], 2)?;
+            combine(queue, &kernel, [words[2], words[1], words[2]], 2)?;
+            combine(queue, &kernel, [words[2], words[1], words[2]], 2)
+        })
+        .unwrap();
+    assert_eq!(marker.value, first.value + 1, "one marker for the three launches");
+    assert_eq!(gpu.run_until_idle(), 5, "two markers and three kernels");
+    assert_eq!(word(&gpu, words[2]), 3);
+    assert!(!ends.unsignalled(LaneId(0)));
+}
+
 /// A settling that finds the lane's ring full is published again behind the lane's progress, and the second try, once
 /// the device has run the work, ends the lane with a signalled marker: the settler never waits, and does not drop the
 /// quantum.

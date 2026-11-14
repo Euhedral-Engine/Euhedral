@@ -801,17 +801,18 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
     let modes = quantum.lanes.modes(quantum.mode.row_exact);
     let table = quantum.lanes.kernels();
     let marker = if idle {
-        submit_on(&**lane, cx.waits.iter().copied(), |_| Ok(()))?
+        quantum
+            .ends
+            .submit(&**lane, cx.waits.iter().copied(), signal, |_| Ok(()))?
     } else {
         let waits = cx.waits.iter().copied().chain(stage.waits(quantum));
-        submit_on(&**lane, waits, |queue| {
+        quantum.ends.submit(&**lane, waits, signal, |queue| {
             stage.launch(
                 quantum,
                 &mut RusteeOps::new(queue, table, modes).with_pdl(quantum.mode.pdl),
             )
         })?
     };
-    quantum.ends.record(marker, signal);
     Ok(Submitted::marker(marker))
 }
 
@@ -881,7 +882,8 @@ impl StageLaunch for Chain {
 
     fn waits(&self, quantum: &Quantum) -> Vec<Marker> {
         let mut waits: Vec<Marker> = Vec::new();
-        for marker in self.launches.iter().flat_map(|launch| launch.waits(quantum)) {
+        let busy = self.launches.iter().filter(|launch| !launch.idle(quantum));
+        for marker in busy.flat_map(|launch| launch.waits(quantum)) {
             if !waits.contains(&marker) {
                 waits.push(marker);
             }
@@ -890,10 +892,27 @@ impl StageLaunch for Chain {
     }
 
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
-        self.launches
-            .iter()
-            .try_for_each(|launch| launch.launch(quantum, kernels))
+        // As a graph capture does, skip the stages with nothing to queue: a chain does not rely on each stage's own guard.
+        for_each_busy(
+            &self.launches,
+            |launch| launch.idle(quantum),
+            |launch| launch.launch(quantum, kernels),
+        )
     }
+}
+
+/// Calls `launch` on each of `stages` that is not `idle`, in order, and stops at the first failure.
+fn for_each_busy<S: ?Sized>(
+    stages: &[Arc<S>],
+    idle: impl Fn(&S) -> bool,
+    mut launch: impl FnMut(&S) -> Result<(), StageError>,
+) -> Result<(), StageError> {
+    for stage in stages {
+        if !idle(stage) {
+            launch(stage)?;
+        }
+    }
+    Ok(())
 }
 
 /// A stage of a plan's graph: runs as [`run_stage`] with the signalling the plan gave it.
@@ -946,6 +965,33 @@ mod tests {
         assert_eq!(InputRecordRef::position_offset(2), 8);
         assert_eq!(InputRecordRef::position_offset(3), 16);
         assert_eq!(InputRecordRef::position_offset(512), 2048);
+    }
+
+    #[test]
+    fn a_chain_launches_its_busy_stages_in_order_and_stops_at_a_failure() {
+        let stages: Vec<Arc<u32>> = (0..6).map(Arc::new).collect();
+        let mut seen = Vec::new();
+        for_each_busy(
+            &stages,
+            |stage| stage % 2 == 1,
+            |stage| {
+                seen.push(*stage);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, vec![0, 2, 4], "idle stages queue nothing, the rest in order");
+        let mut seen = Vec::new();
+        let failed = for_each_busy(
+            &stages,
+            |_| false,
+            |stage| {
+                seen.push(*stage);
+                if *stage == 2 { Err(fatal("refused")) } else { Ok(()) }
+            },
+        );
+        assert!(matches!(failed, Err(StageError::Fatal(_))));
+        assert_eq!(seen, vec![0, 1, 2], "nothing after the failing stage is launched");
     }
 
     #[test]
