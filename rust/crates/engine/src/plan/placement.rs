@@ -2,10 +2,11 @@
 //!
 //! A graph of a chain needs one lane; a fan-out needs as many as the stages that can run at once. So the lane count is
 //! the width of the widest graph: the most stages no edge orders, which is the size of a largest antichain (Dilworth:
-//! the stage count less a largest matching of the ordering). RustEE's `StageGraph` places the stages by the path
-//! policy (`StageGraph.markPaths`): it keeps a graph's critical chain on one lane and gives the other branches of a
-//! fan-out lanes of their own; [`path_predecessors`] is the same rule, which the plan reads to know where a chain of a
-//! lane ends.
+//! the stage count less a largest matching of the ordering). RustEE's `StageGraph` continues a stage on the lane of its
+//! path predecessor (`StageGraph.markPaths`: the critical chain of a graph keeps one lane) and, left alone, puts every
+//! other branch of a fan-out on a random allowed lane. The plan therefore fixes the lane of each chain of
+//! continuations ([`chain_lanes`]) and allows each stage only that lane; [`path_predecessors`] is the rule that forms
+//! the chains, which the plan also reads to know where a chain of a lane ends.
 
 use std::collections::VecDeque;
 
@@ -207,7 +208,8 @@ pub(crate) fn chain_lanes(edges: &[Vec<usize>], width: usize) -> Vec<u16> {
     };
     let mut chain_lane: Vec<Option<u16>> = vec![None; chains.len()];
     for (index, chain) in chains.iter().enumerate() {
-        if edges[chain[0]].is_empty() {
+        // The first root is on the home lane; any other root is placed like the chains of a fan-out.
+        if index == 0 && edges[chain[0]].is_empty() {
             chain_lane[index] = Some(0);
             continue;
         }
@@ -226,6 +228,11 @@ pub(crate) fn chain_lanes(edges: &[Vec<usize>], width: usize) -> Vec<u16> {
                 break;
             }
         }
+        debug_assert!(
+            best.is_some_and(|(crowd, _)| crowd == 0),
+            "the chain starting at stage {} shares a lane with stages it can overlap: {width} lanes are too few",
+            chain[0]
+        );
         chain_lane[index] = best.map(|(_, lane)| lane);
     }
     chain_of.iter().map(|&chain| chain_lane[chain].unwrap_or(0)).collect()
@@ -351,6 +358,17 @@ mod tests {
         let edges = [vec![], vec![0], vec![0], vec![1, 2], vec![3], vec![3], vec![4, 5]];
         assert_eq!(chain_lanes(&edges, fan_out_width(&edges)), vec![0, 0, 1, 1, 1, 0, 0]);
         assert_eq!(chain_lanes(&[vec![], vec![0], vec![1]], 1), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn roots_after_the_first_take_lanes_of_their_own() {
+        // Two unordered roots, each with one stage after it, and a join.
+        let edges = [vec![], vec![], vec![0], vec![1], vec![2, 3]];
+        let lanes = chain_lanes(&edges, fan_out_width(&edges));
+        assert_eq!(lanes[0], 0);
+        assert_ne!(lanes[0], lanes[1]);
+        assert_eq!(lanes[2], lanes[0]);
+        assert_eq!(lanes[3], lanes[1]);
     }
 
     #[test]
