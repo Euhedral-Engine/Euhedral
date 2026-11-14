@@ -536,19 +536,24 @@ fn the_settler_publishes_a_busy_settling_again_behind_progress() {
     );
 }
 
-/// The home of a quantum is taken from its own id: quanta spread over more than one home (and over all of them, in
-/// proportion), and the same id has the same home.
+/// A fixed start time for the quantum with `id`, so the tests do not depend on a clock.
+fn clock_of(id: u64) -> u64 {
+    id.wrapping_mul(1_000_003).wrapping_add(17)
+}
+
+/// The home of a quantum is taken from its id and start time: quanta spread over more than one home (and over all
+/// of them, in proportion), and the same id and time have the same home.
 #[test]
 fn quanta_with_different_ids_have_different_homes() {
     for stage_lanes in [2usize, 3, 4, 7] {
         let mut counts = vec![0usize; stage_lanes];
         for id in 0..4000u64 {
-            let home = home_of(id, stage_lanes);
+            let home = home_of(id, clock_of(id), stage_lanes);
             assert!(home < stage_lanes, "home {home} of {stage_lanes} lanes");
             assert_eq!(
                 home,
-                home_of(id, stage_lanes),
-                "a quantum's home is a function of its id"
+                home_of(id, clock_of(id), stage_lanes),
+                "a quantum's home is a function of its id and time"
             );
             counts[home] += 1;
         }
@@ -560,7 +565,7 @@ fn quanta_with_different_ids_have_different_homes() {
             );
         }
     }
-    assert_eq!(home_of(12345, 1), 0, "one stage lane is every quantum's home");
+    assert_eq!(home_of(12345, 99, 1), 0, "one stage lane is every quantum's home");
 }
 
 /// A quantum's stages run on `(home + offset) mod stage_lanes`: a chain (one offset) keeps its lane, the branches of a
@@ -570,7 +575,7 @@ fn quanta_with_different_ids_have_different_homes() {
 fn a_chain_keeps_its_lane_branches_stay_distinct_and_reserved_lanes_are_never_chosen() {
     let (compute, transfers) = (4, 3);
     for id in 0..200u64 {
-        let home = home_of(id, compute);
+        let home = home_of(id, clock_of(id), compute);
         // A chain of three stages shares offset 1: the same lane each time.
         let chain: Vec<usize> = [1usize, 1, 1]
             .iter()

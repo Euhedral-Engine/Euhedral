@@ -26,6 +26,7 @@ mod input_record;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 use euhedral_graph::{
     DeviceQueue, EdgeKind, ExternalEdge, GraphError, GraphRuntime, LaneId, Marker, QuantumOutcome, QuantumRef, Stage,
@@ -535,6 +536,8 @@ pub struct Executor {
     plan: Arc<Plan>,
     /// The lanes the stage graphs run on; a quantum's home is one of them.
     stage_lanes: usize,
+    /// The reading of the monotonic clock the home hash is seeded with is the time since this instant.
+    origin: Instant,
     /// By variant, the eager graph for each home lane.
     eager: Vec<Vec<Arc<StageGraph<Quantum>>>>,
     replay: Vec<Option<Arc<StageGraph<Quantum>>>>,
@@ -622,9 +625,15 @@ impl Executor {
         Ok(Executor {
             plan,
             stage_lanes,
+            origin: Instant::now(),
             eager,
             replay,
         })
+    }
+
+    /// One monotonic reading, in nanoseconds, taken as a quantum starts.
+    fn clock(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
     /// The plan the executor runs.
@@ -648,7 +657,7 @@ impl Executor {
         let variant = view.variant();
         let homes = &self.eager[variant.index()];
         let eager = homes
-            .get(home::home_of(quantum.id(), self.stage_lanes))
+            .get(home::home_of(quantum.id(), self.clock(), self.stage_lanes))
             .ok_or(StartError::NoView(view))?;
         let stages = self.plan.stages(view).map_or(0, <[_]>::len);
         let stage_by_stage = StageId((stages - 1) as u16);

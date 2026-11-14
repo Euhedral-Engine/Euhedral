@@ -1,17 +1,18 @@
 //! Where a quantum's stages run among the stage lanes.
 //!
 //! The plan gives each stage an offset from the quantum's home lane (a chain of lane continuations has one offset;
-//! the branches of a fan-out have different ones). Each quantum has its own home, taken from its id, so the root of
+//! the branches of a fan-out have different ones). Each quantum has its own home, taken from a hash of its id and the time it starts, so the root of
 //! every quantum does not land on one lane. Only the stage lanes take part: the owner's, the capture and the
 //! transfer lanes are never chosen.
 
-/// The home lane of the quantum with `id`, among `stage_lanes` stage lanes: the high half of the product of a
-/// 64-bit hash of `id` and `stage_lanes`, which is uniform over `0..stage_lanes` without a division.
-pub fn home_of(id: u64, stage_lanes: usize) -> usize {
-    let mut hash = id.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    hash = (hash ^ (hash >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    hash = (hash ^ (hash >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    hash ^= hash >> 31;
+use euhedral_hashing::hasher_api::hash_bytes_with_seed;
+
+/// The home lane of the quantum with `id` started at `clock` (a monotonic reading in nanoseconds), among
+/// `stage_lanes` stage lanes: the high half of the product of the xxHash64 of `id`, seeded with `clock`, and
+/// `stage_lanes`, which is uniform over `0..stage_lanes` without a division. The reading is an argument so the
+/// function is pure.
+pub fn home_of(id: u64, clock: u64, stage_lanes: usize) -> usize {
+    let hash = hash_bytes_with_seed(&id.to_le_bytes(), clock);
     ((u128::from(hash) * stage_lanes as u128) >> 64) as usize
 }
 
