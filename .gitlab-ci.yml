@@ -1,0 +1,42 @@
+# GitLab twin of .github/workflows/rust.yaml and native-package.yaml (Linux only; no Windows/ARM runners, and the Intel
+# SDE AVX-512 step is left to GitHub). Jobs run in the arbiter-gated runner; the lease is set by ARBITER_ARGS.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  ARBITER_ARGS: "--cpu shared:16 --mem 32G"
+  ARBITER_EST: "1800"
+  DOCKER_ARGS: "--security-opt seccomp=unconfined"
+
+rust:
+  stage: test
+  rules:
+    - changes: ["rust/**/*", "native/include/**/*", "mise.toml", ".gitlab-ci.yml"]
+  script:
+    - mise install rust >/dev/null && eval "$(mise env -s bash)"
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends libclang-dev >/dev/null
+    - cargo install bindgen-cli --version 0.72.1 --locked
+    - cd rust
+    - cargo xtask bindings --check
+    - scripts/check-layers.sh --self-test
+    - cargo fmt --all --check
+    - cargo clippy --workspace --all-targets -- -D warnings
+    - rustup target add aarch64-unknown-linux-gnu
+    - cargo check --target aarch64-unknown-linux-gnu -p euhedral-inference-host-gemv
+    - cargo test --workspace
+
+native-package:
+  stage: test
+  rules:
+    - changes: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", ".gitlab-ci.yml"]
+  variables:
+    ZIG_GLOBAL_CACHE_DIR: $CI_PROJECT_DIR/native/.zig-global-cache
+  script:
+    - apt-get update -qq && apt-get install -y -qq llvm xz-utils python3-pip >/dev/null
+    - mise install >/dev/null
+    - mise exec -- gradle nativeVerify :api:bootJar build
+  artifacts:
+    when: on_failure
+    paths: [api/build/test-results/test/*.xml]
