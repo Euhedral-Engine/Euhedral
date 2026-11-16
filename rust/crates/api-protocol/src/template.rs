@@ -12,7 +12,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use escape::{escape_control_tokens, trim};
-pub use json::JsonValue;
+pub use json::{JsonInteger, JsonValue};
 
 const IM_START: &str = "<|im_start|>";
 const IM_END: &str = "<|im_end|>";
@@ -41,6 +41,18 @@ the final answer.";
 const LOW_INSTRUCTIONS: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving \
 directly to the conclusion without unnecessary elaboration.";
 
+/// The control tokens the rendering emits; the tokenizer must encode each as one token.
+pub const CONTROL_TOKENS: [&str; 8] = [
+    IM_START,
+    IM_END,
+    THINK_START,
+    THINK_END,
+    TOOL_CALL_START,
+    TOOL_CALL_END,
+    TOOL_RESPONSE_START,
+    TOOL_RESPONSE_END,
+];
+
 /// The speaker of a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -63,33 +75,66 @@ pub struct ToolCall {
     pub arguments: Vec<(String, JsonValue)>,
 }
 
-/// One turn. Only assistant messages carry `tool_calls`, rendered after the content in list order, and
-/// `reasoning`, the replayed reasoning of an earlier response (empty when there is none).
+/// One turn. Only assistant messages carry tool calls and replayed reasoning.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Message {
-    pub role: Role,
+pub enum Message {
+    System(Vec<ContentPart>),
+    User(Vec<ContentPart>),
+    Assistant(AssistantMessage),
+    /// The result of a tool call.
+    Tool(Vec<ContentPart>),
+}
+
+/// An assistant turn: its content, then `tool_calls` rendered after it in list order, and `reasoning`, the replayed
+/// reasoning of an earlier response (empty when there is none).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AssistantMessage {
     pub content: Vec<ContentPart>,
     pub tool_calls: Vec<ToolCall>,
     pub reasoning: String,
 }
 
 impl Message {
-    /// A message with one text part and no calls or reasoning.
-    pub fn text(role: Role, text: impl Into<String>) -> Self {
-        Self {
-            role,
+    /// A system message of one text part.
+    pub fn system(text: impl Into<String>) -> Self {
+        Self::System(vec![ContentPart::Text(text.into())])
+    }
+
+    /// A user message of one text part.
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::User(vec![ContentPart::Text(text.into())])
+    }
+
+    /// A tool-result message of one text part.
+    pub fn tool(text: impl Into<String>) -> Self {
+        Self::Tool(vec![ContentPart::Text(text.into())])
+    }
+
+    /// An assistant message of one text part, without calls or reasoning.
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self::Assistant(AssistantMessage {
             content: vec![ContentPart::Text(text.into())],
-            tool_calls: Vec::new(),
-            reasoning: String::new(),
+            ..AssistantMessage::default()
+        })
+    }
+
+    /// The speaker.
+    pub fn role(&self) -> Role {
+        match self {
+            Self::System(_) => Role::System,
+            Self::User(_) => Role::User,
+            Self::Assistant(_) => Role::Assistant,
+            Self::Tool(_) => Role::Tool,
         }
     }
 
     /// The text parts joined in order.
     fn joined_text(&self) -> String {
-        self.content
-            .iter()
-            .map(|ContentPart::Text(text)| text.as_str())
-            .collect()
+        let parts = match self {
+            Self::System(parts) | Self::User(parts) | Self::Tool(parts) => parts,
+            Self::Assistant(assistant) => &assistant.content,
+        };
+        parts.iter().map(|ContentPart::Text(text)| text.as_str()).collect()
     }
 }
 
@@ -120,7 +165,7 @@ impl ToolDefinition {
 
 /// What to render: the messages and the tools the model may call (none renders the template's no-tools branch).
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct Conversation {
+pub struct TemplateInput {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
 }
@@ -170,19 +215,16 @@ impl Default for TemplateOptions {
     }
 }
 
-/// A conversation the template refuses; the messages are the template's own.
+/// An input the template refuses; the messages are the template's own. All three are errors of the client's
+/// conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TemplateError {
-    /// The conversation has no messages.
+    /// The input has no messages.
     NoMessages,
     /// No user message that is not a wrapped tool response.
     NoUserQuery,
     /// A system message after the first position.
     SystemNotFirst,
-    /// A message other than an assistant message carries tool calls.
-    ToolCallsOnNonAssistant,
-    /// A message other than an assistant message carries reasoning.
-    ReasoningOnNonAssistant,
 }
 
 impl Display for TemplateError {
@@ -191,8 +233,6 @@ impl Display for TemplateError {
             Self::NoMessages => "No messages provided.",
             Self::NoUserQuery => "No user query found in messages.",
             Self::SystemNotFirst => "System message must be at the beginning.",
-            Self::ToolCallsOnNonAssistant => "only assistant turns carry tool calls",
-            Self::ReasoningOnNonAssistant => "only assistant turns carry reasoning",
         })
     }
 }
@@ -200,23 +240,15 @@ impl Display for TemplateError {
 impl Error for TemplateError {}
 
 /// Renders the conversation followed by the assistant generation prompt.
-pub fn render(conversation: &Conversation, options: &TemplateOptions) -> Result<String, TemplateError> {
+pub fn render(conversation: &TemplateInput, options: &TemplateOptions) -> Result<String, TemplateError> {
     let messages = &conversation.messages;
-    for message in messages {
-        if !message.tool_calls.is_empty() && message.role != Role::Assistant {
-            return Err(TemplateError::ToolCallsOnNonAssistant);
-        }
-        if !message.reasoning.is_empty() && message.role != Role::Assistant {
-            return Err(TemplateError::ReasoningOnNonAssistant);
-        }
-    }
     let Some(first) = messages.first() else {
         return Err(TemplateError::NoMessages);
     };
     let texts: Vec<String> = messages.iter().map(Message::joined_text).collect();
     let mut prompt = String::new();
     let instructions = options.effort.map_or("", Effort::instructions);
-    let system = if first.role == Role::System {
+    let system = if first.role() == Role::System {
         trim(&texts[0])
     } else {
         ""
@@ -255,38 +287,38 @@ pub fn render(conversation: &Conversation, options: &TemplateOptions) -> Result<
     let last_query = last_user_query(messages, &texts).ok_or(TemplateError::NoUserQuery)?;
     for (index, message) in messages.iter().enumerate() {
         let content = trim(&texts[index]);
-        match message.role {
-            Role::System => {
+        match message {
+            Message::System(_) => {
                 if index != 0 {
                     return Err(TemplateError::SystemNotFirst);
                 }
             }
-            Role::User => {
+            Message::User(_) => {
                 prompt.push_str(IM_START);
                 prompt.push_str("user\n");
                 prompt.push_str(&escape_control_tokens(content));
                 prompt.push_str(IM_END);
                 prompt.push('\n');
             }
-            Role::Assistant => {
+            Message::Assistant(assistant) => {
                 prompt.push_str(IM_START);
                 prompt.push_str("assistant\n");
                 if options.preserve_thinking || index > last_query {
                     prompt.push_str(THINK_START);
                     prompt.push('\n');
-                    prompt.push_str(&escape_control_tokens(trim(&message.reasoning)));
+                    prompt.push_str(&escape_control_tokens(trim(&assistant.reasoning)));
                     prompt.push('\n');
                     prompt.push_str(THINK_END);
                     prompt.push_str("\n\n");
                 }
                 prompt.push_str(&escape_control_tokens(content));
-                append_tool_calls(&message.tool_calls, !content.is_empty(), &mut prompt);
+                append_tool_calls(&assistant.tool_calls, !content.is_empty(), &mut prompt);
                 prompt.push_str(IM_END);
                 prompt.push('\n');
             }
             // Consecutive tool results share one user turn, opened only after a non-tool message.
-            Role::Tool => {
-                if index > 0 && messages[index - 1].role != Role::Tool {
+            Message::Tool(_) => {
+                if index > 0 && messages[index - 1].role() != Role::Tool {
                     prompt.push_str(IM_START);
                     prompt.push_str("user");
                 }
@@ -296,7 +328,7 @@ pub fn render(conversation: &Conversation, options: &TemplateOptions) -> Result<
                 prompt.push_str(&escape_control_tokens(content));
                 prompt.push('\n');
                 prompt.push_str(TOOL_RESPONSE_END);
-                if messages.get(index + 1).is_none_or(|next| next.role != Role::Tool) {
+                if messages.get(index + 1).is_none_or(|next| next.role() != Role::Tool) {
                     prompt.push_str(IM_END);
                     prompt.push('\n');
                 }
@@ -343,11 +375,99 @@ fn append_tool_calls(calls: &[ToolCall], after_content: bool, prompt: &mut Strin
 /// The index of the last user message that is not a wrapped tool response.
 fn last_user_query(messages: &[Message], texts: &[String]) -> Option<usize> {
     messages.iter().enumerate().rev().find_map(|(index, message)| {
-        if message.role != Role::User {
+        if message.role() != Role::User {
             return None;
         }
         let content = trim(&texts[index]);
         let wrapped = content.starts_with(TOOL_RESPONSE_START) && content.ends_with(TOOL_RESPONSE_END);
         (!wrapped).then_some(index)
     })
+}
+
+/// A template source that is not the one the rendering reproduces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateSourceError {
+    fragment: String,
+}
+
+impl TemplateSourceError {
+    /// The fragment of template source that is missing.
+    pub fn fragment(&self) -> &str {
+        &self.fragment
+    }
+}
+
+impl Display for TemplateSourceError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "unsupported checkpoint chat template; the Qwen formatter no longer matches fragment: {}",
+            self.fragment
+        )
+    }
+}
+
+impl Error for TemplateSourceError {}
+
+/// Verifies that `source`, the checkpoint's template, still contains every fragment of template source whose
+/// behaviour `render` reproduces; CRLF line endings are read as LF. An artifact whose template changed is refused
+/// here instead of being rendered in the old format.
+pub fn check_template_source(source: &str) -> Result<(), TemplateSourceError> {
+    let normalized = source.replace("\r\n", "\n");
+    // The instructions as the template's string literals spell them (`\n` escapes).
+    let tool_instructions = TOOL_INSTRUCTIONS.replace('\n', "\\n");
+    let fragments = [
+        "{%- if tools and tools is iterable and tools is not mapping %}".to_owned(),
+        "{{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}".to_owned(),
+        "{{- \"\\n\" }}\n        {{- tool | tojson }}".to_owned(),
+        "{{- \"\\n</tools>\" }}".to_owned(),
+        format!("{{{{- '{tool_instructions}' }}}}"),
+        "{{- '\\n\\n' + content }}".to_owned(),
+        "{%- if messages[0].role == 'system' %}".to_owned(),
+        "render_content(messages[0].content, false, true)|trim".to_owned(),
+        "'<|im_start|>system\\n' + (reasoning_instructions + '\\n\\n' if reasoning_instructions else '')  + content + '<|im_end|>\\n'".to_owned(),
+        "raise_exception('No user query found in messages.')".to_owned(),
+        "render_content(message.content, true)|trim".to_owned(),
+        "raise_exception('System message must be at the beginning.')".to_owned(),
+        "'<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n'".to_owned(),
+        "'<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content".to_owned(),
+        "{%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}".to_owned(),
+        "{{- '\\n\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}".to_owned(),
+        "{{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}".to_owned(),
+        "{{- '\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}".to_owned(),
+        "{%- for args_name, args_value in tool_call.arguments|items %}".to_owned(),
+        "{{- '<parameter=' + args_name + '>\\n' }}".to_owned(),
+        "{%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}".to_owned(),
+        "{{- '\\n</parameter>\\n' }}".to_owned(),
+        "{{- '</function>\\n</tool_call>' }}".to_owned(),
+        "{%- if loop.previtem and loop.previtem.role != \"tool\" %}".to_owned(),
+        "{{- '<|im_start|>user' }}".to_owned(),
+        "{{- '\\n<tool_response>\\n' }}".to_owned(),
+        "{{- '\\n</tool_response>' }}".to_owned(),
+        "{%- if not loop.last and loop.nextitem.role != \"tool\" %}".to_owned(),
+        "{%- if enable_thinking is undefined or enable_thinking is true %}".to_owned(),
+        "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}".to_owned(),
+        "{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}".to_owned(),
+        "{%- if resolved_reasoning_effort == 'xhigh' %}".to_owned(),
+        format!("{{%- set reasoning_instructions = '{XHIGH_INSTRUCTIONS}' %}}"),
+        "{%- elif resolved_reasoning_effort == 'low' %}".to_owned(),
+        format!("{{%- set reasoning_instructions = '{LOW_INSTRUCTIONS}' %}}"),
+        "{{- reasoning_instructions + '\\n\\n' }}".to_owned(),
+        "{{- '<|im_start|>system\\n' + reasoning_instructions + '<|im_end|>\\n' }}".to_owned(),
+        "{%- if message.reasoning_content is string %}".to_owned(),
+        "{%- set reasoning_content = reasoning_content|trim %}".to_owned(),
+        "{%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}".to_owned(),
+        "{{- '<|im_start|>' + message.role + '\\n' + content }}".to_owned(),
+        "{%- if enable_thinking is defined and enable_thinking is false %}".to_owned(),
+        "{{- '<think>\\n' }}".to_owned(),
+        "{{- '<|im_start|>assistant\\n' }}".to_owned(),
+        "{{- '<think>\\n\\n</think>\\n\\n' }}".to_owned(),
+    ];
+    match fragments
+        .into_iter()
+        .find(|fragment| !normalized.contains(fragment.as_str()))
+    {
+        Some(fragment) => Err(TemplateSourceError { fragment }),
+        None => Ok(()),
+    }
 }

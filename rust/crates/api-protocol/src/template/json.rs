@@ -8,14 +8,55 @@ use std::fmt::Write;
 pub enum JsonValue {
     Null,
     Bool(bool),
-    /// An integer literal; written verbatim.
-    Integer(i128),
+    /// An integer literal of any size; written as its canonical decimal digits.
+    Integer(JsonInteger),
     /// A fractional or exponent literal; written as Python's `repr` of a float.
     Float(f64),
     String(String),
     Array(Vec<JsonValue>),
     /// Members in the order they are written.
     Object(Vec<(String, JsonValue)>),
+}
+
+/// An integer of any size, held as its canonical decimal digits: no leading zeros or plus sign, and zero is `0`
+/// whatever its sign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonInteger(String);
+
+impl JsonInteger {
+    /// The integer written as an optional `-` and decimal digits; `None` for any other text.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (negative, digits) = match text.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let digits = digits.trim_start_matches('0');
+        Some(Self(match (digits.is_empty(), negative) {
+            (true, _) => "0".to_owned(),
+            (false, true) => format!("-{digits}"),
+            (false, false) => digits.to_owned(),
+        }))
+    }
+
+    /// The canonical decimal digits.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<i128> for JsonInteger {
+    fn from(value: i128) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<u128> for JsonInteger {
+    fn from(value: u128) -> Self {
+        Self(value.to_string())
+    }
 }
 
 impl JsonValue {
@@ -32,9 +73,7 @@ impl JsonValue {
         match self {
             Self::Null => out.push_str("null"),
             Self::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
-            Self::Integer(value) => {
-                let _ = write!(out, "{value}");
-            }
+            Self::Integer(value) => out.push_str(value.as_str()),
             Self::Float(value) => out.push_str(&python_float(*value)),
             Self::String(text) => write_string(text, out),
             Self::Array(items) => {

@@ -11,8 +11,8 @@ pub(super) fn trim(text: &str) -> &str {
 }
 
 /// Replaces the `<` that opens a spelling of a checkpoint control token (`<|...|>`, `<think>`, `</think>`,
-/// `<tool_call>`, `</tool_call>`, `<tool_response>`, `</tool_response>`, `<tts_...>`) with the six characters
-/// `<`, so untrusted text cannot be encoded as a control token. Other angle brackets are unchanged.
+/// `<tool_call>`, `</tool_call>`, `<tool_response>`, `</tool_response>`, `<tts_...>`) with a backslash and `u003c`,
+/// so untrusted text cannot be encoded as a control token. Other angle brackets are unchanged.
 pub(super) fn escape_control_tokens(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
