@@ -2,7 +2,7 @@
 //! (`Stages.ResidualNorm`, `Stages.RmsNorm`).
 
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::{DevicePtr, Submission, ops};
+use euhedral_inference_cuda::{DevicePtr, KernelOps};
 
 use super::{Launch, Quantum, QuantumKind, eager, fatal, launch_u32};
 use crate::workspace::BufferSlot;
@@ -37,19 +37,19 @@ impl ResidualRmsNorm {
 }
 
 impl Launch for ResidualRmsNorm {
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
-        ops::residual_rms_norm_bf16(
-            submission,
-            quantum.slot(self.residual),
-            quantum.slot(self.delta),
-            self.weight,
-            quantum.slot(self.hidden),
-            quantum.slot(self.normalized),
-            quantum.rows_u32()?,
-            launch_u32(quantum.config.hidden_size, "the hidden size")?,
-            quantum.epsilon(),
-        )
-        .map_err(fatal)
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
+        kernels
+            .residual_rms_norm_bf16(
+                quantum.slot(self.residual),
+                quantum.slot(self.delta),
+                self.weight,
+                quantum.slot(self.hidden),
+                quantum.slot(self.normalized),
+                quantum.rows_u32()?,
+                launch_u32(quantum.config.hidden_size, "the hidden size")?,
+                quantum.epsilon(),
+            )
+            .map_err(fatal)
     }
 }
 
@@ -106,7 +106,7 @@ impl Launch for RmsNormUnitOffset {
         self.covered(quantum) == 0 && !self.seeds(quantum)
     }
 
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         if self.idle(quantum) {
             return Ok(());
         }
@@ -124,16 +124,16 @@ impl Launch for RmsNormUnitOffset {
                     quantum.rows, draft.seed_capacity
                 )));
             }
-            ops::rms_norm_unit_offset_bf16(
-                submission,
-                input,
-                self.weight,
-                draft.seed_rows.ptr(),
-                quantum.rows_u32()?,
-                width,
-                quantum.epsilon(),
-            )
-            .map_err(fatal)?;
+            kernels
+                .rms_norm_unit_offset_bf16(
+                    input,
+                    self.weight,
+                    draft.seed_rows.ptr(),
+                    quantum.rows_u32()?,
+                    width,
+                    quantum.epsilon(),
+                )
+                .map_err(fatal)?;
         }
         if covered == 0 {
             return Ok(());
@@ -141,22 +141,23 @@ impl Launch for RmsNormUnitOffset {
         // The final norm of fewer rows than the quantum has reads the last ones.
         let first = (quantum.rows - covered) as u64;
         let output = quantum.slot(self.output);
-        ops::rms_norm_unit_offset_bf16(
-            submission,
-            input.offset(first * row_bytes),
-            self.weight,
-            output,
-            launch_u32(covered, "the norm rows")?,
-            width,
-            quantum.epsilon(),
-        )
-        .map_err(fatal)?;
+        kernels
+            .rms_norm_unit_offset_bf16(
+                input.offset(first * row_bytes),
+                self.weight,
+                output,
+                launch_u32(covered, "the norm rows")?,
+                width,
+                quantum.epsilon(),
+            )
+            .map_err(fatal)?;
         if self.rows == NormRows::Final && quantum.kind == QuantumKind::Draft {
             // The last MTP row's hidden seeds the next recursive draft row.
             let draft =
                 draft.ok_or_else(|| fatal("a draft quantum's final norm needs the sequence's draft buffers"))?;
             let last = (covered as u64 - 1) * row_bytes;
-            ops::copy_device_to_device(submission, draft.recursion_hidden.ptr(), output.offset(last), row_bytes)
+            kernels
+                .copy_device_to_device(draft.recursion_hidden.ptr(), output.offset(last), row_bytes)
                 .map_err(fatal)?;
         }
         Ok(())

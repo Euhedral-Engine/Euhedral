@@ -95,7 +95,7 @@ pub struct QuantumEvent {
     pub retired: Instant,
     /// Whether it ran as one launch of a recorded graph.
     pub replayed: bool,
-    /// Whether the launches of its stages were recorded into a graph beside it.
+    /// Whether its launches were recorded into a graph as it ran.
     pub recorded: bool,
 }
 

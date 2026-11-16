@@ -22,10 +22,15 @@
 
 #[path = "common/linear_gpu.rs"]
 mod linear_gpu;
+#[path = "common/typed.rs"]
+mod typed;
 
 use std::cell::RefCell;
+use std::fmt::Display;
+use std::mem;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::process::abort;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -33,16 +38,16 @@ use std::time::Duration;
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::{FrameSink, LatticeSource};
+use euhedral_gpu::cuda::CudaQueue;
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, GraphRuntime, Join, Lake, LaneId, LanePool, Latch,
-    Marker, QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageId, StageSpec,
-    Submitted,
+    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, GraphRuntime, Lake, LaneId, LanePool, Marker,
+    QuantumOutcome, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
 use euhedral_inference_cuda::{
-    CudaError, CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, GraphRecorder, PinnedPool, RetireList, Submission,
-    SubmitMode, ops,
+    CudaError, CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, LaneOps, PinnedPool, SubmitMode,
 };
 use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorDataType, WeightFormat, WeightLayout};
+use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{LinearFormat, LinearMode, Q3Embedding, ScratchRegion};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{ModelConfig, WeightRef};
@@ -60,6 +65,7 @@ use euhedral_inference_engine::stages::{
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvRetained};
+use euhedral_inference_engine::state::released::ReleasedBuffers;
 use euhedral_inference_engine::state::{KvView, SequenceDevice, SequenceState};
 use euhedral_inference_engine::workspace::{BufferSlot, Workspace, WorkspaceRows};
 use euhedral_inference_settings::{KvFormat, ModelSettings, Settings};
@@ -104,45 +110,93 @@ fn config(kinds: Vec<LayerType>) -> Arc<ModelConfig> {
 }
 
 thread_local! {
-    /// The lane of the rig made on this thread: the host copies of the helpers run on it.
-    static LANE: RefCell<Option<Arc<CudaLane>>> = const { RefCell::new(None) };
+    /// The lane of the rig made on this thread, with its table: the host copies of the helpers run on it.
+    static LANE: RefCell<Option<(LaneTable, Arc<CudaQueue>)>> = const { RefCell::new(None) };
 }
 
 /// Runs `copy` (a blocking host copy) on the rig's lane. Outside a submission such a copy runs on the legacy stream,
 /// which does not order against the lane's work: a kernel could start before the copy's DMA completed, or a read
 /// could see a kernel's results half written. In a submission the copy is queued on the lane and waits for it.
 fn on_lane<T>(copy: impl FnOnce() -> T) -> T {
-    let lane = LANE
+    let (table, lane) = LANE
         .with(|lane| lane.borrow().clone())
         .expect("a rig was made on this thread");
-    let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-    let out = copy();
-    drop(submission);
-    out
+    table.submit_host(&lane, copy).unwrap().0
 }
 
 struct Rig {
     library: Arc<CudaLibrary>,
-    lane: Arc<CudaLane>,
+    /// RustEE's lanes, the ones the stages run on.
+    typed: typed::Typed,
     lanes: LaneTable,
-    pool: LanePool,
+    /// The pool of the one lane, and the lattice that runs a stage under test in a one-stage graph.
+    pool: Arc<LanePool>,
+    completions: Arc<Completions>,
+    lake: Arc<Lake>,
+    lattice: Arc<ControlPlaneLattice>,
     pinned: Arc<PinnedPool>,
-    retire: Arc<RetireList>,
+    released: Arc<ReleasedBuffers>,
 }
 
 fn rig() -> Option<Rig> {
     let library = library()?;
-    let lane = CudaLane::new(&library, LaneId(0), 256).unwrap();
-    LANE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&lane)));
-    let pool = LanePool::new(vec![Arc::clone(&lane) as Arc<dyn DeviceQueue>]);
+    let typed = typed::Typed::open(&library, 1, 256);
+    LANE.with(|slot| *slot.borrow_mut() = Some((typed.table.clone(), Arc::clone(typed.lane(0)))));
+    let pool = Arc::clone(&typed.queues);
+    let settings = Settings::with_model(ModelSettings::default());
+    let lattice = ControlPlaneLattice::new(lattice_config(&settings)).unwrap();
+    let lake = Lake::new(
+        Arc::clone(&lattice),
+        NonZeroUsize::new(2).unwrap(),
+        Duration::from_secs(1),
+    );
+    let completions = Completions::new(Arc::clone(&pool));
+    lattice
+        .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
+        .unwrap();
     Some(Rig {
-        lanes: LaneTable::new(vec![Arc::clone(&lane)]).unwrap(),
+        completions,
+        lake,
+        lattice,
+        lanes: typed.table.clone(),
+        typed,
         pinned: PinnedPool::new(&library, 64 << 20),
-        retire: Arc::new(RetireList::new()),
+        released: Arc::new(ReleasedBuffers::new()),
         library,
-        lane,
         pool,
     })
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        self.lake.complete_gracefully();
+        self.lattice.close();
+    }
+}
+
+/// The quantum a stage under test runs for, borrowed for the length of [`Rig::try_run`].
+struct Borrowed(*const Quantum);
+
+// SAFETY: `try_run` waits for the graph to retire before it returns, so the pointer is valid wherever the graph's
+// frames run, and the stage under test only reads the quantum, as a stage does.
+unsafe impl Send for Borrowed {}
+// SAFETY: as above.
+unsafe impl Sync for Borrowed {}
+
+/// Runs a stage of the engine inside a graph of one stage, and hands over its answer.
+struct UnderTest {
+    stage: &'static dyn Stage<Quantum>,
+    answer: Arc<Handoff<Result<Option<Marker>, StageError>>>,
+}
+
+impl Stage<Borrowed> for UnderTest {
+    fn run(&self, quantum: &Borrowed, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+        // SAFETY: see `Borrowed`.
+        let quantum = unsafe { &*quantum.0 };
+        self.answer
+            .send(self.stage.run(quantum, cx).map(|submitted| submitted.marker));
+        Ok(Submitted::done())
+    }
 }
 
 impl Rig {
@@ -152,24 +206,73 @@ impl Rig {
 
     /// Runs `stage` on the rig's lane for `quantum` and returns its marker, if it queued work.
     fn run(&self, stage: &dyn Stage<Quantum>, quantum: &Quantum) -> Option<Marker> {
-        let cx = StageCx {
-            stage: StageId(0),
-            lane: Some(LaneId(0)),
-            waits: &[],
-            lanes: &self.pool,
+        self.try_run(stage, quantum).unwrap()
+    }
+
+    /// Runs `stage` as the only stage of a graph on the rig's lane, for the context RustEE builds around a stage (it
+    /// builds no other), and returns what the stage answered. The graph is told the stage submitted nothing, so it
+    /// retires at once; the test synchronizes the lane for the work itself.
+    #[allow(
+        clippy::print_stderr,
+        reason = "the process aborts on a timeout; nothing else can report it"
+    )]
+    fn try_run(&self, stage: &dyn Stage<Quantum>, quantum: &Quantum) -> Result<Option<Marker>, StageError> {
+        let answer = Handoff::new();
+        let retired = Handoff::new();
+        let under_test = Arc::new(UnderTest {
+            // SAFETY: the stage outlives the graph's quantum: this call returns only after the graph retired it (or
+            // the wait failed, which fails the test), and nothing else keeps the reference.
+            stage: unsafe { mem::transmute::<&dyn Stage<Quantum>, &'static dyn Stage<Quantum>>(stage) },
+            answer: Arc::clone(&answer),
+        });
+        let mut spec = StageGraphSpec::new();
+        spec.stage(StageSpec {
+            name: "under test",
+            ordered: None,
+            lanes: vec![LaneId(0)],
+        });
+        let done = Arc::clone(&retired);
+        let graph = StageGraph::new(
+            spec,
+            vec![under_test as Arc<dyn Stage<Borrowed>>],
+            GraphRuntime {
+                stages: Arc::clone(&self.lake) as Arc<dyn FrameSink>,
+                completions: Arc::clone(&self.completions),
+                lanes: Arc::clone(&self.pool),
+                retries: Arc::new(RetryCounts::default()),
+                retry_backstop: DEFAULT_RETRY_BACKSTOP,
+            },
+            move |_borrowed, outcome| done.send(outcome),
+        )
+        .unwrap();
+        let unit = self.lake.admit().unwrap();
+        let _ = graph.start(Borrowed(quantum), Arc::new(AtomicBool::new(false)), Vec::new());
+        let Ok(outcome) = retired.wait(Duration::from_secs(60)) else {
+            // Unwinding would free the stage and the quantum while graph frames may still use them: abort instead.
+            eprintln!("the graph did not retire the quantum in time");
+            abort();
         };
-        stage.run(quantum, &cx).unwrap().marker
+        drop(unit);
+        assert_eq!(
+            outcome,
+            QuantumOutcome::Completed,
+            "the stage under test did not fail the graph"
+        );
+        answer.take().expect("the stage answered")
     }
 
     fn sync(&self) {
-        self.lane.synchronize().unwrap();
+        self.typed.sync();
     }
 
-    /// Queues `work` in a submission of the rig's lane and waits for it.
-    fn submit(&self, work: impl FnOnce(&Submission<'_>) -> Result<(), CudaError>) {
-        let submission = Submission::begin(&self.lane, SubmitMode::default()).unwrap();
-        work(&submission).unwrap();
-        submission.finish().unwrap();
+    /// Queues `work` as one submission of the rig's RustEE lane and returns its marker.
+    fn ops<E: Display>(&self, work: impl FnOnce(&mut dyn LaneOps) -> Result<(), E>) -> Marker {
+        self.lanes.submit_ops(self.typed.lane(0), false, work).unwrap().1
+    }
+
+    /// Queues `work` as one submission of the rig's lane and waits for it.
+    fn submit(&self, work: impl FnOnce(&mut dyn LaneOps) -> Result<(), CudaError>) {
+        self.ops(work);
         self.sync();
     }
 
@@ -228,15 +331,18 @@ impl Rig {
         format: KvFormat,
         kv_tokens: u64,
     ) -> (SequenceState, KvRetained) {
-        let submission = Submission::begin(&self.lane, SubmitMode::default()).unwrap();
-        let gdn = GdnStates::allocate(&self.library, config, 8, &submission).unwrap();
-        let mut kv = KvCache::new(&self.library, &self.retire, kv_layers, 1024, format, kv_tokens, 0).unwrap();
+        let mut kv = KvCache::new(&self.library, &self.released, kv_layers, 1024, format, kv_tokens, 0).unwrap();
         let mut retained = KvRetained::default();
-        if kv_layers > 0 && kv_tokens > 0 {
-            kv.reserve(&submission, &self.pinned, 0, kv_tokens, &mut retained)
-                .unwrap();
-        }
-        submission.finish_signalled().unwrap();
+        let mut gdn = None;
+        self.ops(|lane| {
+            gdn = Some(GdnStates::allocate(&self.library, config, 8, lane)?);
+            if kv_layers > 0 && kv_tokens > 0 {
+                kv.reserve(lane, &self.pinned, 0, kv_tokens, &mut retained)
+                    .map_err(|error| CudaError::Argument(error.to_string()))?;
+            }
+            Ok::<(), CudaError>(())
+        });
+        let gdn = gdn.unwrap();
         self.sync();
         let scratch = AttentionScratch::allocate(&self.library, config, 8, true, 16).unwrap();
         (
@@ -470,7 +576,7 @@ struct StubFormat {
 impl LinearFormat for StubFormat {
     fn submit(
         &self,
-        submission: &Submission<'_>,
+        kernels: &mut dyn KernelOps,
         weight: &WeightRef,
         x: DevicePtr,
         y: DevicePtr,
@@ -487,7 +593,7 @@ impl LinearFormat for StubFormat {
         self.scratch_bytes.store(scratch.bytes, Ordering::SeqCst);
         assert_eq!(weight.name, "stub");
         // Four BF16 values per row.
-        ops::copy_device_to_device(submission, y, x, (rows * 8) as u64)
+        kernels.copy_device_to_device(y, x, (rows * 8) as u64)
     }
 
     fn scratch_bytes(&self, _weight: &WeightRef, _rows: usize, _mode: LinearMode) -> usize {
@@ -576,13 +682,7 @@ fn the_linear_stage_hands_its_format_the_geometry_the_mode_and_the_scratch() {
         LinearRows::All,
         None,
     );
-    let cx = StageCx {
-        stage: StageId(0),
-        lane: Some(LaneId(0)),
-        waits: &[],
-        lanes: &rig.pool,
-    };
-    let refused = all.run(&verify, &cx).unwrap_err();
+    let refused = rig.try_run(&all, &verify).unwrap_err();
     assert!(format!("{refused:?}").contains("scratch"), "{refused:?}");
     assert_eq!(format.calls.load(Ordering::SeqCst), 2, "the format was not called");
 }
@@ -1126,8 +1226,7 @@ fn kv_append_then_decode_reads_back() {
     let pages: Vec<DevicePtr> = kv.pages(0).collect();
     assert_eq!(pages.len(), 2, "301 rows take two pages");
     for (page, address) in pages.iter().enumerate() {
-        let mut bytes = vec![0u8; 2 * plane];
-        rig.submit(|submission| ops::copy_device_to_host(submission, &mut bytes, *address));
+        let bytes = rig.typed.download(*address, 2 * plane);
         let tokens = if page == 0 { 256 } else { 45 };
         for token in 0..tokens {
             let position = page * 256 + token;
@@ -1275,16 +1374,16 @@ fn argmax_lowest_id_tie_break() {
         [Some(12_345), Some(77), None, Some(9), Some(VOCABULARY as u32 - 1)]
     );
 
-    // A verification selects every row, and the stage's marker is signalled for the continuation that follows it.
+    // A verification selects every row, and the stage publishes its marker for the continuation that follows it.
     let every = Argmax::new(BufferSlot::Logits, VOCABULARY, SelectedRows::Each);
     let verify = rig
         .quantum(QuantumKind::Verify, 5, 0, &workspace, &sequence, &config)
         .with_selection(Arc::clone(&selection));
-    let marker = rig.run(&every, &verify).expect("a marker for the completion edge");
+    let marker = rig.run(&every, &verify).expect("a marker for the argmax stage");
     rig.sync();
     assert!(
-        rig.lane.completed() >= marker.value,
-        "the lane's completion word reaches the argmax stage's marker"
+        DeviceQueue::completed(&**rig.typed.lane(0)) >= marker.value,
+        "the lane has completed the argmax stage's marker"
     );
     let selected: Vec<Option<u32>> = (0..5).map(|row| selection.token(row)).collect();
     assert_eq!(selected, expected);
@@ -1393,9 +1492,8 @@ fn mtp_stem_concatenates_e_h() {
     // The halves are the single norm launches, bit for bit: [norm(e); norm(h)] per row.
     let single = |input: &DeviceBuffer, weight: &DeviceBuffer| -> Vec<u8> {
         let output = DeviceBuffer::alloc(&rig.library, rows * hidden * 2).unwrap();
-        rig.submit(|submission| {
-            ops::rms_norm_unit_offset_bf16(
-                submission,
+        rig.submit(|ops| {
+            ops.rms_norm_unit_offset_bf16(
                 input.ptr(),
                 weight.ptr(),
                 output.ptr(),
@@ -1425,9 +1523,8 @@ fn mtp_stem_concatenates_e_h() {
 
     // Seeded from the sequence's draft seed rows, from row 2 (a catch-up after the quantum that wrote them).
     let seed_rows = sequence.device.scratch.draft().unwrap().seed_rows.ptr();
-    rig.submit(|submission| {
-        ops::copy_device_to_device(
-            submission,
+    rig.submit(|ops| {
+        ops.copy_device_to_device(
             seed_rows.offset((2 * hidden * 2) as u64),
             seed_buffer.ptr(),
             (rows * hidden * 2) as u64,
@@ -1443,13 +1540,7 @@ fn mtp_stem_concatenates_e_h() {
 
     // A stem with no rows to seed it, or seeded past the rows the sequence holds, is refused.
     let unseeded = rig.quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config);
-    let cx = StageCx {
-        stage: StageId(0),
-        lane: Some(LaneId(0)),
-        waits: &[],
-        lanes: &rig.pool,
-    };
-    assert!(stem.run(&unseeded, &cx).is_err());
+    assert!(rig.try_run(&stem, &unseeded).is_err());
     let past = rig
         .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
         .with_draft_seed(DraftSeed::SeedRow(14));
@@ -1460,13 +1551,13 @@ fn mtp_stem_concatenates_e_h() {
 
 /// A host stage behind the argmax by a completion edge: it reads the selection the argmax wrote.
 struct ReadSelection {
-    seen: Arc<Join<u64>>,
+    seen: Arc<Handoff<u64>>,
 }
 
 impl Stage<Quantum> for ReadSelection {
     fn run(&self, quantum: &Quantum, _cx: &StageCx<'_>) -> Result<Submitted, StageError> {
         let selection = quantum.selection().expect("the quantum selects");
-        self.seen.arrive(0, selection.key(0).unwrap());
+        self.seen.send(selection.key(0).unwrap());
         Ok(Submitted::done())
     }
 }
@@ -1495,15 +1586,15 @@ fn a_completion_edge_after_the_argmax_finds_its_keys_on_the_host() {
         NonZeroUsize::new(2).unwrap(),
         Duration::from_secs(1),
     );
-    let lanes = Arc::new(LanePool::new(vec![Arc::clone(&rig.lane) as Arc<dyn DeviceQueue>]));
+    let lanes = Arc::clone(&rig.typed.queues);
     let completions = Completions::new(Arc::clone(&lanes));
     lattice
         .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
         .unwrap();
-    let (done, finished) = Latch::new();
-    // Part 0 is the key the host stage read, part 1 the retirement of the quantum.
-    let join = Join::new(2, move |parts: Vec<Option<u64>>| done.set(parts));
-    let retired = Arc::clone(&join);
+    // The key the host stage read, and whether the quantum completed when it retired.
+    let seen = Handoff::new();
+    let completed = Handoff::new();
+    let retired = Arc::clone(&completed);
     let mut spec = StageGraphSpec::new();
     let argmax = spec.stage(StageSpec {
         name: "argmax",
@@ -1520,7 +1611,9 @@ fn a_completion_edge_after_the_argmax_finds_its_keys_on_the_host() {
         spec,
         vec![
             Arc::new(Argmax::new(BufferSlot::Logits, VOCABULARY, SelectedRows::Last)),
-            Arc::new(ReadSelection { seen: join }),
+            Arc::new(ReadSelection {
+                seen: Arc::clone(&seen),
+            }),
         ],
         GraphRuntime {
             stages: Arc::clone(&lake) as Arc<dyn FrameSink>,
@@ -1529,17 +1622,18 @@ fn a_completion_edge_after_the_argmax_finds_its_keys_on_the_host() {
             retries: Arc::new(RetryCounts::default()),
             retry_backstop: DEFAULT_RETRY_BACKSTOP,
         },
-        move |_quantum, outcome| retired.arrive(1, u64::from(outcome == QuantumOutcome::Completed)),
+        move |_quantum, outcome| retired.send(outcome == QuantumOutcome::Completed),
     )
     .unwrap();
     let unit = lake.admit().unwrap();
     let _ = graph.start(quantum, Arc::new(AtomicBool::new(false)), Vec::new());
-    let parts = finished.wait();
+    let wait = Duration::from_secs(60);
+    let (key, completed) = (seen.wait(wait), completed.wait(wait));
     drop(unit);
     lake.complete_gracefully();
     lattice.close();
-    assert_eq!(parts[1], Some(1), "the quantum completed");
-    assert_eq!(parts[0].map(|key| key & 0xFFFF_FFFF), Some(0xFFFF_FFFF - 4242));
+    assert_eq!(completed, Ok(true), "the quantum completed");
+    assert_eq!(key.map(|key| key & 0xFFFF_FFFF), Ok(0xFFFF_FFFF - 4242));
 }
 
 // Independent references for the GDN convolution and recurrence and for the Q/K norm with RoPE, at the model's
@@ -1839,7 +1933,7 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
     let reference = |ids: &[i32]| -> Vec<u8> {
         let input = upload(&rig.library, &id_bytes(ids));
         let output = DeviceBuffer::alloc(&rig.library, ids.len() * hidden * 2).unwrap();
-        rig.submit(|submission| Q3Embedding.submit(submission, &weight, input.ptr(), output.ptr(), ids.len()));
+        rig.submit(|ops| Q3Embedding.submit(ops, &weight, input.ptr(), output.ptr(), ids.len()));
         download(&output)
     };
     let looked_up = |rows: usize| get(&workspace, BufferSlot::HiddenState, 0, rows * hidden * 2);
@@ -1885,30 +1979,13 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
         .quantum(QuantumKind::Draft, rows, 0, &workspace, &sequence, &config)
         .reading_draft_tokens(16);
     assert!(past.is_err(), "the builder refuses slots past the step's tokens");
-
-    // Its launch records into a graph, and the replay does what the eager launch did.
-    put(&workspace, BufferSlot::HiddenState, 0, &vec![0u8; rows * hidden * 2]);
-    let recorder = GraphRecorder::begin(&rig.lane).unwrap();
-    {
-        let submission = recorder.submission(quantum.mode()).unwrap();
-        stage.launch(&quantum, &submission).unwrap();
-    }
-    let graph = recorder.end().unwrap();
-    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
-    graph.launch(&submission).unwrap();
-    submission.finish().unwrap();
-    rig.sync();
-    assert!(
-        looked_up(rows) == reference(&step[2..5]),
-        "the replay looks up the same rows"
-    );
 }
 
-// Capture.
+// Every stage on a lane.
 
 #[test]
 #[ignore = "needs a GPU and the native library"]
-fn every_stage_launches_inside_a_graph_capture_and_the_replay_selects() {
+fn every_stage_launches_eagerly_on_a_lane_and_the_selection_is_made() {
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 1, KvFormat::Nvfp4, 256);
@@ -2082,47 +2159,29 @@ fn every_stage_launches_inside_a_graph_capture_and_the_replay_selects() {
         ("selected token", boxed(SelectedToken)),
     ];
 
-    // Eagerly first: it loads every kernel module, which a capture cannot.
-    for (name, stage) in &stages {
-        let submission = Submission::begin(&rig.lane, quantum.mode()).unwrap();
-        stage
-            .launch_on(&quantum, &submission)
-            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
-        submission.finish().unwrap();
-        rig.sync();
-    }
-
-    // Then every launch in one capture: no begin, wait, marker or signal among them.
-    let recorder = GraphRecorder::begin(&rig.lane).unwrap();
-    {
-        let submission = recorder.submission(quantum.mode()).unwrap();
+    let marker = rig.ops(|ops| {
         for (name, stage) in &stages {
             stage
-                .launch_on(&quantum, &submission)
-                .unwrap_or_else(|error| panic!("{name} in a capture: {error:?}"));
+                .launch_on(&quantum, &mut *ops)
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
         }
-    }
-    let graph = recorder.end().unwrap();
-
-    // The graph's launch is followed by the argmax's signal step: the marker the lane's completion word reaches.
-    let submission = Submission::begin(&rig.lane, quantum.mode()).unwrap();
-    graph.launch(&submission).unwrap();
-    let marker = Argmax::signal(submission).unwrap();
+        Ok::<(), CudaError>(())
+    });
     rig.sync();
-    assert!(rig.lane.completed() >= marker.value);
+    assert!(DeviceQueue::completed(&**rig.typed.lane(0)) >= marker.value);
     assert_eq!(selection.token(0), Some(31_337));
     let tokens = download(&sequence.device.scratch.draft().unwrap().tokens);
     assert_eq!(tokens[4..8], 31_337i32.to_ne_bytes(), "the drafted token was passed on");
 }
 
-/// A stage as the capture test holds it: only its launches.
+/// A stage as the all-stages test holds it: only its launches.
 trait LaunchOnly {
-    fn launch_on(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError>;
+    fn launch_on(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError>;
 }
 
 impl<L: Launch> LaunchOnly for L {
-    fn launch_on(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
-        self.launch(quantum, submission)
+    fn launch_on(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
+        self.launch(quantum, kernels)
     }
 }
 
@@ -2136,11 +2195,10 @@ fn boxed<L: Launch + 'static>(stage: L) -> Box<dyn LaunchOnly> {
 #[ignore = "needs a GPU and the native library"]
 fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
     let Some(rig) = rig() else { return };
-    let mut cache = KvCache::new(&rig.library, &rig.retire, 1, 1024, KvFormat::Bf16, 4096, 0).unwrap();
+    let mut cache = KvCache::new(&rig.library, &rig.released, 1, 1024, KvFormat::Bf16, 4096, 0).unwrap();
     let plane = cache.plane_page_bytes();
     let table_entries = |address: DevicePtr, entries: usize| -> Vec<u64> {
-        let mut bytes = vec![0u8; entries * 8];
-        rig.submit(|submission| ops::copy_device_to_host(submission, &mut bytes, address));
+        let bytes = rig.typed.download(address, entries * 8);
         bytes
             .as_chunks::<8>()
             .0
@@ -2151,9 +2209,7 @@ fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
 
     // One page: a table of one slot per plane.
     let mut retained = KvRetained::default();
-    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
-    cache.reserve(&submission, &rig.pinned, 0, 256, &mut retained).unwrap();
-    let marker = submission.finish_signalled().unwrap();
+    let marker = rig.ops(|lane| cache.reserve(lane, &rig.pinned, 0, 256, &mut retained));
     rig.sync();
     let early = cache.view().ready_after(marker);
     assert_eq!(early.ready(), Some(marker));
@@ -2163,22 +2219,20 @@ fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
         table_entries(old_table, 2),
         [first_page.get(), first_page.get() + plane]
     );
-    assert_eq!(rig.retire.pending(), 0);
+    assert_eq!(rig.released.waiting(), 0);
 
     // The cache grows to four pages: a table of four slots replaces it. The early view still names the old one,
-    // and the old one is not handed to the retire list while the view holds it.
+    // and the old one is not handed to the released buffers while the view holds it.
     cache.appended(256).unwrap();
     let mut grown = KvRetained::default();
-    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
-    cache.reserve(&submission, &rig.pinned, 256, 700, &mut grown).unwrap();
-    submission.finish_signalled().unwrap();
+    rig.ops(|lane| cache.reserve(lane, &rig.pinned, 256, 700, &mut grown));
     rig.sync();
     let late = cache.view();
     assert_ne!(late.key_table(0).unwrap(), old_table, "the cache moved to a new table");
     assert_ne!(late.table_generation(0).unwrap(), generation);
     assert_eq!(early.key_table(0), Some(old_table));
     assert_eq!(early.table_generation(0), Some(generation));
-    assert_eq!(rig.retire.pending(), 0, "the early view holds the old table");
+    assert_eq!(rig.released.waiting(), 0, "the early view holds the old table");
     assert_eq!(
         table_entries(old_table, 2),
         [first_page.get(), first_page.get() + plane],
@@ -2188,15 +2242,21 @@ fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
     assert_eq!(pages.len(), 4);
     assert_eq!(table_entries(late.key_table(0).unwrap(), 4)[..4], pages[..]);
 
-    // The last holder lets go: the table goes to the retire list, to be freed in stream order, not under a reader.
+    // The last holder lets go: the table is handed over, to be freed in stream order, not under a reader.
     drop(early);
-    assert_eq!(rig.retire.pending(), 1);
-    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
-    assert_eq!(rig.retire.reap(|_| true, &submission).unwrap(), 1);
-    submission.finish().unwrap();
+    assert_eq!(rig.released.waiting(), 1);
+    rig.ops(|lane| {
+        let mut freed = 0;
+        rig.released.drain(|buffer| {
+            lane.free_async(buffer).unwrap();
+            freed += 1;
+        });
+        assert_eq!(freed, 1);
+        Ok::<(), CudaError>(())
+    });
     rig.sync();
     drop(late);
-    assert_eq!(rig.retire.pending(), 0, "the cache still holds the new table");
+    assert_eq!(rig.released.waiting(), 0, "the cache still holds the new table");
     drop(grown);
     drop(retained);
 }
@@ -2209,8 +2269,7 @@ fn the_cache_stages_wait_for_the_reservation_that_allocated_the_pages() {
     let workspace = rig.workspace(&config, 8, 8, &[]);
     let sequence = rig.sequence(&config, 1, KvFormat::Nvfp4, 256).0;
     // The marker of the submission that reserved the page (here, one that follows the reservation).
-    let submission = Submission::begin(&rig.lane, SubmitMode::default()).unwrap();
-    let marker = submission.finish_signalled().unwrap();
+    let marker = rig.ops(|_| Ok::<(), CudaError>(()));
     rig.sync();
     let make = |view: KvView| {
         Quantum::new(
@@ -2287,10 +2346,7 @@ fn launching_a_stage_on_an_idle_quantum_queues_nothing_and_does_not_underflow() 
     );
     let token = SelectedToken;
     let launch = |stage: &dyn LaunchOnly, quantum: &Quantum| {
-        let submission = Submission::begin(&rig.lane, quantum.mode()).unwrap();
-        stage.launch_on(quantum, &submission).unwrap();
-        submission.finish().unwrap();
-        rig.sync();
+        rig.submit(|ops| stage.launch_on(quantum, ops).map_err(|error| panic!("{error:?}")));
     };
     for stage in [&argmax as &dyn LaunchOnly, &each, &head, &final_norm, &token] {
         launch(stage, &silent);

@@ -8,7 +8,7 @@
 )]
 #![allow(
     clippy::disallowed_methods,
-    reason = "no-wait, waiting call: a test thread waits on the latch for the frames it published, and writes its file"
+    reason = "no-wait, waiting call: a test thread waits on the hand-off for the frames it published, and writes its file"
 )]
 
 use std::fs;
@@ -18,13 +18,15 @@ use std::time::Duration;
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::LatticeSource;
-use euhedral_graph::{AsyncIo, Lake};
+use euhedral_graph::Lake;
+use euhedral_inference_bench::await_value;
 use euhedral_inference_bench::kld::{self, Reference};
 use euhedral_inference_bench::rows::{ReferenceRows, RowInput, RowSink, RowTask};
 use euhedral_inference_bench::score::{FIELDS, score_row};
 use euhedral_inference_engine::generation::{FinishReason, GenerationOutcome, LogitsSink};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_settings::{ModelSettings, Settings};
+use euhedral_io::{AsyncIo, OwnedFile};
 
 const CONTEXT: usize = 40;
 const VOCABULARY: usize = 33;
@@ -115,8 +117,8 @@ fn every_step_is_read_and_scored_in_frames_and_the_values_come_back_in_step_orde
         elapsed: Duration::ZERO,
     });
     drop(sink);
-    assert_eq!(engine.wait().generated, steps);
-    let scored = values.wait().expect("every step is scored");
+    assert_eq!(await_value(&engine).generated, steps);
+    let scored = await_value(&values).expect("every step is scored");
     assert_eq!(scored.len(), steps * FIELDS);
 
     for step in 0..steps {
@@ -136,7 +138,7 @@ fn a_row_past_the_run_or_a_short_reference_record_fails_the_run_with_the_reason(
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("short.bin");
     fs::write(&path, vec![0u8; 100]).unwrap();
-    let file = Arc::new(euhedral_graph::OwnedFile::from(fs::File::open(&path).unwrap()));
+    let file = Arc::new(OwnedFile::from(fs::File::open(&path).unwrap()));
 
     let settings = Settings::with_model(ModelSettings::default());
     let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
@@ -161,7 +163,7 @@ fn a_row_past_the_run_or_a_short_reference_record_fails_the_run_with_the_reason(
     sink.row(0, 1, &logits(0));
     sink.row(5, 1, &logits(1));
     drop(sink);
-    let why = values.wait().expect_err("the run fails");
+    let why = await_value(&values).expect_err("the run fails");
     assert!(
         why.contains("row 5 arrived in a run of 2 steps") || why.contains("reference record"),
         "{why}"
@@ -206,9 +208,7 @@ fn a_panic_while_scoring_a_row_fails_the_run_naming_the_step_and_never_records_z
         sink.row(step, 1, &logits(step));
     }
     drop(sink);
-    let why = values
-        .wait()
-        .expect_err("the run fails instead of reporting a zero for step 3");
+    let why = await_value(&values).expect_err("the run fails instead of reporting a zero for step 3");
     assert!(why.contains("step 3 has no values"), "{why}");
 
     host.complete_gracefully();

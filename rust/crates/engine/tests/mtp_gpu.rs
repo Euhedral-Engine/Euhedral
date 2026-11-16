@@ -17,8 +17,11 @@
 )]
 #![allow(
     clippy::disallowed_methods,
-    reason = "no-wait, blocking I/O and waiting calls: a test reads files and waits on latches and the device"
+    reason = "no-wait, blocking I/O and waiting calls: a test reads files and waits on hand-offs and the device"
 )]
+
+#[path = "common/typed.rs"]
+mod typed;
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -26,18 +29,20 @@ use std::mem;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use euhedral_graph::{LaneId, Latch, LatchSetter};
 use euhedral_inference_bench::prompt::PromptCorpus;
 use euhedral_inference_bench::prompt::words::DEFAULT_SEED;
-use euhedral_inference_cuda::{CudaLane, Submission, SubmitMode, ops};
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
 use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
 use euhedral_inference_engine::stages::QuantumKind;
-use euhedral_inference_engine::{EngineRuntime, RuntimeOwner};
+use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
+use typed::Typed;
+
+/// The longest a device test waits for one hand-off; past it the test fails.
+const WAIT: Duration = Duration::from_secs(20 * 60);
 use euhedral_inference_settings::{ModelSettings, Settings};
 use euhedral_inference_tokenizer::Tokenizer;
 
@@ -65,9 +70,15 @@ fn start(machine: &Machine, max_tokens: u32) -> (Arc<EngineRuntime>, RuntimeOwne
         name: "test".to_string(),
     });
     settings.context.max_tokens = max_tokens;
-    let (ready, waiting) = Latch::new();
-    let owner = EngineRuntime::start(&settings, &machine.library, ready);
-    (waiting.wait().expect("the engine starts"), owner)
+    settings.kernels.graphs.captures_per_view = 8;
+    let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
+    (
+        ready
+            .wait(WAIT)
+            .expect("the engine reports")
+            .expect("the engine starts"),
+        owner,
+    )
 }
 
 fn read_range(file: &mut File, range: Range<u64>) -> Vec<u8> {
@@ -121,7 +132,7 @@ struct Recorder {
     verifications: Vec<Verification>,
     first: Option<Instant>,
     last: Option<Instant>,
-    done: Option<LatchSetter<Recording>>,
+    done: Option<Arc<Handoff<Recording>>>,
 }
 
 impl GenerationListener for Recorder {
@@ -144,7 +155,7 @@ impl GenerationListener for Recorder {
     fn finished(&mut self, outcome: GenerationOutcome) {
         let done = self.done.take().expect("a generation finishes once");
         let now = Instant::now();
-        done.set(Recording {
+        done.send(Recording {
             tokens: mem::take(&mut self.tokens),
             events: mem::take(&mut self.events),
             verifications: mem::take(&mut self.verifications),
@@ -155,6 +166,28 @@ impl GenerationListener for Recorder {
     }
 }
 
+impl Drop for Recorder {
+    /// A listener dropped before its generation finished reports it as failed, so the test fails at once.
+    fn drop(&mut self) {
+        if let Some(done) = self.done.take() {
+            let now = Instant::now();
+            done.send(Recording {
+                tokens: mem::take(&mut self.tokens),
+                events: mem::take(&mut self.events),
+                verifications: mem::take(&mut self.verifications),
+                outcome: GenerationOutcome {
+                    reason: FinishReason::Failed("the listener was dropped before the generation finished".to_string()),
+                    prompt_tokens: 0,
+                    generated: 0,
+                    elapsed: Duration::ZERO,
+                },
+                first_token: self.first.unwrap_or(now),
+                last_token: self.last.unwrap_or(now),
+            });
+        }
+    }
+}
+
 fn generate(
     runtime: &EngineRuntime,
     prompt: &[u32],
@@ -162,7 +195,8 @@ fn generate(
     stop_tokens: &[u32],
     speculation: Speculation,
 ) -> Recording {
-    let (done, waiting) = Latch::new();
+    let done = Handoff::new();
+    let waiting = Arc::clone(&done);
     runtime
         .generate(GenerationRequest {
             prompt: prompt.to_vec(),
@@ -179,7 +213,7 @@ fn generate(
             }),
         })
         .expect("the request is admitted");
-    waiting.wait()
+    waiting.wait(WAIT).expect("the generation reports")
 }
 
 /// Committed rows of the base and MTP caches, quanta in flight and selections leased after a generation.
@@ -220,24 +254,18 @@ struct Snapshot {
     gdn: Vec<Vec<u8>>,
 }
 
-/// A lane of the test's own, for the copies of a snapshot (a lane id exists once per library).
-fn snapshot_lane(runtime: &EngineRuntime) -> Arc<CudaLane> {
-    let library = runtime.library();
-    CudaLane::new(library, LaneId((library.max_lanes() - 1) as u16), 4).unwrap()
+/// A lane of the test's own, for the copies of a snapshot.
+fn snapshot_lane(runtime: &EngineRuntime) -> Arc<Typed> {
+    Arc::new(Typed::plain(runtime.library(), 1, 4))
 }
 
-fn snapshot(runtime: &EngineRuntime, lane: &CudaLane) -> Snapshot {
-    let download = |ptr, bytes: usize| {
-        let mut host = vec![0u8; bytes];
-        let submission = Submission::begin(lane, SubmitMode::default()).unwrap();
-        ops::copy_device_to_host(&submission, &mut host, ptr).unwrap();
-        drop(submission);
-        lane.synchronize().unwrap();
-        host
-    };
+fn snapshot(runtime: &EngineRuntime, lane: &Arc<Typed>) -> Snapshot {
+    // The read runs on the sequence's owner, which may be another thread: it owns what it uses.
+    let lane = Arc::clone(lane);
+    let download = move |ptr, bytes: usize| lane.download(ptr, bytes);
     let layers = runtime.config().layer_kinds.len();
     runtime
-        .inspect_sequence(|sequence| {
+        .inspect_sequence(move |sequence| {
             let full = (sequence.kv.committed() / PAGE) as usize;
             let page_bytes = 2 * sequence.kv.plane_page_bytes() as usize;
             let base_pages = (0..sequence.kv.layers())
@@ -503,7 +531,11 @@ fn long_run(machine: &Machine, prompt: &[u32], graphs: bool) -> LongRun {
     // A first round records the graphs of the keys it sees twice; the second is the one measured.
     let warm = generate(&runtime, prompt, 256, &[], Speculation::Artifact);
     let recording = generate(&runtime, prompt, 256, &[], Speculation::Artifact);
-    assert_eq!(recording.tokens, warm.tokens);
+    assert_eq!(
+        recording.tokens, warm.tokens,
+        "{:?} then {:?}",
+        warm.outcome, recording.outcome
+    );
     let lane = snapshot_lane(&runtime);
     let snapshot = snapshot(&runtime, &lane);
     drop(lane);

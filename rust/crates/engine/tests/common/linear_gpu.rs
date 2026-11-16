@@ -17,14 +17,14 @@
 )]
 
 use std::f32::consts::TAU;
+use std::fmt::Display;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use euhedral_graph::LaneId;
-use euhedral_inference_cuda::{CudaLane, CudaLibrary, DeviceBuffer, Submission, SubmitMode};
+use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, LaneOps};
 use euhedral_inference_edrl::{
     Header, ReadPlan, Region, TensorDataType, TensorTable, TokenizerFooter, TrellisCompanions, WeightFormat,
     WeightLayout, content_end,
@@ -32,17 +32,19 @@ use euhedral_inference_edrl::{
 use euhedral_inference_engine::formats::{LinearFormat, LinearMode, ScratchRegion};
 use euhedral_inference_engine::model::{TrellisParts, WeightRef};
 
+use crate::typed::Typed;
+
 pub struct Rig {
     pub library: Arc<CudaLibrary>,
-    pub lane: Arc<CudaLane>,
+    pub typed: Typed,
 }
 
 /// The library and a lane, or `None` (with a message) on a machine without them.
 pub fn rig() -> Option<Rig> {
     let path = PathBuf::from(test_support::require_property("euhedral.cuda.library")?);
     let library = CudaLibrary::load(&path).expect("the CUDA library loads");
-    let lane = CudaLane::new(&library, LaneId(0), 16).expect("a lane");
-    Some(Rig { library, lane })
+    let typed = Typed::plain(&library, 1, 16);
+    Some(Rig { library, typed })
 }
 
 /// Splitmix64: the same stream for the same seed, on any machine.
@@ -104,7 +106,7 @@ pub fn fp16(value: f32) -> u16 {
 pub fn upload(library: &Arc<CudaLibrary>, bytes: &[u8]) -> DeviceBuffer {
     let buffer = DeviceBuffer::alloc(library, bytes.len().max(256)).unwrap();
     buffer.copy_from_host(0, bytes).unwrap();
-    // Outside a submission the copy runs on the legacy stream, which is not ordered against the lane's work: wait for
+    // The copy runs on the legacy stream, which is not ordered against the lane's work: wait for
     // it before any lane work reads the buffer. A test-only wait.
     library.synchronize().unwrap();
     buffer
@@ -296,6 +298,13 @@ impl Artifact {
 }
 
 impl Rig {
+    /// Runs `work` as one submission of the rig's lane and waits for the device.
+    pub fn run<R, E: Display>(&self, work: impl FnOnce(&mut dyn LaneOps) -> Result<R, E>) -> R {
+        let made = self.typed.table.submit_ops(self.typed.lane(0), false, work).unwrap().0;
+        self.typed.sync();
+        made
+    }
+
     /// Runs `format` over `rows` rows of `x` (BF16, `k` wide) against `weight` and returns the BF16 output bits,
     /// `rows` rows of `n`. The scratch is the format's own size for a prefill-capable launch.
     #[allow(
@@ -317,10 +326,9 @@ impl Rig {
         let scratch = empty(&self.library, scratch_bytes);
         let y = empty(&self.library, rows * n * 2);
         let input = x.ptr().offset((x_offset_rows * k * 2) as u64);
-        let submission = Submission::begin(&self.lane, SubmitMode::default()).unwrap();
-        format
-            .submit(
-                &submission,
+        self.run(|ops| {
+            format.submit(
+                ops,
                 weight,
                 input,
                 y.ptr(),
@@ -331,9 +339,7 @@ impl Rig {
                 },
                 mode,
             )
-            .unwrap();
-        submission.finish().unwrap();
-        self.lane.synchronize().unwrap();
+        });
         let mut host = vec![0u8; rows * n * 2];
         y.copy_to_host(0, &mut host).unwrap();
         host.as_chunks::<2>()

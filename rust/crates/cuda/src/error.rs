@@ -2,7 +2,6 @@
 
 use std::path::PathBuf;
 
-use euhedral_graph::{LaneId, Marker};
 use thiserror::Error;
 
 /// A failed call into the CUDA library, or a refused request that never reached it.
@@ -38,35 +37,6 @@ pub enum CudaError {
     /// An allocation returned a null address.
     #[error("{call} returned a null address for {bytes} bytes")]
     NullAllocation { call: &'static str, bytes: u64 },
-
-    /// A request that would be wrong while the lane is captured into a graph.
-    #[error("{0} is not allowed while the lane is being captured into a graph")]
-    Capturing(&'static str),
-
-    /// A lane id of 64 or more; a `LanePool` holds at most 64 lanes.
-    #[error("lane {} is out of range: a lane pool holds at most 64 lanes", .0.0)]
-    LaneOutOfRange(LaneId),
-
-    /// A second lane was created with an id this library already holds.
-    #[error("lane {} already exists in this library", .0.0)]
-    LaneInUse(LaneId),
-
-    /// The lane already has a live submission (or capture): a lane belongs to one at a time, so that the order its
-    /// work lands in the stream is the order its markers were claimed in.
-    #[error("lane {} is busy: it has a live submission or capture", .0.0)]
-    LaneBusy(LaneId),
-
-    /// A marker too old for its lane's event ring: the lane's later markers have reused its event.
-    #[error("marker {} of lane {} is older than the lane's event ring ({} events, {} markers issued)", .marker.value, .marker.lane.0, .ring, .issued)]
-    StaleMarker { marker: Marker, ring: usize, issued: u64 },
-
-    /// A marker the lane has not issued.
-    #[error("marker {} of lane {} has not been issued ({} markers issued)", .marker.value, .marker.lane.0, .issued)]
-    FutureMarker { marker: Marker, issued: u64 },
-
-    /// A marker names a lane this library has not created.
-    #[error("no lane {} exists in this library", .0.0)]
-    UnknownLane(LaneId),
 
     /// An argument the call cannot take.
     #[error("{0}")]

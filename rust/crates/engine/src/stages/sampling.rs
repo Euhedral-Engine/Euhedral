@@ -10,11 +10,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use euhedral_graph::Marker;
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::{
-    AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, PinnedBuffer, Submission, ops,
-};
+use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, PinnedBuffer};
 
 use super::{Launch, Quantum, eager, fatal, launch_u32};
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
@@ -25,9 +22,8 @@ const KEY_BYTES: usize = 8;
 
 /// The words a quantum's argmax writes on the device and the pinned memory their copy lands in.
 ///
-/// The host reads a key only after the marker of the [`Argmax`] stage that wrote it has been reached (a completion
-/// edge, or the lane's completion word): the stage finishes with a signalled marker, so the lane's completion word
-/// reaches the marker once the copy has retired.
+/// The host reads a key only after the quantum that wrote it has retired, which is after the marker of the [`Argmax`]
+/// stage's work has been reached.
 #[derive(Debug)]
 pub struct Selection {
     keys: DeviceBuffer,
@@ -199,8 +195,7 @@ pub enum SelectedRows {
 
 /// The greedy selection over the quantum's logits, and the copy of its keys to pinned memory.
 ///
-/// The stage's marker is signalled, so that a completion edge to the stage that follows it (the sequence's
-/// continuation) is found by the lane's completion word.
+/// The quantum's retirement is behind the stage's marker, so the keys are readable once the quantum retired.
 #[derive(Clone, Debug)]
 pub struct Argmax {
     logits: BufferSlot,
@@ -219,22 +214,12 @@ impl Argmax {
     }
 }
 
-impl Argmax {
-    /// The signal step of a selection that was launched in a graph: finishes `submission`, on which the graph was
-    /// launched, with a marker whose completion word is written. Eager submission does the same after
-    /// [`Launch::launch`]; a graph capture cannot hold the marker or the signal, so the launch of the graph is
-    /// followed by this.
-    pub fn signal(submission: Submission<'_>) -> Result<Marker, CudaError> {
-        submission.finish_signalled()
-    }
-}
-
 impl Launch for Argmax {
     fn idle(&self, quantum: &Quantum) -> bool {
         quantum.logits_rows == 0
     }
 
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         if self.idle(quantum) {
             return Ok(());
         }
@@ -264,25 +249,19 @@ impl Launch for Argmax {
         let row_bytes = quantum.config.vocab_size as u64 * 2;
         let logits = quantum.slot(self.logits);
         for row in 0..count {
-            ops::argmax_bf16(
-                submission,
-                logits.offset((first + row) as u64 * row_bytes),
-                entries,
-                selection.device_keys().offset((row * KEY_BYTES) as u64),
-            )
-            .map_err(fatal)?;
+            kernels
+                .argmax_bf16(
+                    logits.offset((first + row) as u64 * row_bytes),
+                    entries,
+                    selection.device_keys().offset((row * KEY_BYTES) as u64),
+                )
+                .map_err(fatal)?;
         }
         // SAFETY: the selection is held by the quantum (an `Arc`), which retires only after the marker that follows
         // this launch is reached; the host reads the keys through atomic words, and only once that marker has been
         // reached.
         unsafe {
-            ops::copy_device_to_readback_shared(
-                submission,
-                selection.readback(),
-                0,
-                selection.device_keys(),
-                count * KEY_BYTES,
-            )
+            kernels.copy_device_to_readback_shared(selection.readback(), 0, selection.device_keys(), count * KEY_BYTES)
         }
         .map_err(fatal)
     }
@@ -299,7 +278,7 @@ impl Launch for SelectedToken {
         quantum.draft_token_write.is_none()
     }
 
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let Some(write) = quantum.draft_token_write else {
             return Ok(());
         };
@@ -319,13 +298,13 @@ impl Launch for SelectedToken {
                 write.slot
             )));
         }
-        ops::selected_token(
-            submission,
-            selection.device_keys(),
-            write.ids,
-            draft.tokens.ptr().offset(4 * write.slot as u64),
-        )
-        .map_err(fatal)
+        kernels
+            .selected_token(
+                selection.device_keys(),
+                write.ids,
+                draft.tokens.ptr().offset(4 * write.slot as u64),
+            )
+            .map_err(fatal)
     }
 }
 

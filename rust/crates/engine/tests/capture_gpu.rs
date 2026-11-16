@@ -8,6 +8,7 @@
 //! the sequence's owner: it reserves the cache rows, uploads the input record, starts a quantum, waits for its
 //! retirement and reads the results.
 
+#![allow(clippy::print_stderr, reason = "a test reports what it skipped")]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -15,16 +16,21 @@
 )]
 #![allow(
     clippy::disallowed_methods,
-    reason = "no-wait, waiting calls: the test thread waits on latches and copies device memory to check results"
+    reason = "no-wait, waiting calls: the test thread waits on hand-offs and copies device memory to check results"
 )]
 #![allow(clippy::print_stdout, reason = "a test reports what it measured")]
 
 #[path = "common/linear_gpu.rs"]
 mod linear_gpu;
+#[path = "common/typed.rs"]
+mod typed;
+
+use typed::Typed;
 
 mod common;
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt::Display;
 use std::mem;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -34,20 +40,20 @@ use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::{FrameSink, LatticeSource};
+use euhedral_gpu::cuda::CudaQueue;
+use euhedral_gpu::{GraphStats, Ran};
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, GraphRuntime, Join, Lake, LaneId, LanePool, Latch, Marker,
-    QuantumOutcome, RetryCounts, UnitGuard,
+    Completions, DEFAULT_RETRY_BACKSTOP, GraphRuntime, Lake, LanePool, Marker, QuantumOutcome, RetryCounts, UnitGuard,
 };
-use euhedral_inference_cuda::{
-    CudaLane, CudaLibrary, DeviceBuffer, DevicePtr, PinnedPool, RetireList, Submission, SubmitMode, ops,
-};
+use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, LaneOps, PinnedPool, SubmitMode};
+use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{
     LayerIndex, LayerKind, MTP_ATTENTION_PACK, ModelConfig, Role, WeightRef, object_key,
 };
 use euhedral_inference_engine::plan::{Formats, Plan, View, WeightLookup};
-use euhedral_inference_engine::quantum::{Admission, CaptureKey, Executor, GraphCache};
+use euhedral_inference_engine::quantum::{CaptureKey, Executor};
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, nvfp4, plan as residency_plan};
 use euhedral_inference_engine::stages::attention::KvSource;
 use euhedral_inference_engine::stages::sampling::SelectionPool;
@@ -57,6 +63,7 @@ use euhedral_inference_engine::stages::{
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvRetained};
+use euhedral_inference_engine::state::released::ReleasedBuffers;
 use euhedral_inference_engine::state::{ReserveEpochError, SequenceDevice, SequenceState};
 use euhedral_inference_engine::workspace::{BufferSlot, Workspace, WorkspaceRows};
 use euhedral_inference_settings::{KvFormat, ModelSettings, Settings, TrellisKernelSettings};
@@ -100,16 +107,14 @@ struct Model {
     _trellis: Vec<linear_gpu::Trellis>,
 }
 
-fn upload(library: &Arc<CudaLibrary>, lane: &CudaLane, bytes: &[u8]) -> DeviceBuffer {
+fn upload(library: &Arc<CudaLibrary>, bytes: &[u8]) -> DeviceBuffer {
     let buffer = DeviceBuffer::alloc(library, bytes.len().max(256)).unwrap();
-    let submission = Submission::begin(lane, SubmitMode::default()).unwrap();
     buffer.copy_from_host(0, bytes).unwrap();
-    drop(submission);
     buffer
 }
 
 /// Loads the objects of the first `LAYERS` layers, the globals and the MTP layer from the artifact.
-fn load_model(artifact: &mut Artifact, library: &Arc<CudaLibrary>, lane: &CudaLane) -> Model {
+fn load_model(artifact: &mut Artifact, library: &Arc<CudaLibrary>) -> Model {
     let names: Vec<String> = artifact
         .table()
         .entries()
@@ -150,7 +155,7 @@ fn load_model(artifact: &mut Artifact, library: &Arc<CudaLibrary>, lane: &CudaLa
                 let from = nvfp4::trailer_offset(rows, k, layout).unwrap() as usize;
                 let to = nvfp4::trailer_offset(half, k, layout).unwrap() as usize;
                 out[to..to + trailer].copy_from_slice(&bytes[from..from + trailer]);
-                let buffer = upload(library, lane, &out);
+                let buffer = upload(library, &out);
                 let key = object_key(half_name, LAYERS).unwrap();
                 weights.insert(
                     key,
@@ -197,8 +202,7 @@ fn shared_model() -> Option<&'static Model> {
         .get_or_init(|| {
             let library = library()?;
             let mut artifact = Artifact::open()?;
-            let loader = CudaLane::new(&library, LaneId(63), 16).unwrap();
-            Some(load_model(&mut artifact, &library, &loader))
+            Some(load_model(&mut artifact, &library))
         })
         .as_ref()
 }
@@ -209,14 +213,14 @@ struct World {
     config: Arc<ModelConfig>,
     residency: ResidencyPlan,
     plan: Arc<Plan>,
-    /// The lane of the owner's own submissions: the reservations and the input records.
-    owner: Arc<CudaLane>,
+    /// The RustEE lanes: the stages' own, then the owner's for the reservations and the input records.
+    typed: Typed,
     table: LaneTable,
     pool: Arc<LanePool>,
     runtime: GraphRuntime,
     workspace: Arc<Workspace>,
     pinned: Arc<PinnedPool>,
-    retire: Arc<RetireList>,
+    released: Arc<ReleasedBuffers>,
     lattice: Arc<ControlPlaneLattice>,
     lake: Arc<Lake>,
     unit: Option<UnitGuard>,
@@ -237,18 +241,10 @@ impl World {
         );
         let plan = Arc::new(Plan::build(&config, &model.weights, &residency, &formats).unwrap());
         let width = plan.fan_out_width();
-        // The graphs' lanes, then the capture lane, then the owner's.
-        let lanes: Vec<Arc<CudaLane>> = (0..width + 2)
-            .map(|id| CudaLane::new(&library, LaneId(id as u16), 8192).unwrap())
-            .collect();
-        let owner = Arc::clone(&lanes[width + 1]);
-        let table = LaneTable::new(lanes.clone()).unwrap();
-        let pool = Arc::new(LanePool::new(
-            lanes
-                .iter()
-                .map(|lane| Arc::clone(lane) as Arc<dyn DeviceQueue>)
-                .collect(),
-        ));
+        // The graphs' lanes, then the owner's.
+        let typed = Typed::plain(&library, width + 1, 8192);
+        let table = typed.table.clone();
+        let pool = Arc::clone(&typed.queues);
         let settings = Settings::with_model(ModelSettings::default());
         let lattice = ControlPlaneLattice::new(lattice_config(&settings)).unwrap();
         let lake = Lake::new(
@@ -287,12 +283,12 @@ impl World {
         let unit = lake.admit().unwrap();
         Some(World {
             pinned: PinnedPool::new(&library, 64 << 20),
-            retire: Arc::new(RetireList::new()),
+            released: Arc::new(ReleasedBuffers::new()),
             library,
             config,
             residency,
             plan,
-            owner,
+            typed,
             table,
             pool,
             runtime,
@@ -307,33 +303,50 @@ impl World {
         drop(self.unit.take());
         self.lake.complete_gracefully();
         self.lattice.close();
+        self.typed.sync();
     }
 
-    /// Runs `work` as a submission on the owner's lane, and waits for it (a host copy).
-    fn on_owner<T>(&self, work: impl FnOnce(&Submission<'_>) -> T) -> T {
-        let submission = Submission::begin(&self.owner, SubmitMode::default()).unwrap();
-        let out = work(&submission);
-        drop(submission);
-        self.owner.synchronize().unwrap();
-        out
+    /// The lane of the sequence's own submissions.
+    fn owner(&self) -> &Arc<CudaQueue> {
+        self.typed.lane(self.plan.fan_out_width() as u16)
     }
 
-    fn download(&self, ptr: DevicePtr, bytes: usize) -> Vec<u8> {
+    /// Queues `work` as one submission of the owner's lane and returns its marker and what it made; nothing waits.
+    fn submit_owner<T, E: Display>(&self, work: impl FnOnce(&mut dyn LaneOps) -> Result<T, E>) -> (T, Marker) {
+        self.table.submit_ops(self.owner(), false, work).unwrap()
+    }
+
+    /// Runs `work` as a submission on the owner's lane, and waits for it.
+    fn on_owner<T, E: Display>(&self, work: impl FnOnce(&mut dyn LaneOps) -> Result<T, E>) -> T {
+        let (made, _) = self.submit_owner(work);
+        self.typed.sync();
+        made
+    }
+
+    /// Runs `call`, which uses the library's synchronous calls, as a submission of the owner's lane.
+    fn on_owner_host<T>(&self, call: impl FnOnce() -> T) -> T {
+        let (made, _) = self.table.submit_host(self.owner(), call).unwrap();
+        self.typed.sync();
+        made
+    }
+
+    /// `bytes` bytes of `buffer` from `offset`.
+    fn download(&self, buffer: &DeviceBuffer, offset: usize, bytes: usize) -> Vec<u8> {
         let mut host = vec![0u8; bytes];
-        self.on_owner(|submission| ops::copy_device_to_host(submission, &mut host, ptr).unwrap());
+        self.on_owner_host(|| buffer.copy_to_host(offset, &mut host)).unwrap();
         host
     }
 
     fn sequence(&self) -> SequenceState {
         let config = &self.config;
-        let gdn = self.on_owner(|submission| {
+        let gdn = self.on_owner(|lane| {
             let verified = (1 + self.residency.draft_depth) as u64;
-            GdnStates::allocate(&self.library, config, verified, submission).unwrap()
+            GdnStates::allocate(&self.library, config, verified, lane)
         });
         let kv = |layers: usize| {
             KvCache::new(
                 &self.library,
-                &self.retire,
+                &self.released,
                 layers,
                 config.kv_width() as u64,
                 KvFormat::Nvfp4,
@@ -355,9 +368,12 @@ impl World {
 /// A retired quantum and how it ended.
 type Retired = (Quantum, QuantumOutcome);
 
+/// The longest a device test waits for one retirement; past it the test fails.
+const WAIT: Duration = Duration::from_secs(20 * 60);
+
 /// Where the retirements of one executor are handed to the test thread: step `i` waits on join `i`.
 struct Steps {
-    joins: Vec<OnceLock<Arc<Join<Retired>>>>,
+    joins: Vec<OnceLock<Arc<Handoff<Retired>>>>,
     retired: AtomicUsize,
 }
 
@@ -370,12 +386,9 @@ impl Steps {
     }
 
     /// Arms step `index` and returns what waits for its retirement.
-    fn arm(&self, index: usize) -> euhedral_graph::LatchWaiter<Retired> {
-        let (done, waiting) = Latch::new();
-        let join = Join::new(1, move |mut parts: Vec<Option<Retired>>| {
-            done.set(parts.remove(0).unwrap())
-        });
-        assert!(self.joins[index].set(join).is_ok());
+    fn arm(&self, index: usize) -> Arc<Handoff<Retired>> {
+        let waiting = Handoff::new();
+        assert!(self.joins[index].set(Arc::clone(&waiting)).is_ok());
         waiting
     }
 }
@@ -414,11 +427,10 @@ struct Built {
     retained: KvRetained,
 }
 
-/// One sequence on a world: its state, its graph cache and the executor that runs it.
+/// One sequence on a world: its state and the executor, with the graph cache, that runs it.
 struct Run {
     sequence: SequenceState,
     executor: Executor,
-    cache: GraphCache,
     steps: Arc<Steps>,
     started: usize,
     base_next: u64,
@@ -428,41 +440,40 @@ struct Run {
     ids: DeviceBuffer,
     /// Quanta that ran as one launch of a recorded graph: decode, verification, draft.
     replayed: [usize; 3],
-    /// Quanta that recorded a graph beside their stages.
+    /// Quanta that recorded a graph as they ran.
     recorded: usize,
     /// Quanta that had a capture key.
     keyed: usize,
-}
-
-/// The capture lane's id: the lane after the graphs' own.
-fn capture_lane(world: &World) -> LaneId {
-    LaneId(world.plan.fan_out_width() as u16)
+    /// Whether decode and verification quanta launch their kernels programmatically (the setting `quantum.mode.pdl`).
+    pdl: bool,
 }
 
 impl Run {
-    fn new(world: &World, cache: GraphCache) -> Run {
+    /// A run whose cache keeps `captures` graphs for each view; with 0 every quantum runs stage by stage.
+    fn new(world: &World, captures: usize) -> Run {
         let steps = Steps::new();
         let again = Arc::clone(&steps);
         let executor = Executor::new(
             Arc::clone(&world.plan),
             &world.runtime,
-            capture_lane(world),
+            world.plan.fan_out_width(),
+            Arc::clone(&world.typed.gpu),
+            captures,
             move |quantum, outcome| {
                 let index = again.retired.fetch_add(1, Ordering::AcqRel);
-                again.joins[index].get().expect("armed").arrive(0, (quantum, outcome));
+                again.joins[index].get().expect("armed").send((quantum, outcome));
             },
         )
         .unwrap();
         let ids_bytes: Vec<u8> = (0..131_072u32).flat_map(|row| (row * 2).to_ne_bytes()).collect();
         let ids = {
             let buffer = DeviceBuffer::alloc(&world.library, ids_bytes.len()).unwrap();
-            world.on_owner(|_| buffer.copy_from_host(0, &ids_bytes).unwrap());
+            world.on_owner_host(|| buffer.copy_from_host(0, &ids_bytes)).unwrap();
             buffer
         };
         Run {
             sequence: world.sequence(),
             executor,
-            cache,
             steps,
             started: 0,
             base_next: 0,
@@ -472,6 +483,7 @@ impl Run {
             replayed: [0; 3],
             recorded: 0,
             keyed: 0,
+            pdl: true,
         }
     }
 
@@ -479,19 +491,23 @@ impl Run {
     /// contents are whatever the device memory held.
     fn skip_to(&mut self, world: &World, position: u64) {
         let mut retained = KvRetained::default();
-        world.on_owner(|submission| {
-            let cache = &mut self.sequence.kv;
-            let start = cache.submitted();
-            cache
-                .reserve(submission, &world.pinned, start, position - start, &mut retained)
-                .unwrap();
-            cache.appended(position - start).unwrap();
-            cache.commit(position - start).unwrap();
-        });
+        let cache = &mut self.sequence.kv;
+        let start = cache.submitted();
+        world.on_owner(|lane| cache.reserve(lane, &world.pinned, start, position - start, &mut retained));
+        cache.appended(position - start).unwrap();
+        cache.commit(position - start).unwrap();
         // The reservation was this cache's call for the next quantum's references: claim it.
         drop(self.sequence.refs(KvSource::Base).unwrap());
         self.base_next = position;
         drop(retained);
+    }
+
+    /// Prefills the base cache up to `position` in quanta of at most 256 rows.
+    fn prefill_to(&mut self, world: &World, position: u64) {
+        while self.base_next < position {
+            let rows = (position - self.base_next).min(256) as usize;
+            self.step(world, Step::Prefill(rows));
+        }
     }
 
     /// Reserves, uploads the input record and builds the quantum of `step`; nothing runs yet.
@@ -508,17 +524,15 @@ impl Run {
         // The owner reserves the rows the quantum appends, and records the marker of that work.
         let mut retained = KvRetained::default();
         let marker = {
-            let submission = Submission::begin(&world.owner, SubmitMode::default()).unwrap();
             let cache = if drafting {
                 self.sequence.mtp_kv.as_mut().unwrap()
             } else {
                 &mut self.sequence.kv
             };
-            cache
-                .reserve(&submission, &world.pinned, start, rows as u64, &mut retained)
-                .unwrap();
+            let ((), marker) =
+                world.submit_owner(|lane| cache.reserve(lane, &world.pinned, start, rows as u64, &mut retained));
             cache.appended(rows as u64).unwrap();
-            submission.finish_signalled().unwrap()
+            marker
         };
         let replay = if matches!(kind, QuantumKind::Verify | QuantumKind::Decode) {
             mem::take(&mut self.replay)
@@ -530,11 +544,10 @@ impl Run {
             .sequence
             .refs(source)
             .unwrap()
-            .ordered_after(marker, &world.pool, &world.library)
-            .unwrap()
+            .ordered_after(marker, &world.pool)
             .with_replay_rows(replay);
         let mode = SubmitMode {
-            pdl: matches!(kind, QuantumKind::Decode | QuantumKind::Verify) && start < 1024,
+            pdl: self.pdl && matches!(kind, QuantumKind::Decode | QuantumKind::Verify) && start < 1024,
             row_exact: kind == QuantumKind::Verify,
         };
         let tokens: Vec<u32> = (0..rows as u64).map(|row| token(start + row)).collect();
@@ -576,11 +589,7 @@ impl Run {
                 .unwrap();
         }
         // The input record's upload, ahead of the quantum's first stage.
-        let prepared = {
-            let submission = Submission::begin(&world.owner, SubmitMode::default()).unwrap();
-            quantum.prepare(&world.pinned, &submission).unwrap();
-            submission.finish_signalled().unwrap()
-        };
+        let ((), prepared) = world.submit_owner(|lane| quantum.prepare(&world.pinned, lane));
         quantum.prepared_after(prepared);
         Built {
             quantum,
@@ -613,22 +622,23 @@ impl Run {
         self.started += 1;
         let started = self
             .executor
-            .start(&mut self.cache, quantum, Arc::new(AtomicBool::new(false)), None)
+            .start(quantum, Arc::new(AtomicBool::new(false)), None)
             .unwrap();
+        // Nothing is chained to this quantum: its reference is not held, or it would never retire.
+        drop(started);
+        let (quantum, outcome) = waiting.wait(WAIT).expect("the quantum retires");
+        assert_eq!(outcome, QuantumOutcome::Completed, "{step:?} at {start}");
         let kind_index = match step {
             Step::Decode => Some(0),
             Step::Verify { .. } => Some(1),
             Step::Draft => Some(2),
             Step::Prefill(_) => None,
         };
-        if let (true, Some(index)) = (started.replayed, kind_index) {
+        let ran = quantum.graph_run();
+        if let (Some(Ran::Replayed), Some(index)) = (ran, kind_index) {
             self.replayed[index] += 1;
         }
-        self.recorded += usize::from(started.recording);
-        // Nothing is chained to this quantum: its reference is not held, or it would never retire.
-        drop(started);
-        let (quantum, outcome) = waiting.wait();
-        assert_eq!(outcome, QuantumOutcome::Completed, "{step:?} at {start}");
+        self.recorded += usize::from(matches!(ran, Some(Ran::Recorded | Ran::Rerecorded)));
 
         let keys: Vec<u64> = (0..logits_rows)
             .map(|row| quantum.selection().unwrap().key(row).unwrap())
@@ -640,12 +650,7 @@ impl Run {
             let row_bytes = config.vocab_size * 2;
             let mut out = Vec::new();
             for row in 0..logits_rows {
-                let ptr = world
-                    .workspace
-                    .buffer(BufferSlot::Logits)
-                    .ptr()
-                    .offset((row * row_bytes) as u64);
-                out.extend(world.download(ptr, width * 2));
+                out.extend(world.download(world.workspace.buffer(BufferSlot::Logits), row * row_bytes, width * 2));
             }
             out
         };
@@ -687,12 +692,13 @@ impl Run {
         Outcome { keys, logits }
     }
 
-    /// Ends the run: the sequence closes with no quantum in flight, and its graphs go with the cache.
+    /// Ends the run: the sequence closes with no quantum in flight, and its graphs go with the executor.
     fn close(self, world: &World) {
-        let Run { sequence, cache, .. } = self;
-        drop(cache);
+        let Run { sequence, executor, .. } = self;
+        executor.clear_graphs();
+        drop(executor);
         sequence.close().unwrap();
-        world.on_owner(|_| ());
+        world.typed.sync();
     }
 
     /// The GDN states, layer by layer.
@@ -700,7 +706,7 @@ impl Run {
         (0..LAYERS)
             .filter_map(|layer| self.sequence.device.gdn.layer(layer))
             .flat_map(|state| [state.convolution(), state.recurrent()])
-            .map(|buffer| world.download(buffer.ptr(), buffer.bytes()))
+            .map(|buffer| world.download(buffer, 0, buffer.bytes()))
             .collect()
     }
 }
@@ -720,19 +726,16 @@ fn scenario() -> Vec<Step> {
     steps
 }
 
-#[test]
-#[ignore = "needs a GPU, the native library and the RCO artifact"]
-fn replay_equals_stage_by_stage() {
-    let Some(world) = World::open() else { return };
-    assert!(
-        world.plan.fan_out_width() >= 2,
-        "the stage-by-stage quanta run on several lanes and must retire"
-    );
-    let mut captured = Run::new(&world, GraphCache::with_capacity(8));
-    let mut reference = Run::new(&world, GraphCache::disabled());
-    for (index, step) in scenario().into_iter().enumerate() {
-        let wanted = reference.step(&world, step);
-        let actual = captured.step(&world, step);
+/// Runs `steps` on a stage-by-stage run and on a captured one and asserts that every step selects the same tokens and
+/// leaves bitwise equal logits; the GDN states are equal at the end. Returns the two runs.
+fn compare(world: &World, before: impl Fn(&mut Run), steps: &[Step]) -> (Run, Run) {
+    let mut reference = Run::new(world, 0);
+    let mut captured = Run::new(world, 8);
+    before(&mut reference);
+    before(&mut captured);
+    for (index, step) in steps.iter().copied().enumerate() {
+        let wanted = reference.step(world, step);
+        let actual = captured.step(world, step);
         if !matches!(step, Step::Prefill(_)) {
             assert!(
                 wanted.keys.iter().all(|key| *key != 0),
@@ -746,27 +749,63 @@ fn replay_equals_stage_by_stage() {
         );
     }
     assert!(
-        reference.gdn_state(&world) == captured.gdn_state(&world),
+        reference.gdn_state(world) == captured.gdn_state(world),
         "the GDN states are bitwise equal"
     );
     assert_eq!(reference.replayed, [0; 3], "the reference never replays");
     assert_eq!(reference.recorded, 0, "the reference never records");
-    // A key is run stage by stage on its first sight, recorded on its second (while that quantum runs) and replayed
-    // from the third. Decode: 4 at positions 16 to 21, 3 after the replayed rows at 34 to 36, 1 at the next span.
-    // Verification: rows 3 at 22 to 31 twice, rows 5 and rows 2 once each (the 5-row quanta cross a span). Drafts: the first reserves the MTP cache's first page and has no key, then 3 replays after the sight and the recording.
+    assert_eq!(
+        reference.executor.graph_stats(),
+        GraphStats::default(),
+        "a cache that keeps no graphs counts nothing"
+    );
+    (reference, captured)
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn replay_equals_stage_by_stage() {
+    let Some(world) = World::open() else { return };
+    assert!(
+        world.plan.fan_out_width() >= 2,
+        "the stage-by-stage quanta run on several lanes and must retire"
+    );
+    let (reference, captured) = compare(&world, |_| (), &scenario());
+    // A key runs as a body directly on its first sight, is recorded (and run as the recording) on its second and
+    // replayed from the third. Decode: 4 at positions 16 to 21, 3 after the replayed rows at 34 to 36, 1 at the next
+    // span. Verification: rows 3 at 22 to 31 twice, rows 5 and rows 2 once each (the 5-row quanta cross a span).
+    // Drafts: the first reserves the MTP cache's first page and has no key, then 3 replays after the sight and the
+    // recording.
     let [decode, verify, draft] = captured.replayed;
     assert_eq!(
         [decode, verify, draft],
         [8, 3, 3],
         "replays of decode, verification and draft quanta"
     );
-    // Decode at 17 and at 62, verification of 3 rows at 25, of 5 rows at 40 (its first sight was the quantum that
-    // accepted two rows) and at 50, of 2 rows at 57, and the draft at 2.
-    assert_eq!(captured.recorded, 7, "graphs recorded beside their second sights");
-    // The sequence has passed the first span of decode and of the 5-row verification, whose graphs were released;
-    // decode, 3 and 5 and 2 rows of verification and the draft keep theirs.
-    assert_eq!(captured.cache.recorded(), 5, "graphs the cache holds at the end");
-    assert!(captured.cache.evictions() >= 2, "the passed geometries were released");
+    assert_eq!(captured.recorded, 7, "graphs recorded as their keys' second sights");
+    let stats = captured.executor.graph_stats();
+    assert_eq!(stats.replays as usize, decode + verify + draft, "{stats:?}");
+    assert_eq!(stats.records as usize, captured.recorded, "{stats:?}");
+    assert_eq!(
+        stats.records + stats.replays + stats.directs,
+        captured.keyed as u64,
+        "every keyed quantum ran as a body: {stats:?}"
+    );
+    assert_eq!(
+        (
+            stats.rerecords,
+            stats.failed_records,
+            stats.failed_rerecords,
+            stats.unrecordable_keys
+        ),
+        (0, 0, 0, 0),
+        "{stats:?}"
+    );
+    assert_eq!(
+        captured.executor.graphs().0 as u64,
+        stats.records,
+        "the cache holds every graph it recorded"
+    );
     println!(
         "{} quanta, {} keyed, replayed {:?} (decode, verification, draft), {} recorded",
         scenario().len(),
@@ -779,102 +818,117 @@ fn replay_equals_stage_by_stage() {
     world.close();
 }
 
-/// The recorded hash of the slot a quantum of the step would be admitted to, and the hash of what its stages would
-/// submit now.
-fn hashes(run: &mut Run, world: &World, step: Step) -> (u64, u64) {
-    let built = run.build(world, step);
-    let key = built.quantum.capture_key().expect("the quantum has a key");
-    let Admission::Replay(slot) = run.cache.admit(Some(key)) else {
-        panic!("the key has a recorded graph")
-    };
-    let now = run
-        .executor
-        .stages_hash_for_tests(&built.quantum, world.owner.as_ref())
-        .unwrap();
-    // The quantum is not run: its reservation is undone.
-    run.sequence.kv.discard();
-    if let Some(mtp) = run.sequence.mtp_kv.as_mut() {
-        mtp.discard();
-    }
-    (slot.recorded_hash(), now)
-}
-
+/// Past 2048 keys decode takes the three-warp GQA kernel, 3 rows the row twin (the fused verifier needs 16384 keys),
+/// 5 rows the fused verifier (from 2048 keys): replayed, each equals its stages bit for bit.
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
-fn check_mode_confirms_replay_hash() {
+fn replay_equals_stage_by_stage_for_a_verification_twin_the_fused_verifier_and_deep_decode() {
     let Some(world) = World::open() else { return };
-    let mut run = Run::new(&world, GraphCache::with_capacity(8));
-    run.step(&world, Step::Prefill(16));
-    for _ in 0..4 {
-        run.step(&world, Step::Decode);
+    let mut steps = vec![Step::Decode; 5];
+    for rows in [3usize, 5] {
+        steps.extend([Step::Verify { rows, commit: rows }; 5]);
     }
-    let (recorded, now) = hashes(&mut run, &world, Step::Decode);
-    assert_ne!(recorded, 0, "the recording kept the hash of what it captured");
-    assert_eq!(
-        recorded, now,
-        "the graph repeats what the stages would submit at the next position"
+    steps.extend([Step::Decode; 2]);
+    let (reference, captured) = compare(&world, |run| run.prefill_to(&world, 2100), &steps);
+    assert!(captured.base_next > 2048);
+    let [decode, verify, _] = captured.replayed;
+    assert!(decode >= 4, "deep decode replays: {:?}", captured.replayed);
+    assert!(
+        verify >= 4,
+        "the twin and the fused verifier replay: {:?}",
+        captured.replayed
     );
-    run.close(&world);
+    captured.close(&world);
+    reference.close(&world);
     world.close();
 }
 
+/// Runs `steps` on a stage-by-stage run with programmatic launch `pdl`; returns what every step selected and left in the
+/// logits, and the GDN states at the end.
+fn trace(world: &World, pdl: bool, steps: &[Step]) -> (Vec<Outcome>, Vec<Vec<u8>>) {
+    let mut run = Run::new(world, 0);
+    run.pdl = pdl;
+    let outcomes: Vec<Outcome> = steps.iter().map(|step| run.step(world, *step)).collect();
+    let states = run.gdn_state(world);
+    run.close(world);
+    (outcomes, states)
+}
+
+/// A kernel that overlaps its predecessor without waiting for it reads stale data on some runs: twenty runs with
+/// programmatic launch and twenty without must leave bit-for-bit the same keys, logits and states.
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
-fn check_mode_covers_a_verification_twin_the_fused_verifier_and_deep_decode() {
+fn decode_with_programmatic_launch_equals_without_bit_for_bit() {
+    const RUNS: usize = 20;
     let Some(world) = World::open() else { return };
-    let mut run = Run::new(&world, GraphCache::with_capacity(8));
-    // Past 2048 keys: decode takes the three-warp GQA kernel, 3 rows the row twin (the fused verifier needs 16384
-    // keys), 5 rows the fused verifier (from 2048 keys).
-    run.skip_to(&world, 2100);
-    for _ in 0..4 {
-        run.step(&world, Step::Decode);
-    }
-    for rows in [3usize, 5] {
-        for _ in 0..4 {
-            run.step(&world, Step::Verify { rows, commit: rows });
+    let steps = scenario();
+    let (wanted, wanted_states) = trace(&world, false, &steps);
+    for (index, step) in steps.iter().enumerate() {
+        if !matches!(step, Step::Prefill(_)) {
+            assert!(
+                wanted[index].keys.iter().all(|key| *key != 0),
+                "step {index} {step:?}: the reference selected nothing"
+            );
         }
     }
-    let position = run.base_next;
-    assert!(position > 2048);
-    for step in [
-        Step::Decode,
-        Step::Verify { rows: 3, commit: 3 },
-        Step::Verify { rows: 5, commit: 5 },
-    ] {
-        let (recorded, now) = hashes(&mut run, &world, step);
-        assert_ne!(recorded, 0, "{step:?}");
-        assert_eq!(recorded, now, "{step:?} at {position}: the graph repeats the stages");
+    for (pdl, name) in [(false, "without"), (true, "with")] {
+        for run in 0..RUNS {
+            if !pdl && run == 0 {
+                continue;
+            }
+            let (actual, states) = trace(&world, pdl, &steps);
+            for (index, step) in steps.iter().enumerate() {
+                assert_eq!(
+                    actual[index].keys, wanted[index].keys,
+                    "{name} programmatic launch, run {run}, step {index} {step:?}: the selected tokens"
+                );
+                assert!(
+                    actual[index].logits == wanted[index].logits,
+                    "{name} programmatic launch, run {run}, step {index} {step:?}: the logits are bitwise equal"
+                );
+            }
+            assert!(
+                states == wanted_states,
+                "{name} programmatic launch, run {run}: the GDN states are bitwise equal"
+            );
+        }
     }
-    // The oracle can tell: the stages of another step do not hash as the graph of this one.
-    let (recorded, _) = hashes(&mut run, &world, Step::Decode);
-    let (_, other) = hashes(&mut run, &world, Step::Verify { rows: 3, commit: 3 });
-    assert_ne!(recorded, other);
-    run.close(&world);
     world.close();
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
-fn a_graph_is_replayed_only_after_its_recording_finished() {
+fn a_key_runs_direct_once_is_recorded_once_and_is_then_replayed() {
     let Some(world) = World::open() else { return };
-    let mut run = Run::new(&world, GraphCache::with_capacity(8));
+    let mut run = Run::new(&world, 8);
     run.step(&world, Step::Prefill(16));
-    let first = run.build(&world, Step::Decode);
-    run.run(&world, first);
-    assert_eq!(
-        (run.recorded, run.replayed[0]),
-        (0, 0),
-        "the first sight runs stage by stage"
+    let counted = |run: &Run| {
+        let stats = run.executor.graph_stats();
+        (stats.directs, stats.records, stats.replays)
+    };
+    let mut digests = Vec::new();
+    for (expected, recorded) in [
+        ((1, 0, 0), false),
+        ((1, 1, 0), false),
+        ((1, 1, 1), true),
+        ((1, 1, 2), true),
+    ] {
+        let built = run.build(&world, Step::Decode);
+        let digest = built.quantum.capture_key().expect("the quantum has a key").digest();
+        assert_eq!(
+            run.executor.has_graph(digest),
+            recorded,
+            "before the quantum of {expected:?}"
+        );
+        digests.push(digest);
+        run.run(&world, built);
+        assert_eq!(counted(&run), expected);
+    }
+    assert!(
+        digests.iter().all(|digest| *digest == digests[0]),
+        "one key for the positions of a span"
     );
-    run.step(&world, Step::Decode);
-    assert_eq!(
-        (run.recorded, run.replayed[0]),
-        (1, 0),
-        "the second records beside its stages and is not replayed"
-    );
-    // Retired quanta have their record stage done: the third replays.
-    run.step(&world, Step::Decode);
-    assert_eq!((run.recorded, run.replayed[0]), (1, 1));
+    assert_eq!(run.executor.graphs().0, 1);
     run.close(&world);
     world.close();
 }
@@ -894,7 +948,7 @@ fn a_recorded_graph_holds_device_memory_that_is_measured() {
         ("decode", Step::Decode),
         ("verification of 3 rows", Step::Verify { rows: 3, commit: 3 }),
     ] {
-        let mut run = Run::new(&world, GraphCache::with_capacity(8));
+        let mut run = Run::new(&world, GEOMETRIES as usize);
         run.step(&world, Step::Prefill(16));
         // Warm: the kernels this view launches are loaded by the first quanta.
         for _ in 0..3 {
@@ -934,11 +988,11 @@ fn a_recorded_graph_holds_device_memory_that_is_measured() {
 /// A light world: a lane, a workspace and a sequence, no weights and no lattice.
 struct Light {
     library: Arc<CudaLibrary>,
-    lane: Arc<CudaLane>,
-    pool: LanePool,
+    typed: Typed,
+    pool: Arc<LanePool>,
     table: LaneTable,
     pinned: Arc<PinnedPool>,
-    retire: Arc<RetireList>,
+    released: Arc<ReleasedBuffers>,
     config: Arc<ModelConfig>,
     workspace: Arc<Workspace>,
 }
@@ -946,7 +1000,7 @@ struct Light {
 fn light() -> Option<Light> {
     let library = library()?;
     let config = reduced_config();
-    let lane = CudaLane::new(&library, LaneId(0), 4).unwrap();
+    let typed = Typed::plain(&library, 1, 1024);
     let workspace = Arc::new(
         Workspace::allocate(
             &library,
@@ -960,26 +1014,30 @@ fn light() -> Option<Light> {
         .unwrap(),
     );
     Some(Light {
-        table: LaneTable::new(vec![Arc::clone(&lane)]).unwrap(),
-        pool: LanePool::new(vec![Arc::clone(&lane) as Arc<dyn DeviceQueue>]),
+        table: typed.table.clone(),
+        pool: Arc::clone(&typed.queues),
         pinned: PinnedPool::new(&library, 16 << 20),
-        retire: Arc::new(RetireList::new()),
+        released: Arc::new(ReleasedBuffers::new()),
         library,
-        lane,
+        typed,
         config,
         workspace,
     })
 }
 
 impl Light {
+    /// Queues `work` as one submission of the lane, waits for it and returns its marker.
+    fn on_lane<T, E: Display>(&self, work: impl FnOnce(&mut dyn LaneOps) -> Result<T, E>) -> (T, Marker) {
+        let made = self.table.submit_ops(self.typed.lane(0), false, work).unwrap();
+        self.typed.sync();
+        made
+    }
+
     fn sequence(&self, kv_tokens: u64, layers: usize) -> SequenceState {
-        let submission = Submission::begin(&self.lane, SubmitMode::default()).unwrap();
-        let gdn = GdnStates::allocate(&self.library, &self.config, 8, &submission).unwrap();
-        submission.finish_signalled().unwrap();
-        self.lane.synchronize().unwrap();
+        let (gdn, _) = self.on_lane(|lane| GdnStates::allocate(&self.library, &self.config, 8, lane));
         let kv = KvCache::new(
             &self.library,
-            &self.retire,
+            &self.released,
             layers,
             self.config.kv_width() as u64,
             KvFormat::Nvfp4,
@@ -1006,14 +1064,12 @@ impl Light {
         row_exact_mode: bool,
     ) -> Quantum {
         let mut retained = KvRetained::default();
-        let submission = Submission::begin(&self.lane, SubmitMode::default()).unwrap();
-        sequence
-            .kv
-            .reserve(&submission, &self.pinned, start, rows as u64, &mut retained)
-            .unwrap();
+        self.on_lane(|lane| {
+            sequence
+                .kv
+                .reserve(lane, &self.pinned, start, rows as u64, &mut retained)
+        });
         sequence.kv.appended(rows as u64).unwrap();
-        drop(submission);
-        self.lane.synchronize().unwrap();
         let quantum = Quantum::new(
             kind,
             rows,
@@ -1146,45 +1202,32 @@ fn a_selection_is_held_by_its_quantum_until_the_quantum_is_dropped() {
 
 #[test]
 #[ignore = "needs a GPU and the native library"]
-fn a_reservation_marker_is_kept_in_the_ring_and_dropped_when_reached() {
+fn a_reservation_marker_is_kept_until_reached_and_then_dropped() {
     let Some(light) = light() else { return };
     let mut sequence = light.sequence(1024, 1);
     let mut retained = KvRetained::default();
-    let submission = Submission::begin(&light.lane, SubmitMode::default()).unwrap();
-    sequence
-        .kv
-        .reserve(&submission, &light.pinned, 0, 8, &mut retained)
+    let ((), reserved) = light
+        .table
+        .submit_ops(light.typed.lane(0), false, |lane| {
+            sequence.kv.reserve(lane, &light.pinned, 0, 8, &mut retained)
+        })
         .unwrap();
-    let reserved = submission.finish().unwrap();
-    // The ring holds 4 events: the reservation's marker is stale after 4 more.
-    for _ in 0..3 {
-        Submission::begin(&light.lane, SubmitMode::default())
-            .unwrap()
-            .finish()
-            .unwrap();
-    }
     let view = sequence.kv.view();
-    let kept = view.clone().ordered_after(reserved, &light.pool, &light.library);
-    assert_eq!(kept.unwrap().ready(), Some(reserved), "within the ring");
-    for _ in 0..2 {
-        Submission::begin(&light.lane, SubmitMode::default())
-            .unwrap()
-            .finish()
-            .unwrap();
-    }
-    assert!(!light.library.marker_waitable(reserved));
-    let refused = view.clone().ordered_after(reserved, &light.pool, &light.library);
+    light.typed.sync();
+    assert!(light.pool.reached(reserved), "the reservation has run");
+    let unreached = Marker {
+        value: reserved.value + 1,
+        ..reserved
+    };
     assert!(
-        refused.is_err(),
-        "older than the ring and not reached: the owner holds the quantum back"
+        !light.pool.reached(unreached),
+        "nothing has been submitted past the reservation"
     );
-    let marker: Marker = Submission::begin(&light.lane, SubmitMode::default())
-        .unwrap()
-        .finish_signalled()
-        .unwrap();
-    light.lane.synchronize().unwrap();
+    let kept = view.clone().ordered_after(unreached, &light.pool);
+    assert_eq!(kept.ready(), Some(unreached), "work not yet reached is waited for");
+    let ((), marker) = light.on_lane(|_| Ok::<(), CudaError>(()));
     assert!(light.pool.reached(marker));
-    let done = view.ordered_after(reserved, &light.pool, &light.library).unwrap();
+    let done = view.ordered_after(reserved, &light.pool);
     assert_eq!(done.ready(), None, "reached work needs no ordering");
 }
 
@@ -1203,14 +1246,8 @@ fn a_cache_reserved_twice_or_not_at_all_for_a_quantum_is_refused_its_references(
     );
     let mut retained = KvRetained::default();
     let reserve = |sequence: &mut SequenceState, retained: &mut KvRetained, start: u64| {
-        let submission = Submission::begin(&light.lane, SubmitMode::default()).unwrap();
-        sequence
-            .kv
-            .reserve(&submission, &light.pinned, start, 1, retained)
-            .unwrap();
+        light.on_lane(|lane| sequence.kv.reserve(lane, &light.pinned, start, 1, retained));
         sequence.kv.appended(1).unwrap();
-        drop(submission);
-        light.lane.synchronize().unwrap();
         sequence.kv.commit(1).unwrap();
     };
     reserve(&mut sequence, &mut retained, 0);
@@ -1233,13 +1270,7 @@ fn a_sequence_closes_only_when_no_quantum_is_in_flight() {
     let Some(light) = light() else { return };
     let mut sequence = light.sequence(1024, 1);
     let mut retained = KvRetained::default();
-    let submission = Submission::begin(&light.lane, SubmitMode::default()).unwrap();
-    sequence
-        .kv
-        .reserve(&submission, &light.pinned, 0, 1, &mut retained)
-        .unwrap();
-    drop(submission);
-    light.lane.synchronize().unwrap();
+    light.on_lane(|lane| sequence.kv.reserve(lane, &light.pinned, 0, 1, &mut retained));
     let refs = sequence.refs(KvSource::Base).unwrap();
     assert_eq!(sequence.in_flight(), 1);
     let busy = sequence.close().unwrap_err();
@@ -1263,7 +1294,7 @@ fn growing_a_cache_after_a_view_was_taken_costs_one_handle_copy_per_page() {
     let layers = 16;
     let mut kv = KvCache::new(
         &light.library,
-        &light.retire,
+        &light.released,
         layers,
         light.config.kv_width() as u64,
         KvFormat::Nvfp4,
@@ -1272,24 +1303,21 @@ fn growing_a_cache_after_a_view_was_taken_costs_one_handle_copy_per_page() {
     )
     .unwrap();
     let mut retained = KvRetained::default();
-    let submission = Submission::begin(&light.lane, SubmitMode::default()).unwrap();
     // Reserve all but the pages the rounds grow into.
     let almost = 131_072 - (2 * ROUNDS as u64 + 2) * 256;
-    kv.reserve(&submission, &light.pinned, 0, almost, &mut retained)
-        .unwrap();
+    light.on_lane(|lane| kv.reserve(lane, &light.pinned, 0, almost, &mut retained));
     kv.appended(almost).unwrap();
-    drop(submission);
-    light.lane.synchronize().unwrap();
     let grow = |kv: &mut KvCache, retained: &mut KvRetained, held: bool| -> Duration {
         let view = held.then(|| kv.view());
         let start = kv.submitted();
-        let submission = Submission::begin(&light.lane, SubmitMode::default()).unwrap();
-        let begun = Instant::now();
-        kv.reserve(&submission, &light.pinned, start, 256, retained).unwrap();
-        let took = begun.elapsed();
+        let mut took = Duration::ZERO;
+        light.on_lane(|lane| {
+            let begun = Instant::now();
+            let reserved = kv.reserve(lane, &light.pinned, start, 256, retained);
+            took = begun.elapsed();
+            reserved
+        });
         kv.appended(256).unwrap();
-        drop(submission);
-        light.lane.synchronize().unwrap();
         drop(view);
         took
     };

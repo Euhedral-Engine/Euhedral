@@ -15,6 +15,8 @@
 
 #[path = "common/linear_gpu.rs"]
 mod linear_gpu;
+#[path = "common/typed.rs"]
+mod typed;
 
 use euhedral_inference_engine::formats::{LinearMode, Nvfp4Linear, TrellisLinear};
 use linear_gpu::{Artifact, Random, Rig, activations, rig, synthetic_trellis, upload, values};

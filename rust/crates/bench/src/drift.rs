@@ -12,6 +12,7 @@ use std::sync::{Arc, OnceLock};
 use euhedral_inference_engine::EngineRuntime;
 use euhedral_inference_engine::generation::FinishReason;
 
+use crate::await_value;
 use crate::config::ConfigError;
 use crate::rows::{self, RowInput, RowTask};
 
@@ -184,8 +185,8 @@ fn run(
 ) -> Result<Vec<f64>, ConfigError> {
     let steps = forced.len();
     let (engine, values) = rows::start(runtime, prefix, forced, task)?;
-    let outcome = engine.wait();
-    let values = values.wait();
+    let outcome = await_value(&engine);
+    let values = await_value(&values);
     if outcome.reason != FinishReason::Length || outcome.generated != steps {
         return Err(ConfigError::Invalid(format!(
             "the run ended with {:?} after {} of {steps} steps",

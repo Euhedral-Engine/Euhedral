@@ -1,18 +1,15 @@
 //! Loading the CUDA library and binding the device.
 
-use std::array;
 use std::ffi::{CStr, CString, c_int};
 use std::fmt;
 use std::path::{self, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 
-use euhedral_graph::{LaneId, Marker};
 use libloading::Library;
 
 use crate::device::DeviceInfo;
 use crate::error::{CudaError, check};
-use crate::lane::EventRing;
 use crate::memory::AllocationId;
 use crate::sys::EuhedralCuda;
 
@@ -36,9 +33,9 @@ const RUNTIME: &[&str] = &["cudart64_13.dll", "nvrtc-builtins64_131.dll", "nvrtc
 )))]
 const RUNTIME: &[&str] = &[];
 
-/// The loaded CUDA library: its entry points, the device it bound, and the event rings of the lanes created on it.
+/// The loaded CUDA library: its entry points, and the device it bound.
 ///
-/// One per process in practice; a lane, a buffer or a graph keeps it alive through an `Arc`.
+/// One per process in practice; a buffer keeps it alive through an `Arc`.
 pub struct CudaLibrary {
     // `api` holds the library handle and drops before the runtime libraries it links.
     api: EuhedralCuda,
@@ -46,7 +43,6 @@ pub struct CudaLibrary {
     path: PathBuf,
     device: DeviceInfo,
     allocations: AtomicU64,
-    rings: [OnceLock<EventRing>; MAX_LANES],
 }
 
 impl fmt::Debug for CudaLibrary {
@@ -92,11 +88,10 @@ impl CudaLibrary {
             path: library,
             device,
             allocations: AtomicU64::new(0),
-            rings: array::from_fn(|_| OnceLock::new()),
         }))
     }
 
-    /// The most lanes this library holds: lane ids are `0..max_lanes()`.
+    /// The most lanes an engine creates on this library: lane ids are `0..max_lanes()`.
     pub fn max_lanes(&self) -> usize {
         MAX_LANES
     }
@@ -213,43 +208,10 @@ impl CudaLibrary {
         &self.api
     }
 
-    /// Whether a wait on `marker` would be accepted now: value 0 (always reached), or a marker its lane has issued
-    /// and whose event the lane's later markers have not reused. A marker older than its lane's event ring is refused
-    /// by [`Submission::wait`](crate::Submission::wait); the caller orders behind the lane another way.
-    pub fn marker_waitable(&self, marker: Marker) -> bool {
-        self.ring(marker.lane).and_then(|ring| ring.waitable(marker)).is_ok()
-    }
-
     /// The next allocation serial. A serial is never reused, so a buffer read by a captured graph is told apart from
     /// a later allocation at the same address.
     pub(crate) fn next_allocation(&self) -> AllocationId {
         AllocationId(self.allocations.fetch_add(1, Ordering::Relaxed) + 1)
-    }
-
-    /// Registers the event ring of lane `id`; each id registers once.
-    pub(crate) fn register_ring(&self, id: LaneId, ring: EventRing) -> Result<(), (CudaError, EventRing)> {
-        let Some(slot) = self.rings.get(usize::from(id.0)) else {
-            return Err((CudaError::LaneOutOfRange(id), ring));
-        };
-        slot.set(ring).map_err(|ring| (CudaError::LaneInUse(id), ring))
-    }
-
-    /// The event ring of lane `id`; its events live as long as the library.
-    pub(crate) fn ring(&self, id: LaneId) -> Result<&EventRing, CudaError> {
-        self.rings
-            .get(usize::from(id.0))
-            .and_then(OnceLock::get)
-            .ok_or(CudaError::UnknownLane(id))
-    }
-}
-
-impl Drop for CudaLibrary {
-    fn drop(&mut self) {
-        // Lane ids are never reused, so no event is destroyed while a lane could still wait on it: they go together,
-        // here, before the library handle closes.
-        for ring in self.rings.iter().filter_map(OnceLock::get) {
-            ring.destroy(&self.api);
-        }
     }
 }
 

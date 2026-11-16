@@ -28,8 +28,8 @@ pub(crate) enum Kind {
     Owner,
     /// The arrival of a teacher-forced step's logits row.
     Logits,
-    /// The settling of one lane of a quantum that ended before its last stage.
-    Settle,
+    /// The running of the work a parked quantum waited for on the owner's lane.
+    Reaped,
 }
 
 /// The id hash of a frame of `kind` on chain `chain`: distinct per kind and chain, mixed so that the chains spread

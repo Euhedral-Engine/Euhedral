@@ -1,4 +1,4 @@
-//! A lock-free stack for the retire list and the pinned pool.
+//! A lock-free stack for the pinned pool.
 
 use std::fmt;
 use std::ptr;

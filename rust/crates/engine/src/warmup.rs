@@ -13,7 +13,7 @@
 //! stages that own those launches warm them.
 
 use euhedral_graph::Marker;
-use euhedral_inference_cuda::{CudaError, CudaLane, Submission, SubmitMode, ops};
+use euhedral_inference_cuda::{CudaError, KernelOps};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 
 use crate::model::{LayerIndex, ModelConfig, NormKind, Role, WeightRef, Weights};
@@ -29,42 +29,57 @@ pub struct Warmed {
     pub failed: Vec<String>,
 }
 
-/// The launches queued so far on the warm-up lane.
+/// The launches made so far in the warm-up's one submission.
 struct Launcher<'a> {
-    lane: &'a CudaLane,
+    kernels: &'a mut dyn KernelOps,
     warmed: Warmed,
-    /// The marker of the last launch queued: the lane reaches it when every launch has run.
-    last: Option<Marker>,
 }
 
 impl Launcher<'_> {
-    fn launch(&mut self, module: &'static str, work: impl FnOnce(&Submission<'_>) -> Result<(), CudaError>) {
-        let result = Submission::begin(self.lane, SubmitMode::default()).and_then(|submission| {
-            work(&submission)?;
-            submission.finish_signalled()
-        });
-        match result {
-            Ok(marker) => {
-                self.warmed.modules.push(module);
-                self.last = Some(marker);
-            }
+    fn launch(&mut self, module: &'static str, work: impl FnOnce(&mut dyn KernelOps) -> Result<(), CudaError>) {
+        match work(&mut *self.kernels) {
+            Ok(()) => self.warmed.modules.push(module),
             Err(error) => self.warmed.failed.push(format!("{module}: {error}")),
         }
     }
 }
 
-/// Warms the modules the engine's loaded model can launch with only its own buffers.
+/// Warms the modules the engine's loaded model can launch with only its own buffers: every launch is made in one
+/// submission on the first transfer lane, so the lane's ring holds one marker for all of them. Returns the marker the
+/// lane reaches when they have all run (none if the lane refused the submission, which then warmed nothing).
 pub(crate) fn run(
     core: &Core,
     config: &ModelConfig,
     weights: &Weights,
     workspace: &Workspace,
 ) -> (Warmed, Option<Marker>) {
-    let lane = &core.transfer[0];
+    let mut warmed = Warmed::default();
+    let submitted = core.lane_table.submit_ops(core.transfer_lane(0), false, |lane| {
+        warmed = warm(core, config, weights, workspace, lane);
+        Ok::<(), CudaError>(())
+    });
+    match submitted {
+        Ok(((), marker)) => (warmed, Some(marker)),
+        Err(error) => (
+            Warmed {
+                modules: Vec::new(),
+                failed: vec![format!("warm-up: {error}")],
+            },
+            None,
+        ),
+    }
+}
+
+fn warm(
+    core: &Core,
+    config: &ModelConfig,
+    weights: &Weights,
+    workspace: &Workspace,
+    kernels: &mut dyn KernelOps,
+) -> Warmed {
     let mut launcher = Launcher {
-        lane,
+        kernels,
         warmed: Warmed::default(),
-        last: None,
     };
     let hidden = config.hidden_size as u32;
     let intermediate = config.intermediate_size as u32;
@@ -81,16 +96,15 @@ pub(crate) fn run(
         BufferSlot::TokenIds,
     ] {
         let buffer = workspace.buffer(input);
-        launcher.launch("zero", |submission| {
-            ops::zero_device_memory(submission, buffer.ptr(), buffer.bytes() as u64)
+        launcher.launch("zero", |kernels| {
+            kernels.zero_device_memory(buffer.ptr(), buffer.bytes() as u64)
         });
     }
 
     if let Some(norm) = weights.get(LayerIndex::GLOBAL, Role::Norm(NormKind::Final)) {
         let epsilon = config.rms_norm_epsilon as f32;
-        launcher.launch("norm", |submission| {
-            ops::rms_norm_unit_offset_bf16(
-                submission,
+        launcher.launch("norm", |kernels| {
+            kernels.rms_norm_unit_offset_bf16(
                 slot(BufferSlot::HiddenState),
                 norm.ptr,
                 slot(BufferSlot::InputNormalized),
@@ -100,26 +114,18 @@ pub(crate) fn run(
             )
         });
     }
-    launcher.launch("elementwise", |submission| {
-        ops::residual_add_bf16(
-            submission,
+    launcher.launch("elementwise", |kernels| {
+        kernels.residual_add_bf16(
             slot(BufferSlot::HiddenState),
             slot(BufferSlot::MixerDelta),
             slot(BufferSlot::HiddenState),
             1,
             hidden,
         )?;
-        ops::swiglu_bf16(
-            submission,
-            slot(BufferSlot::GateUp),
-            slot(BufferSlot::Swiglu),
-            1,
-            intermediate,
-        )
+        kernels.swiglu_bf16(slot(BufferSlot::GateUp), slot(BufferSlot::Swiglu), 1, intermediate)
     });
-    launcher.launch("sampling", |submission| {
-        ops::argmax_bf16(
-            submission,
+    launcher.launch("sampling", |kernels| {
+        kernels.argmax_bf16(
             slot(BufferSlot::Logits),
             config.vocab_size as u32,
             slot(BufferSlot::FinalNormalized),
@@ -129,9 +135,8 @@ pub(crate) fn run(
         .get(LayerIndex::GLOBAL, Role::Embedding)
         .filter(|weight| weight.format == WeightFormat::Q3G64Fp16 && weight.layout == WeightLayout::RowSplitK128V1)
     {
-        launcher.launch("embedding", |submission| {
-            ops::embed_q3(
-                submission,
+        launcher.launch("embedding", |kernels| {
+            kernels.embed_q3(
                 slot(BufferSlot::TokenIds),
                 embedding.ptr,
                 slot(BufferSlot::HiddenState),
@@ -148,9 +153,8 @@ pub(crate) fn run(
     if let Some(head) = head
         && let Some((out, input)) = matrix(head)
     {
-        launcher.launch("nvfp4", |submission| {
-            ops::linear_nvfp4_bf16(
-                submission,
+        launcher.launch("nvfp4", |kernels| {
+            kernels.linear_nvfp4_bf16(
                 slot(BufferSlot::InputNormalized),
                 head.ptr,
                 slot(BufferSlot::Logits),
@@ -178,9 +182,8 @@ pub(crate) fn run(
                 if needed > scratch.bytes() as u64 {
                     continue;
                 }
-                launcher.launch(module, |submission| {
-                    ops::linear_nvfp4_native_bf16(
-                        submission,
+                launcher.launch(module, |kernels| {
+                    kernels.linear_nvfp4_native_bf16(
                         slot(BufferSlot::Swiglu),
                         down.ptr,
                         slot(BufferSlot::FfnDelta),
@@ -195,7 +198,7 @@ pub(crate) fn run(
             }
         }
     }
-    (launcher.warmed, launcher.last)
+    launcher.warmed
 }
 
 /// `(rows, columns)` of a two-dimensional tensor, as the launches take them.

@@ -7,7 +7,7 @@
 )]
 #![allow(
     clippy::disallowed_methods,
-    reason = "no-wait, waiting call: a test thread waits on the latch for the frames it published"
+    reason = "no-wait, waiting call: a test thread waits on the hand-off for the frames it published"
 )]
 
 use std::num::NonZeroUsize;
@@ -15,18 +15,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use euhedral_core::config::FragmentConfig;
+use euhedral_core::config::{FragmentConfig, IdlePolicy};
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
-use euhedral_graph::{Join, Lake, Latch};
-use euhedral_inference_engine::{RuntimeOwner, Teardown, fragment_config, lattice_config};
+use euhedral_graph::Lake;
+use euhedral_inference_engine::{Handoff, RuntimeOwner, Teardown, fragment_config, lattice_config};
 use euhedral_inference_settings::{Auto, ModelSettings, Settings};
+
+/// The longest a test waits for its frames; past it the test fails, never hangs.
+const WAIT: Duration = Duration::from_secs(60);
 
 struct Counted {
     header: FrameHeader,
     ran: Arc<AtomicUsize>,
-    join: Arc<Join<usize>>,
-    part: usize,
+    /// Frames still to run; the one that brings it to zero sends `total` to `done`.
+    pending: Arc<AtomicUsize>,
+    total: usize,
+    done: Arc<Handoff<usize>>,
 }
 
 impl Frame for Counted {
@@ -40,7 +45,9 @@ impl Frame for Counted {
 
     fn execute(&mut self) -> Result<(), FrameError> {
         self.ran.fetch_add(1, Ordering::AcqRel);
-        self.join.arrive(self.part, self.part);
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.done.send(self.total);
+        }
         Ok(())
     }
 }
@@ -54,19 +61,20 @@ fn run_frames(settings: &Settings, frames: usize) -> usize {
         Duration::from_secs(1),
     );
     let unit = lake.admit().unwrap();
-    let (done, finished) = Latch::new();
+    let finished = Handoff::new();
     let ran = Arc::new(AtomicUsize::new(0));
-    let join = Join::new(frames, move |parts| done.set(parts.len()));
+    let pending = Arc::new(AtomicUsize::new(frames));
     for part in 0..frames {
         let frame = Counted {
             header: FrameHeader::new(part as u64 + 1),
             ran: Arc::clone(&ran),
-            join: Arc::clone(&join),
-            part,
+            pending: Arc::clone(&pending),
+            total: frames,
+            done: Arc::clone(&finished),
         };
         assert!(lake.offer(Box::new(frame)).is_ok());
     }
-    assert_eq!(finished.wait(), frames);
+    assert_eq!(finished.wait(WAIT), Ok(frames));
     drop(unit);
     lake.complete_gracefully();
     lattice.close();
@@ -77,6 +85,27 @@ fn settings(max_batch_size: Auto<u32>) -> Settings {
     let mut settings = Settings::with_model(ModelSettings::default());
     settings.host.max_batch_size = max_batch_size;
     settings
+}
+
+/// The engine's workers idle on fixed timing: the park and half-life are RustEE's defaults whatever a worker's history,
+/// and the other timings are RustEE's.
+#[test]
+fn workers_idle_on_fixed_timing() {
+    let policy = fragment_config(&settings(Auto::Auto)).idle_policy().clone();
+    let default = IdlePolicy::default();
+    assert_eq!(policy.idle_park(), IdlePolicy::DEFAULT_IDLE_PARK);
+    assert_eq!(policy.contention_half_life(), IdlePolicy::DEFAULT_CONTENTION_HALF_LIFE);
+    assert_eq!(policy.probe_interval(), IdlePolicy::DEFAULT_PROBE_INTERVAL);
+    assert_eq!(policy.unproductive_park(), IdlePolicy::DEFAULT_UNPRODUCTIVE_PARK);
+    assert_eq!(policy.probe_interval(), default.probe_interval());
+    for (contention, productive, body) in [(0.0, 1.0, 1.0e3), (0.9, 0.1, 5.0e6)] {
+        let park = policy.function().park(contention, productive, body, policy.idle_park());
+        let half_life = policy
+            .function()
+            .half_life(contention, productive, body, policy.contention_half_life());
+        assert_eq!(park, IdlePolicy::DEFAULT_IDLE_PARK);
+        assert_eq!(half_life, IdlePolicy::DEFAULT_CONTENTION_HALF_LIFE);
+    }
 }
 
 #[test]
@@ -121,16 +150,16 @@ fn dropping_the_owner_closes_the_lakes_and_the_lattice_whatever_handles_are_aliv
 
     // The engine is working: a frame has run on the lattice.
     let unit = lakes[0].admit().unwrap();
-    let (done, finished) = Latch::new();
-    let join = Join::new(1, move |parts: Vec<Option<usize>>| done.set(parts.len()));
+    let finished = Handoff::new();
     let frame = Counted {
         header: FrameHeader::new(1),
         ran: Arc::new(AtomicUsize::new(0)),
-        join,
-        part: 0,
+        pending: Arc::new(AtomicUsize::new(1)),
+        total: 1,
+        done: Arc::clone(&finished),
     };
     assert!(lakes[0].offer(Box::new(frame)).is_ok());
-    assert_eq!(finished.wait(), 1);
+    assert_eq!(finished.wait(WAIT), Ok(1));
     drop(unit);
 
     // `teardown` stands for a handle a frame still holds (the runtime's, in an engine): the drop closes anyway.

@@ -2,10 +2,11 @@
 //!
 //! A graph of a chain needs one lane; a fan-out needs as many as the stages that can run at once. So the lane count is
 //! the width of the widest graph: the most stages no edge orders, which is the size of a largest antichain (Dilworth:
-//! the stage count less a largest matching of the ordering). RustEE's `StageGraph` places the stages by the path
-//! policy (`StageGraph.markPaths`): it keeps a graph's critical chain on one lane and gives the other branches of a
-//! fan-out lanes of their own; [`path_predecessors`] is the same rule, which the plan reads to know where a chain of a
-//! lane ends.
+//! the stage count less a largest matching of the ordering). RustEE's `StageGraph` continues a stage on the lane of its
+//! path predecessor (`StageGraph.markPaths`: the critical chain of a graph keeps one lane) and, left alone, puts every
+//! other branch of a fan-out on a random allowed lane. The plan therefore fixes the lane of each chain of
+//! continuations ([`chain_lanes`]) and allows each stage only that lane; [`path_predecessors`] is the rule that forms
+//! the chains.
 
 use std::collections::VecDeque;
 
@@ -14,14 +15,9 @@ fn words(len: usize) -> usize {
     len.div_ceil(64)
 }
 
-/// The most stages of a graph that no chain of `edges` orders, where `edges[node]` lists the nodes before `node`
-/// (every one a smaller index).
-pub(crate) fn fan_out_width(edges: &[Vec<usize>]) -> usize {
+/// below[node]: the nodes before `node` by any chain of `edges`, as a bit set.
+fn ordering(edges: &[Vec<usize>]) -> Vec<Vec<u64>> {
     let count = edges.len();
-    if count == 0 {
-        return 0;
-    }
-    // below[node]: the nodes before `node` by any chain.
     let mut below: Vec<Vec<u64>> = Vec::with_capacity(count);
     for (node, predecessors) in edges.iter().enumerate() {
         let mut reach = vec![0u64; words(count)];
@@ -34,6 +30,17 @@ pub(crate) fn fan_out_width(edges: &[Vec<usize>]) -> usize {
         }
         below.push(reach);
     }
+    below
+}
+
+/// The most stages of a graph that no chain of `edges` orders, where `edges[node]` lists the nodes before `node`
+/// (every one a smaller index).
+pub(crate) fn fan_out_width(edges: &[Vec<usize>]) -> usize {
+    let count = edges.len();
+    if count == 0 {
+        return 0;
+    }
+    let below = ordering(edges);
     // The ordering as a bipartite graph: a node on the left matches a node on the right that comes after it.
     let mut after: Vec<Vec<u32>> = vec![Vec::new(); count];
     for (node, reach) in below.iter().enumerate() {
@@ -166,21 +173,146 @@ pub(crate) fn path_predecessors(edges: &[Vec<usize>]) -> Vec<Option<usize>> {
     path
 }
 
-/// Which stages end a chain of lane continuations: those no stage continues the lane of (`path[s]` names no later
-/// stage's predecessor). RustEE's graph puts a stage on the lane of its path predecessor and every other branch on a
-/// lane of its own, so a lane's last marker belongs to the end of a chain; those stages signal. `edges[node]` lists
-/// the nodes before `node`.
-pub(crate) fn chain_ends(edges: &[Vec<usize>]) -> Vec<bool> {
-    let mut continued = vec![false; edges.len()];
-    for predecessor in path_predecessors(edges).into_iter().flatten() {
-        continued[predecessor] = true;
+/// The lane of each stage: every chain of lane continuations (a stage and those that continue its lane, by
+/// `path_predecessors`) has one lane. A root is on lane 0, the home lane; the other chains go in order of their first
+/// stage, each on the lowest of the `width` lanes that holds no chain with a stage the chain's stages run beside (no
+/// edge orders them), so the branches of a fan-out never share a lane. When every lane holds such a chain (the greedy
+/// order needs more than `width`), the chain takes the lane with the fewest stages it runs beside, the lowest on
+/// ties: a lane only serialises stages that could overlap. The result is a function of the graph alone.
+pub(crate) fn chain_lanes(edges: &[Vec<usize>], width: usize) -> Vec<u16> {
+    let count = edges.len();
+    let width = width.max(1);
+    let path = path_predecessors(edges);
+    let below = ordering(edges);
+    let ordered = |a: usize, b: usize| below[a][b / 64] >> (b % 64) & 1 == 1 || below[b][a / 64] >> (a % 64) & 1 == 1;
+    // Chains by first stage; a stage continues its path predecessor's chain.
+    let mut chain_of = vec![0usize; count];
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    for stage in 0..count {
+        match path[stage] {
+            Some(predecessor) => {
+                chain_of[stage] = chain_of[predecessor];
+                chains[chain_of[stage]].push(stage);
+            }
+            None => {
+                chain_of[stage] = chains.len();
+                chains.push(vec![stage]);
+            }
+        }
     }
-    continued.into_iter().map(|continued| !continued).collect()
+    let beside = |chain: &[usize], other: &[usize]| -> usize {
+        chain
+            .iter()
+            .flat_map(|&a| other.iter().filter(move |&&b| a != b && !ordered(a, b)))
+            .count()
+    };
+    let mut chain_lane: Vec<Option<u16>> = vec![None; chains.len()];
+    for (index, chain) in chains.iter().enumerate() {
+        // The first root is on the home lane; any other root is placed like the chains of a fan-out.
+        if index == 0 && edges[chain[0]].is_empty() {
+            chain_lane[index] = Some(0);
+            continue;
+        }
+        let mut best: Option<(usize, u16)> = None;
+        for lane in 0..width {
+            let crowd: usize = chains
+                .iter()
+                .zip(&chain_lane)
+                .filter(|(_, assigned)| **assigned == Some(lane as u16))
+                .map(|(other, _)| beside(chain, other))
+                .sum();
+            if best.is_none_or(|(least, _)| crowd < least) {
+                best = Some((crowd, lane as u16));
+            }
+            if crowd == 0 {
+                break;
+            }
+        }
+        debug_assert!(
+            best.is_some_and(|(crowd, _)| crowd == 0),
+            "the chain starting at stage {} shares a lane with stages it can overlap: {width} lanes are too few",
+            chain[0]
+        );
+        chain_lane[index] = best.map(|(_, lane)| lane);
+    }
+    chain_of.iter().map(|&chain| chain_lane[chain].unwrap_or(0)).collect()
+}
+
+/// The stages that run in one frame: each is a list of consecutive stages (by index) of which every one but the first
+/// has the one before it as its only predecessor that no other predecessor already follows, and which the one before
+/// it has as its only such successor, on the same lane. An edge from a stage that another predecessor of the same stage
+/// follows orders nothing the other does not (the residual stream's join with the layer's start). Such a stage can only
+/// start once the one before it was submitted, and nothing else waits for the one before it, so running them one after
+/// the other as one submission changes no ordering and gives no worker a hand-off to make. A stage with several
+/// successors or predecessors that nothing else orders (a fan-out, a join), or whose neighbour is on another lane,
+/// starts a unit of its own. `edges[node]` lists the nodes before `node`; `lanes[node]` is its lane.
+pub(crate) fn fused_units(edges: &[Vec<usize>], lanes: &[u16]) -> Vec<Vec<usize>> {
+    let below = ordering(edges);
+    let follows = |later: usize, earlier: usize| below[later][earlier / 64] >> (earlier % 64) & 1 == 1;
+    let needed: Vec<Vec<usize>> = edges
+        .iter()
+        .map(|predecessors| {
+            predecessors
+                .iter()
+                .copied()
+                .filter(|&predecessor| {
+                    !predecessors
+                        .iter()
+                        .any(|&other| other != predecessor && follows(other, predecessor))
+                })
+                .collect()
+        })
+        .collect();
+    let mut successors = vec![0usize; edges.len()];
+    for predecessors in &needed {
+        for &predecessor in predecessors {
+            successors[predecessor] += 1;
+        }
+    }
+    let mut units: Vec<Vec<usize>> = Vec::new();
+    let mut unit_of = vec![0usize; edges.len()];
+    for (node, predecessors) in needed.iter().enumerate() {
+        match predecessors.as_slice() {
+            [only] if successors[*only] == 1 && lanes[*only] == lanes[node] => {
+                unit_of[node] = unit_of[*only];
+                units[unit_of[node]].push(node);
+            }
+            _ => {
+                unit_of[node] = units.len();
+                units.push(vec![node]);
+            }
+        }
+    }
+    units
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chain_of_single_links_on_one_lane_is_one_unit_and_a_fan_out_or_a_join_is_not() {
+        // 0 -> 1 -> 2, then 2 fans out to 3 and 4, which 5 joins, then 5 -> 6.
+        let edges = [vec![], vec![0], vec![1], vec![2], vec![2], vec![3, 4], vec![5]];
+        let lanes = [0, 0, 0, 0, 1, 0, 0];
+        assert_eq!(
+            fused_units(&edges, &lanes),
+            vec![vec![0, 1, 2], vec![3], vec![4], vec![5, 6]]
+        );
+    }
+
+    #[test]
+    fn an_edge_another_predecessor_already_follows_does_not_keep_a_stage_from_its_chain() {
+        // 2 also follows 0 directly, as a layer's residual add follows the stream it adds to.
+        let edges = [vec![], vec![0], vec![0, 1], vec![2]];
+        assert_eq!(fused_units(&edges, &[0, 0, 0, 0]), vec![vec![0, 1, 2, 3]]);
+    }
+
+    #[test]
+    fn a_link_to_another_lane_is_not_fused() {
+        let edges = [vec![], vec![0], vec![1]];
+        assert_eq!(fused_units(&edges, &[0, 0, 1]), vec![vec![0, 1], vec![2]]);
+    }
 
     #[test]
     fn a_chain_is_one_wide_and_a_fan_out_is_as_wide_as_its_branches() {
@@ -277,12 +409,25 @@ mod tests {
     }
 
     #[test]
-    fn a_chain_ends_where_no_stage_continues_its_lane() {
+    fn chains_take_distinct_lanes_beside_each_other_and_reuse_a_lane_once_ordered() {
+        // 0 feeds 1, 2 and 3; 5 joins 4, 2 and 3. 1 -> 4 -> 5 is the critical chain.
         let edges = [vec![], vec![0], vec![0], vec![0], vec![1], vec![4, 2, 3]];
-        // 2 and 3 are branches that end at the join; 5 ends the main chain.
-        assert_eq!(chain_ends(&edges), vec![false, false, true, true, false, true]);
-        // The tie: 2 continues the join, so 1 ends its chain.
-        let tie = [vec![], vec![0], vec![0], vec![1, 2]];
-        assert_eq!(chain_ends(&tie), vec![false, true, false, true]);
+        assert_eq!(chain_lanes(&edges, fan_out_width(&edges)), vec![0, 0, 1, 2, 0, 0]);
+        // Two diamonds in a row: the join 3 continues branch 2's lane, which 4 follows; 5 is a branch beside 4 and
+        // takes lane 0, the lane of the chain 0, 1 that ended before it.
+        let edges = [vec![], vec![0], vec![0], vec![1, 2], vec![3], vec![3], vec![4, 5]];
+        assert_eq!(chain_lanes(&edges, fan_out_width(&edges)), vec![0, 0, 1, 1, 1, 0, 0]);
+        assert_eq!(chain_lanes(&[vec![], vec![0], vec![1]], 1), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn roots_after_the_first_take_lanes_of_their_own() {
+        // Two unordered roots, each with one stage after it, and a join.
+        let edges = [vec![], vec![], vec![0], vec![1], vec![2, 3]];
+        let lanes = chain_lanes(&edges, fan_out_width(&edges));
+        assert_eq!(lanes[0], 0);
+        assert_ne!(lanes[0], lanes[1]);
+        assert_eq!(lanes[2], lanes[0]);
+        assert_eq!(lanes[3], lanes[1]);
     }
 }

@@ -10,7 +10,7 @@
 //! admitted: the stage only reads them.
 
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::{CudaError, DevicePtr, Submission, ops};
+use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps};
 
 use super::{Launch, Quantum, QuantumKind, eager, fatal, launch_u32};
 use crate::state::gdn::{GdnSpeculative, GdnState};
@@ -81,21 +81,21 @@ impl GdnProjectControl {
 }
 
 impl Launch for GdnProjectControl {
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
-        ops::gdn_project_control_fp32(
-            submission,
-            quantum.slot(self.input),
-            self.a_weight,
-            self.b_weight,
-            self.a_log,
-            self.dt_bias,
-            quantum.slot(self.alpha),
-            quantum.slot(self.beta),
-            quantum.rows_u32()?,
-            launch_u32(quantum.config.hidden_size, "the hidden size")?,
-            launch_u32(quantum.config.linear_num_value_heads, "the value heads")?,
-        )
-        .map_err(fatal)
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
+        kernels
+            .gdn_project_control_fp32(
+                quantum.slot(self.input),
+                self.a_weight,
+                self.b_weight,
+                self.a_log,
+                self.dt_bias,
+                quantum.slot(self.alpha),
+                quantum.slot(self.beta),
+                quantum.rows_u32()?,
+                launch_u32(quantum.config.hidden_size, "the hidden size")?,
+                launch_u32(quantum.config.linear_num_value_heads, "the value heads")?,
+            )
+            .map_err(fatal)
     }
 }
 
@@ -135,7 +135,7 @@ impl GdnConvolution {
     fn replay(
         &self,
         quantum: &Quantum,
-        submission: &Submission<'_>,
+        kernels: &mut dyn KernelOps,
         state: &GdnState,
         rows: usize,
     ) -> Result<(), StageError> {
@@ -148,16 +148,14 @@ impl GdnConvolution {
         let value_heads = launch_u32(config.linear_num_value_heads, "the value heads")?;
         let key_head_dim = launch_u32(config.linear_key_head_dim, "the key head dimension")?;
         let value_head_dim = launch_u32(config.linear_value_head_dim, "the value head dimension")?;
-        ops::select_row_exact(submission, true);
+        kernels.set_row_exact(true);
         let replayed = (|| {
-            ops::copy_device_to_device(
-                submission,
+            kernels.copy_device_to_device(
                 state.convolution().ptr(),
                 buffers.convolution_checkpoint.ptr(),
                 state.convolution().bytes() as u64,
             )?;
-            ops::gdn_convolution_bf16(
-                submission,
+            kernels.gdn_convolution_bf16(
                 buffers.query_key_rows.ptr(),
                 buffers.value_z_rows.ptr(),
                 self.weights,
@@ -169,14 +167,12 @@ impl GdnConvolution {
                 channels,
                 kernel,
             )?;
-            ops::copy_device_to_device(
-                submission,
+            kernels.copy_device_to_device(
                 state.recurrent().ptr(),
                 buffers.recurrent_checkpoint.ptr(),
                 state.recurrent().bytes() as u64,
             )?;
-            ops::gdn_recurrence_bf16(
-                submission,
+            kernels.gdn_recurrence_bf16(
                 buffers.replay_convolved.ptr(),
                 buffers.alpha_rows.ptr(),
                 buffers.beta_rows.ptr(),
@@ -192,7 +188,7 @@ impl GdnConvolution {
             Ok::<(), CudaError>(())
         })();
         // The rest of the stage runs as the quantum does.
-        ops::select_row_exact(submission, quantum.mode.row_exact);
+        kernels.set_row_exact(quantum.mode.row_exact);
         replayed.map_err(fatal)
     }
 }
@@ -208,7 +204,7 @@ fn widths(quantum: &Quantum) -> Result<(u32, u32, u32), StageError> {
 }
 
 impl Launch for GdnConvolution {
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let config = &quantum.config;
         let state = layer_state(quantum, self.layer)?;
         let (query_key_width, value_width, channels) = widths(quantum)?;
@@ -217,47 +213,47 @@ impl Launch for GdnConvolution {
         // A verification before this quantum accepted only part of its rows: rebuild this layer's state first.
         let replay = quantum.seq.replay_rows(self.layer) as usize;
         if replay > 0 {
-            self.replay(quantum, submission, state, replay)?;
+            self.replay(quantum, kernels, state, replay)?;
         }
         if quantum.kind == QuantumKind::Verify {
             let buffers = speculative(state, quantum.rows)?;
             let rows = quantum.rows as u64;
-            ops::copy_device_to_device(
-                submission,
-                buffers.convolution_checkpoint.ptr(),
-                state.convolution().ptr(),
-                state.convolution().bytes() as u64,
-            )
-            .map_err(fatal)?;
-            ops::copy_device_to_device(
-                submission,
-                buffers.query_key_rows.ptr(),
-                query_key,
-                rows * u64::from(query_key_width) * 2,
-            )
-            .map_err(fatal)?;
-            ops::copy_device_to_device(
-                submission,
-                buffers.value_z_rows.ptr(),
-                value_z,
-                rows * 2 * u64::from(value_width) * 2,
-            )
-            .map_err(fatal)?;
+            kernels
+                .copy_device_to_device(
+                    buffers.convolution_checkpoint.ptr(),
+                    state.convolution().ptr(),
+                    state.convolution().bytes() as u64,
+                )
+                .map_err(fatal)?;
+            kernels
+                .copy_device_to_device(
+                    buffers.query_key_rows.ptr(),
+                    query_key,
+                    rows * u64::from(query_key_width) * 2,
+                )
+                .map_err(fatal)?;
+            kernels
+                .copy_device_to_device(
+                    buffers.value_z_rows.ptr(),
+                    value_z,
+                    rows * 2 * u64::from(value_width) * 2,
+                )
+                .map_err(fatal)?;
         }
-        ops::gdn_convolution_bf16(
-            submission,
-            query_key,
-            value_z,
-            self.weights,
-            state.convolution().ptr(),
-            quantum.slot(self.output),
-            quantum.rows_u32()?,
-            query_key_width,
-            value_width,
-            channels,
-            launch_u32(config.linear_conv_kernel_dim, "the convolution kernel")?,
-        )
-        .map_err(fatal)
+        kernels
+            .gdn_convolution_bf16(
+                query_key,
+                value_z,
+                self.weights,
+                state.convolution().ptr(),
+                quantum.slot(self.output),
+                quantum.rows_u32()?,
+                query_key_width,
+                value_width,
+                channels,
+                launch_u32(config.linear_conv_kernel_dim, "the convolution kernel")?,
+            )
+            .map_err(fatal)
     }
 }
 
@@ -285,7 +281,7 @@ impl GdnRecurrence {
 }
 
 impl Launch for GdnRecurrence {
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let config = &quantum.config;
         let state = layer_state(quantum, self.layer)?;
         let value_heads = launch_u32(config.linear_num_value_heads, "the value heads")?;
@@ -294,31 +290,35 @@ impl Launch for GdnRecurrence {
         if quantum.kind == QuantumKind::Verify {
             let buffers = speculative(state, quantum.rows)?;
             let control_bytes = quantum.rows as u64 * u64::from(value_heads) * 4;
-            ops::copy_device_to_device(
-                submission,
-                buffers.recurrent_checkpoint.ptr(),
-                state.recurrent().ptr(),
-                state.recurrent().bytes() as u64,
-            )
-            .map_err(fatal)?;
-            ops::copy_device_to_device(submission, buffers.alpha_rows.ptr(), alpha, control_bytes).map_err(fatal)?;
-            ops::copy_device_to_device(submission, buffers.beta_rows.ptr(), beta, control_bytes).map_err(fatal)?;
+            kernels
+                .copy_device_to_device(
+                    buffers.recurrent_checkpoint.ptr(),
+                    state.recurrent().ptr(),
+                    state.recurrent().bytes() as u64,
+                )
+                .map_err(fatal)?;
+            kernels
+                .copy_device_to_device(buffers.alpha_rows.ptr(), alpha, control_bytes)
+                .map_err(fatal)?;
+            kernels
+                .copy_device_to_device(buffers.beta_rows.ptr(), beta, control_bytes)
+                .map_err(fatal)?;
         }
-        ops::gdn_recurrence_bf16(
-            submission,
-            quantum.slot(self.convolved),
-            alpha,
-            beta,
-            state.recurrent().ptr(),
-            quantum.slot(self.output),
-            quantum.rows_u32()?,
-            launch_u32(config.linear_num_key_heads, "the key heads")?,
-            value_heads,
-            launch_u32(config.linear_key_head_dim, "the key head dimension")?,
-            launch_u32(config.linear_value_head_dim, "the value head dimension")?,
-            output_scale(config.linear_key_head_dim),
-        )
-        .map_err(fatal)
+        kernels
+            .gdn_recurrence_bf16(
+                quantum.slot(self.convolved),
+                alpha,
+                beta,
+                state.recurrent().ptr(),
+                quantum.slot(self.output),
+                quantum.rows_u32()?,
+                launch_u32(config.linear_num_key_heads, "the key heads")?,
+                value_heads,
+                launch_u32(config.linear_key_head_dim, "the key head dimension")?,
+                launch_u32(config.linear_value_head_dim, "the value head dimension")?,
+                output_scale(config.linear_key_head_dim),
+            )
+            .map_err(fatal)
     }
 }
 
@@ -343,20 +343,20 @@ impl GdnGatedRmsNorm {
 }
 
 impl Launch for GdnGatedRmsNorm {
-    fn launch(&self, quantum: &Quantum, submission: &Submission<'_>) -> Result<(), StageError> {
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let config = &quantum.config;
-        ops::gdn_gated_rms_norm_bf16(
-            submission,
-            quantum.slot(self.recurrent),
-            quantum.slot(self.value_z),
-            self.weight,
-            quantum.slot(self.output),
-            quantum.rows_u32()?,
-            launch_u32(config.linear_num_value_heads, "the value heads")?,
-            launch_u32(config.linear_value_head_dim, "the value head dimension")?,
-            quantum.epsilon(),
-        )
-        .map_err(fatal)
+        kernels
+            .gdn_gated_rms_norm_bf16(
+                quantum.slot(self.recurrent),
+                quantum.slot(self.value_z),
+                self.weight,
+                quantum.slot(self.output),
+                quantum.rows_u32()?,
+                launch_u32(config.linear_num_value_heads, "the value heads")?,
+                launch_u32(config.linear_value_head_dim, "the value head dimension")?,
+                quantum.epsilon(),
+            )
+            .map_err(fatal)
     }
 }
 

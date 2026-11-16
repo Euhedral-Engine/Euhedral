@@ -9,7 +9,7 @@ mod nvfp4;
 pub mod shapes;
 mod trellis;
 
-use euhedral_inference_cuda::{CudaError, DevicePtr, Submission};
+use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps};
 
 use crate::model::WeightRef;
 
@@ -44,7 +44,7 @@ pub struct LinearMode {
 
 /// One format's way of running `y = W x` over `rows` rows.
 pub trait LinearFormat: Send + Sync {
-    /// Queues the launches of one linear on `submission`'s lane: `weight` multiplies the `rows` rows at `x`, the
+    /// Queues the launches of one linear on `kernels`: `weight` multiplies the `rows` rows at `x`, the
     /// result lands at `y`, and `scratch` holds what the route needs (at least [`LinearFormat::scratch_bytes`]).
     /// Nothing waits.
     #[allow(
@@ -53,7 +53,7 @@ pub trait LinearFormat: Send + Sync {
     )]
     fn submit(
         &self,
-        submission: &Submission<'_>,
+        kernels: &mut dyn KernelOps,
         weight: &WeightRef,
         x: DevicePtr,
         y: DevicePtr,

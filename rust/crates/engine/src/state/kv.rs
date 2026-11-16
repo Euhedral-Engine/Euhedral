@@ -5,17 +5,17 @@
 //! device array of raw page addresses (the K planes, then the V planes), grown by doubling; the attention kernels
 //! read the pages through it. Reservation runs inside the owning quantum on its lane: it allocates pages in stream
 //! order and uploads a rewritten table from pinned staging by a queued copy, so it never waits for the device.
-//! The staging is handed back in a [`KvRetained`] for the caller to retire once the lane has reached the quantum's
+//! The staging is handed back in a [`KvRetained`] for the caller to keep until the lane has reached the quantum's
 //! marker.
 //!
 //! Pages and tables are shared with the quanta that read them. A quantum takes a [`KvView`] at admission, which holds
 //! the cache's pages and page tables of that moment (a [`PageStore`] behind an `Arc`); growing the cache after that
 //! makes a copy of the store, so the view keeps the old tables and pages alive. A page or a table is freed when the
 //! last holder lets go, a quantum after its retirement or the cache itself: its [`SharedBuffer`] hands the buffer to
-//! the cache's [`RetireList`] (value-0 marker, always reached) for the stream-ordered free, never the synchronizing
-//! one. Whoever polls the list reaps it. The host region and arena are allocated at startup and freed with the cache
-//! (the owner drops the cache after its last quantum has retired); a view holds them too, so they are never freed
-//! under a reader.
+//! the cache's [`ReleasedBuffers`] for the stream-ordered free, never the synchronizing one; the generation's owner
+//! frees what has been handed over on each of its turns. The host region and arena are allocated at startup and freed
+//! with the cache (the owner drops the cache after its last quantum has retired); a view holds them too, so they are
+//! never freed under a reader.
 //!
 //! Rows move through three frontiers. `reserved` rows are backed by pages. `submitted` rows are written by work
 //! queued on the owning quantum's lane; later stages of that quantum may read them, because the lane's order puts
@@ -29,14 +29,15 @@
 
 use std::sync::Arc;
 
-use euhedral_graph::{LaneId, LanePool, Marker};
+use euhedral_graph::{LanePool, Marker};
 use euhedral_inference_cuda::{
-    AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena, PinnedPool, PooledPinned,
-    RetireList, Submission, ops,
+    AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena, KernelOps, LaneOps, PinnedPool,
+    PooledPinned,
 };
 use euhedral_inference_settings::KvFormat;
 use thiserror::Error;
 
+use super::released::ReleasedBuffers;
 use crate::residency::footprint::{PAGE_TOKENS, plane_page_bytes};
 
 /// Rows of the quanta whose host page copies depend only on the reservation: decode, verification and draft quanta,
@@ -61,9 +62,10 @@ pub enum KvError {
     Cuda(#[from] CudaError),
 }
 
-/// What a reservation leaves for the caller: pinned staging that a queued table upload reads. Retire it with the
-/// marker of the lane work that queued the reservation (`RetireList::retire`), whether the reservation succeeded or
-/// failed. (Outgrown tables are not here: a quantum that reads one holds it, and it is freed with its last holder.)
+/// What a reservation leaves for the caller: pinned staging that a queued table upload reads. Keep it until the lane
+/// work that queued the reservation has run, whether the reservation succeeded or failed; dropping it then returns
+/// it to the pool. (Outgrown tables are not here: a quantum that reads one holds it, and it is freed with its last
+/// holder.)
 #[derive(Debug, Default)]
 pub struct KvRetained {
     pub staging: Vec<PooledPinned>,
@@ -77,20 +79,20 @@ impl KvRetained {
 }
 
 /// A stream-ordered device buffer (a page or a page table) shared by the cache and the views of the quanta that
-/// read it. The last holder to let go hands it to the retire list, to be freed in stream order when the list is
-/// reaped; it is never freed by the synchronizing `cudaFree`. By then every quantum that held it has retired, so no
-/// reader is left: the list's marker is the one that is always reached.
+/// read it. The last holder to let go hands it to the cache's [`ReleasedBuffers`], to be freed in stream order by the
+/// generation's owner; it is never freed by the synchronizing `cudaFree`. By then every quantum that held it has
+/// retired, so no reader is left.
 #[derive(Debug)]
 pub struct SharedBuffer {
     buffer: Option<DeviceBuffer>,
-    retire: Arc<RetireList>,
+    released: Arc<ReleasedBuffers>,
 }
 
 impl SharedBuffer {
-    fn new(buffer: DeviceBuffer, retire: &Arc<RetireList>) -> Arc<SharedBuffer> {
+    fn new(buffer: DeviceBuffer, released: &Arc<ReleasedBuffers>) -> Arc<SharedBuffer> {
         Arc::new(SharedBuffer {
             buffer: Some(buffer),
-            retire: Arc::clone(retire),
+            released: Arc::clone(released),
         })
     }
 
@@ -113,15 +115,7 @@ impl SharedBuffer {
 impl Drop for SharedBuffer {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
-            // A buffer that is not stream-ordered comes back with the reason, and dropping it is the blocking free;
-            // every buffer made here is stream-ordered.
-            let _ = self.retire.retire(
-                buffer,
-                Marker {
-                    lane: LaneId(0),
-                    value: 0,
-                },
-            );
+            self.released.give(buffer);
         }
     }
 }
@@ -158,7 +152,7 @@ pub struct KvCache {
     /// Pages a layer may hold, device and host.
     max_pages: u64,
     store: Arc<PageStore>,
-    retire: Arc<RetireList>,
+    released: Arc<ReleasedBuffers>,
     host: Option<HostPages>,
     table_slots: u64,
     reserved: u64,
@@ -174,10 +168,10 @@ impl KvCache {
     /// A cache of `layers` layers of rows `kv_width` wide, for up to `device_tokens + host_tokens` positions. The
     /// tokens past `device_tokens` live in pinned host memory (`host_tokens` of 0: every page on the device). This
     /// allocates the host arena and the device region with the waiting allocators: startup only. Pages and tables
-    /// are allocated on demand, by [`KvCache::reserve`], and freed through `retire` when their last holder lets go.
+    /// are allocated on demand, by [`KvCache::reserve`], and freed through `released` when their last holder lets go.
     pub fn new(
         library: &Arc<CudaLibrary>,
-        retire: &Arc<RetireList>,
+        released: &Arc<ReleasedBuffers>,
         layers: usize,
         kv_width: u64,
         format: KvFormat,
@@ -212,7 +206,7 @@ impl KvCache {
             store: Arc::new(PageStore {
                 layers: (0..layers).map(|_| LayerPages::default()).collect(),
             }),
-            retire: Arc::clone(retire),
+            released: Arc::clone(released),
             host,
             table_slots: 0,
             reserved: 0,
@@ -301,11 +295,15 @@ impl KvCache {
     }
 
     /// Reserves `rows` contiguous append rows at `start`, without publishing them. The rows continue the submitted
-    /// frontier. This queues stream-ordered allocations and a table upload on `submission`'s lane and waits for
-    /// nothing; what the upload reads, and the tables it replaced, are added to `retained`.
+    /// frontier. This queues stream-ordered allocations and a table upload on `lane` and waits for nothing; what the
+    /// upload reads, and the tables it replaced, are added to `retained`.
+    ///
+    /// The pages and the table are allocated in stream order on `lane`, and the upload is queued through the same
+    /// `lane`: an upload queued on another stream could run before that allocation has completed, and write the table
+    /// before it exists. One [`LaneOps`] does both, so they cannot differ.
     pub fn reserve(
         &mut self,
-        submission: &Submission<'_>,
+        lane: &mut dyn LaneOps,
         pool: &Arc<PinnedPool>,
         start: u64,
         rows: u64,
@@ -343,16 +341,16 @@ impl KvCache {
         for layer in &mut store.layers {
             while (layer.pages.len() as u64) < device {
                 layer.pages.push(SharedBuffer::new(
-                    DeviceBuffer::alloc_async(submission, (2 * plane) as usize)?,
-                    &self.retire,
+                    lane.alloc_async((2 * plane) as usize)?,
+                    &self.released,
                 ));
             }
             let next = if slots == self.table_slots {
                 None
             } else {
                 Some(SharedBuffer::new(
-                    DeviceBuffer::alloc_async(submission, table_bytes as usize)?,
-                    &self.retire,
+                    lane.alloc_async(table_bytes as usize)?,
+                    &self.released,
                 ))
             };
             let mut staging = pool.acquire(table_bytes as usize)?;
@@ -378,7 +376,7 @@ impl KvCache {
             let staged = retained.staging[retained.staging.len() - 1].buffer();
             // SAFETY: the staging stays alive and unmodified in `retained` until the caller retires it behind the
             // lane's marker, which is after the copy has run.
-            unsafe { ops::copy_upload_to_device(submission, target, staged, 0, table_bytes as usize) }?;
+            unsafe { lane.copy_upload_to_device(target, staged, 0, table_bytes as usize) }?;
             if let Some(next) = next {
                 // The table it replaces stays with the views that hold it.
                 layer.table = Some(next);
@@ -546,21 +544,14 @@ impl KvCache {
     }
 
     /// As [`KvView::stage_in`], for the cache as it is now.
-    pub fn stage_in(&self, submission: &Submission<'_>, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
-        self.view().stage_in(submission, layer, start, rows)
+    pub fn stage_in(&self, kernels: &mut dyn KernelOps, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
+        self.view().stage_in(kernels, layer, start, rows)
     }
 
     /// As [`KvView::stage_out`], for the cache as it is now.
-    pub fn stage_out(&self, submission: &Submission<'_>, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
-        self.view().stage_out(submission, layer, start, rows)
+    pub fn stage_out(&self, kernels: &mut dyn KernelOps, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
+        self.view().stage_out(kernels, layer, start, rows)
     }
-}
-
-/// The marker of the work that reserved a cache's rows is older than its lane's event ring and has not completed.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("the reservation's marker {} of lane {} is older than its lane's event ring and not reached", .marker.value, .marker.lane.0)]
-pub struct StaleReservation {
-    pub marker: Marker,
 }
 
 /// The page tables of one layer as a view holds them.
@@ -589,13 +580,13 @@ struct HostView {
 ///
 /// The view keeps alive what it names: the pages and page tables of that moment (a [`PageStore`] behind an `Arc`),
 /// and the host arena and region. A page table the cache outgrows afterwards is freed only when the last view that
-/// holds it is dropped, through the cache's retire list (see [`SharedBuffer`]). Drop a quantum, and so its view,
+/// holds it is dropped, through the cache's released buffers (see [`SharedBuffer`]). Drop a quantum, and so its view,
 /// only after its device work has retired.
 ///
 /// Pages are allocated in stream order on the lane that reserved them. A stage on another lane must be ordered
 /// behind that allocation: the owner passes the marker of the reserving submission with
 /// [`KvView::ready_after`], and the cache stages wait for it on the device (`Launch::waits`). The owner passes it
-/// only while the reservation is recent: a marker older than its lane's event ring is refused by the wait.
+/// as long as the reservation has not completed.
 #[derive(Clone, Debug)]
 pub struct KvView {
     format: KvFormat,
@@ -626,25 +617,14 @@ impl KvView {
         self
     }
 
-    /// The view with the reserving submission's marker, if the marker can still be waited for. A wait refuses a marker
-    /// older than its lane's event ring (the lane's later markers have reused its event), so:
-    /// - a marker within the ring orders the view as [`KvView::ready_after`] does;
-    /// - an older marker whose work has completed (`lanes` has reached it) needs no ordering, and the view stays as it
-    ///   is;
-    /// - an older marker that has not been reached cannot be ordered behind at all: the owner holds the quantum back
-    ///   until it is, and asks again.
-    pub fn ordered_after(
-        self,
-        marker: Marker,
-        lanes: &LanePool,
-        library: &CudaLibrary,
-    ) -> Result<Self, StaleReservation> {
-        if library.marker_waitable(marker) {
-            Ok(self.ready_after(marker))
-        } else if lanes.reached(marker) {
-            Ok(self)
+    /// The view with the reserving submission's marker, unless its work has completed (`lanes` has reached it): then
+    /// nothing needs ordering and the view stays as it is. A marker older than its lane's ring is safe to wait for: the
+    /// lanes treat it as done.
+    pub fn ordered_after(self, marker: Marker, lanes: &LanePool) -> Self {
+        if lanes.reached(marker) {
+            self
         } else {
-            Err(StaleReservation { marker })
+            self.ready_after(marker)
         }
     }
 
@@ -703,11 +683,11 @@ impl KvView {
         self.tables.get(layer)?.as_ref().map(|table| table.generation)
     }
 
-    /// Queues on `submission`'s lane the copy of layer `layer`'s host pages that an append of `rows` rows at `start`
+    /// Queues on `kernels` the copy of layer `layer`'s host pages that an append of `rows` rows at `start`
     /// and the attention after it read into the device region: every reserved one for a quantum of at most
     /// [`STAGED_TAIL_ROWS`] rows, otherwise those holding the rows before `start + rows`. Nothing without host
     /// pages.
-    pub fn stage_in(&self, submission: &Submission<'_>, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
+    pub fn stage_in(&self, kernels: &mut dyn KernelOps, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
         let Some(host) = &self.host else { return Ok(()) };
         let reserved = host.reserved_host_pages;
         if reserved == 0 {
@@ -725,8 +705,7 @@ impl KvView {
         // SAFETY: the arena lives as long as the view (it is shared); the host pages of a layer are written only by
         // the copy `stage_out` queues on the same lane, which the lane orders before this one.
         unsafe {
-            ops::copy_host_weights_to_device(
-                submission,
+            kernels.copy_host_weights_to_device(
                 host.region,
                 &host.arena,
                 offset as usize,
@@ -736,10 +715,10 @@ impl KvView {
         Ok(())
     }
 
-    /// Queues on `submission`'s lane the copy back to host memory of the host pages that an append of `rows` rows at
+    /// Queues on `kernels` the copy back to host memory of the host pages that an append of `rows` rows at
     /// `start` wrote: the last two reserved ones for a quantum of at most [`STAGED_TAIL_ROWS`] rows (an append at the
     /// end of the reservation touches no other), otherwise exactly those holding its rows.
-    pub fn stage_out(&self, submission: &Submission<'_>, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
+    pub fn stage_out(&self, kernels: &mut dyn KernelOps, layer: usize, start: u64, rows: u64) -> Result<(), KvError> {
         let Some(host) = &self.host else { return Ok(()) };
         let reserved = host.reserved_host_pages;
         if reserved == 0 {
@@ -760,8 +739,7 @@ impl KvView {
         let offset = layer as u64 * host.layer_bytes + first * page;
         // SAFETY: as `stage_in`: the arena outlives the copy, and no other copy writes these pages meanwhile.
         unsafe {
-            ops::copy_device_to_host_weights(
-                submission,
+            kernels.copy_device_to_host_weights(
                 &host.arena,
                 offset as usize,
                 host.region.offset(first * page),

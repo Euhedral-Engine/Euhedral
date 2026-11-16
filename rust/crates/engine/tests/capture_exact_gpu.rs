@@ -13,21 +13,22 @@
 )]
 
 mod common;
+#[path = "common/typed.rs"]
+mod typed;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use euhedral_graph::LaneId;
 use euhedral_inference_cuda::PinnedPool;
-use euhedral_inference_cuda::RetireList;
-use euhedral_inference_cuda::{CudaLane, CudaLibrary, Submission, SubmitMode};
+use euhedral_inference_cuda::{CudaLibrary, SubmitMode};
 use euhedral_inference_engine::model::{LayerKind, ModelConfig};
 use euhedral_inference_engine::stages::attention::KvSource;
 use euhedral_inference_engine::stages::sampling::SelectionPool;
-use euhedral_inference_engine::stages::{InputRecordRef, LaneTable, Quantum, QuantumKind};
+use euhedral_inference_engine::stages::{InputRecordRef, Quantum, QuantumKind};
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvRetained};
+use euhedral_inference_engine::state::released::ReleasedBuffers;
 use euhedral_inference_engine::state::{SequenceDevice, SequenceState};
 use euhedral_inference_engine::workspace::{Workspace, WorkspaceRows};
 use euhedral_inference_settings::KvFormat;
@@ -43,9 +44,9 @@ fn a_quantum_is_never_captured_under_exact_numerics() {
     config.layer_kinds = vec![LayerKind::GatedDeltaNet, LayerKind::FullAttention];
     config.num_hidden_layers = 2;
     let config: Arc<ModelConfig> = Arc::new(config);
-    let lane = CudaLane::new(&library, LaneId(0), 16).unwrap();
-    let table = LaneTable::new(vec![Arc::clone(&lane)]).unwrap();
-    let retire = Arc::new(RetireList::new());
+    let typed = typed::Typed::open(&library, 1, 16);
+    let table = typed.table.clone();
+    let retire = Arc::new(ReleasedBuffers::new());
     let pinned = PinnedPool::new(&library, 16 << 20);
     let workspace = Arc::new(
         Workspace::allocate(
@@ -59,10 +60,12 @@ fn a_quantum_is_never_captured_under_exact_numerics() {
         )
         .unwrap(),
     );
-    let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-    let gdn = GdnStates::allocate(&library, &config, 8, &submission).unwrap();
-    submission.finish_signalled().unwrap();
-    lane.synchronize().unwrap();
+    let (gdn, _) = table
+        .submit_ops(typed.lane(0), false, |ops| {
+            GdnStates::allocate(&library, &config, 8, ops)
+        })
+        .unwrap();
+    typed.sync();
     let kv = KvCache::new(&library, &retire, 1, config.kv_width() as u64, KvFormat::Nvfp4, 1024, 0).unwrap();
     let scratch = AttentionScratch::allocate(&library, &config, 8, true, 16).unwrap();
     let mut sequence = SequenceState::from_parts(
@@ -74,14 +77,13 @@ fn a_quantum_is_never_captured_under_exact_numerics() {
     // The decode quantum at `start`, after the one reservation of its row.
     let mut retained = KvRetained::default();
     let mut quantum = |sequence: &mut SequenceState, start: u64| {
-        let submission = Submission::begin(&lane, SubmitMode::default()).unwrap();
-        sequence
-            .kv
-            .reserve(&submission, &pinned, start, 1, &mut retained)
+        table
+            .submit_ops(typed.lane(0), false, |ops| {
+                sequence.kv.reserve(ops, &pinned, start, 1, &mut retained)
+            })
             .unwrap();
         sequence.kv.appended(1).unwrap();
-        drop(submission);
-        lane.synchronize().unwrap();
+        typed.sync();
         sequence.kv.commit(1).unwrap();
         Quantum::new(
             QuantumKind::Decode,
