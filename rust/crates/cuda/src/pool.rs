@@ -4,18 +4,51 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
+
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
 use euhedral_io::IoMemory;
 
 use crate::error::CudaError;
 use crate::library::CudaLibrary;
 use crate::memory::PinnedBuffer;
-use crate::stack::Stack;
 
 /// The smallest size class: one page.
 const MIN_CLASS_BYTES: usize = 4096;
 /// Size classes are powers of two from [`MIN_CLASS_BYTES`]; a `usize` has at most this many.
 const CLASSES: usize = usize::BITS as usize;
+
+/// Slots in one chunk of a class's queue. The queue is unbounded and grows by chunks, so this is the size of an
+/// allocation step and never a limit: a released buffer is always kept.
+const CHUNK: usize = 64;
+
+/// The released buffers of one size class, oldest first: any thread releases and any thread takes, and neither waits.
+struct Class<T> {
+    producer: Producer<T, Multi>,
+    consumer: Consumer<T, Multi>,
+}
+
+impl<T> Class<T> {
+    fn new() -> Class<T> {
+        let queue = MpmcQueue::<T>::new(CHUNK);
+        Class {
+            producer: queue.producer(),
+            consumer: queue.consumer(),
+        }
+    }
+
+    /// Keeps `item` for reuse. The queue is unbounded, so the offer is always taken; a refusal would be a defect in
+    /// the queue, and is caught in debug builds (the item is dropped in release builds).
+    fn give(&self, item: T) {
+        let offered = self.producer.offer(item);
+        debug_assert!(offered.is_ok(), "an unbounded queue refused an item");
+    }
+
+    /// The longest-held item, if any.
+    fn take(&self) -> Option<T> {
+        self.consumer.poll()
+    }
+}
 
 /// Pinned buffers, kept after release so the next request reuses one.
 ///
@@ -34,7 +67,7 @@ pub struct PinnedPool {
     limit_bytes: u64,
     held_bytes: AtomicU64,
     allocated_bytes: AtomicU64,
-    classes: Box<[Stack<PinnedBuffer>]>,
+    classes: Box<[Class<PinnedBuffer>]>,
 }
 
 impl fmt::Debug for PinnedPool {
@@ -54,7 +87,7 @@ impl PinnedPool {
             limit_bytes,
             held_bytes: AtomicU64::new(0),
             allocated_bytes: AtomicU64::new(0),
-            classes: (0..CLASSES).map(|_| Stack::new()).collect(),
+            classes: (0..CLASSES).map(|_| Class::new()).collect(),
         })
     }
 
@@ -65,7 +98,7 @@ impl PinnedPool {
             .checked_next_power_of_two()
             .ok_or_else(|| CudaError::Argument(format!("{bytes} bytes is too large for a pinned buffer")))?;
         let class = capacity.trailing_zeros() as usize;
-        let buffer = match self.classes[class].pop() {
+        let buffer = match self.classes[class].take() {
             Some(buffer) => {
                 self.held_bytes.fetch_sub(capacity as u64, Ordering::Relaxed);
                 buffer
@@ -105,7 +138,9 @@ impl PinnedPool {
         let mut freed = 0;
         for class in (0..CLASSES).rev() {
             while self.over_limit_bytes() > 0 {
-                let Some(buffer) = self.classes[class].pop() else { break };
+                let Some(buffer) = self.classes[class].take() else {
+                    break;
+                };
                 self.held_bytes.fetch_sub(buffer.len() as u64, Ordering::Relaxed);
                 self.allocated_bytes.fetch_sub(buffer.len() as u64, Ordering::Relaxed);
                 drop(buffer);
@@ -117,7 +152,7 @@ impl PinnedPool {
 
     fn release(&self, buffer: PinnedBuffer) {
         self.held_bytes.fetch_add(buffer.len() as u64, Ordering::Relaxed);
-        self.classes[buffer.len().trailing_zeros() as usize].push(buffer);
+        self.classes[buffer.len().trailing_zeros() as usize].give(buffer);
     }
 }
 
@@ -215,5 +250,85 @@ impl Drop for PooledPinned {
         if let Some(buffer) = self.buffer.take() {
             self.pool.release(buffer);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the test starts threads to release and acquire at once, and joins them"
+)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn a_class_hands_out_in_release_order() {
+        let class = Class::<u32>::new();
+        assert_eq!(class.take(), None);
+        for value in 0..200 {
+            class.give(value);
+        }
+        for value in 0..200 {
+            assert_eq!(class.take(), Some(value));
+        }
+        assert_eq!(class.take(), None);
+    }
+
+    #[test]
+    fn buffers_released_while_others_acquire_are_each_taken_once_and_none_is_lost() {
+        const PRODUCERS: usize = 4;
+        const CONSUMERS: usize = 4;
+        const EACH: usize = 2000;
+        let class = Class::<usize>::new();
+        let taken_total = AtomicUsize::new(0);
+        let producers_done = AtomicUsize::new(0);
+        let mut seen = vec![0u8; PRODUCERS * EACH];
+        thread::scope(|scope| {
+            for producer in 0..PRODUCERS {
+                let (class, done) = (&class, &producers_done);
+                scope.spawn(move || {
+                    for index in 0..EACH {
+                        class.give(producer * EACH + index);
+                        if index % 7 == 0 {
+                            thread::yield_now();
+                        }
+                    }
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+            let consumers: Vec<_> = (0..CONSUMERS)
+                .map(|_| {
+                    let (class, done, total) = (&class, &producers_done, &taken_total);
+                    scope.spawn(move || {
+                        let mut mine = Vec::new();
+                        // Stops once every producer is done and a take finds the class empty; the second take
+                        // after the last `done` sees every release, which happened before it.
+                        loop {
+                            let finished = done.load(Ordering::SeqCst) == PRODUCERS;
+                            match class.take() {
+                                Some(item) => {
+                                    mine.push(item);
+                                    total.fetch_add(1, Ordering::Relaxed);
+                                }
+                                None if finished => break,
+                                None => thread::yield_now(),
+                            }
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            for consumer in consumers {
+                for item in consumer.join().unwrap() {
+                    seen[item] += 1;
+                }
+            }
+        });
+        assert_eq!(taken_total.load(Ordering::Relaxed), PRODUCERS * EACH);
+        assert!(seen.iter().all(|&count| count == 1), "a buffer was lost or taken twice");
+        assert_eq!(class.take(), None);
     }
 }
