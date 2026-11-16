@@ -500,7 +500,7 @@ fn placed_by_rustee(plan: &Plan, view: View) -> Vec<u16> {
             .map(|_| Arc::new(Idle(QueueId::next())) as Arc<dyn DeviceQueue>)
             .collect(),
     ));
-    let completions = Completions::new(Arc::clone(&pool));
+    let completions = Completions::new(&pool);
     lattice
         .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
         .unwrap();
