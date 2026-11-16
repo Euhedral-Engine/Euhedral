@@ -354,6 +354,10 @@ version = "0.1.0"
 source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=40fdda43717bb99d26c64fcd119992d0e48fe7db#40fdda43717bb99d26c64fcd119992d0e48fe7db"
 
 [[package]]
+name = "euhedral-inference-api-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "euhedral-inference-bench"
 version = "0.1.0"
 dependencies = [
