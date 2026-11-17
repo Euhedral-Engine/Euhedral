@@ -18,6 +18,12 @@
 //! layer's state has run past the rows that were not accepted: the next base quantum replays the accepted rows from
 //! the checkpoint the verification took (`SequenceRefs::with_replay_rows`).
 //!
+//! A sampled request (a [`SampledRows`] in the state) speculates the same way. Its drafts stay greedy, on the device;
+//! its prompt's last row and its verification's rows are copied to the host, one [`Kind::Sample`](crate::frames::Kind)
+//! frame selects each row at the position of the token it chooses, and the owner joins the answers and resolves them
+//! with [`accept_tokens`], the function the greedy path's keys reach too. The first token is the host's selection of the
+//! prompt's last row, and the catch-up pairs the rows with it.
+//!
 //! The prompt is prefilled in chunks, each followed by its catch-up (the next chunk's seed rows overwrite its own); the
 //! last chunk's catch-up is the first step's, which waits for the first token. The output is greedy decode's.
 
@@ -27,8 +33,9 @@ use std::time::{Duration, Instant};
 
 use euhedral_inference_cuda::DevicePtr;
 
-use super::acceptance::accept;
+use super::acceptance::{Accepted, accept, accept_tokens};
 use super::request::{FinishReason, Verification};
+use super::sampled::SampledRows;
 use super::source::{Admission, Flying, Mode, OVERLAP_MAX_START_POSITION, Owner, Role, Run, Step};
 use crate::model::{LayerKind, ModelConfig};
 use crate::stages::attention::KvSource;
@@ -59,6 +66,39 @@ pub(super) struct Speculating {
     drafted_at: Option<Instant>,
     /// Whether the decode that feeds the last token has been admitted (a test hook).
     settled: bool,
+    /// The samplers and the join of the host's selections, for a request that samples.
+    rows: Option<SampledRows>,
+    /// What the selections awaited are for.
+    joining: Option<Joining>,
+}
+
+/// What the host's selections of a quantum's rows decide.
+#[derive(Debug)]
+pub(super) enum Joining {
+    /// The token after the prompt (`first`), or after the last row the cache holds.
+    Token { first: bool },
+    /// A verification, which the selections resolve.
+    Verification(Verifying),
+}
+
+/// The verification of a step, as far as its resolution needs it: the quantum that ran it has been concluded.
+#[derive(Debug)]
+pub(super) struct Verifying {
+    start: u64,
+    rows: usize,
+    admitted: Instant,
+    retired_at: Option<Instant>,
+}
+
+impl Verifying {
+    pub(super) fn of(flying: &Flying) -> Verifying {
+        Verifying {
+            start: flying.start,
+            rows: flying.rows,
+            admitted: flying.admitted,
+            retired_at: flying.retired_at,
+        }
+    }
 }
 
 impl Speculating {
@@ -77,7 +117,34 @@ impl Speculating {
             admitted: None,
             drafted_at: None,
             settled: false,
+            rows: None,
+            joining: None,
         }
+    }
+
+    /// The state of a request whose tokens the host selects with `rows`.
+    pub(super) fn sampled(mut self, rows: SampledRows) -> Speculating {
+        self.rows = Some(rows);
+        self
+    }
+
+    /// Whether the host selects the request's tokens.
+    pub(super) fn samples(&self) -> bool {
+        self.rows.is_some()
+    }
+
+    pub(super) fn rows_mut(&mut self) -> Option<&mut SampledRows> {
+        self.rows.as_mut()
+    }
+
+    /// Whether the host's selections of a quantum's rows are awaited.
+    pub(super) fn selecting(&self) -> bool {
+        self.rows.as_ref().is_some_and(SampledRows::waiting)
+    }
+
+    /// The selections about to be awaited are for `joining`.
+    pub(super) fn joining(&mut self, joining: Joining) {
+        self.joining = Some(joining);
     }
 
     /// Whether the request drafts: the prompt's chunks seed it.
@@ -391,11 +458,6 @@ impl Owner {
     /// The verification of the live step retired: accepts the drafts the model's own tokens confirm, commits that many
     /// rows, reports the tokens and goes on from the verifier's.
     pub(super) fn verified(&mut self, flying: &Flying) {
-        let now = Instant::now();
-        let Some(run) = self.run.as_mut() else { return };
-        let Mode::Speculative { listener, state } = &mut run.mode else {
-            return;
-        };
         let Some(selection) = flying.selection.as_ref() else {
             return self.fail_step("a verification retired with no selection".to_string());
         };
@@ -403,16 +465,83 @@ impl Owner {
         let Some(keys) = keys else {
             return self.fail_step("a verification's keys are out of its selection".to_string());
         };
+        self.resolve(Verifying::of(flying), |drafts, eos, budget| {
+            accept(drafts, &keys, eos, budget)
+        });
+    }
+
+    /// The host selected the rows of a quantum of a sampled speculative request: the token after the prompt, which the
+    /// steps go on from, or the tokens of a verification's rows, which are resolved against its drafts.
+    pub(super) fn joined_rows(&mut self) {
+        let Some(run) = self.run.as_mut() else { return };
+        let Mode::Speculative { state, .. } = &mut run.mode else {
+            return;
+        };
+        let Some(rows) = state.rows.as_mut() else { return };
+        let tokens = rows.take_tokens();
+        let joining = state.joining.take();
+        match joining {
+            Some(Joining::Token { first }) => {
+                if let Some(token) = tokens.first().copied() {
+                    self.selected_token(token, first);
+                }
+            }
+            Some(Joining::Verification(verifying)) => {
+                let count = verifying.rows.min(tokens.len());
+                self.resolve(verifying, |drafts, eos, budget| {
+                    accept_tokens(drafts, &tokens[..count], eos, budget)
+                });
+            }
+            None => self.fail_step("the host selected rows nothing waited for".to_string()),
+        }
+        if let Some(Run {
+            mode: Mode::Speculative { state, .. },
+            ..
+        }) = self.run.as_mut()
+            && let Some(rows) = state.rows.as_mut()
+        {
+            rows.restore(tokens);
+        }
+    }
+
+    /// The host selected the token after the prompt (`first`) or after the last row: reports it, and goes on from it.
+    fn selected_token(&mut self, token: u32, first: bool) {
+        let Some(run) = self.run.as_mut() else { return };
+        run.generated += 1;
+        if let Some(listener) = run.listener() {
+            listener.token(token, Instant::now());
+        }
+        if run.stop_tokens.contains(&token) {
+            run.stop(FinishReason::Stop);
+        } else if run.generated >= run.wanted {
+            run.stop(FinishReason::Length);
+        } else if let Mode::Speculative { state, .. } = &mut run.mode {
+            if first {
+                state.first_token(token, &run.prompt);
+            } else {
+                state.current = Some(token);
+            }
+        }
+    }
+
+    /// Resolves the verification of the live step with `accept`, which is given the drafts, the end tokens and the
+    /// budget: commits the rows of the accepted outputs, reports them and goes on from the last.
+    fn resolve(&mut self, verifying: Verifying, accept: impl FnOnce(&[u32], &[u32], u32) -> Accepted) {
+        let now = Instant::now();
+        let Some(run) = self.run.as_mut() else { return };
+        let Mode::Speculative { listener, state } = &mut run.mode else {
+            return;
+        };
         let drafts = mem::take(&mut state.drafts);
-        if drafts.len() + 1 != flying.rows {
+        if drafts.len() + 1 != verifying.rows {
             return self.fail_step(format!(
                 "a verification of {} rows retired with {} drafts",
-                flying.rows,
+                verifying.rows,
                 drafts.len()
             ));
         }
         let budget = u32::try_from(run.wanted - run.generated).unwrap_or(u32::MAX);
-        let accepted = accept(&drafts, &keys, &run.stop_tokens, budget);
+        let accepted = accept(&drafts, &run.stop_tokens, budget);
         if accepted.unselected {
             return self.fail_step("the head selected no token: every logit was NaN or negative infinity".to_string());
         }
@@ -423,7 +552,7 @@ impl Owner {
         }
         match self.sequence.mtp_kv.as_mut() {
             Some(cache) => {
-                if let Err(error) = cache.truncate(flying.start) {
+                if let Err(error) = cache.truncate(verifying.start) {
                     return self.fail_step(format!("dropping the speculative MTP rows: {error}"));
                 }
             }
@@ -433,9 +562,9 @@ impl Owner {
             run.generated += 1;
             listener.token(*token, now);
         }
-        let clock = state.admitted.unwrap_or(flying.admitted);
+        let clock = state.admitted.unwrap_or(verifying.admitted);
         let drafted_at = state.drafted_at.unwrap_or(clock);
-        let retired = flying.retired_at.unwrap_or(now);
+        let retired = verifying.retired_at.unwrap_or(now);
         listener.verification(Verification {
             accepted: accepted.accepted_drafts,
             drafted: drafts.len(),
@@ -444,13 +573,13 @@ impl Owner {
             draft_nanos: nanos(drafted_at.saturating_duration_since(clock)),
         });
         state.current = accepted.outputs.last().copied();
-        state.mtp_position = flying.start;
-        state.replay = if accepted.count < flying.rows {
+        state.mtp_position = verifying.start;
+        state.replay = if accepted.count < verifying.rows {
             accepted.count as u32
         } else {
             0
         };
-        run.position = flying.start + accepted.count as u64;
+        run.position = verifying.start + accepted.count as u64;
         let ended = accepted.eos_at.is_some();
         state.catch_up = accepted.outputs;
         if ended {

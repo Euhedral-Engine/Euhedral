@@ -6,6 +6,9 @@
 //! accepted drafts followed by the first `g` that no draft matched, which is exactly the tokens ordinary decode
 //! produces. They are cut after the first end-of-generation token and at the budget.
 //!
+//! One function, [`accept_tokens`], resolves a greedy verification (whose keys [`accept`] maps to tokens) and a sampled
+//! one (whose rows the host selected).
+//!
 //! The rows the step commits equal the output count: row 0 carries `t0` and rows `1..count` the first `count - 1`
 //! outputs, which one-row decode would have fed. The last output (the next `t0`, or the end token) is not fed yet.
 
@@ -29,7 +32,8 @@ pub struct Accepted {
 }
 
 /// Resolves a verification of `drafts` from the argmax key of each verified row (`verified_keys[j]` is row `j`'s, so
-/// there is one more key than drafts): `eos` are the ids that end a generation and `budget` caps the outputs.
+/// there is one more key than drafts): `eos` are the ids that end a generation and `budget` caps the outputs. A key that
+/// holds no token ends the tokens the rows give, as [`accept_tokens`] reads them.
 ///
 /// # Panics
 ///
@@ -42,12 +46,45 @@ pub fn accept(drafts: &[u32], verified_keys: &[u64], eos: &[u32], budget: u32) -
         "one verified key per row: the current token and each draft"
     );
     assert!(budget > 0, "a step is admitted while tokens are wanted");
+    // Row `j` gives its token or none; the rules read no row past the first that gives none.
+    resolve(
+        drafts,
+        |row| verified_keys.get(row).and_then(|key| token_of(*key)),
+        eos,
+        budget,
+    )
+}
+
+/// Resolves a verification of `drafts` from the token each verified row selected (`selected[j]` is row `j`'s, the token
+/// at the position after the row, however it was selected): `eos` are the ids that end a generation and `budget` caps
+/// the outputs. The order of the checks is the one ordinary decode has: the drafts that match, the verifier's own token,
+/// the budget, then the first end token.
+///
+/// `selected` holds a token for each row up to the first that selected none (every logit NaN or negative infinity), so
+/// it is at most one longer than `drafts`.
+///
+/// # Panics
+///
+/// If `selected` is more than one longer than `drafts`, or `budget` is 0 (a step is admitted only while tokens are
+/// wanted).
+pub fn accept_tokens(drafts: &[u32], selected: &[u32], eos: &[u32], budget: u32) -> Accepted {
+    assert!(
+        selected.len() <= drafts.len() + 1,
+        "at most one selected token per row: the current token and each draft"
+    );
+    assert!(budget > 0, "a step is admitted while tokens are wanted");
+    resolve(drafts, |row| selected.get(row).copied(), eos, budget)
+}
+
+/// The rules of [`accept_tokens`], reading the token of row `j` as `selected(j)`, which is none from the first row that
+/// selected no token on.
+fn resolve(drafts: &[u32], selected: impl Fn(usize) -> Option<u32>, eos: &[u32], budget: u32) -> Accepted {
     let mut accepted = 0;
-    while accepted < drafts.len() && token_of(verified_keys[accepted]) == Some(drafts[accepted]) {
+    while accepted < drafts.len() && selected(accepted) == Some(drafts[accepted]) {
         accepted += 1;
     }
     let mut outputs: Vec<u32> = drafts[..accepted].to_vec();
-    let unselected = match token_of(verified_keys[accepted]) {
+    let unselected = match selected(accepted) {
         Some(token) => {
             outputs.push(token);
             false
@@ -181,5 +218,59 @@ mod tests {
         let cut = accept(&drafts, &selected, &[EOS], 2);
         assert_eq!(cut.outputs, [6, 7]);
         assert!(!cut.unselected);
+    }
+
+    /// The same cases as above, from the tokens the rows selected.
+    fn resolve_tokens(rows: &[u32], selected: &[u32], budget: u32) -> Accepted {
+        accept_tokens(&rows[1..], selected, &[EOS], budget)
+    }
+
+    #[test]
+    fn tokens_resolve_as_the_keys_of_the_same_tokens_do() {
+        let cases: [(&[u32], &[u32], u32); 8] = [
+            (&[5, 6, 7, 8], &[1, 2, 3, 4], 16),
+            (&[5, 6, 7, 8], &[6, 7, 3, 4], 16),
+            (&[5, 6, 7, 8], &[6, 7, 8, 9], 16),
+            (&[5, 6, 7, 8], &[6, 0, 8, 9], 16),
+            (&[5, EOS, 7, 8], &[EOS, 7, 8, 9], 16),
+            (&[5, 6, 7, 8], &[6, EOS, 1, 2], 16),
+            (&[5, 6, 7, 8], &[6, 7, 8, 9], 2),
+            (&[5, 6, 7, 8], &[6, 7, EOS, 9], 2),
+        ];
+        for (rows, selected, budget) in cases {
+            assert_eq!(
+                resolve_tokens(rows, selected, budget),
+                resolve(rows, selected, budget),
+                "rows {rows:?} selected {selected:?} budget {budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sampled_row_that_differs_ends_the_accepted_drafts_there() {
+        // A draft is kept only while it is the token the row selected at its position.
+        let accepted = resolve_tokens(&[5, 6, 7, 8], &[6, 9, 8, 4], 16);
+        assert_eq!(accepted.accepted_drafts, 1);
+        assert_eq!(accepted.outputs, [6, 9]);
+        assert_eq!(accepted.count, 2);
+        assert!(accepted.eos_at.is_none() && !accepted.unselected);
+        // The stop token inside the accepted prefix ends the outputs, and is the last of them.
+        let stopped = resolve_tokens(&[5, 6, EOS, 8], &[6, EOS, 8, 4], 16);
+        assert_eq!(stopped.outputs, [6, EOS]);
+        assert_eq!(stopped.eos_at, Some(1));
+        // The budget ends them before a stop token past it.
+        let cut = resolve_tokens(&[5, 6, 7, EOS], &[6, 7, EOS, 4], 2);
+        assert_eq!(cut.outputs, [6, 7]);
+        assert_eq!(cut.eos_at, None);
+        // Fewer tokens than rows: the rows after the last one that selected are not there.
+        let short = accept_tokens(&[6, 7], &[6], &[EOS], 16);
+        assert_eq!(short.outputs, [6]);
+        assert!(short.unselected);
+    }
+
+    #[test]
+    #[should_panic(expected = "at most one selected token per row")]
+    fn more_tokens_than_rows_is_refused() {
+        accept_tokens(&[6], &[6, 7, 8], &[EOS], 16);
     }
 }

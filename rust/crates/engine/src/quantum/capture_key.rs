@@ -286,6 +286,30 @@ mod tests {
     }
 
     #[test]
+    fn a_sampled_verification_is_keyed_apart_from_a_greedy_one_and_the_greedy_key_names_no_copy() {
+        let greedy = key();
+        assert!(
+            greedy.selects && greedy.copies_rows.is_none(),
+            "a greedy quantum selects on the device"
+        );
+        // A sampled verification copies every row to its readback and runs no argmax; its graph holds another readback.
+        let mut sampled = key();
+        sampled.selects = false;
+        sampled.copies_rows = Some(SelectedRows::Each);
+        sampled.buffer_generations.push(AllocationId(9));
+        assert_ne!(sampled.digest(), greedy.digest());
+        // Two readbacks are two graphs: the launch bakes the address in.
+        let mut other = sampled.clone();
+        other.buffer_generations.pop();
+        other.buffer_generations.push(AllocationId(10));
+        assert_ne!(sampled.digest(), other.digest());
+        // A decode that copies its last row is not a verification that copies each.
+        let mut decode = sampled.clone();
+        decode.copies_rows = Some(SelectedRows::Last);
+        assert_ne!(sampled.digest(), decode.digest());
+    }
+
+    #[test]
     fn variable_length_parts_do_not_run_into_each_other() {
         let mut a = key();
         a.replay_rows = vec![1, 2];
