@@ -44,7 +44,10 @@ impl fmt::Debug for GenerationRequest {
     }
 }
 
-/// The cancel of one generation. Clones share it. [`cancel`](CancelHandle::cancel) may be called from any thread, from a
+/// The cancel of one generation. The caller makes it and passes it with the request
+/// ([`EngineRuntime::generate_cancellable`](crate::EngineRuntime::generate_cancellable)), so a cancel asked for before or
+/// while the generation starts is never lost: a handle already cancelled ends the generation before its first quantum.
+/// One handle belongs to one generation. Clones share it. [`cancel`](CancelHandle::cancel) may be called from any thread, from a
 /// listener's methods too, at any time and any number of times: it only sets a flag, never waits, and the generation's
 /// owner observes it at its next turn, which is a quantum boundary (nothing is torn down mid-quantum). The generation then
 /// ends through its listener, once, as [`FinishReason::Cancelled`], and the sequence is free for the next request. A
@@ -57,12 +60,14 @@ pub struct CancelHandle {
 impl CancelHandle {
     /// Asks the generation to end at its next quantum boundary.
     pub fn cancel(&self) {
-        self.flag.store(true, Ordering::Release);
+        // Relaxed: the flag carries no data. The owner only needs to see it at some later turn, and the turns that
+        // follow are ordered after the retirements that start them.
+        self.flag.store(true, Ordering::Relaxed);
     }
 
     /// Whether a cancel was requested (it stays so after the generation ended).
     pub fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::Acquire)
+        self.flag.load(Ordering::Relaxed)
     }
 }
 

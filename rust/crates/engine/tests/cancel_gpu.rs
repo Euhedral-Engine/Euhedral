@@ -21,11 +21,12 @@
 
 use std::mem;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use euhedral_inference_engine::generation::{
     CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
+    Verification,
 };
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
@@ -35,8 +36,10 @@ use euhedral_inference_settings::{ModelSettings, Settings};
 const WAIT: Duration = Duration::from_secs(20 * 60);
 /// Tokens of the reference generation.
 const TOKENS: u32 = 64;
-/// Tokens of the long prompt, which takes several prompt chunks.
-const LONG_PROMPT: usize = 3000;
+/// Rows of a prompt chunk.
+const PREFILL_CHUNK: usize = 256;
+/// Tokens of the long prompt: twelve prompt chunks.
+const LONG_PROMPT: usize = 12 * PREFILL_CHUNK;
 
 struct Machine {
     artifact: PathBuf,
@@ -60,6 +63,8 @@ fn start(machine: &Machine) -> (Arc<EngineRuntime>, RuntimeOwner) {
     });
     settings.context.max_tokens = 4096;
     settings.kernels.graphs.captures_per_view = 8;
+    // The long prompt takes many chunks of this size, whatever the default is.
+    settings.batching.prefill_chunk_tokens = PREFILL_CHUNK as u32;
     let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
     (
         ready
@@ -78,12 +83,16 @@ fn prompt(length: usize) -> Vec<u32> {
 /// Where a test's cancel is asked for, from inside the listener.
 #[derive(Clone, Copy, Debug)]
 enum Trigger {
-    /// Never: the test's thread cancels, or nobody does.
+    /// Never.
     Never,
     /// At the report of the `n`th token.
     Token(usize),
     /// At the report of the `n`th prompt chunk's quantum.
     PromptChunk(usize),
+    /// At the first draft quantum (the catch-up or a recursive draft of a speculative step) that retires after a
+    /// verification was reported: the step's rows of the MTP cache are committed and its verification is still to come,
+    /// and is discarded.
+    StepDraft,
 }
 
 /// What a generation told its listener.
@@ -91,30 +100,27 @@ enum Trigger {
 struct Recording {
     tokens: Vec<u32>,
     prompt_chunks: usize,
+    quanta: usize,
     outcome: GenerationOutcome,
 }
-
-type Slot = Arc<OnceLock<CancelHandle>>;
 
 struct Recorder {
     tokens: Vec<u32>,
     prompt_chunks: usize,
+    quanta: usize,
+    verified: bool,
     trigger: Trigger,
-    slot: Slot,
+    cancel: CancelHandle,
     ended: bool,
     done: Option<Arc<Handoff<Recording>>>,
 }
 
 impl Recorder {
     fn cancel_here(&self) {
-        let handle = self
-            .slot
-            .get()
-            .expect("the handle is set long before the second quantum retires");
-        handle.cancel();
+        self.cancel.cancel();
         // Twice, and the flag reads back: idempotent, never waits.
-        handle.cancel();
-        assert!(handle.is_cancelled());
+        self.cancel.cancel();
+        assert!(self.cancel.is_cancelled());
     }
 }
 
@@ -133,12 +139,22 @@ impl GenerationListener for Recorder {
 
     fn quantum(&mut self, event: QuantumEvent) {
         assert!(!self.ended, "no call follows `finished`");
-        if event.kind == QuantumKind::Prefill {
-            self.prompt_chunks += 1;
-            if matches!(self.trigger, Trigger::PromptChunk(n) if n == self.prompt_chunks) {
-                self.cancel_here();
+        self.quanta += 1;
+        match event.kind {
+            QuantumKind::Prefill => {
+                self.prompt_chunks += 1;
+                if matches!(self.trigger, Trigger::PromptChunk(n) if n == self.prompt_chunks) {
+                    self.cancel_here();
+                }
             }
+            QuantumKind::Draft if self.verified && matches!(self.trigger, Trigger::StepDraft) => self.cancel_here(),
+            _ => {}
         }
+    }
+
+    fn verification(&mut self, _event: Verification) {
+        assert!(!self.ended, "no call follows `finished`");
+        self.verified = true;
     }
 
     fn finished(&mut self, outcome: GenerationOutcome) {
@@ -148,43 +164,48 @@ impl GenerationListener for Recorder {
         done.send(Recording {
             tokens: mem::take(&mut self.tokens),
             prompt_chunks: self.prompt_chunks,
+            quanta: self.quanta,
             outcome,
         });
     }
 }
 
-/// Starts a generation and returns its handle and the hand-off of its recording.
-fn begin(
+/// Runs a generation whose listener cancels `cancel` at `trigger`, and waits for its recording.
+fn run(
     runtime: &EngineRuntime,
     prompt: &[u32],
     speculation: Speculation,
     trigger: Trigger,
-) -> (CancelHandle, Arc<Handoff<Recording>>) {
+    cancel: &CancelHandle,
+) -> Recording {
     let done = Handoff::new();
-    let slot = Slot::default();
-    let handle = runtime
-        .generate_cancellable(GenerationRequest {
-            prompt: prompt.to_vec(),
-            max_tokens: TOKENS,
-            stop_tokens: Vec::new(),
-            speculation,
-            listener: Box::new(Recorder {
-                tokens: Vec::new(),
-                prompt_chunks: 0,
-                trigger,
-                slot: Arc::clone(&slot),
-                ended: false,
-                done: Some(Arc::clone(&done)),
-            }),
-        })
+    runtime
+        .generate_cancellable(
+            GenerationRequest {
+                prompt: prompt.to_vec(),
+                max_tokens: TOKENS,
+                stop_tokens: Vec::new(),
+                speculation,
+                listener: Box::new(Recorder {
+                    tokens: Vec::new(),
+                    prompt_chunks: 0,
+                    quanta: 0,
+                    verified: false,
+                    trigger,
+                    cancel: cancel.clone(),
+                    ended: false,
+                    done: Some(Arc::clone(&done)),
+                }),
+            },
+            cancel.clone(),
+        )
         .expect("the request is admitted");
-    slot.set(handle.clone()).expect("the handle is set once");
-    (handle, done)
+    done.wait(WAIT).expect("the generation reports")
 }
 
-fn run(runtime: &EngineRuntime, prompt: &[u32], speculation: Speculation, trigger: Trigger) -> Recording {
-    let (_, done) = begin(runtime, prompt, speculation, trigger);
-    done.wait(WAIT).expect("the generation reports")
+/// A generation with a handle of its own that nobody cancels but `trigger`.
+fn run_with(runtime: &EngineRuntime, prompt: &[u32], speculation: Speculation, trigger: Trigger) -> Recording {
+    run(runtime, prompt, speculation, trigger, &CancelHandle::default())
 }
 
 /// The sequence is free: nothing in flight and no selection leased.
@@ -195,6 +216,7 @@ fn assert_free(runtime: &EngineRuntime) {
     assert_eq!((in_flight, leased), (0, 0), "no quantum in flight, no selection leased");
 }
 
+/// The generation ended cancelled with a prefix of `reference`, strictly shorter than it.
 fn assert_cancelled(recording: &Recording, reference: &[u32], prompt_tokens: usize) {
     assert_eq!(recording.outcome.reason, FinishReason::Cancelled);
     assert_eq!(recording.outcome.prompt_tokens, prompt_tokens);
@@ -210,8 +232,58 @@ fn assert_cancelled(recording: &Recording, reference: &[u32], prompt_tokens: usi
     );
 }
 
-/// Cancels at a token and at a prompt chunk, with `speculation`; each time the next generation on the engine selects the
-/// reference's tokens.
+/// The next generations on the engine, greedy and speculative, select the reference's tokens.
+fn assert_recovered(runtime: &EngineRuntime, prompt: &[u32], reference: &[u32], after: &str) {
+    assert_free(runtime);
+    for speculation in [Speculation::Off, Speculation::Artifact] {
+        let again = run_with(runtime, prompt, speculation, Trigger::Never);
+        assert_eq!(
+            again.outcome.reason,
+            FinishReason::Length,
+            "{speculation:?} after {after}"
+        );
+        assert_eq!(again.tokens, reference, "{speculation:?} after {after}");
+    }
+}
+
+/// The cancels `speculation` allows, each followed by full generations that equal the reference.
+fn cancel_all_ways(
+    runtime: &EngineRuntime,
+    speculation: Speculation,
+    short: &[u32],
+    long: &[u32],
+    references: &[Vec<u32>; 2],
+) {
+    let [short_reference, long_reference] = references;
+
+    // Mid-decode, from inside the listener.
+    let cut = run_with(runtime, short, speculation, Trigger::Token(8));
+    assert_cancelled(&cut, short_reference, short.len());
+    assert!(cut.tokens.len() >= 8);
+    assert_recovered(runtime, short, short_reference, "a cancel mid-decode");
+
+    // Mid-prefill: the long prompt takes twelve chunks and the cancel comes at the second one's report.
+    let cut = run_with(runtime, long, speculation, Trigger::PromptChunk(2));
+    assert_eq!(cut.outcome.reason, FinishReason::Cancelled);
+    assert_eq!(cut.outcome.generated, 0, "the prompt did not end: nothing was selected");
+    assert!(cut.tokens.is_empty());
+    assert!(
+        cut.prompt_chunks >= 2 && cut.prompt_chunks < LONG_PROMPT / PREFILL_CHUNK,
+        "the cancel cut the prefill"
+    );
+    assert_recovered(runtime, long, long_reference, "a cancel mid-prefill");
+
+    // Part-way through a speculative step.
+    if matches!(speculation, Speculation::Artifact) {
+        let cut = run_with(runtime, short, speculation, Trigger::StepDraft);
+        assert_cancelled(&cut, short_reference, short.len());
+        assert!(!cut.tokens.is_empty(), "a verification was reported before the cancel");
+        assert_recovered(runtime, short, short_reference, "a cancel inside a speculative step");
+    }
+}
+
+/// Cancels in every way `speculation` allows: before the first quantum, mid-decode, mid-prefill and (speculating)
+/// inside a step, with captured graphs and without; after each, full generations equal one no cancel preceded.
 fn cancels_and_recovers(speculation: Speculation) {
     let Some(machine) = machine() else { return };
     let (runtime, owner) = start(&machine);
@@ -219,57 +291,36 @@ fn cancels_and_recovers(speculation: Speculation) {
     let long = prompt(LONG_PROMPT);
 
     // The references come first, before any cancel.
-    let short_reference = run(&runtime, &short, Speculation::Off, Trigger::Never);
+    let short_reference = run_with(&runtime, &short, Speculation::Off, Trigger::Never);
     assert_eq!(short_reference.outcome.reason, FinishReason::Length);
     assert_eq!(short_reference.tokens.len(), TOKENS as usize);
-    let long_reference = run(&runtime, &long, Speculation::Off, Trigger::Never);
+    let long_reference = run_with(&runtime, &long, Speculation::Off, Trigger::Never);
     assert_eq!(long_reference.tokens.len(), TOKENS as usize);
+    let references = [short_reference.tokens, long_reference.tokens];
 
-    // Mid-decode, from inside the listener.
-    let cut = run(&runtime, &short, speculation, Trigger::Token(8));
-    assert_cancelled(&cut, &short_reference.tokens, short.len());
-    assert!(cut.tokens.len() >= 8);
-    assert_free(&runtime);
-    let again = run(&runtime, &short, speculation, Trigger::Never);
-    assert_eq!(again.outcome.reason, FinishReason::Length);
-    assert_eq!(again.tokens, short_reference.tokens, "after a cancel mid-decode");
-
-    // Mid-prefill: the long prompt takes several chunks and the cancel comes at the second one's report.
-    let cut = run(&runtime, &long, speculation, Trigger::PromptChunk(2));
+    // A handle cancelled before the request: the generation ends without running a quantum.
+    let cancelled = CancelHandle::default();
+    cancelled.cancel();
+    let cut = run(&runtime, &short, speculation, Trigger::Never, &cancelled);
     assert_eq!(cut.outcome.reason, FinishReason::Cancelled);
-    assert_eq!(cut.outcome.generated, 0, "the prompt did not end: nothing was selected");
+    assert_eq!(cut.outcome.generated, 0);
+    assert_eq!(cut.quanta, 0, "no quantum ran");
     assert!(cut.tokens.is_empty());
-    assert!(cut.prompt_chunks >= 2);
-    assert_free(&runtime);
-    let again = run(&runtime, &long, speculation, Trigger::Never);
-    assert_eq!(again.outcome.reason, FinishReason::Length);
-    assert_eq!(again.tokens, long_reference.tokens, "after a cancel mid-prefill");
+    assert_recovered(&runtime, &short, &references[0], "a cancel before the first quantum");
 
-    // From the test's thread, at once (the generation takes tens of milliseconds): a second cancel and a cancel after
-    // the end change nothing.
-    let (handle, done) = begin(&runtime, &short, speculation, Trigger::Never);
-    handle.cancel();
-    handle.cancel();
-    let cut = done.wait(WAIT).expect("the generation reports");
-    assert_eq!(cut.outcome.reason, FinishReason::Cancelled);
-    assert_eq!(cut.tokens, short_reference.tokens[..cut.tokens.len()]);
-    handle.cancel();
-    assert!(handle.is_cancelled());
-    assert_free(&runtime);
-    let again = run(&runtime, &short, speculation, Trigger::Never);
-    assert_eq!(
-        again.tokens, short_reference.tokens,
-        "after a cancel from the test's thread"
-    );
+    cancel_all_ways(&runtime, speculation, &short, &long, &references);
 
-    // A cancel after the end is a no-op: the generation finished at its length, and the next one is not affected.
-    let (handle, done) = begin(&runtime, &short, speculation, Trigger::Never);
-    let finished = done.wait(WAIT).expect("the generation reports");
+    // A cancel after the end is a no-op, and a second cancel changes nothing.
+    let spent = CancelHandle::default();
+    let finished = run(&runtime, &short, speculation, Trigger::Never, &spent);
     assert_eq!(finished.outcome.reason, FinishReason::Length);
-    handle.cancel();
-    let next = run(&runtime, &short, speculation, Trigger::Never);
-    assert_eq!(next.outcome.reason, FinishReason::Length);
-    assert_eq!(next.tokens, short_reference.tokens);
+    spent.cancel();
+    spent.cancel();
+    assert_recovered(&runtime, &short, &references[0], "a cancel after the end");
+
+    // The same without captured graphs.
+    assert!(runtime.disable_graphs_for_tests(), "no request runs");
+    cancel_all_ways(&runtime, speculation, &short, &long, &references);
     owner.shutdown(runtime).unwrap();
 }
 

@@ -417,15 +417,16 @@ impl EngineRuntime {
     /// frames on the engine's lattice, and its listener is told of it there. The sequence takes one request at a time;
     /// it starts each from nothing, whatever the one before left in it.
     pub fn generate(&self, request: GenerationRequest) -> Result<(), AdmissionError> {
-        self.generation.generate(request).map(drop)
+        self.generation.generate(request, CancelHandle::default())
     }
 
-    /// As [`EngineRuntime::generate`], and returns the handle that cancels the generation: from any thread, from the
-    /// listener too, without waiting, taking effect at the next quantum boundary. The generation then ends through its
-    /// listener, once, as [`FinishReason::Cancelled`](crate::generation::FinishReason), with the tokens reported until
-    /// then, and the sequence takes the next request.
-    pub fn generate_cancellable(&self, request: GenerationRequest) -> Result<CancelHandle, AdmissionError> {
-        self.generation.generate(request)
+    /// As [`EngineRuntime::generate`], with `cancel` made by the caller, who keeps a clone: `cancel` ends the generation
+    /// from any thread, from the listener too, without waiting, at the next quantum boundary. The generation then ends
+    /// through its listener, once, as [`FinishReason::Cancelled`](crate::generation::FinishReason), with the tokens
+    /// reported until then, and the sequence takes the next request. A handle already cancelled ends the generation
+    /// before its first quantum.
+    pub fn generate_cancellable(&self, request: GenerationRequest, cancel: CancelHandle) -> Result<(), AdmissionError> {
+        self.generation.generate(request, cancel)
     }
 
     /// A test hook: the sequence's owner panics at the end of the turn in which the next request has admitted `quanta`

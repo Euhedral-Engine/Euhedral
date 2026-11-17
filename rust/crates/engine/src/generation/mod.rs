@@ -218,15 +218,12 @@ impl Generation {
     }
 
     /// Starts `request` on the engine's sequence.
-    pub(crate) fn generate(&self, request: GenerationRequest) -> Result<CancelHandle, AdmissionError> {
+    pub(crate) fn generate(&self, request: GenerationRequest, cancel: CancelHandle) -> Result<(), AdmissionError> {
         let core = Arc::clone(&self.shared.core);
-        let handle = CancelHandle::default();
-        let cancel = handle.clone();
         self.start(move |owner| match owner {
             Some(owner) => owner.begin(admit(&core), request, cancel),
             None => Err(closed(Audience::Greedy(request.listener))),
-        })?;
-        Ok(handle)
+        })
     }
 
     /// Starts a teacher-forced run on the engine's sequence.
