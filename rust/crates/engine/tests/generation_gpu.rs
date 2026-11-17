@@ -673,7 +673,7 @@ fn forced_rows(runtime: &EngineRuntime, prompt: &[u32], forced: &[u32]) -> Vec<V
 }
 
 /// The position of each sampled token is the length of what precedes it: the prompt's for the first, one more for
-/// each after it. Checked with a configuration in which the position changes the token (a nucleus cut, not top-k 1):
+/// each after it. Checked with a configuration in which the position changes the token (a flattened distribution, not top-k 1):
 /// each token the engine sampled is the one a fresh sampler draws from the same row at that position, and not the one
 /// it draws at the next, over a prompt of one chunk and of several.
 #[test]
@@ -681,7 +681,7 @@ fn forced_rows(runtime: &EngineRuntime, prompt: &[u32], forced: &[u32]) -> Vec<V
 fn sampled_tokens_are_drawn_at_the_position_they_follow() {
     let Some(machine) = machine() else { return };
     let reference = greedy_reference(&machine);
-    let config = SamplingConfig::new(1.0, 0, 0.95, 77, false).unwrap();
+    let config = SamplingConfig::new(50.0, 40, 1.0, 77, false).unwrap();
     let tokens = 24;
     let mut settings = settings(&machine.artifact, 4096);
     settings.batching.prefill_chunk_tokens = 256;
@@ -725,7 +725,7 @@ fn sampled_tokens_are_drawn_at_the_position_they_follow() {
 fn a_sampled_first_token_can_be_the_stop_token_or_the_whole_budget() {
     let Some(machine) = machine() else { return };
     let reference = greedy_reference(&machine);
-    let config = SamplingConfig::new(1.0, 0, 0.95, 5, false).unwrap();
+    let config = SamplingConfig::new(50.0, 40, 1.0, 5, false).unwrap();
     let (runtime, owner) = start(&machine, 4096);
     let full = generate_sampled(&runtime, &reference.prompt, 8, &[], config);
     assert_eq!(full.tokens.len(), 8);
