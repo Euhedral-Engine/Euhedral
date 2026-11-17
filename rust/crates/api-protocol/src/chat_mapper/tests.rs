@@ -15,12 +15,20 @@ fn defaults() -> Defaults {
 }
 
 fn map(body: &str) -> Result<GenerationRequest, ApiError> {
+    map_request(body).map(|mapped| mapped.generation)
+}
+
+fn map_request(body: &str) -> Result<ChatRequest, ApiError> {
     let request = ChatCompletionRequest::parse(body).expect("the body parses");
     map_chat(request, &defaults())
 }
 
 fn accepted(body: &str) -> GenerationRequest {
     map(body).unwrap_or_else(|error| panic!("{body} was rejected: {}", error.message))
+}
+
+fn accepted_request(body: &str) -> ChatRequest {
+    map_request(body).unwrap_or_else(|error| panic!("{body} was rejected: {}", error.message))
 }
 
 /// A request of one user message with `rest` appended to its members (`,"key":value`).
@@ -241,6 +249,11 @@ fn rows() -> Vec<Row> {
             with_tools(r#"[{"type":"custom"}]"#, ""),
             "tools[0].type",
         ),
+        unsupported(
+            "tool of another type with an unknown key",
+            with_tools(r#"[{"type":"custom","x":1}]"#, ""),
+            "tools[0].type",
+        ),
         unrecognized(
             "tool with unknown key",
             with_tools(r#"[{"type":"function","function":{"name":"a"},"x":1}]"#, ""),
@@ -376,6 +389,11 @@ fn rows() -> Vec<Row> {
         unsupported(
             "tool_choice of another type",
             tool_choice(r#"{"type":"custom"}"#),
+            "tool_choice.type",
+        ),
+        unsupported(
+            "tool_choice of another type with an unknown key",
+            tool_choice(r#"{"type":"custom","x":1}"#),
             "tool_choice.type",
         ),
         unrecognized(
@@ -698,6 +716,12 @@ fn rows() -> Vec<Row> {
             Some("messages[0].content[0].text"),
             "Text content part requires 'text'.",
         ),
+        bad(
+            "text part without text and with an unknown key",
+            part(r#"{"type":"text","cache":1}"#),
+            Some("messages[0].content[0].text"),
+            "Text content part requires 'text'.",
+        ),
         unrecognized(
             "text part with unknown key",
             part(r#"{"type":"text","text":"x","cache":1}"#),
@@ -802,6 +826,18 @@ fn rows() -> Vec<Row> {
         bad(
             "tool call arguments not JSON",
             call_function(r#"{"name":"f","arguments":"{"}"#),
+            Some("messages[1].tool_calls[0].function.arguments"),
+            "Tool call 'arguments' must be valid JSON.",
+        ),
+        bad(
+            "tool call arguments with trailing text",
+            call_function(r#"{"name":"f","arguments":"{\"a\":1} trailing"}"#),
+            Some("messages[1].tool_calls[0].function.arguments"),
+            "Tool call 'arguments' must be valid JSON.",
+        ),
+        bad(
+            "tool call arguments with a second value",
+            call_function(r#"{"name":"f","arguments":"{} {}"}"#),
             Some("messages[1].tool_calls[0].function.arguments"),
             "Tool call 'arguments' must be valid JSON.",
         ),
@@ -1043,7 +1079,11 @@ fn a_minimal_request_takes_the_defaults() {
     assert_eq!(mapped.max_tokens_param, "max_completion_tokens");
     assert!(!mapped.stream);
     assert!(!mapped.return_token_ids);
-    assert!(!mapped.include_usage);
+}
+
+#[test]
+fn usage_is_not_asked_for_unless_the_stream_options_say_so() {
+    assert!(!accepted_request(&req("")).include_usage);
 }
 
 #[test]
@@ -1202,19 +1242,6 @@ fn results_close_at_the_end_of_the_conversation() {
 }
 
 #[test]
-fn arguments_read_the_first_json_value_and_ignore_what_follows() {
-    let mapped = accepted(&msgs(
-        r#"[{"role":"user","content":"x"},
-            {"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{\"a\":1,\"a\":2} trailing"}}]},
-            {"role":"tool","tool_call_id":"c1","content":"r"}]"#,
-    ));
-    let Message::Assistant(assistant) = &mapped.template.messages[1] else {
-        panic!("an assistant message");
-    };
-    assert_eq!(assistant.tool_calls[0].arguments, vec![("a".to_owned(), number("2"))]);
-}
-
-#[test]
 fn tools_map_with_their_choice_and_parallel_flag() {
     let both = r#"[{"type":"function","function":{"name":"a","description":"d","parameters":{"type":"object","properties":{"p":{"type":"string"}},"required":["p"]},"strict":true}},
                    {"type":"function","function":{"name":"b"}}]"#;
@@ -1229,6 +1256,7 @@ fn tools_map_with_their_choice_and_parallel_flag() {
     assert_eq!(mapped.tools.tools[1].definition.parameters, None);
     assert_eq!(mapped.template.tools.len(), 2);
     assert_eq!(mapped.template.tools[0].name, "a");
+    assert_eq!(mapped.template.tools, mapped.tools.prompt_tools());
 
     let required = accepted(&with_tools(
         both,
@@ -1249,6 +1277,7 @@ fn tools_map_with_their_choice_and_parallel_flag() {
     assert_eq!(none.tools.choice, ToolChoice::None);
     assert_eq!(none.tools.tools.len(), 2);
     assert!(none.template.tools.is_empty());
+    assert_eq!(none.template.tools, none.tools.prompt_tools());
     assert!(none.tools.pipeline_options().is_none());
 }
 
@@ -1334,7 +1363,7 @@ fn response_formats_map() {
     else {
         panic!("a schema format");
     };
-    assert_eq!(name, "n");
+    assert_eq!(name.as_deref(), Some("n"));
     assert_eq!(schema_param, "response_format.json_schema.schema");
     assert_eq!(schema.to_compact_string(), r#"{"type":"object","z":1,"a":2}"#);
     assert!(mapped.format.is_json());
@@ -1356,12 +1385,12 @@ fn response_formats_map() {
 
 #[test]
 fn stream_options_and_token_ids() {
-    let mapped = accepted(&req(
+    let mapped = accepted_request(&req(
         r#","stream":true,"stream_options":{"include_usage":true,"include_obfuscation":false}"#,
     ));
-    assert!(mapped.stream);
+    assert!(mapped.generation.stream);
     assert!(mapped.include_usage);
-    let without_usage = accepted(&req(r#","stream":true,"stream_options":{"include_usage":false}"#));
+    let without_usage = accepted_request(&req(r#","stream":true,"stream_options":{"include_usage":false}"#));
     assert!(!without_usage.include_usage);
     let ids = accepted(&req(r#","return_token_ids":true"#));
     assert!(ids.return_token_ids);

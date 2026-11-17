@@ -8,14 +8,26 @@ use std::collections::HashSet;
 use std::slice;
 
 use crate::error::ApiError;
-use crate::generation::{Defaults, GenerationRequest, MAX_STOP_SEQUENCES, Sampling};
+use crate::generation::{Defaults, GenerationRequest, GenerationSettings, Sampling};
 use crate::json::JsonValue;
 use crate::openai::{ChatCompletionRequest, ChatMessage};
 use crate::reasoning;
 use crate::response_format::ResponseFormat;
-use crate::template::{AssistantMessage, ContentPart, Message, Role, TemplateInput, ToolCall};
+use crate::template::{AssistantMessage, ContentPart, Message, Role, ToolCall};
 use crate::tool_calling::{ToolCalling, check_keys, is_function_name, is_parameter_name, member};
 use crate::tool_results::ToolResults;
+
+/// The most stop sequences a Chat Completions request may carry.
+const MAX_STOP_SEQUENCES: usize = 4;
+
+/// A mapped Chat Completions request: the generation to run, and the one thing only this surface asks of the
+/// reply.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatRequest {
+    pub generation: GenerationRequest,
+    /// The streamed reply ends with a usage chunk.
+    pub include_usage: bool,
+}
 
 /// Accepted and ignored: these never influence the generated tokens.
 const IGNORED_METADATA: [&str; 7] = [
@@ -29,7 +41,7 @@ const IGNORED_METADATA: [&str; 7] = [
 ];
 
 /// Validates everything the request states and maps it. The first failing check decides the error.
-pub fn map_chat(mut request: ChatCompletionRequest, defaults: &Defaults) -> Result<GenerationRequest, ApiError> {
+pub fn map_chat(mut request: ChatCompletionRequest, defaults: &Defaults) -> Result<ChatRequest, ApiError> {
     check_other_fields(&request.other, top_level_neutral, "")?;
     let stream = request.stream == Some(true);
     let include_usage = stream_options_include_usage(&request, stream)?;
@@ -63,15 +75,10 @@ pub fn map_chat(mut request: ChatCompletionRequest, defaults: &Defaults) -> Resu
     } else {
         "max_completion_tokens"
     };
-    Ok(GenerationRequest {
+    let settings = GenerationSettings {
         model,
-        template: TemplateInput {
-            messages,
-            tools: tools.prompt_tools(),
-        },
         thinking,
         reasoning_budget: None,
-        tools,
         format,
         stops,
         sampling,
@@ -79,6 +86,9 @@ pub fn map_chat(mut request: ChatCompletionRequest, defaults: &Defaults) -> Resu
         max_tokens_param: max_tokens_param.to_owned(),
         stream,
         return_token_ids,
+    };
+    Ok(ChatRequest {
+        generation: GenerationRequest::new(messages, tools, settings),
         include_usage,
     })
 }
@@ -99,9 +109,8 @@ fn require_served_model(model: Option<&str>, served: &str) -> Result<String, Api
     }
 }
 
-/// Java's notion of blank text: empty or only characters its `Character.isWhitespace` accepts, which are the space
-/// separators other than the no-break spaces, the line and paragraph separators and the controls U+0009 to U+000D
-/// and U+001C to U+001F.
+/// Blank text: empty or only whitespace as the wire format counts it, which is the space separators other than the
+/// no-break spaces, the line and paragraph separators and the controls U+0009 to U+000D and U+001C to U+001F.
 fn is_blank(text: &str) -> bool {
     text.chars().all(|character| {
         matches!(character, '\u{9}'..='\u{d}' | '\u{1c}'..='\u{1f}')
@@ -297,7 +306,7 @@ fn arguments(value: Option<&JsonValue>, function_path: &str) -> Result<Vec<(Stri
     if text.is_empty() {
         return Ok(Vec::new());
     }
-    let Some(parsed) = JsonValue::parse_prefix(text) else {
+    let Some(parsed) = JsonValue::parse(text) else {
         return Err(ApiError::invalid_request(
             "Tool call 'arguments' must be valid JSON.",
             Some(&path),

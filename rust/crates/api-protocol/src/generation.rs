@@ -4,11 +4,8 @@
 //! the generation, prefix reuse, the reply encoding) is shared.
 
 use crate::response_format::ResponseFormat;
-use crate::template::{TemplateInput, TemplateOptions};
+use crate::template::{Message, TemplateInput, TemplateOptions};
 use crate::tool_calling::ToolCalling;
-
-/// The most stop sequences a request may carry.
-pub const MAX_STOP_SEQUENCES: usize = 4;
 
 /// What the server states for every request: the served model and the values a request that omits a field takes.
 #[derive(Clone, Debug, PartialEq)]
@@ -35,12 +32,36 @@ pub struct Sampling {
     pub greedy: bool,
 }
 
+/// Everything of a validated request but its messages and tool calling, which [`GenerationRequest::new`] takes
+/// apart because the prompt's tools follow from the tool calling.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenerationSettings {
+    /// The model the request named.
+    pub model: String,
+    /// The thinking variables of the template.
+    pub thinking: TemplateOptions,
+    /// Caps the reasoning tokens; `None` is no cap.
+    pub reasoning_budget: Option<u32>,
+    pub format: ResponseFormat,
+    pub stops: Vec<String>,
+    pub sampling: Sampling,
+    /// The requested completion budget; `None` takes the server's default. Checking it against the context is the
+    /// planner's.
+    pub max_tokens: Option<i32>,
+    /// The request field that carries `max_tokens`, for errors.
+    pub max_tokens_param: String,
+    pub stream: bool,
+    /// Asks for the prompt's and the completion's token ids.
+    pub return_token_ids: bool,
+}
+
 /// A validated request: the turns to render and how to answer them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationRequest {
     /// The model the request named.
     pub model: String,
-    /// The messages, and the tools the prompt offers (none when the choice is `none`).
+    /// The messages, and the tools the prompt offers (none when the choice is `none`); built by
+    /// [`GenerationRequest::new`] from the tool calling, so the two cannot disagree.
     pub template: TemplateInput,
     /// The thinking variables of the template.
     pub thinking: TemplateOptions,
@@ -58,11 +79,43 @@ pub struct GenerationRequest {
     pub stream: bool,
     /// Asks for the prompt's and the completion's token ids.
     pub return_token_ids: bool,
-    /// The streamed reply ends with a usage chunk (Chat Completions only).
-    pub include_usage: bool,
 }
 
 impl GenerationRequest {
+    /// Builds the request; the template's tools are those `tools` offers the prompt.
+    pub fn new(messages: Vec<Message>, tools: ToolCalling, settings: GenerationSettings) -> Self {
+        let GenerationSettings {
+            model,
+            thinking,
+            reasoning_budget,
+            format,
+            stops,
+            sampling,
+            max_tokens,
+            max_tokens_param,
+            stream,
+            return_token_ids,
+        } = settings;
+        let template = TemplateInput {
+            messages,
+            tools: tools.prompt_tools(),
+        };
+        Self {
+            model,
+            template,
+            thinking,
+            reasoning_budget,
+            tools,
+            format,
+            stops,
+            sampling,
+            max_tokens,
+            max_tokens_param,
+            stream,
+            return_token_ids,
+        }
+    }
+
     /// True when the output opens inside the model's think block.
     pub fn reasoning(&self) -> bool {
         self.thinking.effort.is_some()

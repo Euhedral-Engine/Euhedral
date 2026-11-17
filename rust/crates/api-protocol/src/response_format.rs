@@ -15,7 +15,8 @@ pub enum ResponseFormat {
     JsonObject,
     /// A JSON document of `schema`, an object (empty when the request gave none).
     JsonSchema {
-        name: String,
+        /// The schema's name; `None` when the request gives none.
+        name: Option<String>,
         schema: JsonValue,
         schema_param: String,
     },
@@ -86,7 +87,7 @@ fn json_schema(definition: Option<&JsonValue>) -> Result<ResponseFormat, ApiErro
     };
     check_keys(definition, &["name", "description", "schema", "strict"], path)?;
     let name = match member(definition, "name") {
-        Some(JsonValue::String(name)) if is_function_name(name) => name.clone(),
+        Some(JsonValue::String(name)) if is_function_name(name) => Some(name.clone()),
         _ => {
             return Err(ApiError::invalid_request(
                 format!("'{path}.name' must be 1-64 characters of a-z, A-Z, 0-9, underscores, and dashes."),
