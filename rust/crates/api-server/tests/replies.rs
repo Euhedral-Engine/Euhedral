@@ -339,8 +339,10 @@ fn chat_invalid_tool_calls_fail_and_stop_decoding() {
         settle(&fx);
     }
     // An unfinished call at the end of the output is just as invalid.
-    fx.backend
-        .set_script(tokens(&["<tool_call>\n<function=get_weather>\n<parameter=city>\n"], true));
+    fx.backend.set_script(tokens(
+        &["<tool_call>\n<function=get_weather>\n<parameter=city>\n"],
+        true,
+    ));
     let response = chat(&fx, &tools(""));
     assert_eq!(response.status, 500, "{}", text(&response));
     assert!(text(&response).contains("invalid_tool_call"));
@@ -405,7 +407,10 @@ fn chat_structured_output_valid_invalid_and_truncated() {
     assert_eq!(response.status, 500, "{}", text(&response));
     let body = norm(text(&response));
     assert!(body.contains(r#""code":"invalid_structured_output""#), "{body}");
-    assert!(body.contains("not valid JSON for the requested response format"), "{body}");
+    assert!(
+        body.contains("not valid JSON for the requested response format"),
+        "{body}"
+    );
 
     // Cut by the budget, the document is simply unfinished: length, not an error.
     fx.backend.set_script(tokens(&[r#"{"name":"#, r#""Ada"}"#], false));
@@ -495,14 +500,20 @@ fn responses_surface() {
     let tool = r#","tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]"#;
     let body = json(&ask(tool), 200);
     assert!(body.contains(r#""type":"function_call""#), "{body}");
-    assert!(body.contains(r#""name":"get_weather","arguments":"{\"city\":\"Paris\"}""#), "{body}");
+    assert!(
+        body.contains(r#""name":"get_weather","arguments":"{\"city\":\"Paris\"}""#),
+        "{body}"
+    );
 
     fx.backend
         .set_script(tokens(&["\nLet me", " think.\n", "</think>", "\n\n", "Hello."], true));
     let on = format!(r#"{{"model":"{MODEL_ID}","input":"Hi"}}"#);
     let body = json(&fx.post(RESPONSES, JSON, &on), 200);
     assert!(body.contains(r#""type":"reasoning""#), "{body}");
-    assert!(body.contains(r#""type":"reasoning""#) && body.contains("Let me think."), "{body}");
+    assert!(
+        body.contains(r#""type":"reasoning""#) && body.contains("Let me think."),
+        "{body}"
+    );
     assert!(body.contains(r#""text":"Hello.""#), "{body}");
     assert_closed_once(&fx);
     fx.finish();
