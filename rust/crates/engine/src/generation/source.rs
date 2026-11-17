@@ -1182,8 +1182,13 @@ impl Owner {
         let lease = Arc::new(lease);
         for row in 0..count {
             let Some(sampler) = rows.sampler(row) else {
-                // Checked by `begin`; the rows already published answer for themselves.
-                return self.fail("a row's sampler is in use".to_string());
+                // Checked by `begin`. The rows published answer for themselves and the join then fails the request;
+                // with none published nothing answers, so it fails here.
+                let why = "a row's sampler is in use".to_string();
+                if !rows.abandon_from(row, why.clone()) {
+                    self.fail(why);
+                }
+                return;
             };
             let address = Arc::clone(&shared.address);
             let frame = sample_frame(

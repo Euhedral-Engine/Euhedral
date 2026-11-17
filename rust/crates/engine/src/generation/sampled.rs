@@ -87,6 +87,14 @@ impl Pending {
     pub(crate) fn waiting(&self) -> bool {
         self.outstanding > 0
     }
+
+    /// Gives up the selections from `row` on, which were never published, so only the published ones are awaited.
+    pub(crate) fn abandon_from(&mut self, row: usize) {
+        for answered in self.answered.iter_mut().skip(row).filter(|answered| !**answered) {
+            *answered = true;
+            self.outstanding -= 1;
+        }
+    }
 }
 
 /// What an answer did to the join.
@@ -163,6 +171,14 @@ impl SampledRows {
 
     /// Whether answers are awaited.
     pub(crate) fn waiting(&self) -> bool {
+        self.pending.waiting()
+    }
+
+    /// Ends a quantum whose frames from `row` on could not be published, saying `why`: the frames published answer, and
+    /// the join then reports the failure. Whether any answer is still awaited.
+    pub(crate) fn abandon_from(&mut self, row: usize, why: String) -> bool {
+        self.pending.abandon_from(row);
+        self.failure.get_or_insert(why);
         self.pending.waiting()
     }
 
@@ -452,6 +468,24 @@ mod tests {
         assert!(join.begin(8, 3).is_err(), "the failed row's sampler did not come back");
         assert!(join.begin(8, 1).is_ok());
         assert_eq!(join.failure(), None);
+    }
+
+    #[test]
+    fn rows_never_published_are_no_longer_awaited() {
+        let mut join = rows(3);
+        join.begin(5, 3).unwrap();
+        assert!(
+            join.abandon_from(2, "no sampler".to_string()),
+            "two published rows answer"
+        );
+        assert_eq!(join.answer(answered(5, 1)), Answered::Waiting);
+        assert_eq!(join.answer(answered(6, 2)), Answered::Joined);
+        assert_eq!(join.failure(), Some("no sampler"));
+        join.begin(8, 3).unwrap();
+        assert!(
+            !join.abandon_from(0, "none".to_string()),
+            "nothing was published: nothing answers"
+        );
     }
 
     #[test]

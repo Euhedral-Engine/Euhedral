@@ -45,8 +45,14 @@ pub fn accept(drafts: &[u32], verified_keys: &[u64], eos: &[u32], budget: u32) -
         drafts.len() + 1,
         "one verified key per row: the current token and each draft"
     );
-    let selected: Vec<u32> = verified_keys.iter().map_while(|key| token_of(*key)).collect();
-    accept_tokens(drafts, &selected, eos, budget)
+    assert!(budget > 0, "a step is admitted while tokens are wanted");
+    // Row `j` gives its token or none; the rules read no row past the first that gives none.
+    resolve(
+        drafts,
+        |row| verified_keys.get(row).and_then(|key| token_of(*key)),
+        eos,
+        budget,
+    )
 }
 
 /// Resolves a verification of `drafts` from the token each verified row selected (`selected[j]` is row `j`'s, the token
@@ -67,14 +73,20 @@ pub fn accept_tokens(drafts: &[u32], selected: &[u32], eos: &[u32], budget: u32)
         "at most one selected token per row: the current token and each draft"
     );
     assert!(budget > 0, "a step is admitted while tokens are wanted");
+    resolve(drafts, |row| selected.get(row).copied(), eos, budget)
+}
+
+/// The rules of [`accept_tokens`], reading the token of row `j` as `selected(j)`, which is none from the first row that
+/// selected no token on.
+fn resolve(drafts: &[u32], selected: impl Fn(usize) -> Option<u32>, eos: &[u32], budget: u32) -> Accepted {
     let mut accepted = 0;
-    while accepted < drafts.len() && selected.get(accepted) == Some(&drafts[accepted]) {
+    while accepted < drafts.len() && selected(accepted) == Some(drafts[accepted]) {
         accepted += 1;
     }
     let mut outputs: Vec<u32> = drafts[..accepted].to_vec();
-    let unselected = match selected.get(accepted) {
+    let unselected = match selected(accepted) {
         Some(token) => {
-            outputs.push(*token);
+            outputs.push(token);
             false
         }
         None => true,

@@ -515,8 +515,12 @@ impl Owner {
             run.stop(FinishReason::Stop);
         } else if run.generated >= run.wanted {
             run.stop(FinishReason::Length);
-        } else if let (Mode::Speculative { state, .. }, true) = (&mut run.mode, first) {
-            state.first_token(token, &run.prompt);
+        } else if let Mode::Speculative { state, .. } = &mut run.mode {
+            if first {
+                state.first_token(token, &run.prompt);
+            } else {
+                state.current = Some(token);
+            }
         }
     }
 
