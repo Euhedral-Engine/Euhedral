@@ -336,3 +336,38 @@ fn a_file_of_the_wrong_shape_is_refused() {
         "{error}"
     );
 }
+
+#[test]
+fn a_token_exposes_its_exact_bytes_even_when_they_are_not_valid_utf8() {
+    let tokenizer = tokenizer();
+    assert_eq!(tokenizer.vocabulary_size(), 265);
+    assert_eq!(tokenizer.token_bytes(u32::from(b'a')), Some(&b"a"[..]));
+    assert_eq!(tokenizer.token_bytes(HELLO), Some(&b"hello"[..]));
+    assert_eq!(tokenizer.token_bytes(SPACE_W), Some(&b" w"[..]));
+    // A lone lead byte and a lone continuation byte: neither is text, and a one-token decode loses them.
+    assert_eq!(tokenizer.token_bytes(0xC3), Some(&[0xC3u8][..]));
+    assert_eq!(tokenizer.token_bytes(0x80), Some(&[0x80u8][..]));
+    assert_eq!(tokenizer.decode(&[0xC3]).unwrap(), "\u{fffd}");
+    assert!(std::str::from_utf8(tokenizer.token_bytes(0xC3).unwrap()).is_err());
+}
+
+#[test]
+fn added_and_unused_ids_have_no_bytes_and_added_ones_are_control_tokens() {
+    let tokenizer = tokenizer();
+    for (id, text) in [
+        (IM_START, "<|im_start|>"),
+        (IM_END, "<|im_end|>"),
+        (END_OF_TEXT, "<|endoftext|>"),
+        (THINK, "<think>"),
+    ] {
+        assert!(tokenizer.is_control_token(id), "{text}");
+        assert_eq!(tokenizer.token_bytes(id), None, "{text}");
+        assert_eq!(tokenizer.control_token_text(id), Some(text));
+    }
+    for id in [0, HELLO, 265, u32::MAX] {
+        assert!(!tokenizer.is_control_token(id), "{id}");
+        assert_eq!(tokenizer.control_token_text(id), None, "{id}");
+    }
+    assert_eq!(tokenizer.token_bytes(265), None);
+    assert_eq!(tokenizer.token_bytes(u32::MAX), None);
+}

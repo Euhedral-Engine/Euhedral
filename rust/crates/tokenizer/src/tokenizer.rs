@@ -156,6 +156,32 @@ impl Tokenizer {
     pub fn vocabulary_size(&self) -> usize {
         self.pieces.len()
     }
+
+    /// The exact bytes of an ordinary token, which may end inside a UTF-8 sequence (decoding one such token alone is
+    /// lossy; its bytes are not). `None` for an added token, an unused ID and an ID past the vocabulary.
+    pub fn token_bytes(&self, id: u32) -> Option<&[u8]> {
+        match self.piece(id)? {
+            Piece::Bytes(bytes) => Some(bytes),
+            Piece::Absent | Piece::Control(_) => None,
+        }
+    }
+
+    /// Whether `id` is an added token (special or not, EOS included): one whose text is its spelling, not bytes.
+    pub fn is_control_token(&self, id: u32) -> bool {
+        matches!(self.piece(id), Some(Piece::Control(_)))
+    }
+
+    /// The spelling of an added token; `None` for any other ID.
+    pub fn control_token_text(&self, id: u32) -> Option<&str> {
+        match self.piece(id)? {
+            Piece::Control(text) => Some(text),
+            Piece::Absent | Piece::Bytes(_) => None,
+        }
+    }
+
+    fn piece(&self, id: u32) -> Option<&Piece> {
+        self.pieces.get(usize::try_from(id).ok()?)
+    }
 }
 
 fn file<'a>(section: &'a TokenizerSection, name: &'static str) -> Result<&'a [u8], TokenizerError> {
