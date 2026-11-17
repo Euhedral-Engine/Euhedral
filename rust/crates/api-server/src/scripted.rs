@@ -68,6 +68,8 @@ pub struct ScriptedBackend {
     generations: Mutex<Vec<Arc<ScriptedGeneration>>>,
     encoded: AtomicUsize,
     report: Mutex<EngineReport>,
+    grammar_refusal: Mutex<Option<String>>,
+    schema_refusal: Mutex<Option<String>>,
 }
 
 impl Debug for ScriptedBackend {
@@ -94,6 +96,8 @@ impl ScriptedBackend {
             generations: Mutex::new(Vec::new()),
             encoded: AtomicUsize::new(0),
             report: Mutex::new(EngineReport::default()),
+            grammar_refusal: Mutex::new(None),
+            schema_refusal: Mutex::new(None),
         })
     }
 
@@ -110,6 +114,21 @@ impl ScriptedBackend {
     /// Sets what [`Backend::engine_report`] returns. The speculative depth is read when the server starts.
     pub fn set_engine_report(&self, report: EngineReport) {
         *self.report.lock().unwrap_or_else(PoisonError::into_inner) = report;
+    }
+
+    /// Sets the longest sequence, prompt plus completion.
+    pub fn set_context_length(&self, tokens: usize) {
+        self.context_length.store(tokens, Ordering::Release);
+    }
+
+    /// Makes every grammar check refuse with `reason` (`None`: accept), as a grammar llguidance cannot compile.
+    pub fn refuse_grammars(&self, reason: Option<&str>) {
+        *self.grammar_refusal.lock().unwrap_or_else(PoisonError::into_inner) = reason.map(str::to_owned);
+    }
+
+    /// Makes every JSON Schema check refuse with `reason` (`None`: accept).
+    pub fn refuse_schemas(&self, reason: Option<&str>) {
+        *self.schema_refusal.lock().unwrap_or_else(PoisonError::into_inner) = reason.map(str::to_owned);
     }
 
     /// Sets the script of the generations opened from now on.
@@ -186,11 +205,17 @@ impl Backend for ScriptedBackend {
     }
 
     fn check_grammar(&self, _grammar: &str) -> Result<(), BackendError> {
-        Ok(())
+        match &*self.grammar_refusal.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(reason) => Err(BackendError::Unenforceable(reason.clone())),
+            None => Ok(()),
+        }
     }
 
     fn check_json_schema(&self, _schema: &str) -> Result<(), BackendError> {
-        Ok(())
+        match &*self.schema_refusal.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(reason) => Err(BackendError::Unenforceable(reason.clone())),
+            None => Ok(()),
+        }
     }
 
     fn open_generation(

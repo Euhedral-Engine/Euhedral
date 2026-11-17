@@ -21,6 +21,7 @@ use crate::backend::Backend;
 use crate::frames::once_or_refused;
 use crate::limits::Limits;
 use crate::metrics::Metrics;
+use crate::planning::{Planner, RequestDefaults};
 use crate::router::Router;
 
 /// What a server needs to start.
@@ -34,6 +35,8 @@ pub struct ApiConfig {
     pub backend: Arc<dyn Backend>,
     /// When the model was created, in seconds since the epoch, as the model lists show it.
     pub created_at: i64,
+    /// What a request that states nothing takes, and the completion budget when it states none.
+    pub defaults: RequestDefaults,
     /// The sockets' engine, when the caller has one to share: it must be attached to the lattice already, and the
     /// caller completes it. `None`: the server opens one, attaches it and completes it on release.
     pub io: Option<Arc<AsyncIo>>,
@@ -107,7 +110,14 @@ pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Resul
         config.backend.engine_report().speculative_depth,
         Metrics::wall_clock_ms(),
     ));
-    let router = Router::new(config.backend, config.created_at, config.limits, metrics.clone());
+    let planner = Planner::new(config.backend.clone(), config.defaults, sink.clone());
+    let router = Router::new(
+        config.backend,
+        config.created_at,
+        config.limits,
+        metrics.clone(),
+        planner,
+    );
     let handle = match serve(
         lattice.clone(),
         io.clone(),

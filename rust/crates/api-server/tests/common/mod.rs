@@ -21,7 +21,7 @@ use euhedral_core::impls::{BaseCloneableObject, DefaultExecutor};
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_hardware_utils::affinity;
 use euhedral_inference_api_server::scripted::ScriptedBackend;
-use euhedral_inference_api_server::{ApiConfig, ApiServer, EngineReport, Limits, once, start};
+use euhedral_inference_api_server::{ApiConfig, ApiServer, EngineReport, Limits, RequestDefaults, once, start};
 use euhedral_io::AsyncIo;
 use euhedral_net::{ClientConfig, Method, NetError, Request, Response, request};
 
@@ -86,6 +86,7 @@ impl Fixture {
             address: "127.0.0.1:0".parse().expect("an address"),
             limits,
             backend: backend.clone(),
+            defaults: RequestDefaults::default(),
             io: None,
             created_at: CREATED,
         };
