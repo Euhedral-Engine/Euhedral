@@ -63,7 +63,7 @@ RUSTEE_OWNERS = {ENGINE, BENCH, CUDA}
 YAML = "serde_yaml_ng"
 YAML_OWNERS = {SETTINGS}
 # crate -> the only external crates it may depend on.
-EXTERNAL_ONLY = {CUDA: {"euhedral-gpu", "euhedral-graph", "euhedral-io", "libloading", "thiserror"}}
+EXTERNAL_ONLY = {CUDA: {"euhedral-data-structures", "euhedral-gpu", "euhedral-graph", "euhedral-io", "libloading", "thiserror"}}
 # External crates no crate may depend on (glob patterns), with the rule each protects.
 DENIED = {
     "level-zero*": "hardware agnosticism: no Intel iGPU-specific code; integrated-GPU compute goes through a "

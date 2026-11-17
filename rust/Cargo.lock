@@ -357,8 +357,8 @@ source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=40fdda43717bb99d
 name = "euhedral-inference-api-protocol"
 version = "0.1.0"
 dependencies = [
- "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -385,6 +385,7 @@ dependencies = [
 name = "euhedral-inference-cuda"
 version = "0.1.0"
 dependencies = [
+ "euhedral-data-structures",
  "euhedral-gpu",
  "euhedral-graph",
  "euhedral-inference-cuda",

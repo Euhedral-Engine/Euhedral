@@ -1,20 +1,26 @@
 //! OpenAI Chat Completions: the request, the `chat.completion` reply, the `chat.completion.chunk` stream payloads and
 //! the model list.
 //!
-//! Requests accept every top-level field: the ones the server understands are typed, the rest are kept in `other` in
-//! the order they arrived, for the mapper to accept or reject. A field of the wrong type fails to deserialise; a
-//! `null` is the same as an absent field. Replies serialise their fields in the order the declarations give.
+//! A request body is read as JSON and then field by field: the fields the server understands are typed (scalars are
+//! read as [`crate::coerce`] describes), the rest are kept in `other` in the order they arrived, and fields that take
+//! several shapes stay [`JsonValue`]s. A `null` is the same as an absent field. Replies are [`ToJson`]: their members
+//! are written in declaration order, with explicit nulls only where stated.
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use crate::coerce;
+use crate::error::ApiError;
+use crate::json::JsonValue;
+use crate::wire::{
+    Members, Reader, ToJson, int, int_list, list, members, object, optional_text, push, push_some, text,
+};
 
 /// A Chat Completions request. `stop`, `tools`, `tool_choice`, `reasoning_effort`, `chat_template_kwargs` and
-/// `response_format` stay untyped JSON so the mapper can report precise errors and render tool schemas in their
-/// original key order.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+/// `response_format` stay untyped so the mapper can report precise errors and render tool schemas in their original
+/// key order.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChatCompletionRequest {
     pub model: Option<String>,
-    pub messages: Option<Vec<ChatMessage>>,
+    /// The messages; a `null` element is kept as `None`.
+    pub messages: Option<Vec<Option<ChatMessage>>>,
     pub stream: Option<bool>,
     pub stream_options: Option<StreamOptions>,
     pub max_tokens: Option<i32>,
@@ -23,57 +29,182 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f64>,
     pub top_k: Option<i32>,
     pub seed: Option<i64>,
-    pub stop: Option<Value>,
-    pub tools: Option<Value>,
-    pub tool_choice: Option<Value>,
+    pub stop: Option<JsonValue>,
+    pub tools: Option<JsonValue>,
+    pub tool_choice: Option<JsonValue>,
     pub parallel_tool_calls: Option<bool>,
-    pub reasoning_effort: Option<Value>,
-    pub chat_template_kwargs: Option<Value>,
-    pub response_format: Option<Value>,
+    pub reasoning_effort: Option<JsonValue>,
+    pub chat_template_kwargs: Option<JsonValue>,
+    pub response_format: Option<JsonValue>,
     pub return_token_ids: Option<bool>,
-    /// Every other top-level field.
-    #[serde(flatten)]
-    pub other: Map<String, Value>,
+    /// Every other top-level field, in arrival order; nulls included.
+    pub other: Members,
+}
+
+impl ChatCompletionRequest {
+    /// Reads a request body; any body that is not a JSON object of the documented shape is an unparsable body.
+    pub fn parse(body: &str) -> Result<ChatCompletionRequest, ApiError> {
+        let mut reader = Reader::parse(body)?;
+        let mut request = ChatCompletionRequest {
+            model: reader
+                .take("model")
+                .map(|value| coerce::string(&value))
+                .transpose()?
+                .flatten(),
+            messages: match reader.take("messages") {
+                Some(value) => {
+                    let items = coerce::array(&value)?.unwrap_or_default();
+                    Some(items.iter().map(message_or_null).collect::<Result<Vec<_>, _>>()?)
+                }
+                None => None,
+            },
+            stream: reader
+                .take("stream")
+                .map(|value| coerce::boolean(&value))
+                .transpose()?
+                .flatten(),
+            stream_options: reader.take("stream_options").map(StreamOptions::read).transpose()?,
+            max_tokens: reader
+                .take("max_tokens")
+                .map(|value| coerce::integer(&value))
+                .transpose()?
+                .flatten(),
+            max_completion_tokens: reader
+                .take("max_completion_tokens")
+                .map(|value| coerce::integer(&value))
+                .transpose()?
+                .flatten(),
+            temperature: reader
+                .take("temperature")
+                .map(|value| coerce::double(&value))
+                .transpose()?
+                .flatten(),
+            top_p: reader
+                .take("top_p")
+                .map(|value| coerce::double(&value))
+                .transpose()?
+                .flatten(),
+            top_k: reader
+                .take("top_k")
+                .map(|value| coerce::integer(&value))
+                .transpose()?
+                .flatten(),
+            seed: reader
+                .take("seed")
+                .map(|value| coerce::long(&value))
+                .transpose()?
+                .flatten(),
+            stop: reader.take("stop"),
+            tools: reader.take("tools"),
+            tool_choice: reader.take("tool_choice"),
+            parallel_tool_calls: reader
+                .take("parallel_tool_calls")
+                .map(|value| coerce::boolean(&value))
+                .transpose()?
+                .flatten(),
+            reasoning_effort: reader.take("reasoning_effort"),
+            chat_template_kwargs: reader.take("chat_template_kwargs"),
+            response_format: reader.take("response_format"),
+            return_token_ids: reader
+                .take("return_token_ids")
+                .map(|value| coerce::boolean(&value))
+                .transpose()?
+                .flatten(),
+            other: Vec::new(),
+        };
+        request.other = reader.rest();
+        Ok(request)
+    }
+}
+
+fn message_or_null(value: &JsonValue) -> Result<Option<ChatMessage>, ApiError> {
+    match value {
+        JsonValue::Null => Ok(None),
+        other => ChatMessage::read(other.clone()).map(Some),
+    }
 }
 
 /// One request message. `content` is a string, a list of content parts, or absent; `tool_calls`, `tool_call_id` and
-/// `reasoning_content` stay untyped JSON for validation.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+/// `reasoning_content` stay untyped for validation.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChatMessage {
     pub role: Option<String>,
-    pub content: Option<Value>,
+    pub content: Option<JsonValue>,
     pub name: Option<String>,
-    pub tool_calls: Option<Value>,
-    pub tool_call_id: Option<Value>,
-    pub reasoning_content: Option<Value>,
-    /// Every other field of the message.
-    #[serde(flatten)]
-    pub other: Map<String, Value>,
+    pub tool_calls: Option<JsonValue>,
+    pub tool_call_id: Option<JsonValue>,
+    pub reasoning_content: Option<JsonValue>,
+    /// Every other field of the message, in arrival order; nulls included.
+    pub other: Members,
+}
+
+impl ChatMessage {
+    fn read(value: JsonValue) -> Result<ChatMessage, ApiError> {
+        let mut reader = Reader::of(value)?;
+        let mut message = ChatMessage {
+            role: reader
+                .take("role")
+                .map(|value| coerce::string(&value))
+                .transpose()?
+                .flatten(),
+            content: reader.take("content"),
+            name: reader
+                .take("name")
+                .map(|value| coerce::string(&value))
+                .transpose()?
+                .flatten(),
+            tool_calls: reader.take("tool_calls"),
+            tool_call_id: reader.take("tool_call_id"),
+            reasoning_content: reader.take("reasoning_content"),
+            other: Vec::new(),
+        };
+        message.other = reader.rest();
+        Ok(message)
+    }
 }
 
 /// The `stream_options` of a request.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct StreamOptions {
     pub include_usage: Option<bool>,
-    /// Every other field of the options.
-    #[serde(flatten)]
-    pub other: Map<String, Value>,
+    /// Every other field of the options, in arrival order; nulls included.
+    pub other: Members,
+}
+
+impl StreamOptions {
+    fn read(value: JsonValue) -> Result<StreamOptions, ApiError> {
+        let mut reader = Reader::of(value)?;
+        let include_usage = reader
+            .take("include_usage")
+            .map(|value| coerce::boolean(&value))
+            .transpose()?
+            .flatten();
+        Ok(StreamOptions {
+            include_usage,
+            other: reader.rest(),
+        })
+    }
 }
 
 /// A function call the assistant made. `arguments` is a JSON object serialised as a string.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ToolCall {
     pub id: String,
-    #[serde(rename = "type")]
     pub kind: String,
     pub function: ToolCallFunction,
 }
 
 /// The named function and its arguments of a [`ToolCall`].
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ToolCallFunction {
     pub name: String,
     pub arguments: String,
+}
+
+impl ToJson for ToolCallFunction {
+    fn to_json(&self) -> JsonValue {
+        object([("name", text(&self.name)), ("arguments", text(&self.arguments))])
+    }
 }
 
 impl ToolCall {
@@ -90,26 +221,34 @@ impl ToolCall {
     }
 }
 
+impl ToJson for ToolCall {
+    fn to_json(&self) -> JsonValue {
+        object([
+            ("id", text(&self.id)),
+            ("type", text(&self.kind)),
+            ("function", self.function.to_json()),
+        ])
+    }
+}
+
 /// Token accounting of one completion. Absent details are left out.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Usage {
     pub prompt_tokens: i32,
     pub completion_tokens: i32,
     pub total_tokens: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptDetails>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens_details: Option<CompletionDetails>,
 }
 
 /// The prompt tokens restored from the prefix cache (part of `prompt_tokens`).
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PromptDetails {
     pub cached_tokens: i32,
 }
 
 /// The reasoning tokens (part of `completion_tokens`).
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CompletionDetails {
     pub reasoning_tokens: i32,
 }
@@ -127,8 +266,32 @@ impl Usage {
     }
 }
 
+impl ToJson for Usage {
+    fn to_json(&self) -> JsonValue {
+        let mut fields = Vec::new();
+        push(&mut fields, "prompt_tokens", int(self.prompt_tokens));
+        push(&mut fields, "completion_tokens", int(self.completion_tokens));
+        push(&mut fields, "total_tokens", int(self.total_tokens));
+        push_some(
+            &mut fields,
+            "prompt_tokens_details",
+            self.prompt_tokens_details
+                .as_ref()
+                .map(|details| object([("cached_tokens", int(details.cached_tokens))])),
+        );
+        push_some(
+            &mut fields,
+            "completion_tokens_details",
+            self.completion_tokens_details
+                .as_ref()
+                .map(|details| object([("reasoning_tokens", int(details.reasoning_tokens))])),
+        );
+        members(fields)
+    }
+}
+
 /// The non-streaming `chat.completion` object with exactly one assistant choice.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChatCompletionResponse {
     pub id: String,
     pub object: String,
@@ -136,32 +299,82 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<Choice>,
     pub usage: Usage,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_token_ids: Option<Vec<i32>>,
 }
 
 /// A choice of a [`ChatCompletionResponse`]; `logprobs` and `finish_reason` are explicit nulls when absent.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Choice {
     pub index: i32,
     pub message: AssistantMessage,
-    pub logprobs: Option<Value>,
+    pub logprobs: Option<JsonValue>,
     pub finish_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub token_ids: Option<Vec<i32>>,
 }
 
 /// The assistant message of a choice. `content` is null when the assistant only called tools and `refusal` is always
-/// null; `reasoning_content` and `tool_calls` are left out when empty.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+/// null; `reasoning_content` and `tool_calls` are left out when absent.
+#[derive(Clone, Debug, PartialEq)]
 pub struct AssistantMessage {
     pub role: String,
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     pub refusal: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+impl ToJson for AssistantMessage {
+    fn to_json(&self) -> JsonValue {
+        let mut fields = Vec::new();
+        push(&mut fields, "role", text(&self.role));
+        push(&mut fields, "content", optional_text(self.content.as_deref()));
+        push_some(
+            &mut fields,
+            "reasoning_content",
+            self.reasoning_content.as_deref().map(text),
+        );
+        push(&mut fields, "refusal", optional_text(self.refusal.as_deref()));
+        push_some(&mut fields, "tool_calls", self.tool_calls.as_deref().map(list));
+        members(fields)
+    }
+}
+
+impl ToJson for Choice {
+    fn to_json(&self) -> JsonValue {
+        let mut fields = Vec::new();
+        push(&mut fields, "index", int(self.index));
+        push(&mut fields, "message", self.message.to_json());
+        push(
+            &mut fields,
+            "logprobs",
+            self.logprobs.clone().unwrap_or(JsonValue::Null),
+        );
+        push(
+            &mut fields,
+            "finish_reason",
+            optional_text(self.finish_reason.as_deref()),
+        );
+        push_some(&mut fields, "token_ids", self.token_ids.as_deref().map(int_list));
+        members(fields)
+    }
+}
+
+impl ToJson for ChatCompletionResponse {
+    fn to_json(&self) -> JsonValue {
+        let mut fields = Vec::new();
+        push(&mut fields, "id", text(&self.id));
+        push(&mut fields, "object", text(&self.object));
+        push(&mut fields, "created", int(self.created));
+        push(&mut fields, "model", text(&self.model));
+        push(&mut fields, "choices", list(&self.choices));
+        push(&mut fields, "usage", self.usage.to_json());
+        push_some(
+            &mut fields,
+            "prompt_token_ids",
+            self.prompt_token_ids.as_deref().map(int_list),
+        );
+        members(fields)
+    }
 }
 
 /// The parts of a finished generation that make a [`ChatCompletionResponse`].
@@ -220,47 +433,91 @@ impl ChatCompletionResponse {
 }
 
 /// A streaming `chat.completion.chunk`. `usage` appears only on the optional final usage chunk.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChatCompletionChunk {
     pub id: String,
     pub object: String,
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
 }
 
 /// A choice of a chunk; `logprobs` and `finish_reason` are explicit nulls when absent.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChunkChoice {
     pub index: i32,
     pub delta: Delta,
-    pub logprobs: Option<Value>,
+    pub logprobs: Option<JsonValue>,
     pub finish_reason: Option<String>,
 }
 
 /// The increment of a chunk; absent parts are left out. `reasoning_content` precedes any `content`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Delta {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 /// Streaming form of [`ToolCall`]; `index` identifies the call across chunks.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ToolCallDelta {
     pub index: i32,
     pub id: String,
-    #[serde(rename = "type")]
     pub kind: String,
     pub function: ToolCallFunction,
+}
+
+impl ToJson for ToolCallDelta {
+    fn to_json(&self) -> JsonValue {
+        object([
+            ("index", int(self.index)),
+            ("id", text(&self.id)),
+            ("type", text(&self.kind)),
+            ("function", self.function.to_json()),
+        ])
+    }
+}
+
+impl ToJson for Delta {
+    fn to_json(&self) -> JsonValue {
+        let mut fields = Vec::new();
+        push_some(&mut fields, "role", self.role.as_deref().map(text));
+        push_some(&mut fields, "content", self.content.as_deref().map(text));
+        push_some(
+            &mut fields,
+            "reasoning_content",
+            self.reasoning_content.as_deref().map(text),
+        );
+        push_some(&mut fields, "tool_calls", self.tool_calls.as_deref().map(list));
+        members(fields)
+    }
+}
+
+impl ToJson for ChunkChoice {
+    fn to_json(&self) -> JsonValue {
+        object([
+            ("index", int(self.index)),
+            ("delta", self.delta.to_json()),
+            ("logprobs", self.logprobs.clone().unwrap_or(JsonValue::Null)),
+            ("finish_reason", optional_text(self.finish_reason.as_deref())),
+        ])
+    }
+}
+
+impl ToJson for ChatCompletionChunk {
+    fn to_json(&self) -> JsonValue {
+        let mut fields = Vec::new();
+        push(&mut fields, "id", text(&self.id));
+        push(&mut fields, "object", text(&self.object));
+        push(&mut fields, "created", int(self.created));
+        push(&mut fields, "model", text(&self.model));
+        push(&mut fields, "choices", list(&self.choices));
+        push_some(&mut fields, "usage", self.usage.as_ref().map(ToJson::to_json));
+        members(fields)
+    }
 }
 
 impl ChatCompletionChunk {
@@ -345,14 +602,14 @@ impl ChatCompletionChunk {
 pub const STREAM_DONE: &str = "[DONE]";
 
 /// The `/v1/models` listing; only the public model id is exposed.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ModelList {
     pub object: String,
     pub data: Vec<Model>,
 }
 
 /// One served model.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Model {
     pub id: String,
     pub object: String,
@@ -382,36 +639,57 @@ impl ModelList {
     }
 }
 
+impl ToJson for Model {
+    fn to_json(&self) -> JsonValue {
+        object([
+            ("id", text(&self.id)),
+            ("object", text(&self.object)),
+            ("created", int(self.created)),
+            ("owned_by", text(&self.owned_by)),
+        ])
+    }
+}
+
+impl ToJson for ModelList {
+    fn to_json(&self) -> JsonValue {
+        object([("object", text(&self.object)), ("data", list(&self.data))])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn json<T: Serialize>(value: &T) -> String {
-        serde_json::to_string(value).expect("serialises")
+    fn json(text: &str) -> JsonValue {
+        JsonValue::parse(text).expect("valid json")
     }
 
     #[test]
-    fn a_request_with_every_known_field_deserialises() {
-        let request: ChatCompletionRequest = serde_json::from_str(
+    fn a_request_with_every_known_field_is_read() {
+        let request = ChatCompletionRequest::parse(
             r#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":[{"type":"text","text":"hi"}],"name":"bob"},
             {"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}],"reasoning_content":"r"},
-            {"role":"tool","tool_call_id":"c","content":"x"}],
+            {"role":"tool","tool_call_id":"c","content":"x","extra":null}, null],
             "stream":true,"stream_options":{"include_usage":true,"extra":1},"max_tokens":5,"max_completion_tokens":6,"temperature":0.5,
             "top_p":0.9,"top_k":4,"seed":123456789012,"stop":["a","b"],"tools":[{"type":"function","function":{"name":"f","parameters":{"z":1,"a":2}}}],
             "tool_choice":"auto","parallel_tool_calls":false,"reasoning_effort":"low","chat_template_kwargs":{"enable_thinking":false},
-            "response_format":{"type":"json_object"},"return_token_ids":true,"n":2,"user":"u"}"#,
+            "response_format":{"type":"json_object"},"return_token_ids":true,"n":2,"user":"u","metadata":null}"#,
         )
-        .expect("deserialises");
+        .expect("reads");
         assert_eq!(request.model.as_deref(), Some("m"));
         let messages = request.messages.expect("messages");
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[1].name.as_deref(), Some("bob"));
-        assert!(messages[2].content.is_none());
-        assert!(messages[2].tool_calls.is_some());
-        assert_eq!(messages[3].tool_call_id, Some(Value::String("c".into())));
+        assert_eq!(messages.len(), 5);
+        assert!(messages[4].is_none());
+        let user = messages[1].as_ref().expect("user");
+        assert_eq!(user.name.as_deref(), Some("bob"));
+        assert!(messages[2].as_ref().expect("assistant").content.is_none());
+        assert!(messages[2].as_ref().expect("assistant").tool_calls.is_some());
+        let tool = messages[3].as_ref().expect("tool");
+        assert_eq!(tool.tool_call_id, Some(json("\"c\"")));
+        assert_eq!(tool.other, vec![("extra".to_owned(), JsonValue::Null)]);
         let options = request.stream_options.expect("options");
         assert_eq!(options.include_usage, Some(true));
-        assert!(options.other.contains_key("extra"));
+        assert_eq!(options.other, vec![("extra".to_owned(), json("1"))]);
         assert_eq!(request.stream, Some(true));
         assert_eq!(
             (request.max_tokens, request.max_completion_tokens, request.top_k),
@@ -421,31 +699,62 @@ mod tests {
             (request.temperature, request.top_p, request.seed),
             (Some(0.5), Some(0.9), Some(123456789012))
         );
-        assert_eq!(json(&request.stop.expect("stop")), r#"["a","b"]"#);
+        assert_eq!(request.stop.expect("stop").to_compact_string(), r#"["a","b"]"#);
         assert_eq!(
-            json(&request.tools.expect("tools")),
+            request.tools.expect("tools").to_compact_string(),
             r#"[{"type":"function","function":{"name":"f","parameters":{"z":1,"a":2}}}]"#
         );
         assert_eq!(request.parallel_tool_calls, Some(false));
         assert_eq!(request.return_token_ids, Some(true));
-        assert_eq!(request.other.keys().collect::<Vec<_>>(), ["n", "user"]);
+        let names: Vec<&str> = request.other.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["n", "user", "metadata"]);
     }
 
     #[test]
     fn an_empty_object_and_explicit_nulls_are_the_same() {
-        let empty: ChatCompletionRequest = serde_json::from_str("{}").expect("empty");
-        let nulls: ChatCompletionRequest =
-            serde_json::from_str(r#"{"model":null,"messages":null,"stream":null,"stop":null,"tools":null}"#)
+        let empty = ChatCompletionRequest::parse("{}").expect("empty");
+        let nulls =
+            ChatCompletionRequest::parse(r#"{"model":null,"messages":null,"stream":null,"stop":null,"tools":null}"#)
                 .expect("nulls");
         assert_eq!(empty, nulls);
         assert!(empty.other.is_empty());
     }
 
     #[test]
-    fn a_field_of_the_wrong_type_is_rejected() {
-        assert!(serde_json::from_str::<ChatCompletionRequest>(r#"{"stream":"yes"}"#).is_err());
-        assert!(serde_json::from_str::<ChatCompletionRequest>(r#"{"messages":"hi"}"#).is_err());
-        assert!(serde_json::from_str::<ChatCompletionRequest>("[]").is_err());
+    fn scalars_are_coerced_and_the_last_duplicate_wins() {
+        let request = ChatCompletionRequest::parse(
+            r#"{"model":123,"max_tokens":"7","temperature":" 0.7 ","top_p":1e400,"stream":"TRUE","top_k":5.9,"seed":"","stream":0,"n":1,"n":2}"#,
+        )
+        .expect("reads");
+        assert_eq!(request.model.as_deref(), Some("123"));
+        assert_eq!(request.max_tokens, Some(7));
+        assert_eq!(request.temperature, Some(0.7));
+        assert_eq!(request.top_p, Some(f64::INFINITY));
+        assert_eq!(request.top_k, Some(5));
+        assert_eq!(request.seed, None);
+        assert_eq!(request.stream, Some(false));
+        assert_eq!(request.other, vec![("n".to_owned(), json("2"))]);
+    }
+
+    #[test]
+    fn a_body_of_the_wrong_shape_is_unparsable() {
+        for body in [
+            r#"{"stream":"yes"}"#,
+            r#"{"messages":"hi"}"#,
+            r#"{"messages":{"role":"user"}}"#,
+            r#"{"messages":["hi"]}"#,
+            r#"{"stream_options":[]}"#,
+            r#"{"max_tokens":2147483648}"#,
+            r#"{"model":[]}"#,
+            "[]",
+            "null",
+            "",
+            r#"{"model":"m"} x"#,
+            r#"{"model":"m""#,
+        ] {
+            let error = ChatCompletionRequest::parse(body).expect_err(body);
+            assert_eq!(error, ApiError::unparsable_body(), "{body}");
+        }
     }
 
     fn completion() -> Completion {
@@ -466,7 +775,7 @@ mod tests {
     #[test]
     fn a_plain_reply_has_null_logprobs_and_refusal() {
         assert_eq!(
-            json(&ChatCompletionResponse::of(completion())),
+            ChatCompletionResponse::of(completion()).to_json_string(),
             r#"{"id":"chatcmpl-1","object":"chat.completion","created":7,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hello","refusal":null},"logprobs":null,"finish_reason":"stop","token_ids":[1,2]}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13,"prompt_tokens_details":{"cached_tokens":4}}}"#
         );
     }
@@ -481,7 +790,7 @@ mod tests {
         parts.usage = Usage::of(10, 0, 3, Some(2));
         parts.prompt_token_ids = Some(vec![5, 6]);
         assert_eq!(
-            json(&ChatCompletionResponse::of(parts)),
+            ChatCompletionResponse::of(parts).to_json_string(),
             r#"{"id":"chatcmpl-1","object":"chat.completion","created":7,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"reasoning_content":"think","refusal":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]},"logprobs":null,"finish_reason":"tool_calls","token_ids":[1,2]}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":2}},"prompt_token_ids":[5,6]}"#
         );
     }
@@ -489,37 +798,55 @@ mod tests {
     #[test]
     fn every_chunk_kind_has_its_payload() {
         let (id, model) = ("c1", "m");
-        let chunks = [
-            ChatCompletionChunk::role(id, 7, model),
-            ChatCompletionChunk::reasoning(id, 7, model, "r"),
-            ChatCompletionChunk::content(id, 7, model, "t"),
-            ChatCompletionChunk::tool_call(id, 7, model, 1, ToolCall::function("call_1", "f", "{}")),
-            ChatCompletionChunk::finish(id, 7, model, "stop"),
-            ChatCompletionChunk::usage(id, 7, model, Usage::of(2, 1, 3, Some(1))),
-        ];
         let head = r#"{"id":"c1","object":"chat.completion.chunk","created":7,"model":"m","choices":["#;
-        let expected = [
-            r#"{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}"#,
-            r#"{"index":0,"delta":{"reasoning_content":"r"},"logprobs":null,"finish_reason":null}]}"#,
-            r#"{"index":0,"delta":{"content":"t"},"logprobs":null,"finish_reason":null}]}"#,
-            r#"{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]},"logprobs":null,"finish_reason":null}]}"#,
-            r#"{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}"#,
-            r#"],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5,"prompt_tokens_details":{"cached_tokens":1},"completion_tokens_details":{"reasoning_tokens":1}}}"#,
+        let cases = [
+            (
+                ChatCompletionChunk::role(id, 7, model),
+                r#"{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}"#,
+            ),
+            (
+                ChatCompletionChunk::reasoning(id, 7, model, "r"),
+                r#"{"index":0,"delta":{"reasoning_content":"r"},"logprobs":null,"finish_reason":null}]}"#,
+            ),
+            (
+                ChatCompletionChunk::content(id, 7, model, "t"),
+                r#"{"index":0,"delta":{"content":"t"},"logprobs":null,"finish_reason":null}]}"#,
+            ),
+            (
+                ChatCompletionChunk::tool_call(id, 7, model, 1, ToolCall::function("call_1", "f", "{}")),
+                r#"{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]},"logprobs":null,"finish_reason":null}]}"#,
+            ),
+            (
+                ChatCompletionChunk::finish(id, 7, model, "stop"),
+                r#"{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}"#,
+            ),
+            (
+                ChatCompletionChunk::usage(id, 7, model, Usage::of(2, 1, 3, Some(1))),
+                r#"],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5,"prompt_tokens_details":{"cached_tokens":1},"completion_tokens_details":{"reasoning_tokens":1}}}"#,
+            ),
         ];
-        for (chunk, tail) in chunks.iter().zip(expected) {
-            assert_eq!(json(chunk), format!("{head}{tail}"));
+        for (chunk, tail) in cases {
+            assert_eq!(chunk.to_json_string(), format!("{head}{tail}"));
         }
+    }
+
+    #[test]
+    fn control_characters_in_a_text_delta_are_written_with_capital_hex() {
+        assert_eq!(
+            ChatCompletionChunk::content("c1", 7, "m", "a\u{1b}b\u{b}c\u{1f}d\"\\\n").to_json_string(),
+            r#"{"id":"c1","object":"chat.completion.chunk","created":7,"model":"m","choices":[{"index":0,"delta":{"content":"a\u001Bb\u000Bc\u001Fd\"\\\n"},"logprobs":null,"finish_reason":null}]}"#
+        );
     }
 
     #[test]
     fn the_model_list_and_model_have_the_listing_shape() {
         let model = Model::of("m", 9);
         assert_eq!(
-            json(&model),
+            model.to_json_string(),
             r#"{"id":"m","object":"model","created":9,"owned_by":"euhedral"}"#
         );
         assert_eq!(
-            json(&ModelList::of(model)),
+            ModelList::of(model).to_json_string(),
             r#"{"object":"list","data":[{"id":"m","object":"model","created":9,"owned_by":"euhedral"}]}"#
         );
     }

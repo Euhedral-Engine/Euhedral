@@ -1,6 +1,7 @@
 //! The API's errors: one status, type, code and message per failure, and the two JSON bodies that carry them.
 
-use serde::Serialize;
+use crate::json::JsonValue;
+use crate::wire::{ToJson, object, optional_text, text};
 
 /// The API surface an error is answered on; each has its own error format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,35 +35,60 @@ pub struct ApiError {
 }
 
 /// OpenAI's error envelope: `{"error": {"message", "type", "param", "code"}}`, every field always present.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenAiErrorEnvelope {
     pub error: OpenAiErrorBody,
 }
 
 /// The object inside OpenAI's error envelope.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenAiErrorBody {
     pub message: String,
-    #[serde(rename = "type")]
     pub kind: String,
     pub param: Option<String>,
     pub code: Option<String>,
 }
 
 /// Anthropic's error envelope: `{"type": "error", "error": {"type", "message"}}`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnthropicErrorEnvelope {
-    #[serde(rename = "type")]
-    pub kind: &'static str,
     pub error: AnthropicErrorBody,
 }
 
 /// The object inside Anthropic's error envelope, its type named after the status.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnthropicErrorBody {
-    #[serde(rename = "type")]
     pub kind: &'static str,
     pub message: String,
+}
+
+impl ToJson for OpenAiErrorBody {
+    fn to_json(&self) -> JsonValue {
+        object([
+            ("message", text(&self.message)),
+            ("type", text(&self.kind)),
+            ("param", optional_text(self.param.as_deref())),
+            ("code", optional_text(self.code.as_deref())),
+        ])
+    }
+}
+
+impl ToJson for OpenAiErrorEnvelope {
+    fn to_json(&self) -> JsonValue {
+        object([("error", self.error.to_json())])
+    }
+}
+
+impl ToJson for AnthropicErrorBody {
+    fn to_json(&self) -> JsonValue {
+        object([("type", text(self.kind)), ("message", text(&self.message))])
+    }
+}
+
+impl ToJson for AnthropicErrorEnvelope {
+    fn to_json(&self) -> JsonValue {
+        object([("type", text("error")), ("error", self.error.to_json())])
+    }
 }
 
 const INVALID_REQUEST: &str = "invalid_request_error";
@@ -220,6 +246,37 @@ impl ApiError {
         )
     }
 
+    /// A request with a method the URL does not take; Spring's wording.
+    pub fn method_not_supported(method: &str) -> ApiError {
+        ApiError::protocol(405, format!("Method '{method}' is not supported."))
+    }
+
+    /// A request whose content type the URL does not take; Spring's wording.
+    pub fn unsupported_media_type(content_type: &str) -> ApiError {
+        ApiError::protocol(415, format!("Content-Type '{content_type}' is not supported."))
+    }
+
+    /// A request whose content type header cannot be read; Spring's wording.
+    pub fn unreadable_content_type() -> ApiError {
+        ApiError::protocol(415, "Could not parse Content-Type.")
+    }
+
+    /// A request whose `Accept` header allows none of the types the URL produces; Spring's wording, naming the types
+    /// the URL produces.
+    pub fn not_acceptable(produces: &[&str]) -> ApiError {
+        ApiError::protocol(406, format!("Acceptable representations: [{}].", produces.join(", ")))
+    }
+
+    /// A request whose `Accept` header cannot be read; Spring's wording.
+    pub fn unreadable_accept() -> ApiError {
+        ApiError::protocol(406, "Could not parse Accept header.")
+    }
+
+    /// Any other client error the web layer raised, with the detail it gave; `Invalid request.` when it gave none.
+    pub fn framework(status: u16, detail: Option<&str>) -> ApiError {
+        ApiError::protocol(status, detail.unwrap_or("Invalid request."))
+    }
+
     /// A request for a URL the server does not serve.
     pub fn unknown_url(method: &str, path: &str) -> ApiError {
         ApiError::not_found(format!("Unknown request URL: {method} {path}."))
@@ -264,7 +321,6 @@ impl ApiError {
     /// The error as Anthropic's error object.
     pub fn anthropic_envelope(&self) -> AnthropicErrorEnvelope {
         AnthropicErrorEnvelope {
-            kind: "error",
             error: AnthropicErrorBody {
                 kind: ApiError::anthropic_type(self.status),
                 message: self.message.clone(),
@@ -274,12 +330,11 @@ impl ApiError {
 
     /// The JSON body of the error on a surface.
     pub fn body(&self, surface: Surface) -> Vec<u8> {
-        let bytes = match surface {
-            Surface::OpenAi => serde_json::to_vec(&self.openai_envelope()),
-            Surface::Anthropic => serde_json::to_vec(&self.anthropic_envelope()),
+        let text = match surface {
+            Surface::OpenAi => self.openai_envelope().to_json_string(),
+            Surface::Anthropic => self.anthropic_envelope().to_json_string(),
         };
-        // Both envelopes hold only strings and nulls, which always serialise.
-        bytes.unwrap_or_default()
+        text.into_bytes()
     }
 }
 
@@ -287,269 +342,339 @@ impl ApiError {
 mod tests {
     use super::*;
 
+    struct Row {
+        error: ApiError,
+        status: u16,
+        kind: &'static str,
+        param: Option<&'static str>,
+        code: Option<&'static str>,
+        message: &'static str,
+        anthropic_status: u16,
+        openai_body: &'static str,
+        anthropic_body: &'static str,
+    }
+
     fn text(error: &ApiError, surface: Surface) -> String {
         String::from_utf8(error.body(surface)).expect("utf-8")
     }
 
     #[test]
     fn every_constructor_has_its_status_type_code_and_bodies() {
-        // (error, status, kind, param, code, message, anthropic status, anthropic type)
-        type Row = (
-            ApiError,
-            u16,
-            &'static str,
-            Option<&'static str>,
-            Option<&'static str>,
-            &'static str,
-            u16,
-            &'static str,
-        );
-        let rows: Vec<Row> = vec![
-            (
-                ApiError::protocol(405, "Method not allowed."),
-                405,
-                "invalid_request_error",
-                None,
-                None,
-                "Method not allowed.",
-                405,
-                "invalid_request_error",
-            ),
-            (
-                ApiError::protocol(415, "Unsupported media type."),
-                415,
-                "invalid_request_error",
-                None,
-                None,
-                "Unsupported media type.",
-                415,
-                "invalid_request_error",
-            ),
-            (
-                ApiError::protocol(429, "Slow down."),
-                429,
-                "invalid_request_error",
-                None,
-                None,
-                "Slow down.",
-                429,
-                "rate_limit_error",
-            ),
-            (
-                ApiError::unenforceable_schema("bad schema", Some("response_format")),
-                400,
-                "invalid_request_error",
-                Some("response_format"),
-                Some("unsupported_schema"),
-                "bad schema",
-                400,
-                "invalid_request_error",
-            ),
-            (
-                ApiError::invalid_request("nope", Some("messages")),
-                400,
-                "invalid_request_error",
-                Some("messages"),
-                None,
-                "nope",
-                400,
-                "invalid_request_error",
-            ),
-            (
-                ApiError::invalid_request("nope", None),
-                400,
-                "invalid_request_error",
-                None,
-                None,
-                "nope",
-                400,
-                "invalid_request_error",
-            ),
-            (
-                ApiError::request_too_large(),
-                413,
-                "invalid_request_error",
-                None,
-                Some("request_too_large"),
-                "The chat completion request body exceeds the configured size limit.",
-                413,
-                "request_too_large",
-            ),
-            (
-                ApiError::unsupported_parameter("n"),
-                400,
-                "invalid_request_error",
-                Some("n"),
-                Some("unsupported_parameter"),
-                "Unsupported parameter: 'n' is not supported by this server.",
-                400,
-                "invalid_request_error",
-            ),
-            (
-                ApiError::unrecognized_argument("foo"),
-                400,
-                "invalid_request_error",
-                Some("foo"),
-                Some("unrecognized_argument"),
-                "Unrecognized request argument supplied: foo",
-                400,
-                "invalid_request_error",
-            ),
-            (
-                ApiError::context_length_exceeded("too long", Some("messages")),
-                400,
-                "invalid_request_error",
-                Some("messages"),
-                Some("context_length_exceeded"),
-                "too long",
-                400,
-                "invalid_request_error",
-            ),
-            (
-                ApiError::model_not_found("gpt-x"),
-                404,
-                "invalid_request_error",
-                Some("model"),
-                Some("model_not_found"),
-                "The model 'gpt-x' does not exist or you do not have access to it.",
-                404,
-                "not_found_error",
-            ),
-            (
-                ApiError::not_found("gone"),
-                404,
-                "invalid_request_error",
-                None,
-                None,
-                "gone",
-                404,
-                "not_found_error",
-            ),
-            (
-                ApiError::unavailable("busy"),
-                503,
-                "service_unavailable_error",
-                None,
-                Some("engine_unavailable"),
-                "busy",
-                529,
-                "overloaded_error",
-            ),
-            (
-                ApiError::server_error(),
-                500,
-                "server_error",
-                None,
-                None,
-                "The server had an error while processing your request.",
-                500,
-                "api_error",
-            ),
-            (
-                ApiError::invalid_tool_call("unknown tool"),
-                500,
-                "server_error",
-                None,
-                Some("invalid_tool_call"),
-                "The model produced an invalid tool call: unknown tool.",
-                500,
-                "api_error",
-            ),
-            (
-                ApiError::invalid_structured_output(),
-                500,
-                "server_error",
-                None,
-                Some("invalid_structured_output"),
-                "The model's output is not valid JSON for the requested response format.",
-                500,
-                "api_error",
-            ),
-            (
-                ApiError::client_closed(),
-                503,
-                "service_unavailable_error",
-                None,
-                Some("client_closed"),
-                "The client closed the connection.",
-                529,
-                "overloaded_error",
-            ),
-            (
-                ApiError::timeout(),
-                503,
-                "service_unavailable_error",
-                None,
-                Some("timeout"),
-                "The request timed out before generation completed.",
-                529,
-                "overloaded_error",
-            ),
-            (
-                ApiError::engine_unavailable("starting"),
-                503,
-                "service_unavailable_error",
-                None,
-                Some("engine_unavailable"),
-                "The inference engine is unavailable: starting",
-                529,
-                "overloaded_error",
-            ),
-            (
-                ApiError::unparsable_body(),
-                400,
-                "invalid_request_error",
-                None,
-                None,
-                "We could not parse the JSON body of your request. Check that it is valid JSON and that each field has the documented type.",
-                400,
-                "invalid_request_error",
-            ),
-            (
-                ApiError::unknown_url("GET", "/v1/nothing"),
-                404,
-                "invalid_request_error",
-                None,
-                None,
-                "Unknown request URL: GET /v1/nothing.",
-                404,
-                "not_found_error",
-            ),
+        let rows = vec![
+            Row {
+                error: ApiError::protocol(405, "Method not allowed."),
+                status: 405,
+                kind: "invalid_request_error",
+                param: None,
+                code: None,
+                message: r##"Method not allowed."##,
+                anthropic_status: 405,
+                openai_body: r##"{"error":{"message":"Method not allowed.","type":"invalid_request_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"Method not allowed."}}"##,
+            },
+            Row {
+                error: ApiError::protocol(429, "Slow down."),
+                status: 429,
+                kind: "invalid_request_error",
+                param: None,
+                code: None,
+                message: r##"Slow down."##,
+                anthropic_status: 429,
+                openai_body: r##"{"error":{"message":"Slow down.","type":"invalid_request_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"rate_limit_error","message":"Slow down."}}"##,
+            },
+            Row {
+                error: ApiError::unenforceable_schema("bad schema", Some("response_format")),
+                status: 400,
+                kind: "invalid_request_error",
+                param: Some("response_format"),
+                code: Some("unsupported_schema"),
+                message: r##"bad schema"##,
+                anthropic_status: 400,
+                openai_body: r##"{"error":{"message":"bad schema","type":"invalid_request_error","param":"response_format","code":"unsupported_schema"}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"bad schema"}}"##,
+            },
+            Row {
+                error: ApiError::invalid_request("nope", Some("messages")),
+                status: 400,
+                kind: "invalid_request_error",
+                param: Some("messages"),
+                code: None,
+                message: r##"nope"##,
+                anthropic_status: 400,
+                openai_body: r##"{"error":{"message":"nope","type":"invalid_request_error","param":"messages","code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"nope"}}"##,
+            },
+            Row {
+                error: ApiError::invalid_request("nope", None),
+                status: 400,
+                kind: "invalid_request_error",
+                param: None,
+                code: None,
+                message: r##"nope"##,
+                anthropic_status: 400,
+                openai_body: r##"{"error":{"message":"nope","type":"invalid_request_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"nope"}}"##,
+            },
+            Row {
+                error: ApiError::request_too_large(),
+                status: 413,
+                kind: "invalid_request_error",
+                param: None,
+                code: Some("request_too_large"),
+                message: r##"The chat completion request body exceeds the configured size limit."##,
+                anthropic_status: 413,
+                openai_body: r##"{"error":{"message":"The chat completion request body exceeds the configured size limit.","type":"invalid_request_error","param":null,"code":"request_too_large"}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"request_too_large","message":"The chat completion request body exceeds the configured size limit."}}"##,
+            },
+            Row {
+                error: ApiError::unsupported_parameter("n"),
+                status: 400,
+                kind: "invalid_request_error",
+                param: Some("n"),
+                code: Some("unsupported_parameter"),
+                message: r##"Unsupported parameter: 'n' is not supported by this server."##,
+                anthropic_status: 400,
+                openai_body: r##"{"error":{"message":"Unsupported parameter: 'n' is not supported by this server.","type":"invalid_request_error","param":"n","code":"unsupported_parameter"}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"Unsupported parameter: 'n' is not supported by this server."}}"##,
+            },
+            Row {
+                error: ApiError::unrecognized_argument("foo"),
+                status: 400,
+                kind: "invalid_request_error",
+                param: Some("foo"),
+                code: Some("unrecognized_argument"),
+                message: r##"Unrecognized request argument supplied: foo"##,
+                anthropic_status: 400,
+                openai_body: r##"{"error":{"message":"Unrecognized request argument supplied: foo","type":"invalid_request_error","param":"foo","code":"unrecognized_argument"}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"Unrecognized request argument supplied: foo"}}"##,
+            },
+            Row {
+                error: ApiError::context_length_exceeded("too long", Some("messages")),
+                status: 400,
+                kind: "invalid_request_error",
+                param: Some("messages"),
+                code: Some("context_length_exceeded"),
+                message: r##"too long"##,
+                anthropic_status: 400,
+                openai_body: r##"{"error":{"message":"too long","type":"invalid_request_error","param":"messages","code":"context_length_exceeded"}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"too long"}}"##,
+            },
+            Row {
+                error: ApiError::model_not_found("gpt-x"),
+                status: 404,
+                kind: "invalid_request_error",
+                param: Some("model"),
+                code: Some("model_not_found"),
+                message: r##"The model 'gpt-x' does not exist or you do not have access to it."##,
+                anthropic_status: 404,
+                openai_body: r##"{"error":{"message":"The model 'gpt-x' does not exist or you do not have access to it.","type":"invalid_request_error","param":"model","code":"model_not_found"}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"not_found_error","message":"The model 'gpt-x' does not exist or you do not have access to it."}}"##,
+            },
+            Row {
+                error: ApiError::not_found("gone"),
+                status: 404,
+                kind: "invalid_request_error",
+                param: None,
+                code: None,
+                message: r##"gone"##,
+                anthropic_status: 404,
+                openai_body: r##"{"error":{"message":"gone","type":"invalid_request_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"not_found_error","message":"gone"}}"##,
+            },
+            Row {
+                error: ApiError::unavailable("busy"),
+                status: 503,
+                kind: "service_unavailable_error",
+                param: None,
+                code: Some("engine_unavailable"),
+                message: r##"busy"##,
+                anthropic_status: 529,
+                openai_body: r##"{"error":{"message":"busy","type":"service_unavailable_error","param":null,"code":"engine_unavailable"}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"##,
+            },
+            Row {
+                error: ApiError::server_error(),
+                status: 500,
+                kind: "server_error",
+                param: None,
+                code: None,
+                message: r##"The server had an error while processing your request."##,
+                anthropic_status: 500,
+                openai_body: r##"{"error":{"message":"The server had an error while processing your request.","type":"server_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"api_error","message":"The server had an error while processing your request."}}"##,
+            },
+            Row {
+                error: ApiError::invalid_tool_call("unknown tool"),
+                status: 500,
+                kind: "server_error",
+                param: None,
+                code: Some("invalid_tool_call"),
+                message: r##"The model produced an invalid tool call: unknown tool."##,
+                anthropic_status: 500,
+                openai_body: r##"{"error":{"message":"The model produced an invalid tool call: unknown tool.","type":"server_error","param":null,"code":"invalid_tool_call"}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"api_error","message":"The model produced an invalid tool call: unknown tool."}}"##,
+            },
+            Row {
+                error: ApiError::invalid_structured_output(),
+                status: 500,
+                kind: "server_error",
+                param: None,
+                code: Some("invalid_structured_output"),
+                message: r##"The model's output is not valid JSON for the requested response format."##,
+                anthropic_status: 500,
+                openai_body: r##"{"error":{"message":"The model's output is not valid JSON for the requested response format.","type":"server_error","param":null,"code":"invalid_structured_output"}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"api_error","message":"The model's output is not valid JSON for the requested response format."}}"##,
+            },
+            Row {
+                error: ApiError::client_closed(),
+                status: 503,
+                kind: "service_unavailable_error",
+                param: None,
+                code: Some("client_closed"),
+                message: r##"The client closed the connection."##,
+                anthropic_status: 529,
+                openai_body: r##"{"error":{"message":"The client closed the connection.","type":"service_unavailable_error","param":null,"code":"client_closed"}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"overloaded_error","message":"The client closed the connection."}}"##,
+            },
+            Row {
+                error: ApiError::timeout(),
+                status: 503,
+                kind: "service_unavailable_error",
+                param: None,
+                code: Some("timeout"),
+                message: r##"The request timed out before generation completed."##,
+                anthropic_status: 529,
+                openai_body: r##"{"error":{"message":"The request timed out before generation completed.","type":"service_unavailable_error","param":null,"code":"timeout"}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"overloaded_error","message":"The request timed out before generation completed."}}"##,
+            },
+            Row {
+                error: ApiError::engine_unavailable("starting"),
+                status: 503,
+                kind: "service_unavailable_error",
+                param: None,
+                code: Some("engine_unavailable"),
+                message: r##"The inference engine is unavailable: starting"##,
+                anthropic_status: 529,
+                openai_body: r##"{"error":{"message":"The inference engine is unavailable: starting","type":"service_unavailable_error","param":null,"code":"engine_unavailable"}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"overloaded_error","message":"The inference engine is unavailable: starting"}}"##,
+            },
+            Row {
+                error: ApiError::unparsable_body(),
+                status: 400,
+                kind: "invalid_request_error",
+                param: None,
+                code: None,
+                message: r##"We could not parse the JSON body of your request. Check that it is valid JSON and that each field has the documented type."##,
+                anthropic_status: 400,
+                openai_body: r##"{"error":{"message":"We could not parse the JSON body of your request. Check that it is valid JSON and that each field has the documented type.","type":"invalid_request_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"We could not parse the JSON body of your request. Check that it is valid JSON and that each field has the documented type."}}"##,
+            },
+            Row {
+                error: ApiError::unknown_url("GET", "/v1/nothing"),
+                status: 404,
+                kind: "invalid_request_error",
+                param: None,
+                code: None,
+                message: r##"Unknown request URL: GET /v1/nothing."##,
+                anthropic_status: 404,
+                openai_body: r##"{"error":{"message":"Unknown request URL: GET /v1/nothing.","type":"invalid_request_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"not_found_error","message":"Unknown request URL: GET /v1/nothing."}}"##,
+            },
+            Row {
+                error: ApiError::method_not_supported("PUT"),
+                status: 405,
+                kind: "invalid_request_error",
+                param: None,
+                code: None,
+                message: r##"Method 'PUT' is not supported."##,
+                anthropic_status: 405,
+                openai_body: r##"{"error":{"message":"Method 'PUT' is not supported.","type":"invalid_request_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"Method 'PUT' is not supported."}}"##,
+            },
+            Row {
+                error: ApiError::unsupported_media_type("text/plain"),
+                status: 415,
+                kind: "invalid_request_error",
+                param: None,
+                code: None,
+                message: r##"Content-Type 'text/plain' is not supported."##,
+                anthropic_status: 415,
+                openai_body: r##"{"error":{"message":"Content-Type 'text/plain' is not supported.","type":"invalid_request_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"Content-Type 'text/plain' is not supported."}}"##,
+            },
+            Row {
+                error: ApiError::unreadable_content_type(),
+                status: 415,
+                kind: "invalid_request_error",
+                param: None,
+                code: None,
+                message: r##"Could not parse Content-Type."##,
+                anthropic_status: 415,
+                openai_body: r##"{"error":{"message":"Could not parse Content-Type.","type":"invalid_request_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"Could not parse Content-Type."}}"##,
+            },
+            Row {
+                error: ApiError::not_acceptable(&["application/json", "text/event-stream"]),
+                status: 406,
+                kind: "invalid_request_error",
+                param: None,
+                code: None,
+                message: r##"Acceptable representations: [application/json, text/event-stream]."##,
+                anthropic_status: 406,
+                openai_body: r##"{"error":{"message":"Acceptable representations: [application/json, text/event-stream].","type":"invalid_request_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"Acceptable representations: [application/json, text/event-stream]."}}"##,
+            },
+            Row {
+                error: ApiError::unreadable_accept(),
+                status: 406,
+                kind: "invalid_request_error",
+                param: None,
+                code: None,
+                message: r##"Could not parse Accept header."##,
+                anthropic_status: 406,
+                openai_body: r##"{"error":{"message":"Could not parse Accept header.","type":"invalid_request_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"Could not parse Accept header."}}"##,
+            },
+            Row {
+                error: ApiError::framework(400, None),
+                status: 400,
+                kind: "invalid_request_error",
+                param: None,
+                code: None,
+                message: r##"Invalid request."##,
+                anthropic_status: 400,
+                openai_body: r##"{"error":{"message":"Invalid request.","type":"invalid_request_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid request."}}"##,
+            },
+            Row {
+                error: ApiError::framework(406, Some("Detail.")),
+                status: 406,
+                kind: "invalid_request_error",
+                param: None,
+                code: None,
+                message: r##"Detail."##,
+                anthropic_status: 406,
+                openai_body: r##"{"error":{"message":"Detail.","type":"invalid_request_error","param":null,"code":null}}"##,
+                anthropic_body: r##"{"type":"error","error":{"type":"invalid_request_error","message":"Detail."}}"##,
+            },
         ];
-        for (error, status, kind, param, code, message, anthropic_status, anthropic_type) in rows {
-            assert_eq!(error.status, status, "{message}");
-            assert_eq!(error.kind, kind, "{message}");
-            assert_eq!(error.param.as_deref(), param, "{message}");
-            assert_eq!(error.code, code, "{message}");
-            assert_eq!(error.message, message);
-            assert_eq!(error.status_on(Surface::OpenAi), status);
-            assert_eq!(error.status_on(Surface::Anthropic), anthropic_status, "{message}");
-            let openai = format!(
-                "{{\"error\":{{\"message\":{},\"type\":{},\"param\":{},\"code\":{}}}}}",
-                serde_json::to_string(message).unwrap(),
-                serde_json::to_string(kind).unwrap(),
-                serde_json::to_string(&param).unwrap(),
-                serde_json::to_string(&code).unwrap(),
+        for row in rows {
+            let message = row.message;
+            assert_eq!(row.error.status, row.status, "{message}");
+            assert_eq!(row.error.kind, row.kind, "{message}");
+            assert_eq!(row.error.param.as_deref(), row.param, "{message}");
+            assert_eq!(row.error.code, row.code, "{message}");
+            assert_eq!(row.error.message, message);
+            assert_eq!(row.error.status_on(Surface::OpenAi), row.status);
+            assert_eq!(
+                row.error.status_on(Surface::Anthropic),
+                row.anthropic_status,
+                "{message}"
             );
-            assert_eq!(text(&error, Surface::OpenAi), openai);
-            let anthropic = format!(
-                "{{\"type\":\"error\",\"error\":{{\"type\":\"{anthropic_type}\",\"message\":{}}}}}",
-                serde_json::to_string(message).unwrap(),
-            );
-            assert_eq!(text(&error, Surface::Anthropic), anthropic);
+            assert_eq!(text(&row.error, Surface::OpenAi), row.openai_body, "{message}");
+            assert_eq!(text(&row.error, Surface::Anthropic), row.anthropic_body, "{message}");
         }
-    }
-
-    #[test]
-    fn a_full_openai_body_has_the_documented_bytes() {
-        assert_eq!(
-            text(&ApiError::model_not_found("m"), Surface::OpenAi),
-            r#"{"error":{"message":"The model 'm' does not exist or you do not have access to it.","type":"invalid_request_error","param":"model","code":"model_not_found"}}"#
-        );
-        assert_eq!(
-            text(&ApiError::server_error(), Surface::OpenAi),
-            r#"{"error":{"message":"The server had an error while processing your request.","type":"server_error","param":null,"code":null}}"#
-        );
     }
 
     #[test]
@@ -573,11 +698,15 @@ mod tests {
     }
 
     #[test]
-    fn quotes_and_control_characters_are_escaped() {
-        let error = ApiError::invalid_request("a \"b\"\n\u{1}é", None);
+    fn quotes_and_control_characters_are_escaped_with_capital_hex() {
+        let error = ApiError::invalid_request("a \"b\"\n\u{1b}\u{b}\u{1f}\u{1}\u{8}\u{c}é", None);
         assert_eq!(
             text(&error, Surface::Anthropic),
-            "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"a \\\"b\\\"\\n\\u0001é\"}}"
+            r##"{"type":"error","error":{"type":"invalid_request_error","message":"a \"b\"\n\u001B\u000B\u001F\u0001\b\fé"}}"##
+        );
+        assert_eq!(
+            text(&error, Surface::OpenAi),
+            r##"{"error":{"message":"a \"b\"\n\u001B\u000B\u001F\u0001\b\fé","type":"invalid_request_error","param":null,"code":null}}"##
         );
     }
 }
