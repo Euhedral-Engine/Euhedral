@@ -9,9 +9,11 @@
 mod common;
 
 use std::collections::HashSet;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::{Fixture, PATIENCE, assert_json, lattice, small_limits};
 use euhedral_core::control_plane::ControlPlaneLattice;
@@ -19,8 +21,10 @@ use euhedral_core::frames::Frame;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_inference_api_protocol::ApiError;
 use euhedral_inference_api_protocol::json::JsonValue;
-use euhedral_inference_api_server::scripted::{MODEL_ID, ScriptedBackend};
-use euhedral_inference_api_server::{Endpoint, Extras, Limits, Planned, Planner, Publisher, RequestDefaults};
+use euhedral_inference_api_server::scripted::{CheckFault, MODEL_ID, ScriptedBackend};
+use euhedral_inference_api_server::{
+    DefaultsError, Endpoint, Extras, Limits, Planned, Planner, Publisher, RequestDefaults,
+};
 use euhedral_net::Method;
 
 const JSON: Option<&str> = Some("application/json");
@@ -73,7 +77,7 @@ impl Rig {
             allowed,
             hashes: Mutex::new(Vec::new()),
         });
-        let planner = Planner::new(backend.clone(), defaults, publisher.clone());
+        let planner = Planner::new(backend.clone(), defaults, publisher.clone()).expect("settings the planner holds");
         Rig {
             lattice,
             backend,
@@ -438,14 +442,28 @@ fn a_frame_the_lattice_refuses_answers_that_the_server_is_shutting_down() {
     let rig = Rig::with(RequestDefaults::default(), 2);
     let error = expect_error(rig.plan(Endpoint::ChatCompletions, &chat("")));
     assert_eq!(error, ApiError::shutting_down());
-    // The very first frame refused.
-    let rig_none = Rig::with(RequestDefaults::default(), 0);
-    let error = expect_error(rig_none.plan(Endpoint::ChatCompletions, &chat("")));
-    assert_eq!(error, ApiError::shutting_down());
-    let counted = rig_none.count(b"{}");
-    assert_eq!(counted, Err(ApiError::shutting_down()));
     rig.finish();
-    rig_none.finish();
+}
+
+#[test]
+fn a_first_frame_the_lattice_refuses_answers_that_the_server_is_shutting_down() {
+    let rig = Rig::with(RequestDefaults::default(), 0);
+    let error = expect_error(rig.plan(Endpoint::ChatCompletions, &chat("")));
+    assert_eq!(error, ApiError::shutting_down());
+    assert_eq!(rig.count(b"{}"), Err(ApiError::shutting_down()));
+    rig.finish();
+}
+
+#[test]
+fn a_plan_frame_the_lattice_refuses_answers_that_the_server_is_shutting_down() {
+    // The first frame, the map, the grammar and the template are accepted; the plan frame, which the backend's
+    // encoding continuation publishes, is refused.
+    let rig = Rig::with(RequestDefaults::default(), 4);
+    let error = expect_error(rig.plan(Endpoint::ChatCompletions, &chat("")));
+    assert_eq!(error, ApiError::shutting_down());
+    assert_eq!(rig.frames(), 5);
+    assert_eq!(rig.backend.encoded(), 1);
+    rig.finish();
 }
 
 #[test]
@@ -480,20 +498,25 @@ fn sampling_reaches_the_plan_and_a_missing_seed_is_drawn() {
         .plan(Endpoint::ChatCompletions, &chat(&format!(r#"{base},"temperature":0"#)))
         .expect("a plan");
     assert!(greedy.config.greedy);
+    rig.finish();
+}
+
+#[test]
+fn the_servers_sampling_defaults_replace_the_built_in_ones() {
     let defaults = RequestDefaults {
         temperature: 0.5,
         top_k: 3,
         top_p: 0.9,
         max_tokens: 10,
     };
-    let rig_set = Rig::with(defaults, usize::MAX);
-    let planned = rig_set.plan(Endpoint::ChatCompletions, &chat(base)).expect("a plan");
+    let rig = Rig::with(defaults, usize::MAX);
+    let body = chat(r#","reasoning_effort":"none""#);
+    let planned = rig.plan(Endpoint::ChatCompletions, &body).expect("a plan");
     assert_eq!(
         (planned.config.temperature, planned.config.top_k, planned.config.top_p),
         (0.5, 3, 0.9)
     );
     rig.finish();
-    rig_set.finish();
 }
 
 #[test]
@@ -575,5 +598,258 @@ fn errors_of_each_step_reach_the_client_in_their_surface_format() {
         400,
         &anthropic,
     );
+    fixture.finish();
+}
+
+fn assert_surface_error(result: Result<Planned, ApiError>, status: u16, message: &str, param: Option<&str>) {
+    let error = expect_error(result);
+    assert_eq!(
+        (error.status, error.message.as_str(), error.param.as_deref()),
+        (status, message, param)
+    );
+}
+
+#[test]
+fn a_responses_budget_of_zero_is_refused_about_max_output_tokens() {
+    let rig = Rig::new();
+    let body = format!(r#"{{"model":"{MODEL_ID}","input":"Hi","max_output_tokens":0}}"#);
+    assert_surface_error(
+        rig.plan(Endpoint::Responses, &body),
+        400,
+        "'max_output_tokens' must be at least 1.",
+        Some("max_output_tokens"),
+    );
+    rig.finish();
+}
+
+#[test]
+fn a_responses_budget_over_the_context_is_refused_with_the_count_in_the_message() {
+    let rig = Rig::new();
+    let body = |budget: u32| format!(r#"{{"model":"{MODEL_ID}","input":"Hi","max_output_tokens":{budget}}}"#);
+    let prompt = rig
+        .plan(Endpoint::Responses, &body(1))
+        .expect("a plan")
+        .prompt
+        .token_count();
+    rig.backend.set_context_length(prompt + 10);
+    assert_eq!(
+        rig.plan(Endpoint::Responses, &body(10)).expect("a plan").max_new_tokens,
+        10
+    );
+    let message = format!(
+        "This model's maximum context length is {} tokens. However, you requested {} tokens ({prompt} in the \
+         messages, 11 in the completion).",
+        prompt + 10,
+        prompt + 11
+    );
+    assert_surface_error(
+        rig.plan(Endpoint::Responses, &body(11)),
+        400,
+        &message,
+        Some("max_output_tokens"),
+    );
+    rig.finish();
+}
+
+#[test]
+fn a_strict_tool_whose_schema_is_refused_ends_the_chain_at_the_grammar_frame() {
+    let rig = Rig::new();
+    let tool = r#","reasoning_effort":"none","tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"},"strict":true}}]"#;
+    assert!(rig.plan(Endpoint::ChatCompletions, &chat(tool)).is_ok());
+    rig.backend.refuse_schemas(Some("no if"));
+    assert_surface_error(
+        rig.plan(Endpoint::ChatCompletions, &chat(tool)),
+        400,
+        "The JSON Schema cannot be enforced: no if",
+        Some("tools[0].function.parameters"),
+    );
+    assert_eq!(rig.frames(), 3);
+    rig.finish();
+}
+
+#[test]
+fn a_check_the_backend_cannot_make_is_unavailable_or_the_servers_error() {
+    let rig = Rig::new();
+    let object = chat(r#","reasoning_effort":"none","response_format":{"type":"json_object"}"#);
+    let schema = chat(
+        r#","reasoning_effort":"none","response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"}}}"#,
+    );
+    for body in [&object, &schema] {
+        rig.backend
+            .set_check_fault(Some(CheckFault::Unavailable("closing".to_owned())));
+        let error = expect_error(rig.plan(Endpoint::ChatCompletions, body));
+        assert_eq!(error, ApiError::engine_unavailable("closing"));
+        assert_eq!(error.status, 503);
+        assert_eq!(rig.frames(), 3);
+        rig.backend.set_check_fault(Some(CheckFault::Failed("boom".to_owned())));
+        let error = expect_error(rig.plan(Endpoint::ChatCompletions, body));
+        assert_eq!(error, ApiError::server_error());
+        assert_eq!(error.status, 500);
+        assert_eq!(rig.frames(), 3);
+    }
+    rig.finish();
+}
+
+#[test]
+fn a_backend_that_drops_its_continuation_gets_the_servers_error() {
+    let rig = Rig::new();
+    rig.backend.drop_continuations(true);
+    assert_eq!(
+        rig.plan(Endpoint::ChatCompletions, &chat("")),
+        Err(ApiError::server_error())
+    );
+    assert_eq!(rig.count(chat("").as_bytes()), Err(ApiError::server_error()));
+    rig.finish();
+}
+
+/// Runs each frame where it is published, and keeps a panic from leaving the test thread.
+struct Inline;
+
+impl Publisher for Inline {
+    fn publish(&self, mut frame: Box<dyn Frame>) {
+        let ran = catch_unwind(AssertUnwindSafe(|| frame.execute()));
+        drop(ran);
+    }
+}
+
+#[test]
+fn a_step_that_panics_gets_the_servers_error() {
+    let lattice = lattice(Some(1));
+    let backend = ScriptedBackend::on(&lattice);
+    let planner = Planner::new(backend.clone(), RequestDefaults::default(), Arc::new(Inline)).expect("a planner");
+    backend.set_check_fault(Some(CheckFault::Panic));
+    let object = chat(r#","reasoning_effort":"none","response_format":{"type":"json_object"}"#);
+    let (tx, rx) = channel();
+    let first = planner.plan(
+        Endpoint::ChatCompletions,
+        object.into_bytes(),
+        Box::new(move |outcome| {
+            tx.send(outcome).ok();
+        }),
+    );
+    Inline.publish(first);
+    let outcome = rx.recv_timeout(PATIENCE).expect("the chain answered");
+    assert_eq!(outcome.expect_err("an error"), ApiError::server_error());
+    // The outcome was called once: nothing else is waiting.
+    assert!(rx.try_recv().is_err());
+    backend.release();
+    lattice.close();
+}
+
+#[test]
+fn a_leading_byte_order_mark_is_skipped_on_each_surface() {
+    let rig = Rig::new();
+    let mark = "\u{feff}";
+    let responses = format!(r#"{{"model":"{MODEL_ID}","input":"Hi"}}"#);
+    for (endpoint, body) in [
+        (Endpoint::ChatCompletions, chat("")),
+        (Endpoint::Messages, messages("")),
+        (Endpoint::Responses, responses),
+    ] {
+        let plain = rig.plan(endpoint, &body).expect("a plan");
+        let marked = rig
+            .plan(endpoint, &format!("{mark}{body}"))
+            .expect("a plan with the mark");
+        assert_eq!(marked.prompt.text, plain.prompt.text);
+    }
+    let count = format!(r#"{{"model":"{MODEL_ID}","messages":{HI}}}"#);
+    assert_eq!(
+        rig.count(format!("{mark}{count}").as_bytes()),
+        Ok(HI_PROMPT.chars().count())
+    );
+    // Only one mark is skipped.
+    let error = expect_error(rig.plan(Endpoint::ChatCompletions, &format!("{mark}{mark}{}", chat(""))));
+    assert_eq!(error, ApiError::unparsable_body());
+    rig.finish();
+}
+
+#[test]
+fn a_plan_is_stamped_with_the_second_its_request_was_mapped() {
+    let rig = Rig::new();
+    let seconds = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs()
+    };
+    let before = seconds();
+    let planned = rig.plan(Endpoint::ChatCompletions, &chat("")).expect("a plan");
+    let after = seconds();
+    assert!(
+        (before..=after).contains(&planned.created),
+        "{before} {} {after}",
+        planned.created
+    );
+    rig.finish();
+}
+
+#[test]
+fn defaults_the_planner_cannot_hold_are_refused_when_it_is_built() {
+    let rig = Rig::new();
+    let built = |defaults: RequestDefaults| Planner::new(rig.backend.clone(), defaults, rig.publisher.clone()).err();
+    let base = RequestDefaults::default();
+    assert_eq!(built(base), None);
+    assert_eq!(
+        built(RequestDefaults { max_tokens: 0, ..base }),
+        Some(DefaultsError::MaxTokens)
+    );
+    assert_eq!(
+        built(RequestDefaults { max_tokens: -5, ..base }),
+        Some(DefaultsError::MaxTokens)
+    );
+    assert_eq!(
+        built(RequestDefaults {
+            temperature: -0.1,
+            ..base
+        }),
+        Some(DefaultsError::Temperature)
+    );
+    assert_eq!(
+        built(RequestDefaults {
+            temperature: f32::NAN,
+            ..base
+        }),
+        Some(DefaultsError::Temperature)
+    );
+    assert_eq!(built(RequestDefaults { top_k: -1, ..base }), Some(DefaultsError::TopK));
+    assert_eq!(built(RequestDefaults { top_p: 0.0, ..base }), Some(DefaultsError::TopP));
+    assert_eq!(built(RequestDefaults { top_p: 1.5, ..base }), Some(DefaultsError::TopP));
+    // The edges that are held.
+    assert_eq!(
+        built(RequestDefaults {
+            max_tokens: 1,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0
+        }),
+        None
+    );
+    rig.finish();
+}
+
+#[test]
+fn count_tokens_refuses_a_conversation_the_template_refuses_in_the_anthropic_format() {
+    let fixture = roomy();
+    let body = format!(
+        r#"{{"model":"{MODEL_ID}","messages":[{{"role":"user","content":"<tool_response>\\nx\\n</tool_response>"}}]}}"#
+    );
+    let answer = fixture.post("/v1/messages/count_tokens", JSON, &body);
+    assert_json(
+        &answer,
+        400,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"No user query found in messages."}}"#,
+    );
+    fixture.finish();
+}
+
+#[test]
+fn a_chain_that_loses_its_outcome_is_answered_with_the_servers_error_over_http() {
+    let fixture = roomy();
+    fixture.backend.drop_continuations(true);
+    let body = format!(r#"{{"model":"{MODEL_ID}","messages":{HI}}}"#);
+    let openai = r#"{"error":{"message":"The server had an error while processing your request.","type":"server_error","param":null,"code":null}}"#;
+    assert_json(&fixture.post("/v1/chat/completions", JSON, &body), 500, openai);
+    let anthropic = r#"{"type":"error","error":{"type":"api_error","message":"The server had an error while processing your request."}}"#;
+    assert_json(&fixture.post("/v1/messages/count_tokens", JSON, &body), 500, anthropic);
     fixture.finish();
 }

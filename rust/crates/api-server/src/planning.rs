@@ -12,15 +12,20 @@
 //! budget against the context. Counting tokens (`count_tokens`) runs the same chain without the grammar and the plan:
 //! it ends with the number of the prompt's tokens.
 //!
+//! The outcome is guarded: if a step panics, or a backend drops its continuation without calling it, the guard answers
+//! `ApiError::server_error()` when the chain's state is dropped, so a request never goes unanswered.
+//!
 //! The prompt is encoded in one step, by [`Backend::encode_prompt`]: the backend takes the rendered prompt whole, so
 //! a prompt cannot be cut at message boundaries into several encodings from here.
 
 use std::collections::hash_map::RandomState;
-use std::fmt::{self, Debug, Formatter};
+use std::error::Error;
+use std::fmt::{self, Debug, Display, Formatter};
 use std::hash::BuildHasher;
 use std::str::from_utf8;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use euhedral_core::frames::Frame;
 use euhedral_core::ingest::QueueIngestSink;
@@ -45,6 +50,49 @@ pub struct RequestDefaults {
     pub top_p: f32,
     /// The completion budget of a request that states none, before the context caps it.
     pub max_tokens: i32,
+}
+
+/// A default [`RequestDefaults`] cannot hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefaultsError {
+    /// The completion budget is below 1.
+    MaxTokens,
+    /// The temperature is negative or not a number.
+    Temperature,
+    /// The top-k is negative.
+    TopK,
+    /// The top-p is not in (0, 1].
+    TopP,
+}
+
+impl Display for DefaultsError {
+    fn fmt(&self, out: &mut Formatter<'_>) -> fmt::Result {
+        out.write_str(match self {
+            DefaultsError::MaxTokens => "the default max_tokens must be at least 1",
+            DefaultsError::Temperature => "the default temperature must not be negative",
+            DefaultsError::TopK => "the default top_k must not be negative",
+            DefaultsError::TopP => "the default top_p must be greater than 0 and at most 1",
+        })
+    }
+}
+
+impl Error for DefaultsError {}
+
+impl RequestDefaults {
+    /// Checks the settings, as the server does when it loads them.
+    pub fn validate(&self) -> Result<(), DefaultsError> {
+        if self.max_tokens < 1 {
+            Err(DefaultsError::MaxTokens)
+        } else if self.temperature.is_nan() || self.temperature < 0.0 {
+            Err(DefaultsError::Temperature)
+        } else if self.top_k < 0 {
+            Err(DefaultsError::TopK)
+        } else if !(self.top_p > 0.0 && self.top_p <= 1.0) {
+            Err(DefaultsError::TopP)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Default for RequestDefaults {
@@ -100,6 +148,8 @@ pub struct Planned {
     /// Names the request in logs; the surfaces derive their public ids from it. 32 lower-case hex digits.
     pub id: String,
     pub endpoint: Endpoint,
+    /// When the request was mapped, in seconds since the epoch: what the OpenAI and Responses replies call `created`.
+    pub created: u64,
     /// The mapped request: the stops, the tools, the response format, `stream`, `return_token_ids`.
     pub request: GenerationRequest,
     pub extras: Extras,
@@ -125,24 +175,52 @@ enum Parsed {
 
 /// The request as mapped, with what its reply needs of the surface.
 struct Mapped {
+    created: u64,
     request: GenerationRequest,
     endpoint: Endpoint,
     extras: Extras,
 }
 
+/// An outcome that is called once: with the result it is given, or, if it is dropped before (a step panicked, a
+/// backend let go of its continuation), with the server's error.
+struct Guard<T>(Option<Outcome<T>>);
+
+impl<T> Guard<T> {
+    fn finish(mut self, result: Result<T, ApiError>) {
+        if let Some(outcome) = self.0.take() {
+            outcome(result);
+        }
+    }
+}
+
+impl<T> Drop for Guard<T> {
+    fn drop(&mut self) {
+        if let Some(outcome) = self.0.take() {
+            outcome(Err(ApiError::server_error()));
+        }
+    }
+}
+
 /// How the chain ends.
 enum Finish {
-    Plan(Outcome<Planned>),
-    Count(Outcome<usize>),
+    Plan(Guard<Planned>),
+    Count(Guard<usize>),
 }
 
 impl Finish {
     fn fail(self, error: ApiError) {
         match self {
-            Finish::Plan(outcome) => outcome(Err(error)),
-            Finish::Count(outcome) => outcome(Err(error)),
+            Finish::Plan(guard) => guard.finish(Err(error)),
+            Finish::Count(guard) => guard.finish(Err(error)),
         }
     }
+}
+
+/// Seconds since the epoch now.
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// A frame of the chain: `work` runs on a worker with the chain's end, or, if the lattice refuses the frame, the end
@@ -210,8 +288,13 @@ impl Debug for Planner {
 }
 
 impl Planner {
-    /// A planner over `backend` whose frames go to `publisher`.
-    pub fn new(backend: Arc<dyn Backend>, defaults: RequestDefaults, publisher: Arc<dyn Publisher>) -> Planner {
+    /// A planner over `backend` whose frames go to `publisher`, or the setting `defaults` cannot hold.
+    pub fn new(
+        backend: Arc<dyn Backend>,
+        defaults: RequestDefaults,
+        publisher: Arc<dyn Publisher>,
+    ) -> Result<Planner, DefaultsError> {
+        defaults.validate()?;
         let mapper_defaults = Defaults {
             model: backend.model_id().to_owned(),
             temperature: defaults.temperature,
@@ -219,14 +302,14 @@ impl Planner {
             top_k: defaults.top_k,
             max_tokens: defaults.max_tokens,
         };
-        Planner {
+        Ok(Planner {
             inner: Arc::new(Inner {
                 backend,
                 publisher,
                 defaults: mapper_defaults,
                 max_tokens: defaults.max_tokens,
             }),
-        }
+        })
     }
 
     /// The chain of a generating request: returns its first frame, which the caller publishes. `outcome` is called
@@ -237,12 +320,12 @@ impl Planner {
             Endpoint::Messages => Kind::Messages,
             Endpoint::Responses => Kind::Responses,
         };
-        self.parse(kind, body, Finish::Plan(outcome))
+        self.parse(kind, body, Finish::Plan(Guard(Some(outcome))))
     }
 
     /// The chain of a `count_tokens` request: its first frame; `outcome` is called once with the prompt's token count.
     pub fn count_tokens(&self, body: Vec<u8>, outcome: Outcome<usize>) -> Box<dyn Frame> {
-        self.parse(Kind::Count, body, Finish::Count(outcome))
+        self.parse(Kind::Count, body, Finish::Count(Guard(Some(outcome))))
     }
 
     fn publish(&self, frame: Box<dyn Frame>) {
@@ -254,6 +337,8 @@ impl Planner {
         step(finish, move |finish| {
             let parsed = from_utf8(&body)
                 .map_err(|_| ApiError::unparsable_body())
+                // One leading byte order mark is skipped, as the JSON readers of the surfaces' own servers do.
+                .map(|text| text.strip_prefix('\u{feff}').unwrap_or(text))
                 .and_then(|text| match kind {
                     Kind::Chat => ChatCompletionRequest::parse(text).map(Parsed::Chat),
                     Kind::Messages => MessagesRequest::parse(text).map(Parsed::Messages),
@@ -271,8 +356,10 @@ impl Planner {
         let planner = self.clone();
         step(finish, move |finish| {
             let defaults = &planner.inner.defaults;
+            let created = now_seconds();
             let mapped = match parsed {
                 Parsed::Chat(request) => map_chat(request, defaults).map(|chat| Mapped {
+                    created,
                     request: chat.generation,
                     endpoint: Endpoint::ChatCompletions,
                     extras: Extras::Chat {
@@ -280,11 +367,13 @@ impl Planner {
                     },
                 }),
                 Parsed::Messages(request) => map_messages(request, defaults).map(|request| Mapped {
+                    created,
                     request,
                     endpoint: Endpoint::Messages,
                     extras: Extras::Messages,
                 }),
                 Parsed::Responses(request) => map_responses(request, defaults).map(|responses| Mapped {
+                    created,
                     request: responses.generation,
                     endpoint: Endpoint::Responses,
                     extras: Extras::Responses {
@@ -293,6 +382,7 @@ impl Planner {
                     },
                 }),
                 Parsed::Count(request) => map_count_tokens(request, defaults).map(|request| Mapped {
+                    created,
                     request,
                     endpoint: Endpoint::Messages,
                     extras: Extras::Messages,
@@ -339,17 +429,17 @@ impl Planner {
     fn encode(&self, mapped: Mapped, grammar: Option<String>, prompt: String, finish: Finish) {
         let backend = self.inner.backend.clone();
         match finish {
-            Finish::Count(outcome) => backend.count_tokens(
+            Finish::Count(guard) => backend.count_tokens(
                 prompt,
-                Box::new(move |counted| outcome(counted.map_err(backend_failure))),
+                Box::new(move |counted| guard.finish(counted.map_err(backend_failure))),
             ),
-            Finish::Plan(outcome) => {
+            Finish::Plan(guard) => {
                 let planner = self.clone();
                 backend.encode_prompt(
                     prompt,
                     Box::new(move |encoded| match encoded {
-                        Ok(encoded) => planner.publish(planner.plan_step(mapped, grammar, encoded, outcome)),
-                        Err(error) => outcome(Err(backend_failure(error))),
+                        Ok(encoded) => planner.publish(planner.plan_step(mapped, grammar, encoded, guard)),
+                        Err(error) => guard.finish(Err(backend_failure(error))),
                     }),
                 );
             }
@@ -361,14 +451,14 @@ impl Planner {
         mapped: Mapped,
         grammar: Option<String>,
         encoded: EncodedPrompt,
-        outcome: Outcome<Planned>,
+        guard: Guard<Planned>,
     ) -> Box<dyn Frame> {
         let planner = self.clone();
         once_or_refused(move |ran| {
             if ran {
-                outcome(planner.planned(mapped, grammar, encoded));
+                guard.finish(planner.planned(mapped, grammar, encoded));
             } else {
-                outcome(Err(ApiError::shutting_down()));
+                guard.finish(Err(ApiError::shutting_down()));
             }
         })
     }
@@ -376,6 +466,7 @@ impl Planner {
     /// The completion budget checked against the context, and the plan.
     fn planned(&self, mapped: Mapped, grammar: Option<String>, prompt: EncodedPrompt) -> Result<Planned, ApiError> {
         let Mapped {
+            created,
             request,
             endpoint,
             extras,
@@ -390,6 +481,7 @@ impl Planner {
         Ok(Planned {
             id: new_id(),
             endpoint,
+            created,
             request,
             extras,
             prompt,

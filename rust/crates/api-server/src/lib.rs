@@ -25,5 +25,5 @@ pub use backend::{
 };
 pub use frames::once;
 pub use limits::Limits;
-pub use planning::{Endpoint, Extras, Outcome, Planned, Planner, Publisher, RequestDefaults};
+pub use planning::{DefaultsError, Endpoint, Extras, Outcome, Planned, Planner, Publisher, RequestDefaults};
 pub use server::{ApiConfig, ApiServer, start};
