@@ -361,7 +361,7 @@ fn a_request_gets_the_grammar_of_its_format_and_tools() {
     let checker = checker();
     let plain = ToolCalling::disabled();
     let schema = ResponseFormat::JsonSchema {
-        name: "p".to_owned(),
+        name: Some("p".to_owned()),
         schema: json(r#"{"type":"object","properties":{"age":{"type":"integer"}},"required":["age"]}"#),
         schema_param: "response_format.json_schema.schema".to_owned(),
     };
@@ -409,7 +409,7 @@ fn a_schema_llguidance_refuses_is_an_unenforceable_schema_at_its_parameter() {
         ),
     ] {
         let format = ResponseFormat::JsonSchema {
-            name: "p".to_owned(),
+            name: Some("p".to_owned()),
             schema: json(schema),
             schema_param: param.to_owned(),
         };
