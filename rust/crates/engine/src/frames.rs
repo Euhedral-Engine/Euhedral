@@ -28,6 +28,8 @@ pub(crate) enum Kind {
     Owner,
     /// The arrival of a teacher-forced step's logits row.
     Logits,
+    /// The selection of a sampled request's token from its logits row, on the host.
+    Sample,
     /// The running of the work a parked quantum waited for on the owner's lane.
     Reaped,
 }

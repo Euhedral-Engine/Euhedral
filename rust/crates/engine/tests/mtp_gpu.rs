@@ -37,6 +37,7 @@ use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSectio
 use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
+use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
 use typed::Typed;
@@ -203,6 +204,7 @@ fn generate(
             max_tokens,
             stop_tokens: stop_tokens.to_vec(),
             speculation,
+            sampling: SamplingConfig::greedy(0),
             listener: Box::new(Recorder {
                 tokens: Vec::new(),
                 events: Vec::new(),

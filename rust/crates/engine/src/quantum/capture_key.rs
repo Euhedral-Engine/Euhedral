@@ -12,6 +12,7 @@ use euhedral_inference_cuda::AllocationId;
 
 use crate::plan::View;
 use crate::stages::QuantumKind;
+use crate::stages::sampling::SelectedRows;
 
 /// Keys with the same value record and replay the same graph.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -23,6 +24,9 @@ pub struct CaptureKey {
     pub logits: usize,
     /// Whether the quantum selects: its argmax and the copy of its keys are in the graph.
     pub selects: bool,
+    /// Which logits rows the quantum copies to the host's readback (a sampling request's quantum, whose graph holds
+    /// the copy and no argmax): the readback's allocation is among the `buffer_generations`.
+    pub copies_rows: Option<SelectedRows>,
     pub seeds_draft: bool,
     /// The address of the rows that seed a draft quantum (a recursive draft's hidden).
     pub draft_seed: Option<u64>,
@@ -68,6 +72,7 @@ impl CaptureKey {
             rows,
             logits,
             selects,
+            copies_rows,
             seeds_draft,
             draft_seed,
             draft_read,
@@ -101,6 +106,11 @@ impl CaptureKey {
         bytes.extend_from_slice(&(*rows as u64).to_le_bytes());
         bytes.extend_from_slice(&(*logits as u64).to_le_bytes());
         bytes.push(u8::from(*selects));
+        bytes.push(match copies_rows {
+            None => 0,
+            Some(SelectedRows::Last) => 1,
+            Some(SelectedRows::Each) => 2,
+        });
         bytes.push(u8::from(*seeds_draft));
         push_option(&mut bytes, draft_seed.map(u64::to_le_bytes));
         push_option(&mut bytes, draft_read.map(|slot| [slot]));
@@ -207,6 +217,7 @@ mod tests {
             rows: 4,
             logits: 4,
             selects: true,
+            copies_rows: None,
             seeds_draft: false,
             draft_seed: Some(0x10),
             draft_read: Some(1),
@@ -244,6 +255,8 @@ mod tests {
             ("rows", |k| k.rows = 5),
             ("logits", |k| k.logits = 5),
             ("selects", |k| k.selects = false),
+            ("copies_rows last", |k| k.copies_rows = Some(SelectedRows::Last)),
+            ("copies_rows each", |k| k.copies_rows = Some(SelectedRows::Each)),
             ("seeds_draft", |k| k.seeds_draft = true),
             ("draft_seed", |k| k.draft_seed = Some(0x11)),
             ("draft_seed absent", |k| k.draft_seed = None),
