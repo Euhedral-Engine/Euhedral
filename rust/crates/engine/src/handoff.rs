@@ -188,6 +188,7 @@ impl<T> Drop for Handoff<T> {
     reason = "the tests start threads to race senders, and join them"
 )]
 mod tests {
+    #[allow(clippy::disallowed_types, reason = "the test lines two threads up so that they race")]
     use std::sync::Barrier;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
@@ -322,6 +323,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_types, reason = "the test lines two threads up so that they race")]
     fn a_race_between_the_abandon_and_the_arrival_frees_exactly_once() {
         for _ in 0..500 {
             let freed = Arc::new(AtomicUsize::new(0));

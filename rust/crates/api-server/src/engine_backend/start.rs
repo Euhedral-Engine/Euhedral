@@ -174,7 +174,7 @@ fn artifact_problem(path: &Path) -> Option<String> {
 /// with [`ready`](EngineStarting::ready), on the thread that started it.
 pub struct EngineStarting {
     pending: Pending,
-    tokenizer: Option<Tokenizer>,
+    tokenizer: Tokenizer,
     settings: Settings,
 }
 
@@ -188,8 +188,8 @@ struct Pending {
 
 impl Pending {
     /// The owner, for a start that ended (or that this takes over).
-    fn owner(&mut self) -> RuntimeOwner {
-        self.owner.take().expect("the owner is taken once")
+    fn owner(&mut self) -> Option<RuntimeOwner> {
+        self.owner.take()
     }
 
     /// Ends the start without serving it. Nothing waits here beyond what the owner's drop does.
@@ -232,7 +232,7 @@ pub fn begin_start(
             owner: Some(owner),
             ready,
         },
-        tokenizer: Some(tokenizer),
+        tokenizer,
         settings: settings.clone(),
     })
 }
@@ -253,7 +253,7 @@ impl Debug for EngineHost {
 
 impl EngineStarting {
     /// The loaded engine, or this still loading (`Err`), without waiting.
-    pub fn ready(mut self) -> Result<Result<EngineHost, StartError>, Box<EngineStarting>> {
+    pub fn ready(self) -> Result<Result<EngineHost, StartError>, Box<EngineStarting>> {
         match self.pending.ready.take() {
             Some(loaded) => Ok(self.host(loaded)),
             None => Err(Box::new(self)),
@@ -278,24 +278,22 @@ impl EngineStarting {
         }
     }
 
-    /// Frees a runtime that will not be served, through its owner.
-    fn stop(&mut self, runtime: Arc<EngineRuntime>) {
-        if let Err(error) = self.pending.owner().shutdown(runtime) {
-            log::error!("stopping the engine that did not start failed: {error}");
-        }
-    }
-
     fn host(mut self, loaded: Result<Arc<EngineRuntime>, EngineError>) -> Result<EngineHost, StartError> {
         let runtime = match loaded {
             Ok(runtime) => runtime,
             // Nothing was loaded; the owner's drop closes what started.
             Err(error) => return Err(StartError::from(error)),
         };
+        let Some(owner) = self.pending.owner() else {
+            return Err(StartError::Engine("the engine's owner is gone".to_owned()));
+        };
         let plan = runtime.plan();
         let context_length = plan.max_context_tokens.min(runtime.config().max_position_embeddings);
         let sink = Arc::new(QueueIngestSink::new());
         if let Err(error) = runtime.lattice().add_upstream(sink.delegate()) {
-            self.stop(runtime);
+            if let Err(stop) = owner.shutdown(runtime) {
+                log::error!("stopping the engine that did not start failed: {stop}");
+            }
             return Err(StartError::Engine(format!("the lattice takes no backend: {error:?}")));
         }
         let engine = Arc::new(RuntimeEngine {
@@ -310,12 +308,12 @@ impl EngineStarting {
         });
         let backend = Arc::new(EngineBackend::new(
             engine,
-            Arc::new(self.tokenizer.take().expect("the tokenizer is taken once")),
+            Arc::new(self.tokenizer),
             sink,
             self.settings.model.name.clone(),
         ));
         Ok(EngineHost {
-            owner: self.pending.owner(),
+            owner,
             runtime,
             backend,
         })
