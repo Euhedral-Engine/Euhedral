@@ -160,6 +160,7 @@ impl GenerationListener for Probe {
         };
         let ending = match outcome.reason {
             FinishReason::Failed(reason) => Ending::Failed(reason),
+            FinishReason::Cancelled => Ending::Failed("the request was cancelled".to_string()),
             FinishReason::Length | FinishReason::Stop | FinishReason::ContextFull => Ending::Completed,
         };
         recorder.finished = Some((at, ending));

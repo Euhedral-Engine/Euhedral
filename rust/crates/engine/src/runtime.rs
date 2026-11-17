@@ -28,7 +28,7 @@ use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
 use crate::error::EngineError;
 use crate::generation::GREEDY_DEPTH;
-use crate::generation::{AdmissionError, Generation, GenerationRequest, LogitsSink};
+use crate::generation::{AdmissionError, CancelHandle, Generation, GenerationRequest, LogitsSink};
 use crate::handoff::Handoff;
 use crate::kernels::kernel_sources;
 use crate::model::{ModelConfig, Weights};
@@ -417,6 +417,14 @@ impl EngineRuntime {
     /// frames on the engine's lattice, and its listener is told of it there. The sequence takes one request at a time;
     /// it starts each from nothing, whatever the one before left in it.
     pub fn generate(&self, request: GenerationRequest) -> Result<(), AdmissionError> {
+        self.generation.generate(request).map(drop)
+    }
+
+    /// As [`EngineRuntime::generate`], and returns the handle that cancels the generation: from any thread, from the
+    /// listener too, without waiting, taking effect at the next quantum boundary. The generation then ends through its
+    /// listener, once, as [`FinishReason::Cancelled`](crate::generation::FinishReason), with the tokens reported until
+    /// then, and the sequence takes the next request.
+    pub fn generate_cancellable(&self, request: GenerationRequest) -> Result<CancelHandle, AdmissionError> {
         self.generation.generate(request)
     }
 
