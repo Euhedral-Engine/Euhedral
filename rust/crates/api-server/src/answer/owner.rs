@@ -121,12 +121,7 @@ pub(super) struct Owner {
 }
 
 impl Owner {
-    pub(super) fn new(
-        inbox: Consumer<Command, Single>,
-        responder: Responder,
-        queued_ns: u64,
-        epoch: Instant,
-    ) -> Owner {
+    pub(super) fn new(inbox: Consumer<Command, Single>, responder: Responder, queued_ns: u64, epoch: Instant) -> Owner {
         Owner {
             inbox,
             responder: Some(responder),

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use common::{Fixture, PATIENCE, Raw, headers, json_headers, text};
 use euhedral_inference_api_server::scripted::{LaunchFault, MODEL_ID, Script};
-use euhedral_inference_api_server::{BackendError, Counts, Generation, Limits};
+use euhedral_inference_api_server::{Backend, BackendError, Counts, Generation, Limits};
 use euhedral_net::Response;
 
 const CHAT: &str = "/v1/chat/completions";
@@ -730,7 +730,10 @@ fn a_client_leaving_as_its_request_starts_still_cancels_the_generation() {
     drop(raw);
     // The owner has heard the client leave (the request is recorded as cancelled) before the open returns.
     until("the owner heard the client leave", || {
-        text(&fx.get("/metrics")).contains(r#"outcome="cancelled"}"#)
+        fx.server
+            .metrics()
+            .render(MODEL_ID, 4096, &fx.backend.engine_report(), 0)
+            .contains(r#"outcome="cancelled"}"#)
     });
     fx.backend.release_open();
     until("the generation was cancelled", || {
@@ -765,7 +768,12 @@ fn invalid_tool_calls_cancel_inside_the_listener_too() {
     let fx = Fixture::with(limits(), Some(2));
     fx.backend.set_quantum(8);
     fx.backend.set_script(tokens(
-        &["<tool_call>\n<function=nope>\n", "</function>\n</tool_call>", "more", "more"],
+        &[
+            "<tool_call>\n<function=nope>\n",
+            "</function>\n</tool_call>",
+            "more",
+            "more",
+        ],
         true,
     ));
     let response = chat(&fx, &tools(r#","return_token_ids":true"#));
@@ -809,7 +817,9 @@ fn a_generation_that_finishes_after_it_was_abandoned_is_still_closed() {
     settle(&fx);
     assert_eq!(fx.backend.generations()[0].close_count(), 0);
     assert!(fx.backend.generations()[0].finish_held());
-    until("closed after the late end", || fx.backend.generations()[0].close_count() == 1);
+    until("closed after the late end", || {
+        fx.backend.generations()[0].close_count() == 1
+    });
     drop(raw);
     fx.finish_after_stop();
 }

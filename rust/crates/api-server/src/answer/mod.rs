@@ -328,7 +328,10 @@ impl Listener {
 
     fn end(&mut self, result: Result<GenerationResult, BackendError>) -> Ending {
         let engine_cancelled = !(self.pipeline.stop_matched() || self.pipeline.call_limit_reached())
-            && self.generation.as_ref().is_some_and(|generation| generation.is_cancelled());
+            && self
+                .generation
+                .as_ref()
+                .is_some_and(|generation| generation.is_cancelled());
         let mut settled = None;
         let mut result = result;
         if let Ok(done) = &result
