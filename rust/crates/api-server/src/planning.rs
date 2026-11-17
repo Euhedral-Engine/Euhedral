@@ -391,7 +391,12 @@ impl Planner {
             match mapped {
                 Ok(mapped) => {
                     let next = match finish {
-                        Finish::Plan(_) => planner.grammar(mapped, finish),
+                        Finish::Plan(_) => {
+                            if let Some(error) = planner.inner.backend.refusal(mapped.endpoint, &mapped.request) {
+                                return finish.fail(error);
+                            }
+                            planner.grammar(mapped, finish)
+                        }
                         Finish::Count(_) => planner.template(mapped, None, finish),
                     };
                     planner.publish(next);

@@ -12,6 +12,11 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
+use euhedral_inference_api_protocol::ApiError;
+use euhedral_inference_api_protocol::generation::GenerationRequest;
+
+use crate::planning::Endpoint;
+
 /// The rest of a request, run with the outcome of one piece of work. It runs exactly once, on a worker, and must not
 /// wait; if the work cannot be offered to the lattice it runs with an error instead.
 pub type Next<T> = Box<dyn FnOnce(T) + Send>;
@@ -229,6 +234,13 @@ pub trait Backend: Send + Sync + 'static {
     /// reads counters and sizes the engine already holds.
     fn engine_report(&self) -> EngineReport {
         EngineReport::default()
+    }
+
+    /// Why the engine cannot run this request, as the surface's error, or `None` when it can. Asked once the request is
+    /// mapped and before anything is compiled or encoded for it; a request that is only counted is not asked.
+    fn refusal(&self, endpoint: Endpoint, request: &GenerationRequest) -> Option<ApiError> {
+        let _ = (endpoint, request);
+        None
     }
 
     /// Encodes a rendered prompt on the workers, so that the plan counts its tokens and the generation runs them: a
