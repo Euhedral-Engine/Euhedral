@@ -5,6 +5,7 @@
 //! `tokenizers` library (byte-level BPE, NFC, one isolated split); decoding is [`TokenStream`], which holds back an
 //! incomplete UTF-8 suffix between tokens.
 
+mod artifact;
 mod byte_level;
 mod error;
 mod files;
@@ -12,6 +13,7 @@ mod lossy;
 mod stream;
 mod tokenizer;
 
+pub use artifact::{ArtifactTokenizerError, read_artifact_tokenizer};
 pub use error::TokenizerError;
 pub use stream::TokenStream;
 pub use tokenizer::Tokenizer;

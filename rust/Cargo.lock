@@ -421,10 +421,14 @@ dependencies = [
  "euhedral-hardware-utils",
  "euhedral-inference-api-protocol",
  "euhedral-inference-api-server",
+ "euhedral-inference-engine",
+ "euhedral-inference-settings",
+ "euhedral-inference-tokenizer",
  "euhedral-io",
  "euhedral-net",
  "log",
  "sha2",
+ "test-support",
 ]
 
 [[package]]
