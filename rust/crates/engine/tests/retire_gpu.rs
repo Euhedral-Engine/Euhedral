@@ -168,7 +168,7 @@ impl World {
             NonZeroUsize::new(2).unwrap(),
             Duration::from_secs(1),
         );
-        let completions = Completions::new(Arc::clone(&pool));
+        let completions = Completions::new(&pool);
         lattice
             .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
             .unwrap();

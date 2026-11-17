@@ -179,7 +179,7 @@ fn rig(markers: u32) -> Rig {
         )
     });
     let lanes = open_shared_lanes(&gpu, &specs).unwrap();
-    let completions = Completions::new(lanes.queues.clone());
+    let completions = Completions::new(&lanes.queues);
     let queue = MpmcQueue::<Box<dyn Frame>>::bounded(1024);
     let frames: Consumer<Box<dyn Frame>, Multi> = queue.consumer();
     let mut spec = StageGraphSpec::new();
