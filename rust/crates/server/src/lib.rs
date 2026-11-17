@@ -208,7 +208,10 @@ pub fn serve(
             return EXIT_START_FAILED;
         }
     };
-    log::info!("Listening on port {}, serving model {model}", server.local_addr().port());
+    log::info!(
+        "Listening on port {}, serving model {model}",
+        server.local_addr().port()
+    );
     let code = wait_for_stop(server.local_addr());
     log::info!("{}: shutting down", signal_name(code));
     let (stopped, reported) = channel();
@@ -239,17 +242,17 @@ fn now_seconds() -> i64 {
 }
 
 /// Prints `text` on the error stream.
-#[allow(clippy::print_stderr, reason = "the report of a failed start is the process's output")]
+#[allow(
+    clippy::print_stderr,
+    reason = "the report of a failed start is the process's output"
+)]
 fn report(text: &str) {
     eprintln!("{text}");
 }
 
 /// The settings the file named by `--config` (or `--config=`, else `EUHEDRAL_CONFIG`) and the environment give; on
 /// failure every problem, each as one line.
-pub fn load_settings(
-    args: &[OsString],
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Result<Settings, Vec<String>> {
+pub fn load_settings(args: &[OsString], env: &dyn Fn(&str) -> Option<String>) -> Result<Settings, Vec<String>> {
     euhedral_inference_settings::load(args, env)
         .map_err(|errors| errors.0.iter().map(|problem| problem.message().to_owned()).collect())
 }
@@ -261,7 +264,10 @@ pub fn ignored_arguments(args: &[OsString]) -> Vec<String> {
     while let Some(arg) = rest.next() {
         if arg == "--config" {
             rest.next();
-        } else if !arg.to_str().is_some_and(|text| text.starts_with("--config=")) {
+        } else if !arg
+            .to_str()
+            .is_some_and(|text| text.starts_with("--config=") || text.starts_with("--scripted-backend"))
+        {
             ignored.push(arg.to_string_lossy().into_owned());
         }
     }

@@ -3,11 +3,11 @@
 //! second one ends the process at once with the same code, without waiting for the stop in progress.
 
 #[cfg(unix)]
+use signal_hook::iterator::Signals as Delivered;
+#[cfg(unix)]
 use std::fmt::{self, Debug, Formatter};
 #[cfg(unix)]
 use std::io;
-#[cfg(unix)]
-use signal_hook::iterator::Signals as Delivered;
 
 /// The exit code of a stop by SIGTERM.
 const TERM: u8 = crate::EXIT_SIGTERM;

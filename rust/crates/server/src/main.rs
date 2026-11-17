@@ -26,7 +26,7 @@ use std::process::ExitCode;
 use euhedral_inference_server::scripted::{script_named, start_with};
 use euhedral_inference_server::signals::install;
 use euhedral_inference_server::{
-    EXIT_INVALID_SETTINGS, EXIT_START_FAILED, Started, StartError, ignored_arguments, install_logger, load_settings,
+    EXIT_INVALID_SETTINGS, EXIT_START_FAILED, StartError, Started, ignored_arguments, install_logger, load_settings,
     serve,
 };
 use euhedral_inference_settings::{Settings, process_env};
@@ -73,11 +73,7 @@ fn main() -> ExitCode {
             eprintln!("unknown scripted backend {name}");
             return ExitCode::from(EXIT_INVALID_SETTINGS);
         };
-        return ExitCode::from(serve(
-            &settings,
-            |_| start_with(script),
-            wait,
-        ));
+        return ExitCode::from(serve(&settings, |_| start_with(script), wait));
     }
     ExitCode::from(serve(&settings, start_backend, wait))
 }

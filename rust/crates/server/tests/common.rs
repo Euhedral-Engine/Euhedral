@@ -9,6 +9,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use euhedral_inference_api_server::scripted::MODEL_ID;
@@ -19,15 +20,24 @@ pub const PATIENCE: Duration = Duration::from_secs(30);
 /// The whole of one exchange: `request` sent, the answer read until the server closes (`Connection: close`) or the
 /// patience ends; what was read either way.
 pub fn exchange(addr: SocketAddr, method: &str, target: &str, body: Option<&str>) -> String {
-    let mut stream = TcpStream::connect_timeout(&addr, PATIENCE).expect("a connection");
-    stream.set_read_timeout(Some(Duration::from_millis(200))).expect("a timeout");
+    try_exchange(addr, method, target, body).unwrap_or_else(|error| panic!("{method} {target}: {error}"))
+}
+
+/// [`exchange`], reporting a connection that fails or an empty answer instead of panicking.
+pub fn try_exchange(addr: SocketAddr, method: &str, target: &str, body: Option<&str>) -> Result<String, String> {
+    let mut stream = TcpStream::connect_timeout(&addr, PATIENCE).map_err(|error| format!("connecting: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|error| error.to_string())?;
     let body = body.unwrap_or("");
     let request = format!(
         "{method} {target} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(request.as_bytes()).expect("a request written");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("writing: {error}"))?;
     let mut text = Vec::new();
     let deadline = Instant::now() + PATIENCE;
     let mut chunk = [0_u8; 4096];
@@ -35,12 +45,18 @@ pub fn exchange(addr: SocketAddr, method: &str, target: &str, body: Option<&str>
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => text.extend_from_slice(&chunk[..count]),
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
-            Err(error) => panic!("reading the answer to {method} {target}: {error}"),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(format!("reading: {error}")),
         }
     }
-    assert!(!text.is_empty(), "no answer to {method} {target}");
-    String::from_utf8_lossy(&text).into_owned()
+    if text.is_empty() {
+        return Err("no answer".to_owned());
+    }
+    Ok(String::from_utf8_lossy(&text).into_owned())
 }
 
 pub fn status(answer: &str) -> u16 {
@@ -72,6 +88,6 @@ pub fn until(what: &str, mut check: impl FnMut() -> bool) {
     let deadline = Instant::now() + PATIENCE;
     while !check() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(10));
+        sleep(Duration::from_millis(10));
     }
 }

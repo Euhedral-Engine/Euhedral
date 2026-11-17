@@ -10,6 +10,7 @@
 mod common;
 
 use std::cell::Cell;
+use std::fs::write;
 use std::net::TcpListener;
 use std::rc::Rc;
 use std::sync::mpsc::channel;
@@ -22,7 +23,7 @@ use euhedral_inference_server::scripted::{start, start_with};
 use euhedral_inference_server::{
     EXIT_SIGINT, EXIT_SIGTERM, EXIT_START_FAILED, StartError, defaults, limits, load_settings, serve,
 };
-use euhedral_inference_settings::{ModelSettings, Settings};
+use euhedral_inference_settings::{ByteSize, ModelSettings, Settings};
 
 const CHAT: &str = "/v1/chat/completions";
 
@@ -75,18 +76,33 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one_within_the_s
         |_| start_with(Script::Hung),
         |addr| {
             let running = clients.clone();
-            spawn(move || running.send(("running", exchange(addr, "POST", CHAT, Some(&chat(true, 3000))))).ok());
-            until("the first request to run", || gauge(addr, "euhedral_generations_active") == Some(1.0));
+            spawn(move || {
+                running
+                    .send(("running", exchange(addr, "POST", CHAT, Some(&chat(true, 3000)))))
+                    .ok()
+            });
+            until("the first request to run", || {
+                gauge(addr, "euhedral_generations_active") == Some(1.0)
+            });
             let queued = clients.clone();
-            spawn(move || queued.send(("queued", exchange(addr, "POST", CHAT, Some(&chat(false, 3000))))).ok());
-            until("the second request to wait", || gauge(addr, "euhedral_generations_queued") == Some(1.0));
+            spawn(move || {
+                queued
+                    .send(("queued", exchange(addr, "POST", CHAT, Some(&chat(false, 3000)))))
+                    .ok()
+            });
+            until("the second request to wait", || {
+                gauge(addr, "euhedral_generations_queued") == Some(1.0)
+            });
             EXIT_SIGTERM
         },
     );
     assert_eq!(code, EXIT_SIGTERM);
     // The generation never ends, so the stop waits for it up to the shutdown timeout and no longer.
     let took = started.elapsed();
-    assert!(took < shutdown_timeout + Duration::from_secs(10), "stopping took {took:?}");
+    assert!(
+        took < shutdown_timeout + Duration::from_secs(10),
+        "stopping took {took:?}"
+    );
     drop(clients);
     let mut running = String::new();
     let mut queued = String::new();
@@ -115,7 +131,9 @@ fn a_stop_with_a_generation_that_never_ends_returns_after_the_shutdown_timeout()
         |_| start_with(Script::Hung),
         |addr| {
             spawn(move || exchange(addr, "POST", CHAT, Some(&chat(true, 10))));
-            until("the request to run", || gauge(addr, "euhedral_generations_active") == Some(1.0));
+            until("the request to run", || {
+                gauge(addr, "euhedral_generations_active") == Some(1.0)
+            });
             EXIT_SIGTERM
         },
     );
@@ -164,8 +182,14 @@ fn the_report_of_a_failed_start_names_the_step_the_causes_and_the_action() {
     let mut error = StartError::new("Loading the model", ["cannot open", "no such file"]);
     let report = error.report();
     assert!(report.contains("APPLICATION FAILED TO START"), "{report}");
-    assert!(report.contains("Loading the model failed:\n\n    cannot open\n    caused by: no such file"), "{report}");
-    assert!(report.contains("Action:\n\nCorrect what the message names."), "{report}");
+    assert!(
+        report.contains("Loading the model failed:\n\n    cannot open\n    caused by: no such file"),
+        "{report}"
+    );
+    assert!(
+        report.contains("Action:\n\nCorrect what the message names."),
+        "{report}"
+    );
     error.device = true;
     assert!(error.report().contains("nvidia-smi"));
 }
@@ -173,7 +197,7 @@ fn the_report_of_a_failed_start_names_the_step_the_causes_and_the_action() {
 #[test]
 fn the_limits_and_defaults_come_from_the_settings() {
     let mut settings = settings(Duration::from_secs(7));
-    settings.server.requests.max_body_size = euhedral_inference_settings::ByteSize(2048);
+    settings.server.requests.max_body_size = ByteSize(2048);
     settings.server.requests.timeout = Duration::from_secs(300);
     settings.server.requests.default_max_tokens = 99;
     let limits = limits(&settings);
@@ -189,7 +213,7 @@ fn the_limits_and_defaults_come_from_the_settings() {
 fn a_bad_file_lists_every_problem_on_its_own_line() {
     let directory = tempfile::tempdir().expect("a directory");
     let file = directory.path().join("config.yaml");
-    std::fs::write(
+    write(
         &file,
         "model:\n  artifact: /m.edrl\n  name: n\nserver:\n  port: 0\n  colour: red\ncontext:\n  max-tokens: many\n",
     )
@@ -200,5 +224,8 @@ fn a_bad_file_lists_every_problem_on_its_own_line() {
         assert!(problems.iter().any(|line| line.contains(key)), "{key}: {problems:?}");
     }
     let missing = load_settings(&[], &|_| None).expect_err("no model");
-    assert!(missing.iter().any(|line| line.contains("model.artifact")), "{missing:?}");
+    assert!(
+        missing.iter().any(|line| line.contains("model.artifact")),
+        "{missing:?}"
+    );
 }
