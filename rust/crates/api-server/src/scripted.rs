@@ -94,6 +94,7 @@ pub struct ScriptedBackend {
     launch_fault: Mutex<Option<LaunchFault>>,
     reasoning_tokens: AtomicUsize,
     cached_prompt_tokens: AtomicUsize,
+    prefill_quanta: AtomicUsize,
 }
 
 /// How the grammar and schema checks of a scripted backend break.
@@ -141,6 +142,7 @@ impl ScriptedBackend {
             launch_fault: Mutex::new(None),
             reasoning_tokens: AtomicUsize::new(0),
             cached_prompt_tokens: AtomicUsize::new(0),
+            prefill_quanta: AtomicUsize::new(0),
         })
     }
 
@@ -219,6 +221,11 @@ impl ScriptedBackend {
     pub fn set_counts(&self, reasoning_tokens: usize, cached_prompt_tokens: usize) {
         self.reasoning_tokens.store(reasoning_tokens, Ordering::Release);
         self.cached_prompt_tokens.store(cached_prompt_tokens, Ordering::Release);
+    }
+
+    /// Sets how many prefill quanta the generations opened from now on retire before their first text (none at first).
+    pub fn set_prefill_quanta(&self, quanta: usize) {
+        self.prefill_quanta.store(quanta, Ordering::Release);
     }
 
     fn check_faulted(&self) -> Result<(), BackendError> {
@@ -345,6 +352,7 @@ impl Backend for ScriptedBackend {
             fault: self.launch_fault.lock().unwrap_or_else(PoisonError::into_inner).clone(),
             reasoning_tokens: self.reasoning_tokens.load(Ordering::Acquire),
             cached_prompt_tokens: self.cached_prompt_tokens.load(Ordering::Acquire),
+            prefill_quanta: self.prefill_quanta.load(Ordering::Acquire),
             held: Mutex::new(None),
             quantum: self.quantum.load(Ordering::Acquire),
             sink: self.sink.clone(),
@@ -370,6 +378,7 @@ pub struct ScriptedGeneration {
     fault: Option<LaunchFault>,
     reasoning_tokens: usize,
     cached_prompt_tokens: usize,
+    prefill_quanta: usize,
     /// The listener of a hung generation.
     held: Mutex<Option<Box<dyn TextListener>>>,
     quantum: usize,
@@ -397,6 +406,47 @@ impl ScriptedGeneration {
         match held {
             Some(mut listener) => {
                 listener.finished(Err(BackendError::Failed("finished late".to_owned())));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Gives the held listener of a hung generation `text`, as a step would. Returns whether a listener was held.
+    pub fn emit_held(&self, text: &str) -> bool {
+        match &mut *self.held.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(listener) => {
+                self.emitted.fetch_add(1, Ordering::AcqRel);
+                listener.text(text);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Tells the held listener of a hung generation that a prefill quantum retired.
+    pub fn prefill_held(&self) -> bool {
+        match &mut *self.held.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(listener) => {
+                listener.prefilled();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Ends a hung generation as one that completed: `completion_tokens` sampled, the stop token reached or not.
+    pub fn finish_held_ok(&self, completion_tokens: usize, stop_token: bool) -> bool {
+        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner).take();
+        match held {
+            Some(mut listener) => {
+                listener.finished(Ok(GenerationResult {
+                    completion_tokens,
+                    stop_token_reached: stop_token,
+                    token_ids: Vec::new(),
+                    reasoning_tokens: self.reasoning_tokens,
+                    cached_prompt_tokens: self.cached_prompt_tokens,
+                }));
                 true
             }
             None => false,
@@ -504,6 +554,11 @@ impl Run {
     /// Emits the next chunks or ends, and offers the following step.
     fn step(mut self) {
         let generation = self.generation.clone();
+        if self.index == 0 {
+            for _ in 0..generation.prefill_quanta {
+                self.listener.prefilled();
+            }
+        }
         for _ in 0..generation.quantum {
             let cancelled = generation.is_cancelled();
             if cancelled || self.index == self.max_new_tokens {
@@ -572,6 +627,10 @@ impl Generation for ScriptedGeneration {
             self.sink
                 .offer(once_or_refused(move |ran| if ran { run.step() } else { run.refuse() })),
         );
+    }
+
+    fn cached_prompt_tokens(&self) -> usize {
+        self.cached_prompt_tokens
     }
 
     fn cancel(&self) {

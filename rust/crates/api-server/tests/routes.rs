@@ -313,29 +313,6 @@ fn without_a_ready_backend_each_generation_route_is_unavailable_in_its_surface_f
 }
 
 #[test]
-fn with_a_ready_backend_each_planned_streaming_route_answers_the_placeholder() {
-    let limits = Limits {
-        max_body_bytes: 4096,
-        ..small_limits()
-    };
-    let fixture = Fixture::with(limits, Some(2));
-    let openai = r#"{"error":{"message":"This route is not implemented yet.","type":"server_error","param":null,"code":"not_implemented"}}"#;
-    let anthropic = r#"{"type":"error","error":{"type":"api_error","message":"This route is not implemented yet."}}"#;
-    let user = r#"[{"role":"user","content":"Hi"}]"#;
-    let chat = format!(r#"{{"model":"{MODEL}","stream":true,"messages":{user}}}"#);
-    let responses = format!(r#"{{"model":"{MODEL}","stream":true,"input":"Hi"}}"#);
-    let messages = format!(r#"{{"model":"{MODEL}","stream":true,"max_tokens":8,"messages":{user}}}"#);
-    assert_json(
-        &fixture.post("/v1/chat/completions", Some("application/json; charset=utf-8"), &chat),
-        501,
-        openai,
-    );
-    assert_json(&fixture.post("/v1/responses", JSON, &responses), 501, openai);
-    assert_json(&fixture.post("/v1/messages", JSON, &messages), 501, anthropic);
-    fixture.finish();
-}
-
-#[test]
 fn an_error_has_a_content_type_and_nothing_else_of_its_own() {
     let fixture = Fixture::start();
     let response = fixture.get("/v1/nothing");

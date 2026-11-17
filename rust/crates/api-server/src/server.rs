@@ -80,12 +80,23 @@ impl Debug for ApiServer {
 /// the sink and the timers to the lattice and attaches the listener as a source. Every step of the server is a frame
 /// of the lattice. If it fails, what it attached is completed and nothing is left running.
 pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Result<ApiServer> {
-    // Settings the planner cannot hold are refused before anything is bound or attached.
+    // Settings the planner cannot hold are refused before anything is bound.
     config
         .defaults
         .validate()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let listener = TcpListener::bind(config.address)?;
+    start_on(lattice, config, listener)
+}
+
+/// Starts the server like [`start`] on a `listener` the caller bound (to set what `TcpListener::bind` does not, such as
+/// listening on both address families); `config.address` is not used.
+pub fn start_on(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig, listener: TcpListener) -> io::Result<ApiServer> {
+    // Settings the planner cannot hold are refused before anything is bound or attached.
+    config
+        .defaults
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let local_addr = listener.local_addr()?;
     let (io, own_io) = match config.io {
         Some(io) => (io, false),
@@ -123,7 +134,8 @@ pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Resul
             return Err(io::Error::new(io::ErrorKind::InvalidInput, error));
         }
     };
-    let answerer = Answerer::new(config.backend.clone(), metrics.clone(), admission.clone(), sink.clone());
+    let answerer = Answerer::new(config.backend.clone(), metrics.clone(), admission.clone(), sink.clone())
+        .with_held_limit(config.limits.max_held_bytes);
     let router = Router::new(
         config.backend,
         config.created_at,
