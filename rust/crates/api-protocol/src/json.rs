@@ -624,4 +624,17 @@ mod tests {
             "{\"a\": [1, 2.5, \"é\\u0001\\n\"], \"b\": {\"c\": null, \"d\": true}, \"e\": {}, \"f\": []}"
         );
     }
+
+    #[test]
+    fn a_prefix_read_ignores_what_follows_the_first_value() {
+        assert_eq!(
+            JsonValue::parse_prefix(" {\"a\":1} tail").map(|value| value.to_compact_string()),
+            Some("{\"a\":1}".to_owned())
+        );
+        assert_eq!(JsonValue::parse_prefix("1 2"), JsonValue::parse("1"));
+        assert_eq!(JsonValue::parse_prefix(""), None);
+        assert_eq!(JsonValue::parse_prefix("  "), None);
+        assert_eq!(JsonValue::parse_prefix("{"), None);
+        assert_eq!(JsonValue::parse("{} x"), None);
+    }
 }
