@@ -26,7 +26,7 @@ mod logger;
 pub mod scripted;
 pub mod signals;
 
-use OsString;
+use std::ffi::OsString;
 use std::fmt::{self, Debug, Formatter};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -212,7 +212,9 @@ pub fn serve(
     let code = wait_for_stop(server.local_addr());
     log::info!("{}: shutting down", signal_name(code));
     let (stopped, reported) = channel();
-    server.stop(once(move || drop(stopped.send(()))));
+    server.stop(once(move || {
+        stopped.send(()).ok();
+    }));
     // Admission waits for the generations up to the shutdown limit and then tells them to give up; the margin lets its
     // own timer report before this wait gives up first.
     match reported.recv_timeout(patience.saturating_add(patience.max(Duration::from_secs(1)))) {

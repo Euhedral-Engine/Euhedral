@@ -2,7 +2,12 @@
 //! events). The first one asks the process to stop in order and gives the exit code (128 plus the signal's number); a
 //! second one ends the process at once with the same code, without waiting for the stop in progress.
 
+#[cfg(unix)]
+use std::fmt::{self, Debug, Formatter};
+#[cfg(unix)]
 use std::io;
+#[cfg(unix)]
+use signal_hook::iterator::Signals as Delivered;
 
 /// The exit code of a stop by SIGTERM.
 const TERM: u8 = crate::EXIT_SIGTERM;
@@ -12,12 +17,12 @@ const INT: u8 = crate::EXIT_SIGINT;
 /// The handlers, installed. [`wait`](Signals::wait) blocks the calling (main) thread until the first stop request.
 #[cfg(unix)]
 pub struct Signals {
-    signals: signal_hook::iterator::Signals,
+    signals: Delivered,
 }
 
 #[cfg(unix)]
-impl std::fmt::Debug for Signals {
-    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Signals {
+    fn fmt(&self, out: &mut Formatter<'_>) -> fmt::Result {
         out.debug_struct("Signals").finish_non_exhaustive()
     }
 }
@@ -34,7 +39,6 @@ pub fn install() -> io::Result<Signals> {
 
     use signal_hook::consts::{SIGINT, SIGTERM};
     use signal_hook::flag::{register, register_conditional_shutdown};
-    use signal_hook::iterator::Signals as Delivered;
 
     let again = Arc::new(AtomicBool::new(false));
     register_conditional_shutdown(SIGTERM, i32::from(TERM), again.clone())?;
@@ -126,7 +130,7 @@ mod console {
             exit(i32::from(code));
         }
         if let Some(sender) = SENDER.get() {
-            drop(sender.lock().unwrap_or_else(PoisonError::into_inner).send(code));
+            sender.lock().unwrap_or_else(PoisonError::into_inner).send(code).ok();
         }
         if closing {
             // Windows ends the process when the handler of one of these events returns: stay until `main` exits.

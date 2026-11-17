@@ -18,8 +18,12 @@
 )]
 
 use std::env;
+#[cfg(feature = "scripted")]
+use std::ffi::OsString;
 use std::process::ExitCode;
 
+#[cfg(feature = "scripted")]
+use euhedral_inference_server::scripted::{script_named, start_with};
 use euhedral_inference_server::signals::install;
 use euhedral_inference_server::{
     EXIT_INVALID_SETTINGS, EXIT_START_FAILED, Started, StartError, ignored_arguments, install_logger, load_settings,
@@ -65,13 +69,13 @@ fn main() -> ExitCode {
     };
     #[cfg(feature = "scripted")]
     if let Some(name) = scripted_name(&args) {
-        let Some(script) = euhedral_inference_server::scripted::script_named(&name) else {
+        let Some(script) = script_named(&name) else {
             eprintln!("unknown scripted backend {name}");
             return ExitCode::from(EXIT_INVALID_SETTINGS);
         };
         return ExitCode::from(serve(
             &settings,
-            |_| euhedral_inference_server::scripted::start_with(script),
+            |_| start_with(script),
             wait,
         ));
     }
@@ -80,7 +84,7 @@ fn main() -> ExitCode {
 
 /// The script named by `--scripted-backend` or `--scripted-backend=NAME` (`hello` when no name is given).
 #[cfg(feature = "scripted")]
-fn scripted_name(args: &[std::ffi::OsString]) -> Option<String> {
+fn scripted_name(args: &[OsString]) -> Option<String> {
     args.iter().find_map(|argument| {
         let text = argument.to_str()?;
         if text == "--scripted-backend" {
