@@ -172,7 +172,9 @@ fn assert_closed_once(fx: &Fixture) {
         for generation in &generations {
             generation.finish_held_ok(0, false);
         }
-        generations.iter().all(|g| g.close_count() == 1)
+        // A queued request whose client left may start after the first ones ended (its generation is then hung with
+        // a stream nobody reads): the loop goes on until no slot is held, so that one is ended too.
+        generations.iter().all(|g| g.close_count() == 1) && fx.server.admission().counts() == Counts::default()
     });
     settle(fx);
 }
@@ -201,11 +203,6 @@ fn prompt_tokens(fx: &Fixture, index: usize) -> usize {
         .0
         .chars()
         .count()
-}
-
-fn endless(fx: &Fixture) {
-    fx.backend.set_context_length(1 << 30);
-    fx.backend.set_script(Script::Endless);
 }
 
 /// A generation that is launched and never ends by itself: the queue behind it stays where it is.
@@ -1037,14 +1034,23 @@ fn disconnect_while_queued_leaves_the_queue() {
 
 #[test]
 fn disconnect_while_generating_cancels() {
+    // The generation says a word every few milliseconds, as a model does; a generator that never waits can say
+    // more than the owner takes in on a loaded machine, and then it is the bound that ends the request.
     let fx = Fixture::with(limits(), Some(2));
-    endless(&fx);
+    hung(&fx);
     let mut raw = Raw::connect(fx.addr);
     raw.send(&post_raw(CHAT, &chat_body(BIG)));
+    raw.read_until(HEAD);
+    until("launched", || launched(&fx));
+    assert!(fx.backend.generations()[0].emit_held("tok0 "));
     let seen = raw.read_until("tok0");
-    assert!(seen.starts_with(HEAD), "{seen}");
+    assert!(seen.contains("tok0"), "{seen}");
     drop(raw);
-    until("cancelled", || fx.backend.generations()[0].is_cancelled());
+    until("cancelled", || {
+        fx.backend.generations()[0].emit_held("tok ");
+        fx.backend.generations()[0].is_cancelled()
+    });
+    assert!(fx.backend.generations()[0].finish_held_ok(1, true));
     assert_closed_once(&fx);
     fx.backend.set_script(tokens(&["Hi"], true));
     assert!(!stream(&fx, CHAT, &chat_body("")).is_empty());
@@ -1370,6 +1376,26 @@ fn text_arrives_as_it_is_generated() {
     assert!(generation.finish_held_ok(3, true));
     let events = rest(&mut raw, seen);
     assert_eq!(events.last(), Some(&done()));
+    assert_closed_once(&fx);
+    fx.finish();
+}
+
+#[test]
+fn a_queued_request_that_starts_after_its_client_left_is_released() {
+    let fx = Fixture::with(limits(), Some(2));
+    fx.backend.set_max_active(1);
+    hung(&fx);
+    let mut first = Raw::connect(fx.addr);
+    first.send(&post_raw(CHAT, &chat_body(BIG)));
+    until("launched", || launched(&fx));
+    let mut second = Raw::connect(fx.addr);
+    second.send(&post_raw(CHAT, &chat_body(BIG)));
+    until("queued", || fx.server.admission().counts().waiting == 1);
+    // The first ends while the second is still connected, so the second starts; then its client leaves. Its stream
+    // is open and nothing is written to it until text comes: the slot is released when the generation ends.
+    assert!(fx.backend.generations()[0].finish_held_ok(1, true));
+    until("second launched", || fx.backend.generations().len() == 2);
+    drop((first, second));
     assert_closed_once(&fx);
     fx.finish();
 }
