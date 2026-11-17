@@ -12,6 +12,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use common::{Fixture, PATIENCE, Raw, headers, json_headers, text};
+use euhedral_inference_api_server::answer::{owner_fault_is_held, release_owner_fault};
 use euhedral_inference_api_server::scripted::{LaunchFault, MODEL_ID, Script};
 use euhedral_inference_api_server::{Backend, BackendError, Counts, Generation, Limits};
 use euhedral_net::Response;
@@ -812,12 +813,9 @@ fn a_panic_in_a_turn_with_the_end_already_queued_still_closes_and_frees() {
     raw.send(&raw_post(CHAT, &faulty));
     // The turn that handles the launch is held; the generation ends meanwhile, so its end is queued behind the
     // command the turn then panics on.
-    until(
-        "the launch was handled",
-        euhedral_inference_api_server::answer::owner_fault_is_held,
-    );
+    until("the launch was handled", owner_fault_is_held);
     assert!(fx.backend.generations()[0].finish_held());
-    euhedral_inference_api_server::answer::release_owner_fault();
+    release_owner_fault();
     let seen = raw.read_until("server_error");
     assert!(seen.starts_with("HTTP/1.1 500"), "{seen}");
     assert_closed_once(&fx);
