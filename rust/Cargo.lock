@@ -408,6 +408,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "euhedral-inference-api-server"
+version = "0.1.0"
+dependencies = [
+ "euhedral-core",
+ "euhedral-graph",
+ "euhedral-hardware-utils",
+ "euhedral-inference-api-protocol",
+ "euhedral-inference-api-server",
+ "euhedral-io",
+ "euhedral-net",
+]
+
+[[package]]
 name = "euhedral-inference-bench"
 version = "0.1.0"
 dependencies = [
@@ -524,6 +537,17 @@ dependencies = [
  "euhedral-hashing",
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "euhedral-net"
+version = "0.1.0"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bb15d07e8befd09e1446c9e2d638423c88251581#bb15d07e8befd09e1446c9e2d638423c88251581"
+dependencies = [
+ "euhedral-core",
+ "euhedral-data-structures",
+ "euhedral-graph",
+ "euhedral-io",
 ]
 
 [[package]]
