@@ -9,6 +9,7 @@ pub mod backend;
 mod frames;
 pub mod health;
 pub mod limits;
+pub mod metrics;
 pub mod models;
 pub mod router;
 #[cfg(any(test, feature = "test-support"))]
@@ -16,8 +17,8 @@ pub mod scripted;
 mod server;
 
 pub use backend::{
-    Backend, BackendError, EncodedPrompt, Generation, GenerationConfig, GenerationResult, Next, OutputSpec,
-    TextListener,
+    Backend, BackendError, EncodedPrompt, EngineReport, Generation, GenerationConfig, GenerationResult, Next,
+    OutputSpec, PrefixCacheReport, TextListener,
 };
 pub use frames::once;
 pub use limits::Limits;
