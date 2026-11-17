@@ -234,6 +234,21 @@ impl ApiError {
         )
     }
 
+    /// Every generation slot is busy and the queue is full.
+    pub fn at_capacity() -> ApiError {
+        ApiError::unavailable("The server is at generation capacity; retry later.")
+    }
+
+    /// The server is shutting down and takes no more generations.
+    pub fn shutting_down() -> ApiError {
+        ApiError::unavailable("The server is shutting down.")
+    }
+
+    /// A running generation was stopped because the server is shutting down.
+    pub fn interrupted_by_shutdown() -> ApiError {
+        ApiError::unavailable("Generation was interrupted by server shutdown.")
+    }
+
     /// The engine cannot take work; `reason` is the engine's own text.
     pub fn engine_unavailable(reason: &str) -> ApiError {
         ApiError::unavailable(format!("The inference engine is unavailable: {reason}"))
@@ -758,5 +773,25 @@ mod tests {
             converted.message,
             "The model produced an invalid tool call: unknown function 'x'."
         );
+    }
+
+    #[test]
+    fn admission_refusals_are_503_with_the_engine_unavailable_code() {
+        for (error, message) in [
+            (
+                ApiError::at_capacity(),
+                "The server is at generation capacity; retry later.",
+            ),
+            (ApiError::shutting_down(), "The server is shutting down."),
+            (
+                ApiError::interrupted_by_shutdown(),
+                "Generation was interrupted by server shutdown.",
+            ),
+        ] {
+            assert_eq!(error.status, 503);
+            assert_eq!(error.kind, "service_unavailable_error");
+            assert_eq!(error.code, Some("engine_unavailable"));
+            assert_eq!(error.message, message);
+        }
     }
 }

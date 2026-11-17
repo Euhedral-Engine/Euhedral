@@ -148,6 +148,67 @@ pub trait Generation: Send + Sync {
     fn close(&self);
 }
 
+/// The prefix cache's counters and sizes. The counters only grow; the times are in nanoseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefixCacheReport {
+    pub lookups: u64,
+    pub hits: u64,
+    pub restored_tokens: u64,
+    pub captures: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub evictions: u64,
+    pub restores: u64,
+    pub capture_nanos: u64,
+    pub restore_nanos: u64,
+    pub nodes: u64,
+    pub used_bytes: u64,
+    pub capacity_bytes: u64,
+}
+
+/// What the engine reports about itself at a scrape of the metrics: its model, its memory and its prefix cache. Every
+/// value is read at that moment; nothing is recorded on the engine's paths for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineReport {
+    /// The artifact the model was loaded from, `None` when it was not profiled.
+    pub artifact: Option<String>,
+    /// The speculative strategy: `none`, `mtp` or `dflash2`.
+    pub speculation: String,
+    /// The tokens drafted per verification; 0 without speculation.
+    pub speculative_depth: usize,
+    /// The worker CPUs of the engine's lattice.
+    pub workers: usize,
+    /// Device memory the engine allocated: weights, KV cache, sequence state, workspaces.
+    pub allocated_device_bytes: u64,
+    /// Free device memory as the driver reports it.
+    pub free_device_bytes: u64,
+    /// Weights held in pinned host memory and streamed to the device.
+    pub host_backed_weight_bytes: u64,
+    /// Released pinned staging buffers kept for reuse.
+    pub pinned_pool_bytes: u64,
+    /// Released pinned staging buffers the pool had no room for (a counter).
+    pub pinned_pool_overflows: u64,
+    /// The prefix cache, `None` without one.
+    pub prefix_cache: Option<PrefixCacheReport>,
+}
+
+impl Default for EngineReport {
+    fn default() -> EngineReport {
+        EngineReport {
+            artifact: None,
+            speculation: "none".to_owned(),
+            speculative_depth: 0,
+            workers: 0,
+            allocated_device_bytes: 0,
+            free_device_bytes: 0,
+            host_backed_weight_bytes: 0,
+            pinned_pool_bytes: 0,
+            pinned_pool_overflows: 0,
+            prefix_cache: None,
+        }
+    }
+}
+
 /// The API layer's narrow view of the loaded model.
 pub trait Backend: Send + Sync + 'static {
     /// The model's identity as the engine knows it.
@@ -162,6 +223,12 @@ pub trait Backend: Send + Sync + 'static {
     /// How many generations may run at once: the sequences the engine holds. The service queues the rest.
     fn max_active_generations(&self) -> usize {
         1
+    }
+
+    /// The engine's state for the metrics, read now. It runs in the frame that answers a scrape and must not wait: it
+    /// reads counters and sizes the engine already holds.
+    fn engine_report(&self) -> EngineReport {
+        EngineReport::default()
     }
 
     /// Encodes a rendered prompt on the workers, so that the plan counts its tokens and the generation runs them: a
