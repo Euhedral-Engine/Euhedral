@@ -142,10 +142,15 @@ fn run_command(args: &[String], command_line: &str, started: SystemTime) -> Resu
     let tokenizer = load_tokenizer(&options.artifact)?;
     let prepared = prepare(&options, &tokenizer)?;
     println!(
-        "max context: {} tokens; prefix cache 0 bytes; warmup {}, measured {} per scenario; generation greedy; fork {}",
+        "max context: {} tokens; prefix cache 0 bytes; warmup {}, measured {} per scenario; generation {}; fork {}",
         options.max_context_tokens,
         options.warmup,
         options.iterations,
+        if options.sampling.is_greedy() {
+            "greedy"
+        } else {
+            "sample"
+        },
         fork_id.as_deref().unwrap_or("unspecified")
     );
     for (scenario, prompts) in &prepared.prompts {

@@ -169,6 +169,24 @@ impl GenerationListener for Probe {
     }
 }
 
+/// The `generation` field of a row: the settings every request of the run was sent with.
+pub fn generation(sampling: &SamplingConfig) -> Value {
+    // A float is written as its shortest decimal, not as the double it widens to: 0.7, not 0.699999988079071.
+    let shortest = |value: f32| {
+        value
+            .to_string()
+            .parse::<f64>()
+            .map_or(Value::Null, |number| json!(number))
+    };
+    json!({
+        "temperature": shortest(sampling.temperature()),
+        "topK": sampling.top_k(),
+        "topP": shortest(sampling.top_p()),
+        "seed": sampling.seed() as i64,
+        "greedy": sampling.is_greedy(),
+    })
+}
+
 /// The description of this engine and run a row's `engine` field carries.
 pub fn snapshot(options: &Options, runtime: &EngineRuntime) -> Value {
     let config = runtime.config();
@@ -201,7 +219,7 @@ pub fn snapshot(options: &Options, runtime: &EngineRuntime) -> Value {
                 "maxPositionEmbeddings": config.max_position_embeddings,
             },
         },
-        "generation": {"mode": "greedy", "seed": options.generation_seed},
+        "generation": generation(&options.sampling),
         "runtime": {
             "implementation": IMPLEMENTATION,
             "engineVersion": env!("CARGO_PKG_VERSION"),
@@ -285,7 +303,7 @@ impl Iteration<'_> {
             prompt: ids,
             max_tokens: requested as u32,
             stop_tokens: self.tokenizer.eos_ids().to_vec(),
-            sampling: SamplingConfig::greedy(0),
+            sampling: self.options.sampling,
             speculation: match self.options.speculation {
                 SpeculationMode::Artifact => Speculation::Artifact,
                 SpeculationMode::Off => Speculation::Off,

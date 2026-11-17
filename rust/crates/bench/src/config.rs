@@ -2,17 +2,20 @@
 //! defaults and checks. Unknown fields are rejected, as Java rejects them, except `tokenizer`, which older files carry and
 //! the Rust benchmark ignores (it reads the tokenizer from the artifact).
 //!
+//! `generation` is `greedy` (the default; `temperature`, `topK` and `topP` are refused) or `sample` (temperature 0.7,
+//! topK 20, topP 0.8 unless given); the seed is a signed 64-bit number whose bits seed the sampler.
+//!
 //! A file that asks for something this engine does not do is refused with the reason, never run with the request
 //! dropped, because the two engines' rows would then measure different work:
 //! - `prefixCacheBytes` above 0: the engine always prefills the whole prompt;
 //! - `cpus` other than `all`, or any `excludeCpus` / `excludeCores`: the engine uses every processor and never restricts
 //!   its workers;
-//! - `generation.mode` `sample`: the engine selects greedily.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use euhedral_inference_engine::sampling::{SamplingConfig, SamplingError};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -217,7 +220,7 @@ pub struct Options {
     pub scenarios: Vec<Scenario>,
     pub warmup: usize,
     pub iterations: usize,
-    pub generation_seed: i64,
+    pub sampling: SamplingConfig,
     pub prompt_seed: i64,
     pub output: PathBuf,
     pub overwrite: bool,
@@ -267,6 +270,34 @@ struct RawGeneration {
     temperature: Option<f64>,
     top_k: Option<i64>,
     top_p: Option<f64>,
+}
+
+impl RawGeneration {
+    /// The sampling the section asks for, checked as the Java benchmark checks it.
+    fn sampling(&self) -> Result<SamplingConfig, ConfigError> {
+        let seed = self.seed.unwrap_or(1) as u64;
+        let refused = |error: SamplingError| ConfigError::Invalid(error.to_string());
+        match self.mode.as_deref().unwrap_or("greedy") {
+            "greedy" => {
+                if self.temperature.is_some() || self.top_k.is_some() || self.top_p.is_some() {
+                    return invalid("temperature, topK, and topP require mode \"sample\"");
+                }
+                Ok(SamplingConfig::greedy(seed))
+            }
+            "sample" => {
+                let top_k = self.top_k.unwrap_or(20);
+                let top_k = match u32::try_from(top_k) {
+                    Ok(top_k) if top_k <= i32::MAX as u32 => top_k,
+                    _ if top_k < 0 => return invalid("topK must not be negative"),
+                    _ => return invalid("topK is too large"),
+                };
+                let temperature = self.temperature.unwrap_or(0.7) as f32;
+                let top_p = self.top_p.unwrap_or(0.8) as f32;
+                SamplingConfig::new(temperature, top_k, top_p, seed, false).map_err(refused)
+            }
+            _ => invalid("generation.mode must be greedy or sample"),
+        }
+    }
 }
 
 impl Options {
@@ -327,22 +358,10 @@ impl Options {
         }
         let warmup = non_negative(raw.warmup, 1, "warmup")?;
         let iterations = positive(raw.iterations, 3, "iterations")? as usize;
-        let mut generation_seed = 1;
-        if let Some(generation) = &raw.generation {
-            let mode = generation.mode.as_deref().unwrap_or("greedy");
-            match mode {
-                "greedy" => {
-                    if generation.temperature.is_some() || generation.top_k.is_some() || generation.top_p.is_some() {
-                        return invalid("temperature, topK, and topP require mode \"sample\"");
-                    }
-                }
-                "sample" => {
-                    return invalid("generation.mode \"sample\" is not supported: the Rust engine selects greedily");
-                }
-                _ => return invalid("generation.mode must be greedy or sample"),
-            }
-            generation_seed = generation.seed.unwrap_or(1);
-        }
+        let sampling = match &raw.generation {
+            Some(generation) => generation.sampling()?,
+            None => SamplingConfig::greedy(1),
+        };
         let prompt_corpus = match raw.prompt_corpus.as_deref().map(str::trim).unwrap_or("words") {
             "words" => PromptCorpus::Words,
             "chat" => PromptCorpus::Chat,
@@ -376,7 +395,7 @@ impl Options {
             scenarios,
             warmup,
             iterations,
-            generation_seed,
+            sampling,
             prompt_seed: raw.prompt_seed.unwrap_or(DEFAULT_SEED as i64),
             output,
             overwrite,
