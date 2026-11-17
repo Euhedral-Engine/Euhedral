@@ -10,7 +10,8 @@
 )]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::str::from_utf8;
 use std::sync::OnceLock;
 
 use euhedral_inference_edrl::{FOOTER_BYTES, TOKENIZER_ENTRIES, TokenizerFooter, TokenizerSection};
@@ -55,7 +56,7 @@ impl Fixture {
 
 /// The checkpoint's tokenizer packaged as the artifact's tokenizer section, the way the Java loader reads a
 /// checkpoint directory: the generation config's special-token IDs only.
-fn load(directory: &PathBuf) -> Tokenizer {
+fn load(directory: &Path) -> Tokenizer {
     let read = |name: &str| fs::read(directory.join(name)).unwrap_or_else(|_| panic!("the checkpoint has {name}"));
     let generation: Value = serde_json::from_slice(&read("generation_config.json")).unwrap();
     let special: serde_json::Map<String, Value> = SPECIAL_TOKEN_KEYS
@@ -148,10 +149,10 @@ fn the_table_is_the_tokens_bytes_and_names_for_the_rest() {
         assert!(!bytes.is_empty(), "token {id}");
         if let Some(exact) = tokenizer.token_bytes(id) {
             assert_eq!(bytes, exact, "token {id}");
-            partial += usize::from(std::str::from_utf8(exact).is_err());
+            partial += usize::from(from_utf8(exact).is_err());
         } else {
             assert_eq!(bytes[0], 0xFF, "token {id}");
-            assert!(std::str::from_utf8(&bytes[1..]).is_ok(), "token {id}");
+            assert!(from_utf8(&bytes[1..]).is_ok(), "token {id}");
         }
     }
     assert!(

@@ -7,6 +7,8 @@
     reason = "a test file: a failed unwrap is the failure"
 )]
 
+use std::str::from_utf8;
+
 use euhedral_inference_edrl::{FOOTER_BYTES, TOKENIZER_ENTRIES, TokenizerFooter, TokenizerSection};
 use euhedral_inference_tokenizer::{Tokenizer, TokenizerError};
 use serde_json::{Value, json};
@@ -348,7 +350,7 @@ fn a_token_exposes_its_exact_bytes_even_when_they_are_not_valid_utf8() {
     assert_eq!(tokenizer.token_bytes(0xC3), Some(&[0xC3u8][..]));
     assert_eq!(tokenizer.token_bytes(0x80), Some(&[0x80u8][..]));
     assert_eq!(tokenizer.decode(&[0xC3]).unwrap(), "\u{fffd}");
-    assert!(std::str::from_utf8(tokenizer.token_bytes(0xC3).unwrap()).is_err());
+    assert!(from_utf8(tokenizer.token_bytes(0xC3).unwrap()).is_err());
 }
 
 #[test]
