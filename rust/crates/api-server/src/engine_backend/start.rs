@@ -58,21 +58,14 @@ impl Error for StartError {}
 
 impl From<EngineError> for StartError {
     fn from(error: EngineError) -> StartError {
-        match error {
-            // Only the library and its driver failing to load are the driver probe's; any other call failing is the
-            // engine's. The engine does not export the library's error type and this crate may not depend on it, so
-            // the variant is read from its derived `Debug` name.
-            EngineError::Cuda(error) if loads_nothing(&format!("{error:?}")) => StartError::Driver(error.to_string()),
-            other => StartError::Engine(other.to_string()),
+        // Only nothing loading (the library, its runtime or the driver) is the driver probe's; any other call failing
+        // is the engine's.
+        if error.loads_nothing() {
+            StartError::Driver(error.to_string())
+        } else {
+            StartError::Engine(error.to_string())
         }
     }
-}
-
-/// Whether a CUDA error, in its `Debug` form, is the library or its runtime not loading.
-fn loads_nothing(debug: &str) -> bool {
-    ["LibraryMissing", "RuntimeMissing", "Load"]
-        .iter()
-        .any(|variant| debug.starts_with(variant) && !debug[variant.len()..].starts_with(|c: char| c.is_alphanumeric()))
 }
 
 /// The engine behind the traits: the runtime, held weakly so that [`EngineHost::shutdown`] holds the last handle.
@@ -180,25 +173,65 @@ fn artifact_problem(path: &Path) -> Option<String> {
 /// An engine that is loading. It holds the engine's owner: finish it with [`wait`](EngineStarting::wait) or poll it
 /// with [`ready`](EngineStarting::ready), on the thread that started it.
 pub struct EngineStarting {
-    owner: RuntimeOwner,
-    ready: ReadyHandoff,
+    pending: Pending,
     tokenizer: Tokenizer,
     settings: Settings,
 }
 
+/// The owner and the hand-off of a start that has not ended. Dropped with its start still pending, it abandons the
+/// start: a runtime that arrives later is freed by its arrival, and one that is already there is freed through the
+/// owner.
+struct Pending {
+    owner: Option<RuntimeOwner>,
+    ready: ReadyHandoff,
+}
+
+impl Pending {
+    /// The owner, for a start that ended (or that this takes over).
+    fn owner(&mut self) -> Option<RuntimeOwner> {
+        self.owner.take()
+    }
+
+    /// Ends the start without serving it. Nothing waits here beyond what the owner's drop does.
+    fn abandon(&mut self) {
+        let Some(owner) = self.owner.take() else { return };
+        match self.ready.abandon() {
+            Some(Ok(runtime)) => {
+                if let Err(error) = owner.shutdown(runtime) {
+                    log::error!("stopping the engine that did not start failed: {error}");
+                }
+            }
+            Some(Err(_)) | None => drop(owner),
+        }
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.abandon();
+    }
+}
+
 /// Checks the artifact, reads its tokenizer and starts the engine of `settings` on the CUDA library at `library`.
 /// Returns at once; the engine loads on its own lattice. Call it from the thread that will shut the engine down, which
-/// is not a worker of any lattice.
-pub fn begin_start(settings: &Settings, library: &Path) -> Result<EngineStarting, StartError> {
+/// is not a worker of any lattice. `close_timeout` is the longest the lattice's close waits for the workers (the server
+/// passes `server.shutdown-timeout`); `None` keeps the default.
+pub fn begin_start(
+    settings: &Settings,
+    library: &Path,
+    close_timeout: Option<Duration>,
+) -> Result<EngineStarting, StartError> {
     if let Some(problem) = artifact_problem(&settings.model.artifact) {
         return Err(StartError::Setup(problem));
     }
     let tokenizer =
         read_artifact_tokenizer(&settings.model.artifact).map_err(|error| StartError::Tokenizer(error.to_string()))?;
-    let (owner, ready) = EngineRuntime::start(settings, library);
+    let (owner, ready) = EngineRuntime::start_with(settings, library, close_timeout);
     Ok(EngineStarting {
-        owner,
-        ready,
+        pending: Pending {
+            owner: Some(owner),
+            ready,
+        },
         tokenizer,
         settings: settings.clone(),
     })
@@ -221,7 +254,7 @@ impl Debug for EngineHost {
 impl EngineStarting {
     /// The loaded engine, or this still loading (`Err`), without waiting.
     pub fn ready(self) -> Result<Result<EngineHost, StartError>, Box<EngineStarting>> {
-        match self.ready.take() {
+        match self.pending.ready.take() {
             Some(loaded) => Ok(self.host(loaded)),
             None => Err(Box::new(self)),
         }
@@ -229,42 +262,38 @@ impl EngineStarting {
 
     /// Waits up to `limit` for the engine, on the caller's own thread: the one wait of a start. An engine that is not
     /// ready by then is stopped.
-    pub fn wait(self, limit: Duration) -> Result<EngineHost, StartError> {
-        match self.ready.wait(limit) {
+    pub fn wait(mut self, limit: Duration) -> Result<EngineHost, StartError> {
+        match self.pending.ready.wait(limit) {
             Ok(loaded) => self.host(loaded),
             Err(_) => {
-                let error = StartError::Engine(format!("the engine was not ready within {} s", limit.as_secs()));
-                // It may have finished just now; what is loaded is freed through the owner. Else the owner's drop
+                // It may have finished just now: what is loaded is freed through the owner. Otherwise the start is
+                // marked abandoned, so that a runtime arriving later is freed by its arrival, and the owner's drop
                 // closes the lattice.
-                match self.ready.take() {
-                    Some(Ok(runtime)) => {
-                        self.stop(runtime);
-                    }
-                    Some(Err(_)) | None => drop(self.owner),
-                }
-                Err(error)
+                self.pending.abandon();
+                Err(StartError::Engine(format!(
+                    "the engine was not ready within {} s",
+                    limit.as_secs()
+                )))
             }
         }
     }
 
-    /// Frees a runtime that will not be served, through its owner.
-    fn stop(self, runtime: Arc<EngineRuntime>) {
-        if let Err(error) = self.owner.shutdown(runtime) {
-            log::error!("stopping the engine that did not start failed: {error}");
-        }
-    }
-
-    fn host(self, loaded: Result<Arc<EngineRuntime>, EngineError>) -> Result<EngineHost, StartError> {
+    fn host(mut self, loaded: Result<Arc<EngineRuntime>, EngineError>) -> Result<EngineHost, StartError> {
         let runtime = match loaded {
             Ok(runtime) => runtime,
             // Nothing was loaded; the owner's drop closes what started.
             Err(error) => return Err(StartError::from(error)),
         };
+        let Some(owner) = self.pending.owner() else {
+            return Err(StartError::Engine("the engine's owner is gone".to_owned()));
+        };
         let plan = runtime.plan();
         let context_length = plan.max_context_tokens.min(runtime.config().max_position_embeddings);
         let sink = Arc::new(QueueIngestSink::new());
         if let Err(error) = runtime.lattice().add_upstream(sink.delegate()) {
-            self.stop(runtime);
+            if let Err(stop) = owner.shutdown(runtime) {
+                log::error!("stopping the engine that did not start failed: {stop}");
+            }
             return Err(StartError::Engine(format!("the lattice takes no backend: {error:?}")));
         }
         let engine = Arc::new(RuntimeEngine {
@@ -284,7 +313,7 @@ impl EngineStarting {
             self.settings.model.name.clone(),
         ));
         Ok(EngineHost {
-            owner: self.owner,
+            owner,
             runtime,
             backend,
         })
@@ -315,30 +344,65 @@ impl EngineHost {
         self.runtime.lattice()
     }
 
-    /// Stops the engine: the backend admits nothing more, then the lattice closes and the device memory is freed. Call
-    /// it on the thread that started the engine, after the server has stopped and no generation runs.
-    pub fn shutdown(self) -> Result<(), StartError> {
+    /// Stops the engine within `window`: the backend admits nothing more, then the lattice closes and the device
+    /// memory is freed. What it could not finish in the window is reported (and not waited for): the error says what
+    /// stays. Call it on the thread that started the engine, after the server has stopped and no generation runs.
+    pub fn shutdown(self, window: Duration) -> Result<(), StartError> {
         self.backend.close();
-        self.owner.shutdown(self.runtime).map_err(StartError::from)
+        self.owner
+            .shutdown_within(self.runtime, window)
+            .map_err(StartError::from)
     }
 }
 
 /// Starts the engine and waits up to `limit` for it: [`begin_start`] and [`EngineStarting::wait`].
-pub fn start(settings: &Settings, library: &Path, limit: Duration) -> Result<EngineHost, StartError> {
-    begin_start(settings, library)?.wait(limit)
+pub fn start(
+    settings: &Settings,
+    library: &Path,
+    limit: Duration,
+    close_timeout: Option<Duration>,
+) -> Result<EngineHost, StartError> {
+    begin_start(settings, library, close_timeout)?.wait(limit)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::path::PathBuf;
+
+    use euhedral_inference_engine::runtime::Teardown;
+    use euhedral_inference_engine::{Handoff, lattice_config};
+    use euhedral_inference_settings::ModelSettings;
+
     use super::*;
 
     #[test]
-    fn only_a_library_that_does_not_load_is_the_driver_probe() {
-        assert!(loads_nothing(r#"LibraryMissing("x.so")"#));
-        assert!(loads_nothing("RuntimeMissing { library: \"x\", missing: [] }"));
-        assert!(loads_nothing("Load { path: \"x\" }"));
-        assert!(!loads_nothing(r#"Call { call: "cudaMalloc", status: 2 }"#));
-        assert!(!loads_nothing("LoadedElsewhere"));
+    fn an_error_that_is_not_nothing_loading_is_the_engines() {
+        // The three load errors and another call failing are classified by the engine's `loads_nothing`, whose tests
+        // build the CUDA errors; this crate may not.
+        let error = StartError::from(EngineError::Runtime("no lattice".to_owned()));
+        assert_eq!(error, StartError::Engine("no lattice".to_owned()));
+    }
+
+    #[test]
+    fn a_start_dropped_without_waiting_is_abandoned() {
+        let settings = Settings::with_model(ModelSettings {
+            artifact: PathBuf::from("m.edrl"),
+            name: "n".to_owned(),
+        });
+        let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
+        let owner = RuntimeOwner::over(Teardown::new(lattice, Vec::new()));
+        let ready = Handoff::new();
+        drop(Pending {
+            owner: Some(owner),
+            ready: Arc::clone(&ready),
+        });
+        // An arrival after the drop finds the start abandoned and is released by its sender, once.
+        let released = Cell::new(0);
+        ready.deliver(Err(EngineError::Runtime("late".to_owned())), |_| {
+            released.set(released.get() + 1)
+        });
+        assert_eq!(released.get(), 1);
     }
 
     #[test]
