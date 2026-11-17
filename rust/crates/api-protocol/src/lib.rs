@@ -19,7 +19,7 @@ mod tool_definition;
 pub mod tool_results;
 mod wire;
 
-pub use chat_mapper::map_chat;
+pub use chat_mapper::{ChatRequest, map_chat};
 pub use error::{ApiError, Surface};
 pub use messages_mapper::{map_count_tokens, map_messages};
 pub use tool_definition::ToolDefinition;

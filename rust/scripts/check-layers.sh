@@ -31,6 +31,7 @@ CUDA = "euhedral-inference-cuda"
 HOST_GEMV = "euhedral-inference-host-gemv"
 TOKENIZER = "euhedral-inference-tokenizer"
 ENGINE = "euhedral-inference-engine"
+API_SERVER = "euhedral-inference-api-server"
 BENCH = "euhedral-inference-bench"
 TEST_SUPPORT = "test-support"
 XTASK = "xtask"
@@ -47,6 +48,7 @@ ALLOWED = {
     TEST_SUPPORT: set(),
     TOKENIZER: {EDRL},
     CUDA: set(),
+    API_SERVER: {API_PROTOCOL, ENGINE, SETTINGS, TOKENIZER},
     ENGINE: {SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER},
     BENCH: {ENGINE, SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER},
     XTASK: set(),
@@ -57,8 +59,8 @@ BINARIES = {BENCH, XTASK}
 DEV_ONLY = {TEST_SUPPORT}
 
 # external crate -> crates that may depend on it.
-RUSTEE = {"euhedral-core", "euhedral-gpu", "euhedral-graph", "euhedral-io"}
-RUSTEE_OWNERS = {ENGINE, BENCH, CUDA}
+RUSTEE = {"euhedral-core", "euhedral-gpu", "euhedral-graph", "euhedral-io", "euhedral-net"}
+RUSTEE_OWNERS = {ENGINE, BENCH, CUDA, API_SERVER}
 # Configuration is parsed in one place.
 YAML = "serde_yaml_ng"
 YAML_OWNERS = {SETTINGS}
