@@ -268,10 +268,8 @@ impl Mode {
 }
 
 /// `count` samplers of `config` for rows of `vocabulary` logits, all made when the request begins.
-fn samplers(config: SamplingConfig, vocabulary: usize, count: usize) -> Result<Vec<Box<TokenSampler>>, SamplingError> {
-    (0..count)
-        .map(|_| TokenSampler::new(config, vocabulary).map(Box::new))
-        .collect()
+fn samplers(config: SamplingConfig, vocabulary: usize, count: usize) -> Result<Vec<TokenSampler>, SamplingError> {
+    (0..count).map(|_| TokenSampler::new(config, vocabulary)).collect()
 }
 
 /// What a quantum of the request is for.

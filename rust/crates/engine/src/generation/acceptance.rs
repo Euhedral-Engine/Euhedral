@@ -207,4 +207,58 @@ mod tests {
         assert_eq!(cut.outputs, [6, 7]);
         assert!(!cut.unselected);
     }
+
+    /// The same cases as above, from the tokens the rows selected.
+    fn resolve_tokens(rows: &[u32], selected: &[u32], budget: u32) -> Accepted {
+        accept_tokens(&rows[1..], selected, &[EOS], budget)
+    }
+
+    #[test]
+    fn tokens_resolve_as_the_keys_of_the_same_tokens_do() {
+        let cases: [(&[u32], &[u32], u32); 8] = [
+            (&[5, 6, 7, 8], &[1, 2, 3, 4], 16),
+            (&[5, 6, 7, 8], &[6, 7, 3, 4], 16),
+            (&[5, 6, 7, 8], &[6, 7, 8, 9], 16),
+            (&[5, 6, 7, 8], &[6, 0, 8, 9], 16),
+            (&[5, EOS, 7, 8], &[EOS, 7, 8, 9], 16),
+            (&[5, 6, 7, 8], &[6, EOS, 1, 2], 16),
+            (&[5, 6, 7, 8], &[6, 7, 8, 9], 2),
+            (&[5, 6, 7, 8], &[6, 7, EOS, 9], 2),
+        ];
+        for (rows, selected, budget) in cases {
+            assert_eq!(
+                resolve_tokens(rows, selected, budget),
+                resolve(rows, selected, budget),
+                "rows {rows:?} selected {selected:?} budget {budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sampled_row_that_differs_ends_the_accepted_drafts_there() {
+        // A draft is kept only while it is the token the row selected at its position.
+        let accepted = resolve_tokens(&[5, 6, 7, 8], &[6, 9, 8, 4], 16);
+        assert_eq!(accepted.accepted_drafts, 1);
+        assert_eq!(accepted.outputs, [6, 9]);
+        assert_eq!(accepted.count, 2);
+        assert!(accepted.eos_at.is_none() && !accepted.unselected);
+        // The stop token inside the accepted prefix ends the outputs, and is the last of them.
+        let stopped = resolve_tokens(&[5, 6, EOS, 8], &[6, EOS, 8, 4], 16);
+        assert_eq!(stopped.outputs, [6, EOS]);
+        assert_eq!(stopped.eos_at, Some(1));
+        // The budget ends them before a stop token past it.
+        let cut = resolve_tokens(&[5, 6, 7, EOS], &[6, 7, EOS, 4], 2);
+        assert_eq!(cut.outputs, [6, 7]);
+        assert_eq!(cut.eos_at, None);
+        // Fewer tokens than rows: the rows after the last one that selected are not there.
+        let short = accept_tokens(&[6, 7], &[6], &[EOS], 16);
+        assert_eq!(short.outputs, [6]);
+        assert!(short.unselected);
+    }
+
+    #[test]
+    #[should_panic(expected = "at most one selected token per row")]
+    fn more_tokens_than_rows_is_refused() {
+        accept_tokens(&[6], &[6, 7, 8], &[EOS], 16);
+    }
 }

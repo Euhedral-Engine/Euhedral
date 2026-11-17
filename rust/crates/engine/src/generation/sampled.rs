@@ -9,6 +9,7 @@
 //! that is dropped without running, or whose selection panics, still posts, with an error, so the request ends and never
 //! waits for a selection that will not come.
 
+use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 
@@ -110,10 +111,10 @@ pub(crate) struct SampledRows {
 }
 
 impl SampledRows {
-    pub(crate) fn new(samplers: Vec<Box<TokenSampler>>) -> SampledRows {
+    pub(crate) fn new(samplers: Vec<TokenSampler>) -> SampledRows {
         let rows = samplers.len();
         SampledRows {
-            samplers: samplers.into_iter().map(Some).collect(),
+            samplers: samplers.into_iter().map(|sampler| Some(Box::new(sampler))).collect(),
             pending: Pending::default(),
             tokens: vec![0; rows],
             failure: None,
@@ -177,7 +178,7 @@ impl SampledRows {
 
     /// The tokens, to read while the owner changes the request; [`SampledRows::restore`] gives them back.
     pub(crate) fn take_tokens(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.tokens)
+        mem::take(&mut self.tokens)
     }
 
     pub(crate) fn restore(&mut self, tokens: Vec<u32>) {
@@ -395,7 +396,7 @@ mod tests {
 
     /// A sampled request's rows: `count` samplers of top-k 1, which pick the largest logit of a row.
     fn rows(count: usize) -> SampledRows {
-        SampledRows::new((0..count).map(|_| sampler(4, 1)).collect())
+        SampledRows::new((0..count).map(|_| *sampler(4, 1)).collect())
     }
 
     /// The answer of the frame of `row`, which selected `token`.
@@ -434,6 +435,10 @@ mod tests {
     fn an_error_in_one_row_is_kept_until_the_join_and_names_the_failure() {
         let mut join = rows(3);
         join.begin(5, 3).unwrap();
+        assert!(
+            (0..3).all(|row| join.sampler(row).is_some()),
+            "the frames take the samplers"
+        );
         let failed = Sampled {
             step: 6,
             result: Err("no token".to_string()),
