@@ -49,6 +49,7 @@ use euhedral_inference_engine::generation::{
     AdmissionError, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, LogitsSink, QuantumEvent,
     Speculation,
 };
+use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
 
@@ -230,6 +231,17 @@ fn dropped_outcome() -> GenerationOutcome {
 
 /// Runs a greedy generation and waits for its listener's hand-off.
 fn generate(runtime: &EngineRuntime, prompt: &[u32], max_tokens: u32, stop_tokens: &[u32]) -> Recording {
+    generate_sampled(runtime, prompt, max_tokens, stop_tokens, SamplingConfig::greedy(0))
+}
+
+/// Runs a generation with `sampling` and waits for its listener's hand-off.
+fn generate_sampled(
+    runtime: &EngineRuntime,
+    prompt: &[u32],
+    max_tokens: u32,
+    stop_tokens: &[u32],
+    sampling: SamplingConfig,
+) -> Recording {
     let done = Handoff::new();
     let waiting = Arc::clone(&done);
     let began = Instant::now();
@@ -239,6 +251,7 @@ fn generate(runtime: &EngineRuntime, prompt: &[u32], max_tokens: u32, stop_token
             max_tokens,
             stop_tokens: stop_tokens.to_vec(),
             speculation: Speculation::Off,
+            sampling,
             listener: Box::new(Recorder {
                 tokens: Vec::new(),
                 token_times: Vec::new(),
@@ -367,6 +380,7 @@ fn a_stop_token_ends_the_generation_and_leaves_no_overshoot_in_the_sequence() {
             max_tokens: 1,
             stop_tokens: Vec::new(),
             speculation: Speculation::Off,
+            sampling: SamplingConfig::greedy(0),
             listener: Box::new(Recorder {
                 tokens: Vec::new(),
                 token_times: Vec::new(),
@@ -576,5 +590,50 @@ fn a_panic_in_the_owner_ends_the_request_with_a_failure_and_the_engine_serves_th
     let recording = generate(&runtime, &reference.prompt, 128, &[]);
     assert_eq!(recording.outcome.reason, FinishReason::Length);
     assert_eq!(recording.tokens, reference.generated);
+    owner.shutdown(runtime).unwrap();
+}
+
+/// A sampled configuration: temperature 1, the given `top_k`, no nucleus cut, and the seed.
+fn sampled(top_k: u32, seed: u64) -> SamplingConfig {
+    SamplingConfig::new(1.0, top_k, 1.0, seed, false).unwrap()
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
+fn sampled_requests_select_on_the_host_and_agree_with_greedy_at_top_k_one() {
+    let Some(machine) = machine() else { return };
+    let reference = greedy_reference(&machine);
+    let tokens = 32;
+    let (runtime, owner) = start(&machine, 4096);
+    let expected = &reference.generated[..tokens as usize];
+
+    // Temperature 0 is greedy: the device selects, no row is copied.
+    let zero = SamplingConfig::new(0.0, 0, 1.0, 5, false).unwrap();
+    let greedy_path = generate_sampled(&runtime, &reference.prompt, tokens, &[], zero);
+    assert_eq!(greedy_path.outcome.reason, FinishReason::Length);
+    assert_eq!(greedy_path.tokens, expected, "temperature 0 equals greedy");
+
+    // Top-k 1 samples on the host and must choose the greedy token every time.
+    let top_one = generate_sampled(&runtime, &reference.prompt, tokens, &[], sampled(1, 11));
+    assert_eq!(top_one.outcome.reason, FinishReason::Length);
+    assert_eq!(top_one.tokens, expected, "top-k 1 equals greedy token for token");
+    assert_eq!(top_one.outcome.generated, tokens as usize);
+    let (_, in_flight, leased) = sequence_state(&runtime);
+    assert_eq!((in_flight, leased), (0, 0), "nothing left in flight or leased");
+
+    // The same seed gives the same tokens; a different seed is allowed to differ.
+    let first = generate_sampled(&runtime, &reference.prompt, tokens, &[], sampled(40, 21));
+    let second = generate_sampled(&runtime, &reference.prompt, tokens, &[], sampled(40, 21));
+    assert_eq!(first.outcome.reason, FinishReason::Length);
+    assert_eq!(first.tokens.len(), tokens as usize);
+    assert_eq!(first.tokens, second.tokens, "the same seed gives the same output");
+    let other = generate_sampled(&runtime, &reference.prompt, tokens, &[], sampled(40, 22));
+    assert_eq!(other.tokens.len(), tokens as usize);
+    println!("seeds 21 and 22 differ: {}", other.tokens != first.tokens);
+
+    let leased = runtime
+        .inspect_sequence(|sequence| sequence.row_readbacks.leased())
+        .expect("the generation gave the sequence back");
+    assert_eq!(leased, 0, "no row left leased");
     owner.shutdown(runtime).unwrap();
 }

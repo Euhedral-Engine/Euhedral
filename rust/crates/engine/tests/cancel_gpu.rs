@@ -28,6 +28,7 @@ use euhedral_inference_engine::generation::{
     CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
     Verification,
 };
+use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
 use euhedral_inference_settings::{ModelSettings, Settings};
@@ -178,6 +179,18 @@ fn run(
     trigger: Trigger,
     cancel: &CancelHandle,
 ) -> Recording {
+    run_sampling(runtime, prompt, speculation, trigger, cancel, SamplingConfig::greedy(0))
+}
+
+/// [`run`] with the sampling configuration `sampling`.
+fn run_sampling(
+    runtime: &EngineRuntime,
+    prompt: &[u32],
+    speculation: Speculation,
+    trigger: Trigger,
+    cancel: &CancelHandle,
+    sampling: SamplingConfig,
+) -> Recording {
     let done = Handoff::new();
     runtime
         .generate_cancellable(
@@ -186,6 +199,7 @@ fn run(
                 max_tokens: TOKENS,
                 stop_tokens: Vec::new(),
                 speculation,
+                sampling,
                 listener: Box::new(Recorder {
                     tokens: Vec::new(),
                     prompt_chunks: 0,
@@ -211,9 +225,18 @@ fn run_with(runtime: &EngineRuntime, prompt: &[u32], speculation: Speculation, t
 /// The sequence is free: nothing in flight and no selection leased.
 fn assert_free(runtime: &EngineRuntime) {
     let (in_flight, leased) = runtime
-        .inspect_sequence(|sequence| (sequence.in_flight(), sequence.selections.leased()))
+        .inspect_sequence(|sequence| {
+            (
+                sequence.in_flight(),
+                sequence.selections.leased() + sequence.row_readbacks.leased(),
+            )
+        })
         .expect("the generation gave the sequence back");
-    assert_eq!((in_flight, leased), (0, 0), "no quantum in flight, no selection leased");
+    assert_eq!(
+        (in_flight, leased),
+        (0, 0),
+        "no quantum in flight, no selection or row leased"
+    );
 }
 
 /// The generation ended cancelled with a prefix of `reference`, strictly shorter than it.
@@ -334,4 +357,58 @@ fn a_cancel_ends_a_greedy_generation_and_frees_the_sequence() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_cancel_ends_a_speculative_generation_and_frees_the_sequence() {
     cancels_and_recovers(Speculation::Artifact);
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_cancel_ends_a_sampled_generation_and_frees_the_sequence() {
+    let Some(machine) = machine() else { return };
+    let (runtime, owner) = start(&machine);
+    let short = prompt(40);
+    let sampling = SamplingConfig::new(1.0, 40, 1.0, 3, false).unwrap();
+    let uncut = run_sampling(
+        &runtime,
+        &short,
+        Speculation::Off,
+        Trigger::Never,
+        &CancelHandle::default(),
+        sampling,
+    );
+    assert_eq!(uncut.outcome.reason, FinishReason::Length);
+    assert_eq!(uncut.tokens.len(), TOKENS as usize);
+
+    // Mid-decode, from the listener, while a selection may be waiting: the tokens reported are the uncut run's.
+    for _ in 0..2 {
+        let cut = run_sampling(
+            &runtime,
+            &short,
+            Speculation::Off,
+            Trigger::Token(8),
+            &CancelHandle::default(),
+            sampling,
+        );
+        assert_cancelled(&cut, &uncut.tokens, short.len());
+        assert!(cut.tokens.len() >= 8);
+        assert_free(&runtime);
+    }
+
+    // Before the first quantum.
+    let cancelled = CancelHandle::default();
+    cancelled.cancel();
+    let cut = run_sampling(&runtime, &short, Speculation::Off, Trigger::Never, &cancelled, sampling);
+    assert_eq!(cut.outcome.reason, FinishReason::Cancelled);
+    assert_eq!(cut.quanta, 0);
+    assert_free(&runtime);
+
+    // The engine is whole: the same request gives the same tokens as before.
+    let again = run_sampling(
+        &runtime,
+        &short,
+        Speculation::Off,
+        Trigger::Never,
+        &CancelHandle::default(),
+        sampling,
+    );
+    assert_eq!(again.tokens, uncut.tokens);
+    owner.shutdown(runtime).unwrap();
 }

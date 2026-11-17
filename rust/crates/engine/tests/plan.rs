@@ -95,8 +95,8 @@ fn built() -> &'static Built {
 }
 
 use StageKind::{
-    Argmax, AttentionCausal, Embed, GdnConvolution, GdnGatedRmsNorm, GdnProjectControl, GdnRecurrence, KvAppend,
-    Linear, MtpStem, QkNormRope, ResidualAdd, ResidualRmsNorm, RmsNormUnitOffset, SelectedToken, Swiglu,
+    Argmax, AttentionCausal, CopyRows, Embed, GdnConvolution, GdnGatedRmsNorm, GdnProjectControl, GdnRecurrence,
+    KvAppend, Linear, MtpStem, QkNormRope, ResidualAdd, ResidualRmsNorm, RmsNormUnitOffset, SelectedToken, Swiglu,
 };
 
 /// The stages of one layer of the fused views, as `prefillView` leaves them: the layer's last stage is the residual
@@ -128,8 +128,8 @@ fn decode_view_stage_order_matches_java() {
         let gdn = *kind == LayerKind::GatedDeltaNet;
         expected.extend(fused_layer(gdn, index + 1 == built.config.layer_kinds.len()));
     }
-    expected.extend([RmsNormUnitOffset, Linear, Argmax]);
-    assert_eq!(expected.len(), 2 + 48 * 12 + 16 * 11 + 3);
+    expected.extend([RmsNormUnitOffset, Linear, Argmax, CopyRows]);
+    assert_eq!(expected.len(), 2 + 48 * 12 + 16 * 11 + 4);
     for view in [
         View::Decode,
         View::Verify { rows: 5 },
@@ -270,7 +270,7 @@ fn the_trellis_value_projection_has_a_scratch_region_of_its_own_in_decode_type_v
         assert_eq!(regions[3], Some(0), "query/key: {view:?}");
         assert_eq!(regions[4], Some(usize::from(decode_type)), "value/z: {view:?}");
         // The LM head is NVFP4: it takes scratch only in the multi-row views.
-        let head = regions.len() - 2;
+        let head = regions.len() - 3;
         let multi_row = matches!(view, View::PrefillChunk | View::Verify { rows: 9 });
         assert_eq!(regions[head].is_some(), multi_row, "head: {view:?}");
     }
@@ -662,10 +662,10 @@ fn a_run_of_stages_that_each_wait_only_for_the_one_before_is_one_stage_of_the_gr
             "{view:?}: the selection ends the last unit, on its lane"
         );
     }
-    // The decode view of the RCO artifact: 757 stages in 289 units. Each gated delta-net layer keeps its fan-out (the
+    // The decode view of the RCO artifact: 758 stages in 289 units. Each gated delta-net layer keeps its fan-out (the
     // control projection and the two linears) and its joins (the convolution, then the recurrence with everything
     // after it up to the next layer's norm) as separate stages.
-    assert_eq!(plan.stages(View::Decode).unwrap().len(), 757);
+    assert_eq!(plan.stages(View::Decode).unwrap().len(), 758);
     assert_eq!(plan.unit_stages(View::Decode).unwrap().len(), 289);
 }
 
@@ -736,5 +736,30 @@ fn fusing_stages_into_units_keeps_every_ordering_of_the_decode_view() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn the_row_copy_ends_each_base_view_after_the_selection_and_no_draft_view_has_one() {
+    let built = built();
+    for view in [
+        View::Decode,
+        View::Verify { rows: 5 },
+        View::Verify { rows: 9 },
+        View::PrefillChunk,
+    ] {
+        let kinds = built.plan.kinds(view).unwrap();
+        let copies = kinds.iter().filter(|kind| **kind == CopyRows).count();
+        assert_eq!(copies, 1, "{view:?}");
+        let argmax = kinds.iter().position(|kind| *kind == Argmax).unwrap();
+        assert_eq!(kinds[argmax + 1], CopyRows, "{view:?}: the copy follows the selection");
+    }
+    for view in [
+        View::Draft { rows: 1 },
+        View::Draft { rows: 8 },
+        View::CatchUp { rows: 9 },
+    ] {
+        let kinds = built.plan.kinds(view).unwrap();
+        assert!(!kinds.contains(&CopyRows), "{view:?}: a draft is never sampled");
     }
 }
