@@ -261,7 +261,7 @@ fn schema_violations_cannot_be_generated() {
 #[test]
 fn unsupported_schemas_are_refused_with_llguidances_reason() {
     let mut checker = checker();
-    let refused = |schema: &str| {
+    let mut refused = |schema: &str| {
         let error = checker
             .check_json_schema(&JsonValue::parse(schema).expect("JSON"), "schema")
             .expect_err(schema);
@@ -416,5 +416,59 @@ fn a_refused_grammar_is_not_cached_and_a_zero_bound_keeps_nothing() {
     let mut matcher = none.constraint(&grammar(0)).expect("compiles");
     assert!(feed(&mut matcher, "g0"));
     assert!(matcher.is_accepting());
+    assert_eq!(none.compiled.len(), 0);
+}
+
+const NUMBER: &str = r#"{"type":"integer"}"#;
+
+#[test]
+fn a_checked_grammar_compiles_once_for_its_generation() {
+    let mut checker = checker();
+    checker.check_grammar(&grammar(0)).expect("compiles");
+    assert_eq!(checker.compiled.compilations, 1);
+    let mut matcher = checker.constraint(&grammar(0)).expect("cached");
+    assert!(feed(&mut matcher, "g0"));
+    checker.check_grammar(&grammar(0)).expect("cached");
+    assert_eq!(checker.compiled.compilations, 1);
+}
+
+#[test]
+fn a_checked_schema_compiles_once_for_its_generation() {
+    let mut checker = checker();
+    let schema = JsonValue::parse(NUMBER).expect("JSON");
+    checker.check_json_schema(&schema, "schema").expect("compiles");
+    assert_eq!(checker.compiled.compilations, 1);
+    let mut matcher = checker.json_schema_constraint(&schema, "schema").expect("cached");
+    assert!(feed(&mut matcher, "42"));
+    assert!(matcher.is_accepting());
+    assert_eq!(checker.compiled.compilations, 1);
+}
+
+#[test]
+fn a_schema_and_a_grammar_of_the_same_text_are_two_entries() {
+    let mut checker = checker();
+    let schema = JsonValue::parse(NUMBER).expect("JSON");
+    let text = OutputGrammar::schema_text(&schema);
+    checker.check_json_schema(&schema, "schema").expect("compiles");
+    assert!(checker.compiled.holds_kind(Kind::JsonSchema, &text));
+    assert!(!checker.compiled.holds_kind(Kind::Lark, &text));
+    // The same text as a grammar is no Lark grammar: the schema's entry does not answer for it.
+    assert!(checker.check_grammar(&text).is_err());
+    assert_eq!(checker.compiled.compilations, 2);
+    assert_eq!(checker.compiled.len(), 1);
+}
+
+#[test]
+fn a_refused_check_is_not_cached_and_a_zero_bound_still_checks() {
+    let mut checker = checker();
+    assert!(checker.check_grammar("start: nothing").is_err());
+    assert!(checker.check_grammar("start: nothing").is_err());
+    assert_eq!(checker.compiled.compilations, 2);
+    assert_eq!(checker.compiled.len(), 0);
+    let mut none = GrammarChecker::with_cache_size(&tokens(), &[END], 0).expect("vocabulary");
+    none.check_grammar(&grammar(0)).expect("compiles");
+    none.check_json_schema(&JsonValue::parse(NUMBER).expect("JSON"), "schema")
+        .expect("compiles");
+    assert!(none.check_grammar("start: nothing").is_err());
     assert_eq!(none.compiled.len(), 0);
 }
