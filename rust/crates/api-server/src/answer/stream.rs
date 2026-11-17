@@ -22,7 +22,7 @@ use euhedral_inference_api_protocol::responses_mapper::encrypt;
 use euhedral_inference_api_protocol::{ApiError, ToJson};
 use euhedral_net::Response as Head;
 
-use super::reply::{count, responses_extras, signature};
+use super::reply::{count, opening_message, responses_extras, signature};
 use crate::backend::GenerationResult;
 use crate::metrics::FinishReason;
 use crate::planning::{Endpoint, Extras, Planned, new_id};
@@ -194,7 +194,7 @@ impl Encoder {
                 Self::chunk(out, &ChatCompletionChunk::role(&self.id, self.created, &self.model));
             }
             Endpoint::Messages => {
-                let message = super::reply::opening_message(&self.id, &self.model, self.prompt_tokens, count(cached));
+                let message = opening_message(&self.id, &self.model, self.prompt_tokens, count(cached));
                 Self::event(out, &StreamEvent::MessageStart { message });
             }
             Endpoint::Responses => {

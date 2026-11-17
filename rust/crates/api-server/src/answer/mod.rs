@@ -221,15 +221,9 @@ impl Shared {
                 let shared = self.clone();
                 responder.stream(
                     head,
+                    // Once the head is out the client is found gone by a failed write, not by the transport's
+                    // cancel flag, which a half-closed client also raises.
                     Box::new(move |opened| {
-                        let opened = opened.inspect(|stream| {
-                            let gone = Arc::downgrade(&shared);
-                            stream.on_cancel(once(move || {
-                                if let Some(shared) = gone.upgrade() {
-                                    shared.client_gone();
-                                }
-                            }));
-                        });
                         shared.post(Command::Head(opened));
                         no_work()
                     }),
@@ -445,7 +439,16 @@ impl Listener {
             };
             match settled {
                 Ok(pieces) => self.parts.extend(pieces),
-                Err(error) => return Err(error.message().to_owned()),
+                Err(error) => {
+                    // What the model said before the call is delivered to a stream ahead of the error.
+                    let message = error.message().to_owned();
+                    let PipelineError::MalformedToolCall { emitted, .. } = error;
+                    self.parts.extend(emitted);
+                    if self.handoff.is_some() {
+                        self.hand_over();
+                    }
+                    return Err(message);
+                }
             }
         }
         let reason = if self.pipeline.stop_matched() {
@@ -712,7 +715,7 @@ impl Answerer {
         }
     }
 
-    /// The most bytes of a streamed reply that are held while a write is in flight; past it the generation is
+    /// The most text, in bytes of what the model said, that a streamed reply takes in while a write is in flight; past it the generation is
     /// cancelled and the stream cut.
     pub fn with_held_limit(mut self, bytes: usize) -> Answerer {
         self.held_limit = bytes;

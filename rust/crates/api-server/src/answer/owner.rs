@@ -124,8 +124,10 @@ struct Streaming {
     /// The body is cut where it is: the client is gone or does not read.
     cut: bool,
     quanta: usize,
-    /// The most bytes held while a write is in flight.
+    /// The most text, in bytes of what the generation said, that may arrive while one write is in flight.
     max_held: usize,
+    /// The text that arrived since the write in flight began.
+    arrived: usize,
     /// The batches the listener left.
     texts: Consumer<Batch, Single>,
     relay: Arc<Relay>,
@@ -262,6 +264,7 @@ impl Owner {
             cut: false,
             quanta: 0,
             max_held,
+            arrived: 0,
             texts,
             relay,
         });
@@ -311,9 +314,15 @@ impl Owner {
                 Command::Finished(ending) => self.ended(ending, effects),
                 Command::Refused(error) => self.refused(error, effects),
                 Command::Interrupt(why) => self.interrupted(why, effects),
+                // Once the head is out the client is found gone by a failed write; the transport's cancel flag is
+                // also raised by a client that only half-closed, which still reads its stream.
+                Command::ClientGone if self.head_sent() => {}
                 Command::ClientGone => self.gone(effects),
                 Command::Text => self.settled_text(),
-                Command::Overrun => self.too_slow(effects),
+                Command::Overrun => self.too_slow(
+                    effects,
+                    "the owner does not keep up: the settled text waiting for it passed the limit",
+                ),
                 Command::Prefilled => self.prefilled(),
                 Command::Head(_) | Command::Sent(_) => {}
             }
@@ -355,10 +364,12 @@ impl Owner {
         // Cleared before the queue is read: a batch left after this read posts the next wake.
         s.relay.wake.store(false, Ordering::SeqCst);
         while let Some(batch) = s.texts.poll() {
-            s.relay.unread.fetch_sub(batch.weight(), Ordering::SeqCst);
+            let weight = batch.weight();
+            s.relay.unread.fetch_sub(weight, Ordering::SeqCst);
             if self.answered || s.terminal || matches!(s.wire, Wire::Unsent) {
                 continue;
             }
+            s.arrived += weight;
             if let Some(cached) = batch.cached {
                 s.encoder.start(cached, &mut s.held);
             }
@@ -405,6 +416,7 @@ impl Owner {
                     drop(stream);
                 } else if !s.held.is_empty() {
                     let bytes = replace(&mut s.held, take(&mut s.spare));
+                    s.arrived = 0;
                     s.wire = Wire::Writing;
                     effects.push(Effect::Write(stream, bytes));
                 } else if s.terminal {
@@ -414,19 +426,23 @@ impl Owner {
                 }
             }
             wire @ (Wire::Opening | Wire::Writing) => {
-                slow = !s.cut && s.held.len() > s.max_held;
+                // Once the end is queued nothing more arrives: what is held is all that is left.
+                slow = !s.cut && !s.terminal && s.arrived > s.max_held;
                 s.wire = wire;
             }
             wire @ (Wire::Unsent | Wire::Over) => s.wire = wire,
         }
         if slow {
-            self.too_slow(effects);
+            self.too_slow(
+                effects,
+                "the client does not read: the text that arrived during one write passed the limit",
+            );
         }
     }
 
     /// The client does not read: the body is cut and the generation cancelled.
-    fn too_slow(&mut self, effects: &mut Vec<Effect>) {
-        if self.streaming.as_ref().is_none_or(|s| s.cut) {
+    fn too_slow(&mut self, effects: &mut Vec<Effect>, why: &str) {
+        if self.streaming.as_ref().is_none_or(|s| s.cut || s.terminal) {
             return;
         }
         self.cut_stream();
@@ -434,7 +450,7 @@ impl Owner {
         self.answer_early(
             ApiError::client_closed(),
             Outcome::Cancelled,
-            Some("the client does not read: the held events passed the limit".to_owned()),
+            Some(why.to_owned()),
             None,
             effects,
         );
@@ -726,6 +742,7 @@ impl Owner {
             return;
         }
         self.finished = true;
+        self.settled_text();
         self.timing.first_token_ns = ending.first_token_ns;
         // `answered` is set only once the verdict exists: a panic in it still gets the error answer from the salvage.
         let verdict = if self.answered {

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use common::{Fixture, PATIENCE, Raw};
 use euhedral_inference_api_server::answer::{owner_fault_is_held, release_owner_fault};
-use euhedral_inference_api_server::scripted::{MODEL_ID, Script};
+use euhedral_inference_api_server::scripted::{LaunchFault, MODEL_ID, Script};
 use euhedral_inference_api_server::{Counts, Generation, Limits};
 
 const CHAT: &str = "/v1/chat/completions";
@@ -302,17 +302,28 @@ fn chat_stop_sequence_and_a_held_back_partial_match() {
     );
     // A partial match that does not complete is delivered once it is known to be text.
     fx.backend.set_script(tokens(&["Hello ", "ST", "Xmore"], true));
-    let joined = joined(&stream(&fx, CHAT, &chat_body(stop)));
-    assert!(joined.contains(r#""content":"Hello ""#), "{joined}");
-    assert!(
-        joined.contains(r#""content":"STXmore""#) || joined.contains(r#""content":"ST""#),
-        "{joined}"
+    assert_eq!(
+        stream(&fx, CHAT, &chat_body(stop)),
+        vec![
+            role(),
+            content("Hello "),
+            content("STXmore"),
+            chunk("{}", r#""stop""#),
+            done()
+        ]
     );
-    assert!(joined.contains(r#""finish_reason":"stop""#), "{joined}");
     // A partial match at the very end of the text is text too.
     fx.backend.set_script(tokens(&["Hello ", "ST"], true));
-    let joined = self::joined(&stream(&fx, CHAT, &chat_body(stop)));
-    assert!(joined.contains(r#""content":"ST""#), "{joined}");
+    assert_eq!(
+        stream(&fx, CHAT, &chat_body(stop)),
+        vec![
+            role(),
+            content("Hello "),
+            content("ST"),
+            chunk("{}", r#""stop""#),
+            done()
+        ]
+    );
     fx.finish();
 }
 
@@ -415,35 +426,84 @@ fn message_tools() -> &'static str {
     r#","tools":[{"name":"get_weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]"#
 }
 
+fn usage(input: usize, output: usize) -> String {
+    format!(
+        r#""usage":{{"input_tokens":{input},"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":{output}}}"#
+    )
+}
+
+fn event(name: &str, data: &str) -> String {
+    format!("event:{name}\ndata:{data}")
+}
+
+fn message_start(input: usize) -> String {
+    event(
+        "message_start",
+        &format!(
+            r#"{{"type":"message_start","message":{{"id":"ID","type":"message","role":"assistant","model":"{MODEL_ID}","content":[],"stop_reason":null,"stop_sequence":null,{}}}}}"#,
+            usage(input, 0)
+        ),
+    )
+}
+
+fn block_start(index: usize, block: &str) -> String {
+    event(
+        "content_block_start",
+        &format!(r#"{{"type":"content_block_start","index":{index},"content_block":{block}}}"#),
+    )
+}
+
+fn block_delta(index: usize, delta: &str) -> String {
+    event(
+        "content_block_delta",
+        &format!(r#"{{"type":"content_block_delta","index":{index},"delta":{delta}}}"#),
+    )
+}
+
+fn text_delta(index: usize, text: &str) -> String {
+    block_delta(index, &format!(r#"{{"type":"text_delta","text":"{text}"}}"#))
+}
+
+fn block_stop(index: usize) -> String {
+    event(
+        "content_block_stop",
+        &format!(r#"{{"type":"content_block_stop","index":{index}}}"#),
+    )
+}
+
+fn message_end(reason: &str, sequence: &str, input: usize, output: usize) -> Vec<String> {
+    vec![
+        event(
+            "message_delta",
+            &format!(
+                r#"{{"type":"message_delta","delta":{{"stop_reason":"{reason}","stop_sequence":{sequence}}},{}}}"#,
+                usage(input, output)
+            ),
+        ),
+        event("message_stop", r#"{"type":"message_stop"}"#),
+    ]
+}
+
+fn text_block() -> String {
+    block_start(0, r#"{"type":"text","text":""}"#)
+}
+
 #[test]
 fn messages_plain_thinking_and_usage() {
     let fx = Fixture::with(limits(), Some(2));
     fx.backend.set_script(tokens(&["Hello", ", ", "world"], true));
     let events = stream(&fx, MESSAGES, &message_body(""));
     let prompt = prompt_tokens(&fx, 0);
-    assert_eq!(
-        named(&events),
-        [
-            "message_start",
-            "content_block_start",
-            "content_block_delta",
-            "content_block_delta",
-            "content_block_delta",
-            "content_block_stop",
-            "message_delta",
-            "message_stop"
-        ]
-    );
-    let usage = format!(
-        r#""usage":{{"input_tokens":{prompt},"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":4}}"#
-    );
-    assert_eq!(
-        events[6],
-        format!(
-            "event:message_delta\ndata:{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},{usage}}}"
-        )
-    );
-    assert_eq!(events[7], "event:message_stop\ndata:{\"type\":\"message_stop\"}");
+    let mut expected = vec![
+        message_start(prompt),
+        text_block(),
+        text_delta(0, "Hello"),
+        text_delta(0, ", "),
+        text_delta(0, "world"),
+        block_stop(0),
+    ];
+    expected.extend(message_end("end_turn", "null", prompt, 4));
+    assert_eq!(events, expected);
 
     fx.backend
         .set_script(tokens(&["\nLet me", " think.\n", "</think>", "\n\n", "Hello."], true));
@@ -451,31 +511,26 @@ fn messages_plain_thinking_and_usage() {
         r#"{{"model":"{MODEL_ID}","stream":true,"max_tokens":64,"thinking":{{"type":"enabled","budget_tokens":32}},"messages":[{{"role":"user","content":"Hi"}}]}}"#
     );
     let events = stream(&fx, MESSAGES, &thinking);
-    let joined = joined(&events);
-    assert_eq!(
-        named(&events),
-        [
-            "message_start",
-            "content_block_start",
-            "content_block_delta",
-            "content_block_delta",
-            "content_block_delta",
-            "content_block_stop",
-            "content_block_start",
-            "content_block_delta",
-            "content_block_stop",
-            "message_delta",
-            "message_stop"
-        ]
-    );
-    assert!(
-        joined.contains(r#""delta":{"type":"signature_delta","signature":"euhedral-"#),
-        "{joined}"
-    );
-    assert!(
-        joined.contains(r#""content_block":{"type":"thinking","thinking":"","signature":""}"#),
-        "{joined}"
-    );
+    let prompt = prompt_tokens(&fx, 1);
+    let signature = events[4]
+        .split(r#""signature":""#)
+        .nth(1)
+        .and_then(|rest| rest.strip_suffix(r#""}}"#))
+        .expect("a signature");
+    assert!(signature.starts_with("euhedral-"), "{signature}");
+    let mut expected = vec![
+        message_start(prompt),
+        block_start(0, r#"{"type":"thinking","thinking":"","signature":""}"#),
+        block_delta(0, r#"{"type":"thinking_delta","thinking":"Let me"}"#),
+        block_delta(0, r#"{"type":"thinking_delta","thinking":" think."}"#),
+        block_delta(0, &format!(r#"{{"type":"signature_delta","signature":"{signature}"}}"#)),
+        block_stop(0),
+        block_start(1, r#"{"type":"text","text":""}"#),
+        text_delta(1, "Hello."),
+        block_stop(1),
+    ];
+    expected.extend(message_end("end_turn", "null", prompt, 6));
+    assert_eq!(events, expected);
     fx.finish();
 }
 
@@ -484,42 +539,57 @@ fn messages_stop_sequence_length_tools_and_errors() {
     let fx = Fixture::with(limits(), Some(2));
     fx.backend.set_script(tokens(&["Hello ", "ST", "OP never"], true));
     let events = stream(&fx, MESSAGES, &message_body(r#","stop_sequences":["STOP"]"#));
-    let joined_stop = joined(&events);
-    assert!(joined_stop.contains(r#""text":"Hello ""#), "{joined_stop}");
-    assert!(!joined_stop.contains("never"), "{joined_stop}");
-    assert!(
-        joined_stop.contains(r#""stop_reason":"stop_sequence","stop_sequence":"STOP""#),
-        "{joined_stop}"
-    );
+    let prompt = prompt_tokens(&fx, 0);
+    let mut expected = vec![
+        message_start(prompt),
+        text_block(),
+        text_delta(0, "Hello "),
+        block_stop(0),
+    ];
+    expected.extend(message_end("stop_sequence", r#""STOP""#, prompt, 3));
+    assert_eq!(events, expected);
 
     fx.backend.set_script(tokens(&["a", "b", "c"], false));
     let body = message_body("").replace(r#""max_tokens":64"#, r#""max_tokens":2"#);
-    let joined_len = joined(&stream(&fx, MESSAGES, &body));
-    assert!(joined_len.contains(r#""stop_reason":"max_tokens""#), "{joined_len}");
+    let events = stream(&fx, MESSAGES, &body);
+    let mut expected = vec![
+        message_start(prompt),
+        text_block(),
+        text_delta(0, "a"),
+        text_delta(0, "b"),
+        block_stop(0),
+    ];
+    expected.extend(message_end("max_tokens", "null", prompt, 2));
+    assert_eq!(events, expected);
 
     fx.backend
         .set_script(tokens(&[&call("get_weather", &[("city", "Paris")])], true));
     let events = stream(&fx, MESSAGES, &message_body(message_tools()));
-    let joined_tool = joined(&events);
-    assert!(
-        joined_tool.contains(r#""content_block":{"type":"tool_use","id":"ID","name":"get_weather","input":{}}"#),
-        "{joined_tool}"
-    );
-    assert!(
-        joined_tool.contains(r#""delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Paris\"}"}"#),
-        "{joined_tool}"
-    );
-    assert!(joined_tool.contains(r#""stop_reason":"tool_use""#), "{joined_tool}");
+    let prompt = prompt_tokens(&fx, 2);
+    let mut expected = vec![
+        message_start(prompt),
+        block_start(0, r#"{"type":"tool_use","id":"ID","name":"get_weather","input":{}}"#),
+        block_delta(
+            0,
+            r#"{"type":"input_json_delta","partial_json":"{\"city\":\"Paris\"}"}"#,
+        ),
+        block_stop(0),
+    ];
+    expected.extend(message_end("tool_use", "null", prompt, 2));
+    assert_eq!(events, expected);
 
     fx.backend.set_script(tokens(&[&call("nothing", &[]), "tail"], true));
     let events = stream(&fx, MESSAGES, &message_body(message_tools()));
-    let last = events.last().expect("an event");
-    assert!(
-        last.starts_with("event:error\ndata:{\"type\":\"error\",\"error\":{"),
-        "{last}"
+    assert_eq!(
+        events,
+        vec![
+            message_start(prompt),
+            event(
+                "error",
+                r#"{"type":"error","error":{"type":"api_error","message":"The model produced an invalid tool call: the model called a function that was not offered: nothing."}}"#
+            )
+        ]
     );
-    assert!(last.contains("invalid tool call"), "{last}");
-    assert!(!named(&events).contains(&"message_stop"), "{events:?}");
     fx.finish();
 }
 
@@ -529,55 +599,192 @@ fn response_tools() -> &'static str {
     r#","tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]"#
 }
 
+const WEATHER: &str = r#"[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]"#;
+
+/// What differs between the responses of the tests: the parts of the response object an event carries.
+struct Shape {
+    effort: &'static str,
+    tools: &'static str,
+    max_output: &'static str,
+}
+
+impl Shape {
+    fn response(&self, status: &str, incomplete: &str, output: &str, usage: &str) -> String {
+        format!(
+            r#"{{"id":"ID","object":"response","created_at":0,"status":"{status}","error":null,"incomplete_details":{incomplete},"model":"{MODEL_ID}","output":{output},"instructions":null,"max_output_tokens":{max},"parallel_tool_calls":true,"temperature":null,"top_p":null,"tool_choice":"auto","tools":{tools},"text":{{"format":{{"type":"text"}}}},"reasoning":{{"effort":"{effort}","summary":null}},"store":false,"metadata":{{}},"usage":{usage}}}"#,
+            max = self.max_output,
+            tools = self.tools,
+            effort = self.effort
+        )
+    }
+
+    /// `response.created` and `response.in_progress`.
+    fn opening(&self) -> Vec<String> {
+        let open = self.response("in_progress", "null", "[]", "null");
+        vec![
+            numbered("response.created", 0, &format!(r#""response":{open}"#)),
+            numbered("response.in_progress", 1, &format!(r#""response":{open}"#)),
+        ]
+    }
+
+    fn closing(&self, name: &str, number: usize, reason: &str, output: &str, input: usize, out: usize) -> String {
+        let (status, incomplete) = if name == "response.completed" {
+            ("completed", "null".to_owned())
+        } else {
+            ("incomplete", format!(r#"{{"reason":"{reason}"}}"#))
+        };
+        let usage = format!(
+            r#"{{"input_tokens":{input},"input_tokens_details":{{"cached_tokens":0}},"output_tokens":{out},"output_tokens_details":{{"reasoning_tokens":0}},"total_tokens":{}}}"#,
+            input + out
+        );
+        let response = self.response(status, &incomplete, output, &usage);
+        numbered(name, number, &format!(r#""response":{response}"#))
+    }
+}
+
+/// An event of the Responses stream: its name, its sequence number and the rest of its fields.
+fn numbered(name: &str, number: usize, fields: &str) -> String {
+    event(
+        name,
+        &format!(r#"{{"type":"{name}","sequence_number":{number},{fields}}}"#),
+    )
+}
+
+fn message_item(text: &str, status: &str) -> String {
+    let content = if status == "completed" {
+        format!(r#"[{{"type":"output_text","text":"{text}","annotations":[]}}]"#)
+    } else {
+        "[]".to_owned()
+    };
+    format!(r#"{{"id":"ID","type":"message","status":"{status}","role":"assistant","content":{content}}}"#)
+}
+
+/// The events of a message item that carries `deltas` as output `index`, starting at sequence number `first`.
+fn message_events(index: usize, first: usize, deltas: &[&str]) -> Vec<String> {
+    let at = format!(r#""item_id":"ID","output_index":{index},"content_index":0"#);
+    let text = deltas.concat();
+    let mut number = first;
+    let mut next = || {
+        number += 1;
+        number - 1
+    };
+    let mut out = vec![
+        numbered(
+            "response.output_item.added",
+            next(),
+            &format!(r#""output_index":{index},"item":{}"#, message_item("", "in_progress")),
+        ),
+        numbered(
+            "response.content_part.added",
+            next(),
+            &format!(r#"{at},"part":{{"type":"output_text","text":"","annotations":[]}}"#),
+        ),
+    ];
+    for delta in deltas {
+        out.push(numbered(
+            "response.output_text.delta",
+            next(),
+            &format!(r#"{at},"delta":"{delta}""#),
+        ));
+    }
+    out.push(numbered(
+        "response.output_text.done",
+        next(),
+        &format!(r#"{at},"text":"{text}""#),
+    ));
+    out.push(numbered(
+        "response.content_part.done",
+        next(),
+        &format!(r#"{at},"part":{{"type":"output_text","text":"{text}","annotations":[]}}"#),
+    ));
+    out.push(numbered(
+        "response.output_item.done",
+        next(),
+        &format!(r#""output_index":{index},"item":{}"#, message_item(&text, "completed")),
+    ));
+    out
+}
+
 #[test]
 fn responses_plain_reasoning_and_sequence_numbers() {
     let fx = Fixture::with(limits(), Some(2));
     fx.backend.set_script(tokens(&["Hello", ", ", "world"], true));
     let events = stream(&fx, RESPONSES, &response_body(""));
-    assert_eq!(
-        named(&events),
-        [
-            "response.created",
-            "response.in_progress",
-            "response.output_item.added",
-            "response.content_part.added",
-            "response.output_text.delta",
-            "response.output_text.delta",
-            "response.output_text.delta",
-            "response.output_text.done",
-            "response.content_part.done",
-            "response.output_item.done",
-            "response.completed"
-        ]
-    );
-    for (number, event) in events.iter().enumerate() {
-        assert!(event.contains(&format!(r#""sequence_number":{number},"#)), "{event}");
-    }
-    assert!(events[10].contains(r#""status":"completed""#));
+    let prompt = prompt_tokens(&fx, 0);
+    let off = Shape {
+        effort: "none",
+        tools: "[]",
+        max_output: "null",
+    };
+    let mut expected = off.opening();
+    expected.extend(message_events(0, 2, &["Hello", ", ", "world"]));
+    expected.push(off.closing(
+        "response.completed",
+        10,
+        "",
+        &format!("[{}]", message_item("Hello, world", "completed")),
+        prompt,
+        4,
+    ));
+    assert_eq!(events, expected);
 
     fx.backend
         .set_script(tokens(&["\nLet me", " think.\n", "</think>", "\n\n", "Hello."], true));
     let on = format!(r#"{{"model":"{MODEL_ID}","stream":true,"input":"Hi"}}"#);
     let events = stream(&fx, RESPONSES, &on);
-    assert_eq!(
-        named(&events)[2..],
-        [
+    let prompt = prompt_tokens(&fx, 1);
+    let high = Shape {
+        effort: "xhigh",
+        tools: "[]",
+        max_output: "null",
+    };
+    let at = r#""item_id":"ID","output_index":0,"content_index":0"#;
+    let reasoning =
+        r#"{"id":"ID","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"Let me think."}]}"#;
+    let mut expected = high.opening();
+    expected.extend([
+        numbered(
             "response.output_item.added",
+            2,
+            r#""output_index":0,"item":{"id":"ID","type":"reasoning","summary":[],"content":[]}"#,
+        ),
+        numbered(
             "response.content_part.added",
+            3,
+            &format!(r#"{at},"part":{{"type":"reasoning_text","text":""}}"#),
+        ),
+        numbered("response.reasoning_text.delta", 4, &format!(r#"{at},"delta":"Let me""#)),
+        numbered(
             "response.reasoning_text.delta",
-            "response.reasoning_text.delta",
+            5,
+            &format!(r#"{at},"delta":" think.""#),
+        ),
+        numbered(
             "response.reasoning_text.done",
+            6,
+            &format!(r#"{at},"text":"Let me think.""#),
+        ),
+        numbered(
             "response.content_part.done",
+            7,
+            &format!(r#"{at},"part":{{"type":"reasoning_text","text":"Let me think."}}"#),
+        ),
+        numbered(
             "response.output_item.done",
-            "response.output_item.added",
-            "response.content_part.added",
-            "response.output_text.delta",
-            "response.output_text.done",
-            "response.content_part.done",
-            "response.output_item.done",
-            "response.completed"
-        ]
-    );
+            8,
+            &format!(r#""output_index":0,"item":{reasoning}"#),
+        ),
+    ]);
+    expected.extend(message_events(1, 9, &["Hello."]));
+    expected.push(high.closing(
+        "response.completed",
+        15,
+        "",
+        &format!("[{reasoning},{}]", message_item("Hello.", "completed")),
+        prompt,
+        6,
+    ));
+    assert_eq!(events, expected);
     fx.finish();
 }
 
@@ -586,35 +793,81 @@ fn responses_length_tools_and_errors() {
     let fx = Fixture::with(limits(), Some(2));
     fx.backend.set_script(tokens(&["a", "b", "c"], false));
     let events = stream(&fx, RESPONSES, &response_body(r#","max_output_tokens":2"#));
-    let last = events.last().expect("an event");
-    assert!(last.starts_with("event:response.incomplete\n"), "{last}");
-    assert!(
-        last.contains(r#""incomplete_details":{"reason":"max_output_tokens"}"#),
-        "{last}"
-    );
+    let prompt = prompt_tokens(&fx, 0);
+    let capped = Shape {
+        effort: "none",
+        tools: "[]",
+        max_output: "2",
+    };
+    let mut expected = capped.opening();
+    expected.extend(message_events(0, 2, &["a", "b"]));
+    expected.push(capped.closing(
+        "response.incomplete",
+        9,
+        "max_output_tokens",
+        &format!("[{}]", message_item("ab", "completed")),
+        prompt,
+        2,
+    ));
+    assert_eq!(events, expected);
 
     fx.backend
         .set_script(tokens(&[&call("get_weather", &[("city", "Paris")])], true));
     let events = stream(&fx, RESPONSES, &response_body(response_tools()));
-    assert_eq!(
-        named(&events)[2..],
-        [
+    let prompt = prompt_tokens(&fx, 1);
+    let offered = Shape {
+        effort: "none",
+        tools: WEATHER,
+        max_output: "null",
+    };
+    let arguments = r#"{\"city\":\"Paris\"}"#;
+    let item = |status: &str, arguments: &str| {
+        format!(
+            r#"{{"id":"ID","type":"function_call","status":"{status}","call_id":"ID","name":"get_weather","arguments":"{arguments}"}}"#
+        )
+    };
+    let mut expected = offered.opening();
+    expected.extend([
+        numbered(
             "response.output_item.added",
+            2,
+            &format!(r#""output_index":0,"item":{}"#, item("in_progress", "")),
+        ),
+        numbered(
             "response.function_call_arguments.delta",
+            3,
+            &format!(r#""item_id":"ID","output_index":0,"delta":"{arguments}""#),
+        ),
+        numbered(
             "response.function_call_arguments.done",
+            4,
+            &format!(r#""item_id":"ID","output_index":0,"arguments":"{arguments}""#),
+        ),
+        numbered(
             "response.output_item.done",
-            "response.completed"
-        ]
-    );
-    assert!(events[2].contains(r#""arguments":"""#), "{}", events[2]);
-    assert!(events[3].contains(r#""delta":"{\"city\":\"Paris\"}""#), "{}", events[3]);
+            5,
+            &format!(r#""output_index":0,"item":{}"#, item("completed", arguments)),
+        ),
+        offered.closing(
+            "response.completed",
+            6,
+            "",
+            &format!("[{}]", item("completed", arguments)),
+            prompt,
+            2,
+        ),
+    ]);
+    assert_eq!(events, expected);
 
     fx.backend.set_script(tokens(&[&call("nothing", &[]), "tail"], true));
     let events = stream(&fx, RESPONSES, &response_body(response_tools()));
-    let last = events.last().expect("an event");
-    assert!(last.starts_with("event:error\ndata:{\"type\":\"error\""), "{last}");
-    assert!(last.contains(r#""code":"invalid_tool_call""#), "{last}");
-    assert!(!named(&events).contains(&"response.completed"));
+    let mut expected = offered.opening();
+    expected.push(numbered(
+        "error",
+        2,
+        r#""code":"invalid_tool_call","message":"The model produced an invalid tool call: the model called a function that was not offered: nothing.","param":null"#,
+    ));
+    assert_eq!(events, expected);
     fx.finish();
 }
 
@@ -867,24 +1120,31 @@ fn a_reader_too_slow_for_the_held_bound_ends_the_request() {
 
 #[test]
 fn time_limit_while_generating_ends_the_stream_with_an_error() {
+    // The limit is long next to what a loaded machine takes to launch a generation, and both requests wait for it
+    // together; nothing below depends on how soon the limit comes, only on its coming after the launch.
     let mut limits = limits();
-    limits.request_limit = Duration::from_millis(1500);
+    limits.request_limit = Duration::from_secs(4);
     let fx = Fixture::with(limits, Some(2));
+    fx.backend.set_max_active(2);
     fx.backend.set_script(Script::Hung);
+    let mut raws = Vec::new();
     for (index, (target, body)) in [(CHAT, chat_body("")), (MESSAGES, message_body(""))]
         .into_iter()
         .enumerate()
     {
         let mut raw = Raw::connect(fx.addr);
         raw.send(&post_raw(target, &body));
+        let head = raw.read_until(HEAD);
         until("launched", || {
             fx.backend
                 .generations()
                 .get(index)
                 .is_some_and(|g| g.started().is_some())
         });
-        assert!(fx.backend.generations()[index].emit_held("Hi"));
-        let seen = raw.read_until(END);
+        raws.push((target, raw, head));
+    }
+    for (index, (target, mut raw, head)) in raws.into_iter().enumerate() {
+        let seen = head + &raw.read_until(END);
         assert!(seen.starts_with(HEAD), "{seen}");
         if target == CHAT {
             assert!(seen.contains(r#""code":"timeout""#), "{seen}");
@@ -896,9 +1156,8 @@ fn time_limit_while_generating_ends_the_stream_with_an_error() {
             );
         }
         until("cancelled", || fx.backend.generations()[index].is_cancelled());
-        assert!(fx.backend.generations()[index].finish_held_ok(1, false));
-        assert_closed_once(&fx);
     }
+    assert_closed_once(&fx);
     fx.finish();
 }
 
@@ -962,5 +1221,155 @@ fn a_panic_in_the_owner_after_the_head_ends_the_stream_and_frees_the_slot() {
     assert_closed_once(&fx);
     fx.backend.set_script(tokens(&["Hi"], true));
     assert!(!stream(&fx, CHAT, &chat_body("")).is_empty());
+    fx.finish();
+}
+
+// What the review asked for.
+
+/// Reads the stream of a raw connection to its end.
+fn rest(raw: &mut Raw, head: String) -> Vec<String> {
+    let wire = head + &raw.read_until(END);
+    events(&wire)
+}
+
+#[test]
+fn a_large_reasoning_block_on_a_slow_reader_still_completes() {
+    let mut limits = limits();
+    limits.max_held_bytes = 512 << 10;
+    let fx = Fixture::with(limits, Some(2));
+    fx.backend.set_script(Script::Hung);
+    let on = format!(r#"{{"model":"{MODEL_ID}","stream":true,"input":"Hi"}}"#);
+    let mut raw = Raw::connect(fx.addr);
+    raw.send(&post_raw(RESPONSES, &on));
+    let head = raw.read_until(HEAD);
+    until("launched", || launched(&fx));
+    let generation = fx.backend.generations()[0].clone();
+    assert!(generation.emit_held("\nthinking "));
+    // The reader reads nothing while a quarter of a megabyte of reasoning is said; the events repeat it several times.
+    for _ in 0..16 {
+        assert!(generation.emit_held(&"a".repeat(16 << 10)));
+    }
+    assert!(generation.emit_held("\n</think>\n\nDone."));
+    assert!(generation.finish_held_ok(3, true));
+    let events = rest(&mut raw, head);
+    assert!(!generation.is_cancelled());
+    let names = named(&events);
+    assert_eq!(names.last(), Some(&"response.completed"), "{names:?}");
+    assert!(names.contains(&"response.reasoning_text.done"), "{names:?}");
+    assert!(events.last().expect("an event").contains(r#""status":"completed""#));
+    assert_closed_once(&fx);
+    fx.finish();
+}
+
+#[test]
+fn text_before_a_malformed_call_is_delivered_before_the_error() {
+    let fx = Fixture::with(limits(), Some(2));
+    // The call is complete and wrong: the error is found as the text arrives.
+    let bad = call("nothing", &[]);
+    fx.backend.set_script(tokens(&["Let me check. ", &bad], true));
+    let events = stream(&fx, CHAT, &chat_body(&tools("")));
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(events[0], role());
+    assert_eq!(events[1], content("Let me check."));
+    assert!(events[2].contains(r#""code":"invalid_tool_call""#), "{events:?}");
+    // The call is cut off at the end: the error is found when the pipeline finishes.
+    fx.backend.set_script(tokens(
+        &["Let me check.", "<tool_call>\n<function=get_weather>\n"],
+        true,
+    ));
+    let events = stream(&fx, CHAT, &chat_body(&tools("")));
+    assert_eq!(events[0], role(), "{events:?}");
+    assert_eq!(events[1], content("Let me check."), "{events:?}");
+    let last = events.last().expect("an event");
+    assert!(last.contains(r#""code":"invalid_tool_call""#), "{events:?}");
+    assert!(!joined(&events).contains("[DONE]"), "{events:?}");
+    fx.finish();
+}
+
+#[test]
+fn a_half_closed_client_gets_the_whole_stream() {
+    let fx = Fixture::with(limits(), Some(2));
+    fx.backend.set_script(Script::Hung);
+    let mut raw = Raw::connect(fx.addr);
+    raw.send(&post_raw(CHAT, &chat_body("")));
+    let head = raw.read_until(HEAD);
+    until("launched", || launched(&fx));
+    raw.half_close();
+    let generation = fx.backend.generations()[0].clone();
+    assert!(generation.emit_held("one "));
+    sleep(Duration::from_millis(200));
+    assert!(generation.emit_held("two"));
+    sleep(Duration::from_millis(200));
+    assert!(!generation.is_cancelled());
+    assert!(generation.finish_held_ok(2, true));
+    let events = rest(&mut raw, head);
+    assert_eq!(
+        events,
+        vec![
+            role(),
+            content("one "),
+            content("two"),
+            chunk("{}", r#""stop""#),
+            done()
+        ]
+    );
+    assert!(!generation.is_cancelled());
+    assert_closed_once(&fx);
+    fx.finish();
+}
+
+#[test]
+fn a_client_that_leaves_during_prefill_is_found_by_a_keep_alive() {
+    let fx = Fixture::with(limits(), Some(2));
+    fx.backend.set_script(Script::Hung);
+    let mut raw = Raw::connect(fx.addr);
+    raw.send(&post_raw(CHAT, &chat_body("")));
+    raw.read_until(HEAD);
+    until("launched", || launched(&fx));
+    drop(raw);
+    // Each quantum writes a keep-alive; the write that fails ends the request.
+    until("cancelled", || {
+        fx.backend.generations()[0].prefill_held();
+        fx.backend.generations()[0].is_cancelled()
+    });
+    assert!(fx.backend.generations()[0].finish_held_ok(0, false));
+    assert_closed_once(&fx);
+    assert_eq!(fx.backend.generations().len(), 1);
+    fx.finish();
+}
+
+#[test]
+fn a_launch_failure_after_the_head_is_an_error_event() {
+    let fx = Fixture::with(limits(), Some(2));
+    fx.backend.set_launch_fault(Some(LaunchFault::Fail("late".to_owned())));
+    let events = stream(&fx, CHAT, &chat_body(""));
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(events[0].starts_with(r#"data:{"error":{"#), "{events:?}");
+    assert!(events[0].contains(r#""type":"server_error""#), "{events:?}");
+    assert!(!events[0].contains("late"), "{events:?}");
+    fx.backend.set_launch_fault(None);
+    fx.backend.set_script(tokens(&["Hi"], true));
+    assert!(!stream(&fx, CHAT, &chat_body("")).is_empty());
+    fx.finish();
+}
+
+#[test]
+fn text_arrives_as_it_is_generated() {
+    let fx = Fixture::with(limits(), Some(2));
+    fx.backend.set_script(Script::Hung);
+    let mut raw = Raw::connect(fx.addr);
+    raw.send(&post_raw(CHAT, &chat_body("")));
+    let mut seen = raw.read_until(HEAD);
+    until("launched", || launched(&fx));
+    let generation = fx.backend.generations()[0].clone();
+    for word in ["alpha", "beta", "gamma"] {
+        assert!(generation.emit_held(word));
+        seen += &raw.read_until(&format!(r#""content":"{word}""#));
+        assert!(!seen.ends_with(END));
+    }
+    assert!(generation.finish_held_ok(3, true));
+    let events = rest(&mut raw, seen);
+    assert_eq!(events.last(), Some(&done()));
+    assert_closed_once(&fx);
     fx.finish();
 }

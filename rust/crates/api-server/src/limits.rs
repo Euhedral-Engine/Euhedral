@@ -51,8 +51,10 @@ pub struct Limits {
     /// How long a stop lets the requests in flight (the waiting ones included) finish before admission refuses the
     /// waiting ones and interrupts the running ones.
     pub drain_limit: Duration,
-    /// The most bytes of a streamed reply's events held while a piece is being written. A client that does not read
-    /// lets them pile up; past this the generation is cancelled and the stream is cut.
+    /// The most text a streamed reply takes in, counted in bytes of what the model said (not of the events that
+    /// repeat it), while one piece is being written or while the owner has not yet taken it. A client that does not
+    /// read lets it pile up; past this the generation is cancelled and the stream is cut. It does not apply once the
+    /// end of the stream is queued.
     pub max_held_bytes: usize,
 }
 
