@@ -6,6 +6,7 @@
 //! clock in milliseconds, passed in by the caller; a clock that goes backwards rotates nothing until it passes the last
 //! rotation again.
 
+use std::array::from_fn;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 /// The length of one window.
@@ -28,7 +29,7 @@ impl WindowMax {
     /// An empty ring whose first window began at `now_ms`.
     pub fn new(now_ms: i64) -> WindowMax {
         WindowMax {
-            ring: std::array::from_fn(|_| AtomicU64::new(0)),
+            ring: from_fn(|_| AtomicU64::new(0)),
             current: AtomicUsize::new(0),
             last_rotate_ms: AtomicI64::new(now_ms),
             rotating: AtomicBool::new(false),
