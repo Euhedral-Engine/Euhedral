@@ -27,6 +27,8 @@ pub struct Completed {
     /// The stop string that matched, when one did.
     pub stop_sequence: Option<String>,
     pub result: GenerationResult,
+    /// Tool calls that went out in the stream as they came, so that `parts` does not hold them.
+    pub streamed_calls: usize,
 }
 
 impl Completed {
@@ -52,14 +54,16 @@ impl Completed {
 
     /// The number of tool calls in the answer.
     pub fn calls(&self) -> usize {
-        self.parts
-            .iter()
-            .filter(|part| matches!(part, Piece::ToolCall(_)))
-            .count()
+        self.streamed_calls
+            + self
+                .parts
+                .iter()
+                .filter(|part| matches!(part, Piece::ToolCall(_)))
+                .count()
     }
 }
 
-fn count(value: usize) -> i32 {
+pub(super) fn count(value: usize) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
 
@@ -120,7 +124,7 @@ fn chat(planned: &Planned, model: &str, done: &Completed) -> ChatCompletionRespo
 }
 
 /// The opaque token naming the thinking it accompanies.
-fn signature(thinking: &str) -> String {
+pub(super) fn signature(thinking: &str) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let digest = Sha256::digest(thinking.as_bytes());
     let mut token = String::from("euhedral-");
@@ -204,9 +208,9 @@ fn close(open: Option<Open>, encrypted: bool, items: &mut Vec<OutputItem>) {
     }
 }
 
-fn response(planned: &Planned, model: &str, done: &Completed) -> Response {
-    let result = &done.result;
-    let (encrypted, echo) = match &planned.extras {
+/// Whether the reasoning is returned encrypted, and the request settings a Responses reply repeats.
+pub(super) fn responses_extras(planned: &Planned) -> (bool, Vec<(String, JsonValue)>) {
+    match &planned.extras {
         Extras::Responses {
             include_encrypted_content,
             echo: JsonValue::Object(members),
@@ -216,7 +220,22 @@ fn response(planned: &Planned, model: &str, done: &Completed) -> Response {
             ..
         } => (*include_encrypted_content, Vec::new()),
         _ => (false, Vec::new()),
-    };
+    }
+}
+
+/// The message a stream opens with: no content yet, and the prompt tokens split by what the prefix cache restored.
+pub(super) fn opening_message(id: &str, model: &str, prompt_tokens: i32, cached: i32) -> Message {
+    Message::new(
+        id.to_owned(),
+        model.to_owned(),
+        Vec::new(),
+        AnthropicUsage::of(prompt_tokens, cached, 0),
+    )
+}
+
+fn response(planned: &Planned, model: &str, done: &Completed) -> Response {
+    let result = &done.result;
+    let (encrypted, echo) = responses_extras(planned);
     let mut items = Vec::new();
     let mut open: Option<Open> = None;
     for part in &done.parts {

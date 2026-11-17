@@ -8,7 +8,7 @@
 )]
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::str::from_utf8;
 use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
@@ -218,6 +218,11 @@ impl Raw {
 
     pub fn send(&mut self, bytes: &str) {
         self.stream.write_all(bytes.as_bytes()).expect("a write");
+    }
+
+    /// Closes the sending side only: the client still reads, as one that has sent its whole request does.
+    pub fn half_close(&mut self) {
+        self.stream.shutdown(Shutdown::Write).expect("a half close");
     }
 
     /// What arrives within `wait`, possibly nothing; `None` once the server has closed and nothing is left.
