@@ -152,4 +152,19 @@ mod tests {
         assert_eq!(filter.accept("日本語!"), "");
         assert!(filter.matched());
     }
+
+    #[test]
+    fn which_stop_matches_can_depend_on_where_the_text_is_cut() {
+        let mut whole = filter(&["abc", "ab"]);
+        assert_eq!(whole.accept("xabc"), "x");
+        assert_eq!(whole.matched_stop(), Some("abc"));
+        let mut cut = filter(&["abc", "ab"]);
+        assert_eq!(cut.accept("xab"), "x");
+        assert_eq!(cut.matched_stop(), Some("ab"));
+        let mut whole = filter(&["abcd", "c"]);
+        assert_eq!(whole.accept("abcd"), "");
+        let mut cut = filter(&["abcd", "c"]);
+        assert_eq!(cut.accept("abc"), "ab");
+        assert_eq!(cut.accept("d"), "");
+    }
 }

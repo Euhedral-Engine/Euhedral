@@ -1,23 +1,168 @@
-//! A JSON document as the pipeline reads and writes it: object members keep their insertion order, integers keep
-//! their digits, and a document is parsed strictly (no trailing text, no comments, no non-finite literals).
+//! JSON values for the whole crate: the chat template's `tojson` form (Python's `json.dumps(value,
+//! ensure_ascii=False)`), the compact form of tool-call arguments, and a strict parser.
 
 use std::fmt::Write;
 
-/// The deepest nesting a document may have.
+/// The deepest nesting a parsed document may have.
 const MAX_DEPTH: usize = 1000;
 
-/// One JSON value.
-#[derive(Clone, Debug, PartialEq)]
+/// A JSON value whose objects keep their insertion order.
+#[derive(Debug, Clone, PartialEq)]
 pub enum JsonValue {
     Null,
     Bool(bool),
-    /// An integer of any size, as its decimal digits with a leading `-` when negative.
-    Integer(String),
+    /// An integer literal of any size; written as its canonical decimal digits.
+    Integer(JsonInteger),
+    /// A fractional or exponent literal; written as Python's `repr` of a float.
     Float(f64),
     String(String),
     Array(Vec<JsonValue>),
-    /// Members in insertion order; a repeated key replaces the earlier value in place.
+    /// Members in the order they are written.
     Object(Vec<(String, JsonValue)>),
+}
+
+/// An integer of any size, held as its canonical decimal digits: no leading zeros or plus sign, and zero is `0`
+/// whatever its sign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonInteger(String);
+
+impl JsonInteger {
+    /// The integer written as an optional `-` and decimal digits; `None` for any other text.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (negative, digits) = match text.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let digits = digits.trim_start_matches('0');
+        Some(Self(match (digits.is_empty(), negative) {
+            (true, _) => "0".to_owned(),
+            (false, true) => format!("-{digits}"),
+            (false, false) => digits.to_owned(),
+        }))
+    }
+
+    /// The canonical decimal digits.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<i128> for JsonInteger {
+    fn from(value: i128) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<u128> for JsonInteger {
+    fn from(value: u128) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl JsonValue {
+    /// The value as Python's `json.dumps(value, ensure_ascii=False)` writes it: `", "` and `": "` separators,
+    /// insertion key order, only `"`, `\` and C0 controls escaped, non-finite floats as `Infinity`, `-Infinity`
+    /// and `NaN`.
+    pub fn to_python_json(&self) -> String {
+        let mut out = String::new();
+        self.write_python_json(&mut out);
+        out
+    }
+
+    fn write_python_json(&self, out: &mut String) {
+        match self {
+            Self::Null => out.push_str("null"),
+            Self::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+            Self::Integer(value) => out.push_str(value.as_str()),
+            Self::Float(value) => out.push_str(&python_float(*value)),
+            Self::String(text) => write_string(text, out),
+            Self::Array(items) => {
+                out.push('[');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    item.write_python_json(out);
+                }
+                out.push(']');
+            }
+            Self::Object(members) => {
+                out.push('{');
+                for (index, (key, value)) in members.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    write_string(key, out);
+                    out.push_str(": ");
+                    value.write_python_json(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+}
+
+fn write_string(text: &str, out: &mut String) {
+    out.push('"');
+    for value in text.chars() {
+        match value {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            control if control < ' ' => {
+                let _ = write!(out, "\\u{:04x}", u32::from(control));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+}
+
+/// Python's `float.__repr__`: the shortest round-tripping digits, positional when the decimal exponent is in
+/// [-4, 16), otherwise `d.ddde±XX`.
+pub(crate) fn python_float(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_owned();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
+    }
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    if value == 0.0 {
+        return format!("{sign}0.0");
+    }
+    // `{:e}` writes the shortest digits that round-trip: `d[.ddd]e<exponent>`.
+    let scientific = format!("{:e}", value.abs());
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    if (-4..16).contains(&exponent) {
+        let positional = if exponent >= 0 {
+            let integer_len = exponent as usize + 1;
+            if digits.len() <= integer_len {
+                format!("{digits}{}.0", "0".repeat(integer_len - digits.len()))
+            } else {
+                format!("{}.{}", &digits[..integer_len], &digits[integer_len..])
+            }
+        } else {
+            format!("0.{}{digits}", "0".repeat((-exponent - 1) as usize))
+        };
+        return format!("{sign}{positional}");
+    }
+    let mantissa = if digits.len() == 1 {
+        digits
+    } else {
+        format!("{}.{}", &digits[..1], &digits[1..])
+    };
+    let exponent_sign = if exponent < 0 { '-' } else { '+' };
+    format!("{sign}{mantissa}e{exponent_sign}{:02}", exponent.abs())
 }
 
 impl JsonValue {
@@ -52,7 +197,8 @@ impl JsonValue {
         }
     }
 
-    /// Reads one whole document; `None` when `text` is not exactly one JSON value.
+    /// Reads one whole document strictly; `None` when `text` is not exactly one JSON value. Integers of any
+    /// length keep their digits; a repeated object key replaces the earlier value in place.
     pub fn parse(text: &str) -> Option<JsonValue> {
         let mut parser = Parser { text, position: 0 };
         parser.skip_space();
@@ -61,8 +207,8 @@ impl JsonValue {
         (parser.position == text.len()).then_some(value)
     }
 
-    /// The compact form: no spaces, integers as written, other numbers in the shortest form that reads back
-    /// (positional from `1e-3` up to `1e7`, otherwise a mantissa and a signed power of ten, `1.0E10`).
+    /// The compact form: no spaces, escapes in capitals, other numbers in the form of Java's
+    /// `Double.toString` (`1.0E10`, positional from `1e-3` up to `1e7`).
     pub fn to_compact_string(&self) -> String {
         let mut json = String::new();
         self.write_compact(&mut json);
@@ -73,9 +219,9 @@ impl JsonValue {
         match self {
             JsonValue::Null => json.push_str("null"),
             JsonValue::Bool(flag) => json.push_str(if *flag { "true" } else { "false" }),
-            JsonValue::Integer(digits) => json.push_str(digits),
+            JsonValue::Integer(digits) => json.push_str(digits.as_str()),
             JsonValue::Float(number) => json.push_str(&compact_float(*number)),
-            JsonValue::String(text) => write_string(text, json),
+            JsonValue::String(text) => write_compact_string(text, json),
             JsonValue::Array(items) => {
                 json.push('[');
                 for (index, item) in items.iter().enumerate() {
@@ -92,7 +238,7 @@ impl JsonValue {
                     if index > 0 {
                         json.push(',');
                     }
-                    write_string(key, json);
+                    write_compact_string(key, json);
                     json.push(':');
                     value.write_compact(json);
                 }
@@ -110,8 +256,8 @@ pub(crate) fn put(members: &mut Vec<(String, JsonValue)>, key: String, value: Js
     }
 }
 
-/// Quotes a string, escaping `"`, `\` and the controls (short escapes where they exist, else `\u00XX`).
-fn write_string(text: &str, json: &mut String) {
+/// Quotes a string for the compact form: `"`, `\` and the controls are escaped, the latter with capital hex digits.
+fn write_compact_string(text: &str, json: &mut String) {
     json.push('"');
     for value in text.chars() {
         match value {
@@ -302,8 +448,7 @@ impl Parser<'_> {
         }
         let literal = &self.text[start..self.position];
         if integer {
-            let digits = if literal == "-0" { "0" } else { literal };
-            return Some(JsonValue::Integer(digits.to_string()));
+            return JsonInteger::parse(literal).map(JsonValue::Integer);
         }
         literal.parse::<f64>().ok().map(JsonValue::Float)
     }
@@ -441,5 +586,34 @@ mod tests {
         let value = JsonValue::parse("123456789012345678901234567890").unwrap();
         assert_eq!(value.to_compact_string(), "123456789012345678901234567890");
         assert!(matches!(JsonValue::parse("1e400"), Some(JsonValue::Float(number)) if number.is_infinite()));
+    }
+
+    #[test]
+    fn python_floats_follow_repr() {
+        let cases = [
+            (1.0e-5, "1e-05"),
+            (1.0e16, "1e+16"),
+            (1.0e15, "1000000000000000.0"),
+            (2.0, "2.0"),
+            (0.0001, "0.0001"),
+            (0.00001234, "1.234e-05"),
+            (-1.5e300, "-1.5e+300"),
+            (f64::NAN, "NaN"),
+            (f64::NEG_INFINITY, "-Infinity"),
+            (-0.0, "-0.0"),
+        ];
+        for (number, expected) in cases {
+            assert_eq!(python_float(number), expected);
+        }
+    }
+
+    #[test]
+    fn python_documents_use_python_separators_and_keep_non_ascii_text() {
+        let value = JsonValue::parse(r#"{"a": [1, 2.50, "é\u0001\n"], "b": {"c": null, "d": true}, "e": {}, "f": []}"#)
+            .unwrap();
+        assert_eq!(
+            value.to_python_json(),
+            "{\"a\": [1, 2.5, \"é\\u0001\\n\"], \"b\": {\"c\": null, \"d\": true}, \"e\": {}, \"f\": []}"
+        );
     }
 }

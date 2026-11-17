@@ -2,8 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::pipeline::function_tool::FunctionTool;
-use crate::pipeline::json_value::{JsonValue, put};
+use crate::ToolDefinition;
+#[cfg(test)]
+use crate::json::JsonInteger;
+use crate::json::{JsonValue, put};
 use crate::pipeline::text_space::{held_tag_prefix, is_block_space, trailing_space_start};
 
 const CALL_START: &str = "<tool_call>";
@@ -47,7 +49,7 @@ enum State {
 /// one, is held back until the next chunk decides it.
 #[derive(Debug)]
 pub struct ToolCallParser {
-    callable: Vec<FunctionTool>,
+    callable: Vec<ToolDefinition>,
     parallel: bool,
     /// A required or named choice: the grammar forces a call, so an answer without one is malformed.
     requires_call: bool,
@@ -57,7 +59,7 @@ pub struct ToolCallParser {
 }
 
 impl ToolCallParser {
-    pub fn new(callable: Vec<FunctionTool>, parallel: bool, requires_call: bool) -> Self {
+    pub fn new(callable: Vec<ToolDefinition>, parallel: bool, requires_call: bool) -> Self {
         Self {
             callable,
             parallel,
@@ -252,7 +254,7 @@ fn parameter_end(block: &str, from: usize) -> Option<usize> {
 
 /// Inverts the template: strings render verbatim, every other value as JSON. The schema's declared types decide
 /// between the two readings; an untyped parameter takes the JSON reading when it parses.
-fn argument_value(tool: &FunctionTool, key: &str, raw: &str) -> Result<JsonValue, MalformedToolCall> {
+fn argument_value(tool: &ToolDefinition, key: &str, raw: &str) -> Result<JsonValue, MalformedToolCall> {
     let types = tool.parameter_types(key);
     let text = || JsonValue::String(raw.to_string());
     if types.len() == 1 && types.contains("string") {
@@ -312,12 +314,27 @@ fn type_list(types: &BTreeSet<String>) -> String {
     format!("[{}]", names.join(", "))
 }
 
-/// The start of a value, for an error message.
+/// The start of a value, for an error message: at most 80 UTF-16 code units, then `...`. A character cut in half
+/// by the limit is written as U+FFFD.
 fn excerpt(raw: &str) -> String {
-    match raw.char_indices().nth(80) {
-        None => format!("'{raw}'"),
-        Some((end, _)) => format!("'{}...'", &raw[..end]),
+    const LIMIT: usize = 80;
+    if raw.encode_utf16().count() <= LIMIT {
+        return format!("'{raw}'");
     }
+    let mut cut = String::new();
+    let mut units = 0;
+    for value in raw.chars() {
+        let width = value.len_utf16();
+        if units + width > LIMIT {
+            if units < LIMIT {
+                cut.push('\u{fffd}');
+            }
+            break;
+        }
+        cut.push(value);
+        units += width;
+    }
+    format!("'{cut}...'")
 }
 
 fn strip_one_newline(value: &str) -> &str {
@@ -337,8 +354,31 @@ fn malformed(message: &str) -> MalformedToolCall {
 mod tests {
     use super::*;
 
-    fn tool(parameters: Option<&str>) -> FunctionTool {
-        FunctionTool::new("f", parameters.map(|text| JsonValue::parse(text).unwrap()))
+    fn tool(parameters: Option<&str>) -> ToolDefinition {
+        tool_definition("f", parameters)
+    }
+
+    fn tool_definition(name: &str, parameters: Option<&str>) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: None,
+            parameters: parameters.map(|text| JsonValue::parse(text).unwrap()),
+        }
+    }
+
+    #[test]
+    fn an_excerpt_counts_utf16_units_and_cuts_after_eighty() {
+        assert_eq!(excerpt(&"a".repeat(80)), format!("'{}'", "a".repeat(80)));
+        assert_eq!(excerpt(&"a".repeat(81)), format!("'{}...'", "a".repeat(80)));
+        // 40 emoji are 80 units and fit; 50 emoji are 100 units and are cut after the 40th.
+        assert_eq!(excerpt(&"😀".repeat(40)), format!("'{}'", "😀".repeat(40)));
+        assert_eq!(excerpt(&"😀".repeat(50)), format!("'{}...'", "😀".repeat(40)));
+        // A pair cut in half by the limit becomes U+FFFD.
+        assert_eq!(
+            excerpt(&format!("a{}", "😀".repeat(50))),
+            format!("'a{}\u{fffd}...'", "😀".repeat(39))
+        );
+        assert_eq!(excerpt("é"), "'é'");
     }
 
     fn parser(parameters: Option<&str>, parallel: bool, requires_call: bool) -> ToolCallParser {
@@ -601,6 +641,6 @@ mod tests {
         let arguments = arguments(schema, &["s", dangerous, "x", "5"]).unwrap();
         let parsed = JsonValue::parse(&arguments).unwrap();
         assert_eq!(parsed.get("s"), Some(&JsonValue::String(dangerous.to_string())));
-        assert_eq!(parsed.get("x"), Some(&JsonValue::Integer("5".to_string())));
+        assert_eq!(parsed.get("x"), Some(&JsonValue::Integer(JsonInteger::from(5_i128))));
     }
 }

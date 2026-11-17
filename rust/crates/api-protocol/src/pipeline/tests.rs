@@ -1,4 +1,5 @@
-//! The pipeline as a whole: what a request's output turns into, and that it does not depend on how the text is cut.
+//! The pipeline as a whole: what a request's output turns into, and that ordinary output does not depend on how the
+//! text is cut.
 
 use std::iter::once;
 use std::sync::mpsc::channel;
@@ -6,12 +7,17 @@ use std::thread::spawn;
 use std::time::Duration;
 
 use super::*;
+use crate::json::JsonValue;
 
 const CALL_F: &str = "<tool_call>\n<function=f>\n</function>\n</tool_call>";
 const SCHEMA: &str = r#"{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}}"#;
 
-fn tool(name: &str, schema: Option<&str>) -> FunctionTool {
-    FunctionTool::new(name, schema.map(|text| JsonValue::parse(text).unwrap()))
+fn tool(name: &str, schema: Option<&str>) -> ToolDefinition {
+    ToolDefinition {
+        name: name.to_string(),
+        description: None,
+        parameters: schema.map(|text| JsonValue::parse(text).unwrap()),
+    }
 }
 
 fn tools(choice: ToolChoice, parallel: bool) -> Option<ToolOptions> {
@@ -520,7 +526,11 @@ fn unfinished_reasoning_is_released_trimmed_and_reported_open() {
 
 /// Runs `work` on its own thread and fails the test when it has not returned in time, so a pipeline that loops
 /// forever fails fast instead of hanging the suite.
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // the rule: no threads or channels; a watchdog is a test fixture.
+#[allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "a test fixture: a watchdog thread and a channel make a hang fail fast"
+)]
 fn within_deadline<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
     let (sender, receiver) = channel();
     spawn(move || {

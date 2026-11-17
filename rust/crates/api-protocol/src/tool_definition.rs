@@ -1,22 +1,32 @@
-//! A function the model may call, as far as parsing its calls needs to know it.
+//! A function tool offered to the model: what the prompt renders and what a generated call is checked against.
 
 use std::collections::BTreeSet;
 
-use crate::pipeline::json_value::JsonValue;
+use crate::json::JsonValue;
 
-/// One function tool: its name and the JSON Schema object of its parameters, when the request gave one.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FunctionTool {
+/// A function tool offered to the model. `description` and `parameters` (a JSON Schema object) are left out of the
+/// prompt when `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDefinition {
     pub name: String,
+    pub description: Option<String>,
     pub parameters: Option<JsonValue>,
 }
 
-impl FunctionTool {
-    pub fn new(name: &str, parameters: Option<JsonValue>) -> Self {
-        Self {
-            name: name.to_string(),
-            parameters,
+impl ToolDefinition {
+    /// The object the template serializes for the tool: `{"type": "function", "function": {...}}`.
+    pub(crate) fn to_json(&self) -> JsonValue {
+        let mut function = vec![("name".to_owned(), JsonValue::String(self.name.clone()))];
+        if let Some(description) = &self.description {
+            function.push(("description".to_owned(), JsonValue::String(description.clone())));
         }
+        if let Some(parameters) = &self.parameters {
+            function.push(("parameters".to_owned(), parameters.clone()));
+        }
+        JsonValue::Object(vec![
+            ("type".to_owned(), JsonValue::String("function".to_owned())),
+            ("function".to_owned(), JsonValue::Object(function)),
+        ])
     }
 
     /// JSON types the schema declares for a parameter through `type`, `anyOf`/`oneOf` branch types, or an

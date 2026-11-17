@@ -3,9 +3,6 @@
 //! [`StopSequenceFilter`] applies the request's `stop` strings to the answer only, then [`ToolCallParser`] reads
 //! the answer's `<tool_call>` blocks. Each stage is usable alone; [`TextPipeline`] composes them.
 
-mod function_tool;
-mod json_value;
-pub mod python_json;
 mod reasoning_splitter;
 mod stop_sequence_filter;
 mod text_space;
@@ -14,13 +11,13 @@ mod tool_call_parser;
 #[cfg(test)]
 mod tests;
 
-pub use function_tool::FunctionTool;
-pub use json_value::JsonValue;
 pub use reasoning_splitter::{ReasoningSplitter, Split, THINK_END};
 pub use stop_sequence_filter::StopSequenceFilter;
 pub use tool_call_parser::{MalformedToolCall, ToolCall, ToolCallParser, ToolEvent};
 
 use thiserror::Error;
+
+use crate::ToolDefinition;
 
 /// One settled part of the output, in generation order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +46,7 @@ pub enum ToolChoice {
 /// The request's tools and how they may be called.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolOptions {
-    pub tools: Vec<FunctionTool>,
+    pub tools: Vec<ToolDefinition>,
     pub choice: ToolChoice,
     /// False ends the response after the first complete call.
     pub parallel: bool,
@@ -57,7 +54,7 @@ pub struct ToolOptions {
 
 impl ToolOptions {
     /// Functions the model may call in this response.
-    fn callable(&self) -> Vec<FunctionTool> {
+    fn callable(&self) -> Vec<ToolDefinition> {
         match &self.choice {
             ToolChoice::None => Vec::new(),
             ToolChoice::Function(name) => self.tools.iter().filter(|tool| tool.name == *name).cloned().collect(),
@@ -82,6 +79,13 @@ pub struct PipelineOptions {
 pub enum PipelineError {
     /// The output claims to be a tool call but is not one the request can accept. `emitted` holds the pieces
     /// settled by the same call before the failure was found; the pipeline accepts no text after it.
+    ///
+    /// What a caller does with it: send `emitted` first, as it would any pieces, because it was settled before the
+    /// failure. Then hold the error until the generation completes (the generation should be cancelled at once,
+    /// since nothing after the failure is used), and deliver it only when nothing outranks it: a client that
+    /// abandoned the request, a server shutdown and an engine failure take precedence. When the engine itself
+    /// cancelled the generation, do not call `finish`. After a failure `finish` returns this error again, with
+    /// no `emitted` pieces, so the completion step can read it there.
     #[error("{message}")]
     MalformedToolCall { message: String, emitted: Vec<Piece> },
 }
@@ -95,9 +99,12 @@ impl PipelineError {
     }
 }
 
-/// Turns the decoded text of one generation into pieces. Text may be cut anywhere between characters: the pieces
-/// concatenate to the same reasoning, text and calls however it is cut. Text that could still be part of a marker,
-/// a stop string or a call is held until it is decided, and [`finish`](Self::finish) releases what remains.
+/// Turns the decoded text of one generation into pieces. Text may be cut anywhere between characters. Text that
+/// could still be part of a marker, a stop string or a call is held until it is decided, and
+/// [`finish`](Self::finish) releases what remains. The reasoning split and the call parser give the same pieces
+/// wherever the text is cut for ordinary output. With several stop strings where one is a prefix or a part of
+/// another (`abc` and `ab`; `abcd` and `c`), which stop is reported and where the text ends can depend on the
+/// cut: a stop is matched as soon as the received text contains it.
 #[derive(Debug)]
 pub struct TextPipeline {
     splitter: Option<ReasoningSplitter>,
