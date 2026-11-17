@@ -1,5 +1,5 @@
-//! The test oracle: the selection as it was before its loops were fused, kept straightforward. It takes the unit
-//! draw as an argument so a test can give it the keyed draw of a position.
+//! The test oracle: a straightforward selection that builds the candidate list, keeps the top-k with a heap, sorts
+//! and draws step by step. It takes the unit draw as an argument so a test can give it the keyed draw of a position.
 
 use super::config::{SamplingConfig, SamplingError};
 

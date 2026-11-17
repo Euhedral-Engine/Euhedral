@@ -1,5 +1,5 @@
-//! The sampler's cases, run host-only. The reference selection draws from a sequential stream; this one draws only
-//! by position, so a case that repeated a selection to see the stream advance repeats it over positions instead.
+//! The sampler's cases, run host-only. Every draw is keyed by a position, so a case that needs several draws from one
+//! row takes them at consecutive positions.
 
 use std::cell::Cell;
 
@@ -34,7 +34,7 @@ fn picks(sampler: &mut TokenSampler, row: &[f32], first: u64, length: u64) -> Ve
         .collect()
 }
 
-// ---- GenerationConfigTest
+// ---- configuration
 
 #[test]
 fn rejects_invalid_sampling_ranges() {
@@ -68,7 +68,7 @@ fn a_vocabulary_of_zero_is_refused() {
     );
 }
 
-// ---- TokenSamplerTest
+// ---- selection
 
 #[test]
 fn greedy_selection_returns_the_maximum_logit_and_breaks_ties_by_lowest_token_id() {
@@ -313,7 +313,7 @@ fn keyed_calls_ignore_earlier_calls_and_call_order() {
     assert_eq!(expected, actual);
 }
 
-// ---- TokenSamplerKeyedTest
+// ---- keyed draws
 
 #[test]
 fn a_position_samples_the_same_token_in_any_order() {
@@ -380,13 +380,22 @@ fn unit_draw_is_the_split_mix_stream_and_wraps() {
         unit_draw(0, 0),
         (0xE220_A839_7B1D_CDAF_u64 >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
     );
+    // The second output of the same state, and a nonzero seed, worked out with an independent implementation.
+    assert_eq!(
+        unit_draw(0, 1),
+        (0x6E78_9E6A_A1B9_65F4_u64 >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
+    );
+    assert_eq!(
+        unit_draw(12345, 7),
+        (0x6E74_11B0_6820_371C_u64 >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
+    );
     // Positions and seeds at the top of the range wrap instead of overflowing.
     let u = unit_draw(u64::MAX, u64::MAX);
     assert!((0.0..1.0).contains(&u));
     assert_eq!(unit_draw(u64::MAX, u64::MAX), unit_draw(u64::MAX, u64::MAX));
 }
 
-// ---- ConstrainedTokenSamplerTest
+// ---- filtered selection
 
 const VOCABULARY: usize = 3000;
 
@@ -539,13 +548,53 @@ fn a_filter_that_rejects_everything_fails() {
 }
 
 #[test]
-fn a_filtered_selection_after_a_masked_one_sees_the_row_it_was_given() {
-    // The masked path overwrites the caller's row; the next call brings its own.
+fn the_masked_path_overwrites_the_disallowed_entries_of_the_callers_row() {
+    // Too few allowed tokens among the best ranked: the whole row is masked in place.
     let mut sampler = sampled(1.0, 2, 1.0, 4, 6);
     let filter = Modulo::new(6, 5);
     let mut row = [3.0, 2.0, 1.0, 0.5, 0.25, 0.1];
     assert_eq!(sampler.select_filtered(&mut row, &filter, 0), Ok(5));
     assert_eq!(row[..5], [NEG_INF; 5]);
+}
+
+#[test]
+fn at_top_p_one_the_filtered_path_draws_in_priority_order_and_the_masked_path_in_heap_order() {
+    // Scores 1, 3, 2 with top-k 2 keep tokens 1 and 2. In priority order they are [1, 2] with probabilities
+    // 0.731 and 0.269; the heap built over the row holds [2, 1] after token 2 replaces token 0.
+    // The draw at position 2 of seed 1 is 0.971: priority order passes 0.731 and picks token 2, heap order
+    // picks token 2 only below 0.269 and otherwise token 1.
+    let row = [1.0, 3.0, 2.0];
+    let mut sampler = sampled(1.0, 2, 1.0, 1, 3);
+    assert!((unit_draw(1, 2) - 0.971).abs() < 1.0e-3);
+    let filtered = sampler.select_filtered(&mut row.clone(), &Modulo::new(1, 0), 2);
+    assert_eq!(filtered, Ok(2));
+    assert_eq!(sampler.select(&row, 2), Ok(1));
+}
+
+#[test]
+fn fewer_selectable_tokens_than_the_ranking_limit_are_all_ranked_without_masking() {
+    // Three selectable tokens against a limit of 64, two of them allowed, top-k 5: the ranking holds every
+    // selectable token, so the allowed ones are drawn in priority order [70, 40] with probabilities 0.731 and
+    // 0.269. The draw at position 3 of seed 1 is 0.444 and picks 70; at position 2 it is 0.971 and picks 40.
+    let mut row = vec![NEG_INF; 100];
+    row[10] = 1.0;
+    row[40] = 2.0;
+    row[70] = 3.0;
+    let filter = FromIds(&[40, 70]);
+    let mut sampler = sampled(1.0, 5, 1.0, 1, 100);
+    assert!((unit_draw(1, 3) - 0.444).abs() < 1.0e-3);
+    assert_eq!(sampler.select_filtered(&mut row, &filter, 3), Ok(70));
+    assert_eq!(sampler.select_filtered(&mut row, &filter, 2), Ok(40));
+    // The disallowed token was ranked but never masked: the row is as it was given.
+    assert_eq!(row[10], 1.0);
+}
+
+struct FromIds<'a>(&'a [u32]);
+
+impl TokenFilter for FromIds<'_> {
+    fn allows(&self, id: u32) -> bool {
+        self.0.contains(&id)
+    }
 }
 
 // ---- bf16 rows
@@ -588,12 +637,16 @@ fn a_bf16_row_of_the_wrong_size_is_refused() {
     let mut sampler = sampler(SamplingConfig::greedy(1), 3);
     assert_eq!(
         sampler.select_bf16(&[0; 5], 0, None),
-        Err(SamplingError::RowWidth { expected: 3, got: 2 })
+        Err(SamplingError::RowBytes { expected: 6, got: 5 })
+    );
+    assert_eq!(
+        sampler.select_bf16(&[0; 4], 0, None),
+        Err(SamplingError::RowBytes { expected: 6, got: 4 })
     );
     assert_eq!(sampler.select_bf16(&bf16(&[0.0, 1.0, 0.5]), 0, None), Ok(1));
 }
 
-// ---- TokenSamplerEquivalenceTest
+// ---- agreement with the straightforward oracle
 
 const TEMPERATURES: [f32; 8] = [
     1.0,

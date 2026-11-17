@@ -2,7 +2,7 @@
 //! position, greedy selection and selection under a filter that says which tokens may be chosen.
 //!
 //! The result is fixed by the order of the floating-point operations and by the layout of the heaps, so the loops
-//! here are written to be followed line by line against the reference selection they reproduce. Nothing in this
+//! are written out step by step and must not be reordered. Nothing in this
 //! module touches the device, a thread or a lock; a sampler is owned by one request and its scratch rows are
 //! allocated once, when it is made.
 

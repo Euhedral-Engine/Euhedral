@@ -1,9 +1,8 @@
-//! The selection itself. Every loop here is the reference loop: the comparisons are `>` on the raw float (never a
-//! total order), the heaps are sifted the same way, and sums run in array order, because the chosen token depends
-//! on all three.
+//! The selection itself. The chosen token depends on the order of the floating-point operations and on the layout of
+//! the heaps, so the comparisons are `>` on the raw float (never a total order), the heaps are sifted exactly as
+//! written here, and sums run in array order.
 
 use std::cmp::Ordering;
-use std::mem::take;
 
 use super::config::{SamplingConfig, SamplingError};
 
@@ -42,13 +41,10 @@ fn exp(x: f64) -> f64 {
     x.exp()
 }
 
-/// Selects one token from one row of vocabulary logits, drawing with [`unit_draw`] of the seed and the position of
-/// the token being chosen, so a position selects the same token however it is reached. NaN and negative infinity
-/// are never selected; positive infinities share the probability mass equally.
-///
-/// One sampler serves one generation. It is not shared: its scratch rows are written by every selection.
+/// The scratch rows and the selection loops. Kept apart from the BF16 conversion row so a conversion can be
+/// selected from without moving the row out of its owner.
 #[derive(Debug)]
-pub struct TokenSampler {
+struct Selector {
     config: SamplingConfig,
     vocabulary: usize,
     /// Scaled score of each candidate token, indexed by token id.
@@ -59,13 +55,10 @@ pub struct TokenSampler {
     probabilities: Vec<f64>,
     /// The best tokens of a filtered selection, best first.
     ranked: Vec<u32>,
-    /// A BF16 row converted to f32.
-    row: Vec<f32>,
 }
 
-impl TokenSampler {
-    /// A sampler for rows of `vocabulary` logits. All scratch is allocated here.
-    pub fn new(config: SamplingConfig, vocabulary: usize) -> Result<Self, SamplingError> {
+impl Selector {
+    fn new(config: SamplingConfig, vocabulary: usize) -> Result<Self, SamplingError> {
         if vocabulary == 0 {
             return Err(SamplingError::EmptyVocabulary);
         }
@@ -84,34 +77,19 @@ impl TokenSampler {
             candidates: vec![0; rows],
             probabilities: vec![0.0; rows],
             ranked: vec![0; limit],
-            row: vec![0.0; vocabulary],
         })
     }
 
-    pub fn vocabulary(&self) -> usize {
-        self.vocabulary
-    }
-
-    /// Whether every selection is the argmax of the row.
-    pub fn is_greedy(&self) -> bool {
+    fn is_greedy(&self) -> bool {
         self.config.is_greedy()
     }
 
-    /// Selects the token at `position` from `row`.
-    pub fn select(&mut self, row: &[f32], position: u64) -> Result<u32, SamplingError> {
+    fn select(&mut self, row: &[f32], position: u64) -> Result<u32, SamplingError> {
         self.check_width(row.len())?;
         self.select_row(row, unit_draw(self.config.seed(), position))
     }
 
-    /// Selects the token at `position` from `row` as if every token the filter rejects were removed, testing as few
-    /// tokens as it can: the best candidates are tested in order until enough are allowed (one when greedy, top-k
-    /// when sampling), and every token only when they are not, in which case the disallowed entries of `row` are
-    /// overwritten with negative infinity.
-    ///
-    /// A greedy selection, and sampling with a top-p below one, select exactly what the masked row selects. With a
-    /// top-p of one the same candidates and probabilities are drawn in priority order rather than in the masked
-    /// row's heap order, so a seed may select another token of the same distribution.
-    pub fn select_filtered(
+    fn select_filtered(
         &mut self,
         row: &mut [f32],
         filter: &dyn TokenFilter,
@@ -149,32 +127,6 @@ impl TokenSampler {
         }
         filter.mask_disallowed(row);
         self.select_row(row, unit)
-    }
-
-    /// Selects as [`TokenSampler::select`] and [`TokenSampler::select_filtered`] do from a row of BF16 logits, two
-    /// little-endian bytes each, converted exactly to f32.
-    pub fn select_bf16(
-        &mut self,
-        row: &[u8],
-        position: u64,
-        filter: Option<&dyn TokenFilter>,
-    ) -> Result<u32, SamplingError> {
-        if row.len() != self.vocabulary * 2 {
-            return Err(SamplingError::RowWidth {
-                expected: self.vocabulary,
-                got: row.len() / 2,
-            });
-        }
-        let mut converted = take(&mut self.row);
-        for (logit, pair) in converted.iter_mut().zip(row.as_chunks::<2>().0) {
-            *logit = f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16);
-        }
-        let selected = match filter {
-            None => self.select(&converted, position),
-            Some(filter) => self.select_filtered(&mut converted, filter, position),
-        };
-        self.row = converted;
-        selected
     }
 
     fn check_width(&self, got: usize) -> Result<(), SamplingError> {
@@ -300,6 +252,87 @@ impl TokenSampler {
             }
         }
         draw(candidates, probabilities, retained, unit)
+    }
+}
+
+/// Selects one token from one row of vocabulary logits, drawing with [`unit_draw`] of the seed and the position of
+/// the token being chosen, so a position selects the same token however it is reached. NaN and negative infinity
+/// are never selected; positive infinities share the probability mass equally.
+///
+/// One sampler serves one generation. It is not shared: its scratch rows are written by every selection, and all of
+/// them are allocated when it is made.
+#[derive(Debug)]
+pub struct TokenSampler {
+    selector: Selector,
+    /// A BF16 row converted to f32.
+    row: Vec<f32>,
+}
+
+impl TokenSampler {
+    /// A sampler for rows of `vocabulary` logits.
+    pub fn new(config: SamplingConfig, vocabulary: usize) -> Result<Self, SamplingError> {
+        Ok(Self {
+            selector: Selector::new(config, vocabulary)?,
+            row: vec![0.0; vocabulary],
+        })
+    }
+
+    pub fn vocabulary(&self) -> usize {
+        self.selector.vocabulary
+    }
+
+    /// Whether every selection is the argmax of the row.
+    pub fn is_greedy(&self) -> bool {
+        self.selector.is_greedy()
+    }
+
+    /// Selects the token at `position` from `row`.
+    pub fn select(&mut self, row: &[f32], position: u64) -> Result<u32, SamplingError> {
+        self.selector.select(row, position)
+    }
+
+    /// Selects the token at `position` from `row` as if every token the filter rejects were removed, testing as few
+    /// tokens as it can: the best candidates are tested in order until enough are allowed (one when greedy, top-k
+    /// when sampling), and every token only when they are not, in which case the disallowed entries of `row` are
+    /// overwritten with negative infinity.
+    ///
+    /// A greedy selection, and sampling with a top-p below one, select exactly what the masked row selects. With a
+    /// top-p of one the same candidates and probabilities are drawn in priority order rather than in the masked
+    /// row's heap order, so a seed may select another token of the same distribution.
+    pub fn select_filtered(
+        &mut self,
+        row: &mut [f32],
+        filter: &dyn TokenFilter,
+        position: u64,
+    ) -> Result<u32, SamplingError> {
+        self.selector.select_filtered(row, filter, position)
+    }
+
+    /// Selects as [`TokenSampler::select`] and [`TokenSampler::select_filtered`] do from a row of BF16 logits, two
+    /// little-endian bytes each, converted exactly to f32.
+    pub fn select_bf16(
+        &mut self,
+        row: &[u8],
+        position: u64,
+        filter: Option<&dyn TokenFilter>,
+    ) -> Result<u32, SamplingError> {
+        let Self {
+            selector,
+            row: converted,
+        } = self;
+        if row.len() != selector.vocabulary * 2 {
+            return Err(SamplingError::RowBytes {
+                expected: selector.vocabulary * 2,
+                got: row.len(),
+            });
+        }
+        for (logit, pair) in converted.iter_mut().zip(row.as_chunks::<2>().0) {
+            *logit = f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16);
+        }
+        match filter {
+            None => selector.select(converted, position),
+            Some(filter) => selector.select_filtered(converted, filter, position),
+        }
     }
 }
 

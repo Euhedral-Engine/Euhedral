@@ -21,6 +21,10 @@ pub enum SamplingError {
     #[error("expected {expected} vocabulary logits, got {got}")]
     RowWidth { expected: usize, got: usize },
 
+    /// A BF16 row is not two bytes per vocabulary entry.
+    #[error("expected {expected} bytes of BF16 logits, got {got}")]
+    RowBytes { expected: usize, got: usize },
+
     /// The row holds no token that is neither NaN nor negative infinity.
     #[error("logit row has no selectable token")]
     NoSelectableToken,
