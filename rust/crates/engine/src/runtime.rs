@@ -28,7 +28,7 @@ use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
 use crate::error::EngineError;
 use crate::generation::GREEDY_DEPTH;
-use crate::generation::{AdmissionError, Generation, GenerationRequest, LogitsSink};
+use crate::generation::{AdmissionError, CancelHandle, Generation, GenerationRequest, LogitsSink};
 use crate::handoff::Handoff;
 use crate::kernels::kernel_sources;
 use crate::model::{ModelConfig, Weights};
@@ -417,7 +417,16 @@ impl EngineRuntime {
     /// frames on the engine's lattice, and its listener is told of it there. The sequence takes one request at a time;
     /// it starts each from nothing, whatever the one before left in it.
     pub fn generate(&self, request: GenerationRequest) -> Result<(), AdmissionError> {
-        self.generation.generate(request)
+        self.generation.generate(request, CancelHandle::default())
+    }
+
+    /// As [`EngineRuntime::generate`], with `cancel` made by the caller, who keeps a clone: `cancel` ends the generation
+    /// from any thread, from the listener too, without waiting, at the next quantum boundary. The generation then ends
+    /// through its listener, once, as [`FinishReason::Cancelled`](crate::generation::FinishReason), with the tokens
+    /// reported until then, and the sequence takes the next request. A handle already cancelled ends the generation
+    /// before its first quantum.
+    pub fn generate_cancellable(&self, request: GenerationRequest, cancel: CancelHandle) -> Result<(), AdmissionError> {
+        self.generation.generate(request, cancel)
     }
 
     /// A test hook: the sequence's owner panics at the end of the turn in which the next request has admitted `quanta`

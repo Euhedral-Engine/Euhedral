@@ -54,7 +54,9 @@ use euhedral_inference_cuda::{DevicePtr, PooledPinned, SubmitMode};
 use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
 use super::mtp::Speculating;
-use super::request::{AdmissionError, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation};
+use super::request::{
+    AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
+};
 use super::teacher_forced::LogitsSink;
 use crate::frames::{Kind, step};
 use crate::model::ModelConfig;
@@ -294,6 +296,8 @@ pub(super) struct Run {
     /// The selection of the latest quantum that selects.
     pub(super) previous: Option<Arc<Selection>>,
     pub(super) stopping: Option<FinishReason>,
+    /// Set from any thread to end the request at the next quantum boundary.
+    cancel: CancelHandle,
     /// A teacher-forced step's logits row is being copied.
     pub(super) waiting_logits: bool,
     /// Turns of the owner that panicked during this request.
@@ -478,6 +482,7 @@ impl Owner {
         &mut self,
         units: Result<Units, AdmissionError>,
         request: GenerationRequest,
+        cancel: CancelHandle,
     ) -> Result<(), Rejected> {
         let GenerationRequest {
             prompt,
@@ -510,7 +515,7 @@ impl Owner {
                 }
             }
         };
-        self.start_run(units, mode, prompt, max_tokens as usize, stop_tokens)
+        self.start_run(units, mode, prompt, max_tokens as usize, stop_tokens, cancel)
     }
 
     /// Starts a teacher-forced run. A refused run gives its sink back.
@@ -547,7 +552,14 @@ impl Owner {
         if wanted == 0 {
             return Err(Rejected::new(AdmissionError::EmptyPrompt, Audience::Forced(sink)));
         }
-        self.start_run(units, Mode::Forced { forced, sink }, prefix, wanted, Vec::new())
+        self.start_run(
+            units,
+            Mode::Forced { forced, sink },
+            prefix,
+            wanted,
+            Vec::new(),
+            CancelHandle::default(),
+        )
     }
 
     /// Ends a request that was refused after the caller was told it was accepted (it was posted while a turn held the
@@ -563,6 +575,7 @@ impl Owner {
         prompt: Vec<u32>,
         wanted: usize,
         stop_tokens: Vec<u32>,
+        cancel: CancelHandle,
     ) -> Result<(), Rejected> {
         // Busy means a request is running: an outcome that waits to be told does not hold the sequence.
         if self.run.is_some() {
@@ -609,6 +622,7 @@ impl Owner {
             chain: None,
             previous: None,
             stopping: None,
+            cancel,
             waiting_logits: false,
             panics: 0,
             began: Instant::now(),
@@ -808,6 +822,16 @@ impl Owner {
             .after_marker(marker, step(Kind::Reaped, 0, move || address.post(Message::Reaped)));
     }
 
+    /// Ends the request as cancelled if a cancel was asked for: one relaxed atomic load. `conclude` calls it at the top
+    /// of every iteration, and runs at least one, so every turn loads the flag once before it admits anything and again
+    /// after each listener call that may have cancelled. The quanta in flight are stopped and
+    /// retire as when a stop token ends a request; no step is admitted after it.
+    fn observe_cancel(&mut self) {
+        if let Some(run) = self.run.as_mut().filter(|run| run.cancel.is_cancelled()) {
+            run.stop(FinishReason::Cancelled);
+        }
+    }
+
     /// Ends the request with a failure.
     fn fail(&mut self, why: String) {
         if let Some(run) = self.run.as_mut() {
@@ -818,6 +842,9 @@ impl Owner {
     /// Concludes the quanta that retired, oldest first: commits their rows, reads their tokens, tells the listener.
     fn conclude(&mut self) {
         loop {
+            // Also the turn's one look when nothing retired; a cancel from a listener's call ends the reports of the
+            // quanta that retired behind it.
+            self.observe_cancel();
             let Some(run) = self.run.as_mut() else { return };
             if !run.in_flight.front().is_some_and(|flying| flying.retired.is_some()) {
                 return;
