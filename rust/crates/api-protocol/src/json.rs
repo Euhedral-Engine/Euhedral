@@ -6,10 +6,10 @@ use std::fmt::Write;
 /// The deepest nesting a parsed document may have.
 /// The deepest nesting of arrays and objects a document may have, and the most digits one number may have
 /// (the integer digits for an integer; integer, fraction and exponent digits together for a float), and the
-/// longest object key in UTF-8 bytes: the limits of the reader the wire format is defined by.
+/// longest object key in UTF-16 code units (Jackson's characters): the limits of the reader the wire format is defined by.
 const MAX_DEPTH: usize = 500;
 const MAX_NUMBER_DIGITS: usize = 1000;
-const MAX_NAME_BYTES: usize = 50_000;
+const MAX_NAME_UNITS: usize = 50_000;
 
 /// A JSON value whose objects keep their insertion order.
 #[derive(Debug, Clone, PartialEq)]
@@ -442,7 +442,7 @@ impl Parser<'_> {
                 return None;
             }
             let key = self.string()?;
-            if key.len() > MAX_NAME_BYTES {
+            if key.len() > 3 * MAX_NAME_UNITS || key.encode_utf16().count() > MAX_NAME_UNITS {
                 return None;
             }
             self.skip_space();
@@ -751,12 +751,16 @@ mod tests {
     }
 
     #[test]
-    fn object_keys_of_fifty_thousand_bytes_are_read_and_one_more_is_refused() {
+    fn object_keys_of_fifty_thousand_characters_are_read_and_one_more_is_refused() {
         let object = |key: String| format!("{{\"{key}\":1}}");
         assert!(JsonValue::parse(&object("k".repeat(50_000))).is_some());
         assert!(JsonValue::parse(&object("k".repeat(50_001))).is_none());
-        assert!(JsonValue::parse(&object("\u{e9}".repeat(25_000))).is_some());
-        assert!(JsonValue::parse(&object("\u{e9}".repeat(25_001))).is_none());
+        assert!(JsonValue::parse(&object("\u{e9}".repeat(50_000))).is_some());
+        assert!(JsonValue::parse(&object("\u{e9}".repeat(50_001))).is_none());
+        // Three bytes each, one unit each; an astral character is two units.
+        assert!(JsonValue::parse(&object("\u{20ac}".repeat(50_000))).is_some());
+        assert!(JsonValue::parse(&object("\u{1f600}".repeat(25_000))).is_some());
+        assert!(JsonValue::parse(&object("\u{1f600}".repeat(25_001))).is_none());
         let long_value = format!("[\"{}\"]", "v".repeat(200_000));
         assert!(JsonValue::parse(&long_value).is_some());
     }

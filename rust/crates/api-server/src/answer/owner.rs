@@ -12,13 +12,12 @@
 //! when the start reports. An answer is sent once: the first of the early answers (the client left, the time limit
 //! passed, the shutdown limit passed) or the answer of the finished generation.
 
-use std::mem::take;
 use std::sync::Arc;
 use std::time::Instant;
 
 use euhedral_core::frames::Frame;
 use euhedral_inference_api_protocol::ApiError;
-use euhedral_inference_api_protocol::pipeline::{Piece, PipelineError, PipelineOptions, TextPipeline};
+use euhedral_inference_api_protocol::pipeline::Piece;
 use euhedral_net::Responder;
 
 use super::Conclusion;
@@ -45,13 +44,33 @@ pub(super) enum Command {
     Begun(Slot, Opened),
     /// `generate` returned.
     Launched,
-    Text(String),
-    Finished(Result<GenerationResult, BackendError>),
+    /// The generation ended and the listener settled the text.
+    Finished(Ending),
     /// The entry never ran and never will.
     Refused(ApiError),
     Interrupt(Interruption),
     /// The client went away.
     ClientGone,
+}
+
+/// What the text pipeline settled when the generation ended: made by the listener, which is where the text is read, so
+/// that it holds what was true at the moment the generation was cancelled.
+pub(super) struct Ending {
+    pub(super) result: Result<GenerationResult, BackendError>,
+    /// The message of the malformed tool call that ended the output.
+    pub(super) failure: Option<String>,
+    /// Nobody in this request cancelled, so the engine did.
+    pub(super) engine_cancelled: bool,
+    /// The text after the final flush; `None` when the end was not an answer.
+    pub(super) settled: Option<Result<Settled, String>>,
+    pub(super) first_token_ns: u64,
+}
+
+/// The answer's text and how it ended.
+pub(super) struct Settled {
+    pub(super) parts: Vec<Piece>,
+    pub(super) reason: FinishReason,
+    pub(super) stop_sequence: Option<String>,
 }
 
 /// What a turn decided, carried out once the claim is back.
@@ -77,10 +96,6 @@ pub(super) struct Owner {
     handle: Option<Handle>,
     slot: Option<Slot>,
     generation: Option<Arc<dyn Generation>>,
-    pipeline: TextPipeline,
-    parts: Vec<Piece>,
-    /// The message of the malformed tool call that ended the output.
-    failure: Option<String>,
     started: bool,
     launched: bool,
     finished: bool,
@@ -96,6 +111,11 @@ pub(super) struct Owner {
     abandoned: bool,
     /// Nothing more happens: the request is over.
     over: bool,
+    /// A turn panicked: only what frees the generation and the slot is still done.
+    broken: bool,
+    /// A fault to raise at the launch, to test the recovery from a panic in a turn.
+    #[cfg(feature = "test-support")]
+    pub(super) fault: bool,
     timing: Timing,
     epoch: Instant,
 }
@@ -104,7 +124,6 @@ impl Owner {
     pub(super) fn new(
         inbox: Consumer<Command, Single>,
         responder: Responder,
-        options: &PipelineOptions,
         queued_ns: u64,
         epoch: Instant,
     ) -> Owner {
@@ -114,9 +133,6 @@ impl Owner {
             handle: None,
             slot: None,
             generation: None,
-            pipeline: TextPipeline::new(options),
-            parts: Vec::new(),
-            failure: None,
             started: false,
             launched: false,
             finished: false,
@@ -127,6 +143,9 @@ impl Owner {
             answered: false,
             abandoned: false,
             over: false,
+            broken: false,
+            #[cfg(feature = "test-support")]
+            fault: false,
             timing: Timing {
                 queued_ns,
                 started_ns: 0,
@@ -154,20 +173,102 @@ impl Owner {
             if self.over {
                 continue;
             }
+            if self.broken {
+                self.salvaging(command, effects);
+                continue;
+            }
             match command {
                 Command::Handle(handle) => self.named(handle, effects),
                 Command::Begun(slot, opened) => self.begun(slot, opened, effects),
                 Command::Launched => {
                     self.launched = true;
+                    #[cfg(feature = "test-support")]
+                    assert!(!self.fault, "a fault raised in a turn");
                     self.apply_cancel(effects);
                 }
-                Command::Text(text) => self.text(&text, effects),
-                Command::Finished(result) => self.ended(result, effects),
+                Command::Finished(ending) => self.ended(ending, effects),
                 Command::Refused(error) => self.refused(error, effects),
                 Command::Interrupt(why) => self.interrupted(why, effects),
                 Command::ClientGone => self.gone(effects),
             }
         }
+    }
+
+    /// A turn panicked: answers with a server error if nothing was answered, asks the generation to stop and, if it
+    /// ended already, hands it and the slot to the conclusion. From now on [`salvaging`](Owner::salvaging) takes the
+    /// commands.
+    pub(super) fn salvage(&mut self, effects: &mut Vec<Effect>) {
+        self.broken = true;
+        if self.over {
+            return;
+        }
+        self.cancel_wanted = true;
+        self.apply_cancel(effects);
+        if self.finished {
+            self.conclude_silently(effects);
+            return;
+        }
+        // The slot stays with the generation: it is released when the generation has ended and is closed.
+        self.answer_early(ApiError::server_error(), Outcome::Failed, None, effects);
+    }
+
+    /// What a broken owner does with a command: only what frees the generation and the slot.
+    fn salvaging(&mut self, command: Command, effects: &mut Vec<Effect>) {
+        match command {
+            Command::Begun(slot, opened) => {
+                self.started = true;
+                match opened {
+                    Opened::Generation(generation) => {
+                        self.generation = Some(generation);
+                        if !self.abandoned {
+                            self.slot = Some(slot);
+                        }
+                    }
+                    Opened::Failed(_) | Opened::Skipped => self.over = true,
+                }
+            }
+            Command::Launched => {
+                self.launched = true;
+                self.apply_cancel(effects);
+            }
+            Command::Finished(_) => {
+                self.finished = true;
+                self.conclude_silently(effects);
+            }
+            Command::Interrupt(Interruption::Abandoned) => {
+                self.abandoned = true;
+                self.slot = None;
+                self.cancel_wanted = true;
+                self.apply_cancel(effects);
+            }
+            Command::Interrupt(_) | Command::ClientGone => {
+                self.cancel_wanted = true;
+                self.apply_cancel(effects);
+            }
+            Command::Handle(_) | Command::Refused(_) => {}
+        }
+    }
+
+    /// Hands the generation and the slot to a conclusion that sends nothing more.
+    fn conclude_silently(&mut self, effects: &mut Vec<Effect>) {
+        let verdict = if self.answered {
+            Verdict::Silent
+        } else {
+            self.answered = true;
+            Verdict::Error {
+                error: ApiError::server_error(),
+                outcome: Outcome::Failed,
+                log: Some("the request's owner failed".to_owned()),
+            }
+        };
+        effects.push(Effect::Conclude(Conclusion {
+            responder: self.responder.take(),
+            verdict,
+            generation: self.generation.take(),
+            slot: self.slot.take(),
+            timing: self.timing,
+        }));
+        self.over = true;
     }
 
     fn named(&mut self, handle: Handle, effects: &mut Vec<Effect>) {
@@ -233,36 +334,12 @@ impl Owner {
             }
             Opened::Skipped => {
                 if self.shutdown {
-                    self.answer_early(
-                        ApiError::interrupted_by_shutdown(),
-                        Outcome::Rejected,
-                        Some(slot),
-                        effects,
-                    );
+                    self.answer_early(ApiError::shutting_down(), Outcome::Rejected, Some(slot), effects);
                 } else {
                     drop(slot);
                 }
                 self.over = true;
             }
-        }
-    }
-
-    fn text(&mut self, text: &str, effects: &mut Vec<Effect>) {
-        if self.finished || self.answered || self.failure.is_some() || self.pipeline.ended() {
-            return;
-        }
-        if self.timing.first_token_ns == 0 {
-            self.timing.first_token_ns = self.now_ns();
-        }
-        match self.pipeline.push(text) {
-            Ok(pieces) => self.parts.extend(pieces),
-            Err(PipelineError::MalformedToolCall { message, emitted }) => {
-                self.parts.extend(emitted);
-                self.failure = Some(message);
-            }
-        }
-        if self.failure.is_some() || self.pipeline.ended() {
-            self.cancel(effects);
         }
     }
 
@@ -273,13 +350,15 @@ impl Owner {
     }
 
     fn gone(&mut self, effects: &mut Vec<Effect>) {
+        // The generation may be opened or be opening while the client leaves: it is cancelled once launched, always.
+        self.cancel(effects);
         self.answer_early(ApiError::client_closed(), Outcome::Cancelled, None, effects);
-        if self.started {
-            self.cancel(effects);
-        } else if let Some(handle) = self.handle.take() {
-            effects.push(Effect::Withdraw(handle));
-        } else {
-            self.withdraw_wanted = true;
+        if !self.started {
+            if let Some(handle) = self.handle.take() {
+                effects.push(Effect::Withdraw(handle));
+            } else {
+                self.withdraw_wanted = true;
+            }
         }
     }
 
@@ -287,8 +366,8 @@ impl Owner {
         match why {
             Interruption::Cancelled => self.gone(effects),
             Interruption::TimedOut => {
-                self.answer_early(ApiError::timeout(), Outcome::Cancelled, None, effects);
                 self.cancel(effects);
+                self.answer_early(ApiError::timeout(), Outcome::Cancelled, None, effects);
             }
             Interruption::Shutdown => {
                 self.shutdown = true;
@@ -296,29 +375,25 @@ impl Owner {
             }
             Interruption::Abandoned => {
                 self.abandoned = true;
+                self.cancel(effects);
                 let slot = self.slot.take();
                 self.answer_early(ApiError::interrupted_by_shutdown(), Outcome::Rejected, slot, effects);
-                self.cancel(effects);
             }
         }
     }
 
     /// The generation ended: decides the answer and hands the generation and the slot to the conclusion.
-    fn ended(&mut self, result: Result<GenerationResult, BackendError>, effects: &mut Vec<Effect>) {
+    fn ended(&mut self, ending: Ending, effects: &mut Vec<Effect>) {
         if self.finished {
             return;
         }
         self.finished = true;
-        let engine_cancelled = !(self.pipeline.stop_matched() || self.pipeline.call_limit_reached())
-            && self
-                .generation
-                .as_ref()
-                .is_some_and(|generation| generation.is_cancelled());
+        self.timing.first_token_ns = ending.first_token_ns;
         let verdict = if self.answered {
             Verdict::Silent
         } else {
             self.answered = true;
-            self.verdict(result, engine_cancelled)
+            self.verdict(ending)
         };
         effects.push(Effect::Conclude(Conclusion {
             responder: self.responder.take(),
@@ -330,7 +405,7 @@ impl Owner {
         self.over = true;
     }
 
-    fn verdict(&mut self, result: Result<GenerationResult, BackendError>, engine_cancelled: bool) -> Verdict {
+    fn verdict(&mut self, ending: Ending) -> Verdict {
         let failed = |error: ApiError, log: Option<String>| Verdict::Error {
             error,
             outcome: Outcome::Failed,
@@ -343,55 +418,30 @@ impl Owner {
                 log: None,
             };
         }
-        let result = match result {
+        let result = match ending.result {
             Ok(result) => result,
-            Err(BackendError::Unavailable(reason)) => {
-                return Verdict::Error {
-                    error: ApiError::unavailable("Generation was interrupted by engine shutdown."),
-                    outcome: Outcome::Rejected,
-                    log: Some(format!("generation interrupted: {reason}")),
-                };
-            }
             Err(error) => return failed(ApiError::server_error(), Some(error.to_string())),
         };
-        if let Some(message) = &self.failure {
+        if let Some(message) = &ending.failure {
             return failed(ApiError::invalid_tool_call(message), None);
         }
-        if engine_cancelled {
+        if ending.engine_cancelled {
             return Verdict::Error {
                 error: ApiError::unavailable("Generation was interrupted by engine shutdown."),
                 outcome: Outcome::Rejected,
                 log: None,
             };
         }
-        if !self.pipeline.call_limit_reached() {
-            let settled = if result.stop_token_reached && !self.pipeline.stop_matched() {
-                self.pipeline.finish()
-            } else {
-                self.pipeline.finish_truncated()
-            };
-            match settled {
-                Ok(pieces) => self.parts.extend(pieces),
-                Err(error) => return failed(ApiError::invalid_tool_call(error.message()), None),
-            }
+        match ending.settled {
+            Some(Ok(settled)) => Verdict::Answer(Completed {
+                parts: settled.parts,
+                reason: settled.reason,
+                stop_sequence: settled.stop_sequence,
+                result,
+            }),
+            Some(Err(message)) => failed(ApiError::invalid_tool_call(&message), None),
+            None => failed(ApiError::server_error(), Some("the text was not settled".to_owned())),
         }
-        let reason = if self.pipeline.stop_matched() {
-            FinishReason::StopSequence
-        } else if self.pipeline.call_limit_reached() {
-            FinishReason::ToolCalls
-        } else if !result.stop_token_reached {
-            FinishReason::Length
-        } else if self.pipeline.tool_calls() > 0 {
-            FinishReason::ToolCalls
-        } else {
-            FinishReason::End
-        };
-        Verdict::Answer(Completed {
-            parts: take(&mut self.parts),
-            reason,
-            stop_sequence: self.pipeline.matched_stop().map(str::to_owned),
-            result,
-        })
     }
 }
 

@@ -619,14 +619,16 @@ fn disconnect_while_queued_leaves_the_queue_and_the_next_request_runs() {
 #[test]
 fn time_limit_while_generating_is_a_503() {
     let mut limits = limits();
-    limits.request_limit = Duration::from_millis(300);
+    limits.request_limit = Duration::from_millis(1500);
     let fx = Fixture::with(limits, Some(2));
     endless(&fx);
     let response = chat(&fx, BIG);
     assert_eq!(response.status, 503, "{}", text(&response));
     let body = norm(text(&response));
     assert!(body.contains(r#""code":"timeout""#), "{body}");
-    assert!(fx.backend.generations()[0].is_cancelled());
+    until("cancelled", || {
+        fx.backend.generations().first().is_some_and(|g| g.is_cancelled())
+    });
     assert_closed_once(&fx);
     fx.finish();
 }
@@ -634,8 +636,9 @@ fn time_limit_while_generating_is_a_503() {
 #[test]
 fn time_limit_while_queued_is_a_503() {
     let mut limits = limits();
-    limits.request_limit = Duration::from_millis(400);
-    limits.queue_limit = Some(Duration::from_millis(200));
+    // Only the queue limit is short: the request limit must not fire first on a loaded machine.
+    limits.request_limit = Duration::from_secs(15);
+    limits.queue_limit = Some(Duration::from_millis(300));
     let fx = Fixture::with(limits, Some(2));
     fx.backend.set_max_active(1);
     endless(&fx);
@@ -711,4 +714,157 @@ fn a_backend_that_never_finishes_is_abandoned_at_shutdown() {
     settle(&fx);
     drop(raw);
     fx.finish_after_stop();
+}
+
+// What the listener settles, and the lifecycle around it.
+
+#[test]
+fn a_client_leaving_as_its_request_starts_still_cancels_the_generation() {
+    let fx = Fixture::with(limits(), Some(2));
+    fx.backend.set_max_active(1);
+    endless(&fx);
+    fx.backend.hold_open();
+    let mut raw = Raw::connect(fx.addr);
+    raw.send(&raw_post(CHAT, &chat_body(BIG)));
+    assert!(fx.backend.open_is_held(PATIENCE), "the open never started");
+    drop(raw);
+    // The owner has heard the client leave (the request is recorded as cancelled) before the open returns.
+    until("the owner heard the client leave", || {
+        text(&fx.get("/metrics")).contains(r#"outcome="cancelled"}"#)
+    });
+    fx.backend.release_open();
+    until("the generation was cancelled", || {
+        fx.backend.generations().first().is_some_and(|g| g.is_cancelled())
+    });
+    assert_closed_once(&fx);
+    fx.backend.set_script(tokens(&["Hi"], true));
+    assert_eq!(chat(&fx, "").status, 200);
+    assert_closed_once(&fx);
+    fx.finish();
+}
+
+#[test]
+fn a_stop_sequence_cancels_inside_the_listener_so_the_counts_are_those_of_the_stop() {
+    let fx = Fixture::with(limits(), Some(2));
+    // Eight chunks go in one step: a cancel that came a turn later would let all of them and the stop token through.
+    fx.backend.set_quantum(8);
+    fx.backend
+        .set_script(tokens(&["one ", "tw", "o STO", "P three", " four", " five"], true));
+    let body = json(&chat(&fx, r#","stop":["STOP"],"return_token_ids":true"#), 200);
+    assert!(body.contains(r#""content":"one two ""#), "{body}");
+    assert!(body.contains(r#""finish_reason":"stop""#), "{body}");
+    assert!(body.contains(r#""token_ids":[5000,5001,5002,5003]"#), "{body}");
+    assert!(body.contains(r#""completion_tokens":4"#), "{body}");
+    assert_closed_once(&fx);
+    assert_eq!(fx.backend.generations()[0].emitted(), 4);
+    fx.finish();
+}
+
+#[test]
+fn invalid_tool_calls_cancel_inside_the_listener_too() {
+    let fx = Fixture::with(limits(), Some(2));
+    fx.backend.set_quantum(8);
+    fx.backend.set_script(tokens(
+        &["<tool_call>\n<function=nope>\n", "</function>\n</tool_call>", "more", "more"],
+        true,
+    ));
+    let response = chat(&fx, &tools(r#","return_token_ids":true"#));
+    assert_eq!(response.status, 500, "{}", text(&response));
+    assert!(text(&response).contains("invalid_tool_call"), "{}", text(&response));
+    assert_closed_once(&fx);
+    assert!(fx.backend.generations()[0].emitted() <= 2);
+    fx.finish();
+}
+
+#[test]
+fn a_panic_in_an_owner_turn_answers_a_server_error_and_frees_the_slot() {
+    let fx = Fixture::with(limits(), Some(2));
+    fx.backend.set_max_active(1);
+    fx.backend.set_script(tokens(&["Hi"], true));
+    let faulty = format!(
+        r#"{{"model":"{MODEL_ID}","reasoning_effort":"none","messages":[{{"role":"user","content":"owner-turn-fault"}}]}}"#
+    );
+    let response = fx.post(CHAT, JSON, &faulty);
+    assert_eq!(response.status, 500, "{}", text(&response));
+    assert_closed_once(&fx);
+    assert_eq!(chat(&fx, "").status, 200);
+    assert_closed_once(&fx);
+    fx.finish();
+}
+
+#[test]
+fn a_generation_that_finishes_after_it_was_abandoned_is_still_closed() {
+    let mut limits = limits();
+    limits.drain_limit = Duration::from_millis(100);
+    limits.shutdown_limit = Duration::from_millis(300);
+    let fx = Fixture::with(limits, Some(2));
+    fx.backend.set_context_length(1 << 30);
+    fx.backend.set_script(Script::Hung);
+    let mut raw = Raw::connect(fx.addr);
+    raw.send(&raw_post(CHAT, &chat_body(BIG)));
+    until("opened", || {
+        fx.backend.generations().first().is_some_and(|g| g.started().is_some())
+    });
+    fx.stop();
+    settle(&fx);
+    assert_eq!(fx.backend.generations()[0].close_count(), 0);
+    assert!(fx.backend.generations()[0].finish_held());
+    until("closed after the late end", || fx.backend.generations()[0].close_count() == 1);
+    drop(raw);
+    fx.finish_after_stop();
+}
+
+#[test]
+fn anthropic_input_tokens_leave_out_the_cached_ones() {
+    let fx = Fixture::with(limits(), Some(2));
+    fx.backend.set_script(tokens(&["Hello"], true));
+    fx.backend.set_counts(0, 1);
+    let body = format!(
+        r#"{{"model":"{MODEL_ID}","max_tokens":16,"thinking":{{"type":"disabled"}},"messages":[{{"role":"user","content":"Hi"}}]}}"#
+    );
+    let response = fx.post(MESSAGES, JSON, &body);
+    let prompt = prompt_tokens(&fx, 0);
+    let body = json(&response, 200);
+    assert!(
+        body.contains(&format!(
+            r#""usage":{{"input_tokens":{},"cache_creation_input_tokens":0,"cache_read_input_tokens":1,"output_tokens":2}}"#,
+            prompt - 1
+        )),
+        "{body}"
+    );
+    assert_closed_once(&fx);
+    fx.finish();
+}
+
+#[test]
+fn responses_reply_body_is_exact() {
+    let fx = Fixture::with(limits(), Some(2));
+    fx.backend.set_script(tokens(&["Hello", ", ", "world"], true));
+    let request = format!(r#"{{"model":"{MODEL_ID}","reasoning":{{"effort":"none"}},"input":"Hi"}}"#);
+    let response = fx.post(RESPONSES, JSON, &request);
+    let prompt = prompt_tokens(&fx, 0);
+    let body = json(&response, 200);
+    let expected = format!(
+        r#"{{"id":"ID","object":"response","created_at":0,"status":"completed","error":null,"incomplete_details":null,"model":"{MODEL_ID}","output":[{{"id":"ID","type":"message","status":"completed","role":"assistant","content":[{{"type":"output_text","text":"Hello, world","annotations":[]}}]}}],"instructions":null,"max_output_tokens":null,"parallel_tool_calls":true,"temperature":null,"top_p":null,"tool_choice":"auto","tools":[],"text":{{"format":{{"type":"text"}}}},"reasoning":{{"effort":"none","summary":null}},"store":false,"metadata":{{}},"usage":{{"input_tokens":{prompt},"input_tokens_details":{{"cached_tokens":0}},"output_tokens":4,"output_tokens_details":{{"reasoning_tokens":0}},"total_tokens":{}}}}}"#,
+        prompt + 4
+    );
+    assert_eq!(body, expected);
+    fx.finish();
+}
+
+#[test]
+fn chat_tool_call_reply_body_is_exact() {
+    let fx = Fixture::with(limits(), Some(2));
+    let generated = call("get_weather", &[("city", "Paris"), ("days", "3")]);
+    fx.backend.set_script(tokens(&[&generated], true));
+    let response = chat(&fx, &tools(""));
+    let prompt = prompt_tokens(&fx, 0);
+    let body = json(&response, 200);
+    let expected = format!(
+        r#"{{"id":"ID","object":"chat.completion","created":0,"model":"{MODEL_ID}","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"refusal":null,"tool_calls":[{{"id":"ID","type":"function","function":{{"name":"get_weather","arguments":"{{\"city\":\"Paris\",\"days\":3}}"}}}}]}},"logprobs":null,"finish_reason":"tool_calls"}}],{}}}"#,
+        usage(prompt, 2, 0, 0)
+    );
+    assert_eq!(body, expected);
+    assert_closed_once(&fx);
+    fx.finish();
 }

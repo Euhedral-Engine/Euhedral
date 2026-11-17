@@ -11,7 +11,8 @@
 
 use std::fmt::{self, Debug, Formatter};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
@@ -76,6 +77,10 @@ pub struct ScriptedBackend {
     sink: Arc<QueueIngestSink>,
     available: AtomicBool,
     context_length: AtomicUsize,
+    /// How many chunks a step emits.
+    quantum: AtomicUsize,
+    /// Holds `open_generation` until released, to order an open against what else happens to the request.
+    gate: Arc<Gate>,
     max_active: AtomicUsize,
     script: Mutex<Script>,
     generations: Mutex<Vec<Arc<ScriptedGeneration>>>,
@@ -121,6 +126,8 @@ impl ScriptedBackend {
             sink,
             available: AtomicBool::new(true),
             context_length: AtomicUsize::new(4096),
+            quantum: AtomicUsize::new(1),
+            gate: Arc::new(Gate::default()),
             max_active: AtomicUsize::new(1),
             script: Mutex::new(Script::hello()),
             generations: Mutex::new(Vec::new()),
@@ -155,6 +162,27 @@ impl ScriptedBackend {
     /// Sets the longest sequence, prompt plus completion.
     pub fn set_context_length(&self, tokens: usize) {
         self.context_length.store(tokens, Ordering::Release);
+    }
+
+    /// Sets how many chunks one step of a generation emits (at least one): with more, a generation that is not
+    /// cancelled inside the listener's call goes on to emit what follows in the same step.
+    pub fn set_quantum(&self, chunks: usize) {
+        self.quantum.store(chunks.max(1), Ordering::Release);
+    }
+
+    /// Makes the next `open_generation` wait until [`release_open`](ScriptedBackend::release_open).
+    pub fn hold_open(&self) {
+        self.gate.arm();
+    }
+
+    /// Waits until an `open_generation` is held, for at most `limit`.
+    pub fn open_is_held(&self, limit: Duration) -> bool {
+        self.gate.wait_entered(limit)
+    }
+
+    /// Lets the held `open_generation` go on.
+    pub fn release_open(&self) {
+        self.gate.release();
     }
 
     /// Makes every grammar check refuse with `reason` (`None`: accept), as a grammar llguidance cannot compile.
@@ -304,6 +332,7 @@ impl Backend for ScriptedBackend {
                 "inference engine is shutting down".to_owned(),
             ));
         }
+        self.gate.pass();
         if let Some(error) = self.open_fault.lock().unwrap_or_else(PoisonError::into_inner).clone() {
             return Err(error);
         }
@@ -317,6 +346,7 @@ impl Backend for ScriptedBackend {
             reasoning_tokens: self.reasoning_tokens.load(Ordering::Acquire),
             cached_prompt_tokens: self.cached_prompt_tokens.load(Ordering::Acquire),
             held: Mutex::new(None),
+            quantum: self.quantum.load(Ordering::Acquire),
             sink: self.sink.clone(),
             cancelled: AtomicBool::new(false),
             emitted: AtomicUsize::new(0),
@@ -342,6 +372,7 @@ pub struct ScriptedGeneration {
     cached_prompt_tokens: usize,
     /// The listener of a hung generation.
     held: Mutex<Option<Box<dyn TextListener>>>,
+    quantum: usize,
     sink: Arc<QueueIngestSink>,
     cancelled: AtomicBool,
     emitted: AtomicUsize,
@@ -359,6 +390,19 @@ impl Debug for ScriptedGeneration {
 }
 
 impl ScriptedGeneration {
+    /// Ends a hung generation late, as a backend that finishes after it was abandoned: the held listener hears a
+    /// failure. Returns whether a listener was held.
+    pub fn finish_held(&self) -> bool {
+        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner).take();
+        match held {
+            Some(mut listener) => {
+                listener.finished(Err(BackendError::Failed("finished late".to_owned())));
+                true
+            }
+            None => false,
+        }
+    }
+
     /// How many chunks were emitted.
     pub fn emitted(&self) -> usize {
         self.emitted.load(Ordering::Acquire)
@@ -380,6 +424,74 @@ fn refused() -> BackendError {
     BackendError::Unavailable("the lattice refused the work".to_owned())
 }
 
+/// Holds one `open_generation` until released.
+#[derive(Default)]
+struct Gate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    armed: bool,
+    entered: bool,
+    released: bool,
+}
+
+impl Gate {
+    fn arm(&self) {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = GateState {
+            armed: true,
+            ..GateState::default()
+        };
+    }
+
+    /// Called by the open: waits, bounded, when armed.
+    fn pass(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if !state.armed {
+            return;
+        }
+        state.armed = false;
+        state.entered = true;
+        self.changed.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !state.released {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    fn wait_entered(&self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while !state.entered {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).released = true;
+        self.changed.notify_all();
+    }
+}
+
 /// The state one step hands to the next.
 struct Run {
     generation: Arc<ScriptedGeneration>,
@@ -389,20 +501,22 @@ struct Run {
 }
 
 impl Run {
-    /// Emits the next chunk or ends, and offers the following step.
+    /// Emits the next chunks or ends, and offers the following step.
     fn step(mut self) {
         let generation = self.generation.clone();
-        let cancelled = generation.is_cancelled();
-        if cancelled || self.index == self.max_new_tokens {
-            return self.finish(false);
+        for _ in 0..generation.quantum {
+            let cancelled = generation.is_cancelled();
+            if cancelled || self.index == self.max_new_tokens {
+                return self.finish(false);
+            }
+            let Some(chunk) = generation.script.chunk(self.index) else {
+                let stop = generation.script.stop_token();
+                return self.finish(stop);
+            };
+            generation.emitted.fetch_add(1, Ordering::AcqRel);
+            self.index += 1;
+            self.listener.text(&chunk);
         }
-        let Some(chunk) = generation.script.chunk(self.index) else {
-            let stop = generation.script.stop_token() && !cancelled;
-            return self.finish(stop);
-        };
-        generation.emitted.fetch_add(1, Ordering::AcqRel);
-        self.index += 1;
-        self.listener.text(&chunk);
         drop(generation.sink.offer(once_or_refused(
             move |ran| if ran { self.step() } else { self.refuse() },
         )));

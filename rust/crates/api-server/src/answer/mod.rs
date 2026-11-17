@@ -16,6 +16,7 @@ mod owner;
 mod reply;
 
 use std::fmt::{self, Debug, Formatter};
+use std::mem::take;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, Ordering, fence};
 use std::sync::{Arc, Weak};
@@ -25,17 +26,17 @@ use euhedral_core::frames::Frame;
 use euhedral_core::ingest::QueueIngestSink;
 use euhedral_data_structures::queues::{MpscQueue, Multi, Producer};
 use euhedral_data_structures::sync::ClaimCell;
-use euhedral_inference_api_protocol::pipeline::PipelineOptions;
+use euhedral_inference_api_protocol::pipeline::{Piece, PipelineError, PipelineOptions, TextPipeline};
 use euhedral_inference_api_protocol::{ApiError, Surface};
 use euhedral_net::Responder;
 use log::{error, info, warn};
 
-use self::owner::{Command, Effect, Opened, Owner};
+use self::owner::{Command, Effect, Ending, Opened, Owner, Settled};
 use self::reply::{Completed, body};
 use crate::admission::{Admission, Counts, Entry, Interruption, Slot};
 use crate::backend::{Backend, BackendError, Generation, GenerationResult, TextListener};
 use crate::frames::{once, once_or_refused};
-use crate::metrics::{Api, ConstraintFailure, Generation as Finished, Metrics, Outcome};
+use crate::metrics::{Api, ConstraintFailure, FinishReason, Generation as Finished, Metrics, Outcome};
 use crate::planning::{Endpoint, Planned};
 use crate::router::{error_response, json};
 
@@ -148,7 +149,14 @@ impl Shared {
             };
             self.pending.swap(false, Ordering::SeqCst);
             let mut effects = Vec::new();
-            claim.turn(&mut effects);
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| claim.turn(&mut effects))) {
+                error!(target: "euhedral.requests", "{} {}: the request's turn panicked", self.api.label(), self.planned.id);
+                drop(payload);
+                // What the turn decided before the panic still stands; the rest is salvaged.
+                if catch_unwind(AssertUnwindSafe(|| claim.salvage(&mut effects))).is_err() {
+                    error!(target: "euhedral.requests", "{} {}: salvaging the request failed", self.api.label(), self.planned.id);
+                }
+            }
             claim.release_seq_cst();
             let mut panic = None;
             for effect in effects {
@@ -205,8 +213,21 @@ impl Entry for Shared {
             Err(error) => return self.post(Command::Begun(slot, Opened::Failed(error))),
         };
         self.post(Command::Begun(slot, Opened::Generation(generation.clone())));
+        let Some(shared) = self.me.upgrade() else {
+            return;
+        };
         let listener = Box::new(Listener {
-            shared: self.me.clone(),
+            shared,
+            generation: Some(generation.clone()),
+            pipeline: TextPipeline::new(&PipelineOptions {
+                reasoning: self.planned.output.reasoning,
+                stops: self.planned.request.stops.clone(),
+                tools: self.planned.request.tools.pipeline_options(),
+            }),
+            parts: Vec::new(),
+            failure: None,
+            first_token_ns: 0,
+            panicked: false,
             done: false,
         });
         // A panic drops the listener, which reports the end.
@@ -230,37 +251,141 @@ impl Entry for Shared {
     }
 }
 
-/// The generation's ear: hands every event to the owner and does nothing else.
+/// A prompt that holds this text makes the owner's turn panic when the generation is launched (feature `test-support`),
+/// to test that such a request still ends and frees its slot.
+#[cfg(feature = "test-support")]
+pub const OWNER_FAULT_MARKER: &str = "owner-turn-fault";
+
+/// The generation's ear. It reads the text through the pipeline, because its calls are serial and come in order: when
+/// the pipeline decides the output is complete (a stop sequence, the call limit, a malformed call) it cancels the
+/// generation before it returns, so what the backend counts is what the answer holds. Then it tells the owner.
 struct Listener {
-    shared: Weak<Shared>,
+    /// Strong: the answer must be settled and the generation closed even when the request was abandoned meanwhile.
+    shared: Arc<Shared>,
+    /// Dropped at the end, so that a backend holding the listener and the generation holds no cycle.
+    generation: Option<Arc<dyn Generation>>,
+    pipeline: TextPipeline,
+    parts: Vec<Piece>,
+    /// The message of the malformed tool call that ended the output.
+    failure: Option<String>,
+    first_token_ns: u64,
+    /// The pipeline panicked: the request ends with a server error.
+    panicked: bool,
     /// `finished` was called.
     done: bool,
 }
 
+impl Listener {
+    fn cancel(&self) {
+        if let Some(generation) = &self.generation {
+            guarded(|| generation.cancel());
+        }
+    }
+
+    fn push(&mut self, text: &str) {
+        if self.first_token_ns == 0 {
+            self.first_token_ns = self.shared.nanos();
+        }
+        match self.pipeline.push(text) {
+            Ok(pieces) => self.parts.extend(pieces),
+            Err(PipelineError::MalformedToolCall { message, emitted }) => {
+                self.parts.extend(emitted);
+                self.failure = Some(message);
+            }
+        }
+    }
+
+    /// The text after the final flush, and how the answer ended.
+    fn settle(&mut self, result: &GenerationResult) -> Result<Settled, String> {
+        if !self.pipeline.call_limit_reached() {
+            let settled = if result.stop_token_reached && !self.pipeline.stop_matched() {
+                self.pipeline.finish()
+            } else {
+                self.pipeline.finish_truncated()
+            };
+            match settled {
+                Ok(pieces) => self.parts.extend(pieces),
+                Err(error) => return Err(error.message().to_owned()),
+            }
+        }
+        let reason = if self.pipeline.stop_matched() {
+            FinishReason::StopSequence
+        } else if self.pipeline.call_limit_reached() {
+            FinishReason::ToolCalls
+        } else if !result.stop_token_reached {
+            FinishReason::Length
+        } else if self.pipeline.tool_calls() > 0 {
+            FinishReason::ToolCalls
+        } else {
+            FinishReason::End
+        };
+        Ok(Settled {
+            parts: take(&mut self.parts),
+            reason,
+            stop_sequence: self.pipeline.matched_stop().map(str::to_owned),
+        })
+    }
+
+    fn end(&mut self, result: Result<GenerationResult, BackendError>) -> Ending {
+        let engine_cancelled = !(self.pipeline.stop_matched() || self.pipeline.call_limit_reached())
+            && self.generation.as_ref().is_some_and(|generation| generation.is_cancelled());
+        let mut settled = None;
+        let mut result = result;
+        if let Ok(done) = &result
+            && self.failure.is_none()
+            && !engine_cancelled
+        {
+            let done = done.clone();
+            match catch_unwind(AssertUnwindSafe(|| self.settle(&done))) {
+                Ok(outcome) => settled = Some(outcome),
+                Err(_) => self.panicked = true,
+            }
+        }
+        if self.panicked {
+            result = Err(BackendError::Failed("the text pipeline panicked".to_owned()));
+        }
+        Ending {
+            result,
+            failure: self.failure.take(),
+            engine_cancelled,
+            settled,
+            first_token_ns: self.first_token_ns,
+        }
+    }
+}
+
 impl TextListener for Listener {
     fn text(&mut self, text: &str) {
-        if let Some(shared) = self.shared.upgrade() {
-            shared.post(Command::Text(text.to_owned()));
+        if self.done || self.panicked || self.failure.is_some() || self.pipeline.ended() {
+            return;
+        }
+        if catch_unwind(AssertUnwindSafe(|| self.push(text))).is_err() {
+            error!(target: "euhedral.requests", "{} {}: the text pipeline panicked", self.shared.api.label(), self.shared.planned.id);
+            self.panicked = true;
+        }
+        if self.panicked || self.failure.is_some() || self.pipeline.ended() {
+            self.cancel();
         }
     }
 
     fn finished(&mut self, result: Result<GenerationResult, BackendError>) {
-        self.done = true;
-        if let Some(shared) = self.shared.upgrade() {
-            shared.post(Command::Finished(result));
+        if self.done {
+            return;
         }
+        self.done = true;
+        let ending = self.end(result);
+        self.generation = None;
+        self.shared.post(Command::Finished(ending));
     }
 }
 
 impl Drop for Listener {
     /// A backend that lets go of its listener without the end still ends the request.
     fn drop(&mut self) {
-        if !self.done
-            && let Some(shared) = self.shared.upgrade()
-        {
-            shared.post(Command::Finished(Err(BackendError::Failed(
+        if !self.done {
+            self.finished(Err(BackendError::Failed(
                 "the backend dropped the generation's listener".to_owned(),
-            ))));
+            )));
         }
     }
 }
@@ -459,11 +584,8 @@ impl Answerer {
         let queued_ns = u64::try_from(arrived.saturating_duration_since(self.epoch).as_nanos())
             .unwrap_or(u64::MAX)
             .saturating_add(1);
-        let options = PipelineOptions {
-            reasoning: planned.output.reasoning,
-            stops: planned.request.stops.clone(),
-            tools: planned.request.tools.pipeline_options(),
-        };
+        #[cfg(feature = "test-support")]
+        let fault = planned.prompt.text.contains(OWNER_FAULT_MARKER);
         let queue = MpscQueue::<Command>::new(COMMANDS_PER_CHUNK);
         let inbox = queue.producer();
         let consumer = queue.consumer();
@@ -477,13 +599,17 @@ impl Answerer {
             api,
             epoch: self.epoch,
             inbox,
-            owner: ClaimCell::new(Owner::new(consumer, reply, &options, queued_ns, self.epoch)),
+            owner: ClaimCell::new(Owner::new(consumer, reply, queued_ns, self.epoch)),
             pending: AtomicBool::new(false),
             cut: AtomicBool::new(false),
             me: me.clone(),
         });
         // Nothing else holds the claim yet: the request was not offered.
-        if let Some(claim) = shared.owner.try_claim() {
+        if let Some(mut claim) = shared.owner.try_claim() {
+            #[cfg(feature = "test-support")]
+            {
+                claim.fault = fault;
+            }
             let gone = Arc::downgrade(&shared);
             claim.watch(once(move || {
                 if let Some(shared) = gone.upgrade() {
