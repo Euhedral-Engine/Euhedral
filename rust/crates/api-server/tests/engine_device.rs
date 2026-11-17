@@ -168,14 +168,16 @@ fn run_on_engine(
 fn counted_tokens(addr: SocketAddr) -> u64 {
     let mut raw = Raw::connect(addr);
     raw.send("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
-    let series = "\neuhedral_completion_tokens_total ";
+    let series = "\neuhedral_completion_tokens_total{";
     let end = Instant::now() + Duration::from_secs(30);
     let mut seen = String::new();
     while Instant::now() < end {
         if let Some(from) = seen.find(series)
-            && let Some(line) = seen[from + series.len()..].split_once('\n')
+            && let Some((labels, rest)) = seen[from + series.len()..].split_once("} ")
+            && let Some((value, _)) = rest.split_once('\n')
         {
-            return line.0.trim().parse::<f64>().expect("a count") as u64;
+            assert!(!labels.contains('\n'), "the labels of the series");
+            return value.trim().parse::<f64>().expect("a count") as u64;
         }
         match raw.read_for(Duration::from_millis(200)) {
             Some(more) => seen.push_str(&more),
@@ -373,6 +375,9 @@ fn a_greedy_chat_completion_matches_the_engine_and_a_cancel_frees_the_sequence()
     let again_ids = completion_ids_of(&again);
     let waited = before.elapsed();
     assert_eq!(again_ids, reference, "the sequence after a cancel starts clean");
+    // The budget's 3000 tokens take far longer than this on the card; a cancel that did not take effect would make the
+    // next request wait for them.
+    assert!(waited < Duration::from_secs(10), "the next request waited {waited:?}");
     println!("the request after the cancel was answered in {waited:?}");
     let produced = counted_tokens(server.local_addr()) - counted - again_ids.len() as u64;
     println!("the cancelled request produced {produced} of {BUDGET} tokens");
