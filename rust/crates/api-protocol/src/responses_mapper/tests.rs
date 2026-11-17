@@ -662,6 +662,27 @@ fn rows() -> Vec<Row> {
             &results_message("c2"),
         ),
         bad(
+            "a call missing its output before a reasoning item",
+            two_calls(&format!(r#"{},{{"type":"reasoning"}}"#, output("c1"))),
+            Some("input[1]"),
+            &results_message("c2"),
+        ),
+        bad(
+            "a call missing its output before another function call",
+            two_calls(&format!(
+                r#"{},{{"type":"function_call","call_id":"c3","name":"f","arguments":"{{}}"}}"#,
+                output("c1")
+            )),
+            Some("input[1]"),
+            &results_message("c2"),
+        ),
+        bad(
+            "a call missing its output before an assistant message",
+            two_calls(&format!(r#"{},{{"role":"assistant","content":"y"}}"#, output("c1"))),
+            Some("input[1]"),
+            &results_message("c2"),
+        ),
+        bad(
             "a call missing its output at the end",
             two_calls(&output("c2")),
             Some("input[1]"),
@@ -1485,8 +1506,71 @@ fn a_json_format_does_not_refuse_the_conversation_around_it() {
 }
 
 #[test]
-fn value_text_writes_values_as_a_param_spells_them() {
-    let text = |json: &str| value_text(&JsonValue::parse(json).expect("json"));
+fn results_close_when_the_next_assistant_item_arrives() {
+    let call = |id: &str| format!(r#",{{"type":"function_call","call_id":"{id}","name":"f","arguments":"{{}}"}}"#);
+    let result = |id: &str| output(id);
+    let user = r#"{"role":"user","content":"x"}"#;
+    // A second call after the first call's result starts a second assistant turn.
+    let calls = accepted(&items(&format!(
+        "[{user}{}{}{}{}]",
+        call("c1"),
+        result("c1"),
+        call("c2"),
+        result("c2")
+    )));
+    let messages = &calls.template.messages;
+    assert_eq!(messages.len(), 5);
+    assert_eq!(assistant_of(&messages[1]).tool_calls.len(), 1);
+    assert_eq!(messages[2], Message::tool("r"));
+    assert_eq!(assistant_of(&messages[3]).tool_calls.len(), 1);
+    assert_eq!(messages[4], Message::tool("r"));
+    // So does a reasoning item.
+    let reasoning = accepted(&items(&format!(
+        r#"[{user}{}{},{{"type":"reasoning","content":[{{"type":"reasoning_text","text":"t"}}]}},{{"role":"assistant","content":"done"}}]"#,
+        call("c1"),
+        result("c1")
+    )));
+    let messages = &reasoning.template.messages;
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[2], Message::tool("r"));
+    assert_eq!(text_of(&messages[3]), "done");
+    // And so does an assistant message.
+    let message = accepted(&items(&format!(
+        r#"[{user}{}{},{{"role":"assistant","content":"done"}}]"#,
+        call("c1"),
+        result("c1")
+    )));
+    assert_eq!(message.template.messages.len(), 4);
+    assert_eq!(message.template.messages[2], Message::tool("r"));
+    assert_eq!(text_of(&message.template.messages[3]), "done");
+}
+
+#[test]
+fn the_echo_repeats_the_requests_settings() {
+    let defaults = accepted_mapped(&req(""));
+    assert_eq!(
+        defaults.echo.to_compact_string(),
+        r#"{"instructions":null,"max_output_tokens":null,"parallel_tool_calls":true,"temperature":null,"top_p":null,"tool_choice":"auto","tools":[],"text":{"format":{"type":"text"}},"reasoning":{"effort":"xhigh","summary":null},"store":false,"metadata":{}}"#
+    );
+    let set = accepted_mapped(&req(
+        r#","temperature":0.3,"top_p":1,"max_output_tokens":9,"instructions":"be brief","metadata":{"k":"v"},"parallel_tool_calls":false,"tools":[{"type":"function","name":"a"}],"tool_choice":"required","text":{"format":{"type":"json_object"}},"reasoning":{"effort":"low"}"#,
+    ));
+    assert_eq!(
+        set.echo.to_compact_string(),
+        r#"{"instructions":"be brief","max_output_tokens":9,"parallel_tool_calls":false,"temperature":0.3,"top_p":1.0,"tool_choice":"required","tools":[{"type":"function","name":"a"}],"text":{"format":{"type":"json_object"}},"reasoning":{"effort":"low","summary":null},"store":false,"metadata":{"k":"v"}}"#
+    );
+    let none = accepted_mapped(&req(r#","reasoning":{"effort":"none"},"metadata":null"#));
+    let echo = none.echo.to_compact_string();
+    assert!(
+        echo.contains(r#""reasoning":{"effort":"none","summary":null}"#),
+        "{echo}"
+    );
+    assert!(echo.ends_with(r#""store":false,"metadata":null}"#), "{echo}");
+}
+
+#[test]
+fn param_text_writes_values_as_a_param_spells_them() {
+    let text = |json: &str| JsonValue::parse(json).expect("json").param_text();
     assert_eq!(text("null"), "null");
     assert_eq!(text("true"), "true");
     assert_eq!(text("12"), "12");
@@ -1495,4 +1579,6 @@ fn value_text_writes_values_as_a_param_spells_them() {
     assert_eq!(text(r#""s""#), "s");
     assert_eq!(text(r#"[1,"a",[],{}]"#), "[1, a, [], {}]");
     assert_eq!(text(r#"{"a":1,"b":[true]}"#), "{a=1, b=[true]}");
+    assert_eq!(text("1e400"), "Infinity");
+    assert_eq!(text("-0"), "0");
 }

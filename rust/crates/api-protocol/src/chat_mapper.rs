@@ -53,7 +53,11 @@ pub fn map_chat(mut request: ChatCompletionRequest, defaults: &Defaults) -> Resu
             Some("return_token_ids"),
         ));
     }
-    let model = require_served_model(request.model.as_deref(), &defaults.model)?;
+    let model = require_served_model(
+        request.model.as_deref(),
+        &defaults.model,
+        "You must provide a model parameter.",
+    )?;
     let tools = ToolCalling::from_request(
         request.tools.as_ref(),
         request.tool_choice.as_ref(),

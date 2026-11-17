@@ -14,7 +14,7 @@ use crate::reasoning;
 use crate::response_format::ResponseFormat;
 use crate::responses::ResponsesRequest;
 use crate::served_model::require_served_model;
-use crate::template::{AssistantMessage, ContentPart, Message, ToolCall};
+use crate::template::{AssistantMessage, ContentPart, Effort, Message, TemplateOptions, ToolCall};
 use crate::tool_calling::{FunctionTool, ToolCalling, check_keys, is_function_name, parameters};
 use crate::tool_definition::ToolDefinition;
 use crate::tool_results::ToolResults;
@@ -54,12 +54,18 @@ pub struct MappedResponses {
     pub generation: GenerationRequest,
     /// The request asked for `reasoning.encrypted_content`: reasoning items carry the opaque token.
     pub include_encrypted_content: bool,
+    /// The settings every response repeats, in the order they are written.
+    pub echo: JsonValue,
 }
 
 /// Validates everything the request states and maps it. The first failing check decides the error.
 pub fn map_responses(request: ResponsesRequest, defaults: &Defaults) -> Result<MappedResponses, ApiError> {
     check_other_fields(&request.other)?;
-    let model = require_served_model(request.model.as_deref(), &defaults.model)?;
+    let model = require_served_model(
+        request.model.as_deref(),
+        &defaults.model,
+        "You must provide a model parameter.",
+    )?;
     let include_encrypted_content = include(present(request.include.as_ref()))?;
     let tools = tools(
         present(request.tools.as_ref()),
@@ -71,6 +77,7 @@ pub fn map_responses(request: ResponsesRequest, defaults: &Defaults) -> Result<M
     let format = format(present(request.text.as_ref()))?;
     let messages = turns(request.instructions.as_deref(), present(request.input.as_ref()))?;
     let sampling = sampling(&request, defaults)?;
+    let echo = echo(&request, &tools, &thinking);
     let settings = GenerationSettings {
         model,
         thinking,
@@ -86,35 +93,73 @@ pub fn map_responses(request: ResponsesRequest, defaults: &Defaults) -> Result<M
     Ok(MappedResponses {
         generation: GenerationRequest::new(messages, tools, settings),
         include_encrypted_content,
+        echo,
     })
+}
+
+/// The request's settings as a response repeats them; absent ones take their defaults.
+fn echo(request: &ResponsesRequest, tools: &ToolCalling, thinking: &TemplateOptions) -> JsonValue {
+    let raw = |value: Option<&JsonValue>, default: JsonValue| present(value).cloned().unwrap_or(default);
+    let text = |value: &str| JsonValue::String(value.to_owned());
+    let effort = match thinking.effort {
+        None => "none",
+        Some(Effort::Low) => "low",
+        Some(Effort::Medium) => "medium",
+        Some(Effort::XHigh) => "xhigh",
+    };
+    let metadata = request
+        .other
+        .iter()
+        .find(|(name, _)| name == "metadata")
+        .map_or_else(|| JsonValue::Object(Vec::new()), |(_, value)| value.clone());
+    let default_text = JsonValue::Object(vec![(
+        "format".to_owned(),
+        JsonValue::Object(vec![("type".to_owned(), text("text"))]),
+    )]);
+    JsonValue::Object(vec![
+        (
+            "instructions".to_owned(),
+            request.instructions.as_deref().map_or(JsonValue::Null, text),
+        ),
+        (
+            "max_output_tokens".to_owned(),
+            request
+                .max_output_tokens
+                .map_or(JsonValue::Null, |tokens| JsonValue::Integer(i128::from(tokens).into())),
+        ),
+        ("parallel_tool_calls".to_owned(), JsonValue::Bool(tools.parallel)),
+        (
+            "temperature".to_owned(),
+            request.temperature.map_or(JsonValue::Null, JsonValue::Float),
+        ),
+        (
+            "top_p".to_owned(),
+            request.top_p.map_or(JsonValue::Null, JsonValue::Float),
+        ),
+        (
+            "tool_choice".to_owned(),
+            raw(request.tool_choice.as_ref(), text("auto")),
+        ),
+        (
+            "tools".to_owned(),
+            raw(request.tools.as_ref(), JsonValue::Array(Vec::new())),
+        ),
+        ("text".to_owned(), raw(request.text.as_ref(), default_text)),
+        (
+            "reasoning".to_owned(),
+            JsonValue::Object(vec![
+                ("effort".to_owned(), text(effort)),
+                ("summary".to_owned(), JsonValue::Null),
+            ]),
+        ),
+        ("store".to_owned(), JsonValue::Bool(false)),
+        ("metadata".to_owned(), metadata),
+    ])
 }
 
 /// A JSON null is the same as an absent field.
 fn present(value: Option<&JsonValue>) -> Option<&JsonValue> {
     value.filter(|value| **value != JsonValue::Null)
-}
-
-/// The text of a value as the wire format spells it in a `param`: strings bare, lists as `[a, b]` and objects as
-/// `{k=v}`.
-fn value_text(value: &JsonValue) -> String {
-    match value {
-        JsonValue::Null => "null".to_owned(),
-        JsonValue::Bool(flag) => flag.to_string(),
-        JsonValue::Integer(digits) => digits.as_str().to_owned(),
-        JsonValue::Float(_) => value.to_compact_string(),
-        JsonValue::String(text) => text.clone(),
-        JsonValue::Array(items) => {
-            let items: Vec<String> = items.iter().map(value_text).collect();
-            format!("[{}]", items.join(", "))
-        }
-        JsonValue::Object(members) => {
-            let members: Vec<String> = members
-                .iter()
-                .map(|(key, value)| format!("{key}={}", value_text(value)))
-                .collect();
-            format!("{{{}}}", members.join(", "))
-        }
-    }
 }
 
 fn check_other_fields(fields: &[(String, JsonValue)]) -> Result<(), ApiError> {
@@ -389,7 +434,7 @@ fn content(content: Option<&JsonValue>, path: &str) -> Result<String, ApiError> 
         if !matches!(kind, Some(JsonValue::String(name)) if name == "input_text" || name == "output_text") {
             return Err(ApiError::unsupported_parameter(&format!(
                 "{part_path}.type={}",
-                kind.map_or_else(|| "null".to_owned(), value_text)
+                kind.map_or_else(|| "null".to_owned(), JsonValue::param_text)
             )));
         }
         check_keys(part, &["type", "text", "annotations", "logprobs"], &part_path)?;
@@ -556,7 +601,7 @@ fn include(value: Option<&JsonValue>) -> Result<bool, ApiError> {
         } else {
             return Err(ApiError::unsupported_parameter(&format!(
                 "include={}",
-                value_text(entry)
+                entry.param_text()
             )));
         }
     }
@@ -582,7 +627,8 @@ fn tools(
             if !matches!(tool.get("type"), Some(JsonValue::String(kind)) if kind == "function") {
                 return Err(ApiError::unsupported_parameter(&format!(
                     "{path}.type={}",
-                    tool.get("type").map_or_else(|| "null".to_owned(), value_text)
+                    tool.get("type")
+                        .map_or_else(|| "null".to_owned(), JsonValue::param_text)
                 )));
             }
             check_keys(tool, &["type", "name", "description", "parameters", "strict"], &path)?;
@@ -658,7 +704,9 @@ fn tools(
             if !matches!(named.get("type"), Some(JsonValue::String(kind)) if kind == "function") {
                 return Err(ApiError::unsupported_parameter(&format!(
                     "tool_choice.type={}",
-                    named.get("type").map_or_else(|| "null".to_owned(), value_text)
+                    named
+                        .get("type")
+                        .map_or_else(|| "null".to_owned(), JsonValue::param_text)
                 )));
             }
             check_keys(named, &["type", "name"], "tool_choice")?;
