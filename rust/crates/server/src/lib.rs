@@ -24,6 +24,7 @@
     reason = "a binary: the main thread waits for the stop request and for the server's report that it stopped"
 )]
 
+pub mod engine;
 mod logger;
 #[cfg(feature = "scripted")]
 pub mod scripted;

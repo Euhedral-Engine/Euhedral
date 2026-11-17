@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use euhedral_inference_edrl::TokenizerSection;
 use tokenizers::Tokenizer as HfTokenizer;
@@ -20,7 +21,7 @@ const SPECIAL_TOKENS: &str = "special_tokens.json";
 /// everything between them is NFC-normalized, split by the checkpoint's expression and merged by BPE.
 pub struct Tokenizer {
     inner: HfTokenizer,
-    pieces: Vec<Piece>,
+    pieces: Arc<[Piece]>,
     control_ids: HashMap<String, u32>,
     eos_id: u32,
     bos_id: Option<u32>,
@@ -84,7 +85,7 @@ impl Tokenizer {
 
         Ok(Tokenizer {
             inner,
-            pieces,
+            pieces: pieces.into(),
             control_ids,
             eos_id,
             bos_id,
@@ -120,8 +121,8 @@ impl Tokenizer {
     }
 
     /// A stream that decodes generated IDs to text, holding back an incomplete UTF-8 suffix.
-    pub fn decode_stream(&self) -> TokenStream<'_> {
-        TokenStream::new(&self.pieces)
+    pub fn decode_stream(&self) -> TokenStream {
+        TokenStream::new(Arc::clone(&self.pieces))
     }
 
     /// The text of `ids`, with every control token (EOS included) spelled out.

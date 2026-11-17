@@ -27,12 +27,26 @@ pub fn reach(addr: SocketAddr) -> SocketAddr {
     }
 }
 
-/// Waits until the server answers `/health`: a connection made in the first moments after the port opens is
-/// sometimes reset, and the test must not fail on that.
+/// Waits until the port accepts connections, then requires the first exchange to be answered: a connection made in the
+/// first moments after the port opens must not be reset or dropped.
 pub fn ready(addr: SocketAddr) {
-    until("the server to answer", || {
-        try_exchange(addr, "GET", "/health", None).is_ok_and(|answer| status(&answer) == 200)
-    });
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match try_exchange(addr, "GET", "/health", None) {
+            Err(error) if error.starts_with("connecting") => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for the port to open: {error}"
+                );
+                sleep(Duration::from_millis(10));
+            }
+            Ok(answer) => {
+                assert_eq!(status(&answer), 200, "the first answer: {answer}");
+                return;
+            }
+            Err(error) => panic!("the first connection after the port opened failed: {error}"),
+        }
+    }
 }
 
 /// The whole of one exchange: `request` sent, the answer read until the server closes (`Connection: close`) or the

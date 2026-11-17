@@ -8,13 +8,14 @@
 
 mod common;
 
-use std::fs::write;
+use std::fs::{create_dir, write};
 use std::io::Read;
 use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio, id};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::thread::{sleep, spawn as spawn_thread};
+use std::thread::{scope as scope_threads, sleep, spawn as spawn_thread};
 use std::time::{Duration, Instant};
 
 use common::{PATIENCE, chat, exchange, gauge, ready, status, try_exchange, until};
@@ -31,9 +32,16 @@ impl Drop for Server {
     }
 }
 
+/// Held while a port is probed and while a child is spawned. A child holds a copy of every descriptor its parent had
+/// open between the fork and the exec: a probe socket that another thread opens in that window stays open in the child
+/// after the probe closed it, and a connection to the port the probe found lands in that socket and is reset when the
+/// child executes.
+static FORKS: Mutex<()> = Mutex::new(());
+
 /// A port nothing listens on, below the range the system hands out to the sockets of clients: a port from that range
 /// can be taken by a client of another test between the choice and the server's bind, or connect to itself.
 fn free_port() -> u16 {
+    let _forks = FORKS.lock().expect("the lock");
     static NEXT: AtomicU16 = AtomicU16::new(0);
     let start = u16::try_from(id() % 2000).expect("a small number") * 5;
     loop {
@@ -62,6 +70,7 @@ fn spawn(arguments: &[&str]) -> Server {
 
 /// A server whose standard output is `stdout`.
 fn spawn_with(arguments: &[&str], stdout: Stdio) -> Server {
+    let _forks = FORKS.lock().expect("the lock");
     let child = Command::new(SERVER)
         .args(arguments)
         .env_clear()
@@ -131,6 +140,30 @@ fn a_backend_that_does_not_start_exits_with_one_and_says_why() {
     let text = stderr_of(&mut server);
     assert!(text.contains("APPLICATION FAILED TO START"), "{text}");
     assert!(text.contains("Starting the engine failed"), "{text}");
+}
+
+#[test]
+fn a_missing_cuda_library_exits_with_one_and_gives_the_driver_message() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let cache = directory.path().join("native");
+    let extra = format!("host:\n  native-cache: {}\n", cache.display());
+    let file = config(directory.path(), free_port(), &extra);
+    let mut server = spawn(&["--config", file.to_str().expect("a path")]);
+    assert_eq!(exit_code(&mut server, PATIENCE), 1);
+    let text = stderr_of(&mut server);
+    assert!(
+        text.contains("the NVIDIA driver is required, with an NVIDIA Blackwell GPU:"),
+        "{text}"
+    );
+    assert!(
+        text.contains("install the driver (nvidia-smi lists the GPU when it works)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("libeuhedral_cuda") || text.contains("euhedral_cuda"),
+        "{text}"
+    );
+    assert!(text.contains("check nvidia-smi"), "{text}");
 }
 
 #[test]
@@ -269,4 +302,65 @@ fn the_server_answers_on_both_loopback_addresses() {
         let answer = try_exchange(v6, "GET", "/health", None).expect("an answer on ::1");
         assert_eq!(status(&answer), 200, "{answer}");
     }
+}
+
+/// How many servers the first-connection test starts together, and how many times.
+const WAVE: usize = 16;
+const WAVES: usize = 4;
+
+/// Starts one scripted server and makes its first connection as soon as the port accepts: the outcome of that one
+/// exchange. No retry after a connection was made.
+fn first_exchange(directory: &Path, start: usize) -> Result<(), String> {
+    let port = free_port();
+    let file = config(&directory.join(start.to_string()), port, "");
+    let mut server = spawn(&["--config", file.to_str().expect("a path"), "--scripted-backend=hello"]);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + PATIENCE;
+    let outcome = loop {
+        match try_exchange(addr, "GET", "/health", None) {
+            Err(error) if error.starts_with("connecting") && Instant::now() < deadline => {
+                sleep(Duration::from_millis(1 + (start % 10) as u64));
+            }
+            other => break other,
+        }
+    };
+    match outcome {
+        Ok(answer) if status(&answer) == 200 => Ok(()),
+        other => Err(format!(
+            "port {port}: {other:?}; the process {:?}",
+            server.0.try_wait().expect("a status")
+        )),
+    }
+}
+
+/// The first connection made as soon as the port accepts is answered: no reset, no empty answer, no retry. Many servers
+/// start together, so that the processes compete for the machine as the tests of a suite do.
+#[test]
+fn the_first_connection_after_the_port_opens_is_answered() {
+    let directory = tempfile::tempdir().expect("a directory");
+    for index in 0..WAVE {
+        create_dir(directory.path().join(index.to_string())).expect("a directory");
+    }
+    let mut failures = Vec::new();
+    for _ in 0..WAVES {
+        let wave: Vec<_> = scope_threads(|scope| {
+            let started: Vec<_> = (0..WAVE)
+                .map(|start| {
+                    let path = directory.path();
+                    scope.spawn(move || first_exchange(path, start))
+                })
+                .collect();
+            started
+                .into_iter()
+                .map(|handle| handle.join().expect("a probe"))
+                .collect()
+        });
+        failures.extend(wave.into_iter().filter_map(Result::err));
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} starts: {failures:#?}",
+        failures.len(),
+        WAVE * WAVES
+    );
 }
