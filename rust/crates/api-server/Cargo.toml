@@ -12,6 +12,7 @@ test-support = []
 
 [dependencies]
 euhedral-core.workspace = true
+euhedral-data-structures.workspace = true
 euhedral-graph.workspace = true
 euhedral-io.workspace = true
 euhedral-net.workspace = true
