@@ -200,6 +200,10 @@ impl Owner {
 
     /// Panics as the test asked: at once, or once the test has let the generation end (so the end is queued behind).
     #[cfg(feature = "test-support")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test hook: holds a turn so that a queued end is ordered behind it"
+    )]
     fn raise_fault(&self) {
         use std::sync::atomic::Ordering;
         use std::thread::sleep;
