@@ -15,6 +15,7 @@ use euhedral_net::{Handler, Method, Request, Responder, Response, no_work};
 use crate::backend::Backend;
 use crate::health;
 use crate::limits::Limits;
+use crate::metrics::{CONTENT_TYPE as METRICS_TYPE, Metrics};
 use crate::models::Served;
 
 const JSON: &str = "application/json";
@@ -23,6 +24,8 @@ const JSON: &str = "application/json";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
     Health,
+    /// `GET /metrics`: the series of the server and the engine as Prometheus text.
+    Metrics,
     Models,
     /// `GET /v1/models/{model}`, with the model percent-decoded.
     Model(String),
@@ -51,6 +54,7 @@ fn route_of(path: &str) -> Option<(Route, bool)> {
     let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
     match segments[..] {
         ["health"] => Some((Route::Health, true)),
+        ["metrics"] => Some((Route::Metrics, true)),
         ["v1", "models"] => Some((Route::Models, true)),
         ["v1", "models", model] if !model.is_empty() => Some((Route::Model(model.to_owned()), true)),
         ["v1", "chat", "completions"] => Some((Route::ChatCompletions, false)),
@@ -265,6 +269,7 @@ pub struct Router {
     backend: Arc<dyn Backend>,
     served: Served,
     limits: Limits,
+    metrics: Arc<Metrics>,
 }
 
 /// What a route that lists the model produces: `application/json` and its `+json` family.
@@ -280,11 +285,12 @@ impl Debug for Router {
 }
 
 impl Router {
-    pub fn new(backend: Arc<dyn Backend>, created_at: i64, limits: Limits) -> Router {
+    pub fn new(backend: Arc<dyn Backend>, created_at: i64, limits: Limits, metrics: Arc<Metrics>) -> Router {
         Router {
             backend,
             served: Served { created_at },
             limits,
+            metrics,
         }
     }
 
@@ -316,6 +322,19 @@ impl Router {
                 }
                 let (status, body) = health::report(self.backend.is_available(), self.backend.model_id());
                 json(status, body.into_bytes())
+            }
+            Route::Metrics => {
+                if let Some(refusal) = refuse_accept(request, &[METRICS_TYPE]) {
+                    return error_response(&refusal, surface);
+                }
+                let text = self.metrics.render(
+                    self.backend.model_id(),
+                    self.backend.context_length(),
+                    &self.backend.engine_report(),
+                );
+                Response::with_status(200)
+                    .header("Content-Type", METRICS_TYPE)
+                    .with_body(text.into_bytes())
             }
             Route::Models => {
                 if let Some(refusal) = refuse_accept(request, &MODEL_TYPES) {
