@@ -365,16 +365,16 @@ fn decide(budgets: Budgets, whole: Layout, split: Option<Layout>) -> Result<(Lay
 fn admit(budgets: Budgets, layout: Layout) -> Result<(), Location> {
     let planner = Planner::with_owners(
         [
-        LocationSpec {
-            kind: LocationKind::HostPinned,
-            capacity: budgets.host.min(CAPACITY_CAP.max(layout.cache_host)),
-            reserve: 0,
-        },
-        LocationSpec {
-            kind: LocationKind::Device { ordinal: 0 },
-            capacity: budgets.device.min(CAPACITY_CAP.max(layout.device_bytes())),
-            reserve: 0,
-        },
+            LocationSpec {
+                kind: LocationKind::HostPinned,
+                capacity: budgets.host.min(CAPACITY_CAP.max(layout.cache_host)),
+                reserve: 0,
+            },
+            LocationSpec {
+                kind: LocationKind::Device { ordinal: 0 },
+                capacity: budgets.device.min(CAPACITY_CAP.max(layout.device_bytes())),
+                reserve: 0,
+            },
         ],
         1,
     );
@@ -673,9 +673,22 @@ mod tests {
         };
         for device in [u64::MAX, whole.device_bytes(), whole.device_bytes() - 1] {
             let budgets = Budgets { device, host: u64::MAX };
-            assert!(same(&decide(budgets, whole, None), &before(budgets, whole, None)), "device {device}");
+            assert!(
+                same(&decide(budgets, whole, None), &before(budgets, whole, None)),
+                "device {device}"
+            );
         }
-        assert!(decide(Budgets { device: u64::MAX, host: u64::MAX }, whole, None).is_ok());
+        assert!(
+            decide(
+                Budgets {
+                    device: u64::MAX,
+                    host: u64::MAX
+                },
+                whole,
+                None
+            )
+            .is_ok()
+        );
     }
 
     #[test]
