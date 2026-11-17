@@ -10,7 +10,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+llguidance.workspace = true
 thiserror.workspace = true
+toktrie.workspace = true
 
 [dev-dependencies]
-serde_json = { workspace = true, features = ["preserve_order"] }
+serde_json.workspace = true

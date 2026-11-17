@@ -307,12 +307,15 @@ pub fn plan_with(
     })
 }
 
-/// Capacities stay far below `u64::MAX` so the memory planner's sums cannot overflow: an unknown or unlimited budget
-/// is this large.
+/// An unknown or unlimited budget is given to the memory planner as this many bytes, or as the bytes the plan asks of
+/// that location if that is more, so the capacity stays below `u64::MAX / 2` for any plan the sums can hold and the
+/// answer is the same as with the budget itself.
 const CAPACITY_CAP: u64 = u64::MAX / 4;
 
 /// The two memory spaces of a plan: pinned host memory first, so a refusal at the host is reported before one at the
-/// device.
+/// device. When both are short the result relies on `Planner::admit` reporting the lowest location index, which
+/// RustEE does not promise; the unit test `the_memory_planner_decides_as_the_hand_written_fit_did` (host and device
+/// both short in its sweep) guards it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Location {
     Host,
@@ -344,7 +347,8 @@ impl Layout {
 /// Everything on the device first; when that is refused and there is a `split` (the cache pages past the device
 /// minimum on pinned host memory), the split before any weight leaves the device: each attention layer's host pages
 /// are copied to one device region of the sequence's before the layer reads them. The error is the layout whose
-/// numbers the refusal reports (`Ok` says whether the cache spilled): the split one when the host holds its pages and the device is short, else the whole.
+/// numbers the refusal reports (`Ok` says whether the cache spilled): the split one when the host holds its pages and
+/// the device is short, else the whole.
 fn decide(budgets: Budgets, whole: Layout, split: Option<Layout>) -> Result<(Layout, bool), Layout> {
     if admit(budgets, whole).is_ok() {
         return Ok((whole, false));
@@ -359,18 +363,21 @@ fn decide(budgets: Budgets, whole: Layout, split: Option<Layout>) -> Result<(Lay
 /// Asks the memory planner whether `layout` fits `budgets`: every consumer is required. The planner is the plan's own
 /// and holds nothing after this returns. The error is the first location that is short.
 fn admit(budgets: Budgets, layout: Layout) -> Result<(), Location> {
-    let planner = Planner::new([
+    let planner = Planner::with_owners(
+        [
         LocationSpec {
             kind: LocationKind::HostPinned,
-            capacity: budgets.host.min(CAPACITY_CAP),
+            capacity: budgets.host.min(CAPACITY_CAP.max(layout.cache_host)),
             reserve: 0,
         },
         LocationSpec {
             kind: LocationKind::Device { ordinal: 0 },
-            capacity: budgets.device.min(CAPACITY_CAP),
+            capacity: budgets.device.min(CAPACITY_CAP.max(layout.device_bytes())),
             reserve: 0,
         },
-    ]);
+        ],
+        1,
+    );
     let host = LocationId(0);
     let device = LocationId(1);
     let owner = planner.open_owner(OwnerSpec::new("residency", Priority(0), Scope::Plan(0)));
@@ -653,6 +660,22 @@ mod tests {
             }
         }
         assert!(cases > 10_000);
+    }
+
+    #[test]
+    fn a_need_above_the_cap_is_judged_against_the_budget_itself() {
+        let whole = Layout {
+            weights: 1000,
+            runtime_reserve: u64::MAX / 4 + 1,
+            scratch: 50,
+            cache_device: 400,
+            cache_host: 0,
+        };
+        for device in [u64::MAX, whole.device_bytes(), whole.device_bytes() - 1] {
+            let budgets = Budgets { device, host: u64::MAX };
+            assert!(same(&decide(budgets, whole, None), &before(budgets, whole, None)), "device {device}");
+        }
+        assert!(decide(Budgets { device: u64::MAX, host: u64::MAX }, whole, None).is_ok());
     }
 
     #[test]
