@@ -14,7 +14,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use euhedral_core::ingest::QueueIngestSink;
+use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_inference_api_protocol::ApiError;
 use euhedral_inference_api_protocol::generation::GenerationRequest;
 use euhedral_inference_engine::generation::{
@@ -111,10 +111,11 @@ impl EngineBackend {
         }
     }
 
-    /// Stops admitting generations and offering frames: the lattice is about to close.
+    /// Stops admitting generations and refuses the frames offered from now on (their continuations are told): the lattice
+    /// is about to close.
     pub fn close(&self) {
         self.available.store(false, Ordering::Release);
-        self.sink.complete_gracefully();
+        self.sink.complete();
     }
 }
 
