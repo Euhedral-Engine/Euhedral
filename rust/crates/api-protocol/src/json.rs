@@ -4,7 +4,12 @@
 use std::fmt::Write;
 
 /// The deepest nesting a parsed document may have.
-const MAX_DEPTH: usize = 1000;
+/// The deepest nesting of arrays and objects a document may have, and the most digits one number may have
+/// (the integer digits for an integer; integer, fraction and exponent digits together for a float), and the
+/// longest object key in UTF-8 bytes: the limits of the reader the wire format is defined by.
+const MAX_DEPTH: usize = 500;
+const MAX_NUMBER_DIGITS: usize = 1000;
+const MAX_NAME_BYTES: usize = 50_000;
 
 /// A JSON value whose objects keep their insertion order.
 #[derive(Debug, Clone, PartialEq)]
@@ -336,9 +341,6 @@ impl Parser<'_> {
     }
 
     fn value(&mut self, depth: usize) -> Option<JsonValue> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
         match self.peek()? {
             b'n' => self.literal("null", JsonValue::Null),
             b't' => self.literal("true", JsonValue::Bool(true)),
@@ -352,6 +354,9 @@ impl Parser<'_> {
     }
 
     fn array(&mut self, depth: usize) -> Option<JsonValue> {
+        if depth >= MAX_DEPTH {
+            return None;
+        }
         self.position += 1;
         let mut items = Vec::new();
         self.skip_space();
@@ -375,6 +380,9 @@ impl Parser<'_> {
     }
 
     fn object(&mut self, depth: usize) -> Option<JsonValue> {
+        if depth >= MAX_DEPTH {
+            return None;
+        }
         self.position += 1;
         let mut members = Vec::new();
         self.skip_space();
@@ -388,6 +396,9 @@ impl Parser<'_> {
                 return None;
             }
             let key = self.string()?;
+            if key.len() > MAX_NAME_BYTES {
+                return None;
+            }
             self.skip_space();
             if self.peek()? != b':' {
                 return None;
@@ -418,23 +429,29 @@ impl Parser<'_> {
 
     fn number(&mut self) -> Option<JsonValue> {
         let start = self.position;
+        let mut digit_count = 0;
         if self.peek() == Some(b'-') {
             self.position += 1;
         }
         match self.peek()? {
             b'0' => self.position += 1,
             b'1'..=b'9' => {
-                self.digits();
+                digit_count += self.digits();
             }
             _ => return None,
+        }
+        if digit_count == 0 {
+            digit_count = 1;
         }
         let mut integer = true;
         if self.peek() == Some(b'.') {
             integer = false;
             self.position += 1;
-            if self.digits() == 0 {
+            let fraction = self.digits();
+            if fraction == 0 {
                 return None;
             }
+            digit_count += fraction;
         }
         if matches!(self.peek(), Some(b'e' | b'E')) {
             integer = false;
@@ -442,9 +459,14 @@ impl Parser<'_> {
             if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.position += 1;
             }
-            if self.digits() == 0 {
+            let exponent = self.digits();
+            if exponent == 0 {
                 return None;
             }
+            digit_count += exponent;
+        }
+        if digit_count > MAX_NUMBER_DIGITS {
+            return None;
         }
         let literal = &self.text[start..self.position];
         if integer {
@@ -545,7 +567,7 @@ mod tests {
 
     #[test]
     fn deep_nesting_is_refused_instead_of_overflowing_the_stack() {
-        let text = format!("{}{}", "[".repeat(5000), "]".repeat(5000));
+        let text = format!("{}{}", "[".repeat(50_000), "]".repeat(50_000));
         assert!(JsonValue::parse(&text).is_none());
     }
 
@@ -615,5 +637,56 @@ mod tests {
             value.to_python_json(),
             "{\"a\": [1, 2.5, \"é\\u0001\\n\"], \"b\": {\"c\": null, \"d\": true}, \"e\": {}, \"f\": []}"
         );
+    }
+
+    #[test]
+    fn trailing_text_after_the_value_is_refused() {
+        assert_eq!(JsonValue::parse("{} x"), None);
+        assert_eq!(JsonValue::parse("1 2"), None);
+        assert!(JsonValue::parse(" {\"a\":1} ").is_some());
+    }
+
+    fn nested(open: &str, close: &str, levels: usize) -> String {
+        format!("{}{}", open.repeat(levels), close.repeat(levels))
+    }
+
+    #[test]
+    fn nesting_of_five_hundred_levels_is_read_and_one_more_is_refused() {
+        assert!(JsonValue::parse(&nested("[", "]", 500)).is_some());
+        assert!(JsonValue::parse(&nested("[", "]", 501)).is_none());
+        let objects = |levels: usize| format!("{}1{}", "{\"a\":".repeat(levels), "}".repeat(levels));
+        assert!(JsonValue::parse(&objects(500)).is_some());
+        assert!(JsonValue::parse(&objects(501)).is_none());
+        let mixed = format!("{}0{}", "[{\"a\":".repeat(250), "}]".repeat(250));
+        assert!(JsonValue::parse(&mixed).is_some());
+        let mixed = format!("[{}0{}]", "[{\"a\":".repeat(250), "}]".repeat(250));
+        assert!(JsonValue::parse(&mixed).is_none());
+    }
+
+    #[test]
+    fn numbers_of_a_thousand_digits_are_read_and_one_more_is_refused() {
+        let digits = |count: usize| "1".repeat(count);
+        assert!(JsonValue::parse(&digits(1000)).is_some());
+        assert!(JsonValue::parse(&digits(1001)).is_none());
+        assert!(JsonValue::parse(&format!("-{}", digits(1000))).is_some());
+        assert!(JsonValue::parse(&format!("-{}", digits(1001))).is_none());
+        assert!(JsonValue::parse(&format!("{}.{}", digits(500), digits(500))).is_some());
+        assert!(JsonValue::parse(&format!("{}.{}", digits(500), digits(501))).is_none());
+        assert!(JsonValue::parse(&format!("-{}.{}", digits(500), digits(500))).is_some());
+        assert!(JsonValue::parse(&format!("1.{}e-{}", digits(499), digits(500))).is_some());
+        assert!(JsonValue::parse(&format!("1.{}e-{}", digits(499), digits(501))).is_none());
+        assert!(JsonValue::parse(&format!("0.{}", digits(999))).is_some());
+        assert!(JsonValue::parse(&format!("0.{}", digits(1000))).is_none());
+    }
+
+    #[test]
+    fn object_keys_of_fifty_thousand_bytes_are_read_and_one_more_is_refused() {
+        let object = |key: String| format!("{{\"{key}\":1}}");
+        assert!(JsonValue::parse(&object("k".repeat(50_000))).is_some());
+        assert!(JsonValue::parse(&object("k".repeat(50_001))).is_none());
+        assert!(JsonValue::parse(&object("\u{e9}".repeat(25_000))).is_some());
+        assert!(JsonValue::parse(&object("\u{e9}".repeat(25_001))).is_none());
+        let long_value = format!("[\"{}\"]", "v".repeat(200_000));
+        assert!(JsonValue::parse(&long_value).is_some());
     }
 }

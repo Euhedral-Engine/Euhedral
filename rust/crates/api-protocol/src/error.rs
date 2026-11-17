@@ -1,6 +1,8 @@
 //! The API's errors: one status, type, code and message per failure, and the two JSON bodies that carry them.
 
 use crate::json::JsonValue;
+use crate::pipeline::PipelineError;
+use crate::template::TemplateError;
 use crate::wire::{ToJson, object, optional_text, text};
 
 /// The API surface an error is answered on; each has its own error format.
@@ -338,9 +340,24 @@ impl ApiError {
     }
 }
 
+/// A conversation the template refuses is the client's: a bad request about its messages.
+impl From<TemplateError> for ApiError {
+    fn from(error: TemplateError) -> ApiError {
+        ApiError::invalid_request(error.to_string(), Some("messages"))
+    }
+}
+
+/// Output the pipeline cannot accept is a server error: the model produced an invalid tool call.
+impl From<PipelineError> for ApiError {
+    fn from(error: PipelineError) -> ApiError {
+        ApiError::invalid_tool_call(error.message())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::Piece;
 
     struct Row {
         error: ApiError,
@@ -707,6 +724,39 @@ mod tests {
         assert_eq!(
             text(&error, Surface::OpenAi),
             r##"{"error":{"message":"a \"b\"\n\u001B\u000B\u001F\u0001\b\fé","type":"invalid_request_error","param":null,"code":null}}"##
+        );
+    }
+
+    #[test]
+    fn a_template_refusal_is_a_bad_request_about_the_messages() {
+        for (error, message) in [
+            (TemplateError::NoMessages, "No messages provided."),
+            (TemplateError::NoUserQuery, "No user query found in messages."),
+            (
+                TemplateError::SystemNotFirst,
+                "System message must be at the beginning.",
+            ),
+        ] {
+            let converted = ApiError::from(error);
+            assert_eq!(converted, ApiError::invalid_request(message, Some("messages")));
+            assert_eq!((converted.status, converted.code), (400, None));
+            assert_eq!(converted.param.as_deref(), Some("messages"));
+        }
+    }
+
+    #[test]
+    fn a_malformed_tool_call_is_an_internal_error_with_the_reason() {
+        let failure = PipelineError::MalformedToolCall {
+            message: "unknown function 'x'".to_owned(),
+            emitted: vec![Piece::Text("kept".to_owned())],
+        };
+        let converted = ApiError::from(failure);
+        assert_eq!(converted, ApiError::invalid_tool_call("unknown function 'x'"));
+        assert_eq!(converted.status, 500);
+        assert_eq!(converted.code, Some("invalid_tool_call"));
+        assert_eq!(
+            converted.message,
+            "The model produced an invalid tool call: unknown function 'x'."
         );
     }
 }
