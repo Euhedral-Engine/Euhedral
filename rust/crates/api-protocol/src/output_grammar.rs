@@ -36,6 +36,13 @@ use crate::pipeline::ToolChoice;
 use crate::response_format::ResponseFormat;
 use crate::tool_calling::{FunctionTool, ToolCalling};
 
+mod matcher;
+mod vocabulary;
+
+use matcher::{CompiledGrammars, Kind, grammar_refusal, schema_refusal};
+pub use matcher::{DEFAULT_CACHED_GRAMMARS, GrammarMatcher, MatcherError};
+pub use vocabulary::{end_ids, token_bytes};
+
 /// The skipped whitespace between JSON tokens.
 pub const WHITESPACE: &str = "[\\x20\\x0A\\x0D\\x09]{1,40}";
 
@@ -107,7 +114,7 @@ impl OutputGrammar {
         calling: &ToolCalling,
         format: &ResponseFormat,
         reasoning: bool,
-        checker: &dyn GrammarCheck,
+        checker: &mut dyn GrammarCheck,
     ) -> Result<Option<String>, ApiError> {
         if let ResponseFormat::JsonSchema {
             schema, schema_param, ..
@@ -301,18 +308,18 @@ pub struct VocabularyError(String);
 /// What compiles a request's grammar and schemas: the checker over the vocabulary, or the backend that holds it.
 pub trait GrammarCheck {
     /// Whether the Lark grammar compiles; a refusal is a 400 without a parameter.
-    fn check_grammar(&self, grammar: &str) -> Result<(), ApiError>;
+    fn check_grammar(&mut self, grammar: &str) -> Result<(), ApiError>;
 
     /// Whether `schema` compiles on its own; a refusal is an unenforceable schema at `param`.
-    fn check_json_schema(&self, schema: &JsonValue, param: &str) -> Result<(), ApiError>;
+    fn check_json_schema(&mut self, schema: &JsonValue, param: &str) -> Result<(), ApiError>;
 }
 
 impl GrammarCheck for GrammarChecker {
-    fn check_grammar(&self, grammar: &str) -> Result<(), ApiError> {
+    fn check_grammar(&mut self, grammar: &str) -> Result<(), ApiError> {
         GrammarChecker::check_grammar(self, grammar)
     }
 
-    fn check_json_schema(&self, schema: &JsonValue, param: &str) -> Result<(), ApiError> {
+    fn check_json_schema(&mut self, schema: &JsonValue, param: &str) -> Result<(), ApiError> {
         GrammarChecker::check_json_schema(self, schema, param)
     }
 }
@@ -320,6 +327,9 @@ impl GrammarCheck for GrammarChecker {
 /// Checks that grammars and JSON schemas compile over one vocabulary, the way the generation will compile them.
 pub struct GrammarChecker {
     factory: ParserFactory,
+    size: u32,
+    end_ids: Arc<[u32]>,
+    compiled: CompiledGrammars,
 }
 
 impl Debug for GrammarChecker {
@@ -341,6 +351,16 @@ impl GrammarChecker {
     /// Compiling a grammar costs enough (a large schema or tool set takes noticeable CPU) that a caller runs a check
     /// as its own frame, never inline in a request handler.
     pub fn new(token_bytes: &[Vec<u8>], end_ids: &[u32]) -> Result<GrammarChecker, VocabularyError> {
+        Self::with_cache_size(token_bytes, end_ids, DEFAULT_CACHED_GRAMMARS)
+    }
+
+    /// As [`GrammarChecker::new`], keeping up to `cached_grammars` compiled grammars for reuse by
+    /// [`GrammarChecker::constraint`]; zero keeps none.
+    pub fn with_cache_size(
+        token_bytes: &[Vec<u8>],
+        end_ids: &[u32],
+        cached_grammars: usize,
+    ) -> Result<GrammarChecker, VocabularyError> {
         let Some(&end) = end_ids.first() else {
             return Err(VocabularyError("a grammar needs an end token".to_owned()));
         };
@@ -369,31 +389,27 @@ impl GrammarChecker {
             &SlicedBiasComputer::general_slices(),
         )
         .map_err(|error| VocabularyError(error.to_string()))?;
-        Ok(GrammarChecker { factory })
-    }
-
-    /// Whether llguidance compiles the Lark grammar; the refusal is a 400 without a parameter.
-    pub fn check_grammar(&self, grammar: &str) -> Result<(), ApiError> {
-        self.compile(grammar, "lark").map_err(|refused| {
-            ApiError::invalid_request(format!("The requested output cannot be enforced: {refused}"), None)
+        Ok(GrammarChecker {
+            factory,
+            size,
+            end_ids: end_ids.into(),
+            compiled: CompiledGrammars::new(cached_grammars),
         })
     }
 
-    /// Whether llguidance compiles `schema` on its own, so that a refusal names the schema's problem rather than a
-    /// grammar around it; the refusal is an unenforceable schema at `param`.
-    pub fn check_json_schema(&self, schema: &JsonValue, param: &str) -> Result<(), ApiError> {
-        self.compile(&OutputGrammar::schema_text(schema), "json_schema")
-            .map_err(|refused| {
-                ApiError::unenforceable_schema(format!("The JSON Schema cannot be enforced: {refused}"), Some(param))
-            })
+    /// Whether llguidance compiles the Lark grammar; the refusal is a 400 without a parameter. A compiled grammar is
+    /// kept for [`GrammarChecker::constraint`] to start from.
+    pub fn check_grammar(&mut self, grammar: &str) -> Result<(), ApiError> {
+        self.check(Kind::Lark, grammar)
+            .map_err(|refused| grammar_refusal(&refused))
     }
 
-    /// Compiles `grammar` of the given tagged type as a matcher does, with nothing logged.
-    fn compile(&self, grammar: &str, kind: &str) -> Result<(), String> {
-        match self.matcher(grammar, kind).get_error() {
-            None => Ok(()),
-            Some(message) => Err(summary(&message)),
-        }
+    /// Whether llguidance compiles `schema` on its own, so that a refusal names the schema's problem rather than a
+    /// grammar around it; the refusal is an unenforceable schema at `param`. A compiled schema is kept for
+    /// [`GrammarChecker::json_schema_constraint`] to start from.
+    pub fn check_json_schema(&mut self, schema: &JsonValue, param: &str) -> Result<(), ApiError> {
+        self.check(Kind::JsonSchema, &OutputGrammar::schema_text(schema))
+            .map_err(|refused| schema_refusal(&refused, param))
     }
 
     fn matcher(&self, grammar: &str, kind: &str) -> Matcher {
@@ -425,5 +441,7 @@ fn summary(message: &str) -> String {
     rest.unwrap_or(first).to_owned()
 }
 
+#[cfg(test)]
+mod real_vocabulary;
 #[cfg(test)]
 mod tests;

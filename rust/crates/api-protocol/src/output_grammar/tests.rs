@@ -50,11 +50,9 @@ fn call(name: &str, parameters: &str) -> String {
     format!("<tool_call>\n<function={name}>\n{parameters}</function>\n</tool_call>")
 }
 
-/// Whether a generation could produce exactly `text` and then end.
-fn finishes(grammar: &str, text: &str) -> bool {
-    let checker = checker();
-    let mut matcher = checker.matcher(grammar, "lark");
-    assert_eq!(matcher.get_error(), None, "{grammar}");
+/// The token ids of `text`: the two call tags are control tokens, every other byte its own token.
+fn encode(text: &str) -> Vec<TokenId> {
+    let mut ids = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
         let (token, length) = if rest.starts_with("<tool_call>") {
@@ -64,12 +62,23 @@ fn finishes(grammar: &str, text: &str) -> bool {
         } else {
             (TokenId::from(rest.as_bytes()[0]), 1)
         };
-        if !matcher.compute_mask_or_eos().expect("mask").is_allowed(token) || matcher.consume_token(token).is_err() {
-            return false;
-        }
+        ids.push(token);
         rest = &rest[length..];
     }
-    matcher.compute_mask_or_eos().expect("mask").is_allowed(END)
+    ids
+}
+
+/// Whether a generation could produce exactly `text` and then end.
+fn finishes(grammar: &str, text: &str) -> bool {
+    let mut checker = checker();
+    let mut matcher = checker.constraint(grammar).expect(grammar);
+    for id in encode(text) {
+        if !matcher.allows(id).expect("mask") {
+            return false;
+        }
+        matcher.consume(id).expect("allowed");
+    }
+    matcher.allows(END).expect("mask")
 }
 
 fn tools(calling: &ToolCalling, answer: Option<&JsonValue>, reasoning: bool) -> String {
@@ -358,29 +367,29 @@ fn a_string_enum_skips_literals_that_are_not_strings() {
 
 #[test]
 fn a_request_gets_the_grammar_of_its_format_and_tools() {
-    let checker = checker();
+    let mut checker = checker();
     let plain = ToolCalling::disabled();
     let schema = ResponseFormat::JsonSchema {
         name: Some("p".to_owned()),
         schema: json(r#"{"type":"object","properties":{"age":{"type":"integer"}},"required":["age"]}"#),
         schema_param: "response_format.json_schema.schema".to_owned(),
     };
-    let grammar = OutputGrammar::for_request(&plain, &schema, false, &checker).expect("planned");
+    let grammar = OutputGrammar::for_request(&plain, &schema, false, &mut checker).expect("planned");
     let grammar = grammar.expect("a grammar");
     assert!(
         grammar.starts_with("start: answer\nanswer: %json {\"x-guidance\":"),
         "{grammar}"
     );
     assert!(grammar.contains("\"required\":[\"age\"]"), "{grammar}");
-    let text = OutputGrammar::for_request(&plain, &ResponseFormat::Text, false, &checker);
+    let text = OutputGrammar::for_request(&plain, &ResponseFormat::Text, false, &mut checker);
     assert_eq!(text.expect("planned"), None);
     // Auto calls under free text are split by the parser, not constrained.
     let auto = weather(ToolChoice::Auto, true, true);
     assert_eq!(
-        OutputGrammar::for_request(&auto, &ResponseFormat::Text, false, &checker).expect("planned"),
+        OutputGrammar::for_request(&auto, &ResponseFormat::Text, false, &mut checker).expect("planned"),
         None
     );
-    let with_answer = OutputGrammar::for_request(&auto, &schema, false, &checker)
+    let with_answer = OutputGrammar::for_request(&auto, &schema, false, &mut checker)
         .expect("planned")
         .expect("a grammar");
     assert!(with_answer.contains("start: (calls | answer)"), "{with_answer}");
@@ -388,7 +397,7 @@ fn a_request_gets_the_grammar_of_its_format_and_tools() {
     // A strict tool's schema is compiled as it is.
     let bounded = r#"{"type":"object","properties":{"n":{"type":"integer","minimum":0}},"required":["n"]}"#;
     let strict = calling_of(vec![tool("f", Some(bounded), true)], ToolChoice::Required, true);
-    let grammar = OutputGrammar::for_request(&strict, &ResponseFormat::Text, false, &checker)
+    let grammar = OutputGrammar::for_request(&strict, &ResponseFormat::Text, false, &mut checker)
         .expect("planned")
         .expect("a grammar");
     assert!(grammar.contains("\"minimum\":0"), "{grammar}");
@@ -396,7 +405,7 @@ fn a_request_gets_the_grammar_of_its_format_and_tools() {
 
 #[test]
 fn a_schema_llguidance_refuses_is_an_unenforceable_schema_at_its_parameter() {
-    let checker = checker();
+    let mut checker = checker();
     let param = "response_format.json_schema.schema";
     for (schema, message) in [
         (
@@ -414,7 +423,7 @@ fn a_schema_llguidance_refuses_is_an_unenforceable_schema_at_its_parameter() {
             schema_param: param.to_owned(),
         };
         let refused =
-            OutputGrammar::for_request(&ToolCalling::disabled(), &format, false, &checker).expect_err("refused");
+            OutputGrammar::for_request(&ToolCalling::disabled(), &format, false, &mut checker).expect_err("refused");
         assert_eq!(refused.status, 400);
         assert_eq!(refused.code, Some("unsupported_schema"));
         assert_eq!(refused.param.as_deref(), Some(param));
