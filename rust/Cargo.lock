@@ -401,8 +401,12 @@ source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=48ef55d71ec29643
 name = "euhedral-inference-api-protocol"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
+ "euhedral-inference-edrl",
+ "euhedral-inference-tokenizer",
  "llguidance",
  "serde_json",
+ "test-support",
  "thiserror",
  "toktrie",
 ]
