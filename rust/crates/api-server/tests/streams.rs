@@ -165,9 +165,14 @@ fn until(what: &str, check: impl Fn() -> bool) {
     }
 }
 
+/// Lets a hung generation end (a generation that is not held is left alone), then waits for every close and slot.
 fn assert_closed_once(fx: &Fixture) {
     until("every generation closed", || {
-        fx.backend.generations().iter().all(|g| g.close_count() == 1)
+        let generations = fx.backend.generations();
+        for generation in &generations {
+            generation.finish_held_ok(0, false);
+        }
+        generations.iter().all(|g| g.close_count() == 1)
     });
     settle(fx);
 }
@@ -203,8 +208,14 @@ fn endless(fx: &Fixture) {
     fx.backend.set_script(Script::Endless);
 }
 
-fn generating(fx: &Fixture) -> bool {
-    fx.backend.generations().first().is_some_and(|g| g.emitted() > 0)
+/// A generation that is launched and never ends by itself: the queue behind it stays where it is.
+fn hung(fx: &Fixture) {
+    fx.backend.set_context_length(1 << 30);
+    fx.backend.set_script(Script::Hung);
+}
+
+fn launched(fx: &Fixture) -> bool {
+    fx.backend.generations().first().is_some_and(|g| g.started().is_some())
 }
 
 fn chunk(delta: &str, finish: &str) -> String {
@@ -711,10 +722,10 @@ fn errors_before_the_head_are_json_replies() {
     limits.max_queued = 1;
     let fx = Fixture::with(limits, Some(2));
     fx.backend.set_max_active(1);
-    endless(&fx);
+    hung(&fx);
     let mut first = Raw::connect(fx.addr);
     first.send(&post_raw(CHAT, &chat_body(BIG)));
-    until("generating", || generating(&fx));
+    until("launched", || launched(&fx));
     let mut second = Raw::connect(fx.addr);
     second.send(&post_raw(CHAT, &chat_body(BIG)));
     until("queued", || fx.server.admission().counts().waiting == 1);
@@ -735,10 +746,10 @@ fn time_limit_while_queued_is_a_json_503() {
     limits.queue_limit = Some(Duration::from_millis(300));
     let fx = Fixture::with(limits, Some(2));
     fx.backend.set_max_active(1);
-    endless(&fx);
+    hung(&fx);
     let mut first = Raw::connect(fx.addr);
     first.send(&post_raw(CHAT, &chat_body(BIG)));
-    until("generating", || generating(&fx));
+    until("launched", || launched(&fx));
     let mut second = Raw::connect(fx.addr);
     second.send(&post_raw(CHAT, &chat_body(BIG)));
     let seen = second.read_until(r#""code":"timeout""#);
@@ -754,10 +765,10 @@ fn time_limit_while_queued_is_a_json_503() {
 fn disconnect_while_queued_leaves_the_queue() {
     let fx = Fixture::with(limits(), Some(2));
     fx.backend.set_max_active(1);
-    endless(&fx);
+    hung(&fx);
     let mut first = Raw::connect(fx.addr);
     first.send(&post_raw(CHAT, &chat_body(BIG)));
-    until("generating", || generating(&fx));
+    until("launched", || launched(&fx));
     let mut second = Raw::connect(fx.addr);
     second.send(&post_raw(CHAT, &chat_body(BIG)));
     until("queued", || fx.server.admission().counts().waiting == 1);
@@ -895,17 +906,20 @@ fn time_limit_while_generating_ends_the_stream_with_an_error() {
 fn shutdown_ends_the_stream_with_an_error() {
     let mut limits = limits();
     limits.drain_limit = Duration::from_millis(100);
+    limits.shutdown_limit = Duration::from_millis(300);
     let fx = Fixture::with(limits, Some(2));
-    endless(&fx);
+    hung(&fx);
     let mut raw = Raw::connect(fx.addr);
     raw.send(&post_raw(RESPONSES, &response_body(BIG_OUTPUT)));
-    until("generating", || generating(&fx));
+    until("launched", || launched(&fx));
     fx.stop();
-    let seen = raw.read_until("interrupted by server shutdown");
+    let seen = raw.read_until(END);
+    assert!(seen.contains("interrupted by server shutdown"), "{seen}");
     assert!(
         seen.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream"),
         "{seen}"
     );
+    assert!(fx.backend.generations()[0].finish_held_ok(1, false));
     assert_closed_once(&fx);
     fx.finish_after_stop();
 }
