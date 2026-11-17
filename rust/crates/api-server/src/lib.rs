@@ -12,6 +12,7 @@ pub mod health;
 pub mod limits;
 pub mod metrics;
 pub mod models;
+pub mod planning;
 pub mod router;
 #[cfg(any(test, feature = "test-support"))]
 pub mod scripted;
@@ -24,4 +25,5 @@ pub use backend::{
 };
 pub use frames::once;
 pub use limits::Limits;
+pub use planning::{DefaultsError, Endpoint, Extras, Outcome, Planned, Planner, Publisher, RequestDefaults};
 pub use server::{ApiConfig, ApiServer, start};

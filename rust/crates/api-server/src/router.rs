@@ -17,6 +17,7 @@ use crate::health;
 use crate::limits::Limits;
 use crate::metrics::{CONTENT_TYPE as METRICS_TYPE, Metrics};
 use crate::models::Served;
+use crate::planning::{Endpoint, Planner};
 
 const JSON: &str = "application/json";
 
@@ -270,6 +271,7 @@ pub struct Router {
     served: Served,
     limits: Limits,
     metrics: Arc<Metrics>,
+    planner: Planner,
 }
 
 /// What a route that lists the model produces: `application/json` and its `+json` family.
@@ -285,17 +287,24 @@ impl Debug for Router {
 }
 
 impl Router {
-    pub fn new(backend: Arc<dyn Backend>, created_at: i64, limits: Limits, metrics: Arc<Metrics>) -> Router {
+    pub fn new(
+        backend: Arc<dyn Backend>,
+        created_at: i64,
+        limits: Limits,
+        metrics: Arc<Metrics>,
+        planner: Planner,
+    ) -> Router {
         Router {
             backend,
             served: Served { created_at },
             limits,
             metrics,
+            planner,
         }
     }
 
-    /// The whole answer to `request`.
-    pub fn answer(&self, request: &Request) -> Response {
+    /// The path of `request` without its query, and the surface that answers its errors.
+    fn locate(request: &Request) -> (&str, Surface) {
         let target = request.target.as_str();
         // An absolute-form target is the path after its authority.
         let target = target
@@ -303,13 +312,68 @@ impl Router {
             .or_else(|| target.strip_prefix("https://"))
             .map_or(target, |rest| rest.find('/').map_or("/", |at| &rest[at..]));
         let path = target.split(['?', '#']).next().unwrap_or(target);
-        let surface = Surface::of_path(path);
+        (path, Surface::of_path(path))
+    }
+
+    /// The whole answer to `request`, or the work that answers it: the first frame of the chain of a generating
+    /// route whose request passed the checks made before its body is read.
+    fn route(&self, request: Request, reply: Responder) -> Box<dyn Frame> {
+        let (path, surface) = Router::locate(&request);
         let method = request.method.as_str();
-        match resolve(&request.method, path) {
+        let response = match resolve(&request.method, path) {
             Resolution::NotFound => error_response(&ApiError::unknown_url(method, path), surface),
             Resolution::MethodNotAllowed => error_response(&ApiError::method_not_supported(method), surface),
             Resolution::Options(allow) => Response::with_status(200).header("Allow", allow),
-            Resolution::Found(route) => self.serve(route, request, surface),
+            Resolution::Found(Route::ChatCompletions) => {
+                return self.generating(Some(Endpoint::ChatCompletions), request, reply, surface);
+            }
+            Resolution::Found(Route::Messages) => {
+                return self.generating(Some(Endpoint::Messages), request, reply, surface);
+            }
+            Resolution::Found(Route::Responses) => {
+                return self.generating(Some(Endpoint::Responses), request, reply, surface);
+            }
+            Resolution::Found(Route::CountTokens) => {
+                return self.generating(None, request, reply, surface);
+            }
+            Resolution::Found(route) => self.serve(route, &request, surface),
+        };
+        reply.send(response);
+        no_work()
+    }
+
+    /// The first frame of a generating route's chain once the checks made before the body is read pass, or the error
+    /// that ends the request. `endpoint` `None` counts the tokens of a Messages request.
+    fn generating(
+        &self,
+        endpoint: Option<Endpoint>,
+        request: Request,
+        reply: Responder,
+        surface: Surface,
+    ) -> Box<dyn Frame> {
+        if let Err(error) = self.check_generating(&request) {
+            reply.send(error_response(&error, surface));
+            return no_work();
+        }
+        match endpoint {
+            Some(endpoint) => self.planner.plan(
+                endpoint,
+                request.body,
+                Box::new(move |planned| match planned {
+                    // The admission of generations replaces this answer.
+                    Ok(_) => reply.send(error_response(&not_implemented(), surface)),
+                    Err(error) => reply.send(error_response(&error, surface)),
+                }),
+            ),
+            None => self.planner.count_tokens(
+                request.body,
+                Box::new(move |counted| {
+                    reply.send(match counted {
+                        Ok(tokens) => json(200, format!("{{\"input_tokens\":{tokens}}}").into_bytes()),
+                        Err(error) => error_response(&error, surface),
+                    });
+                }),
+            ),
         }
     }
 
@@ -353,17 +417,15 @@ impl Router {
                 },
                 None => error_response(&ApiError::model_not_found(&name), surface),
             },
+            // The generating routes are started by `route`, which has the body's owner and the responder.
             Route::ChatCompletions | Route::Messages | Route::CountTokens | Route::Responses => {
-                match self.generating(request) {
-                    Ok(()) => error_response(&not_implemented(), surface),
-                    Err(error) => error_response(&error, surface),
-                }
+                error_response(&ApiError::server_error(), surface)
             }
         }
     }
 
     /// The checks every generating route makes before it reads the body, in the order a client sees their errors: type, size, readiness.
-    fn generating(&self, request: &Request) -> Result<(), ApiError> {
+    fn check_generating(&self, request: &Request) -> Result<(), ApiError> {
         require_json(request)?;
         self.limits.check_body(request.body.len())?;
         if !self.backend.is_available() {
@@ -423,11 +485,10 @@ fn refuse_accept(request: &Request, produces: &[&str]) -> Option<ApiError> {
     (!fits).then(|| ApiError::not_acceptable(produces))
 }
 
-/// The server's handler: answers each request at once.
+/// The server's handler: answers a request at once, or returns the first frame of the chain that plans it.
 impl Handler for Router {
     fn handle(&self, request: Request, reply: Responder) -> Box<dyn Frame> {
-        reply.send(self.answer(&request));
-        no_work()
+        self.route(request, reply)
     }
 }
 

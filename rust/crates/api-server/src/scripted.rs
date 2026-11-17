@@ -68,6 +68,21 @@ pub struct ScriptedBackend {
     generations: Mutex<Vec<Arc<ScriptedGeneration>>>,
     encoded: AtomicUsize,
     report: Mutex<EngineReport>,
+    grammar_refusal: Mutex<Option<String>>,
+    schema_refusal: Mutex<Option<String>>,
+    check_fault: Mutex<Option<CheckFault>>,
+    drop_continuations: AtomicBool,
+}
+
+/// How the grammar and schema checks of a scripted backend break.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckFault {
+    /// The engine is closing: [`BackendError::Unavailable`] with this reason.
+    Unavailable(String),
+    /// The check fails: [`BackendError::Failed`] with this reason.
+    Failed(String),
+    /// The check panics, as a bug in a step would.
+    Panic,
 }
 
 impl Debug for ScriptedBackend {
@@ -94,6 +109,10 @@ impl ScriptedBackend {
             generations: Mutex::new(Vec::new()),
             encoded: AtomicUsize::new(0),
             report: Mutex::new(EngineReport::default()),
+            grammar_refusal: Mutex::new(None),
+            schema_refusal: Mutex::new(None),
+            check_fault: Mutex::new(None),
+            drop_continuations: AtomicBool::new(false),
         })
     }
 
@@ -110,6 +129,40 @@ impl ScriptedBackend {
     /// Sets what [`Backend::engine_report`] returns. The speculative depth is read when the server starts.
     pub fn set_engine_report(&self, report: EngineReport) {
         *self.report.lock().unwrap_or_else(PoisonError::into_inner) = report;
+    }
+
+    /// Sets the longest sequence, prompt plus completion.
+    pub fn set_context_length(&self, tokens: usize) {
+        self.context_length.store(tokens, Ordering::Release);
+    }
+
+    /// Makes every grammar check refuse with `reason` (`None`: accept), as a grammar llguidance cannot compile.
+    pub fn refuse_grammars(&self, reason: Option<&str>) {
+        *self.grammar_refusal.lock().unwrap_or_else(PoisonError::into_inner) = reason.map(str::to_owned);
+    }
+
+    /// Makes every JSON Schema check refuse with `reason` (`None`: accept).
+    pub fn refuse_schemas(&self, reason: Option<&str>) {
+        *self.schema_refusal.lock().unwrap_or_else(PoisonError::into_inner) = reason.map(str::to_owned);
+    }
+
+    /// Makes every grammar and schema check break as `fault` says (`None`: work as before).
+    pub fn set_check_fault(&self, fault: Option<CheckFault>) {
+        *self.check_fault.lock().unwrap_or_else(PoisonError::into_inner) = fault;
+    }
+
+    /// Makes encoding and counting drop their continuation without calling it, as a backend with a bug does.
+    pub fn drop_continuations(&self, drop: bool) {
+        self.drop_continuations.store(drop, Ordering::Release);
+    }
+
+    fn check_faulted(&self) -> Result<(), BackendError> {
+        match &*self.check_fault.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(CheckFault::Unavailable(reason)) => Err(BackendError::Unavailable(reason.clone())),
+            Some(CheckFault::Failed(reason)) => Err(BackendError::Failed(reason.clone())),
+            Some(CheckFault::Panic) => panic!("the scripted check panics"),
+            None => Ok(()),
+        }
     }
 
     /// Sets the script of the generations opened from now on.
@@ -173,6 +226,9 @@ impl Backend for ScriptedBackend {
 
     fn encode_prompt(&self, prompt: String, then: Next<Result<EncodedPrompt, BackendError>>) {
         self.encoded.fetch_add(1, Ordering::AcqRel);
+        if self.drop_continuations.load(Ordering::Acquire) {
+            return;
+        }
         self.offer(move |ran| {
             if !ran {
                 return then(Err(refused()));
@@ -186,11 +242,19 @@ impl Backend for ScriptedBackend {
     }
 
     fn check_grammar(&self, _grammar: &str) -> Result<(), BackendError> {
-        Ok(())
+        self.check_faulted()?;
+        match &*self.grammar_refusal.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(reason) => Err(BackendError::Unenforceable(reason.clone())),
+            None => Ok(()),
+        }
     }
 
     fn check_json_schema(&self, _schema: &str) -> Result<(), BackendError> {
-        Ok(())
+        self.check_faulted()?;
+        match &*self.schema_refusal.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(reason) => Err(BackendError::Unenforceable(reason.clone())),
+            None => Ok(()),
+        }
     }
 
     fn open_generation(

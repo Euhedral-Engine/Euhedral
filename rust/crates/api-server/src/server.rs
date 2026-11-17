@@ -21,6 +21,7 @@ use crate::backend::Backend;
 use crate::frames::once_or_refused;
 use crate::limits::Limits;
 use crate::metrics::Metrics;
+use crate::planning::{Planner, RequestDefaults};
 use crate::router::Router;
 
 /// What a server needs to start.
@@ -34,6 +35,8 @@ pub struct ApiConfig {
     pub backend: Arc<dyn Backend>,
     /// When the model was created, in seconds since the epoch, as the model lists show it.
     pub created_at: i64,
+    /// What a request that states nothing takes, and the completion budget when it states none.
+    pub defaults: RequestDefaults,
     /// The sockets' engine, when the caller has one to share: it must be attached to the lattice already, and the
     /// caller completes it. `None`: the server opens one, attaches it and completes it on release.
     pub io: Option<Arc<AsyncIo>>,
@@ -76,6 +79,11 @@ impl Debug for ApiServer {
 /// the sink and the timers to the lattice and attaches the listener as a source. Every step of the server is a frame
 /// of the lattice. If it fails, what it attached is completed and nothing is left running.
 pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Result<ApiServer> {
+    // Settings the planner cannot hold are refused before anything is bound or attached.
+    config
+        .defaults
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let listener = TcpListener::bind(config.address)?;
     let local_addr = listener.local_addr()?;
     let (io, own_io) = match config.io {
@@ -107,7 +115,20 @@ pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Resul
         config.backend.engine_report().speculative_depth,
         Metrics::wall_clock_ms(),
     ));
-    let router = Router::new(config.backend, config.created_at, config.limits, metrics.clone());
+    let planner = match Planner::new(config.backend.clone(), config.defaults, sink.clone()) {
+        Ok(planner) => planner,
+        Err(error) => {
+            undo(true);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, error));
+        }
+    };
+    let router = Router::new(
+        config.backend,
+        config.created_at,
+        config.limits,
+        metrics.clone(),
+        planner,
+    );
     let handle = match serve(
         lattice.clone(),
         io.clone(),
