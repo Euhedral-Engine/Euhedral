@@ -134,6 +134,30 @@ fn a_backend_that_does_not_start_exits_with_one_and_says_why() {
 }
 
 #[test]
+fn a_missing_cuda_library_exits_with_one_and_gives_the_driver_message() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let cache = directory.path().join("native");
+    let extra = format!("host:\n  native-cache: {}\n", cache.display());
+    let file = config(directory.path(), free_port(), &extra);
+    let mut server = spawn(&["--config", file.to_str().expect("a path")]);
+    assert_eq!(exit_code(&mut server, PATIENCE), 1);
+    let text = stderr_of(&mut server);
+    assert!(
+        text.contains("the NVIDIA driver is required, with an NVIDIA Blackwell GPU:"),
+        "{text}"
+    );
+    assert!(
+        text.contains("install the driver (nvidia-smi lists the GPU when it works)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("libeuhedral_cuda") || text.contains("euhedral_cuda"),
+        "{text}"
+    );
+    assert!(text.contains("check nvidia-smi"), "{text}");
+}
+
+#[test]
 fn a_port_in_use_exits_with_one_and_names_the_port() {
     let taken = TcpListener::bind("0.0.0.0:0").expect("a listener");
     let port = taken.local_addr().expect("an address").port();

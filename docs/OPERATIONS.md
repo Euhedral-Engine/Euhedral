@@ -19,7 +19,7 @@ See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 | Setting | Default | Meaning |
 |---|---|---|
 | `model.artifact` | required | The `.edrl` artifact to serve. It carries the checkpoint's tokenizer, chat template and special-token ids ([Artifacts and their tokenizer](#artifacts-and-their-tokenizer)). |
-| `host.native-cache` | the user's cache directory | Where the jar unpacks its native files (the CUDA library, llguidance, the CUDA runtime and NVRTC, kernel sources and CUDA headers), in a subdirectory named by their content hash: `$XDG_CACHE_HOME/euhedral`, else `~/.cache/euhedral`; `%LOCALAPPDATA%\euhedral` on Windows. Servers started together share one copy. The directory is per user (keep it `0700`): give each user their own, or leave the default. |
+| `host.native-cache` | the user's cache directory | Where the jar unpacks its native files (the CUDA library, llguidance, the CUDA runtime and NVRTC, kernel sources and CUDA headers), in a subdirectory named by their content hash: `$XDG_CACHE_HOME/euhedral`, else `~/.cache/euhedral`; `%LOCALAPPDATA%\euhedral` on Windows. Servers started together share one copy. The directory is per user (keep it `0700`): give each user their own, or leave the default. The Rust server has no jar to unpack: it loads the CUDA library from `lib/` under this directory when it is set, else from `lib/` beside the executable. |
 | `host.cpus` | every available processor | Processor IDs or ranges for the engine's worker threads, for example `2-5,8`; Euhedral pins one worker per selected core. |
 | `model.name` | required | The name clients send as `model`. |
 | `sampling.temperature` | 1.0 | Temperature for a request that sets none; 0 is greedy decoding. |

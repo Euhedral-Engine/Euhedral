@@ -10,7 +10,7 @@
 //! process at once with the same code.
 //!
 //! This file is the process's edge: it reads the arguments and the environment, installs the logger and the signals,
-//! and chooses the backend.
+//! and starts the engine as the backend (`engine::start_engine`).
 
 use std::env;
 #[cfg(feature = "scripted")]
@@ -19,27 +19,16 @@ use std::process::ExitCode;
 #[cfg(feature = "scripted")]
 use std::time::Duration;
 
+use euhedral_inference_server::engine::start_engine;
 #[cfg(feature = "scripted")]
 use euhedral_inference_server::scripted::{script_named, start_with};
 use euhedral_inference_server::signals::install;
 #[cfg(feature = "scripted")]
 use euhedral_inference_server::{DRAIN_WINDOW, SHUTDOWN_WINDOW};
 use euhedral_inference_server::{
-    EXIT_INVALID_SETTINGS, EXIT_START_FAILED, StartError, Started, StopWindows, ignored_arguments, install_logger,
-    load_settings, say, serve,
+    EXIT_INVALID_SETTINGS, EXIT_START_FAILED, StopWindows, ignored_arguments, install_logger, load_settings, say, serve,
 };
-use euhedral_inference_settings::{Settings, process_env};
-
-/// The backend this binary serves.
-///
-/// THE PLACE TO PASS THE ENGINE ADAPTER: until the adapter exists the start function fails, naming why. Replace its
-/// body with the adapter's start (it returns a [`Started`]: the lattice, the backend and the engine's shutdown).
-fn start_backend(_settings: &Settings) -> Result<Started, StartError> {
-    Err(StartError::new(
-        "Starting the engine",
-        ["this binary has no engine adapter built in"],
-    ))
-}
+use euhedral_inference_settings::process_env;
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().skip(1).collect();
@@ -81,7 +70,7 @@ fn main() -> ExitCode {
         };
         return ExitCode::from(serve(&settings, windows, |_| start_with(script), wait));
     }
-    ExitCode::from(serve(&settings, StopWindows::default(), start_backend, wait))
+    ExitCode::from(serve(&settings, StopWindows::default(), start_engine, wait))
 }
 
 /// The duration in milliseconds that `--scripted-...-ms=N` states, if the argument is there.
