@@ -8,8 +8,14 @@
 
 mod common;
 
-use common::{Fixture, assert_json, headers, text};
+use common::{Fixture, Raw, assert_json, headers, small_limits, text};
+use euhedral_core::generics::LatticeSource;
+use euhedral_inference_api_server::scripted::ScriptedBackend;
+use euhedral_inference_api_server::{ApiConfig, Limits, once, start};
+use euhedral_io::AsyncIo;
 use euhedral_net::Method;
+use std::sync::mpsc::channel;
+use std::time::Duration;
 
 const MODEL: &str = "euhedral-test-model";
 const JSON: Option<&str> = Some("application/json");
@@ -36,6 +42,12 @@ fn health_answers_head_with_the_head_only_and_refuses_an_accept_without_json() {
     let head = fixture.call(&Fixture::req(Method::Head, "/health"));
     assert_eq!(head.status, 200);
     assert!(head.body.is_empty());
+    let get = fixture.get("/health");
+    assert_eq!(
+        head.headers.get("content-length"),
+        Some(get.body.len().to_string().as_str())
+    );
+    assert_eq!(head.headers.get("content-type"), Some("application/json"));
     let accepts_json = Fixture::req(Method::Get, "/health").header("Accept", "text/html, application/json;q=0.5");
     assert_eq!(fixture.call(&accepts_json).status, 200);
     let not_acceptable = Fixture::req(Method::Get, "/health").header("Accept", "text/plain");
@@ -53,6 +65,54 @@ fn models_are_listed_in_openai_form() {
     assert_json(&fixture.get("/v1/models"), 200, OPENAI_LIST);
     assert_json(&fixture.get(&format!("/v1/models/{MODEL}")), 200, OPENAI_MODEL);
     assert_json(&fixture.get("/v1/models?limit=3"), 200, OPENAI_LIST);
+    fixture.finish();
+}
+
+#[test]
+fn the_model_routes_refuse_an_accept_without_json() {
+    let fixture = Fixture::start();
+    let refused = r#"{"error":{"message":"Acceptable representations: [application/json, application/*+json].","type":"invalid_request_error","param":null,"code":null}}"#;
+    let with = |target: &str, accept: &str| Fixture::req(Method::Get, target).header("Accept", accept);
+    assert_json(&fixture.call(&with("/v1/models", "text/plain")), 406, refused);
+    assert_json(
+        &fixture.call(&with(&format!("/v1/models/{MODEL}"), "text/plain")),
+        406,
+        refused,
+    );
+    // The model routes are on the OpenAI surface whichever client asks.
+    let version = with("/v1/models", "text/plain").header("anthropic-version", "2023-06-01");
+    assert_json(&fixture.call(&version), 406, refused);
+    let unreadable = r#"{"error":{"message":"Could not parse Accept header.","type":"invalid_request_error","param":null,"code":null}}"#;
+    assert_json(&fixture.call(&with("/v1/models", "nonsense")), 406, unreadable);
+    // What the lists may be answered to.
+    for accept in [
+        "*; q=.2",
+        "application/*+json",
+        "application/vnd.api+json",
+        "text/plain, */*;q=0.1",
+        "application/*",
+    ] {
+        assert_json(&fixture.call(&with("/v1/models", accept)), 200, OPENAI_LIST);
+    }
+    // An unknown model is an error the client's Accept does not change.
+    let missing = r#"{"error":{"message":"The model 'other' does not exist or you do not have access to it.","type":"invalid_request_error","param":"model","code":"model_not_found"}}"#;
+    assert_json(&fixture.call(&with("/v1/models/other", "text/plain")), 404, missing);
+    fixture.finish();
+}
+
+#[test]
+fn a_percent_encoded_path_is_read_by_segments() {
+    let fixture = Fixture::start();
+    assert_json(&fixture.get("/v1/%6Dodels"), 200, OPENAI_LIST);
+    assert_json(
+        &fixture.get("/%68ealth"),
+        200,
+        r#"{"status":"up","engine":"ready","model":"euhedral-test-model"}"#,
+    );
+    assert_json(&fixture.get("/v1/models/euhedral%2Dtest%2Dmodel"), 200, OPENAI_MODEL);
+    // An error names the path as it was sent.
+    let body = r#"{"error":{"message":"Unknown request URL: GET /v1/%6Dodelz.","type":"invalid_request_error","param":null,"code":null}}"#;
+    assert_json(&fixture.get("/v1/%6Dodelz"), 404, body);
     fixture.finish();
 }
 
@@ -95,6 +155,18 @@ fn an_unknown_url_is_not_found_in_the_format_of_its_surface() {
     assert_eq!(fixture.get("/v1/models/").status, 404);
     assert_eq!(fixture.get("/v1/models/a/b").status, 404);
     assert_eq!(fixture.get("/health/").status, 404);
+    // Whatever the method.
+    for (method, name) in [
+        (Method::Post, "POST"),
+        (Method::Options, "OPTIONS"),
+        (Method::Delete, "DELETE"),
+        (Method::Put, "PUT"),
+    ] {
+        let body = format!(
+            r#"{{"error":{{"message":"Unknown request URL: {name} /nothing.","type":"invalid_request_error","param":null,"code":null}}}}"#
+        );
+        assert_json(&fixture.call(&Fixture::req(method, "/nothing")), 404, &body);
+    }
     fixture.finish();
 }
 
@@ -122,12 +194,6 @@ fn a_method_the_url_does_not_take_is_405_with_the_error_of_its_surface() {
         r#"{"type":"error","error":{"type":"invalid_request_error","message":"Method 'GET' is not supported."}}"#;
     assert_json(&fixture.get("/v1/messages"), 405, anthropic);
     assert_json(&fixture.get("/v1/messages/count_tokens"), 405, anthropic);
-    // Any other method on an unknown URL is also 405.
-    assert_json(
-        &fixture.call(&Fixture::req(Method::Post, "/nothing")),
-        405,
-        &openai("POST"),
-    );
     fixture.finish();
 }
 
@@ -140,9 +206,17 @@ fn options_answers_with_the_methods_of_the_url() {
         assert!(response.body.is_empty());
         response.headers.get("allow").map(str::to_owned)
     };
-    assert_eq!(allow("/v1/models").as_deref(), Some("GET, HEAD, OPTIONS"));
-    assert_eq!(allow("/v1/chat/completions").as_deref(), Some("POST, OPTIONS"));
-    assert_eq!(allow("/nothing").as_deref(), Some("GET,HEAD,OPTIONS"));
+    assert_eq!(allow("/v1/models").as_deref(), Some("GET,HEAD,OPTIONS"));
+    assert_eq!(allow("/health").as_deref(), Some("GET,HEAD,OPTIONS"));
+    assert_eq!(allow("/v1/models/m").as_deref(), Some("GET,HEAD,OPTIONS"));
+    for route in [
+        "/v1/chat/completions",
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+        "/v1/responses",
+    ] {
+        assert_eq!(allow(route).as_deref(), Some("POST,OPTIONS"), "{route}");
+    }
     fixture.finish();
 }
 
@@ -165,11 +239,7 @@ fn a_generation_route_wants_json() {
         415,
         &wrong("text/plain;charset=UTF-8"),
     );
-    assert_json(
-        &fixture.post("/v1/responses", None, "{}"),
-        415,
-        &wrong("application/octet-stream"),
-    );
+    assert_json(&fixture.post("/v1/responses", None, "{}"), 415, &wrong("null"));
     let unreadable = r#"{"error":{"message":"Could not parse Content-Type.","type":"invalid_request_error","param":null,"code":null}}"#;
     assert_json(&fixture.post(route, Some("garbage"), "{}"), 415, unreadable);
     let anthropic = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Content-Type 'text/plain' is not supported."}}"#;
@@ -275,4 +345,120 @@ fn stop_ends_the_server_and_refuses_new_connections() {
     assert!(fixture.try_call(&Fixture::req(Method::Get, "/health")).is_err());
     assert_eq!(fixture.server.counters().open, 0);
     fixture.finish_after_stop();
+}
+
+#[test]
+fn stop_with_an_idle_connection_open_closes_it() {
+    let fixture = Fixture::start();
+    let mut idle = Raw::connect(fixture.addr);
+    fixture.wait_open(1);
+    fixture.stop();
+    assert!(idle.closed_by_server(), "the idle connection stayed open");
+    assert_eq!(fixture.server.counters().open, 0);
+    fixture.finish_after_stop();
+}
+
+#[test]
+fn stop_with_a_request_half_received_closes_the_connection() {
+    let fixture = Fixture::start();
+    let mut partial = Raw::connect(fixture.addr);
+    partial.send("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n{\"a\"");
+    fixture.wait_open(1);
+    // The head and a part of the body are in: the request is waiting for the rest of its body.
+    assert_eq!(partial.read_for(Duration::from_millis(200)), Some(String::new()));
+    fixture.stop();
+    assert!(
+        partial.closed_by_server(),
+        "the half-received request kept its connection"
+    );
+    assert_eq!(fixture.server.counters().open, 0);
+    fixture.finish_after_stop();
+}
+
+#[test]
+fn a_connection_over_the_cap_waits_until_one_ends() {
+    let fixture = Fixture::with(
+        Limits {
+            max_connections: 1,
+            ..small_limits()
+        },
+        Some(2),
+    );
+    let ask = "GET /health HTTP/1.1\r\nHost: t\r\n\r\n";
+    let mut first = Raw::connect(fixture.addr);
+    first.send(ask);
+    assert!(first.read_until("\"engine\"").starts_with("HTTP/1.1 200"));
+    let mut second = Raw::connect(fixture.addr);
+    second.send(ask);
+    // The second connection is in the kernel's backlog: nothing reads it while the first is open.
+    assert_eq!(second.read_for(Duration::from_millis(500)), Some(String::new()));
+    assert_eq!(fixture.server.counters().open, 1);
+    drop(first);
+    assert!(second.read_until("\"engine\"").starts_with("HTTP/1.1 200"));
+    drop(second);
+    fixture.finish();
+}
+
+#[test]
+fn expect_100_continue_is_answered_by_the_transport_and_the_body_then_read() {
+    let fixture = Fixture::start();
+    let mut raw = Raw::connect(fixture.addr);
+    raw.send("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: 2\r\nExpect: 100-continue\r\n\r\n");
+    assert_eq!(raw.read_until("\r\n\r\n"), "HTTP/1.1 100 Continue\r\n\r\n");
+    raw.send("{}");
+    assert!(raw.read_until("not_implemented").starts_with("HTTP/1.1 501"));
+    drop(raw);
+    fixture.finish();
+}
+
+#[test]
+fn an_expectation_over_the_limit_is_refused_by_the_transport_before_the_body() {
+    let fixture = Fixture::start();
+    let mut raw = Raw::connect(fixture.addr);
+    raw.send("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: 100000\r\nExpect: 100-continue\r\n\r\n");
+    let answer = raw.read_until("\r\n\r\n");
+    assert!(answer.starts_with("HTTP/1.1 413"), "{answer}");
+    drop(raw);
+    fixture.finish();
+}
+
+#[test]
+fn a_blank_content_type_is_no_content_type() {
+    let fixture = Fixture::start();
+    let mut raw = Raw::connect(fixture.addr);
+    raw.send("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type:   \r\nContent-Length: 2\r\n\r\n{}");
+    let answer = raw.read_until("}}");
+    assert!(answer.starts_with("HTTP/1.1 415"), "{answer}");
+    assert!(answer.contains("Content-Type 'null' is not supported."), "{answer}");
+    drop(raw);
+    fixture.finish();
+}
+
+#[test]
+fn a_server_can_share_the_callers_io_and_leaves_it_running() {
+    let lattice = common::lattice(Some(2));
+    let io = AsyncIo::open().expect("an AsyncIo");
+    lattice.add_upstream(io.clone()).expect("io attached");
+    let backend = ScriptedBackend::on(&lattice);
+    let config = ApiConfig {
+        address: "127.0.0.1:0".parse().expect("an address"),
+        limits: small_limits(),
+        backend: backend.clone(),
+        io: Some(io.clone()),
+        created_at: 1,
+    };
+    let server = start(&lattice, config).expect("a started server");
+    let mut raw = Raw::connect(server.local_addr());
+    raw.send("GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    assert!(raw.read_until("\"engine\"").starts_with("HTTP/1.1 200"));
+    drop(raw);
+    let (tx, rx) = channel();
+    server.stop(once(move || {
+        tx.send(()).ok();
+    }));
+    rx.recv_timeout(common::PATIENCE).expect("a stop report");
+    server.release();
+    backend.release();
+    assert!(!io.is_complete(), "the caller's io was completed");
+    lattice.close();
 }

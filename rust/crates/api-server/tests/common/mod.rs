@@ -7,18 +7,20 @@
     reason = "test fixture: the test thread is not a lattice worker; it waits on a channel with a bound"
 )]
 
-use std::net::SocketAddr;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::str::from_utf8;
 use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
-use std::time::Duration;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use euhedral_core::config::{FragmentConfig, LatticeConfig};
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::impls::{BaseCloneableObject, DefaultExecutor};
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_hardware_utils::affinity;
-use euhedral_inference_api_server::scripted::{MODEL_ID, ScriptedBackend};
+use euhedral_inference_api_server::scripted::ScriptedBackend;
 use euhedral_inference_api_server::{ApiConfig, ApiServer, Limits, once, start};
 use euhedral_io::AsyncIo;
 use euhedral_net::{ClientConfig, Method, NetError, Request, Response, request};
@@ -78,7 +80,7 @@ impl Fixture {
             address: "127.0.0.1:0".parse().expect("an address"),
             limits,
             backend: backend.clone(),
-            model_name: MODEL_ID.to_owned(),
+            io: None,
             created_at: CREATED,
         };
         let server = start(&lattice, config).expect("a started server");
@@ -189,9 +191,80 @@ pub fn text(response: &Response) -> &str {
     from_utf8(&response.body).expect("a UTF-8 body")
 }
 
-/// Asserts a JSON answer: status, the headers Java sets and the exact body.
+/// Asserts a JSON answer: status, the headers the API sets and the exact body.
 pub fn assert_json(response: &Response, status: u16, body: &str) {
     assert_eq!(response.status, status, "{}", text(response));
     assert_eq!(headers(response), json_headers(body.len()));
     assert_eq!(text(response), body);
+}
+
+/// A plain socket to the server, for what the client cannot do: send a request in parts, hold a connection open.
+pub struct Raw {
+    stream: TcpStream,
+}
+
+impl Raw {
+    pub fn connect(addr: SocketAddr) -> Raw {
+        let stream = TcpStream::connect_timeout(&addr, PATIENCE).expect("a connection");
+        Raw { stream }
+    }
+
+    pub fn send(&mut self, bytes: &str) {
+        self.stream.write_all(bytes.as_bytes()).expect("a write");
+    }
+
+    /// What arrives within `wait`, possibly nothing; `None` once the server has closed and nothing is left.
+    pub fn read_for(&mut self, wait: Duration) -> Option<String> {
+        self.stream.set_read_timeout(Some(wait)).expect("a read timeout");
+        let mut buffer = [0u8; 4096];
+        let read = loop {
+            match self.stream.read(&mut buffer) {
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                other => break other,
+            }
+        };
+        match read {
+            Ok(0) => None,
+            Ok(count) => Some(String::from_utf8_lossy(&buffer[..count]).into_owned()),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Some(String::new()),
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => None,
+            Err(error) => panic!("a read failed: {error}"),
+        }
+    }
+
+    /// Reads until `needle` has arrived, within the patience of a test.
+    pub fn read_until(&mut self, needle: &str) -> String {
+        let end = Instant::now() + PATIENCE;
+        let mut seen = String::new();
+        while !seen.contains(needle) {
+            assert!(Instant::now() < end, "no {needle:?} in {seen:?}");
+            match self.read_for(Duration::from_millis(200)) {
+                Some(more) => seen.push_str(&more),
+                None => panic!("the server closed before {needle:?}; seen {seen:?}"),
+            }
+        }
+        seen
+    }
+
+    /// Whether the server closes the connection within the patience of a test.
+    pub fn closed_by_server(&mut self) -> bool {
+        let end = Instant::now() + PATIENCE;
+        while Instant::now() < end {
+            if self.read_for(Duration::from_millis(200)).is_none() {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl Fixture {
+    /// Waits, within the patience of a test, until the server counts `open` connections.
+    pub fn wait_open(&self, open: u64) {
+        let end = Instant::now() + PATIENCE;
+        while self.server.counters().open != open {
+            assert!(Instant::now() < end, "{:?}", self.server.counters());
+            sleep(Duration::from_millis(10));
+        }
+    }
 }

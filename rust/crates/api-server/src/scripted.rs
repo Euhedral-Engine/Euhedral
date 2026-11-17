@@ -20,7 +20,7 @@ use crate::backend::{
     Backend, BackendError, EncodedPrompt, Generation, GenerationConfig, GenerationResult, Next, OutputSpec,
     TextListener,
 };
-use crate::frames::once;
+use crate::frames::once_or_refused;
 
 /// The model id a scripted backend reports.
 pub const MODEL_ID: &str = "euhedral-test-model";
@@ -118,9 +118,14 @@ impl ScriptedBackend {
         self.sink.complete_gracefully();
     }
 
-    fn offer(&self, work: impl FnOnce() + Send + 'static) {
-        // A refused frame (the lattice is closing) is dropped with its work.
-        drop(self.sink.offer(once(work)));
+    /// Makes the lattice refuse every frame the backend offers from now on, as a lattice that is closing does.
+    pub fn refuse_work(&self) {
+        self.sink.complete();
+    }
+
+    fn offer(&self, work: impl FnOnce(bool) + Send + 'static) {
+        // A refused frame (the lattice is closing) is dropped, and its work is called with `false`.
+        drop(self.sink.offer(once_or_refused(work)));
     }
 
     /// The tokens of a scripted prompt: one per character.
@@ -146,7 +151,10 @@ impl Backend for ScriptedBackend {
 
     fn encode_prompt(&self, prompt: String, then: Next<Result<EncodedPrompt, BackendError>>) {
         self.encoded.fetch_add(1, Ordering::AcqRel);
-        self.offer(move || {
+        self.offer(move |ran| {
+            if !ran {
+                return then(Err(refused()));
+            }
             let token_ids = ScriptedBackend::prompt_tokens(&prompt);
             then(Ok(EncodedPrompt {
                 text: prompt,
@@ -182,7 +190,6 @@ impl Backend for ScriptedBackend {
             sink: self.sink.clone(),
             cancelled: AtomicBool::new(false),
             emitted: AtomicUsize::new(0),
-            emitted_after_cancel: AtomicUsize::new(0),
             close_count: AtomicUsize::new(0),
             started: Mutex::new(None),
         });
@@ -203,7 +210,6 @@ pub struct ScriptedGeneration {
     sink: Arc<QueueIngestSink>,
     cancelled: AtomicBool,
     emitted: AtomicUsize,
-    emitted_after_cancel: AtomicUsize,
     close_count: AtomicUsize,
     /// The prompt text and the token budget `generate` was called with.
     started: Mutex<Option<(String, usize)>>,
@@ -223,11 +229,6 @@ impl ScriptedGeneration {
         self.emitted.load(Ordering::Acquire)
     }
 
-    /// How many chunks were emitted after a cancel.
-    pub fn emitted_after_cancel(&self) -> usize {
-        self.emitted_after_cancel.load(Ordering::Acquire)
-    }
-
     /// How many times `close` was called.
     pub fn close_count(&self) -> usize {
         self.close_count.load(Ordering::Acquire)
@@ -237,6 +238,11 @@ impl ScriptedGeneration {
     pub fn started(&self) -> Option<(String, usize)> {
         self.started.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
+}
+
+/// What a backend says when the lattice would not run its work.
+fn refused() -> BackendError {
+    BackendError::Unavailable("the lattice refused the work".to_owned())
 }
 
 /// The state one step hands to the next.
@@ -259,13 +265,17 @@ impl Run {
             let stop = generation.script.stop_token() && !cancelled;
             return self.finish(stop);
         };
-        if cancelled {
-            generation.emitted_after_cancel.fetch_add(1, Ordering::AcqRel);
-        }
         generation.emitted.fetch_add(1, Ordering::AcqRel);
         self.index += 1;
         self.listener.text(&chunk);
-        drop(generation.sink.offer(once(move || self.step())));
+        drop(generation.sink.offer(once_or_refused(
+            move |ran| if ran { self.step() } else { self.refuse() },
+        )));
+    }
+
+    /// The lattice would not run the next step: the listener hears it failed.
+    fn refuse(mut self) {
+        self.listener.finished(Err(refused()));
     }
 
     fn finish(mut self, stop_token: bool) {
@@ -286,14 +296,20 @@ impl Generation for ScriptedGeneration {
     fn generate(&self, prompt: EncodedPrompt, max_new_tokens: usize, listener: Box<dyn TextListener>) {
         *self.started.lock().unwrap_or_else(PoisonError::into_inner) = Some((prompt.text, max_new_tokens));
         // The step frames hold the generation until the last one.
-        let Some(generation) = self.me.upgrade() else { return };
+        let Some(generation) = self.me.upgrade() else {
+            let mut listener = listener;
+            return listener.finished(Err(refused()));
+        };
         let run = Run {
             generation,
             listener,
             index: 0,
             max_new_tokens,
         };
-        drop(self.sink.offer(once(move || run.step())));
+        drop(
+            self.sink
+                .offer(once_or_refused(move |ran| if ran { run.step() } else { run.refuse() })),
+        );
     }
 
     fn cancel(&self) {

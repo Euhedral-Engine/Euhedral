@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::Frame;
+use euhedral_core::generics::LatticeSource;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_graph::Completions;
 use euhedral_io::AsyncIo;
@@ -22,12 +23,14 @@ pub struct ApiConfig {
     /// The address to listen on; port 0 takes a free one (see [`ApiServer::local_addr`]).
     pub address: SocketAddr,
     pub limits: Limits,
-    /// What the generating routes use, and whose readiness `/health` and those routes report.
+    /// What the generating routes use. Its identity is the model name the lists and `/health` show, and its readiness
+    /// is what `/health` and those routes report.
     pub backend: Arc<dyn Backend>,
-    /// The public model name: what the model lists and `/health` show.
-    pub model_name: String,
     /// When the model was created, in seconds since the epoch, as the model lists show it.
     pub created_at: i64,
+    /// The sockets' engine, when the caller has one to share: it must be attached to the lattice already, and the
+    /// caller completes it. `None`: the server opens one, attaches it and completes it on release.
+    pub io: Option<Arc<AsyncIo>>,
 }
 
 impl Debug for ApiConfig {
@@ -35,7 +38,6 @@ impl Debug for ApiConfig {
         out.debug_struct("ApiConfig")
             .field("address", &self.address)
             .field("limits", &self.limits)
-            .field("model_name", &self.model_name)
             .field("created_at", &self.created_at)
             .finish_non_exhaustive()
     }
@@ -46,8 +48,11 @@ pub struct ApiServer {
     handle: ServerHandle,
     local_addr: SocketAddr,
     sink: Arc<QueueIngestSink>,
-    // Held so that the engine outlives the server: the transport holds it weakly.
-    _io: Arc<AsyncIo>,
+    timers: Arc<Completions>,
+    // The sockets' engine, held so that it outlives the server (the transport holds it weakly); `own_io` says the
+    // server opened it and so completes it.
+    io: Arc<AsyncIo>,
+    own_io: bool,
 }
 
 impl Debug for ApiServer {
@@ -58,33 +63,59 @@ impl Debug for ApiServer {
     }
 }
 
-/// Starts the server on `lattice`: it binds the address, attaches the sockets' engine, the sink and the timers to the
-/// lattice and attaches the listener as a source. Every step of the server is a frame of the lattice.
+/// Starts the server on `lattice`: it binds the address, attaches the sockets' engine (unless the config brings one),
+/// the sink and the timers to the lattice and attaches the listener as a source. Every step of the server is a frame
+/// of the lattice. If it fails, what it attached is completed and nothing is left running.
 pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Result<ApiServer> {
     let listener = TcpListener::bind(config.address)?;
     let local_addr = listener.local_addr()?;
-    let io = AsyncIo::open()?;
+    let (io, own_io) = match config.io {
+        Some(io) => (io, false),
+        None => (AsyncIo::open()?, true),
+    };
     let sink = Arc::new(QueueIngestSink::new());
     let timers = Completions::without_lanes();
+    let undo = |attached_io: bool| {
+        sink.complete_gracefully();
+        timers.complete();
+        if attached_io && own_io {
+            io.complete();
+        }
+    };
     let attach = |result: Result<_, _>| result.map(|_| ()).map_err(|e| io::Error::other(format!("{e:?}")));
-    attach(lattice.add_upstream(io.clone()))?;
-    attach(lattice.add_upstream(sink.delegate()))?;
-    attach(lattice.add_upstream(timers.clone()))?;
-    let router = Router::new(config.backend, config.model_name, config.created_at, config.limits);
-    let handle = serve(
+    if own_io && let Err(error) = attach(lattice.add_upstream(io.clone())) {
+        undo(false);
+        return Err(error);
+    }
+    if let Err(error) =
+        attach(lattice.add_upstream(sink.delegate())).and_then(|()| attach(lattice.add_upstream(timers.clone())))
+    {
+        undo(true);
+        return Err(error);
+    }
+    let router = Router::new(config.backend, config.created_at, config.limits);
+    let handle = match serve(
         lattice.clone(),
         io.clone(),
         sink.clone(),
         listener,
         config.limits.transport(),
         Arc::new(router),
-        timers,
-    )?;
+        timers.clone(),
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            undo(true);
+            return Err(error);
+        }
+    };
     Ok(ApiServer {
         handle,
         local_addr,
         sink,
-        _io: io,
+        timers,
+        io,
+        own_io,
     })
 }
 
@@ -105,8 +136,13 @@ impl ApiServer {
         self.handle.stop(stopped);
     }
 
-    /// Lets go of the server's sink once the stop was reported. Call it before the lattice closes.
+    /// Completes everything the server opened: its sink, its timers and, if it opened it, the sockets' engine. Call it
+    /// once the stop was reported (no operation is pending then) and before the lattice closes.
     pub fn release(self) {
         self.sink.complete_gracefully();
+        self.timers.complete();
+        if self.own_io {
+            self.io.complete();
+        }
     }
 }

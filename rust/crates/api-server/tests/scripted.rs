@@ -147,3 +147,29 @@ fn an_unavailable_backend_opens_no_generation() {
     backend.release();
     lattice.close();
 }
+
+#[test]
+fn work_the_lattice_refuses_still_reports_exactly_once() {
+    let lattice = lattice(Some(2));
+    let backend = ScriptedBackend::on(&lattice);
+    let generation = backend
+        .open_generation(GenerationConfig::greedy(1), OutputSpec::text())
+        .expect("a generation");
+    backend.refuse_work();
+    let (tx, rx) = channel();
+    backend.encode_prompt("abc".to_owned(), Box::new(move |encoded| drop(tx.send(encoded))));
+    assert!(matches!(
+        rx.recv_timeout(PATIENCE).expect("a report"),
+        Err(BackendError::Unavailable(_))
+    ));
+    assert!(rx.try_recv().is_err(), "reported twice");
+    let (tx, rx) = channel();
+    generation.generate(prompt("abc"), 3, Box::new(Collect(tx)));
+    assert!(matches!(
+        rx.recv_timeout(PATIENCE).expect("a report"),
+        Event::Done(Err(BackendError::Unavailable(_)))
+    ));
+    assert!(rx.try_recv().is_err(), "reported twice");
+    generation.close();
+    lattice.close();
+}

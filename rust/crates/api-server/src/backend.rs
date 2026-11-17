@@ -3,12 +3,17 @@
 //! Nothing here waits. A call that has to do work on the engine's workers returns at once and reports through a
 //! continuation ([`Next`]) or a [`TextListener`]; both run on a worker of the engine's lattice, one call at a time and
 //! in the order of the events, and must not block: hand the event on and return.
+//!
+//! A continuation or a listener's `finished` runs exactly once on every path: with the result when the work was done,
+//! with an error when the work could not be offered to the lattice (it is closing or refused the frame), never
+//! dropped unrun and never twice.
 
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-/// The rest of a request, run with the outcome of one piece of work. It runs on a worker and must not wait.
+/// The rest of a request, run with the outcome of one piece of work. It runs exactly once, on a worker, and must not
+/// wait; if the work cannot be offered to the lattice it runs with an error instead.
 pub type Next<T> = Box<dyn FnOnce(T) + Send>;
 
 /// Why a backend could not do what it was asked.
@@ -114,11 +119,13 @@ pub trait TextListener: Send {
     /// A prefill quantum retired, before the next is admitted.
     fn prefilled(&mut self) {}
 
-    /// The generation ended: the last call, made after the last text.
+    /// The generation ended: the last call, made after the last text, and made exactly once on every path (a refused
+    /// start and a cancellation included).
     fn finished(&mut self, result: Result<GenerationResult, BackendError>);
 }
 
-/// One request's sequence state, opened by [`Backend::open_generation`]. The caller closes it on every path.
+/// One request's sequence state, opened by [`Backend::open_generation`]. The caller closes it on every path, after
+/// the generation has ended.
 pub trait Generation: Send + Sync {
     /// Starts prefill and decode on the workers and returns at once; `listener` hears the rest.
     fn generate(&self, prompt: EncodedPrompt, max_new_tokens: usize, listener: Box<dyn TextListener>);
@@ -134,7 +141,10 @@ pub trait Generation: Send + Sync {
         0
     }
 
-    /// Releases the sequence. The generation is idle after it.
+    /// Releases the sequence at once, without waiting. The caller makes this call only when no generation is running:
+    /// after the listener's `finished` has run, or when `generate` was never called. A caller that cancels waits for
+    /// `finished` (by continuation, not by blocking) before it closes; a close while a generation runs is a misuse
+    /// the backend need not honour.
     fn close(&self);
 }
 

@@ -8,10 +8,18 @@ use euhedral_net::ServerConfig;
 
 /// Limits on requests and connections.
 ///
-/// `euhedral-net` refuses a body longer than its own limit with an empty 413 before the handler runs, so a request
-/// over `max_body_bytes` could not be answered with the API's JSON error. The transport's limit is therefore
-/// `max_body_bytes + over_limit_read_bytes`: a body between the two is read and answered with the JSON error, and only a
-/// declared length beyond both gets the transport's empty 413.
+/// The transport answers some requests by itself, before the handler runs, and its answers have an empty body and no
+/// content type: 400 (a malformed request), 408 (a request that took longer than `read_limit` after its first byte),
+/// 411 (a chunked request body), 413 for a body declared longer than `max_body_bytes + over_limit_read_bytes`, 414 (a
+/// request line too long), 431 (header lines over `max_header_bytes`) and 505 (an unsupported HTTP version). Everything
+/// else reaches the handler, which answers with the API's JSON error.
+///
+/// That is why the transport's body limit is `max_body_bytes + over_limit_read_bytes` and not `max_body_bytes`: the
+/// transport refuses a declared body over its limit at the head, so a body between the two limits is read in full and
+/// answered by the handler with the JSON 413. The price is that a connection may have the server buffer up to
+/// `max_body_bytes + over_limit_read_bytes` bytes of a request that is then refused, and a transport answer closes the
+/// connection after the server has read and discarded what the peer still sends, up to the size limits, for at most
+/// the transport's linger time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// The longest body of a generation request, in bytes. Longer is answered 413 with the API's error.
@@ -20,7 +28,8 @@ pub struct Limits {
     pub over_limit_read_bytes: usize,
     /// The most connections open at once.
     pub max_connections: usize,
-    /// The most bytes of a request's header lines (more is the transport's empty 431).
+    /// The most bytes of a request's header lines; more is the transport's empty 431. The default, 8 KiB, is the limit of
+    /// common HTTP servers.
     pub max_header_bytes: usize,
     /// How long a whole request may take to arrive from its first byte (the transport answers 408 after it).
     pub read_limit: Option<Duration>,
@@ -37,7 +46,7 @@ impl Default for Limits {
             max_body_bytes: 1024 * 1024,
             over_limit_read_bytes: 1024 * 1024,
             max_connections: transport.max_connections,
-            max_header_bytes: transport.max_header_bytes,
+            max_header_bytes: 8 * 1024,
             read_limit: transport.read_limit,
             idle_limit: transport.idle_limit,
             write_limit: transport.write_limit,
