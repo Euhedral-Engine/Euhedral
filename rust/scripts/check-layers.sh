@@ -33,6 +33,7 @@ TOKENIZER = "euhedral-inference-tokenizer"
 ENGINE = "euhedral-inference-engine"
 API_SERVER = "euhedral-inference-api-server"
 BENCH = "euhedral-inference-bench"
+SERVER = "euhedral-inference-server"
 TEST_SUPPORT = "test-support"
 XTASK = "xtask"
 
@@ -51,19 +52,23 @@ ALLOWED = {
     API_SERVER: {API_PROTOCOL, ENGINE, SETTINGS, TOKENIZER},
     ENGINE: {SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER},
     BENCH: {ENGINE, SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER},
+    SERVER: {API_SERVER, SETTINGS},
     XTASK: set(),
 }
 # Binaries: their main thread may block, so they do not carry the no-wait clippy.toml. Every other crate does.
-BINARIES = {BENCH, XTASK}
+BINARIES = {BENCH, SERVER, XTASK}
 # Crates that no crate may depend on except as a dev-dependency.
 DEV_ONLY = {TEST_SUPPORT}
 
 # external crate -> crates that may depend on it.
 RUSTEE = {"euhedral-core", "euhedral-gpu", "euhedral-graph", "euhedral-io", "euhedral-memory", "euhedral-net"}
-RUSTEE_OWNERS = {ENGINE, BENCH, CUDA, API_SERVER}
+RUSTEE_OWNERS = {ENGINE, BENCH, CUDA, API_SERVER, SERVER}
 # Configuration is parsed in one place.
 YAML = "serde_yaml_ng"
 YAML_OWNERS = {SETTINGS}
+# Signal handling belongs to the server binary: nothing else installs handlers.
+SIGNALS = "signal-hook"
+SIGNALS_OWNERS = {SERVER}
 # crate -> the only external crates it may depend on.
 EXTERNAL_ONLY = {CUDA: {"euhedral-data-structures", "euhedral-gpu", "euhedral-graph", "euhedral-io", "libloading", "thiserror"}}
 # External crates no crate may depend on (glob patterns), with the rule each protects.
@@ -98,6 +103,8 @@ def check(meta, clippy_texts):
 
         if YAML in normal and name not in YAML_OWNERS:
             errors.append(f"{name} may not depend on {YAML}: configuration is parsed in {SETTINGS} only")
+        if SIGNALS in normal and name not in SIGNALS_OWNERS:
+            errors.append(f"{name} may not depend on {SIGNALS}: only the server binary installs signal handlers")
         if (RUSTEE & external) and name not in RUSTEE_OWNERS:
             errors.append(f"{name} may not depend on {sorted(RUSTEE & external)}: only {sorted(RUSTEE_OWNERS)} do")
         for pattern, why in DENIED.items():
@@ -157,6 +164,7 @@ def self_test(meta, texts):
     plant("a workspace edge outside the table", f"{EDRL} may not depend on", edge=(EDRL, CUDA))
     plant("a dependency on the cuda crate from settings", f"{SETTINGS} may not depend on", edge=(SETTINGS, CUDA))
     plant("test-support as a normal dependency", "dev-dependency only", edge=(EDRL, TEST_SUPPORT))
+    plant("signal-hook outside the server", f"may not depend on {SIGNALS}", edge=(EDRL, SIGNALS))
     plant("serde_yaml_ng outside settings", f"may not depend on {YAML}", edge=(EDRL, YAML))
     plant("euhedral-graph outside engine, bench and cuda", "may not depend on ['euhedral-graph']",
           edge=(SETTINGS, "euhedral-graph"))
