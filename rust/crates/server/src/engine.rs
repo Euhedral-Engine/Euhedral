@@ -51,7 +51,8 @@ pub fn start_engine(settings: &Settings) -> Result<Started, StartError> {
         let missing = EngineStartError::Driver(format!("{} is not there", library.display()));
         return Err(start_error(&missing));
     }
-    let host = start(settings, &library, START_LIMIT).map_err(|error| start_error(&error))?;
+    let host = start(settings, &library, START_LIMIT, Some(settings.server.shutdown_timeout))
+        .map_err(|error| start_error(&error))?;
     Ok(started(host))
 }
 
@@ -59,8 +60,9 @@ fn started(host: EngineHost) -> Started {
     Started {
         lattice: host.lattice().clone(),
         backend: host.backend(),
-        // The engine's shutdown closes the backend, then the lattice, and returns when the device memory is freed.
-        shutdown: Box::new(move |_window| host.shutdown().map_err(|error| error.to_string())),
+        // The engine's shutdown closes the backend, then the lattice, and returns when the device memory is freed or
+        // `server.shutdown-timeout` is spent, saying what it left.
+        shutdown: Box::new(move |window| host.shutdown(window).map_err(|error| error.to_string())),
     }
 }
 

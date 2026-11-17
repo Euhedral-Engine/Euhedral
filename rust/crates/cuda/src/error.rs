@@ -43,6 +43,17 @@ pub enum CudaError {
     Argument(String),
 }
 
+impl CudaError {
+    /// Whether nothing could be loaded: the library file, its runtime libraries or the driver they need is not there.
+    /// Any other failure is a call the loaded library refused.
+    pub fn loads_nothing(&self) -> bool {
+        matches!(
+            self,
+            CudaError::LibraryMissing(_) | CudaError::RuntimeMissing { .. } | CudaError::Load { .. }
+        )
+    }
+}
+
 /// The meaning of a status: the library's own codes, else a CUDA runtime or driver error number.
 fn describe(status: i32) -> String {
     match status {
@@ -67,6 +78,25 @@ pub(crate) fn check(call: &'static str, status: i32) -> Result<(), CudaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_library_that_does_not_load_loads_nothing() {
+        assert!(CudaError::LibraryMissing(PathBuf::from("x.so")).loads_nothing());
+        let missing = CudaError::RuntimeMissing {
+            library: PathBuf::from("x.so"),
+            missing: Vec::new(),
+        };
+        assert!(missing.loads_nothing());
+        let refused = libloading::Error::DlOpenUnknown;
+        let load = CudaError::Load {
+            path: PathBuf::from("x.so"),
+            source: refused,
+        };
+        assert!(load.loads_nothing());
+        assert!(!check("cudaMalloc", 2).unwrap_err().loads_nothing());
+        assert!(!CudaError::IncludeDirectory(PathBuf::from("i")).loads_nothing());
+        assert!(!CudaError::Argument("a".to_owned()).loads_nothing());
+    }
 
     #[test]
     fn a_failed_call_names_the_call_and_the_status() {
