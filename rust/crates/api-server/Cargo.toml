@@ -17,6 +17,8 @@ euhedral-graph.workspace = true
 euhedral-io.workspace = true
 euhedral-net.workspace = true
 euhedral-inference-api-protocol = { path = "../api-protocol" }
+log.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 euhedral-inference-api-server = { path = ".", features = ["test-support"] }

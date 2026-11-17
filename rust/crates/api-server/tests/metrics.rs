@@ -8,9 +8,13 @@
 
 mod common;
 
-use common::{Fixture, assert_json, headers, small_limits, text};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
+use common::{Fixture, PATIENCE, Raw, assert_json, headers, small_limits, text};
 use euhedral_inference_api_server::metrics::{Api, ConstraintFailure, Outcome};
-use euhedral_inference_api_server::{EngineReport, PrefixCacheReport};
+use euhedral_inference_api_server::scripted::Script;
+use euhedral_inference_api_server::{Counts, EngineReport, PrefixCacheReport};
 use euhedral_net::Method;
 
 const TYPE: &str = "text/plain;version=0.0.4;charset=utf-8";
@@ -50,7 +54,6 @@ fn recordings_show_in_the_next_scrape() {
     metrics.request(Api::ChatCompletions, Outcome::Invalid);
     metrics.request(Api::ChatCompletions, Outcome::Invalid);
     metrics.constrained_failure(ConstraintFailure::InvalidToolCall);
-    metrics.set_queue(1, 3);
     let answer = fixture.get("/metrics");
     let body = text(&answer);
     let app = "application=\"euhedral-inference\"";
@@ -60,8 +63,49 @@ fn recordings_show_in_the_next_scrape() {
     assert!(body.contains(&format!(
         "euhedral_constrained_failures_total{{{app},reason=\"invalid_tool_call\"}} 1.0\n"
     )));
-    assert!(body.contains(&format!("euhedral_generations_active{{{app}}} 1.0\n")));
-    assert!(body.contains(&format!("euhedral_generations_queued{{{app}}} 3.0\n")));
+    fixture.finish();
+}
+
+#[test]
+fn the_queue_gauges_show_the_slots_in_use_and_the_requests_waiting() {
+    let mut limits = small_limits();
+    limits.max_body_bytes = 1 << 20;
+    let fixture = Fixture::with(limits, Some(2));
+    fixture.backend.set_max_active(1);
+    fixture.backend.set_context_length(1 << 30);
+    fixture.backend.set_script(Script::Endless);
+    let body = r#"{"model":"euhedral-test-model","reasoning_effort":"none","max_tokens":100000000,"messages":[{"role":"user","content":"Hi"}]}"#;
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut first = Raw::connect(fixture.addr);
+    first.send(&request);
+    let mut second = Raw::connect(fixture.addr);
+    second.send(&request);
+    let end = Instant::now() + PATIENCE;
+    while fixture.server.admission().counts() != (Counts { active: 1, waiting: 1 }) {
+        assert!(Instant::now() < end, "{:?}", fixture.server.admission().counts());
+        sleep(Duration::from_millis(5));
+    }
+    let answer = fixture.get("/metrics");
+    let text = text(&answer);
+    let app = "application=\"euhedral-inference\"";
+    assert!(
+        text.contains(&format!("euhedral_generations_active{{{app}}} 1.0\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("euhedral_generations_queued{{{app}}} 1.0\n")),
+        "{text}"
+    );
+    drop(first);
+    drop(second);
+    let end = Instant::now() + PATIENCE;
+    while fixture.server.admission().counts() != Counts::default() {
+        assert!(Instant::now() < end, "{:?}", fixture.server.admission().counts());
+        sleep(Duration::from_millis(5));
+    }
     fixture.finish();
 }
 

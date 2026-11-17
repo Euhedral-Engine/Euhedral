@@ -7,11 +7,13 @@
 
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
+use std::time::Instant;
 
 use euhedral_core::frames::Frame;
 use euhedral_inference_api_protocol::{ApiError, Surface};
 use euhedral_net::{Handler, Method, Request, Responder, Response, no_work};
 
+use crate::answer::Answerer;
 use crate::backend::Backend;
 use crate::health;
 use crate::limits::Limits;
@@ -253,7 +255,7 @@ impl Media {
 }
 
 /// The JSON reply with `status`.
-fn json(status: u16, body: Vec<u8>) -> Response {
+pub(crate) fn json(status: u16, body: Vec<u8>) -> Response {
     Response::with_status(status)
         .header("Content-Type", JSON)
         .with_body(body)
@@ -272,6 +274,7 @@ pub struct Router {
     limits: Limits,
     metrics: Arc<Metrics>,
     planner: Planner,
+    answerer: Answerer,
 }
 
 /// What a route that lists the model produces: `application/json` and its `+json` family.
@@ -293,6 +296,7 @@ impl Router {
         limits: Limits,
         metrics: Arc<Metrics>,
         planner: Planner,
+        answerer: Answerer,
     ) -> Router {
         Router {
             backend,
@@ -300,6 +304,7 @@ impl Router {
             limits,
             metrics,
             planner,
+            answerer,
         }
     }
 
@@ -356,15 +361,24 @@ impl Router {
             return no_work();
         }
         match endpoint {
-            Some(endpoint) => self.planner.plan(
-                endpoint,
-                request.body,
-                Box::new(move |planned| match planned {
-                    // The admission of generations replaces this answer.
-                    Ok(_) => reply.send(error_response(&not_implemented(), surface)),
-                    Err(error) => reply.send(error_response(&error, surface)),
-                }),
-            ),
+            Some(endpoint) => {
+                let arrived = Instant::now();
+                let answerer = self.answerer.clone();
+                self.planner.plan(
+                    endpoint,
+                    request.body,
+                    Box::new(move |planned| match planned {
+                        Ok(planned) if planned.request.stream => {
+                            reply.send(error_response(&not_implemented(), surface));
+                        }
+                        Ok(planned) => answerer.answer(planned, reply, surface, arrived),
+                        Err(error) => {
+                            answerer.planning_failed(endpoint, &error);
+                            reply.send(error_response(&error, surface));
+                        }
+                    }),
+                )
+            }
             None => self.planner.count_tokens(
                 request.body,
                 Box::new(move |counted| {
@@ -391,6 +405,8 @@ impl Router {
                 if let Some(refusal) = refuse_accept(request, &[METRICS_TYPE]) {
                     return error_response(&refusal, surface);
                 }
+                let counts = self.answerer.counts();
+                self.metrics.set_queue(counts.active, counts.waiting);
                 let text = self.metrics.render(
                     self.backend.model_id(),
                     self.backend.context_length(),
@@ -435,7 +451,7 @@ impl Router {
     }
 }
 
-/// The reply of a generating route until its change lands.
+/// The reply of a streamed generating request until streaming lands.
 fn not_implemented() -> ApiError {
     ApiError {
         status: 501,

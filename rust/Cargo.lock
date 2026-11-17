@@ -423,6 +423,8 @@ dependencies = [
  "euhedral-inference-api-server",
  "euhedral-io",
  "euhedral-net",
+ "log",
+ "sha2",
 ]
 
 [[package]]
