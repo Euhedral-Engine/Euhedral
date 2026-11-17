@@ -1,0 +1,498 @@
+//! The answer to one planned request that is not streamed: admission, the generation, the pipeline and one JSON reply.
+//!
+//! A request is an [`Entry`] of the admission and has an owner that is touched by one turn at a time (see
+//! [`owner`]). Whoever has news posts a command to the owner's inbox and publishes the frame that drives it: the
+//! admission (the entry was started, refused or interrupted), the listener of the generation (text, the end) and the
+//! transport (the client went away). Nothing runs inside such a call but the hand-off. The owner decides; what it
+//! decides is carried out as frames of their own: the cancellation of a generation, the withdrawal of a queued
+//! request, and the conclusion, which builds the reply, sends it, records the request and closes the generation and
+//! releases its slot, in that order, so that the slot is freed exactly once on every path.
+//!
+//! The frames of a request after planning are the start (open the generation, launch it), the turns of the owner (one
+//! per hand-off), and the conclusion. A streaming answer would reuse the owner, the pipeline and the conclusion's
+//! bookkeeping and replace the reply built at the end by the chunks written as text arrives.
+
+mod owner;
+mod reply;
+
+use std::fmt::{self, Debug, Formatter};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::atomic::{AtomicBool, Ordering, fence};
+use std::sync::{Arc, Weak};
+use std::time::Instant;
+
+use euhedral_core::frames::Frame;
+use euhedral_core::ingest::QueueIngestSink;
+use euhedral_data_structures::queues::{MpscQueue, Multi, Producer};
+use euhedral_data_structures::sync::ClaimCell;
+use euhedral_inference_api_protocol::pipeline::PipelineOptions;
+use euhedral_inference_api_protocol::{ApiError, Surface};
+use euhedral_net::Responder;
+use log::{error, info, warn};
+
+use self::owner::{Command, Effect, Opened, Owner};
+use self::reply::{Completed, body};
+use crate::admission::{Admission, Counts, Entry, Interruption, Slot};
+use crate::backend::{Backend, BackendError, Generation, GenerationResult, TextListener};
+use crate::frames::{once, once_or_refused};
+use crate::metrics::{Api, ConstraintFailure, Generation as Finished, Metrics, Outcome};
+use crate::planning::{Endpoint, Planned};
+use crate::router::{error_response, json};
+
+/// Turns one drive runs before it hands the rest to a new frame.
+const TURNS_PER_DRIVE: usize = 4;
+
+/// Slots in a chunk of the inbox.
+const COMMANDS_PER_CHUNK: usize = 64;
+
+/// The stages' instants of a request, in nanoseconds since the answerer began (the first instant is 1, so that 0 is
+/// "never").
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Timing {
+    pub(crate) queued_ns: u64,
+    pub(crate) started_ns: u64,
+    pub(crate) first_token_ns: u64,
+}
+
+/// How a request is answered.
+pub(crate) enum Verdict {
+    /// The generation ended with an answer to give.
+    Answer(Completed),
+    /// The answer is an error.
+    Error {
+        error: ApiError,
+        outcome: Outcome,
+        /// For the log only.
+        log: Option<String>,
+    },
+    /// The answer was sent already.
+    Silent,
+}
+
+/// The end of a request: the answer, and what is given back after it.
+pub(crate) struct Conclusion {
+    pub(crate) responder: Option<Responder>,
+    pub(crate) verdict: Verdict,
+    /// Closed after the answer: only a generation that ended.
+    pub(crate) generation: Option<Arc<dyn Generation>>,
+    /// Released last.
+    pub(crate) slot: Option<Slot>,
+    pub(crate) timing: Timing,
+}
+
+/// Runs `work`; a panic is logged and goes no further, so that what follows it still runs.
+fn guarded(work: impl FnOnce()) {
+    if catch_unwind(AssertUnwindSafe(work)).is_err() {
+        error!(target: "euhedral.requests", "a step of a request's end panicked");
+    }
+}
+
+/// The metrics' api of an endpoint.
+pub fn api_of(endpoint: Endpoint) -> Api {
+    match endpoint {
+        Endpoint::ChatCompletions => Api::ChatCompletions,
+        Endpoint::Messages => Api::Messages,
+        Endpoint::Responses => Api::Responses,
+    }
+}
+
+struct Shared {
+    backend: Arc<dyn Backend>,
+    metrics: Arc<Metrics>,
+    admission: Admission,
+    /// Weak: a frame queued in the sink holds this state.
+    sink: Weak<QueueIngestSink>,
+    planned: Planned,
+    surface: Surface,
+    api: Api,
+    epoch: Instant,
+    inbox: Producer<Command, Multi>,
+    owner: ClaimCell<Owner>,
+    /// A command was posted that no turn has taken yet.
+    pending: AtomicBool,
+    /// The request ended or was interrupted: a start that has not opened its generation does not.
+    cut: AtomicBool,
+    me: Weak<Shared>,
+}
+
+impl Shared {
+    /// Tells the owner `command` and publishes the frame that runs its turns. Never waits.
+    fn post(&self, command: Command) {
+        if self.inbox.offer(command).is_err() {
+            error!(target: "euhedral.requests", "{} {}: the request's inbox refused a command", self.api.label(), self.planned.id);
+            return;
+        }
+        // The command is written before the claim is tried: see the admission's module documentation.
+        self.pending.store(true, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        self.schedule();
+    }
+
+    fn schedule(&self) {
+        if let Some(shared) = self.me.upgrade() {
+            self.publish(once_or_refused(move |_| shared.drive()));
+        }
+    }
+
+    /// Offers a frame to the sink; with the sink gone the frame is dropped, which runs its work in place.
+    fn publish(&self, frame: Box<dyn Frame>) {
+        if let Some(sink) = self.sink.upgrade() {
+            drop(sink.offer(frame));
+        }
+    }
+
+    fn drive(self: &Arc<Self>) {
+        for _ in 0..TURNS_PER_DRIVE {
+            let Some(mut claim) = self.owner.try_claim() else {
+                return;
+            };
+            self.pending.swap(false, Ordering::SeqCst);
+            let mut effects = Vec::new();
+            claim.turn(&mut effects);
+            claim.release_seq_cst();
+            let mut panic = None;
+            for effect in effects {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.carry_out(effect))) {
+                    panic.get_or_insert(payload);
+                }
+            }
+            if let Some(payload) = panic {
+                self.schedule();
+                resume_unwind(payload);
+            }
+            if !self.pending.load(Ordering::SeqCst) {
+                return;
+            }
+        }
+        self.schedule();
+    }
+
+    fn carry_out(self: &Arc<Self>, effect: Effect) {
+        match effect {
+            Effect::Withdraw(handle) => self.admission.cancel(handle),
+            Effect::CancelGeneration(generation) => generation.cancel(),
+            Effect::Conclude(conclusion) => {
+                let shared = self.clone();
+                self.publish(once_or_refused(move |_| conclusion.run(&shared)));
+            }
+        }
+    }
+
+    fn nanos(&self) -> u64 {
+        u64::try_from(Instant::now().saturating_duration_since(self.epoch).as_nanos())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
+    }
+
+    fn client_gone(&self) {
+        self.cut.store(true, Ordering::Release);
+        self.post(Command::ClientGone);
+    }
+}
+
+impl Entry for Shared {
+    fn start(&self, slot: Slot) {
+        if self.cut.load(Ordering::Acquire) {
+            return self.post(Command::Begun(slot, Opened::Skipped));
+        }
+        let output = self.planned.output.clone();
+        let opened = catch_unwind(AssertUnwindSafe(|| {
+            self.backend.open_generation(self.planned.config, output)
+        }))
+        .unwrap_or_else(|_| Err(BackendError::Failed("opening the generation panicked".to_owned())));
+        let generation = match opened {
+            Ok(generation) => generation,
+            Err(error) => return self.post(Command::Begun(slot, Opened::Failed(error))),
+        };
+        self.post(Command::Begun(slot, Opened::Generation(generation.clone())));
+        let listener = Box::new(Listener {
+            shared: self.me.clone(),
+            done: false,
+        });
+        // A panic drops the listener, which reports the end.
+        let launched = catch_unwind(AssertUnwindSafe(|| {
+            generation.generate(self.planned.prompt.clone(), self.planned.max_new_tokens, listener);
+        }));
+        if launched.is_err() {
+            error!(target: "euhedral.requests", "{} {}: starting the generation panicked", self.api.label(), self.planned.id);
+        }
+        self.post(Command::Launched);
+    }
+
+    fn refuse(&self, error: ApiError) {
+        self.cut.store(true, Ordering::Release);
+        self.post(Command::Refused(error));
+    }
+
+    fn interrupt(&self, why: Interruption) {
+        self.cut.store(true, Ordering::Release);
+        self.post(Command::Interrupt(why));
+    }
+}
+
+/// The generation's ear: hands every event to the owner and does nothing else.
+struct Listener {
+    shared: Weak<Shared>,
+    /// `finished` was called.
+    done: bool,
+}
+
+impl TextListener for Listener {
+    fn text(&mut self, text: &str) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.post(Command::Text(text.to_owned()));
+        }
+    }
+
+    fn finished(&mut self, result: Result<GenerationResult, BackendError>) {
+        self.done = true;
+        if let Some(shared) = self.shared.upgrade() {
+            shared.post(Command::Finished(result));
+        }
+    }
+}
+
+impl Drop for Listener {
+    /// A backend that lets go of its listener without the end still ends the request.
+    fn drop(&mut self) {
+        if !self.done
+            && let Some(shared) = self.shared.upgrade()
+        {
+            shared.post(Command::Finished(Err(BackendError::Failed(
+                "the backend dropped the generation's listener".to_owned(),
+            ))));
+        }
+    }
+}
+
+impl Conclusion {
+    /// Builds and sends the answer, records the request, closes the generation and releases the slot.
+    fn run(self, shared: &Shared) {
+        let Conclusion {
+            responder,
+            verdict,
+            generation,
+            slot,
+            timing,
+        } = self;
+        let ended_ns = shared.nanos();
+        let surface = shared.surface;
+        let (response, completed) = match verdict {
+            Verdict::Silent => (None, None),
+            Verdict::Error { error, outcome, log } => (
+                Some(error_response(&error, surface)),
+                Some(Record::Failed(error, outcome, log)),
+            ),
+            Verdict::Answer(done) => {
+                let built = catch_unwind(AssertUnwindSafe(|| {
+                    body(&shared.planned, shared.backend.model_id(), &done)
+                }))
+                .unwrap_or_else(|_| Err(ApiError::server_error()));
+                match built {
+                    Ok(bytes) => (Some(json(200, bytes)), Some(Record::Answered(done))),
+                    Err(error) => (
+                        Some(error_response(&error, surface)),
+                        Some(Record::Failed(error, Outcome::Failed, None)),
+                    ),
+                }
+            }
+        };
+        if let (Some(responder), Some(response)) = (responder, response) {
+            guarded(|| responder.send(response));
+        }
+        match completed {
+            Some(Record::Answered(done)) => guarded(|| shared.record_answer(&done, timing, ended_ns)),
+            Some(Record::Failed(error, outcome, log)) => {
+                guarded(|| shared.record_failure(&error, outcome, log.as_deref()));
+            }
+            None => {}
+        }
+        if let Some(generation) = generation {
+            guarded(|| generation.close());
+        }
+        if let Some(slot) = slot {
+            slot.release();
+        }
+    }
+}
+
+/// What a conclusion records.
+enum Record {
+    Answered(Completed),
+    Failed(ApiError, Outcome, Option<String>),
+}
+
+impl Shared {
+    fn record_failure(&self, error: &ApiError, outcome: Outcome, log: Option<&str>) {
+        let api = self.api;
+        self.metrics.request(api, outcome);
+        match error.code {
+            Some("invalid_tool_call") => self.metrics.constrained_failure(ConstraintFailure::InvalidToolCall),
+            Some("invalid_structured_output") => {
+                self.metrics
+                    .constrained_failure(ConstraintFailure::InvalidStructuredOutput);
+            }
+            _ => {}
+        }
+        let id = &self.planned.id;
+        match (log, outcome) {
+            (Some(text), Outcome::Failed) => {
+                error!(target: "euhedral.requests", "{} {id}: {text}", api.label());
+            }
+            (Some(text), _) => warn!(target: "euhedral.requests", "{} {id}: {text}", api.label()),
+            (None, Outcome::Failed) => {
+                warn!(target: "euhedral.requests", "{} {id}: answered with {}", api.label(), error.message);
+            }
+            (None, _) => {}
+        }
+    }
+
+    fn record_answer(&self, done: &Completed, timing: Timing, ended_ns: u64) {
+        let api = self.api;
+        let result = &done.result;
+        let prompt = self.planned.prompt.token_count() as u64;
+        let reasoning = self.planned.output.reasoning.then_some(result.reasoning_tokens as u64);
+        let finished = Finished {
+            api,
+            reason: done.reason,
+            prompt_tokens: prompt,
+            cached_prompt_tokens: result.cached_prompt_tokens as u64,
+            completion_tokens: result.completion_tokens as u64,
+            reasoning_tokens: reasoning,
+            queued_ns: timing.queued_ns,
+            started_ns: timing.started_ns,
+            first_token_ns: timing.first_token_ns,
+            ended_ns,
+        };
+        self.metrics.request(api, Outcome::Success);
+        self.metrics.generation(&finished, Metrics::wall_clock_ms());
+        self.metrics.tool_calls(api, done.calls() as u64);
+        let first = timing.first_token_ns != 0;
+        let first_token_s = if first {
+            timing.first_token_ns.saturating_sub(timing.started_ns) as f64 / 1e9
+        } else {
+            0.0
+        };
+        let decode_ns = ended_ns.saturating_sub(timing.first_token_ns);
+        let rate = if first && result.completion_tokens >= 2 && decode_ns > 0 {
+            (result.completion_tokens - 1) as f64 * 1e9 / decode_ns as f64
+        } else {
+            0.0
+        };
+        let reasoned = reasoning.map_or_else(String::new, |tokens| format!(" ({tokens} reasoning)"));
+        info!(
+            target: "euhedral.requests",
+            "{} {}: prompt {} tokens ({} restored from the prefix cache), {} generated{}, first token {:.3} s, {:.1} tok/s, {}",
+            api.label(),
+            self.planned.id,
+            prompt,
+            result.cached_prompt_tokens,
+            result.completion_tokens,
+            reasoned,
+            first_token_s,
+            rate,
+            done.reason.label(),
+        );
+    }
+}
+
+/// Answers planned requests: admits them, runs their generations and sends one JSON reply each. Cheap to clone.
+#[derive(Clone)]
+pub struct Answerer {
+    backend: Arc<dyn Backend>,
+    metrics: Arc<Metrics>,
+    admission: Admission,
+    sink: Arc<QueueIngestSink>,
+    epoch: Instant,
+}
+
+impl Debug for Answerer {
+    fn fmt(&self, out: &mut Formatter<'_>) -> fmt::Result {
+        out.debug_struct("Answerer")
+            .field("admission", &self.admission)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Answerer {
+    /// An answerer over `backend`'s generations admitted by `admission`; its frames go through `sink`, which must be
+    /// attached to the lattice and outlive the requests.
+    pub fn new(
+        backend: Arc<dyn Backend>,
+        metrics: Arc<Metrics>,
+        admission: Admission,
+        sink: Arc<QueueIngestSink>,
+    ) -> Answerer {
+        Answerer {
+            backend,
+            metrics,
+            admission,
+            sink,
+            epoch: Instant::now(),
+        }
+    }
+
+    /// How many generations run and wait.
+    pub fn counts(&self) -> Counts {
+        self.admission.counts()
+    }
+
+    /// Records a request that was refused while it was planned.
+    pub fn planning_failed(&self, endpoint: Endpoint, error: &ApiError) {
+        let api = api_of(endpoint);
+        let outcome = match error.status {
+            400..=499 => Outcome::Invalid,
+            503 => Outcome::Rejected,
+            _ => Outcome::Failed,
+        };
+        self.metrics.request(api, outcome);
+        if error.code == Some("unsupported_schema") {
+            self.metrics.schema_rejected(api);
+        }
+    }
+
+    /// Takes a planned request that is not streamed to its answer: it is offered to the admission at `arrived` (the
+    /// request limit counts from there) and `reply` is answered when it ends, or never if the client is gone. Returns
+    /// at once.
+    pub fn answer(&self, planned: Planned, reply: Responder, surface: Surface, arrived: Instant) {
+        let api = api_of(planned.endpoint);
+        let queued_ns = u64::try_from(arrived.saturating_duration_since(self.epoch).as_nanos())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let options = PipelineOptions {
+            reasoning: planned.output.reasoning,
+            stops: planned.request.stops.clone(),
+            tools: planned.request.tools.pipeline_options(),
+        };
+        let queue = MpscQueue::<Command>::new(COMMANDS_PER_CHUNK);
+        let inbox = queue.producer();
+        let consumer = queue.consumer();
+        let shared = Arc::new_cyclic(|me: &Weak<Shared>| Shared {
+            backend: self.backend.clone(),
+            metrics: self.metrics.clone(),
+            admission: self.admission.clone(),
+            sink: Arc::downgrade(&self.sink),
+            planned,
+            surface,
+            api,
+            epoch: self.epoch,
+            inbox,
+            owner: ClaimCell::new(Owner::new(consumer, reply, &options, queued_ns, self.epoch)),
+            pending: AtomicBool::new(false),
+            cut: AtomicBool::new(false),
+            me: me.clone(),
+        });
+        // Nothing else holds the claim yet: the request was not offered.
+        if let Some(claim) = shared.owner.try_claim() {
+            let gone = Arc::downgrade(&shared);
+            claim.watch(once(move || {
+                if let Some(shared) = gone.upgrade() {
+                    shared.client_gone();
+                }
+            }));
+            claim.release_seq_cst();
+        }
+        let handle = self.admission.offer_at(shared.clone(), arrived);
+        shared.post(Command::Handle(handle));
+    }
+}

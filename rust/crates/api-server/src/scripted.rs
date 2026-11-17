@@ -35,6 +35,18 @@ pub enum Script {
     Tokens { chunks: Vec<String>, stop_token: bool },
     /// `tok0 tok1 ...` until cancelled or the budget is used.
     Endless,
+    /// Nothing is emitted and the listener is kept: the generation never ends, even when cancelled, as a backend
+    /// with a bug would.
+    Hung,
+}
+
+/// How a scripted generation breaks when it is launched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchFault {
+    /// The listener hears `finished` with a failure at once.
+    Fail(String),
+    /// `generate` panics.
+    Panic,
 }
 
 impl Script {
@@ -50,6 +62,7 @@ impl Script {
         match self {
             Script::Tokens { chunks, .. } => chunks.get(index).cloned(),
             Script::Endless => Some(format!("tok{index} ")),
+            Script::Hung => None,
         }
     }
 
@@ -72,6 +85,10 @@ pub struct ScriptedBackend {
     schema_refusal: Mutex<Option<String>>,
     check_fault: Mutex<Option<CheckFault>>,
     drop_continuations: AtomicBool,
+    open_fault: Mutex<Option<BackendError>>,
+    launch_fault: Mutex<Option<LaunchFault>>,
+    reasoning_tokens: AtomicUsize,
+    cached_prompt_tokens: AtomicUsize,
 }
 
 /// How the grammar and schema checks of a scripted backend break.
@@ -113,6 +130,10 @@ impl ScriptedBackend {
             schema_refusal: Mutex::new(None),
             check_fault: Mutex::new(None),
             drop_continuations: AtomicBool::new(false),
+            open_fault: Mutex::new(None),
+            launch_fault: Mutex::new(None),
+            reasoning_tokens: AtomicUsize::new(0),
+            cached_prompt_tokens: AtomicUsize::new(0),
         })
     }
 
@@ -154,6 +175,22 @@ impl ScriptedBackend {
     /// Makes encoding and counting drop their continuation without calling it, as a backend with a bug does.
     pub fn drop_continuations(&self, drop: bool) {
         self.drop_continuations.store(drop, Ordering::Release);
+    }
+
+    /// Makes opening a generation fail with `error` (`None`: open).
+    pub fn set_open_fault(&self, error: Option<BackendError>) {
+        *self.open_fault.lock().unwrap_or_else(PoisonError::into_inner) = error;
+    }
+
+    /// Makes launching a generation break as `fault` says (`None`: run the script).
+    pub fn set_launch_fault(&self, fault: Option<LaunchFault>) {
+        *self.launch_fault.lock().unwrap_or_else(PoisonError::into_inner) = fault;
+    }
+
+    /// Sets the reasoning tokens and the cached prompt tokens the generations opened from now on report.
+    pub fn set_counts(&self, reasoning_tokens: usize, cached_prompt_tokens: usize) {
+        self.reasoning_tokens.store(reasoning_tokens, Ordering::Release);
+        self.cached_prompt_tokens.store(cached_prompt_tokens, Ordering::Release);
     }
 
     fn check_faulted(&self) -> Result<(), BackendError> {
@@ -267,12 +304,19 @@ impl Backend for ScriptedBackend {
                 "inference engine is shutting down".to_owned(),
             ));
         }
+        if let Some(error) = self.open_fault.lock().unwrap_or_else(PoisonError::into_inner).clone() {
+            return Err(error);
+        }
         let script = self.script.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let generation = Arc::new_cyclic(|me| ScriptedGeneration {
             me: me.clone(),
             config,
             output,
             script,
+            fault: self.launch_fault.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+            reasoning_tokens: self.reasoning_tokens.load(Ordering::Acquire),
+            cached_prompt_tokens: self.cached_prompt_tokens.load(Ordering::Acquire),
+            held: Mutex::new(None),
             sink: self.sink.clone(),
             cancelled: AtomicBool::new(false),
             emitted: AtomicUsize::new(0),
@@ -293,6 +337,11 @@ pub struct ScriptedGeneration {
     pub output: OutputSpec,
     me: Weak<ScriptedGeneration>,
     script: Script,
+    fault: Option<LaunchFault>,
+    reasoning_tokens: usize,
+    cached_prompt_tokens: usize,
+    /// The listener of a hung generation.
+    held: Mutex<Option<Box<dyn TextListener>>>,
     sink: Arc<QueueIngestSink>,
     cancelled: AtomicBool,
     emitted: AtomicUsize,
@@ -373,7 +422,8 @@ impl Run {
             completion_tokens,
             stop_token_reached: stop_token,
             token_ids,
-            ..GenerationResult::default()
+            reasoning_tokens: self.generation.reasoning_tokens,
+            cached_prompt_tokens: self.generation.cached_prompt_tokens,
         }));
     }
 }
@@ -381,6 +431,18 @@ impl Run {
 impl Generation for ScriptedGeneration {
     fn generate(&self, prompt: EncodedPrompt, max_new_tokens: usize, listener: Box<dyn TextListener>) {
         *self.started.lock().unwrap_or_else(PoisonError::into_inner) = Some((prompt.text, max_new_tokens));
+        match &self.fault {
+            Some(LaunchFault::Fail(reason)) => {
+                let mut listener = listener;
+                return listener.finished(Err(BackendError::Failed(reason.clone())));
+            }
+            Some(LaunchFault::Panic) => panic!("the scripted generation panics when launched"),
+            None => {}
+        }
+        if self.script == Script::Hung {
+            *self.held.lock().unwrap_or_else(PoisonError::into_inner) = Some(listener);
+            return;
+        }
         // The step frames hold the generation until the last one.
         let Some(generation) = self.me.upgrade() else {
             let mut listener = listener;

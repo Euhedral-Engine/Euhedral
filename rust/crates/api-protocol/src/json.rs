@@ -229,7 +229,21 @@ impl JsonValue {
     /// Reads one whole document strictly; `None` when `text` is not exactly one JSON value. Integers of any
     /// length keep their digits; a repeated object key replaces the earlier value in place.
     pub fn parse(text: &str) -> Option<JsonValue> {
-        let mut parser = Parser { text, position: 0 };
+        JsonValue::read(text, false)
+    }
+
+    /// As [`parse`](JsonValue::parse), except that an object with a repeated key is not a document: `None`. This is
+    /// the reading that decides whether a model's answer is JSON.
+    pub fn parse_distinct(text: &str) -> Option<JsonValue> {
+        JsonValue::read(text, true)
+    }
+
+    fn read(text: &str, distinct: bool) -> Option<JsonValue> {
+        let mut parser = Parser {
+            text,
+            position: 0,
+            distinct,
+        };
         parser.skip_space();
         let value = parser.value(0)?;
         parser.skip_space();
@@ -344,6 +358,8 @@ fn compact_float(number: f64) -> String {
 struct Parser<'a> {
     text: &'a str,
     position: usize,
+    /// A repeated object key ends the parse.
+    distinct: bool,
 }
 
 impl Parser<'_> {
@@ -436,6 +452,9 @@ impl Parser<'_> {
             self.position += 1;
             self.skip_space();
             let value = self.value(depth + 1)?;
+            if self.distinct && members.iter().any(|(name, _)| *name == key) {
+                return None;
+            }
             put(&mut members, key, value);
             self.skip_space();
             match self.peek()? {
@@ -572,6 +591,15 @@ mod tests {
         let text = r#"{"b": [1, 2.5, "x\ny", null, true], "a": {"k": -0}, "b": 7}"#;
         let value = JsonValue::parse(text).unwrap();
         assert_eq!(value.to_compact_string(), r#"{"b":7,"a":{"k":0}}"#);
+    }
+
+    #[test]
+    fn a_repeated_key_is_refused_by_the_distinct_reading_only() {
+        let repeated = r#"{"a": 1, "b": {"c": 1, "c": 2}}"#;
+        assert!(JsonValue::parse(repeated).is_some());
+        assert!(JsonValue::parse_distinct(repeated).is_none());
+        assert!(JsonValue::parse_distinct(r#"{"a": {"c": 1}, "b": {"c": 2}}"#).is_some());
+        assert!(JsonValue::parse_distinct(r#"{"a":1} x"#).is_none());
     }
 
     #[test]

@@ -556,7 +556,7 @@ fn random() -> u64 {
 }
 
 /// A request id: 32 lower-case hex digits.
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     format!("{:016x}{:016x}", random(), random())
 }
 
