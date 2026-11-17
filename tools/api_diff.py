@@ -7,21 +7,29 @@ Usage:
   tools/api_diff.py --out-dir DIR --only compare            compare the replies saved earlier (no device)
   tools/api_diff.py --self-test                             the tests of the normaliser and the stream parser
 
-One server runs at a time, each under one launcher grant (`system-run --gpu shared:16 ...`): the harness starts it on a
+One server runs at a time, each under one launcher grant (`system-run --gpu shared:14 ...`): the harness starts it on a
 free local port (never the port of a running service), waits for `/health`, sends the requests of
 `api_diff_requests.py` one after the other, saves every raw reply under `OUT/<side>/<request>.json`, stops the server
 with SIGTERM (its pid is written by a small `sh` wrapper, so the signal goes to the server and nothing else) and records
 its exit code. Both servers read the given settings file; the harness overrides, by environment, only the port, the
 context length (so a too-long prompt is cheap) and the body limit.
 
-The comparison reads the saved replies. Per request the verdict is `same`, `differs` (first differing path and both
-values) or `refused` (the request is marked as one the Rust server refuses by design for now, and it answered
-`unsupported_parameter`). It compares status, headers (name set and values; not date, framing, lengths), the JSON body
-and the stream's events (names, order, payloads), with ids normalised to their prefix, length and alphabet, and
-times to a marker. The result is written to `OUT/differences.txt` and `OUT/differences.json`.
+The comparison reads the saved replies and sorts what differs into two classes. MUST MATCH, the model's input and
+output: the prompt token count, the generated text, the reasoning text, the names and arguments of tool calls, the
+finish reason and the completion token count, of the whole and the streamed reply on all three surfaces (a request that
+one server answers and the other refuses counts too). Everything else is informational: headers, error wording and
+status, event framing, field order, optional fields; ids and times are normalised first. Informational differences go
+to `OUT/informational.txt`, never to the verdict. Separately every Rust reply is checked on its own terms: it came at
+all, it is no server error, and its body or stream has the shape its API documents (required fields, the terminal
+event, `[DONE]`, `text/event-stream`).
 
-Exit code: 0 when nothing unexpected differs, 1 when a request differs, a reply is missing or a server exited
-unexpectedly, 2 when the arguments are wrong or a server could not run.
+The verdict per request is `same`, `differs` (a must-match difference, first paths and both values), `invalid` (the Rust
+reply is wrong on its own terms), `refused` (the request is marked as one the Rust server refuses by design for now, and
+it answered `unsupported_parameter`) or `missing`. The result is written to `OUT/differences.txt` and
+`OUT/differences.json`.
+
+Exit code: 0 when no request differs, is invalid or is missing and both servers ended with 143 (SIGTERM) or 0, 1
+otherwise, 2 when the arguments are wrong or a server could not run.
 """
 
 from __future__ import annotations
@@ -226,17 +234,229 @@ def short(value, limit: int = 160) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
-def judge(request: dict, java: dict | None, rust: dict | None) -> tuple[str, list[str]]:
-    """(verdict, difference lines): `same`, `differs`, `refused` or `missing`."""
+def parse_args_json(text):
+    try:
+        return json.loads(text) if isinstance(text, str) and text else text
+    except ValueError:
+        return text
+
+
+def sse_data(events: list[dict]) -> list[dict]:
+    return [e["data"] for e in events if isinstance(e.get("data"), dict)]
+
+
+def reply_events(reply: dict) -> list[dict]:
+    return parse_sse(base64.b64decode(reply.get("body_b64", "")))
+
+
+def reply_json(reply: dict):
+    try:
+        return json.loads(base64.b64decode(reply.get("body_b64", "")))
+    except ValueError:
+        return None
+
+
+def usage_of(usage: dict | None, keys: tuple[str, ...]) -> dict:
+    return {k: (usage or {}).get(k) for k in keys}
+
+
+def chat_view(body: dict) -> dict:
+    choice = (body.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    calls = [(c.get("function", {}).get("name"), parse_args_json(c.get("function", {}).get("arguments")))
+             for c in message.get("tool_calls") or []]
+    return {"text": message.get("content") or "", "reasoning": message.get("reasoning_content") or "", "tool_calls": calls,
+            "finish": choice.get("finish_reason"), **usage_of(body.get("usage"), ("prompt_tokens", "completion_tokens"))}
+
+
+def chat_stream_view(events: list[dict]) -> dict:
+    text, reasoning, finish, usage, calls = "", "", None, None, {}
+    for chunk in sse_data(events):
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            text += delta.get("content") or ""
+            reasoning += delta.get("reasoning_content") or ""
+            for call in delta.get("tool_calls") or []:
+                entry = calls.setdefault(call.get("index", 0), ["", ""])
+                entry[0] = (call.get("function") or {}).get("name") or entry[0]
+                entry[1] += (call.get("function") or {}).get("arguments") or ""
+            finish = choice.get("finish_reason") or finish
+        usage = chunk.get("usage") or usage
+    return {"text": text, "reasoning": reasoning, "tool_calls": [(n, parse_args_json(a)) for n, a in calls.values()],
+            "finish": finish, **usage_of(usage, ("prompt_tokens", "completion_tokens"))}
+
+
+def messages_view(body: dict) -> dict:
+    text = thinking = ""
+    calls = []
+    for block in body.get("content") or []:
+        if block.get("type") == "text":
+            text += block.get("text", "")
+        elif block.get("type") == "thinking":
+            thinking += block.get("thinking", "")
+        elif block.get("type") == "tool_use":
+            calls.append((block.get("name"), block.get("input")))
+    return {"text": text, "reasoning": thinking, "tool_calls": calls, "finish": body.get("stop_reason"),
+            **usage_of(body.get("usage"), ("input_tokens", "output_tokens"))}
+
+
+def messages_stream_view(events: list[dict]) -> dict:
+    text = thinking = ""
+    blocks: dict = {}
+    finish, input_tokens, output_tokens = None, None, None
+    for e in sse_data(events):
+        kind = e.get("type")
+        if kind == "message_start":
+            input_tokens = (e.get("message", {}).get("usage") or {}).get("input_tokens")
+        elif kind == "content_block_start":
+            block = e.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                blocks[e.get("index")] = [block.get("name"), ""]
+        elif kind == "content_block_delta":
+            delta = e.get("delta") or {}
+            text += delta.get("text", "") if delta.get("type") == "text_delta" else ""
+            thinking += delta.get("thinking", "") if delta.get("type") == "thinking_delta" else ""
+            if delta.get("type") == "input_json_delta" and e.get("index") in blocks:
+                blocks[e["index"]][1] += delta.get("partial_json", "")
+        elif kind == "message_delta":
+            finish = (e.get("delta") or {}).get("stop_reason") or finish
+            output_tokens = (e.get("usage") or {}).get("output_tokens", output_tokens)
+            input_tokens = (e.get("usage") or {}).get("input_tokens", input_tokens)
+    return {"text": text, "reasoning": thinking, "tool_calls": [(n, parse_args_json(a or "{}")) for n, a in blocks.values()],
+            "finish": finish, "input_tokens": input_tokens, "output_tokens": output_tokens}
+
+
+def responses_view(body: dict) -> dict:
+    text = reasoning = ""
+    calls = []
+    for item in body.get("output") or []:
+        if item.get("type") == "message":
+            text += "".join(c.get("text", "") for c in item.get("content") or [])
+        elif item.get("type") == "reasoning":
+            reasoning += "".join(c.get("text", "") for c in (item.get("summary") or []) + (item.get("content") or []))
+        elif item.get("type") == "function_call":
+            calls.append((item.get("name"), parse_args_json(item.get("arguments"))))
+    finish = body.get("status")
+    if body.get("incomplete_details"):
+        finish = f"{finish}:{body['incomplete_details'].get('reason')}"
+    return {"text": text, "reasoning": reasoning, "tool_calls": calls, "finish": finish,
+            **usage_of(body.get("usage"), ("input_tokens", "output_tokens"))}
+
+
+def responses_stream_view(events: list[dict]) -> dict | None:
+    final = [e["response"] for e in sse_data(events) if isinstance(e.get("response"), dict)
+             and e.get("type") in ("response.completed", "response.incomplete", "response.failed")]
+    return responses_view(final[-1]) if final else None
+
+
+def semantic_view(request: dict, reply: dict):
+    """What the model saw and said, from a successful reply: None when there is nothing to compare (an error reply, a
+    request that is not a generation, a stream cut by the client)."""
+    path, status = request["path"], reply.get("status") or 0
+    if request["method"] != "POST" or not 200 <= status < 300 or request.get("disconnect_after"):
+        return None
+    stream = request.get("stream")
+    if path == "/v1/chat/completions":
+        return chat_stream_view(reply_events(reply)) if stream else chat_view(reply_json(reply) or {})
+    if path == "/v1/messages":
+        return messages_stream_view(reply_events(reply)) if stream else messages_view(reply_json(reply) or {})
+    if path == "/v1/responses":
+        return responses_stream_view(reply_events(reply)) if stream else responses_view(reply_json(reply) or {})
+    if path == "/v1/messages/count_tokens":
+        return {"input_tokens": (reply_json(reply) or {}).get("input_tokens")}
+    return None
+
+
+def error_shaped(body) -> bool:
+    return isinstance(body, dict) and (isinstance(body.get("error"), (dict, str)))
+
+
+def validity_problems(request: dict, reply: dict) -> list[str]:
+    """Why a reply is wrong on its own terms (crash, hang, a shape its API does not document); empty when it is fine."""
+    if reply.get("error"):
+        return [f"no reply: {reply['error']}"]
+    status, path, problems = reply["status"], request["path"], []
+    if status >= 500:
+        problems.append(f"server error status {status}")
+    generation = request["method"] == "POST" and path in ("/v1/chat/completions", "/v1/messages", "/v1/responses")
+    if not generation:
+        return problems
+    content_type = (header_map(reply["headers"]).get("content-type") or "").split(";")[0].strip().lower()
+    if status >= 400:
+        body = reply_json(reply)
+        if not error_shaped(body):
+            problems.append("an error reply that is not an error object")
+        return problems
+    if request.get("stream"):
+        if content_type != "text/event-stream":
+            problems.append(f"stream content-type {content_type!r}, not text/event-stream")
+        if request.get("disconnect_after"):
+            return problems
+        events = reply_events(reply)
+        if not events:
+            return problems + ["a stream without events"]
+        raw = base64.b64decode(reply.get("body_b64", ""))
+        if not raw.endswith(b"\n\n") and not raw.endswith(b"\r\n\r\n"):
+            problems.append("the stream ends in the middle of an event")
+        data = sse_data(events)
+        if path == "/v1/chat/completions":
+            if events[-1].get("data") != "[DONE]":
+                problems.append("the stream does not end with [DONE]")
+            if any("choices" not in d for d in data):
+                problems.append("a chunk without choices")
+            if not any((c.get("finish_reason")) for d in data for c in d.get("choices") or []):
+                problems.append("no chunk carries a finish_reason")
+        elif path == "/v1/messages":
+            types = [e.get("event") or (e.get("data") or {}).get("type") for e in events if isinstance(e.get("data"), dict)]
+            if not types or types[0] != "message_start" or types[-1] != "message_stop":
+                problems.append(f"events do not run message_start..message_stop: {types[:1]}..{types[-1:]}")
+            if any(e.get("event") != (e.get("data") or {}).get("type") for e in events if isinstance(e.get("data"), dict)):
+                problems.append("an event name differs from its payload type")
+        else:
+            types = [d.get("type") for d in data]
+            if not types or types[0] != "response.created":
+                problems.append("the first event is not response.created")
+            if not set(types) & {"response.completed", "response.incomplete", "response.failed"}:
+                problems.append("no terminal response event")
+        return problems
+    body = reply_json(reply)
+    if not isinstance(body, dict):
+        return problems + ["the body is not a JSON object"]
+    required = {"/v1/chat/completions": ("id", "object", "model", "choices", "usage"),
+                "/v1/messages": ("id", "type", "role", "content", "stop_reason", "usage"),
+                "/v1/responses": ("id", "object", "status", "output", "usage")}[path]
+    missing = [k for k in required if k not in body]
+    if missing:
+        problems.append(f"required fields missing: {missing}")
+    if path == "/v1/chat/completions" and body.get("choices") and "finish_reason" not in body["choices"][0]:
+        problems.append("a choice without finish_reason")
+    return problems
+
+
+def informational_request(request: dict) -> bool:
+    return not (request["method"] == "POST" and "_err_" not in request["name"] and not request["name"].startswith("http_")
+                and request["path"] in ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/messages/count_tokens"))
+
+
+def judge(request: dict, java: dict | None, rust: dict | None) -> dict:
+    """The verdict of one request: `same`, `differs` (a must-match difference), `invalid` (the Rust reply is wrong on its
+    own terms), `refused` or `missing`, with the lines of each class: `must`, `invalid`, `info`."""
     if java is None or rust is None:
         absent = [s for s, r in (("java", java), ("rust", rust)) if r is None]
-        return "missing", [f"no saved reply of {', '.join(absent)}"]
-    lines = compare_reply(java, rust)
-    if not lines:
-        return "same", []
+        return {"verdict": "missing", "must": [f"no saved reply of {', '.join(absent)}"], "invalid": [], "info": []}
+    info = compare_reply(java, rust) if not (java.get("error") or rust.get("error")) else []
+    invalid = validity_problems(request, rust)
+    must: list[str] = []
     if request.get("refusal") and refused_by_design(rust) and not java.get("error"):
-        return "refused", [f"rust refuses: status {rust['status']}"]
-    return "differs", lines
+        return {"verdict": "refused", "must": [], "invalid": [], "info": [f"rust refuses: status {rust['status']}"]}
+    if not informational_request(request) and not java.get("error"):
+        jv, rv = semantic_view(request, java), semantic_view(request, rust)
+        if jv is not None and rv is None and not rust.get("error"):
+            must.append(f"java answered {java['status']}, rust answered {rust['status']}")
+        elif jv is not None and rv is not None:
+            must = [f"{path}: java {short(a)} rust {short(b)}" for path, a, b in first_diffs(jv, rv, "view", limit=8)]
+    verdict = "differs" if must else "invalid" if invalid else "same"
+    return {"verdict": verdict, "must": must, "invalid": invalid, "info": info}
 
 
 # ---------------------------------------------------------------------------------------------------- the client
@@ -351,10 +571,13 @@ def run_side(side: str, args, requests_dir: Path) -> int:
     port = free_port()
     native_cache = args.out_dir / "native-cache"
     if side == "rust":
-        (native_cache / "lib").mkdir(parents=True, exist_ok=True)
-        link = native_cache / "lib" / args.cuda_library.name
-        link.unlink(missing_ok=True)
-        link.symlink_to(args.cuda_library.resolve())
+        native_cache.mkdir(parents=True, exist_ok=True)
+        # the native product directory (lib, share, include) is the native cache, as the jar unpacks it
+        for source in args.cuda_library.resolve().parent.parent.iterdir():
+            link = native_cache / source.name
+            if link.is_symlink() or link.exists():
+                link.unlink() if link.is_symlink() else shutil.rmtree(link)
+            link.symlink_to(source)
     model = args.model or model_name(config)
     requests = requests_for(model, BODY_LIMIT, CONTEXT_TOKENS)
     pidfile = out / "server.pid"
@@ -435,15 +658,20 @@ def compare_saved(args) -> int:
     for side in SIDES:
         path = args.out_dir / side / "exit.json"
         exits[side] = json.loads(path.read_text())["exit_code"] if path.is_file() else None
-    rows, counts = [], {"same": 0, "differs": 0, "refused": 0, "missing": 0}
+    rows, counts = [], {"same": 0, "differs": 0, "invalid": 0, "refused": 0, "missing": 0}
     for request in requests:
-        verdict, lines = judge(request, java.get(request["name"]), rust.get(request["name"]))
-        counts[verdict] += 1
-        rows.append({"request": request["name"], "verdict": verdict, "differences": lines})
+        result = judge(request, java.get(request["name"]), rust.get(request["name"]))
+        counts[result["verdict"]] += 1
+        rows.append({"request": request["name"], **result})
     text = [f"{'request':<44} verdict"]
+    info = ["differences that do not need to match (headers, wording, framing, optional fields), per request"]
     for row in rows:
         text.append(f"{row['request']:<44} {row['verdict']}")
-        text.extend(f"    {line}" for line in row["differences"])
+        text.extend(f"    must match: {line}" for line in row["must"])
+        text.extend(f"    rust reply wrong on its own terms: {line}" for line in row["invalid"])
+        if row["info"]:
+            info.append(f"{row['request']}:")
+            info.extend(f"    {line}" for line in row["info"])
     bad_exit = [s for s in SIDES if exits[s] not in (0, 143)]
     text.append("")
     text.append(f"{len(rows)} requests: " + ", ".join(f"{n} {k}" for k, n in counts.items()))
@@ -451,8 +679,9 @@ def compare_saved(args) -> int:
     report = "\n".join(text) + "\n"
     print(report, end="")
     (args.out_dir / "differences.txt").write_text(report)
+    (args.out_dir / "informational.txt").write_text("\n".join(info) + "\n")
     (args.out_dir / "differences.json").write_text(json.dumps({"rows": rows, "exit_codes": exits}, indent=1) + "\n")
-    return 1 if counts["differs"] or counts["missing"] or bad_exit else 0
+    return 1 if counts["differs"] or counts["invalid"] or counts["missing"] or bad_exit else 0
 
 
 # ---------------------------------------------------------------------------------------------------- self-test
@@ -513,11 +742,52 @@ def self_test() -> int:
     # verdicts
     refusal = reply(400, [json_type], b'{"error":{"code":"unsupported_parameter","param":"tool_choice"}}')
     ok = reply(200, [json_type], b'{"a":1}')
-    check("refused by design", judge({"refusal": True}, ok, refusal)[0], "refused")
-    check("not marked", judge({}, ok, refusal)[0], "differs")
-    check("marked but answered the same", judge({"refusal": True}, ok, ok)[0], "same")
-    check("marked, other error", judge({"refusal": True}, ok, reply(500, [json_type], b"{}"))[0], "differs")
-    check("missing", judge({}, ok, None)[0], "missing")
+    chat = {"method": "POST", "path": "/v1/chat/completions", "name": "chat_x"}
+    def chat_reply(text, prompt=5, finish="stop", status=200):
+        body = {"id": "chatcmpl-aaaaaaaa", "object": "chat.completion", "model": "m", "usage": {"prompt_tokens": prompt, "completion_tokens": 2},
+                "choices": [{"index": 0, "finish_reason": finish, "message": {"role": "assistant", "content": text}}]}
+        return reply(status, [json_type], json.dumps(body).encode())
+    check("same text", judge(chat, chat_reply("hi"), chat_reply("hi"))["verdict"], "same")
+    check("other text", judge(chat, chat_reply("hi"), chat_reply("ho"))["verdict"], "differs")
+    check("other prompt tokens", judge(chat, chat_reply("hi", 5), chat_reply("hi", 6))["verdict"], "differs")
+    check("other finish", judge(chat, chat_reply("hi"), chat_reply("hi", finish="length"))["verdict"], "differs")
+    check("java answers, rust errors", judge(chat, chat_reply("hi"), reply(400, [json_type], b'{"error":{"message":"x"}}'))["verdict"], "differs")
+    check("rust server error", judge(chat, chat_reply("hi"), reply(500, [json_type], b'{"error":{}}'))["verdict"], "differs")
+    refusal = reply(400, [json_type], b'{"error":{"code":"unsupported_parameter","param":"tool_choice"}}')
+    check("refused by design", judge({**chat, "refusal": True}, chat_reply("hi"), refusal)["verdict"], "refused")
+    check("not marked", judge(chat, chat_reply("hi"), refusal)["verdict"], "differs")
+    err = {"method": "POST", "path": "/v1/chat/completions", "name": "chat_err_x"}
+    e400 = reply(400, [json_type], b'{"error":{"message":"a"}}')
+    e422 = reply(422, [json_type], b'{"error":{"message":"b"}}')
+    check("error wording is informational", judge(err, e400, e422)["verdict"], "same")
+    check("error wording is listed", len(judge(err, e400, e422)["info"]) > 0, True)
+    check("error that is no error object", judge(err, e400, reply(400, [json_type], b"[]"))["verdict"], "invalid")
+    check("missing", judge({}, chat_reply("a"), None)["verdict"], "missing")
+    check("rust did not answer", validity_problems(chat, {"error": "timeout"}), ["no reply: timeout"])
+    # views
+    chunks = (b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\ndata: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+              b'data: {"choices":[{"delta":{"content":"b"},"finish_reason":"stop"}]}\n\n'
+              b'data: {"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2}}\n\ndata: [DONE]\n\n')
+    check("chat stream view", chat_stream_view(parse_sse(chunks)),
+          {"text": "ab", "reasoning": "", "tool_calls": [], "finish": "stop", "prompt_tokens": 4, "completion_tokens": 2})
+    stream_request = {**chat, "stream": True}
+    check("chat stream is valid", validity_problems(stream_request, reply(200, [sse], chunks)),
+          [])
+    check("chat stream without DONE", validity_problems(stream_request, reply(200, [sse], chunks[:-len(b"data: [DONE]\n\n")])),
+          ["the stream does not end with [DONE]"])
+    anth = (b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":7}}}\n\n'
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"f"}}\n\n'
+            b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"a\\":"}}\n\n'
+            b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"1}"}}\n\n'
+            b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}}\n\n'
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+    check("messages stream view", messages_stream_view(parse_sse(anth)),
+          {"text": "", "reasoning": "", "tool_calls": [("f", {"a": 1})], "finish": "tool_use", "input_tokens": 7, "output_tokens": 9})
+    check("messages stream is valid", validity_problems({"method": "POST", "path": "/v1/messages", "name": "m", "stream": True},
+                                                       reply(200, [sse], anth)), [])
+    check("responses view", responses_view({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+          "output": [{"type": "message", "content": [{"type": "output_text", "text": "x"}]}], "usage": {"input_tokens": 3, "output_tokens": 1}}),
+          {"text": "x", "reasoning": "", "tool_calls": [], "finish": "incomplete:max_output_tokens", "input_tokens": 3, "output_tokens": 1})
     # header ids
     check("request id header", normalise_header("X-Request-Id", "abcxyz"), "<id 6 alnum>")
     # a chunked body request is well formed
@@ -547,13 +817,13 @@ def main() -> int:
     parser.add_argument("--rust-config", type=Path)
     parser.add_argument("--java-jar", type=Path, help="the server jar of the `api` module (`bootJar`)")
     parser.add_argument("--rust-binary", type=Path, help="the release binary `euhedral-server`")
-    parser.add_argument("--cuda-library", type=Path, help="libeuhedral_cuda.so for the Rust server (linked into its native cache)")
+    parser.add_argument("--cuda-library", type=Path, help="libeuhedral_cuda.so for the Rust server (the product directory that holds its lib/ is linked as the native cache)")
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--only", choices=("java", "rust", "compare"), help="run one side, or only compare the saved replies")
     parser.add_argument("--who", default="api-diff", help="the name given to the arbiter")
     parser.add_argument("--launcher", default=LAUNCHER)
     parser.add_argument("--model", help="the model name clients send (default: model.name of the Java config)")
-    parser.add_argument("--gpu-gb", type=int, default=16, help="device memory asked of the launcher, in GB")
+    parser.add_argument("--gpu-gb", type=int, default=14, help="device memory asked of the launcher, in GB")
     parser.add_argument("--memory-max", default="24G", help="host memory cap of a server (launcher --mem)")
     parser.add_argument("--est", type=int, default=MAX_EST_SECONDS, help="seconds the launcher is told a server runs (at most 600)")
     parser.add_argument("--queue-timeout", type=float, default=3600.0, help="seconds to wait for the grant")
