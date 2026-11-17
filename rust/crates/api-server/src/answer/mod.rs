@@ -1,4 +1,5 @@
-//! The answer to one planned request that is not streamed: admission, the generation, the pipeline and one JSON reply.
+//! The answer to one planned request: admission, the generation, the pipeline and one JSON reply, or a stream of
+//! server-sent events.
 //!
 //! A request is an [`Entry`] of the admission and has an owner that is touched by one turn at a time (see
 //! [`owner`]). Whoever has news posts a command to the owner's inbox and publishes the frame that drives it: the
@@ -9,8 +10,13 @@
 //! releases its slot, in that order, so that the slot is freed exactly once on every path.
 //!
 //! The frames of a request after planning are the start (open the generation, launch it), the turns of the owner (one
-//! per hand-off), and the conclusion. A streaming answer would reuse the owner, the pipeline and the conclusion's
-//! bookkeeping and replace the reply built at the end by the chunks written as text arrives.
+//! per hand-off), and the conclusion. A streamed request has the same frames. Its listener leaves the settled text in
+//! a relay (one wake for all that waits, so a fast generation cannot fill the inbox) and the owner turns it into events
+//! (see [`stream`]), which it writes through the transport one piece at a time: the continuation of a write posts the
+//! command that starts the next one, and the events that come meanwhile are held and sent together. What is held is
+//! bounded; a client that does not read is cut off and its generation cancelled. The head goes out as soon as the
+//! generation is open; an error after it is an event of the stream, and the conclusion then records the request
+//! without a reply of its own.
 
 mod owner;
 mod reply;
@@ -34,7 +40,7 @@ use log::{error, info, warn};
 
 #[cfg(feature = "test-support")]
 use self::owner::Fault;
-use self::owner::{Batch, Command, Effect, Ending, Opened, Owner, Settled};
+use self::owner::{Batch, Command, Effect, Ending, Opened, Owner, Relay, Settled};
 use self::reply::{Completed, body};
 use self::stream::Encoder;
 use crate::admission::{Admission, Counts, Entry, Interruption, Slot};
@@ -115,6 +121,10 @@ struct Shared {
     api: Api,
     epoch: Instant,
     inbox: Producer<Command, Multi>,
+    /// A stream's relay of settled text from the listener to the owner.
+    relay: Option<(Producer<Batch, Multi>, Arc<Relay>)>,
+    /// The most settled text a stream holds.
+    held_limit: usize,
     owner: ClaimCell<Owner>,
     /// A command was posted that no turn has taken yet.
     pending: AtomicBool,
@@ -282,7 +292,12 @@ impl Entry for Shared {
             first_token_ns: 0,
             panicked: false,
             done: false,
-            stream: self.planned.request.stream,
+            handoff: self.relay.as_ref().map(|(texts, relay)| Handoff {
+                texts: texts.clone(),
+                relay: relay.clone(),
+                limit: self.held_limit,
+                overran: false,
+            }),
             announced: false,
         });
         // A panic drops the listener, which reports the end.
@@ -352,9 +367,19 @@ struct Listener {
     /// `finished` was called.
     done: bool,
     /// The reply is a stream: what the pipeline settles is handed to the owner as it comes.
-    stream: bool,
+    handoff: Option<Handoff>,
     /// The first text was handed over, with the prompt tokens the prefix cache restored.
     announced: bool,
+}
+
+/// The listener's side of the relay to the owner of a stream.
+struct Handoff {
+    texts: Producer<Batch, Multi>,
+    relay: Arc<Relay>,
+    /// The most text that may wait for the owner.
+    limit: usize,
+    /// The limit was passed and the owner told.
+    overran: bool,
 }
 
 impl Listener {
@@ -386,8 +411,27 @@ impl Listener {
                 .map_or(0, |generation| generation.cached_prompt_tokens())
         });
         let pieces = take(&mut self.parts);
-        if cached.is_some() || !pieces.is_empty() {
-            self.shared.post(Command::Text(Batch { pieces, cached }));
+        if cached.is_none() && pieces.is_empty() {
+            return;
+        }
+        let Some(handoff) = &mut self.handoff else {
+            return;
+        };
+        let batch = Batch { pieces, cached };
+        let weight = batch.weight();
+        let unread = handoff.relay.unread.fetch_add(weight, Ordering::SeqCst) + weight;
+        if handoff.texts.offer(batch).is_err() {
+            handoff.relay.unread.fetch_sub(weight, Ordering::SeqCst);
+            error!(target: "euhedral.requests", "{} {}: the text relay refused a batch", self.shared.api.label(), self.shared.planned.id);
+            return;
+        }
+        if !handoff.relay.wake.swap(true, Ordering::SeqCst) {
+            self.shared.post(Command::Text);
+        }
+        if unread > handoff.limit && !handoff.overran {
+            handoff.overran = true;
+            self.cancel();
+            self.shared.post(Command::Overrun);
         }
     }
 
@@ -462,7 +506,7 @@ impl TextListener for Listener {
             error!(target: "euhedral.requests", "{} {}: the text pipeline panicked", self.shared.api.label(), self.shared.planned.id);
             self.panicked = true;
         }
-        if self.stream {
+        if self.handoff.is_some() {
             self.hand_over();
         }
         if self.panicked || self.failure.is_some() || self.pipeline.ended() {
@@ -471,7 +515,7 @@ impl TextListener for Listener {
     }
 
     fn prefilled(&mut self) {
-        if self.stream && !self.done {
+        if self.handoff.is_some() && !self.done {
             self.shared.post(Command::Prefilled);
         }
     }
@@ -710,6 +754,13 @@ impl Answerer {
         } else {
             Fault::None
         };
+        let texts = planned
+            .request
+            .stream
+            .then(|| MpscQueue::<Batch>::new(COMMANDS_PER_CHUNK));
+        let relay = texts
+            .as_ref()
+            .map(|queue| (queue.producer(), Arc::new(Relay::default())));
         let queue = MpscQueue::<Command>::new(COMMANDS_PER_CHUNK);
         let inbox = queue.producer();
         let consumer = queue.consumer();
@@ -723,6 +774,8 @@ impl Answerer {
             api,
             epoch: self.epoch,
             inbox,
+            relay,
+            held_limit: self.held_limit,
             owner: ClaimCell::new(Owner::new(consumer, reply, queued_ns, self.epoch)),
             pending: AtomicBool::new(false),
             cut: AtomicBool::new(false),
@@ -735,8 +788,13 @@ impl Answerer {
                 claim.fault = fault;
             }
             let gone = Arc::downgrade(&shared);
-            if shared.planned.request.stream {
-                claim.stream(Encoder::new(&shared.planned, self.backend.model_id()), self.held_limit);
+            if let (Some(texts), Some((_, relay))) = (texts, &shared.relay) {
+                claim.stream(
+                    Encoder::new(&shared.planned, self.backend.model_id()),
+                    self.held_limit,
+                    texts.consumer(),
+                    relay.clone(),
+                );
             }
             claim.watch(once(move || {
                 if let Some(shared) = gone.upgrade() {

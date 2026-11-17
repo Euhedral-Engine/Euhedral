@@ -266,7 +266,7 @@ pub fn error_response(error: &ApiError, surface: Surface) -> Response {
     json(error.status_on(surface), error.body(surface))
 }
 
-/// The answer of every route that needs no generation, and the placeholder of the others.
+/// The answer of every route that needs no generation; the others are planned here and answered by the answerer.
 #[derive(Clone)]
 pub struct Router {
     backend: Arc<dyn Backend>,

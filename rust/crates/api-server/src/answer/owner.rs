@@ -31,6 +31,7 @@ use crate::admission::{Handle, Interruption, Slot};
 use crate::backend::{BackendError, Generation, GenerationResult};
 use crate::metrics::{FinishReason, Outcome};
 use euhedral_data_structures::queues::{Consumer, Single};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// What the start found when it tried to open the generation.
 pub(super) enum Opened {
@@ -54,8 +55,10 @@ pub(super) enum Command {
     Interrupt(Interruption),
     /// The client went away.
     ClientGone,
-    /// Text the pipeline settled while the generation runs (a streamed request only).
-    Text(Batch),
+    /// The listener left text in the relay (a streamed request only).
+    Text,
+    /// The listener holds more settled text than the stream may hold: the client does not read.
+    Overrun,
     /// A prefill quantum retired (a streamed request only).
     Prefilled,
     /// The head of the stream was written, or could not be.
@@ -69,6 +72,29 @@ pub(super) enum Command {
 pub(super) struct Batch {
     pub(super) pieces: Vec<Piece>,
     pub(super) cached: Option<usize>,
+}
+
+impl Batch {
+    /// The bytes of text the batch holds.
+    pub(super) fn weight(&self) -> usize {
+        self.pieces
+            .iter()
+            .map(|piece| match piece {
+                Piece::Reasoning(text) | Piece::Text(text) => text.len(),
+                Piece::ToolCall(call) => call.name.len() + call.arguments.len(),
+            })
+            .sum()
+    }
+}
+
+/// What the listener and the owner of a stream agree on: the listener leaves its batches in a queue and wakes the owner
+/// once for all that wait, so a generation faster than the owner never fills the owner's inbox.
+#[derive(Default)]
+pub(super) struct Relay {
+    /// A `Text` command was posted and the owner has not begun to read the queue.
+    pub(super) wake: AtomicBool,
+    /// The bytes in the queue.
+    pub(super) unread: AtomicUsize,
 }
 
 /// Where the body of a streamed reply is.
@@ -100,6 +126,9 @@ struct Streaming {
     quanta: usize,
     /// The most bytes held while a write is in flight.
     max_held: usize,
+    /// The batches the listener left.
+    texts: Consumer<Batch, Single>,
+    relay: Arc<Relay>,
 }
 
 /// What the text pipeline settled when the generation ended: made by the listener, which is where the text is read, so
@@ -217,7 +246,13 @@ impl Owner {
     }
 
     /// Makes the reply a stream of `encoder`'s events, holding at most `max_held` bytes while a write is in flight.
-    pub(super) fn stream(&mut self, encoder: Encoder, max_held: usize) {
+    pub(super) fn stream(
+        &mut self,
+        encoder: Encoder,
+        max_held: usize,
+        texts: Consumer<Batch, Single>,
+        relay: Arc<Relay>,
+    ) {
         self.streaming = Some(Streaming {
             encoder,
             wire: Wire::Unsent,
@@ -227,6 +262,8 @@ impl Owner {
             cut: false,
             quanta: 0,
             max_held,
+            texts,
+            relay,
         });
     }
 
@@ -275,7 +312,8 @@ impl Owner {
                 Command::Refused(error) => self.refused(error, effects),
                 Command::Interrupt(why) => self.interrupted(why, effects),
                 Command::ClientGone => self.gone(effects),
-                Command::Text(batch) => self.settled_text(batch),
+                Command::Text => self.settled_text(),
+                Command::Overrun => self.too_slow(effects),
                 Command::Prefilled => self.prefilled(),
                 Command::Head(_) | Command::Sent(_) => {}
             }
@@ -310,21 +348,23 @@ impl Owner {
     }
 
     /// Settled text of a streamed reply becomes events.
-    fn settled_text(&mut self, batch: Batch) {
-        if self.answered {
-            return;
-        }
+    fn settled_text(&mut self) {
         let Some(s) = &mut self.streaming else {
             return;
         };
-        if s.terminal || matches!(s.wire, Wire::Unsent) {
-            return;
-        }
-        if let Some(cached) = batch.cached {
-            s.encoder.start(cached, &mut s.held);
-        }
-        for piece in &batch.pieces {
-            s.encoder.piece(piece, &mut s.held);
+        // Cleared before the queue is read: a batch left after this read posts the next wake.
+        s.relay.wake.store(false, Ordering::SeqCst);
+        while let Some(batch) = s.texts.poll() {
+            s.relay.unread.fetch_sub(batch.weight(), Ordering::SeqCst);
+            if self.answered || s.terminal || matches!(s.wire, Wire::Unsent) {
+                continue;
+            }
+            if let Some(cached) = batch.cached {
+                s.encoder.start(cached, &mut s.held);
+            }
+            for piece in &batch.pieces {
+                s.encoder.piece(piece, &mut s.held);
+            }
         }
     }
 
@@ -380,16 +420,24 @@ impl Owner {
             wire @ (Wire::Unsent | Wire::Over) => s.wire = wire,
         }
         if slow {
-            self.cut_stream();
-            self.cancel(effects);
-            self.answer_early(
-                ApiError::client_closed(),
-                Outcome::Cancelled,
-                Some("the client does not read: the held events passed the limit".to_owned()),
-                None,
-                effects,
-            );
+            self.too_slow(effects);
         }
+    }
+
+    /// The client does not read: the body is cut and the generation cancelled.
+    fn too_slow(&mut self, effects: &mut Vec<Effect>) {
+        if self.streaming.as_ref().is_none_or(|s| s.cut) {
+            return;
+        }
+        self.cut_stream();
+        self.cancel(effects);
+        self.answer_early(
+            ApiError::client_closed(),
+            Outcome::Cancelled,
+            Some("the client does not read: the held events passed the limit".to_owned()),
+            None,
+            effects,
+        );
     }
 
     /// Hands the head to the transport once the generation is open.
@@ -517,7 +565,12 @@ impl Owner {
                 self.apply_cancel(effects);
             }
             Command::Handle(handle) => self.named(handle, effects),
-            Command::Refused(_) | Command::Text(_) | Command::Prefilled | Command::Head(_) | Command::Sent(_) => {}
+            Command::Refused(_)
+            | Command::Text
+            | Command::Overrun
+            | Command::Prefilled
+            | Command::Head(_)
+            | Command::Sent(_) => {}
         }
     }
 
