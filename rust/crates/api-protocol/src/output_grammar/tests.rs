@@ -398,9 +398,15 @@ fn a_request_gets_the_grammar_of_its_format_and_tools() {
 fn a_schema_llguidance_refuses_is_an_unenforceable_schema_at_its_parameter() {
     let checker = checker();
     let param = "response_format.json_schema.schema";
-    for schema in [
-        r#"{"type":"object","if":{}}"#,
-        r#"{"type":"integer","minimum":3,"maximum":2}"#,
+    for (schema, message) in [
+        (
+            r#"{"type":"object","if":{}}"#,
+            "The JSON Schema cannot be enforced: Unimplemented keys: [\"if\"]",
+        ),
+        (
+            r#"{"type":"integer","minimum":3,"maximum":2}"#,
+            "The JSON Schema cannot be enforced: Unsatisfiable schema: minimum (3) is greater than maximum (2)",
+        ),
     ] {
         let format = ResponseFormat::JsonSchema {
             name: "p".to_owned(),
@@ -412,20 +418,8 @@ fn a_schema_llguidance_refuses_is_an_unenforceable_schema_at_its_parameter() {
         assert_eq!(refused.status, 400);
         assert_eq!(refused.code, Some("unsupported_schema"));
         assert_eq!(refused.param.as_deref(), Some(param));
-        assert!(
-            refused.message.starts_with("The JSON Schema cannot be enforced: "),
-            "{}",
-            refused.message
-        );
-        eprintln!("{schema} -> {}", refused.message);
+        assert_eq!(refused.message, message);
     }
-    let format = ResponseFormat::JsonSchema {
-        name: "p".to_owned(),
-        schema: json(r#"{"type":"object","if":{}}"#),
-        schema_param: param.to_owned(),
-    };
-    let refused = OutputGrammar::for_request(&ToolCalling::disabled(), &format, false, &checker).expect_err("refused");
-    assert!(refused.message.contains("if"), "{}", refused.message);
 }
 
 #[test]
@@ -434,13 +428,34 @@ fn an_invalid_grammar_is_a_bad_request_without_a_parameter() {
     assert_eq!(refused.status, 400);
     assert_eq!(refused.code, None);
     assert_eq!(refused.param, None);
-    assert!(
-        refused.message.starts_with("The requested output cannot be enforced: "),
-        "{}",
-        refused.message
+    assert_eq!(
+        refused.message,
+        "The requested output cannot be enforced: unknown name: \"missing_rule\""
     );
-    eprintln!("{}", refused.message);
     assert!(checker().check_grammar("start: \"a\"\n").is_ok());
+}
+
+#[test]
+fn a_string_parameter_with_no_string_literal_is_refused() {
+    for property in [
+        r#"{"type":"string","enum":[1,2]}"#,
+        r#"{"type":"string","const":null}"#,
+        r#"{"type":"string","const":"x","enum":[1]}"#,
+        r#"{"type":"string","enum":[]}"#,
+    ] {
+        let schema = format!(r#"{{"type":"object","properties":{{"mode":{property}}},"required":["mode"]}}"#);
+        let calling = calling_of(vec![tool("f", Some(&schema), true)], ToolChoice::Required, true);
+        let refused = OutputGrammar::for_tools(&calling, None, false).expect_err(property);
+        assert_eq!(refused.status, 400, "{property}");
+        assert_eq!(refused.code, Some("unsupported_schema"), "{property}");
+        assert_eq!(refused.param.as_deref(), Some("parameters"), "{property}");
+        assert_eq!(
+            refused.message,
+            "The JSON Schema cannot be enforced: a string parameter of a native tool call needs a string in its \
+             'enum' or 'const'; parameter 'mode' of f.",
+            "{property}"
+        );
+    }
 }
 
 #[test]

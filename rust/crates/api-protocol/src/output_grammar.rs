@@ -20,10 +20,12 @@
 
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter, Result as FmtResult, Write};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use llguidance::api::{GrammarInit, ParserLimits, TopLevelGrammar};
 use llguidance::earley::SlicedBiasComputer;
+use llguidance::panic_utils::catch_unwind;
 use llguidance::{Logger, Matcher, ParserFactory};
 use thiserror::Error;
 use toktrie::{ApproximateTokEnv, InferenceCapabilities, TokEnv, TokRxInfo, TokTrie};
@@ -239,7 +241,8 @@ fn value(
             }
             _ => return Ok("TEXT".to_owned()),
         };
-        // Only a string can be the value of a string parameter: another literal is not offered.
+        // Only a string can be the value of a string parameter: another literal is not offered, and a parameter
+        // left with no literal at all cannot be enforced (an empty choice would admit an empty value).
         let choices: Vec<String> = literals
             .iter()
             .filter_map(|literal| match literal {
@@ -247,6 +250,16 @@ fn value(
                 _ => None,
             })
             .collect();
+        if choices.is_empty() {
+            return Err(ApiError::unenforceable_schema(
+                format!(
+                    "The JSON Schema cannot be enforced: a string parameter of a native tool call needs a string \
+                     in its 'enum' or 'const'; parameter '{key}' of {}.",
+                    tool.name()
+                ),
+                Some(&tool.parameters_param),
+            ));
+        }
         return Ok(format!("({}) \"\\n</parameter>\\n\"", choices.join(" | ")));
     }
     let annotation_only = members.iter().all(|(name, _)| ANNOTATIONS.contains(&name.as_str()));
@@ -300,6 +313,14 @@ impl GrammarChecker {
     /// A checker over the vocabulary whose token `id` is `token_bytes[id]`: its text for an ordinary token, `0xFF`
     /// and its name for a token a grammar may only name explicitly (a control token). Every ID needs bytes. A
     /// grammar ends with any of `end_ids`, the first of which is the main end token.
+    ///
+    /// What a check decides depends on the vocabulary: llguidance precomputes lexemes and enforces its lexer-state
+    /// limits against the whole token trie, and `<tool_call>` is only a name in a grammar when its token is a `0xFF`
+    /// control token. The caller therefore builds the vocabulary the generation will sample over, padded to the
+    /// logits row's width with unused-token names as the native side does, and checks with that very checker.
+    ///
+    /// Compiling a grammar costs enough (a large schema or tool set takes noticeable CPU) that a caller runs a check
+    /// as its own frame, never inline in a request handler.
     pub fn new(token_bytes: &[Vec<u8>], end_ids: &[u32]) -> Result<GrammarChecker, VocabularyError> {
         let Some(&end) = end_ids.first() else {
             return Err(VocabularyError("a grammar needs an end token".to_owned()));
@@ -357,15 +378,19 @@ impl GrammarChecker {
     }
 
     fn matcher(&self, grammar: &str, kind: &str) -> Matcher {
-        let parser = TopLevelGrammar::from_tagged_str(kind, grammar).and_then(|top| {
-            self.factory.create_parser_from_init_ext(
-                GrammarInit::Serialized(top),
-                Logger::new(0, 0),
-                InferenceCapabilities::default(),
-                ParserLimits::default(),
-            )
-        });
-        Matcher::new(parser)
+        // A panic inside llguidance is a refusal ("panic: ..."), as on the native side.
+        let compiled = catch_unwind(AssertUnwindSafe(|| {
+            let parser = TopLevelGrammar::from_tagged_str(kind, grammar).and_then(|top| {
+                self.factory.create_parser_from_init_ext(
+                    GrammarInit::Serialized(top),
+                    Logger::new(0, 0),
+                    InferenceCapabilities::default(),
+                    ParserLimits::default(),
+                )
+            });
+            Ok(Matcher::new(parser))
+        }));
+        compiled.unwrap_or_else(|panicked| Matcher::new(Err(panicked)))
     }
 }
 
