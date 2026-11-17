@@ -412,6 +412,7 @@ name = "euhedral-inference-api-server"
 version = "0.1.0"
 dependencies = [
  "euhedral-core",
+ "euhedral-data-structures",
  "euhedral-graph",
  "euhedral-hardware-utils",
  "euhedral-inference-api-protocol",

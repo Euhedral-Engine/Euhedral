@@ -5,19 +5,22 @@
 //! Nothing here owns a thread or waits: the server is frames on the caller's lattice, and the backend's work is
 //! reported through continuations and listeners.
 
+pub mod admission;
 pub mod backend;
 mod frames;
 pub mod health;
 pub mod limits;
+pub mod metrics;
 pub mod models;
 pub mod router;
 #[cfg(any(test, feature = "test-support"))]
 pub mod scripted;
 mod server;
 
+pub use admission::{Admission, Counts, Entry, Handle, Interruption, Slot};
 pub use backend::{
-    Backend, BackendError, EncodedPrompt, Generation, GenerationConfig, GenerationResult, Next, OutputSpec,
-    TextListener,
+    Backend, BackendError, EncodedPrompt, EngineReport, Generation, GenerationConfig, GenerationResult, Next,
+    OutputSpec, PrefixCacheReport, TextListener,
 };
 pub use frames::once;
 pub use limits::Limits;

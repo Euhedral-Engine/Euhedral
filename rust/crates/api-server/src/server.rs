@@ -4,17 +4,23 @@ use std::fmt::{self, Debug, Formatter};
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::LatticeSource;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
+use euhedral_data_structures::sync::ClaimCell;
 use euhedral_graph::Completions;
 use euhedral_io::AsyncIo;
 use euhedral_net::{Counters, ServerHandle, serve};
 
+use crate::admission::Admission;
 use crate::backend::Backend;
+use crate::frames::once_or_refused;
 use crate::limits::Limits;
+use crate::metrics::Metrics;
 use crate::router::Router;
 
 /// What a server needs to start.
@@ -49,10 +55,13 @@ pub struct ApiServer {
     local_addr: SocketAddr,
     sink: Arc<QueueIngestSink>,
     timers: Arc<Completions>,
+    admission: Admission,
+    drain_limit: Duration,
     // The sockets' engine, held so that it outlives the server (the transport holds it weakly); `own_io` says the
     // server opened it and so completes it.
     io: Arc<AsyncIo>,
     own_io: bool,
+    metrics: Arc<Metrics>,
 }
 
 impl Debug for ApiServer {
@@ -93,7 +102,12 @@ pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Resul
         undo(true);
         return Err(error);
     }
-    let router = Router::new(config.backend, config.created_at, config.limits);
+    let admission = Admission::new(config.backend.clone(), &config.limits, sink.clone(), timers.clone());
+    let metrics = Arc::new(Metrics::new(
+        config.backend.engine_report().speculative_depth,
+        Metrics::wall_clock_ms(),
+    ));
+    let router = Router::new(config.backend, config.created_at, config.limits, metrics.clone());
     let handle = match serve(
         lattice.clone(),
         io.clone(),
@@ -114,8 +128,11 @@ pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Resul
         local_addr,
         sink,
         timers,
+        admission,
+        drain_limit: config.limits.drain_limit,
         io,
         own_io,
+        metrics,
     })
 }
 
@@ -125,15 +142,49 @@ impl ApiServer {
         self.local_addr
     }
 
+    /// The registry the routes export: what the request code records into.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
     /// What the transport counted so far.
     pub fn counters(&self) -> Counters {
         self.handle.counters()
     }
 
-    /// Stops accepting, lets the requests in flight finish and offers `stopped` when the server is done. Returns at
-    /// once.
+    /// The admission of generations the generating routes use.
+    pub fn admission(&self) -> &Admission {
+        &self.admission
+    }
+
+    /// Stops the server and offers `stopped` when it is done; returns at once.
+    ///
+    /// The transport stops accepting at once and lets the requests in flight, the waiting ones included, finish.
+    /// Admission stops when they all have, or when the drain limit passes, whichever comes first: it then refuses the
+    /// requests still waiting for a slot, interrupts the running generations and waits for them up to the shutdown
+    /// limit (after which it tells them to give up). `stopped` is offered once the transport and admission are both
+    /// done.
     pub fn stop(&self, stopped: Box<dyn Frame>) {
-        self.handle.stop(stopped);
+        let stop = Arc::new(Stop {
+            remaining: AtomicUsize::new(2),
+            stopped: ClaimCell::new(Some(stopped)),
+            sink: self.sink.clone(),
+            admission: self.admission.clone(),
+            begun: AtomicBool::new(false),
+        });
+        let drained = stop.clone();
+        self.handle.stop(once_or_refused(move |_| {
+            drained.stop_admission();
+            drained.arrive();
+        }));
+        let late = stop;
+        let deadline = Instant::now().checked_add(self.drain_limit);
+        let frame = once_or_refused(move |_| late.stop_admission());
+        match deadline {
+            Some(deadline) => self.timers.at(deadline, frame),
+            // A drain limit too long to count is never reached.
+            None => drop(frame),
+        }
     }
 
     /// Completes everything the server opened: its sink, its timers and, if it opened it, the sockets' engine. Call it
@@ -143,6 +194,38 @@ impl ApiServer {
         self.timers.complete();
         if self.own_io {
             self.io.complete();
+        }
+    }
+}
+
+/// What the stop of a server waits for: the transport and admission. Offers `stopped` when both arrived.
+struct Stop {
+    remaining: AtomicUsize,
+    /// Taken by the last arrival only, so it is never contended.
+    stopped: ClaimCell<Option<Box<dyn Frame>>>,
+    sink: Arc<QueueIngestSink>,
+    admission: Admission,
+    /// Admission's stop was started.
+    begun: AtomicBool,
+}
+
+impl Stop {
+    /// Starts admission's stop, once.
+    fn stop_admission(self: &Arc<Self>) {
+        if !self.begun.swap(true, Ordering::AcqRel) {
+            let stop = self.clone();
+            self.admission.stop(move || stop.arrive());
+        }
+    }
+
+    fn arrive(&self) {
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        if let Some(mut claim) = self.stopped.try_claim()
+            && let Some(stopped) = claim.take()
+        {
+            drop(self.sink.offer(stopped));
         }
     }
 }

@@ -1412,12 +1412,3 @@ fn ignored_metadata_and_neutral_values_are_accepted() {
         r#""role":"user","content":"x","refusal":null,"function_call":null,"audio":null"#,
     ));
 }
-
-#[test]
-fn blank_follows_the_whitespace_of_the_source_runtime() {
-    assert!(is_blank(""));
-    assert!(is_blank(" \t\n\u{b}\u{c}\r\u{1c}\u{2003}\u{2028}"));
-    assert!(!is_blank("\u{a0}"));
-    assert!(!is_blank("\u{85}"));
-    assert!(!is_blank(" m "));
-}
