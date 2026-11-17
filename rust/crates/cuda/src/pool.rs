@@ -23,6 +23,10 @@ const CLASSES: usize = usize::BITS as usize;
 const CHUNK: usize = 64;
 
 /// The released buffers of one size class, oldest first: any thread releases and any thread takes, and neither waits.
+///
+/// A take can come back empty while the class holds buffers: another consumer is polling at that moment, or a release
+/// is part-way through publishing its buffer. The caller then allocates a new buffer; nothing is lost, because the
+/// buffer the other thread is taking or publishing stays in the class or goes to that thread.
 struct Class<T> {
     producer: Producer<T, Multi>,
     consumer: Consumer<T, Multi>,
@@ -37,11 +41,10 @@ impl<T> Class<T> {
         }
     }
 
-    /// Keeps `item` for reuse. The queue is unbounded, so the offer is always taken; a refusal would be a defect in
-    /// the queue, and is caught in debug builds (the item is dropped in release builds).
-    fn give(&self, item: T) {
-        let offered = self.producer.offer(item);
-        debug_assert!(offered.is_ok(), "an unbounded queue refused an item");
+    /// Keeps `item` for reuse. The queue is unbounded, so the offer is always taken; if it is ever refused, the item
+    /// comes back to the caller.
+    fn give(&self, item: T) -> Result<(), T> {
+        self.producer.offer(item)
     }
 
     /// The longest-held item, if any.
@@ -133,7 +136,9 @@ impl PinnedPool {
     }
 
     /// Frees released buffers, largest class first, until the pool holds no more than its limit; returns how many.
-    /// Freeing pinned memory waits for the device: call this where waiting is allowed (startup, shutdown).
+    /// Freeing pinned memory waits for the device: call this where waiting is allowed (startup, shutdown). It is for
+    /// startup and shutdown: while other threads acquire and release, it may skip a class whose buffers are being
+    /// taken or published at that moment, and so stop above the limit.
     pub fn trim(&self) -> usize {
         let mut freed = 0;
         for class in (0..CLASSES).rev() {
@@ -152,7 +157,14 @@ impl PinnedPool {
 
     fn release(&self, buffer: PinnedBuffer) {
         self.held_bytes.fetch_add(buffer.len() as u64, Ordering::Relaxed);
-        self.classes[buffer.len().trailing_zeros() as usize].give(buffer);
+        let class = &self.classes[buffer.len().trailing_zeros() as usize];
+        if let Err(refused) = class.give(buffer) {
+            // The unbounded queue never refuses; if it does, the buffer is freed and no longer counted.
+            debug_assert!(false, "an unbounded queue refused a buffer");
+            self.held_bytes.fetch_sub(refused.len() as u64, Ordering::Relaxed);
+            self.allocated_bytes.fetch_sub(refused.len() as u64, Ordering::Relaxed);
+            drop(refused);
+        }
     }
 }
 
@@ -264,12 +276,21 @@ mod tests {
 
     use super::*;
 
+    /// Counts a producer as finished when it returns or unwinds, so a panic fails the test instead of hanging it.
+    struct CountOnDrop<'a>(&'a AtomicUsize);
+
+    impl Drop for CountOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     #[test]
     fn a_class_hands_out_in_release_order() {
         let class = Class::<u32>::new();
         assert_eq!(class.take(), None);
         for value in 0..200 {
-            class.give(value);
+            class.give(value).unwrap();
         }
         for value in 0..200 {
             assert_eq!(class.take(), Some(value));
@@ -290,13 +311,13 @@ mod tests {
             for producer in 0..PRODUCERS {
                 let (class, done) = (&class, &producers_done);
                 scope.spawn(move || {
+                    let _counted = CountOnDrop(done);
                     for index in 0..EACH {
-                        class.give(producer * EACH + index);
+                        class.give(producer * EACH + index).unwrap();
                         if index % 7 == 0 {
                             thread::yield_now();
                         }
                     }
-                    done.fetch_add(1, Ordering::SeqCst);
                 });
             }
             let consumers: Vec<_> = (0..CONSUMERS)
