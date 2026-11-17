@@ -11,7 +11,7 @@ mod common;
 use common::{Fixture, Raw, assert_json, headers, small_limits, text};
 use euhedral_core::generics::LatticeSource;
 use euhedral_inference_api_server::scripted::ScriptedBackend;
-use euhedral_inference_api_server::{ApiConfig, Limits, once, start};
+use euhedral_inference_api_server::{ApiConfig, Limits, RequestDefaults, once, start};
 use euhedral_io::AsyncIo;
 use euhedral_net::Method;
 use std::sync::mpsc::channel;
@@ -274,9 +274,9 @@ fn a_body_over_the_limit_is_413_with_the_json_error() {
             ANTHROPIC_TOO_LARGE,
         );
     }
-    // A body at the limit passes it.
+    // A body at the limit passes it, and is then read: this one is not JSON.
     let at_limit = "x".repeat(64);
-    assert_eq!(fixture.post("/v1/chat/completions", JSON, &at_limit).status, 501);
+    assert_eq!(fixture.post("/v1/chat/completions", JSON, &at_limit).status, 400);
     fixture.finish();
 }
 
@@ -313,18 +313,25 @@ fn without_a_ready_backend_each_generation_route_is_unavailable_in_its_surface_f
 }
 
 #[test]
-fn with_a_ready_backend_each_generation_route_answers_the_placeholder() {
-    let fixture = Fixture::start();
+fn with_a_ready_backend_each_planned_generation_route_answers_the_placeholder() {
+    let limits = Limits {
+        max_body_bytes: 4096,
+        ..small_limits()
+    };
+    let fixture = Fixture::with(limits, Some(2));
     let openai = r#"{"error":{"message":"This route is not implemented yet.","type":"server_error","param":null,"code":"not_implemented"}}"#;
     let anthropic = r#"{"type":"error","error":{"type":"api_error","message":"This route is not implemented yet."}}"#;
+    let user = r#"[{"role":"user","content":"Hi"}]"#;
+    let chat = format!(r#"{{"model":"{MODEL}","messages":{user}}}"#);
+    let responses = format!(r#"{{"model":"{MODEL}","input":"Hi"}}"#);
+    let messages = format!(r#"{{"model":"{MODEL}","max_tokens":8,"messages":{user}}}"#);
     assert_json(
-        &fixture.post("/v1/chat/completions", Some("application/json; charset=utf-8"), "{}"),
+        &fixture.post("/v1/chat/completions", Some("application/json; charset=utf-8"), &chat),
         501,
         openai,
     );
-    assert_json(&fixture.post("/v1/responses", JSON, "{}"), 501, openai);
-    assert_json(&fixture.post("/v1/messages", JSON, "{}"), 501, anthropic);
-    assert_json(&fixture.post("/v1/messages/count_tokens", JSON, "{}"), 501, anthropic);
+    assert_json(&fixture.post("/v1/responses", JSON, &responses), 501, openai);
+    assert_json(&fixture.post("/v1/messages", JSON, &messages), 501, anthropic);
     fixture.finish();
 }
 
@@ -406,7 +413,7 @@ fn expect_100_continue_is_answered_by_the_transport_and_the_body_then_read() {
     raw.send("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: 2\r\nExpect: 100-continue\r\n\r\n");
     assert_eq!(raw.read_until("\r\n\r\n"), "HTTP/1.1 100 Continue\r\n\r\n");
     raw.send("{}");
-    assert!(raw.read_until("not_implemented").starts_with("HTTP/1.1 501"));
+    assert!(raw.read_until("\"error\"").starts_with("HTTP/1.1 400"));
     drop(raw);
     fixture.finish();
 }
@@ -444,6 +451,7 @@ fn a_server_can_share_the_callers_io_and_leaves_it_running() {
         address: "127.0.0.1:0".parse().expect("an address"),
         limits: small_limits(),
         backend: backend.clone(),
+        defaults: RequestDefaults::default(),
         io: Some(io.clone()),
         created_at: 1,
     };

@@ -107,7 +107,7 @@ impl OutputGrammar {
         calling: &ToolCalling,
         format: &ResponseFormat,
         reasoning: bool,
-        checker: &GrammarChecker,
+        checker: &dyn GrammarCheck,
     ) -> Result<Option<String>, ApiError> {
         if let ResponseFormat::JsonSchema {
             schema, schema_param, ..
@@ -297,6 +297,25 @@ fn start(reasoning: bool, rule: &str) -> String {
 #[derive(Debug, Error)]
 #[error("llguidance refused the vocabulary: {0}")]
 pub struct VocabularyError(String);
+
+/// What compiles a request's grammar and schemas: the checker over the vocabulary, or the backend that holds it.
+pub trait GrammarCheck {
+    /// Whether the Lark grammar compiles; a refusal is a 400 without a parameter.
+    fn check_grammar(&self, grammar: &str) -> Result<(), ApiError>;
+
+    /// Whether `schema` compiles on its own; a refusal is an unenforceable schema at `param`.
+    fn check_json_schema(&self, schema: &JsonValue, param: &str) -> Result<(), ApiError>;
+}
+
+impl GrammarCheck for GrammarChecker {
+    fn check_grammar(&self, grammar: &str) -> Result<(), ApiError> {
+        GrammarChecker::check_grammar(self, grammar)
+    }
+
+    fn check_json_schema(&self, schema: &JsonValue, param: &str) -> Result<(), ApiError> {
+        GrammarChecker::check_json_schema(self, schema, param)
+    }
+}
 
 /// Checks that grammars and JSON schemas compile over one vocabulary, the way the generation will compile them.
 pub struct GrammarChecker {
