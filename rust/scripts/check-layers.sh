@@ -25,11 +25,13 @@ import os
 import sys
 
 SETTINGS = "euhedral-inference-settings"
+API_PROTOCOL = "euhedral-inference-api-protocol"
 EDRL = "euhedral-inference-edrl"
 CUDA = "euhedral-inference-cuda"
 HOST_GEMV = "euhedral-inference-host-gemv"
 TOKENIZER = "euhedral-inference-tokenizer"
 ENGINE = "euhedral-inference-engine"
+API_SERVER = "euhedral-inference-api-server"
 BENCH = "euhedral-inference-bench"
 TEST_SUPPORT = "test-support"
 XTASK = "xtask"
@@ -40,11 +42,13 @@ XTASK = "xtask"
 # crate -> workspace crates it may depend on.
 ALLOWED = {
     SETTINGS: set(),
+    API_PROTOCOL: {SETTINGS, TOKENIZER},
     EDRL: set(),
     HOST_GEMV: set(),
     TEST_SUPPORT: set(),
     TOKENIZER: {EDRL},
     CUDA: set(),
+    API_SERVER: {API_PROTOCOL, ENGINE, SETTINGS, TOKENIZER},
     ENGINE: {SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER},
     BENCH: {ENGINE, SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER},
     XTASK: set(),
@@ -55,13 +59,13 @@ BINARIES = {BENCH, XTASK}
 DEV_ONLY = {TEST_SUPPORT}
 
 # external crate -> crates that may depend on it.
-RUSTEE = {"euhedral-core", "euhedral-gpu", "euhedral-graph", "euhedral-io"}
-RUSTEE_OWNERS = {ENGINE, BENCH, CUDA}
+RUSTEE = {"euhedral-core", "euhedral-gpu", "euhedral-graph", "euhedral-io", "euhedral-memory", "euhedral-net"}
+RUSTEE_OWNERS = {ENGINE, BENCH, CUDA, API_SERVER}
 # Configuration is parsed in one place.
 YAML = "serde_yaml_ng"
 YAML_OWNERS = {SETTINGS}
 # crate -> the only external crates it may depend on.
-EXTERNAL_ONLY = {CUDA: {"euhedral-gpu", "euhedral-graph", "euhedral-io", "libloading", "thiserror"}}
+EXTERNAL_ONLY = {CUDA: {"euhedral-data-structures", "euhedral-gpu", "euhedral-graph", "euhedral-io", "libloading", "thiserror"}}
 # External crates no crate may depend on (glob patterns), with the rule each protects.
 DENIED = {
     "level-zero*": "hardware agnosticism: no Intel iGPU-specific code; integrated-GPU compute goes through a "
@@ -156,6 +160,8 @@ def self_test(meta, texts):
     plant("serde_yaml_ng outside settings", f"may not depend on {YAML}", edge=(EDRL, YAML))
     plant("euhedral-graph outside engine, bench and cuda", "may not depend on ['euhedral-graph']",
           edge=(SETTINGS, "euhedral-graph"))
+    plant("euhedral-memory outside engine, bench and cuda", "may not depend on ['euhedral-memory']",
+          edge=(SETTINGS, "euhedral-memory"))
     plant("an extra external crate in cuda", f"{CUDA} may depend externally only on", edge=(CUDA, "serde_json"))
     plant("a drifted clippy.toml", f"{EDRL}'s clippy.toml differs", text=(EDRL, texts["__canonical__"] + "\n# drift\n"))
     plant("a missing clippy.toml", f"{SETTINGS} has no clippy.toml", text=(SETTINGS, None))

@@ -150,7 +150,7 @@ fn rig() -> Option<Rig> {
         NonZeroUsize::new(2).unwrap(),
         Duration::from_secs(1),
     );
-    let completions = Completions::new(Arc::clone(&pool));
+    let completions = Completions::new(&pool);
     lattice
         .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
         .unwrap();
@@ -1587,7 +1587,7 @@ fn a_completion_edge_after_the_argmax_finds_its_keys_on_the_host() {
         Duration::from_secs(1),
     );
     let lanes = Arc::clone(&rig.typed.queues);
-    let completions = Completions::new(Arc::clone(&lanes));
+    let completions = Completions::new(&lanes);
     lattice
         .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
         .unwrap();

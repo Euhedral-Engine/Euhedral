@@ -679,7 +679,7 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
         open_lane_set(&gpu, compute, ring, chains).map_err(|error| runtime("the lanes would not open", &error))?;
     let lanes = set.queues;
     let lane_table = LaneTable::new(set.typed, Arc::clone(&kernels), Arc::clone(&library));
-    let completions = Completions::new(Arc::clone(&lanes));
+    let completions = Completions::new(&lanes);
     lattice
         .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
         .map_err(|error| runtime("the lattice would not take the file I/O", &format!("{error:?}")))?;

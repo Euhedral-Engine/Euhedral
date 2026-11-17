@@ -25,7 +25,6 @@ mod library;
 mod memory;
 pub mod ops;
 mod pool;
-mod stack;
 
 /// The generated declarations of the C ABI (`cargo xtask bindings` rewrites this file).
 #[rustfmt::skip]

@@ -26,6 +26,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -59,6 +65,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "borrow-or-share"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
+
+[[package]]
+name = "bytemuck"
+version = "1.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a1f896587b6f2c069c73d2f0913e2d590c3990285cd2f0b6aa02b786b4c679c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -242,6 +271,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "derivre"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a4fbc4bbc70b71fbf8f4d9270006e8b238b91c6179f8aad06b6d25589494347"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "bytemuck",
+ "bytemuck_derive",
+ "hashbrown",
+ "regex-syntax",
+ "strum",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -296,7 +340,7 @@ checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 [[package]]
 name = "euhedral-core"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=40fdda43717bb99d26c64fcd119992d0e48fe7db#40fdda43717bb99d26c64fcd119992d0e48fe7db"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bb15d07e8befd09e1446c9e2d638423c88251581#bb15d07e8befd09e1446c9e2d638423c88251581"
 dependencies = [
  "euhedral-data-structures",
  "euhedral-hardware-utils",
@@ -307,7 +351,7 @@ dependencies = [
 [[package]]
 name = "euhedral-data-structures"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=40fdda43717bb99d26c64fcd119992d0e48fe7db#40fdda43717bb99d26c64fcd119992d0e48fe7db"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bb15d07e8befd09e1446c9e2d638423c88251581#bb15d07e8befd09e1446c9e2d638423c88251581"
 dependencies = [
  "loom",
 ]
@@ -315,7 +359,7 @@ dependencies = [
 [[package]]
 name = "euhedral-gpu"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=40fdda43717bb99d26c64fcd119992d0e48fe7db#40fdda43717bb99d26c64fcd119992d0e48fe7db"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bb15d07e8befd09e1446c9e2d638423c88251581#bb15d07e8befd09e1446c9e2d638423c88251581"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -328,7 +372,7 @@ dependencies = [
 [[package]]
 name = "euhedral-graph"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=40fdda43717bb99d26c64fcd119992d0e48fe7db#40fdda43717bb99d26c64fcd119992d0e48fe7db"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bb15d07e8befd09e1446c9e2d638423c88251581#bb15d07e8befd09e1446c9e2d638423c88251581"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -340,7 +384,7 @@ dependencies = [
 [[package]]
 name = "euhedral-hardware-utils"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=40fdda43717bb99d26c64fcd119992d0e48fe7db#40fdda43717bb99d26c64fcd119992d0e48fe7db"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bb15d07e8befd09e1446c9e2d638423c88251581#bb15d07e8befd09e1446c9e2d638423c88251581"
 dependencies = [
  "euhedral-data-structures",
  "libc",
@@ -351,7 +395,31 @@ dependencies = [
 [[package]]
 name = "euhedral-hashing"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=40fdda43717bb99d26c64fcd119992d0e48fe7db#40fdda43717bb99d26c64fcd119992d0e48fe7db"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bb15d07e8befd09e1446c9e2d638423c88251581#bb15d07e8befd09e1446c9e2d638423c88251581"
+
+[[package]]
+name = "euhedral-inference-api-protocol"
+version = "0.1.0"
+dependencies = [
+ "llguidance",
+ "serde_json",
+ "thiserror",
+ "toktrie",
+]
+
+[[package]]
+name = "euhedral-inference-api-server"
+version = "0.1.0"
+dependencies = [
+ "euhedral-core",
+ "euhedral-data-structures",
+ "euhedral-graph",
+ "euhedral-hardware-utils",
+ "euhedral-inference-api-protocol",
+ "euhedral-inference-api-server",
+ "euhedral-io",
+ "euhedral-net",
+]
 
 [[package]]
 name = "euhedral-inference-bench"
@@ -377,6 +445,7 @@ dependencies = [
 name = "euhedral-inference-cuda"
 version = "0.1.0"
 dependencies = [
+ "euhedral-data-structures",
  "euhedral-gpu",
  "euhedral-graph",
  "euhedral-inference-cuda",
@@ -414,6 +483,7 @@ dependencies = [
  "euhedral-inference-settings",
  "euhedral-inference-tokenizer",
  "euhedral-io",
+ "euhedral-memory",
  "log",
  "sha2",
  "tempfile",
@@ -449,7 +519,7 @@ dependencies = [
 [[package]]
 name = "euhedral-io"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=40fdda43717bb99d26c64fcd119992d0e48fe7db#40fdda43717bb99d26c64fcd119992d0e48fe7db"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bb15d07e8befd09e1446c9e2d638423c88251581#bb15d07e8befd09e1446c9e2d638423c88251581"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -461,7 +531,7 @@ dependencies = [
 [[package]]
 name = "euhedral-memory"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=40fdda43717bb99d26c64fcd119992d0e48fe7db#40fdda43717bb99d26c64fcd119992d0e48fe7db"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bb15d07e8befd09e1446c9e2d638423c88251581#bb15d07e8befd09e1446c9e2d638423c88251581"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -469,6 +539,17 @@ dependencies = [
  "euhedral-hashing",
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "euhedral-net"
+version = "0.1.0"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bb15d07e8befd09e1446c9e2d638423c88251581#bb15d07e8befd09e1446c9e2d638423c88251581"
+dependencies = [
+ "euhedral-core",
+ "euhedral-data-structures",
+ "euhedral-graph",
+ "euhedral-io",
 ]
 
 [[package]]
@@ -495,10 +576,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
+name = "fluent-uri"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1918b65d96df47d3591bed19c5cca17e3fa5d0707318e4b5ef2eae01764df7e5"
+dependencies = [
+ "borrow-or-share",
+ "ref-cast",
+ "serde",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "generator"
@@ -552,6 +650,12 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
+name = "heck"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "ident_case"
@@ -633,6 +737,31 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "llguidance"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04ede1356c8ee73a0d29ef573dbeb2123a1667cfc3ebfc7e2c41346a6e92c3c8"
+dependencies = [
+ "anyhow",
+ "derivre",
+ "indexmap",
+ "referencing",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "toktrie",
+]
+
+[[package]]
+name = "lock_api"
+version = "0.4.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
 
 [[package]]
 name = "log"
@@ -744,6 +873,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "parking_lot"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
+dependencies = [
+ "lock_api",
+ "parking_lot_core",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "redox_syscall",
+ "smallvec",
+ "windows-link 0.2.1",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -754,6 +906,12 @@ name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
+name = "percent-encoding"
+version = "2.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pin-project-lite"
@@ -861,6 +1019,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_syscall"
+version = "0.5.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
+name = "ref-cast"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e440fb4e4b4147295338efb76001ab9e4efc0e5839df2c47fc5ac2381d365c3"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
+name = "referencing"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40a64b3a635fad9000648b4d8a59c8710c523ab61a23d392a7d91d47683f5adc"
+dependencies = [
+ "ahash",
+ "fluent-uri",
+ "once_cell",
+ "parking_lot",
+ "percent-encoding",
+ "serde_json",
+]
+
+[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -962,6 +1163,8 @@ version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
+ "foldhash",
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -1043,6 +1246,27 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "strum"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
+dependencies = [
+ "strum_macros",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "syn"
@@ -1147,6 +1371,19 @@ dependencies = [
  "unicode-normalization-alignments",
  "unicode-segmentation",
  "unicode_categories",
+]
+
+[[package]]
+name = "toktrie"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bd80f04d68b86f1a4bf03bd4bed87b31341e74c48035697cded09d797cb1c05"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "bytemuck_derive",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

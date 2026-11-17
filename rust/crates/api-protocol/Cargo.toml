@@ -1,0 +1,18 @@
+[package]
+name = "euhedral-inference-api-protocol"
+version = "0.1.0"
+description = "The request and reply types, errors and text processing of the HTTP API, with no I/O."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+llguidance.workspace = true
+thiserror.workspace = true
+toktrie.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

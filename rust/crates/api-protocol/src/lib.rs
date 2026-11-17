@@ -1,0 +1,30 @@
+//! The HTTP API's protocol: the request and reply types, the errors and the text processing that turn a request into
+//! engine input and an engine result into a reply. The crate does no I/O; the server crate carries the bytes.
+
+pub mod anthropic;
+pub mod chat_mapper;
+pub mod coerce;
+pub mod error;
+pub mod generation;
+pub mod json;
+pub mod messages_mapper;
+pub mod openai;
+pub mod output_grammar;
+pub mod pipeline;
+pub mod reasoning;
+pub mod response_format;
+pub mod responses;
+pub mod responses_mapper;
+mod served_model;
+pub mod template;
+pub mod tool_calling;
+mod tool_definition;
+pub mod tool_results;
+mod wire;
+
+pub use chat_mapper::{ChatRequest, map_chat};
+pub use error::{ApiError, Surface};
+pub use messages_mapper::{map_count_tokens, map_messages};
+pub use responses_mapper::map_responses;
+pub use tool_definition::ToolDefinition;
+pub use wire::ToJson;
