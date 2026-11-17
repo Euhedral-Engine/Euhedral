@@ -188,6 +188,7 @@ impl<T> Drop for Handoff<T> {
     reason = "the tests start threads to race senders, and join them"
 )]
 mod tests {
+    use std::sync::Barrier;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
 
@@ -327,13 +328,17 @@ mod tests {
             let handoff = Handoff::new();
             let sender = Arc::clone(&handoff);
             let released = Arc::clone(&freed);
+            let gate = Arc::new(Barrier::new(2));
+            let arrival_gate = Arc::clone(&gate);
             let arriving = thread::spawn(move || {
+                arrival_gate.wait();
                 sender.deliver(Counted(Arc::clone(&released)), |value| {
                     released.fetch_add(100, Ordering::SeqCst);
                     drop(value);
                 });
             });
             // The abandoning side frees what it gets back.
+            gate.wait();
             let got = handoff.abandon();
             let gave = got.is_some();
             drop(got);

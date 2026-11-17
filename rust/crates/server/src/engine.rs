@@ -51,7 +51,8 @@ pub fn start_engine(settings: &Settings) -> Result<Started, StartError> {
         let missing = EngineStartError::Driver(format!("{} is not there", library.display()));
         return Err(start_error(&missing));
     }
-    let host = start(settings, &library, START_LIMIT).map_err(|error| start_error(&error))?;
+    let host = start(settings, &library, START_LIMIT, Some(settings.server.shutdown_timeout))
+        .map_err(|error| start_error(&error))?;
     Ok(started(host))
 }
 

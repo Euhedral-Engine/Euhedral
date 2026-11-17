@@ -6,7 +6,7 @@
 //! model is ready, or with the error that stopped it. The calling thread waits for the latch and for nothing else.
 
 use std::fmt;
-use std::mem::ManuallyDrop;
+use std::mem::{self, ManuallyDrop};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
@@ -285,24 +285,32 @@ impl RuntimeOwner {
 
 /// Stops an engine within `window`: `close` runs (it waits for the workers, up to the lattice's own timeout), and when
 /// the window is spent by then, `free` does not run and `left` says what stays. A `free` that has begun is not
-/// interrupted: it waits for the device, as the unbounded stop does.
-fn stop_within(
+/// Stops an engine within `window`: `close` runs (it waits for the workers, up to the lattice's own close timeout, which
+/// the start fixed: a `window` shorter than that is not shortened by it, and the free is skipped when the close spent
+/// the window, whatever the two values are). When the window is spent, `keep` (the runtime and the teardown share) is
+/// forgotten and not dropped, because dropping a runtime frees its sequence's buffers, which waits for the device;
+/// the process is ending, and `left` says what stays. A `free` that has begun is not interrupted.
+fn stop_within<T>(
     window: Duration,
-    close: impl FnOnce(),
-    free: impl FnOnce() -> Result<(), EngineError>,
-    left: impl FnOnce() -> String,
+    keep: T,
+    close: impl FnOnce(&T),
+    free: impl FnOnce(T) -> Result<(), EngineError>,
+    left: impl FnOnce(&T) -> String,
 ) -> Result<(), EngineError> {
     let begun = Instant::now();
-    close();
+    close(&keep);
     if begun.elapsed() >= window {
-        return Err(EngineError::Unfinished { window, left: left() });
+        let left = left(&keep);
+        mem::forget(keep);
+        return Err(EngineError::Unfinished { window, left });
     }
-    free()
+    free(keep)
 }
 
-/// Frees a runtime that arrived after its start was abandoned: the arrival carries the release. The lattice is
-/// closed by the abandoning side's owner, so this only frees the device memory, which waits for the device as the
-/// frames of the startup's device lake already do.
+/// Frees a runtime that arrived after its start was abandoned: the arrival carries the release. It runs in the frame
+/// from the completions source that delivers the runtime, not in the stages lake, and the free waits for the device
+/// there. No hop to the stages lake is possible: the abandoning side's owner has closed the lakes. The lattice is
+/// closed by that owner too, so this only frees the device memory.
 pub(crate) fn free_arrival(arrival: Result<Arc<EngineRuntime>, EngineError>) {
     let Ok(runtime) = arrival else { return };
     let core = Arc::clone(&runtime.core);
@@ -329,23 +337,20 @@ impl Teardown {
 impl RuntimeOwner {
     /// [`shutdown`](RuntimeOwner::shutdown) bounded by `window`: it returns once the window is spent, saying what it
     /// did not do (`EngineError::Unfinished`), and the device memory it did not free stays allocated until the
-    /// process exits. The lattice's close is bounded by its own timeout (`server.shutdown-timeout`); when that spends
-    /// the window, the device memory is not freed. A free that has begun is not interrupted.
+    /// process exits (the runtime is forgotten, not dropped, so nothing waits for the device). The lattice's close is
+    /// bounded by the timeout given to [`EngineRuntime::start_with`], else RustEE's default; when it spends the
+    /// window, the device memory is not freed. A free that has begun is not interrupted.
     pub fn shutdown_within(mut self, runtime: Arc<EngineRuntime>, window: Duration) -> Result<(), EngineError> {
         let teardown = self.teardown.take();
-        let bytes = || {
-            teardown
-                .as_ref()
-                .map_or(0, |teardown| teardown.device_bytes.load(Ordering::Acquire))
-        };
         stop_within(
             window,
-            || {
-                if let Some(teardown) = &teardown {
+            (runtime, teardown),
+            |(_, teardown)| {
+                if let Some(teardown) = teardown {
                     teardown.close();
                 }
             },
-            || match Arc::try_unwrap(runtime) {
+            |(runtime, teardown)| match Arc::try_unwrap(runtime) {
                 Ok(runtime) => {
                     runtime.release();
                     if let Some(teardown) = &teardown {
@@ -364,10 +369,12 @@ impl RuntimeOwner {
                     ))
                 }
             },
-            || {
+            |(_, teardown)| {
+                let bytes = teardown
+                    .as_ref()
+                    .map_or(0, |teardown| teardown.device_bytes.load(Ordering::Acquire));
                 format!(
-                    "the lattice was still closing; {} bytes of device memory stay allocated until the process exits",
-                    bytes()
+                    "the lattice was still closing; {bytes} bytes of device memory stay allocated until the process exits"
                 )
             },
         )
@@ -430,8 +437,18 @@ impl EngineRuntime {
     /// until the engine is done (see its contract): it closes the lattice and frees the device memory, on the calling
     /// thread.
     pub fn start(settings: &Settings, library: &Path) -> (RuntimeOwner, ReadyHandoff) {
+        Self::start_with(settings, library, None)
+    }
+
+    /// [`start`](EngineRuntime::start) with the longest the lattice's close waits for the workers: `None` keeps
+    /// RustEE's default. The server sets it from `server.shutdown-timeout`; nothing else does.
+    pub fn start_with(
+        settings: &Settings,
+        library: &Path,
+        close_timeout: Option<Duration>,
+    ) -> (RuntimeOwner, ReadyHandoff) {
         let ready = Handoff::new();
-        match build(settings, library) {
+        match build(settings, library, close_timeout) {
             Ok(core) => {
                 let owner = RuntimeOwner::over(Arc::clone(&core.teardown));
                 startup::run(core, Arc::clone(&ready));
@@ -657,7 +674,6 @@ pub fn fragment_config(settings: &Settings) -> FragmentConfig {
 pub fn lattice_config(settings: &Settings) -> LatticeConfig {
     let cloneable = BaseCloneableObject::new(fragment_config(settings), DefaultExecutor::new());
     let mut config = LatticeConfig::new(Arc::new(cloneable));
-    config.shutdown_timeout = settings.server.shutdown_timeout;
     if let Auto::Value(cpus) = &settings.host.cpus {
         config.allowed_cpus = cpus.ids().map(|cpu| cpu as usize).collect::<CpuSet>();
     }
@@ -733,12 +749,15 @@ pub fn open_lane_set<G: Gpu>(
 }
 
 /// Builds the lattice, the lakes, the lanes and the pools of a startup, on the calling thread.
-fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineError> {
+fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duration>) -> Result<Arc<Core>, EngineError> {
     let started = Instant::now();
     let library = CudaLibrary::load(library_path)?;
     let runtime = |what: &str, error: &dyn fmt::Display| EngineError::Runtime(format!("{what}: {error}"));
 
-    let config = lattice_config(settings);
+    let mut config = lattice_config(settings);
+    if let Some(timeout) = close_timeout {
+        config.shutdown_timeout = timeout;
+    }
     let lattice = ControlPlaneLattice::new(config)
         .map_err(|error| runtime("the lattice would not start", &format!("{error:?}")))?;
 
@@ -808,30 +827,43 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::rc::Rc;
     use std::thread;
 
     use super::*;
+
+    /// A stand-in for the runtime that counts its drops.
+    struct Counted(Rc<Cell<usize>>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
 
     #[test]
     #[allow(
         clippy::disallowed_methods,
         reason = "the test stands for a close that outlasts its window"
     )]
-    fn a_close_that_spends_the_window_skips_the_free_and_says_what_is_left() {
+    fn a_close_that_spends_the_window_skips_the_free_drops_nothing_and_says_what_is_left() {
         let freed = Cell::new(false);
+        let drops = Rc::new(Cell::new(0));
         let window = Duration::from_millis(20);
         let begun = Instant::now();
         let result = stop_within(
             window,
-            || thread::sleep(Duration::from_millis(40)),
-            || {
+            Counted(Rc::clone(&drops)),
+            |_| thread::sleep(Duration::from_millis(40)),
+            |_| {
                 freed.set(true);
                 Ok(())
             },
-            || "7 bytes stay".to_owned(),
+            |_| "7 bytes stay".to_owned(),
         );
         assert!(begun.elapsed() < Duration::from_secs(5));
         assert!(!freed.get());
+        assert_eq!(drops.get(), 0, "the runtime is left undropped");
         match result {
             Err(EngineError::Unfinished { window: reported, left }) => {
                 assert_eq!(reported, window);
@@ -844,16 +876,20 @@ mod tests {
     #[test]
     fn a_close_within_the_window_goes_on_to_free() {
         let freed = Cell::new(false);
+        let drops = Rc::new(Cell::new(0));
         let result = stop_within(
             Duration::from_secs(60),
-            || {},
-            || {
+            Counted(Rc::clone(&drops)),
+            |_| {},
+            |kept| {
                 freed.set(true);
+                drop(kept);
                 Ok(())
             },
-            || unreachable!("nothing is left"),
+            |_| unreachable!("nothing is left"),
         );
         assert!(result.is_ok());
         assert!(freed.get());
+        assert_eq!(drops.get(), 1);
     }
 }

@@ -232,7 +232,7 @@ fn a_greedy_chat_completion_matches_the_engine_and_a_cancel_frees_the_sequence()
         name: "qwen".to_owned(),
     });
     settings.context.max_tokens = 4096;
-    let host = start(&settings, &machine.library, WAIT).expect("the engine starts");
+    let host = start(&settings, &machine.library, WAIT, None).expect("the engine starts");
     let backend = host.backend();
 
     let config = ApiConfig {
