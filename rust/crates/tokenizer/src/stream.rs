@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::error::TokenizerError;
 use crate::lossy::decode_lossy;
 
@@ -14,17 +16,18 @@ pub(crate) enum Piece {
 
 /// Turns generated token IDs into text, holding back an incomplete UTF-8 suffix until the next token completes it.
 ///
-/// Created by [`Tokenizer::decode_stream`](crate::Tokenizer::decode_stream). Everything a token adds is emitted as
+/// Created by [`Tokenizer::decode_stream`](crate::Tokenizer::decode_stream). It shares the vocabulary with the
+/// tokenizer and outlives it, so a listener may own one. Everything a token adds is emitted as
 /// soon as it is complete text; a control token first flushes the held bytes, so an invalid suffix before it becomes
 /// U+FFFD rather than waiting. [`TokenStream::finish`] flushes the rest the same way.
 #[derive(Debug)]
-pub struct TokenStream<'a> {
-    pieces: &'a [Piece],
+pub struct TokenStream {
+    pieces: Arc<[Piece]>,
     pending: Vec<u8>,
 }
 
-impl<'a> TokenStream<'a> {
-    pub(crate) fn new(pieces: &'a [Piece]) -> TokenStream<'a> {
+impl TokenStream {
+    pub(crate) fn new(pieces: Arc<[Piece]>) -> TokenStream {
         TokenStream {
             pieces,
             pending: Vec::new(),
@@ -33,9 +36,10 @@ impl<'a> TokenStream<'a> {
 
     /// Appends one token and returns the complete text it finishes (possibly empty).
     pub fn push(&mut self, id: u32) -> Result<String, TokenizerError> {
+        let pieces = Arc::clone(&self.pieces);
         let piece = usize::try_from(id)
             .ok()
-            .and_then(|index| self.pieces.get(index))
+            .and_then(|index| pieces.get(index))
             .ok_or(TokenizerError::UnknownToken(id))?;
         match piece {
             Piece::Absent => Err(TokenizerError::UnknownToken(id)),
@@ -139,7 +143,7 @@ mod tests {
     }
 
     fn stream_all(pieces: &[Piece], ids: &[u32]) -> String {
-        let mut stream = TokenStream::new(pieces);
+        let mut stream = TokenStream::new(pieces.into());
         let mut text = String::new();
         for id in ids {
             text.push_str(&stream.push(*id).unwrap());
@@ -151,7 +155,7 @@ mod tests {
     #[test]
     fn a_character_split_across_tokens_is_emitted_when_it_completes() {
         let pieces = pieces();
-        let mut stream = TokenStream::new(&pieces);
+        let mut stream = TokenStream::new(pieces.clone().into());
         assert_eq!(stream.push(1).unwrap(), "");
         assert_eq!(stream.push(2).unwrap(), "");
         assert_eq!(stream.push(3).unwrap(), "");
@@ -162,7 +166,7 @@ mod tests {
     #[test]
     fn a_chunk_and_single_tokens_decode_alike() {
         let pieces = pieces();
-        let mut chunked = TokenStream::new(&pieces);
+        let mut chunked = TokenStream::new(pieces.clone().into());
         assert_eq!(chunked.push_all(&[0, 1, 2]).unwrap(), "A");
         assert_eq!(chunked.push_all(&[3, 4, 7, 8]).unwrap(), "😀€");
         assert_eq!(chunked.finish(), "");
@@ -175,7 +179,7 @@ mod tests {
         assert_eq!(stream_all(&pieces, &[1]), "\u{fffd}");
         assert_eq!(stream_all(&pieces, &[1, 0]), "\u{fffd}A");
         assert_eq!(stream_all(&pieces, &[1, 5]), "\u{fffd}<|im_end|>");
-        let mut stream = TokenStream::new(&pieces);
+        let mut stream = TokenStream::new(pieces.clone().into());
         assert_eq!(stream.push(1).unwrap(), "");
         assert_eq!(stream.push(5).unwrap(), "\u{fffd}<|im_end|>");
         assert_eq!(stream.finish(), "");
@@ -184,7 +188,7 @@ mod tests {
     #[test]
     fn a_continuation_byte_with_no_start_is_replaced_at_once() {
         let pieces = pieces();
-        let mut stream = TokenStream::new(&pieces);
+        let mut stream = TokenStream::new(pieces.clone().into());
         assert_eq!(stream.push(4).unwrap(), "\u{fffd}");
         assert_eq!(stream.push(0).unwrap(), "A");
     }
@@ -201,7 +205,7 @@ mod tests {
     #[test]
     fn unknown_and_unused_ids_are_refused() {
         let pieces = pieces();
-        let mut stream = TokenStream::new(&pieces);
+        let mut stream = TokenStream::new(pieces.clone().into());
         assert!(matches!(stream.push(6), Err(TokenizerError::UnknownToken(6))));
         assert!(matches!(stream.push(99), Err(TokenizerError::UnknownToken(99))));
     }
