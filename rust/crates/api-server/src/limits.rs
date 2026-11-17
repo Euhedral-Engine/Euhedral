@@ -51,6 +51,9 @@ pub struct Limits {
     /// How long a stop lets the requests in flight (the waiting ones included) finish before admission refuses the
     /// waiting ones and interrupts the running ones.
     pub drain_limit: Duration,
+    /// The most bytes of a streamed reply's events held while a piece is being written. A client that does not read
+    /// lets them pile up; past this the generation is cancelled and the stream is cut.
+    pub max_held_bytes: usize,
 }
 
 impl Default for Limits {
@@ -69,6 +72,7 @@ impl Default for Limits {
             request_limit: Duration::from_secs(30 * 60),
             shutdown_limit: Duration::from_secs(30),
             drain_limit: Duration::from_secs(30),
+            max_held_bytes: 1024 * 1024,
         }
     }
 }

@@ -123,7 +123,8 @@ pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Resul
             return Err(io::Error::new(io::ErrorKind::InvalidInput, error));
         }
     };
-    let answerer = Answerer::new(config.backend.clone(), metrics.clone(), admission.clone(), sink.clone());
+    let answerer = Answerer::new(config.backend.clone(), metrics.clone(), admission.clone(), sink.clone())
+        .with_held_limit(config.limits.max_held_bytes);
     let router = Router::new(
         config.backend,
         config.created_at,

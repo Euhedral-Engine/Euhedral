@@ -12,18 +12,21 @@
 //! when the start reports. An answer is sent once: the first of the early answers (the client left, the time limit
 //! passed, the shutdown limit passed) or the answer of the finished generation.
 
+use std::mem::{replace, take};
 use std::sync::Arc;
 use std::time::Instant;
 
 use euhedral_core::frames::Frame;
 use euhedral_inference_api_protocol::ApiError;
+use euhedral_inference_api_protocol::json::JsonValue;
 use euhedral_inference_api_protocol::pipeline::Piece;
-use euhedral_net::Responder;
+use euhedral_net::{PieceSent, ReplyStream, Responder, Response, StreamError};
 
 use super::Conclusion;
 use super::Timing;
 use super::Verdict;
 use super::reply::Completed;
+use super::stream::{Encoder, head};
 use crate::admission::{Handle, Interruption, Slot};
 use crate::backend::{BackendError, Generation, GenerationResult};
 use crate::metrics::{FinishReason, Outcome};
@@ -51,6 +54,52 @@ pub(super) enum Command {
     Interrupt(Interruption),
     /// The client went away.
     ClientGone,
+    /// Text the pipeline settled while the generation runs (a streamed request only).
+    Text(Batch),
+    /// A prefill quantum retired (a streamed request only).
+    Prefilled,
+    /// The head of the stream was written, or could not be.
+    Head(Result<ReplyStream, StreamError>),
+    /// A piece of the stream was written, or the stream failed.
+    Sent(Result<PieceSent, StreamError>),
+}
+
+/// The pieces one call of the listener settled. The first batch of a stream says how many prompt tokens the prefix
+/// cache restored.
+pub(super) struct Batch {
+    pub(super) pieces: Vec<Piece>,
+    pub(super) cached: Option<usize>,
+}
+
+/// Where the body of a streamed reply is.
+enum Wire {
+    /// The head was not sent: an answer is still a whole reply.
+    Unsent,
+    /// The head is being written.
+    Opening,
+    /// Nothing is being written.
+    Idle(ReplyStream),
+    /// A piece is being written.
+    Writing,
+    /// Ended, cut or failed.
+    Over,
+}
+
+/// The state of a streamed reply. The events are held in `held` and written in order, one piece at a time: the write
+/// that returns starts the next.
+struct Streaming {
+    encoder: Encoder,
+    wire: Wire,
+    held: Vec<u8>,
+    /// The buffer of the last write, empty, for the next one.
+    spare: Vec<u8>,
+    /// Nothing more is appended; the body ends once the held events are written.
+    terminal: bool,
+    /// The body is cut where it is: the client is gone or does not read.
+    cut: bool,
+    quanta: usize,
+    /// The most bytes held while a write is in flight.
+    max_held: usize,
 }
 
 /// What the text pipeline settled when the generation ended: made by the listener, which is where the text is read, so
@@ -88,6 +137,12 @@ pub(super) enum Effect {
     Withdraw(Handle),
     CancelGeneration(Arc<dyn Generation>),
     Conclude(Conclusion),
+    /// Write the head of the stream.
+    OpenStream(Responder, Response),
+    /// Write a piece.
+    Write(ReplyStream, Vec<u8>),
+    /// End the body.
+    End(ReplyStream),
 }
 
 /// The outcome a refusal of admission is recorded with.
@@ -127,6 +182,7 @@ pub(super) struct Owner {
     pub(super) fault: Fault,
     timing: Timing,
     epoch: Instant,
+    streaming: Option<Streaming>,
 }
 
 impl Owner {
@@ -156,7 +212,27 @@ impl Owner {
                 first_token_ns: 0,
             },
             epoch,
+            streaming: None,
         }
+    }
+
+    /// Makes the reply a stream of `encoder`'s events, holding at most `max_held` bytes while a write is in flight.
+    pub(super) fn stream(&mut self, encoder: Encoder, max_held: usize) {
+        self.streaming = Some(Streaming {
+            encoder,
+            wire: Wire::Unsent,
+            held: Vec::new(),
+            spare: Vec::new(),
+            terminal: false,
+            cut: false,
+            quanta: 0,
+            max_held,
+        });
+    }
+
+    /// The head of the stream was handed to the transport.
+    fn head_sent(&self) -> bool {
+        self.streaming.as_ref().is_some_and(|s| !matches!(s.wire, Wire::Unsent))
     }
 
     /// Asks the transport to run `frame` if the client goes away before the answer is sent.
@@ -174,6 +250,11 @@ impl Owner {
 
     pub(super) fn turn(&mut self, effects: &mut Vec<Effect>) {
         while let Some(command) = self.inbox.poll() {
+            // The wire outlives the request: what was held is written after the generation ended.
+            if matches!(command, Command::Head(_) | Command::Sent(_)) {
+                self.wire_event(command, effects);
+                continue;
+            }
             if self.over {
                 continue;
             }
@@ -194,7 +275,148 @@ impl Owner {
                 Command::Refused(error) => self.refused(error, effects),
                 Command::Interrupt(why) => self.interrupted(why, effects),
                 Command::ClientGone => self.gone(effects),
+                Command::Text(batch) => self.settled_text(batch),
+                Command::Prefilled => self.prefilled(),
+                Command::Head(_) | Command::Sent(_) => {}
             }
+        }
+        self.pump(effects);
+    }
+
+    /// The head or a piece was written, or the stream failed.
+    fn wire_event(&mut self, command: Command, effects: &mut Vec<Effect>) {
+        let Some(s) = &mut self.streaming else {
+            return;
+        };
+        let lost = match command {
+            Command::Head(Ok(stream)) => {
+                s.wire = Wire::Idle(stream);
+                false
+            }
+            Command::Sent(Ok(sent)) => {
+                s.spare = sent.piece;
+                s.wire = Wire::Idle(sent.stream);
+                false
+            }
+            _ => {
+                s.wire = Wire::Over;
+                true
+            }
+        };
+        if lost {
+            // The client cannot be written to: what is held goes nowhere, and the generation is not wanted.
+            self.gone(effects);
+        }
+    }
+
+    /// Settled text of a streamed reply becomes events.
+    fn settled_text(&mut self, batch: Batch) {
+        if self.answered {
+            return;
+        }
+        let Some(s) = &mut self.streaming else {
+            return;
+        };
+        if s.terminal || matches!(s.wire, Wire::Unsent) {
+            return;
+        }
+        if let Some(cached) = batch.cached {
+            s.encoder.start(cached, &mut s.held);
+        }
+        for piece in &batch.pieces {
+            s.encoder.piece(piece, &mut s.held);
+        }
+    }
+
+    /// A prefill quantum retired: after the first, and until something else is written, the stream says it is alive.
+    fn prefilled(&mut self) {
+        if self.answered {
+            return;
+        }
+        let Some(s) = &mut self.streaming else {
+            return;
+        };
+        let seen = s.quanta;
+        s.quanta += 1;
+        if seen > 0 && !s.terminal && !s.encoder.started() && !matches!(s.wire, Wire::Unsent) {
+            s.encoder.keep_alive(&mut s.held);
+        }
+    }
+
+    /// The client is gone: the body goes no further.
+    fn cut_stream(&mut self) {
+        if let Some(s) = &mut self.streaming {
+            s.cut = true;
+            s.terminal = true;
+            s.held.clear();
+        }
+    }
+
+    /// Writes the held events if the wire is free, ends the body when all is written, and cancels the generation of a
+    /// client that does not read.
+    fn pump(&mut self, effects: &mut Vec<Effect>) {
+        let Some(s) = &mut self.streaming else {
+            return;
+        };
+        let mut slow = false;
+        match replace(&mut s.wire, Wire::Over) {
+            Wire::Idle(stream) => {
+                if s.cut {
+                    drop(stream);
+                } else if !s.held.is_empty() {
+                    let bytes = replace(&mut s.held, take(&mut s.spare));
+                    s.wire = Wire::Writing;
+                    effects.push(Effect::Write(stream, bytes));
+                } else if s.terminal {
+                    effects.push(Effect::End(stream));
+                } else {
+                    s.wire = Wire::Idle(stream);
+                }
+            }
+            wire @ (Wire::Opening | Wire::Writing) => {
+                slow = !s.cut && s.held.len() > s.max_held;
+                s.wire = wire;
+            }
+            wire @ (Wire::Unsent | Wire::Over) => s.wire = wire,
+        }
+        if slow {
+            self.cut_stream();
+            self.cancel(effects);
+            self.answer_early(
+                ApiError::client_closed(),
+                Outcome::Cancelled,
+                Some("the client does not read: the held events passed the limit".to_owned()),
+                None,
+                effects,
+            );
+        }
+    }
+
+    /// Hands the head to the transport once the generation is open.
+    fn open_stream(&mut self, effects: &mut Vec<Effect>) {
+        if self.answered {
+            return;
+        }
+        let Some(s) = &mut self.streaming else {
+            return;
+        };
+        if !matches!(s.wire, Wire::Unsent) {
+            return;
+        }
+        if let Some(responder) = self.responder.take() {
+            s.wire = Wire::Opening;
+            effects.push(Effect::OpenStream(responder, head()));
+        }
+    }
+
+    /// Appends the in-stream error of a failure after the head, unless the body was cut.
+    fn stream_error(&mut self, error: &ApiError) {
+        if let Some(s) = &mut self.streaming
+            && !matches!(s.wire, Wire::Unsent)
+            && !s.terminal
+        {
+            s.encoder.error(error, &mut s.held);
+            s.terminal = true;
         }
     }
 
@@ -234,6 +456,11 @@ impl Owner {
     /// ended already, hands it and the slot to the conclusion. From now on [`salvaging`](Owner::salvaging) takes the
     /// commands.
     pub(super) fn salvage(&mut self, effects: &mut Vec<Effect>) {
+        self.salvage_turn(effects);
+        self.pump(effects);
+    }
+
+    fn salvage_turn(&mut self, effects: &mut Vec<Effect>) {
         self.broken = true;
         if self.over {
             return;
@@ -253,7 +480,7 @@ impl Owner {
             }
         }
         // The slot stays with the generation: it is released when the generation has ended and is closed.
-        self.answer_early(ApiError::server_error(), Outcome::Failed, None, effects);
+        self.answer_early(ApiError::server_error(), Outcome::Failed, None, None, effects);
     }
 
     /// What a broken owner does with a command: only what frees the generation and the slot.
@@ -290,7 +517,7 @@ impl Owner {
                 self.apply_cancel(effects);
             }
             Command::Handle(handle) => self.named(handle, effects),
-            Command::Refused(_) => {}
+            Command::Refused(_) | Command::Text(_) | Command::Prefilled | Command::Head(_) | Command::Sent(_) => {}
         }
     }
 
@@ -300,6 +527,7 @@ impl Owner {
             Verdict::Silent
         } else {
             self.answered = true;
+            self.stream_error(&ApiError::server_error());
             Verdict::Error {
                 error: ApiError::server_error(),
                 outcome: Outcome::Failed,
@@ -325,18 +553,22 @@ impl Owner {
     }
 
     /// Sends `error` as the answer, unless an answer went out.
-    fn answer_early(&mut self, error: ApiError, outcome: Outcome, slot: Option<Slot>, effects: &mut Vec<Effect>) {
+    fn answer_early(
+        &mut self,
+        error: ApiError,
+        outcome: Outcome,
+        log: Option<String>,
+        slot: Option<Slot>,
+        effects: &mut Vec<Effect>,
+    ) {
         if self.answered {
             return drop(slot);
         }
         self.answered = true;
+        self.stream_error(&error);
         effects.push(Effect::Conclude(Conclusion {
             responder: self.responder.take(),
-            verdict: Verdict::Error {
-                error,
-                outcome,
-                log: None,
-            },
+            verdict: Verdict::Error { error, outcome, log },
             generation: None,
             slot,
             timing: self.timing,
@@ -369,17 +601,18 @@ impl Owner {
                     drop(slot);
                 } else {
                     self.slot = Some(slot);
+                    self.open_stream(effects);
                 }
             }
             Opened::Failed(error) => {
                 let (error, outcome) = open_failure(&error);
-                self.answer_early(error, outcome, Some(slot), effects);
+                self.answer_early(error, outcome, None, Some(slot), effects);
                 // The slot of an answered request goes with the answer; one that was answered earlier is freed now.
                 self.over = true;
             }
             Opened::Skipped => {
                 if self.shutdown {
-                    self.answer_early(ApiError::shutting_down(), Outcome::Rejected, Some(slot), effects);
+                    self.answer_early(ApiError::shutting_down(), Outcome::Rejected, None, Some(slot), effects);
                 } else {
                     drop(slot);
                 }
@@ -390,14 +623,15 @@ impl Owner {
 
     fn refused(&mut self, error: ApiError, effects: &mut Vec<Effect>) {
         let outcome = outcome_of(&error);
-        self.answer_early(error, outcome, None, effects);
+        self.answer_early(error, outcome, None, None, effects);
         self.over = true;
     }
 
     fn gone(&mut self, effects: &mut Vec<Effect>) {
         // The generation may be opened or be opening while the client leaves: it is cancelled once launched, always.
         self.cancel(effects);
-        self.answer_early(ApiError::client_closed(), Outcome::Cancelled, None, effects);
+        self.cut_stream();
+        self.answer_early(ApiError::client_closed(), Outcome::Cancelled, None, None, effects);
         if !self.started {
             if let Some(handle) = self.handle.take() {
                 effects.push(Effect::Withdraw(handle));
@@ -412,7 +646,7 @@ impl Owner {
             Interruption::Cancelled => self.gone(effects),
             Interruption::TimedOut => {
                 self.cancel(effects);
-                self.answer_early(ApiError::timeout(), Outcome::Cancelled, None, effects);
+                self.answer_early(ApiError::timeout(), Outcome::Cancelled, None, None, effects);
             }
             Interruption::Shutdown => {
                 self.shutdown = true;
@@ -422,7 +656,13 @@ impl Owner {
                 self.abandoned = true;
                 self.cancel(effects);
                 let slot = self.slot.take();
-                self.answer_early(ApiError::interrupted_by_shutdown(), Outcome::Rejected, slot, effects);
+                self.answer_early(
+                    ApiError::interrupted_by_shutdown(),
+                    Outcome::Rejected,
+                    None,
+                    slot,
+                    effects,
+                );
             }
         }
     }
@@ -440,6 +680,16 @@ impl Owner {
         } else {
             let verdict = self.verdict(ending);
             self.answered = true;
+            match &verdict {
+                Verdict::Error { error, .. } => self.stream_error(error),
+                _ => {
+                    if let Some(s) = &mut self.streaming
+                        && !matches!(s.wire, Wire::Unsent)
+                    {
+                        s.terminal = true;
+                    }
+                }
+            }
             verdict
         };
         effects.push(Effect::Conclude(Conclusion {
@@ -480,15 +730,56 @@ impl Owner {
             };
         }
         match ending.settled {
+            Some(Ok(settled)) if self.head_sent() => self.streamed(settled, result),
             Some(Ok(settled)) => Verdict::Answer(Completed {
                 parts: settled.parts,
                 reason: settled.reason,
                 stop_sequence: settled.stop_sequence,
                 result,
+                streamed_calls: 0,
             }),
             Some(Err(message)) => failed(ApiError::invalid_tool_call(&message), None),
             None => failed(ApiError::server_error(), Some("the text was not settled".to_owned())),
         }
+    }
+}
+
+impl Owner {
+    /// The last events of a streamed answer: the final flush of the pipeline and the finish, or the error of a
+    /// structured answer that is not one JSON document.
+    fn streamed(&mut self, settled: Settled, result: GenerationResult) -> Verdict {
+        let Some(s) = &mut self.streaming else {
+            return Verdict::Silent;
+        };
+        if s.cut {
+            return Verdict::Silent;
+        }
+        s.encoder.start(result.cached_prompt_tokens, &mut s.held);
+        for piece in &settled.parts {
+            s.encoder.piece(piece, &mut s.held);
+        }
+        if result.stop_token_reached
+            && s.encoder.calls() == 0
+            && let Some(answer) = s.encoder.answer()
+            && !answer.trim().is_empty()
+            && JsonValue::parse_distinct(answer).is_none()
+        {
+            return Verdict::Error {
+                error: ApiError::invalid_structured_output(),
+                outcome: Outcome::Failed,
+                log: None,
+            };
+        }
+        s.encoder
+            .finish(settled.reason, settled.stop_sequence.as_deref(), &result, &mut s.held);
+        let calls = s.encoder.calls();
+        Verdict::Streamed(Completed {
+            parts: Vec::new(),
+            reason: settled.reason,
+            stop_sequence: settled.stop_sequence,
+            result,
+            streamed_calls: calls,
+        })
     }
 }
 

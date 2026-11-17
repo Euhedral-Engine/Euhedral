@@ -14,6 +14,7 @@
 
 mod owner;
 mod reply;
+mod stream;
 
 use std::fmt::{self, Debug, Formatter};
 use std::mem::take;
@@ -28,16 +29,18 @@ use euhedral_data_structures::queues::{MpscQueue, Multi, Producer};
 use euhedral_data_structures::sync::ClaimCell;
 use euhedral_inference_api_protocol::pipeline::{Piece, PipelineError, PipelineOptions, TextPipeline};
 use euhedral_inference_api_protocol::{ApiError, Surface};
-use euhedral_net::Responder;
+use euhedral_net::{Responder, no_work};
 use log::{error, info, warn};
 
 #[cfg(feature = "test-support")]
 use self::owner::Fault;
-use self::owner::{Command, Effect, Ending, Opened, Owner, Settled};
+use self::owner::{Batch, Command, Effect, Ending, Opened, Owner, Settled};
 use self::reply::{Completed, body};
+use self::stream::Encoder;
 use crate::admission::{Admission, Counts, Entry, Interruption, Slot};
 use crate::backend::{Backend, BackendError, Generation, GenerationResult, TextListener};
 use crate::frames::{once, once_or_refused};
+use crate::limits::Limits;
 use crate::metrics::{Api, ConstraintFailure, FinishReason, Generation as Finished, Metrics, Outcome};
 use crate::planning::{Endpoint, Planned};
 use crate::router::{error_response, json};
@@ -68,6 +71,8 @@ pub(crate) enum Verdict {
         /// For the log only.
         log: Option<String>,
     },
+    /// The answer went out as a stream; what is left is to record it.
+    Streamed(Completed),
     /// The answer was sent already.
     Silent,
 }
@@ -202,6 +207,35 @@ impl Shared {
                 let shared = self.clone();
                 self.publish(once_or_refused(move |_| conclusion.run(&shared)));
             }
+            Effect::OpenStream(responder, head) => {
+                let shared = self.clone();
+                responder.stream(
+                    head,
+                    Box::new(move |opened| {
+                        let opened = opened.inspect(|stream| {
+                            let gone = Arc::downgrade(&shared);
+                            stream.on_cancel(once(move || {
+                                if let Some(shared) = gone.upgrade() {
+                                    shared.client_gone();
+                                }
+                            }));
+                        });
+                        shared.post(Command::Head(opened));
+                        no_work()
+                    }),
+                );
+            }
+            Effect::Write(stream, bytes) => {
+                let shared = self.clone();
+                stream.send(
+                    bytes,
+                    Box::new(move |sent| {
+                        shared.post(Command::Sent(sent));
+                        no_work()
+                    }),
+                );
+            }
+            Effect::End(stream) => stream.end(),
         }
     }
 
@@ -248,6 +282,8 @@ impl Entry for Shared {
             first_token_ns: 0,
             panicked: false,
             done: false,
+            stream: self.planned.request.stream,
+            announced: false,
         });
         // A panic drops the listener, which reports the end.
         let launched = catch_unwind(AssertUnwindSafe(|| {
@@ -315,6 +351,10 @@ struct Listener {
     panicked: bool,
     /// `finished` was called.
     done: bool,
+    /// The reply is a stream: what the pipeline settles is handed to the owner as it comes.
+    stream: bool,
+    /// The first text was handed over, with the prompt tokens the prefix cache restored.
+    announced: bool,
 }
 
 impl Listener {
@@ -334,6 +374,20 @@ impl Listener {
                 self.parts.extend(emitted);
                 self.failure = Some(message);
             }
+        }
+    }
+
+    /// Hands the owner what the pipeline settled so far.
+    fn hand_over(&mut self) {
+        let cached = (!self.announced).then(|| {
+            self.announced = true;
+            self.generation
+                .as_ref()
+                .map_or(0, |generation| generation.cached_prompt_tokens())
+        });
+        let pieces = take(&mut self.parts);
+        if cached.is_some() || !pieces.is_empty() {
+            self.shared.post(Command::Text(Batch { pieces, cached }));
         }
     }
 
@@ -408,8 +462,17 @@ impl TextListener for Listener {
             error!(target: "euhedral.requests", "{} {}: the text pipeline panicked", self.shared.api.label(), self.shared.planned.id);
             self.panicked = true;
         }
+        if self.stream {
+            self.hand_over();
+        }
         if self.panicked || self.failure.is_some() || self.pipeline.ended() {
             self.cancel();
+        }
+    }
+
+    fn prefilled(&mut self) {
+        if self.stream && !self.done {
+            self.shared.post(Command::Prefilled);
         }
     }
 
@@ -449,6 +512,7 @@ impl Conclusion {
         let surface = shared.surface;
         let (response, completed) = match verdict {
             Verdict::Silent => (None, None),
+            Verdict::Streamed(done) => (None, Some(Record::Answered(done))),
             Verdict::Error { error, outcome, log } => (
                 Some(error_response(&error, surface)),
                 Some(Record::Failed(error, outcome, log)),
@@ -566,7 +630,7 @@ impl Shared {
     }
 }
 
-/// Answers planned requests: admits them, runs their generations and sends one JSON reply each. Cheap to clone.
+/// Answers planned requests: admits them, runs their generations and sends one JSON reply or one event stream each. Cheap to clone.
 #[derive(Clone)]
 pub struct Answerer {
     backend: Arc<dyn Backend>,
@@ -574,6 +638,7 @@ pub struct Answerer {
     admission: Admission,
     sink: Arc<QueueIngestSink>,
     epoch: Instant,
+    held_limit: usize,
 }
 
 impl Debug for Answerer {
@@ -599,7 +664,15 @@ impl Answerer {
             admission,
             sink,
             epoch: Instant::now(),
+            held_limit: Limits::default().max_held_bytes,
         }
+    }
+
+    /// The most bytes of a streamed reply that are held while a write is in flight; past it the generation is
+    /// cancelled and the stream cut.
+    pub fn with_held_limit(mut self, bytes: usize) -> Answerer {
+        self.held_limit = bytes;
+        self
     }
 
     /// How many generations run and wait.
@@ -621,7 +694,7 @@ impl Answerer {
         }
     }
 
-    /// Takes a planned request that is not streamed to its answer: it is offered to the admission at `arrived` (the
+    /// Takes a planned request to its answer, a whole reply or a stream: it is offered to the admission at `arrived` (the
     /// request limit counts from there) and `reply` is answered when it ends, or never if the client is gone. Returns
     /// at once.
     pub fn answer(&self, planned: Planned, reply: Responder, surface: Surface, arrived: Instant) {
@@ -662,6 +735,9 @@ impl Answerer {
                 claim.fault = fault;
             }
             let gone = Arc::downgrade(&shared);
+            if shared.planned.request.stream {
+                claim.stream(Encoder::new(&shared.planned, self.backend.model_id()), self.held_limit);
+            }
             claim.watch(once(move || {
                 if let Some(shared) = gone.upgrade() {
                     shared.client_gone();

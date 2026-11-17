@@ -368,9 +368,6 @@ impl Router {
                     endpoint,
                     request.body,
                     Box::new(move |planned| match planned {
-                        Ok(planned) if planned.request.stream => {
-                            reply.send(error_response(&not_implemented(), surface));
-                        }
                         Ok(planned) => answerer.answer(planned, reply, surface, arrived),
                         Err(error) => {
                             answerer.planning_failed(endpoint, &error);
@@ -448,17 +445,6 @@ impl Router {
             return Err(ApiError::engine_unavailable("inference engine is shutting down"));
         }
         Ok(())
-    }
-}
-
-/// The reply of a streamed generating request until streaming lands.
-fn not_implemented() -> ApiError {
-    ApiError {
-        status: 501,
-        kind: "server_error",
-        code: Some("not_implemented"),
-        param: None,
-        message: "This route is not implemented yet.".to_owned(),
     }
 }
 
