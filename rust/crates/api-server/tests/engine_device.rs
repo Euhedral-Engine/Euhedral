@@ -394,5 +394,5 @@ fn a_greedy_chat_completion_matches_the_engine_and_a_cancel_frees_the_sequence()
     rx.recv_timeout(Duration::from_secs(30)).expect("the server stopped");
     server.release();
     sink.complete_gracefully();
-    host.shutdown().expect("the engine stops");
+    host.shutdown(Duration::from_secs(30)).expect("the engine stops");
 }

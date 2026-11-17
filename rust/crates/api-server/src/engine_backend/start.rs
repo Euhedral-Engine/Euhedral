@@ -58,21 +58,14 @@ impl Error for StartError {}
 
 impl From<EngineError> for StartError {
     fn from(error: EngineError) -> StartError {
-        match error {
-            // Only the library and its driver failing to load are the driver probe's; any other call failing is the
-            // engine's. The engine does not export the library's error type and this crate may not depend on it, so
-            // the variant is read from its derived `Debug` name.
-            EngineError::Cuda(error) if loads_nothing(&format!("{error:?}")) => StartError::Driver(error.to_string()),
-            other => StartError::Engine(other.to_string()),
+        // Only nothing loading (the library, its runtime or the driver) is the driver probe's; any other call failing
+        // is the engine's.
+        if error.loads_nothing() {
+            StartError::Driver(error.to_string())
+        } else {
+            StartError::Engine(error.to_string())
         }
     }
-}
-
-/// Whether a CUDA error, in its `Debug` form, is the library or its runtime not loading.
-fn loads_nothing(debug: &str) -> bool {
-    ["LibraryMissing", "RuntimeMissing", "Load"]
-        .iter()
-        .any(|variant| debug.starts_with(variant) && !debug[variant.len()..].starts_with(|c: char| c.is_alphanumeric()))
 }
 
 /// The engine behind the traits: the runtime, held weakly so that [`EngineHost::shutdown`] holds the last handle.
@@ -234,12 +227,11 @@ impl EngineStarting {
             Ok(loaded) => self.host(loaded),
             Err(_) => {
                 let error = StartError::Engine(format!("the engine was not ready within {} s", limit.as_secs()));
-                // It may have finished just now; what is loaded is freed through the owner. Else the owner's drop
+                // It may have finished just now: what is loaded is freed through the owner. Otherwise the start is
+                // marked abandoned, so that a runtime arriving later is freed by its arrival, and the owner's drop
                 // closes the lattice.
-                match self.ready.take() {
-                    Some(Ok(runtime)) => {
-                        self.stop(runtime);
-                    }
+                match self.ready.abandon() {
+                    Some(Ok(runtime)) => self.stop(runtime),
                     Some(Err(_)) | None => drop(self.owner),
                 }
                 Err(error)
@@ -315,11 +307,14 @@ impl EngineHost {
         self.runtime.lattice()
     }
 
-    /// Stops the engine: the backend admits nothing more, then the lattice closes and the device memory is freed. Call
-    /// it on the thread that started the engine, after the server has stopped and no generation runs.
-    pub fn shutdown(self) -> Result<(), StartError> {
+    /// Stops the engine within `window`: the backend admits nothing more, then the lattice closes and the device
+    /// memory is freed. What it could not finish in the window is reported (and not waited for): the error says what
+    /// stays. Call it on the thread that started the engine, after the server has stopped and no generation runs.
+    pub fn shutdown(self, window: Duration) -> Result<(), StartError> {
         self.backend.close();
-        self.owner.shutdown(self.runtime).map_err(StartError::from)
+        self.owner
+            .shutdown_within(self.runtime, window)
+            .map_err(StartError::from)
     }
 }
 
@@ -333,12 +328,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_library_that_does_not_load_is_the_driver_probe() {
-        assert!(loads_nothing(r#"LibraryMissing("x.so")"#));
-        assert!(loads_nothing("RuntimeMissing { library: \"x\", missing: [] }"));
-        assert!(loads_nothing("Load { path: \"x\" }"));
-        assert!(!loads_nothing(r#"Call { call: "cudaMalloc", status: 2 }"#));
-        assert!(!loads_nothing("LoadedElsewhere"));
+    fn an_error_that_is_not_nothing_loading_is_the_engines() {
+        // The three load errors and another call failing are classified by the engine's `loads_nothing`, whose tests
+        // build the CUDA errors; this crate may not.
+        let error = StartError::from(EngineError::Runtime("no lattice".to_owned()));
+        assert_eq!(error, StartError::Engine("no lattice".to_owned()));
     }
 
     #[test]

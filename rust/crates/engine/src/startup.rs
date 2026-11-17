@@ -43,7 +43,7 @@ use crate::model::{
 use crate::residency::budget::{self, HostBudget};
 use crate::residency::loader::{self, LoadOutcome, Ring};
 use crate::residency::planner::{Placement, PlanInputs, ResidencyPlan, plan_with};
-use crate::runtime::{Core, EngineRuntime, ReadyHandoff, StartupReport, Units, raw_file};
+use crate::runtime::{Core, EngineRuntime, ReadyHandoff, StartupReport, Units, free_arrival, raw_file};
 use crate::state::SequenceState;
 use crate::warmup;
 use crate::workspace::{Workspace, input_records};
@@ -151,7 +151,8 @@ impl Startup {
             .device_bytes
             .store(runtime.report().allocated_bytes, Ordering::Release);
         if let Some(ready) = self.ready.take() {
-            ready.send(Ok(Arc::new(runtime)));
+            // A start abandoned by now has no taker: the arrival frees the runtime itself.
+            ready.deliver(Ok(Arc::new(runtime)), free_arrival);
         }
     }
 

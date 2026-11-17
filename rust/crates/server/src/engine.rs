@@ -59,8 +59,9 @@ fn started(host: EngineHost) -> Started {
     Started {
         lattice: host.lattice().clone(),
         backend: host.backend(),
-        // The engine's shutdown closes the backend, then the lattice, and returns when the device memory is freed.
-        shutdown: Box::new(move |_window| host.shutdown().map_err(|error| error.to_string())),
+        // The engine's shutdown closes the backend, then the lattice, and returns when the device memory is freed or
+        // `server.shutdown-timeout` is spent, saying what it left.
+        shutdown: Box::new(move |window| host.shutdown(window).map_err(|error| error.to_string())),
     }
 }
 

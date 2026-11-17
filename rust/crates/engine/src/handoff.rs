@@ -31,7 +31,13 @@ impl fmt::Display for TimedOut {
 
 impl Error for TimedOut {}
 
-/// A cell that takes one value from any thread and gives it to one.
+/// The mark of an abandoned hand-off: the address of this static is stored where a value's box would be. It is never
+/// read through.
+static ABANDONED: u8 = 0;
+
+/// A cell that takes one value from any thread and gives it to one. The taker may give up first
+/// ([`abandon`](Handoff::abandon)): a value that arrives after that goes to the sender's own release, never into the
+/// cell.
 pub struct Handoff<T> {
     value: AtomicPtr<T>,
     /// The cell owns a `T` that crosses threads: `Send` only when `T` is.
@@ -49,6 +55,10 @@ impl<T> fmt::Debug for Handoff<T> {
 }
 
 impl<T> Handoff<T> {
+    fn abandoned_mark() -> *mut T {
+        ptr::from_ref(&ABANDONED).cast_mut().cast::<T>()
+    }
+
     /// An empty hand-off, to share between the sending end and the waiting end.
     pub fn new() -> Arc<Handoff<T>> {
         Arc::new(Handoff::empty())
@@ -65,29 +75,77 @@ impl<T> Handoff<T> {
     /// Hands `value` over. Only the first send counts: a later value is dropped (and a debug build panics, since two
     /// senders mean a holder sent without checking that it had not).
     pub fn send(&self, value: T) {
+        self.deliver(value, drop);
+    }
+
+    /// Hands `value` over like [`send`](Handoff::send), unless the taker has abandoned the hand-off: then `release`
+    /// gets the value, on this thread and at once, because nobody will take it. Either the taker or `release` ends up
+    /// with a value, never both and never neither.
+    pub fn deliver(&self, value: T, release: impl FnOnce(T)) {
         let new = Box::into_raw(Box::new(value));
-        if self
+        match self
             .value
             .compare_exchange(ptr::null_mut(), new, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
         {
-            // SAFETY: `new` came from `Box::into_raw` above and was not published.
-            drop(unsafe { Box::from_raw(new) });
-            debug_assert!(false, "a hand-off was sent twice");
+            Ok(_) => {}
+            Err(current) => {
+                // SAFETY: `new` came from `Box::into_raw` above and was not published.
+                let value = *unsafe { Box::from_raw(new) };
+                if current == Self::abandoned_mark() {
+                    release(value);
+                } else {
+                    drop(value);
+                    debug_assert!(false, "a hand-off was sent twice");
+                }
+            }
+        }
+    }
+
+    /// Gives up the hand-off: returns the value if one was sent and not yet taken, and otherwise marks the hand-off
+    /// so that the value still to come goes to its sender's release ([`deliver`](Handoff::deliver)). Nothing waits.
+    pub fn abandon(&self) -> Option<T> {
+        let mark = Self::abandoned_mark();
+        let mut current = self.value.load(Ordering::Acquire);
+        loop {
+            if current == mark {
+                return None;
+            }
+            match self
+                .value
+                .compare_exchange(current, mark, Ordering::AcqRel, Ordering::Acquire)
+            {
+                // SAFETY: a non-null pointer other than the mark was published by `deliver` from `Box::into_raw`,
+                // and the exchange gave it to this call alone.
+                Ok(taken) => return (!taken.is_null()).then(|| *unsafe { Box::from_raw(taken) }),
+                Err(seen) => current = seen,
+            }
         }
     }
 
     /// Takes the value if it was sent and not yet taken.
     pub fn take(&self) -> Option<T> {
-        let taken = self.value.swap(ptr::null_mut(), Ordering::Acquire);
-        // SAFETY: a non-null pointer was published by `send` from `Box::into_raw`, and the swap gave it to this call
-        // alone.
-        (!taken.is_null()).then(|| *unsafe { Box::from_raw(taken) })
+        let mark = Self::abandoned_mark();
+        let mut current = self.value.load(Ordering::Acquire);
+        loop {
+            if current.is_null() || current == mark {
+                return None;
+            }
+            match self
+                .value
+                .compare_exchange(current, ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire)
+            {
+                // SAFETY: a non-null pointer other than the mark was published by `deliver` from `Box::into_raw`,
+                // and the exchange gave it to this call alone.
+                Ok(taken) => return Some(*unsafe { Box::from_raw(taken) }),
+                Err(seen) => current = seen,
+            }
+        }
     }
 
     /// Whether a value waits to be taken.
     pub fn is_set(&self) -> bool {
-        !self.value.load(Ordering::Acquire).is_null()
+        let current = self.value.load(Ordering::Acquire);
+        !current.is_null() && current != Self::abandoned_mark()
     }
 
     /// Waits for the value for at most `deadline`, checking at growing pauses (50 microseconds up to 1 ms).
@@ -221,6 +279,69 @@ mod tests {
         handoff.send(Counted(Arc::clone(&dropped)));
         drop(handoff);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    struct Counted(Arc<AtomicUsize>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_value_that_arrives_after_the_abandon_is_released_once_by_its_sender() {
+        let freed = Arc::new(AtomicUsize::new(0));
+        let handoff = Handoff::new();
+        assert!(handoff.abandon().is_none());
+        assert!(handoff.abandon().is_none(), "abandoning twice changes nothing");
+        let counted = Arc::clone(&freed);
+        handoff.deliver(Counted(Arc::clone(&freed)), move |value| {
+            // The sender frees it: a count of frees by the release, apart from the drop.
+            counted.fetch_add(100, Ordering::SeqCst);
+            drop(value);
+        });
+        assert_eq!(freed.load(Ordering::SeqCst), 101);
+        assert!(!handoff.is_set());
+        assert!(handoff.take().is_none());
+        drop(handoff);
+        assert_eq!(freed.load(Ordering::SeqCst), 101, "nothing is freed again");
+    }
+
+    #[test]
+    fn a_value_that_arrived_before_the_abandon_comes_back_from_it() {
+        let freed = Arc::new(AtomicUsize::new(0));
+        let handoff = Handoff::new();
+        handoff.send(Counted(Arc::clone(&freed)));
+        let value = handoff.abandon();
+        assert!(value.is_some());
+        drop(value);
+        drop(handoff);
+        assert_eq!(freed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_race_between_the_abandon_and_the_arrival_frees_exactly_once() {
+        for _ in 0..500 {
+            let freed = Arc::new(AtomicUsize::new(0));
+            let handoff = Handoff::new();
+            let sender = Arc::clone(&handoff);
+            let released = Arc::clone(&freed);
+            let arriving = thread::spawn(move || {
+                sender.deliver(Counted(Arc::clone(&released)), |value| {
+                    released.fetch_add(100, Ordering::SeqCst);
+                    drop(value);
+                });
+            });
+            // The abandoning side frees what it gets back.
+            let got = handoff.abandon();
+            let gave = got.is_some();
+            drop(got);
+            arriving.join().unwrap();
+            drop(handoff);
+            let count = freed.load(Ordering::SeqCst);
+            assert_eq!(count, if gave { 1 } else { 101 }, "freed {count} times");
+        }
     }
 
     #[cfg(debug_assertions)]

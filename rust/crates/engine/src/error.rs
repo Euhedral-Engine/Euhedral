@@ -2,6 +2,7 @@
 
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use euhedral_inference_cuda::CudaError;
 use euhedral_inference_edrl::EdrlError;
@@ -70,9 +71,19 @@ pub enum EngineError {
     /// The runtime could not start the lattice or one of its sources.
     #[error("{0}")]
     Runtime(String),
+
+    /// The engine did not finish stopping within the window it was given; `left` says what was not done.
+    #[error("the engine did not finish stopping within {} ms: {left}", .window.as_millis())]
+    Unfinished { window: Duration, left: String },
 }
 
 impl EngineError {
+    /// Whether nothing could be loaded: the CUDA library, its runtime libraries or the driver is missing. A start
+    /// that fails this way never reached the device.
+    pub fn loads_nothing(&self) -> bool {
+        matches!(self, Self::Cuda(error) if error.loads_nothing())
+    }
+
     pub(crate) fn io(what: impl Into<String>, source: io::Error) -> Self {
         Self::Io {
             what: what.into(),
@@ -85,5 +96,29 @@ impl EngineError {
             path: path.display().to_string(),
             source,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn a_missing_library_or_driver_loads_nothing_and_another_call_failing_does_not() {
+        let library = EngineError::Cuda(CudaError::LibraryMissing(PathBuf::from("x.so")));
+        let runtime = EngineError::Cuda(CudaError::RuntimeMissing {
+            library: PathBuf::from("x.so"),
+            missing: vec![PathBuf::from("libcudart.so")],
+        });
+        let call = EngineError::Cuda(CudaError::Call {
+            call: "cudaMalloc",
+            status: 2,
+        });
+        assert!(library.loads_nothing());
+        assert!(runtime.loads_nothing());
+        assert!(!call.loads_nothing());
+        assert!(!EngineError::Runtime("x".to_owned()).loads_nothing());
     }
 }

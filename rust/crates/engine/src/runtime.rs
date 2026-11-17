@@ -283,6 +283,38 @@ impl RuntimeOwner {
     }
 }
 
+/// Stops an engine within `window`: `close` runs (it waits for the workers, up to the lattice's own timeout), and when
+/// the window is spent by then, `free` does not run and `left` says what stays. A `free` that has begun is not
+/// interrupted: it waits for the device, as the unbounded stop does.
+fn stop_within(
+    window: Duration,
+    close: impl FnOnce(),
+    free: impl FnOnce() -> Result<(), EngineError>,
+    left: impl FnOnce() -> String,
+) -> Result<(), EngineError> {
+    let begun = Instant::now();
+    close();
+    if begun.elapsed() >= window {
+        return Err(EngineError::Unfinished { window, left: left() });
+    }
+    free()
+}
+
+/// Frees a runtime that arrived after its start was abandoned: the arrival carries the release. The lattice is
+/// closed by the abandoning side's owner, so this only frees the device memory, which waits for the device as the
+/// frames of the startup's device lake already do.
+pub(crate) fn free_arrival(arrival: Result<Arc<EngineRuntime>, EngineError>) {
+    let Ok(runtime) = arrival else { return };
+    let core = Arc::clone(&runtime.core);
+    match Arc::try_unwrap(runtime) {
+        Ok(runtime) => {
+            runtime.release();
+            core.teardown.device_bytes.store(0, Ordering::Release);
+        }
+        Err(_) => core.teardown.log_leak(),
+    }
+}
+
 impl Teardown {
     fn log_leak(&self) {
         let bytes = self.device_bytes.load(Ordering::Acquire);
@@ -291,6 +323,54 @@ impl Teardown {
                 "{bytes} bytes of device memory stay allocated until the process exits: the engine was not shut down"
             );
         }
+    }
+}
+
+impl RuntimeOwner {
+    /// [`shutdown`](RuntimeOwner::shutdown) bounded by `window`: it returns once the window is spent, saying what it
+    /// did not do (`EngineError::Unfinished`), and the device memory it did not free stays allocated until the
+    /// process exits. The lattice's close is bounded by its own timeout (`server.shutdown-timeout`); when that spends
+    /// the window, the device memory is not freed. A free that has begun is not interrupted.
+    pub fn shutdown_within(mut self, runtime: Arc<EngineRuntime>, window: Duration) -> Result<(), EngineError> {
+        let teardown = self.teardown.take();
+        let bytes = || {
+            teardown
+                .as_ref()
+                .map_or(0, |teardown| teardown.device_bytes.load(Ordering::Acquire))
+        };
+        stop_within(
+            window,
+            || {
+                if let Some(teardown) = &teardown {
+                    teardown.close();
+                }
+            },
+            || match Arc::try_unwrap(runtime) {
+                Ok(runtime) => {
+                    runtime.release();
+                    if let Some(teardown) = &teardown {
+                        teardown.device_bytes.store(0, Ordering::Release);
+                    }
+                    Ok(())
+                }
+                Err(_) => {
+                    if let Some(teardown) = &teardown {
+                        teardown.log_leak();
+                    }
+                    Err(EngineError::Runtime(
+                        "another handle to the runtime is alive: its device memory stays allocated until the process \
+                         exits"
+                            .to_string(),
+                    ))
+                }
+            },
+            || {
+                format!(
+                    "the lattice was still closing; {} bytes of device memory stay allocated until the process exits",
+                    bytes()
+                )
+            },
+        )
     }
 }
 
@@ -577,6 +657,7 @@ pub fn fragment_config(settings: &Settings) -> FragmentConfig {
 pub fn lattice_config(settings: &Settings) -> LatticeConfig {
     let cloneable = BaseCloneableObject::new(fragment_config(settings), DefaultExecutor::new());
     let mut config = LatticeConfig::new(Arc::new(cloneable));
+    config.shutdown_timeout = settings.server.shutdown_timeout;
     if let Auto::Value(cpus) = &settings.host.cpus {
         config.allowed_cpus = cpus.ids().map(|cpu| cpu as usize).collect::<CpuSet>();
     }
@@ -722,4 +803,57 @@ fn build(settings: &Settings, library_path: &Path) -> Result<Arc<Core>, EngineEr
         started,
         teardown,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test stands for a close that outlasts its window"
+    )]
+    fn a_close_that_spends_the_window_skips_the_free_and_says_what_is_left() {
+        let freed = Cell::new(false);
+        let window = Duration::from_millis(20);
+        let begun = Instant::now();
+        let result = stop_within(
+            window,
+            || thread::sleep(Duration::from_millis(40)),
+            || {
+                freed.set(true);
+                Ok(())
+            },
+            || "7 bytes stay".to_owned(),
+        );
+        assert!(begun.elapsed() < Duration::from_secs(5));
+        assert!(!freed.get());
+        match result {
+            Err(EngineError::Unfinished { window: reported, left }) => {
+                assert_eq!(reported, window);
+                assert_eq!(left, "7 bytes stay");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_close_within_the_window_goes_on_to_free() {
+        let freed = Cell::new(false);
+        let result = stop_within(
+            Duration::from_secs(60),
+            || {},
+            || {
+                freed.set(true);
+                Ok(())
+            },
+            || unreachable!("nothing is left"),
+        );
+        assert!(result.is_ok());
+        assert!(freed.get());
+    }
 }
