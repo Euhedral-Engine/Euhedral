@@ -198,7 +198,10 @@ def body_view(reply: dict):
 
 def refused_by_design(reply: dict) -> bool:
     status = reply.get("status") or 0
-    return 400 <= status < 500 and b"unsupported_parameter" in base64.b64decode(reply.get("body_b64", ""))
+    return 400 <= status < 500 and (
+        b"unsupported_parameter" in base64.b64decode(reply.get("body_b64", ""))
+        or b"Unsupported parameter" in base64.b64decode(reply.get("body_b64", ""))
+    )
 
 
 def compare_reply(java: dict, rust: dict) -> list[str]:
@@ -434,7 +437,7 @@ def validity_problems(request: dict, reply: dict) -> list[str]:
 
 
 def informational_request(request: dict) -> bool:
-    return not (request["method"] == "POST" and "_err_" not in request["name"] and not request["name"].startswith("http_")
+    return not (request["method"] == "POST" and "_err_" not in request["name"] and (request["name"] == "http_chunked_body" or not request["name"].startswith("http_"))
                 and request["path"] in ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/messages/count_tokens"))
 
 
