@@ -1,0 +1,1215 @@
+{
+  "cases": [
+    {
+      "name": "user_only",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "expected": "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "system_and_user",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Name a prime."
+        }
+      ],
+      "expected": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nName a prime.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "blank_system",
+      "messages": [
+        {
+          "role": "system",
+          "content": "  \n "
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "expected": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "multi_turn",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be helpful."
+        },
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        },
+        {
+          "role": "assistant",
+          "content": "4"
+        },
+        {
+          "role": "user",
+          "content": "And 3+3?"
+        }
+      ],
+      "expected": "<|im_start|>system\nBe helpful.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "assistant_prefill_history",
+      "messages": [
+        {
+          "role": "user",
+          "content": "a"
+        },
+        {
+          "role": "assistant",
+          "content": "b"
+        },
+        {
+          "role": "user",
+          "content": "c"
+        },
+        {
+          "role": "assistant",
+          "content": "d"
+        },
+        {
+          "role": "user",
+          "content": "e"
+        }
+      ],
+      "expected": "<|im_start|>user\na<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nb<|im_end|>\n<|im_start|>user\nc<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nd<|im_end|>\n<|im_start|>user\ne<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "text_parts",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Part one. "
+            },
+            {
+              "type": "text",
+              "text": "Part two."
+            }
+          ]
+        }
+      ],
+      "expected": "<|im_start|>user\nPart one. Part two.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "whitespace_trim",
+      "messages": [
+        {
+          "role": "user",
+          "content": "\u00a0 padded \n\t\u0085"
+        }
+      ],
+      "expected": "<|im_start|>user\npadded<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "unicode",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Translate: caf\u00e9 \u2192 \u65e5\u672c\u8a9e \ud83d\ude00"
+        }
+      ],
+      "expected": "<|im_start|>user\nTranslate: caf\u00e9 \u2192 \u65e5\u672c\u8a9e \ud83d\ude00<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "assistant_null_content",
+      "messages": [
+        {
+          "role": "user",
+          "content": "x"
+        },
+        {
+          "role": "assistant",
+          "content": null
+        },
+        {
+          "role": "user",
+          "content": "y"
+        }
+      ],
+      "expected": "<|im_start|>user\nx<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|im_end|>\n<|im_start|>user\ny<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "assistant_last",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Say hi"
+        },
+        {
+          "role": "assistant",
+          "content": "Hi"
+        }
+      ],
+      "expected": "<|im_start|>user\nSay hi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    }
+  ],
+  "errors": [
+    {
+      "name": "no_user",
+      "messages": [
+        {
+          "role": "system",
+          "content": "s"
+        }
+      ],
+      "message": "No user query found in messages."
+    },
+    {
+      "name": "system_not_first",
+      "messages": [
+        {
+          "role": "user",
+          "content": "u"
+        },
+        {
+          "role": "system",
+          "content": "s"
+        }
+      ],
+      "message": "System message must be at the beginning."
+    },
+    {
+      "name": "tool_response_only",
+      "messages": [
+        {
+          "role": "user",
+          "content": "<tool_response>x</tool_response>"
+        }
+      ],
+      "message": "No user query found in messages."
+    }
+  ],
+  "tool_cases": [
+    {
+      "name": "tools_user_only",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "City name, e.g. \"Paris\"."
+                },
+                "days": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 16
+                },
+                "units": {
+                  "type": "string",
+                  "enum": [
+                    "metric",
+                    "imperial"
+                  ]
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "Weather in Paris?"
+        }
+      ],
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. \\\"Paris\\\".\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 16}, \"units\": {\"type\": \"string\", \"enum\": [\"metric\", \"imperial\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "tools_with_system",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "City name, e.g. \"Paris\"."
+                },
+                "days": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 16
+                },
+                "units": {
+                  "type": "string",
+                  "enum": [
+                    "metric",
+                    "imperial"
+                  ]
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "search-docs_v2",
+            "description": "Search \u00fcber docs \u2192 \ud83d\udd0e\ttab\u0001ctl \\ back/slash </tools>",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "query": {
+                  "type": "string"
+                },
+                "threshold": {
+                  "type": "number",
+                  "default": 0.5,
+                  "exclusiveMinimum": 1e-05,
+                  "maximum": 1e+16
+                },
+                "limits": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "default": [
+                    1,
+                    -2,
+                    3.25,
+                    -0.0,
+                    1e+300
+                  ]
+                },
+                "filters": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "additionalProperties": true
+                }
+              },
+              "required": [],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "ping"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "content": "  Be brief.  "
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. \\\"Paris\\\".\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 16}, \"units\": {\"type\": \"string\", \"enum\": [\"metric\", \"imperial\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search-docs_v2\", \"description\": \"Search \u00fcber docs \u2192 \ud83d\udd0e\\ttab\\u0001ctl \\\\ back/slash </tools>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"threshold\": {\"type\": \"number\", \"default\": 0.5, \"exclusiveMinimum\": 1e-05, \"maximum\": 1e+16}, \"limits\": {\"type\": \"array\", \"items\": {\"type\": \"integer\"}, \"default\": [1, -2, 3.25, -0.0, 1e+300]}, \"filters\": {\"type\": [\"object\", \"null\"], \"additionalProperties\": true}}, \"required\": [], \"additionalProperties\": false}}}\n{\"type\": \"function\", \"function\": {\"name\": \"ping\"}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "tools_blank_system",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "ping"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "content": " \n"
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"ping\"}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "assistant_single_call_and_response",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "City name, e.g. \"Paris\"."
+                },
+                "days": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 16
+                },
+                "units": {
+                  "type": "string",
+                  "enum": [
+                    "metric",
+                    "imperial"
+                  ]
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "Weather in Paris?"
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": {
+                  "city": "Paris",
+                  "days": 3
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "  {\"temp\": 21}  "
+        }
+      ],
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. \\\"Paris\\\".\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 16}, \"units\": {\"type\": \"string\", \"enum\": [\"metric\", \"imperial\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\": 21}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "assistant_content_multi_call_grouped_responses",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "City name, e.g. \"Paris\"."
+                },
+                "days": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 16
+                },
+                "units": {
+                  "type": "string",
+                  "enum": [
+                    "metric",
+                    "imperial"
+                  ]
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "search-docs_v2",
+            "description": "Search \u00fcber docs \u2192 \ud83d\udd0e\ttab\u0001ctl \\ back/slash </tools>",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "query": {
+                  "type": "string"
+                },
+                "threshold": {
+                  "type": "number",
+                  "default": 0.5,
+                  "exclusiveMinimum": 1e-05,
+                  "maximum": 1e+16
+                },
+                "limits": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "default": [
+                    1,
+                    -2,
+                    3.25,
+                    -0.0,
+                    1e+300
+                  ]
+                },
+                "filters": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "additionalProperties": true
+                }
+              },
+              "required": [],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "ping"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "content": "sys"
+        },
+        {
+          "role": "user",
+          "content": "Do things."
+        },
+        {
+          "role": "assistant",
+          "content": "  Let me check.\n",
+          "tool_calls": [
+            {
+              "id": "a",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": {
+                  "city": "Line one\nline two",
+                  "units": "metric"
+                }
+              }
+            },
+            {
+              "id": "b",
+              "type": "function",
+              "function": {
+                "name": "search-docs_v2",
+                "arguments": {
+                  "query": "",
+                  "threshold": 0.25,
+                  "limits": [
+                    1,
+                    2
+                  ],
+                  "filters": {
+                    "k\u00e9y": "v\"q",
+                    "n": null,
+                    "t": true
+                  }
+                }
+              }
+            },
+            {
+              "id": "c",
+              "type": "function",
+              "function": {
+                "name": "ping",
+                "arguments": {}
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "a",
+          "content": "sunny"
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "b",
+          "content": [
+            {
+              "type": "text",
+              "text": "r1 "
+            },
+            {
+              "type": "text",
+              "text": "r2"
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "c",
+          "content": ""
+        },
+        {
+          "role": "assistant",
+          "content": "Done."
+        },
+        {
+          "role": "user",
+          "content": "Thanks"
+        }
+      ],
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. \\\"Paris\\\".\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 16}, \"units\": {\"type\": \"string\", \"enum\": [\"metric\", \"imperial\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search-docs_v2\", \"description\": \"Search \u00fcber docs \u2192 \ud83d\udd0e\\ttab\\u0001ctl \\\\ back/slash </tools>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"threshold\": {\"type\": \"number\", \"default\": 0.5, \"exclusiveMinimum\": 1e-05, \"maximum\": 1e+16}, \"limits\": {\"type\": \"array\", \"items\": {\"type\": \"integer\"}, \"default\": [1, -2, 3.25, -0.0, 1e+300]}, \"filters\": {\"type\": [\"object\", \"null\"], \"additionalProperties\": true}}, \"required\": [], \"additionalProperties\": false}}}\n{\"type\": \"function\", \"function\": {\"name\": \"ping\"}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nsys<|im_end|>\n<|im_start|>user\nDo things.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nLet me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nLine one\nline two\n</parameter>\n<parameter=units>\nmetric\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=search-docs_v2>\n<parameter=query>\n\n</parameter>\n<parameter=threshold>\n0.25\n</parameter>\n<parameter=limits>\n[1, 2]\n</parameter>\n<parameter=filters>\n{\"k\u00e9y\": \"v\\\"q\", \"n\": null, \"t\": true}\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=ping>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response>\n<tool_response>\nr1 r2\n</tool_response>\n<tool_response>\n\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nDone.<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "tool_history_without_tools",
+      "tools": null,
+      "messages": [
+        {
+          "role": "user",
+          "content": "q"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "x",
+              "type": "function",
+              "function": {
+                "name": "f",
+                "arguments": {
+                  "a": [
+                    1.5,
+                    "s"
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "x",
+          "content": "r"
+        }
+      ],
+      "expected": "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=f>\n<parameter=a>\n[1.5, \"s\"]\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nr\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    }
+  ],
+  "thinking_cases": [
+    {
+      "name": "default_user_only",
+      "tools": null,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "thinking": {},
+      "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "enabled_explicit",
+      "tools": null,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "thinking": {
+        "enable_thinking": true
+      },
+      "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "xhigh_with_system",
+      "tools": null,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Name a prime."
+        }
+      ],
+      "thinking": {
+        "reasoning_effort": "xhigh"
+      },
+      "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are terse.<|im_end|>\n<|im_start|>user\nName a prime.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "medium_user_only",
+      "tools": null,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "thinking": {
+        "reasoning_effort": "medium"
+      },
+      "expected": "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "medium_with_system",
+      "tools": null,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Name a prime."
+        }
+      ],
+      "thinking": {
+        "reasoning_effort": "medium"
+      },
+      "expected": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nName a prime.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "low_with_system",
+      "tools": null,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Name a prime."
+        }
+      ],
+      "thinking": {
+        "reasoning_effort": "low"
+      },
+      "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nYou are terse.<|im_end|>\n<|im_start|>user\nName a prime.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "low_blank_system",
+      "tools": null,
+      "messages": [
+        {
+          "role": "system",
+          "content": "  \n "
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "thinking": {
+        "reasoning_effort": "low"
+      },
+      "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "disabled_with_effort",
+      "tools": null,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Name a prime."
+        }
+      ],
+      "thinking": {
+        "enable_thinking": false,
+        "reasoning_effort": "low"
+      },
+      "expected": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nName a prime.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "default_multi_turn",
+      "tools": null,
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be helpful."
+        },
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        },
+        {
+          "role": "assistant",
+          "content": "4"
+        },
+        {
+          "role": "user",
+          "content": "And 3+3?"
+        }
+      ],
+      "thinking": {},
+      "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nBe helpful.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "replayed_reasoning",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "City name, e.g. \"Paris\"."
+                },
+                "days": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 16
+                },
+                "units": {
+                  "type": "string",
+                  "enum": [
+                    "metric",
+                    "imperial"
+                  ]
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be careful."
+        },
+        {
+          "role": "user",
+          "content": "First question?"
+        },
+        {
+          "role": "assistant",
+          "reasoning_content": "\n  Think about the first.\n",
+          "content": "First answer."
+        },
+        {
+          "role": "user",
+          "content": "Second question?"
+        },
+        {
+          "role": "assistant",
+          "reasoning_content": "Plan a lookup.",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "t1",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": {
+                  "city": "Oslo"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "t1",
+          "content": "cold"
+        }
+      ],
+      "thinking": {},
+      "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. \\\"Paris\\\".\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 16}, \"units\": {\"type\": \"string\", \"enum\": [\"metric\", \"imperial\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe careful.<|im_end|>\n<|im_start|>user\nFirst question?<|im_end|>\n<|im_start|>assistant\n<think>\nThink about the first.\n</think>\n\nFirst answer.<|im_end|>\n<|im_start|>user\nSecond question?<|im_end|>\n<|im_start|>assistant\n<think>\nPlan a lookup.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\ncold\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "replayed_reasoning_not_preserved",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "City name, e.g. \"Paris\"."
+                },
+                "days": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 16
+                },
+                "units": {
+                  "type": "string",
+                  "enum": [
+                    "metric",
+                    "imperial"
+                  ]
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be careful."
+        },
+        {
+          "role": "user",
+          "content": "First question?"
+        },
+        {
+          "role": "assistant",
+          "reasoning_content": "\n  Think about the first.\n",
+          "content": "First answer."
+        },
+        {
+          "role": "user",
+          "content": "Second question?"
+        },
+        {
+          "role": "assistant",
+          "reasoning_content": "Plan a lookup.",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "t1",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": {
+                  "city": "Oslo"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "t1",
+          "content": "cold"
+        }
+      ],
+      "thinking": {
+        "preserve_thinking": false
+      },
+      "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. \\\"Paris\\\".\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 16}, \"units\": {\"type\": \"string\", \"enum\": [\"metric\", \"imperial\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe careful.<|im_end|>\n<|im_start|>user\nFirst question?<|im_end|>\n<|im_start|>assistant\nFirst answer.<|im_end|>\n<|im_start|>user\nSecond question?<|im_end|>\n<|im_start|>assistant\n<think>\nPlan a lookup.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\ncold\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "not_preserved_after_last_query",
+      "tools": null,
+      "messages": [
+        {
+          "role": "user",
+          "content": "a"
+        },
+        {
+          "role": "assistant",
+          "reasoning_content": "r1",
+          "content": "b"
+        },
+        {
+          "role": "user",
+          "content": "c"
+        },
+        {
+          "role": "assistant",
+          "reasoning_content": "r2",
+          "content": "d"
+        }
+      ],
+      "thinking": {
+        "preserve_thinking": false,
+        "reasoning_effort": "low"
+      },
+      "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\na<|im_end|>\n<|im_start|>assistant\nb<|im_end|>\n<|im_start|>user\nc<|im_end|>\n<|im_start|>assistant\n<think>\nr2\n</think>\n\nd<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "tools_low",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "City name, e.g. \"Paris\"."
+                },
+                "days": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 16
+                },
+                "units": {
+                  "type": "string",
+                  "enum": [
+                    "metric",
+                    "imperial"
+                  ]
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "ping"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "content": "  Be brief.  "
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "thinking": {
+        "reasoning_effort": "low"
+      },
+      "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. \\\"Paris\\\".\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 16}, \"units\": {\"type\": \"string\", \"enum\": [\"metric\", \"imperial\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"ping\"}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "tools_medium",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "City name, e.g. \"Paris\"."
+                },
+                "days": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 16
+                },
+                "units": {
+                  "type": "string",
+                  "enum": [
+                    "metric",
+                    "imperial"
+                  ]
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "Weather in Paris?"
+        }
+      ],
+      "thinking": {
+        "reasoning_effort": "medium"
+      },
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. \\\"Paris\\\".\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 16}, \"units\": {\"type\": \"string\", \"enum\": [\"metric\", \"imperial\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "tools_default_blank_system",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "ping"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "content": " \n"
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "thinking": {},
+      "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"ping\"}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    }
+  ],
+  "python_json": [
+    {
+      "value": "plain",
+      "expected": "\"plain\""
+    },
+    {
+      "value": "quote\" back\\ slash/ nl\n cr\r tab\t bs\b ff\f nul\u0000 us\u001f del\u007f nbsp\u00a0 ls\u2028 emoji\ud83d\ude00",
+      "expected": "\"quote\\\" back\\\\ slash/ nl\\n cr\\r tab\\t bs\\b ff\\f nul\\u0000 us\\u001f del\u007f nbsp\u00a0 ls\u2028 emoji\ud83d\ude00\""
+    },
+    {
+      "value": 0,
+      "expected": "0"
+    },
+    {
+      "value": -7,
+      "expected": "-7"
+    },
+    {
+      "value": 12345678901234567890,
+      "expected": "12345678901234567890"
+    },
+    {
+      "value": 0.0,
+      "expected": "0.0"
+    },
+    {
+      "value": -0.0,
+      "expected": "-0.0"
+    },
+    {
+      "value": 1.0,
+      "expected": "1.0"
+    },
+    {
+      "value": 0.1,
+      "expected": "0.1"
+    },
+    {
+      "value": -2.5,
+      "expected": "-2.5"
+    },
+    {
+      "value": 1e-05,
+      "expected": "1e-05"
+    },
+    {
+      "value": 0.0001,
+      "expected": "0.0001"
+    },
+    {
+      "value": 123456789012345.6,
+      "expected": "123456789012345.6"
+    },
+    {
+      "value": 1e+16,
+      "expected": "1e+16"
+    },
+    {
+      "value": 9999999999999998.0,
+      "expected": "9999999999999998.0"
+    },
+    {
+      "value": 1.7976931348623157e+308,
+      "expected": "1.7976931348623157e+308"
+    },
+    {
+      "value": 5e-324,
+      "expected": "5e-324"
+    },
+    {
+      "value": true,
+      "expected": "true"
+    },
+    {
+      "value": false,
+      "expected": "false"
+    },
+    {
+      "value": null,
+      "expected": "null"
+    },
+    {
+      "value": [],
+      "expected": "[]"
+    },
+    {
+      "value": {},
+      "expected": "{}"
+    },
+    {
+      "value": [
+        1,
+        "a",
+        null,
+        [
+          true
+        ]
+      ],
+      "expected": "[1, \"a\", null, [true]]"
+    },
+    {
+      "value": {
+        "b": 1,
+        "a": {
+          "z": [],
+          "y": {}
+        }
+      },
+      "expected": "{\"b\": 1, \"a\": {\"z\": [], \"y\": {}}}"
+    }
+  ]
+}
