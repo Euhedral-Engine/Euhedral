@@ -1,0 +1,32 @@
+[package]
+name = "euhedral-inference-server"
+version = "0.1.0"
+description = "The server binary: loads the settings, starts the backend, serves the API, and stops in order on SIGTERM or SIGINT."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# A backend that follows a script instead of the engine, behind the hidden `--scripted-backend` argument, so that the
+# process can be tested without a device.
+scripted = ["euhedral-inference-api-server/test-support"]
+
+[[bin]]
+name = "euhedral-server"
+path = "src/main.rs"
+
+[dependencies]
+euhedral-core.workspace = true
+euhedral-inference-api-server = { path = "../api-server" }
+euhedral-inference-settings = { path = "../settings" }
+log.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
+
+[dev-dependencies]
+euhedral-inference-server = { path = ".", features = ["scripted"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
