@@ -63,6 +63,7 @@ pub struct ScriptedBackend {
     sink: Arc<QueueIngestSink>,
     available: AtomicBool,
     context_length: AtomicUsize,
+    max_active: AtomicUsize,
     script: Mutex<Script>,
     generations: Mutex<Vec<Arc<ScriptedGeneration>>>,
     encoded: AtomicUsize,
@@ -87,6 +88,7 @@ impl ScriptedBackend {
             sink,
             available: AtomicBool::new(true),
             context_length: AtomicUsize::new(4096),
+            max_active: AtomicUsize::new(1),
             script: Mutex::new(Script::hello()),
             generations: Mutex::new(Vec::new()),
             encoded: AtomicUsize::new(0),
@@ -96,6 +98,11 @@ impl ScriptedBackend {
     /// Makes the backend available or not (engine shutdown).
     pub fn set_available(&self, available: bool) {
         self.available.store(available, Ordering::Release);
+    }
+
+    /// Sets how many generations may run at once (one at first), as an engine that loaded more sequences does.
+    pub fn set_max_active(&self, count: usize) {
+        self.max_active.store(count, Ordering::Release);
     }
 
     /// Sets the script of the generations opened from now on.
@@ -147,6 +154,10 @@ impl Backend for ScriptedBackend {
 
     fn context_length(&self) -> usize {
         self.context_length.load(Ordering::Acquire)
+    }
+
+    fn max_active_generations(&self) -> usize {
+        self.max_active.load(Ordering::Acquire)
     }
 
     fn encode_prompt(&self, prompt: String, then: Next<Result<EncodedPrompt, BackendError>>) {

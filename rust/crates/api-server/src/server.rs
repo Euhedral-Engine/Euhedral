@@ -4,16 +4,20 @@ use std::fmt::{self, Debug, Formatter};
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::LatticeSource;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
+use euhedral_data_structures::sync::ClaimCell;
 use euhedral_graph::Completions;
 use euhedral_io::AsyncIo;
 use euhedral_net::{Counters, ServerHandle, serve};
 
+use crate::admission::Admission;
 use crate::backend::Backend;
+use crate::frames::once_or_refused;
 use crate::limits::Limits;
 use crate::router::Router;
 
@@ -49,6 +53,7 @@ pub struct ApiServer {
     local_addr: SocketAddr,
     sink: Arc<QueueIngestSink>,
     timers: Arc<Completions>,
+    admission: Admission,
     // The sockets' engine, held so that it outlives the server (the transport holds it weakly); `own_io` says the
     // server opened it and so completes it.
     io: Arc<AsyncIo>,
@@ -93,6 +98,7 @@ pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Resul
         undo(true);
         return Err(error);
     }
+    let admission = Admission::new(config.backend.clone(), &config.limits, sink.clone(), timers.clone());
     let router = Router::new(config.backend, config.created_at, config.limits);
     let handle = match serve(
         lattice.clone(),
@@ -114,6 +120,7 @@ pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Resul
         local_addr,
         sink,
         timers,
+        admission,
         io,
         own_io,
     })
@@ -130,10 +137,26 @@ impl ApiServer {
         self.handle.counters()
     }
 
-    /// Stops accepting, lets the requests in flight finish and offers `stopped` when the server is done. Returns at
-    /// once.
+    /// The admission of generations the generating routes use.
+    pub fn admission(&self) -> &Admission {
+        &self.admission
+    }
+
+    /// Stops the server and offers `stopped` when it is done; returns at once.
+    ///
+    /// Admission stops first: the requests waiting for a slot are refused, the running generations are interrupted and
+    /// the stop waits for them up to the shutdown limit. At the same time the transport stops accepting and lets the
+    /// requests in flight finish, which the refusals and the interruptions bring about. `stopped` is offered once both
+    /// are done.
     pub fn stop(&self, stopped: Box<dyn Frame>) {
-        self.handle.stop(stopped);
+        let join = Arc::new(Join {
+            remaining: AtomicUsize::new(2),
+            stopped: ClaimCell::new(Some(stopped)),
+            sink: self.sink.clone(),
+        });
+        let admitted = join.clone();
+        self.admission.stop(move || admitted.arrive());
+        self.handle.stop(once_or_refused(move |_| join.arrive()));
     }
 
     /// Completes everything the server opened: its sink, its timers and, if it opened it, the sockets' engine. Call it
@@ -143,6 +166,27 @@ impl ApiServer {
         self.timers.complete();
         if self.own_io {
             self.io.complete();
+        }
+    }
+}
+
+/// Offers `stopped` when the last of the two stops arrives.
+struct Join {
+    remaining: AtomicUsize,
+    /// Taken by the last arrival only, so it is never contended.
+    stopped: ClaimCell<Option<Box<dyn Frame>>>,
+    sink: Arc<QueueIngestSink>,
+}
+
+impl Join {
+    fn arrive(&self) {
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        if let Some(mut claim) = self.stopped.try_claim()
+            && let Some(stopped) = claim.take()
+        {
+            drop(self.sink.offer(stopped));
         }
     }
 }

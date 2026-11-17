@@ -37,6 +37,17 @@ pub struct Limits {
     pub idle_limit: Option<Duration>,
     /// How long one reply may take to go out.
     pub write_limit: Option<Duration>,
+    /// How many generation requests may wait for a free slot; a request that finds the queue full is refused. Zero
+    /// refuses every request that cannot start at once.
+    pub max_queued: usize,
+    /// How long a request may wait for a slot before it is refused with the timeout error. `None`: as long as the
+    /// request limit allows.
+    pub queue_limit: Option<Duration>,
+    /// How long a request may take from its arrival, waiting and generating together; after it a waiting request is
+    /// refused and a running one is interrupted, both with the timeout error.
+    pub request_limit: Duration,
+    /// How long a stop waits for the running generations to end before it reports itself done anyway.
+    pub shutdown_limit: Duration,
 }
 
 impl Default for Limits {
@@ -50,6 +61,10 @@ impl Default for Limits {
             read_limit: transport.read_limit,
             idle_limit: transport.idle_limit,
             write_limit: transport.write_limit,
+            max_queued: 16,
+            queue_limit: None,
+            request_limit: Duration::from_secs(30 * 60),
+            shutdown_limit: Duration::from_secs(30),
         }
     }
 }
