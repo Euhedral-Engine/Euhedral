@@ -101,8 +101,20 @@ fn number(value: Option<&JsonValue>) -> usize {
 }
 
 fn body(extra: &str, tokens: u32) -> String {
+    ask(QUESTION, extra, tokens)
+}
+
+fn ask(question: &str, extra: &str, tokens: u32) -> String {
     format!(
-        r#"{{"model":"qwen","messages":[{{"role":"user","content":"{QUESTION}"}}],"max_tokens":{tokens},"temperature":0,"reasoning_effort":"none"{extra}}}"#
+        r#"{{"model":"qwen","messages":[{{"role":"user","content":"{question}"}}],"max_tokens":{tokens},"temperature":0,"reasoning_effort":"none"{extra}}}"#
+    )
+}
+
+/// A chat completions request as a raw socket sends it.
+fn post_head(body: &str) -> String {
+    format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
     )
 }
 
@@ -235,20 +247,23 @@ fn a_greedy_chat_completion_matches_the_engine_and_a_cancel_frees_the_sequence()
     assert_eq!(content, decoded, "the text is the decoded tokens");
 
     // The streamed completion says the same, with its usage.
-    let streamed = client.post(&body(
+    let mut raw = Raw::connect(server.local_addr());
+    raw.send(&post_head(&body(
         r#","stream":true,"stream_options":{"include_usage":true}"#,
         NEW_TOKENS,
-    ));
-    assert_eq!(streamed.status, 200, "{}", text(&streamed));
+    )));
+    let streamed = raw.read_until("data:[DONE]");
+    assert!(streamed.starts_with("HTTP/1.1 200"), "{streamed}");
+    drop(raw);
     let mut streamed_text = String::new();
     let mut streamed_finish = None;
     let mut streamed_usage = None;
     let mut done_marker = false;
-    for line in text(&streamed).lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
+    for line in streamed.lines() {
+        let Some(data) = line.trim_end().strip_prefix("data:") else {
             continue;
         };
-        if data == "[DONE]" {
+        if data.trim_start() == "[DONE]" {
             done_marker = true;
             continue;
         }
@@ -277,13 +292,13 @@ fn a_greedy_chat_completion_matches_the_engine_and_a_cancel_frees_the_sequence()
 
     // A request cancelled mid-generation (its client hangs up) frees the one sequence: the next request runs, and in
     // far less time than the cancelled generation's budget would take.
-    let long = body(r#","stream":true"#, 3000);
     let mut raw = Raw::connect(server.local_addr());
-    raw.send(&format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{long}",
-        long.len()
-    ));
-    raw.read_until("data: ");
+    raw.send(&post_head(&ask(
+        "Write a very long story about a dragon.",
+        r#","stream":true"#,
+        3000,
+    )));
+    raw.read_until(r#""delta":{"content":""#);
     drop(raw);
     let before = Instant::now();
     let again = client.post(&body(r#","return_token_ids":true"#, NEW_TOKENS));
