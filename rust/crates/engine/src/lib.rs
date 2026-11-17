@@ -12,6 +12,7 @@ pub mod plan;
 pub mod quantum;
 pub mod residency;
 pub mod runtime;
+pub mod sampling;
 pub mod stages;
 mod startup;
 pub mod state;
