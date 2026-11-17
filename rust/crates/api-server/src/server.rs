@@ -4,7 +4,8 @@ use std::fmt::{self, Debug, Formatter};
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::Frame;
@@ -54,6 +55,7 @@ pub struct ApiServer {
     sink: Arc<QueueIngestSink>,
     timers: Arc<Completions>,
     admission: Admission,
+    drain_limit: Duration,
     // The sockets' engine, held so that it outlives the server (the transport holds it weakly); `own_io` says the
     // server opened it and so completes it.
     io: Arc<AsyncIo>,
@@ -121,6 +123,7 @@ pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Resul
         sink,
         timers,
         admission,
+        drain_limit: config.limits.drain_limit,
         io,
         own_io,
     })
@@ -144,19 +147,32 @@ impl ApiServer {
 
     /// Stops the server and offers `stopped` when it is done; returns at once.
     ///
-    /// Admission stops first: the requests waiting for a slot are refused, the running generations are interrupted and
-    /// the stop waits for them up to the shutdown limit. At the same time the transport stops accepting and lets the
-    /// requests in flight finish, which the refusals and the interruptions bring about. `stopped` is offered once both
-    /// are done.
+    /// The transport stops accepting at once and lets the requests in flight, the waiting ones included, finish.
+    /// Admission stops when they all have, or when the drain limit passes, whichever comes first: it then refuses the
+    /// requests still waiting for a slot, interrupts the running generations and waits for them up to the shutdown
+    /// limit (after which it tells them to give up). `stopped` is offered once the transport and admission are both
+    /// done.
     pub fn stop(&self, stopped: Box<dyn Frame>) {
-        let join = Arc::new(Join {
+        let stop = Arc::new(Stop {
             remaining: AtomicUsize::new(2),
             stopped: ClaimCell::new(Some(stopped)),
             sink: self.sink.clone(),
+            admission: self.admission.clone(),
+            begun: AtomicBool::new(false),
         });
-        let admitted = join.clone();
-        self.admission.stop(move || admitted.arrive());
-        self.handle.stop(once_or_refused(move |_| join.arrive()));
+        let drained = stop.clone();
+        self.handle.stop(once_or_refused(move |_| {
+            drained.stop_admission();
+            drained.arrive();
+        }));
+        let late = stop;
+        let deadline = Instant::now().checked_add(self.drain_limit);
+        let frame = once_or_refused(move |_| late.stop_admission());
+        match deadline {
+            Some(deadline) => self.timers.at(deadline, frame),
+            // A drain limit too long to count is never reached.
+            None => drop(frame),
+        }
     }
 
     /// Completes everything the server opened: its sink, its timers and, if it opened it, the sockets' engine. Call it
@@ -170,15 +186,26 @@ impl ApiServer {
     }
 }
 
-/// Offers `stopped` when the last of the two stops arrives.
-struct Join {
+/// What the stop of a server waits for: the transport and admission. Offers `stopped` when both arrived.
+struct Stop {
     remaining: AtomicUsize,
     /// Taken by the last arrival only, so it is never contended.
     stopped: ClaimCell<Option<Box<dyn Frame>>>,
     sink: Arc<QueueIngestSink>,
+    admission: Admission,
+    /// Admission's stop was started.
+    begun: AtomicBool,
 }
 
-impl Join {
+impl Stop {
+    /// Starts admission's stop, once.
+    fn stop_admission(self: &Arc<Self>) {
+        if !self.begun.swap(true, Ordering::AcqRel) {
+            let stop = self.clone();
+            self.admission.stop(move || stop.arrive());
+        }
+    }
+
     fn arrive(&self) {
         if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;

@@ -28,10 +28,12 @@
 use std::collections::VecDeque;
 use std::fmt::{self, Debug, Formatter};
 use std::mem::take;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use euhedral_core::frames::Frame;
 use euhedral_core::ingest::QueueIngestSink;
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
 use euhedral_data_structures::sync::ClaimCell;
@@ -60,11 +62,18 @@ pub enum Interruption {
     TimedOut,
     /// The server is stopping.
     Shutdown,
+    /// The shutdown limit passed and the entry still holds its slot: the last signal. The entry answers with
+    /// [`ApiError::interrupted_by_shutdown`] and releases its slot at once, without waiting for its generation to end.
+    Abandoned,
 }
 
 /// One request's claim on admission. Each entry receives exactly one of [`start`](Entry::start) and
-/// [`refuse`](Entry::refuse), each on a worker and none of them waiting; a started entry may then be
-/// [interrupted](Entry::interrupt), any number of times at most once per cause, until it releases its slot.
+/// [`refuse`](Entry::refuse), each on a worker and none of them waiting. A started entry is [interrupted](Entry::interrupt)
+/// at most once for a cause ([`Cancelled`](Interruption::Cancelled), [`TimedOut`](Interruption::TimedOut) or
+/// [`Shutdown`](Interruption::Shutdown); the first that happens), and then at most once more with
+/// [`Abandoned`](Interruption::Abandoned) if the shutdown limit passes before it released its slot. An interruption is
+/// decided while the entry runs but delivered by a frame, so it may arrive before `start` has finished and after the
+/// entry released its slot: an entry tolerates one late interruption.
 pub trait Entry: Send + Sync + 'static {
     /// A slot is free: run. The entry releases `slot` when its generation has ended on every path (dropping the slot
     /// releases it too). May be preceded by an interruption that arrived while the start was in flight: the entry
@@ -77,6 +86,12 @@ pub trait Entry: Send + Sync + 'static {
 
     /// A started entry must stop: see [`Interruption`]. Called from a worker; must not wait.
     fn interrupt(&self, why: Interruption);
+
+    /// Whether the request limit of a running entry counts from its start instead of its arrival (a stream: the reply
+    /// is under way from then on). Waiting always counts from the arrival.
+    fn limit_from_start(&self) -> bool {
+        false
+    }
 }
 
 /// Names an offered entry, to cancel it.
@@ -156,8 +171,10 @@ struct Running {
     id: u64,
     entry: Arc<dyn Entry>,
     arrived: Instant,
-    /// An interruption was sent; one is enough.
+    /// An interruption for a cause was sent; one is enough.
     interrupted: bool,
+    /// The final interruption was sent.
+    abandoned: bool,
 }
 
 struct Stopping {
@@ -231,8 +248,13 @@ impl Owner {
         self.running.push(Running {
             id,
             entry: entry.clone(),
-            arrived,
+            arrived: if entry.limit_from_start() {
+                Instant::now()
+            } else {
+                arrived
+            },
             interrupted: false,
+            abandoned: false,
         });
         effects.push(Effect::Start(entry, id));
     }
@@ -319,7 +341,15 @@ impl Owner {
         if stopping.done {
             return;
         }
-        let late = stopping.deadline.is_none_or(|deadline| deadline <= now);
+        let late = stopping.deadline.is_some_and(|deadline| deadline <= now);
+        if late {
+            for running in &mut self.running {
+                if !running.abandoned {
+                    running.abandoned = true;
+                    effects.push(Effect::Interrupt(running.entry.clone(), Interruption::Abandoned));
+                }
+            }
+        }
         if self.running.is_empty() || late {
             stopping.done = true;
             effects.push(Effect::Stopped(take(&mut stopping.continuations)));
@@ -361,7 +391,9 @@ impl Owner {
 struct Shared {
     backend: Arc<dyn Backend>,
     rules: Rules,
-    sink: Arc<QueueIngestSink>,
+    /// Weak: a frame queued in the sink holds this state, so a strong reference would be a cycle if the sink is
+    /// detached with frames queued.
+    sink: Weak<QueueIngestSink>,
     timers: Arc<Completions>,
     inbox: Producer<Command, Multi>,
     owner: ClaimCell<Owner>,
@@ -397,7 +429,14 @@ impl Shared {
     /// Publishes a frame of work that runs exactly once, on a worker or, if the lattice refuses it, on the thread that
     /// drops it.
     fn publish(&self, work: impl FnOnce() + Send + 'static) {
-        drop(self.sink.offer(once_or_refused(move |_| work())));
+        self.offer_frame(once_or_refused(move |_| work()));
+    }
+
+    /// Offers a frame to the sink; with the sink gone the frame is dropped, which runs its work in place.
+    fn offer_frame(&self, frame: Box<dyn Frame>) {
+        if let Some(sink) = self.sink.upgrade() {
+            drop(sink.offer(frame));
+        }
     }
 
     fn drive(self: &Arc<Self>) {
@@ -412,8 +451,16 @@ impl Shared {
             self.waiting.store(claim.waiting.len(), Ordering::Release);
             // The claim goes back before `pending` is loaded and before anyone is told.
             claim.release_seq_cst();
+            // An effect that panics (a refused frame runs an entry's work in place) must not lose the others.
+            let mut panic = None;
             for effect in effects {
-                self.carry_out(effect);
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.carry_out(effect))) {
+                    panic.get_or_insert(payload);
+                }
+            }
+            if let Some(payload) = panic {
+                self.schedule();
+                resume_unwind(payload);
             }
             if !self.pending.load(Ordering::SeqCst) {
                 return;
@@ -429,14 +476,14 @@ impl Shared {
                     shared: Some(self.clone()),
                     id,
                 };
-                drop(self.sink.offer(once_or_refused(move |ran| {
+                self.offer_frame(once_or_refused(move |ran| {
                     if ran {
                         entry.start(slot);
                     } else {
                         entry.refuse(ApiError::unavailable("The server's work queue is closed."));
                         drop(slot);
                     }
-                })));
+                }));
             }
             Effect::Refuse(entry, error) => self.publish(move || entry.refuse(error)),
             Effect::Interrupt(entry, why) => self.publish(move || entry.interrupt(why)),
@@ -456,6 +503,25 @@ impl Shared {
                     }),
                 );
             }
+        }
+    }
+}
+
+impl Drop for Shared {
+    /// Nothing can drive the owner any more: the entries still waiting are refused, so none is dropped silently.
+    fn drop(&mut self) {
+        let owner = self.owner.get_mut();
+        while let Some(command) = owner.inbox.poll() {
+            if let Command::Offer { entry, .. } = command {
+                owner.waiting.push_back(Queued {
+                    id: 0,
+                    entry,
+                    arrived: Instant::now(),
+                });
+            }
+        }
+        for queued in owner.waiting.drain(..) {
+            queued.entry.refuse(ApiError::shutting_down());
         }
     }
 }
@@ -500,7 +566,7 @@ impl Admission {
                 request_limit: limits.request_limit,
                 shutdown_limit: limits.shutdown_limit,
             },
-            sink,
+            sink: Arc::downgrade(&sink),
             timers,
             inbox,
             owner: ClaimCell::new(owner),
@@ -516,12 +582,14 @@ impl Admission {
     /// Offers `entry`: it starts when a slot is free (first come, first served), or is refused with the error that
     /// says why. Returns at once; the request limit counts from this call.
     pub fn offer(&self, entry: Arc<dyn Entry>) -> Handle {
+        self.offer_at(entry, Instant::now())
+    }
+
+    /// Offers `entry` as [`offer`](Admission::offer) does, for a request that arrived at `arrived`: the request limit
+    /// and the queue limit count from then.
+    pub fn offer_at(&self, entry: Arc<dyn Entry>, arrived: Instant) -> Handle {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        self.shared.post(Command::Offer {
-            id,
-            entry,
-            arrived: Instant::now(),
-        });
+        self.shared.post(Command::Offer { id, entry, arrived });
         Handle(id)
     }
 

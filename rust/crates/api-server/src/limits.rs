@@ -48,6 +48,9 @@ pub struct Limits {
     pub request_limit: Duration,
     /// How long a stop waits for the running generations to end before it reports itself done anyway.
     pub shutdown_limit: Duration,
+    /// How long a stop lets the requests in flight (the waiting ones included) finish before admission refuses the
+    /// waiting ones and interrupts the running ones.
+    pub drain_limit: Duration,
 }
 
 impl Default for Limits {
@@ -65,6 +68,7 @@ impl Default for Limits {
             queue_limit: None,
             request_limit: Duration::from_secs(30 * 60),
             shutdown_limit: Duration::from_secs(30),
+            drain_limit: Duration::from_secs(30),
         }
     }
 }
