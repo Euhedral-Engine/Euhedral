@@ -13,6 +13,7 @@ pub mod reasoning;
 pub mod response_format;
 pub mod responses;
 pub mod responses_mapper;
+mod served_model;
 pub mod template;
 pub mod tool_calling;
 mod tool_definition;

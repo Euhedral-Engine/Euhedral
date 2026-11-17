@@ -1,6 +1,6 @@
 use super::*;
 use crate::json::JsonInteger;
-use crate::template::{Effort, TemplateOptions};
+use crate::template::{Effort, TemplateInput, TemplateOptions};
 
 fn defaults() -> Defaults {
     Defaults {
@@ -12,12 +12,16 @@ fn defaults() -> Defaults {
     }
 }
 
-fn map(body: &str) -> Result<GenerationRequest, ApiError> {
+fn map(body: &str) -> Result<MappedResponses, ApiError> {
     let request = ResponsesRequest::parse(body).expect("the body parses");
     map_responses(request, &defaults())
 }
 
 fn accepted(body: &str) -> GenerationRequest {
+    accepted_mapped(body).generation
+}
+
+fn accepted_mapped(body: &str) -> MappedResponses {
     map(body).unwrap_or_else(|error| panic!("{body} was rejected: {}", error.message))
 }
 
@@ -573,6 +577,18 @@ fn rows() -> Vec<Row> {
             "'arguments' must be valid JSON.",
         ),
         bad(
+            "arguments with trailing text",
+            call(r##""call_id":"c","name":"f","arguments":"{\"a\":1} trailing""##),
+            Some("input[0].arguments"),
+            "'arguments' must be valid JSON.",
+        ),
+        bad(
+            "arguments of two objects",
+            call(r#""call_id":"c","name":"f","arguments":"{} {}""#),
+            Some("input[0].arguments"),
+            "'arguments' must be valid JSON.",
+        ),
+        bad(
             "arguments blank",
             call(r#""call_id":"c","name":"f","arguments":" ""#),
             Some("input[0].arguments"),
@@ -1011,7 +1027,6 @@ fn a_minimal_request_takes_the_defaults() {
             max_tokens_param: "max_output_tokens".to_owned(),
             stream: false,
             return_token_ids: false,
-            include_usage: false,
         }
     );
     assert!(mapped.reasoning());
@@ -1326,7 +1341,7 @@ fn function_calls_and_their_outputs_follow_call_order() {
 }
 
 #[test]
-fn arguments_read_the_first_json_value_and_ignore_what_follows() {
+fn arguments_are_one_json_object() {
     let arguments = |text: &str| {
         let mapped = accepted(&items(&format!(
             r#"[{{"type":"function_call","call_id":"c","name":"f","arguments":{}}},{{"type":"function_call_output","call_id":"c","output":""}}]"#,
@@ -1336,11 +1351,17 @@ fn arguments_read_the_first_json_value_and_ignore_what_follows() {
             .arguments
             .clone()
     };
-    assert_eq!(arguments(r#"{"a":1} trailing"#).len(), 1);
-    assert_eq!(arguments(r#"  {"a":1}{"b":2}"#).len(), 1);
+    assert_eq!(arguments(r#"  {"a":1}  "#).len(), 1);
     assert!(arguments("{}").is_empty());
     // The argument names are not checked.
     assert_eq!(arguments(r#"{"a<b":1}"#).len(), 1);
+}
+
+#[test]
+fn include_asks_for_the_encrypted_reasoning_token() {
+    assert!(!accepted_mapped(&req("")).include_encrypted_content);
+    assert!(!accepted_mapped(&req(r#","include":[]"#)).include_encrypted_content);
+    assert!(accepted_mapped(&req(r#","include":["reasoning.encrypted_content"]"#)).include_encrypted_content);
 }
 
 #[test]
@@ -1435,7 +1456,7 @@ fn response_formats_map() {
     else {
         panic!("a JSON schema format");
     };
-    assert_eq!(name, "n");
+    assert_eq!(name.as_deref(), Some("n"));
     assert_eq!(
         schema.to_compact_string(),
         r#"{"type":"object","properties":{"n":{"type":"integer"}}}"#
@@ -1444,7 +1465,7 @@ fn response_formats_map() {
     assert_eq!(
         format(r#"{"type":"json_schema","name":"n"}"#),
         ResponseFormat::JsonSchema {
-            name: "n".to_owned(),
+            name: Some("n".to_owned()),
             schema: JsonValue::Object(Vec::new()),
             schema_param: "text.format.schema".to_owned(),
         }
@@ -1464,19 +1485,8 @@ fn a_json_format_does_not_refuse_the_conversation_around_it() {
 }
 
 #[test]
-fn blank_follows_the_whitespace_of_the_source_runtime() {
-    assert!(is_blank(""));
-    assert!(is_blank(" \t\n\u{b}\u{c}\r\u{1c}\u{2003}\u{2028}\u{3000}"));
-    assert!(!is_blank("\u{a0}"));
-    assert!(!is_blank("\u{2007}"));
-    assert!(!is_blank("\u{85}"));
-    assert!(!is_blank(" m "));
-    assert!(map(r#"{"model":" ","input":"x"}"#).is_err_and(|error| error.status == 404));
-}
-
-#[test]
-fn java_text_writes_values_as_the_source_runtime_does() {
-    let text = |json: &str| java_text(&JsonValue::parse(json).expect("json"));
+fn value_text_writes_values_as_a_param_spells_them() {
+    let text = |json: &str| value_text(&JsonValue::parse(json).expect("json"));
     assert_eq!(text("null"), "null");
     assert_eq!(text("true"), "true");
     assert_eq!(text("12"), "12");

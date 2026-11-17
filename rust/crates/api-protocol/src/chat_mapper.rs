@@ -13,6 +13,7 @@ use crate::json::JsonValue;
 use crate::openai::{ChatCompletionRequest, ChatMessage};
 use crate::reasoning;
 use crate::response_format::ResponseFormat;
+use crate::served_model::require_served_model;
 use crate::template::{AssistantMessage, ContentPart, Message, Role, ToolCall};
 use crate::tool_calling::{ToolCalling, check_keys, is_function_name, is_parameter_name, member};
 use crate::tool_results::ToolResults;
@@ -90,31 +91,6 @@ pub fn map_chat(mut request: ChatCompletionRequest, defaults: &Defaults) -> Resu
     Ok(ChatRequest {
         generation: GenerationRequest::new(messages, tools, settings),
         include_usage,
-    })
-}
-
-fn require_served_model(model: Option<&str>, served: &str) -> Result<String, ApiError> {
-    match model {
-        Some(model) if !is_blank(model) => {
-            if model == served {
-                Ok(model.to_owned())
-            } else {
-                Err(ApiError::model_not_found(model))
-            }
-        }
-        _ => Err(ApiError::invalid_request(
-            "You must provide a model parameter.",
-            Some("model"),
-        )),
-    }
-}
-
-/// Blank text: empty or only whitespace as the wire format counts it, which is the space separators other than the
-/// no-break spaces, the line and paragraph separators and the controls U+0009 to U+000D and U+001C to U+001F.
-fn is_blank(text: &str) -> bool {
-    text.chars().all(|character| {
-        matches!(character, '\u{9}'..='\u{d}' | '\u{1c}'..='\u{1f}')
-            || (character.is_whitespace() && !matches!(character, '\u{a0}' | '\u{2007}' | '\u{202f}' | '\u{85}'))
     })
 }
 

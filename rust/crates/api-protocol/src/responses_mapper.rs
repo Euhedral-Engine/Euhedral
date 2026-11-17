@@ -7,13 +7,14 @@
 use std::collections::HashSet;
 
 use crate::error::ApiError;
-use crate::generation::{Defaults, GenerationRequest, Sampling};
+use crate::generation::{Defaults, GenerationRequest, GenerationSettings, Sampling};
 use crate::json::JsonValue;
 use crate::pipeline::ToolChoice;
 use crate::reasoning;
 use crate::response_format::ResponseFormat;
 use crate::responses::ResponsesRequest;
-use crate::template::{AssistantMessage, ContentPart, Message, TemplateInput, ToolCall};
+use crate::served_model::require_served_model;
+use crate::template::{AssistantMessage, ContentPart, Message, ToolCall};
 use crate::tool_calling::{FunctionTool, ToolCalling, check_keys, is_function_name, parameters};
 use crate::tool_definition::ToolDefinition;
 use crate::tool_results::ToolResults;
@@ -47,11 +48,19 @@ const MAX_TOKENS_PARAM: &str = "max_output_tokens";
 
 const FUNCTION_NAME_MESSAGE: &str = "Function names must be 1-64 characters of a-z, A-Z, 0-9, underscores, and dashes.";
 
+/// A mapped Responses request: the generation to run, and what only this surface asks of the reply.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MappedResponses {
+    pub generation: GenerationRequest,
+    /// The request asked for `reasoning.encrypted_content`: reasoning items carry the opaque token.
+    pub include_encrypted_content: bool,
+}
+
 /// Validates everything the request states and maps it. The first failing check decides the error.
-pub fn map_responses(request: ResponsesRequest, defaults: &Defaults) -> Result<GenerationRequest, ApiError> {
+pub fn map_responses(request: ResponsesRequest, defaults: &Defaults) -> Result<MappedResponses, ApiError> {
     check_other_fields(&request.other)?;
     let model = require_served_model(request.model.as_deref(), &defaults.model)?;
-    include(present(request.include.as_ref()))?;
+    let include_encrypted_content = include(present(request.include.as_ref()))?;
     let tools = tools(
         present(request.tools.as_ref()),
         present(request.tool_choice.as_ref()),
@@ -62,15 +71,10 @@ pub fn map_responses(request: ResponsesRequest, defaults: &Defaults) -> Result<G
     let format = format(present(request.text.as_ref()))?;
     let messages = turns(request.instructions.as_deref(), present(request.input.as_ref()))?;
     let sampling = sampling(&request, defaults)?;
-    Ok(GenerationRequest {
+    let settings = GenerationSettings {
         model,
-        template: TemplateInput {
-            messages,
-            tools: tools.prompt_tools(),
-        },
         thinking,
         reasoning_budget: None,
-        tools,
         format,
         stops: Vec::new(),
         sampling,
@@ -78,7 +82,10 @@ pub fn map_responses(request: ResponsesRequest, defaults: &Defaults) -> Result<G
         max_tokens_param: MAX_TOKENS_PARAM.to_owned(),
         stream: request.stream == Some(true),
         return_token_ids: false,
-        include_usage: false,
+    };
+    Ok(MappedResponses {
+        generation: GenerationRequest::new(messages, tools, settings),
+        include_encrypted_content,
     })
 }
 
@@ -87,8 +94,9 @@ fn present(value: Option<&JsonValue>) -> Option<&JsonValue> {
     value.filter(|value| **value != JsonValue::Null)
 }
 
-/// The text of a value as Java's `String.valueOf` writes it, which is how the source names a bad value in `param`.
-fn java_text(value: &JsonValue) -> String {
+/// The text of a value as the wire format spells it in a `param`: strings bare, lists as `[a, b]` and objects as
+/// `{k=v}`.
+fn value_text(value: &JsonValue) -> String {
     match value {
         JsonValue::Null => "null".to_owned(),
         JsonValue::Bool(flag) => flag.to_string(),
@@ -96,13 +104,13 @@ fn java_text(value: &JsonValue) -> String {
         JsonValue::Float(_) => value.to_compact_string(),
         JsonValue::String(text) => text.clone(),
         JsonValue::Array(items) => {
-            let items: Vec<String> = items.iter().map(java_text).collect();
+            let items: Vec<String> = items.iter().map(value_text).collect();
             format!("[{}]", items.join(", "))
         }
         JsonValue::Object(members) => {
             let members: Vec<String> = members
                 .iter()
-                .map(|(key, value)| format!("{key}={}", java_text(value)))
+                .map(|(key, value)| format!("{key}={}", value_text(value)))
                 .collect();
             format!("{{{}}}", members.join(", "))
         }
@@ -130,32 +138,6 @@ fn check_other_fields(fields: &[(String, JsonValue)]) -> Result<(), ApiError> {
         return Err(ApiError::unrecognized_argument(name));
     }
     Ok(())
-}
-
-fn require_served_model(model: Option<&str>, served: &str) -> Result<String, ApiError> {
-    match model {
-        Some(model) if !is_blank(model) => {
-            if model == served {
-                Ok(model.to_owned())
-            } else {
-                Err(ApiError::model_not_found(model))
-            }
-        }
-        _ => Err(ApiError::invalid_request(
-            "You must provide a model parameter.",
-            Some("model"),
-        )),
-    }
-}
-
-/// Java's notion of blank text: empty or only characters its `Character.isWhitespace` accepts, which are the space
-/// separators other than the no-break spaces, the line and paragraph separators and the controls U+0009 to U+000D
-/// and U+001C to U+001F.
-fn is_blank(text: &str) -> bool {
-    text.chars().all(|character| {
-        matches!(character, '\u{9}'..='\u{d}' | '\u{1c}'..='\u{1f}')
-            || (character.is_whitespace() && !matches!(character, '\u{a0}' | '\u{2007}' | '\u{202f}' | '\u{85}'))
-    })
 }
 
 // Input.
@@ -407,7 +389,7 @@ fn content(content: Option<&JsonValue>, path: &str) -> Result<String, ApiError> 
         if !matches!(kind, Some(JsonValue::String(name)) if name == "input_text" || name == "output_text") {
             return Err(ApiError::unsupported_parameter(&format!(
                 "{part_path}.type={}",
-                kind.map_or_else(|| "null".to_owned(), java_text)
+                kind.map_or_else(|| "null".to_owned(), value_text)
             )));
         }
         check_keys(part, &["type", "text", "annotations", "logprobs"], &part_path)?;
@@ -485,7 +467,7 @@ pub fn encrypt(reasoning: &str) -> String {
     token
 }
 
-/// Decodes the URL-safe base64 alphabet as Java's decoder does: padding is optional, but when present it must close
+/// Decodes the URL-safe base64 alphabet as the wire format's decoder does: padding is optional, but when present it must close
 /// the last group exactly; any other character, or a last group of one character, is refused.
 fn decode_url_base64(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
@@ -543,7 +525,7 @@ fn arguments(value: Option<&JsonValue>, path: &str) -> Result<Vec<(String, JsonV
     if text.is_empty() {
         return Ok(Vec::new());
     }
-    let Some(parsed) = JsonValue::parse_prefix(text) else {
+    let Some(parsed) = JsonValue::parse(text) else {
         return Err(ApiError::invalid_request(
             "'arguments' must be valid JSON.",
             Some(&param),
@@ -560,22 +542,25 @@ fn arguments(value: Option<&JsonValue>, path: &str) -> Result<Vec<(String, JsonV
 
 // Options.
 
-fn include(value: Option<&JsonValue>) -> Result<(), ApiError> {
+fn include(value: Option<&JsonValue>) -> Result<bool, ApiError> {
     let Some(value) = value else {
-        return Ok(());
+        return Ok(false);
     };
     let JsonValue::Array(entries) = value else {
         return Err(ApiError::invalid_request("'include' must be a list.", Some("include")));
     };
+    let mut encrypted = false;
     for entry in entries {
-        if !matches!(entry, JsonValue::String(name) if name == "reasoning.encrypted_content") {
+        if matches!(entry, JsonValue::String(name) if name == "reasoning.encrypted_content") {
+            encrypted = true;
+        } else {
             return Err(ApiError::unsupported_parameter(&format!(
                 "include={}",
-                java_text(entry)
+                value_text(entry)
             )));
         }
     }
-    Ok(())
+    Ok(encrypted)
 }
 
 fn tools(
@@ -597,7 +582,7 @@ fn tools(
             if !matches!(tool.get("type"), Some(JsonValue::String(kind)) if kind == "function") {
                 return Err(ApiError::unsupported_parameter(&format!(
                     "{path}.type={}",
-                    tool.get("type").map_or_else(|| "null".to_owned(), java_text)
+                    tool.get("type").map_or_else(|| "null".to_owned(), value_text)
                 )));
             }
             check_keys(tool, &["type", "name", "description", "parameters", "strict"], &path)?;
@@ -673,7 +658,7 @@ fn tools(
             if !matches!(named.get("type"), Some(JsonValue::String(kind)) if kind == "function") {
                 return Err(ApiError::unsupported_parameter(&format!(
                     "tool_choice.type={}",
-                    named.get("type").map_or_else(|| "null".to_owned(), java_text)
+                    named.get("type").map_or_else(|| "null".to_owned(), value_text)
                 )));
             }
             check_keys(named, &["type", "name"], "tool_choice")?;
