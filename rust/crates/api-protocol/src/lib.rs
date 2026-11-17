@@ -8,6 +8,7 @@ pub mod error;
 pub mod generation;
 pub mod json;
 pub mod openai;
+pub mod output_grammar;
 pub mod pipeline;
 pub mod reasoning;
 pub mod response_format;
