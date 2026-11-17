@@ -17,6 +17,8 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use euhedral_inference_bench::config::{ConfigError, Options, Scenario, ScenarioKind, SpeculationMode};
 use euhedral_inference_bench::prompt::PromptCorpus;
+use euhedral_inference_bench::run::generation;
+use euhedral_inference_engine::sampling::SamplingConfig;
 
 fn configs_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../benchmark/configs")
@@ -140,21 +142,77 @@ fn what_the_engine_cannot_do_is_refused_with_the_reason() {
         assert!(parse(&with(&format!(r#", "{key}": []"#))).is_ok());
     }
 
-    let message = parse(&with(r#", "generation": {"mode": "sample"}"#)).unwrap_err();
-    assert!(
-        message.contains("sample") && message.contains("selects greedily"),
-        "{message}"
-    );
-    let message = parse(&with(r#", "generation": {"temperature": 0.7}"#)).unwrap_err();
-    assert!(
-        message.contains("temperature, topK, and topP require mode"),
-        "{message}"
-    );
     assert_eq!(
         parse(&with(r#", "generation": {"mode": "greedy", "seed": 7}"#))
             .unwrap()
-            .generation_seed,
+            .sampling
+            .seed(),
         7
+    );
+}
+
+fn sampling(generation: &str) -> Result<SamplingConfig, String> {
+    parse(&with(&format!(r#", "generation": {generation}"#))).map(|options| options.sampling)
+}
+
+#[test]
+fn sample_mode_takes_the_defaults_and_each_field() {
+    let defaults = sampling(r#"{"mode": "sample"}"#).unwrap();
+    assert_eq!(defaults, SamplingConfig::new(0.7, 20, 0.8, 1, false).unwrap());
+    let all = sampling(r#"{"mode": "sample", "seed": 9, "temperature": 0.3, "topK": 5, "topP": 0.5}"#).unwrap();
+    assert_eq!(all, SamplingConfig::new(0.3, 5, 0.5, 9, false).unwrap());
+    assert_eq!(sampling(r#"{"mode": "sample", "topK": 0}"#).unwrap().top_k(), 0);
+    assert_eq!(sampling(r#"{"mode": "sample", "topP": 1}"#).unwrap().top_p(), 1.0);
+    assert_eq!(sampling(r#"{"seed": 3}"#).unwrap(), SamplingConfig::greedy(3));
+    assert_eq!(parse(&with("")).unwrap().sampling, SamplingConfig::greedy(1));
+}
+
+#[test]
+fn a_negative_seed_keeps_its_bits() {
+    let negative = sampling(r#"{"mode": "sample", "seed": -1}"#).unwrap();
+    assert_eq!(negative.seed(), u64::MAX);
+    assert_eq!(sampling(r#"{"seed": -2}"#).unwrap().seed(), u64::MAX - 1);
+}
+
+#[test]
+fn sampling_values_are_refused_as_java_refuses_them() {
+    for (generation, expected) in [
+        (r#"{"mode": "sample", "topK": -1}"#, "topK must not be negative"),
+        (
+            r#"{"mode": "sample", "topP": 0}"#,
+            "top_p must be finite and in the range (0, 1]",
+        ),
+        (r#"{"mode": "sample", "topP": 1.5}"#, "top_p must be finite"),
+        (
+            r#"{"mode": "sample", "temperature": 1e300}"#,
+            "temperature must be finite",
+        ),
+        (r#"{"mode": "nucleus"}"#, "generation.mode must be greedy or sample"),
+        (r#"{"temperature": 0.7}"#, "temperature, topK, and topP require mode"),
+        (
+            r#"{"mode": "greedy", "topK": 3}"#,
+            "temperature, topK, and topP require mode",
+        ),
+        (
+            r#"{"mode": "greedy", "topP": 0.5}"#,
+            "temperature, topK, and topP require mode",
+        ),
+    ] {
+        let message = sampling(generation).unwrap_err();
+        assert!(message.contains(expected), "{generation}: {message}");
+    }
+}
+
+#[test]
+fn the_generation_block_holds_the_settings_sent() {
+    let sample = sampling(r#"{"mode": "sample", "seed": -1, "temperature": 0.7, "topK": 20, "topP": 0.8}"#).unwrap();
+    assert_eq!(
+        generation(&sample).to_string(),
+        r#"{"temperature":0.7,"topK":20,"topP":0.8,"seed":-1,"greedy":false}"#
+    );
+    assert_eq!(
+        generation(&SamplingConfig::greedy(7)).to_string(),
+        r#"{"temperature":0.0,"topK":0,"topP":1.0,"seed":7,"greedy":true}"#
     );
 }
 
