@@ -17,6 +17,7 @@ euhedral-gpu = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "b
 euhedral-graph = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bb15d07e8befd09e1446c9e2d638423c88251581", default-features = false }
 euhedral-hardware-utils = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bb15d07e8befd09e1446c9e2d638423c88251581" }
 euhedral-io = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bb15d07e8befd09e1446c9e2d638423c88251581" }
+euhedral-memory = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bb15d07e8befd09e1446c9e2d638423c88251581", default-features = false }
 euhedral-hashing = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bb15d07e8befd09e1446c9e2d638423c88251581" }
 euhedral-net = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bb15d07e8befd09e1446c9e2d638423c88251581" }
 java-properties = "2"

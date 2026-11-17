@@ -483,6 +483,7 @@ dependencies = [
  "euhedral-inference-settings",
  "euhedral-inference-tokenizer",
  "euhedral-io",
+ "euhedral-memory",
  "log",
  "sha2",
  "tempfile",
