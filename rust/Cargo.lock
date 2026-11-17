@@ -517,6 +517,7 @@ dependencies = [
  "signal-hook",
  "socket2",
  "tempfile",
+ "test-support",
 ]
 
 [[package]]
