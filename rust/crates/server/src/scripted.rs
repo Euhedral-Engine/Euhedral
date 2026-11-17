@@ -28,20 +28,27 @@ fn lattice() -> Result<Arc<ControlPlaneLattice>, StartError> {
 
 /// A scripted backend that follows `script`.
 pub fn start_with(script: Script) -> Result<Started, StartError> {
+    start_scripted(script).map(|(started, _)| started)
+}
+
+/// A scripted backend that follows `script`, and the backend itself, for a test that steers its generations.
+pub fn start_scripted(script: Script) -> Result<(Started, Arc<ScriptedBackend>), StartError> {
     let lattice = lattice()?;
     let backend = ScriptedBackend::on(&lattice);
     backend.set_script(script);
     let stop = (backend.clone(), lattice.clone());
-    Ok(Started {
+    let started = Started {
         lattice,
-        backend,
-        shutdown: Box::new(move || {
+        backend: backend.clone(),
+        // The lattice of a scripted backend closes within its own bound.
+        shutdown: Box::new(move |_timeout| {
             let (backend, lattice) = stop;
             backend.release();
             lattice.close();
             Ok(())
         }),
-    })
+    };
+    Ok((started, backend))
 }
 
 /// A scripted backend that says `Hello, world`.

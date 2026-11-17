@@ -10,14 +10,14 @@ mod common;
 
 use std::fs::write;
 use std::io::Read;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio, id};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::thread::{sleep, spawn as spawn_thread};
 use std::time::{Duration, Instant};
 
-use common::{PATIENCE, chat, exchange, gauge, status, try_exchange, until};
+use common::{PATIENCE, chat, exchange, gauge, ready, status, try_exchange, until};
 
 const SERVER: &str = env!("CARGO_BIN_EXE_euhedral-server");
 
@@ -57,11 +57,16 @@ fn config(directory: &Path, port: u16, extra: &str) -> PathBuf {
 }
 
 fn spawn(arguments: &[&str]) -> Server {
+    spawn_with(arguments, Stdio::null())
+}
+
+/// A server whose standard output is `stdout`.
+fn spawn_with(arguments: &[&str], stdout: Stdio) -> Server {
     let child = Command::new(SERVER)
         .args(arguments)
         .env_clear()
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(stdout)
         .stderr(Stdio::piped())
         .spawn()
         .expect("the server binary");
@@ -140,20 +145,21 @@ fn a_port_in_use_exits_with_one_and_names_the_port() {
     assert!(text.contains(&format!("Port {port} was already in use.")), "{text}");
 }
 
-/// Starts a scripted server and waits until it answers.
-fn serving(directory: &Path, script: &str, extra: &str) -> (Server, SocketAddr) {
+/// Starts a scripted server and waits until it answers. `windows` are the hidden arguments that shorten the stop's
+/// windows.
+fn serving(directory: &Path, script: &str, windows: &[&str]) -> (Server, SocketAddr) {
+    serving_on(directory, script, windows, Stdio::null())
+}
+
+fn serving_on(directory: &Path, script: &str, windows: &[&str], stdout: Stdio) -> (Server, SocketAddr) {
     let port = free_port();
-    let file = config(directory, port, extra);
-    let server = spawn(&[
-        "--config",
-        file.to_str().expect("a path"),
-        &format!("--scripted-backend={script}"),
-    ]);
+    let file = config(directory, port, "");
+    let backend = format!("--scripted-backend={script}");
+    let mut arguments = vec!["--config", file.to_str().expect("a path"), &backend];
+    arguments.extend_from_slice(windows);
+    let server = spawn_with(&arguments, stdout);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    // A connection made in the first moments after the port opens is sometimes reset: ask until the server answers.
-    until("the server to answer", || {
-        try_exchange(addr, "GET", "/health", None).is_ok_and(|answer| status(&answer) == 200)
-    });
+    ready(addr);
     (server, addr)
 }
 
@@ -171,7 +177,7 @@ fn signal(server: &Server, name: &str) {
 #[test]
 fn sigterm_stops_a_serving_process_with_143() {
     let directory = tempfile::tempdir().expect("a directory");
-    let (mut server, _) = serving(directory.path(), "hello", "");
+    let (mut server, _) = serving(directory.path(), "hello", &[]);
     signal(&server, "TERM");
     assert_eq!(exit_code(&mut server, PATIENCE), 143);
 }
@@ -180,7 +186,7 @@ fn sigterm_stops_a_serving_process_with_143() {
 #[test]
 fn sigint_stops_a_serving_process_with_130() {
     let directory = tempfile::tempdir().expect("a directory");
-    let (mut server, _) = serving(directory.path(), "hello", "");
+    let (mut server, _) = serving(directory.path(), "hello", &[]);
     signal(&server, "INT");
     assert_eq!(exit_code(&mut server, PATIENCE), 130);
 }
@@ -190,7 +196,11 @@ fn sigint_stops_a_serving_process_with_130() {
 fn a_second_signal_ends_the_process_at_once_with_the_code_of_the_signal() {
     let directory = tempfile::tempdir().expect("a directory");
     // A generation that never ends keeps the stop waiting for the whole shutdown timeout.
-    let (mut server, addr) = serving(directory.path(), "hung", "  shutdown-timeout: 60s\n");
+    let (mut server, addr) = serving(
+        directory.path(),
+        "hung",
+        &["--scripted-drain-ms=0", "--scripted-shutdown-ms=60000"],
+    );
     spawn_thread(move || exchange(addr, "POST", "/v1/chat/completions", Some(&chat(true, 10))));
     until("the request to run", || {
         gauge(addr, "euhedral_generations_active") == Some(1.0)
@@ -212,7 +222,11 @@ fn a_second_signal_ends_the_process_at_once_with_the_code_of_the_signal() {
 #[test]
 fn a_stop_by_signal_interrupts_a_running_request_and_refuses_the_queued_one() {
     let directory = tempfile::tempdir().expect("a directory");
-    let (mut server, addr) = serving(directory.path(), "hung", "  shutdown-timeout: 2s\n");
+    let (mut server, addr) = serving(
+        directory.path(),
+        "hung",
+        &["--scripted-drain-ms=0", "--scripted-shutdown-ms=2000"],
+    );
     let running = spawn_thread(move || exchange(addr, "POST", "/v1/chat/completions", Some(&chat(true, 10))));
     until("the request to run", || {
         gauge(addr, "euhedral_generations_active") == Some(1.0)
@@ -228,4 +242,31 @@ fn a_stop_by_signal_interrupts_a_running_request_and_refuses_the_queued_one() {
     assert!(queued.contains("shutting down"), "{queued}");
     let running = running.join().expect("a client");
     assert!(running.contains("interrupted by server shutdown"), "{running}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stop_by_signal_still_ends_in_order_when_the_standard_output_is_closed() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let (mut server, _) = serving_on(directory.path(), "hello", &[], Stdio::piped());
+    // The reader goes away: from now on every line of the log fails to be written.
+    drop(server.0.stdout.take());
+    signal(&server, "TERM");
+    assert_eq!(exit_code(&mut server, PATIENCE), 143);
+    let text = stderr_of(&mut server);
+    assert!(!text.contains("panicked"), "{text}");
+}
+
+#[test]
+fn the_server_answers_on_both_loopback_addresses() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let (_server, addr) = serving(directory.path(), "hello", &[]);
+    let v4 = try_exchange(addr, "GET", "/health", None).expect("an answer on 127.0.0.1");
+    assert_eq!(status(&v4), 200, "{v4}");
+    // A host without IPv6 cannot be asked.
+    if TcpListener::bind("[::1]:0").is_ok() {
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, addr.port()));
+        let answer = try_exchange(v6, "GET", "/health", None).expect("an answer on ::1");
+        assert_eq!(status(&answer), 200, "{answer}");
+    }
 }

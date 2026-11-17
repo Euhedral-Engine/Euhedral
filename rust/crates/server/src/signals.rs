@@ -9,10 +9,7 @@ use std::fmt::{self, Debug, Formatter};
 #[cfg(unix)]
 use std::io;
 
-/// The exit code of a stop by SIGTERM.
-const TERM: u8 = crate::EXIT_SIGTERM;
-/// The exit code of a stop by SIGINT.
-const INT: u8 = crate::EXIT_SIGINT;
+use crate::{EXIT_SIGINT, EXIT_SIGTERM};
 
 /// The handlers, installed. [`wait`](Signals::wait) blocks the calling (main) thread until the first stop request.
 #[cfg(unix)]
@@ -41,8 +38,8 @@ pub fn install() -> io::Result<Signals> {
     use signal_hook::flag::{register, register_conditional_shutdown};
 
     let again = Arc::new(AtomicBool::new(false));
-    register_conditional_shutdown(SIGTERM, i32::from(TERM), again.clone())?;
-    register_conditional_shutdown(SIGINT, i32::from(INT), again.clone())?;
+    register_conditional_shutdown(SIGTERM, i32::from(EXIT_SIGTERM), again.clone())?;
+    register_conditional_shutdown(SIGINT, i32::from(EXIT_SIGINT), again.clone())?;
     let signals = Delivered::new([SIGTERM, SIGINT])?;
     register(SIGTERM, again.clone())?;
     register(SIGINT, again)?;
@@ -56,8 +53,8 @@ impl Signals {
     pub fn wait(&mut self) -> u8 {
         use signal_hook::consts::SIGINT;
         match self.signals.forever().next() {
-            Some(SIGINT) => INT,
-            _ => TERM,
+            Some(SIGINT) => EXIT_SIGINT,
+            _ => EXIT_SIGTERM,
         }
     }
 }
@@ -69,13 +66,12 @@ pub use console::{Signals, install};
 #[cfg(windows)]
 mod console {
     use std::io;
-    use std::process::exit;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::sync::{Mutex, OnceLock, PoisonError};
     use std::thread::park;
 
-    use super::{INT, TERM};
+    use super::{EXIT_SIGINT, EXIT_SIGTERM};
 
     const CTRL_C_EVENT: u32 = 0;
     const CTRL_BREAK_EVENT: u32 = 1;
@@ -86,6 +82,8 @@ mod console {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
+        fn GetCurrentProcess() -> isize;
+        fn TerminateProcess(process: isize, code: u32) -> i32;
     }
 
     static STOPPING: AtomicBool = AtomicBool::new(false);
@@ -116,18 +114,22 @@ mod console {
         /// Blocks until the first stop request; returns its exit code.
         #[allow(clippy::disallowed_methods, reason = "the main thread waits for the stop request")]
         pub fn wait(&mut self) -> u8 {
-            self.requests.recv().unwrap_or(TERM)
+            self.requests.recv().unwrap_or(EXIT_SIGTERM)
         }
     }
 
     unsafe extern "system" fn handler(event: u32) -> i32 {
         let (code, closing) = match event {
-            CTRL_C_EVENT | CTRL_BREAK_EVENT => (INT, false),
-            CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => (TERM, true),
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => (EXIT_SIGINT, false),
+            CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => (EXIT_SIGTERM, true),
             _ => return 0,
         };
         if STOPPING.swap(true, Ordering::AcqRel) {
-            exit(i32::from(code));
+            // The second event ends the process at once, from this thread: `exit` would wait for the runtime's
+            // locks that the stop in progress may hold.
+            // SAFETY: the pseudo handle of the current process is valid for the call, which takes no pointers.
+            unsafe { TerminateProcess(GetCurrentProcess(), u32::from(code)) };
+            return 1;
         }
         if let Some(sender) = SENDER.get() {
             sender.lock().unwrap_or_else(PoisonError::into_inner).send(code).ok();

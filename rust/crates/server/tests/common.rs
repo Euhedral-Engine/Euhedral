@@ -8,7 +8,7 @@
 )]
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,24 @@ use euhedral_inference_api_server::scripted::MODEL_ID;
 
 /// How long a test waits for anything before it fails.
 pub const PATIENCE: Duration = Duration::from_secs(30);
+
+/// The address a client connects to for a server that listens on `addr`: the loopback address where it listens on every
+/// address.
+pub fn reach(addr: SocketAddr) -> SocketAddr {
+    if addr.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+    } else {
+        addr
+    }
+}
+
+/// Waits until the server answers `/health`: a connection made in the first moments after the port opens is
+/// sometimes reset, and the test must not fail on that.
+pub fn ready(addr: SocketAddr) {
+    until("the server to answer", || {
+        try_exchange(addr, "GET", "/health", None).is_ok_and(|answer| status(&answer) == 200)
+    });
+}
 
 /// The whole of one exchange: `request` sent, the answer read until the server closes (`Connection: close`) or the
 /// patience ends; what was read either way.
@@ -25,7 +43,8 @@ pub fn exchange(addr: SocketAddr, method: &str, target: &str, body: Option<&str>
 
 /// [`exchange`], reporting a connection that fails or an empty answer instead of panicking.
 pub fn try_exchange(addr: SocketAddr, method: &str, target: &str, body: Option<&str>) -> Result<String, String> {
-    let mut stream = TcpStream::connect_timeout(&addr, PATIENCE).map_err(|error| format!("connecting: {error}"))?;
+    let mut stream =
+        TcpStream::connect_timeout(&reach(addr), PATIENCE).map_err(|error| format!("connecting: {error}"))?;
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .map_err(|error| error.to_string())?;

@@ -1,6 +1,6 @@
 //! The log: one line per record on the standard output, `LEVEL message`, at info and above.
 
-#![allow(clippy::print_stdout, reason = "the log is the process's standard output")]
+use std::io::{Write, stdout};
 
 use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError, set_logger, set_max_level};
 
@@ -13,7 +13,8 @@ impl Log for Stdout {
 
     fn log(&self, record: &Record<'_>) {
         if self.enabled(record.metadata()) {
-            println!("{:>5} {}", record.level(), record.args());
+            // A closed standard output loses the line; it must not stop the process from stopping in order.
+            writeln!(stdout().lock(), "{:>5} {}", record.level(), record.args()).ok();
         }
     }
 

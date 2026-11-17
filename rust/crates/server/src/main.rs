@@ -12,22 +12,21 @@
 //! This file is the process's edge: it reads the arguments and the environment, installs the logger and the signals,
 //! and chooses the backend.
 
-#![allow(
-    clippy::print_stderr,
-    reason = "a command-line binary: what it says about a bad command line and bad settings is its output"
-)]
-
 use std::env;
 #[cfg(feature = "scripted")]
 use std::ffi::OsString;
 use std::process::ExitCode;
+#[cfg(feature = "scripted")]
+use std::time::Duration;
 
 #[cfg(feature = "scripted")]
 use euhedral_inference_server::scripted::{script_named, start_with};
 use euhedral_inference_server::signals::install;
+#[cfg(feature = "scripted")]
+use euhedral_inference_server::{DRAIN_WINDOW, SHUTDOWN_WINDOW};
 use euhedral_inference_server::{
-    EXIT_INVALID_SETTINGS, EXIT_START_FAILED, StartError, Started, ignored_arguments, install_logger, load_settings,
-    serve,
+    EXIT_INVALID_SETTINGS, EXIT_START_FAILED, StartError, Started, StopWindows, ignored_arguments, install_logger,
+    load_settings, say, serve,
 };
 use euhedral_inference_settings::{Settings, process_env};
 
@@ -48,34 +47,49 @@ fn main() -> ExitCode {
         Ok(settings) => settings,
         Err(problems) => {
             for problem in problems {
-                eprintln!("{problem}");
+                say(&problem);
             }
             return ExitCode::from(EXIT_INVALID_SETTINGS);
         }
     };
     // A failed logger install only loses the log lines.
     if install_logger().is_err() {
-        eprintln!("the log could not be installed");
+        say("the log could not be installed");
     }
     for argument in ignored_arguments(&args) {
         log::warn!("ignoring the argument {argument}");
     }
-    let wait = |_| match install() {
-        Ok(mut signals) => signals.wait(),
+    // The handlers come before the backend starts: a signal that arrives while it starts is kept, and stops the server
+    // in order as soon as it serves.
+    let mut signals = match install() {
+        Ok(signals) => signals,
         Err(error) => {
-            eprintln!("the signal handlers could not be installed: {error}");
-            EXIT_START_FAILED
+            say(&format!("the signal handlers could not be installed: {error}"));
+            return ExitCode::from(EXIT_START_FAILED);
         }
     };
+    let wait = move |_| signals.wait();
     #[cfg(feature = "scripted")]
     if let Some(name) = scripted_name(&args) {
         let Some(script) = script_named(&name) else {
-            eprintln!("unknown scripted backend {name}");
+            say(&format!("unknown scripted backend {name}"));
             return ExitCode::from(EXIT_INVALID_SETTINGS);
         };
-        return ExitCode::from(serve(&settings, |_| start_with(script), wait));
+        let windows = StopWindows {
+            drain: scripted_millis(&args, "--scripted-drain-ms=").unwrap_or(DRAIN_WINDOW),
+            shutdown: scripted_millis(&args, "--scripted-shutdown-ms=").unwrap_or(SHUTDOWN_WINDOW),
+        };
+        return ExitCode::from(serve(&settings, windows, |_| start_with(script), wait));
     }
-    ExitCode::from(serve(&settings, start_backend, wait))
+    ExitCode::from(serve(&settings, StopWindows::default(), start_backend, wait))
+}
+
+/// The duration in milliseconds that `--scripted-...-ms=N` states, if the argument is there.
+#[cfg(feature = "scripted")]
+fn scripted_millis(args: &[OsString], prefix: &str) -> Option<Duration> {
+    args.iter()
+        .find_map(|argument| argument.to_str()?.strip_prefix(prefix)?.parse().ok())
+        .map(Duration::from_millis)
 }
 
 /// The script named by `--scripted-backend` or `--scripted-backend=NAME` (`hello` when no name is given).
