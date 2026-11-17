@@ -21,7 +21,7 @@ use euhedral_core::impls::{BaseCloneableObject, DefaultExecutor};
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_hardware_utils::affinity;
 use euhedral_inference_api_server::scripted::ScriptedBackend;
-use euhedral_inference_api_server::{ApiConfig, ApiServer, Limits, once, start};
+use euhedral_inference_api_server::{ApiConfig, ApiServer, EngineReport, Limits, once, start};
 use euhedral_io::AsyncIo;
 use euhedral_net::{ClientConfig, Method, NetError, Request, Response, request};
 
@@ -74,8 +74,14 @@ impl Fixture {
     }
 
     pub fn with(limits: Limits, cpus: Option<usize>) -> Fixture {
+        Fixture::reporting(limits, cpus, EngineReport::default())
+    }
+
+    /// A server whose backend reports `report` for the metrics.
+    pub fn reporting(limits: Limits, cpus: Option<usize>, report: EngineReport) -> Fixture {
         let lattice = lattice(cpus);
         let backend = ScriptedBackend::on(&lattice);
+        backend.set_engine_report(report);
         let config = ApiConfig {
             address: "127.0.0.1:0".parse().expect("an address"),
             limits,

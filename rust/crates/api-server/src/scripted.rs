@@ -17,8 +17,8 @@ use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 
 use crate::backend::{
-    Backend, BackendError, EncodedPrompt, Generation, GenerationConfig, GenerationResult, Next, OutputSpec,
-    TextListener,
+    Backend, BackendError, EncodedPrompt, EngineReport, Generation, GenerationConfig, GenerationResult, Next,
+    OutputSpec, TextListener,
 };
 use crate::frames::once_or_refused;
 
@@ -67,6 +67,7 @@ pub struct ScriptedBackend {
     script: Mutex<Script>,
     generations: Mutex<Vec<Arc<ScriptedGeneration>>>,
     encoded: AtomicUsize,
+    report: Mutex<EngineReport>,
 }
 
 impl Debug for ScriptedBackend {
@@ -92,6 +93,7 @@ impl ScriptedBackend {
             script: Mutex::new(Script::hello()),
             generations: Mutex::new(Vec::new()),
             encoded: AtomicUsize::new(0),
+            report: Mutex::new(EngineReport::default()),
         })
     }
 
@@ -103,6 +105,11 @@ impl ScriptedBackend {
     /// Sets how many generations may run at once (one at first), as an engine that loaded more sequences does.
     pub fn set_max_active(&self, count: usize) {
         self.max_active.store(count, Ordering::Release);
+    }
+
+    /// Sets what [`Backend::engine_report`] returns. The speculative depth is read when the server starts.
+    pub fn set_engine_report(&self, report: EngineReport) {
+        *self.report.lock().unwrap_or_else(PoisonError::into_inner) = report;
     }
 
     /// Sets the script of the generations opened from now on.
@@ -158,6 +165,10 @@ impl Backend for ScriptedBackend {
 
     fn max_active_generations(&self) -> usize {
         self.max_active.load(Ordering::Acquire)
+    }
+
+    fn engine_report(&self) -> EngineReport {
+        self.report.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     fn encode_prompt(&self, prompt: String, then: Next<Result<EncodedPrompt, BackendError>>) {

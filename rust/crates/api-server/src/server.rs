@@ -20,6 +20,7 @@ use crate::admission::Admission;
 use crate::backend::Backend;
 use crate::frames::once_or_refused;
 use crate::limits::Limits;
+use crate::metrics::Metrics;
 use crate::router::Router;
 
 /// What a server needs to start.
@@ -60,6 +61,7 @@ pub struct ApiServer {
     // server opened it and so completes it.
     io: Arc<AsyncIo>,
     own_io: bool,
+    metrics: Arc<Metrics>,
 }
 
 impl Debug for ApiServer {
@@ -101,7 +103,11 @@ pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Resul
         return Err(error);
     }
     let admission = Admission::new(config.backend.clone(), &config.limits, sink.clone(), timers.clone());
-    let router = Router::new(config.backend, config.created_at, config.limits);
+    let metrics = Arc::new(Metrics::new(
+        config.backend.engine_report().speculative_depth,
+        Metrics::wall_clock_ms(),
+    ));
+    let router = Router::new(config.backend, config.created_at, config.limits, metrics.clone());
     let handle = match serve(
         lattice.clone(),
         io.clone(),
@@ -126,6 +132,7 @@ pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Resul
         drain_limit: config.limits.drain_limit,
         io,
         own_io,
+        metrics,
     })
 }
 
@@ -133,6 +140,11 @@ impl ApiServer {
     /// The address the server listens on.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The registry the routes export: what the request code records into.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
     }
 
     /// What the transport counted so far.
