@@ -49,7 +49,7 @@ use euhedral_inference_engine::generation::{
     AdmissionError, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, LogitsSink, QuantumEvent,
     Speculation,
 };
-use euhedral_inference_engine::sampling::SamplingConfig;
+use euhedral_inference_engine::sampling::{SamplingConfig, TokenSampler};
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
 
@@ -635,5 +635,122 @@ fn sampled_requests_select_on_the_host_and_agree_with_greedy_at_top_k_one() {
         .inspect_sequence(|sequence| sequence.row_readbacks.leased())
         .expect("the generation gave the sequence back");
     assert_eq!(leased, 0, "no row left leased");
+    owner.shutdown(runtime).unwrap();
+}
+
+/// Collects the logits rows of a teacher-forced run.
+struct Rows {
+    rows: Vec<Vec<u8>>,
+    done: Option<Arc<Handoff<Vec<Vec<u8>>>>>,
+}
+
+impl LogitsSink for Rows {
+    fn row(&mut self, step: usize, _forced: u32, logits: &[u8]) {
+        assert_eq!(step, self.rows.len(), "the rows arrive in order");
+        self.rows.push(logits.to_vec());
+    }
+
+    fn finished(&mut self, _outcome: GenerationOutcome) {
+        let done = self.done.take().expect("a run finishes once");
+        done.send(mem::take(&mut self.rows));
+    }
+}
+
+/// The logits row that predicts each of `forced` after `prompt`.
+fn forced_rows(runtime: &EngineRuntime, prompt: &[u32], forced: &[u32]) -> Vec<Vec<u8>> {
+    let done = Handoff::new();
+    runtime
+        .teacher_forced(
+            prompt.to_vec(),
+            forced.to_vec(),
+            Box::new(Rows {
+                rows: Vec::new(),
+                done: Some(Arc::clone(&done)),
+            }),
+        )
+        .expect("the run is admitted");
+    done.wait(WAIT).expect("the run reports")
+}
+
+/// The position of each sampled token is the length of what precedes it: the prompt's for the first, one more for
+/// each after it. Checked with a configuration in which the position changes the token (a nucleus cut, not top-k 1):
+/// each token the engine sampled is the one a fresh sampler draws from the same row at that position, and not the one
+/// it draws at the next, over a prompt of one chunk and of several.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
+fn sampled_tokens_are_drawn_at_the_position_they_follow() {
+    let Some(machine) = machine() else { return };
+    let reference = greedy_reference(&machine);
+    let config = SamplingConfig::new(1.0, 0, 0.95, 77, false).unwrap();
+    let tokens = 24;
+    let mut settings = settings(&machine.artifact, 4096);
+    settings.batching.prefill_chunk_tokens = 256;
+    let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    let prompts = [
+        reference.prompt.clone(),
+        reference.prompt.iter().copied().cycle().take(700).collect::<Vec<u32>>(),
+    ];
+    for prompt in prompts {
+        let recording = generate_sampled(&runtime, &prompt, tokens, &[], config);
+        assert_eq!(recording.tokens.len(), tokens as usize);
+        let rows = forced_rows(&runtime, &prompt, &recording.tokens);
+        assert_eq!(rows.len(), tokens as usize);
+        let vocabulary = rows[0].len() / 2;
+        let mut sampler = TokenSampler::new(config, vocabulary).unwrap();
+        let mut shifted_differs = false;
+        for (index, row) in rows.iter().enumerate() {
+            let position = (prompt.len() + index) as u64;
+            let chosen = sampler.select_bf16(row, position, None).unwrap();
+            assert_eq!(
+                chosen,
+                recording.tokens[index],
+                "token {index} of a {}-token prompt is drawn at position {position}",
+                prompt.len()
+            );
+            shifted_differs |= sampler.select_bf16(row, position + 1, None).unwrap() != chosen;
+        }
+        assert!(shifted_differs, "the position matters in this configuration");
+    }
+    owner.shutdown(runtime).unwrap();
+}
+
+/// A stop token as the first sampled token ends the request after reporting it, as for a greedy request; a budget of
+/// one ends it after one token; neither leaves a quantum in flight or a row leased.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
+fn a_sampled_first_token_can_be_the_stop_token_or_the_whole_budget() {
+    let Some(machine) = machine() else { return };
+    let reference = greedy_reference(&machine);
+    let config = SamplingConfig::new(1.0, 0, 0.95, 5, false).unwrap();
+    let (runtime, owner) = start(&machine, 4096);
+    let full = generate_sampled(&runtime, &reference.prompt, 8, &[], config);
+    assert_eq!(full.tokens.len(), 8);
+    let first = full.tokens[0];
+
+    let one = generate_sampled(&runtime, &reference.prompt, 1, &[], config);
+    assert_eq!(one.outcome.reason, FinishReason::Length);
+    assert_eq!(one.tokens, [first], "a budget of one is the first token");
+    assert_eq!(sequence_state(&runtime), (reference.prompt.len() as u64, 0, 0));
+
+    let stopped = generate_sampled(&runtime, &reference.prompt, 8, &[first], config);
+    assert_eq!(stopped.outcome.reason, FinishReason::Stop);
+    assert_eq!(stopped.tokens, [first], "the stop token is reported, and is the last");
+    assert_eq!(stopped.outcome.generated, 1);
+    let leased = runtime
+        .inspect_sequence(|sequence| sequence.row_readbacks.leased())
+        .expect("the generation gave the sequence back");
+    assert_eq!(leased, 0);
+
+    // The same stop token, when it is a later token, ends the run there.
+    let later = full.tokens[3];
+    if !full.tokens[..3].contains(&later) {
+        let stopped = generate_sampled(&runtime, &reference.prompt, 8, &[later], config);
+        assert_eq!(stopped.outcome.reason, FinishReason::Stop);
+        assert_eq!(stopped.tokens, full.tokens[..4]);
+    }
     owner.shutdown(runtime).unwrap();
 }

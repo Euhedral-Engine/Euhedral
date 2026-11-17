@@ -458,6 +458,8 @@ pub(crate) struct Owner {
     parked: Vec<Parked>,
     /// Outcomes to tell once the claim is released: a request's end, and the refusals of requests posted meanwhile.
     finished: VecDeque<Finished>,
+    /// The number of the next selection a sampled request publishes; it never restarts, whatever the request.
+    sample_steps: u64,
 }
 
 impl fmt::Debug for Owner {
@@ -481,6 +483,7 @@ impl Owner {
             run: None,
             parked: Vec::new(),
             finished: VecDeque::new(),
+            sample_steps: 0,
         }
     }
 
@@ -547,7 +550,8 @@ impl Owner {
         let mode = match speculation {
             // The host selects, one token at a time: no speculation yet, whatever the request asks for.
             _ if !sampling.is_greedy() => {
-                if self.sequence.row_readbacks.is_empty() {
+                if self.sequence.row_readbacks.is_exhausted() {
+                    // Refused before the prompt prefills: the last chunk would find no row to copy its logits to.
                     let error = AdmissionError::Engine("the sequence has no row readback to sample from".to_string());
                     return Err(Rejected::new(error, Audience::Greedy(listener)));
                 }
@@ -1071,17 +1075,21 @@ impl Owner {
 
     /// Publishes the frame that selects the token of a sampled quantum from the row it copied: the quantum retired, so
     /// the row is in the readback. The frame owns the row's lease, the request's sampler and the position the token
-    /// takes, which is the position after the quantum's last row (Java's `samplePosition`).
+    /// takes, which is the position after the quantum's last row.
     fn sample(&mut self, flying: &mut Flying) {
         let Some(row) = flying.row.take() else {
             return self.fail("a sampled quantum retired with no row readback".to_string());
         };
         let position = flying.start + flying.rows as u64;
+        // The step is the owner's, not the request's: an answer that comes late from a request that ended never
+        // matches a selection of the next one.
+        let step = self.sample_steps;
+        self.sample_steps += 1;
         let prepared = match self.run.as_mut().map(|run| &mut run.mode) {
             Some(Mode::Sampled { state, .. }) => state
                 .sampler
                 .take()
-                .map(|sampler| (state.pending.begin(), sampler))
+                .map(|sampler| (state.pending.begin(step), sampler))
                 .ok_or("the request's sampler is in use"),
             _ => return,
         };

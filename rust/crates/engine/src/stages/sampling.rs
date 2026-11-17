@@ -411,6 +411,11 @@ impl RowReadbackPool {
         self.readbacks.is_empty()
     }
 
+    /// Whether no readback is free to lease: the pool has none, or every one is held.
+    pub fn is_exhausted(&self) -> bool {
+        self.leased() >= self.len()
+    }
+
     /// Readbacks leased now.
     pub fn leased(&self) -> usize {
         self.readbacks
@@ -531,6 +536,16 @@ mod tests {
         assert_eq!(token_of(0xFFFF_FFFF - 5), Some(5));
         assert_eq!(token_of((0x3f80 << 32) | (0xFFFF_FFFF - 248_319)), Some(248_319));
         assert_eq!(token_of(0xFFFF_FFFF), Some(0));
+    }
+
+    #[test]
+    fn a_pool_with_no_readback_has_none_free() {
+        let pool = RowReadbackPool::none();
+        assert!(pool.is_empty());
+        assert!(
+            pool.is_exhausted(),
+            "a request that samples is refused before it prefills"
+        );
     }
 
     #[test]

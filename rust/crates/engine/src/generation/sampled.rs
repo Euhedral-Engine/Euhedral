@@ -2,7 +2,7 @@
 //! tells the owner which selection it is waiting for.
 //!
 //! A sampled quantum copies its logits row to pinned memory inside its graph. When the quantum has retired the owner
-//! publishes one [`Kind::Sample`](crate::frames::Kind::Sample) frame, which owns the row's lease, the request's sampler
+//! publishes one [`Kind::Sample`] frame, which owns the row's lease, the request's sampler
 //! and the step and position it selects for. The frame runs [`TokenSampler::select_bf16`], lets go of the row, and posts
 //! the answer to the owner. The owner admits nothing until the answer arrives: the token is the next decode's input.
 //! A frame that is dropped without running, or whose selection panics, still posts, with an error, so the request ends
@@ -39,15 +39,13 @@ pub(crate) struct Sampled {
 /// The one selection of a sampled request that is waiting for its frame.
 #[derive(Debug, Default)]
 pub(crate) struct Pending {
-    issued: u64,
     waiting: Option<u64>,
 }
 
 impl Pending {
-    /// Starts a selection and returns its step. One at a time: a request keeps one quantum in flight.
-    pub(crate) fn begin(&mut self) -> u64 {
-        let step = self.issued;
-        self.issued += 1;
+    /// Starts the selection numbered `step`, which the owner draws from a counter that never restarts. One at a time:
+    /// a request keeps one quantum in flight.
+    pub(crate) fn begin(&mut self, step: u64) -> u64 {
         self.waiting = Some(step);
         step
     }
@@ -247,16 +245,28 @@ mod tests {
     fn only_the_awaited_step_is_taken_and_a_stale_one_is_ignored() {
         let mut pending = Pending::default();
         assert!(!pending.waiting());
-        let first = pending.begin();
+        let first = pending.begin(10);
         assert!(pending.waiting());
         assert!(!pending.take(first + 1), "a step not issued");
         assert!(pending.waiting(), "a stale answer leaves the wait");
         assert!(pending.take(first));
         assert!(!pending.take(first), "an answer comes once");
         assert!(!pending.waiting());
-        let second = pending.begin();
+        let second = pending.begin(11);
         assert_ne!(first, second);
         assert!(!pending.take(first), "the answer of an earlier selection is stale");
         assert!(pending.take(second));
+    }
+
+    #[test]
+    fn an_answer_of_an_earlier_request_does_not_match_the_next_requests_selection() {
+        // Two requests of one owner number their selections from one counter: the second's first selection is not
+        // the first's.
+        let mut earlier = Pending::default();
+        let late = earlier.begin(0);
+        let mut next = Pending::default();
+        let current = next.begin(1);
+        assert!(!next.take(late), "the late answer is stale");
+        assert!(next.take(current));
     }
 }
