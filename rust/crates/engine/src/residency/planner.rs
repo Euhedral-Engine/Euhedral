@@ -13,6 +13,10 @@
 use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFormat, WeightLayout};
 use euhedral_inference_settings::{Auto, KvFormat, Settings};
 
+use euhedral_memory::{
+    LocationId, LocationKind, LocationSpec, OwnerSpec, PlanItem, PlanRequest, Planner, Priority, Scope,
+};
+
 use crate::error::PlanError;
 use crate::model::{
     ArtifactProfile, LayerIndex, MTP_ATTENTION_PACK, MTP_PACK_HALVES, ModelConfig, Role, Speculation, object_key,
@@ -120,10 +124,25 @@ pub struct ResidencyPlan {
 }
 
 impl ResidencyPlan {
+    /// The bytes the plan asks of each location: what `plan_with` had the memory planner admit.
+    pub fn location_bytes(&self) -> LocationBytes {
+        LocationBytes {
+            device: self.device_bytes,
+            host: self.kv_host_bytes,
+        }
+    }
+
     /// The placement named `name`.
     pub fn placement(&self, name: &str) -> Option<&Placement> {
         self.device.iter().find(|placement| placement.name == name)
     }
+}
+
+/// The bytes a plan asks of the device and of pinned host memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocationBytes {
+    pub device: u64,
+    pub host: u64,
 }
 
 /// What the plan is made against besides the model: the device and the host.
@@ -231,36 +250,42 @@ pub fn plan_with(
         .map_or(DEFAULT_RUNTIME_RESERVE_BYTES, |size| size.bytes());
 
     let whole_kv = footprint::kv_bytes(config, max_tokens, kv_format);
-    let fixed = whole_kv + runtime_reserve + scratch_bytes;
-    let mut kv_device_tokens = footprint::pages_for(max_tokens) * PAGE_TOKENS;
-    let (mut kv_host_tokens, mut kv_device_bytes, mut kv_host_bytes) = (0, whole_kv, 0);
-    let mut device_bytes = arena_bytes + fixed;
-    if device_bytes > available {
-        // The cache past the device minimum moves to host memory before any weight leaves the device: each attention
-        // layer's host pages are copied to one device region of the sequence's before the layer reads them.
-        let pages = footprint::pages_for(max_tokens);
-        let device_pages = pages.min(footprint::pages_for(u64::from(context.kv_cache_on_gpu_tokens)));
-        let host_pages = pages - device_pages;
-        let page = footprint::page_bytes(config, kv_format);
-        let region = host_pages * page;
-        let spilled = region * config.attention_layers() as u64;
-        if host_pages > 0 && spilled <= inputs.host_pinned_bytes {
-            let kept = footprint::kv_bytes(config, device_pages * PAGE_TOKENS, kv_format) + region;
-            device_bytes = arena_bytes + (fixed - whole_kv + kept);
-            kv_device_tokens = device_pages * PAGE_TOKENS;
-            kv_host_tokens = host_pages * PAGE_TOKENS;
-            kv_device_bytes = kept;
-            kv_host_bytes = spilled;
-        }
-    }
-    if device_bytes > available {
-        return Err(PlanError::WeightsDoNotFit {
-            weights_needed: arena_bytes,
-            state_needed: device_bytes - arena_bytes,
-            available,
-            free: inputs.device_free,
-        });
-    }
+    let pages = footprint::pages_for(max_tokens);
+    let device_pages = pages.min(footprint::pages_for(u64::from(context.kv_cache_on_gpu_tokens)));
+    let host_pages = pages - device_pages;
+    let page = footprint::page_bytes(config, kv_format);
+    let region = host_pages * page;
+    let spilled = region * config.attention_layers() as u64;
+    let kept = footprint::kv_bytes(config, device_pages * PAGE_TOKENS, kv_format) + region;
+    let budgets = Budgets {
+        device: available,
+        host: inputs.host_pinned_bytes,
+    };
+    let whole = Layout {
+        weights: arena_bytes,
+        runtime_reserve,
+        scratch: scratch_bytes,
+        cache_device: whole_kv,
+        cache_host: 0,
+    };
+    let split = (host_pages > 0).then_some(Layout {
+        cache_device: kept,
+        cache_host: spilled,
+        ..whole
+    });
+    let (layout, spills) = decide(budgets, whole, split).map_err(|refused| PlanError::WeightsDoNotFit {
+        weights_needed: arena_bytes,
+        state_needed: refused.device_bytes() - arena_bytes,
+        available,
+        free: inputs.device_free,
+    })?;
+    let (kv_device_tokens, kv_host_tokens) = if spills {
+        (device_pages * PAGE_TOKENS, host_pages * PAGE_TOKENS)
+    } else {
+        (pages * PAGE_TOKENS, 0)
+    };
+    let (kv_device_bytes, kv_host_bytes) = (layout.cache_device, layout.cache_host);
+    let device_bytes = layout.device_bytes();
     Ok(ResidencyPlan {
         device,
         arena_bytes,
@@ -280,6 +305,87 @@ pub fn plan_with(
         draft_depth,
         max_context_tokens: max_tokens as usize,
     })
+}
+
+/// Capacities stay far below `u64::MAX` so the memory planner's sums cannot overflow: an unknown or unlimited budget
+/// is this large.
+const CAPACITY_CAP: u64 = u64::MAX / 4;
+
+/// The two memory spaces of a plan: pinned host memory first, so a refusal at the host is reported before one at the
+/// device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Location {
+    Host,
+    Device,
+}
+
+#[derive(Clone, Copy)]
+struct Budgets {
+    device: u64,
+    host: u64,
+}
+
+/// What a plan asks of the two locations, by consumer.
+#[derive(Clone, Copy)]
+struct Layout {
+    weights: u64,
+    runtime_reserve: u64,
+    scratch: u64,
+    cache_device: u64,
+    cache_host: u64,
+}
+
+impl Layout {
+    fn device_bytes(&self) -> u64 {
+        self.weights + self.runtime_reserve + self.scratch + self.cache_device
+    }
+}
+
+/// Everything on the device first; when that is refused and there is a `split` (the cache pages past the device
+/// minimum on pinned host memory), the split before any weight leaves the device: each attention layer's host pages
+/// are copied to one device region of the sequence's before the layer reads them. The error is the layout whose
+/// numbers the refusal reports (`Ok` says whether the cache spilled): the split one when the host holds its pages and the device is short, else the whole.
+fn decide(budgets: Budgets, whole: Layout, split: Option<Layout>) -> Result<(Layout, bool), Layout> {
+    if admit(budgets, whole).is_ok() {
+        return Ok((whole, false));
+    }
+    match split.map(|split| (split, admit(budgets, split))) {
+        Some((split, Ok(()))) => Ok((split, true)),
+        Some((split, Err(Location::Device))) => Err(split),
+        Some((_, Err(Location::Host))) | None => Err(whole),
+    }
+}
+
+/// Asks the memory planner whether `layout` fits `budgets`: every consumer is required. The planner is the plan's own
+/// and holds nothing after this returns. The error is the first location that is short.
+fn admit(budgets: Budgets, layout: Layout) -> Result<(), Location> {
+    let planner = Planner::new([
+        LocationSpec {
+            kind: LocationKind::HostPinned,
+            capacity: budgets.host.min(CAPACITY_CAP),
+            reserve: 0,
+        },
+        LocationSpec {
+            kind: LocationKind::Device { ordinal: 0 },
+            capacity: budgets.device.min(CAPACITY_CAP),
+            reserve: 0,
+        },
+    ]);
+    let host = LocationId(0);
+    let device = LocationId(1);
+    let owner = planner.open_owner(OwnerSpec::new("residency", Priority(0), Scope::Plan(0)));
+    let items = vec![
+        PlanItem::required("weights", device, layout.weights),
+        PlanItem::required("runtime reserve", device, layout.runtime_reserve),
+        PlanItem::required("scratch", device, layout.scratch),
+        PlanItem::required("cache", device, layout.cache_device),
+        PlanItem::required("cache pages on the host", host, layout.cache_host),
+    ];
+    match planner.admit(&PlanRequest { owner, items }) {
+        Ok(_) => Ok(()),
+        Err(shortfall) if shortfall.location == host => Err(Location::Host),
+        Err(_) => Err(Location::Device),
+    }
 }
 
 /// Which of a trellis object's routes a scratch is for.
@@ -483,5 +589,85 @@ pub mod nvfp4 {
     /// Bytes of a tensor of `rows` rows of `k` values.
     pub fn byte_size(rows: u64, k: u64, layout: WeightLayout) -> Option<u64> {
         Some(trailer_offset(rows, k, layout)? + trailer_bytes(layout)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The decision before the memory planner made it: device bytes against the budget, the spill when the host
+    /// holds it.
+    fn before(budgets: Budgets, whole: Layout, split: Option<Layout>) -> Result<(Layout, bool), Layout> {
+        let mut layout = whole;
+        let mut spills = false;
+        if layout.device_bytes() > budgets.device
+            && let Some(split) = split.filter(|split| split.cache_host <= budgets.host)
+        {
+            layout = split;
+            spills = true;
+        }
+        if layout.device_bytes() > budgets.device {
+            return Err(layout);
+        }
+        Ok((layout, spills))
+    }
+
+    fn same(a: &Result<(Layout, bool), Layout>, b: &Result<(Layout, bool), Layout>) -> bool {
+        let key = |l: &Layout| (l.weights, l.runtime_reserve, l.scratch, l.cache_device, l.cache_host);
+        match (a, b) {
+            (Ok((x, s)), Ok((y, t))) => key(x) == key(y) && s == t,
+            (Err(x), Err(y)) => key(x) == key(y),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn the_memory_planner_decides_as_the_hand_written_fit_did() {
+        let whole = Layout {
+            weights: 1000,
+            runtime_reserve: 100,
+            scratch: 50,
+            cache_device: 400,
+            cache_host: 0,
+        };
+        let split = Layout {
+            cache_device: 150,
+            cache_host: 300,
+            ..whole
+        };
+        let hosts = [0, 299, 300, 301, 5000, u64::MAX];
+        let mut cases = 0;
+        for with_split in [None, Some(split)] {
+            for host in hosts {
+                for device in (0..=1700).step_by(1).chain([u64::MAX]) {
+                    let budgets = Budgets { device, host };
+                    let (new, old) = (decide(budgets, whole, with_split), before(budgets, whole, with_split));
+                    assert!(
+                        same(&new, &old),
+                        "device {device}, host {host}, split {}",
+                        with_split.is_some()
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        assert!(cases > 10_000);
+    }
+
+    #[test]
+    fn unknown_budgets_do_not_overflow() {
+        let whole = Layout {
+            weights: 1 << 40,
+            runtime_reserve: 1 << 30,
+            scratch: 1 << 30,
+            cache_device: 1 << 36,
+            cache_host: 0,
+        };
+        let budgets = Budgets {
+            device: u64::MAX,
+            host: u64::MAX,
+        };
+        assert!(matches!(decide(budgets, whole, None), Ok((_, false))));
     }
 }

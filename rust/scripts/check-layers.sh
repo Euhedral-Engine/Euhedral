@@ -57,7 +57,7 @@ BINARIES = {BENCH, XTASK}
 DEV_ONLY = {TEST_SUPPORT}
 
 # external crate -> crates that may depend on it.
-RUSTEE = {"euhedral-core", "euhedral-gpu", "euhedral-graph", "euhedral-io"}
+RUSTEE = {"euhedral-core", "euhedral-gpu", "euhedral-graph", "euhedral-io", "euhedral-memory"}
 RUSTEE_OWNERS = {ENGINE, BENCH, CUDA}
 # Configuration is parsed in one place.
 YAML = "serde_yaml_ng"
@@ -158,6 +158,8 @@ def self_test(meta, texts):
     plant("serde_yaml_ng outside settings", f"may not depend on {YAML}", edge=(EDRL, YAML))
     plant("euhedral-graph outside engine, bench and cuda", "may not depend on ['euhedral-graph']",
           edge=(SETTINGS, "euhedral-graph"))
+    plant("euhedral-memory outside engine, bench and cuda", "may not depend on ['euhedral-memory']",
+          edge=(SETTINGS, "euhedral-memory"))
     plant("an extra external crate in cuda", f"{CUDA} may depend externally only on", edge=(CUDA, "serde_json"))
     plant("a drifted clippy.toml", f"{EDRL}'s clippy.toml differs", text=(EDRL, texts["__canonical__"] + "\n# drift\n"))
     plant("a missing clippy.toml", f"{SETTINGS} has no clippy.toml", text=(SETTINGS, None))
