@@ -138,13 +138,34 @@ pub(crate) fn sample_frame<R: Row + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
 
     use super::*;
     use crate::sampling::SamplingConfig;
 
-    const WITHIN: Duration = Duration::from_secs(5);
+    /// What the frames under test posted: the first answer and how many came.
+    #[derive(Clone, Default)]
+    struct Answers {
+        first: Arc<OnceLock<Sampled>>,
+        count: Arc<AtomicUsize>,
+    }
+
+    impl Answers {
+        fn poster(&self) -> impl FnOnce(Sampled) + Send + 'static {
+            let (first, count) = (Arc::clone(&self.first), Arc::clone(&self.count));
+            move |sampled| {
+                count.fetch_add(1, Ordering::SeqCst);
+                let _ = first.set(sampled);
+            }
+        }
+
+        /// The answer posted, which must be the only one.
+        fn only(&self) -> &Sampled {
+            assert_eq!(self.count.load(Ordering::SeqCst), 1, "one answer");
+            self.first.get().unwrap()
+        }
+    }
 
     struct Bytes(Vec<u8>);
 
@@ -180,52 +201,46 @@ mod tests {
 
     #[test]
     fn a_frame_selects_the_row_and_hands_the_sampler_back() {
-        let (sender, receiver) = mpsc::channel();
+        let answers = Answers::default();
         let row = Bytes(bf16(&[0.5, 3.0, -1.0, 2.0]));
-        let mut frame = sample_frame(4, 9, sampler(4, 1), row, move |sampled| sender.send(sampled).unwrap());
+        let mut frame = sample_frame(4, 9, sampler(4, 1), row, answers.poster());
         run(&mut frame);
-        let sampled = receiver.recv_timeout(WITHIN).unwrap();
+        let sampled = answers.only();
         assert_eq!(sampled.step, 4);
-        let (token, sampler) = sampled.result.unwrap();
-        assert_eq!(token, 1, "the highest logit under top-k 1");
+        let (token, sampler) = sampled.result.as_ref().unwrap();
+        assert_eq!(*token, 1, "the highest logit under top-k 1");
         assert_eq!(sampler.vocabulary(), 4);
-        assert!(receiver.try_recv().is_err(), "one answer");
     }
 
     #[test]
     fn a_row_of_the_wrong_width_is_an_error() {
-        let (sender, receiver) = mpsc::channel();
-        let mut frame = sample_frame(0, 0, sampler(4, 1), Bytes(bf16(&[1.0, 2.0])), move |sampled| {
-            sender.send(sampled).unwrap()
-        });
+        let answers = Answers::default();
+        let mut frame = sample_frame(0, 0, sampler(4, 1), Bytes(bf16(&[1.0, 2.0])), answers.poster());
         run(&mut frame);
-        let sampled = receiver.recv_timeout(WITHIN).unwrap();
+        let sampled = answers.only();
         assert!(sampled.result.is_err());
     }
 
     #[test]
     fn a_frame_dropped_before_it_ran_still_answers_once_with_an_error() {
-        let (sender, receiver) = mpsc::channel();
-        let frame = sample_frame(2, 0, sampler(4, 1), Bytes(bf16(&[1.0; 4])), move |sampled| {
-            sender.send(sampled).unwrap()
-        });
+        let answers = Answers::default();
+        let frame = sample_frame(2, 0, sampler(4, 1), Bytes(bf16(&[1.0; 4])), answers.poster());
         drop(frame);
-        let sampled = receiver.recv_timeout(WITHIN).expect("a dropped frame answers");
+        let sampled = answers.only();
         assert_eq!(sampled.step, 2);
         assert!(sampled.result.is_err());
-        assert!(receiver.try_recv().is_err(), "once");
     }
 
     #[test]
     fn a_selection_that_panics_answers_with_an_error() {
-        let (sender, receiver) = mpsc::channel();
-        let mut frame = sample_frame(1, 0, sampler(4, 1), Panics, move |sampled| {
-            sender.send(sampled).unwrap()
-        });
+        let answers = Answers::default();
+        let mut frame = sample_frame(1, 0, sampler(4, 1), Panics, answers.poster());
         run(&mut frame);
-        let sampled = receiver.recv_timeout(WITHIN).unwrap();
-        assert_eq!(sampled.result.err().as_deref(), Some("the sampler panicked"));
-        assert!(receiver.try_recv().is_err(), "once");
+        let sampled = answers.only();
+        assert_eq!(
+            sampled.result.as_ref().err().map(String::as_str),
+            Some("the sampler panicked")
+        );
     }
 
     #[test]
