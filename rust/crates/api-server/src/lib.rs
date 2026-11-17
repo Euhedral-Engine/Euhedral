@@ -31,4 +31,4 @@ pub use engine_backend::{Codec, Engine, EngineBackend, EngineHost, EngineStartin
 pub use frames::once;
 pub use limits::Limits;
 pub use planning::{DefaultsError, Endpoint, Extras, Outcome, Planned, Planner, Publisher, RequestDefaults};
-pub use server::{ApiConfig, ApiServer, start};
+pub use server::{ApiConfig, ApiServer, start, start_on};
