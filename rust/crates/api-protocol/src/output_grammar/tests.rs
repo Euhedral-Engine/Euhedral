@@ -50,11 +50,9 @@ fn call(name: &str, parameters: &str) -> String {
     format!("<tool_call>\n<function={name}>\n{parameters}</function>\n</tool_call>")
 }
 
-/// Whether a generation could produce exactly `text` and then end.
-fn finishes(grammar: &str, text: &str) -> bool {
-    let checker = checker();
-    let mut matcher = checker.matcher(grammar, "lark");
-    assert_eq!(matcher.get_error(), None, "{grammar}");
+/// The token ids of `text`: the two call tags are control tokens, every other byte its own token.
+fn encode(text: &str) -> Vec<TokenId> {
+    let mut ids = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
         let (token, length) = if rest.starts_with("<tool_call>") {
@@ -64,12 +62,23 @@ fn finishes(grammar: &str, text: &str) -> bool {
         } else {
             (TokenId::from(rest.as_bytes()[0]), 1)
         };
-        if !matcher.compute_mask_or_eos().expect("mask").is_allowed(token) || matcher.consume_token(token).is_err() {
-            return false;
-        }
+        ids.push(token);
         rest = &rest[length..];
     }
-    matcher.compute_mask_or_eos().expect("mask").is_allowed(END)
+    ids
+}
+
+/// Whether a generation could produce exactly `text` and then end.
+fn finishes(grammar: &str, text: &str) -> bool {
+    let mut checker = checker();
+    let mut matcher = checker.constraint(grammar).expect(grammar);
+    for id in encode(text) {
+        if !matcher.allows(id).expect("mask") {
+            return false;
+        }
+        matcher.consume(id).expect("allowed");
+    }
+    matcher.allows(END).expect("mask")
 }
 
 fn tools(calling: &ToolCalling, answer: Option<&JsonValue>, reasoning: bool) -> String {

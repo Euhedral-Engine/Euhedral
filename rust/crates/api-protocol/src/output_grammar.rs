@@ -36,6 +36,11 @@ use crate::pipeline::ToolChoice;
 use crate::response_format::ResponseFormat;
 use crate::tool_calling::{FunctionTool, ToolCalling};
 
+mod matcher;
+
+use matcher::CompiledGrammars;
+pub use matcher::{DEFAULT_CACHED_GRAMMARS, GrammarMatcher, MatcherError};
+
 /// The skipped whitespace between JSON tokens.
 pub const WHITESPACE: &str = "[\\x20\\x0A\\x0D\\x09]{1,40}";
 
@@ -320,6 +325,9 @@ impl GrammarCheck for GrammarChecker {
 /// Checks that grammars and JSON schemas compile over one vocabulary, the way the generation will compile them.
 pub struct GrammarChecker {
     factory: ParserFactory,
+    size: u32,
+    end_ids: Arc<[u32]>,
+    compiled: CompiledGrammars,
 }
 
 impl Debug for GrammarChecker {
@@ -341,6 +349,16 @@ impl GrammarChecker {
     /// Compiling a grammar costs enough (a large schema or tool set takes noticeable CPU) that a caller runs a check
     /// as its own frame, never inline in a request handler.
     pub fn new(token_bytes: &[Vec<u8>], end_ids: &[u32]) -> Result<GrammarChecker, VocabularyError> {
+        Self::with_cache_size(token_bytes, end_ids, DEFAULT_CACHED_GRAMMARS)
+    }
+
+    /// As [`GrammarChecker::new`], keeping up to `cached_grammars` compiled grammars for reuse by
+    /// [`GrammarChecker::constraint`]; zero keeps none.
+    pub fn with_cache_size(
+        token_bytes: &[Vec<u8>],
+        end_ids: &[u32],
+        cached_grammars: usize,
+    ) -> Result<GrammarChecker, VocabularyError> {
         let Some(&end) = end_ids.first() else {
             return Err(VocabularyError("a grammar needs an end token".to_owned()));
         };
@@ -369,7 +387,12 @@ impl GrammarChecker {
             &SlicedBiasComputer::general_slices(),
         )
         .map_err(|error| VocabularyError(error.to_string()))?;
-        Ok(GrammarChecker { factory })
+        Ok(GrammarChecker {
+            factory,
+            size,
+            end_ids: end_ids.into(),
+            compiled: CompiledGrammars::new(cached_grammars),
+        })
     }
 
     /// Whether llguidance compiles the Lark grammar; the refusal is a 400 without a parameter.
