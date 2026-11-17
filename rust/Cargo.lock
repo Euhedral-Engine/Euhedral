@@ -428,6 +428,7 @@ dependencies = [
  "euhedral-net",
  "log",
  "sha2",
+ "test-support",
 ]
 
 [[package]]

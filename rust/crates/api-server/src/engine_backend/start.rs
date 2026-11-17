@@ -273,6 +273,12 @@ impl EngineHost {
         Arc::clone(&self.backend)
     }
 
+    /// The runtime itself, for what the backend does not offer (a direct generation, a snapshot). Do not keep the
+    /// handle: [`shutdown`](EngineHost::shutdown) needs the last one.
+    pub fn runtime(&self) -> &Arc<EngineRuntime> {
+        &self.runtime
+    }
+
     /// The engine's lattice: the server's frames run here.
     pub fn lattice(&self) -> &Arc<ControlPlaneLattice> {
         self.runtime.lattice()
