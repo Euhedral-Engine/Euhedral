@@ -579,7 +579,7 @@ fn rows() -> Vec<Row> {
         "message role that is no string",
         msgs(r#"[{"role":1,"content":"a"}]"#),
         "messages[0].role",
-        "messages[0].role: must be 'user' or 'assistant'",
+        "messages[0].role: Field required",
     ));
     rows.push(bad(
         "content that is no string or list",
@@ -1233,15 +1233,12 @@ fn a_count_tokens_request_maps_like_a_message_without_a_budget() {
 #[test]
 fn values_print_as_error_parameters() {
     let value = |text: &str| JsonValue::parse(text).unwrap();
-    assert_eq!(display_value(Some(&value("1.0"))), "1.0");
-    assert_eq!(display_value(Some(&value("5"))), "5");
-    assert_eq!(display_value(Some(&value("0.5"))), "0.5");
-    assert_eq!(display_value(Some(&value("1e10"))), "1.0E10");
-    assert_eq!(display_value(Some(&value("1.5e-5"))), "1.5E-5");
-    assert_eq!(display_value(Some(&value("true"))), "true");
-    assert_eq!(display_value(Some(&value("null"))), "null");
-    assert_eq!(
-        display_value(Some(&value(r#"{"a":[1,"b"],"c":{}}"#))),
-        "{a=[1, b], c={}}"
-    );
+    assert_eq!(value("1.0").param_text(), "1.0");
+    assert_eq!(value("5").param_text(), "5");
+    assert_eq!(value("0.5").param_text(), "0.5");
+    assert_eq!(value("1e10").param_text(), "1.0E10");
+    assert_eq!(value("1.5e-5").param_text(), "1.5E-5");
+    assert_eq!(value("true").param_text(), "true");
+    assert_eq!(value("null").param_text(), "null");
+    assert_eq!(&value(r#"{"a":[1,"b"],"c":{}}"#).param_text(), "{a=[1, b], c={}}");
 }

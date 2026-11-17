@@ -6,15 +6,15 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::fmt::Write;
 
 use crate::anthropic::MessagesRequest;
-use crate::chat_mapper::is_blank;
 use crate::error::ApiError;
 use crate::generation::{Defaults, GenerationRequest, GenerationSettings, Sampling};
 use crate::json::JsonValue;
 use crate::pipeline::ToolChoice;
 use crate::response_format::ResponseFormat;
+use crate::responses_mapper::present;
+use crate::served_model::require_served_model;
 use crate::template::{AssistantMessage, ContentPart, Effort, Message, TemplateOptions, ToolCall};
 use crate::tool_calling::{FunctionTool, ToolCalling, check_keys, is_parameter_name, member, parameters};
 use crate::tool_definition::ToolDefinition;
@@ -44,13 +44,7 @@ fn map(request: MessagesRequest, defaults: &Defaults, generating: bool) -> Resul
             _ => return Err(ApiError::unrecognized_argument(name)),
         }
     }
-    let model = match request.model.as_deref() {
-        Some(model) if !is_blank(model) => model,
-        _ => return Err(ApiError::invalid_request("model: Field required", Some("model"))),
-    };
-    if model != defaults.model {
-        return Err(ApiError::model_not_found(model));
-    }
+    let model = require_served_model(request.model.as_deref(), &defaults.model, "model: Field required")?;
     let max_tokens = request.max_tokens;
     if generating {
         match max_tokens {
@@ -76,15 +70,18 @@ fn map(request: MessagesRequest, defaults: &Defaults, generating: bool) -> Resul
         return Err(ApiError::unrecognized_argument("stream"));
     }
 
-    let tools = tools(present(&request.tools), present(&request.tool_choice))?;
+    let tools = tools(present(request.tools.as_ref()), present(request.tool_choice.as_ref()))?;
     let (thinking, reasoning_budget) = thinking(
-        present(&request.thinking),
-        present(&request.output_config),
+        present(request.thinking.as_ref()),
+        present(request.output_config.as_ref()),
         max_tokens,
         generating,
     )?;
-    let format = format(present(&request.output_config), present(&request.output_format))?;
-    let stops = stops(present(&request.stop_sequences))?;
+    let format = format(
+        present(request.output_config.as_ref()),
+        present(request.output_format.as_ref()),
+    )?;
+    let stops = stops(present(request.stop_sequences.as_ref()))?;
     if format.is_json() && !stops.is_empty() {
         return Err(ApiError::invalid_request(
             "stop_sequences cannot be combined with a JSON output format: a stop inside the JSON would end it \
@@ -92,10 +89,10 @@ fn map(request: MessagesRequest, defaults: &Defaults, generating: bool) -> Resul
             Some("stop_sequences"),
         ));
     }
-    let messages = turns(present(&request.system), request.messages.as_deref())?;
+    let messages = turns(present(request.system.as_ref()), request.messages.as_deref())?;
     let sampling = sampling(&request, defaults)?;
     let settings = GenerationSettings {
-        model: model.to_owned(),
+        model,
         thinking,
         reasoning_budget,
         format,
@@ -107,11 +104,6 @@ fn map(request: MessagesRequest, defaults: &Defaults, generating: bool) -> Resul
         return_token_ids: false,
     };
     Ok(GenerationRequest::new(messages, tools, settings))
-}
-
-/// A field that is present and not null.
-fn present(value: &Option<JsonValue>) -> Option<&JsonValue> {
-    value.as_ref().filter(|value| **value != JsonValue::Null)
 }
 
 /// Anthropic's tool-name rule: 1-128 of `a-z`, `A-Z`, `0-9`, `_` and `-`.
@@ -241,14 +233,14 @@ fn turns(system: Option<&JsonValue>, messages: Option<&[JsonValue]>) -> Result<V
                     reasoning,
                 }));
             }
-            None => {
-                return Err(invalid(format!("{path}.role: Field required"), &format!("{path}.role")));
-            }
-            Some(_) => {
+            Some(JsonValue::String(_)) => {
                 return Err(invalid(
                     format!("{path}.role: must be 'user' or 'assistant'"),
                     &format!("{path}.role"),
                 ));
+            }
+            _ => {
+                return Err(invalid(format!("{path}.role: Field required"), &format!("{path}.role")));
             }
         }
     }
@@ -395,60 +387,12 @@ fn block_text<'a>(block: &'a JsonValue, path: &str) -> Result<&'a str, ApiError>
 }
 
 fn unsupported_block(block: &JsonValue, path: &str) -> ApiError {
-    ApiError::unsupported_parameter(&format!("{path}.type={}", display_value(block.get("type"))))
-}
-
-/// The value as plain text for the parameter names of errors: strings bare, lists as
-/// `[a, b]`, objects as `{k=v}`.
-fn display_value(value: Option<&JsonValue>) -> String {
-    match value {
-        None | Some(JsonValue::Null) => "null".to_owned(),
-        Some(JsonValue::Bool(flag)) => flag.to_string(),
-        Some(JsonValue::Integer(digits)) => digits.as_str().to_owned(),
-        Some(JsonValue::Float(number)) => double_text(*number),
-        Some(JsonValue::String(text)) => text.clone(),
-        Some(JsonValue::Array(items)) => {
-            let parts: Vec<String> = items.iter().map(|item| display_value(Some(item))).collect();
-            format!("[{}]", parts.join(", "))
-        }
-        Some(JsonValue::Object(members)) => {
-            let parts: Vec<String> = members
-                .iter()
-                .map(|(key, value)| format!("{key}={}", display_value(Some(value))))
-                .collect();
-            format!("{{{}}}", parts.join(", "))
-        }
-    }
-}
-
-/// A double as plain decimal from 1e-3 up to 1e7, otherwise computerized scientific notation.
-fn double_text(number: f64) -> String {
-    if number.is_nan() {
-        return "NaN".to_owned();
-    }
-    if number.is_infinite() {
-        return if number > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
-    }
-    if number == 0.0 {
-        return if number.is_sign_negative() { "-0.0" } else { "0.0" }.to_owned();
-    }
-    let magnitude = number.abs();
-    if (1e-3..1e7).contains(&magnitude) {
-        let plain = format!("{number}");
-        return if plain.contains('.') {
-            plain
-        } else {
-            format!("{plain}.0")
-        };
-    }
-    let scientific = format!("{number:e}");
-    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
-    let mut out = String::from(mantissa);
-    if !mantissa.contains('.') {
-        out.push_str(".0");
-    }
-    let _ = write!(out, "E{exponent}");
-    out
+    ApiError::unsupported_parameter(&format!(
+        "{path}.type={}",
+        block
+            .get("type")
+            .map_or_else(|| "null".to_owned(), JsonValue::param_text)
+    ))
 }
 
 // Tools.
@@ -470,7 +414,7 @@ fn tools(value: Option<&JsonValue>, choice: Option<&JsonValue>) -> Result<ToolCa
             {
                 return Err(ApiError::unsupported_parameter(&format!(
                     "{path}.type={}",
-                    display_value(Some(kind))
+                    kind.param_text()
                 )));
             }
             check_keys(
