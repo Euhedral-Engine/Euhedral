@@ -6,10 +6,10 @@ use std::fmt::Write;
 /// The deepest nesting a parsed document may have.
 /// The deepest nesting of arrays and objects a document may have, and the most digits one number may have
 /// (the integer digits for an integer; integer, fraction and exponent digits together for a float), and the
-/// longest object key in UTF-8 bytes: the limits of the reader the wire format is defined by.
+/// longest object key in UTF-16 code units (Jackson's characters): the limits of the reader the wire format is defined by.
 const MAX_DEPTH: usize = 500;
 const MAX_NUMBER_DIGITS: usize = 1000;
-const MAX_NAME_BYTES: usize = 50_000;
+const MAX_NAME_UNITS: usize = 50_000;
 
 /// A JSON value whose objects keep their insertion order.
 #[derive(Debug, Clone, PartialEq)]
@@ -229,7 +229,21 @@ impl JsonValue {
     /// Reads one whole document strictly; `None` when `text` is not exactly one JSON value. Integers of any
     /// length keep their digits; a repeated object key replaces the earlier value in place.
     pub fn parse(text: &str) -> Option<JsonValue> {
-        let mut parser = Parser { text, position: 0 };
+        JsonValue::read(text, false)
+    }
+
+    /// As [`parse`](JsonValue::parse), except that an object with a repeated key is not a document: `None`. This is
+    /// the reading that decides whether a model's answer is JSON.
+    pub fn parse_distinct(text: &str) -> Option<JsonValue> {
+        JsonValue::read(text, true)
+    }
+
+    fn read(text: &str, distinct: bool) -> Option<JsonValue> {
+        let mut parser = Parser {
+            text,
+            position: 0,
+            distinct,
+        };
         parser.skip_space();
         let value = parser.value(0)?;
         parser.skip_space();
@@ -344,6 +358,8 @@ fn compact_float(number: f64) -> String {
 struct Parser<'a> {
     text: &'a str,
     position: usize,
+    /// A repeated object key ends the parse.
+    distinct: bool,
 }
 
 impl Parser<'_> {
@@ -426,7 +442,7 @@ impl Parser<'_> {
                 return None;
             }
             let key = self.string()?;
-            if key.len() > MAX_NAME_BYTES {
+            if key.len() > 3 * MAX_NAME_UNITS || key.encode_utf16().count() > MAX_NAME_UNITS {
                 return None;
             }
             self.skip_space();
@@ -436,6 +452,9 @@ impl Parser<'_> {
             self.position += 1;
             self.skip_space();
             let value = self.value(depth + 1)?;
+            if self.distinct && members.iter().any(|(name, _)| *name == key) {
+                return None;
+            }
             put(&mut members, key, value);
             self.skip_space();
             match self.peek()? {
@@ -572,6 +591,15 @@ mod tests {
         let text = r#"{"b": [1, 2.5, "x\ny", null, true], "a": {"k": -0}, "b": 7}"#;
         let value = JsonValue::parse(text).unwrap();
         assert_eq!(value.to_compact_string(), r#"{"b":7,"a":{"k":0}}"#);
+    }
+
+    #[test]
+    fn a_repeated_key_is_refused_by_the_distinct_reading_only() {
+        let repeated = r#"{"a": 1, "b": {"c": 1, "c": 2}}"#;
+        assert!(JsonValue::parse(repeated).is_some());
+        assert!(JsonValue::parse_distinct(repeated).is_none());
+        assert!(JsonValue::parse_distinct(r#"{"a": {"c": 1}, "b": {"c": 2}}"#).is_some());
+        assert!(JsonValue::parse_distinct(r#"{"a":1} x"#).is_none());
     }
 
     #[test]
@@ -723,12 +751,16 @@ mod tests {
     }
 
     #[test]
-    fn object_keys_of_fifty_thousand_bytes_are_read_and_one_more_is_refused() {
+    fn object_keys_of_fifty_thousand_characters_are_read_and_one_more_is_refused() {
         let object = |key: String| format!("{{\"{key}\":1}}");
         assert!(JsonValue::parse(&object("k".repeat(50_000))).is_some());
         assert!(JsonValue::parse(&object("k".repeat(50_001))).is_none());
-        assert!(JsonValue::parse(&object("\u{e9}".repeat(25_000))).is_some());
-        assert!(JsonValue::parse(&object("\u{e9}".repeat(25_001))).is_none());
+        assert!(JsonValue::parse(&object("\u{e9}".repeat(50_000))).is_some());
+        assert!(JsonValue::parse(&object("\u{e9}".repeat(50_001))).is_none());
+        // Three bytes each, one unit each; an astral character is two units.
+        assert!(JsonValue::parse(&object("\u{20ac}".repeat(50_000))).is_some());
+        assert!(JsonValue::parse(&object("\u{1f600}".repeat(25_000))).is_some());
+        assert!(JsonValue::parse(&object("\u{1f600}".repeat(25_001))).is_none());
         let long_value = format!("[\"{}\"]", "v".repeat(200_000));
         assert!(JsonValue::parse(&long_value).is_some());
     }

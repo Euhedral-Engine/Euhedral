@@ -6,6 +6,7 @@
 //! reported through continuations and listeners.
 
 pub mod admission;
+pub mod answer;
 pub mod backend;
 mod frames;
 pub mod health;
@@ -19,6 +20,7 @@ pub mod scripted;
 mod server;
 
 pub use admission::{Admission, Counts, Entry, Handle, Interruption, Slot};
+pub use answer::Answerer;
 pub use backend::{
     Backend, BackendError, EncodedPrompt, EngineReport, Generation, GenerationConfig, GenerationResult, Next,
     OutputSpec, PrefixCacheReport, TextListener,

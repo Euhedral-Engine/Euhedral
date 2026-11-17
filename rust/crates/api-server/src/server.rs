@@ -17,6 +17,7 @@ use euhedral_io::AsyncIo;
 use euhedral_net::{Counters, ServerHandle, serve};
 
 use crate::admission::Admission;
+use crate::answer::Answerer;
 use crate::backend::Backend;
 use crate::frames::once_or_refused;
 use crate::limits::Limits;
@@ -122,12 +123,14 @@ pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Resul
             return Err(io::Error::new(io::ErrorKind::InvalidInput, error));
         }
     };
+    let answerer = Answerer::new(config.backend.clone(), metrics.clone(), admission.clone(), sink.clone());
     let router = Router::new(
         config.backend,
         config.created_at,
         config.limits,
         metrics.clone(),
         planner,
+        answerer,
     );
     let handle = match serve(
         lattice.clone(),
