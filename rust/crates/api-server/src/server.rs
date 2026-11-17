@@ -95,7 +95,10 @@ pub fn start(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig) -> io::Resul
         undo(true);
         return Err(error);
     }
-    let metrics = Arc::new(Metrics::new(config.backend.engine_report().speculative_depth));
+    let metrics = Arc::new(Metrics::new(
+        config.backend.engine_report().speculative_depth,
+        Metrics::wall_clock_ms(),
+    ));
     let router = Router::new(config.backend, config.created_at, config.limits, metrics.clone());
     let handle = match serve(
         lattice.clone(),

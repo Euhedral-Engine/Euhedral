@@ -10,13 +10,16 @@
 
 mod buckets;
 mod render;
+mod window;
 
 use std::array::from_fn;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use buckets::{DURATION_BOUNDS_NS, RATE_BOUNDS};
 
 pub use render::CONTENT_TYPE;
+pub use window::{WINDOW_MS, WINDOWS, WindowMax};
 
 /// The value of the `application` label every series carries.
 pub const APPLICATION: &str = "euhedral-inference";
@@ -184,23 +187,23 @@ pub struct Generation {
 struct Durations {
     buckets: [AtomicU64; DURATION_BOUNDS_NS.len() + 1],
     sum_ns: AtomicU64,
-    max_ns: AtomicU64,
+    max_ns: WindowMax,
 }
 
 impl Durations {
-    fn new() -> Durations {
+    fn new(now_ms: i64) -> Durations {
         Durations {
             buckets: from_fn(|_| AtomicU64::new(0)),
             sum_ns: AtomicU64::new(0),
-            max_ns: AtomicU64::new(0),
+            max_ns: WindowMax::new(now_ms),
         }
     }
 
-    fn record(&self, nanos: u64) {
+    fn record(&self, nanos: u64, now_ms: i64) {
         let at = DURATION_BOUNDS_NS.partition_point(|bound| *bound < nanos);
         self.buckets[at].fetch_add(1, Ordering::Relaxed);
         self.sum_ns.fetch_add(nanos, Ordering::Relaxed);
-        self.max_ns.fetch_max(nanos, Ordering::Relaxed);
+        self.max_ns.record(nanos, now_ms);
     }
 }
 
@@ -209,29 +212,28 @@ impl Durations {
 struct Rates {
     buckets: [AtomicU64; RATE_BOUNDS.len() + 1],
     sum: AtomicU64,
-    max: AtomicU64,
+    max: WindowMax,
 }
 
 impl Rates {
-    fn new() -> Rates {
+    fn new(now_ms: i64) -> Rates {
         Rates {
             buckets: from_fn(|_| AtomicU64::new(0)),
             sum: AtomicU64::new(0f64.to_bits()),
-            max: AtomicU64::new(0f64.to_bits()),
+            max: WindowMax::new(now_ms),
         }
     }
 
-    fn record(&self, value: f64) {
+    fn record(&self, value: f64, now_ms: i64) {
         if value.is_nan() || value < 0.0 {
             return;
         }
         let at = RATE_BOUNDS.partition_point(|bound| *bound < value);
         self.buckets[at].fetch_add(1, Ordering::Relaxed);
-        // A closure that always answers keeps the update a single compare-and-swap loop.
         let added = |bits: u64| Some((f64::from_bits(bits) + value).to_bits());
-        let larger = |bits: u64| Some(f64::from_bits(bits).max(value).to_bits());
         let _ = self.sum.try_update(Ordering::Relaxed, Ordering::Relaxed, added);
-        let _ = self.max.try_update(Ordering::Relaxed, Ordering::Relaxed, larger);
+        // The bits of a non-negative `f64` order as the values do.
+        self.max.record(value.to_bits(), now_ms);
     }
 }
 
@@ -264,9 +266,10 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// A registry with every series at zero. `speculative_depth` is the tokens drafted per verification (0 without
+    /// A registry with every series at zero, made at `now_ms` (the wall clock in milliseconds, which the largest values
+    /// of the histograms are windowed by). `speculative_depth` is the tokens drafted per verification (0 without
     /// speculation): the accepted counts are exported for 0 up to that many drafts.
-    pub fn new(speculative_depth: usize) -> Metrics {
+    pub fn new(speculative_depth: usize, now_ms: i64) -> Metrics {
         let counters = |count: usize| -> Box<[AtomicU64]> { (0..count).map(|_| AtomicU64::new(0)).collect() };
         let mut drafts_by_label: Vec<usize> = (0..=speculative_depth).collect();
         drafts_by_label.sort_by_key(ToString::to_string);
@@ -283,11 +286,11 @@ impl Metrics {
             prompt_prefilled_tokens: AtomicU64::new(0),
             completion_tokens: AtomicU64::new(0),
             reasoning_tokens: AtomicU64::new(0),
-            request_duration: from_fn(|_| Durations::new()),
-            queue_wait: from_fn(|_| Durations::new()),
-            time_to_first_token: from_fn(|_| Durations::new()),
-            prefill_rate: Rates::new(),
-            decode_rate: Rates::new(),
+            request_duration: from_fn(|_| Durations::new(now_ms)),
+            queue_wait: from_fn(|_| Durations::new(now_ms)),
+            time_to_first_token: from_fn(|_| Durations::new(now_ms)),
+            prefill_rate: Rates::new(now_ms),
+            decode_rate: Rates::new(now_ms),
             speculative_verifications: AtomicU64::new(0),
             speculative_accepted: counters(speculative_depth + 1),
             drafts_by_label: drafts_by_label.into_boxed_slice(),
@@ -299,6 +302,13 @@ impl Metrics {
     pub fn set_queue(&self, active: usize, queued: usize) {
         self.active.store(active, Ordering::Relaxed);
         self.queued.store(queued, Ordering::Relaxed);
+    }
+
+    /// The wall clock now in milliseconds since the epoch, for the windows of the largest values.
+    pub fn wall_clock_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
     }
 
     /// A request that ended, or was refused, with `outcome`.
@@ -325,7 +335,7 @@ impl Metrics {
 
     /// One answered generation: its finish, token counts and timings. A stage that ran backwards on the clock records no
     /// duration.
-    pub fn generation(&self, generation: &Generation) {
+    pub fn generation(&self, generation: &Generation, now_ms: i64) {
         let api = generation.api.index();
         self.finishes[api][generation.reason.index()].fetch_add(1, Ordering::Relaxed);
         let prefilled = generation.prompt_tokens.saturating_sub(generation.cached_prompt_tokens);
@@ -340,25 +350,28 @@ impl Metrics {
             self.reasoning_tokens.fetch_add(reasoning, Ordering::Relaxed);
         }
         if let Some(total) = generation.ended_ns.checked_sub(generation.queued_ns) {
-            self.request_duration[api].record(total);
+            self.request_duration[api].record(total, now_ms);
         }
         if let Some(waited) = generation.started_ns.checked_sub(generation.queued_ns) {
-            self.queue_wait[api].record(waited);
+            self.queue_wait[api].record(waited, now_ms);
         }
         if generation.first_token_ns == 0 {
             return;
         }
         let to_first = generation.first_token_ns.checked_sub(generation.started_ns);
         if let Some(to_first) = to_first {
-            self.time_to_first_token[api].record(to_first);
+            self.time_to_first_token[api].record(to_first, now_ms);
             if prefilled > 0 && to_first > 0 {
-                self.prefill_rate.record(prefilled as f64 * 1e9 / to_first as f64);
+                self.prefill_rate
+                    .record(prefilled as f64 * 1e9 / to_first as f64, now_ms);
             }
         }
         let decoding = generation.ended_ns.saturating_sub(generation.first_token_ns);
         if generation.completion_tokens > 1 && decoding > 0 {
-            self.decode_rate
-                .record((generation.completion_tokens - 1) as f64 * 1e9 / decoding as f64);
+            self.decode_rate.record(
+                (generation.completion_tokens - 1) as f64 * 1e9 / decoding as f64,
+                now_ms,
+            );
         }
     }
 

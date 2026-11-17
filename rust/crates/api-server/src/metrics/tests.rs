@@ -81,18 +81,21 @@ fn record_everything(metrics: &Metrics) {
             let queued = 1000;
             let started = queued + 12_345_678 * (api_at + 1);
             let first = started + 87_654_321 * (at + 1);
-            metrics.generation(&Generation {
-                api,
-                reason,
-                prompt_tokens: 50 + 7 * api_at + at,
-                cached_prompt_tokens: 10 + at,
-                completion_tokens: 20 + 3 * api_at + at,
-                reasoning_tokens: (at % 2 == 0).then_some(5 + api_at),
-                queued_ns: queued,
-                started_ns: started,
-                first_token_ns: first,
-                ended_ns: first + 1_234_567_890 * (at + 1),
-            });
+            metrics.generation(
+                &Generation {
+                    api,
+                    reason,
+                    prompt_tokens: 50 + 7 * api_at + at,
+                    cached_prompt_tokens: 10 + at,
+                    completion_tokens: 20 + 3 * api_at + at,
+                    reasoning_tokens: (at % 2 == 0).then_some(5 + api_at),
+                    queued_ns: queued,
+                    started_ns: started,
+                    first_token_ns: first,
+                    ended_ns: first + 1_234_567_890 * (at + 1),
+                },
+                0,
+            );
         }
     }
     metrics.constrained_failure(ConstraintFailure::InvalidToolCall);
@@ -108,20 +111,20 @@ fn record_everything(metrics: &Metrics) {
 
 #[test]
 fn a_registry_that_recorded_nothing_exports_every_series_at_zero() {
-    let metrics = Metrics::new(3);
-    assert_eq!(metrics.render("m1", 4096, &report(false)), IDLE);
+    let metrics = Metrics::new(3, 0);
+    assert_eq!(metrics.render("m1", 4096, &report(false), 0), IDLE);
 }
 
 #[test]
 fn recordings_are_exported_as_the_reference_text_has_them() {
-    let metrics = Metrics::new(3);
+    let metrics = Metrics::new(3, 0);
     record_everything(&metrics);
-    assert_eq!(metrics.render("m1", 4096, &report(true)), RECORDED);
+    assert_eq!(metrics.render("m1", 4096, &report(true), 0), RECORDED);
 }
 
 #[test]
 fn an_engine_without_a_prefix_cache_or_artifact_exports_neither() {
-    let text = Metrics::new(0).render("m", 8, &EngineReport::default());
+    let text = Metrics::new(0, 0).render("m", 8, &EngineReport::default(), 0);
     assert!(text.contains(
         "euhedral_engine_info{application=\"euhedral-inference\",artifact=\"unknown\",model=\"m\",speculation=\"none\",speculative_depth=\"0\"} 1\n"
     ));
@@ -134,7 +137,7 @@ fn an_engine_without_a_prefix_cache_or_artifact_exports_neither() {
 
 #[test]
 fn labels_and_help_are_escaped() {
-    let text = Metrics::new(0).render("a\"b\\c\nd", 1, &EngineReport::default());
+    let text = Metrics::new(0, 0).render("a\"b\\c\nd", 1, &EngineReport::default(), 0);
     assert!(text.contains("model=\"a\\\"b\\\\c\\nd\""), "{text}");
 }
 
@@ -179,7 +182,7 @@ fn value(text: &str, name: &str, labels: &[&str]) -> f64 {
 
 #[test]
 fn refusals_and_failures_are_counted_by_api_and_outcome() {
-    let metrics = Metrics::new(0);
+    let metrics = Metrics::new(0, 0);
     metrics.request(Api::ChatCompletions, Outcome::Success);
     metrics.request(Api::Messages, Outcome::Success);
     metrics.request(Api::ChatCompletions, Outcome::Invalid);
@@ -187,7 +190,7 @@ fn refusals_and_failures_are_counted_by_api_and_outcome() {
     metrics.request(Api::ChatCompletions, Outcome::Failed);
     metrics.schema_rejected(Api::ChatCompletions);
     metrics.constrained_failure(ConstraintFailure::InvalidToolCall);
-    let text = metrics.render("m", 1, &EngineReport::default());
+    let text = metrics.render("m", 1, &EngineReport::default(), 0);
     let requests = |api: &str, outcome: &str| {
         value(
             &text,
@@ -215,7 +218,7 @@ fn refusals_and_failures_are_counted_by_api_and_outcome() {
     assert_eq!(value(&text, "euhedral_generations_active", &[]), 0.0);
     assert_eq!(value(&text, "euhedral_generations_queued", &[]), 0.0);
     metrics.set_queue(1, 4);
-    let text = metrics.render("m", 1, &EngineReport::default());
+    let text = metrics.render("m", 1, &EngineReport::default(), 0);
     assert_eq!(value(&text, "euhedral_generations_active", &[]), 1.0);
     assert_eq!(value(&text, "euhedral_generations_queued", &[]), 4.0);
 }
@@ -237,9 +240,9 @@ fn generation(api: Api, first_token_ns: u64, completion_tokens: u64) -> Generati
 
 #[test]
 fn a_generation_without_a_token_records_no_first_token_and_no_rates() {
-    let metrics = Metrics::new(0);
-    metrics.generation(&generation(Api::Messages, 0, 0));
-    let text = metrics.render("m", 1, &EngineReport::default());
+    let metrics = Metrics::new(0, 0);
+    metrics.generation(&generation(Api::Messages, 0, 0), 0);
+    let text = metrics.render("m", 1, &EngineReport::default(), 0);
     let api = ["api=\"messages\""];
     assert_eq!(value(&text, "euhedral_request_duration_seconds_count", &api), 1.0);
     assert_eq!(value(&text, "euhedral_queue_wait_seconds_count", &api), 1.0);
@@ -252,32 +255,32 @@ fn a_generation_without_a_token_records_no_first_token_and_no_rates() {
 
 #[test]
 fn rates_are_tokens_per_second_of_the_stage() {
-    let metrics = Metrics::new(0);
+    let metrics = Metrics::new(0, 0);
     // 60 tokens prefilled in 1 ms; 9 more tokens in 1 s after the first of 10.
-    metrics.generation(&generation(Api::Messages, 3_001_000, 10));
-    let text = metrics.render("m", 1, &EngineReport::default());
+    metrics.generation(&generation(Api::Messages, 3_001_000, 10), 0);
+    let text = metrics.render("m", 1, &EngineReport::default(), 0);
     assert_eq!(value(&text, "euhedral_prefill_tokens_per_second_sum", &[]), 60_000.0);
     assert_eq!(value(&text, "euhedral_decode_tokens_per_second_sum", &[]), 9.0);
     assert_eq!(value(&text, "euhedral_decode_tokens_per_second_max", &[]), 9.0);
     // One token is no decode rate.
-    metrics.generation(&generation(Api::Messages, 3_001_000, 1));
-    let text = metrics.render("m", 1, &EngineReport::default());
+    metrics.generation(&generation(Api::Messages, 3_001_000, 1), 0);
+    let text = metrics.render("m", 1, &EngineReport::default(), 0);
     assert_eq!(value(&text, "euhedral_decode_tokens_per_second_count", &[]), 1.0);
 }
 
 #[test]
 fn a_duration_counts_in_the_first_bucket_whose_bound_it_does_not_pass() {
-    let durations = Durations::new();
-    durations.record(10_000_000);
-    durations.record(10_000_001);
-    durations.record(600_000_000_000);
-    durations.record(600_000_000_001);
+    let durations = Durations::new(0);
+    durations.record(10_000_000, 0);
+    durations.record(10_000_001, 0);
+    durations.record(600_000_000_000, 0);
+    durations.record(600_000_000_001, 0);
     assert_eq!(durations.buckets[0].load(Ordering::Relaxed), 1);
     assert_eq!(durations.buckets[1].load(Ordering::Relaxed), 1);
     let last = DURATION_BOUNDS_NS.len();
     assert_eq!(durations.buckets[last - 1].load(Ordering::Relaxed), 1);
     assert_eq!(durations.buckets[last].load(Ordering::Relaxed), 1);
-    assert_eq!(durations.max_ns.load(Ordering::Relaxed), 600_000_000_001);
+    assert_eq!(durations.max_ns.poll(0), 600_000_000_001);
     assert_eq!(DURATION_BOUNDS_NS[last - 1], 600_000_000_000);
     assert!(DURATION_BOUNDS_NS.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(RATE_BOUNDS.windows(2).all(|pair| pair[0] < pair[1]));
@@ -285,13 +288,13 @@ fn a_duration_counts_in_the_first_bucket_whose_bound_it_does_not_pass() {
 
 #[test]
 fn a_clock_that_ran_backwards_and_a_zero_tool_call_record_nothing() {
-    let metrics = Metrics::new(0);
+    let metrics = Metrics::new(0, 0);
     let mut backwards = generation(Api::Responses, 0, 5);
     backwards.ended_ns = 0;
     backwards.started_ns = 0;
-    metrics.generation(&backwards);
+    metrics.generation(&backwards, 0);
     metrics.tool_calls(Api::Responses, 0);
-    let text = metrics.render("m", 1, &EngineReport::default());
+    let text = metrics.render("m", 1, &EngineReport::default(), 0);
     let api = ["api=\"responses\""];
     assert_eq!(value(&text, "euhedral_request_duration_seconds_count", &api), 0.0);
     assert_eq!(value(&text, "euhedral_queue_wait_seconds_count", &api), 0.0);
@@ -301,11 +304,11 @@ fn a_clock_that_ran_backwards_and_a_zero_tool_call_record_nothing() {
 
 #[test]
 fn speculative_steps_are_counted_by_drafts_accepted_in_label_order() {
-    let metrics = Metrics::new(11);
+    let metrics = Metrics::new(11, 0);
     metrics.speculative_step(2);
     metrics.speculative_step(11);
     metrics.speculative_step(40);
-    let text = metrics.render("m", 1, &EngineReport::default());
+    let text = metrics.render("m", 1, &EngineReport::default(), 0);
     let drafts: Vec<&str> = text
         .lines()
         .filter(|line| line.starts_with("euhedral_speculative_accepted_total{"))
@@ -318,4 +321,26 @@ fn speculative_steps_are_counted_by_drafts_accepted_in_label_order() {
     );
     assert_eq!(value(&text, "euhedral_speculative_verifications_total", &[]), 3.0);
     assert_eq!(value(&text, "euhedral_speculative_accepted_tokens_total", &[]), 24.0);
+}
+
+#[test]
+fn the_largest_values_expire_by_windows_of_a_minute() {
+    const MINUTE: i64 = 60_000;
+    let max_of = |text: &str| value(text, "euhedral_request_duration_seconds_max", &["api=\"messages\""]);
+    let metrics = Metrics::new(0, 0);
+    metrics.generation(&generation(Api::Messages, 3_001_000, 10), 0);
+    let report = EngineReport::default();
+    let first = max_of(&metrics.render("m", 1, &report, 0));
+    assert!(first > 0.0);
+    // Still reported just before the third window ends, gone when it has.
+    assert_eq!(max_of(&metrics.render("m", 1, &report, 3 * MINUTE - 1)), first);
+    assert_eq!(max_of(&metrics.render("m", 1, &report, 3 * MINUTE)), 0.0);
+    // The rates have their own windows.
+    assert!(
+        value(
+            &metrics.render("m", 1, &report, 0),
+            "euhedral_decode_tokens_per_second_max",
+            &[]
+        ) == 0.0
+    );
 }

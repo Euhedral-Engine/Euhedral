@@ -331,6 +331,7 @@ impl Router {
                     self.backend.model_id(),
                     self.backend.context_length(),
                     &self.backend.engine_report(),
+                    Metrics::wall_clock_ms(),
                 );
                 Response::with_status(200)
                     .header("Content-Type", METRICS_TYPE)

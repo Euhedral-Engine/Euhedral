@@ -169,7 +169,7 @@ impl Page<'_> {
     }
 
     /// The duration histograms of every `api` (`name` is the family's, in seconds) and the family of their largest.
-    fn durations(&mut self, name: &str, help: &str, series: &[Durations]) {
+    fn durations(&mut self, name: &str, help: &str, series: &[Durations], now_ms: i64) {
         self.family(name, Kind::Histogram, help);
         let bucket = format!("{name}_bucket");
         let count = format!("{name}_count");
@@ -193,13 +193,13 @@ impl Page<'_> {
         let max = format!("{name}_max");
         self.family(&max, Kind::Gauge, help);
         for api in Api::ALL {
-            let nanos = series[api.index()].max_ns.load(Ordering::Relaxed);
+            let nanos = series[api.index()].max_ns.poll(now_ms);
             self.sample(&max, &[("api", api.label())], &[], nanos as f64 / SECONDS);
         }
     }
 
     /// The rate histogram and the family of its largest value.
-    fn rates(&mut self, name: &str, help: &str, series: &Rates) {
+    fn rates(&mut self, name: &str, help: &str, series: &Rates, now_ms: i64) {
         self.family(name, Kind::Histogram, help);
         let bucket = format!("{name}_bucket");
         let mut bound = String::new();
@@ -221,7 +221,7 @@ impl Page<'_> {
         );
         let max = format!("{name}_max");
         self.family(&max, Kind::Gauge, help);
-        self.sample(&max, &[], &[], f64::from_bits(series.max.load(Ordering::Relaxed)));
+        self.sample(&max, &[], &[], f64::from_bits(series.max.poll(now_ms)));
     }
 }
 
@@ -232,22 +232,22 @@ fn load(counter: &AtomicU64) -> f64 {
 impl Metrics {
     /// The text of every series now. `model` and `context_tokens` are the served model's; `engine` is what the engine
     /// reports at this scrape.
-    pub fn render(&self, model: &str, context_tokens: usize, engine: &EngineReport) -> String {
+    pub fn render(&self, model: &str, context_tokens: usize, engine: &EngineReport, now_ms: i64) -> String {
         let mut text = String::with_capacity(96 * 1024);
         let mut page = Page { out: &mut text };
         // The families run in the order of their names, a counter's `_total` aside.
-        self.before_engine(&mut page);
+        self.before_engine(&mut page, now_ms);
         engine_state(&mut page, model, context_tokens, engine);
-        self.finishes_and_queue(&mut page);
+        self.finishes_and_queue(&mut page, now_ms);
         if let Some(cache) = &engine.prefix_cache {
             prefix_cache(&mut page, cache);
         }
-        self.tokens_and_timings(&mut page);
-        self.requests_and_speculation(&mut page);
+        self.tokens_and_timings(&mut page, now_ms);
+        self.requests_and_speculation(&mut page, now_ms);
         text
     }
 
-    fn before_engine(&self, page: &mut Page<'_>) {
+    fn before_engine(&self, page: &mut Page<'_>, now_ms: i64) {
         page.counter(
             "euhedral_completion_tokens_total",
             "Generated tokens, reasoning included",
@@ -263,10 +263,11 @@ impl Metrics {
             "euhedral_decode_tokens_per_second",
             "Generated tokens per second after the first",
             &self.decode_rate,
+            now_ms,
         );
     }
 
-    fn finishes_and_queue(&self, page: &mut Page<'_>) {
+    fn finishes_and_queue(&self, page: &mut Page<'_>, now_ms: i64) {
         let name = "euhedral_finishes_total";
         page.family(name, Kind::Counter, "Generations by finish reason");
         for api in Api::ALL {
@@ -289,10 +290,11 @@ impl Metrics {
             "euhedral_prefill_tokens_per_second",
             "Prefilled tokens per second up to the first token",
             &self.prefill_rate,
+            now_ms,
         );
     }
 
-    fn tokens_and_timings(&self, page: &mut Page<'_>) {
+    fn tokens_and_timings(&self, page: &mut Page<'_>, now_ms: i64) {
         page.counter(
             "euhedral_prompt_cached_tokens_total",
             "Prompt tokens restored from the prefix cache",
@@ -312,6 +314,7 @@ impl Metrics {
             "euhedral_queue_wait_seconds",
             "From arrival to the start of generation",
             &self.queue_wait,
+            now_ms,
         );
         page.counter(
             "euhedral_reasoning_tokens_total",
@@ -322,10 +325,11 @@ impl Metrics {
             "euhedral_request_duration_seconds",
             "From arrival to the last token",
             &self.request_duration,
+            now_ms,
         );
     }
 
-    fn requests_and_speculation(&self, page: &mut Page<'_>) {
+    fn requests_and_speculation(&self, page: &mut Page<'_>, now_ms: i64) {
         let name = "euhedral_requests_total";
         page.family(name, Kind::Counter, "Requests by API surface and outcome");
         for api in Api::ALL {
@@ -365,6 +369,7 @@ impl Metrics {
             "euhedral_time_to_first_token_seconds",
             "From the start of generation to the first token",
             &self.time_to_first_token,
+            now_ms,
         );
         page.per_api("euhedral_tool_calls_total", "Tool calls returned", &self.tool_calls);
     }
