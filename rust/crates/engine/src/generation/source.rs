@@ -53,17 +53,17 @@ use euhedral_inference_cuda::{DevicePtr, PooledPinned, SubmitMode};
 
 use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
-use super::mtp::Speculating;
+use super::mtp::{Joining, Speculating, Verifying};
 use super::request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
-use super::sampled::{Pending, Sampled, sample_frame};
+use super::sampled::{Answered, LeasedRow, Sampled, SampledRows, sample_frame};
 use super::teacher_forced::LogitsSink;
 use crate::frames::{Kind, step};
 use crate::model::ModelConfig;
 use crate::quantum::{Executor, Started};
 use crate::runtime::{Core, Units};
-use crate::sampling::TokenSampler;
+use crate::sampling::{SamplingConfig, SamplingError, TokenSampler};
 use crate::stages::attention::KvSource;
 use crate::stages::sampling::{RowReadbackLease, Selection};
 use crate::stages::{InputRecordRef, Quantum, QuantumError, QuantumKind, SubmitError};
@@ -235,7 +235,8 @@ pub(super) enum Mode {
         state: Box<Speculating>,
     },
     /// Copies each step's logits row to the host, which selects the token there ([`Sampled`]): the token is then the
-    /// input of the next decode. One quantum is in flight at a time, and the request does not speculate.
+    /// input of the next decode. One quantum is in flight at a time, and the request does not speculate. A sampled
+    /// request that speculates is a [`Mode::Speculative`] one whose state holds the samplers.
     Sampled {
         listener: Box<dyn GenerationListener>,
         state: Box<Sampling>,
@@ -249,12 +250,28 @@ pub(super) enum Mode {
 
 /// What a sampled request keeps between its quanta.
 pub(super) struct Sampling {
-    /// The request's sampler, which a selection frame holds while it selects.
-    sampler: Option<Box<TokenSampler>>,
-    /// The selection the owner waits for.
-    pending: Pending,
+    /// The request's sampler, which a selection frame holds while it selects, and the selection the owner waits for.
+    rows: SampledRows,
     /// The token the host selected, which the next decode feeds.
     next: Option<u32>,
+}
+
+impl Mode {
+    /// The samplers and the join of a request whose host selects.
+    fn sampled_rows(&mut self) -> Option<&mut SampledRows> {
+        match self {
+            Mode::Sampled { state, .. } => Some(&mut state.rows),
+            Mode::Speculative { state, .. } => state.rows_mut(),
+            Mode::Greedy { .. } | Mode::Forced { .. } => None,
+        }
+    }
+}
+
+/// `count` samplers of `config` for rows of `vocabulary` logits, all made when the request begins.
+fn samplers(config: SamplingConfig, vocabulary: usize, count: usize) -> Result<Vec<Box<TokenSampler>>, SamplingError> {
+    (0..count)
+        .map(|_| TokenSampler::new(config, vocabulary).map(Box::new))
+        .collect()
 }
 
 /// What a quantum of the request is for.
@@ -371,21 +388,36 @@ impl Run {
     pub(super) fn selections(&self, step: Step) -> usize {
         match step {
             // A sampled request's rows go to the host: it takes a row readback (`Owner::admit_quantum`), no selection.
-            Step::Prefill { last, .. } => usize::from(last && self.wanted > 0 && !self.samples()),
-            Step::Decode => usize::from(!self.samples()),
+            Step::Prefill { last, .. } => {
+                usize::from(last && self.wanted > 0 && !self.copies_rows(Role::Prefill { last }))
+            }
+            Step::Decode => usize::from(!self.copies_rows(Role::Decode)),
             Step::PromptCatchUp { .. } | Step::Settle => 0,
-            Step::Speculate { drafts } => drafts + 1,
+            // The drafts are always selected on the device; the verification only when the host does not.
+            Step::Speculate { drafts } => drafts + usize::from(!self.copies_rows(Role::Verify)),
         }
     }
 
-    /// Whether the host selects the request's tokens.
-    pub(super) fn samples(&self) -> bool {
-        matches!(self.mode, Mode::Sampled { .. })
+    /// Whether the logits rows of a quantum of `role` go to the host, which selects the tokens: every quantum of a
+    /// sampled request that does not speculate, and the prompt's and the verifications' of one that does. Its drafts
+    /// stay greedy and on the device.
+    pub(super) fn copies_rows(&self, role: Role) -> bool {
+        match &self.mode {
+            Mode::Sampled { .. } => true,
+            Mode::Speculative { state, .. } => {
+                state.samples() && matches!(role, Role::Prefill { .. } | Role::Decode | Role::Verify)
+            }
+            Mode::Greedy { .. } | Mode::Forced { .. } => false,
+        }
     }
 
-    /// Whether the request waits for the host's selection of a token.
+    /// Whether the request waits for the host's selections of a quantum's rows.
     fn selecting(&self) -> bool {
-        matches!(&self.mode, Mode::Sampled { state, .. } if state.pending.waiting())
+        match &self.mode {
+            Mode::Sampled { state, .. } => state.rows.waiting(),
+            Mode::Speculative { state, .. } => state.selecting(),
+            Mode::Greedy { .. } | Mode::Forced { .. } => false,
+        }
     }
 
     /// The listener of a generation that reports tokens.
@@ -548,27 +580,50 @@ impl Owner {
             Err(error) => return Err(Rejected::new(error, Audience::Greedy(listener))),
         };
         let mode = match speculation {
-            // The host selects, one token at a time: no speculation yet, whatever the request asks for.
+            // The host selects the tokens: its drafts, if it speculates, stay greedy.
             _ if !sampling.is_greedy() => {
                 if self.sequence.row_readbacks.is_exhausted() {
                     // Refused before the prompt prefills: the last chunk would find no row to copy its logits to.
                     let error = AdmissionError::Engine("the sequence has no row readback to sample from".to_string());
                     return Err(Rejected::new(error, Audience::Greedy(listener)));
                 }
-                let sampler = match TokenSampler::new(sampling, self.shared.config.vocab_size) {
-                    Ok(sampler) => sampler,
+                let vocabulary = self.shared.config.vocab_size;
+                let drafts = match speculation {
+                    Speculation::Off => None,
+                    Speculation::Artifact => match self.shared.drafts.as_ref() {
+                        Some(drafts) => Some(drafts.depth),
+                        None => {
+                            return Err(Rejected::new(
+                                AdmissionError::SpeculationUnavailable,
+                                Audience::Greedy(listener),
+                            ));
+                        }
+                    },
+                };
+                // One sampler for each row a quantum selects from at once: a verification's rows, or one.
+                let rows = drafts.map_or(1, |depth| depth + 1);
+                let samplers = match samplers(sampling, vocabulary, rows) {
+                    Ok(samplers) => SampledRows::new(samplers),
                     Err(error) => {
                         let error = AdmissionError::Engine(format!("the sampler: {error}"));
                         return Err(Rejected::new(error, Audience::Greedy(listener)));
                     }
                 };
-                Mode::Sampled {
-                    listener,
-                    state: Box::new(Sampling {
-                        sampler: Some(Box::new(sampler)),
-                        pending: Pending::default(),
-                        next: None,
-                    }),
+                match drafts {
+                    None => Mode::Sampled {
+                        listener,
+                        state: Box::new(Sampling {
+                            rows: samplers,
+                            next: None,
+                        }),
+                    },
+                    Some(depth) => Mode::Speculative {
+                        listener,
+                        state: Box::new(
+                            Speculating::new(depth, self.shared.capacity, prompt.len(), max_tokens as usize)
+                                .sampled(samplers),
+                        ),
+                    },
                 }
             }
             Speculation::Off => Mode::Greedy { listener },
@@ -718,7 +773,8 @@ impl Owner {
     /// the quanta in flight.
     fn admissible(&self) -> Option<Step> {
         let run = self.run.as_ref()?;
-        if run.waiting_logits || run.in_flight.len() >= run.depth {
+        // The tokens the host is selecting decide the next step.
+        if run.waiting_logits || run.selecting() || run.in_flight.len() >= run.depth {
             return None;
         }
         let next = match run.next_step(self.shared.chunk) {
@@ -849,29 +905,44 @@ impl Owner {
         }
     }
 
-    /// Takes the host's selection of a sampled request's token: reports it, ends the request at a stop token or its
-    /// budget, and otherwise keeps it for the next decode to feed. An answer for a selection the request no longer
-    /// waits for is ignored; a token that arrives after the request stopped is never reported.
+    /// Takes in the host's selection of one row of a sampled quantum. An answer for a selection the request no longer
+    /// waits for is ignored; the last answer of the quantum joins them: a sampled request's token is reported and
+    /// fed to the next decode, a speculative one's rows are resolved against its drafts. Nothing is reported once the
+    /// request stopped.
     fn deliver_sample(&mut self, sampled: Sampled) {
         let Some(run) = self.run.as_mut() else { return };
-        let Mode::Sampled { state, .. } = &mut run.mode else {
+        let Some(rows) = run.mode.sampled_rows() else {
             return;
         };
-        if !state.pending.take(sampled.step) {
-            log::warn!(
-                "the answer of selection {} is not the one awaited, and is ignored",
-                sampled.step
-            );
+        let step = sampled.step;
+        if rows.answer(sampled) == Answered::Stale {
+            log::warn!("the answer of selection {step} is not the one awaited, and is ignored");
             return;
         }
-        let (token, sampler) = match sampled.result {
-            Ok(selected) => selected,
-            Err(why) => return self.fail(format!("selecting the token: {why}")),
+        // A failure ends the request at once; the answers still to come are awaited before it ends (`selecting`).
+        if let Some(why) = rows.failure() {
+            let why = format!("selecting the token: {why}");
+            return self.fail(why);
+        }
+        if rows.waiting() || run.stopping.is_some() {
+            return;
+        }
+        match &run.mode {
+            Mode::Sampled { .. } => self.sampled_token(),
+            _ => self.joined_rows(),
+        }
+    }
+
+    /// The host selected the token of a sampled request that does not speculate: reports it, ends the request at a stop
+    /// token or its budget, and otherwise keeps it for the next decode to feed.
+    fn sampled_token(&mut self) {
+        let Some(run) = self.run.as_mut() else { return };
+        let Mode::Sampled { state, .. } = &run.mode else {
+            return;
         };
-        state.sampler = Some(sampler);
-        if run.stopping.is_some() {
+        let Some(token) = state.rows.tokens().first().copied() else {
             return;
-        }
+        };
         run.generated += 1;
         if let Some(listener) = run.listener() {
             listener.token(token, Instant::now());
@@ -1034,6 +1105,7 @@ impl Owner {
             Role::Settle => return,
             Role::PromptCatchUp => return,
             Role::CatchUp | Role::Draft => return self.drafted(flying),
+            Role::Verify if run.copies_rows(Role::Verify) => return self.sample(flying),
             Role::Verify => return self.verified(flying),
             Role::Prefill { .. } | Role::Decode => {}
         }
@@ -1044,7 +1116,7 @@ impl Owner {
             }
             return;
         }
-        if run.samples() {
+        if run.copies_rows(flying.role) {
             return self.sample(flying);
         }
         if let Mode::Forced { .. } = run.mode {
@@ -1073,35 +1145,58 @@ impl Owner {
         }
     }
 
-    /// Publishes the frame that selects the token of a sampled quantum from the row it copied: the quantum retired, so
-    /// the row is in the readback. The frame owns the row's lease, the request's sampler and the position the token
-    /// takes, which is the position after the quantum's last row.
+    /// Publishes the frames that select the tokens of a sampled quantum from the rows it copied: the quantum retired, so
+    /// the rows are in the readback. A prompt chunk's or a decode's last row takes the position after it; row `j` of a
+    /// verification (which feeds the current token and the drafts) takes the position `j + 1` after the current token's,
+    /// the position of the token it selects. Each frame owns one row's sampler and a share of the readback's lease, and
+    /// the frames run side by side: they are independent.
     fn sample(&mut self, flying: &mut Flying) {
-        let Some(row) = flying.row.take() else {
+        let Some(lease) = flying.row.take() else {
             return self.fail("a sampled quantum retired with no row readback".to_string());
         };
-        let position = flying.start + flying.rows as u64;
-        // The step is the owner's, not the request's: an answer that comes late from a request that ended never
+        let verifying = flying.role == Role::Verify;
+        let count = if verifying { flying.rows } else { 1 };
+        let first_position = if verifying {
+            flying.start + 1
+        } else {
+            flying.start + flying.rows as u64
+        };
+        // The steps are the owner's, not the request's: an answer that comes late from a request that ended never
         // matches a selection of the next one.
-        let step = self.sample_steps;
-        self.sample_steps += 1;
-        let prepared = match self.run.as_mut().map(|run| &mut run.mode) {
-            Some(Mode::Sampled { state, .. }) => state
-                .sampler
-                .take()
-                .map(|sampler| (state.pending.begin(step), sampler))
-                .ok_or("the request's sampler is in use"),
-            _ => return,
+        let first_step = self.sample_steps;
+        self.sample_steps += count as u64;
+        let shared = &self.shared;
+        let Some(run) = self.run.as_mut() else { return };
+        if let Mode::Speculative { state, .. } = &mut run.mode {
+            state.joining(match flying.role {
+                Role::Verify => Joining::Verification(Verifying::of(flying)),
+                role => Joining::Token {
+                    first: matches!(role, Role::Prefill { .. }),
+                },
+            });
+        }
+        let Some(rows) = run.mode.sampled_rows() else {
+            return;
         };
-        let (step, sampler) = match prepared {
-            Ok(prepared) => prepared,
-            Err(why) => return self.fail(why.to_string()),
-        };
-        let address = Arc::clone(&self.shared.address);
-        let frame = sample_frame(step, position, sampler, row, move |sampled| {
-            address.post(Message::Sampled(sampled));
-        });
-        self.shared.core.completions.at(Instant::now(), frame);
+        if let Err(why) = rows.begin(first_step, count) {
+            return self.fail(why);
+        }
+        let lease = Arc::new(lease);
+        for row in 0..count {
+            let Some(sampler) = rows.sampler(row) else {
+                // Checked by `begin`; the rows already published answer for themselves.
+                return self.fail("a row's sampler is in use".to_string());
+            };
+            let address = Arc::clone(&shared.address);
+            let frame = sample_frame(
+                first_step + row as u64,
+                first_position + row as u64,
+                sampler,
+                LeasedRow::new(Arc::clone(&lease), row),
+                move |sampled| address.post(Message::Sampled(sampled)),
+            );
+            shared.core.completions.at(Instant::now(), frame);
+        }
     }
 
     /// Queues the copy of the quantum's logits row to pinned memory, and of its last row's final hidden state when the
@@ -1337,7 +1432,7 @@ impl Owner {
             .map_err(why("the quantum's logits rows"))?;
         let mut row = None;
         if logits > 0 {
-            if run.samples() {
+            if run.copies_rows(role) {
                 let lease = self.sequence.row_readbacks.acquire().map_err(why("the row readback"))?;
                 quantum = quantum.with_row_readback(Arc::clone(lease.readback()));
                 row = Some(lease);

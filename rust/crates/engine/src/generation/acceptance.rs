@@ -6,6 +6,9 @@
 //! accepted drafts followed by the first `g` that no draft matched, which is exactly the tokens ordinary decode
 //! produces. They are cut after the first end-of-generation token and at the budget.
 //!
+//! One function, [`accept_tokens`], resolves a greedy verification (whose keys [`accept`] maps to tokens) and a sampled
+//! one (whose rows the host selected).
+//!
 //! The rows the step commits equal the output count: row 0 carries `t0` and rows `1..count` the first `count - 1`
 //! outputs, which one-row decode would have fed. The last output (the next `t0`, or the end token) is not fed yet.
 
@@ -29,7 +32,8 @@ pub struct Accepted {
 }
 
 /// Resolves a verification of `drafts` from the argmax key of each verified row (`verified_keys[j]` is row `j`'s, so
-/// there is one more key than drafts): `eos` are the ids that end a generation and `budget` caps the outputs.
+/// there is one more key than drafts): `eos` are the ids that end a generation and `budget` caps the outputs. A key that
+/// holds no token ends the tokens the rows give, as [`accept_tokens`] reads them.
 ///
 /// # Panics
 ///
@@ -41,15 +45,36 @@ pub fn accept(drafts: &[u32], verified_keys: &[u64], eos: &[u32], budget: u32) -
         drafts.len() + 1,
         "one verified key per row: the current token and each draft"
     );
+    let selected: Vec<u32> = verified_keys.iter().map_while(|key| token_of(*key)).collect();
+    accept_tokens(drafts, &selected, eos, budget)
+}
+
+/// Resolves a verification of `drafts` from the token each verified row selected (`selected[j]` is row `j`'s, the token
+/// at the position after the row, however it was selected): `eos` are the ids that end a generation and `budget` caps
+/// the outputs. The order of the checks is the one ordinary decode has: the drafts that match, the verifier's own token,
+/// the budget, then the first end token.
+///
+/// `selected` holds a token for each row up to the first that selected none (every logit NaN or negative infinity), so
+/// it is at most one longer than `drafts`.
+///
+/// # Panics
+///
+/// If `selected` is more than one longer than `drafts`, or `budget` is 0 (a step is admitted only while tokens are
+/// wanted).
+pub fn accept_tokens(drafts: &[u32], selected: &[u32], eos: &[u32], budget: u32) -> Accepted {
+    assert!(
+        selected.len() <= drafts.len() + 1,
+        "at most one selected token per row: the current token and each draft"
+    );
     assert!(budget > 0, "a step is admitted while tokens are wanted");
     let mut accepted = 0;
-    while accepted < drafts.len() && token_of(verified_keys[accepted]) == Some(drafts[accepted]) {
+    while accepted < drafts.len() && selected.get(accepted) == Some(&drafts[accepted]) {
         accepted += 1;
     }
     let mut outputs: Vec<u32> = drafts[..accepted].to_vec();
-    let unselected = match token_of(verified_keys[accepted]) {
+    let unselected = match selected.get(accepted) {
         Some(token) => {
-            outputs.push(token);
+            outputs.push(*token);
             false
         }
         None => true,
