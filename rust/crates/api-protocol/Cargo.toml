@@ -11,8 +11,12 @@ workspace = true
 
 [dependencies]
 llguidance.workspace = true
+euhedral-inference-tokenizer = { path = "../tokenizer" }
 thiserror.workspace = true
 toktrie.workspace = true
 
 [dev-dependencies]
+crc32fast.workspace = true
+euhedral-inference-edrl = { path = "../edrl" }
+test-support = { path = "../test-support" }
 serde_json.workspace = true

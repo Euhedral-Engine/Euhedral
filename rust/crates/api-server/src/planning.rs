@@ -239,7 +239,7 @@ fn step(finish: Finish, work: impl FnOnce(Finish) + Send + 'static) -> Box<dyn F
 struct BackendChecks<'a>(&'a dyn Backend);
 
 impl GrammarCheck for BackendChecks<'_> {
-    fn check_grammar(&self, grammar: &str) -> Result<(), ApiError> {
+    fn check_grammar(&mut self, grammar: &str) -> Result<(), ApiError> {
         self.0.check_grammar(grammar).map_err(|error| match error {
             BackendError::Unenforceable(reason) => {
                 ApiError::invalid_request(format!("The requested output cannot be enforced: {reason}"), None)
@@ -248,7 +248,7 @@ impl GrammarCheck for BackendChecks<'_> {
         })
     }
 
-    fn check_json_schema(&self, schema: &JsonValue, param: &str) -> Result<(), ApiError> {
+    fn check_json_schema(&mut self, schema: &JsonValue, param: &str) -> Result<(), ApiError> {
         self.0
             .check_json_schema(&OutputGrammar::schema_text(schema))
             .map_err(|error| match error {
@@ -405,8 +405,8 @@ impl Planner {
         let planner = self.clone();
         step(finish, move |finish| {
             let request = &mapped.request;
-            let checks = BackendChecks(planner.inner.backend.as_ref());
-            match OutputGrammar::for_request(&request.tools, &request.format, request.reasoning(), &checks) {
+            let mut checks = BackendChecks(planner.inner.backend.as_ref());
+            match OutputGrammar::for_request(&request.tools, &request.format, request.reasoning(), &mut checks) {
                 Ok(grammar) => planner.publish(planner.template(mapped, grammar, finish)),
                 Err(error) => finish.fail(error),
             }

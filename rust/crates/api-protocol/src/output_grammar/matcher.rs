@@ -9,8 +9,9 @@ use llguidance::panic_utils::catch_unwind;
 use thiserror::Error;
 use toktrie::SimpleVob;
 
-use super::{GrammarChecker, summary};
+use super::{GrammarChecker, OutputGrammar, summary};
 use crate::error::ApiError;
+use crate::json::JsonValue;
 
 /// Compiled grammars a checker keeps for reuse unless told otherwise.
 pub const DEFAULT_CACHED_GRAMMARS: usize = 32;
@@ -145,38 +146,107 @@ impl GrammarChecker {
     /// The cache is the checker's own state, polled by whoever owns the checker one request at a time: no lock, no
     /// wait. Compiling costs enough that the owner does it as its own frame, never inline in a request handler; a
     /// cached grammar only copies. A grammar llguidance refuses is a 400 without a parameter and is not cached.
+    /// A grammar already checked by [`GrammarChecker::check_grammar`] is cached and compiles no more.
     pub fn constraint(&mut self, grammar: &str) -> Result<GrammarMatcher, ApiError> {
-        let matcher = if self.compiled.touch(grammar) {
+        match self.cloned(Kind::Lark, grammar)? {
+            Ok(matcher) => Ok(GrammarMatcher::new(matcher, self.size, Arc::clone(&self.end_ids))),
+            Err(refused) => Err(grammar_refusal(&refused)),
+        }
+    }
+
+    /// A matcher at the start of the JSON Schema `schema`, owned by the caller, sharing the cache of
+    /// [`GrammarChecker::constraint`] under its own keys: a schema and a grammar of the same text never meet. A
+    /// refusal is an unenforceable schema at `param` and is not cached.
+    pub fn json_schema_constraint(&mut self, schema: &JsonValue, param: &str) -> Result<GrammarMatcher, ApiError> {
+        match self.cloned(Kind::JsonSchema, &OutputGrammar::schema_text(schema))? {
+            Ok(matcher) => Ok(GrammarMatcher::new(matcher, self.size, Arc::clone(&self.end_ids))),
+            Err(refused) => Err(schema_refusal(&refused, param)),
+        }
+    }
+
+    /// Whether `text` of `kind` compiles: found in the cache, else compiled now and kept unless the cache is
+    /// disabled. A refusal is llguidance's, in its summary, and is not kept.
+    pub(super) fn check(&mut self, kind: Kind, text: &str) -> Result<(), String> {
+        if self.compiled.touch(kind, text) {
+            return Ok(());
+        }
+        let compiled = self.compile(kind, text)?;
+        if !self.compiled.is_disabled() {
+            self.compiled.insert(kind, text, compiled);
+        }
+        Ok(())
+    }
+
+    /// A copy of the compiled grammar of `kind`, from the cache or compiled now and kept.
+    fn cloned(&mut self, kind: Kind, text: &str) -> Result<Result<Matcher, String>, ApiError> {
+        if self.compiled.touch(kind, text) {
             let template = self.compiled.latest().ok_or_else(ApiError::server_error)?;
             // A panic copying is a server fault, never the request's.
-            catch_unwind(AssertUnwindSafe(|| Ok(template.deep_clone()))).map_err(|_| ApiError::server_error())?
-        } else {
-            let compiled = self.matcher(grammar, "lark");
-            if let Some(message) = compiled.get_error() {
-                return Err(ApiError::invalid_request(
-                    format!("The requested output cannot be enforced: {}", summary(&message)),
-                    None,
-                ));
-            }
-            if self.compiled.is_disabled() {
-                // Nothing is kept: the compiled grammar is this generation's own.
-                compiled
-            } else {
-                let copy = catch_unwind(AssertUnwindSafe(|| Ok(compiled.deep_clone())))
-                    .map_err(|_| ApiError::server_error())?;
-                self.compiled.insert(grammar, compiled);
-                copy
-            }
+            return catch_unwind(AssertUnwindSafe(|| Ok(template.deep_clone())))
+                .map(Ok)
+                .map_err(|_| ApiError::server_error());
+        }
+        let compiled = match self.compile(kind, text) {
+            Ok(compiled) => compiled,
+            Err(refused) => return Ok(Err(refused)),
         };
-        Ok(GrammarMatcher::new(matcher, self.size, Arc::clone(&self.end_ids)))
+        if self.compiled.is_disabled() {
+            // Nothing is kept: the compiled grammar is this generation's own.
+            return Ok(Ok(compiled));
+        }
+        let copy =
+            catch_unwind(AssertUnwindSafe(|| Ok(compiled.deep_clone()))).map_err(|_| ApiError::server_error())?;
+        self.compiled.insert(kind, text, compiled);
+        Ok(Ok(copy))
+    }
+
+    /// Compiles `text` of `kind`: the matcher, or llguidance's refusal in its summary.
+    fn compile(&mut self, kind: Kind, text: &str) -> Result<Matcher, String> {
+        #[cfg(test)]
+        {
+            self.compiled.compilations += 1;
+        }
+        let compiled = self.matcher(text, kind.tag());
+        match compiled.get_error() {
+            None => Ok(compiled),
+            Some(message) => Err(summary(&message)),
+        }
     }
 }
 
-/// The compiled grammars of a checker, keyed by grammar text, least recently used first. The last entry is the one
+/// What is compiled, which is part of a cache key: a JSON schema and a grammar of the same text are two entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    Lark,
+    JsonSchema,
+}
+
+impl Kind {
+    /// The type tag llguidance is given with the text.
+    fn tag(self) -> &'static str {
+        match self {
+            Kind::Lark => "lark",
+            Kind::JsonSchema => "json_schema",
+        }
+    }
+}
+
+pub(super) fn grammar_refusal(refused: &str) -> ApiError {
+    ApiError::invalid_request(format!("The requested output cannot be enforced: {refused}"), None)
+}
+
+pub(super) fn schema_refusal(refused: &str, param: &str) -> ApiError {
+    ApiError::unenforceable_schema(format!("The JSON Schema cannot be enforced: {refused}"), Some(param))
+}
+
+/// The compiled grammars of a checker, keyed by kind and text, least recently used first. The last entry is the one
 /// just used or inserted.
 pub(super) struct CompiledGrammars {
     capacity: usize,
-    entries: Vec<(Box<str>, Matcher)>,
+    entries: Vec<(Kind, Box<str>, Matcher)>,
+    /// How many times llguidance compiled a grammar, hit or refused or kept.
+    #[cfg(test)]
+    pub(super) compilations: usize,
 }
 
 impl CompiledGrammars {
@@ -184,6 +254,8 @@ impl CompiledGrammars {
         CompiledGrammars {
             capacity,
             entries: Vec::new(),
+            #[cfg(test)]
+            compilations: 0,
         }
     }
 
@@ -191,9 +263,9 @@ impl CompiledGrammars {
         self.capacity == 0
     }
 
-    /// Makes `grammar` the most recent entry; false when it is not kept.
-    fn touch(&mut self, grammar: &str) -> bool {
-        let Some(index) = self.entries.iter().position(|(key, _)| &**key == grammar) else {
+    /// Makes the entry the most recent; false when it is not kept.
+    fn touch(&mut self, kind: Kind, text: &str) -> bool {
+        let Some(index) = self.entries.iter().position(|(k, key, _)| *k == kind && &**key == text) else {
             return false;
         };
         let entry = self.entries.remove(index);
@@ -202,15 +274,15 @@ impl CompiledGrammars {
     }
 
     /// Keeps `compiled` as the most recent entry, dropping the least recent when the bound is reached.
-    fn insert(&mut self, grammar: &str, compiled: Matcher) {
+    fn insert(&mut self, kind: Kind, text: &str, compiled: Matcher) {
         if self.entries.len() >= self.capacity {
             self.entries.remove(0);
         }
-        self.entries.push((grammar.into(), compiled));
+        self.entries.push((kind, text.into(), compiled));
     }
 
     fn latest(&self) -> Option<&Matcher> {
-        self.entries.last().map(|(_, matcher)| matcher)
+        self.entries.last().map(|(_, _, matcher)| matcher)
     }
 
     #[cfg(test)]
@@ -220,7 +292,12 @@ impl CompiledGrammars {
 
     #[cfg(test)]
     pub(super) fn holds(&self, grammar: &str) -> bool {
-        self.entries.iter().any(|(key, _)| &**key == grammar)
+        self.holds_kind(Kind::Lark, grammar)
+    }
+
+    #[cfg(test)]
+    pub(super) fn holds_kind(&self, kind: Kind, text: &str) -> bool {
+        self.entries.iter().any(|(k, key, _)| *k == kind && &**key == text)
     }
 }
 
