@@ -25,7 +25,7 @@ use crate::stages::gdn::{GdnConvolution, GdnGatedRmsNorm, GdnProjectControl, Gdn
 use crate::stages::linear::{Linear, LinearRows};
 use crate::stages::mtp::MtpStem;
 use crate::stages::norm::{NormRows, ResidualRmsNorm, RmsNormUnitOffset};
-use crate::stages::sampling::{Argmax, SelectedRows, SelectedToken};
+use crate::stages::sampling::{Argmax, CopyRows, SelectedRows, SelectedToken};
 use crate::stages::{Launch, Quantum, StageLaunch};
 use crate::workspace::BufferSlot::{
     self, AttentionContext, AttentionQkNormalized, FfnDelta, FinalHiddenState, FinalNormalized, GateUp, GdnAlpha,
@@ -95,6 +95,7 @@ pub enum StageKind {
     Swiglu,
     MtpStem,
     Argmax,
+    CopyRows,
     SelectedToken,
 }
 
@@ -117,6 +118,7 @@ impl StageKind {
             StageKind::Swiglu => "swiglu",
             StageKind::MtpStem => "mtp-stem",
             StageKind::Argmax => "argmax",
+            StageKind::CopyRows => "copy-rows",
             StageKind::SelectedToken => "selected-token",
         }
     }
@@ -186,6 +188,7 @@ pub(crate) enum Make {
     Argmax {
         vocabulary: usize,
     },
+    CopyRows,
     SelectedToken,
 }
 
@@ -207,6 +210,7 @@ impl Make {
             Make::Swiglu => StageKind::Swiglu,
             Make::MtpStem { .. } => StageKind::MtpStem,
             Make::Argmax { .. } => StageKind::Argmax,
+            Make::CopyRows => StageKind::CopyRows,
             Make::SelectedToken => StageKind::SelectedToken,
         }
     }
@@ -239,6 +243,7 @@ impl Make {
             Make::Swiglu => (vec![GateUp], vec![SwigluSlot]),
             Make::MtpStem { .. } => (vec![HiddenState], vec![MtpNormed, MtpPacked]),
             Make::Argmax { .. } => (vec![Logits], vec![]),
+            Make::CopyRows => (vec![Logits], vec![]),
             Make::SelectedToken => (vec![], vec![]),
         };
         Access {
@@ -357,6 +362,14 @@ impl Make {
                 };
                 entry(self.kind(), Argmax::new(Logits, vocabulary, rows))
             }
+            Make::CopyRows => {
+                let rows = if variant.selects_each() {
+                    SelectedRows::Each
+                } else {
+                    SelectedRows::Last
+                };
+                entry(self.kind(), CopyRows::new(Logits, rows))
+            }
             Make::SelectedToken => entry(self.kind(), SelectedToken),
         })
     }
@@ -445,13 +458,15 @@ impl<W: WeightLookup + ?Sized> Nodes<'_, W> {
     }
 }
 
-/// Where the logits come from and go: the final norm, the head, and the selection after it.
+/// Where the logits come from and go: the final norm, the head, and the selection after it (and, for the base model, the
+/// copy of a sampled quantum's row to the host).
 fn head<W: WeightLookup + ?Sized>(
     nodes: &mut Nodes<'_, W>,
     after: usize,
     final_norm: WeightRef,
     head: WeightRef,
     vocabulary: usize,
+    copies_rows: bool,
 ) -> usize {
     let norm = nodes.push(
         Make::RmsNorm {
@@ -471,7 +486,14 @@ fn head<W: WeightLookup + ?Sized>(
         },
         &[norm],
     );
-    nodes.push(Make::Argmax { vocabulary }, &[logits])
+    let selected = nodes.push(Make::Argmax { vocabulary }, &[logits]);
+    if copies_rows {
+        // After the argmax, in its fused chain: a quantum of a sampling request copies its row here and its argmax is
+        // idle, any other quantum's copy is.
+        nodes.push(Make::CopyRows, &[selected])
+    } else {
+        selected
+    }
 }
 
 /// The base model's views: embedding, every layer in the fused form, the final norm, the head and the selection.
@@ -596,7 +618,7 @@ pub(crate) fn base_nodes<W: WeightLookup + ?Sized>(
     }
     let final_norm = nodes.norm_weight(global, NormKind::Final)?;
     let lm_head = nodes.weight(global, Role::LmHead)?;
-    head(&mut nodes, previous, final_norm, lm_head, config.vocab_size);
+    head(&mut nodes, previous, final_norm, lm_head, config.vocab_size, true);
     Ok(nodes.list)
 }
 
@@ -697,7 +719,7 @@ pub(crate) fn mtp_nodes<W: WeightLookup + ?Sized>(
     let draft_head = nodes.weight(global, Role::DraftHead)?;
     let vocabulary = usize::try_from(draft_head.shape.first().copied().unwrap_or(0))
         .map_err(|_| PlanBuildError::Geometry("the draft head has too many rows".into()))?;
-    let selected = head(&mut nodes, finish, final_norm, draft_head, vocabulary);
+    let selected = head(&mut nodes, finish, final_norm, draft_head, vocabulary, false);
     nodes.push(Make::SelectedToken, &[selected]);
     Ok(nodes.list)
 }

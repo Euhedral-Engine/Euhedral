@@ -57,13 +57,15 @@ use super::mtp::Speculating;
 use super::request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
+use super::sampled::{Pending, Sampled, sample_frame};
 use super::teacher_forced::LogitsSink;
 use crate::frames::{Kind, step};
 use crate::model::ModelConfig;
 use crate::quantum::{Executor, Started};
 use crate::runtime::{Core, Units};
+use crate::sampling::TokenSampler;
 use crate::stages::attention::KvSource;
-use crate::stages::sampling::Selection;
+use crate::stages::sampling::{RowReadbackLease, Selection};
 use crate::stages::{InputRecordRef, Quantum, QuantumError, QuantumKind, SubmitError};
 use crate::state::SequenceState;
 use crate::state::kv::KvRetained;
@@ -86,6 +88,8 @@ pub(crate) enum Message {
     Retired(Box<Retired>),
     /// The logits row of a teacher-forced step reached pinned memory.
     Logits(LogitsCopied),
+    /// The host selected the token of a sampled request (or could not).
+    Sampled(Sampled),
     /// The work a parked quantum waited for on the owner's lane has run: the turn lets the quantum go.
     Reaped,
 }
@@ -95,6 +99,7 @@ impl fmt::Debug for Message {
         match self {
             Message::Retired(_) => formatter.write_str("Message::Retired"),
             Message::Logits(copied) => write!(formatter, "Message::Logits(step {})", copied.step),
+            Message::Sampled(sampled) => write!(formatter, "Message::Sampled(step {})", sampled.step),
             Message::Reaped => formatter.write_str("Message::Reaped"),
         }
     }
@@ -202,8 +207,20 @@ impl Mode {
     /// The request's listener or sink, for a request that did not start.
     fn into_audience(self) -> Audience {
         match self {
-            Mode::Greedy { listener } | Mode::Speculative { listener, .. } => Audience::Greedy(listener),
+            Mode::Greedy { listener } | Mode::Speculative { listener, .. } | Mode::Sampled { listener, .. } => {
+                Audience::Greedy(listener)
+            }
             Mode::Forced { sink, .. } => Audience::Forced(sink),
+        }
+    }
+
+    /// How the request that ran in this mode ended.
+    fn into_finished(self, outcome: GenerationOutcome) -> Finished {
+        match self {
+            Mode::Greedy { listener } | Mode::Speculative { listener, .. } | Mode::Sampled { listener, .. } => {
+                Finished::Greedy(listener, outcome)
+            }
+            Mode::Forced { sink, .. } => Finished::Forced(sink, outcome),
         }
     }
 }
@@ -217,11 +234,27 @@ pub(super) enum Mode {
         listener: Box<dyn GenerationListener>,
         state: Box<Speculating>,
     },
+    /// Copies each step's logits row to the host, which selects the token there ([`Sampled`]): the token is then the
+    /// input of the next decode. One quantum is in flight at a time, and the request does not speculate.
+    Sampled {
+        listener: Box<dyn GenerationListener>,
+        state: Box<Sampling>,
+    },
     /// Feeds the given tokens and hands each step's logits row to a sink.
     Forced {
         forced: Vec<u32>,
         sink: Box<dyn LogitsSink>,
     },
+}
+
+/// What a sampled request keeps between its quanta.
+pub(super) struct Sampling {
+    /// The request's sampler, which a selection frame holds while it selects.
+    sampler: Option<Box<TokenSampler>>,
+    /// The selection the owner waits for.
+    pending: Pending,
+    /// The token the host selected, which the next decode feeds.
+    next: Option<u32>,
 }
 
 /// What a quantum of the request is for.
@@ -251,6 +284,8 @@ pub(super) struct Flying {
     pub(super) rows: usize,
     pub(super) last_chunk: bool,
     pub(super) selection: Option<Arc<Selection>>,
+    /// The readback a sampled quantum's row is copied to, leased to the owner until the row has been selected from.
+    pub(super) row: Option<RowReadbackLease>,
     pub(super) retained: KvRetained,
     pub(super) admitted: Instant,
     /// Set to stop the quantum when the request stops while it is in flight.
@@ -335,17 +370,30 @@ impl Run {
     /// The selections `step` takes, one for each quantum of it that selects a token.
     pub(super) fn selections(&self, step: Step) -> usize {
         match step {
-            Step::Prefill { last, .. } => usize::from(last && self.wanted > 0),
-            Step::Decode => 1,
+            // A sampled request's rows go to the host: it takes a row readback (`Owner::admit_quantum`), no selection.
+            Step::Prefill { last, .. } => usize::from(last && self.wanted > 0 && !self.samples()),
+            Step::Decode => usize::from(!self.samples()),
             Step::PromptCatchUp { .. } | Step::Settle => 0,
             Step::Speculate { drafts } => drafts + 1,
         }
     }
 
+    /// Whether the host selects the request's tokens.
+    pub(super) fn samples(&self) -> bool {
+        matches!(self.mode, Mode::Sampled { .. })
+    }
+
+    /// Whether the request waits for the host's selection of a token.
+    fn selecting(&self) -> bool {
+        matches!(&self.mode, Mode::Sampled { state, .. } if state.pending.waiting())
+    }
+
     /// The listener of a generation that reports tokens.
     pub(super) fn listener(&mut self) -> Option<&mut dyn GenerationListener> {
         match &mut self.mode {
-            Mode::Greedy { listener } | Mode::Speculative { listener, .. } => Some(listener.as_mut()),
+            Mode::Greedy { listener } | Mode::Speculative { listener, .. } | Mode::Sampled { listener, .. } => {
+                Some(listener.as_mut())
+            }
             Mode::Forced { .. } => None,
         }
     }
@@ -476,7 +524,7 @@ impl Owner {
         self.shared.executor.set_captures(false);
     }
 
-    /// Starts a greedy request, or one that speculates with the artifact's draft layer. `units` is what the engine's
+    /// Starts a greedy request, a sampled one, or one that speculates with the artifact's draft layer. `units` is what the engine's
     /// admission answered. A refused request gives its listener back.
     pub(crate) fn begin(
         &mut self,
@@ -489,6 +537,7 @@ impl Owner {
             max_tokens,
             stop_tokens,
             speculation,
+            sampling,
             listener,
         } = request;
         let units = match units {
@@ -496,6 +545,28 @@ impl Owner {
             Err(error) => return Err(Rejected::new(error, Audience::Greedy(listener))),
         };
         let mode = match speculation {
+            // The host selects, one token at a time: no speculation yet, whatever the request asks for.
+            _ if !sampling.is_greedy() => {
+                if self.sequence.row_readbacks.is_empty() {
+                    let error = AdmissionError::Engine("the sequence has no row readback to sample from".to_string());
+                    return Err(Rejected::new(error, Audience::Greedy(listener)));
+                }
+                let sampler = match TokenSampler::new(sampling, self.shared.config.vocab_size) {
+                    Ok(sampler) => sampler,
+                    Err(error) => {
+                        let error = AdmissionError::Engine(format!("the sampler: {error}"));
+                        return Err(Rejected::new(error, Audience::Greedy(listener)));
+                    }
+                };
+                Mode::Sampled {
+                    listener,
+                    state: Box::new(Sampling {
+                        sampler: Some(Box::new(sampler)),
+                        pending: Pending::default(),
+                        next: None,
+                    }),
+                }
+            }
             Speculation::Off => Mode::Greedy { listener },
             Speculation::Artifact => {
                 let Some(drafts) = self.shared.drafts.as_ref() else {
@@ -604,7 +675,7 @@ impl Owner {
         let depth = match mode {
             Mode::Greedy { .. } => GREEDY_DEPTH,
             Mode::Speculative { .. } => self.shared.workspace.records(),
-            Mode::Forced { .. } => 1,
+            Mode::Forced { .. } | Mode::Sampled { .. } => 1,
         };
         self.run = Some(Run {
             mode,
@@ -650,6 +721,10 @@ impl Owner {
             Some(next) => next,
             None => self.settle_step()?,
         };
+        // A sampled decode feeds the token the host selected: it waits for it.
+        if matches!((&run.mode, next), (Mode::Sampled { state, .. }, Step::Decode) if state.next.is_none()) {
+            return None;
+        }
         let alone = matches!(next, Step::Speculate { .. } | Step::Settle)
             || matches!((&run.mode, next), (Mode::Speculative { .. }, Step::Decode));
         if alone && !run.in_flight.is_empty() {
@@ -709,10 +784,7 @@ impl Owner {
             generated: run.generated,
             elapsed: run.began.elapsed(),
         };
-        self.finished.push_back(match run.mode {
-            Mode::Greedy { listener } | Mode::Speculative { listener, .. } => Finished::Greedy(listener, outcome),
-            Mode::Forced { sink, .. } => Finished::Forced(sink, outcome),
-        });
+        self.finished.push_back(run.mode.into_finished(outcome));
     }
 
     fn receive(&mut self, message: Message) {
@@ -743,6 +815,7 @@ impl Owner {
                 }
             }
             Message::Logits(copied) => self.deliver_row(copied),
+            Message::Sampled(sampled) => self.deliver_sample(sampled),
             // The turn's `reap` is what the message is for.
             Message::Reaped => {}
         }
@@ -769,6 +842,42 @@ impl Owner {
         run.generated += 1;
         if run.generated >= run.wanted {
             run.stop(FinishReason::Length);
+        }
+    }
+
+    /// Takes the host's selection of a sampled request's token: reports it, ends the request at a stop token or its
+    /// budget, and otherwise keeps it for the next decode to feed. An answer for a selection the request no longer
+    /// waits for is ignored; a token that arrives after the request stopped is never reported.
+    fn deliver_sample(&mut self, sampled: Sampled) {
+        let Some(run) = self.run.as_mut() else { return };
+        let Mode::Sampled { state, .. } = &mut run.mode else {
+            return;
+        };
+        if !state.pending.take(sampled.step) {
+            log::warn!(
+                "the answer of selection {} is not the one awaited, and is ignored",
+                sampled.step
+            );
+            return;
+        }
+        let (token, sampler) = match sampled.result {
+            Ok(selected) => selected,
+            Err(why) => return self.fail(format!("selecting the token: {why}")),
+        };
+        state.sampler = Some(sampler);
+        if run.stopping.is_some() {
+            return;
+        }
+        run.generated += 1;
+        if let Some(listener) = run.listener() {
+            listener.token(token, Instant::now());
+        }
+        if run.stop_tokens.contains(&token) {
+            run.stop(FinishReason::Stop);
+        } else if run.generated >= run.wanted {
+            run.stop(FinishReason::Length);
+        } else if let Mode::Sampled { state, .. } = &mut run.mode {
+            state.next = Some(token);
         }
     }
 
@@ -858,7 +967,7 @@ impl Owner {
             // The quantum that feeds the last token of a speculative request runs after the request ended.
             let live = run.stopping.is_none() || flying.role == Role::Settle;
             match outcome {
-                QuantumOutcome::Completed if live => self.completed(&flying, &quantum),
+                QuantumOutcome::Completed if live => self.completed(&mut flying, &quantum),
                 // Behind the quantum that ended the request: its rows never become part of the sequence.
                 QuantumOutcome::Completed | QuantumOutcome::Killed if !live => {}
                 QuantumOutcome::Killed => self.fail("a quantum was stopped".to_string()),
@@ -883,7 +992,7 @@ impl Owner {
     }
 
     /// A quantum of the live request completed.
-    fn completed(&mut self, flying: &Flying, quantum: &Quantum) {
+    fn completed(&mut self, flying: &mut Flying, quantum: &Quantum) {
         let now = Instant::now();
         // The rows of a quantum become part of its cache; a verification's accepted prefix does, once it is known.
         let rows = flying.rows as u64;
@@ -924,12 +1033,15 @@ impl Owner {
             Role::Verify => return self.verified(flying),
             Role::Prefill { .. } | Role::Decode => {}
         }
-        if run.wanted == 0 || flying.selection.is_none() {
+        if run.wanted == 0 || (flying.selection.is_none() && flying.row.is_none()) {
             // A prompt with nothing to generate, or a chunk that is not the last.
             if run.wanted == 0 && flying.last_chunk {
                 run.stop(FinishReason::Length);
             }
             return;
+        }
+        if run.samples() {
+            return self.sample(flying);
         }
         if let Mode::Forced { .. } = run.mode {
             let step = run.generated;
@@ -955,6 +1067,33 @@ impl Owner {
             // The prompt's last chunk selected the first token: the speculative steps go on from it.
             state.first_token(token, &run.prompt);
         }
+    }
+
+    /// Publishes the frame that selects the token of a sampled quantum from the row it copied: the quantum retired, so
+    /// the row is in the readback. The frame owns the row's lease, the request's sampler and the position the token
+    /// takes, which is the position after the quantum's last row (Java's `samplePosition`).
+    fn sample(&mut self, flying: &mut Flying) {
+        let Some(row) = flying.row.take() else {
+            return self.fail("a sampled quantum retired with no row readback".to_string());
+        };
+        let position = flying.start + flying.rows as u64;
+        let prepared = match self.run.as_mut().map(|run| &mut run.mode) {
+            Some(Mode::Sampled { state, .. }) => state
+                .sampler
+                .take()
+                .map(|sampler| (state.pending.begin(), sampler))
+                .ok_or("the request's sampler is in use"),
+            _ => return,
+        };
+        let (step, sampler) = match prepared {
+            Ok(prepared) => prepared,
+            Err(why) => return self.fail(why.to_string()),
+        };
+        let address = Arc::clone(&self.shared.address);
+        let frame = sample_frame(step, position, sampler, row, move |sampled| {
+            address.post(Message::Sampled(sampled));
+        });
+        self.shared.core.completions.at(Instant::now(), frame);
     }
 
     /// Queues the copy of the quantum's logits row to pinned memory, and of its last row's final hidden state when the
@@ -1064,8 +1203,9 @@ impl Owner {
         };
         let tokens: Vec<u32> = match next {
             Step::Prefill { rows, .. } => run.prompt[run.offset..run.offset + rows].to_vec(),
-            _ => match &run.mode {
+            _ => match &mut run.mode {
                 Mode::Forced { forced, .. } => vec![forced[run.decodes]],
+                Mode::Sampled { state, .. } => vec![state.next.take().ok_or("a decode has no token to feed")?],
                 Mode::Speculative { state, .. } => vec![state.current().ok_or("a decode has no token to feed")?],
                 Mode::Greedy { .. } => Vec::new(),
             },
@@ -1187,8 +1327,16 @@ impl Owner {
         quantum = quantum
             .with_logits_rows(logits)
             .map_err(why("the quantum's logits rows"))?;
+        let mut row = None;
         if logits > 0 {
-            quantum = quantum.with_selection_lease(self.sequence.selections.acquire().map_err(why("the selection"))?);
+            if run.samples() {
+                let lease = self.sequence.row_readbacks.acquire().map_err(why("the row readback"))?;
+                quantum = quantum.with_row_readback(Arc::clone(lease.readback()));
+                row = Some(lease);
+            } else {
+                quantum =
+                    quantum.with_selection_lease(self.sequence.selections.acquire().map_err(why("the selection"))?);
+            }
         }
         // Everything the executor would refuse is refused before the record is queued for upload: a quantum dropped
         // after that would free the pinned record under the copy.
@@ -1216,6 +1364,7 @@ impl Owner {
             rows,
             last_chunk,
             selection: selection.clone(),
+            row,
             retained,
             admitted,
             kill,
@@ -1237,7 +1386,7 @@ impl Owner {
         let chunk = self.shared.chunk;
         let Some(run) = self.run.as_ref() else { return };
         let ended = run.stopping.is_some() || run.next_step(chunk).is_none();
-        if !run.in_flight.is_empty() || run.waiting_logits || !ended {
+        if !run.in_flight.is_empty() || run.waiting_logits || run.selecting() || !ended {
             return;
         }
         // Quanta that were stopped may still have work queued on the owner's lane.
@@ -1262,10 +1411,7 @@ impl Owner {
             generated: run.generated,
             elapsed: run.began.elapsed(),
         };
-        self.finished.push_back(match run.mode {
-            Mode::Greedy { listener } | Mode::Speculative { listener, .. } => Finished::Greedy(listener, outcome),
-            Mode::Forced { sink, .. } => Finished::Forced(sink, outcome),
-        });
+        self.finished.push_back(run.mode.into_finished(outcome));
     }
 }
 
