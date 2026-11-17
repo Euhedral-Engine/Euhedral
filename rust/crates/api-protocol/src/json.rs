@@ -68,6 +68,30 @@ impl From<u128> for JsonInteger {
 }
 
 impl JsonValue {
+    /// The text of a value as the wire format spells it in a `param`: strings bare, lists as `[a, b]`, objects as
+    /// `{k=v}`, integers by their canonical digits (zero has no sign) and doubles as `NaN`, `Infinity`, `-Infinity` or the shortest
+    /// digits in the compact form.
+    pub fn param_text(&self) -> String {
+        match self {
+            JsonValue::Null => "null".to_owned(),
+            JsonValue::Bool(flag) => flag.to_string(),
+            JsonValue::Integer(digits) => digits.as_str().to_owned(),
+            JsonValue::Float(number) => compact_float(*number),
+            JsonValue::String(text) => text.clone(),
+            JsonValue::Array(items) => {
+                let items: Vec<String> = items.iter().map(JsonValue::param_text).collect();
+                format!("[{}]", items.join(", "))
+            }
+            JsonValue::Object(members) => {
+                let members: Vec<String> = members
+                    .iter()
+                    .map(|(key, value)| format!("{key}={}", value.param_text()))
+                    .collect();
+                format!("{{{}}}", members.join(", "))
+            }
+        }
+    }
+
     /// The value as Python's `json.dumps(value, ensure_ascii=False)` writes it: `", "` and `": "` separators,
     /// insertion key order, only `"`, `\` and C0 controls escaped, non-finite floats as `Infinity`, `-Infinity`
     /// and `NaN`.
@@ -282,8 +306,14 @@ fn write_compact_string(text: &str, json: &mut String) {
     json.push('"');
 }
 
-/// A finite double in the form above.
+/// A double in the form above; the non-finite values are `NaN`, `Infinity` and `-Infinity`.
 fn compact_float(number: f64) -> String {
+    if number.is_nan() {
+        return "NaN".to_owned();
+    }
+    if number.is_infinite() {
+        return if number > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
+    }
     if number == 0.0 {
         return if number.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
     }
@@ -608,6 +638,19 @@ mod tests {
         let value = JsonValue::parse("123456789012345678901234567890").unwrap();
         assert_eq!(value.to_compact_string(), "123456789012345678901234567890");
         assert!(matches!(JsonValue::parse("1e400"), Some(JsonValue::Float(number)) if number.is_infinite()));
+    }
+
+    #[test]
+    fn param_text_spells_values_as_the_wire_format_does() {
+        let text = |json: &str| JsonValue::parse(json).expect("json").param_text();
+        assert_eq!(text("1e400"), "Infinity");
+        assert_eq!(text("-1e400"), "-Infinity");
+        assert_eq!(text("-0"), "0");
+        assert_eq!(text("-0.0"), "-0.0");
+        assert_eq!(text("[-0, 1.5, null, true]"), "[0, 1.5, null, true]");
+        assert_eq!(text(r#"{"a":"x","b":[1,{"c":2.0}]}"#), "{a=x, b=[1, {c=2.0}]}");
+        assert_eq!(JsonValue::Float(f64::NAN).param_text(), "NaN");
+        assert_eq!(JsonValue::Float(f64::NEG_INFINITY).param_text(), "-Infinity");
     }
 
     #[test]
