@@ -584,7 +584,7 @@ fn disconnect_while_generating_cancels_and_frees_the_slot() {
     fx.backend.set_max_active(1);
     endless(&fx);
     let mut raw = Raw::connect(fx.addr);
-    raw.send(&raw_post(CHAT, &chat_body("")));
+    raw.send(&raw_post(CHAT, &chat_body(BIG)));
     until("generating", || generating(&fx));
     drop(raw);
     until("cancelled", || fx.backend.generations()[0].is_cancelled());
@@ -601,10 +601,10 @@ fn disconnect_while_queued_leaves_the_queue_and_the_next_request_runs() {
     fx.backend.set_max_active(1);
     endless(&fx);
     let mut first = Raw::connect(fx.addr);
-    first.send(&raw_post(CHAT, &chat_body("")));
+    first.send(&raw_post(CHAT, &chat_body(BIG)));
     until("generating", || generating(&fx));
     let mut second = Raw::connect(fx.addr);
-    second.send(&raw_post(CHAT, &chat_body("")));
+    second.send(&raw_post(CHAT, &chat_body(BIG)));
     until("queued", || fx.server.admission().counts().waiting == 1);
     drop(second);
     until("left the queue", || fx.server.admission().counts().waiting == 0);
