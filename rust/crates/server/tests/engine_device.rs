@@ -3,6 +3,7 @@
 //! device grant, with `euhedral.cuda.library` and `euhedral.qwen.rco-artifact` set.
 #![cfg(unix)]
 #![allow(
+    clippy::print_stdout,
     clippy::expect_used,
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -58,6 +59,7 @@ fn the_server_serves_the_engine_and_stops_on_sigterm() {
         ),
     )
     .expect("a file");
+    let began = Instant::now();
     let mut child = Command::new(SERVER)
         .args(["--config", file.to_str().expect("a path")])
         .stdin(Stdio::null())
@@ -71,6 +73,7 @@ fn the_server_serves_the_engine_and_stops_on_sigterm() {
     let deadline = Instant::now() + LOAD;
     loop {
         if try_exchange(addr, "GET", "/health", None).is_ok_and(|answer| status(&answer) == 200) {
+            println!("healthy after {:?}", began.elapsed());
             break;
         }
         if let Some(code) = child.try_wait().expect("a status") {
@@ -86,7 +89,9 @@ fn the_server_serves_the_engine_and_stops_on_sigterm() {
 
     let body = "{\"model\":\"m\",\"reasoning_effort\":\"none\",\"max_tokens\":24,\"messages\":[{\"role\":\"user\",\
                 \"content\":\"What is the capital of France? Answer in one word.\"}]}";
+    let asked = Instant::now();
     let answer = try_exchange(addr, "POST", "/v1/chat/completions", Some(body));
+    println!("chat answered after {:?}", asked.elapsed());
     let stop = Command::new("kill")
         .arg("-TERM")
         .arg(child.id().to_string())
@@ -105,6 +110,7 @@ fn the_server_serves_the_engine_and_stops_on_sigterm() {
         }
         sleep(Duration::from_millis(50));
     };
+    println!("SIGTERM to exit {:?}, code {code:?}", stopped_at.elapsed());
     let answer = answer.expect("a chat answer");
     assert_eq!(status(&answer), 200, "{answer}");
     let content = answer.split("\"content\":\"").nth(1).expect("a content field");
