@@ -73,6 +73,15 @@ pub(super) struct Settled {
     pub(super) stop_sequence: Option<String>,
 }
 
+/// A panic a test makes the owner's turn raise when the generation is launched.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Fault {
+    None,
+    Now,
+    AfterFinish,
+}
+
 /// What a turn decided, carried out once the claim is back.
 pub(super) enum Effect {
     /// Take the entry out of the admission's queue.
@@ -115,7 +124,7 @@ pub(super) struct Owner {
     broken: bool,
     /// A fault to raise at the launch, to test the recovery from a panic in a turn.
     #[cfg(feature = "test-support")]
-    pub(super) fault: bool,
+    pub(super) fault: Fault,
     timing: Timing,
     epoch: Instant,
 }
@@ -140,7 +149,7 @@ impl Owner {
             over: false,
             broken: false,
             #[cfg(feature = "test-support")]
-            fault: false,
+            fault: Fault::None,
             timing: Timing {
                 queued_ns,
                 started_ns: 0,
@@ -178,7 +187,7 @@ impl Owner {
                 Command::Launched => {
                     self.launched = true;
                     #[cfg(feature = "test-support")]
-                    assert!(!self.fault, "a fault raised in a turn");
+                    self.raise_fault();
                     self.apply_cancel(effects);
                 }
                 Command::Finished(ending) => self.ended(ending, effects),
@@ -187,6 +196,34 @@ impl Owner {
                 Command::ClientGone => self.gone(effects),
             }
         }
+    }
+
+    /// Panics as the test asked: at once, or once the test has let the generation end (so the end is queued behind).
+    #[cfg(feature = "test-support")]
+    fn raise_fault(&self) {
+        use std::sync::atomic::Ordering;
+        use std::thread::sleep;
+        use std::time::Duration;
+        match self.fault {
+            Fault::None => {}
+            Fault::Now => panic!("a fault raised in a turn"),
+            Fault::AfterFinish => {
+                super::OWNER_FAULT_HELD.store(true, Ordering::Release);
+                let end = Instant::now() + Duration::from_secs(10);
+                while !super::OWNER_FAULT_RELEASED.load(Ordering::Acquire) && Instant::now() < end {
+                    sleep(Duration::from_millis(1));
+                }
+                // The frame the queued end published has run and found the claim held by now.
+                sleep(Duration::from_millis(200));
+                panic!("a fault raised in a turn, after the end was queued");
+            }
+        }
+    }
+
+    /// Whether the fault models a wake-up lost to the race between a claim and a post.
+    #[cfg(feature = "test-support")]
+    pub(super) fn loses_the_wake(&self) -> bool {
+        self.fault == Fault::AfterFinish
     }
 
     /// A turn panicked: answers with a server error if nothing was answered, asks the generation to stop and, if it
@@ -202,6 +239,14 @@ impl Owner {
         if self.finished {
             self.conclude_silently(effects);
             return;
+        }
+        // A request that has not started and is answered now must not be opened later.
+        if !self.started {
+            if let Some(handle) = self.handle.take() {
+                effects.push(Effect::Withdraw(handle));
+            } else {
+                self.withdraw_wanted = true;
+            }
         }
         // The slot stays with the generation: it is released when the generation has ended and is closed.
         self.answer_early(ApiError::server_error(), Outcome::Failed, None, effects);
@@ -240,7 +285,8 @@ impl Owner {
                 self.cancel_wanted = true;
                 self.apply_cancel(effects);
             }
-            Command::Handle(_) | Command::Refused(_) => {}
+            Command::Handle(handle) => self.named(handle, effects),
+            Command::Refused(_) => {}
         }
     }
 
@@ -384,11 +430,13 @@ impl Owner {
         }
         self.finished = true;
         self.timing.first_token_ns = ending.first_token_ns;
+        // `answered` is set only once the verdict exists: a panic in it still gets the error answer from the salvage.
         let verdict = if self.answered {
             Verdict::Silent
         } else {
+            let verdict = self.verdict(ending);
             self.answered = true;
-            self.verdict(ending)
+            verdict
         };
         effects.push(Effect::Conclude(Conclusion {
             responder: self.responder.take(),

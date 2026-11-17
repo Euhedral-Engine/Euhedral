@@ -801,6 +801,33 @@ fn a_panic_in_an_owner_turn_answers_a_server_error_and_frees_the_slot() {
 }
 
 #[test]
+fn a_panic_in_a_turn_with_the_end_already_queued_still_closes_and_frees() {
+    let fx = Fixture::with(limits(), Some(2));
+    fx.backend.set_max_active(1);
+    fx.backend.set_script(Script::Hung);
+    let faulty = format!(
+        r#"{{"model":"{MODEL_ID}","reasoning_effort":"none","messages":[{{"role":"user","content":"owner-turn-fault-late"}}]}}"#
+    );
+    let mut raw = Raw::connect(fx.addr);
+    raw.send(&raw_post(CHAT, &faulty));
+    // The turn that handles the launch is held; the generation ends meanwhile, so its end is queued behind the
+    // command the turn then panics on.
+    until(
+        "the launch was handled",
+        euhedral_inference_api_server::answer::owner_fault_is_held,
+    );
+    assert!(fx.backend.generations()[0].finish_held());
+    euhedral_inference_api_server::answer::release_owner_fault();
+    let seen = raw.read_until("server_error");
+    assert!(seen.starts_with("HTTP/1.1 500"), "{seen}");
+    assert_closed_once(&fx);
+    fx.backend.set_script(tokens(&["Hi"], true));
+    assert_eq!(chat(&fx, "").status, 200);
+    assert_closed_once(&fx);
+    fx.finish();
+}
+
+#[test]
 fn a_generation_that_finishes_after_it_was_abandoned_is_still_closed() {
     let mut limits = limits();
     limits.drain_limit = Duration::from_millis(100);

@@ -31,6 +31,8 @@ use euhedral_inference_api_protocol::{ApiError, Surface};
 use euhedral_net::Responder;
 use log::{error, info, warn};
 
+#[cfg(feature = "test-support")]
+use self::owner::Fault;
 use self::owner::{Command, Effect, Ending, Opened, Owner, Settled};
 use self::reply::{Completed, body};
 use crate::admission::{Admission, Counts, Entry, Interruption, Slot};
@@ -156,9 +158,26 @@ impl Shared {
                 if catch_unwind(AssertUnwindSafe(|| claim.salvage(&mut effects))).is_err() {
                     error!(target: "euhedral.requests", "{} {}: salvaging the request failed", self.api.label(), self.planned.id);
                 }
+                #[cfg(feature = "test-support")]
+                if claim.loses_the_wake() {
+                    self.pending.store(false, Ordering::SeqCst);
+                }
+                // Commands the turn did not reach are still queued, and the post that announced them may have been
+                // taken as seen: another turn must drain them, or the generation and the slot are never freed.
+                self.pending.store(true, Ordering::SeqCst);
+            }
+            // A cancel never waits and is made while the claim is held, so it comes before any close of the
+            // generation, which only a conclusion (carried out after the claim) does.
+            let (cancels, effects): (Vec<Effect>, Vec<Effect>) = effects
+                .into_iter()
+                .partition(|effect| matches!(effect, Effect::CancelGeneration(_)));
+            let mut panic = None;
+            for effect in cancels {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.carry_out(effect))) {
+                    panic.get_or_insert(payload);
+                }
             }
             claim.release_seq_cst();
-            let mut panic = None;
             for effect in effects {
                 if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.carry_out(effect))) {
                     panic.get_or_insert(payload);
@@ -255,6 +274,29 @@ impl Entry for Shared {
 /// to test that such a request still ends and frees its slot.
 #[cfg(feature = "test-support")]
 pub const OWNER_FAULT_MARKER: &str = "owner-turn-fault";
+
+/// Like [`OWNER_FAULT_MARKER`], but the turn waits for [`release_owner_fault`] before it panics, so that the end of
+/// the generation is queued behind the command it panics on.
+#[cfg(feature = "test-support")]
+pub const OWNER_FAULT_LATE_MARKER: &str = "owner-turn-fault-late";
+
+#[cfg(feature = "test-support")]
+static OWNER_FAULT_RELEASED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "test-support")]
+static OWNER_FAULT_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Whether an owner turn is held by [`OWNER_FAULT_LATE_MARKER`] (it has handled the launch).
+#[cfg(feature = "test-support")]
+pub fn owner_fault_is_held() -> bool {
+    OWNER_FAULT_HELD.load(Ordering::Acquire)
+}
+
+/// Lets the owner turns held by [`OWNER_FAULT_LATE_MARKER`] panic.
+#[cfg(feature = "test-support")]
+pub fn release_owner_fault() {
+    OWNER_FAULT_RELEASED.store(true, Ordering::Release);
+}
 
 /// The generation's ear. It reads the text through the pipeline, because its calls are serial and come in order: when
 /// the pipeline decides the output is complete (a stop sequence, the call limit, a malformed call) it cancels the
@@ -588,7 +630,13 @@ impl Answerer {
             .unwrap_or(u64::MAX)
             .saturating_add(1);
         #[cfg(feature = "test-support")]
-        let fault = planned.prompt.text.contains(OWNER_FAULT_MARKER);
+        let fault = if planned.prompt.text.contains(OWNER_FAULT_LATE_MARKER) {
+            Fault::AfterFinish
+        } else if planned.prompt.text.contains(OWNER_FAULT_MARKER) {
+            Fault::Now
+        } else {
+            Fault::None
+        };
         let queue = MpscQueue::<Command>::new(COMMANDS_PER_CHUNK);
         let inbox = queue.producer();
         let consumer = queue.consumer();
