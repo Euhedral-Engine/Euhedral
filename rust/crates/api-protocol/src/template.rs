@@ -6,13 +6,13 @@
 //! spellings of control tokens defused, so it cannot be encoded as one.
 
 mod escape;
-mod json;
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+pub use crate::json::{JsonInteger, JsonValue};
+pub use crate::tool_definition::ToolDefinition;
 use escape::{escape_control_tokens, trim};
-pub use json::{JsonInteger, JsonValue};
 
 const IM_START: &str = "<|im_start|>";
 const IM_END: &str = "<|im_end|>";
@@ -135,31 +135,6 @@ impl Message {
             Self::Assistant(assistant) => &assistant.content,
         };
         parts.iter().map(|ContentPart::Text(text)| text.as_str()).collect()
-    }
-}
-
-/// A function tool offered to the model. `description` and `parameters` are left out of the prompt when `None`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: Option<String>,
-    pub parameters: Option<JsonValue>,
-}
-
-impl ToolDefinition {
-    /// The object the template serializes for the tool: `{"type": "function", "function": {...}}`.
-    fn to_json(&self) -> JsonValue {
-        let mut function = vec![("name".to_owned(), JsonValue::String(self.name.clone()))];
-        if let Some(description) = &self.description {
-            function.push(("description".to_owned(), JsonValue::String(description.clone())));
-        }
-        if let Some(parameters) = &self.parameters {
-            function.push(("parameters".to_owned(), parameters.clone()));
-        }
-        JsonValue::Object(vec![
-            ("type".to_owned(), JsonValue::String("function".to_owned())),
-            ("function".to_owned(), JsonValue::Object(function)),
-        ])
     }
 }
 
