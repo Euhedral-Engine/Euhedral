@@ -84,7 +84,22 @@ impl GrammarMatcher {
 
     /// Whether the text so far is a whole sentence of the grammar; false once the matcher is unusable.
     pub fn is_accepting(&mut self) -> bool {
-        self.failure.is_none() && self.matcher.is_accepting().unwrap_or(false)
+        if self.failure.is_some() {
+            return false;
+        }
+        match self.matcher.is_accepting() {
+            Ok(accepting) => accepting,
+            Err(error) => {
+                self.fail(error.to_string());
+                false
+            }
+        }
+    }
+
+    /// The mask computed for this step by [`GrammarMatcher::compute_mask`], read without computing; `None` before
+    /// it is computed, after a [`GrammarMatcher::consume`] and after a failure.
+    pub fn mask(&self) -> Option<&[u32]> {
+        self.mask.as_ref().map(SimpleVob::as_slice)
     }
 
     /// False once llguidance has failed; the matcher then refuses every step.
@@ -131,7 +146,11 @@ impl GrammarChecker {
     /// wait. Compiling costs enough that the owner does it as its own frame, never inline in a request handler; a
     /// cached grammar only copies. A grammar llguidance refuses is a 400 without a parameter and is not cached.
     pub fn constraint(&mut self, grammar: &str) -> Result<GrammarMatcher, ApiError> {
-        if self.compiled.touch(grammar).is_none() {
+        let matcher = if self.compiled.touch(grammar) {
+            let template = self.compiled.latest().ok_or_else(ApiError::server_error)?;
+            // A panic copying is a server fault, never the request's.
+            catch_unwind(AssertUnwindSafe(|| Ok(template.deep_clone()))).map_err(|_| ApiError::server_error())?
+        } else {
             let compiled = self.matcher(grammar, "lark");
             if let Some(message) = compiled.get_error() {
                 return Err(ApiError::invalid_request(
@@ -139,13 +158,17 @@ impl GrammarChecker {
                     None,
                 ));
             }
-            self.compiled.insert(grammar, compiled);
-        }
-        let template = self.compiled.latest().ok_or_else(ApiError::server_error)?;
-        // A panic copying is a server fault, never the request's.
-        let copy =
-            catch_unwind(AssertUnwindSafe(|| Ok(template.deep_clone()))).map_err(|_| ApiError::server_error())?;
-        Ok(GrammarMatcher::new(copy, self.size, Arc::clone(&self.end_ids)))
+            if self.compiled.is_disabled() {
+                // Nothing is kept: the compiled grammar is this generation's own.
+                compiled
+            } else {
+                let copy = catch_unwind(AssertUnwindSafe(|| Ok(compiled.deep_clone())))
+                    .map_err(|_| ApiError::server_error())?;
+                self.compiled.insert(grammar, compiled);
+                copy
+            }
+        };
+        Ok(GrammarMatcher::new(matcher, self.size, Arc::clone(&self.end_ids)))
     }
 }
 
@@ -154,8 +177,6 @@ impl GrammarChecker {
 pub(super) struct CompiledGrammars {
     capacity: usize,
     entries: Vec<(Box<str>, Matcher)>,
-    /// The grammar of the last [`CompiledGrammars::insert`] when nothing was kept (a capacity of zero).
-    uncached: Option<Matcher>,
 }
 
 impl CompiledGrammars {
@@ -163,25 +184,25 @@ impl CompiledGrammars {
         CompiledGrammars {
             capacity,
             entries: Vec::new(),
-            uncached: None,
         }
     }
 
-    /// Makes `grammar` the most recent entry; `None` when it is not kept.
-    fn touch(&mut self, grammar: &str) -> Option<()> {
-        self.uncached = None;
-        let index = self.entries.iter().position(|(key, _)| &**key == grammar)?;
+    fn is_disabled(&self) -> bool {
+        self.capacity == 0
+    }
+
+    /// Makes `grammar` the most recent entry; false when it is not kept.
+    fn touch(&mut self, grammar: &str) -> bool {
+        let Some(index) = self.entries.iter().position(|(key, _)| &**key == grammar) else {
+            return false;
+        };
         let entry = self.entries.remove(index);
         self.entries.push(entry);
-        Some(())
+        true
     }
 
     /// Keeps `compiled` as the most recent entry, dropping the least recent when the bound is reached.
     fn insert(&mut self, grammar: &str, compiled: Matcher) {
-        if self.capacity == 0 {
-            self.uncached = Some(compiled);
-            return;
-        }
         if self.entries.len() >= self.capacity {
             self.entries.remove(0);
         }
@@ -189,9 +210,7 @@ impl CompiledGrammars {
     }
 
     fn latest(&self) -> Option<&Matcher> {
-        self.uncached
-            .as_ref()
-            .or_else(|| self.entries.last().map(|(_, matcher)| matcher))
+        self.entries.last().map(|(_, matcher)| matcher)
     }
 
     #[cfg(test)]

@@ -312,20 +312,64 @@ fn matchers_from_one_cached_grammar_are_independent() {
 }
 
 #[test]
-fn a_panic_inside_llguidance_leaves_the_matcher_unusable() {
+fn a_failure_in_the_middle_of_a_generation_leaves_the_matcher_unusable() {
+    let mut checker = checker();
+    let mut matcher = constraint(&mut checker, PERSON);
+    assert!(feed(&mut matcher, r#"{"name":"A"#));
+    matcher.compute_mask().expect("mask");
+    assert!(matcher.mask().is_some());
+    matcher
+        .matcher
+        .test_trigger_lexer_error()
+        .expect_err("the hook fails the matcher");
+    // A mask computed before the failure is still the step's; the next computation reports the failure.
+    matcher.mask = None;
+    let error = matcher.compute_mask().expect_err("a failed matcher has no mask");
+    assert!(matches!(error, MatcherError::Failed(_)), "{error}");
+    assert!(!matcher.is_usable());
+    assert!(matcher.mask().is_none());
+    assert!(matches!(matcher.allows(u32::from(b'a')), Err(MatcherError::Failed(_))));
+    assert!(matches!(matcher.consume(u32::from(b'a')), Err(MatcherError::Failed(_))));
+    assert!(!matcher.is_accepting());
+}
+
+#[test]
+fn a_failure_found_by_the_acceptance_query_makes_the_matcher_unusable() {
+    let mut checker = checker();
+    let mut matcher = constraint(&mut checker, PERSON);
+    assert!(feed(&mut matcher, r#"{"name":"A"#));
+    matcher
+        .matcher
+        .test_trigger_lexer_error()
+        .expect_err("the hook fails the matcher");
+    assert!(matcher.is_usable(), "nothing has noticed yet");
+    assert!(!matcher.is_accepting());
+    assert!(!matcher.is_usable());
+}
+
+#[test]
+fn a_matcher_that_failed_when_built_reports_the_failure() {
     let panicked = catch_unwind::<_, TokenParser>(AssertUnwindSafe(|| panic!("boom")));
-    let failed = Matcher::new(panicked);
-    let mut matcher = GrammarMatcher::new(failed, SIZE, Arc::from([END]));
-    assert!(matcher.is_usable());
+    let mut matcher = GrammarMatcher::new(Matcher::new(panicked), SIZE, Arc::from([END]));
     let error = matcher.compute_mask().expect_err("a failed matcher has no mask");
     assert!(
         matches!(&error, MatcherError::Failed(message) if message.contains("boom")),
         "{error}"
     );
     assert!(!matcher.is_usable());
-    assert!(matches!(matcher.allows(1), Err(MatcherError::Failed(_))));
-    assert!(matches!(matcher.consume(1), Err(MatcherError::Failed(_))));
-    assert!(!matcher.is_accepting());
+}
+
+#[test]
+fn the_mask_is_read_without_computing_and_dropped_by_consume() {
+    let mut checker = checker();
+    let mut matcher = constraint(&mut checker, r#"{"type":"boolean"}"#);
+    assert!(matcher.mask().is_none());
+    let computed = matcher.compute_mask().expect("mask").to_vec();
+    assert_eq!(matcher.mask(), Some(&computed[..]));
+    matcher.consume(u32::from(b't')).expect("allowed");
+    assert!(matcher.mask().is_none());
+    matcher.compute_mask().expect("mask");
+    assert!(matcher.mask().is_some());
 }
 
 fn grammar(number: usize) -> String {
