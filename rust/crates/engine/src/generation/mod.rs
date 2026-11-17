@@ -42,7 +42,8 @@ pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
 pub use listener::GenerationListener;
 use mailbox::{Address, Mailbox, Spawn};
 pub use request::{
-    AdmissionError, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
+    AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
+    Verification,
 };
 pub(crate) use source::GREEDY_DEPTH;
 use source::{Audience, Drafts, Message, Owner, Rejected, Retired, Shared};
@@ -217,10 +218,10 @@ impl Generation {
     }
 
     /// Starts `request` on the engine's sequence.
-    pub(crate) fn generate(&self, request: GenerationRequest) -> Result<(), AdmissionError> {
+    pub(crate) fn generate(&self, request: GenerationRequest, cancel: CancelHandle) -> Result<(), AdmissionError> {
         let core = Arc::clone(&self.shared.core);
         self.start(move |owner| match owner {
-            Some(owner) => owner.begin(admit(&core), request),
+            Some(owner) => owner.begin(admit(&core), request, cancel),
             None => Err(closed(Audience::Greedy(request.listener))),
         })
     }

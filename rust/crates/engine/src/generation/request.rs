@@ -1,6 +1,8 @@
 //! What a caller asks of a generation, and what it is told when the generation ends.
 
 use std::fmt::{self, Formatter};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -42,6 +44,33 @@ impl fmt::Debug for GenerationRequest {
     }
 }
 
+/// The cancel of one generation. The caller makes it and passes it with the request
+/// ([`EngineRuntime::generate_cancellable`](crate::EngineRuntime::generate_cancellable)), so a cancel asked for before or
+/// while the generation starts is never lost: a handle already cancelled ends the generation before its first quantum.
+/// One handle belongs to one generation. Clones share it. [`cancel`](CancelHandle::cancel) may be called from any thread, from a
+/// listener's methods too, at any time and any number of times: it only sets a flag, never waits, and the generation's
+/// owner observes it at its next turn, which is a quantum boundary (nothing is torn down mid-quantum). The generation then
+/// ends through its listener, once, as [`FinishReason::Cancelled`], and the sequence is free for the next request. A
+/// cancel after the generation ended does nothing.
+#[derive(Clone, Debug, Default)]
+pub struct CancelHandle {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelHandle {
+    /// Asks the generation to end at its next quantum boundary.
+    pub fn cancel(&self) {
+        // Relaxed: the flag carries no data. The owner only needs to see it at some later turn, and the turns that
+        // follow are ordered after the retirements that start them.
+        self.flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a cancel was requested (it stays so after the generation ended).
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+}
+
 /// Why a request was refused before anything ran.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AdmissionError {
@@ -68,6 +97,8 @@ pub enum FinishReason {
     Stop,
     /// The context was full before `max_tokens` tokens were generated.
     ContextFull,
+    /// The generation was cancelled: it ends with the tokens reported before the cancel was observed.
+    Cancelled,
     /// A quantum failed or the engine could not run one; the text says why.
     Failed(String),
 }
@@ -115,4 +146,25 @@ pub struct Verification {
     /// From the admission of the step to the retirement of its last draft quantum: the catch-up and the recursive
     /// drafts.
     pub draft_nanos: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CancelHandle;
+
+    #[test]
+    fn a_cancel_is_idempotent_shared_by_clones_and_seen_from_any_thread() {
+        let handle = CancelHandle::default();
+        assert!(!handle.is_cancelled());
+        let clone = handle.clone();
+        clone.cancel();
+        clone.cancel();
+        assert!(handle.is_cancelled());
+        handle.cancel();
+        assert!(handle.is_cancelled());
+        assert!(
+            !CancelHandle::default().is_cancelled(),
+            "a generation's handle is its own"
+        );
+    }
 }
