@@ -111,7 +111,7 @@ fn require_served_model(model: Option<&str>, served: &str) -> Result<String, Api
 
 /// Blank text: empty or only whitespace as the wire format counts it, which is the space separators other than the
 /// no-break spaces, the line and paragraph separators and the controls U+0009 to U+000D and U+001C to U+001F.
-fn is_blank(text: &str) -> bool {
+pub(crate) fn is_blank(text: &str) -> bool {
     text.chars().all(|character| {
         matches!(character, '\u{9}'..='\u{d}' | '\u{1c}'..='\u{1f}')
             || (character.is_whitespace() && !matches!(character, '\u{a0}' | '\u{2007}' | '\u{202f}' | '\u{85}'))

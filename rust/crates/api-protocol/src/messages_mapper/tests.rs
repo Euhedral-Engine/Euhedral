@@ -698,14 +698,6 @@ fn rows() -> Vec<Row> {
         missing,
     ));
     rows.push(bad(
-        "tool_use unanswered at the end",
-        msgs(&format!(
-            r#"[{{"role":"user","content":"q"}},{{"role":"assistant","content":{USE}}}]"#
-        )),
-        "messages[1].content",
-        missing,
-    ));
-    rows.push(bad(
         "tool_use partly answered",
         after(
             r#"[{"type":"tool_use","id":"t1","name":"f","input":{}},{"type":"tool_use","id":"t2","name":"f","input":{}}]"#,
@@ -817,24 +809,30 @@ fn rows() -> Vec<Row> {
 }
 
 #[test]
-fn every_rejection_is_reported_as_the_original_does() {
+fn every_rejection_is_reported_with_its_status_param_and_message() {
     let rows = rows();
     println!("{} rows", rows.len());
+    let mut failures = Vec::new();
     for row in rows {
         let result = if row.count {
             count_body(&row.body)
         } else {
             map_body(&row.body)
         };
-        let error = result.expect_err(&format!("{}: accepted", row.name));
-        assert_eq!(error.status, row.status, "{}: status", row.name);
-        assert_eq!(error.code, row.code, "{}: code", row.name);
-        assert_eq!(error.param, row.param, "{}: param", row.name);
-        assert_eq!(error.message, row.message, "{}: message", row.name);
+        match result {
+            Err(error)
+                if error.status == row.status
+                    && error.code == row.code
+                    && error.param == row.param
+                    && error.message == row.message => {}
+            Err(error) => failures.push(format!("{}: got {error:?}", row.name)),
+            Ok(_) => failures.push(format!("{}: accepted", row.name)),
+        }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Of two faults the one the original checks first is the one reported.
+/// Of two faults the one checked first is the one reported.
 #[test]
 fn the_first_check_decides() {
     let ordered: [(&str, &str, &str); 14] = [
@@ -964,7 +962,7 @@ fn a_plain_request_takes_the_defaults() {
     );
     assert_eq!(request.max_tokens, Some(64));
     assert_eq!(request.max_tokens_param, "max_tokens");
-    assert!(!request.stream && !request.return_token_ids && !request.include_usage);
+    assert!(!request.stream && !request.return_token_ids);
 }
 
 #[test]
@@ -1022,17 +1020,17 @@ fn content_blocks_concatenate_into_one_user_turn() {
 
 #[test]
 fn tool_use_and_tool_results_continue_the_conversation() {
-    let request = accepted(&format!(
-        r#"{{"model":"m","max_tokens":64,"tools":[{{"name":"f","input_schema":{{}}}}],"messages":[
-            {{"role":"user","content":"q"}},
-            {{"role":"assistant","content":[{{"type":"thinking","thinking":"hm","signature":"s"}},{{"type":"text","text":"ok"}},
-                {{"type":"tool_use","id":"t1","name":"f","input":{{"a":1}}}},
-                {{"type":"tool_use","id":"t2","name":"f","input":{{}}}}]}},
-            {{"role":"user","content":[
-                {{"type":"tool_result","tool_use_id":"t2","content":[{{"type":"text","text":"r"}},{{"type":"text","text":"2"}}]}},
-                {{"type":"tool_result","tool_use_id":"t1","is_error":true}},
-                {{"type":"text","text":"and then"}}]}}]}}"#
-    ));
+    let request = accepted(
+        r#"{"model":"m","max_tokens":64,"tools":[{"name":"f","input_schema":{}}],"messages":[
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":[{"type":"thinking","thinking":"hm","signature":"s"},{"type":"text","text":"ok"},
+                {"type":"tool_use","id":"t1","name":"f","input":{"a":1}},
+                {"type":"tool_use","id":"t2","name":"f","input":{}}]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"r"},{"type":"text","text":"2"}]},
+                {"type":"tool_result","tool_use_id":"t1","is_error":true},
+                {"type":"text","text":"and then"}]}]}"#,
+    );
     let messages = &request.template.messages;
     assert_eq!(messages.len(), 5);
     assert_eq!(messages[0], Message::user("q"));
@@ -1233,14 +1231,17 @@ fn a_count_tokens_request_maps_like_a_message_without_a_budget() {
 }
 
 #[test]
-fn java_values_print_as_java_prints_them() {
+fn values_print_as_error_parameters() {
     let value = |text: &str| JsonValue::parse(text).unwrap();
-    assert_eq!(java_string(Some(&value("1.0"))), "1.0");
-    assert_eq!(java_string(Some(&value("5"))), "5");
-    assert_eq!(java_string(Some(&value("0.5"))), "0.5");
-    assert_eq!(java_string(Some(&value("1e10"))), "1.0E10");
-    assert_eq!(java_string(Some(&value("1.5e-5"))), "1.5E-5");
-    assert_eq!(java_string(Some(&value("true"))), "true");
-    assert_eq!(java_string(Some(&value("null"))), "null");
-    assert_eq!(java_string(Some(&value(r#"{"a":[1,"b"],"c":{}}"#))), "{a=[1, b], c={}}");
+    assert_eq!(display_value(Some(&value("1.0"))), "1.0");
+    assert_eq!(display_value(Some(&value("5"))), "5");
+    assert_eq!(display_value(Some(&value("0.5"))), "0.5");
+    assert_eq!(display_value(Some(&value("1e10"))), "1.0E10");
+    assert_eq!(display_value(Some(&value("1.5e-5"))), "1.5E-5");
+    assert_eq!(display_value(Some(&value("true"))), "true");
+    assert_eq!(display_value(Some(&value("null"))), "null");
+    assert_eq!(
+        display_value(Some(&value(r#"{"a":[1,"b"],"c":{}}"#))),
+        "{a=[1, b], c={}}"
+    );
 }

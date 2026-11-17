@@ -9,12 +9,13 @@ use std::collections::HashSet;
 use std::fmt::Write;
 
 use crate::anthropic::MessagesRequest;
+use crate::chat_mapper::is_blank;
 use crate::error::ApiError;
-use crate::generation::{Defaults, GenerationRequest, Sampling};
+use crate::generation::{Defaults, GenerationRequest, GenerationSettings, Sampling};
 use crate::json::JsonValue;
 use crate::pipeline::ToolChoice;
 use crate::response_format::ResponseFormat;
-use crate::template::{AssistantMessage, ContentPart, Effort, Message, TemplateInput, TemplateOptions, ToolCall};
+use crate::template::{AssistantMessage, ContentPart, Effort, Message, TemplateOptions, ToolCall};
 use crate::tool_calling::{FunctionTool, ToolCalling, check_keys, is_parameter_name, member, parameters};
 use crate::tool_definition::ToolDefinition;
 use crate::tool_results::ToolResults;
@@ -93,15 +94,10 @@ fn map(request: MessagesRequest, defaults: &Defaults, generating: bool) -> Resul
     }
     let messages = turns(present(&request.system), request.messages.as_deref())?;
     let sampling = sampling(&request, defaults)?;
-    Ok(GenerationRequest {
+    let settings = GenerationSettings {
         model: model.to_owned(),
-        template: TemplateInput {
-            messages,
-            tools: tools.prompt_tools(),
-        },
         thinking,
         reasoning_budget,
-        tools,
         format,
         stops,
         sampling,
@@ -109,23 +105,13 @@ fn map(request: MessagesRequest, defaults: &Defaults, generating: bool) -> Resul
         max_tokens_param: "max_tokens".to_owned(),
         stream,
         return_token_ids: false,
-        include_usage: false,
-    })
+    };
+    Ok(GenerationRequest::new(messages, tools, settings))
 }
 
 /// A field that is present and not null.
 fn present(value: &Option<JsonValue>) -> Option<&JsonValue> {
     value.as_ref().filter(|value| **value != JsonValue::Null)
-}
-
-/// Java's notion of blank text: empty or only characters its `Character.isWhitespace` accepts, which are the space
-/// separators other than the no-break spaces, the line and paragraph separators and the controls U+0009 to U+000D
-/// and U+001C to U+001F.
-fn is_blank(text: &str) -> bool {
-    text.chars().all(|character| {
-        matches!(character, '\u{9}'..='\u{d}' | '\u{1c}'..='\u{1f}')
-            || (character.is_whitespace() && !matches!(character, '\u{a0}' | '\u{2007}' | '\u{202f}' | '\u{85}'))
-    })
 }
 
 /// Anthropic's tool-name rule: 1-128 of `a-z`, `A-Z`, `0-9`, `_` and `-`.
@@ -409,34 +395,34 @@ fn block_text<'a>(block: &'a JsonValue, path: &str) -> Result<&'a str, ApiError>
 }
 
 fn unsupported_block(block: &JsonValue, path: &str) -> ApiError {
-    ApiError::unsupported_parameter(&format!("{path}.type={}", java_string(block.get("type"))))
+    ApiError::unsupported_parameter(&format!("{path}.type={}", display_value(block.get("type"))))
 }
 
-/// The value as Java's `String.valueOf` writes it, for the parameter names of errors: strings bare, lists as
+/// The value as plain text for the parameter names of errors: strings bare, lists as
 /// `[a, b]`, objects as `{k=v}`.
-fn java_string(value: Option<&JsonValue>) -> String {
+fn display_value(value: Option<&JsonValue>) -> String {
     match value {
         None | Some(JsonValue::Null) => "null".to_owned(),
         Some(JsonValue::Bool(flag)) => flag.to_string(),
         Some(JsonValue::Integer(digits)) => digits.as_str().to_owned(),
-        Some(JsonValue::Float(number)) => java_double(*number),
+        Some(JsonValue::Float(number)) => double_text(*number),
         Some(JsonValue::String(text)) => text.clone(),
         Some(JsonValue::Array(items)) => {
-            let parts: Vec<String> = items.iter().map(|item| java_string(Some(item))).collect();
+            let parts: Vec<String> = items.iter().map(|item| display_value(Some(item))).collect();
             format!("[{}]", parts.join(", "))
         }
         Some(JsonValue::Object(members)) => {
             let parts: Vec<String> = members
                 .iter()
-                .map(|(key, value)| format!("{key}={}", java_string(Some(value))))
+                .map(|(key, value)| format!("{key}={}", display_value(Some(value))))
                 .collect();
             format!("{{{}}}", parts.join(", "))
         }
     }
 }
 
-/// Java's `Double.toString`: plain decimal from 1e-3 up to 1e7, otherwise computerized scientific notation.
-fn java_double(number: f64) -> String {
+/// A double as plain decimal from 1e-3 up to 1e7, otherwise computerized scientific notation.
+fn double_text(number: f64) -> String {
     if number.is_nan() {
         return "NaN".to_owned();
     }
@@ -484,7 +470,7 @@ fn tools(value: Option<&JsonValue>, choice: Option<&JsonValue>) -> Result<ToolCa
             {
                 return Err(ApiError::unsupported_parameter(&format!(
                     "{path}.type={}",
-                    java_string(Some(kind))
+                    display_value(Some(kind))
                 )));
             }
             check_keys(
@@ -732,8 +718,7 @@ fn format(output_config: Option<&JsonValue>, legacy: Option<&JsonValue>) -> Resu
         return Err(ApiError::unsupported_parameter(&format!("{schema_path}.x-guidance")));
     }
     Ok(ResponseFormat::JsonSchema {
-        // The request names no schema.
-        name: String::new(),
+        name: None,
         schema: schema.clone(),
         schema_param: schema_path,
     })
