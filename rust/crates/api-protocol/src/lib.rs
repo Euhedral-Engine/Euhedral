@@ -13,6 +13,8 @@ pub mod pipeline;
 pub mod reasoning;
 pub mod response_format;
 pub mod responses;
+pub mod responses_mapper;
+mod served_model;
 pub mod template;
 pub mod tool_calling;
 mod tool_definition;
@@ -21,5 +23,6 @@ mod wire;
 
 pub use chat_mapper::{ChatRequest, map_chat};
 pub use error::{ApiError, Surface};
+pub use responses_mapper::map_responses;
 pub use tool_definition::ToolDefinition;
 pub use wire::ToJson;
