@@ -25,6 +25,7 @@ import os
 import sys
 
 SETTINGS = "euhedral-inference-settings"
+API_PROTOCOL = "euhedral-inference-api-protocol"
 EDRL = "euhedral-inference-edrl"
 CUDA = "euhedral-inference-cuda"
 HOST_GEMV = "euhedral-inference-host-gemv"
@@ -40,6 +41,7 @@ XTASK = "xtask"
 # crate -> workspace crates it may depend on.
 ALLOWED = {
     SETTINGS: set(),
+    API_PROTOCOL: {SETTINGS, TOKENIZER},
     EDRL: set(),
     HOST_GEMV: set(),
     TEST_SUPPORT: set(),
