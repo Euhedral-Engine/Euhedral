@@ -37,9 +37,11 @@ use crate::response_format::ResponseFormat;
 use crate::tool_calling::{FunctionTool, ToolCalling};
 
 mod matcher;
+mod vocabulary;
 
 use matcher::CompiledGrammars;
 pub use matcher::{DEFAULT_CACHED_GRAMMARS, GrammarMatcher, MatcherError};
+pub use vocabulary::{end_ids, token_bytes};
 
 /// The skipped whitespace between JSON tokens.
 pub const WHITESPACE: &str = "[\\x20\\x0A\\x0D\\x09]{1,40}";
@@ -448,5 +450,7 @@ fn summary(message: &str) -> String {
     rest.unwrap_or(first).to_owned()
 }
 
+#[cfg(test)]
+mod real_vocabulary;
 #[cfg(test)]
 mod tests;
