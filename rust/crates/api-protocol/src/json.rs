@@ -207,6 +207,14 @@ impl JsonValue {
         (parser.position == text.len()).then_some(value)
     }
 
+    /// Reads the first JSON value of `text` and ignores whatever follows it, as a reader that does not fail on
+    /// trailing tokens does; `None` when the text does not start with a value.
+    pub fn parse_prefix(text: &str) -> Option<JsonValue> {
+        let mut parser = Parser { text, position: 0 };
+        parser.skip_space();
+        parser.value(0)
+    }
+
     /// The compact form: no spaces, escapes in capitals, other numbers in the form of Java's
     /// `Double.toString` (`1.0E10`, positional from `1e-3` up to `1e7`).
     pub fn to_compact_string(&self) -> String {

@@ -4,12 +4,17 @@
 pub mod anthropic;
 pub mod coerce;
 pub mod error;
+pub mod generation;
 pub mod json;
 pub mod openai;
 pub mod pipeline;
+pub mod reasoning;
+pub mod response_format;
 pub mod responses;
 pub mod template;
+pub mod tool_calling;
 mod tool_definition;
+pub mod tool_results;
 mod wire;
 
 pub use error::{ApiError, Surface};
