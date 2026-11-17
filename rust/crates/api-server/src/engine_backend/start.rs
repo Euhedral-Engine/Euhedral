@@ -12,7 +12,7 @@ use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_inference_engine::error::EngineError;
 use euhedral_inference_engine::generation::{
-    AdmissionError, CancelHandle, GenerationRequest as EngineRequest, Speculation,
+    AdmissionError, CancelHandle, GenerationRequest as EngineRequest, MAX_VERIFIED, Speculation,
 };
 use euhedral_inference_engine::runtime::{EngineRuntime, ReadyHandoff, RuntimeOwner};
 use euhedral_inference_settings::{Settings, variable_name};
@@ -31,7 +31,7 @@ pub enum StartError {
     Setup(String),
     /// The artifact's tokenizer could not be read.
     Tokenizer(String),
-    /// There is no usable NVIDIA driver or card.
+    /// The CUDA library or the driver it needs is not usable.
     Driver(String),
     /// The engine did not load.
     Engine(String),
@@ -45,7 +45,8 @@ impl Display for StartError {
             StartError::Driver(reason) => {
                 write!(
                     out,
-                    "the NVIDIA driver is required, with an NVIDIA Blackwell GPU: {reason}"
+                    "the NVIDIA driver is required, with an NVIDIA Blackwell GPU: {reason}; install the driver \
+                     (nvidia-smi lists the GPU when it works)"
                 )
             }
             StartError::Engine(reason) => write!(out, "Loading the inference engine failed: {reason}"),
@@ -58,10 +59,20 @@ impl Error for StartError {}
 impl From<EngineError> for StartError {
     fn from(error: EngineError) -> StartError {
         match error {
-            EngineError::Cuda(error) => StartError::Driver(error.to_string()),
+            // Only the library and its driver failing to load are the driver probe's; any other call failing is the
+            // engine's. The engine does not export the library's error type and this crate may not depend on it, so
+            // the variant is read from its derived `Debug` name.
+            EngineError::Cuda(error) if loads_nothing(&format!("{error:?}")) => StartError::Driver(error.to_string()),
             other => StartError::Engine(other.to_string()),
         }
     }
+}
+
+/// Whether a CUDA error, in its `Debug` form, is the library or its runtime not loading.
+fn loads_nothing(debug: &str) -> bool {
+    ["LibraryMissing", "RuntimeMissing", "Load"]
+        .iter()
+        .any(|variant| debug.starts_with(variant) && !debug[variant.len()..].starts_with(|c: char| c.is_alphanumeric()))
 }
 
 /// The engine behind the traits: the runtime, held weakly so that [`EngineHost::shutdown`] holds the last handle.
@@ -105,7 +116,7 @@ impl Engine for RuntimeEngine {
         let Some(runtime) = self.runtime() else {
             return EngineReport::default();
         };
-        let depth = runtime.plan().draft_depth;
+        let depth = runtime.plan().draft_depth.min(MAX_VERIFIED);
         EngineReport {
             artifact: self.artifact.clone(),
             speculation: if depth > 0 { "mtp" } else { "none" }.to_owned(),
@@ -216,21 +227,46 @@ impl EngineStarting {
         }
     }
 
-    /// Waits up to `limit` for the engine, on the caller's own thread: the one wait of a start.
+    /// Waits up to `limit` for the engine, on the caller's own thread: the one wait of a start. An engine that is not
+    /// ready by then is stopped.
     pub fn wait(self, limit: Duration) -> Result<EngineHost, StartError> {
         match self.ready.wait(limit) {
             Ok(loaded) => self.host(loaded),
-            Err(_) => Err(StartError::Engine(format!(
-                "the engine was not ready within {} s",
-                limit.as_secs()
-            ))),
+            Err(_) => {
+                let error = StartError::Engine(format!("the engine was not ready within {} s", limit.as_secs()));
+                // It may have finished just now; what is loaded is freed through the owner. Else the owner's drop
+                // closes the lattice.
+                match self.ready.take() {
+                    Some(Ok(runtime)) => {
+                        self.stop(runtime);
+                    }
+                    Some(Err(_)) | None => drop(self.owner),
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Frees a runtime that will not be served, through its owner.
+    fn stop(self, runtime: Arc<EngineRuntime>) {
+        if let Err(error) = self.owner.shutdown(runtime) {
+            log::error!("stopping the engine that did not start failed: {error}");
         }
     }
 
     fn host(self, loaded: Result<Arc<EngineRuntime>, EngineError>) -> Result<EngineHost, StartError> {
-        let runtime = loaded?;
+        let runtime = match loaded {
+            Ok(runtime) => runtime,
+            // Nothing was loaded; the owner's drop closes what started.
+            Err(error) => return Err(StartError::from(error)),
+        };
         let plan = runtime.plan();
         let context_length = plan.max_context_tokens.min(runtime.config().max_position_embeddings);
+        let sink = Arc::new(QueueIngestSink::new());
+        if let Err(error) = runtime.lattice().add_upstream(sink.delegate()) {
+            self.stop(runtime);
+            return Err(StartError::Engine(format!("the lattice takes no backend: {error:?}")));
+        }
         let engine = Arc::new(RuntimeEngine {
             runtime: Arc::downgrade(&runtime),
             artifact: self
@@ -241,11 +277,6 @@ impl EngineStarting {
                 .map(|name| name.to_string_lossy().into_owned()),
             context_length,
         });
-        let sink = Arc::new(QueueIngestSink::new());
-        runtime
-            .lattice()
-            .add_upstream(sink.delegate())
-            .map_err(|error| StartError::Engine(format!("the lattice takes no backend: {error:?}")))?;
         let backend = Arc::new(EngineBackend::new(
             engine,
             Arc::new(self.tokenizer),
@@ -295,4 +326,25 @@ impl EngineHost {
 /// Starts the engine and waits up to `limit` for it: [`begin_start`] and [`EngineStarting::wait`].
 pub fn start(settings: &Settings, library: &Path, limit: Duration) -> Result<EngineHost, StartError> {
     begin_start(settings, library)?.wait(limit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_library_that_does_not_load_is_the_driver_probe() {
+        assert!(loads_nothing(r#"LibraryMissing("x.so")"#));
+        assert!(loads_nothing("RuntimeMissing { library: \"x\", missing: [] }"));
+        assert!(loads_nothing("Load { path: \"x\" }"));
+        assert!(!loads_nothing(r#"Call { call: "cudaMalloc", status: 2 }"#));
+        assert!(!loads_nothing("LoadedElsewhere"));
+    }
+
+    #[test]
+    fn a_driver_problem_carries_the_install_hint() {
+        let text = StartError::Driver("no library".to_owned()).to_string();
+        assert!(text.starts_with("the NVIDIA driver is required, with an NVIDIA Blackwell GPU: no library; install"));
+        assert!(text.ends_with("(nvidia-smi lists the GPU when it works)"));
+    }
 }

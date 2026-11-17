@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::spawn;
 use std::time::{Duration, Instant};
 
 use common::{CREATED, PATIENCE, lattice, text};
@@ -30,6 +31,7 @@ use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, FinishReason, GenerationListener, GenerationOutcome,
     GenerationRequest as EngineRequest, QuantumEvent, Speculation,
 };
+use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_io::AsyncIo;
 use euhedral_net::{ClientConfig, Method, Request, Response, request};
@@ -89,6 +91,10 @@ enum Mode {
     Refuse(AdmissionError),
     /// Takes it and drops it untold.
     Lose,
+    /// Plays these tokens and this ending from another thread than the offering one.
+    Elsewhere(Vec<u32>, FinishReason),
+    /// Refuses it with an error, but keeps the listener for the test to drop afterwards.
+    RefuseKeeping(AdmissionError),
 }
 
 struct Seen {
@@ -96,8 +102,7 @@ struct Seen {
     max_tokens: u32,
     stop_tokens: Vec<u32>,
     speculation: Speculation,
-    seed: u64,
-    greedy: bool,
+    sampling: SamplingConfig,
 }
 
 struct FakeEngine {
@@ -162,8 +167,7 @@ impl Engine for FakeEngine {
             max_tokens: request.max_tokens,
             stop_tokens: request.stop_tokens.clone(),
             speculation: request.speculation,
-            seed: request.sampling.seed(),
-            greedy: request.sampling.is_greedy(),
+            sampling: request.sampling,
         });
         let mut listener = request.listener;
         let mut mode = locked(&self.mode);
@@ -182,6 +186,19 @@ impl Engine for FakeEngine {
                 _ => AdmissionError::EmptyPrompt,
             }),
             Mode::Lose => Ok(()),
+            Mode::Elsewhere(tokens, reason) => {
+                let (tokens, reason) = (tokens.clone(), reason.clone());
+                spawn(move || play(listener.as_mut(), &tokens, reason));
+                Ok(())
+            }
+            Mode::RefuseKeeping(error) => {
+                let error = match error {
+                    AdmissionError::Engine(text) => AdmissionError::Engine(text.clone()),
+                    _ => AdmissionError::Busy,
+                };
+                locked(&self.held).push_back((listener, cancel));
+                Err(error)
+            }
         }
     }
 
@@ -302,8 +319,8 @@ fn a_request_reaches_the_engine_as_prompt_budget_stops_and_seed() {
     assert_eq!(seen[0].max_tokens, 5);
     assert_eq!(seen[0].stop_tokens, vec![STOP]);
     assert_eq!(seen[0].speculation, Speculation::Artifact);
-    assert_eq!(seen[0].seed, 7);
-    assert!(seen[0].greedy);
+    assert_eq!(seen[0].sampling.seed(), 7);
+    assert!(seen[0].sampling.is_greedy());
     drop(seen);
     rig.finish();
 }
@@ -400,7 +417,8 @@ fn a_failure_is_told_once_after_the_text_before_it() {
     let (heard, rx) = rig.run(&generation);
     ended(&rx);
     let heard = locked(&heard);
-    assert_eq!(heard.events, ["prefilled", "text:a", "text:!"]);
+    // The bytes the decoder holds back are not text of a generation that failed.
+    assert_eq!(heard.events, ["prefilled", "text:a"]);
     assert_eq!(heard.results, [Err(BackendError::Failed("device lost".to_owned()))]);
     drop(heard);
     rig.finish();
@@ -468,6 +486,89 @@ fn a_request_the_engine_drops_later_ends_the_listener_once() {
     drop(locked(&rig.engine.held).pop_front());
     ended(&rx);
     assert!(matches!(locked(&heard).results[0], Err(BackendError::Failed(_))));
+    rig.finish();
+}
+
+#[test]
+fn a_refusal_that_comes_back_after_the_caller_looked_is_told_with_its_reason() {
+    let rig = Rig::new(Mode::RefuseKeeping(AdmissionError::Engine(
+        "the engine is closed".to_owned(),
+    )));
+    let generation = rig.open(OutputSpec::text());
+    let (heard, rx) = rig.run(&generation);
+    assert!(locked(&heard).results.is_empty(), "the engine still holds the listener");
+    // The engine lets go of the request only now, after `generate` returned.
+    drop(locked(&rig.engine.held).pop_front());
+    ended(&rx);
+    assert_eq!(
+        locked(&heard).results,
+        [Err(BackendError::Unavailable("the engine is closed".to_owned()))]
+    );
+    rig.finish();
+}
+
+#[test]
+fn events_from_another_thread_than_the_offering_one_are_delivered_in_order() {
+    let rig = Rig::new(Mode::Elsewhere(
+        vec![u32::from('h'), u32::from('i'), STOP],
+        FinishReason::Stop,
+    ));
+    let generation = rig.open(OutputSpec::text());
+    let (heard, rx) = rig.run(&generation);
+    ended(&rx);
+    let heard = locked(&heard);
+    assert_eq!(heard.events, ["prefilled", "text:h", "text:i", "text:!"]);
+    assert_eq!(heard.results.len(), 1);
+    drop(heard);
+    rig.finish();
+}
+
+#[test]
+fn the_sampling_of_the_request_reaches_the_engine() {
+    let rig = Rig::new(Mode::Run(vec![STOP], FinishReason::Stop));
+    let sampled = GenerationConfig {
+        temperature: 0.6,
+        top_k: 20,
+        top_p: 0.9,
+        seed: 99,
+        greedy: false,
+    };
+    let generation = rig
+        .backend
+        .open_generation(sampled, OutputSpec::text())
+        .expect("a generation");
+    let (_, rx) = rig.run(&generation);
+    ended(&rx);
+    let seen = locked(&rig.engine.seen);
+    let sampling = seen[0].sampling;
+    assert!(!sampling.is_greedy());
+    assert_eq!(
+        (
+            sampling.temperature(),
+            sampling.top_k(),
+            sampling.top_p(),
+            sampling.seed()
+        ),
+        (0.6, 20, 0.9, 99)
+    );
+    drop(seen);
+    rig.finish();
+}
+
+#[test]
+fn a_sampling_the_engine_cannot_take_does_not_open_a_generation() {
+    let rig = Rig::new(Mode::Hold);
+    let sampled = GenerationConfig {
+        temperature: f32::NAN,
+        top_k: 0,
+        top_p: 1.0,
+        seed: 1,
+        greedy: false,
+    };
+    assert!(matches!(
+        rig.backend.open_generation(sampled, OutputSpec::text()),
+        Err(BackendError::Failed(_))
+    ));
     rig.finish();
 }
 
@@ -657,23 +758,86 @@ fn a_greedy_chat_completion_runs_on_the_engine() {
     served.finish();
 }
 
+/// Posts `body` to `target` on an engine that ends at once, and returns the sampling the engine was given.
+fn sampling_of(target: &str, body: &str) -> SamplingConfig {
+    let served = Served::new(Mode::Run(vec![u32::from('o'), STOP], FinishReason::Stop));
+    let response = served.post(target, body);
+    assert_eq!(response.status, 200, "{}", text(&response));
+    let sampling = locked(&served.rig.engine.seen)[0].sampling;
+    served.finish();
+    sampling
+}
+
 #[test]
-fn sampled_requests_are_refused_on_every_surface() {
+fn a_request_that_states_no_temperature_samples_with_the_servers_defaults() {
+    let defaults = RequestDefaults::default();
+    for (target, body) in [
+        (CHAT, chat(r#","reasoning_effort":"none""#)),
+        (MESSAGES, messages("")),
+        (RESPONSES, responses("")),
+    ] {
+        let sampling = sampling_of(target, &body);
+        assert!(!sampling.is_greedy(), "{target}");
+        assert_eq!(sampling.temperature(), defaults.temperature, "{target}");
+        assert_eq!(sampling.top_k(), defaults.top_k as u32, "{target}");
+        assert_eq!(sampling.top_p(), defaults.top_p, "{target}");
+    }
+}
+
+#[test]
+fn a_stated_temperature_of_zero_is_greedy_on_every_surface() {
+    for (target, body) in [
+        (CHAT, chat(r#","temperature":0,"reasoning_effort":"none""#)),
+        (MESSAGES, messages(r#","temperature":0"#)),
+        (RESPONSES, responses(r#","temperature":0"#)),
+    ] {
+        assert!(sampling_of(target, &body).is_greedy(), "{target}");
+    }
+}
+
+#[test]
+fn a_stated_sampling_and_seed_reach_the_engine() {
+    let chat_body = chat(r#","temperature":0.5,"top_p":0.8,"top_k":7,"seed":42,"reasoning_effort":"none""#);
+    let sampling = sampling_of(CHAT, &chat_body);
+    assert!(!sampling.is_greedy());
+    assert_eq!(
+        (
+            sampling.temperature(),
+            sampling.top_p(),
+            sampling.top_k(),
+            sampling.seed()
+        ),
+        (0.5, 0.8, 7, 42)
+    );
+    // A top-p of zero is greedy, as the chat mapper has it.
+    let greedy = sampling_of(CHAT, &chat(r#","top_p":0,"reasoning_effort":"none""#));
+    assert!(greedy.is_greedy());
+    let sampling = sampling_of(MESSAGES, &messages(r#","temperature":0.5,"top_p":0.8,"top_k":7"#));
+    assert_eq!(
+        (sampling.temperature(), sampling.top_p(), sampling.top_k()),
+        (0.5, 0.8, 7)
+    );
+}
+
+#[test]
+fn a_sampling_value_out_of_range_is_the_surfaces_invalid_request() {
     let served = Served::new(Mode::Hold);
-    // A request that states nothing takes the server's sampling defaults, which sample.
-    assert_refused(&served.post(CHAT, &chat("")), "temperature", false);
-    assert_refused(&served.post(CHAT, &chat(r#","temperature":0.7"#)), "temperature", false);
-    assert_refused(
-        &served.post(MESSAGES, &messages(r#","temperature":0.7"#)),
-        "temperature",
-        true,
-    );
-    assert_refused(
-        &served.post(RESPONSES, &responses(r#","temperature":0.7"#)),
-        "temperature",
-        false,
-    );
-    assert!(locked(&served.rig.engine.seen).is_empty(), "nothing reached the engine");
+    let response = served.post(CHAT, &chat(r#","temperature":3,"reasoning_effort":"none""#));
+    let body = text(&response);
+    assert_eq!(response.status, 400, "{body}");
+    assert!(body.contains(r#""param":"temperature""#), "{body}");
+    assert!(locked(&served.rig.engine.seen).is_empty());
+    served.finish();
+}
+
+#[test]
+fn a_sampled_request_the_engine_refuses_at_begin_ends_with_the_reason() {
+    let served = Served::new(Mode::Refuse(AdmissionError::Engine(
+        "the sequence has no row readback to sample from".to_owned(),
+    )));
+    let response = served.post(CHAT, &chat(r#","temperature":0.7,"reasoning_effort":"none""#));
+    assert_ne!(response.status, 200, "{}", text(&response));
+    assert_eq!(locked(&served.rig.engine.seen).len(), 1);
     served.finish();
 }
 

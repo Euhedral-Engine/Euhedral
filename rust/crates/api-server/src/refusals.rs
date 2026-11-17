@@ -7,6 +7,7 @@
 use euhedral_inference_api_protocol::ApiError;
 use euhedral_inference_api_protocol::generation::GenerationRequest;
 use euhedral_inference_api_protocol::pipeline::ToolChoice;
+use euhedral_inference_engine::sampling::{SamplingConfig, SamplingError};
 
 use crate::planning::Endpoint;
 
@@ -30,14 +31,6 @@ impl Rule {
 
 /// Every refusal, in the order they are tried.
 const RULES: &[Rule] = &[
-    // Sampling: the engine can sample, but only without speculation and without a readback the engine may lack, so
-    // generation stays greedy until that is settled.
-    Rule {
-        applies: |request| !request.sampling.greedy,
-        chat: "temperature",
-        messages: "temperature",
-        responses: "temperature",
-    },
     // A JSON answer is a grammar the engine cannot constrain to.
     Rule {
         applies: |request| request.format.is_json(),
@@ -69,4 +62,22 @@ pub fn refusal(endpoint: Endpoint, request: &GenerationRequest) -> Option<ApiErr
         .iter()
         .find(|rule| (rule.applies)(request))
         .map(|rule| ApiError::unsupported_parameter(rule.param(endpoint)))
+}
+
+/// What the engine's sampler refuses of the request's sampling, as the surface's error. The mappers validate the
+/// ranges the API documents, so this answers only for a value the sampler cannot take (not finite).
+pub fn sampling_problem(request: &GenerationRequest) -> Option<ApiError> {
+    let sampling = &request.sampling;
+    let top_k = u32::try_from(sampling.top_k).unwrap_or(0);
+    match SamplingConfig::new(sampling.temperature, top_k, sampling.top_p, 0, sampling.greedy) {
+        Err(SamplingError::Temperature) => Some(ApiError::invalid_request(
+            "'temperature' must be a finite number.",
+            Some("temperature"),
+        )),
+        Err(SamplingError::TopP) => Some(ApiError::invalid_request(
+            "'top_p' must be finite and in the range (0, 1].",
+            Some("top_p"),
+        )),
+        _ => None,
+    }
 }

@@ -29,14 +29,15 @@ use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
+use euhedral_inference_engine::runtime::EngineRuntime;
 use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_settings::{ModelSettings, Settings};
-use euhedral_inference_tokenizer::read_artifact_tokenizer;
+use euhedral_inference_tokenizer::{Tokenizer, read_artifact_tokenizer};
 use euhedral_io::AsyncIo;
 use euhedral_net::{ClientConfig, Method, Request, Response, request};
 
 /// The longest the test waits for the engine to load or for one answer.
-const WAIT: Duration = Duration::from_secs(20 * 60);
+const WAIT: Duration = Duration::from_secs(9 * 60);
 const QUESTION: &str = "What is the capital of France? Answer in one word.";
 const NEW_TOKENS: u32 = 24;
 
@@ -85,6 +86,16 @@ fn integers(value: &JsonValue) -> Vec<u32> {
         .collect()
 }
 
+/// The completion's token ids of a non-streamed chat answer.
+fn completion_ids_of(response: &Response) -> Vec<u32> {
+    assert_eq!(response.status, 200, "{}", text(response));
+    let json = JsonValue::parse(text(response)).expect("a JSON body");
+    match json.get("choices") {
+        Some(JsonValue::Array(choices)) => integers(choices[0].get("token_ids").expect("completion ids")),
+        other => panic!("no choices: {other:?}"),
+    }
+}
+
 fn string(value: Option<&JsonValue>) -> String {
     match value {
         Some(JsonValue::String(text)) => text.clone(),
@@ -105,8 +116,12 @@ fn body(extra: &str, tokens: u32) -> String {
 }
 
 fn ask(question: &str, extra: &str, tokens: u32) -> String {
+    with_sampling(question, r#""temperature":0"#, extra, tokens)
+}
+
+fn with_sampling(question: &str, sampling: &str, extra: &str, tokens: u32) -> String {
     format!(
-        r#"{{"model":"qwen","messages":[{{"role":"user","content":"{question}"}}],"max_tokens":{tokens},"temperature":0,"reasoning_effort":"none"{extra}}}"#
+        r#"{{"model":"qwen","messages":[{{"role":"user","content":"{question}"}}],"max_tokens":{tokens},{sampling},"reasoning_effort":"none"{extra}}}"#
     )
 }
 
@@ -116,6 +131,58 @@ fn post_head(body: &str) -> String {
         "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )
+}
+
+/// The tokens one generation of `prompt` selects when it runs straight on the engine, and how it ended.
+fn run_on_engine(
+    runtime: &EngineRuntime,
+    prompt: &[u32],
+    tokenizer: &Tokenizer,
+    sampling: SamplingConfig,
+) -> (Vec<u32>, FinishReason) {
+    let tokens = Arc::new(Mutex::new(Vec::new()));
+    let done = Handoff::new();
+    runtime
+        .generate(GenerationRequest {
+            prompt: prompt.to_vec(),
+            max_tokens: NEW_TOKENS,
+            stop_tokens: tokenizer.eos_ids().to_vec(),
+            speculation: if runtime.plan().draft_depth > 0 {
+                Speculation::Artifact
+            } else {
+                Speculation::Off
+            },
+            sampling,
+            listener: Box::new(Reference {
+                tokens: Arc::clone(&tokens),
+                done: Arc::clone(&done),
+            }),
+        })
+        .expect("the engine takes the generation");
+    let reason = done.wait(WAIT).expect("the generation ended");
+    let tokens = tokens.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    (tokens, reason)
+}
+
+/// The completion tokens the server has counted so far, read from its metrics.
+fn counted_tokens(addr: SocketAddr) -> u64 {
+    let mut raw = Raw::connect(addr);
+    raw.send("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    let series = "\neuhedral_completion_tokens_total ";
+    let end = Instant::now() + Duration::from_secs(30);
+    let mut seen = String::new();
+    while Instant::now() < end {
+        if let Some(from) = seen.find(series)
+            && let Some(line) = seen[from + series.len()..].split_once('\n')
+        {
+            return line.0.trim().parse::<f64>().expect("a count") as u64;
+        }
+        match raw.read_for(Duration::from_millis(200)) {
+            Some(more) => seen.push_str(&more),
+            None => break,
+        }
+    }
+    panic!("no completion token count in the metrics: {seen:?}");
 }
 
 struct Client {
@@ -212,28 +279,8 @@ fn a_greedy_chat_completion_matches_the_engine_and_a_cancel_frees_the_sequence()
 
     // The same prompt, run straight on the engine as the benchmark runs it: greedy, the artifact's speculation.
     let runtime = host.runtime();
-    let tokens = Arc::new(Mutex::new(Vec::new()));
-    let done = Handoff::new();
-    runtime
-        .generate(GenerationRequest {
-            prompt: prompt_ids.clone(),
-            max_tokens: NEW_TOKENS,
-            stop_tokens: tokenizer.eos_ids().to_vec(),
-            speculation: if runtime.plan().draft_depth > 0 {
-                Speculation::Artifact
-            } else {
-                Speculation::Off
-            },
-            sampling: SamplingConfig::greedy(0),
-            listener: Box::new(Reference {
-                tokens: Arc::clone(&tokens),
-                done: Arc::clone(&done),
-            }),
-        })
-        .expect("the engine takes the reference generation");
-    let reason = done.wait(WAIT).expect("the reference generation ended");
+    let (reference, reason) = run_on_engine(runtime, &prompt_ids, &tokenizer, SamplingConfig::greedy(0));
     assert_eq!(reason, FinishReason::Stop);
-    let reference = tokens.lock().unwrap_or_else(PoisonError::into_inner).clone();
     assert_eq!(
         completion_ids, reference,
         "the server's tokens are the engine's greedy tokens"
@@ -290,26 +337,49 @@ fn a_greedy_chat_completion_matches_the_engine_and_a_cancel_frees_the_sequence()
     assert_eq!(streamed_finish.as_deref(), Some("stop"));
     assert_eq!(streamed_usage, Some((prompt_ids.len(), completion_ids.len())));
 
-    // A request cancelled mid-generation (its client hangs up) frees the one sequence: the next request runs, and in
-    // far less time than the cancelled generation's budget would take.
+    // A sampled request with a fixed seed gives the same tokens twice, and the engine's own sampled tokens for the same
+    // prompt, seed and settings.
+    let sampled_body = with_sampling(
+        QUESTION,
+        r#""temperature":0.7,"top_p":0.9,"top_k":20,"seed":1234"#,
+        r#","return_token_ids":true"#,
+        NEW_TOKENS,
+    );
+    let first = completion_ids_of(&client.post(&sampled_body));
+    let second = completion_ids_of(&client.post(&sampled_body));
+    assert_eq!(first, second, "the same seed gives the same tokens");
+    let sampling = SamplingConfig::new(0.7, 20, 0.9, 1234, false).expect("a sampling");
+    let (engine_sampled, _) = run_on_engine(runtime, &prompt_ids, &tokenizer, sampling);
+    assert_eq!(
+        first, engine_sampled,
+        "the server's tokens are the engine's sampled tokens"
+    );
+
+    // A request cancelled mid-generation (its client hangs up) frees the one sequence: the next request runs, and the
+    // cancelled one stopped long before its budget.
+    const BUDGET: u64 = 3000;
+    let counted = counted_tokens(server.local_addr());
     let mut raw = Raw::connect(server.local_addr());
     raw.send(&post_head(&ask(
         "Write a very long story about a dragon.",
         r#","stream":true"#,
-        3000,
+        BUDGET as u32,
     )));
     raw.read_until(r#""delta":{"content":""#);
     drop(raw);
     let before = Instant::now();
     let again = client.post(&body(r#","return_token_ids":true"#, NEW_TOKENS));
     assert_eq!(again.status, 200, "{}", text(&again));
-    let again = JsonValue::parse(text(&again)).expect("a JSON body");
-    let again_ids = match again.get("choices") {
-        Some(JsonValue::Array(choices)) => integers(choices[0].get("token_ids").expect("completion ids")),
-        other => panic!("no choices: {other:?}"),
-    };
+    let again_ids = completion_ids_of(&again);
+    let waited = before.elapsed();
     assert_eq!(again_ids, reference, "the sequence after a cancel starts clean");
-    println!("the request after the cancel was answered in {:?}", before.elapsed());
+    println!("the request after the cancel was answered in {waited:?}");
+    let produced = counted_tokens(server.local_addr()) - counted - again_ids.len() as u64;
+    println!("the cancelled request produced {produced} of {BUDGET} tokens");
+    assert!(
+        produced < BUDGET / 2,
+        "the cancel took effect: {produced} of {BUDGET} tokens were produced"
+    );
 
     // Stop the server, then the engine.
     let (tx, rx) = channel();

@@ -2,8 +2,8 @@
 //! end is told exactly once whatever the engine does with the request.
 
 use std::mem::take;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use euhedral_inference_engine::Handoff;
@@ -17,18 +17,47 @@ use crate::backend::{BackendError, GenerationResult, TextListener};
 
 /// The listener's way back out of an engine that refused the request: the engine drops the relay without telling it,
 /// so the relay gives the API's listener to whoever offered the request, who ends it.
+///
+/// One state decides who ends the listener: `looked`, set by the caller once it has the engine's answer. A dropped
+/// relay puts its listener in `returned`, then reads `looked`; the caller sets `looked`, then takes from `returned`.
+/// Both orders are sequentially consistent, so one of the two sees the other and the take makes the end happen once.
 pub(super) struct Hand {
-    /// Set by the caller once the engine took the request: from then on a dropped relay ends the listener itself.
-    pub(super) accepted: AtomicBool,
-    pub(super) returned: Handoff<Box<dyn TextListener>>,
+    /// Set by the caller once the engine answered the offer.
+    looked: AtomicBool,
+    /// Why the engine refused, set before `looked`; absent when it took the request.
+    refusal: OnceLock<BackendError>,
+    returned: Handoff<Box<dyn TextListener>>,
 }
 
 impl Hand {
     pub(super) fn new() -> Arc<Hand> {
         Arc::new(Hand {
-            accepted: AtomicBool::new(false),
+            looked: AtomicBool::new(false),
+            refusal: OnceLock::new(),
             returned: Handoff::empty(),
         })
+    }
+
+    /// The caller has the engine's answer: ends the listener now if the engine already let go of it, else leaves that
+    /// to the relay's drop.
+    pub(super) fn answered(&self, refusal: Option<BackendError>) {
+        if let Some(refusal) = refusal {
+            // Only the caller sets it, once.
+            let _ = self.refusal.set(refusal);
+        }
+        self.looked.store(true, Ordering::SeqCst);
+        self.end_returned();
+    }
+
+    fn end_returned(&self) {
+        if let Some(mut listener) = self.returned.take() {
+            let error = self
+                .refusal
+                .get()
+                .cloned()
+                .unwrap_or_else(|| BackendError::Failed("the engine dropped the generation".to_owned()));
+            listener.finished(Err(error));
+        }
     }
 }
 
@@ -136,8 +165,13 @@ impl GenerationListener for Relay {
         let Some(mut listener) = self.listener.take() else {
             return;
         };
+        // Held-back bytes are text only when the generation ran to its end.
+        let ended = matches!(
+            outcome.reason,
+            FinishReason::Stop | FinishReason::Length | FinishReason::ContextFull
+        );
         let tail = match self.stream.take() {
-            Some(stream) if self.broken.is_none() => stream.finish(),
+            Some(stream) if ended && self.broken.is_none() => stream.finish(),
             _ => String::new(),
         };
         if !tail.is_empty() {
@@ -160,18 +194,14 @@ impl GenerationListener for Relay {
 
 impl Drop for Relay {
     /// A relay dropped with its listener still waiting was refused or lost by the engine: the listener goes back to
-    /// the caller, or, when the caller already took the engine's answer for acceptance, ends here.
+    /// the caller, or, when the caller already has the engine's answer, ends here with the right error.
     fn drop(&mut self) {
         let Some(listener) = self.listener.take() else {
             return;
         };
         self.hand.returned.send(listener);
-        if self.hand.accepted.load(Ordering::SeqCst)
-            && let Some(mut listener) = self.hand.returned.take()
-        {
-            listener.finished(Err(BackendError::Failed(
-                "the engine dropped the generation".to_owned(),
-            )));
+        if self.hand.looked.load(Ordering::SeqCst) {
+            self.hand.end_returned();
         }
     }
 }

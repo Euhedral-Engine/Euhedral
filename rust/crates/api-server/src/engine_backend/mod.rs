@@ -27,7 +27,7 @@ use crate::backend::{
 };
 use crate::frames::once_or_refused;
 use crate::planning::Endpoint;
-use crate::refusals::refusal;
+use crate::refusals::{refusal, sampling_problem};
 use relay::{Hand, Relay, Shape};
 pub use start::{EngineHost, EngineStarting, StartError, begin_start, start};
 
@@ -141,7 +141,7 @@ impl Backend for EngineBackend {
     }
 
     fn refusal(&self, endpoint: Endpoint, request: &GenerationRequest) -> Option<ApiError> {
-        refusal(endpoint, request)
+        refusal(endpoint, request).or_else(|| sampling_problem(request))
     }
 
     fn encode_prompt(&self, prompt: String, then: Next<Result<EncodedPrompt, BackendError>>) {
@@ -251,18 +251,9 @@ impl Generation for EngineGeneration {
             sampling: self.sampling,
             listener: Box::new(relay),
         };
-        let offered = self.engine.generate(request, self.cancel.clone());
-        if offered.is_ok() {
-            hand.accepted.store(true, Ordering::SeqCst);
-        }
-        // Whatever the engine dropped untold comes back here; a listener it kept comes back to nobody.
-        if let Some(mut listener) = hand.returned.take() {
-            let error = match offered {
-                Err(error) => refused(error),
-                Ok(()) => BackendError::Failed("the engine dropped the generation".to_owned()),
-            };
-            listener.finished(Err(error));
-        }
+        let refusal = self.engine.generate(request, self.cancel.clone()).err().map(refused);
+        // A listener the engine let go of untold ends here, or in the relay's drop if that comes later.
+        hand.answered(refusal);
     }
 
     fn cancel(&self) {

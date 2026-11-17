@@ -36,21 +36,20 @@ impl TokenStream {
 
     /// Appends one token and returns the complete text it finishes (possibly empty).
     pub fn push(&mut self, id: u32) -> Result<String, TokenizerError> {
-        let pieces = Arc::clone(&self.pieces);
         let piece = usize::try_from(id)
             .ok()
-            .and_then(|index| pieces.get(index))
+            .and_then(|index| self.pieces.get(index))
             .ok_or(TokenizerError::UnknownToken(id))?;
         match piece {
             Piece::Absent => Err(TokenizerError::UnknownToken(id)),
             Piece::Control(text) => {
-                let mut output = self.flush();
+                let mut output = flush(&mut self.pending);
                 output.push_str(text);
                 Ok(output)
             }
             Piece::Bytes(bytes) => {
                 self.pending.extend_from_slice(bytes);
-                Ok(self.emit_complete())
+                Ok(emit_complete(&mut self.pending))
             }
         }
     }
@@ -66,24 +65,24 @@ impl TokenStream {
 
     /// Ends the stream: a truncated UTF-8 suffix becomes U+FFFD.
     pub fn finish(mut self) -> String {
-        self.flush()
+        flush(&mut self.pending)
     }
+}
 
-    fn flush(&mut self) -> String {
-        let text = decode_lossy(&self.pending);
-        self.pending.clear();
-        text
-    }
+fn flush(pending: &mut Vec<u8>) -> String {
+    let text = decode_lossy(pending);
+    pending.clear();
+    text
+}
 
-    fn emit_complete(&mut self) -> String {
-        let safe = complete_utf8_length(&self.pending);
-        if safe == 0 {
-            return String::new();
-        }
-        let text = decode_lossy(&self.pending[..safe]);
-        self.pending.drain(..safe);
-        text
+fn emit_complete(pending: &mut Vec<u8>) -> String {
+    let safe = complete_utf8_length(pending);
+    if safe == 0 {
+        return String::new();
     }
+    let text = decode_lossy(&pending[..safe]);
+    pending.drain(..safe);
+    text
 }
 
 /// The length of the longest prefix of `bytes` that no later byte can change: whole characters, and bytes that can
