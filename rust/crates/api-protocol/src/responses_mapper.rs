@@ -158,7 +158,7 @@ fn echo(request: &ResponsesRequest, tools: &ToolCalling, thinking: &TemplateOpti
 }
 
 /// A JSON null is the same as an absent field.
-fn present(value: Option<&JsonValue>) -> Option<&JsonValue> {
+pub(crate) fn present(value: Option<&JsonValue>) -> Option<&JsonValue> {
     value.filter(|value| **value != JsonValue::Null)
 }
 

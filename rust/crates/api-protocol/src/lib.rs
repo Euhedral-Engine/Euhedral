@@ -7,6 +7,7 @@ pub mod coerce;
 pub mod error;
 pub mod generation;
 pub mod json;
+pub mod messages_mapper;
 pub mod openai;
 pub mod output_grammar;
 pub mod pipeline;
@@ -23,6 +24,7 @@ mod wire;
 
 pub use chat_mapper::{ChatRequest, map_chat};
 pub use error::{ApiError, Surface};
+pub use messages_mapper::{map_count_tokens, map_messages};
 pub use responses_mapper::map_responses;
 pub use tool_definition::ToolDefinition;
 pub use wire::ToJson;
