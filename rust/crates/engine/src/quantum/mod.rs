@@ -46,6 +46,7 @@ use crate::plan::{MAX_CAPTURED_ROWS, Plan, Variant, View};
 use crate::stages::DraftSeed;
 use crate::stages::Quantum;
 use crate::stages::attention::{KvSource, takes_decode_scratch};
+use crate::stages::sampling::SelectedRows;
 use crate::stages::{QuantumError, QuantumKind, StageLaunch, fatal};
 use crate::workspace::BufferSlot;
 use whole::{Launches, Site, run_cached};
@@ -209,19 +210,31 @@ impl Quantum {
             }
         }
         if self.logits_rows > 0 {
-            let Some(selection) = &self.selection else {
-                return invalid("a quantum that scores logits has no selection words".to_string());
-            };
             let wanted = if self.kind == QuantumKind::Verify {
                 self.logits_rows
             } else {
                 1
             };
-            if wanted > selection.capacity() {
-                return invalid(format!(
-                    "{wanted} selected rows exceed the {} the selection holds",
-                    selection.capacity()
-                ));
+            match (&self.selection, &self.row_readback) {
+                (Some(_), Some(_)) => {
+                    return invalid("a quantum selects on the device or on the host, not both".to_string());
+                }
+                (Some(selection), None) if wanted > selection.capacity() => {
+                    return invalid(format!(
+                        "{wanted} selected rows exceed the {} the selection holds",
+                        selection.capacity()
+                    ));
+                }
+                (None, Some(readback)) if wanted > readback.capacity() => {
+                    return invalid(format!(
+                        "{wanted} copied rows exceed the {} the row readback holds",
+                        readback.capacity()
+                    ));
+                }
+                (None, None) => {
+                    return invalid("a quantum that scores logits has no selection words or row readback".to_string());
+                }
+                _ => {}
             }
         }
         if self.draft_token_write.is_some() && (self.selection.is_none() || self.logits_rows == 0) {
@@ -236,6 +249,9 @@ impl Quantum {
         self.seq.device().generations(&mut generations);
         if let Some(selection) = &self.selection {
             generations.push(selection.generation());
+        }
+        if let Some(readback) = &self.row_readback {
+            generations.push(readback.generation());
         }
         // Only the cache the quantum's attention reads: the MTP cache growing does not change a base quantum's graph.
         if let Some(view) = self.attention_source().and_then(|source| self.seq.kv(source)) {
@@ -283,6 +299,13 @@ impl Quantum {
             rows: self.rows,
             logits: self.logits_rows,
             selects: self.selection.is_some(),
+            copies_rows: self.row_readback.as_ref().map(|_| {
+                if self.kind == QuantumKind::Verify {
+                    SelectedRows::Each
+                } else {
+                    SelectedRows::Last
+                }
+            }),
             seeds_draft: self.seeds_draft,
             draft_seed,
             draft_read: self.draft_token_read.and_then(slot),

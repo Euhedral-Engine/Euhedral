@@ -47,7 +47,7 @@ use crate::state::attention::DRAFT_TOKEN_SLOTS;
 use crate::state::{FlightGuard, KvView, SequenceDevice};
 use crate::workspace::{BufferSlot, Workspace, WorkspaceError};
 use attention::KvSource;
-use sampling::{Selection, SelectionLease};
+use sampling::{RowReadback, Selection, SelectionLease};
 pub use unmarked::Unmarked;
 
 /// What a quantum is, which sets the routes of its stages (`Quantum.ExecutionKind`).
@@ -384,6 +384,9 @@ pub struct Quantum {
     /// The lease on `selection` when it came from the sequence's pool: the words are the quantum's until it is
     /// dropped, after its owner read the keys.
     pub(crate) lease: Option<SelectionLease>,
+    /// The pinned readback the quantum's logits row is copied to when the host selects (a sampling request): the
+    /// quantum then has no selection. The owner's lease on it is held apart from the quantum.
+    pub(crate) row_readback: Option<Arc<RowReadback>>,
     /// The token ids of the rows, the input record's first part ([`Quantum::with_tokens`]).
     pub(crate) tokens: Vec<u32>,
     /// The pinned copy of the input record, held until the quantum is dropped: its upload reads it.
@@ -457,6 +460,7 @@ impl Quantum {
             writes_current_token: false,
             selection: None,
             lease: None,
+            row_readback: None,
             tokens: Vec::new(),
             staging: None,
             uploaded: false,
@@ -588,6 +592,18 @@ impl Quantum {
     pub fn with_selection(mut self, selection: Arc<Selection>) -> Self {
         self.selection = Some(selection);
         self
+    }
+
+    /// The quantum copies its logits row to `readback` inside its graph instead of selecting on the device: the host
+    /// selects from the row once the quantum retired.
+    pub fn with_row_readback(mut self, readback: Arc<RowReadback>) -> Self {
+        self.row_readback = Some(readback);
+        self
+    }
+
+    /// The readback the quantum's logits row is copied to, if the host selects.
+    pub fn row_readback(&self) -> Option<&Arc<RowReadback>> {
+        self.row_readback.as_ref()
     }
 
     /// The words and readback of a selection leased from the sequence's pool: the quantum holds the lease until it is

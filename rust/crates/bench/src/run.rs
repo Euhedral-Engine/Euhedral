@@ -14,6 +14,7 @@ use std::time::{Instant, SystemTime};
 use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
+use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff};
 use euhedral_inference_tokenizer::Tokenizer;
@@ -284,6 +285,7 @@ impl Iteration<'_> {
             prompt: ids,
             max_tokens: requested as u32,
             stop_tokens: self.tokenizer.eos_ids().to_vec(),
+            sampling: SamplingConfig::greedy(0),
             speculation: match self.options.speculation {
                 SpeculationMode::Artifact => Speculation::Artifact,
                 SpeculationMode::Off => Speculation::Off,

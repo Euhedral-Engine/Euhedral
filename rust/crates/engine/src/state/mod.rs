@@ -20,7 +20,7 @@ use crate::residency::footprint::{DRAFT_TWIN_ROWS, MINIMUM_VERIFY_ROWS};
 use crate::residency::planner::ResidencyPlan;
 use crate::stages::SequenceRefs;
 use crate::stages::attention::KvSource;
-use crate::stages::sampling::SelectionPool;
+use crate::stages::sampling::{RowReadbackPool, SelectionPool};
 use attention::AttentionScratch;
 use gdn::GdnStates;
 use kv::KvCache;
@@ -113,6 +113,8 @@ pub struct SequenceState {
     pub device: Arc<SequenceDevice>,
     /// The selection words the sequence's quanta take in turn.
     pub selections: SelectionPool,
+    /// The pinned readbacks a sampled quantum's logits row is copied to.
+    pub row_readbacks: RowReadbackPool,
     flight: Arc<Flight>,
     /// The reserve epoch of each cache at the last [`SequenceState::refs`] that appended to it.
     claimed: [AtomicU64; 2],
@@ -172,12 +174,14 @@ impl SequenceState {
         // the first retires, and a decode chain keeps one more behind the one it follows.
         let selections = SelectionPool::new(library, (plan.draft_depth + 2).max(2), (verified_rows as usize).max(1))
             .map_err(|error| EngineError::Runtime(error.to_string()))?;
-        Ok(SequenceState::from_parts(
-            kv,
-            mtp_kv,
-            Arc::new(SequenceDevice { gdn, scratch }),
-            selections,
-        ))
+        // A sampled request keeps one quantum in flight: the readback is the owner's from its admission until the host
+        // has selected from the row, and the next quantum waits for that. The rows are those of a verification.
+        let row_readbacks = RowReadbackPool::new(library, 1, (verified_rows as usize).max(1), config.vocab_size)
+            .map_err(|error| EngineError::Runtime(error.to_string()))?;
+        Ok(
+            SequenceState::from_parts(kv, mtp_kv, Arc::new(SequenceDevice { gdn, scratch }), selections)
+                .with_row_readbacks(row_readbacks),
+        )
     }
 
     /// The state of the given parts, with no quantum in flight.
@@ -192,9 +196,16 @@ impl SequenceState {
             mtp_kv,
             device,
             selections,
+            row_readbacks: RowReadbackPool::none(),
             flight: Arc::new(Flight::default()),
             claimed: [AtomicU64::new(0), AtomicU64::new(0)],
         }
+    }
+
+    /// The sequence with `row_readbacks` for the quanta of sampling requests.
+    pub fn with_row_readbacks(mut self, row_readbacks: RowReadbackPool) -> SequenceState {
+        self.row_readbacks = row_readbacks;
+        self
     }
 
     /// The references a quantum of this sequence reads: the shared device part and a view of each cache as it is now,

@@ -1,6 +1,7 @@
-//! Greedy selection on the device (`generation/HostLogits`, `native/src/sampling/argmax.cuh`): an argmax key per
-//! logits row, the copy of the keys into pinned memory, and the pass of a drafted token to the next quantum of its
-//! step. No logits row is copied to the host.
+//! Selection (`generation/HostLogits`, `native/src/sampling/argmax.cuh`). A greedy quantum selects on the device: an
+//! argmax key per logits row, the copy of the keys into pinned memory, and the pass of a drafted token to the next
+//! quantum of its step; no logits row is copied to the host. A quantum of a sampling request ([`CopyRows`]) copies its
+//! logits row to pinned memory instead, inside its graph, and the host selects from the row.
 //!
 //! A key is 64 bits whose low word is `0xFFFFFFFF` minus the selected token id, so that among equal maxima the
 //! lowest id has the highest key; it is 0 when no logit is selectable (all NaN or negative infinity).
@@ -14,6 +15,7 @@ use euhedral_graph::{Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, PinnedBuffer};
 
 use super::{Launch, Quantum, eager, fatal, launch_u32};
+
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
 use crate::workspace::BufferSlot;
 
@@ -185,7 +187,7 @@ pub fn token_of(key: u64) -> Option<u32> {
 }
 
 /// Which logits rows an argmax selects.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SelectedRows {
     /// The last logits row: decode, and the last row of a prompt.
     Last,
@@ -216,7 +218,8 @@ impl Argmax {
 
 impl Launch for Argmax {
     fn idle(&self, quantum: &Quantum) -> bool {
-        quantum.logits_rows == 0
+        // A quantum whose rows go to the host selects there.
+        quantum.logits_rows == 0 || quantum.row_readback.is_some()
     }
 
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
@@ -308,7 +311,221 @@ impl Launch for SelectedToken {
     }
 }
 
-eager!(Argmax, SelectedToken);
+/// Pinned memory the logits rows of a sampled quantum are copied to, and the allocation identity its graph is keyed
+/// on. The host reads the rows only after the quantum that wrote them has retired.
+#[derive(Debug)]
+pub struct RowReadback {
+    readback: PinnedBuffer,
+    /// Bytes of one row: the model's vocabulary at two bytes an entry.
+    row_bytes: usize,
+    capacity: usize,
+    /// Whether a quantum in flight, or the frame that selects from its rows, holds the readback
+    /// ([`RowReadbackPool::acquire`]).
+    held: AtomicBool,
+}
+
+impl RowReadback {
+    /// Pinned memory for up to `rows` rows (at least 1) of `vocabulary` BF16 entries. The allocation waits: startup
+    /// only, and so is the drop.
+    pub fn new(library: &Arc<CudaLibrary>, rows: usize, vocabulary: usize) -> Result<RowReadback, CudaError> {
+        let rows = rows.max(1);
+        let row_bytes = vocabulary * 2;
+        Ok(RowReadback {
+            readback: PinnedBuffer::alloc(library, rows * row_bytes)?,
+            row_bytes,
+            capacity: rows,
+            held: AtomicBool::new(false),
+        })
+    }
+
+    /// The rows the readback holds.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// The BF16 bytes of `row`, once the quantum that copied it has retired; `None` beyond the capacity.
+    pub fn row(&self, row: usize) -> Option<&[u8]> {
+        if row >= self.capacity {
+            return None;
+        }
+        self.readback
+            .as_slice()
+            .get(row * self.row_bytes..(row + 1) * self.row_bytes)
+    }
+
+    /// The identity a graph that copies into the readback is keyed on: its address, which the launch bakes in, and
+    /// which no other live readback shares.
+    pub fn generation(&self) -> AllocationId {
+        AllocationId(self.readback.as_ptr() as u64)
+    }
+
+    pub(crate) fn pinned(&self) -> &PinnedBuffer {
+        &self.readback
+    }
+}
+
+/// The row readbacks of one sequence: a sampled quantum leases one from its admission until the host has selected from
+/// its row, which is later than the quantum's retirement, so the lease belongs to the owner and then to the frame that
+/// selects, not to the quantum.
+#[derive(Debug, Default)]
+pub struct RowReadbackPool {
+    readbacks: Vec<Arc<RowReadback>>,
+}
+
+/// Every row readback of the pool is leased.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadbacksBusy;
+
+impl fmt::Display for ReadbacksBusy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the sequence has no free row readback")
+    }
+}
+
+impl Error for ReadbacksBusy {}
+
+impl RowReadbackPool {
+    /// `count` readbacks of up to `rows` rows of `vocabulary` entries. The allocations wait: startup only.
+    pub fn new(
+        library: &Arc<CudaLibrary>,
+        count: usize,
+        rows: usize,
+        vocabulary: usize,
+    ) -> Result<RowReadbackPool, CudaError> {
+        let readbacks = (0..count)
+            .map(|_| RowReadback::new(library, rows, vocabulary).map(Arc::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RowReadbackPool { readbacks })
+    }
+
+    /// A pool with no readback: a sequence that cannot serve sampled requests.
+    pub fn none() -> RowReadbackPool {
+        RowReadbackPool::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.readbacks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.readbacks.is_empty()
+    }
+
+    /// Whether no readback is free to lease: the pool has none, or every one is held.
+    pub fn is_exhausted(&self) -> bool {
+        self.leased() >= self.len()
+    }
+
+    /// Readbacks leased now.
+    pub fn leased(&self) -> usize {
+        self.readbacks
+            .iter()
+            .filter(|readback| readback.held.load(Ordering::Acquire))
+            .count()
+    }
+
+    /// Leases a readback no one holds, or refuses. Called by the sequence's owner, one admission at a time.
+    pub fn acquire(&self) -> Result<RowReadbackLease, ReadbacksBusy> {
+        for readback in &self.readbacks {
+            if readback
+                .held
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(RowReadbackLease {
+                    readback: Arc::clone(readback),
+                });
+            }
+        }
+        Err(ReadbacksBusy)
+    }
+}
+
+/// A row readback leased by the owner; dropping it returns the readback to its pool.
+#[derive(Debug)]
+pub struct RowReadbackLease {
+    readback: Arc<RowReadback>,
+}
+
+impl RowReadbackLease {
+    pub fn readback(&self) -> &Arc<RowReadback> {
+        &self.readback
+    }
+}
+
+impl Drop for RowReadbackLease {
+    fn drop(&mut self) {
+        self.readback.held.store(false, Ordering::Release);
+    }
+}
+
+/// Copies the quantum's logits rows to the pinned [`RowReadback`] the quantum was given, for a host that selects
+/// (sampling). Idle for a quantum with no readback, which is every greedy quantum: the stage is in the graph's list
+/// and queues nothing.
+#[derive(Clone, Debug)]
+pub struct CopyRows {
+    logits: BufferSlot,
+    rows: SelectedRows,
+}
+
+impl CopyRows {
+    pub fn new(logits: BufferSlot, rows: SelectedRows) -> Self {
+        Self { logits, rows }
+    }
+}
+
+impl Launch for CopyRows {
+    fn idle(&self, quantum: &Quantum) -> bool {
+        quantum.logits_rows == 0 || quantum.row_readback.is_none()
+    }
+
+    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
+        if self.idle(quantum) {
+            return Ok(());
+        }
+        let readback = quantum
+            .row_readback
+            .as_ref()
+            .ok_or_else(|| fatal("a quantum that copies rows has no readback"))?;
+        let logits_rows = quantum.logits_rows;
+        let (first, count) = match self.rows {
+            SelectedRows::Last => (logits_rows - 1, 1),
+            SelectedRows::Each => (0, logits_rows),
+        };
+        if count > readback.capacity() {
+            return Err(fatal(format!(
+                "{count} copied rows exceed the {} the readback holds",
+                readback.capacity()
+            )));
+        }
+        // The slot's rows are the model's vocabulary wide, whatever head wrote fewer entries into them.
+        let row_bytes = quantum.config.vocab_size * 2;
+        if row_bytes != readback.row_bytes {
+            return Err(fatal(format!(
+                "a readback of {} bytes a row does not fit the logits rows of {row_bytes}",
+                readback.row_bytes
+            )));
+        }
+        let logits = quantum.slot(self.logits);
+        for row in 0..count {
+            // SAFETY: the readback is held by the quantum (an `Arc`), which retires only after the marker that follows
+            // this launch is reached, and by the lease of the owner after it; the host reads the row only once that
+            // marker has been reached, and no other copy writes the range.
+            unsafe {
+                kernels.copy_device_to_readback_shared(
+                    readback.pinned(),
+                    row * row_bytes,
+                    logits.offset(((first + row) * row_bytes) as u64),
+                    row_bytes,
+                )
+            }
+            .map_err(fatal)?;
+        }
+        Ok(())
+    }
+}
+
+eager!(Argmax, SelectedToken, CopyRows);
 
 #[cfg(test)]
 mod tests {
@@ -319,6 +536,16 @@ mod tests {
         assert_eq!(token_of(0xFFFF_FFFF - 5), Some(5));
         assert_eq!(token_of((0x3f80 << 32) | (0xFFFF_FFFF - 248_319)), Some(248_319));
         assert_eq!(token_of(0xFFFF_FFFF), Some(0));
+    }
+
+    #[test]
+    fn a_pool_with_no_readback_has_none_free() {
+        let pool = RowReadbackPool::none();
+        assert!(pool.is_empty());
+        assert!(
+            pool.is_exhausted(),
+            "a request that samples is refused before it prefills"
+        );
     }
 
     #[test]

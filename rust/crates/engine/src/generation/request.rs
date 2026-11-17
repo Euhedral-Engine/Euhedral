@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::listener::GenerationListener;
+use crate::sampling::SamplingConfig;
 use crate::stages::QuantumKind;
 
 /// Whether the generation drafts tokens with the artifact's draft layer and verifies them.
@@ -29,7 +30,13 @@ pub struct GenerationRequest {
     /// The ids that end a generation (the tokenizer's generation terminators). A selected terminator is reported and
     /// returned like any token and is not fed back to the model.
     pub stop_tokens: Vec<u32>,
+    /// Speculation is exact, so it never changes the tokens; a request that samples does not speculate yet, and runs as
+    /// if this were [`Speculation::Off`].
     pub speculation: Speculation,
+    /// How a token is chosen from the logits. A greedy configuration (the flag set or a temperature of zero or less)
+    /// selects on the device, as a request that never asked for sampling; any other copies the logits row to the host
+    /// and selects there, one token at a time, with the draw of the seed and the token's position.
+    pub sampling: SamplingConfig,
     pub listener: Box<dyn GenerationListener>,
 }
 
@@ -40,6 +47,7 @@ impl fmt::Debug for GenerationRequest {
             .field("prompt_tokens", &self.prompt.len())
             .field("max_tokens", &self.max_tokens)
             .field("speculation", &self.speculation)
+            .field("sampling", &self.sampling)
             .finish_non_exhaustive()
     }
 }
