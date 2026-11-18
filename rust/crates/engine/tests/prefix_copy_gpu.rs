@@ -3,7 +3,7 @@
 //! library named by `euhedral.cuda.library` (`EUHEDRAL_TEST_CUDA_LIBRARY`), skipping without it. Every wait is bounded.
 //!
 //! The model is the first four layers of the RCO model (three GDN layers and one full-attention layer); no weights are
-//! loaded. Two sequences capture and restore at the same time, on different lanes, each its own bytes.
+//! loaded, and the sequences do not speculate (a speculating one is refused). Two sequences capture and restore at the same time, on different lanes, each its own bytes.
 
 #![allow(clippy::print_stderr, reason = "a test reports what it skipped")]
 #![allow(
@@ -207,7 +207,7 @@ impl Sequence {
             None,
             Arc::new(SequenceDevice {
                 gdn: gdn.unwrap(),
-                scratch: AttentionScratch::allocate(&world.library, &world.config, 8, true, 16).unwrap(),
+                scratch: AttentionScratch::allocate(&world.library, &world.config, 8, false, 0).unwrap(),
             }),
             SelectionPool::new(&world.library, 4, 8).unwrap(),
         );
