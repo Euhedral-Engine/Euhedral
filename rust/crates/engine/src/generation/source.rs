@@ -55,6 +55,7 @@ use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
 use super::mtp::{Joining, Speculating, Verifying};
 use super::order::Order;
+use super::pool::Lease;
 use super::request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
@@ -139,7 +140,7 @@ pub(crate) struct Shared {
     pub(crate) workspace: Arc<Workspace>,
     pub(crate) executor: Arc<Executor>,
     /// What starts the quanta of the engine's sequences, each behind the quanta it must follow.
-    pub(crate) order: Order<Executor>,
+    pub(crate) order: Arc<Order<Executor>>,
     /// Where frames that tell the owner something post it.
     pub(crate) address: Arc<Address<Owner>>,
     /// Rows of the longest prompt chunk.
@@ -407,6 +408,8 @@ pub(super) struct Run {
     /// Rows the context holds.
     pub(super) capacity: u64,
     _units: Units,
+    /// The sequence's place in the pool, given back when the run is dropped.
+    _lease: Lease,
 }
 
 impl Run {
@@ -620,8 +623,7 @@ impl Owner {
     /// Ends the sequence: frees its caches and the graphs recorded against them. The last release of the pinned host
     /// arena waits for the device, so this is the owner's teardown, after the last quantum retired.
     pub(crate) fn close(self) {
-        let Owner { shared, sequence, .. } = self;
-        shared.executor.clear_graphs();
+        let sequence = self.release();
         if let Err(busy) = sequence.close() {
             log::error!(
                 "the sequence still has {} quanta in flight at shutdown: its device memory stays allocated until the \
@@ -630,6 +632,13 @@ impl Owner {
             );
             mem::forget(busy);
         }
+    }
+
+    /// Gives the sequence back without freeing it: the graphs recorded against its caches are gone.
+    pub(crate) fn release(self) -> SequenceState {
+        let Owner { shared, sequence, .. } = self;
+        shared.executor.clear_graphs();
+        sequence
     }
 
     /// The test hook: the owner records no graphs from now on, and runs every quantum stage by stage.
@@ -645,6 +654,7 @@ impl Owner {
         units: Result<Units, AdmissionError>,
         request: GenerationRequest,
         cancel: CancelHandle,
+        lease: Lease,
     ) -> Result<(), Rejected> {
         let GenerationRequest {
             prompt,
@@ -728,7 +738,7 @@ impl Owner {
                 }
             }
         };
-        self.start_run(units, mode, prompt, max_tokens as usize, stop_tokens, cancel)?;
+        self.start_run(units, lease, mode, prompt, max_tokens as usize, stop_tokens, cancel)?;
         // The first mask is prepared while the prompt prefills.
         self.prepare_constraint();
         Ok(())
@@ -741,6 +751,7 @@ impl Owner {
         prefix: Vec<u32>,
         forced: Vec<u32>,
         sink: Box<dyn LogitsSink>,
+        lease: Lease,
     ) -> Result<(), Rejected> {
         let units = match units {
             Ok(units) => units,
@@ -770,6 +781,7 @@ impl Owner {
         }
         self.start_run(
             units,
+            lease,
             Mode::Forced { forced, sink },
             prefix,
             wanted,
@@ -784,9 +796,11 @@ impl Owner {
         self.finished.push_back(rejected.into_finished());
     }
 
+    #[allow(clippy::too_many_arguments, reason = "what a request carries into its run")]
     fn start_run(
         &mut self,
         units: Units,
+        lease: Lease,
         mode: Mode,
         prompt: Vec<u32>,
         wanted: usize,
@@ -846,6 +860,7 @@ impl Owner {
             began: Instant::now(),
             capacity,
             _units: units,
+            _lease: lease,
         });
         Ok(())
     }
@@ -1094,7 +1109,7 @@ impl Owner {
         self.sample_steps += 1;
         constraining.preparing = Some(step);
         let address = Arc::clone(&self.shared.address);
-        let frame = prepare_frame(step, constraint, move |prepared| {
+        let frame = prepare_frame(self.id.0, step, constraint, move |prepared| {
             address.post(Message::Prepared(prepared))
         });
         self.shared.core.completions.at(Instant::now(), frame);
@@ -1187,8 +1202,10 @@ impl Owner {
             _retained: retained,
         });
         let address = Arc::clone(&self.shared.address);
-        core.completions
-            .after_marker(marker, step(Kind::Reaped, 0, move || address.post(Message::Reaped)));
+        core.completions.after_marker(
+            marker,
+            step(Kind::Reaped, self.id.0, move || address.post(Message::Reaped)),
+        );
     }
 
     /// Ends the request as cancelled if a cancel was asked for: one relaxed atomic load. `conclude` calls it at the top
@@ -1423,6 +1440,7 @@ impl Owner {
             };
             let address = Arc::clone(&shared.address);
             let frame = sample_frame(
+                self.id.0,
                 first_step + row as u64,
                 first_position + row as u64,
                 sampler,
@@ -1471,7 +1489,9 @@ impl Owner {
             })
             .map_err(why("the logits row's copy"))?;
         let address = Arc::clone(&self.shared.address);
-        let frame = step_frame(move || address.post(Message::Logits(LogitsCopied { step, loan })));
+        let frame = step_frame(self.id.0, move || {
+            address.post(Message::Logits(LogitsCopied { step, loan }))
+        });
         core.completions.after_marker(marker, frame);
         Ok(())
     }
@@ -1760,8 +1780,8 @@ impl Owner {
 }
 
 /// A frame that runs `work` once, in the control kind.
-fn step_frame(work: impl FnOnce() + Send + 'static) -> Box<dyn Frame> {
-    step(Kind::Logits, 0, work)
+fn step_frame(chain: usize, work: impl FnOnce() + Send + 'static) -> Box<dyn Frame> {
+    step(Kind::Logits, chain, work)
 }
 
 impl Turn for Owner {

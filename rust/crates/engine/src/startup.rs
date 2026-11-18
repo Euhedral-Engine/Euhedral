@@ -34,7 +34,7 @@ use euhedral_io::{IoBuf, IoDone, OpenSpec, OwnedFile};
 
 use crate::error::EngineError;
 use crate::frames::{Kind, step};
-use crate::generation::Generation;
+use crate::generation::Generations;
 use crate::handoff::Handoff;
 use crate::model::{
     LayerIndex, MTP_ATTENTION_PACK, ModelConfig, Role, TrellisParts, WeightRef, Weights, companion_name,
@@ -732,22 +732,19 @@ impl Finish {
             config,
             weights,
             workspace,
-            mut sequences,
+            sequences,
             report,
         } = self;
         let core = Arc::clone(&startup.core);
-        // The first sequence is the generation's; the rest wait, allocated, for the owners that will take them.
-        let first = sequences.remove(0);
-        match Generation::new(&core, &config, &plan, &weights, &workspace, first, draft_ids) {
-            Ok(generation) => {
-                let runtime =
-                    EngineRuntime::assemble(core, plan, config, weights, workspace, sequences, generation, report);
+        // Every sequence gets an owner, and waits idle in the pool for a request.
+        match Generations::new(&core, &config, &plan, &weights, &workspace, sequences, draft_ids) {
+            Ok(generations) => {
+                let runtime = EngineRuntime::assemble(core, plan, config, weights, workspace, generations, report);
                 startup.succeed(runtime);
             }
             // The plan is refused: what is on the device is freed in a frame of the stages lake, which may wait.
             Err(refused) => {
-                let (error, first) = *refused;
-                sequences.push(first);
+                let (error, sequences) = *refused;
                 let stages = Arc::clone(&core.stages);
                 let _ = stages.offer(step(Kind::Startup, 0, move || {
                     drop((weights, workspace, sequences));

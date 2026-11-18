@@ -89,7 +89,7 @@ impl CancelHandle {
 /// Why a request was refused before anything ran.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AdmissionError {
-    #[error("the engine's sequence is running another generation")]
+    #[error("every sequence is running a generation")]
     Busy,
     #[error("the prompt has no tokens")]
     EmptyPrompt,

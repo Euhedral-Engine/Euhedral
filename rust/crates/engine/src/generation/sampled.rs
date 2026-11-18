@@ -338,6 +338,7 @@ impl<R: Row> Drop for Sample<R> {
 
 /// The frame that selects the token at `position` from `row` with `sampler` and calls `post` with the answer.
 pub(crate) fn sample_frame<R: Row + 'static>(
+    chain: usize,
     step_number: u64,
     position: u64,
     sampler: Box<TokenSampler>,
@@ -353,7 +354,7 @@ pub(crate) fn sample_frame<R: Row + 'static>(
         constraint,
         post: Some(Box::new(post)),
     };
-    step(Kind::Sample, 0, move || sample.run())
+    step(Kind::Sample, chain, move || sample.run())
 }
 
 /// What the frame that prepares a constraint owns, and posts the answer however it ends.
@@ -404,6 +405,7 @@ impl Drop for Prepare {
 
 /// The frame that prepares `constraint` for the next selection and calls `post` with it, or with why it is not ready.
 pub(crate) fn prepare_frame(
+    chain: usize,
     step_number: u64,
     constraint: Guarded,
     post: impl FnOnce(Prepared) + Send + 'static,
@@ -413,7 +415,7 @@ pub(crate) fn prepare_frame(
         constraint: Some(constraint),
         post: Some(Box::new(post)),
     };
-    step(Kind::Prepare, 0, move || prepare.run())
+    step(Kind::Prepare, chain, move || prepare.run())
 }
 
 #[cfg(test)]
@@ -495,7 +497,7 @@ mod tests {
     fn a_frame_selects_the_row_and_hands_the_sampler_back() {
         let answers = Answers::default();
         let row = Bytes(bf16(&[0.5, 3.0, -1.0, 2.0]));
-        let mut frame = sample_frame(4, 9, sampler(4, 1), None, row, answers.poster());
+        let mut frame = sample_frame(0, 4, 9, sampler(4, 1), None, row, answers.poster());
         run(&mut frame);
         let sampled = answers.only();
         assert_eq!(sampled.step, 4);
@@ -507,7 +509,7 @@ mod tests {
     #[test]
     fn a_row_of_the_wrong_width_is_an_error() {
         let answers = Answers::default();
-        let mut frame = sample_frame(0, 0, sampler(4, 1), None, Bytes(bf16(&[1.0, 2.0])), answers.poster());
+        let mut frame = sample_frame(0, 0, 0, sampler(4, 1), None, Bytes(bf16(&[1.0, 2.0])), answers.poster());
         run(&mut frame);
         let sampled = answers.only();
         assert!(sampled.result.is_err());
@@ -516,7 +518,7 @@ mod tests {
     #[test]
     fn a_frame_dropped_before_it_ran_still_answers_once_with_an_error() {
         let answers = Answers::default();
-        let frame = sample_frame(2, 0, sampler(4, 1), None, Bytes(bf16(&[1.0; 4])), answers.poster());
+        let frame = sample_frame(0, 2, 0, sampler(4, 1), None, Bytes(bf16(&[1.0; 4])), answers.poster());
         drop(frame);
         let sampled = answers.only();
         assert_eq!(sampled.step, 2);
@@ -526,7 +528,7 @@ mod tests {
     #[test]
     fn a_selection_that_panics_answers_with_an_error() {
         let answers = Answers::default();
-        let mut frame = sample_frame(1, 0, sampler(4, 1), None, Panics, answers.poster());
+        let mut frame = sample_frame(0, 1, 0, sampler(4, 1), None, Panics, answers.poster());
         run(&mut frame);
         let sampled = answers.only();
         assert_eq!(
@@ -676,6 +678,7 @@ mod tests {
         let answers = Answers::default();
         let mut first = sample_frame(
             0,
+            0,
             5,
             sampler(4, 1),
             None,
@@ -683,6 +686,7 @@ mod tests {
             answers.poster(),
         );
         let mut second = sample_frame(
+            0,
             1,
             6,
             sampler(4, 1),
@@ -788,6 +792,7 @@ mod tests {
         let row = Bytes(bf16(&[0.5, 3.0, -1.0, 2.0]));
         let mut frame = sample_frame(
             0,
+            0,
             4,
             greedy_sampler(4),
             Some(Guarded::new(Box::new(fake))),
@@ -809,6 +814,7 @@ mod tests {
         for step in 0..3u64 {
             let answers = Answers::default();
             let mut frame = sample_frame(
+                0,
                 step,
                 step,
                 sampler,
@@ -833,6 +839,7 @@ mod tests {
         let mut frame = sample_frame(
             0,
             0,
+            0,
             greedy_sampler(4),
             Some(Guarded::new(Box::new(fake))),
             Bytes(bf16(&[1.0, 2.0, 3.0, 4.0])),
@@ -850,6 +857,7 @@ mod tests {
         let answers = Answers::default();
         let (fake, _) = Fake::new(&[1], Fault::RefusesTokens);
         let mut frame = sample_frame(
+            0,
             0,
             0,
             greedy_sampler(4),
@@ -872,6 +880,7 @@ mod tests {
             let mut frame = sample_frame(
                 0,
                 0,
+                0,
                 greedy_sampler(4),
                 Some(Guarded::new(Box::new(fake))),
                 Bytes(bf16(&[1.0, 2.0, 3.0, 4.0])),
@@ -891,6 +900,7 @@ mod tests {
         let answers = Answers::default();
         let (fake, _) = Fake::new(&[1], Fault::None);
         let frame = sample_frame(
+            0,
             3,
             0,
             greedy_sampler(4),
@@ -940,7 +950,7 @@ mod tests {
     fn a_preparation_frame_prepares_once_and_hands_the_constraint_back() {
         let (fake, watch) = Fake::new(&[1], Fault::None);
         let posts = Prepares::default();
-        let mut frame = prepare_frame(7, Guarded::new(Box::new(fake)), posts.poster());
+        let mut frame = prepare_frame(0, 7, Guarded::new(Box::new(fake)), posts.poster());
         run(&mut frame);
         let answer = posts.only();
         assert_eq!(answer.step, 7);
@@ -953,13 +963,13 @@ mod tests {
         for fault in [Fault::ErrorsOnPrepare, Fault::PanicsOnPrepare] {
             let (fake, _) = Fake::new(&[1], fault);
             let posts = Prepares::default();
-            let mut frame = prepare_frame(1, Guarded::new(Box::new(fake)), posts.poster());
+            let mut frame = prepare_frame(0, 1, Guarded::new(Box::new(fake)), posts.poster());
             run(&mut frame);
             assert!(posts.only().result.is_err());
         }
         let (fake, watch) = Fake::new(&[1], Fault::None);
         let posts = Prepares::default();
-        drop(prepare_frame(2, Guarded::new(Box::new(fake)), posts.poster()));
+        drop(prepare_frame(0, 2, Guarded::new(Box::new(fake)), posts.poster()));
         let answer = posts.only();
         assert_eq!(answer.step, 2);
         assert!(answer.result.is_err());
@@ -994,7 +1004,7 @@ mod tests {
         assert!(constraint.take().is_some());
         drop(constraint);
         let posts = Prepares::default();
-        drop(prepare_frame(3, Guarded::new(Box::new(Bomb)), posts.poster()));
+        drop(prepare_frame(0, 3, Guarded::new(Box::new(Bomb)), posts.poster()));
         assert!(posts.only().result.is_err());
     }
 

@@ -104,8 +104,7 @@ impl Engine for RuntimeEngine {
     }
 
     fn sequences(&self) -> usize {
-        // The engine runs one generation at a time, whatever `batching.max-sequences` asks for.
-        1
+        self.runtime().map_or(1, |runtime| runtime.sequences())
     }
 
     fn speculation(&self) -> Speculation {
