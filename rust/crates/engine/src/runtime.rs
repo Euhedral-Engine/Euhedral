@@ -23,17 +23,18 @@ use euhedral_graph::{Completions, DeviceQueue, Lake, LaneId, LanePool, UnitGuard
 use euhedral_hardware_utils::util::CpuSet;
 use euhedral_inference_cuda::launch::load::load;
 use euhedral_inference_cuda::{CudaLibrary, PinnedPool};
-use euhedral_inference_settings::{Auto, Settings};
+use euhedral_inference_edrl::TensorTable;
+use euhedral_inference_settings::{Auto, BatchingSettings, Settings};
 use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
-use crate::error::EngineError;
+use crate::error::{EngineError, PlanError};
 use crate::generation::GREEDY_DEPTH;
 use crate::generation::{AdmissionError, CancelHandle, Generation, GenerationRequest, LogitsSink};
 use crate::handoff::Handoff;
 use crate::kernels::kernel_sources;
-use crate::model::{ModelConfig, Weights};
+use crate::model::{ArtifactProfile, ModelConfig, Speculation, Weights};
 use crate::plan::Plan;
-use crate::residency::planner::ResidencyPlan;
+use crate::residency::planner::{PlanInputs, ResidencyPlan, sequences_for};
 use crate::stages::LaneTable;
 use crate::startup;
 use crate::state::SequenceState;
@@ -51,10 +52,66 @@ pub(crate) const STAGE_RING_QUANTA: usize = GREEDY_DEPTH + 1;
 /// The events a stage lane's ring holds, sized before the model is read: the most markers of the lane that stay in
 /// flight, until their last consumer has waited for them. A quantum records one marker per stage it runs, a marker is
 /// waited for by the quantum itself and by the ones admitted behind it, so the ring holds the stages of the biggest view
-/// of the model the engine runs ([`Plan::stage_bound`]) for [`STAGE_RING_QUANTA`] quanta, rounded up to a power of two.
+/// of the model the engine runs ([`Plan::stage_bound`]) for `quanta_in_flight` quanta, rounded up to a power of two.
 /// The startup refuses a plan that needs more ([`Core::stage_ring`]).
-pub(crate) fn stage_ring() -> usize {
-    (Plan::stage_bound() * STAGE_RING_QUANTA).next_power_of_two()
+pub(crate) fn stage_ring(quanta_in_flight: usize) -> usize {
+    Plan::stage_bound()
+        .saturating_mul(quanta_in_flight)
+        .max(1)
+        .checked_next_power_of_two()
+        .map_or(MAX_STAGE_RING, |ring| ring.min(MAX_STAGE_RING))
+}
+
+/// The most events a lane's ring holds: its size is a `u32`, a power of two.
+const MAX_STAGE_RING: usize = 1 << 31;
+
+/// The quanta in flight when `sequences` sequences each keep [`STAGE_RING_QUANTA`] of them.
+fn quanta_for(sequences: usize) -> usize {
+    STAGE_RING_QUANTA.saturating_mul(sequences.max(1))
+}
+
+/// How many sequences the settings size the lanes' rings for: `batching.max-sequences`, and one when it is 0, which
+/// is decided only once the model is read.
+fn ringed_sequences(batching: &BatchingSettings) -> usize {
+    (batching.max_sequences as usize).max(1)
+}
+
+/// The sequences to hold: `batching.max-sequences` when it is at least 1, otherwise (0, automatic) the largest count
+/// whose plan fits the device and the host ([`sequences_for`]), at most the rows a shared pass holds
+/// (`batching.max-tokens-per-pass`, a prefill chunk by default) over a verification's rows, and 1 for a drafter that
+/// is not the artifact's own.
+pub fn resolve_sequences(
+    config: &ModelConfig,
+    table: &TensorTable,
+    settings: &Settings,
+    inputs: PlanInputs,
+) -> Result<usize, PlanError> {
+    let requested = settings.batching.max_sequences as usize;
+    if requested >= 1 {
+        return Ok(requested);
+    }
+    let profile = ArtifactProfile::of(table, config)?;
+    if profile.speculation == Speculation::Dflash2 {
+        return Ok(1);
+    }
+    let chunk = settings.batching.prefill_chunk_tokens;
+    let rows = settings
+        .batching
+        .max_tokens_per_pass
+        .into_value()
+        .map_or(chunk, |rows| rows.min(chunk)) as usize;
+    let verified = 1 + if profile.speculation == Speculation::Mtp {
+        profile.speculative_depth()?
+    } else {
+        0
+    };
+    let cap = (rows / verified).max(1);
+    let chosen = sequences_for(config, table, settings, inputs, cap)?;
+    log::info!(
+        "sequences: {chosen} of {} tokens each (automatic)",
+        settings.context.max_tokens
+    );
+    Ok(chosen)
 }
 
 /// What the frames of the engine share: the lattice and everything that feeds it, and the device.
@@ -127,6 +184,20 @@ pub(crate) struct Units {
 }
 
 impl Core {
+    /// `sequences`, or fewer when the lanes' rings, sized before the model was read, cannot hold the quanta that many
+    /// sequences keep in flight. Only an automatic count can exceed them.
+    pub(crate) fn hold_sequences(&self, sequences: usize) -> usize {
+        let per_sequence = Plan::stage_bound().saturating_mul(STAGE_RING_QUANTA).max(1);
+        let held = sequences.min((self.stage_ring / per_sequence).max(1));
+        if held < sequences {
+            log::warn!(
+                "{sequences} sequences fit the device but the lanes' rings hold the quanta of {held}; set \
+                 batching.max-sequences to hold more"
+            );
+        }
+        held
+    }
+
     /// The owner's lane: the sequence's reservations and its quanta's input records.
     pub(crate) fn owner_lane(&self) -> &Arc<CudaQueue> {
         self.lane(LaneId(self.compute as u16))
@@ -401,6 +472,8 @@ impl fmt::Debug for RuntimeOwner {
 struct DeviceState {
     weights: Weights,
     workspace: Arc<Workspace>,
+    /// The sequences beyond the generation's: allocated, with no owner yet.
+    spare: Vec<SequenceState>,
 }
 
 /// What [`EngineRuntime::start`] hands over: the running engine, or why it did not start.
@@ -461,12 +534,14 @@ impl EngineRuntime {
         }
     }
 
+    #[allow(clippy::too_many_arguments, reason = "the startup's state, moved into the runtime")]
     pub(crate) fn assemble(
         core: Arc<Core>,
         plan: ResidencyPlan,
         config: Arc<ModelConfig>,
         weights: Weights,
         workspace: Arc<Workspace>,
+        spare: Vec<SequenceState>,
         generation: Generation,
         report: StartupReport,
     ) -> EngineRuntime {
@@ -474,7 +549,11 @@ impl EngineRuntime {
             core,
             plan,
             config,
-            device: ManuallyDrop::new(DeviceState { weights, workspace }),
+            device: ManuallyDrop::new(DeviceState {
+                weights,
+                workspace,
+                spare,
+            }),
             generation,
             report,
         }
@@ -631,11 +710,19 @@ impl EngineRuntime {
             core,
             ..
         } = self;
-        let DeviceState { weights, workspace } = ManuallyDrop::into_inner(device);
+        let DeviceState {
+            weights,
+            workspace,
+            spare,
+        } = ManuallyDrop::into_inner(device);
         // The sequence goes first, by `close`, which refuses while a quantum is in flight. The lattice is closed by
         // now, so a quantum still counted will never be dropped: the caches are left allocated (the process is
         // ending) rather than freed under it.
         generation.close();
+        for sequence in spare {
+            // None has had a quantum; a refusal would leave its caches allocated, as above.
+            let _ = sequence.close();
+        }
         // What the caches gave up and the owner had not yet freed. A queued buffer has no holder left, and the plain
         // free waits for the device, so nothing is freed under queued work.
         core.released.drain(drop);
@@ -783,7 +870,7 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
     let machine = startup::read_machine();
     let compute = Plan::lane_width();
     let chains = startup::transfer_lanes(settings, MAX_LANES.saturating_sub(compute + 1));
-    let ring = stage_ring();
+    let ring = stage_ring(quanta_for(ringed_sequences(&settings.batching)));
     let set =
         open_lane_set(&gpu, compute, ring, chains).map_err(|error| runtime("the lanes would not open", &error))?;
     let lanes = set.queues;
@@ -831,6 +918,37 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn the_stage_ring_holds_the_quanta_in_flight_in_a_power_of_two() {
+        let bound = Plan::stage_bound();
+        let one = stage_ring(quanta_for(1));
+        assert!(one.is_power_of_two() && one >= bound * STAGE_RING_QUANTA);
+        for sequences in [1, 2, 3, 8, 100] {
+            let ring = stage_ring(quanta_for(sequences));
+            assert!(ring.is_power_of_two(), "{sequences}");
+            assert!(ring >= bound * STAGE_RING_QUANTA * sequences, "{sequences}");
+            assert!(
+                ring / 2 < bound * STAGE_RING_QUANTA * sequences,
+                "{sequences}: the smallest power of two"
+            );
+        }
+        assert_eq!(
+            stage_ring(usize::MAX),
+            MAX_STAGE_RING,
+            "a count too large for the ring is bounded, not wrapped"
+        );
+    }
+
+    #[test]
+    fn the_rings_are_sized_for_the_stated_count_and_for_one_when_it_is_automatic() {
+        let mut settings = BatchingSettings::default();
+        assert_eq!(ringed_sequences(&settings), 1);
+        settings.max_sequences = 0;
+        assert_eq!(ringed_sequences(&settings), 1);
+        settings.max_sequences = 4;
+        assert_eq!(ringed_sequences(&settings), 4);
+    }
 
     /// A stand-in for the runtime that counts its drops.
     struct Counted(Rc<Cell<usize>>);

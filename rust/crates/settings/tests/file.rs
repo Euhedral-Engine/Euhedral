@@ -187,6 +187,15 @@ fn auto_only_on_optional_keys() {
 }
 
 #[test]
+fn the_sequence_count_is_one_unless_stated_and_zero_holds_as_many_as_fit() {
+    assert_eq!(load(MODEL).unwrap().batching.max_sequences, 1);
+    for (text, count) in [("0", 0), ("1", 1), ("6", 6)] {
+        let settings = load(&format!("{MODEL}batching:\n  max-sequences: {text}\n")).unwrap();
+        assert_eq!(settings.batching.max_sequences, count, "{text}");
+    }
+}
+
+#[test]
 fn host_layers_keys() {
     let settings = load(&format!(
         "{MODEL}memory:\n  host-layers:\n    compute: stream\n    gemv-rows: 64\n    prefill-slots: 3\n"

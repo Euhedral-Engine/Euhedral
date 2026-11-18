@@ -11,8 +11,8 @@ pub const PAGE_TOKENS: u64 = 256;
 /// Rows `GdnState.speculative` allocates at least, however few are verified.
 pub const MINIMUM_VERIFY_ROWS: u64 = 8;
 
-/// A scored selection on the device: the 8-byte key then the log-probability, padded (`SequenceFootprint`).
-const SELECTION_BYTES: u64 = 2 * 8;
+/// The device bytes of one selected row: its 8-byte key.
+const SELECTION_KEY_BYTES: u64 = 8;
 
 /// Most rows of a draft quantum (MTP catch-up) that run on the decode row twins (`AttentionStates.DRAFT_TWIN_ROWS`).
 pub const DRAFT_TWIN_ROWS: u64 = 8;
@@ -78,11 +78,18 @@ pub fn decode_scratch_bytes(query_heads: u64, rows: u64) -> u64 {
     query_heads * rows * DECODE_SPLITS * DECODE_SPLIT_FLOATS * 4
 }
 
-/// What one sequence needs on the device beyond its attention KV (`SequenceFootprint.extraSequenceBytes`): the GDN
-/// state, the decode scratch for the most rows it verifies, its device selection words and, when it drafts, the
-/// draft seed rows of a prefill chunk (`seed_rows`), the MTP layer's cache for `context_tokens` and the recursion
-/// hidden.
-pub fn sequence_bytes(
+/// Bytes of the draft token buffer of a drafting sequence (`AttentionScratch`): one int32 per slot.
+const DRAFT_TOKENS_BYTES: u64 = 4 * 17;
+
+/// What one more sequence needs on the device beyond its attention KV, as `SequenceState::allocate` allocates it for a
+/// sequence that verifies `verified_rows` rows (0 when it does not draft):
+/// - the GDN state ([`gdn_bytes`]);
+/// - the decode scratch for the most rows it runs, more when it drafts (the catch-up on the decode row twins);
+/// - its selection pool: one key word per verified row (at least one), in as many selections as a step has quanta
+///   that select (the drafts and two more, at least two);
+/// - when it drafts: `seed_rows` draft seed rows (a prefill chunk's, at least [`MINIMUM_VERIFY_ROWS`]), the recursion
+///   hidden, the draft token buffer and the MTP layer's cache for `context_tokens`.
+pub fn extra_sequence_bytes(
     config: &ModelConfig,
     format: KvFormat,
     context_tokens: u64,
@@ -93,18 +100,18 @@ pub fn sequence_bytes(
     let scratch_rows = if drafts {
         verified_rows.max(DRAFT_TWIN_ROWS)
     } else {
-        verified_rows
+        verified_rows.max(1)
     };
+    let selections = if drafts { (verified_rows + 1).max(2) } else { 2 };
     let mut total = gdn_bytes(config, verified_rows)
         + decode_scratch_bytes(config.num_attention_heads as u64, scratch_rows)
-        + SELECTION_BYTES
-        + verified_rows * 8;
+        + selections * verified_rows.max(1) * SELECTION_KEY_BYTES;
     if !drafts {
         return total;
     }
     let seed_rows = seed_rows.max(MINIMUM_VERIFY_ROWS);
     let hidden = config.hidden_size as u64;
-    total += seed_rows * hidden * 2 + hidden * 2;
+    total += seed_rows * hidden * 2 + hidden * 2 + DRAFT_TOKENS_BYTES;
     // The MTP layer is one full-attention layer's cache.
     total += pages_for(context_tokens) * page_bytes(config, format);
     total

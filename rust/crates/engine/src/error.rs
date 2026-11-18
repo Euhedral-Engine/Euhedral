@@ -8,6 +8,17 @@ use euhedral_inference_cuda::CudaError;
 use euhedral_inference_edrl::EdrlError;
 use thiserror::Error;
 
+/// What the refusal of a plan of several sequences adds: they may be what did not fit.
+fn fewer_sequences(sequences: usize) -> String {
+    if sequences > 1 {
+        format!(
+            "; the plan holds {sequences} sequences: set a smaller context.max-tokens or fewer sequences (batching.max-sequences)"
+        )
+    } else {
+        String::new()
+    }
+}
+
 /// Why a residency plan could not be made.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PlanError {
@@ -23,13 +34,14 @@ pub enum PlanError {
     #[error(
         "the weights need {weights_needed} bytes on the device beside {state_needed} bytes of state, but only \
          {available} bytes are available ({free} free, limited by memory.gpu-limit); weights \
-         cannot be backed by host memory yet"
+         cannot be backed by host memory yet{}", fewer_sequences(*.sequences)
     )]
     WeightsDoNotFit {
         weights_needed: u64,
         state_needed: u64,
         available: u64,
         free: u64,
+        sequences: usize,
     },
 
     /// A setting the plan reads is out of range.

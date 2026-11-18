@@ -26,6 +26,7 @@ use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, LaneOps, Pin
 use euhedral_inference_edrl::{LayerType, ModelMetadata};
 use euhedral_inference_engine::model::ModelConfig;
 use euhedral_inference_engine::residency::footprint;
+use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvError, KvRetained};
 use euhedral_inference_engine::state::released::ReleasedBuffers;
@@ -303,6 +304,37 @@ fn gdn_state_is_zeroed_and_as_large_as_the_planner_says() {
     assert_eq!(
         plain.device_bytes(),
         48 * (state.convolution().bytes() + state.recurrent().bytes()) as u64
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn the_extra_state_of_a_sequence_is_what_its_buffers_hold() {
+    let Some(library) = library() else { return };
+    let lane = lane(&library);
+    let config = config();
+    let (seed_rows, context) = (512, 4096);
+    // A sequence that does not draft allocates no verification rows and one decode row.
+    let (gdn, _) = run(&lane, |ops| GdnStates::allocate(&library, &config, 0, ops));
+    let scratch = AttentionScratch::allocate(&library, &config, 1, false, seed_rows).unwrap();
+    let selections = 2 * 8;
+    assert_eq!(
+        footprint::extra_sequence_bytes(&config, KvFormat::Nvfp4, context, 0, false, seed_rows),
+        gdn.device_bytes() + scratch.device_bytes() + selections
+    );
+    // One that drafts 4 tokens a step verifies 5 rows and catches up on the decode row twins' 8; the MTP layer's
+    // cache is one full-attention layer's pages.
+    let verified = 5;
+    let (gdn, _) = run(&lane, |ops| GdnStates::allocate(&library, &config, verified, ops));
+    let scratch = AttentionScratch::allocate(&library, &config, 8, true, seed_rows).unwrap();
+    let selections = (verified + 1) * verified * 8;
+    let extra = footprint::extra_sequence_bytes(&config, KvFormat::Nvfp4, context, verified, true, seed_rows);
+    assert_eq!(
+        extra,
+        gdn.device_bytes()
+            + scratch.device_bytes()
+            + selections
+            + footprint::pages_for(context) * footprint::page_bytes(&config, KvFormat::Nvfp4)
     );
 }
 
