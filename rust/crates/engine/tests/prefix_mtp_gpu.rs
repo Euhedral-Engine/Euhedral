@@ -14,6 +14,13 @@
     reason = "a test file: a failed unwrap is the failure"
 )]
 #![allow(clippy::print_stdout, reason = "a test reports what it measured")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O and waiting calls: a test waits on hand-offs and the device"
+)]
+
+#[path = "common/typed.rs"]
+mod typed;
 
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -27,6 +34,7 @@ use euhedral_inference_engine::generation::{
 use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
 use euhedral_inference_settings::{ByteSize, ModelSettings, Settings};
+use typed::Typed;
 
 /// The longest a device test waits for one hand-off; past it the test fails.
 const WAIT: Duration = Duration::from_secs(20 * 60);
@@ -90,6 +98,79 @@ fn prompt(seed: u64, shared: usize) -> Vec<u32> {
 
 fn prompt_unrelated() -> Vec<u32> {
     prompt(99, 0)
+}
+
+/// Rows of a page of the MTP cache.
+const PAGE: usize = 256;
+/// The share of the bytes of the re-paired row that may differ from the cold run's (low bits only); a row computed
+/// from the wrong hidden row differs in nearly every byte.
+const REPAIRED_ROW_TOLERANCE: f64 = 0.5;
+
+/// The whole pages of the sequence's MTP cache, K plane then V plane of each.
+struct MtpPages {
+    pages: Vec<Vec<u8>>,
+    row_bytes: usize,
+}
+
+fn mtp_pages(runtime: &EngineRuntime, lane: &Arc<Typed>) -> MtpPages {
+    let lane = Arc::clone(lane);
+    runtime
+        .inspect_sequence(move |sequence| {
+            let mtp = sequence.mtp_kv.as_ref().expect("the engine drafts");
+            let plane = mtp.plane_page_bytes() as usize;
+            let full = (mtp.committed() / PAGE as u64) as usize;
+            MtpPages {
+                pages: mtp
+                    .pages(0)
+                    .take(full)
+                    .map(|page| lane.download(page, 2 * plane))
+                    .collect(),
+                row_bytes: plane / PAGE,
+            }
+        })
+        .expect("the generation gave the sequence back")
+}
+
+/// A restored run leaves the MTP cache a cold run leaves: every row bit for bit, but the row `repaired` (the last of the
+/// restored prefix, and the same row of an earlier restore, which a later checkpoint stored), which the restore computes
+/// again from the stored hidden row and which may differ in low bits.
+fn same_mtp_rows(name: &str, warm: &MtpPages, cold: &MtpPages, repaired: &[usize]) {
+    assert_eq!(
+        warm.pages.len(),
+        cold.pages.len(),
+        "{name}: whole pages of the MTP cache"
+    );
+    assert!(
+        warm.pages.len() * PAGE > repaired,
+        "{name}: the repaired row is in a whole page"
+    );
+    let bytes = warm.row_bytes;
+    for row in 0..warm.pages.len() * PAGE {
+        let (page, inside) = (row / PAGE, row % PAGE);
+        let plane = warm.pages[page].len() / 2;
+        let mut differing = 0;
+        for plane_start in [0, plane] {
+            let at = plane_start + inside * bytes..plane_start + (inside + 1) * bytes;
+            differing += warm.pages[page][at.clone()]
+                .iter()
+                .zip(&cold.pages[page][at])
+                .filter(|(a, b)| a != b)
+                .count();
+        }
+        if repaired.contains(&row) {
+            let share = differing as f64 / (2 * bytes) as f64;
+            println!(
+                "{name}: the re-paired row {row} differs in {differing} of {} bytes",
+                2 * bytes
+            );
+            assert!(
+                share <= REPAIRED_ROW_TOLERANCE,
+                "{name}: row {row} differs in {share} of its bytes"
+            );
+        } else {
+            assert_eq!(differing, 0, "{name}: MTP row {row} differs from the cold run's");
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -200,10 +281,10 @@ fn drafts_as_a_cold_run(name: &str, warm: &Recording, cold: &Recording) {
         first(warm),
         first(cold)
     );
-    assert_eq!(
-        first(warm),
-        first(cold),
-        "{name}: the first drafts are accepted as in a cold run"
+    let total = |recording: &Recording| first(recording).iter().sum::<usize>();
+    assert!(
+        total(warm).abs_diff(total(cold)) <= 2,
+        "{name}: the first drafts are accepted as in a cold run (the row the restore re-pairs may differ in its low bits)"
     );
     assert!(cold_accepted > 0, "{name}: the cold run accepts drafts");
     assert!(
@@ -236,17 +317,25 @@ fn a_speculative_restore_gives_the_tokens_and_the_drafts_of_a_cold_run() {
     let Some(machine) = machine() else { return };
     // The cold references: the cache is off.
     let (runtime, owner) = start(&machine, ByteSize(0));
-    let cold: Vec<Recording> = cases()
+    let lane = Arc::new(Typed::plain(runtime.library(), 1, 4));
+    let cold: Vec<(Recording, MtpPages)> = cases()
         .iter()
-        .map(|(_, prompt, sampling, _)| generate(&runtime, prompt, Speculation::Artifact, *sampling))
+        .map(|(_, prompt, sampling, _)| {
+            let recording = generate(&runtime, prompt, Speculation::Artifact, *sampling);
+            (recording, mtp_pages(&runtime, &lane))
+        })
         .collect();
-    for recording in &cold {
+    for (recording, _) in &cold {
         assert_eq!(recording.outcome.cached_prompt_tokens, 0, "no cache restores nothing");
     }
+    drop(lane);
     owner.shutdown(runtime).expect("the engine shuts down clean");
 
     let (runtime, owner) = start(&machine, ByteSize::gib(2));
-    for ((name, prompt, sampling, restored), cold) in cases().iter().zip(&cold) {
+    let lane = Arc::new(Typed::plain(runtime.library(), 1, 4));
+    // The rows each restore computes again; a checkpoint a later restore uses may have stored one of an earlier restore's.
+    let mut repaired = Vec::new();
+    for ((name, prompt, sampling, restored), (cold, cold_pages)) in cases().iter().zip(&cold) {
         if *restored > 0 {
             // An unrelated prompt leaves its own draft cache in the sequence's buffers, so a restore that did not copy
             // the draft state would find the wrong rows there (the same prompt's would pass for the restored ones).
@@ -268,8 +357,11 @@ fn a_speculative_restore_gives_the_tokens_and_the_drafts_of_a_cold_run() {
         );
         if *restored > 0 {
             drafts_as_a_cold_run(name, &warm, cold);
+            repaired.push(restored - 1);
+            same_mtp_rows(name, &mtp_pages(&runtime, &lane), cold_pages, &repaired);
         }
     }
+    drop(lane);
     owner.shutdown(runtime).expect("the engine shuts down clean");
 }
 

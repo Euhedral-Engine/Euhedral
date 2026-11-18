@@ -2101,7 +2101,14 @@ impl Owner {
         quantum.prepared_after(prepared);
 
         let selection = quantum.selection().cloned();
-        let kill = run.first_kill.take().unwrap_or_default();
+        // The restore's flag goes to the first chunk. On a restore of a drafting request the first quantum is the one-row
+        // catch-up that precedes the chunk: it shares the flag (clones it) and the chunk takes it, so a failed copy stops both.
+        let kill = if kind == QuantumKind::Draft {
+            run.first_kill.clone()
+        } else {
+            run.first_kill.take()
+        }
+        .unwrap_or_default();
         let admitted = Instant::now();
         let id = quantum.id();
 
