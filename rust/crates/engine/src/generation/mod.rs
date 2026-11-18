@@ -267,8 +267,13 @@ impl Generation {
         if !copies {
             return Ok(executor);
         }
-        let copier = Copier::new(&runtime, core.lane_table.clone(), core.transfer_lane_id(0), SequenceId(0))
-            .map_err(|error| EngineError::Runtime(format!("the prefix cache's copy graph: {error:?}")))?;
+        let copier = Copier::new(
+            &runtime,
+            core.lane_table.clone(),
+            core.transfer_lane_id(0),
+            SequenceId(0),
+        )
+        .map_err(|error| EngineError::Runtime(format!("the prefix cache's copy graph: {error:?}")))?;
         Ok(executor.with_copier(copier))
     }
 

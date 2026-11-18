@@ -450,7 +450,9 @@ fn admit_with_cache(budgets: Budgets, layout: Layout, prefix: u64) -> Result<boo
         [
             LocationSpec {
                 kind: LocationKind::HostPinned,
-                capacity: budgets.host.min(CAPACITY_CAP.max(layout.cache_host.saturating_add(prefix))),
+                capacity: budgets
+                    .host
+                    .min(CAPACITY_CAP.max(layout.cache_host.saturating_add(prefix))),
                 reserve: 0,
             },
             LocationSpec {

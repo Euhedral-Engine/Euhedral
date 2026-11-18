@@ -43,7 +43,7 @@ pub use capture_key::{CaptureKey, split_geometry};
 pub use input_record::{encode as encode_input_record, encode_into as encode_input_record_into};
 
 use crate::plan::{MAX_CAPTURED_ROWS, Plan, Variant, View};
-use crate::prefix::{CopyJob, Copier};
+use crate::prefix::{Copier, CopyJob};
 use crate::stages::DraftSeed;
 use crate::stages::Quantum;
 use crate::stages::attention::{KvSource, takes_decode_scratch};

@@ -21,7 +21,7 @@ use crate::frames::{Kind, id_hash};
 use crate::model::{LayerKind, ModelConfig};
 use crate::prefix::copy::{CopyJob, Direction, Ended, HostArena, Resolve};
 use crate::prefix::layout::Buffer;
-use crate::quantum::{Started, StartError};
+use crate::quantum::{StartError, Started};
 use crate::stages::attention::KvSource;
 use crate::stages::{LaneTable, SequenceRefs, Unmarked, fatal, submit_on};
 use crate::state::SequenceId;
@@ -40,7 +40,8 @@ pub struct PinnedArena {
 impl PinnedArena {
     /// Pins `bytes` of host memory. Waits on the allocator: startup only.
     pub fn allocate(library: &Arc<CudaLibrary>, bytes: u64) -> Result<PinnedArena, CudaError> {
-        let bytes = usize::try_from(bytes).map_err(|_| CudaError::Argument(format!("{bytes} bytes do not fit in memory")))?;
+        let bytes =
+            usize::try_from(bytes).map_err(|_| CudaError::Argument(format!("{bytes} bytes do not fit in memory")))?;
         Ok(PinnedArena {
             buffer: PinnedBuffer::alloc(library, bytes)?,
         })
@@ -220,12 +221,7 @@ impl Copier {
     }
 
     /// Starts `job` behind each of `after`: its stage waits on the device for their sinks.
-    pub(crate) fn start(
-        &self,
-        job: CopyJob,
-        kill: Arc<AtomicBool>,
-        after: &[&Started],
-    ) -> Result<Started, StartError> {
+    pub(crate) fn start(&self, job: CopyJob, kill: Arc<AtomicBool>, after: &[&Started]) -> Result<Started, StartError> {
         let serial = job.serial();
         let external = after.iter().map(|previous| ExternalEdge {
             from: previous.reference.clone(),

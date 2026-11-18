@@ -19,10 +19,10 @@ mod open;
 mod tree;
 
 pub use cache::{CacheParts, Hit, OpenError, PrefixCacheHandle, PrefixCacheStats, RestoreError, Submit};
-pub(crate) use open::{CacheSpec, open_prefix_cache};
 pub use copier::{Copier, PinnedArena, SequenceAddresses};
 pub use copy::{CopyJob, Direction, Ended, HostArena, Piece, Resolve};
 pub use layout::{Buffer, CheckpointLayout, SlotCopy};
+pub(crate) use open::{CacheSpec, open_prefix_cache};
 pub use tree::{Match, NodeId, POSITION_GRANULE, PrefixNode, PrefixTree, ReserveError, Speculation};
 
 #[cfg(test)]
