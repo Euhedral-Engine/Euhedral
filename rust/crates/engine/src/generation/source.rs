@@ -51,14 +51,13 @@ use euhedral_gpu::Ran;
 use euhedral_graph::QuantumOutcome;
 use euhedral_inference_cuda::{DevicePtr, PooledPinned, SubmitMode};
 
-use super::constraint::TokenConstraint;
 use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
 use super::mtp::{Joining, Speculating, Verifying};
 use super::request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
-use super::sampled::{Answered, LeasedRow, Prepared, Sampled, SampledRows, prepare_frame, sample_frame};
+use super::sampled::{Answered, Guarded, LeasedRow, Prepared, Sampled, SampledRows, prepare_frame, sample_frame};
 use super::teacher_forced::LogitsSink;
 use crate::frames::{Kind, step};
 use crate::model::ModelConfig;
@@ -266,7 +265,7 @@ pub(super) struct Sampling {
 /// (`held`), in the frame that prepares it (`preparing`, the number of the preparation), or in a selection's frame
 /// (the rows' join waits for that).
 struct Constraining {
-    held: Option<Box<dyn TokenConstraint>>,
+    held: Option<Guarded>,
     preparing: Option<u64>,
     /// A quantum that retired before the preparation ended: its row waits, with the position of the token it selects.
     deferred: Option<Deferred>,
@@ -278,7 +277,7 @@ struct Deferred {
 }
 
 impl Constraining {
-    fn new(constraint: Box<dyn TokenConstraint>) -> Constraining {
+    fn new(constraint: Guarded) -> Constraining {
         Constraining {
             held: Some(constraint),
             preparing: None,
@@ -654,7 +653,7 @@ impl Owner {
                         state: Box::new(Sampling {
                             rows: samplers,
                             next: None,
-                            constraint: constraint.map(Constraining::new),
+                            constraint: constraint.map(|constraint| Constraining::new(Guarded::new(constraint))),
                         }),
                     },
                     Some(depth) => Mode::Speculative {
@@ -1008,8 +1007,11 @@ impl Owner {
             run.stop(FinishReason::Length);
         } else if let Mode::Sampled { state, .. } = &mut run.mode {
             state.next = Some(token);
-            // The decode that feeds the token runs while the next mask is prepared.
-            self.prepare_constraint();
+            // The decode that feeds the token runs while the next mask is prepared; with no room for it, no mask
+            // is needed.
+            if run.position < run.capacity {
+                self.prepare_constraint();
+            }
         }
     }
 
@@ -1291,8 +1293,12 @@ impl Owner {
         {
             match constraining.held.take() {
                 Some(held) => constraint = Some(held),
+                None if constraining.preparing.is_none() => {
+                    return self.fail("the constraint was lost".to_string());
+                }
                 None => {
                     // The mask is still being prepared: the row waits for it, and is selected from when it is.
+                    debug_assert!(constraining.deferred.is_none(), "a row already waits for the mask");
                     constraining.deferred = Some(Deferred {
                         lease,
                         position: first_position,
@@ -1319,7 +1325,7 @@ impl Owner {
         lease: RowReadbackLease,
         count: usize,
         first_position: u64,
-        mut constraint: Option<Box<dyn TokenConstraint>>,
+        mut constraint: Option<Guarded>,
     ) {
         // The steps are the owner's, not the request's: an answer that comes late from a request that ended never
         // matches a selection of the next one.

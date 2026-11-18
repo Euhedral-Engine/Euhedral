@@ -189,6 +189,7 @@ impl TokenConstraint for Cycle {
 fn run(
     runtime: &EngineRuntime,
     max_tokens: u32,
+    stop_tokens: Vec<u32>,
     sampling: SamplingConfig,
     speculation: Speculation,
     constraint: Option<Box<dyn TokenConstraint>>,
@@ -198,7 +199,7 @@ fn run(
         .generate(GenerationRequest {
             prompt: PROMPT.to_vec(),
             max_tokens,
-            stop_tokens: Vec::new(),
+            stop_tokens,
             speculation,
             sampling,
             constraint,
@@ -233,6 +234,7 @@ fn a_constraint_that_allows_one_token_a_step_decides_every_token_and_the_request
         let recording = run(
             &runtime,
             24,
+            Vec::new(),
             sampling,
             Speculation::Artifact,
             Some(Box::new(constraint)),
@@ -257,7 +259,14 @@ fn a_constraint_that_allows_one_token_a_step_decides_every_token_and_the_request
         assert!(sequence_free(&runtime), "{what}: every lease is back");
     }
     // A request without a constraint still runs.
-    let free = run(&runtime, 24, SamplingConfig::greedy(0), Speculation::Off, None);
+    let free = run(
+        &runtime,
+        24,
+        Vec::new(),
+        SamplingConfig::greedy(0),
+        Speculation::Off,
+        None,
+    );
     assert_eq!(free.outcome.reason, FinishReason::Length);
     assert_eq!(free.tokens.len(), 24);
     owner.shutdown(runtime).unwrap();
@@ -280,6 +289,7 @@ fn a_constraint_that_fails_ends_the_request_once_with_an_error_and_frees_the_seq
         let recording = run(
             &runtime,
             40,
+            Vec::new(),
             SamplingConfig::greedy(0),
             Speculation::Off,
             Some(Box::new(constraint)),
@@ -289,13 +299,21 @@ fn a_constraint_that_fails_ends_the_request_once_with_an_error_and_frees_the_seq
             "{what}: {:?}",
             recording.outcome.reason
         );
-        assert!(
-            recording.tokens.len() <= 4,
-            "{what}: nothing is reported past the failure"
+        assert_eq!(
+            recording.tokens.len(),
+            3,
+            "{what}: the tokens before the failure are reported, and nothing past it"
         );
         assert!(sequence_free(&runtime), "{what}: every lease is back");
         // The sequence takes the next request.
-        let next = run(&runtime, 8, SamplingConfig::greedy(0), Speculation::Off, None);
+        let next = run(
+            &runtime,
+            8,
+            Vec::new(),
+            SamplingConfig::greedy(0),
+            Speculation::Off,
+            None,
+        );
         assert_eq!(
             next.outcome.reason,
             FinishReason::Length,
@@ -317,6 +335,7 @@ fn the_next_mask_is_prepared_while_the_next_decode_runs_and_a_row_that_retires_f
     let recording = run(
         &runtime,
         12,
+        Vec::new(),
         SamplingConfig::greedy(0),
         Speculation::Off,
         Some(Box::new(constraint)),
@@ -336,5 +355,44 @@ fn the_next_mask_is_prepared_while_the_next_decode_runs_and_a_row_that_retires_f
         "the decode ({admitted:?}) was admitted before the mask was ready ({ended:?})"
     );
     assert!(sequence_free(&runtime));
+    owner.shutdown(runtime).unwrap();
+}
+
+#[test]
+#[ignore = "loads the artifact on the device"]
+fn a_constrained_request_ends_at_a_stop_token_it_chose_and_at_a_budget_of_one() {
+    let Some((runtime, owner)) = start() else { return };
+    let cycle = [4000, 120, 9000, 77];
+    let (constraint, accepted, _) = Cycle::new(&cycle, Fault::None, usize::MAX);
+    let stopped = run(
+        &runtime,
+        40,
+        vec![9000],
+        SamplingConfig::greedy(0),
+        Speculation::Off,
+        Some(Box::new(constraint)),
+    );
+    assert_eq!(stopped.outcome.reason, FinishReason::Stop);
+    assert_eq!(
+        stopped.tokens,
+        vec![4000, 120, 9000],
+        "the stop token is reported, and ends the request"
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    assert!(sequence_free(&runtime), "stop: every lease is back");
+
+    let (constraint, accepted, _) = Cycle::new(&cycle, Fault::None, usize::MAX);
+    let single = run(
+        &runtime,
+        1,
+        Vec::new(),
+        SamplingConfig::greedy(0),
+        Speculation::Off,
+        Some(Box::new(constraint)),
+    );
+    assert_eq!(single.outcome.reason, FinishReason::Length);
+    assert_eq!(single.tokens, vec![4000]);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    assert!(sequence_free(&runtime), "one token: every lease is back");
     owner.shutdown(runtime).unwrap();
 }

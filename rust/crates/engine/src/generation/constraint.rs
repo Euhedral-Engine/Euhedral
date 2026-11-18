@@ -165,12 +165,15 @@ impl fmt::Debug for ReasoningConstraint {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     const THINK_END: u32 = 9;
     const EOS: u32 = 8;
     const VOCABULARY: usize = 12;
 
     /// An answer that allows the ids of its set and counts what it was told.
-    struct Only(Vec<u32>, Vec<u32>, u32);
+    struct Only(Vec<u32>, Vec<u32>, Arc<AtomicU32>);
 
     impl TokenFilter for Only {
         fn allows(&self, id: u32) -> bool {
@@ -180,7 +183,7 @@ mod tests {
 
     impl TokenConstraint for Only {
         fn prepare(&mut self) -> Result<(), ConstraintError> {
-            self.2 += 1;
+            self.2.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -202,7 +205,7 @@ mod tests {
 
     #[test]
     fn reasoning_is_free_then_the_answer_follows_its_constraint() {
-        let answer = Only(vec![1, 2, EOS], Vec::new(), 0);
+        let answer = Only(vec![1, 2, EOS], Vec::new(), Arc::default());
         let mut constraint = ReasoningConstraint::new(THINK_END, vec![EOS], None, Some(Box::new(answer)));
         let reasoning = [3, 4, 5, 6, 7];
         accept_all(&mut constraint, &reasoning);
@@ -248,11 +251,18 @@ mod tests {
 
     #[test]
     fn the_answer_prepares_only_once_it_decides() {
-        let mut constraint =
-            ReasoningConstraint::new(THINK_END, vec![EOS], None, Some(Box::new(Only(vec![1], Vec::new(), 0))));
+        let prepared = Arc::new(AtomicU32::new(0));
+        let answer = Only(vec![1], Vec::new(), Arc::clone(&prepared));
+        let mut constraint = ReasoningConstraint::new(THINK_END, vec![EOS], None, Some(Box::new(answer)));
         constraint.prepare().unwrap();
         constraint.accept(THINK_END).unwrap();
+        assert_eq!(
+            prepared.load(Ordering::SeqCst),
+            0,
+            "still thinking: the answer is not asked"
+        );
         constraint.prepare().unwrap();
+        assert_eq!(prepared.load(Ordering::SeqCst), 1, "answering: the answer prepares");
         constraint.accept(1).unwrap();
         assert!(
             constraint.accept(2).is_err(),
