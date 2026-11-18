@@ -440,16 +440,17 @@ impl Run {
         }
     }
 
+    /// Whether a frame holds the request's constraint to prepare its next mask. Admission does not wait for it (the
+    /// mask is prepared while the decode runs); the end of the request does.
+    fn preparing(&self) -> bool {
+        matches!(&self.mode, Mode::Sampled { state, .. }
+            if state.constraint.as_ref().is_some_and(|constraining| constraining.preparing.is_some()))
+    }
+
     /// Whether the request waits for the host's selections of a quantum's rows.
     fn selecting(&self) -> bool {
         match &self.mode {
-            Mode::Sampled { state, .. } => {
-                state.rows.waiting()
-                    || state
-                        .constraint
-                        .as_ref()
-                        .is_some_and(|constraint| constraint.preparing.is_some())
-            }
+            Mode::Sampled { state, .. } => state.rows.waiting(),
             Mode::Speculative { state, .. } => state.selecting(),
             Mode::Greedy { .. } | Mode::Forced { .. } => false,
         }
@@ -1646,7 +1647,7 @@ impl Owner {
         let chunk = self.shared.chunk;
         let Some(run) = self.run.as_ref() else { return };
         let ended = run.stopping.is_some() || run.next_step(chunk).is_none();
-        if !run.in_flight.is_empty() || run.waiting_logits || run.selecting() || !ended {
+        if !run.in_flight.is_empty() || run.waiting_logits || run.selecting() || run.preparing() || !ended {
             return;
         }
         // Quanta that were stopped may still have work queued on the owner's lane.

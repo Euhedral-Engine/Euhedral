@@ -18,7 +18,7 @@
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -31,8 +31,11 @@ use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
 use euhedral_inference_settings::{ModelSettings, Settings};
 
-/// The longest a device test waits for one hand-off; past it the test fails.
+/// The longest a device test waits for the engine to start; past it the test fails.
 const WAIT: Duration = Duration::from_secs(20 * 60);
+
+/// The longest a test waits for a generation of a few tokens: a request that hangs fails the test inside the grant.
+const GENERATION_WAIT: Duration = Duration::from_secs(60);
 
 /// The prompt: any ids inside the vocabulary will do.
 const PROMPT: [u32; 6] = [3000, 1500, 2200, 800, 4100, 1200];
@@ -60,12 +63,15 @@ fn start() -> Option<(Arc<EngineRuntime>, RuntimeOwner)> {
 struct Recording {
     tokens: Vec<u32>,
     quanta: Vec<QuantumKind>,
+    /// When each decode quantum entered the engine.
+    decodes: Vec<Instant>,
     outcome: GenerationOutcome,
 }
 
 struct Recorder {
     tokens: Vec<u32>,
     quanta: Vec<QuantumKind>,
+    decodes: Vec<Instant>,
     done: Option<Arc<Handoff<Recording>>>,
 }
 
@@ -78,6 +84,9 @@ impl GenerationListener for Recorder {
 
     fn quantum(&mut self, event: QuantumEvent) {
         self.quanta.push(event.kind);
+        if event.kind == QuantumKind::Decode {
+            self.decodes.push(event.admitted);
+        }
     }
 
     fn finished(&mut self, outcome: GenerationOutcome) {
@@ -85,10 +94,14 @@ impl GenerationListener for Recorder {
         done.send(Recording {
             tokens: mem::take(&mut self.tokens),
             quanta: mem::take(&mut self.quanta),
+            decodes: mem::take(&mut self.decodes),
             outcome,
         });
     }
 }
+
+/// How long a slow preparation takes: long enough for the decode that runs beside it to retire first.
+const SLOW: Duration = Duration::from_millis(300);
 
 /// What a fake constraint does at its `fail_at`th step.
 #[derive(Clone, Copy, PartialEq)]
@@ -97,6 +110,8 @@ enum Fault {
     AcceptErrors,
     PrepareErrors,
     PrepareSleepsThenPanics,
+    /// The preparation at `fail_at` takes a while and succeeds; the time it ended is kept.
+    PrepareSleeps,
 }
 
 /// A constraint that allows one token a step, the next of `cycle`.
@@ -107,6 +122,9 @@ struct Cycle {
     fail_at: usize,
     accepted: Arc<AtomicUsize>,
     prepared: Arc<AtomicUsize>,
+    /// Nanoseconds from `base` to the end of the slow preparation.
+    ended: Arc<AtomicU64>,
+    base: Instant,
 }
 
 impl Cycle {
@@ -120,6 +138,8 @@ impl Cycle {
             fail_at,
             accepted: Arc::clone(&accepted),
             prepared: Arc::clone(&prepared),
+            ended: Arc::new(AtomicU64::new(0)),
+            base: Instant::now(),
         };
         (constraint, accepted, prepared)
     }
@@ -139,8 +159,13 @@ impl TokenConstraint for Cycle {
                 Fault::PrepareErrors => return Err(ConstraintError::new("no mask")),
                 Fault::PrepareSleepsThenPanics => {
                     // Long enough for the decode that follows to retire first: its row waits for this mask.
-                    sleep(Duration::from_millis(300));
+                    sleep(SLOW);
                     panic!("a constraint that cannot prepare");
+                }
+                Fault::PrepareSleeps => {
+                    sleep(SLOW);
+                    let nanos = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    self.ended.store(nanos, Ordering::SeqCst);
                 }
                 _ => {}
             }
@@ -180,11 +205,12 @@ fn run(
             listener: Box::new(Recorder {
                 tokens: Vec::new(),
                 quanta: Vec::new(),
+                decodes: Vec::new(),
                 done: Some(Arc::clone(&done)),
             }),
         })
         .expect("the request is admitted");
-    done.wait(WAIT).expect("the generation reports")
+    done.wait(GENERATION_WAIT).expect("the generation reports")
 }
 
 /// Quanta in flight, selections and row readbacks leased after a generation: all free.
@@ -277,6 +303,41 @@ fn a_constraint_that_fails_ends_the_request_once_with_an_error_and_frees_the_seq
             "{what}: the next request runs"
         );
     }
+    drop(runtime);
+    drop(owner);
+}
+
+#[test]
+#[ignore = "loads the artifact on the device"]
+fn the_next_mask_is_prepared_while_the_next_decode_runs_and_a_row_that_retires_first_waits_for_it() {
+    let Some((runtime, owner)) = start() else { return };
+    let cycle = [4000, 120, 9000, 77];
+    let slow_at = 5;
+    let (constraint, _, _) = Cycle::new(&cycle, Fault::PrepareSleeps, slow_at);
+    let ended = Arc::clone(&constraint.ended);
+    let base = constraint.base;
+    let recording = run(
+        &runtime,
+        12,
+        SamplingConfig::greedy(0),
+        Speculation::Off,
+        Some(Box::new(constraint)),
+    );
+    assert_eq!(recording.outcome.reason, FinishReason::Length);
+    let expected: Vec<u32> = (0..12).map(|index| cycle[index % cycle.len()]).collect();
+    assert_eq!(
+        recording.tokens, expected,
+        "a row that waited for its mask selects the same tokens"
+    );
+    // The mask for step `slow_at` is prepared after token `slow_at - 1`, while the decode that feeds that token runs.
+    let ended = Duration::from_nanos(ended.load(Ordering::SeqCst));
+    assert!(ended > Duration::ZERO, "the slow preparation ran");
+    let admitted = recording.decodes[slow_at - 1].duration_since(base);
+    assert!(
+        admitted < ended,
+        "the decode ({admitted:?}) was admitted before the mask was ready ({ended:?})"
+    );
+    assert!(sequence_free(&runtime));
     drop(runtime);
     drop(owner);
 }

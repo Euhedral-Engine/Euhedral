@@ -35,8 +35,9 @@ pub struct GenerationRequest {
     /// if this were [`Speculation::Off`].
     pub speculation: Speculation,
     /// How a token is chosen from the logits. A greedy configuration (the flag set or a temperature of zero or less)
-    /// selects on the device, as a request that never asked for sampling; any other copies the logits row to the host
-    /// and selects there, one token at a time, with the draw of the seed and the token's position.
+    /// selects on the device, as a request that never asked for sampling, unless it has a `constraint`; any other copies
+    /// the logits row to the host and selects there, one token at a time, with the draw of the seed and the token's
+    /// position.
     pub sampling: SamplingConfig,
     /// Which tokens each selection may choose. A constrained request selects on the host even when its configuration is
     /// greedy (the best allowed token), one token at a time, and never speculates: `speculation` is read as
