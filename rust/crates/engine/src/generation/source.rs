@@ -39,10 +39,10 @@ use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter};
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::Arc;
 #[cfg(feature = "test-oracles")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
@@ -203,6 +203,9 @@ pub(crate) struct Shared {
     /// runs).
     #[cfg(feature = "test-oracles")]
     pub(crate) settle_after_speculation: AtomicBool,
+    /// A test hook: told, from the owner, of each prefix-cache copy job once it is admitted (`true` for a restore).
+    #[cfg(feature = "test-oracles")]
+    pub(crate) copy_admitted: OnceLock<Box<dyn Fn(bool) + Send + Sync>>,
 }
 
 /// What speculation needs of the artifact's draft layer.
@@ -1148,7 +1151,7 @@ impl Owner {
             .map_err(why("the sequence's references"))?
             .ordered_after(reserved, &core.lanes);
         let addresses =
-            SequenceAddresses::new(refs, &shared.config).ok_or("the sequence has no cache to restore into")?;
+            SequenceAddresses::base_only(refs, &shared.config).ok_or("the sequence has no cache to restore into")?;
         let Some(run) = self.run.as_mut() else { return Ok(()) };
         let Some(checkpoints) = run.checkpoints.as_mut() else {
             return Ok(());
@@ -1238,6 +1241,10 @@ impl Owner {
             return;
         }
         run.chain |= more;
+        #[cfg(feature = "test-oracles")]
+        if let Some(hook) = shared.copy_admitted.get() {
+            hook(purpose == Purpose::Restore);
+        }
         if let Some(checkpoints) = run.checkpoints.as_mut() {
             match purpose {
                 Purpose::Restore => checkpoints.restore_submitted(),
@@ -1885,7 +1892,7 @@ impl Owner {
         )?;
         let Some(run) = self.run.as_mut() else { return Ok(()) };
         if let Some(refs) = refs
-            && let Some(addresses) = SequenceAddresses::new(refs, &self.shared.config)
+            && let Some(addresses) = SequenceAddresses::base_only(refs, &self.shared.config)
             && let Some(checkpoints) = run.checkpoints.as_mut()
         {
             checkpoints.expect(end, Arc::new(addresses));

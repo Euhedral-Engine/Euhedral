@@ -21,8 +21,8 @@ mod source;
 mod teacher_forced;
 
 use std::fmt::{self, Formatter};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::generics::FrameSink;
@@ -152,6 +152,8 @@ impl Generation {
             panic_after_admissions: AtomicU64::new(u64::MAX),
             #[cfg(feature = "test-oracles")]
             settle_after_speculation: AtomicBool::new(false),
+            #[cfg(feature = "test-oracles")]
+            copy_admitted: OnceLock::new(),
         });
         let mailbox = Arc::new(Mailbox::new(
             Owner::new(Arc::clone(&shared), id, sequence, inbox),
@@ -397,7 +399,8 @@ const CHECKPOINT_GRANULE: u64 = 256;
 
 /// Opens the prefix cache the plan granted memory for, once for the engine; `None` (and why, once, in the log) when the
 /// engine cannot use it: the chunk is not a multiple of the checkpoint granule or does not divide the interval between
-/// checkpoints, or the sequences speculate (the checkpoints of a speculating sequence are not stored). Nothing is
+/// checkpoints. Requests that speculate neither restore nor capture (the state of a draft is not stored); the others do,
+/// on an engine whose sequences can speculate too. Nothing is
 /// opened, and nothing is logged, when the plan granted no memory (`prefix-cache.size: 0`).
 fn open_cache(core: &Arc<Core>, config: &Arc<ModelConfig>, residency: &ResidencyPlan) -> Option<PrefixCacheHandle> {
     if residency.prefix_cache_bytes == 0 {
@@ -415,12 +418,6 @@ fn open_cache(core: &Arc<Core>, config: &Arc<ModelConfig>, residency: &Residency
         log::warn!(
             "the prefix cache is off: the checkpoint interval is {} tokens, and it must be a multiple of the {chunk}-token prefill chunk",
             settings.checkpoint_tokens
-        );
-        return None;
-    }
-    if residency.draft_depth > 0 {
-        log::warn!(
-            "the prefix cache is off: the engine speculates, and the checkpoints of a speculating sequence are not stored"
         );
         return None;
     }
@@ -584,6 +581,19 @@ impl Generations {
     pub(crate) fn settle_after_speculation(&self, settle: bool) {
         for generation in &self.generations {
             generation.settle_after_speculation(settle);
+        }
+    }
+
+    /// The test hook: `hook` is told of every prefix-cache copy job a sequence's owner admits.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn copy_admitted(&self, hook: Arc<dyn Fn(bool) + Send + Sync>) {
+        for generation in &self.generations {
+            let hook = Arc::clone(&hook);
+            // A hook is set once per engine: the first one stays.
+            let _ = generation
+                .shared
+                .copy_admitted
+                .set(Box::new(move |restore| hook(restore)));
         }
     }
 

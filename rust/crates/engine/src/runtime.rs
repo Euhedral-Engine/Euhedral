@@ -705,6 +705,13 @@ impl EngineRuntime {
         self.generations.settle_after_speculation(settle);
     }
 
+    /// A test hook: `hook` is told, from the owner of the sequence, of each prefix-cache copy job it admits, `true` for
+    /// a restore and `false` for a capture, while the job is in flight. It must not block. Set once per engine.
+    #[cfg(feature = "test-oracles")]
+    pub fn on_copy_admitted_for_tests(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
+        self.generations.copy_admitted(Arc::new(hook));
+    }
+
     /// A test hook: the engine records no graphs from now on, so every quantum runs stage by stage. `false` while a
     /// request runs.
     #[cfg(feature = "test-oracles")]
