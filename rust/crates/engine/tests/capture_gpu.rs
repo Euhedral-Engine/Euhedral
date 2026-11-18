@@ -53,7 +53,7 @@ use euhedral_inference_engine::model::{
     LayerIndex, LayerKind, MTP_ATTENTION_PACK, ModelConfig, Role, WeightRef, object_key,
 };
 use euhedral_inference_engine::plan::{Formats, Plan, View, WeightLookup};
-use euhedral_inference_engine::quantum::{CaptureKey, Executor};
+use euhedral_inference_engine::quantum::{CaptureKey, Executor, split_geometry};
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, nvfp4, plan as residency_plan};
 use euhedral_inference_engine::stages::attention::KvSource;
 use euhedral_inference_engine::stages::sampling::SelectionPool;
@@ -1338,4 +1338,62 @@ fn growing_a_cache_after_a_view_was_taken_costs_one_handle_copy_per_page() {
         median(&with).saturating_sub(median(&without)),
         median(&with).saturating_sub(median(&without)).as_nanos() as f64 / handles,
     );
+}
+
+/// The key of each kind of quantum, field by field, as built from a quantum of one segment (the generations of the
+/// buffers are the run's own serials, so they are only checked to be named).
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn the_capture_key_of_each_kind_of_quantum_is_pinned() {
+    let Some(light) = light() else { return };
+    let mut sequence = light.sequence(1024, 1);
+    let group = (light.config.num_attention_heads / light.config.num_key_value_heads.max(1)) as u64;
+    let first = light.quantum(&mut sequence, QuantumKind::Decode, 1, 0, false);
+    drop(first);
+    sequence.kv.commit(1).unwrap();
+    let expected = |kind, rows: usize, logits, start: u64, row_exact| CaptureKey {
+        view: View::of(kind, rows),
+        kind,
+        rows,
+        logits,
+        selects: true,
+        copies_rows: None,
+        seeds_draft: false,
+        draft_seed: None,
+        draft_read: None,
+        draft_write: None,
+        writes_current_token: false,
+        input_record: 0,
+        token_from: None,
+        row_exact,
+        programmatic: false,
+        split_geometry: split_geometry(start, rows as u64, group),
+        reserved_host_pages: [0, 0],
+        replay_rows: Vec::new(),
+        buffer_generations: Vec::new(),
+    };
+    for (kind, rows, start, row_exact) in [
+        (QuantumKind::Decode, 1, 1u64, false),
+        (QuantumKind::Verify, 3, 2, true),
+        (QuantumKind::Verify, 4, 5, true),
+    ] {
+        let quantum = light.quantum(&mut sequence, kind, rows, start, row_exact);
+        let mut key = quantum.capture_key().expect("a quantum inside the page has a key");
+        assert!(!key.buffer_generations.is_empty(), "{kind:?}");
+        key.buffer_generations.clear();
+        let logits = if kind == QuantumKind::Verify { rows } else { 1 };
+        assert_eq!(
+            key,
+            expected(kind, rows, logits, start, row_exact),
+            "{kind:?} of {rows} rows"
+        );
+        assert_eq!(quantum.segments().len(), 1);
+        sequence.kv.commit(rows as u64).unwrap();
+    }
+    // A prefill chunk is not captured, and a draft quantum with no seed rows has no key.
+    let prefill = light.quantum(&mut sequence, QuantumKind::Prefill, 2, 9, false);
+    assert!(prefill.capture_key().is_none());
+    sequence.kv.commit(2).unwrap();
+    let draft = light.quantum(&mut sequence, QuantumKind::Draft, 1, 11, false);
+    assert!(draft.capture_key().is_none());
 }

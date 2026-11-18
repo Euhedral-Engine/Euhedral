@@ -26,7 +26,8 @@ pub enum KvSource {
 
 fn cache(quantum: &Quantum, source: KvSource) -> Result<&KvView, StageError> {
     quantum
-        .seq
+        .segment()
+        .refs
         .kv(source)
         .ok_or_else(|| fatal(format!("the quantum has no view of the {source:?} cache")))
 }
@@ -74,7 +75,7 @@ impl Launch for QkNormRope {
                 launch_u32(config.num_key_value_heads, "the key value heads")?,
                 launch_u32(config.attention_head_dim, "the head dimension")?,
                 rotary,
-                quantum.input.start_position(),
+                quantum.segment().start_position,
                 quantum.position(),
                 quantum.epsilon(),
                 config.rope_theta,
@@ -113,7 +114,8 @@ impl KvAppend {
 impl Launch for KvAppend {
     fn waits(&self, quantum: &Quantum) -> Vec<Marker> {
         quantum
-            .seq
+            .segment()
+            .refs
             .kv(self.source)
             .and_then(KvView::ready)
             .into_iter()
@@ -123,7 +125,7 @@ impl Launch for KvAppend {
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let config = &quantum.config;
         let cache = cache(quantum, self.source)?;
-        let start = quantum.input.start_position();
+        let start = quantum.segment().start_position;
         let rows = quantum.rows as u64;
         if !cache.reserves(start, rows) {
             return Err(fatal(format!(
@@ -209,7 +211,8 @@ impl AttentionCausal {
 impl Launch for AttentionCausal {
     fn waits(&self, quantum: &Quantum) -> Vec<Marker> {
         quantum
-            .seq
+            .segment()
+            .refs
             .kv(self.source)
             .and_then(KvView::ready)
             .into_iter()
@@ -219,7 +222,7 @@ impl Launch for AttentionCausal {
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let config = &quantum.config;
         let cache = cache(quantum, self.source)?;
-        let start = quantum.input.start_position();
+        let start = quantum.segment().start_position;
         let (Some(keys), Some(values)) = (cache.key_table(self.layer), cache.value_table(self.layer)) else {
             return Err(fatal(format!("layer {} of the cache has no page table", self.layer)));
         };
@@ -227,7 +230,7 @@ impl Launch for AttentionCausal {
         let cache_length = u32::try_from(start + quantum.rows as u64)
             .map_err(|_| fatal(format!("{} keys exceed a launch", start + quantum.rows as u64)))?;
         let scratch = if takes_decode_scratch(quantum.kind, quantum.rows) {
-            let scratch = &quantum.seq.device().scratch;
+            let scratch = &quantum.segment().refs.device().scratch;
             if quantum.rows as u64 > scratch.decode_rows() {
                 return Err(fatal(format!(
                     "{} attention rows exceed the {} the decode scratch holds",
