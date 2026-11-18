@@ -27,13 +27,14 @@ pub mod sampling;
 pub mod unmarked;
 
 use std::fmt::{self, Display};
+use std::iter::repeat_n;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use euhedral_gpu::cuda::CudaQueue;
 use euhedral_gpu::{GpuError, Lane};
-use euhedral_graph::{DeviceQueue, LaneId, LanePool, Marker, Stage, StageCx, StageError, Submitted};
+use euhedral_graph::{DeviceQueue, LaneId, LanePool, Marker, QuantumOutcome, Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::launch::Modes;
 use euhedral_inference_cuda::launch::load::KernelTable;
 use euhedral_inference_cuda::launch::ops::RusteeOps;
@@ -45,9 +46,10 @@ use crate::error::EngineError;
 use crate::model::ModelConfig;
 use crate::quantum::Capture;
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
-use crate::state::{FlightGuard, KvView, SequenceDevice};
-use crate::workspace::{BufferSlot, Workspace, WorkspaceError};
+use crate::state::{FlightGuard, KvView, SequenceDevice, SequenceId};
+use crate::workspace::{BufferSlot, Workspace, WorkspaceError, input_record_bytes};
 use attention::KvSource;
+use euhedral_inference_settings::KvFormat;
 use sampling::{RowReadback, Selection, SelectionLease};
 pub use unmarked::Unmarked;
 
@@ -317,11 +319,16 @@ impl SequenceRefs {
 }
 
 /// One sequence's part of a quantum: its rows, where they start in the sequence and in the quantum's rows, and what its
-/// stages read and fill. A quantum has one segment today.
+/// stages read and fill. A quantum of one sequence has one segment; a batch has one per sequence.
 #[derive(Debug)]
 pub struct Segment {
+    /// The segment's place among the quantum's segments: the input record keeps its start position in the slot of
+    /// this number.
+    pub(crate) index: usize,
     /// The sequence the segment's rows belong to, as its stages read it.
     pub(crate) refs: SequenceRefs,
+    /// The sequence's number, for a segment of a batch ([`Quantum::batch`]); a quantum of one sequence does not name it.
+    pub(crate) sequence: Option<SequenceId>,
     /// The position of the segment's first row in its sequence.
     pub(crate) start_position: u64,
     /// The segment's rows.
@@ -340,6 +347,10 @@ pub struct Segment {
     pub(crate) draft_token_read: Option<usize>,
     /// Whether the base rows' post-final-norm hidden also seed the sequence's drafting.
     pub(crate) seeds_draft: bool,
+    /// The rows the segment commits, when its owner knows them before the quantum runs ([`Part::committing`]); else all.
+    pub(crate) committed: Option<usize>,
+    /// Set when the segment's request was cancelled: the segment's rows are then not committed ([`Part::cancelled_by`]).
+    pub(crate) cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Segment {
@@ -361,7 +372,9 @@ impl Segment {
     /// The segment of `rows` rows starting at `start_position`, whose rows are the quantum's first.
     fn new(refs: SequenceRefs, start_position: u64, rows: usize) -> Self {
         Self {
+            index: 0,
             refs,
+            sequence: None,
             start_position,
             rows,
             row_offset: 0,
@@ -370,7 +383,281 @@ impl Segment {
             row_readback: None,
             draft_token_read: None,
             seeds_draft: false,
+            committed: None,
+            cancel: None,
         }
+    }
+
+    /// The segment's place among the quantum's segments.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// The words and readback the segment's argmax fills, if its rows select on the device.
+    pub fn selection(&self) -> Option<&Arc<Selection>> {
+        self.selection.as_ref()
+    }
+
+    /// The readback the segment's logits rows are copied to, if the host selects.
+    pub fn row_readback(&self) -> Option<&Arc<RowReadback>> {
+        self.row_readback.as_ref()
+    }
+
+    /// The sequence of the segment, when the quantum is a batch.
+    pub fn sequence(&self) -> Option<SequenceId> {
+        self.sequence
+    }
+
+    /// Whether the segment's request was cancelled.
+    pub fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+}
+
+/// One sequence's share of a batch ([`Quantum::batch`]): the rows it verifies, with what its segment of the quantum
+/// reads and writes.
+#[derive(Debug)]
+pub struct Part {
+    refs: SequenceRefs,
+    sequence: SequenceId,
+    start_position: u64,
+    tokens: Vec<u32>,
+    selection: Option<Arc<Selection>>,
+    lease: Option<SelectionLease>,
+    row_readback: Option<Arc<RowReadback>>,
+    draft_token_read: Option<usize>,
+    seeds_draft: bool,
+    committed: Option<usize>,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl Part {
+    /// A part of `sequence`: its rows are `tokens`, from `start_position` on, over `refs`.
+    pub fn new(refs: SequenceRefs, sequence: SequenceId, start_position: u64, tokens: Vec<u32>) -> Self {
+        Self {
+            refs,
+            sequence,
+            start_position,
+            tokens,
+            selection: None,
+            lease: None,
+            row_readback: None,
+            draft_token_read: None,
+            seeds_draft: false,
+            committed: None,
+            cancel: None,
+        }
+    }
+
+    /// The part's rows select on the device, into `selection`.
+    pub fn selecting(mut self, selection: Arc<Selection>) -> Self {
+        self.selection = Some(selection);
+        self
+    }
+
+    /// The part's rows select on the device, into a selection leased from its sequence's pool.
+    pub fn selecting_leased(mut self, lease: SelectionLease) -> Self {
+        self.selection = Some(Arc::clone(lease.selection()));
+        self.lease = Some(lease);
+        self
+    }
+
+    /// The part's logits rows are copied to `readback`, and the host selects.
+    pub fn reading_rows(mut self, readback: Arc<RowReadback>) -> Self {
+        self.row_readback = Some(readback);
+        self
+    }
+
+    /// The part's rows read their token ids from the step's tokens from `slot` on ([`Quantum::reading_draft_tokens`]).
+    pub fn reading_draft_tokens(mut self, slot: usize) -> Result<Self, QuantumError> {
+        let end = slot + self.tokens.len();
+        if end as u64 > DRAFT_TOKEN_SLOTS {
+            return Err(QuantumError::DraftTokenSlots { slot, end });
+        }
+        if self.refs.device().scratch.draft().is_none() {
+            return Err(QuantumError::NoDraftBuffers {
+                what: "reading the step's tokens",
+            });
+        }
+        self.draft_token_read = Some(slot);
+        Ok(self)
+    }
+
+    /// The part's post-final-norm hidden rows also seed its sequence's drafting ([`Quantum::seeding_draft`]).
+    pub fn seeding_draft(mut self) -> Result<Self, QuantumError> {
+        let draft = self.refs.device().scratch.draft().ok_or(QuantumError::NoDraftBuffers {
+            what: "seeding drafting",
+        })?;
+        if self.tokens.len() as u64 > draft.seed_capacity {
+            return Err(QuantumError::DraftSeedRows {
+                first: 0,
+                rows: self.tokens.len(),
+                capacity: draft.seed_capacity,
+            });
+        }
+        self.seeds_draft = true;
+        Ok(self)
+    }
+
+    /// The part commits `rows` of its rows, the prefix its owner knows it will accept, not all of them
+    /// ([`Quantum::committed_rows`]).
+    pub fn committing(mut self, rows: usize) -> Result<Self, QuantumError> {
+        if rows > self.tokens.len() {
+            return Err(QuantumError::Invalid {
+                what: format!("{rows} committed rows of a part of {}", self.tokens.len()),
+            });
+        }
+        self.committed = Some(rows);
+        Ok(self)
+    }
+
+    /// The part's request is cancelled once `flag` is set: its segment then concludes as cancelled and commits
+    /// nothing, and the other segments are not affected ([`Quantum::conclusion_for`]).
+    pub fn cancelled_by(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(flag);
+        self
+    }
+
+    /// The sequence the part belongs to.
+    pub fn sequence(&self) -> SequenceId {
+        self.sequence
+    }
+
+    /// The part's rows.
+    pub fn rows(&self) -> usize {
+        self.tokens.len()
+    }
+
+    fn shape(&self) -> Shape {
+        Shape {
+            sequence: self.sequence,
+            rows: self.tokens.len(),
+            kv_format: self.refs.kv(KvSource::Base).map(KvView::format),
+            logits: match (&self.selection, &self.row_readback) {
+                (Some(_), None) => LogitsUse::Device,
+                (None, Some(_)) => LogitsUse::Host,
+                (None, None) => LogitsUse::None,
+                (Some(_), Some(_)) => LogitsUse::Both,
+            },
+            selection: self.selection.as_ref().map(|selection| Arc::as_ptr(selection) as usize),
+            readback: self
+                .row_readback
+                .as_ref()
+                .map(|readback| Arc::as_ptr(readback) as usize),
+        }
+    }
+}
+
+/// How a part's logits rows leave the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogitsUse {
+    None,
+    Device,
+    Host,
+    Both,
+}
+
+/// What [`lay_out`] needs to know of a part.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Shape {
+    pub sequence: SequenceId,
+    pub rows: usize,
+    pub kv_format: Option<KvFormat>,
+    pub logits: LogitsUse,
+    pub selection: Option<usize>,
+    pub readback: Option<usize>,
+}
+
+/// The first row of each part of a batch, the total rows and whether the rows are scored, or why the parts cannot
+/// be one quantum. `record_bytes` is what one input record of the workspace holds.
+pub(crate) fn lay_out(shapes: &[Shape], record_bytes: u64) -> Result<(Vec<usize>, usize, bool), QuantumError> {
+    if shapes.is_empty() {
+        return Err(QuantumError::EmptyBatch);
+    }
+    let mut offsets = Vec::with_capacity(shapes.len());
+    let mut total = 0usize;
+    for (index, shape) in shapes.iter().enumerate() {
+        if shape.rows == 0 {
+            return Err(QuantumError::EmptyPart { part: index });
+        }
+        if shape.logits == LogitsUse::Both {
+            return Err(QuantumError::Invalid {
+                what: format!("part {index} both selects on the device and reads its rows back"),
+            });
+        }
+        if let Some(first) = shapes[..index]
+            .iter()
+            .position(|other| other.sequence == shape.sequence)
+        {
+            return Err(QuantumError::DuplicateSequence {
+                sequence: shape.sequence,
+                first,
+                second: index,
+            });
+        }
+        offsets.push(total);
+        total += shape.rows;
+    }
+    let first = shapes[0].logits;
+    if let Some(other) = shapes.iter().position(|shape| shape.logits != first) {
+        return Err(QuantumError::MixedLogits { first: 0, other });
+    }
+    let formats: Vec<(usize, KvFormat)> = shapes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, shape)| Some((index, shape.kv_format?)))
+        .collect();
+    if let Some(&(first_part, format)) = formats.first()
+        && let Some(&(other, _)) = formats.iter().find(|(_, other)| *other != format)
+    {
+        return Err(QuantumError::KvFormatMismatch {
+            first: first_part,
+            other,
+        });
+    }
+    for (index, shape) in shapes.iter().enumerate() {
+        let shared = shapes[..index].iter().position(|other| {
+            (shape.selection.is_some() && other.selection == shape.selection)
+                || (shape.readback.is_some() && other.readback == shape.readback)
+        });
+        if let Some(first) = shared {
+            return Err(QuantumError::SharedLogitsBuffer { first, second: index });
+        }
+    }
+    let need = InputRecordRef::position_offset(total) + 8 * shapes.len() as u64;
+    if need > record_bytes {
+        return Err(QuantumError::InputRecord {
+            need,
+            have: record_bytes,
+        });
+    }
+    Ok((offsets, total, first != LogitsUse::None))
+}
+
+/// How one segment of a batch ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The quantum ran and the segment's request still stands: its owner reads the rows and commits.
+    Completed,
+    /// The segment's request was cancelled (or the quantum was killed): nothing of it is committed.
+    Cancelled,
+    /// The quantum failed.
+    Failed(String),
+}
+
+/// How a segment concludes when its quantum ended as `outcome` and the segment's request `cancelled` or not. A
+/// member's cancel changes its own conclusion only.
+pub(crate) fn conclude(outcome: &QuantumOutcome, cancelled: bool) -> Outcome {
+    match outcome {
+        QuantumOutcome::Completed if cancelled => Outcome::Cancelled,
+        QuantumOutcome::Completed => Outcome::Completed,
+        QuantumOutcome::Killed if cancelled => Outcome::Cancelled,
+        // A member that still wanted its rows has a half-advanced state: the quantum stopped under it.
+        QuantumOutcome::Killed => {
+            Outcome::Failed("the quantum was killed before the segment's request was cancelled".to_string())
+        }
+        QuantumOutcome::Failed { stage, error } => Outcome::Failed(format!("stage {stage:?} failed: {error:?}")),
+        QuantumOutcome::DeviceFailed { cause } => Outcome::Failed(format!("the device work failed: {cause}")),
     }
 }
 
@@ -401,6 +688,28 @@ pub enum QuantumError {
     TokenCount { given: usize, rows: usize },
     #[error("token id {id} at row {row} is outside the vocabulary of {vocabulary}")]
     TokenOutsideVocabulary { id: u32, row: usize, vocabulary: usize },
+    #[error("a batch of no parts")]
+    EmptyBatch,
+    #[error("part {part} of the batch has no rows")]
+    EmptyPart { part: usize },
+    #[error("parts {first} and {second} of the batch are both sequence {}", sequence.0)]
+    DuplicateSequence {
+        sequence: SequenceId,
+        first: usize,
+        second: usize,
+    },
+    #[error(
+        "part {other} of the batch scores its rows differently from part {first}: all select on the device, all read back, or none scores"
+    )]
+    MixedLogits { first: usize, other: usize },
+    #[error("part {other} of the batch has a cache in another format than part {first}")]
+    KvFormatMismatch { first: usize, other: usize },
+    #[error("parts {first} and {second} of the batch score into the same buffer")]
+    SharedLogitsBuffer { first: usize, second: usize },
+    #[error("the batch's input record takes {need} bytes, and the workspace's records hold {have}")]
+    InputRecord { need: u64, have: u64 },
+    #[error("segment {segment} of a quantum of {segments}")]
+    SegmentOutOfRange { segment: usize, segments: usize },
     #[error("{what}")]
     Invalid { what: String },
 }
@@ -423,6 +732,8 @@ pub struct Quantum {
     /// The latest marker of a failed submission on each lane: work with no marker of the quantum's recorded work
     /// behind it, which the home lane is ordered behind when the quantum is abandoned (see [`unmarked`]).
     pub(crate) unmarked: Unmarked,
+    /// The first use of a builder for one sequence on a quantum of several: `validate` refuses the quantum.
+    misuse: Option<String>,
     /// Logits rows the quantum scores: the rows of its final norm, its head and its selection.
     pub(crate) logits_rows: usize,
     pub(crate) draft_seed: Option<DraftSeed>,
@@ -459,7 +770,7 @@ impl Quantum {
 
     /// The quantum's one segment: what the callers of a quantum of one sequence read.
     pub(crate) fn segment(&self) -> &Segment {
-        debug_assert_eq!(
+        assert_eq!(
             self.segments.len(),
             1,
             "a quantum of several sequences has no one segment"
@@ -469,7 +780,7 @@ impl Quantum {
     }
 
     fn segment_mut(&mut self) -> &mut Segment {
-        debug_assert_eq!(
+        assert_eq!(
             self.segments.len(),
             1,
             "a quantum of several sequences has no one segment"
@@ -520,6 +831,7 @@ impl Quantum {
             mode,
             config,
             unmarked: Unmarked::new(lanes.len()),
+            misuse: None,
             lanes,
             logits_rows,
             record: 0,
@@ -535,8 +847,178 @@ impl Quantum {
         })
     }
 
+    /// One verification of several sequences at once: a row-exact quantum with one segment per part, its rows the
+    /// parts' rows in order. The stages that read or write a sequence's state run once per segment; the linears and
+    /// the norms run once over all rows, so the weights are read once. Refused when two parts are one sequence, when
+    /// the parts do not all select on the device, all read back or all stay unscored, when their caches differ in
+    /// format, when two parts score into one buffer, or when the workspace's input records or logits cannot hold
+    /// the rows. A batch is not captured: it runs stage by stage.
+    pub fn batch(
+        parts: Vec<Part>,
+        workspace: Arc<Workspace>,
+        mode: SubmitMode,
+        config: Arc<ModelConfig>,
+        lanes: LaneTable,
+    ) -> Result<Self, QuantumError> {
+        let shapes: Vec<Shape> = parts.iter().map(Part::shape).collect();
+        let record_bytes = input_record_bytes(workspace.rows().rows);
+        let (offsets, rows, scored) = lay_out(&shapes, record_bytes)?;
+        // Two parts that are one sequence under different ids still share its device buffers.
+        let buffers: Vec<Vec<AllocationId>> = parts
+            .iter()
+            .map(|part| {
+                let mut ids = Vec::new();
+                part.refs.device().generations(&mut ids);
+                ids
+            })
+            .collect();
+        for (second, ids) in buffers.iter().enumerate() {
+            if let Some(first) = buffers[..second]
+                .iter()
+                .position(|other| other.iter().any(|id| ids.contains(id)))
+            {
+                return Err(QuantumError::DuplicateSequence {
+                    sequence: shapes[second].sequence,
+                    first,
+                    second,
+                });
+            }
+        }
+        if !mode.row_exact {
+            return Err(QuantumError::RowExact {
+                kind: QuantumKind::Verify,
+                expected: true,
+                given: false,
+            });
+        }
+        workspace.view(rows as u64)?;
+        let logits_rows = if scored { rows } else { 0 };
+        workspace.rows().check_logits(logits_rows as u64)?;
+        let mut tokens = Vec::with_capacity(rows);
+        let mut segments = SmallVec::new();
+        for (index, (part, row_offset)) in parts.into_iter().zip(offsets).enumerate() {
+            if let Some((row, id)) = part
+                .tokens
+                .iter()
+                .enumerate()
+                .find(|(_, id)| part.draft_token_read.is_none() && **id as usize >= config.vocab_size)
+            {
+                return Err(QuantumError::TokenOutsideVocabulary {
+                    id: *id,
+                    row: row_offset + row,
+                    vocabulary: config.vocab_size,
+                });
+            }
+            let part_rows = part.tokens.len();
+            if part.draft_token_read.is_some() {
+                tokens.extend(repeat_n(0u32, part_rows));
+            } else {
+                tokens.extend_from_slice(&part.tokens);
+            }
+            let mut segment = Segment::new(part.refs, part.start_position, part_rows);
+            segment.index = index;
+            segment.sequence = Some(part.sequence);
+            segment.row_offset = row_offset;
+            segment.selection = part.selection;
+            segment.lease = part.lease;
+            segment.row_readback = part.row_readback;
+            segment.draft_token_read = part.draft_token_read;
+            segment.seeds_draft = part.seeds_draft;
+            segment.committed = part.committed;
+            segment.cancel = part.cancel;
+            segments.push(segment);
+        }
+        Ok(Self {
+            id: NEXT_QUANTUM.fetch_add(1, Ordering::Relaxed),
+            kind: QuantumKind::Verify,
+            rows,
+            workspace,
+            segments,
+            mode,
+            config,
+            unmarked: Unmarked::new(lanes.len()),
+            misuse: None,
+            lanes,
+            logits_rows,
+            record: 0,
+            token_from: None,
+            draft_seed: None,
+            draft_token_write: None,
+            writes_current_token: false,
+            tokens,
+            staging: None,
+            uploaded: false,
+            prepared: None,
+            capture: None,
+        })
+    }
+
+    /// How segment `segment` ended, when the quantum ended as `outcome`: a segment whose request was cancelled
+    /// concludes as cancelled, and the other segments of the quantum conclude as they would alone.
+    pub fn conclusion_for(&self, segment: usize, outcome: &QuantumOutcome) -> Result<Outcome, QuantumError> {
+        Ok(conclude(outcome, self.segment_at(segment)?.cancelled()))
+    }
+
+    /// The rows segment `segment` commits when it completes: the rows its part named ([`Part::committing`]), else
+    /// all of them. The owner commits only for a segment that concluded as [`Outcome::Completed`].
+    pub fn committed_rows(&self, segment: usize) -> Result<usize, QuantumError> {
+        let segment = self.segment_at(segment)?;
+        Ok(segment.committed.unwrap_or(segment.rows))
+    }
+
+    /// Whether every segment's request was cancelled, so that nothing of the quantum is wanted: the only case in which
+    /// the quantum as a whole may be stopped. The executor takes one `Arc<AtomicBool>` as its kill flag, which is no
+    /// member's own flag: the pass that runs the batch owns a flag of its own and sets it when this turns true.
+    pub fn stop_requested(&self) -> bool {
+        self.segments.iter().all(Segment::cancelled)
+    }
+
+    /// Whether the quantum has one segment, which the builders and accessors of one sequence need.
+    fn single(&self) -> bool {
+        self.segments.len() == 1
+    }
+
+    /// Refuses a builder of one sequence on a quantum of several: `Err` for those that can return it.
+    fn require_single(&self, what: &'static str) -> Result<(), QuantumError> {
+        if self.single() {
+            Ok(())
+        } else {
+            Err(QuantumError::Invalid {
+                what: format!(
+                    "{what} is for a quantum of one sequence; this one has {}",
+                    self.segments.len()
+                ),
+            })
+        }
+    }
+
+    /// Notes a builder of one sequence used on a quantum of several, which cannot return the error: `validate`
+    /// refuses the quantum.
+    fn note_single(&mut self, what: &'static str) -> bool {
+        if let Err(error) = self.require_single(what) {
+            self.misuse.get_or_insert_with(|| error.to_string());
+            return false;
+        }
+        true
+    }
+
+    /// The refusal of a builder that was used on a quantum of several sequences, if any.
+    pub(crate) fn misuse(&self) -> Option<&str> {
+        self.misuse.as_deref()
+    }
+
+    fn segment_at(&self, segment: usize) -> Result<&Segment, QuantumError> {
+        self.segments.get(segment).ok_or(QuantumError::SegmentOutOfRange {
+            segment,
+            segments: self.segments.len(),
+        })
+    }
+
     /// Scores `rows` logits rows instead (0: none, a prefill chunk that is not the last).
     pub fn with_logits_rows(mut self, rows: usize) -> Result<Self, WorkspaceError> {
+        if !self.note_single("scoring a number of logits rows") {
+            return Ok(self);
+        }
         self.workspace.rows().check_logits(rows as u64)?;
         self.logits_rows = rows;
         Ok(self)
@@ -545,6 +1027,7 @@ impl Quantum {
     /// The base rows' post-final-norm hidden also seed the sequence's drafting. Refused for a draft quantum, which
     /// does not seed itself, and for rows the sequence's draft seed rows cannot hold.
     pub fn seeding_draft(mut self) -> Result<Self, QuantumError> {
+        self.require_single("seeding drafting")?;
         if self.kind == QuantumKind::Draft {
             return Err(QuantumError::DraftSeedsItself);
         }
@@ -572,6 +1055,7 @@ impl Quantum {
     /// and for seed rows of the sequence that its rows would run past.
     pub fn with_draft_seed(mut self, seed: DraftSeed) -> Result<Self, QuantumError> {
         self.require_draft("takes a draft seed")?;
+        self.require_single("a draft seed")?;
         if let DraftSeed::SeedRow(first) = seed {
             let draft = self
                 .segment()
@@ -635,6 +1119,7 @@ impl Quantum {
     }
 
     fn require_draft_buffers(&self, what: &'static str) -> Result<(), QuantumError> {
+        self.require_single(what)?;
         if self.segment().refs.device().scratch.draft().is_some() {
             Ok(())
         } else {
@@ -653,6 +1138,7 @@ impl Quantum {
     /// the chain, on the device: no id is uploaded, and the host need not have read the token. The quantum's first
     /// stage runs behind the earlier quantum's last (the chain's edge), which has written the keys.
     pub fn token_from(mut self, selection: Arc<Selection>) -> Result<Self, QuantumError> {
+        self.require_single("a token chained from the quantum before")?;
         if self.rows != 1 || self.segment().draft_token_read.is_some() {
             return Err(QuantumError::Invalid {
                 what: format!(
@@ -668,28 +1154,34 @@ impl Quantum {
 
     /// The device words and readback the quantum's argmax fills.
     pub fn with_selection(mut self, selection: Arc<Selection>) -> Self {
-        self.segment_mut().selection = Some(selection);
+        if self.note_single("a selection of the quantum") {
+            self.segment_mut().selection = Some(selection);
+        }
         self
     }
 
     /// The quantum copies its logits row to `readback` inside its graph instead of selecting on the device: the host
     /// selects from the row once the quantum retired.
     pub fn with_row_readback(mut self, readback: Arc<RowReadback>) -> Self {
-        self.segment_mut().row_readback = Some(readback);
+        if self.note_single("a row readback of the quantum") {
+            self.segment_mut().row_readback = Some(readback);
+        }
         self
     }
 
     /// The readback the quantum's logits row is copied to, if the host selects.
     pub fn row_readback(&self) -> Option<&Arc<RowReadback>> {
-        self.segment().row_readback.as_ref()
+        self.segment_of_one()?.row_readback.as_ref()
     }
 
     /// The words and readback of a selection leased from the sequence's pool: the quantum holds the lease until it is
     /// dropped, so no other quantum is given the words before the owner has read the keys.
     pub fn with_selection_lease(mut self, lease: SelectionLease) -> Self {
-        let segment = self.segment_mut();
-        segment.selection = Some(Arc::clone(lease.selection()));
-        segment.lease = Some(lease);
+        if self.note_single("a selection lease of the quantum") {
+            let segment = self.segment_mut();
+            segment.selection = Some(Arc::clone(lease.selection()));
+            segment.lease = Some(lease);
+        }
         self
     }
 
@@ -746,12 +1238,17 @@ impl Quantum {
     /// The allocation serial of layer `layer`'s page table in the cache `source` as of admission: part of the key
     /// of a captured graph that reads the table.
     pub fn table_generation(&self, source: KvSource, layer: usize) -> Option<AllocationId> {
-        self.segment().refs.kv(source)?.table_generation(layer)
+        self.segment_of_one()?.refs.kv(source)?.table_generation(layer)
     }
 
     /// The words and readback the quantum's argmax fills, if it selects.
     pub fn selection(&self) -> Option<&Arc<Selection>> {
-        self.segment().selection.as_ref()
+        self.segment_of_one()?.selection.as_ref()
+    }
+
+    /// The quantum's one segment, or none for a quantum of several sequences (read each through `segments`).
+    fn segment_of_one(&self) -> Option<&Segment> {
+        self.single().then(|| &self.segments[0])
     }
 
     /// The device address of `slot`; for the input record, the one this quantum uploads to.
@@ -762,10 +1259,11 @@ impl Quantum {
         self.workspace.buffer(slot).ptr()
     }
 
-    /// The device address of the start position in the input record.
-    pub(crate) fn position(&self) -> DevicePtr {
+    /// The device address of the start position of segment `index` in the input record: the positions follow the
+    /// token ids, one slot per segment.
+    pub(crate) fn position_of(&self, index: usize) -> DevicePtr {
         self.slot(BufferSlot::TokenIds)
-            .offset(InputRecordRef::position_offset(self.rows))
+            .offset(InputRecordRef::position_offset(self.rows) + 8 * index as u64)
     }
 
     /// The epsilon of the norms, as the kernels take it.
@@ -1047,6 +1545,144 @@ mod tests {
         assert_eq!(InputRecordRef::position_offset(2), 8);
         assert_eq!(InputRecordRef::position_offset(3), 16);
         assert_eq!(InputRecordRef::position_offset(512), 2048);
+    }
+
+    fn shape(sequence: usize, rows: usize) -> Shape {
+        Shape {
+            sequence: SequenceId(sequence),
+            rows,
+            kv_format: Some(KvFormat::Nvfp4),
+            logits: LogitsUse::Device,
+            selection: Some(0x1000 + sequence),
+            readback: None,
+        }
+    }
+
+    const RECORD: u64 = 4096;
+
+    #[test]
+    fn the_segments_of_a_batch_follow_one_another_in_row_order() {
+        let (offsets, total, scored) = lay_out(&[shape(0, 5), shape(1, 8), shape(2, 3)], RECORD).unwrap();
+        assert_eq!((offsets, total, scored), (vec![0, 5, 13], 16, true));
+        let (offsets, total, _) = lay_out(&[shape(4, 1)], RECORD).unwrap();
+        assert_eq!((offsets, total), (vec![0], 1), "one part is a single segment");
+    }
+
+    #[test]
+    fn a_batch_of_unscored_parts_scores_no_rows() {
+        let unscored = |sequence, rows| Shape {
+            logits: LogitsUse::None,
+            selection: None,
+            ..shape(sequence, rows)
+        };
+        assert!(!lay_out(&[unscored(0, 2), unscored(1, 2)], RECORD).unwrap().2);
+    }
+
+    #[test]
+    fn a_batch_refuses_nothing_or_an_empty_part() {
+        assert_eq!(lay_out(&[], RECORD), Err(QuantumError::EmptyBatch));
+        assert_eq!(
+            lay_out(&[shape(0, 2), shape(1, 0)], RECORD),
+            Err(QuantumError::EmptyPart { part: 1 })
+        );
+    }
+
+    #[test]
+    fn a_batch_refuses_one_sequence_twice() {
+        assert_eq!(
+            lay_out(&[shape(3, 2), shape(5, 2), shape(3, 1)], RECORD),
+            Err(QuantumError::DuplicateSequence {
+                sequence: SequenceId(3),
+                first: 0,
+                second: 2
+            })
+        );
+    }
+
+    #[test]
+    fn a_batch_refuses_parts_that_score_differently() {
+        let host = |sequence, rows| Shape {
+            logits: LogitsUse::Host,
+            selection: None,
+            readback: Some(0x2000 + sequence),
+            ..shape(sequence, rows)
+        };
+        assert_eq!(
+            lay_out(&[shape(0, 2), host(1, 2)], RECORD),
+            Err(QuantumError::MixedLogits { first: 0, other: 1 })
+        );
+        let unscored = Shape {
+            logits: LogitsUse::None,
+            selection: None,
+            ..shape(2, 2)
+        };
+        assert_eq!(
+            lay_out(&[host(0, 2), host(1, 2), unscored], RECORD),
+            Err(QuantumError::MixedLogits { first: 0, other: 2 })
+        );
+        assert!(lay_out(&[host(0, 2), host(1, 2)], RECORD).is_ok());
+    }
+
+    #[test]
+    fn a_batch_refuses_caches_of_different_formats() {
+        let bf16 = Shape {
+            kv_format: Some(KvFormat::Bf16),
+            ..shape(1, 2)
+        };
+        assert_eq!(
+            lay_out(&[shape(0, 2), bf16], RECORD),
+            Err(QuantumError::KvFormatMismatch { first: 0, other: 1 })
+        );
+    }
+
+    #[test]
+    fn a_batch_refuses_parts_that_score_into_one_buffer() {
+        let same = Shape {
+            selection: shape(0, 2).selection,
+            ..shape(1, 2)
+        };
+        assert_eq!(
+            lay_out(&[shape(0, 2), same], RECORD),
+            Err(QuantumError::SharedLogitsBuffer { first: 0, second: 1 })
+        );
+    }
+
+    #[test]
+    fn a_batch_refuses_rows_whose_positions_do_not_fit_the_input_record() {
+        // 24 ids are 96 bytes, then three positions: 120 bytes.
+        let parts = [shape(0, 8), shape(1, 8), shape(2, 8)];
+        assert!(lay_out(&parts, 120).is_ok());
+        assert_eq!(
+            lay_out(&parts, 119),
+            Err(QuantumError::InputRecord { need: 120, have: 119 })
+        );
+    }
+
+    #[test]
+    fn a_cancelled_member_concludes_cancelled_and_the_others_complete() {
+        let flags = [false, true, false];
+        let conclusions: Vec<Outcome> = flags
+            .iter()
+            .map(|cancelled| conclude(&QuantumOutcome::Completed, *cancelled))
+            .collect();
+        assert_eq!(
+            conclusions,
+            vec![Outcome::Completed, Outcome::Cancelled, Outcome::Completed]
+        );
+    }
+
+    #[test]
+    fn a_failed_or_killed_quantum_concludes_every_segment_alike() {
+        let killed = QuantumOutcome::Killed;
+        assert!(
+            matches!(conclude(&killed, false), Outcome::Failed(_)),
+            "a member that still wanted its rows"
+        );
+        assert_eq!(conclude(&killed, true), Outcome::Cancelled);
+        let failed = QuantumOutcome::DeviceFailed { cause: "lost".into() };
+        for cancelled in [false, true] {
+            assert!(matches!(conclude(&failed, cancelled), Outcome::Failed(why) if why.contains("lost")));
+        }
     }
 
     #[test]

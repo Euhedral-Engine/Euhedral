@@ -97,7 +97,7 @@ impl RmsNormUnitOffset {
     }
 
     fn seeds(&self, quantum: &Quantum) -> bool {
-        self.rows == NormRows::Final && quantum.segment().seeds_draft
+        self.rows == NormRows::Final && quantum.segments().iter().any(|segment| segment.seeds_draft)
     }
 }
 
@@ -115,25 +115,32 @@ impl Launch for RmsNormUnitOffset {
         let row_bytes = hidden as u64 * 2;
         let covered = self.covered(quantum);
         let input = quantum.slot(self.input);
-        let draft = quantum.segment().refs.device().scratch.draft();
         if self.seeds(quantum) {
-            let draft = draft.ok_or_else(|| fatal("a quantum seeds drafting but the sequence has no draft buffers"))?;
-            if quantum.rows as u64 > draft.seed_capacity {
-                return Err(fatal(format!(
-                    "{} draft seed rows exceed the {} the sequence holds",
-                    quantum.rows, draft.seed_capacity
-                )));
+            // Each segment that seeds drafting normalizes its own rows into its own sequence's seed rows.
+            for segment in quantum.segments().iter().filter(|segment| segment.seeds_draft) {
+                let draft = segment
+                    .refs
+                    .device()
+                    .scratch
+                    .draft()
+                    .ok_or_else(|| fatal("a quantum seeds drafting but the sequence has no draft buffers"))?;
+                if segment.rows as u64 > draft.seed_capacity {
+                    return Err(fatal(format!(
+                        "{} draft seed rows exceed the {} the sequence holds",
+                        segment.rows, draft.seed_capacity
+                    )));
+                }
+                kernels
+                    .rms_norm_unit_offset_bf16(
+                        input.offset(segment.row_offset as u64 * row_bytes),
+                        self.weight,
+                        draft.seed_rows.ptr(),
+                        launch_u32(segment.rows, "the seed rows")?,
+                        width,
+                        quantum.epsilon(),
+                    )
+                    .map_err(fatal)?;
             }
-            kernels
-                .rms_norm_unit_offset_bf16(
-                    input,
-                    self.weight,
-                    draft.seed_rows.ptr(),
-                    quantum.rows_u32()?,
-                    width,
-                    quantum.epsilon(),
-                )
-                .map_err(fatal)?;
         }
         if covered == 0 {
             return Ok(());
@@ -153,8 +160,14 @@ impl Launch for RmsNormUnitOffset {
             .map_err(fatal)?;
         if self.rows == NormRows::Final && quantum.kind == QuantumKind::Draft {
             // The last MTP row's hidden seeds the next recursive draft row.
-            let draft =
-                draft.ok_or_else(|| fatal("a draft quantum's final norm needs the sequence's draft buffers"))?;
+            // A draft quantum is of one sequence.
+            let draft = quantum
+                .segment()
+                .refs
+                .device()
+                .scratch
+                .draft()
+                .ok_or_else(|| fatal("a draft quantum's final norm needs the sequence's draft buffers"))?;
             let last = (covered as u64 - 1) * row_bytes;
             kernels
                 .copy_device_to_device(draft.recursion_hidden.ptr(), output.offset(last), row_bytes)
