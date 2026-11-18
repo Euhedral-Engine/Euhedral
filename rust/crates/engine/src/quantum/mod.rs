@@ -314,7 +314,7 @@ impl Quantum {
                     SelectedRows::Last
                 }
             }),
-            seeds_draft: self.seeds_draft,
+            seeds_draft: self.segment().seeds_draft,
             draft_seed,
             draft_read: self.segment().draft_token_read.and_then(slot),
             draft_write: self

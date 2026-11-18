@@ -234,8 +234,8 @@ mod tests {
         }
     }
 
-    /// The keys a quantum of one segment builds for each kind, as the fields the builder fills, with the digests the
-    /// graph cache indexes them by. A change to what a key holds or how it is hashed changes a digest here.
+    /// Keys of the shapes the engine's quanta have, written out field by field. They pin how a key is hashed and
+    /// which fields it holds; the keys a quantum builds are pinned by the device test of the capture key of each kind.
     fn kind_keys() -> Vec<(&'static str, CaptureKey)> {
         let base = |view, kind, rows, logits| CaptureKey {
             view,
@@ -273,17 +273,7 @@ mod tests {
             reserved_host_pages: [0, 3],
             ..base(View::Draft { rows: 1 }, QuantumKind::Draft, 1, 1)
         };
-        let chunk = CaptureKey {
-            seeds_draft: true,
-            writes_current_token: true,
-            ..base(View::PrefillChunk, QuantumKind::Prefill, 8, 0)
-        };
-        vec![
-            ("decode", decode),
-            ("verify", verify),
-            ("draft", draft),
-            ("prefill chunk", chunk),
-        ]
+        vec![("decode", decode), ("verify", verify), ("draft", draft)]
     }
 
     #[test]
@@ -298,7 +288,6 @@ mod tests {
                 ("decode", 85177849790268152127576662262586288684u128),
                 ("verify", 70383358627103906696142758927274320253),
                 ("draft", 36910513905071537792162313324617904005),
-                ("prefill chunk", 30103246855718407928939939248021006827),
             ]
         );
     }

@@ -97,7 +97,7 @@ impl RmsNormUnitOffset {
     }
 
     fn seeds(&self, quantum: &Quantum) -> bool {
-        self.rows == NormRows::Final && quantum.seeds_draft
+        self.rows == NormRows::Final && quantum.segment().seeds_draft
     }
 }
 

@@ -338,6 +338,8 @@ pub struct Segment {
     pub(crate) row_readback: Option<Arc<RowReadback>>,
     /// The slot of the step's tokens this segment's rows read their token ids from, instead of the input record.
     pub(crate) draft_token_read: Option<usize>,
+    /// Whether the base rows' post-final-norm hidden also seed the sequence's drafting.
+    pub(crate) seeds_draft: bool,
 }
 
 impl Segment {
@@ -367,6 +369,7 @@ impl Segment {
             lease: None,
             row_readback: None,
             draft_token_read: None,
+            seeds_draft: false,
         }
     }
 }
@@ -422,8 +425,6 @@ pub struct Quantum {
     pub(crate) unmarked: Unmarked,
     /// Logits rows the quantum scores: the rows of its final norm, its head and its selection.
     pub(crate) logits_rows: usize,
-    /// Whether the base rows' post-final-norm hidden also seed the sequence's drafting.
-    pub(crate) seeds_draft: bool,
     pub(crate) draft_seed: Option<DraftSeed>,
     pub(crate) draft_token_write: Option<DraftTokenWrite>,
     /// Whether the quantum writes its last input token to slot 0 of the step's tokens as the step's current token.
@@ -458,11 +459,21 @@ impl Quantum {
 
     /// The quantum's one segment: what the callers of a quantum of one sequence read.
     pub(crate) fn segment(&self) -> &Segment {
+        debug_assert_eq!(
+            self.segments.len(),
+            1,
+            "a quantum of several sequences has no one segment"
+        );
         // A quantum is built with one segment, and nothing removes it.
         &self.segments[0]
     }
 
     fn segment_mut(&mut self) -> &mut Segment {
+        debug_assert_eq!(
+            self.segments.len(),
+            1,
+            "a quantum of several sequences has no one segment"
+        );
         &mut self.segments[0]
     }
 
@@ -513,7 +524,6 @@ impl Quantum {
             logits_rows,
             record: 0,
             token_from: None,
-            seeds_draft: false,
             draft_seed: None,
             draft_token_write: None,
             writes_current_token: false,
@@ -554,7 +564,7 @@ impl Quantum {
                 capacity: draft.seed_capacity,
             });
         }
-        self.seeds_draft = true;
+        self.segment_mut().seeds_draft = true;
         Ok(self)
     }
 
