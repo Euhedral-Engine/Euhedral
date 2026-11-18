@@ -10,6 +10,10 @@ pub enum TokenizerError {
         file: &'static str,
         source: serde_json::Error,
     },
+    /// The section holds no chat template: no `chat_template.jinja` text and no `chat_template` string in
+    /// `tokenizer_config.json`.
+    #[error("the tokenizer section has no chat template")]
+    NoChatTemplate,
     /// The tokenizer is not the byte-level BPE with NFC normalization that Qwen checkpoints use, or its metadata is
     /// inconsistent.
     #[error("unsupported tokenizer: {0}")]

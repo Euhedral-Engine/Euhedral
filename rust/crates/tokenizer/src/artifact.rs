@@ -40,11 +40,18 @@ fn read_range(file: &mut File, range: Range<u64>) -> io::Result<Vec<u8>> {
 
 /// Reads the tokenizer of the artifact at `path`: the one the engine's prompts are encoded with. Reads the file
 /// synchronously, so call it on a thread that may wait, before the engine starts.
+pub fn read_artifact_tokenizer(path: &Path) -> Result<Tokenizer, ArtifactTokenizerError> {
+    let section = read_artifact_section(path)?;
+    Tokenizer::from_section(&section).map_err(|error| fail("cannot build the tokenizer", &error))
+}
+
+/// Reads the tokenizer section of the artifact at `path`. Reads the file synchronously, so call it on a thread that
+/// may wait, before the engine starts.
 #[allow(
     clippy::disallowed_methods,
     reason = "blocking I/O at startup: the tokenizer section is read once, before the engine starts"
 )]
-pub fn read_artifact_tokenizer(path: &Path) -> Result<Tokenizer, ArtifactTokenizerError> {
+pub fn read_artifact_section(path: &Path) -> Result<TokenizerSection, ArtifactTokenizerError> {
     let mut file = File::open(path).map_err(|error| fail("cannot open the artifact", &error))?;
     let length = file
         .metadata()
@@ -67,6 +74,5 @@ pub fn read_artifact_tokenizer(path: &Path) -> Result<Tokenizer, ArtifactTokeniz
         .body_range(length)
         .map_err(|error| fail("bad tokenizer section", &error))?;
     let body = read_range(&mut file, range).map_err(|error| fail("cannot read the tokenizer section", &error))?;
-    let section = TokenizerSection::parse(body, &footer).map_err(|error| fail("bad tokenizer section", &error))?;
-    Tokenizer::from_section(&section).map_err(|error| fail("cannot build the tokenizer", &error))
+    TokenizerSection::parse(body, &footer).map_err(|error| fail("bad tokenizer section", &error))
 }
