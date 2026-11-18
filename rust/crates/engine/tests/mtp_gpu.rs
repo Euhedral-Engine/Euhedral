@@ -44,7 +44,7 @@ use typed::Typed;
 
 /// The longest a device test waits for one hand-off; past it the test fails.
 const WAIT: Duration = Duration::from_secs(20 * 60);
-use euhedral_inference_settings::{ModelSettings, Settings};
+use euhedral_inference_settings::{ByteSize, ModelSettings, Settings};
 use euhedral_inference_tokenizer::Tokenizer;
 
 /// Rows of a page of the caches.
@@ -72,6 +72,8 @@ fn start(machine: &Machine, max_tokens: u32) -> (Arc<EngineRuntime>, RuntimeOwne
     });
     settings.context.max_tokens = max_tokens;
     settings.kernels.graphs.captures_per_view = 8;
+    // These tests compare the state a run leaves, so each run must be cold: a prefix cache hit would restore the prompt.
+    settings.prefix_cache.size = ByteSize(0);
     let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
     (
         ready
