@@ -35,6 +35,7 @@
     reason = "no-wait, blocking I/O and waiting calls: a test reads files, runs the comparison script and waits on hand-offs"
 )]
 
+use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::mem;
@@ -47,7 +48,7 @@ use std::time::{Duration, Instant};
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
 use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, LogitsSink,
-    QuantumEvent, Speculation,
+    QuantumEvent, Speculation, Verification,
 };
 use euhedral_inference_engine::sampling::{SamplingConfig, TokenSampler};
 use euhedral_inference_engine::stages::QuantumKind;
@@ -163,6 +164,7 @@ struct Recording {
     tokens: Vec<u32>,
     token_times: Vec<Instant>,
     events: Vec<QuantumEvent>,
+    verifications: Vec<Verification>,
     prefill_done: Option<Instant>,
     outcome: GenerationOutcome,
     began: Instant,
@@ -172,6 +174,7 @@ struct Recorder {
     tokens: Vec<u32>,
     token_times: Vec<Instant>,
     events: Vec<QuantumEvent>,
+    verifications: Vec<Verification>,
     prefill_done: Option<Instant>,
     began: Instant,
     done: Option<Arc<Handoff<Recording>>>,
@@ -200,12 +203,17 @@ impl GenerationListener for Recorder {
         self.events.push(event);
     }
 
+    fn verification(&mut self, event: Verification) {
+        self.verifications.push(event);
+    }
+
     fn finished(&mut self, outcome: GenerationOutcome) {
         let done = self.done.take().expect("a generation finishes once");
         done.send(Recording {
             tokens: mem::take(&mut self.tokens),
             token_times: mem::take(&mut self.token_times),
             events: mem::take(&mut self.events),
+            verifications: mem::take(&mut self.verifications),
             prefill_done: self.prefill_done,
             outcome,
             began: self.began,
@@ -221,6 +229,7 @@ impl Drop for Recorder {
                 tokens: mem::take(&mut self.tokens),
                 token_times: mem::take(&mut self.token_times),
                 events: mem::take(&mut self.events),
+                verifications: mem::take(&mut self.verifications),
                 prefill_done: self.prefill_done,
                 outcome: dropped_outcome(),
                 began: self.began,
@@ -292,6 +301,7 @@ fn submit(
                 tokens: Vec::new(),
                 token_times: Vec::new(),
                 events: Vec::new(),
+                verifications: Vec::new(),
                 prefill_done: None,
                 began,
                 done: Some(Arc::clone(&done)),
@@ -438,6 +448,7 @@ fn a_stop_token_ends_the_generation_and_leaves_no_overshoot_in_the_sequence() {
                 tokens: Vec::new(),
                 token_times: Vec::new(),
                 events: Vec::new(),
+                verifications: Vec::new(),
                 prefill_done: None,
                 began: Instant::now(),
                 done: None,
@@ -896,6 +907,170 @@ fn together(
     (recordings, began.elapsed())
 }
 
+/// Sampled generation with the published settings gives the same tokens with speculation off and on (with drafts
+/// partly rejected among the verifications), and the same tokens when it shares passes with other sessions as when it
+/// runs alone; the seed is used.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn sampled_tokens_do_not_depend_on_speculation_or_on_the_sequences_sharing_a_pass() {
+    const NEW_TOKENS: u32 = 64;
+    let Some(machine) = machine() else { return };
+    let tokenizer = tokenizer(&machine.artifact);
+    let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
+        .iter()
+        .map(|text| tokenizer.encode_with_model_special_tokens(text).unwrap())
+        .collect();
+    let (runtime, owner) = start_with_sequences(&machine, SEQUENCES as u32);
+    let depth = runtime.plan().draft_depth;
+    assert!(depth > 0, "the artifact drafts");
+    let published = |seed: u64| SamplingConfig::new(1.0, 20, 0.95, seed, false).unwrap();
+    // Three sampled sessions and one greedy.
+    let settings: Vec<SamplingConfig> = (0..SEQUENCES)
+        .map(|index| {
+            if index < 3 {
+                published(11 + index as u64)
+            } else {
+                SamplingConfig::greedy(7)
+            }
+        })
+        .collect();
+    let run = |index: usize, speculation: Speculation, sampling: SamplingConfig| {
+        submit(&runtime, &prompts[index], NEW_TOKENS, &[], speculation, sampling, None)
+            .expect("the request is admitted")
+    };
+
+    let mut alone = Vec::new();
+    let (mut verified, mut accepted, mut partial) = (0, 0, 0);
+    for (index, sampling) in settings.iter().enumerate() {
+        let (sampling, index) = (*sampling, index);
+        let plain = run(index, Speculation::Off, sampling).wait(WAIT).unwrap();
+        let speculative = run(index, Speculation::Artifact, sampling).wait(WAIT).unwrap();
+        assert_eq!(
+            plain.tokens, speculative.tokens,
+            "request {index}: speculation changed the tokens"
+        );
+        if index < 3 {
+            verified += speculative.verifications.len();
+            accepted += speculative.verifications.iter().map(|v| v.accepted).sum::<usize>();
+            partial += speculative
+                .verifications
+                .iter()
+                .filter(|v| v.accepted > 0 && v.accepted < v.drafted)
+                .count();
+        }
+        alone.push(speculative);
+    }
+    println!(
+        "SAMPLED_PASSES depth {depth}: {verified} sampled verifications accepted {accepted} drafts, {partial} partly"
+    );
+    assert!(accepted > 0, "no sampled verification accepted a draft");
+    assert!(partial > 0, "no sampled verification was partially rejected");
+
+    // The seed is used.
+    let other = run(0, Speculation::Artifact, published(99)).wait(WAIT).unwrap();
+    assert_ne!(other.tokens, alone[0].tokens, "another seed gave the same tokens");
+
+    // Sharing passes changes no session's tokens.
+    let before = runtime.pass_statistics();
+    let together: Vec<_> = (0..SEQUENCES)
+        .map(|index| run(index, Speculation::Artifact, settings[index]))
+        .collect();
+    for (index, done) in together.into_iter().enumerate() {
+        let together = done.wait(WAIT).expect("the generation reports");
+        assert_eq!(
+            together.tokens, alone[index].tokens,
+            "session {index} changed when it shared passes"
+        );
+    }
+    let after = runtime.pass_statistics();
+    println!(
+        "SAMPLED_PASSES together: {} passes, {} verifications, {} batched, {} rows",
+        after.passes - before.passes,
+        after.segments - before.segments,
+        after.batched - before.batched,
+        after.rows - before.rows
+    );
+    assert!(after.batched > before.batched, "no verification was batched");
+    assert!(after.segments - before.segments > after.passes - before.passes);
+    owner.shutdown(runtime).expect("the engine shuts down clean");
+}
+
+/// The decode rates of speculative requests of 512 prompt tokens and 512 new tokens: one request on an engine of one
+/// sequence, one request alone on an engine of four, and four at once. Run it in a release build; it prints the rates.
+#[test]
+#[ignore = "a measurement: needs a GPU, the native library and the RCO artifact"]
+fn speculative_decode_rates_of_one_and_of_four_requests() {
+    const PROMPT_TOKENS: usize = 512;
+    const NEW_TOKENS: u32 = 512;
+    let Some(machine) = machine() else { return };
+    let tokenizer = tokenizer(&machine.artifact);
+    // Four different prompts of 512 tokens, from the texts the concurrent test uses.
+    let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let text = format!("{text} {}", CONCURRENT_PROMPTS[(index + 1) % SEQUENCES]);
+            let seed = tokenizer.encode_with_model_special_tokens(&text).unwrap();
+            seed.iter().copied().cycle().take(PROMPT_TOKENS).collect()
+        })
+        .collect();
+    let sampling = SamplingConfig::greedy(0);
+    let rate_of = |recordings: &[Recording]| -> f64 {
+        let first = recordings
+            .iter()
+            .map(|r| *r.token_times.first().unwrap())
+            .min()
+            .unwrap();
+        let last = recordings.iter().map(|r| *r.token_times.last().unwrap()).max().unwrap();
+        let tokens: usize = recordings.iter().map(|r| r.tokens.len() - 1).sum();
+        tokens as f64 / last.duration_since(first).as_secs_f64().max(1e-9)
+    };
+    let run = |runtime: &EngineRuntime, count: usize| -> Vec<Recording> {
+        let running: Vec<_> = prompts[..count]
+            .iter()
+            .map(|prompt| {
+                submit(runtime, prompt, NEW_TOKENS, &[], Speculation::Artifact, sampling, None)
+                    .expect("a sequence is idle for the request")
+            })
+            .collect();
+        running.into_iter().map(|done| done.wait(WAIT).unwrap()).collect()
+    };
+    // `EUHEDRAL_RATES_SEQUENCES` picks the engine (1 or 4 sequences) so that each measurement is a run of its own.
+    let only: Option<usize> = env::var("EUHEDRAL_RATES_SEQUENCES")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    for sequences in [1, SEQUENCES]
+        .into_iter()
+        .filter(|count| only.is_none_or(|only| only == *count))
+    {
+        let (runtime, owner) = start_with_sequences(&machine, sequences as u32);
+        assert!(runtime.plan().draft_depth > 0, "the artifact drafts");
+        let _ = run(&runtime, 1);
+        let alone = run(&runtime, 1);
+        println!(
+            "RATES engine of {sequences} sequence(s), one request alone: {:.1} tok/s",
+            decode_rate(&alone[0])
+        );
+        if sequences > 1 {
+            let _ = run(&runtime, SEQUENCES);
+            let before = runtime.pass_statistics();
+            let together = run(&runtime, SEQUENCES);
+            let after = runtime.pass_statistics();
+            let each: Vec<String> = together.iter().map(|r| format!("{:.1}", decode_rate(r))).collect();
+            println!(
+                "RATES {SEQUENCES} requests at once: {} tok/s each, {:.1} tok/s in all; {} passes held {} verifications, \
+                 {} batched",
+                each.join(" / "),
+                rate_of(&together),
+                after.passes - before.passes,
+                after.segments - before.segments,
+                after.batched - before.batched
+            );
+        }
+        owner.shutdown(runtime).expect("the engine shuts down clean");
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn concurrent_sequences_match_alone() {
@@ -917,6 +1092,7 @@ fn concurrent_sequences_match_alone() {
         ("sampled+speculation", Speculation::Artifact, &seeded),
     ];
     let mut alone_greedy = Vec::new();
+    let mut alone_speculative = Vec::new();
     for (name, speculation, sampling) in modes {
         let speculation = if speculation == Speculation::Artifact && runtime.plan().draft_depth == 0 {
             println!("{name}: skipped, the artifact has no draft layer");
@@ -937,7 +1113,20 @@ fn concurrent_sequences_match_alone() {
             .collect();
         // A round that is not measured: it records the graphs of the sequences that have not run yet.
         let _ = together(&runtime, &prompts, speculation, sampling, &[None; SEQUENCES]);
+        let before = runtime.pass_statistics();
         let (both, wall) = together(&runtime, &prompts, speculation, sampling, &[None; SEQUENCES]);
+        let passes = runtime.pass_statistics();
+        if speculation == Speculation::Artifact {
+            // The verifications of concurrent requests ran as shared passes.
+            let (ran, held, batched) = (
+                passes.passes - before.passes,
+                passes.segments - before.segments,
+                passes.batched - before.batched,
+            );
+            println!("PASSES {name}: {ran} passes held {held} verifications, {batched} of them batched");
+            assert!(batched > 0, "{name}: no verification was batched");
+            assert!(held > ran, "{name}: every pass held one verification");
+        }
         for (index, (alone, both)) in alone.iter().zip(&both).enumerate() {
             assert_eq!(both.outcome.reason, FinishReason::Length, "{name}: request {index}");
             assert_eq!(
@@ -965,6 +1154,8 @@ fn concurrent_sequences_match_alone() {
         );
         if name == "greedy" {
             alone_greedy = alone;
+        } else if name == "greedy+speculation" {
+            alone_speculative = alone;
         }
     }
 
@@ -990,6 +1181,31 @@ fn concurrent_sequences_match_alone() {
             cancelled[index].tokens, alone_greedy[index].tokens,
             "request {index} next to a cancel"
         );
+    }
+
+    // The same with speculation on: the cancelled member leaves its pass, and the others' verifications go on batched.
+    if !alone_speculative.is_empty() {
+        let before = runtime.pass_statistics();
+        let (cancelled, _) = together(
+            &runtime,
+            &prompts,
+            Speculation::Artifact,
+            &greedy,
+            &[None, Some(cancelled_at), None, None],
+        );
+        assert_eq!(cancelled[1].outcome.reason, FinishReason::Cancelled);
+        assert_eq!(
+            cancelled[1].tokens,
+            alone_speculative[1].tokens[..cancelled[1].tokens.len()]
+        );
+        for index in [0, 2, 3] {
+            assert_eq!(cancelled[index].outcome.reason, FinishReason::Length, "request {index}");
+            assert_eq!(
+                cancelled[index].tokens, alone_speculative[index].tokens,
+                "speculative request {index} next to a cancel"
+            );
+        }
+        assert!(runtime.pass_statistics().batched > before.batched);
     }
 
     // One of the four fails (its owner panics at the third admission, the hook that takes the first request): the
