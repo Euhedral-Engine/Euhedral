@@ -180,12 +180,13 @@ impl PromptCheckpoints {
         }
     }
 
-    /// Whether a checkpoint at `end` tokens of the prompt is wanted.
+    /// Whether a checkpoint at `end` tokens of the prompt is wanted. One at the prompt's end is not: a match always leaves
+    /// a token to prefill, so nothing would ever restore it.
     pub fn wants(&self, end: usize) -> bool {
         u32::try_from(end)
             .ok()
             .zip(u32::try_from(self.tokens.len()).ok())
-            .is_some_and(|(end, len)| self.cache.wants_checkpoint(end, len))
+            .is_some_and(|(end, len)| end < len && self.cache.wants_checkpoint(end, len))
     }
 
     /// The chunk that ends at `end` is admitted; `refs` are the references it was admitted with.

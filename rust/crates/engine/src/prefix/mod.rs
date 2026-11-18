@@ -38,4 +38,11 @@ mod fixtures;
 #[cfg(test)]
 mod layout_tests;
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "the answers of the cache are collected by the test through the closures it gave"
+)]
+mod prompt_tests;
+#[cfg(test)]
 mod tree_tests;

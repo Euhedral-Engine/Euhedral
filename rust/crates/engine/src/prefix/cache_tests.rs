@@ -20,13 +20,13 @@ use super::{
 use crate::generation::Spawn;
 use crate::state::SequenceId;
 
-const FORMAT: KvFormat = KvFormat::Nvfp4;
-const CHUNK: u32 = 512;
+pub(super) const FORMAT: KvFormat = KvFormat::Nvfp4;
+pub(super) const CHUNK: u32 = 512;
 const INTERVAL: u32 = 1024;
 const SHIFT: u32 = 40;
 
 /// A sequence's buffers, each a byte vector the address of a byte of leads to.
-struct Device {
+pub(super) struct Device {
     format: KvFormat,
     rows: u64,
     speculative: bool,
@@ -36,7 +36,7 @@ struct Device {
 }
 
 impl Device {
-    fn new(format: KvFormat, rows: u64) -> Arc<Device> {
+    pub(super) fn new(format: KvFormat, rows: u64) -> Arc<Device> {
         Arc::new(Device {
             format,
             rows,
@@ -65,7 +65,7 @@ impl Device {
     }
 
     /// Fills every buffer of `layout`'s checkpoint of `position` tokens with bytes only `salt` could have made.
-    fn fill(&self, layout: &CheckpointLayout, position: u32, salt: u8) {
+    pub(super) fn fill(&self, layout: &CheckpointLayout, position: u32, salt: u8) {
         for (index, copy) in everything(layout, position).iter().enumerate() {
             let at = (Device::id(copy.buffer) << SHIFT) + copy.offset;
             let bytes: Vec<u8> = (0..copy.bytes)
@@ -90,7 +90,7 @@ impl Device {
         buffer[from..from + bytes.len()].copy_from_slice(bytes);
     }
 
-    fn read(&self, at: u64, bytes: u64) -> Vec<u8> {
+    pub(super) fn read(&self, at: u64, bytes: u64) -> Vec<u8> {
         let memory = self.memory.lock().unwrap();
         let from = (at & ((1 << SHIFT) - 1)) as usize;
         let mut out = vec![0; bytes as usize];
@@ -156,14 +156,14 @@ impl HostArena for Host {
 }
 
 /// A cache over a device and a host arena, whose jobs wait for the test to run them.
-struct Rig {
-    cache: PrefixCacheHandle,
+pub(super) struct Rig {
+    pub(super) cache: PrefixCacheHandle,
     host: Arc<Host>,
-    layout: CheckpointLayout,
+    pub(super) layout: CheckpointLayout,
     jobs: Arc<Mutex<VecDeque<CopyJob>>>,
 }
 
-fn inline() -> Spawn {
+pub(super) fn inline() -> Spawn {
     Box::new(|work| {
         work();
         true
@@ -171,11 +171,11 @@ fn inline() -> Spawn {
 }
 
 impl Rig {
-    fn new(slots: u32) -> Rig {
+    pub(super) fn new(slots: u32) -> Rig {
         Rig::with(slots, 1 << 20)
     }
 
-    fn with(slots: u32, piece_bytes: u64) -> Rig {
+    pub(super) fn with(slots: u32, piece_bytes: u64) -> Rig {
         let layout = CheckpointLayout::new(&compact(), FORMAT).expect("a layout");
         let arena = arena(slots, layout.slot_bytes());
         let host = Arc::new(Host {
@@ -203,12 +203,12 @@ impl Rig {
         }
     }
 
-    fn submit(&self) -> Submit {
+    pub(super) fn submit(&self) -> Submit {
         let jobs = Arc::clone(&self.jobs);
         Box::new(move |job| jobs.lock().unwrap().push_back(job))
     }
 
-    fn lookup(&self, prompt: &[u32], kind: Option<Speculation>) -> Option<Hit> {
+    pub(super) fn lookup(&self, prompt: &[u32], kind: Option<Speculation>) -> Option<Hit> {
         let answer = Arc::new(Mutex::new(None));
         let told = Arc::clone(&answer);
         self.cache.lookup(prompt.to_vec().into(), kind, move |hit| {
@@ -217,7 +217,7 @@ impl Rig {
         answer.lock().unwrap().take().expect("a lookup is answered")
     }
 
-    fn capture(
+    pub(super) fn capture(
         &self,
         device: &Arc<Device>,
         prompt: &[u32],
@@ -240,7 +240,7 @@ impl Rig {
         answer
     }
 
-    fn restore(
+    pub(super) fn restore(
         &self,
         hit: Hit,
         device: &Arc<Device>,
@@ -261,16 +261,16 @@ impl Rig {
         answer
     }
 
-    fn next_job(&self) -> CopyJob {
+    pub(super) fn next_job(&self) -> CopyJob {
         self.jobs.lock().unwrap().pop_front().expect("a job was submitted")
     }
 
-    fn queued(&self) -> usize {
+    pub(super) fn queued(&self) -> usize {
         self.jobs.lock().unwrap().len()
     }
 
     /// Runs `job` against `device` and the arena, and reports it done.
-    fn run(&self, mut job: CopyJob, device: &Device) {
+    pub(super) fn run(&self, mut job: CopyJob, device: &Device) {
         for piece in job.pieces().to_vec() {
             let mut host = self.host.memory.lock().unwrap();
             let range = piece.host as usize..(piece.host + piece.bytes) as usize;
@@ -282,24 +282,24 @@ impl Rig {
         job.finish(Ended::Done);
     }
 
-    fn run_all(&self, device: &Device) {
+    pub(super) fn run_all(&self, device: &Device) {
         while self.queued() > 0 {
             let job = self.next_job();
             self.run(job, device);
         }
     }
 
-    fn stats(&self) -> PrefixCacheStats {
+    pub(super) fn stats(&self) -> PrefixCacheStats {
         self.cache.stats()
     }
 }
 
-fn answer<T>(slot: &Arc<Mutex<Option<T>>>) -> T {
+pub(super) fn answer<T>(slot: &Arc<Mutex<Option<T>>>) -> T {
     slot.lock().unwrap().take().expect("the request was answered")
 }
 
 /// Whether the two devices hold the same base state of `position` tokens.
-fn same_state(layout: &CheckpointLayout, position: u32, left: &Device, right: &Device) -> bool {
+pub(super) fn same_state(layout: &CheckpointLayout, position: u32, left: &Device, right: &Device) -> bool {
     base_state(layout, position, left, right, false)
 }
 
