@@ -557,8 +557,9 @@ fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: Has
             .max()
             .unwrap_or(0);
         let regions = [plan.scratch_bytes.max(nvfp4_native), plan.decode_scratch_bytes];
-        // A drafting sequence admits the quanta of a step together, each reading a record of its own.
-        let records = input_records(plan.draft_depth);
+        // A drafting sequence admits the quanta of a step together, each reading a record of its own; each sequence has
+        // records of its own.
+        let records = input_records(plan.draft_depth) * plan.sequences as u64;
         let workspace =
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
         let (sequences, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {

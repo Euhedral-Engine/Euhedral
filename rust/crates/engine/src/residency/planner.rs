@@ -247,7 +247,8 @@ pub fn plan_with(
         rows: chunk,
         logits_rows: verified,
     };
-    let workspace_bytes = workspace::workspace_bytes_with_records(config, rows, workspace::input_records(draft_depth));
+    let workspace_bytes =
+        workspace::workspace_bytes_with_records(config, rows, workspace::input_records(draft_depth) * sequences);
     let thresholds = trellis_thresholds(settings, inputs.multiprocessors);
     let widest = inputs.multiprocessors.is_none();
     let scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::Plan);

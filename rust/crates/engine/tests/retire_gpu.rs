@@ -881,7 +881,7 @@ fn a_captured_quantum_killed_before_its_launch_retires() {
     let quantum = captured.quantum.take().unwrap();
     let started = captured
         .executor
-        .start(quantum, Arc::new(AtomicBool::new(true)), None)
+        .start(quantum, Arc::new(AtomicBool::new(true)), &[])
         .unwrap();
     // The reference pins the quantum: it retires only once nothing depends on it.
     drop(started);

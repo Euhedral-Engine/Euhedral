@@ -13,6 +13,7 @@ mod draft_length;
 mod listener;
 mod mailbox;
 mod mtp;
+mod order;
 mod request;
 mod sampled;
 mod source;
@@ -36,20 +37,22 @@ use crate::plan::{Formats, Plan, View};
 use crate::quantum::Executor;
 use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
-use crate::state::SequenceState;
+use crate::state::{SequenceId, SequenceState};
 use crate::workspace::Workspace;
+use crate::workspace::input_records;
 pub use acceptance::{Accepted, accept, accept_tokens};
 pub use constraint::{ConstraintError, ReasoningConstraint, TokenConstraint};
 pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
 pub use listener::GenerationListener;
 pub(crate) use mailbox::OPERATION_BOUND;
 use mailbox::{Address, Mailbox, Spawn};
+use order::Order;
 pub use request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
     Verification,
 };
 pub(crate) use source::GREEDY_DEPTH;
-use source::{Audience, Drafts, Message, Owner, Rejected, Retired, Shared};
+use source::{Audience, Drafts, Message, Owner, Rejected, Retired, Shared, StartFailed};
 pub use teacher_forced::LogitsSink;
 
 /// The engine's admission of a request, as the answer `Owner::begin` takes.
@@ -118,11 +121,24 @@ impl Generation {
             }),
             _ => None,
         };
+        // The engine's one workspace is ordered by one owner. Its starts that fail are told to the sequence's owner, whose
+        // address exists before the owner does.
+        let id = SequenceId(0);
+        let told = Arc::clone(&address);
+        let replies: Vec<order::Reply> = vec![Box::new(move |serial, error| {
+            told.post(Message::StartFailed(Box::new(StartFailed { serial, error })));
+        })];
+        let order = Order::new(
+            replies,
+            input_records(residency.draft_depth) as usize,
+            Self::spawner(core),
+        );
         let shared = Arc::new(Shared {
             core: Arc::clone(core),
             config: Arc::clone(config),
             workspace: Arc::clone(workspace),
-            executor,
+            executor: Arc::new(executor),
+            order,
             address: Arc::clone(&address),
             chunk: residency.rows.rows as usize,
             capacity,
@@ -133,22 +149,26 @@ impl Generation {
             #[cfg(feature = "test-oracles")]
             settle_after_speculation: AtomicBool::new(false),
         });
-        // A frame that drives the owner from a thread that must not run its turn, or after a frame's turns are used:
-        // unordered, so that it may run on any worker.
-        let stages = Arc::clone(&core.stages);
-        let seeds = AtomicU64::new(0);
-        let spawn: Spawn = Box::new(move |work| {
-            let mut frame = step(Kind::Owner, 0, work);
-            frame.header_mut().randomize_hash(seeds.fetch_add(1, Ordering::Relaxed));
-            stages.offer(frame).is_ok()
-        });
         let mailbox = Arc::new(Mailbox::new(
-            Owner::new(Arc::clone(&shared), sequence, inbox),
+            Owner::new(Arc::clone(&shared), id, sequence, inbox),
             producer,
-            spawn,
+            Self::spawner(core),
         ));
         address.set(&mailbox);
         Ok(Generation { shared, mailbox })
+    }
+
+    /// A frame that drives an owner's mailbox from a thread that must not run its turn, or after a frame's turns are
+    /// used: unordered (a random routing hash), so that it may run on any worker, and so that no two owners' frames
+    /// share a chain in the lake.
+    fn spawner(core: &Arc<Core>) -> Spawn {
+        let stages = Arc::clone(&core.stages);
+        let seeds = AtomicU64::new(0);
+        Box::new(move |work| {
+            let mut frame = step(Kind::Owner, 0, work);
+            frame.header_mut().randomize_hash(seeds.fetch_add(1, Ordering::Relaxed));
+            stages.offer(frame).is_ok()
+        })
     }
 
     /// The stage graphs of the model's plan, whose quanta retire into the owner's mailbox.
@@ -345,7 +365,11 @@ impl Generation {
     /// Ends the sequence. Nothing may be running: with a request in flight the sequence stays allocated, and says so.
     pub(crate) fn close(&self) {
         match self.mailbox.close() {
-            Some(owner) => owner.close(),
+            Some(owner) => {
+                owner.close();
+                // What the workspace's owner still pins goes with it.
+                drop(self.shared.order.close());
+            }
             None => log::error!("a generation is running at shutdown: the sequence's device memory stays allocated"),
         }
     }

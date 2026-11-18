@@ -27,6 +27,10 @@ use kv::KvCache;
 pub use kv::KvView;
 use released::ReleasedBuffers;
 
+/// A sequence of a runtime, the unit a step belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SequenceId(pub usize);
+
 /// What the stages of a quantum read of a sequence: its GDN state and its attention scratch. Allocated once, at
 /// full size, and shared by every quantum of the sequence; nothing about it changes while quanta run, except the
 /// contents of the buffers the stages write.

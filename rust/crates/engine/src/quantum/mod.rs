@@ -458,6 +458,8 @@ fn whole_spec(home: usize) -> StageGraphSpec {
 /// quantum of the chain is ordered by.
 #[derive(Clone, Debug)]
 pub struct Started {
+    /// The quantum's own number ([`Quantum::id`]).
+    pub serial: u64,
     pub reference: QuantumRef,
     /// The stage where the quantum enters its graph.
     pub root: StageId,
@@ -472,6 +474,8 @@ pub enum StartError {
     Quantum(#[from] QuantumError),
     #[error("the plan has no graph for {0:?}")]
     NoView(View),
+    #[error("the workspace's owner is closed")]
+    Closed,
 }
 
 /// The stage graphs of a plan on a runtime, the sequence's graph cache, and the choice of the graph a quantum runs.
@@ -615,16 +619,18 @@ impl Executor {
     }
 
     /// Starts `quantum`: validates it, and runs it as one body of the graph cache when it has a capture key, else stage
-    /// by stage. With `after`, the previous quantum of the chain, the new quantum's root waits on the device for the
-    /// previous one's sink (the chain's token passes from one quantum's selection to the next's embedding, so nothing
-    /// of the next could overlap it). Keep the previous [`Started`] until this call returns, then drop it.
+    /// by stage. The new quantum's root waits on the device for the sink of each quantum of `after` (the previous one of
+    /// its chain: the chain's token passes from one quantum's selection to the next's embedding, so nothing of the next
+    /// could overlap it; and the last one on the workspace, whose buffers it reuses). Keep the previous [`Started`]s
+    /// until this call returns, then drop them.
     pub fn start(
         &self,
         mut quantum: Quantum,
         kill: Arc<AtomicBool>,
-        after: Option<&Started>,
+        after: &[&Started],
     ) -> Result<Started, StartError> {
         quantum.validate()?;
+        let serial = quantum.id();
         let view = quantum.view();
         let variant = view.variant();
         let home = home::home_of(quantum.id(), self.clock(), self.stage_lanes);
@@ -643,7 +649,7 @@ impl Executor {
             }
             None => (eager, StageId((stages - 1) as u16)),
         };
-        let external = after.map(|previous| ExternalEdge {
+        let external = after.iter().map(|previous| ExternalEdge {
             from: previous.reference.clone(),
             from_stage: previous.sink,
             to_stage: StageId(0),
@@ -651,6 +657,7 @@ impl Executor {
         });
         let reference = graph.start(quantum, kill, external);
         Ok(Started {
+            serial,
             reference,
             root: StageId(0),
             sink,

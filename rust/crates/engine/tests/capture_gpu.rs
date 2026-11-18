@@ -622,7 +622,7 @@ impl Run {
         self.started += 1;
         let started = self
             .executor
-            .start(quantum, Arc::new(AtomicBool::new(false)), None)
+            .start(quantum, Arc::new(AtomicBool::new(false)), &[])
             .unwrap();
         // Nothing is chained to this quantum: its reference is not held, or it would never retire.
         drop(started);

@@ -22,9 +22,7 @@ use std::collections::{HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
-/// A sequence of a runtime, the unit a step belongs to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SequenceId(pub usize);
+pub use crate::state::SequenceId;
 
 /// A ready step offered for a pass.
 pub trait PassOffer {
