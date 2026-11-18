@@ -19,7 +19,8 @@ use crate::workspace::BufferSlot;
 /// The GDN state of `layer`.
 fn layer_state(quantum: &Quantum, layer: usize) -> Result<&GdnState, StageError> {
     quantum
-        .seq
+        .segment()
+        .refs
         .device()
         .gdn
         .layer(layer)
@@ -211,7 +212,7 @@ impl Launch for GdnConvolution {
         let query_key = quantum.slot(self.query_key);
         let value_z = quantum.slot(self.value_z);
         // A verification before this quantum accepted only part of its rows: rebuild this layer's state first.
-        let replay = quantum.seq.replay_rows(self.layer) as usize;
+        let replay = quantum.segment().refs.replay_rows(self.layer) as usize;
         if replay > 0 {
             self.replay(quantum, kernels, state, replay)?;
         }

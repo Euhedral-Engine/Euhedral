@@ -500,6 +500,7 @@ dependencies = [
  "euhedral-memory",
  "log",
  "sha2",
+ "smallvec",
  "tempfile",
  "test-support",
  "thiserror",

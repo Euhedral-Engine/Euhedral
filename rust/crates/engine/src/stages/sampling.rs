@@ -219,7 +219,7 @@ impl Argmax {
 impl Launch for Argmax {
     fn idle(&self, quantum: &Quantum) -> bool {
         // A quantum whose rows go to the host selects there.
-        quantum.logits_rows == 0 || quantum.row_readback.is_some()
+        quantum.logits_rows == 0 || quantum.segment().row_readback.is_some()
     }
 
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
@@ -228,6 +228,7 @@ impl Launch for Argmax {
         }
         let logits_rows = quantum.logits_rows;
         let selection = quantum
+            .segment()
             .selection
             .as_ref()
             .ok_or_else(|| fatal("a quantum that selects has no selection words"))?;
@@ -286,11 +287,13 @@ impl Launch for SelectedToken {
             return Ok(());
         };
         let selection = quantum
+            .segment()
             .selection
             .as_ref()
             .ok_or_else(|| fatal("a quantum that passes a drafted token has no selection words"))?;
         let draft = quantum
-            .seq
+            .segment()
+            .refs
             .device()
             .scratch
             .draft()
@@ -476,7 +479,7 @@ impl CopyRows {
 
 impl Launch for CopyRows {
     fn idle(&self, quantum: &Quantum) -> bool {
-        quantum.logits_rows == 0 || quantum.row_readback.is_none()
+        quantum.logits_rows == 0 || quantum.segment().row_readback.is_none()
     }
 
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
@@ -484,6 +487,7 @@ impl Launch for CopyRows {
             return Ok(());
         }
         let readback = quantum
+            .segment()
             .row_readback
             .as_ref()
             .ok_or_else(|| fatal("a quantum that copies rows has no readback"))?;

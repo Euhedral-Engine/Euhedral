@@ -56,7 +56,7 @@ use euhedral_inference_engine::plan::{Formats, Plan, View, WeightLookup};
 use euhedral_inference_engine::quantum::{CaptureKey, Executor};
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, nvfp4, plan as residency_plan};
 use euhedral_inference_engine::stages::attention::KvSource;
-use euhedral_inference_engine::stages::sampling::SelectionPool;
+use euhedral_inference_engine::stages::sampling::{RowReadback, SelectedRows, SelectionPool};
 use euhedral_inference_engine::stages::{
     DraftSeed, DraftTokenWrite, InputRecordRef, LaneTable, Quantum, QuantumKind, SequenceRefs,
 };
@@ -1034,6 +1034,11 @@ impl Light {
     }
 
     fn sequence(&self, kv_tokens: u64, layers: usize) -> SequenceState {
+        self.sequence_with(kv_tokens, layers, false)
+    }
+
+    /// A sequence, with an MTP cache of one layer when `mtp`.
+    fn sequence_with(&self, kv_tokens: u64, layers: usize, mtp: bool) -> SequenceState {
         let (gdn, _) = self.on_lane(|lane| GdnStates::allocate(&self.library, &self.config, 8, lane));
         let kv = KvCache::new(
             &self.library,
@@ -1046,15 +1051,27 @@ impl Light {
         )
         .unwrap();
         let scratch = AttentionScratch::allocate(&self.library, &self.config, 8, true, 16).unwrap();
+        let mtp_kv = mtp.then(|| {
+            KvCache::new(
+                &self.library,
+                &self.released,
+                1,
+                self.config.kv_width() as u64,
+                KvFormat::Nvfp4,
+                kv_tokens,
+                0,
+            )
+            .unwrap()
+        });
         SequenceState::from_parts(
             kv,
-            None,
+            mtp_kv,
             Arc::new(SequenceDevice { gdn, scratch }),
             SelectionPool::new(&self.library, 2, 8).unwrap(),
         )
     }
 
-    /// The quantum of `kind` over `rows` rows at `start`, after the one reservation of its cache.
+    /// The quantum of `kind` over `rows` rows at `start`, after the one reservation of its cache, with a selection.
     fn quantum(
         &self,
         sequence: &mut SequenceState,
@@ -1063,19 +1080,48 @@ impl Light {
         start: u64,
         row_exact_mode: bool,
     ) -> Quantum {
+        let quantum = self.bare_quantum(sequence, KvSource::Base, kind, rows, start, row_exact_mode);
+        quantum.with_selection_lease(sequence.selections.acquire().unwrap())
+    }
+
+    /// Appends single rows to the cache `source` until it holds `to` rows, as the owner's decodes would.
+    fn advance(&self, sequence: &mut SequenceState, source: KvSource, to: u64) {
+        let held = match source {
+            KvSource::Base => sequence.kv.committed(),
+            KvSource::Mtp => sequence.mtp_kv.as_ref().unwrap().committed(),
+        };
+        for position in held..to {
+            drop(self.bare_quantum(sequence, source, QuantumKind::Decode, 1, position, false));
+            match source {
+                KvSource::Base => sequence.kv.commit(1).unwrap(),
+                KvSource::Mtp => sequence.mtp_kv.as_mut().unwrap().commit(1).unwrap(),
+            };
+        }
+    }
+
+    /// The quantum with nothing set on it, after the one reservation of the cache `source` it appends to.
+    fn bare_quantum(
+        &self,
+        sequence: &mut SequenceState,
+        source: KvSource,
+        kind: QuantumKind,
+        rows: usize,
+        start: u64,
+        row_exact_mode: bool,
+    ) -> Quantum {
         let mut retained = KvRetained::default();
-        self.on_lane(|lane| {
-            sequence
-                .kv
-                .reserve(lane, &self.pinned, start, rows as u64, &mut retained)
-        });
-        sequence.kv.appended(rows as u64).unwrap();
-        let quantum = Quantum::new(
+        let cache = match source {
+            KvSource::Base => &mut sequence.kv,
+            KvSource::Mtp => sequence.mtp_kv.as_mut().unwrap(),
+        };
+        self.on_lane(|lane| cache.reserve(lane, &self.pinned, start, rows as u64, &mut retained));
+        cache.appended(rows as u64).unwrap();
+        Quantum::new(
             kind,
             rows,
             InputRecordRef::new(start),
             Arc::clone(&self.workspace),
-            sequence.refs(KvSource::Base).unwrap(),
+            sequence.refs(source).unwrap(),
             SubmitMode {
                 pdl: false,
                 row_exact: row_exact_mode,
@@ -1083,8 +1129,7 @@ impl Light {
             Arc::clone(&self.config),
             self.table.clone(),
         )
-        .unwrap();
-        quantum.with_selection_lease(sequence.selections.acquire().unwrap())
+        .unwrap()
     }
 }
 
@@ -1338,4 +1383,123 @@ fn growing_a_cache_after_a_view_was_taken_costs_one_handle_copy_per_page() {
         median(&with).saturating_sub(median(&without)),
         median(&with).saturating_sub(median(&without)).as_nanos() as f64 / handles,
     );
+}
+
+/// The key of each kind of quantum, field by field, as built from a quantum of one segment. The expected values are
+/// written out, not computed with the code under test; the geometry is the number of 48-position tiles the quantum's
+/// last row reaches, in bits 8 and up (no fused verifier below 2048 positions).
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn the_capture_key_of_each_kind_of_quantum_is_pinned() {
+    let Some(light) = light() else { return };
+    let mut sequence = light.sequence_with(1024, 1, true);
+    let vocabulary = light.config.vocab_size;
+    // The first row allocates the first page; the quanta after it are inside it. Each cache is advanced row by row
+    // to the position of the quantum that follows.
+    light.advance(&mut sequence, KvSource::Base, 50);
+    light.advance(&mut sequence, KvSource::Mtp, 50);
+    let base = |view, kind, rows, logits, geometry| CaptureKey {
+        view,
+        kind,
+        rows,
+        logits,
+        selects: true,
+        copies_rows: None,
+        seeds_draft: false,
+        draft_seed: None,
+        draft_read: None,
+        draft_write: None,
+        writes_current_token: false,
+        input_record: 0,
+        token_from: None,
+        row_exact: false,
+        programmatic: false,
+        split_geometry: geometry,
+        reserved_host_pages: [0, 0],
+        replay_rows: Vec::new(),
+        buffer_generations: Vec::new(),
+    };
+    let named = |key: &mut CaptureKey, what: &str, generation| {
+        assert!(
+            key.buffer_generations.contains(&generation),
+            "{what}: the key names the buffer the quantum fills"
+        );
+        key.buffer_generations.clear();
+    };
+
+    // Decode at 50: its last row is position 51, in the second tile of 48.
+    let quantum = light.quantum(&mut sequence, QuantumKind::Decode, 1, 50, false);
+    let generation = quantum.selection().unwrap().generation();
+    let mut key = quantum.capture_key().expect("a decode inside the page has a key");
+    named(&mut key, "decode", generation);
+    assert_eq!(key, base(View::Decode, QuantumKind::Decode, 1, 1, 2 << 8));
+    assert_eq!(quantum.segments().len(), 1);
+    drop(quantum);
+    sequence.kv.commit(1).unwrap();
+
+    // Decode at 100: the third tile.
+    light.advance(&mut sequence, KvSource::Base, 100);
+    let quantum = light.quantum(&mut sequence, QuantumKind::Decode, 1, 100, false);
+    let key = quantum.capture_key().expect("a decode inside the page has a key");
+    assert_eq!(key.split_geometry, 3 << 8);
+    drop(quantum);
+    sequence.kv.commit(1).unwrap();
+
+    // The verification the engine builds: its tokens read from the step's, and its rows seed drafting.
+    let quantum = light.quantum(&mut sequence, QuantumKind::Verify, 3, 101, true);
+    let quantum = quantum.reading_draft_tokens(0).unwrap().seeding_draft().unwrap();
+    let generation = quantum.selection().unwrap().generation();
+    let mut key = quantum.capture_key().expect("a verification inside the page has a key");
+    named(&mut key, "verify", generation);
+    let expected = CaptureKey {
+        row_exact: true,
+        seeds_draft: true,
+        draft_read: Some(0),
+        ..base(View::Verify { rows: 3 }, QuantumKind::Verify, 3, 3, 3 << 8)
+    };
+    assert_eq!(key, expected);
+    drop(quantum);
+    sequence.kv.commit(3).unwrap();
+
+    // A verification whose rows the host selects from: it copies them, and selects none.
+    let readback = Arc::new(RowReadback::new(&light.library, 8, vocabulary).unwrap());
+    let quantum = light.bare_quantum(&mut sequence, KvSource::Base, QuantumKind::Verify, 4, 104, true);
+    let quantum = quantum.with_row_readback(Arc::clone(&readback));
+    let mut key = quantum.capture_key().expect("a verification inside the page has a key");
+    named(&mut key, "readback", readback.generation());
+    let expected = CaptureKey {
+        row_exact: true,
+        selects: false,
+        copies_rows: Some(SelectedRows::Each),
+        ..base(View::Verify { rows: 4 }, QuantumKind::Verify, 4, 4, 3 << 8)
+    };
+    assert_eq!(key, expected);
+    drop(quantum);
+    sequence.kv.commit(4).unwrap();
+
+    // A draft with a seed at an address, over the MTP cache: it names that cache's host pages, not the base's.
+    let seed = sequence.device.scratch.draft().unwrap().seed_rows.ptr();
+    let quantum = light.bare_quantum(&mut sequence, KvSource::Mtp, QuantumKind::Draft, 1, 50, false);
+    let selection = sequence.selections.acquire().unwrap();
+    let generation = selection.selection().generation();
+    let quantum = quantum
+        .with_selection_lease(selection)
+        .with_draft_seed(DraftSeed::Address(seed))
+        .unwrap();
+    let mut key = quantum.capture_key().expect("a draft inside the page has a key");
+    named(&mut key, "draft", generation);
+    let expected = CaptureKey {
+        draft_seed: Some(seed.get()),
+        ..base(View::Draft { rows: 1 }, QuantumKind::Draft, 1, 1, 2 << 8)
+    };
+    assert_eq!(key, expected);
+    drop(quantum);
+    sequence.mtp_kv.as_mut().unwrap().commit(1).unwrap();
+
+    // A prefill chunk is not captured, and a draft with no seed rows has no key.
+    let prefill = light.quantum(&mut sequence, QuantumKind::Prefill, 2, 108, false);
+    assert!(prefill.capture_key().is_none());
+    let draft = light.bare_quantum(&mut sequence, KvSource::Mtp, QuantumKind::Draft, 1, 51, false);
+    let draft = draft.with_selection_lease(sequence.selections.acquire().unwrap());
+    assert!(draft.capture_key().is_none());
 }
