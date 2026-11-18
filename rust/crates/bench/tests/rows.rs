@@ -115,6 +115,7 @@ fn every_step_is_read_and_scored_in_frames_and_the_values_come_back_in_step_orde
         prompt_tokens: reference.prefix_len(),
         generated: steps,
         elapsed: Duration::ZERO,
+        cached_prompt_tokens: 0,
     });
     drop(sink);
     assert_eq!(await_value(&engine).generated, steps);

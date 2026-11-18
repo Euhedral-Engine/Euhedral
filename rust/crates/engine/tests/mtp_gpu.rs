@@ -181,6 +181,7 @@ impl Drop for Recorder {
                     prompt_tokens: 0,
                     generated: 0,
                     elapsed: Duration::ZERO,
+                    cached_prompt_tokens: 0,
                 },
                 first_token: self.first.unwrap_or(now),
                 last_token: self.last.unwrap_or(now),

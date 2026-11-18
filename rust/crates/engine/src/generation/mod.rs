@@ -22,6 +22,8 @@ mod teacher_forced;
 
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
+#[cfg(feature = "test-oracles")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -35,7 +37,7 @@ use crate::formats::{Nvfp4Linear, TrellisLinear};
 use crate::frames::{Kind, step};
 use crate::model::{LayerIndex, ModelConfig, Role, Weights};
 use crate::plan::{Formats, Plan, View};
-use crate::prefix::{Copier, PrefixCacheHandle, Submit};
+use crate::prefix::{CacheSpec, Copier, POSITION_GRANULE, PrefixCacheHandle, open_prefix_cache};
 use crate::quantum::Executor;
 use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
@@ -56,7 +58,7 @@ pub use request::{
     Verification,
 };
 pub(crate) use source::GREEDY_DEPTH;
-use source::{Audience, CopyRequest, Drafts, Message, Owner, Rejected, Retired, Shared, StartFailed};
+use source::{Audience, Drafts, Message, Owner, Rejected, Retired, Shared, StartFailed};
 pub use teacher_forced::LogitsSink;
 
 /// The engine's admission of a request, as the answer `Owner::begin` takes.
@@ -152,6 +154,12 @@ impl Generation {
             panic_after_admissions: AtomicU64::new(u64::MAX),
             #[cfg(feature = "test-oracles")]
             settle_after_speculation: AtomicBool::new(false),
+            #[cfg(feature = "test-oracles")]
+            copy_admitted: OnceLock::new(),
+            #[cfg(feature = "test-oracles")]
+            restore_reserved: OnceLock::new(),
+            #[cfg(feature = "test-oracles")]
+            quantum_admitted: OnceLock::new(),
         });
         let mailbox = Arc::new(Mailbox::new(
             Owner::new(Arc::clone(&shared), id, sequence, inbox),
@@ -268,17 +276,6 @@ impl Generation {
         let copier = Copier::new(&runtime, core.lane_table.clone(), lane, sequence, ended)
             .map_err(|error| EngineError::Runtime(format!("the prefix cache's copy graph: {error:?}")))?;
         Ok(executor.with_copier(copier))
-    }
-
-    /// The `Submit` of a prefix-cache request on this sequence: it hands the job to the sequence's owner, which admits
-    /// it behind the sequence's last device work and counts it in flight until it ends, so the sequence's lease is not
-    /// returned while the job still reads or writes the sequence's state. `kill` stops the job (a restore sets it when
-    /// the copy fails, see [`PrefixCacheHandle::restore`]); `more` is the `more` of the chunk the job follows, or of the
-    /// last chunk admitted when the job follows none.
-    #[allow(dead_code, reason = "the generation's own prefix cache steps call it")]
-    pub(crate) fn copy_submit(&self, kill: Arc<AtomicBool>, more: bool) -> Submit {
-        let address = Arc::clone(&self.shared.address);
-        Box::new(move |job| address.post(Message::Copy(Box::new(CopyRequest { job, kill, more }))))
     }
 
     /// Starts `request` on this sequence, which `lease` holds until the request ends.
@@ -402,13 +399,49 @@ impl Generation {
     }
 }
 
+/// Opens the prefix cache the plan granted memory for, once for the engine; `None` (and why, once, in the log) when the
+/// engine cannot use it: the chunk is not a multiple of the checkpoint granule or does not divide the interval between
+/// checkpoints. Requests that speculate neither restore nor capture (the state of a draft is not stored); the others do,
+/// on an engine whose sequences can speculate too. Nothing is
+/// opened, and nothing is logged, when the plan granted no memory (`prefix-cache.size: 0`).
+fn open_cache(core: &Arc<Core>, config: &Arc<ModelConfig>, residency: &ResidencyPlan) -> Option<PrefixCacheHandle> {
+    if residency.prefix_cache_bytes == 0 {
+        return None;
+    }
+    let settings = core.settings.prefix_cache;
+    let chunk = residency.rows.rows;
+    if chunk == 0 || !chunk.is_multiple_of(u64::from(POSITION_GRANULE)) {
+        log::warn!(
+            "the prefix cache is off: the prefill chunk is {chunk} tokens, and it must be a multiple of {POSITION_GRANULE}, the granule of a checkpoint's position"
+        );
+        return None;
+    }
+    if !u64::from(settings.checkpoint_tokens).is_multiple_of(chunk) {
+        log::warn!(
+            "the prefix cache is off: the checkpoint interval is {} tokens, and it must be a multiple of the {chunk}-token prefill chunk",
+            settings.checkpoint_tokens
+        );
+        return None;
+    }
+    let spec = CacheSpec {
+        library: &core.library,
+        config,
+        format: residency.kv_format,
+        settings,
+        granted: residency.prefix_cache_bytes,
+        chunk: u32::try_from(chunk).ok()?,
+        device_tokens: u32::try_from(residency.kv_device_tokens).unwrap_or(u32::MAX),
+    };
+    open_prefix_cache(spec, Generation::spawner(core))
+}
+
 /// The engine's sequences, each with an owner of its own, the pool that says which of them is idle, and the one order
 /// they share on the workspace.
 pub(crate) struct Generations {
     generations: Vec<Generation>,
     pool: SequencePool,
     order: Arc<Order<Executor>>,
-    /// The prefix cache the sequences share: `None` until restore on admission, its first caller, opens it (see `Generations::new`).
+    /// The prefix cache the sequences share; `None` when it is off (see `open_cache`).
     prefix: Option<PrefixCacheHandle>,
     /// A test hook: the next request admitted arms the owner's panic after this many admissions.
     #[cfg(feature = "test-oracles")]
@@ -458,10 +491,7 @@ impl Generations {
             Generation::spawner(core),
         ));
         let count = sequences.len();
-        // No cache is opened yet: nothing asks it for a lookup, a capture or a restore, and an open one would pin an arena
-        // nobody uses. Restore on admission, its first caller, opens it here (`open_prefix_cache`, once, before the
-        // generations are built); the handle, its clones and its close are plumbed already.
-        let prefix: Option<PrefixCacheHandle> = None;
+        let prefix = open_cache(core, config, residency);
         let mut generations: Vec<Generation> = Vec::with_capacity(count);
         let mut waiting = sequences.into_iter().zip(addresses).enumerate();
         while let Some((index, (sequence, address))) = waiting.next() {
@@ -553,6 +583,40 @@ impl Generations {
     pub(crate) fn settle_after_speculation(&self, settle: bool) {
         for generation in &self.generations {
             generation.settle_after_speculation(settle);
+        }
+    }
+
+    /// The test hook: `hook` is told of every prefix-cache copy job a sequence's owner admits.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn copy_admitted(&self, hook: Arc<dyn Fn(bool) + Send + Sync>) {
+        for generation in &self.generations {
+            let hook = Arc::clone(&hook);
+            // A hook is set once per engine: the first one stays.
+            let _ = generation
+                .shared
+                .copy_admitted
+                .set(Box::new(move |restore| hook(restore)));
+        }
+    }
+
+    /// The test hook: `hook` is told when a sequence's owner has reserved a restore's rows, before the cache plans it.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn restore_reserved(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        for generation in &self.generations {
+            let hook = Arc::clone(&hook);
+            let _ = generation.shared.restore_reserved.set(Box::new(move || hook()));
+        }
+    }
+
+    /// The test hook: `hook` is told of every quantum a sequence's owner admits, with its start position.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn quantum_admitted(&self, hook: Arc<dyn Fn(u64) + Send + Sync>) {
+        for generation in &self.generations {
+            let hook = Arc::clone(&hook);
+            let _ = generation
+                .shared
+                .quantum_admitted
+                .set(Box::new(move |start| hook(start)));
         }
     }
 

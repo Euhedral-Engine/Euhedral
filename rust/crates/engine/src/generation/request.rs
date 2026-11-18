@@ -127,6 +127,9 @@ pub struct GenerationOutcome {
     pub generated: usize,
     /// From the start of the request to its end.
     pub elapsed: Duration,
+    /// The prompt tokens restored from the prefix cache instead of prefilled: the position of the checkpoint the
+    /// request resumed from, 0 on a miss.
+    pub cached_prompt_tokens: usize,
 }
 
 /// A quantum that ran for the generation: what it was, and when it entered the engine and left it.
