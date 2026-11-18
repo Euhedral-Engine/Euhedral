@@ -203,6 +203,12 @@ pub fn input_records(draft_depth: usize) -> u64 {
     (draft_depth as u64 + 1).max(INPUT_RECORDS)
 }
 
+/// The input records a workspace holds for `sequences` sequences that each draft `draft_depth` tokens a step: each
+/// sequence has records of its own.
+pub fn input_records_for(draft_depth: usize, sequences: usize) -> u64 {
+    input_records(draft_depth) * sequences as u64
+}
+
 /// Bytes of the whole workspace for `rows` (without the expansion scratch): every slot once, and the input record
 /// [`INPUT_RECORDS`] times.
 pub fn workspace_bytes(config: &ModelConfig, rows: WorkspaceRows) -> u64 {

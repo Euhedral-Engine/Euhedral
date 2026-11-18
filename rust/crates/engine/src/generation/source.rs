@@ -54,6 +54,7 @@ use euhedral_inference_cuda::{DevicePtr, PooledPinned, SubmitMode};
 use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
 use super::mtp::{Joining, Speculating, Verifying};
+use super::order::Order;
 use super::request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
@@ -62,14 +63,14 @@ use super::teacher_forced::LogitsSink;
 use crate::frames::{Kind, step};
 use crate::handoff::Handoff;
 use crate::model::ModelConfig;
-use crate::quantum::{Executor, Started};
+use crate::quantum::{Executor, StartError};
 use crate::runtime::{Core, Units};
 use crate::sampling::{SamplingConfig, SamplingError, TokenSampler};
 use crate::stages::attention::KvSource;
 use crate::stages::sampling::{RowReadbackLease, Selection};
 use crate::stages::{InputRecordRef, Quantum, QuantumError, QuantumKind, SubmitError};
-use crate::state::SequenceState;
 use crate::state::kv::KvRetained;
+use crate::state::{SequenceId, SequenceState};
 use crate::workspace::{BufferSlot, Workspace};
 
 /// Decode quanta that start below this position overlap their launches with the quantum before them
@@ -95,6 +96,8 @@ pub(crate) enum Message {
     Prepared(Prepared),
     /// The work a parked quantum waited for on the owner's lane has run: the turn lets the quantum go.
     Reaped,
+    /// A quantum the owner admitted did not start.
+    StartFailed(Box<StartFailed>),
 }
 
 impl fmt::Debug for Message {
@@ -105,6 +108,7 @@ impl fmt::Debug for Message {
             Message::Sampled(sampled) => write!(formatter, "Message::Sampled(step {})", sampled.step),
             Message::Prepared(prepared) => write!(formatter, "Message::Prepared(step {})", prepared.step),
             Message::Reaped => formatter.write_str("Message::Reaped"),
+            Message::StartFailed(failed) => write!(formatter, "Message::StartFailed({})", failed.serial),
         }
     }
 }
@@ -113,6 +117,13 @@ impl fmt::Debug for Message {
 pub(crate) struct Retired {
     pub(crate) quantum: Quantum,
     pub(crate) outcome: QuantumOutcome,
+}
+
+/// A quantum that did not start, and why.
+pub(crate) struct StartFailed {
+    /// The quantum's number ([`Flying::id`]).
+    pub(crate) serial: u64,
+    pub(crate) error: StartError,
 }
 
 /// The logits row of step `step` in pinned memory.
@@ -126,7 +137,9 @@ pub(crate) struct Shared {
     pub(crate) core: Arc<Core>,
     pub(crate) config: Arc<ModelConfig>,
     pub(crate) workspace: Arc<Workspace>,
-    pub(crate) executor: Executor,
+    pub(crate) executor: Arc<Executor>,
+    /// What starts the quanta of the engine's sequences, each behind the quanta it must follow.
+    pub(crate) order: Order<Executor>,
     /// Where frames that tell the owner something post it.
     pub(crate) address: Arc<Address<Owner>>,
     /// Rows of the longest prompt chunk.
@@ -326,6 +339,8 @@ pub(super) enum Role {
 
 /// A quantum admitted and not yet concluded.
 pub(super) struct Flying {
+    /// The quantum's number.
+    pub(super) id: u64,
     pub(super) role: Role,
     pub(super) kind: QuantumKind,
     pub(super) start: u64,
@@ -373,9 +388,12 @@ pub(super) struct Run {
     /// Tokens selected and reported, or rows handed to the sink.
     pub(super) generated: usize,
     pub(super) in_flight: VecDeque<Flying>,
-    /// The last quantum admitted, which the next one is chained behind. Held only while another quantum may follow:
-    /// a quantum retires only when its reference is dropped.
-    pub(super) chain: Option<Started>,
+    /// Whether the workspace's owner holds the last quantum admitted, which the next one is chained behind. Held only
+    /// while another quantum may follow: a quantum retires only when its references are dropped.
+    pub(super) chain: bool,
+    /// The sequence the request runs on, and what orders its quanta.
+    sequence: SequenceId,
+    shared: Arc<Shared>,
     /// The selection of the latest quantum that selects.
     pub(super) previous: Option<Arc<Selection>>,
     pub(super) stopping: Option<FinishReason>,
@@ -477,7 +495,14 @@ impl Run {
                 flying.kill.store(true, Ordering::Release);
             }
         }
-        self.chain = None;
+        self.end_chain();
+    }
+
+    /// Nothing is chained behind the last quantum admitted from now on: the workspace's owner lets go of it.
+    pub(super) fn end_chain(&mut self) {
+        if mem::take(&mut self.chain) {
+            self.shared.order.release(self.sequence);
+        }
     }
 }
 
@@ -525,6 +550,8 @@ pub(super) struct Admission {
 /// The owner of the engine's sequence. See the module documentation.
 pub(crate) struct Owner {
     pub(super) shared: Arc<Shared>,
+    /// The sequence's number, which the workspace's owner orders its quanta by.
+    pub(super) id: SequenceId,
     pub(super) sequence: SequenceState,
     inbox: Consumer<Message, Single>,
     /// Whether the sequence holds the state of a request that ended: the next request starts with a reset.
@@ -551,9 +578,15 @@ pub(super) fn why<E: Display>(what: &'static str) -> impl Fn(E) -> String {
 }
 
 impl Owner {
-    pub(crate) fn new(shared: Arc<Shared>, sequence: SequenceState, inbox: Consumer<Message, Single>) -> Owner {
+    pub(crate) fn new(
+        shared: Arc<Shared>,
+        id: SequenceId,
+        sequence: SequenceState,
+        inbox: Consumer<Message, Single>,
+    ) -> Owner {
         Owner {
             shared,
+            id,
             sequence,
             inbox,
             used: false,
@@ -786,7 +819,7 @@ impl Owner {
         }
         let depth = match mode {
             Mode::Greedy { .. } => GREEDY_DEPTH,
-            Mode::Speculative { .. } => self.shared.workspace.records(),
+            Mode::Speculative { .. } => self.shared.order.records(),
             Mode::Forced { .. } | Mode::Sampled { .. } => 1,
         };
         self.run = Some(Run {
@@ -802,7 +835,9 @@ impl Owner {
             decodes: 0,
             generated: 0,
             in_flight: VecDeque::new(),
-            chain: None,
+            chain: false,
+            sequence: self.id,
+            shared: Arc::clone(&self.shared),
             previous: None,
             stopping: None,
             cancel,
@@ -889,7 +924,9 @@ impl Owner {
         let Some(mut run) = self.run.take() else { return };
         log::error!("the owner panicked again: the request ends with its quanta still in flight");
         mem::forget(mem::take(&mut run.in_flight));
-        mem::forget(run.chain.take());
+        if mem::take(&mut run.chain) {
+            self.shared.order.forget(self.id);
+        }
         self.used = true;
         let outcome = GenerationOutcome {
             reason: FinishReason::Failed(format!("the owner panicked: {message}")),
@@ -904,6 +941,8 @@ impl Owner {
         match message {
             Message::Retired(retired) => {
                 let Retired { quantum, outcome } = *retired;
+                // A quantum the workspace waited for is done: the owner of the workspace starts what waits.
+                self.shared.order.retired(quantum.id());
                 let waiting = self.run.as_mut().and_then(|run| {
                     run.in_flight.iter_mut().find(|flying| {
                         flying.retired.is_none()
@@ -932,7 +971,17 @@ impl Owner {
             Message::Prepared(prepared) => self.deliver_prepared(prepared),
             // The turn's `reap` is what the message is for.
             Message::Reaped => {}
+            Message::StartFailed(failed) => self.start_failed(*failed),
         }
+    }
+
+    /// A quantum the owner admitted did not start: it will never retire, so it is no longer in flight, and the request
+    /// fails.
+    fn start_failed(&mut self, failed: StartFailed) {
+        let StartFailed { serial, error } = failed;
+        let Some(run) = self.run.as_mut() else { return };
+        run.in_flight.retain(|flying| flying.id != serial);
+        run.stop(FinishReason::Failed(format!("starting the quantum: {error}")));
     }
 
     /// Hands the logits row of a teacher-forced step to the sink.
@@ -1438,7 +1487,7 @@ impl Owner {
         }
         if let Some(run) = self.run.as_mut().filter(|run| run.next_step(chunk).is_none()) {
             // Nothing will be chained behind the last quantum: let it retire.
-            run.chain = None;
+            run.end_chain();
         }
     }
 
@@ -1611,7 +1660,7 @@ impl Owner {
             core.lane_table.clone(),
         )
         .map_err(why("the quantum"))?
-        .with_input_record(record);
+        .with_input_record(shared.order.record(self.id, record));
         quantum = shape(quantum).map_err(why("the quantum's inputs"))?;
         quantum = quantum
             .with_logits_rows(logits)
@@ -1641,12 +1690,10 @@ impl Owner {
         let selection = quantum.selection().cloned();
         let kill = Arc::new(AtomicBool::new(false));
         let admitted = Instant::now();
-        let started = shared
-            .executor
-            .start(quantum, Arc::clone(&kill), run.chain.as_ref())
-            .map_err(why("starting the quantum"))?;
+        let id = quantum.id();
 
         run.in_flight.push_back(Flying {
+            id,
             role,
             kind,
             start,
@@ -1656,17 +1703,25 @@ impl Owner {
             row,
             retained,
             admitted,
-            kill,
+            kill: Arc::clone(&kill),
             retired_at: None,
             retired: None,
         });
         if selection.is_some() {
             run.previous = selection;
         }
-        // A quantum with nothing admitted behind it would never retire while its reference is held.
-        run.chain = more.then_some(started);
+        // A quantum with nothing admitted behind it would never retire while the workspace's owner held it: without
+        // `more` the owner keeps nothing of it.
+        run.chain = more;
         run.admitted += 1;
         run.cursor += 1;
+        // It starts behind its sequence's last quantum and the workspace's, now or in a later turn of the workspace's
+        // owner; a start that fails is told back as a message.
+        // A start that fails now admits nothing behind it: the caller fails the request.
+        if let Err(error) = shared.order.admit(self.id, &shared.executor, quantum, kill, true, more) {
+            run.in_flight.retain(|flying| flying.id != id);
+            return Err(why("starting the quantum")(error));
+        }
         Ok(())
     }
 

@@ -47,7 +47,7 @@ use crate::runtime::resolve_sequences;
 use crate::runtime::{Core, EngineRuntime, ReadyHandoff, StartupReport, Units, free_arrival, raw_file};
 use crate::state::SequenceState;
 use crate::warmup;
-use crate::workspace::{Workspace, input_records};
+use crate::workspace::{Workspace, input_records_for};
 
 /// The transfer lanes a startup makes: `host.task-parallelism`, the workers that take host work at once, at least 2
 /// and at most half of the library's lanes, which leaves the other half to the stage graphs.
@@ -557,8 +557,9 @@ fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: Has
             .max()
             .unwrap_or(0);
         let regions = [plan.scratch_bytes.max(nvfp4_native), plan.decode_scratch_bytes];
-        // A drafting sequence admits the quanta of a step together, each reading a record of its own.
-        let records = input_records(plan.draft_depth);
+        // A drafting sequence admits the quanta of a step together, each reading a record of its own; each sequence has
+        // records of its own.
+        let records = input_records_for(plan.draft_depth, plan.sequences);
         let workspace =
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
         let (sequences, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {

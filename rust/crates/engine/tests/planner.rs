@@ -454,9 +454,13 @@ fn each_sequence_adds_its_cache_and_its_state() {
     assert!(extra > 0);
     assert_eq!(four.sequences, 4);
     assert_eq!(four.extra_sequence_bytes, extra);
-    // What is shared does not grow.
+    // What is shared does not grow, but the workspace's input records (each sequence has records of its own), which the runtime reserve holds.
     assert_eq!(four.arena_bytes, one.arena_bytes);
-    assert_eq!(four.workspace_bytes, one.workspace_bytes);
+    let records = input_records(four.draft_depth);
+    let records_of = |count: u64| workspace_bytes_with_records(&config, four.rows, count * records);
+    assert_eq!(one.workspace_bytes, records_of(1));
+    assert_eq!(four.workspace_bytes, records_of(4));
+    assert!(four.workspace_bytes > one.workspace_bytes);
     assert_eq!(four.scratch_bytes, one.scratch_bytes);
     // Each sequence's cache is the one sequence's.
     assert_eq!(four.kv_device_bytes, one.kv_device_bytes);
