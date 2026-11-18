@@ -29,6 +29,9 @@ pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 32768;
 /// The tokens of each sequence's attention cache kept on the GPU when the file does not say.
 pub const DEFAULT_KV_DEVICE_MINIMUM_TOKENS: u32 = 65536;
 
+/// The tokens a prefix scenario's request has after its shared prompt.
+pub const PREFIX_TAIL_TOKENS: usize = 16;
+
 /// Why a configuration or a command line was refused.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
@@ -129,6 +132,17 @@ impl Scenario {
             target_prompt_tokens,
             requested_new_tokens,
         })
+    }
+
+    /// The tokens a request carries after the scenario's `target_prompt_tokens`: a prefix scenario's prompt is the
+    /// shared prompt and a short tail, so that the checkpoint at the end of the shared part is one a match can restore
+    /// (a match always leaves a token to prefill). Zero for every other kind.
+    pub fn tail_tokens(&self) -> usize {
+        if self.kind == ScenarioKind::PrefixRepeat {
+            PREFIX_TAIL_TOKENS
+        } else {
+            0
+        }
     }
 
     /// The name rows carry: `prefill-32`, `decode-32-256`.

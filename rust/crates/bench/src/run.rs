@@ -56,7 +56,7 @@ pub fn prepare(options: &Options, tokenizer: &Tokenizer) -> Result<Prepared, Con
             }
         };
         for prompt in set.iter() {
-            let required = prompt.ids.len() + scenario.requested_new_tokens;
+            let required = prompt.ids.len() + scenario.tail_tokens() + scenario.requested_new_tokens;
             if required > options.max_context_tokens as usize {
                 return Err(ConfigError::Invalid(format!(
                     "{} needs {required} positions; context is {} (maxContextTokens)",
@@ -319,6 +319,9 @@ impl Iteration<'_> {
     /// The rows of one iteration of `scenario` on `prompt`: one generation in a fresh sequence, measured; for a prefix
     /// scenario two, the prompt cold and then again.
     ///
+    /// A prefix scenario's request is the prompt (the shared part, `P` tokens) and a tail of the prompt's own first
+    /// tokens, so the cold request stores the checkpoint at `P` and the repeat restores exactly `P`.
+    ///
     /// A cold prompt has to be one the cache has not stored, whichever iteration it is. The prompt's first token is
     /// replaced by one that no earlier request of the run began with, so the prompt (and its length) is the scenario's
     /// but no checkpoint of an earlier iteration is a prefix of it; the repeat sends the same ids.
@@ -380,6 +383,8 @@ impl Iteration<'_> {
                 if let (Some(salt), Some(first)) = (salt, ids.first_mut()) {
                     *first = salt;
                 }
+                let tail: Vec<u32> = ids.iter().copied().take(scenario.tail_tokens()).collect();
+                ids.extend(tail);
                 ids
             }
             Err(error) => {
@@ -421,7 +426,9 @@ impl Iteration<'_> {
         let Turn { warmup, index, pass } = turn;
         let eos = self.tokenizer.eos_ids();
         let mut outcome = metrics::evaluate(scenario, recorder, |id| eos.contains(&id));
-        if outcome.status != result::FAILED && outcome.work.prompt_tokens != Some(prompt.ids.len()) {
+        if outcome.status != result::FAILED
+            && outcome.work.prompt_tokens != Some(prompt.ids.len() + scenario.tail_tokens())
+        {
             outcome.status = result::FAILED;
             outcome.reason = Some("prompt_token_count_mismatch".to_string());
             // As Java keeps the timings of this failure; a failed row reports no rate.
@@ -430,7 +437,7 @@ impl Iteration<'_> {
         // A cold request that restored a prefix, or a repeat that restored none, did not measure what its name says.
         let reason = match pass {
             Pass::Cold if recorder.restored > 0 => Some("cold_request_restored_a_prefix"),
-            Pass::Repeat if recorder.restored == 0 => Some("repeat_restored_no_prefix"),
+            Pass::Repeat if recorder.restored != prompt.ids.len() => Some("repeat_did_not_restore_the_shared_prompt"),
             _ => None,
         };
         if let (Some(reason), result::SUCCESS) = (reason, outcome.status) {
