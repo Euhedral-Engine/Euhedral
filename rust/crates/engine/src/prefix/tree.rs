@@ -98,6 +98,7 @@ impl PrefixNode {
 
 /// The nodes a lookup matched, from the first under the root to the deepest. Pinned until released.
 #[derive(Debug)]
+#[must_use]
 pub struct Match {
     chain: Vec<NodeId>,
     leaf: NodeId,
@@ -315,10 +316,7 @@ impl PrefixTree {
             };
             self.evict(victim);
         }
-        let speculation = match self.get(parent) {
-            Some(node) if parent == self.root || node.speculation == speculation => speculation,
-            _ => None,
-        };
+        let speculation = self.effective_speculation(parent, speculation);
         let node = PrefixNode {
             parent: Some(parent),
             start,
@@ -332,6 +330,16 @@ impl PrefixTree {
             published: false,
         };
         Ok(self.insert(node))
+    }
+
+    /// The kind a node reserved under `parent` with `requested` really holds: the request when `parent` is the root or
+    /// holds the same kind, else none (a speculative node under a base-only parent is unusable). Size a reservation by
+    /// this, not by the request.
+    pub fn effective_speculation(&self, parent: NodeId, requested: Option<Speculation>) -> Option<Speculation> {
+        match self.get(parent) {
+            Some(node) if parent == self.root || node.speculation == requested => requested,
+            _ => None,
+        }
     }
 
     fn unpin_or_pin(&mut self, id: NodeId, pin: bool) {
@@ -373,7 +381,7 @@ impl PrefixTree {
             return None;
         }
         let node = entry.node.take()?;
-        entry.generation += 1;
+        entry.generation = entry.generation.wrapping_add(1);
         self.vacant.push(id.index);
         Some(node)
     }
@@ -395,15 +403,20 @@ impl PrefixTree {
         self.published.push(id);
     }
 
-    /// Gives a reserved node's slots back; it never became visible. Does nothing for a node published or gone.
-    pub fn abort(&mut self, id: NodeId) {
-        if self.get(id).is_none_or(|node| node.published) {
-            return;
+    /// Gives a reserved node's slots back; it never became visible. Refused (`false`, nothing changes) for a node
+    /// that is published, gone, or the parent of an open reservation: abort that child first, or a child could be
+    /// published under a parent that no longer exists.
+    pub fn abort(&mut self, id: NodeId) -> bool {
+        if self.get(id).is_none_or(|node| node.published || node.pins > 0) {
+            return false;
         }
-        let Some(node) = self.remove(id) else { return };
+        let Some(node) = self.remove(id) else {
+            return false;
+        };
         if let Some(parent) = node.parent {
             self.unpin_or_pin(parent, false);
         }
+        true
     }
 
     /// Published nodes.

@@ -3,13 +3,16 @@
 //!
 //! A checkpoint is a snapshot of a live sequence at a token position: the GDN state at that position, the KV pages of
 //! the span since its parent's position, and optionally the speculative state. It lives in slots leased from one
-//! [`euhedral_memory::SlotArena`]; the tree owns the leases and the layout says what each slot holds and which device
+//! [`SlotArena`]; the tree owns the leases and the layout says what each slot holds and which device
 //! buffer each piece of it is copied from or to.
+
+#[cfg(doc)]
+use euhedral_memory::SlotArena;
 
 mod layout;
 mod tree;
 
-pub use layout::{Buffer, CheckpointLayout, Copy};
+pub use layout::{Buffer, CheckpointLayout, SlotCopy};
 pub use tree::{Match, NodeId, POSITION_GRANULE, PrefixNode, PrefixTree, ReserveError, Speculation};
 
 #[cfg(test)]

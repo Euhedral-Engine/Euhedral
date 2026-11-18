@@ -228,11 +228,105 @@ fn the_parent_of_a_reservation_is_not_evicted_for_it() {
         "the only evictable node is the pinned parent"
     );
     assert_eq!(tree.find(root, &stored, 2048, None), Some(a));
-    tree.abort(b);
+    assert!(tree.node(a).pinned(), "the open reservation pins its parent");
+    assert!(tree.abort(b));
+    assert!(!tree.node(a).pinned(), "its pin was released with the abort");
     assert!(
         tree.reserve(a, &stored, 4352, None, 1).is_ok(),
-        "its pin was released with the abort"
+        "and the parent is evictable for nothing else"
     );
+}
+
+#[test]
+fn publishing_releases_the_parents_pin() {
+    let mut tree = tree(4);
+    let stored = tokens(0, 6000);
+    let root = tree.root();
+    let a = add(&mut tree, root, &stored, 2048);
+    let b = tree.reserve(a, &stored, 4096, None, 1).unwrap();
+    assert!(tree.node(a).pinned());
+    tree.publish(b);
+    assert!(!tree.node(a).pinned());
+    assert!(!tree.node(b).pinned());
+    assert!(!tree.node(root).pinned());
+}
+
+#[test]
+fn releasing_a_match_unpins_every_node_of_the_chain() {
+    let mut tree = tree(4);
+    let stored = tokens(0, 6000);
+    let root = tree.root();
+    let a = add(&mut tree, root, &stored, 2048);
+    let b = add(&mut tree, a, &stored, 4096);
+    let matched = tree.lookup(&tokens(0, 5000), None).unwrap();
+    assert!(tree.node(a).pinned() && tree.node(b).pinned());
+    tree.release(matched);
+    assert!(!tree.node(a).pinned());
+    assert!(!tree.node(b).pinned());
+}
+
+#[test]
+fn unpinned_chains_are_evicted_leaf_first_for_room() {
+    let mut tree = tree(2);
+    let stored = tokens(0, 6000);
+    let root = tree.root();
+    let a = add(&mut tree, root, &stored, 2048);
+    let b = add(&mut tree, a, &stored, 4096);
+    let matched = tree.lookup(&tokens(0, 5000), None).unwrap();
+    tree.release(matched);
+    let first = tree.reserve(root, &tokens(10_000, 3000), 2048, None, 1).unwrap();
+    assert!(tree.get(b).is_none() && tree.get(a).is_some(), "the leaf goes first");
+    tree.publish(first);
+    let second = tree.reserve(root, &tokens(20_000, 3000), 2048, None, 1);
+    assert!(second.is_ok(), "the parent became a leaf and was evictable");
+    assert!(tree.get(a).is_none());
+    assert_eq!(tree.evictions(), 2);
+}
+
+#[test]
+fn a_parent_with_an_open_reservation_cannot_be_aborted() {
+    let mut tree = tree(4);
+    let stored = tokens(0, 6000);
+    let root = tree.root();
+    let a = tree.reserve(root, &stored, 2048, None, 1).unwrap();
+    let b = tree.reserve(a, &stored, 4096, None, 1).unwrap();
+    assert!(!tree.abort(a), "refused while b is open under it");
+    assert!(tree.get(a).is_some());
+    assert!(tree.abort(b));
+    assert!(tree.abort(a));
+    assert!(tree.get(a).is_none());
+}
+
+#[test]
+fn a_reservation_may_end_exactly_at_the_end_of_the_tokens() {
+    let mut tree = tree(2);
+    let root = tree.root();
+    assert!(tree.reserve(root, &tokens(0, 2048), 2048, None, 1).is_ok());
+}
+
+#[test]
+fn a_position_off_the_page_grid_is_refused_even_on_a_half_page() {
+    let mut tree = tree(2);
+    let root = tree.root();
+    assert_eq!(
+        tree.reserve(root, &tokens(0, 3000), 2176, None, 1),
+        Err(ReserveError::Span)
+    );
+}
+
+#[test]
+fn the_effective_kind_under_a_parent_follows_the_chain() {
+    let mut tree = tree(4);
+    let stored = tokens(0, 6000);
+    let root = tree.root();
+    let mtp = Some(Speculation::Mtp);
+    assert_eq!(tree.effective_speculation(root, mtp), mtp);
+    let plain = add(&mut tree, root, &stored, 2048);
+    assert_eq!(tree.effective_speculation(plain, mtp), None);
+    assert_eq!(tree.effective_speculation(plain, None), None);
+    let with = tree.reserve(root, &stored, 2048, mtp, 1).unwrap();
+    tree.publish(with);
+    assert_eq!(tree.effective_speculation(with, mtp), mtp);
 }
 
 #[test]
@@ -260,7 +354,7 @@ fn rejects_spans_that_do_not_advance_overrun_the_tokens_or_leave_the_page_grid()
     assert!(!tree.node(root).pinned(), "a refusal leaves no pin");
 }
 
-// Slot accounting: what the byte-extent allocator's tests covered, over slot leases.
+// Slot accounting: slots leased, returned on abort, eviction and drop, and none leaked on a refusal.
 
 #[test]
 fn a_reservation_leases_its_slots_and_abort_returns_them() {

@@ -41,7 +41,7 @@ pub enum Buffer {
 
 /// One copy between a slot of the host arena (at `host`) and `bytes` of `buffer` from `offset`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Copy {
+pub struct SlotCopy {
     pub host: u64,
     pub buffer: Buffer,
     pub offset: u64,
@@ -157,7 +157,7 @@ impl CheckpointLayout {
 
     /// The copies that save `node`'s state from the sequence's buffers into its slots (or, read the other way, load
     /// it): everything the node holds.
-    pub fn copies(&self, node: &PrefixNode) -> Vec<Copy> {
+    pub fn copies(&self, node: &PrefixNode) -> Vec<SlotCopy> {
         let mut copies = self.gdn_copies(node);
         self.page_copies(node, &mut copies);
         if let Some(kind) = node.speculation() {
@@ -169,10 +169,14 @@ impl CheckpointLayout {
     /// The copies that load a matched chain into a sequence: the KV pages of every node and the GDN state of the last
     /// (the state at the matched position), then the speculative state `speculation` names: the pages of every node
     /// in chain order, so a later node overwrites the page it shares with its parent, and the seed row of the last.
-    pub fn restore_copies(&self, chain: &[&PrefixNode], speculation: Option<Speculation>) -> Vec<Copy> {
+    pub fn restore_copies(&self, chain: &[&PrefixNode], speculation: Option<Speculation>) -> Vec<SlotCopy> {
         let Some(leaf) = chain.last() else {
             return Vec::new();
         };
+        debug_assert!(
+            speculation.is_none() || chain.iter().all(|node| node.speculation() == speculation),
+            "every node of the chain must hold the speculative state asked for"
+        );
         let mut copies = self.gdn_copies(leaf);
         for node in chain {
             self.page_copies(node, &mut copies);
@@ -202,7 +206,7 @@ impl CheckpointLayout {
         &slots[from..from + count]
     }
 
-    fn gdn_copies(&self, node: &PrefixNode) -> Vec<Copy> {
+    fn gdn_copies(&self, node: &PrefixNode) -> Vec<SlotCopy> {
         let mut pieces = Vec::new();
         for &layer in &self.gdn_layers {
             pieces.push((Buffer::Convolution { layer }, self.convolution_bytes));
@@ -219,7 +223,7 @@ impl CheckpointLayout {
         copies
     }
 
-    fn page_copies(&self, node: &PrefixNode, copies: &mut Vec<Copy>) {
+    fn page_copies(&self, node: &PrefixNode, copies: &mut Vec<SlotCopy>) {
         let first = (node.start() / PAGE) as usize;
         let count = self.page_slots(node.start(), node.position());
         let slots = self.section(node, self.gdn_slots(), count);
@@ -238,7 +242,7 @@ impl CheckpointLayout {
         kind: Speculation,
         node: &PrefixNode,
         keep: impl Fn(Buffer) -> bool,
-        copies: &mut Vec<Copy>,
+        copies: &mut Vec<SlotCopy>,
     ) {
         let from = self.gdn_slots() + self.page_slots(node.start(), node.position());
         let count = self.speculative_slots(kind, node.start(), node.position());
@@ -259,7 +263,7 @@ fn lay(
     slots: &[SlotLease],
     slot_bytes: u64,
     keep: impl Fn(Buffer) -> bool,
-    copies: &mut Vec<Copy>,
+    copies: &mut Vec<SlotCopy>,
 ) {
     let mut at = 0;
     for &(buffer, bytes) in pieces {
@@ -269,7 +273,7 @@ fn lay(
             let inside = at % slot_bytes;
             let take = (bytes - done).min(slot_bytes - inside);
             if keep(buffer) {
-                copies.push(Copy {
+                copies.push(SlotCopy {
                     host: slots[slot].address() + inside,
                     buffer,
                     offset: done,

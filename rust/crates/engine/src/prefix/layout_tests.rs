@@ -4,7 +4,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use euhedral_inference_settings::KvFormat;
 
 use super::fixtures::{arena, tokens};
-use super::{Buffer, CheckpointLayout, Copy, NodeId, PrefixTree, Speculation};
+use super::{Buffer, CheckpointLayout, NodeId, PrefixTree, SlotCopy, Speculation};
 use crate::model::{LayerKind, ModelConfig};
 use crate::residency::footprint::page_bytes;
 
@@ -121,14 +121,14 @@ impl Device {
         }
     }
 
-    fn capture(&self, host: &mut [u8], copies: &[Copy]) {
+    fn capture(&self, host: &mut [u8], copies: &[SlotCopy]) {
         for copy in copies {
             let from = &self.buffers[&copy.buffer][copy.offset as usize..][..copy.bytes as usize];
             host[copy.host as usize..][..copy.bytes as usize].copy_from_slice(from);
         }
     }
 
-    fn restore(&mut self, host: &[u8], copies: &[Copy]) {
+    fn restore(&mut self, host: &[u8], copies: &[SlotCopy]) {
         for copy in copies {
             let into = self
                 .buffers
@@ -511,4 +511,15 @@ fn a_node_that_lost_its_speculative_state_has_no_speculative_copies() {
 fn an_empty_chain_restores_nothing() {
     let rig = Rig::new(compact(), 4);
     assert!(rig.layout.restore_copies(&[], None).is_empty());
+}
+
+#[test]
+fn bf16_pages_are_larger_and_size_the_slot() {
+    let config = compact();
+    let nvfp4 = CheckpointLayout::new(&config, KvFormat::Nvfp4).unwrap();
+    let bf16 = CheckpointLayout::new(&config, KvFormat::Bf16).unwrap();
+    assert_eq!(bf16.slot_bytes(), 4 * page_bytes(&config, KvFormat::Bf16));
+    assert!(bf16.slot_bytes() > nvfp4.slot_bytes());
+    assert_eq!(bf16.page_slots(0, 768), 3);
+    assert_eq!(bf16.gdn_slots(), 1);
 }
