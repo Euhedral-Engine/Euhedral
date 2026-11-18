@@ -247,6 +247,11 @@ pub struct MemorySettings {
     pub host_limit: Auto<ByteSize>,
     /// Pinned host memory for host-backed weights.
     pub host_weights_limit: Auto<ByteSize>,
+    /// Host memory kept for the system when the budget is derived from what the machine can spare; `auto` is the
+    /// larger of 4 GiB and 10% of it. 0 keeps none.
+    pub host_margin: Auto<ByteSize>,
+    /// Pinned staging slots for weights that stream through the host; `auto` is 4.
+    pub staging_slots: Auto<u32>,
     /// Device memory the engine may use; `auto` is what is free.
     pub gpu_limit: Auto<ByteSize>,
     /// Device memory left for other programs.
@@ -267,6 +272,8 @@ impl Default for MemorySettings {
         Self {
             host_limit: Auto::Auto,
             host_weights_limit: Auto::Auto,
+            host_margin: Auto::Auto,
+            staging_slots: Auto::Auto,
             gpu_limit: Auto::Auto,
             gpu_reserve: ByteSize::mib(700),
             runtime_reserve: Auto::Auto,

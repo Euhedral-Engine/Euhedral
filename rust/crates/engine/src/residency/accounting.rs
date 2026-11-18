@@ -127,7 +127,6 @@ pub struct MemoryAccount {
     holders: OwnerId,
     host: LocationId,
     device: LocationId,
-    host_capacity: u64,
 }
 
 impl fmt::Debug for MemoryAccount {
@@ -137,14 +136,14 @@ impl fmt::Debug for MemoryAccount {
 }
 
 impl MemoryAccount {
-    /// An account of a device with `device_capacity` bytes and pinned host memory of `host_capacity`. The capacities
-    /// a plan is admitted against are the ones it was made against: [`MemoryAccount::admit`] sets them.
-    pub fn open(device_capacity: u64, host_capacity: u64) -> MemoryAccount {
+    /// An account of a device with `device_capacity` bytes. The capacities a plan is admitted against are the ones it
+    /// was made against: [`MemoryAccount::admit`] sets them, the host's from the plan's own host budget.
+    pub fn open(device_capacity: u64) -> MemoryAccount {
         let planner = Planner::with_owners(
             [
                 LocationSpec {
                     kind: LocationKind::HostPinned,
-                    capacity: host_capacity,
+                    capacity: 0,
                     reserve: 0,
                 },
                 LocationSpec {
@@ -165,7 +164,6 @@ impl MemoryAccount {
             holders,
             host,
             device,
-            host_capacity,
         }
     }
 
@@ -179,8 +177,11 @@ impl MemoryAccount {
             let total = if asked.host { &mut host_bytes } else { &mut device_bytes };
             *total = total.saturating_add(asked.bytes);
         }
+        // An unknown host budget allowed no spill: the host holds what the plan admits there (the prefix arena and
+        // any host pages), no more.
+        let host_budget = plan.host_budget_bytes.unwrap_or(host_bytes);
         self.planner
-            .set_capacity(self.host, self.host_capacity.min(CAPACITY_CAP.max(host_bytes)));
+            .set_capacity(self.host, host_budget.min(CAPACITY_CAP.max(host_bytes)));
         self.planner
             .set_capacity(self.device, plan.budget_bytes.min(CAPACITY_CAP.max(device_bytes)));
         let request = PlanRequest {

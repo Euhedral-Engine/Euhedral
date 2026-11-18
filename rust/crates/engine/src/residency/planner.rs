@@ -134,6 +134,9 @@ pub struct ResidencyPlan {
     /// Pinned host bytes the prefix cache's arena may take: what `prefix-cache.size` asks, when the memory planner
     /// places it beside everything else; 0 when the cache is off or the host has no room for it.
     pub prefix_cache_bytes: u64,
+    /// The pinned host bytes the plan was made against (`PlanInputs::host_pinned_bytes`); `None` when the budget was
+    /// unknown, which allowed no spill. The account admits the plan against it.
+    pub host_budget_bytes: Option<u64>,
     /// The most rows one shared pass holds, which the workspace's logits rows are sized for.
     pub pass_rows: usize,
     /// The most sequences one shared pass holds.
@@ -210,14 +213,17 @@ pub struct PlanInputs {
     /// The device's streaming multiprocessors; sizes the trellis K split's partials when
     /// `kernels.trellis.target-blocks` is `auto`. `None`: the widest split the shapes allow.
     pub multiprocessors: Option<u32>,
-    /// Pinned host bytes the cache pages may take.
-    pub host_pinned_bytes: u64,
+    /// Pinned host bytes the cache pages may take. `None`: not known, and no spill is allowed (the prefix cache still
+    /// keeps its stated size).
+    pub host_pinned_bytes: Option<u64>,
     /// The sequences to size for (at least 1).
     pub sequences: usize,
 }
 
 /// Plans residency for `config`'s model in an artifact with `table`, on a device with `device_free` bytes free and
-/// no limit on pinned host memory beyond `memory.host-weights-limit` and `memory.host-limit`.
+/// no limit on pinned host memory beyond `memory.host-weights-limit` and `memory.host-limit`. With neither set the
+/// host budget is taken as known and unlimited (`Some(u64::MAX)`), not unknown: this entry point does not read the
+/// machine, so a spill is never refused here for want of a figure.
 pub fn plan(
     config: &ModelConfig,
     table: &TensorTable,
@@ -229,7 +235,7 @@ pub fn plan(
         .host_weights_limit
         .value()
         .or(settings.memory.host_limit.value())
-        .map_or(u64::MAX, |size| size.bytes());
+        .map_or(Some(u64::MAX), |size| Some(size.bytes()));
     plan_with(
         config,
         table,
@@ -344,7 +350,7 @@ pub fn plan_with(
     let kept = footprint::kv_bytes(config, device_pages * PAGE_TOKENS, kv_format) + region;
     let budgets = Budgets {
         device: available,
-        host: inputs.host_pinned_bytes,
+        host: inputs.host_pinned_bytes.unwrap_or(u64::MAX),
     };
     let whole = Layout {
         weights: arena_bytes,
@@ -367,6 +373,9 @@ pub fn plan_with(
         free: inputs.device_free,
         sequences: inputs.sequences,
     })?;
+    if spills && inputs.host_pinned_bytes.is_none() {
+        return Err(PlanError::HostBudgetUnknown { needed: spilled });
+    }
     let (kv_device_tokens, kv_host_tokens) = if spills {
         (device_pages * PAGE_TOKENS, host_pages * PAGE_TOKENS)
     } else {
@@ -402,6 +411,7 @@ pub fn plan_with(
         draft_depth,
         max_context_tokens: max_tokens as usize,
         prefix_cache_bytes,
+        host_budget_bytes: inputs.host_pinned_bytes,
         pass_rows,
         pass_parts,
     })
@@ -424,7 +434,7 @@ pub fn sequences_for(
         let middle = low + (high - low).div_ceil(2);
         match with(middle) {
             Ok(_) => low = middle,
-            Err(PlanError::WeightsDoNotFit { .. }) => high = middle - 1,
+            Err(PlanError::WeightsDoNotFit { .. } | PlanError::HostBudgetUnknown { .. }) => high = middle - 1,
             Err(other) => return Err(other),
         }
     }

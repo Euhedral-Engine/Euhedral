@@ -79,13 +79,15 @@ pub(crate) struct Machine {
 }
 
 /// The pinned host memory the load may use: `memory.host-weights-limit`, else the host budget (`memory.host-limit`
-/// as stated, else what the machine can spare). Read once, on the calling thread, before the lattice exists.
-pub(crate) fn host_pinned_bytes(settings: &Settings, machine: &Machine) -> u64 {
+/// as stated, else what the machine can spare less `memory.host-margin`). `None` when the machine does not report what
+/// it can spare and neither limit is set: nothing may spill to the host then. The runtime reserve is 0: the margin
+/// covers it. Read once, on the calling thread, before the lattice exists.
+pub(crate) fn host_pinned_bytes(settings: &Settings, machine: &Machine) -> Option<u64> {
     if let Some(limit) = settings.memory.host_weights_limit.value() {
-        return limit.bytes();
+        return Some(limit.bytes());
     }
     let stated = settings.memory.host_limit.value().map(|size| size.bytes());
-    HostBudget::of(stated, machine.available, 0).pinned_bytes()
+    HostBudget::of(stated, machine.available, settings.memory.host_margin, 0).pinned_bytes()
 }
 
 /// Reads the machine's memory: what it can spare now (`HostBudget.availableBytes`: `MemAvailable`, or the least headroom
@@ -127,7 +129,7 @@ pub(crate) fn read_machine() -> Machine {
     }
 }
 
-/// Other platforms report no figure, which the budget reads as no limit.
+/// Other platforms report no figure, which the budget reads as unknown: nothing spills to the host unless a limit is set.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn read_machine() -> Machine {
     Machine::default()
@@ -563,7 +565,7 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
         let ring = Ring::sized(
             core.settings.host.task_parallelism,
             core.pool_bytes,
-            core.host_pinned_bytes,
+            core.host_pinned_bytes.unwrap_or(u64::MAX),
             core.transfer_lanes(),
         );
         // Every allocation takes its claim before it allocates: one larger than the plan fails here, naming its consumer.
@@ -1024,6 +1026,43 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn host_pinned_bytes_reads_the_limits_and_the_margin_and_is_unknown_without_a_figure() {
+        use euhedral_inference_settings::{Auto, ByteSize, ModelSettings};
+        const GIB: u64 = 1 << 30;
+        let mut settings = Settings::with_model(ModelSettings::default());
+        let unknown = Machine::default();
+        assert_eq!(host_pinned_bytes(&settings, &unknown), None);
+        settings.memory.host_limit = Auto::Value(ByteSize::gib(3));
+        assert_eq!(host_pinned_bytes(&settings, &unknown), Some(3 * GIB));
+        settings.memory.host_limit = Auto::Auto;
+        settings.memory.host_weights_limit = Auto::Value(ByteSize::gib(5));
+        assert_eq!(
+            host_pinned_bytes(&settings, &unknown),
+            Some(5 * GIB),
+            "no figure needed"
+        );
+        settings.memory.host_limit = Auto::Value(ByteSize::gib(3));
+        let machine = Machine {
+            available: Some(100 * GIB),
+            total: None,
+        };
+        assert_eq!(
+            host_pinned_bytes(&settings, &machine),
+            Some(5 * GIB),
+            "the weights limit wins"
+        );
+        settings.memory.host_weights_limit = Auto::Auto;
+        settings.memory.host_limit = Auto::Auto;
+        assert_eq!(host_pinned_bytes(&settings, &machine), Some(90 * GIB));
+        settings.memory.host_margin = Auto::Value(ByteSize::gib(1));
+        assert_eq!(
+            host_pinned_bytes(&settings, &machine),
+            Some(99 * GIB),
+            "the margin is passed through"
+        );
+    }
 
     /// A fan-in of `count` parts whose continuation hands over what it was given and counts its runs.
     fn fan_in(count: usize) -> (Arc<SegmentReads>, Arc<Handoff<SegmentParts>>, Arc<AtomicUsize>) {

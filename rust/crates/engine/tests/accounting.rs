@@ -25,7 +25,7 @@ fn inputs(sequences: usize) -> PlanInputs {
     PlanInputs {
         device_free: 64 * GIB,
         multiprocessors: Some(70),
-        host_pinned_bytes: u64::MAX,
+        host_pinned_bytes: Some(u64::MAX),
         sequences,
     }
 }
@@ -50,7 +50,7 @@ fn plans() -> Vec<ResidencyPlan> {
 }
 
 fn admit(plan: &ResidencyPlan) -> (MemoryAccount, PlanReservation) {
-    let account = MemoryAccount::open(plan.budget_bytes, u64::MAX);
+    let account = MemoryAccount::open(plan.budget_bytes);
     let reservation = account.admit(plan).unwrap();
     (account, reservation)
 }
@@ -124,8 +124,9 @@ fn a_claim_beyond_the_plan_is_refused_and_named() {
 
 #[test]
 fn a_host_that_cannot_hold_the_plan_is_not_admitted() {
-    let plan = plans().remove(1);
-    let account = MemoryAccount::open(plan.budget_bytes, plan.kv_host_bytes - 1);
+    let mut plan = plans().remove(1);
+    plan.host_budget_bytes = Some(plan.kv_host_bytes - 1);
+    let account = MemoryAccount::open(plan.budget_bytes);
     assert!(matches!(account.admit(&plan), Err(PlanError::NotAdmitted(_))));
 }
 
@@ -232,4 +233,28 @@ fn the_reserve_claim_that_does_not_fit_names_the_setting() {
         .unwrap_err()
         .to_string();
     assert!(refused.contains("memory.runtime-reserve"), "{refused}");
+}
+
+#[test]
+fn a_plan_made_with_an_unknown_host_budget_is_admitted_and_claimed_on_what_it_asks_of_the_host() {
+    let (config, table) = (config(), rco_table());
+    let mut settings = settings(131_072);
+    settings.prefix_cache.size = ByteSize::gib(1);
+    let mut unknown = inputs(1);
+    unknown.host_pinned_bytes = None;
+    let plan = plan_with(&config, &table, &settings, unknown).unwrap();
+    assert_eq!(plan.host_budget_bytes, None);
+    assert_eq!(plan.kv_host_bytes, 0, "no spill without a budget");
+    assert_eq!(plan.prefix_cache_bytes, GIB, "the prefix cache keeps its size");
+    let (account, mut reservation) = admit(&plan);
+    assert_eq!(reservation.admitted().host, GIB);
+    let claims: Vec<_> = plan
+        .consumers()
+        .iter()
+        .map(|asked| reservation.claim(asked.consumer, asked.bytes).unwrap())
+        .collect();
+    assert_eq!(account.held(), reservation.admitted());
+    drop(claims);
+    drop(reservation);
+    assert!(account.close().is_clean());
 }

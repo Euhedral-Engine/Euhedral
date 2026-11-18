@@ -154,7 +154,7 @@ pub(crate) struct Core {
     /// is gone. The generation's owner frees them on its lane.
     pub(crate) released: Arc<ReleasedBuffers>,
     /// Pinned host bytes the load may use.
-    pub(crate) host_pinned_bytes: u64,
+    pub(crate) host_pinned_bytes: Option<u64>,
     /// The memory planner's account: the plan is admitted against it and every allocation of the startup holds a claim
     /// from it. Closed by the runtime's release, which reports what is still held.
     pub(crate) account: MemoryAccount,
@@ -1046,7 +1046,7 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         cancel_bound,
     );
     let host_pinned_bytes = startup::host_pinned_bytes(settings, &machine);
-    let account = MemoryAccount::open(library.free_bytes().unwrap_or(0), host_pinned_bytes);
+    let account = MemoryAccount::open(library.free_bytes().unwrap_or(0));
     Ok(Arc::new(Core {
         settings: settings.clone(),
         library,
