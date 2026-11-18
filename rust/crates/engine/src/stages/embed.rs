@@ -4,7 +4,7 @@
 use euhedral_graph::{Marker, Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{DevicePtr, KernelOps};
 
-use super::{Launch, Quantum, eager, fatal};
+use super::{Launch, Quantum, Segment, eager, fatal};
 use crate::formats::Q3Embedding;
 use crate::model::WeightRef;
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
@@ -54,9 +54,8 @@ impl Launch for Embed {
         }
         let rows = quantum.rows;
         let ids = quantum.slot(BufferSlot::TokenIds);
-        let step_tokens = || {
-            quantum
-                .segment()
+        let step_tokens = |segment: &Segment| {
+            segment
                 .refs
                 .device()
                 .scratch
@@ -64,16 +63,22 @@ impl Launch for Embed {
                 .map(|draft| draft.tokens.ptr())
                 .ok_or_else(|| fatal("the sequence has no step tokens"))
         };
-        if let Some(slot) = quantum.segment().draft_token_read {
-            if (slot + rows) as u64 > DRAFT_TOKEN_SLOTS {
-                return Err(fatal(format!(
-                    "draft token slots {slot}..{} are out of {DRAFT_TOKEN_SLOTS}",
-                    slot + rows
-                )));
+        for segment in quantum.segments() {
+            if let Some(slot) = segment.draft_token_read {
+                if (slot + segment.rows) as u64 > DRAFT_TOKEN_SLOTS {
+                    return Err(fatal(format!(
+                        "draft token slots {slot}..{} are out of {DRAFT_TOKEN_SLOTS}",
+                        slot + segment.rows
+                    )));
+                }
+                kernels
+                    .copy_device_to_device(
+                        ids.offset(4 * segment.row_offset as u64),
+                        step_tokens(segment)?.offset(4 * slot as u64),
+                        4 * segment.rows as u64,
+                    )
+                    .map_err(fatal)?;
             }
-            kernels
-                .copy_device_to_device(ids, step_tokens()?.offset(4 * slot as u64), 4 * rows as u64)
-                .map_err(fatal)?;
         }
         if let Some(previous) = &quantum.token_from {
             // The token the quantum before selected: the row of the key is the token, the head has no ids.
@@ -86,7 +91,8 @@ impl Launch for Embed {
             .map_err(fatal)?;
         if quantum.writes_current_token {
             kernels
-                .copy_device_to_device(step_tokens()?, ids.offset(4 * (rows as u64 - 1)), 4)
+                // Only a quantum of one sequence writes the step's current token.
+                .copy_device_to_device(step_tokens(quantum.segment())?, ids.offset(4 * (rows as u64 - 1)), 4)
                 .map_err(fatal)?;
         }
         Ok(())

@@ -18,6 +18,21 @@ pub fn encode(ids: &[u32], start_position: u64) -> Vec<u8> {
     bytes
 }
 
+/// The bytes of the record of `ids` with one start position per segment of a batch: the ids, padded to 8 bytes, then
+/// the positions in segment order. One position is the record of [`encode`].
+pub fn encode_positions(ids: &[u32], positions: &[u64]) -> Vec<u8> {
+    let ids_bytes = (ids.len() * 4).div_ceil(8) * 8;
+    let mut bytes = vec![0u8; ids_bytes + 8 * positions.len()];
+    for (index, id) in ids.iter().enumerate() {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&id.to_ne_bytes());
+    }
+    for (index, position) in positions.iter().enumerate() {
+        let at = ids_bytes + 8 * index;
+        bytes[at..at + 8].copy_from_slice(&position.to_ne_bytes());
+    }
+    bytes
+}
+
 /// Writes the record into `out`, which must be at least [`input_record_bytes`] long; the padding is zero.
 pub fn encode_into(ids: &[u32], start_position: u64, out: &mut [u8]) {
     let record = encode(ids, start_position);
@@ -28,6 +43,25 @@ pub fn encode_into(ids: &[u32], start_position: u64, out: &mut [u8]) {
 mod tests {
     use super::*;
     use crate::stages::InputRecordRef;
+
+    #[test]
+    fn a_batch_keeps_one_position_per_segment_after_the_ids() {
+        let ids: Vec<u32> = (0..5u32).map(|row| 7 + row).collect();
+        let bytes = encode_positions(&ids, &[300, 411, 530]);
+        let offset = InputRecordRef::position_offset(ids.len()) as usize;
+        assert_eq!(bytes.len(), offset + 24);
+        for (index, position) in [300u64, 411, 530].iter().enumerate() {
+            assert_eq!(
+                bytes[offset + 8 * index..offset + 8 * index + 8],
+                position.to_ne_bytes()
+            );
+        }
+        assert_eq!(
+            encode_positions(&ids, &[9]),
+            encode(&ids, 9),
+            "one segment is the single record"
+        );
+    }
 
     #[test]
     fn the_ids_come_first_and_the_position_follows_at_an_eight_byte_boundary() {
