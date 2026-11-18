@@ -21,12 +21,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod common;
+
+use common::Closer;
 use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent,
     Speculation,
 };
 use euhedral_inference_engine::sampling::SamplingConfig;
-use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
+use euhedral_inference_engine::{EngineRuntime, Handoff};
 use euhedral_inference_settings::{ByteSize, ModelSettings, Settings};
 
 /// The longest a device test waits for one hand-off; past it the test fails.
@@ -64,15 +67,13 @@ fn settings(artifact: &Path, sequences: u32, cache: ByteSize) -> Settings {
 }
 
 /// Starts the engine with `sequences` sequences and a prefix cache of `cache` bytes (0: off).
-fn start(machine: &Machine, sequences: u32, cache: ByteSize) -> (Arc<EngineRuntime>, RuntimeOwner) {
+fn start(machine: &Machine, sequences: u32, cache: ByteSize) -> (Closer, Arc<EngineRuntime>) {
     let (owner, ready) = EngineRuntime::start(&settings(&machine.artifact, sequences, cache), &machine.library);
-    (
-        ready
-            .wait(WAIT)
-            .expect("the engine reports")
-            .expect("the engine starts"),
-        owner,
-    )
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    (Closer::new(owner, &runtime), runtime)
 }
 
 /// A prompt of `LENGTH` tokens whose first `shared` tokens are those of every prompt of `seed` 0 and whose others
@@ -200,7 +201,7 @@ fn cases() -> Vec<(&'static str, Vec<u32>, SamplingConfig, usize)> {
 fn a_restored_prefix_gives_the_tokens_of_a_cold_run() {
     let Some(machine) = machine() else { return };
     // The cold references: the cache is off.
-    let (runtime, owner) = start(&machine, 1, ByteSize(0));
+    let (owner, runtime) = start(&machine, 1, ByteSize(0));
     let cold: Vec<Recording> = cases()
         .iter()
         .map(|(_, prompt, sampling, _)| generate(&runtime, prompt, *sampling))
@@ -212,7 +213,7 @@ fn a_restored_prefix_gives_the_tokens_of_a_cold_run() {
     }
     owner.shutdown(runtime).expect("the engine shuts down clean");
 
-    let (runtime, owner) = start(&machine, 1, ByteSize::gib(2));
+    let (owner, runtime) = start(&machine, 1, ByteSize::gib(2));
     for ((name, prompt, sampling, restored), cold) in cases().iter().zip(&cold) {
         let warm = generate(&runtime, prompt, *sampling);
         assert_eq!(warm.outcome.reason, FinishReason::Length, "{name}");
@@ -233,7 +234,7 @@ fn a_restored_prefix_gives_the_tokens_of_a_cold_run() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_request_on_one_sequence_restores_what_another_captured() {
     let Some(machine) = machine() else { return };
-    let (runtime, owner) = start(&machine, 2, ByteSize::gib(2));
+    let (owner, runtime) = start(&machine, 2, ByteSize::gib(2));
     let shared = prompt(0, LENGTH);
     let first = generate(&runtime, &shared, SamplingConfig::greedy(0));
     assert_eq!(first.outcome.cached_prompt_tokens, 0);
@@ -271,7 +272,7 @@ fn a_request_on_one_sequence_restores_what_another_captured() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_request_cancelled_while_its_restore_runs_leaves_the_sequence_clean() {
     let Some(machine) = machine() else { return };
-    let (runtime, owner) = start(&machine, 1, ByteSize::gib(2));
+    let (owner, runtime) = start(&machine, 1, ByteSize::gib(2));
     let shared = prompt(0, LENGTH);
     let first = generate(&runtime, &shared, SamplingConfig::greedy(0));
     // The hook cancels the request the moment its restore's job is in flight.
@@ -329,7 +330,7 @@ enum Point {
 /// upload reads pinned staging) is cancelled at `point`: the sequence the next request gets back is clean.
 fn cancel_on_a_fresh_sequence(point: Point) {
     let Some(machine) = machine() else { return };
-    let (runtime, owner) = start(&machine, 2, ByteSize::gib(2));
+    let (owner, runtime) = start(&machine, 2, ByteSize::gib(2));
     let shared = prompt(0, LENGTH);
     let first = generate(&runtime, &shared, SamplingConfig::greedy(0));
     assert_eq!(first.outcome.cached_prompt_tokens, 0);
@@ -413,7 +414,7 @@ fn a_request_cancelled_with_its_first_chunk_behind_the_restore_leaves_a_fresh_se
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn closing_the_engine_while_a_capture_runs_ends_within_its_bound() {
     let Some(machine) = machine() else { return };
-    let (runtime, owner) = start(&machine, 1, ByteSize::gib(2));
+    let (owner, runtime) = start(&machine, 1, ByteSize::gib(2));
     let started = Handoff::new();
     let once = Arc::new(AtomicBool::new(false));
     {

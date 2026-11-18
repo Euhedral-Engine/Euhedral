@@ -690,7 +690,9 @@ impl Generations {
     /// Cancels every request that runs and waits at most `bound` in all until each ended and its listener was told its
     /// last call (a request that ends in a stop is told `Cancelled`). Refuses new requests from now on. Runs while the
     /// lattice still works. `false` when the bound passed with a request still running, and the caller must not free
-    /// what it uses; called from inside a turn it returns `false` at once. For the engine's owner, outside the lattice.
+    /// what it uses; called from inside a turn it returns `false` at once. A request ends only when nothing of its
+    /// sequence is in flight (`may_end`): a quantum or job whose guard never drops keeps it from ending, so this returns
+    /// `false` at the bound, and the runtime's shutdown forgets the runtime and returns an error. For the engine's owner, outside the lattice.
     pub(crate) fn stop(&self, bound: Duration) -> bool {
         // Every owner is told to stop before any is waited for, so that the requests end side by side.
         let deadline = Instant::now() + bound;

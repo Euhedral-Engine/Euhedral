@@ -657,6 +657,9 @@ mod tests {
     use euhedral_data_structures::queues::MpscQueue;
 
     use crate::handoff::Handoff;
+    use crate::state::Flight;
+
+    use super::super::source::may_end;
 
     /// How long a posted message may wait for its turn before the test fails.
     const BOUND: Duration = Duration::from_secs(1);
@@ -1653,5 +1656,92 @@ mod tests {
         assert_eq!(mailbox.with(|probe| probe.handled.len()), Some(101 + 5));
         // Nothing waits: a hand-off finds nothing to do and returns.
         mailbox.hand_on();
+    }
+
+    /// An owner that ends its request when told to stop, but, like the engine's, only once the sequence has nothing in
+    /// flight: the outcome is told, and the sequence is given back, then.
+    struct Ending {
+        inbox: Consumer<bool, Single>,
+        flight: Arc<Flight>,
+        stopped: bool,
+        running: bool,
+        /// Whether the sequence is back in the pool.
+        free: Arc<AtomicBool>,
+        outcomes: Vec<Arc<AtomicUsize>>,
+        told: Arc<AtomicUsize>,
+    }
+
+    impl Turn for Ending {
+        type Message = bool;
+        type Finished = Arc<AtomicUsize>;
+
+        fn turn(&mut self) {
+            while let Some(stop) = self.inbox.poll() {
+                self.stopped |= stop;
+            }
+            if self.running && self.stopped && may_end(0, &self.flight) {
+                self.running = false;
+                self.free.store(true, Ordering::SeqCst);
+                self.outcomes.push(Arc::clone(&self.told));
+            }
+        }
+
+        fn take_finished(&mut self) -> Vec<Self::Finished> {
+            mem::take(&mut self.outcomes)
+        }
+
+        fn abandon(&mut self, _why: &str) -> Vec<Self::Finished> {
+            Vec::new()
+        }
+
+        fn deliver(finished: Self::Finished) {
+            finished.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn shut(&mut self, _idle: Arc<Handoff<()>>) {}
+
+        fn into_barrier(finished: Self::Finished) -> Result<Arc<Handoff<()>>, Self::Finished> {
+            Err(finished)
+        }
+
+        fn idle(&self) -> bool {
+            !self.running
+        }
+    }
+
+    #[test]
+    fn a_cancelled_request_is_told_and_its_sequence_freed_only_once_its_last_quantum_is_dropped() {
+        let queue = MpscQueue::<bool>::new(8);
+        let producer = queue.producer();
+        let flight = Arc::new(Flight::default());
+        let (free, told) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+        let owner = Ending {
+            inbox: queue.consumer(),
+            flight: Arc::clone(&flight),
+            stopped: false,
+            running: true,
+            free: Arc::clone(&free),
+            outcomes: Vec::new(),
+            told: Arc::clone(&told),
+        };
+        let mailbox = Arc::new(Mailbox::new(owner, producer, Box::new(|_| false)));
+        let address = Address::new();
+        address.set(&mailbox);
+        let wake = Arc::clone(&address);
+        flight.on_settled(move || wake.post(false));
+        // A quantum of the request is in flight (a restore's references count as one).
+        let quantum = flight.begin();
+        let second = flight.begin();
+        address.post(true);
+        assert!(
+            !free.load(Ordering::SeqCst),
+            "the cancelled request's sequence is not offered again"
+        );
+        assert_eq!(told.load(Ordering::SeqCst), 0, "its outcome is not told");
+        drop(second);
+        assert_eq!(told.load(Ordering::SeqCst), 0, "one quantum still flies");
+        drop(quantum);
+        assert!(free.load(Ordering::SeqCst), "the last drop freed the sequence");
+        assert_eq!(told.load(Ordering::SeqCst), 1, "and told the outcome, once");
     }
 }

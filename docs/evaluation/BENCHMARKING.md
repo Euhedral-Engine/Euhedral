@@ -130,8 +130,9 @@ repeat that did not restore exactly `P` tokens, is `ineligible` (`cold_request_r
 `repeat_did_not_restore_the_shared_prompt`). A run with a prefix scenario has the prefix cache on, at the size of the engine settings (`engineConfig`, else the
 default), and records that size in the run snapshot; a prefix scenario is refused beside any other scenario, whose work
 the cache would change. `P` must be a multiple of `prefix-cache.checkpoint-tokens` (default 2048), since a restore is
-at a checkpoint; the run refuses it otherwise. Speculative requests do not use the prefix cache yet, so the run needs
-`"speculation": "off"`: with speculation on, every repeat restores nothing and its row is `ineligible`. Any other run
+at a checkpoint; the run refuses it otherwise. Speculative requests restore from the prefix cache too, so the
+run needs no change to `speculation`: the repeat restores `P` tokens and its tokens are exact, though its drafts can
+differ slightly from the cold run's. Any other run
 keeps the cache off.
 
 ### Forks

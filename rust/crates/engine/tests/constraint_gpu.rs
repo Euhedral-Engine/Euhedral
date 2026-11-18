@@ -22,13 +22,16 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+mod common;
+
+use common::Closer;
 use euhedral_inference_engine::generation::{
     ConstraintError, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
     TokenConstraint,
 };
 use euhedral_inference_engine::sampling::{SamplingConfig, TokenFilter};
 use euhedral_inference_engine::stages::QuantumKind;
-use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
+use euhedral_inference_engine::{EngineRuntime, Handoff};
 use euhedral_inference_settings::{ModelSettings, Settings};
 
 /// The longest a device test waits for the engine to start; past it the test fails.
@@ -40,7 +43,7 @@ const GENERATION_WAIT: Duration = Duration::from_secs(60);
 /// The prompt: any ids inside the vocabulary will do.
 const PROMPT: [u32; 6] = [3000, 1500, 2200, 800, 4100, 1200];
 
-fn start() -> Option<(Arc<EngineRuntime>, RuntimeOwner)> {
+fn start() -> Option<(Closer, Arc<EngineRuntime>)> {
     let library = PathBuf::from(test_support::require_property("euhedral.cuda.library")?);
     let artifact = PathBuf::from(test_support::require_property("euhedral.qwen.rco-artifact")?);
     if !artifact.is_file() {
@@ -57,7 +60,7 @@ fn start() -> Option<(Arc<EngineRuntime>, RuntimeOwner)> {
         .wait(WAIT)
         .expect("the engine reports")
         .expect("the engine starts");
-    Some((runtime, owner))
+    Some((Closer::new(owner, &runtime), runtime))
 }
 
 struct Recording {
@@ -226,7 +229,7 @@ fn sequence_free(runtime: &EngineRuntime) -> bool {
 #[test]
 #[ignore = "loads the artifact on the device"]
 fn a_constraint_that_allows_one_token_a_step_decides_every_token_and_the_request_never_speculates() {
-    let Some((runtime, owner)) = start() else { return };
+    let Some((owner, runtime)) = start() else { return };
     let cycle = [4000, 120, 9000, 77];
     let sampled = SamplingConfig::new(1.0, 20, 0.95, 5, false).unwrap();
     for (what, sampling) in [("greedy", SamplingConfig::greedy(0)), ("sampled", sampled)] {
@@ -275,7 +278,7 @@ fn a_constraint_that_allows_one_token_a_step_decides_every_token_and_the_request
 #[test]
 #[ignore = "loads the artifact on the device"]
 fn a_constraint_that_fails_ends_the_request_once_with_an_error_and_frees_the_sequence() {
-    let Some((runtime, owner)) = start() else { return };
+    let Some((owner, runtime)) = start() else { return };
     let cycle = [4000, 120];
     for (what, fault) in [
         ("accept", Fault::AcceptErrors),
@@ -326,7 +329,7 @@ fn a_constraint_that_fails_ends_the_request_once_with_an_error_and_frees_the_seq
 #[test]
 #[ignore = "loads the artifact on the device"]
 fn the_next_mask_is_prepared_while_the_next_decode_runs_and_a_row_that_retires_first_waits_for_it() {
-    let Some((runtime, owner)) = start() else { return };
+    let Some((owner, runtime)) = start() else { return };
     let cycle = [4000, 120, 9000, 77];
     let slow_at = 5;
     let (constraint, _, _) = Cycle::new(&cycle, Fault::PrepareSleeps, slow_at);
@@ -361,7 +364,7 @@ fn the_next_mask_is_prepared_while_the_next_decode_runs_and_a_row_that_retires_f
 #[test]
 #[ignore = "loads the artifact on the device"]
 fn a_constrained_request_ends_at_a_stop_token_it_chose_and_at_a_budget_of_one() {
-    let Some((runtime, owner)) = start() else { return };
+    let Some((owner, runtime)) = start() else { return };
     let cycle = [4000, 120, 9000, 77];
     let (constraint, accepted, _) = Cycle::new(&cycle, Fault::None, usize::MAX);
     let stopped = run(
