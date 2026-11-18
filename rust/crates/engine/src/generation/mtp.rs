@@ -38,6 +38,7 @@ use super::request::{FinishReason, Verification};
 use super::sampled::SampledRows;
 use super::source::{Admission, Flying, Mode, OVERLAP_MAX_START_POSITION, Owner, Role, Run, Step};
 use crate::model::{LayerKind, ModelConfig};
+use crate::prefix::SequenceAddresses;
 use crate::stages::attention::KvSource;
 use crate::stages::{DraftSeed, DraftTokenWrite, QuantumKind};
 
@@ -54,6 +55,8 @@ pub(super) struct Speculating {
     mtp_position: u64,
     /// The rows of the prompt chunk just prefilled, whose catch-up is next.
     prompt_catch_up: Option<usize>,
+    /// The prompt resumes from a restored checkpoint, and the catch-up that is next re-pairs the checkpoint's last row.
+    resuming: bool,
     /// The tokens the next step's catch-up pairs with the base hiddens of the rows from `mtp_position`: the tokens
     /// that followed them.
     catch_up: Vec<u32>,
@@ -111,6 +114,7 @@ impl Speculating {
             current: None,
             mtp_position: 0,
             prompt_catch_up: None,
+            resuming: false,
             catch_up: Vec::new(),
             replay: 0,
             drafts: Vec::new(),
@@ -160,6 +164,22 @@ impl Speculating {
     /// The prompt chunk of `rows` rows was admitted: its catch-up is next.
     pub(super) fn prefilled(&mut self, rows: usize) {
         self.prompt_catch_up = Some(rows);
+    }
+
+    /// The prompt resumes from a checkpoint at `position`, whose draft cache holds the rows below `position - 1` and
+    /// whose seed row holds the base hidden row of `position - 1`. The row `position - 1` pairs that hidden row with the
+    /// token at `position`, which the checkpoint does not know: it is re-paired first, in a catch-up of one row.
+    pub(super) fn resumed_at(&mut self, position: u32) {
+        self.mtp_position = u64::from(position) - 1;
+        self.prompt_catch_up = Some(1);
+        self.resuming = true;
+    }
+
+    /// The restore that was asked for was refused: the prompt starts from its first row.
+    pub(super) fn start_over(&mut self) {
+        self.mtp_position = 0;
+        self.prompt_catch_up = None;
+        self.resuming = false;
     }
 
     /// The prompt selected its first token: the steps go on from it. The last chunk's rows pair with the prompt that
@@ -284,6 +304,16 @@ impl Owner {
         let start = state.mtp_position;
         let first = start as usize + 1;
         let tokens = run.prompt[first..first + rows].to_vec();
+        // The chunk this catch-up completes ends at a checkpoint when it is wanted: the state is whole once the draft's
+        // rows are, and the next chunk (which overwrites the seed rows) waits for the capture. The re-pairing of a
+        // restored checkpoint's last row completes no chunk.
+        let end = first + rows - 1;
+        let resuming = mem::take(&mut state.resuming);
+        let checkpoint = !resuming
+            && run
+                .checkpoints
+                .as_ref()
+                .is_some_and(|checkpoints| checkpoints.wants(end));
         let admission = Admission {
             role: Role::PromptCatchUp,
             kind: QuantumKind::Draft,
@@ -294,11 +324,25 @@ impl Owner {
             logits: 0,
             replay: Vec::new(),
             last_chunk: false,
-            more: true,
+            more: !checkpoint,
         };
-        self.admit_quantum(admission, move |quantum| {
-            quantum.with_tokens(tokens)?.with_draft_seed(DraftSeed::Address(seed))
-        })?;
+        let refs = self.admit_quantum_taking(
+            admission,
+            move |quantum| quantum.with_tokens(tokens)?.with_draft_seed(DraftSeed::Address(seed)),
+            checkpoint,
+        )?;
+        if let Some(refs) = refs
+            && let Some(run) = self.run.as_mut()
+            // The seed row of the checkpoint is the last row of the chunk's seed rows, which is the last row of this
+            // catch-up.
+            && let Some(addresses) = SequenceAddresses::new(refs, &self.shared.config).map(|a| a.with_seed_row(rows as u32 - 1))
+            && let Some(checkpoints) = run.checkpoints.as_mut()
+        {
+            checkpoints.expect(end, Arc::new(addresses));
+            if let Some(flying) = run.in_flight.back_mut() {
+                flying.checkpoint = true;
+            }
+        }
         if let Some(Run {
             mode: Mode::Speculative { state, .. },
             ..

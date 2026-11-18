@@ -89,8 +89,6 @@ pub enum RestoreError {
     Unresolved,
     #[error("the sequence has {rows} rows of its attention caches reserved and the checkpoint is {position} tokens")]
     Unreserved { rows: u64, position: u32 },
-    #[error("the sequence speculates, and the checkpoints of a speculating sequence are not stored")]
-    Speculative,
     #[error("the copy failed: {0}")]
     Copy(String),
 }
@@ -383,9 +381,6 @@ impl PrefixCache {
         if self.closed {
             return Err(RestoreError::Closed);
         }
-        if refs.speculative() {
-            return Err(RestoreError::Speculative);
-        }
         if refs.rows() < u64::from(position) {
             return Err(RestoreError::Unreserved {
                 rows: refs.rows(),
@@ -462,7 +457,7 @@ impl PrefixCache {
             self.told(move || done(parent));
             return;
         };
-        if self.closed || refs.speculative() || refs.kv_format() != self.format || refs.rows() < u64::from(end) {
+        if self.closed || refs.kv_format() != self.format || refs.rows() < u64::from(end) {
             self.told(move || done(parent));
             return;
         }
@@ -721,8 +716,8 @@ impl PrefixCacheHandle {
     /// **The protocol.** The caller is the sequence's owner, before the request's first chunk:
     ///
     /// 1. Its KV pages for `position` (`hit.position()`) must be reserved already: `refs.rows() >= position`, checked
-    ///    here as the precondition of a capture is ([`RestoreError::Unreserved`]). A sequence that speculates is
-    ///    refused ([`RestoreError::Speculative`]) and nothing is copied.
+    ///    here as the precondition of a capture is ([`RestoreError::Unreserved`]). With a speculation `kind` the pages
+    ///    of the draft cache below the last row of `position` must be reserved too, and the draft seed row is written.
     /// 2. `submit` arrives once, from a worker, when the job is built: the owner admits it behind the sequence's last
     ///    device work with `on_workspace` false and **`more` set** (the first chunk follows it), and counts it in
     ///    flight until it ends. A refused restore never calls `submit`; it answers.

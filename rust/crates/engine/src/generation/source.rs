@@ -68,7 +68,7 @@ use crate::handoff::Handoff;
 use crate::model::ModelConfig;
 use crate::prefix::{
     CopyJob, FIRST_COPY_SERIAL, Hit, NodeId, PrefixCacheHandle, PromptCheckpoints, RestoreError, Restored,
-    SequenceAddresses, Submit,
+    SequenceAddresses, Speculation as CheckpointKind, Submit,
 };
 use crate::quantum::{Executor, StartError};
 use crate::runtime::{Core, Units};
@@ -828,20 +828,23 @@ impl Owner {
         Ok(())
     }
 
-    /// Asks the prefix cache for the longest checkpoint of the prompt, unless the request cannot use one: a request that
-    /// speculates keeps missing (its checkpoints carry the draft's state, which is not stored yet), and so does a
-    /// teacher-forced one. The prompt's first chunk waits for the answer ([`PromptCheckpoints::holds`]).
+    /// Asks the prefix cache for the longest checkpoint of the prompt, unless the request cannot use one (a teacher-forced
+    /// one cannot). A request that drafts matches only checkpoints that hold the draft's state too (its MTP cache and
+    /// the seed row), and stores such checkpoints. The prompt's first chunk waits for the answer
+    /// ([`PromptCheckpoints::holds`]).
     fn look_up_prompt(&mut self) {
         let Some(cache) = self.shared.prefix.clone() else {
             return;
         };
         let Some(run) = self.run.as_mut() else { return };
-        if !matches!(run.mode, Mode::Greedy { .. } | Mode::Sampled { .. }) {
-            return;
-        }
+        let kind = match &run.mode {
+            Mode::Greedy { .. } | Mode::Sampled { .. } => None,
+            Mode::Speculative { state, .. } => state.drafting().then_some(CheckpointKind::Mtp),
+            Mode::Forced { .. } => return,
+        };
         let address = Arc::clone(&self.shared.address);
         let tokens: Arc<[u32]> = Arc::from(run.prompt.as_slice());
-        run.checkpoints = Some(PromptCheckpoints::begin(cache, tokens, move |hit| {
+        run.checkpoints = Some(PromptCheckpoints::begin(cache, tokens, kind, move |hit| {
             address.post(Message::Looked(hit));
         }));
     }
@@ -1144,6 +1147,7 @@ impl Owner {
         let core = &shared.core;
         let position = u64::from(hit.position());
         let reset = mem::take(&mut self.used);
+        let drafting = self.drafts();
         let mut retained = KvRetained::default();
         let (_, reserved) = core
             .lane_table
@@ -1157,7 +1161,18 @@ impl Owner {
                     .map_err(why("reserving the restored rows"))?;
                 cache.appended(position).map_err(why("the cache's frontier"))?;
                 // The rows are part of the sequence from here: the copy's job is ordered before everything that reads them.
-                cache.commit(position).map_err(why("the cache's frontier"))
+                cache.commit(position).map_err(why("the cache's frontier"))?;
+                if drafting {
+                    // The draft's cache holds the rows below the checkpoint's last position: the pair of that row's
+                    // hidden row and the token after it belongs to whichever prompt resumes here.
+                    let rows = position - 1;
+                    let mtp = self.sequence.mtp_kv.as_mut().ok_or("the sequence has no MTP cache")?;
+                    mtp.reserve(lane, &core.pool, 0, rows, &mut retained)
+                        .map_err(why("reserving the restored draft rows"))?;
+                    mtp.appended(rows).map_err(why("the draft cache's frontier"))?;
+                    mtp.commit(rows).map_err(why("the draft cache's frontier"))?;
+                }
+                Ok::<(), String>(())
             })
             .map_err(why("the reservation of the restored rows"))?;
         let refs = self
@@ -1165,8 +1180,14 @@ impl Owner {
             .refs(KvSource::Base)
             .map_err(why("the sequence's references"))?
             .ordered_after(reserved, &core.lanes);
+        if drafting {
+            // The draft cache's reservation is claimed too; the references above hold its view.
+            self.sequence
+                .refs(KvSource::Mtp)
+                .map_err(why("the draft cache's references"))?;
+        }
         let addresses =
-            SequenceAddresses::base_only(refs, &shared.config).ok_or("the sequence has no cache to restore into")?;
+            SequenceAddresses::new(refs, &shared.config).ok_or("the sequence has no cache to restore into")?;
         let Some(run) = self.run.as_mut() else { return Ok(()) };
         let Some(checkpoints) = run.checkpoints.as_mut() else {
             return Ok(());
@@ -1188,7 +1209,18 @@ impl Owner {
         run.position = position;
         run.carried = retained;
         run.carried_marker = Some(reserved);
+        if let Mode::Speculative { state, .. } = &mut run.mode
+            && drafting
+        {
+            // The draft pairs the hidden row it was restored with and the token at the position, before the chunks do.
+            state.resumed_at(position as u32);
+        }
         Ok(())
+    }
+
+    /// Whether the request drafts: its checkpoints hold the draft's state.
+    fn drafts(&self) -> bool {
+        matches!(self.run.as_ref().map(|run| &run.mode), Some(Mode::Speculative { state, .. }) if state.drafting())
     }
 
     /// The cache answered the restore.
@@ -1209,7 +1241,11 @@ impl Owner {
                 run.offset = 0;
                 run.position = 0;
                 run.first_kill = None;
-                if let Err(error) = self.sequence.kv.truncate(0) {
+                if let Mode::Speculative { state, .. } = &mut run.mode {
+                    state.start_over();
+                }
+                let draft = self.sequence.mtp_kv.as_mut().map_or(Ok(()), |cache| cache.truncate(0));
+                if let Err(error) = self.sequence.kv.truncate(0).and(draft) {
                     self.fail(format!("starting the prompt over: {error}"));
                 }
             }
@@ -1842,8 +1878,14 @@ impl Owner {
         // A chunk that ends at a checkpoint has nothing chained behind it: it retires, and the state it leaves is captured
         // before the next chunk starts (see `PromptCheckpoints`).
         let end = run.offset + next_rows(next);
+        // A chunk of a request that drafts is captured after its catch-up instead: the draft's cache is not whole before.
+        // The prompt's last chunk of a speculative request is never captured: its first step follows at once.
+        let capturable = match (&run.mode, next) {
+            (Mode::Speculative { .. }, Step::Prefill { last, .. }) => !drafting && !last,
+            _ => true,
+        };
         let checkpoint = matches!(next, Step::Prefill { .. })
-            && !speculative
+            && capturable
             && run
                 .checkpoints
                 .as_ref()
@@ -1862,7 +1904,7 @@ impl Owner {
                 // A greedy request chains the next row behind the prompt; a speculative one chains the next chunk (or the
                 // catch-up of this one) and waits for the first token after the last chunk.
                 more: if speculative {
-                    !last
+                    !last && !checkpoint
                 } else {
                     run.depth > 1 && !checkpoint
                 },
@@ -1918,7 +1960,7 @@ impl Owner {
         )?;
         let Some(run) = self.run.as_mut() else { return Ok(()) };
         if let Some(refs) = refs
-            && let Some(addresses) = SequenceAddresses::base_only(refs, &self.shared.config)
+            && let Some(addresses) = SequenceAddresses::new(refs, &self.shared.config)
             && let Some(checkpoints) = run.checkpoints.as_mut()
         {
             checkpoints.expect(end, Arc::new(addresses));
@@ -1955,7 +1997,7 @@ impl Owner {
 
     /// [`admit_quantum`](Self::admit_quantum) that, when `take` is set, also returns a copy of the references the
     /// quantum was admitted with: what a capture of the state it leaves reads.
-    fn admit_quantum_taking(
+    pub(super) fn admit_quantum_taking(
         &mut self,
         admission: Admission,
         shape: impl FnOnce(Quantum) -> Result<Quantum, QuantumError>,
