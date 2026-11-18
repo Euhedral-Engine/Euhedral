@@ -29,7 +29,6 @@ const SHIFT: u32 = 40;
 pub(super) struct Device {
     format: KvFormat,
     rows: u64,
-    speculative: bool,
     /// Every buffer a job asked this device the address of, in order.
     asked: Mutex<Vec<Buffer>>,
     memory: Mutex<HashMap<u64, Vec<u8>>>,
@@ -40,17 +39,8 @@ impl Device {
         Arc::new(Device {
             format,
             rows,
-            speculative: false,
             asked: Mutex::new(Vec::new()),
             memory: Mutex::new(HashMap::new()),
-        })
-    }
-
-    /// A sequence that speculates.
-    fn speculating(format: KvFormat, rows: u64) -> Arc<Device> {
-        Arc::new(Device {
-            speculative: true,
-            ..Arc::into_inner(Device::new(format, rows)).expect("one owner")
         })
     }
 
@@ -66,14 +56,22 @@ impl Device {
 
     /// Fills every buffer of `layout`'s checkpoint of `position` tokens with bytes only `salt` could have made.
     pub(super) fn fill(&self, layout: &CheckpointLayout, position: u32, salt: u8) {
-        for (index, copy) in everything(layout, position).iter().enumerate() {
+        for copy in everything(layout, position) {
             let at = (Device::id(copy.buffer) << SHIFT) + copy.offset;
+            // A buffer holds the same bytes at every position (the pages a checkpoint shares with its parent agree),
+            // except the seed row, which is the hidden row of the checkpoint's own position.
+            let own = if copy.buffer == Buffer::SeedRow {
+                position as u8
+            } else {
+                0
+            };
             let bytes: Vec<u8> = (0..copy.bytes)
                 .map(|byte| {
                     (byte as u8)
                         .wrapping_mul(31)
                         .wrapping_add(salt)
-                        .wrapping_add(index as u8)
+                        .wrapping_add(Device::id(copy.buffer) as u8)
+                        .wrapping_add(own)
                 })
                 .collect();
             self.write(at, &bytes);
@@ -115,10 +113,6 @@ impl Resolve for Device {
 
     fn rows(&self) -> u64 {
         self.rows
-    }
-
-    fn speculative(&self) -> bool {
-        self.speculative
     }
 
     fn ready(&self) -> Option<Marker> {
@@ -304,7 +298,7 @@ pub(super) fn same_state(layout: &CheckpointLayout, position: u32, left: &Device
 }
 
 /// Whether they hold the same state, the speculative part (the seed row and the MTP pages) included.
-fn same_speculative_state(layout: &CheckpointLayout, position: u32, left: &Device, right: &Device) -> bool {
+pub(super) fn same_speculative_state(layout: &CheckpointLayout, position: u32, left: &Device, right: &Device) -> bool {
     base_state(layout, position, left, right, true)
 }
 
@@ -782,20 +776,34 @@ fn a_capture_copies_the_buffers_of_the_state_and_no_others() {
 }
 
 #[test]
-fn a_sequence_that_speculates_is_neither_captured_nor_restored() {
+fn a_request_without_speculation_restores_a_speculative_node_without_its_draft_state() {
     let rig = Rig::new(64);
-    let plain = Device::new(FORMAT, 1024);
+    let source = Device::new(FORMAT, 1024);
     let prompt = tokens(0, 600);
-    let first = rig.capture(&plain, &prompt, rig.cache.root(), 512, None);
-    rig.run_all(&plain);
-    answer(&first);
-    let speculating = Device::speculating(FORMAT, 1024);
-    let refused = rig.capture(&speculating, &tokens(5000, 600), rig.cache.root(), 512, None);
-    assert_eq!(answer(&refused), rig.cache.root());
-    let hit = rig.lookup(&prompt, None).expect("hit");
-    let restored = rig.restore(hit, &speculating, None, &Arc::new(AtomicBool::new(false)));
-    assert_eq!(answer(&restored), Err(RestoreError::Speculative));
-    assert_eq!(rig.queued(), 0);
+    source.fill(&rig.layout, 512, 9);
+    let stored = rig.capture(&source, &prompt, rig.cache.root(), 512, Some(Speculation::Mtp));
+    rig.run_all(&source);
+    answer(&stored);
+    let hit = rig
+        .lookup(&prompt, None)
+        .expect("a plain lookup matches a speculative node");
+    let target = Device::new(FORMAT, 1024);
+    let restored = rig.restore(hit, &target, None, &Arc::new(AtomicBool::new(false)));
+    rig.run_all(&target);
+    assert_eq!(answer(&restored), Ok(512));
+    assert!(
+        same_state(&rig.layout, 512, &source, &target),
+        "the base state came back"
+    );
+    assert!(
+        !target
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|buffer| matches!(buffer, Buffer::MtpPage { .. } | Buffer::SeedRow)),
+        "the draft's state was left alone"
+    );
 }
 
 #[test]

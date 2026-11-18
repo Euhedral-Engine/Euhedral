@@ -68,9 +68,11 @@ pub struct SequenceAddresses {
     /// By model layer: the full-attention layer's place among the cache's layers.
     attention: Vec<Option<usize>>,
     format: KvFormat,
-    /// The request the state belongs to does not speculate: it copies the base state only, whatever the engine's
-    /// sequences are able to do.
-    base_only: bool,
+    /// The bytes of one hidden row (one row of the draft seed rows).
+    hidden_row_bytes: u64,
+    /// The row of the draft seed rows that holds the base hidden row of the checkpoint's last position: the last row
+    /// of the chunk that ended at a checkpoint, row 0 for the restore into a sequence about to prefill.
+    seed_row: u32,
 }
 
 impl SequenceAddresses {
@@ -92,18 +94,15 @@ impl SequenceAddresses {
             refs,
             attention,
             format,
-            base_only: false,
+            hidden_row_bytes: config.hidden_size as u64 * 2,
+            seed_row: 0,
         })
     }
 
-    /// As [`new`](Self::new), for a request that does not speculate on an engine whose sequences can: its state is the
-    /// base state alone, which is all its checkpoints hold and all a restore into it needs (the draft cache stays as
-    /// the reset left it, and no request drafts from it before the next reset).
-    pub fn base_only(refs: SequenceRefs, config: &ModelConfig) -> Option<SequenceAddresses> {
-        Some(SequenceAddresses {
-            base_only: true,
-            ..Self::new(refs, config)?
-        })
+    /// The seed row the draft's checkpoint state is read from or written to is row `row` of the draft seed rows.
+    pub fn with_seed_row(mut self, row: u32) -> SequenceAddresses {
+        self.seed_row = row;
+        self
     }
 }
 
@@ -112,6 +111,11 @@ impl SequenceAddresses {
     pub fn refs(&self) -> &SequenceRefs {
         &self.refs
     }
+}
+
+/// The offset into the draft seed rows of byte `offset` of row `row`.
+pub(crate) fn seed_offset(row: u32, row_bytes: u64, offset: u64) -> u64 {
+    u64::from(row) * row_bytes + offset
 }
 
 /// The device address of `offset` bytes into `base`, when `bytes` more fit within `size`.
@@ -141,9 +145,11 @@ impl Resolve for SequenceAddresses {
                 let view = self.refs.kv(KvSource::Mtp)?;
                 within(view.page(0, page), 2 * view.plane_page_bytes(), offset, bytes)
             }
-            // The seed of a draft is the hidden row of the last token of the last prefill chunk, not row 0 of the seed
-            // rows: there is no address to copy until the layout of the speculative state is settled.
-            Buffer::SeedRow => None,
+            Buffer::SeedRow => {
+                let rows = &device.scratch.draft()?.seed_rows;
+                let offset = seed_offset(self.seed_row, self.hidden_row_bytes, offset);
+                within(Some(rows.ptr()), rows.bytes() as u64, offset, bytes)
+            }
         }
     }
 
@@ -153,10 +159,6 @@ impl Resolve for SequenceAddresses {
 
     fn rows(&self) -> u64 {
         self.refs.kv(KvSource::Base).map_or(0, |view| view.reserved())
-    }
-
-    fn speculative(&self) -> bool {
-        !self.base_only && (self.refs.kv(KvSource::Mtp).is_some() || self.refs.device().scratch.draft().is_some())
     }
 
     fn ready(&self) -> Option<Marker> {
@@ -282,5 +284,19 @@ impl Copier {
             root: StageId(0),
             sink: StageId(0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::seed_offset;
+
+    #[test]
+    fn the_seed_row_of_a_checkpoint_is_the_last_row_of_its_chunk() {
+        // A chunk of 512 rows of 5120-byte hidden rows ends at row 511 of the seed rows, not at row 0.
+        assert_eq!(seed_offset(511, 5120, 0), 511 * 5120);
+        assert_eq!(seed_offset(0, 5120, 0), 0);
+        // A copy that starts inside the row stays inside it.
+        assert_eq!(seed_offset(3, 5120, 16), 3 * 5120 + 16);
     }
 }

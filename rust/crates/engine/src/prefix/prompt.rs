@@ -23,7 +23,7 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{Hit, NodeId, PrefixCacheHandle, Resolve, RestoreError, Submit};
+use super::{Hit, NodeId, PrefixCacheHandle, Resolve, RestoreError, Speculation, Submit};
 use crate::state::SequenceId;
 
 /// Where the request is in the lookup and the restore.
@@ -69,6 +69,9 @@ pub enum Restored {
 pub struct PromptCheckpoints {
     cache: PrefixCacheHandle,
     tokens: Arc<[u32]>,
+    /// The speculative state the request's checkpoints hold: its lookups match only nodes that hold it, its captures
+    /// store it, its restores write it. `None` for a request that does not draft.
+    kind: Option<Speculation>,
     /// The node the next capture hangs under.
     parent: NodeId,
     start: Start,
@@ -96,10 +99,12 @@ impl Debug for PromptCheckpoints {
 impl PromptCheckpoints {
     /// Asks the cache for the longest checkpoint of `tokens`; `looked` receives the answer (and the owner then calls
     /// [`looked`](Self::looked)). A prompt that cannot match one (at most a chunk long) is not looked up: `looked` is
-    /// never called, and the request starts at once ([`holds`](Self::holds) is false).
+    /// never called, and the request starts at once ([`holds`](Self::holds) is false). A request that drafts passes the
+    /// `kind` of the state its drafts read: only checkpoints that hold it match, and its own hold it.
     pub fn begin(
         cache: PrefixCacheHandle,
         tokens: Arc<[u32]>,
+        kind: Option<Speculation>,
         looked: impl FnOnce(Option<Hit>) + Send + 'static,
     ) -> PromptCheckpoints {
         let parent = cache.root();
@@ -108,6 +113,7 @@ impl PromptCheckpoints {
         let checkpoints = PromptCheckpoints {
             cache: cache.clone(),
             tokens,
+            kind,
             parent,
             start: if lookup { Start::Looking } else { Start::Settled },
             next: Next::None,
@@ -117,7 +123,7 @@ impl PromptCheckpoints {
             cached: 0,
         };
         if lookup {
-            cache.lookup(asking, None, looked);
+            cache.lookup(asking, kind, looked);
         }
         checkpoints
     }
@@ -149,7 +155,7 @@ impl PromptCheckpoints {
             hit,
             sequence,
             refs,
-            None,
+            self.kind,
             Arc::clone(&kill),
             submit(Arc::clone(&kill)),
             done,
@@ -233,7 +239,7 @@ impl PromptCheckpoints {
             Arc::clone(&self.tokens),
             self.parent,
             end,
-            None,
+            self.kind,
             submit(kill),
             done,
         );

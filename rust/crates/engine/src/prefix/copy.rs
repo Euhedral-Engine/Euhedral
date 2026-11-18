@@ -71,11 +71,6 @@ pub trait Resolve: Send + Sync + 'static {
     /// The format the sequence keeps its attention caches in.
     fn kv_format(&self) -> KvFormat;
 
-    /// Whether the sequence speculates (it has a draft cache or draft scratch). The cache refuses to capture or restore
-    /// such a sequence until the layout of the speculative state is settled: a checkpoint of it would not hold the
-    /// state its next draft reads.
-    fn speculative(&self) -> bool;
-
     /// The rows the sequence's attention caches hold.
     fn rows(&self) -> u64;
 
