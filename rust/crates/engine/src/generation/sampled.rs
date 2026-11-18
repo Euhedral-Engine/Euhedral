@@ -1017,4 +1017,29 @@ mod tests {
             self.0.0.get(self.1).map(Vec::as_slice)
         }
     }
+
+    #[test]
+    fn the_sample_and_prepare_frames_of_two_sequences_are_on_different_chains() {
+        let sample = |chain: usize| {
+            sample_frame(
+                chain,
+                0,
+                4,
+                greedy_sampler(4),
+                None,
+                Bytes(bf16(&[0.5, 3.0, -1.0, 2.0])),
+                |_| {},
+            )
+            .header()
+            .id_hash()
+        };
+        let prepare = |chain: usize| {
+            let constraint = Guarded::new(Box::new(Fake::new(&[2], Fault::None).0));
+            prepare_frame(chain, 0, constraint, |_| {}).header().id_hash()
+        };
+        assert_ne!(sample(0), sample(1));
+        assert_ne!(prepare(0), prepare(1));
+        assert_eq!(sample(3), sample(3), "one sequence keeps its chain");
+        assert_ne!(sample(0), prepare(0), "a kind of its own");
+    }
 }

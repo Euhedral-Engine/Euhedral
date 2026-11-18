@@ -409,7 +409,7 @@ pub(super) struct Run {
     pub(super) capacity: u64,
     _units: Units,
     /// The sequence's place in the pool, given back when the run is dropped.
-    _lease: Lease,
+    lease: Lease,
 }
 
 impl Run {
@@ -860,7 +860,7 @@ impl Owner {
             began: Instant::now(),
             capacity,
             _units: units,
-            _lease: lease,
+            lease,
         });
         Ok(())
     }
@@ -937,8 +937,13 @@ impl Owner {
             return self.fail(format!("the owner panicked: {message}"));
         }
         let Some(mut run) = self.run.take() else { return };
-        log::error!("the owner panicked again: the request ends with its quanta still in flight");
+        log::error!(
+            "the owner of sequence {} panicked again: the request ends with its quanta still in flight, and the sequence leaves the pool",
+            self.id.0
+        );
         mem::forget(mem::take(&mut run.in_flight));
+        // The quanta can no longer be accounted for, so a next request on this sequence could race them: it is not given back.
+        mem::forget(run.lease);
         if mem::take(&mut run.chain) {
             self.shared.order.forget(self.id);
         }
@@ -1834,5 +1839,28 @@ impl Turn for Owner {
 
     fn idle(&self) -> bool {
         self.run.is_none() && self.parked.is_empty() && self.finished.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn the_frames_of_two_sequences_are_never_on_one_chain() {
+        let hash = |frame: Box<dyn Frame>| frame.header().id_hash();
+        for kind in [Kind::Reaped, Kind::Logits] {
+            assert_ne!(hash(step(kind, 0, || {})), hash(step(kind, 1, || {})), "{kind:?}");
+        }
+        assert_ne!(
+            hash(step_frame(0, || {})),
+            hash(step_frame(1, || {})),
+            "the control frame"
+        );
+        assert_eq!(
+            hash(step_frame(2, || {})),
+            hash(step_frame(2, || {})),
+            "one sequence keeps its chain"
+        );
     }
 }

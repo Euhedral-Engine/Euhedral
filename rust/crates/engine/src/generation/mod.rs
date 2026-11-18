@@ -543,10 +543,18 @@ impl Generations {
                 generation.mailbox.stopping()
             })
             .collect();
-        let stopped = idle.into_iter().fold(true, |all, idle| {
-            let ended = idle.is_some_and(|idle| idle.wait(deadline.saturating_duration_since(Instant::now())).is_ok());
-            all && ended
-        });
+        // A generation whose barrier could not be set (called from inside a turn) cannot be waited for: none is.
+        if idle.iter().any(Option::is_none) {
+            log::error!("a generation cannot be waited for from inside a turn at shutdown");
+            return false;
+        }
+        let stopped = idle
+            .into_iter()
+            .flatten()
+            .map(|idle| idle.wait(deadline.saturating_duration_since(Instant::now())).is_ok())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .all(|ended| ended);
         if !stopped {
             log::error!("a generation did not end within {bound:?} of the cancel at shutdown");
         }
