@@ -108,7 +108,7 @@ pub fn resolve_sequences(
     let cap = (rows / verified).max(1);
     let chosen = sequences_for(config, table, settings, inputs, cap)?;
     log::info!(
-        "sequences: {chosen} of {} tokens each (automatic)",
+        "sequences: {chosen} of {} tokens each fit the device (automatic)",
         settings.context.max_tokens
     );
     Ok(chosen)
@@ -185,7 +185,8 @@ pub(crate) struct Units {
 
 impl Core {
     /// `sequences`, or fewer when the lanes' rings, sized before the model was read, cannot hold the quanta that many
-    /// sequences keep in flight. Only an automatic count can exceed them.
+    /// sequences keep in flight. Only an automatic count can exceed them: the rings are sized for the stated count, and
+    /// for one when it is automatic, because a ring's markers are device events created with the lane.
     pub(crate) fn hold_sequences(&self, sequences: usize) -> usize {
         let per_sequence = Plan::stage_bound().saturating_mul(STAGE_RING_QUANTA).max(1);
         let held = sequences.min((self.stage_ring / per_sequence).max(1));
