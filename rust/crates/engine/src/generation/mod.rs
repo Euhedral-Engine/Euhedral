@@ -45,7 +45,7 @@ pub use constraint::{ConstraintError, ReasoningConstraint, TokenConstraint};
 pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
 pub use listener::GenerationListener;
 pub(crate) use mailbox::OPERATION_BOUND;
-use mailbox::{Address, Mailbox, Spawn};
+pub(crate) use mailbox::{Address, Mailbox, Spawn, Turn};
 use order::Order;
 pub use request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,

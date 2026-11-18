@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::model::{LayerKind, ModelConfig};
 use euhedral_memory::{LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope, SlotArena};
 
 /// An arena of `count` slots of `slot_bytes`, addressed as offsets from 0, accounted on a host location.
@@ -19,4 +20,45 @@ pub fn arena(count: u32, slot_bytes: u64) -> Arc<SlotArena> {
 
 pub fn tokens(from: u32, count: u32) -> Vec<u32> {
     (from..from + count).collect()
+}
+
+pub fn config(kinds: Vec<LayerKind>, key_heads: usize, value_heads: usize, key_dim: usize) -> ModelConfig {
+    ModelConfig {
+        vocab_size: 1,
+        hidden_size: 64,
+        num_hidden_layers: kinds.len(),
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        attention_head_dim: 256,
+        intermediate_size: 1,
+        linear_num_key_heads: key_heads,
+        linear_num_value_heads: value_heads,
+        linear_key_head_dim: key_dim,
+        linear_value_head_dim: 16,
+        linear_conv_kernel_dim: 4,
+        rms_norm_epsilon: 1.0,
+        rope_theta: 1.0,
+        partial_rotary_factor: 1.0,
+        max_position_embeddings: 1,
+        layer_kinds: kinds,
+        num_experts: 0,
+        tie_word_embeddings: false,
+        attention_output_gate: true,
+        mtp_layer_count: 1,
+        draft_depth: None,
+    }
+}
+
+/// Eight layers, GDN on the even ones and full attention on the odd ones; small GDN state.
+pub fn compact() -> ModelConfig {
+    let kinds = (0..8)
+        .map(|layer| {
+            if layer % 2 == 1 {
+                LayerKind::FullAttention
+            } else {
+                LayerKind::GatedDeltaNet
+            }
+        })
+        .collect();
+    config(kinds, 2, 4, 8)
 }

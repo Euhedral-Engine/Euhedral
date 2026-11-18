@@ -9,12 +9,25 @@
 #[cfg(doc)]
 use euhedral_memory::SlotArena;
 
+#[allow(dead_code, reason = "the runtime opens the cache once it is wired in")]
+mod cache;
+#[allow(dead_code, reason = "the runtime opens the cache once it is wired in")]
+mod copy;
 mod layout;
 mod tree;
 
+pub use cache::{CacheParts, Hit, OpenError, PrefixCacheHandle, PrefixCacheStats, RestoreError, Submit};
+pub use copy::{CopyJob, Direction, Ended, HostArena, Piece, Resolve};
 pub use layout::{Buffer, CheckpointLayout, SlotCopy};
 pub use tree::{Match, NodeId, POSITION_GRANULE, PrefixNode, PrefixTree, ReserveError, Speculation};
 
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "the fake device and the jobs' queue are shared between the test and the closures the cache is given"
+)]
+mod cache_tests;
 #[cfg(test)]
 mod fixtures;
 #[cfg(test)]
