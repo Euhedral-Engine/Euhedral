@@ -904,6 +904,43 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn host_pinned_bytes_reads_the_limits_and_the_margin_and_is_unknown_without_a_figure() {
+        use euhedral_inference_settings::{Auto, ByteSize, ModelSettings};
+        const GIB: u64 = 1 << 30;
+        let mut settings = Settings::with_model(ModelSettings::default());
+        let unknown = Machine::default();
+        assert_eq!(host_pinned_bytes(&settings, &unknown), None);
+        settings.memory.host_limit = Auto::Value(ByteSize::gib(3));
+        assert_eq!(host_pinned_bytes(&settings, &unknown), Some(3 * GIB));
+        settings.memory.host_limit = Auto::Auto;
+        settings.memory.host_weights_limit = Auto::Value(ByteSize::gib(5));
+        assert_eq!(
+            host_pinned_bytes(&settings, &unknown),
+            Some(5 * GIB),
+            "no figure needed"
+        );
+        settings.memory.host_limit = Auto::Value(ByteSize::gib(3));
+        let machine = Machine {
+            available: Some(100 * GIB),
+            total: None,
+        };
+        assert_eq!(
+            host_pinned_bytes(&settings, &machine),
+            Some(5 * GIB),
+            "the weights limit wins"
+        );
+        settings.memory.host_weights_limit = Auto::Auto;
+        settings.memory.host_limit = Auto::Auto;
+        assert_eq!(host_pinned_bytes(&settings, &machine), Some(90 * GIB));
+        settings.memory.host_margin = Auto::Value(ByteSize::gib(1));
+        assert_eq!(
+            host_pinned_bytes(&settings, &machine),
+            Some(99 * GIB),
+            "the margin is passed through"
+        );
+    }
+
     /// A fan-in of `count` parts whose continuation hands over what it was given and counts its runs.
     fn fan_in(count: usize) -> (Arc<SegmentReads>, Arc<Handoff<SegmentParts>>, Arc<AtomicUsize>) {
         let seen = Handoff::new();

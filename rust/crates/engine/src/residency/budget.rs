@@ -10,7 +10,7 @@
 
 use euhedral_inference_settings::{Auto, ByteSize};
 
-/// A budget never closer to exhaustion than this (`HostBudget.MARGIN_FLOOR`): the room the operating system needs.
+/// A budget never closer to exhaustion than this: the room the operating system needs.
 const MARGIN_FLOOR: u64 = 4 << 30;
 
 /// Where the budget came from.
@@ -52,7 +52,7 @@ impl HostBudget {
     }
 
     /// A budget from the memory the machine can spare, less `margin`: when `auto`, 10% of it but never closer than
-    /// 4 GiB to exhaustion (`HostBudget.ofAvailable`).
+    /// 4 GiB to exhaustion.
     pub fn of_available(available_bytes: u64, margin: Auto<ByteSize>) -> Self {
         let margin = margin
             .value()
@@ -66,7 +66,7 @@ impl HostBudget {
     }
 
     /// The budget of a machine that can spare `available` bytes now (`None`: unknown), keeping `margin` and
-    /// `runtime_reserve` bytes for the system and the runtime, or `stated` bytes (`HostBudget.of`). Nothing stated and
+    /// `runtime_reserve` bytes for the system and the runtime, or `stated` bytes. Nothing stated and
     /// nothing known is [`BudgetSource::Unknown`].
     pub fn of(stated: Option<u64>, available: Option<u64>, margin: Auto<ByteSize>, runtime_reserve: u64) -> Self {
         let machine = available.map(|available| {
@@ -89,8 +89,8 @@ impl HostBudget {
         }
     }
 
-    /// The pinned memory this budget allows: as stated when stated, else what the machine can spare
-    /// (`HostBudget.pinnedBytes`); `None` when unknown.
+    /// The pinned memory this budget allows: as stated when stated, else what the machine can spare;
+    /// `None` when unknown.
     pub fn pinned_bytes(&self) -> Option<u64> {
         match self.source {
             BudgetSource::Explicit => Some(self.resident_bytes),
@@ -132,7 +132,7 @@ pub fn cgroup_path(proc_self_cgroup: &str) -> Option<&str> {
 }
 
 /// The headroom of one cgroup: `memory.max` less `memory.current`, or `None` when it has no limit
-/// (`HostBudget.headroom`).
+///.
 pub fn cgroup_headroom(memory_max: &str, memory_current: &str) -> Option<u64> {
     let max = memory_max.trim();
     if max.is_empty() || max == "max" {
@@ -144,7 +144,7 @@ pub fn cgroup_headroom(memory_max: &str, memory_current: &str) -> Option<u64> {
 }
 
 /// The memory the machine and the process's cgroups can spare now: the lesser of `MemAvailable` and the least cgroup
-/// headroom (`HostBudget.availableBytes`). `None` when neither is known.
+/// headroom. `None` when neither is known.
 pub fn available_bytes(mem_available: Option<u64>, least_cgroup_headroom: Option<u64>) -> Option<u64> {
     match (mem_available, least_cgroup_headroom) {
         (Some(available), Some(headroom)) => Some(available.min(headroom)),
@@ -165,6 +165,9 @@ mod tests {
         assert_eq!(HostBudget::of_available(100 * GIB, Auto::Auto).resident_bytes, 90 * GIB);
         // 20 GiB: 10% is 2 GiB, the 4 GiB floor applies.
         assert_eq!(HostBudget::of_available(20 * GIB, Auto::Auto).resident_bytes, 16 * GIB);
+        // 10% of 123 GiB + 1 byte rounds down; the margin is 12.3 GiB, above the floor.
+        let odd = 123 * GIB + 1;
+        assert_eq!(HostBudget::of_available(odd, Auto::Auto).resident_bytes, odd - odd / 10);
         // Under the floor nothing is left.
         assert_eq!(HostBudget::of_available(3 * GIB, Auto::Auto).resident_bytes, 0);
     }

@@ -1,5 +1,5 @@
 //! The residency plan's fit, spill and refusal are the memory planner's decision: what the plan asks of each
-//! location, where the host budget and the device budget draw the line, and that an unknown budget is no overflow.
+//! location, where the host budget and the device budget draw the line, and that an unlimited budget is no overflow.
 
 #![allow(
     clippy::unwrap_used,
@@ -8,7 +8,7 @@
 )]
 
 use euhedral_inference_engine::error::PlanError;
-use euhedral_inference_engine::residency::planner::{PlanInputs, plan_with};
+use euhedral_inference_engine::residency::planner::{PlanInputs, plan_with, sequences_for};
 use euhedral_inference_settings::{Auto, ByteSize};
 
 mod common;
@@ -74,11 +74,11 @@ fn unknown_budgets_do_not_overflow() {
     let plan = plan_with(&config, &table, &settings, inputs(u64::MAX, Some(u64::MAX))).unwrap();
     assert_eq!(plan.kv_host_tokens, 0);
     assert_eq!(plan.budget_bytes, u64::MAX);
-    // A limit and an unknown host with the device short: the spill is admitted, not an overflow.
+    // A limit and an unlimited host with the device short: the spill is admitted, not an overflow.
     settings.memory.gpu_limit = Auto::Value(ByteSize(plan.device_bytes - 1));
     let spilled = plan_with(&config, &table, &settings, inputs(u64::MAX, Some(u64::MAX))).unwrap();
     assert!(spilled.kv_host_bytes > 0);
-    // Nothing fits and the host is unknown: the refusal reports the numbers it always did.
+    // Nothing fits and the host is unlimited: the refusal reports the numbers it always did.
     settings.memory.gpu_limit = Auto::Value(ByteSize(GIB));
     let Err(PlanError::WeightsDoNotFit { available, free, .. }) =
         plan_with(&config, &table, &settings, inputs(u64::MAX, Some(u64::MAX)))
@@ -121,6 +121,33 @@ fn an_unknown_host_budget_refuses_a_spill_and_a_stated_one_allows_it() {
         plan_with(&config, &table, &settings, inputs(GIB, None)),
         Err(PlanError::WeightsDoNotFit { .. })
     ));
+}
+
+#[test]
+fn the_sequence_search_treats_an_unknown_host_budget_as_no_room_to_spill() {
+    let (table, config) = (rco_table(), config());
+    let settings = settings(131_072);
+    let mut two = inputs(u64::MAX, Some(u64::MAX));
+    two.sequences = 2;
+    let whole_two = plan_with(&config, &table, &settings, two).unwrap();
+    // One sequence fits whole; a second fits only with the cache spilled.
+    let free = whole_two.device_bytes - 1;
+    assert!(plan_with(&config, &table, &settings, inputs(free, Some(u64::MAX))).is_ok());
+    let spills = plan_with(
+        &config,
+        &table,
+        &settings,
+        PlanInputs {
+            sequences: 2,
+            ..inputs(free, Some(u64::MAX))
+        },
+    );
+    assert!(spills.unwrap().kv_host_bytes > 0);
+    let mut probe = inputs(free, None);
+    probe.sequences = 1;
+    let known = sequences_for(&config, &table, &settings, inputs(free, Some(0)), 8).unwrap();
+    assert_eq!(known, 1);
+    assert_eq!(sequences_for(&config, &table, &settings, probe, 8), Ok(known));
 }
 
 #[test]

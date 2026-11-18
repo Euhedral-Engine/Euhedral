@@ -199,7 +199,9 @@ pub struct PlanInputs {
 }
 
 /// Plans residency for `config`'s model in an artifact with `table`, on a device with `device_free` bytes free and
-/// no limit on pinned host memory beyond `memory.host-weights-limit` and `memory.host-limit`.
+/// no limit on pinned host memory beyond `memory.host-weights-limit` and `memory.host-limit`. With neither set the
+/// host budget is taken as known and unlimited (`Some(u64::MAX)`), not unknown: this entry point does not read the
+/// machine, so a spill is never refused here for want of a figure.
 pub fn plan(
     config: &ModelConfig,
     table: &TensorTable,
@@ -408,7 +410,7 @@ pub fn sequences_for(
         let middle = low + (high - low).div_ceil(2);
         match with(middle) {
             Ok(_) => low = middle,
-            Err(PlanError::WeightsDoNotFit { .. }) => high = middle - 1,
+            Err(PlanError::WeightsDoNotFit { .. } | PlanError::HostBudgetUnknown { .. }) => high = middle - 1,
             Err(other) => return Err(other),
         }
     }
