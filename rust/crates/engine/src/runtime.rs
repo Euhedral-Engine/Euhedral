@@ -635,6 +635,11 @@ impl EngineRuntime {
         &self.plan
     }
 
+    /// The sequences beyond the generation's that the engine holds allocated, without an owner.
+    pub fn spare_sequences(&self) -> usize {
+        self.device.spare.len()
+    }
+
     /// The model's dimensions.
     pub fn config(&self) -> &ModelConfig {
         &self.config

@@ -28,7 +28,6 @@ use euhedral_inference_engine::model::ModelConfig;
 use euhedral_inference_engine::residency::footprint;
 use euhedral_inference_engine::residency::planner::plan;
 use euhedral_inference_engine::state::SequenceState;
-use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvError, KvRetained};
 use euhedral_inference_engine::state::released::ReleasedBuffers;
