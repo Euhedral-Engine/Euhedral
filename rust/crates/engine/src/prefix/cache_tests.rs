@@ -2,10 +2,13 @@
 //! sequence's owner, running (or failing, or dropping) the jobs the cache hands it. Nothing waits: the mailbox's
 //! hand-offs run on the calling thread, so every answer has arrived when a request returns.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
+use euhedral_graph::Marker;
 use euhedral_inference_cuda::PinnedBuffer;
 use euhedral_inference_settings::KvFormat;
 
@@ -26,6 +29,9 @@ const SHIFT: u32 = 40;
 struct Device {
     format: KvFormat,
     rows: u64,
+    speculative: bool,
+    /// Every buffer a job asked this device the address of, in order.
+    asked: Mutex<Vec<Buffer>>,
     memory: Mutex<HashMap<u64, Vec<u8>>>,
 }
 
@@ -34,7 +40,17 @@ impl Device {
         Arc::new(Device {
             format,
             rows,
+            speculative: false,
+            asked: Mutex::new(Vec::new()),
             memory: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// A sequence that speculates.
+    fn speculating(format: KvFormat, rows: u64) -> Arc<Device> {
+        Arc::new(Device {
+            speculative: true,
+            ..Arc::into_inner(Device::new(format, rows)).expect("one owner")
         })
     }
 
@@ -89,6 +105,7 @@ impl Device {
 
 impl Resolve for Device {
     fn address(&self, buffer: Buffer, offset: u64, _bytes: u64) -> Option<u64> {
+        self.asked.lock().unwrap().push(buffer);
         Some((Device::id(buffer) << SHIFT) + offset)
     }
 
@@ -100,7 +117,11 @@ impl Resolve for Device {
         self.rows
     }
 
-    fn ready(&self) -> Option<euhedral_graph::Marker> {
+    fn speculative(&self) -> bool {
+        self.speculative
+    }
+
+    fn ready(&self) -> Option<Marker> {
         None
     }
 }
@@ -458,7 +479,7 @@ fn a_closed_cache_stores_and_restores_nothing() {
     rig.run_all(&source);
     answer(&first);
     let hit = rig.lookup(&prompt, None).expect("hit");
-    rig.cache.close();
+    assert!(rig.cache.close(Duration::from_secs(5)));
     assert!(rig.lookup(&prompt, None).is_none());
     let captured = rig.capture(&source, &prompt, rig.cache.root(), 256, None);
     assert_eq!(answer(&captured), rig.cache.root());
@@ -723,4 +744,230 @@ fn a_cache_over_the_wrong_slot_size_or_an_off_grid_interval_does_not_open() {
     let off = PrefixCacheHandle::open(parts(layout.slot_bytes(), 700), inline());
     assert_eq!(off.err(), Some(OpenError::Interval));
     assert!(PrefixCacheHandle::open(parts(layout.slot_bytes(), 0), inline()).is_err());
+}
+
+#[test]
+fn a_capture_copies_the_buffers_of_the_state_and_no_others() {
+    // Written out from the model, not from the layout: `compact()` has the GDN state on layers 0, 2, 4 and 6 and the
+    // attention caches on layers 1, 3, 5 and 7, and 512 tokens are two pages of 256.
+    let expected: HashSet<Buffer> = [0, 2, 4, 6]
+        .into_iter()
+        .flat_map(|layer| [Buffer::Convolution { layer }, Buffer::Recurrent { layer }])
+        .chain(
+            [1, 3, 5, 7]
+                .into_iter()
+                .flat_map(|layer| [0, 1].map(|page| Buffer::KvPage { layer, page })),
+        )
+        .collect();
+    assert_eq!(expected.len(), 8 + 8);
+    let rig = Rig::new(64);
+    let source = Device::new(FORMAT, 1024);
+    let prompt = tokens(0, 600);
+    let captured = rig.capture(&source, &prompt, rig.cache.root(), 512, None);
+    rig.run_all(&source);
+    answer(&captured);
+    assert_eq!(
+        source.asked.lock().unwrap().iter().copied().collect::<HashSet<_>>(),
+        expected
+    );
+    let target = Device::new(FORMAT, 1024);
+    let hit = rig.lookup(&prompt, None).expect("hit");
+    let restored = rig.restore(hit, &target, None, &Arc::new(AtomicBool::new(false)));
+    rig.run_all(&target);
+    assert_eq!(answer(&restored), Ok(512));
+    assert_eq!(
+        target.asked.lock().unwrap().iter().copied().collect::<HashSet<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn a_sequence_that_speculates_is_neither_captured_nor_restored() {
+    let rig = Rig::new(64);
+    let plain = Device::new(FORMAT, 1024);
+    let prompt = tokens(0, 600);
+    let first = rig.capture(&plain, &prompt, rig.cache.root(), 512, None);
+    rig.run_all(&plain);
+    answer(&first);
+    let speculating = Device::speculating(FORMAT, 1024);
+    let refused = rig.capture(&speculating, &tokens(5000, 600), rig.cache.root(), 512, None);
+    assert_eq!(answer(&refused), rig.cache.root());
+    let hit = rig.lookup(&prompt, None).expect("hit");
+    let restored = rig.restore(hit, &speculating, None, &Arc::new(AtomicBool::new(false)));
+    assert_eq!(answer(&restored), Err(RestoreError::Speculative));
+    assert_eq!(rig.queued(), 0);
+}
+
+#[test]
+fn a_restore_into_pages_that_are_not_reserved_is_refused_without_a_job() {
+    let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
+    let rig = Rig::new(layout.slots(0, 256, None) as u32);
+    let source = Device::new(FORMAT, 1024);
+    let prompt = tokens(0, 300);
+    let first = rig.capture(&source, &prompt, rig.cache.root(), 256, None);
+    rig.run_all(&source);
+    answer(&first);
+    let short = Device::new(FORMAT, 100);
+    let hit = rig.lookup(&prompt, None).expect("hit");
+    let restored = rig.restore(hit, &short, None, &Arc::new(AtomicBool::new(false)));
+    assert_eq!(
+        answer(&restored),
+        Err(RestoreError::Unreserved {
+            rows: 100,
+            position: 256
+        })
+    );
+    assert_eq!(rig.queued(), 0);
+    let other = rig.capture(&source, &tokens(1000, 300), rig.cache.root(), 256, None);
+    rig.run_all(&source);
+    assert_ne!(answer(&other), rig.cache.root(), "the refusal unpinned the match");
+}
+
+#[test]
+fn a_restore_that_fails_sets_the_requests_kill_flag_before_it_answers() {
+    let rig = Rig::new(64);
+    let source = Device::new(FORMAT, 1024);
+    let prompt = tokens(0, 600);
+    let first = rig.capture(&source, &prompt, rig.cache.root(), 512, None);
+    rig.run_all(&source);
+    answer(&first);
+    for how in 0..3 {
+        let kill = Arc::new(AtomicBool::new(false));
+        let hit = rig.lookup(&prompt, None).expect("hit");
+        let restored = rig.restore(hit, &source, None, &kill);
+        let mut job = rig.next_job();
+        match how {
+            0 => job.finish(Ended::Failed("the lane failed".to_string())),
+            1 => drop(job),
+            _ => job.finish(Ended::Cancelled),
+        }
+        let flag = kill.load(Ordering::Acquire);
+        match (how, answer(&restored)) {
+            (0, Err(RestoreError::Copy(why))) => assert_eq!(why, "the lane failed"),
+            (1, Err(RestoreError::Copy(_))) => {}
+            (2, Err(RestoreError::Cancelled)) => {}
+            (_, other) => panic!("case {how}: {other:?}"),
+        }
+        assert_eq!(
+            flag,
+            how != 2,
+            "case {how}: a failed copy kills the request, a cancel needs no kill"
+        );
+    }
+}
+
+#[test]
+fn a_restores_match_stays_pinned_until_its_job_ended() {
+    let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
+    let rig = Rig::new(layout.slots(0, 256, None) as u32);
+    let source = Device::new(FORMAT, 1024);
+    let (a, b) = (tokens(0, 300), tokens(1000, 300));
+    let first = rig.capture(&source, &a, rig.cache.root(), 256, None);
+    rig.run_all(&source);
+    answer(&first);
+    let target = Device::new(FORMAT, 1024);
+    let hit = rig.lookup(&a, None).expect("hit");
+    let restored = rig.restore(hit, &target, None, &Arc::new(AtomicBool::new(false)));
+    // The job is built and submitted but has not run: its slots are still being read.
+    let job = rig.next_job();
+    let refused = rig.capture(&source, &b, rig.cache.root(), 256, None);
+    assert_eq!(
+        answer(&refused),
+        rig.cache.root(),
+        "the only checkpoint is pinned by the restore"
+    );
+    assert_eq!(rig.stats().skipped, 1);
+    assert_eq!(rig.stats().evictions, 0);
+    rig.run(job, &target);
+    assert_eq!(answer(&restored), Ok(256));
+    let stored = rig.capture(&source, &b, rig.cache.root(), 256, None);
+    rig.run_all(&source);
+    assert_ne!(answer(&stored), rig.cache.root(), "the ended job let it go");
+}
+
+#[test]
+fn a_job_runs_in_groups_and_only_the_last_reports() {
+    let rig = Rig::with(64, 1000);
+    let source = Device::new(FORMAT, 1024);
+    let prompt = tokens(0, 600);
+    let captured = rig.capture(&source, &prompt, rig.cache.root(), 512, None);
+    let job = rig.next_job();
+    let total: u64 = job.pieces().iter().map(|piece| piece.bytes).sum();
+    let mut groups = job.split();
+    assert!(groups.len() > 2);
+    let bytes = |group: &CopyJob| group.pieces().iter().map(|piece| piece.bytes).sum::<u64>();
+    assert_eq!(groups.iter().map(bytes).sum::<u64>(), total);
+    assert!(groups.iter().all(|group| bytes(group) <= 1000 && bytes(group) > 0));
+    let last = groups.len() - 1;
+    assert!(
+        groups
+            .iter()
+            .enumerate()
+            .all(|(index, group)| group.is_last() == (index == last))
+    );
+    for group in &mut groups[..last] {
+        group.finish(Ended::Done);
+    }
+    assert!(
+        captured.lock().unwrap().is_none(),
+        "the groups before the last say nothing"
+    );
+    groups[last].finish(Ended::Done);
+    assert_ne!(answer(&captured), rig.cache.root());
+    assert_eq!(rig.stats().captures, 1);
+}
+
+#[test]
+fn a_group_that_fails_fails_the_job_at_the_last_group() {
+    let rig = Rig::with(64, 1000);
+    let source = Device::new(FORMAT, 1024);
+    let captured = rig.capture(&source, &tokens(0, 600), rig.cache.root(), 512, None);
+    let mut groups = rig.next_job().split();
+    let last = groups.len() - 1;
+    groups[0].finish(Ended::Failed("the first group failed".to_string()));
+    assert!(
+        groups[1].skipped() && groups[last].skipped(),
+        "the groups after a failure copy nothing"
+    );
+    for group in &mut groups[1..last] {
+        group.finish(Ended::Done);
+    }
+    assert!(captured.lock().unwrap().is_none());
+    groups[last].finish(Ended::Done);
+    assert_eq!(answer(&captured), rig.cache.root());
+    let stats = rig.stats();
+    assert_eq!((stats.failed, stats.captures, stats.used_bytes), (1, 0, 0));
+}
+
+#[test]
+fn closing_waits_for_a_copy_in_flight_and_then_frees_the_cache() {
+    let rig = Rig::new(64);
+    let source = Device::new(FORMAT, 1024);
+    let captured = rig.capture(&source, &tokens(0, 600), rig.cache.root(), 512, None);
+    let mut job = rig.next_job();
+    let closed = thread::scope(|scope| {
+        scope.spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            job.finish(Ended::Done);
+        });
+        rig.cache.close(Duration::from_secs(10))
+    });
+    assert!(closed, "the copy ended inside the bound");
+    assert_ne!(
+        answer(&captured),
+        rig.cache.root(),
+        "the copy in flight was published, not abandoned"
+    );
+}
+
+#[test]
+fn closing_abandons_a_copy_that_does_not_end_within_the_bound() {
+    let rig = Rig::new(64);
+    let source = Device::new(FORMAT, 1024);
+    let captured = rig.capture(&source, &tokens(0, 600), rig.cache.root(), 512, None);
+    let job = rig.next_job();
+    assert!(!rig.cache.close(Duration::from_millis(50)));
+    assert_eq!(answer(&captured), rig.cache.root(), "the pending capture was failed");
+    assert_eq!(rig.stats().failed, 1);
+    drop(job);
 }

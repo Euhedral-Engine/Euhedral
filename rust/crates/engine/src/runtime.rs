@@ -29,7 +29,7 @@ use euhedral_inference_settings::{Auto, BatchingSettings, Settings};
 use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
 use crate::error::{EngineError, PlanError};
-use crate::generation::{AdmissionError, CancelHandle, Generation, GenerationRequest, LogitsSink};
+use crate::generation::{AdmissionError, CancelHandle, GenerationRequest, Generations, LogitsSink};
 use crate::generation::{GREEDY_DEPTH, OPERATION_BOUND};
 use crate::handoff::Handoff;
 use crate::kernels::kernel_sources;
@@ -367,7 +367,7 @@ impl RuntimeOwner {
             .as_ref()
             .map_or(OPERATION_BOUND, |teardown| teardown.cancel_bound);
         // The running request ends on the lattice's workers, so before the lattice closes.
-        let stopped = runtime.generation.stop(bound);
+        let stopped = runtime.generations.stop(bound);
         if let Some(teardown) = &teardown {
             teardown.close();
         }
@@ -472,7 +472,7 @@ impl RuntimeOwner {
                 let bound = teardown
                     .as_ref()
                     .map_or(window, |teardown| window.min(teardown.cancel_bound));
-                stopped.set(runtime.generation.stop(bound));
+                stopped.set(runtime.generations.stop(bound));
                 if let Some(teardown) = teardown {
                     teardown.close();
                 }
@@ -543,13 +543,11 @@ impl fmt::Debug for RuntimeOwner {
     }
 }
 
-/// What the engine keeps on the device. Freed only by [`RuntimeOwner::shutdown`], because freeing waits. The sequence
-/// is the generation's.
+/// What the engine keeps on the device. Freed only by [`RuntimeOwner::shutdown`], because freeing waits. The sequences
+/// are the generations'.
 struct DeviceState {
     weights: Weights,
     workspace: Arc<Workspace>,
-    /// The sequences beyond the generation's: allocated, with no owner yet.
-    spare: Vec<SequenceState>,
 }
 
 /// What [`EngineRuntime::start`] hands over: the running engine, or why it did not start.
@@ -562,8 +560,8 @@ pub struct EngineRuntime {
     config: Arc<ModelConfig>,
     // Never dropped by `Drop`: freeing waits for the device, so only `release` (the owner's shutdown) frees it.
     device: ManuallyDrop<DeviceState>,
-    // The sequence and the graphs that run it. Closed by `release`.
-    generation: Generation,
+    // The sequences and the graphs that run them, each with an owner. Closed by `release`.
+    generations: Generations,
     report: StartupReport,
 }
 
@@ -617,20 +615,15 @@ impl EngineRuntime {
         config: Arc<ModelConfig>,
         weights: Weights,
         workspace: Arc<Workspace>,
-        spare: Vec<SequenceState>,
-        generation: Generation,
+        generations: Generations,
         report: StartupReport,
     ) -> EngineRuntime {
         EngineRuntime {
             core,
             plan,
             config,
-            device: ManuallyDrop::new(DeviceState {
-                weights,
-                workspace,
-                spare,
-            }),
-            generation,
+            device: ManuallyDrop::new(DeviceState { weights, workspace }),
+            generations,
             report,
         }
     }
@@ -640,9 +633,9 @@ impl EngineRuntime {
         &self.plan
     }
 
-    /// The sequences beyond the generation's that the engine holds allocated, without an owner.
-    pub fn spare_sequences(&self) -> usize {
-        self.device.spare.len()
+    /// The sequences the engine holds, each of which runs one request at a time: the requests that run at once.
+    pub fn sequences(&self) -> usize {
+        self.generations.sequences()
     }
 
     /// The model's dimensions.
@@ -660,21 +653,32 @@ impl EngineRuntime {
         &self.device.workspace
     }
 
-    /// Reads the device state of the one sequence the engine holds, when no generation is running on it: `None` while
-    /// one is. Not for a lattice worker: when a turn of the owner holds the sequence at the moment, the read waits for
-    /// it (a bounded wait).
+    /// Reads the device state of the engine's first sequence, when no generation is running on it: `None` while one
+    /// is. Not for a lattice worker: when a turn of the owner holds the sequence at the moment, the read waits for it
+    /// (a bounded wait). Requests take the lowest idle sequence, so one that runs alone runs on this one.
     pub fn inspect_sequence<R: Send + 'static>(
         &self,
         read: impl FnOnce(&SequenceState) -> R + Send + 'static,
     ) -> Option<R> {
-        self.generation.inspect(read)
+        self.inspect_sequence_at(0, read)
     }
 
-    /// Starts generating from `request`'s prompt on the engine's sequence, and returns at once: the request runs as
-    /// frames on the engine's lattice, and its listener is told of it there. The sequence takes one request at a time;
-    /// it starts each from nothing, whatever the one before left in it.
+    /// As [`inspect_sequence`](EngineRuntime::inspect_sequence), for sequence `index`; `None` too when there is none.
+    pub fn inspect_sequence_at<R: Send + 'static>(
+        &self,
+        index: usize,
+        read: impl FnOnce(&SequenceState) -> R + Send + 'static,
+    ) -> Option<R> {
+        self.generations.inspect(index, read)
+    }
+
+    /// Starts generating from `request`'s prompt on an idle sequence of the engine, and returns at once: the request
+    /// runs as frames on the engine's lattice, and its listener is told of it there. A sequence takes one request at a
+    /// time and starts each from nothing, whatever the one before left in it; the sequences run their requests
+    /// interleaved, each producing the tokens it would alone. [`AdmissionError::Busy`] when every sequence is running
+    /// one.
     pub fn generate(&self, request: GenerationRequest) -> Result<(), AdmissionError> {
-        self.generation.generate(request, CancelHandle::default())
+        self.generations.generate(request, CancelHandle::default())
     }
 
     /// As [`EngineRuntime::generate`], with `cancel` made by the caller, who keeps a clone: `cancel` ends the generation
@@ -683,14 +687,14 @@ impl EngineRuntime {
     /// reported until then, and the sequence takes the next request. A handle already cancelled ends the generation
     /// before its first quantum.
     pub fn generate_cancellable(&self, request: GenerationRequest, cancel: CancelHandle) -> Result<(), AdmissionError> {
-        self.generation.generate(request, cancel)
+        self.generations.generate(request, cancel)
     }
 
     /// A test hook: the sequence's owner panics at the end of the turn in which the next request has admitted `quanta`
     /// quanta. The request ends with a failure and the engine serves the next.
     #[cfg(feature = "test-oracles")]
     pub fn panic_after_admissions_for_tests(&self, quanta: u64) {
-        self.generation.panic_after_admissions(quanta);
+        self.generations.panic_after_admissions(quanta);
     }
 
     /// A test hook: with `settle`, a speculative request that ends at its token budget ends with one decode quantum that
@@ -698,14 +702,14 @@ impl EngineRuntime {
     /// last verification has run).
     #[cfg(feature = "test-oracles")]
     pub fn settle_after_speculation_for_tests(&self, settle: bool) {
-        self.generation.settle_after_speculation(settle);
+        self.generations.settle_after_speculation(settle);
     }
 
     /// A test hook: the engine records no graphs from now on, so every quantum runs stage by stage. `false` while a
     /// request runs.
     #[cfg(feature = "test-oracles")]
     pub fn disable_graphs_for_tests(&self) -> bool {
-        self.generation.disable_graphs()
+        self.generations.disable_graphs()
     }
 
     /// Starts a teacher-forced run on the engine's sequence, as [`EngineRuntime::generate`] does: prefills `prefix`,
@@ -717,7 +721,7 @@ impl EngineRuntime {
         forced: Vec<u32>,
         sink: Box<dyn LogitsSink>,
     ) -> Result<(), AdmissionError> {
-        self.generation.teacher_forced(prefix, forced, sink)
+        self.generations.teacher_forced(prefix, forced, sink)
     }
 
     /// What the startup measured.
@@ -787,25 +791,15 @@ impl EngineRuntime {
     fn release(self) {
         let Self {
             device,
-            generation,
+            generations,
             core,
             ..
         } = self;
-        let DeviceState {
-            weights,
-            workspace,
-            spare,
-        } = ManuallyDrop::into_inner(device);
-        // The sequence goes first, by `close`, which refuses while a quantum is in flight. The lattice is closed by
+        let DeviceState { weights, workspace } = ManuallyDrop::into_inner(device);
+        // The sequences go first, by `close`, which refuses while a quantum is in flight. The lattice is closed by
         // now, so a quantum still counted will never be dropped: the caches are left allocated (the process is
         // ending) rather than freed under it.
-        generation.close();
-        for sequence in spare {
-            // None has had a quantum, so none refuses; one that did stays allocated, like the generation's.
-            if let Err(busy) = sequence.close() {
-                mem::forget(busy);
-            }
-        }
+        generations.close();
         // What the caches gave up and the owner had not yet freed. A queued buffer has no holder left, and the plain
         // free waits for the device, so nothing is freed under queued work.
         core.released.drain(drop);

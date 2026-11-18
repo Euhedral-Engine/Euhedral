@@ -127,10 +127,9 @@ impl Resolve for SequenceAddresses {
                 let view = self.refs.kv(KvSource::Mtp)?;
                 within(view.page(0, page), 2 * view.plane_page_bytes(), offset, bytes)
             }
-            Buffer::SeedRow => {
-                let seed = &device.scratch.draft()?.seed_rows;
-                within(Some(seed.ptr()), seed.bytes() as u64, offset, bytes)
-            }
+            // The seed of a draft is the hidden row of the last token of the last prefill chunk, not row 0 of the seed
+            // rows: there is no address to copy until the layout of the speculative state is settled.
+            Buffer::SeedRow => None,
         }
     }
 
@@ -140,6 +139,10 @@ impl Resolve for SequenceAddresses {
 
     fn rows(&self) -> u64 {
         self.refs.kv(KvSource::Base).map_or(0, |view| view.reserved())
+    }
+
+    fn speculative(&self) -> bool {
+        self.refs.kv(KvSource::Mtp).is_some() || self.refs.device().scratch.draft().is_some()
     }
 
     fn ready(&self) -> Option<Marker> {
@@ -169,7 +172,7 @@ impl Stage<CopyJob> for CopyStage {
         let waits = cx.waits.iter().copied().chain(job.ready());
         let marker = submit_on(&**lane, waits, &self.unmarked, |queue| {
             let mut ops = RusteeOps::new(queue, table, modes);
-            for piece in job.pieces() {
+            for piece in job.pieces().iter().filter(|_| !job.skipped()) {
                 let (host, bytes) = (piece.host as usize, piece.bytes as usize);
                 if host.checked_add(bytes).is_none_or(|end| end > arena.len()) {
                     return Err(fatal(format!("a copy of {bytes} bytes at {host} leaves the arena")));
@@ -201,12 +204,14 @@ pub struct Copier {
 }
 
 impl Copier {
-    /// The copier of `sequence`, whose jobs run on transfer lane `lane` of `lanes`.
+    /// The copier of `sequence`, whose jobs run on transfer lane `lane` of `lanes`; `ended` is told the number of each job
+    /// once it has ended and been reported.
     pub fn new(
         runtime: &GraphRuntime,
         lanes: LaneTable,
         lane: LaneId,
         sequence: SequenceId,
+        ended: Box<dyn Fn(u64) + Send + Sync>,
     ) -> Result<Copier, GraphError> {
         let mut spec = StageGraphSpec::new();
         spec.stage(StageSpec {
@@ -216,32 +221,52 @@ impl Copier {
         });
         let unmarked = Unmarked::new(lanes.len());
         let stage: Arc<dyn Stage<CopyJob>> = Arc::new(CopyStage { lanes, unmarked });
-        let graph = StageGraph::new(spec, vec![stage], runtime.clone(), |mut job: CopyJob, outcome| {
+        let graph = StageGraph::new(spec, vec![stage], runtime.clone(), move |mut job: CopyJob, outcome| {
+            let (serial, last) = (job.serial(), job.is_last());
             job.finish(match outcome {
                 QuantumOutcome::Completed => Ended::Done,
                 QuantumOutcome::Failed { error, .. } => Ended::Failed(format!("the copy failed: {error:?}")),
                 QuantumOutcome::DeviceFailed { cause } => Ended::Failed(format!("the device failed: {cause}")),
-                QuantumOutcome::Killed => Ended::Failed("the copy was cancelled".to_string()),
+                QuantumOutcome::Killed => Ended::Cancelled,
             });
+            // Whatever waited for the job's end (see the order) starts now.
+            if last {
+                ended(serial);
+            }
         })?;
         Ok(Copier { graph })
     }
 
-    /// Starts `job` behind each of `after`: its stage waits on the device for their sinks.
+    /// Starts `job` behind each of `after`: its first group's stage waits on the device for their sinks. The job runs
+    /// in groups of at most the piece size, a frame each, each behind the one before; the last, which reports, is the
+    /// one returned.
     pub fn start(&self, job: CopyJob, kill: Arc<AtomicBool>, after: &[&Started]) -> Result<Started, StartError> {
-        let serial = job.serial();
+        let mut last: Option<Started> = None;
+        for group in job.split() {
+            let started = match &last {
+                Some(previous) => self.start_group(group, Arc::clone(&kill), &[previous]),
+                None => self.start_group(group, Arc::clone(&kill), after),
+            };
+            last = Some(started);
+        }
+        // A job has at least one group.
+        last.ok_or(StartError::Closed)
+    }
+
+    fn start_group(&self, group: CopyJob, kill: Arc<AtomicBool>, after: &[&Started]) -> Started {
+        let serial = group.serial();
         let external = after.iter().map(|previous| ExternalEdge {
             from: previous.reference.clone(),
             from_stage: previous.sink,
             to_stage: StageId(0),
             kind: EdgeKind::Submission,
         });
-        let reference = self.graph.start(job, kill, external);
-        Ok(Started {
+        let reference = self.graph.start(group, kill, external);
+        Started {
             serial,
             reference,
             root: StageId(0),
             sink: StageId(0),
-        })
+        }
     }
 }

@@ -536,9 +536,16 @@ impl<O: Turn> Mailbox<O> {
     /// passed, or called from inside a turn or an operation (which could only be ended by the caller itself, after it:
     /// refused at once). The request ends on a worker; the caller waits on a one-shot hand-off of its own, never as a
     /// lattice worker, and must not be one. For threads outside the lattice.
+    #[cfg(test)]
     pub(crate) fn stop(self: &Arc<Self>, bound: Duration) -> bool {
+        self.stopping().is_some_and(|idle| idle.wait(bound).is_ok())
+    }
+
+    /// The first half of [`stop`](Mailbox::stop): the owner is told to cancel and to say when it is idle, and the
+    /// hand-off that carries the answer is returned, to be waited on. `None` when this thread holds the claim.
+    pub(crate) fn stopping(self: &Arc<Self>) -> Option<Arc<Handoff<()>>> {
         if Holding::by_this_thread(Arc::as_ptr(self).addr()) {
-            return false;
+            return None;
         }
         let idle = Handoff::new();
         let told = Arc::clone(&idle);
@@ -550,7 +557,7 @@ impl<O: Turn> Mailbox<O> {
             }
             Vec::new()
         });
-        idle.wait(bound).is_ok()
+        Some(idle)
     }
 
     /// Takes the owner out, for its teardown, while it is idle: now if the claim is free, else once the holder or the

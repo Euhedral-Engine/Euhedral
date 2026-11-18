@@ -26,7 +26,13 @@
 //!   dropped so that the quantum can retire. A quantum that is the workspace's last then has nothing to be started
 //!   behind, so the owner **gates** the workspace on it: admissions that use the workspace wait in the owner, in order,
 //!   until [`Order::retired`] tells it that quantum retired, and then start with no edge to it (a retired quantum has
-//!   finished on the device). Admissions that touch only a sequence's state do not wait for it.
+//!   finished on the device). Admissions that touch only another sequence's state do not wait for it.
+//!
+//! **A job never starts ahead of its own sequence's last device work.** A sequence's last job whose chain ended is no
+//! longer pinned, and may still be running: whatever is admitted for the sequence next (a quantum, or work that touches
+//! only its state, such as a prefix-cache copy) waits in the owner until that job retired ([`Order::retired`]), and then
+//! starts with no edge to it. This holds whether or not the job was on the workspace, and whichever sequence's work
+//! the workspace is gated on.
 //!
 //! The gate costs nothing on the path of one sequence: its next admission follows the retirement of the last quantum.
 
@@ -180,12 +186,24 @@ pub(crate) struct WorkspaceOwner<L: Launch> {
     gate: Arc<AtomicU64>,
     /// Admissions that wait for the gate, in post order.
     waiting: VecDeque<Item<L>>,
+    /// Each sequence's last job whose chain ended and whose retirement is not told yet: nothing of the sequence starts
+    /// before it.
+    ended: Vec<Option<u64>>,
+    /// `ended`, for the owners that tell a job retired.
+    ended_gate: Arc<[AtomicU64]>,
 }
 
 impl<L: Launch> WorkspaceOwner<L> {
-    fn new(inbox: Consumer<Message, Single>, replies: Arc<[Reply]>, gate: Arc<AtomicU64>) -> WorkspaceOwner<L> {
+    fn new(
+        inbox: Consumer<Message, Single>,
+        replies: Arc<[Reply]>,
+        gate: Arc<AtomicU64>,
+        ended_gate: Arc<[AtomicU64]>,
+    ) -> WorkspaceOwner<L> {
         WorkspaceOwner {
             inbox,
+            ended: vec![None; replies.len()],
+            ended_gate,
             last_of: (0..replies.len()).map(|_| None).collect(),
             replies,
             last: None,
@@ -246,6 +264,9 @@ impl<L: Launch> WorkspaceOwner<L> {
 
     /// Whether `item` has to wait: for the gate, or for an earlier item that waits and that it must start behind.
     fn blocked(&self, item: &Item<L>, earlier: &VecDeque<Item<L>>) -> bool {
+        if matches!(item, Item::Start(_)) && self.ended.get(item.sequence().0).is_some_and(Option::is_some) {
+            return true;
+        }
         if item.on_workspace() {
             self.draining.is_some() || earlier.iter().any(Item::on_workspace)
         } else {
@@ -314,16 +335,35 @@ impl<L: Launch> WorkspaceOwner<L> {
             // The quantum before it is let go here, after the start took its edge.
             self.last_of[sequence.0] = Some(started);
         } else if on_workspace {
+            self.mark_ended(sequence, L::serial_of(&started));
             self.gate_on(L::serial_of(&started));
             self.last_of[sequence.0] = None;
         } else {
             // Nothing is kept of it, and the workspace's last, if it is this sequence's, has nothing behind it either.
+            self.mark_ended(sequence, L::serial_of(&started));
             self.release_now(sequence);
+        }
+    }
+
+    /// Records that `sequence`'s last job, numbered `serial`, is no longer pinned: nothing of the sequence starts until
+    /// it retired. Set before the pin is dropped, so that it cannot retire first.
+    fn mark_ended(&mut self, sequence: SequenceId, serial: u64) {
+        if let Some(ended) = self.ended.get_mut(sequence.0) {
+            *ended = Some(serial);
+            self.ended_gate[sequence.0].store(serial, Ordering::Release);
         }
     }
 
     fn release_now(&mut self, sequence: SequenceId) {
         let own = self.last_of.get_mut(sequence.0).and_then(Option::take);
+        // A job that ended the chain after `own` is the later: it has an edge to `own`, so waiting for it covers it.
+        if let Some(serial) = own
+            .as_ref()
+            .map(L::serial_of)
+            .filter(|_| self.ended.get(sequence.0) == Some(&None))
+        {
+            self.mark_ended(sequence, serial);
+        }
         if let Some(serial) = self
             .last
             .as_ref()
@@ -346,9 +386,20 @@ impl<L: Launch> WorkspaceOwner<L> {
 
     fn take_in(&mut self) {
         while let Some(Message::Retired(serial)) = self.inbox.poll() {
-            if self.draining == Some(serial) {
-                self.draining = None;
-                self.gate.store(NONE, Ordering::Release);
+            self.retire(serial);
+        }
+    }
+
+    /// The job `serial` retired: what waited for it may start.
+    fn retire(&mut self, serial: u64) {
+        if self.draining == Some(serial) {
+            self.draining = None;
+            self.gate.store(NONE, Ordering::Release);
+        }
+        for (sequence, ended) in self.ended.iter_mut().enumerate() {
+            if *ended == Some(serial) {
+                *ended = None;
+                self.ended_gate[sequence].store(NONE, Ordering::Release);
             }
         }
     }
@@ -425,6 +476,8 @@ impl<L: Launch> Turn for WorkspaceOwner<L> {
 pub(crate) struct Order<L: Launch> {
     mailbox: Arc<Mailbox<WorkspaceOwner<L>>>,
     gate: Arc<AtomicU64>,
+    /// Each sequence's last job that ended its chain and has not retired (see [`WorkspaceOwner`]).
+    ended: Arc<[AtomicU64]>,
     replies: Arc<[Reply]>,
     /// The input records each sequence has.
     records: usize,
@@ -444,10 +497,12 @@ impl<L: Launch> Order<L> {
         let (producer, inbox) = (queue.producer(), queue.consumer());
         let gate = Arc::new(AtomicU64::new(NONE));
         let replies: Arc<[Reply]> = replies.into();
-        let owner = WorkspaceOwner::new(inbox, Arc::clone(&replies), Arc::clone(&gate));
+        let ended: Arc<[AtomicU64]> = (0..replies.len()).map(|_| AtomicU64::new(NONE)).collect();
+        let owner = WorkspaceOwner::new(inbox, Arc::clone(&replies), Arc::clone(&gate), Arc::clone(&ended));
         Order {
             mailbox: Arc::new(Mailbox::new(owner, producer, spawn)),
             gate,
+            ended,
             replies,
             records: records.max(1),
         }
@@ -510,10 +565,14 @@ impl<L: Launch> Order<L> {
         self.mailbox.tell(move |owner| owner.forget(sequence));
     }
 
-    /// Tells the owner the quantum numbered `serial` retired; only the quantum the workspace is gated on matters, and
-    /// for any other this is one load.
-    pub(crate) fn retired(&self, serial: u64) {
-        if self.gate.load(Ordering::Acquire) == serial {
+    /// Tells the owner the job numbered `serial` of `sequence` retired; only the job the workspace is gated on, and the
+    /// sequence's own last that ended its chain, matter, and for any other this is two loads.
+    pub(crate) fn retired(&self, sequence: SequenceId, serial: u64) {
+        let own = self
+            .ended
+            .get(sequence.0)
+            .is_some_and(|ended| ended.load(Ordering::Acquire) == serial);
+        if own || self.gate.load(Ordering::Acquire) == serial {
             self.mailbox.post(Message::Retired(serial));
         }
     }
@@ -613,7 +672,7 @@ mod tests {
 
     type Told = Arc<Mutex<Vec<(usize, u64, String)>>>;
 
-    fn owner(sequences: usize) -> (WorkspaceOwner<Fake>, Arc<Fake>, Told, Arc<AtomicU64>) {
+    fn owner_of(sequences: usize) -> (WorkspaceOwner<Fake>, Arc<Fake>, Told, Arc<AtomicU64>) {
         let told: Told = Arc::default();
         let replies = (0..sequences)
             .map(|sequence| {
@@ -625,7 +684,8 @@ mod tests {
             .collect::<Vec<_>>();
         let queue = MpscQueue::<Message>::new(INBOX_CHUNK);
         let gate = Arc::new(AtomicU64::new(NONE));
-        let owner = WorkspaceOwner::new(queue.consumer(), replies.into(), Arc::clone(&gate));
+        let ended: Arc<[AtomicU64]> = (0..sequences).map(|_| AtomicU64::new(NONE)).collect();
+        let owner = WorkspaceOwner::new(queue.consumer(), replies.into(), Arc::clone(&gate), ended);
         // The queue's producing end is not needed: the tests tell the owner through `retire`.
         mem::forget(queue);
         (owner, Arc::new(Fake::default()), told, gate)
@@ -644,16 +704,13 @@ mod tests {
 
     /// Tells the owner `serial` retired, as the sequence's owner does when the gate names it.
     fn retire(owner: &mut WorkspaceOwner<Fake>, serial: u64) {
-        if owner.gate.load(Ordering::Acquire) == serial {
-            owner.draining = None;
-            owner.gate.store(NONE, Ordering::Release);
-            owner.flush();
-        }
+        owner.retire(serial);
+        owner.flush();
     }
 
     #[test]
     fn starts_follow_post_order_and_wait_on_both_edges() {
-        let (mut owner, fake, _, _) = owner(2);
+        let (mut owner, fake, _, _) = owner_of(2);
         admit(&mut owner, &fake, A, 1, true, true).unwrap();
         admit(&mut owner, &fake, B, 2, true, true).unwrap();
         admit(&mut owner, &fake, A, 3, true, true).unwrap();
@@ -667,7 +724,7 @@ mod tests {
 
     #[test]
     fn a_job_of_the_sequence_alone_does_not_wait_on_another_sequence() {
-        let (mut owner, fake, _, _) = owner(2);
+        let (mut owner, fake, _, _) = owner_of(2);
         admit(&mut owner, &fake, A, 1, true, true).unwrap();
         admit(&mut owner, &fake, B, 2, false, true).unwrap();
         admit(&mut owner, &fake, B, 3, false, true).unwrap();
@@ -701,7 +758,7 @@ mod tests {
             &[(1, true, false), (2, true, true), (3, false, false)],
         ];
         for pattern in patterns {
-            let (mut owner, fake, _, _) = owner(1);
+            let (mut owner, fake, _, _) = owner_of(1);
             let mut chain: Option<u64> = None;
             let mut expected = Vec::new();
             for &(job, more, release) in pattern {
@@ -726,7 +783,7 @@ mod tests {
 
     #[test]
     fn the_workspace_waits_for_the_quantum_nothing_is_started_behind() {
-        let (mut owner, fake, _, gate) = owner(2);
+        let (mut owner, fake, _, gate) = owner_of(2);
         admit(&mut owner, &fake, A, 1, true, true).unwrap();
         admit(&mut owner, &fake, B, 2, true, true).unwrap();
         // A's chain ends: its last, the workspace's last, is let go so that it can retire, and the workspace is gated.
@@ -749,7 +806,7 @@ mod tests {
 
     #[test]
     fn a_release_lets_the_last_quantum_retire_and_gates_the_workspace_on_it() {
-        let (mut owner, fake, _, gate) = owner(2);
+        let (mut owner, fake, _, gate) = owner_of(2);
         admit(&mut owner, &fake, A, 1, true, true).unwrap();
         assert_eq!(fake.alive(), 2);
         owner.release(A);
@@ -767,13 +824,69 @@ mod tests {
         admit(&mut owner, &fake, A, 3, true, true).unwrap();
         owner.release(B);
         assert_eq!(gate.load(Ordering::Acquire), NONE);
+        // B's own last ended its chain, though, and B starts nothing before it retired.
         admit(&mut owner, &fake, B, 4, true, true).unwrap();
+        assert_eq!(fake.starts().len(), 3);
+        retire(&mut owner, 2);
         assert_eq!(fake.starts()[3], (4, vec![3]));
+    }
+
+    /// The jobs a sequence admits that touch only its state (the prefix cache's copies), in the three places they can
+    /// meet the chain.
+    #[test]
+    fn a_job_of_the_sequence_alone_starts_behind_the_sequences_last_work_in_every_case() {
+        // The chain goes on: the job is ordered behind the quantum by an edge.
+        {
+            let (mut owner, fake, _, _) = owner_of(2);
+            admit(&mut owner, &fake, A, 1, true, true).unwrap();
+            admit(&mut owner, &fake, A, 2, false, true).unwrap();
+            assert_eq!(fake.starts(), vec![(1, vec![]), (2, vec![1])]);
+        }
+
+        // The chain ended with the quantum: the quantum is not pinned and may be running, so the job waits for its
+        // retirement, and then starts with no edge to it.
+        {
+            let (mut owner, fake, _, _) = owner_of(2);
+            admit(&mut owner, &fake, A, 1, true, false).unwrap();
+            admit(&mut owner, &fake, A, 2, false, true).unwrap();
+            assert_eq!(fake.starts(), vec![(1, vec![])], "the job waits for the quantum");
+            retire(&mut owner, 1);
+            assert_eq!(fake.starts(), vec![(1, vec![]), (2, vec![])]);
+        }
+
+        // The chain of another sequence ended: the workspace is gated on that quantum, which is no concern of this
+        // sequence's job; it starts at once, behind its own sequence's last only.
+        let (mut owner, fake, _, _) = owner_of(2);
+        admit(&mut owner, &fake, A, 1, true, true).unwrap();
+        admit(&mut owner, &fake, B, 2, true, true).unwrap();
+        owner.release(B);
+        admit(&mut owner, &fake, A, 3, false, true).unwrap();
+        assert_eq!(fake.starts()[2], (3, vec![1]));
+        admit(&mut owner, &fake, A, 4, false, false).unwrap();
+        assert_eq!(fake.starts()[3], (4, vec![3]));
+        // The job that ended its chain is waited for in its turn: the sequence's next quantum starts after it retired.
+        admit(&mut owner, &fake, A, 5, true, true).unwrap();
+        assert_eq!(fake.starts().len(), 4);
+        retire(&mut owner, 4);
+        assert_eq!(fake.starts().len(), 4, "the workspace is still gated on B's quantum");
+        retire(&mut owner, 2);
+        assert_eq!(fake.starts()[4], (5, vec![]));
+    }
+
+    #[test]
+    fn a_job_waits_for_a_chain_ended_by_a_release_too() {
+        let (mut owner, fake, _, _) = owner_of(2);
+        admit(&mut owner, &fake, A, 1, true, true).unwrap();
+        owner.release(A);
+        admit(&mut owner, &fake, A, 2, false, true).unwrap();
+        assert_eq!(fake.starts().len(), 1);
+        retire(&mut owner, 1);
+        assert_eq!(fake.starts()[1], (2, vec![]));
     }
 
     #[test]
     fn a_release_waits_behind_its_sequences_admissions() {
-        let (mut owner, fake, _, _) = owner(2);
+        let (mut owner, fake, _, _) = owner_of(2);
         admit(&mut owner, &fake, A, 1, true, false).unwrap();
         admit(&mut owner, &fake, B, 2, true, true).unwrap();
         owner.release(B);
@@ -786,7 +899,7 @@ mod tests {
 
     #[test]
     fn a_start_that_fails_now_is_the_calls_result_and_takes_no_place_on_the_workspace() {
-        let (mut owner, fake, told, _) = owner(2);
+        let (mut owner, fake, told, _) = owner_of(2);
         fake.refuse.lock().unwrap().push(2);
         admit(&mut owner, &fake, A, 1, true, true).unwrap();
         assert!(admit(&mut owner, &fake, B, 2, true, true).is_err());
@@ -799,7 +912,7 @@ mod tests {
 
     #[test]
     fn a_start_that_fails_without_more_lets_go_of_the_chain_before_it() {
-        let (mut owner, fake, told, gate) = owner(1);
+        let (mut owner, fake, told, gate) = owner_of(1);
         fake.refuse.lock().unwrap().push(2);
         // Drafts are admitted with more behind them; the verification that ends the step is not.
         admit(&mut owner, &fake, A, 1, true, true).unwrap();
@@ -820,7 +933,7 @@ mod tests {
 
     #[test]
     fn a_quantum_of_the_sequence_alone_that_ends_its_chain_lets_go_of_its_last_on_the_workspace() {
-        let (mut owner, fake, _, gate) = owner(2);
+        let (mut owner, fake, _, gate) = owner_of(2);
         admit(&mut owner, &fake, A, 1, true, true).unwrap();
         admit(&mut owner, &fake, A, 2, false, false).unwrap();
         assert_eq!(fake.alive(), 0);
@@ -829,7 +942,7 @@ mod tests {
 
     #[test]
     fn a_waiting_start_that_fails_is_told_when_the_gate_opens() {
-        let (mut owner, fake, told, _) = owner(2);
+        let (mut owner, fake, told, _) = owner_of(2);
         fake.refuse.lock().unwrap().push(2);
         admit(&mut owner, &fake, A, 1, true, false).unwrap();
         admit(&mut owner, &fake, B, 2, true, true).unwrap();
@@ -842,7 +955,7 @@ mod tests {
 
     #[test]
     fn a_launcher_that_panics_is_a_failed_start_and_what_waits_behind_it_still_starts() {
-        let (mut owner, fake, told, _) = owner(2);
+        let (mut owner, fake, told, _) = owner_of(2);
         fake.panics.lock().unwrap().push(2);
         admit(&mut owner, &fake, A, 1, true, false).unwrap();
         admit(&mut owner, &fake, B, 2, true, true).unwrap();
@@ -871,9 +984,9 @@ mod tests {
         order.admit(B, &fake, 2u64, Arc::default(), true, true).unwrap();
         assert_eq!(fake.starts().len(), 1, "the workspace waits for the quantum 1");
         // Another quantum's retirement opens nothing.
-        order.retired(2);
+        order.retired(A, 2);
         assert_eq!(fake.starts().len(), 1);
-        order.retired(1);
+        order.retired(A, 1);
         assert_eq!(fake.starts()[1], (2, vec![]));
     }
 

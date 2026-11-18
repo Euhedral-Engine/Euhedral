@@ -55,6 +55,7 @@ use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
 use super::mtp::{Joining, Speculating, Verifying};
 use super::order::Order;
+use super::pool::Lease;
 use super::request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
@@ -63,7 +64,7 @@ use super::teacher_forced::LogitsSink;
 use crate::frames::{Kind, step};
 use crate::handoff::Handoff;
 use crate::model::ModelConfig;
-use crate::prefix::PrefixCacheHandle;
+use crate::prefix::{CopyJob, FIRST_COPY_SERIAL, PrefixCacheHandle};
 use crate::quantum::{Executor, StartError};
 use crate::runtime::{Core, Units};
 use crate::sampling::{SamplingConfig, SamplingError, TokenSampler};
@@ -99,6 +100,17 @@ pub(crate) enum Message {
     Reaped,
     /// A quantum the owner admitted did not start.
     StartFailed(Box<StartFailed>),
+    /// A prefix-cache copy job of this sequence to admit (see [`Generation::copy_submit`](super::Generation)).
+    Copy(Box<CopyRequest>),
+    /// A copy job of this sequence ended and was reported.
+    CopyEnded,
+}
+
+/// A copy job and how it is admitted.
+pub(crate) struct CopyRequest {
+    pub(crate) job: CopyJob,
+    pub(crate) kill: Arc<AtomicBool>,
+    pub(crate) more: bool,
 }
 
 impl fmt::Debug for Message {
@@ -110,6 +122,8 @@ impl fmt::Debug for Message {
             Message::Prepared(prepared) => write!(formatter, "Message::Prepared(step {})", prepared.step),
             Message::Reaped => formatter.write_str("Message::Reaped"),
             Message::StartFailed(failed) => write!(formatter, "Message::StartFailed({})", failed.serial),
+            Message::Copy(_) => formatter.write_str("Message::Copy"),
+            Message::CopyEnded => formatter.write_str("Message::CopyEnded"),
         }
     }
 }
@@ -140,7 +154,7 @@ pub(crate) struct Shared {
     pub(crate) workspace: Arc<Workspace>,
     pub(crate) executor: Arc<Executor>,
     /// What starts the quanta of the engine's sequences, each behind the quanta it must follow.
-    pub(crate) order: Order<Executor>,
+    pub(crate) order: Arc<Order<Executor>>,
     /// Where frames that tell the owner something post it.
     pub(crate) address: Arc<Address<Owner>>,
     /// Rows of the longest prompt chunk.
@@ -150,6 +164,7 @@ pub(crate) struct Shared {
     /// What speculation needs of the artifact; `None` for an artifact without the draft layer.
     pub(crate) drafts: Option<Drafts>,
     /// The prefix cache, when the plan granted it memory and it opened.
+    #[allow(dead_code, reason = "the generation's prefix cache steps read it")]
     pub(crate) prefix: Option<PrefixCacheHandle>,
     /// Set when the engine stops: no request begins after it.
     pub(crate) closing: AtomicBool,
@@ -410,6 +425,8 @@ pub(super) struct Run {
     /// Rows the context holds.
     pub(super) capacity: u64,
     _units: Units,
+    /// The sequence's place in the pool, given back when the run is dropped.
+    lease: Lease,
 }
 
 impl Run {
@@ -567,6 +584,9 @@ pub(crate) struct Owner {
     watch: Option<Arc<Handoff<()>>>,
     /// The number of the next selection a sampled request publishes; it never restarts, whatever the request.
     sample_steps: u64,
+    /// The prefix cache's copy jobs of this sequence admitted and not yet ended. The sequence's lease is not returned,
+    /// and the owner is not idle, while one is in flight: a capture reads the sequence's state and a restore writes it.
+    copies: usize,
 }
 
 impl fmt::Debug for Owner {
@@ -598,6 +618,7 @@ impl Owner {
             finished: VecDeque::new(),
             watch: None,
             sample_steps: 0,
+            copies: 0,
         }
     }
 
@@ -623,8 +644,7 @@ impl Owner {
     /// Ends the sequence: frees its caches and the graphs recorded against them. The last release of the pinned host
     /// arena waits for the device, so this is the owner's teardown, after the last quantum retired.
     pub(crate) fn close(self) {
-        let Owner { shared, sequence, .. } = self;
-        shared.executor.clear_graphs();
+        let sequence = self.release();
         if let Err(busy) = sequence.close() {
             log::error!(
                 "the sequence still has {} quanta in flight at shutdown: its device memory stays allocated until the \
@@ -633,6 +653,13 @@ impl Owner {
             );
             mem::forget(busy);
         }
+    }
+
+    /// Gives the sequence back without freeing it: the graphs recorded against its caches are gone.
+    pub(crate) fn release(self) -> SequenceState {
+        let Owner { shared, sequence, .. } = self;
+        shared.executor.clear_graphs();
+        sequence
     }
 
     /// The test hook: the owner records no graphs from now on, and runs every quantum stage by stage.
@@ -648,6 +675,7 @@ impl Owner {
         units: Result<Units, AdmissionError>,
         request: GenerationRequest,
         cancel: CancelHandle,
+        lease: Lease,
     ) -> Result<(), Rejected> {
         let GenerationRequest {
             prompt,
@@ -731,7 +759,7 @@ impl Owner {
                 }
             }
         };
-        self.start_run(units, mode, prompt, max_tokens as usize, stop_tokens, cancel)?;
+        self.start_run(units, lease, mode, prompt, max_tokens as usize, stop_tokens, cancel)?;
         // The first mask is prepared while the prompt prefills.
         self.prepare_constraint();
         Ok(())
@@ -744,6 +772,7 @@ impl Owner {
         prefix: Vec<u32>,
         forced: Vec<u32>,
         sink: Box<dyn LogitsSink>,
+        lease: Lease,
     ) -> Result<(), Rejected> {
         let units = match units {
             Ok(units) => units,
@@ -773,6 +802,7 @@ impl Owner {
         }
         self.start_run(
             units,
+            lease,
             Mode::Forced { forced, sink },
             prefix,
             wanted,
@@ -787,9 +817,11 @@ impl Owner {
         self.finished.push_back(rejected.into_finished());
     }
 
+    #[allow(clippy::too_many_arguments, reason = "what a request carries into its run")]
     fn start_run(
         &mut self,
         units: Units,
+        lease: Lease,
         mode: Mode,
         prompt: Vec<u32>,
         wanted: usize,
@@ -849,6 +881,7 @@ impl Owner {
             began: Instant::now(),
             capacity,
             _units: units,
+            lease,
         });
         Ok(())
     }
@@ -925,8 +958,13 @@ impl Owner {
             return self.fail(format!("the owner panicked: {message}"));
         }
         let Some(mut run) = self.run.take() else { return };
-        log::error!("the owner panicked again: the request ends with its quanta still in flight");
+        log::error!(
+            "the owner of sequence {} panicked again: the request ends with its quanta still in flight, and the sequence leaves the pool",
+            self.id.0
+        );
         mem::forget(mem::take(&mut run.in_flight));
+        // The quanta can no longer be accounted for, so a next request on this sequence could race them: it is not given back.
+        mem::forget(run.lease);
         if mem::take(&mut run.chain) {
             self.shared.order.forget(self.id);
         }
@@ -945,7 +983,7 @@ impl Owner {
             Message::Retired(retired) => {
                 let Retired { quantum, outcome } = *retired;
                 // A quantum the workspace waited for is done: the owner of the workspace starts what waits.
-                self.shared.order.retired(quantum.id());
+                self.shared.order.retired(self.id, quantum.id());
                 let waiting = self.run.as_mut().and_then(|run| {
                     run.in_flight.iter_mut().find(|flying| {
                         flying.retired.is_none()
@@ -975,6 +1013,20 @@ impl Owner {
             // The turn's `reap` is what the message is for.
             Message::Reaped => {}
             Message::StartFailed(failed) => self.start_failed(*failed),
+            Message::Copy(request) => self.admit_copy(*request),
+            Message::CopyEnded => self.copies = self.copies.saturating_sub(1),
+        }
+    }
+
+    /// Admits a copy job of this sequence behind the sequence's last device work, and counts it until it ends. A job
+    /// that cannot start is dropped, which reports it failed to the cache, and is not counted.
+    fn admit_copy(&mut self, request: CopyRequest) {
+        let CopyRequest { job, kill, more } = request;
+        let shared = Arc::clone(&self.shared);
+        self.copies += 1;
+        if let Err(error) = shared.order.admit(self.id, &shared.executor, job, kill, false, more) {
+            self.copies -= 1;
+            log::error!("a prefix-cache copy did not start: {error}");
         }
     }
 
@@ -982,6 +1034,12 @@ impl Owner {
     /// fails.
     fn start_failed(&mut self, failed: StartFailed) {
         let StartFailed { serial, error } = failed;
+        if serial >= FIRST_COPY_SERIAL {
+            // A copy job that did not start was dropped, and so reported failed: no request fails with it.
+            self.copies = self.copies.saturating_sub(1);
+            log::error!("a prefix-cache copy did not start: {error}");
+            return;
+        }
         let Some(run) = self.run.as_mut() else { return };
         run.in_flight.retain(|flying| flying.id != serial);
         run.stop(FinishReason::Failed(format!("starting the quantum: {error}")));
@@ -1097,7 +1155,7 @@ impl Owner {
         self.sample_steps += 1;
         constraining.preparing = Some(step);
         let address = Arc::clone(&self.shared.address);
-        let frame = prepare_frame(step, constraint, move |prepared| {
+        let frame = prepare_frame(self.id.0, step, constraint, move |prepared| {
             address.post(Message::Prepared(prepared))
         });
         self.shared.core.completions.at(Instant::now(), frame);
@@ -1190,8 +1248,10 @@ impl Owner {
             _retained: retained,
         });
         let address = Arc::clone(&self.shared.address);
-        core.completions
-            .after_marker(marker, step(Kind::Reaped, 0, move || address.post(Message::Reaped)));
+        core.completions.after_marker(
+            marker,
+            step(Kind::Reaped, self.id.0, move || address.post(Message::Reaped)),
+        );
     }
 
     /// Ends the request as cancelled if a cancel was asked for: one relaxed atomic load. `conclude` calls it at the top
@@ -1208,6 +1268,7 @@ impl Owner {
     fn then_idle(&mut self, mut told: Vec<Finished>) -> Vec<Finished> {
         if self.run.is_none()
             && self.parked.is_empty()
+            && self.copies == 0
             && let Some(idle) = self.watch.take()
         {
             told.push(Finished::Idle(idle));
@@ -1426,6 +1487,7 @@ impl Owner {
             };
             let address = Arc::clone(&shared.address);
             let frame = sample_frame(
+                self.id.0,
                 first_step + row as u64,
                 first_position + row as u64,
                 sampler,
@@ -1474,7 +1536,9 @@ impl Owner {
             })
             .map_err(why("the logits row's copy"))?;
         let address = Arc::clone(&self.shared.address);
-        let frame = step_frame(move || address.post(Message::Logits(LogitsCopied { step, loan })));
+        let frame = step_frame(self.id.0, move || {
+            address.post(Message::Logits(LogitsCopied { step, loan }))
+        });
         core.completions.after_marker(marker, frame);
         Ok(())
     }
@@ -1732,6 +1796,9 @@ impl Owner {
     fn finish_if_done(&mut self) {
         let chunk = self.shared.chunk;
         let Some(run) = self.run.as_ref() else { return };
+        if self.copies > 0 {
+            return;
+        }
         let ended = run.stopping.is_some() || run.next_step(chunk).is_none();
         if !run.in_flight.is_empty() || run.waiting_logits || run.selecting() || run.preparing() || !ended {
             return;
@@ -1763,8 +1830,8 @@ impl Owner {
 }
 
 /// A frame that runs `work` once, in the control kind.
-fn step_frame(work: impl FnOnce() + Send + 'static) -> Box<dyn Frame> {
-    step(Kind::Logits, 0, work)
+fn step_frame(chain: usize, work: impl FnOnce() + Send + 'static) -> Box<dyn Frame> {
+    step(Kind::Logits, chain, work)
 }
 
 impl Turn for Owner {
@@ -1801,7 +1868,7 @@ impl Turn for Owner {
         }
         // Always told through the outcomes' own path, after them: also with nothing running, because a turn that ended
         // the request may have its outcome in a list not yet told.
-        if self.run.is_none() && self.parked.is_empty() {
+        if self.run.is_none() && self.parked.is_empty() && self.copies == 0 {
             self.finished.push_back(Finished::Idle(idle));
         } else {
             self.watch = Some(idle);
@@ -1816,6 +1883,29 @@ impl Turn for Owner {
     }
 
     fn idle(&self) -> bool {
-        self.run.is_none() && self.parked.is_empty() && self.finished.is_empty()
+        self.run.is_none() && self.parked.is_empty() && self.copies == 0 && self.finished.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn the_frames_of_two_sequences_are_never_on_one_chain() {
+        let hash = |frame: Box<dyn Frame>| frame.header().id_hash();
+        for kind in [Kind::Reaped, Kind::Logits] {
+            assert_ne!(hash(step(kind, 0, || {})), hash(step(kind, 1, || {})), "{kind:?}");
+        }
+        assert_ne!(
+            hash(step_frame(0, || {})),
+            hash(step_frame(1, || {})),
+            "the control frame"
+        );
+        assert_eq!(
+            hash(step_frame(2, || {})),
+            hash(step_frame(2, || {})),
+            "one sequence keeps its chain"
+        );
     }
 }

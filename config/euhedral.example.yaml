@@ -41,7 +41,7 @@ context:
   kv-cache-on-gpu-tokens: 65536               # optional, default 65536: tokens of a sequence kept on the GPU before its cache spills to the host
 
 prefix-cache:
-  size: 4GiB                                  # optional, default 4GiB: host memory for shared prompt prefixes; 0 disables
+  size: 0                                     # optional, default 0 (off): host memory for shared prompt prefixes; a size the host cannot hold shrinks to what fits
   checkpoint-tokens: 2048                     # optional, default 2048: tokens between stored checkpoints; a positive multiple of 512
   copy-piece-bytes: 16MiB                     # optional, default 16MiB, Rust engine only: most bytes one checkpoint copy moves at a time
 

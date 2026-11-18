@@ -317,13 +317,7 @@ pub fn plan_with(
     let device_bytes = layout.device_bytes();
     let asked = settings.prefix_cache.size.bytes();
     let prefix_cache_bytes = if asked > 0 && config.layer_kinds.len() > 1 {
-        match admit_with_cache(budgets, layout, asked) {
-            Ok(true) => asked,
-            Ok(false) | Err(_) => {
-                log::warn!("the host has no room for the {asked}-byte prefix cache: the engine runs without it");
-                0
-            }
-        }
+        shrink_to_fit(budgets, layout, asked)
     } else {
         0
     };
@@ -441,6 +435,23 @@ fn decide(budgets: Budgets, whole: Layout, split: Option<Layout>) -> Result<(Lay
 /// and holds nothing after this returns. The error is the first location that is short.
 fn admit(budgets: Budgets, layout: Layout) -> Result<(), Location> {
     admit_with_cache(budgets, layout, 0).map(|_| ())
+}
+
+/// The largest arena of at most `asked` bytes that the host has room for beside the plan's own pages: `asked` when it
+/// fits, else what is left (with a warning), else 0 (the engine then runs without the cache).
+fn shrink_to_fit(budgets: Budgets, layout: Layout, asked: u64) -> u64 {
+    if let Ok(true) = admit_with_cache(budgets, layout, asked) {
+        return asked;
+    }
+    let room = budgets.host.saturating_sub(layout.cache_host).min(asked);
+    if room > 0
+        && let Ok(true) = admit_with_cache(budgets, layout, room)
+    {
+        log::warn!("the host has room for {room} of the {asked} bytes asked for the prefix cache: it is that size");
+        return room;
+    }
+    log::warn!("the host has no room for the {asked}-byte prefix cache: the engine runs without it");
+    0
 }
 
 /// As [`admit`], with the prefix cache's arena of `prefix` bytes as the lowest-priority item and the only one that is

@@ -658,8 +658,10 @@ fn the_prefix_cache_arena_is_granted_only_the_host_room_left_over() {
         plan_with(&config, &table, settings, inputs).unwrap().prefix_cache_bytes
     };
     assert_eq!(granted(&settings, u64::MAX), GIB);
-    // The arena is the plan's last item: a host too small for it drops it, and the plan is still made.
-    assert_eq!(granted(&settings, GIB - 1), 0);
+    // A host too small for the whole arena grants what is left of it, and the plan is still made.
+    let shrunk = granted(&settings, GIB - 1);
+    assert!(shrunk > 0 && shrunk < GIB, "{shrunk}");
+    assert_eq!(granted(&settings, 0), 0);
     assert_eq!(granted(&settings, GIB), GIB);
     settings.prefix_cache.size = ByteSize(0);
     assert_eq!(granted(&settings, u64::MAX), 0);

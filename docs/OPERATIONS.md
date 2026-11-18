@@ -26,7 +26,7 @@ See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 | `sampling.top-k` | 20 | Top-k for a request that sets none (the OpenAI APIs have no field for it); 0 keeps every token. |
 | `sampling.top-p` | 0.95 | Top-p for a request that sets none, above 0 and at most 1. |
 | `context.max-tokens` | 32768 | The longest prompt plus completion. The engine keeps device memory for that much KV cache and holds weights in pinned host memory when both do not fit. At most the model's 262144 positions. |
-| `prefix-cache.size` | 4GiB | Pinned host memory for the prefix cache ([PREFIX_CACHE.md](PREFIX_CACHE.md)); 0 turns it off. |
+| `prefix-cache.size` | 0 (off) | Pinned host memory for the prefix cache ([PREFIX_CACHE.md](PREFIX_CACHE.md)); 0 turns it off. |
 | `prefix-cache.checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints, a multiple of 512. |
 | `prefix-cache.copy-piece-bytes` | 16MiB | The most bytes one prefix-cache copy moves at a time. Only the Rust engine reads it. |
 | `context.kv-cache-format` | the artifact's (`nvfp4`) | The attention cache format: `nvfp4` (144 bytes per head row) or `bf16` (512 bytes, the keys and values as computed). The engine sizes the context's device memory by it ([ATTENTION_DECODE.md](kernels/ATTENTION_DECODE.md#cache-formats)). |

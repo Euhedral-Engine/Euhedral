@@ -3,7 +3,7 @@
 //! library named by `euhedral.cuda.library` (`EUHEDRAL_TEST_CUDA_LIBRARY`), skipping without it. Every wait is bounded.
 //!
 //! The model is the first four layers of the RCO model (three GDN layers and one full-attention layer); no weights are
-//! loaded.
+//! loaded. Two sequences capture and restore at the same time, on different lanes, each its own bytes.
 
 #![allow(clippy::print_stderr, reason = "a test reports what it skipped")]
 #![allow(
@@ -61,6 +61,9 @@ const LAYERS: usize = 4;
 /// Tokens of the checkpoint: two cache pages.
 const TOKENS: u32 = 512;
 
+/// Sequences that copy at once, each on its own lane and chain.
+const SEQUENCES: usize = 2;
+
 fn pattern(seed: u8, bytes: usize) -> Vec<u8> {
     (0..bytes)
         .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
@@ -78,7 +81,7 @@ struct World {
 }
 
 impl World {
-    /// Two lanes: 0 for the copies, 1 the owner's.
+    /// One lane per sequence for its copies (lanes 0 and 1), and the owner's after them.
     fn open() -> Option<World> {
         let path = test_support::require_property("euhedral.cuda.library")?;
         let library = CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads");
@@ -86,7 +89,7 @@ impl World {
         config.layer_kinds.truncate(LAYERS);
         config.num_hidden_layers = LAYERS;
         assert_eq!(config.layer_kinds[3], LayerKind::FullAttention);
-        let typed = Typed::plain(&library, 2, 1024);
+        let typed = Typed::plain(&library, 1 + SEQUENCES, 1024);
         let pool = Arc::clone(&typed.queues);
         let settings = Settings::with_model(ModelSettings::default());
         let lattice = ControlPlaneLattice::new(lattice_config(&settings)).unwrap();
@@ -119,7 +122,7 @@ impl World {
     }
 
     fn owner(&self) -> &Arc<CudaQueue> {
-        self.typed.lane(1)
+        self.typed.lane(SEQUENCES as u16)
     }
 
     fn on_owner<E: Display>(&self, work: impl FnOnce(&mut dyn LaneOps) -> Result<(), E>) {
@@ -169,9 +172,106 @@ fn expect<T>(receiver: &Receiver<T>, what: &str) -> T {
         .unwrap_or_else(|_| panic!("the cache did not answer the {what} within {DEADLINE:?}"))
 }
 
+/// One sequence of the test: its state, the addresses a copy resolves, and where its checkpointed bytes are.
+struct Sequence {
+    addresses: Arc<SequenceAddresses>,
+    regions: Vec<(DevicePtr, usize)>,
+    original: Vec<Vec<u8>>,
+    copier: Arc<Copier>,
+    tokens: Arc<[u32]>,
+    // Held so that the sequence's buffers outlive the copies.
+    _state: (SequenceState, KvRetained, Arc<PinnedPool>),
+}
+
+impl Sequence {
+    /// The sequence `index`: its state, filled with bytes only it could have written, copied on lane `index`.
+    fn new(world: &World, index: usize, format: KvFormat) -> Sequence {
+        let mut gdn = None;
+        world.on_owner(|lane| {
+            gdn = Some(GdnStates::allocate(&world.library, &world.config, 8, lane)?);
+            Ok::<(), CudaError>(())
+        });
+        let released = Arc::new(ReleasedBuffers::new());
+        let pinned = PinnedPool::new(&world.library, 16 << 20);
+        let mut sequence = SequenceState::from_parts(
+            KvCache::new(
+                &world.library,
+                &released,
+                1,
+                world.config.kv_width() as u64,
+                format,
+                u64::from(TOKENS),
+                0,
+            )
+            .unwrap(),
+            None,
+            Arc::new(SequenceDevice {
+                gdn: gdn.unwrap(),
+                scratch: AttentionScratch::allocate(&world.library, &world.config, 8, true, 16).unwrap(),
+            }),
+            SelectionPool::new(&world.library, 4, 8).unwrap(),
+        );
+        let mut retained = KvRetained::default();
+        world.on_owner(|lane| sequence.kv.reserve(lane, &pinned, 0, u64::from(TOKENS), &mut retained));
+        sequence.kv.appended(u64::from(TOKENS)).unwrap();
+        let addresses =
+            Arc::new(SequenceAddresses::new(sequence.refs(KvSource::Base).unwrap(), &world.config).unwrap());
+        let regions = regions(addresses.refs(), &world.config);
+        let original: Vec<Vec<u8>> = regions
+            .iter()
+            .enumerate()
+            .map(|(region, (_, bytes))| pattern((region + 50 * index) as u8 + 1, *bytes))
+            .collect();
+        for ((ptr, _), data) in regions.iter().zip(&original) {
+            world.write(*ptr, data);
+        }
+        let copier = Arc::new(
+            Copier::new(
+                &world.runtime,
+                world.typed.table.clone(),
+                LaneId(index as u16),
+                SequenceId(index),
+                Box::new(|_| ()),
+            )
+            .expect("the copier builds"),
+        );
+        // A prompt of its own: the two checkpoints are different nodes.
+        let tokens: Arc<[u32]> = (0..=TOKENS).map(|token| token + 1000 * index as u32).collect();
+        Sequence {
+            addresses,
+            regions,
+            original,
+            copier,
+            tokens,
+            _state: (sequence, retained, pinned),
+        }
+    }
+
+    fn submit(&self) -> Submit {
+        let copier = Arc::clone(&self.copier);
+        Box::new(move |job| {
+            copier
+                .start(job, Arc::new(AtomicBool::new(false)), &[])
+                .expect("the copy job starts");
+        })
+    }
+
+    /// Overwrites the state with bytes that are not the checkpoint's.
+    fn clobber(&self, world: &World, index: usize) {
+        for (region, (ptr, bytes)) in self.regions.iter().enumerate() {
+            world.write(*ptr, &pattern(0xA5 ^ (region + index) as u8, *bytes));
+            assert_ne!(
+                world.typed.download(*ptr, *bytes),
+                self.original[region],
+                "region {region} of sequence {index} was not overwritten"
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU"]
-fn a_checkpoint_captured_and_restored_brings_back_every_byte() {
+fn two_sequences_capture_and_restore_their_own_bytes_at_once() {
     let Some(world) = World::open() else {
         eprintln!("skipped: no CUDA library");
         return;
@@ -179,41 +279,12 @@ fn a_checkpoint_captured_and_restored_brings_back_every_byte() {
     let format = KvFormat::Nvfp4;
     let layout = CheckpointLayout::new(&world.config, format).unwrap();
     let slot = layout.slot_bytes();
+    let sequences: Vec<Sequence> = (0..SEQUENCES)
+        .map(|index| Sequence::new(&world, index, format))
+        .collect();
 
-    // The sequence: its state and the cache rows of the checkpoint.
-    let mut gdn = None;
-    world.on_owner(|lane| {
-        gdn = Some(GdnStates::allocate(&world.library, &world.config, 8, lane)?);
-        Ok::<(), CudaError>(())
-    });
-    let released = Arc::new(ReleasedBuffers::new());
-    let pinned = PinnedPool::new(&world.library, 16 << 20);
-    let mut sequence = SequenceState::from_parts(
-        KvCache::new(
-            &world.library,
-            &released,
-            1,
-            world.config.kv_width() as u64,
-            format,
-            u64::from(TOKENS),
-            0,
-        )
-        .unwrap(),
-        None,
-        Arc::new(SequenceDevice {
-            gdn: gdn.unwrap(),
-            scratch: AttentionScratch::allocate(&world.library, &world.config, 8, true, 16).unwrap(),
-        }),
-        SelectionPool::new(&world.library, 4, 8).unwrap(),
-    );
-    let mut retained = KvRetained::default();
-    world.on_owner(|lane| sequence.kv.reserve(lane, &pinned, 0, u64::from(TOKENS), &mut retained));
-    sequence.kv.appended(u64::from(TOKENS)).unwrap();
-    let addresses = Arc::new(SequenceAddresses::new(sequence.refs(KvSource::Base).unwrap(), &world.config).unwrap());
-    let regions = regions(addresses.refs(), &world.config);
-
-    // The cache, with copy pieces smaller than a slot so that a copy is cut.
-    let granted = (layout.gdn_slots() as u64 + 2 + 2) * slot;
+    // The cache, with copy pieces smaller than a slot so that a copy is cut into groups.
+    let granted = (SEQUENCES as u64 * (layout.gdn_slots() as u64 + 2) + 2) * slot;
     let spawn: Spawn = Box::new(|work| {
         thread::spawn(work);
         true
@@ -235,80 +306,75 @@ fn a_checkpoint_captured_and_restored_brings_back_every_byte() {
         spawn,
     )
     .expect("the cache opens");
-    let copier = Arc::new(
-        Copier::new(&world.runtime, world.typed.table.clone(), LaneId(0), SequenceId(0)).expect("the copier builds"),
-    );
-    let submit = || -> Submit {
-        let copier = Arc::clone(&copier);
-        Box::new(move |job| {
-            copier
-                .start(job, Arc::new(AtomicBool::new(false)), &[])
-                .expect("the copy job starts");
-        })
-    };
 
-    // The state the checkpoint holds.
-    let original: Vec<Vec<u8>> = regions
+    // Both captures are asked before either answer is waited for: the two copies are in flight together.
+    let answers: Vec<_> = sequences
         .iter()
         .enumerate()
-        .map(|(index, (_, bytes))| pattern(index as u8 + 1, *bytes))
+        .map(|(index, sequence)| {
+            let (told, answer) = channel();
+            cache.capture(
+                SequenceId(index),
+                sequence.addresses.clone(),
+                Arc::clone(&sequence.tokens),
+                cache.root(),
+                TOKENS,
+                None,
+                sequence.submit(),
+                move |node| told.send(node).unwrap(),
+            );
+            answer
+        })
         .collect();
-    for ((ptr, _), data) in regions.iter().zip(&original) {
-        world.write(*ptr, data);
+    for (index, answer) in answers.iter().enumerate() {
+        let node = expect(answer, "capture");
+        assert_ne!(node, cache.root(), "the capture of sequence {index} stored nothing");
     }
 
-    let tokens: Arc<[u32]> = (0..TOKENS + 1).collect();
-    let (told, answer) = channel();
-    cache.capture(
-        SequenceId(0),
-        addresses.clone(),
-        Arc::clone(&tokens),
-        cache.root(),
-        TOKENS,
-        None,
-        submit(),
-        move |node| told.send(node).unwrap(),
-    );
-    let node = expect(&answer, "capture");
-    assert_ne!(node, cache.root(), "the capture stored nothing");
-
-    // Overwrite everything, then restore.
-    for (index, (ptr, bytes)) in regions.iter().enumerate() {
-        let clobbered = pattern(0xA5 ^ index as u8, *bytes);
-        world.write(*ptr, &clobbered);
-        assert_ne!(
-            world.typed.download(*ptr, *bytes),
-            original[index],
-            "region {index} was not overwritten"
-        );
+    for (index, sequence) in sequences.iter().enumerate() {
+        sequence.clobber(&world, index);
     }
-    let (told, answer) = channel();
-    cache.lookup(tokens, None, move |hit| told.send(hit).unwrap());
-    let hit = expect(&answer, "lookup").expect("the lookup finds the checkpoint");
-    assert_eq!(hit.position(), TOKENS);
-    let (told, answer) = channel();
-    cache.restore(
-        hit,
-        SequenceId(0),
-        addresses.clone(),
-        None,
-        Arc::new(AtomicBool::new(false)),
-        submit(),
-        move |restored| told.send(restored).unwrap(),
-    );
-    assert_eq!(expect(&answer, "restore"), Ok(TOKENS));
+    let answers: Vec<_> = sequences
+        .iter()
+        .enumerate()
+        .map(|(index, sequence)| {
+            let (told, hit) = channel();
+            cache.lookup(Arc::clone(&sequence.tokens), None, move |hit| told.send(hit).unwrap());
+            let hit = expect(&hit, "lookup").expect("the lookup finds the checkpoint");
+            assert_eq!(hit.position(), TOKENS);
+            let (told, answer) = channel();
+            cache.restore(
+                hit,
+                SequenceId(index),
+                sequence.addresses.clone(),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                sequence.submit(),
+                move |restored| told.send(restored).unwrap(),
+            );
+            answer
+        })
+        .collect();
+    for answer in &answers {
+        assert_eq!(expect(answer, "restore"), Ok(TOKENS));
+    }
     world.typed.sync();
-    for (index, (ptr, bytes)) in regions.iter().enumerate() {
-        assert!(
-            world.typed.download(*ptr, *bytes) == original[index],
-            "region {index} of {} differs after the restore",
-            regions.len()
-        );
+    for (index, sequence) in sequences.iter().enumerate() {
+        for (region, (ptr, bytes)) in sequence.regions.iter().enumerate() {
+            assert!(
+                world.typed.download(*ptr, *bytes) == sequence.original[region],
+                "region {region} of {} of sequence {index} differs after the restore",
+                sequence.regions.len()
+            );
+        }
     }
     let stats = cache.stats();
-    assert_eq!((stats.captures, stats.hits), (1, 1));
+    assert_eq!((stats.captures, stats.hits, stats.restores), (2, 2, 2));
 
-    cache.close();
-    drop(copier);
+    assert!(
+        cache.close(Duration::from_secs(30)),
+        "the copies ended and the cache closed"
+    );
+    drop(sequences);
     world.close();
 }

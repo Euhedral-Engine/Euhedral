@@ -23,7 +23,7 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Single};
 use euhedral_inference_settings::KvFormat;
@@ -87,6 +87,10 @@ pub enum RestoreError {
     Format { sequence: KvFormat, cache: KvFormat },
     #[error("the sequence has no buffer for a copy of the checkpoint")]
     Unresolved,
+    #[error("the sequence has {rows} rows of its attention caches reserved and the checkpoint is {position} tokens")]
+    Unreserved { rows: u64, position: u32 },
+    #[error("the sequence speculates, and the checkpoints of a speculating sequence are not stored")]
+    Speculative,
     #[error("the copy failed: {0}")]
     Copy(String),
 }
@@ -203,6 +207,8 @@ pub(crate) struct PrefixCache {
     ticket: u64,
     told: Vec<Finished>,
     closed: bool,
+    /// Told once the cache is shut and no copy job is left in flight.
+    idle_signal: Option<Arc<Handoff<()>>>,
 }
 
 /// What a cache is opened over.
@@ -290,6 +296,7 @@ impl PrefixCache {
             ticket: 0,
             told: Vec::new(),
             closed: false,
+            idle_signal: None,
         };
         let mailbox = Arc::new(Mailbox::new(cache, producer, spawn));
         address.set(&mailbox);
@@ -344,6 +351,7 @@ impl PrefixCache {
         direction: Direction,
         pieces: Vec<Piece>,
         refs: Arc<dyn Resolve>,
+        on_failure: Option<Arc<AtomicBool>>,
     ) -> (u64, CopyJob) {
         self.ticket += 1;
         let serial = self.shared.serials.fetch_add(1, Ordering::Relaxed);
@@ -353,6 +361,8 @@ impl PrefixCache {
             buffers: refs,
             ticket: self.ticket,
             cache: Arc::clone(&self.address),
+            group_bytes: self.piece_bytes,
+            on_failure,
         };
         (self.ticket, CopyJob::new(serial, direction, pieces, link))
     }
@@ -364,6 +374,7 @@ impl PrefixCache {
         refs: &dyn Resolve,
         kind: Option<Speculation>,
         cancel: &AtomicBool,
+        position: u32,
     ) -> Result<Vec<Piece>, RestoreError> {
         let chain: Vec<_> = matched.chain().iter().filter_map(|&id| self.tree.get(id)).collect();
         if kind.is_some() && chain.iter().any(|node| node.speculation() != kind) {
@@ -371,6 +382,15 @@ impl PrefixCache {
         }
         if self.closed {
             return Err(RestoreError::Closed);
+        }
+        if refs.speculative() {
+            return Err(RestoreError::Speculative);
+        }
+        if refs.rows() < u64::from(position) {
+            return Err(RestoreError::Unreserved {
+                rows: refs.rows(),
+                position,
+            });
         }
         if refs.kv_format() != self.format {
             return Err(RestoreError::Format {
@@ -401,7 +421,7 @@ impl PrefixCache {
             self.told(move || done(Err(RestoreError::Closed)));
             return;
         };
-        let planned = self.plan_restore(&matched, refs.as_ref(), kind, &cancel);
+        let planned = self.plan_restore(&matched, refs.as_ref(), kind, &cancel, position);
         let pieces = match planned {
             Ok(pieces) => pieces,
             Err(error) => {
@@ -410,7 +430,7 @@ impl PrefixCache {
                 return;
             }
         };
-        let (ticket, job) = self.job(sequence, Direction::ToDevice, pieces, refs);
+        let (ticket, job) = self.job(sequence, Direction::ToDevice, pieces, refs, Some(Arc::clone(&cancel)));
         self.pending.insert(
             ticket,
             Pending::Restore {
@@ -442,7 +462,7 @@ impl PrefixCache {
             self.told(move || done(parent));
             return;
         };
-        if self.closed || refs.kv_format() != self.format || refs.rows() < u64::from(end) {
+        if self.closed || refs.speculative() || refs.kv_format() != self.format || refs.rows() < u64::from(end) {
             self.told(move || done(parent));
             return;
         }
@@ -484,7 +504,7 @@ impl PrefixCache {
             self.told(move || done(parent));
             return;
         };
-        let (ticket, job) = self.job(sequence, Direction::ToHost, pieces, refs);
+        let (ticket, job) = self.job(sequence, Direction::ToHost, pieces, refs, None);
         self.pending.insert(
             ticket,
             Pending::Capture {
@@ -528,17 +548,28 @@ impl PrefixCache {
                 done,
             } => {
                 self.tree.release(matched);
+                // A failed job sets the request's flag itself, so the flag says nothing of why it ended.
                 let result = match ended {
-                    _ if cancel.load(Ordering::Acquire) => Err(RestoreError::Cancelled),
+                    Ended::Failed(why) => Err(RestoreError::Copy(why)),
+                    Ended::Cancelled => Err(RestoreError::Cancelled),
+                    Ended::Done if cancel.load(Ordering::Acquire) => Err(RestoreError::Cancelled),
                     Ended::Done => {
                         count(&self.shared.restores, 1);
                         count(&self.shared.restore_nanos, nanos(started));
                         Ok(position)
                     }
-                    Ended::Failed(why) => Err(RestoreError::Copy(why)),
                 };
                 self.told(move || done(result));
             }
+        }
+    }
+
+    /// Tells whoever waits for the shut cache that no job is left in flight.
+    fn signal_idle(&mut self) {
+        if self.pending.is_empty()
+            && let Some(idle) = self.idle_signal.take()
+        {
+            idle.send(());
         }
     }
 
@@ -566,6 +597,7 @@ impl Turn for PrefixCache {
                 Message::Unpin(matched) => self.tree.release(matched),
             }
         }
+        self.signal_idle();
     }
 
     fn take_finished(&mut self) -> Vec<Finished> {
@@ -574,6 +606,7 @@ impl Turn for PrefixCache {
 
     fn abandon(&mut self, why: &str) -> Vec<Finished> {
         self.fail_all(why);
+        self.signal_idle();
         self.take_told()
     }
 
@@ -582,9 +615,11 @@ impl Turn for PrefixCache {
         then();
     }
 
+    /// Stops new requests; `idle` is told once every copy job in flight has ended and been answered.
     fn shut(&mut self, idle: Arc<Handoff<()>>) {
         self.closed = true;
-        idle.send(());
+        self.idle_signal = Some(idle);
+        self.signal_idle();
     }
 
     fn into_barrier(finished: Finished) -> Result<Arc<Handoff<()>>, Finished> {
@@ -676,6 +711,25 @@ impl PrefixCacheHandle {
 
     /// Restores `hit` into `sequence`'s buffers (`refs`) through the job `submit` admits, and answers with the position
     /// restored. A cancel seen before or after the copies answers [`RestoreError::Cancelled`]; every answer unpins.
+    ///
+    /// **The protocol.** The caller is the sequence's owner, before the request's first chunk:
+    ///
+    /// 1. Its KV pages for `position` (`hit.position()`) must be reserved already: `refs.rows() >= position`, checked
+    ///    here as the precondition of a capture is ([`RestoreError::Unreserved`]). A sequence that speculates is
+    ///    refused ([`RestoreError::Speculative`]) and nothing is copied.
+    /// 2. `submit` arrives once, from a worker, when the job is built: the owner admits it behind the sequence's last
+    ///    device work with `on_workspace` false and **`more` set** (the first chunk follows it), and counts it in
+    ///    flight until it ends. A refused restore never calls `submit`; it answers.
+    /// 3. The owner holds the request's first chunk until `submit` has admitted the job: a chunk admitted before it
+    ///    would not wait for it and would read the state the job is still writing. The chunk is then admitted at
+    ///    `position` with the usual `more`.
+    /// 4. `done` arrives after the job ended (or was refused or dropped): `Ok(position)` when the copies ran, an error
+    ///    otherwise. On any failure of the copy the job has already set `cancel`, the request's kill flag, before
+    ///    whatever was admitted behind it can start, so the chunk behind a failed restore does not run and cannot emit a
+    ///    token before the failure reaches the owner, which then ends the request with the error.
+    ///
+    /// The match stays pinned until the job has ended, not until it is built: the arena slots it reads cannot be
+    /// evicted or reused by another request meanwhile.
     #[allow(clippy::too_many_arguments, reason = "one request's parts")]
     pub fn restore(
         &self,
@@ -726,13 +780,26 @@ impl PrefixCacheHandle {
         });
     }
 
-    /// Closes the cache: it stores and restores nothing from now on. Requests in flight still end.
-    pub fn close(&self) {
-        self.mailbox.defer(move |cache| {
-            if let Some(cache) = cache {
-                cache.closed = true;
-            }
-            Vec::new()
-        });
+    /// Shuts the cache: it stores and restores nothing from now on, and this waits (at most `bound`, from outside the
+    /// lattice) for the copy jobs in flight to end and be answered, then frees the cache. After `bound` the jobs left
+    /// are abandoned (failed and unpinned) and the arena stays allocated until the last of them is dropped. `false`
+    /// when it could not wait (called from inside a turn) or the bound passed.
+    pub fn close(&self, bound: Duration) -> bool {
+        let Some(idle) = self.mailbox.stopping() else {
+            log::error!("the prefix cache cannot be waited for from inside a turn at shutdown");
+            return false;
+        };
+        let ended = idle.wait(bound).is_ok();
+        if !ended {
+            log::error!(
+                "the prefix cache's copy jobs did not end within {bound:?} of the shutdown: they are abandoned"
+            );
+            self.mailbox.defer(|cache| match cache {
+                Some(cache) => cache.abandon("the engine is shutting down"),
+                None => Vec::new(),
+            });
+        }
+        drop(self.mailbox.close());
+        ended
     }
 }

@@ -17,6 +17,7 @@ mod open;
 mod tree;
 
 pub use cache::{CacheParts, Hit, OpenError, PrefixCacheHandle, PrefixCacheStats, RestoreError, Submit};
+pub(crate) use copier::FIRST_COPY_SERIAL;
 pub use copier::{Copier, PinnedArena, SequenceAddresses};
 pub use copy::{CopyJob, Direction, Ended, HostArena, Piece, Resolve};
 pub use layout::{Buffer, CheckpointLayout, SlotCopy};
