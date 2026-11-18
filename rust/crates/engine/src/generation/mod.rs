@@ -35,7 +35,7 @@ use crate::formats::{Nvfp4Linear, TrellisLinear};
 use crate::frames::{Kind, step};
 use crate::model::{LayerIndex, ModelConfig, Role, Weights};
 use crate::plan::{Formats, Plan, View};
-use crate::prefix::{CacheSpec, Copier, PrefixCacheHandle, Submit, open_prefix_cache};
+use crate::prefix::{Copier, PrefixCacheHandle, Submit};
 use crate::quantum::Executor;
 use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
@@ -408,7 +408,7 @@ pub(crate) struct Generations {
     generations: Vec<Generation>,
     pool: SequencePool,
     order: Arc<Order<Executor>>,
-    /// The prefix cache the sequences share, when the plan granted it memory and it opened.
+    /// The prefix cache the sequences share: `None` until restore on admission, its first caller, opens it (see `Generations::new`).
     prefix: Option<PrefixCacheHandle>,
     /// A test hook: the next request admitted arms the owner's panic after this many admissions.
     #[cfg(feature = "test-oracles")]
@@ -458,18 +458,10 @@ impl Generations {
             Generation::spawner(core),
         ));
         let count = sequences.len();
-        let prefix = open_prefix_cache(
-            CacheSpec {
-                library: &core.library,
-                config,
-                format: residency.kv_format,
-                settings: core.settings.prefix_cache,
-                granted: residency.prefix_cache_bytes,
-                chunk: residency.rows.rows as u32,
-                device_tokens: u32::try_from(residency.kv_device_tokens).unwrap_or(u32::MAX),
-            },
-            Generation::spawner(core),
-        );
+        // No cache is opened yet: nothing asks it for a lookup, a capture or a restore, and an open one would pin an arena
+        // nobody uses. Restore on admission, its first caller, opens it here (`open_prefix_cache`, once, before the
+        // generations are built); the handle, its clones and its close are plumbed already.
+        let prefix: Option<PrefixCacheHandle> = None;
         let mut generations: Vec<Generation> = Vec::with_capacity(count);
         let mut waiting = sequences.into_iter().zip(addresses).enumerate();
         while let Some((index, (sequence, address))) = waiting.next() {

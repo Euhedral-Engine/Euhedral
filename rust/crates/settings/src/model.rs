@@ -209,7 +209,7 @@ pub struct PrefixCacheSettings {
 impl Default for PrefixCacheSettings {
     fn default() -> Self {
         Self {
-            size: ByteSize(0),
+            size: ByteSize::gib(4),
             checkpoint_tokens: 2048,
             copy_piece_bytes: ByteSize::mib(16),
         }

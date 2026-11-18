@@ -9,7 +9,7 @@ cache takes no device memory: the context length and the weight residency are th
 
 | Property | Default | Meaning |
 |---|---|---|
-| `prefix-cache.size` | 0 (off) | Pinned host memory for the cache. 0 turns it off. Memory that cannot be pinned turns it off with a warning, and the engine serves as before. |
+| `prefix-cache.size` | 4GiB | Pinned host memory for the cache. 0 turns it off. Memory that cannot be pinned turns it off with a warning, and the engine serves as before. |
 | `prefix-cache.checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints. A multiple of 512, the prefill chunk. |
 | `prefix-cache.copy-piece-bytes` | 16MiB | The most bytes one copy between a sequence and the arena moves. A checkpoint is copied in groups of pieces, each group holding at most this many bytes and running in its own frame chained behind the one before (a single piece larger than this is a group of its own), so one long copy never holds a transfer lane for its whole length; only the last group reports to the cache. Only the Rust engine reads it. |
 
