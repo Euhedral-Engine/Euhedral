@@ -15,7 +15,7 @@ use crate::response_format::ResponseFormat;
 use crate::responses::ResponsesRequest;
 use crate::served_model::require_served_model;
 use crate::template::{AssistantMessage, ContentPart, Effort, Message, TemplateOptions, ToolCall};
-use crate::tool_calling::{FunctionTool, ToolCalling, check_keys, is_function_name, parameters};
+use crate::tool_calling::{FunctionTool, ToolCalling, check_keys, is_function_name, is_parameter_name, parameters};
 use crate::tool_definition::ToolDefinition;
 use crate::tool_results::ToolResults;
 
@@ -576,13 +576,19 @@ fn arguments(value: Option<&JsonValue>, path: &str) -> Result<Vec<(String, JsonV
             Some(&param),
         ));
     };
-    match parsed {
-        JsonValue::Object(members) => Ok(members),
-        _ => Err(ApiError::invalid_request(
+    let JsonValue::Object(members) = parsed else {
+        return Err(ApiError::invalid_request(
             "'arguments' must encode a JSON object.",
             Some(&param),
-        )),
+        ));
+    };
+    if members.iter().any(|(key, _)| !is_parameter_name(key)) {
+        return Err(ApiError::invalid_request(
+            "Argument names must be non-empty and free of '<', '>' and line breaks.",
+            Some(&param),
+        ));
     }
+    Ok(members)
 }
 
 // Options.

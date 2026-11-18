@@ -31,55 +31,77 @@ impl StopSequenceFilter {
             return chunk.to_string();
         }
         self.pending.push_str(chunk);
-        if let Some(position) = self.earliest_match() {
-            self.matched_stop = self
-                .stops
-                .iter()
-                .find(|stop| self.pending[position..].starts_with(stop.as_str()))
-                .cloned();
-            self.matched = true;
-            let emitted = self.pending[..position].to_string();
-            self.pending.clear();
-            return emitted;
+        match self.earliest_match() {
+            Some((position, stop)) => {
+                // A stop that starts at or before this one and could still complete would win over it.
+                if self.hold_start().is_some_and(|start| start <= position) {
+                    return self.release_before_hold();
+                }
+                self.settle(position, stop)
+            }
+            None => self.release_before_hold(),
         }
-        let safe = self.pending.len() - self.longest_stop_prefix_suffix();
-        self.pending.drain(..safe).collect()
     }
 
-    /// Releases held-back text at the natural end of generation.
+    /// Releases held-back text at the natural end of generation; a complete stop still waiting for a longer one to
+    /// finish is decided now, as nothing more can arrive.
     pub fn finish(&mut self) -> String {
-        take(&mut self.pending)
+        match self.earliest_match() {
+            Some((position, stop)) => self.settle(position, stop),
+            None => take(&mut self.pending),
+        }
     }
 
     pub fn matched(&self) -> bool {
         self.matched
     }
 
-    /// The stop string that matched (the first listed of those matching at the earliest position), if any.
+    /// The stop string that matched: of those matching at the earliest position, the longest, if any.
     pub fn matched_stop(&self) -> Option<&str> {
         self.matched_stop.as_deref()
     }
 
-    fn earliest_match(&self) -> Option<usize> {
-        self.stops
-            .iter()
-            .filter_map(|stop| self.pending.find(stop.as_str()))
-            .min()
+    fn settle(&mut self, position: usize, stop: usize) -> String {
+        self.matched_stop = Some(self.stops[stop].clone());
+        self.matched = true;
+        let emitted = self.pending[..position].to_string();
+        self.pending.clear();
+        emitted
     }
 
-    /// Byte length of the longest suffix of the pending text that is a proper prefix of some stop string.
-    fn longest_stop_prefix_suffix(&self) -> usize {
-        let mut longest = 0;
-        for stop in &self.stops {
-            let prefix = stop
-                .char_indices()
-                .map(|(index, _)| index)
-                .rfind(|&length| length > longest && length > 0 && self.pending.ends_with(&stop[..length]));
-            if let Some(length) = prefix {
-                longest = length;
+    /// Emits the text before the earliest point where a stop could still begin; the rest stays held.
+    fn release_before_hold(&mut self) -> String {
+        let safe = self.hold_start().unwrap_or(self.pending.len());
+        self.pending.drain(..safe).collect()
+    }
+
+    /// The earliest complete stop in the pending text: its position and index; the longest at that position.
+    fn earliest_match(&self) -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize)> = None;
+        for (index, stop) in self.stops.iter().enumerate() {
+            let Some(position) = self.pending.find(stop.as_str()) else {
+                continue;
+            };
+            let better = match best {
+                None => true,
+                Some((at, held)) => position < at || (position == at && stop.len() > self.stops[held].len()),
+            };
+            if better {
+                best = Some((position, index));
             }
         }
-        longest
+        best
+    }
+
+    /// The start of the earliest suffix of the pending text that is a proper prefix of some stop string. It is
+    /// shorter than the longest stop, so the hold never exceeds that.
+    fn hold_start(&self) -> Option<usize> {
+        self.pending.char_indices().map(|(start, _)| start).find(|&start| {
+            let suffix = &self.pending[start..];
+            self.stops
+                .iter()
+                .any(|stop| stop.len() > suffix.len() && stop.starts_with(suffix))
+        })
     }
 }
 
@@ -136,10 +158,10 @@ mod tests {
     }
 
     #[test]
-    fn the_first_listed_of_the_stops_matching_at_the_earliest_position_is_reported() {
+    fn the_longest_of_the_stops_matching_at_the_earliest_position_is_reported() {
         let mut filter = filter(&["ab", "abc"]);
         assert_eq!(filter.accept("xabc"), "x");
-        assert_eq!(filter.matched_stop(), Some("ab"));
+        assert_eq!(filter.matched_stop(), Some("abc"));
     }
 
     #[test]
@@ -154,17 +176,58 @@ mod tests {
     }
 
     #[test]
-    fn which_stop_matches_can_depend_on_where_the_text_is_cut() {
-        let mut whole = filter(&["abc", "ab"]);
-        assert_eq!(whole.accept("xabc"), "x");
-        assert_eq!(whole.matched_stop(), Some("abc"));
+    fn a_shorter_stop_waits_for_a_longer_one_that_starts_at_the_same_place() {
         let mut cut = filter(&["abc", "ab"]);
         assert_eq!(cut.accept("xab"), "x");
-        assert_eq!(cut.matched_stop(), Some("ab"));
+        assert!(!cut.matched());
+        assert_eq!(cut.accept("c"), "");
+        assert_eq!(cut.matched_stop(), Some("abc"));
+        let mut broken = filter(&["abc", "ab"]);
+        assert_eq!(broken.accept("xab"), "x");
+        assert_eq!(broken.accept("y"), "");
+        assert_eq!(broken.matched_stop(), Some("ab"));
+    }
+
+    #[test]
+    fn a_stop_waits_for_a_longer_one_that_starts_earlier() {
         let mut whole = filter(&["abcd", "c"]);
         assert_eq!(whole.accept("abcd"), "");
+        assert_eq!(whole.matched_stop(), Some("abcd"));
         let mut cut = filter(&["abcd", "c"]);
-        assert_eq!(cut.accept("abc"), "ab");
+        assert_eq!(cut.accept("abc"), "");
+        assert!(!cut.matched());
         assert_eq!(cut.accept("d"), "");
+        assert_eq!(cut.matched_stop(), Some("abcd"));
+        let mut broken = filter(&["abcd", "c"]);
+        assert_eq!(broken.accept("abc"), "");
+        assert_eq!(broken.accept("x"), "ab");
+        assert_eq!(broken.matched_stop(), Some("c"));
+    }
+
+    #[test]
+    fn a_stop_prefix_that_never_completes_is_released_at_finish() {
+        let mut filter = filter(&["abcd", "c"]);
+        assert_eq!(filter.accept("xab"), "x");
+        assert_eq!(filter.finish(), "ab");
+        assert!(!filter.matched());
+    }
+
+    #[test]
+    fn a_complete_stop_still_waiting_is_decided_at_finish() {
+        let mut filter = filter(&["abcd", "c"]);
+        assert_eq!(filter.accept("xabc"), "x");
+        assert_eq!(filter.finish(), "ab");
+        assert_eq!(filter.matched_stop(), Some("c"));
+    }
+
+    #[test]
+    fn the_hold_never_exceeds_the_longest_stop() {
+        let mut filter = filter(&["abcd", "c", "xyz"]);
+        let longest = 4;
+        for chunk in ["ab", "abc", "a", "x", "xy", "abcab", "ab"] {
+            filter.accept(chunk);
+            assert!(!filter.matched() || filter.pending.is_empty());
+            assert!(filter.pending.len() < longest, "held {:?}", filter.pending);
+        }
     }
 }

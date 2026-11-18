@@ -102,9 +102,8 @@ impl PipelineError {
 /// Turns the decoded text of one generation into pieces. Text may be cut anywhere between characters. Text that
 /// could still be part of a marker, a stop string or a call is held until it is decided, and
 /// [`finish`](Self::finish) releases what remains. The reasoning split and the call parser give the same pieces
-/// wherever the text is cut for ordinary output. With several stop strings where one is a prefix or a part of
-/// another (`abc` and `ab`; `abcd` and `c`), which stop is reported and where the text ends can depend on the
-/// cut: a stop is matched as soon as the received text contains it.
+/// wherever the text is cut. A stop is decided only once no stop that starts at the same or an earlier place could
+/// still complete; the earliest start wins, and the longest stop at equal starts.
 #[derive(Debug)]
 pub struct TextPipeline {
     splitter: Option<ReasoningSplitter>,

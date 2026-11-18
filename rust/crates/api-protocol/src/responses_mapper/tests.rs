@@ -84,6 +84,7 @@ fn unrecognized(name: &'static str, body: String, param: &str) -> Row {
 
 const TOOL: &str = r#"{"type":"function","name":"a"}"#;
 const NAME_MESSAGE: &str = "Function names must be 1-64 characters of a-z, A-Z, 0-9, underscores, and dashes.";
+const NAMES_MESSAGE: &str = "Argument names must be non-empty and free of '<', '>' and line breaks.";
 
 /// Two calls, `c1` and `c2`, after a user item, then `after` items (`,{...}`).
 fn two_calls(after: &str) -> String {
@@ -569,6 +570,24 @@ fn rows() -> Vec<Row> {
             call(r#""call_id":"c","name":"f","arguments":{}"#),
             Some("input[0].arguments"),
             "'arguments' must be a JSON string.",
+        ),
+        bad(
+            "argument name with a tag delimiter",
+            call(r##""call_id":"c","name":"f","arguments":"{\"a<b\":1}""##),
+            Some("input[0].arguments"),
+            NAMES_MESSAGE,
+        ),
+        bad(
+            "argument name empty",
+            call(r##""call_id":"c","name":"f","arguments":"{\"\":1}""##),
+            Some("input[0].arguments"),
+            NAMES_MESSAGE,
+        ),
+        bad(
+            "argument name with a line break",
+            call(r##""call_id":"c","name":"f","arguments":"{\"a\\nb\":1}""##),
+            Some("input[0].arguments"),
+            NAMES_MESSAGE,
         ),
         bad(
             "arguments invalid",
@@ -1374,8 +1393,7 @@ fn arguments_are_one_json_object() {
     };
     assert_eq!(arguments(r#"  {"a":1}  "#).len(), 1);
     assert!(arguments("{}").is_empty());
-    // The argument names are not checked.
-    assert_eq!(arguments(r#"{"a<b":1}"#).len(), 1);
+    assert_eq!(arguments(r#"{"a b":1}"#).len(), 1);
 }
 
 #[test]

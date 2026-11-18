@@ -161,8 +161,8 @@ impl ToolCallParser {
         let mut from = 0;
         while let Some(found) = self.buffer[from..].find(CALL_END) {
             let end = from + found;
-            // Without any function opening, this cannot be parameter text; reject the closed block now.
-            if !self.buffer.contains(FUNCTION_START) {
+            // Without a function opening before it, this cannot be parameter text; reject the closed block now.
+            if !self.buffer[..end].contains(FUNCTION_START) {
                 return Some(end);
             }
             let before = self.buffer[..end].trim_end_matches(is_block_space);
