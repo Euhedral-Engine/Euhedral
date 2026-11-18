@@ -37,7 +37,7 @@ use crate::formats::{Nvfp4Linear, TrellisLinear};
 use crate::frames::{Kind, step};
 use crate::model::{LayerIndex, ModelConfig, Role, Weights};
 use crate::plan::{Formats, Plan, View};
-use crate::prefix::{CacheSpec, Copier, POSITION_GRANULE, PrefixCacheHandle, open_prefix_cache};
+use crate::prefix::{CacheSpec, Copier, POSITION_GRANULE, PrefixCacheHandle, PrefixCacheStats, open_prefix_cache};
 use crate::quantum::Executor;
 use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
@@ -558,6 +558,11 @@ impl Generations {
     pub(crate) fn generate(&self, request: GenerationRequest, cancel: CancelHandle) -> Result<(), AdmissionError> {
         let (generation, lease) = self.take()?;
         generation.generate(request, cancel, lease)
+    }
+
+    /// The prefix cache's counters; `None` when the cache is off.
+    pub(crate) fn prefix_cache_stats(&self) -> Option<PrefixCacheStats> {
+        self.prefix.as_ref().map(PrefixCacheHandle::stats)
     }
 
     /// Starts a teacher-forced run on an idle sequence.

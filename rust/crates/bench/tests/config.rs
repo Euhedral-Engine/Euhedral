@@ -94,6 +94,7 @@ fn scenarios_parse_and_print_as_java() {
         ("first-token:1024", "first-token-1024"),
         ("prompt-to-n:1024:64", "prompt-to-n-1024-64"),
         ("decode:32:256", "decode-32-256"),
+        ("prefix:2048", "prefix-2048"),
     ] {
         let scenario = Scenario::parse(spec).unwrap();
         assert_eq!((scenario.spec().as_str(), scenario.name().as_str()), (spec, name));
@@ -110,6 +111,9 @@ fn scenarios_parse_and_print_as_java() {
         "decode:8",
         "decode:8:1",
         "decode:x:4",
+        "prefix",
+        "prefix:0",
+        "prefix:2048:4",
         "sleep:8",
     ] {
         assert!(Scenario::parse(bad).is_err(), "{bad}");
@@ -120,7 +124,7 @@ fn scenarios_parse_and_print_as_java() {
 fn what_the_engine_cannot_do_is_refused_with_the_reason() {
     let message = parse(&with(r#", "prefixCacheBytes": 1073741824"#)).unwrap_err();
     assert!(
-        message.contains("prefixCacheBytes must be 0") && message.contains("prefills the whole prompt"),
+        message.contains("prefixCacheBytes must be 0") && message.contains("which turn it on"),
         "{message}"
     );
     assert!(parse(&with(r#", "prefixCacheBytes": 0"#)).is_ok());
@@ -261,4 +265,38 @@ fn values_are_checked_as_java_checks_them() {
             .unwrap()
             .json_output()
     );
+}
+
+#[test]
+fn a_prefix_scenario_turns_the_prefix_cache_on_for_the_run_and_no_other_does() {
+    let options = parse(&with(r#", "scenarios": ["prefix:2048"]"#)).unwrap();
+    assert!(options.uses_prefix_cache());
+    assert_eq!(options.scenarios[0].kind, ScenarioKind::PrefixRepeat);
+    assert_eq!(options.scenarios[0].requested_new_tokens, 1);
+    assert!(!parse(&with("")).unwrap().uses_prefix_cache());
+    assert!(
+        !parse(&with(r#", "scenarios": ["decode:512:512", "first-token:2048"]"#))
+            .unwrap()
+            .uses_prefix_cache()
+    );
+}
+
+#[test]
+fn a_prefix_scenario_is_refused_beside_any_other() {
+    let message = parse(&with(r#", "scenarios": ["prefix:2048", "decode:512:512"]"#)).unwrap_err();
+    assert!(message.contains("run it alone"), "{message}");
+    assert!(parse(&with(r#", "scenarios": ["prefix:2048", "prefix:4096"]"#)).is_ok());
+}
+
+#[test]
+fn a_prefix_prompt_must_end_on_a_checkpoint() {
+    let prefix = Scenario::parse("prefix:2048").unwrap();
+    assert!(prefix.check_checkpoint(2048).is_ok());
+    assert!(prefix.check_checkpoint(512).is_ok());
+    let message = prefix.check_checkpoint(1536).unwrap_err().to_string();
+    assert!(
+        message.contains("not a multiple of the checkpoint interval"),
+        "{message}"
+    );
+    assert!(Scenario::parse("decode:100:4").unwrap().check_checkpoint(2048).is_ok());
 }

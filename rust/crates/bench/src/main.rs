@@ -142,8 +142,9 @@ fn run_command(args: &[String], command_line: &str, started: SystemTime) -> Resu
     let tokenizer = load_tokenizer(&options.artifact)?;
     let prepared = prepare(&options, &tokenizer)?;
     println!(
-        "max context: {} tokens; prefix cache 0 bytes; warmup {}, measured {} per scenario; generation {}; fork {}",
+        "max context: {} tokens; prefix cache {}; warmup {}, measured {} per scenario; generation {}; fork {}",
         options.max_context_tokens,
+        if options.uses_prefix_cache() { "on" } else { "off" },
         options.warmup,
         options.iterations,
         if options.sampling.is_greedy() {
@@ -172,6 +173,12 @@ fn run_command(args: &[String], command_line: &str, started: SystemTime) -> Resu
     }
 
     let settings = settings_for(&options)?;
+    if options.uses_prefix_cache() {
+        let interval = settings.prefix_cache.checkpoint_tokens as usize;
+        for scenario in &options.scenarios {
+            scenario.check_checkpoint(interval)?;
+        }
+    }
     let (owner, waiting) = EngineRuntime::start(&settings, &options.cuda_library);
     let runtime = match await_value(&waiting) {
         Ok(runtime) => runtime,
@@ -255,7 +262,10 @@ fn settings_for(options: &Options) -> Result<Settings, Failure> {
     settings.context.max_tokens = options.max_context_tokens;
     // Always assigned, as the Java benchmark always passes it (a settings file does not win over the configuration).
     settings.context.kv_cache_on_gpu_tokens = options.kv_device_minimum_tokens;
-    settings.prefix_cache.size = ByteSize::mib(0);
+    // Off unless the run is of prefix scenarios, which need it (then the settings' own size).
+    if !options.uses_prefix_cache() {
+        settings.prefix_cache.size = ByteSize::mib(0);
+    }
     Ok(settings)
 }
 

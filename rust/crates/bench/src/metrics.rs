@@ -27,6 +27,38 @@ use std::time::{Duration, Instant};
 use crate::config::{Scenario, ScenarioKind};
 use crate::result::{DraftPhase, FAILED, INELIGIBLE, SUCCESS, Speculative, Throughput, Timings, Work, output_sha256};
 
+/// Which request of a scenario a row measures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pass {
+    /// The only request of every scenario but a prefix one.
+    Only,
+    /// The first request of a prompt the cache has not seen.
+    Cold,
+    /// The same prompt again.
+    Repeat,
+}
+
+impl Pass {
+    /// What the row's scenario name carries after the scenario's own.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Pass::Only => "",
+            Pass::Cold => "-cold",
+            Pass::Repeat => "-repeat",
+        }
+    }
+}
+
+/// Why a successful prefix row did not measure what its name says, if so: a cold request that restored anything, or a
+/// repeat that did not restore exactly the `shared` tokens of the prompt it repeats.
+pub fn prefix_ineligibility(pass: Pass, restored: usize, shared: usize) -> Option<&'static str> {
+    match pass {
+        Pass::Cold if restored > 0 => Some("cold_request_restored_a_prefix"),
+        Pass::Repeat if restored != shared => Some("repeat_did_not_restore_the_shared_prompt"),
+        _ => None,
+    }
+}
+
 /// What a quantum was, for the benchmark.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -82,6 +114,8 @@ pub struct Recorder {
     /// Drafting quanta by phase: count and summed admission-to-retirement time.
     pub draft_phases: BTreeMap<String, (u64, Duration)>,
     pub finished: Option<(Instant, Ending)>,
+    /// The prompt tokens the engine restored from its prefix cache instead of prefilling.
+    pub restored: usize,
 }
 
 impl Recorder {
@@ -94,6 +128,7 @@ impl Recorder {
             steps: Vec::new(),
             draft_phases: BTreeMap::new(),
             finished: None,
+            restored: 0,
         }
     }
 }
@@ -124,6 +159,12 @@ pub fn per_second(count: usize, nanos: Option<i64>) -> Option<f64> {
 /// Evaluates one generation against its scenario. `is_eos` says whether a token id ends generation.
 pub fn evaluate(scenario: &Scenario, recorder: &Recorder, is_eos: impl Fn(u32) -> bool) -> Outcome {
     let prompt_tokens = recorder.encoded.map(|(_, count)| count);
+    // Only a prefix scenario runs with the cache, so only its rows have a restore.
+    let restored = if scenario.kind == ScenarioKind::PrefixRepeat {
+        recorder.restored
+    } else {
+        0
+    };
     let prefill: Vec<&QuantumRecord> = recorder.quanta.iter().filter(|q| q.phase == Phase::Prefill).collect();
     let prefill_tokens: usize = prefill.iter().map(|q| q.rows).sum();
     let tokens: Vec<u32> = recorder.tokens.iter().map(|(id, _)| *id).collect();
@@ -147,7 +188,7 @@ pub fn evaluate(scenario: &Scenario, recorder: &Recorder, is_eos: impl Fn(u32) -
                 eos_observed: None,
                 speculative: None,
                 output_sha256: None,
-                prefix_restored_tokens: None,
+                prefix_restored_tokens: (restored > 0).then_some(restored),
             },
             timings: None,
             throughput: None,
@@ -226,7 +267,7 @@ pub fn evaluate(scenario: &Scenario, recorder: &Recorder, is_eos: impl Fn(u32) -
         eos_observed: Some(eos),
         speculative,
         output_sha256: Some(output_sha256(&tokens)),
-        prefix_restored_tokens: None,
+        prefix_restored_tokens: (restored > 0).then_some(restored),
     };
 
     let prefill_time = match (prefill.first(), prefill.last()) {
@@ -267,7 +308,8 @@ pub fn evaluate(scenario: &Scenario, recorder: &Recorder, is_eos: impl Fn(u32) -
     let requested = scenario.requested_new_tokens;
     let mut status = SUCCESS;
     let mut reason = None;
-    if prompt_tokens.is_none() || prefill_tokens != prompt_tokens.unwrap_or(0) || prefill.is_empty() {
+    // What the cache restored is not prefilled: the two make the prompt.
+    if prompt_tokens.is_none() || prefill_tokens + restored != prompt_tokens.unwrap_or(0) || prefill.is_empty() {
         status = FAILED;
         reason = Some("incomplete_prefill".to_string());
     } else {
@@ -278,7 +320,7 @@ pub fn evaluate(scenario: &Scenario, recorder: &Recorder, is_eos: impl Fn(u32) -
                     reason = Some("inconsistent_generation_boundaries".to_string());
                 }
             }
-            ScenarioKind::FirstToken => {
+            ScenarioKind::FirstToken | ScenarioKind::PrefixRepeat => {
                 if tokens.len() != 1 {
                     status = FAILED;
                     reason = Some("no_first_token".to_string());
