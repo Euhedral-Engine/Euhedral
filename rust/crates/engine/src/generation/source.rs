@@ -2096,7 +2096,7 @@ impl Owner {
         }
         #[cfg(feature = "test-oracles")]
         if let Some(hook) = shared.quantum_admitted.get() {
-            hook(u64::from(start));
+            hook(start);
         }
         Ok(taken)
     }
