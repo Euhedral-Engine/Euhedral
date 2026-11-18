@@ -60,6 +60,7 @@ use super::request::{
 use super::sampled::{Answered, Guarded, LeasedRow, Prepared, Sampled, SampledRows, prepare_frame, sample_frame};
 use super::teacher_forced::LogitsSink;
 use crate::frames::{Kind, step};
+use crate::handoff::Handoff;
 use crate::model::ModelConfig;
 use crate::quantum::{Executor, Started};
 use crate::runtime::{Core, Units};
@@ -135,6 +136,8 @@ pub(crate) struct Shared {
     /// What speculation needs of the artifact; `None` for an artifact without the draft layer.
     pub(crate) drafts: Option<Drafts>,
     /// A test hook: the owner panics at the end of the turn in which it has admitted this many quanta.
+    /// Set when the engine stops: no request begins after it.
+    pub(crate) closing: AtomicBool,
     #[cfg(feature = "test-oracles")]
     pub(crate) panic_after_admissions: AtomicU64,
     /// A test hook: a speculative request ends with one decode quantum that feeds its last token, so that the state of
@@ -482,11 +485,14 @@ impl Run {
 pub(crate) enum Finished {
     Greedy(Box<dyn GenerationListener>, GenerationOutcome),
     Forced(Box<dyn LogitsSink>, GenerationOutcome),
+    /// The owner is idle and every outcome before this one was told: a shutdown waits for it.
+    Idle(Arc<Handoff<()>>),
 }
 
 impl Finished {
     pub(crate) fn deliver(self) {
         match self {
+            Finished::Idle(idle) => idle.send(()),
             Finished::Greedy(mut listener, outcome) => listener.finished(outcome),
             Finished::Forced(mut sink, outcome) => sink.finished(outcome),
         }
@@ -525,6 +531,8 @@ pub(crate) struct Owner {
     parked: Vec<Parked>,
     /// Outcomes to tell once the claim is released: a request's end, and the refusals of requests posted meanwhile.
     finished: VecDeque<Finished>,
+    /// A shutdown's wait for the owner to be idle: sent after the last outcome is told.
+    watch: Option<Arc<Handoff<()>>>,
     /// The number of the next selection a sampled request publishes; it never restarts, whatever the request.
     sample_steps: u64,
 }
@@ -550,6 +558,7 @@ impl Owner {
             run: None,
             parked: Vec::new(),
             finished: VecDeque::new(),
+            watch: None,
             sample_steps: 0,
         }
     }
@@ -1141,6 +1150,17 @@ impl Owner {
         }
     }
 
+    /// `told` and, when a shutdown waits and nothing runs any more, the signal that comes after them.
+    fn then_idle(&mut self, mut told: Vec<Finished>) -> Vec<Finished> {
+        if self.run.is_none()
+            && self.parked.is_empty()
+            && let Some(idle) = self.watch.take()
+        {
+            told.push(Finished::Idle(idle));
+        }
+        told
+    }
+
     /// Ends the request with a failure.
     fn fail(&mut self, why: String) {
         if let Some(run) = self.run.as_mut() {
@@ -1698,7 +1718,8 @@ impl Turn for Owner {
     }
 
     fn take_finished(&mut self) -> Vec<Finished> {
-        self.finished.drain(..).collect()
+        let told = self.finished.drain(..).collect();
+        self.then_idle(told)
     }
 
     fn deliver(finished: Finished) {
@@ -1710,7 +1731,19 @@ impl Turn for Owner {
         let message = why.to_string();
         self.panicked(&message);
         self.panicked(&message);
-        self.finished.drain(..).collect()
+        let told = self.finished.drain(..).collect();
+        self.then_idle(told)
+    }
+
+    fn shut(&mut self, idle: Arc<Handoff<()>>) {
+        if let Some(run) = self.run.as_mut() {
+            run.stop(FinishReason::Cancelled);
+        }
+        if self.idle() {
+            idle.send(());
+        } else {
+            self.watch = Some(idle);
+        }
     }
 
     fn idle(&self) -> bool {

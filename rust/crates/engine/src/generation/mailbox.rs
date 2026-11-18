@@ -90,6 +90,11 @@ pub(crate) trait Turn: Send + 'static {
     /// Tells `finished`'s audience. The claim is free: a listener may start the next request from here.
     fn deliver(finished: Self::Finished);
 
+    /// Ends what runs, as a cancel: the request's audience is told once, and `idle` is sent once nothing runs and every
+    /// outcome was told (the sending is the last of the outcomes, so after the audience's last call). With nothing
+    /// running, `idle` is sent at once. The owner's own turn ends it: this only asks.
+    fn shut(&mut self, idle: Arc<Handoff<()>>);
+
     /// Whether no request is in flight and nothing the owner queued on the device is still held: only then may a
     /// thread outside the frames look at the owner's state or end it.
     fn idle(&self) -> bool;
@@ -494,6 +499,27 @@ impl<O: Turn> Mailbox<O> {
         cell.wait(OPERATION_BOUND).ok().flatten().flatten()
     }
 
+    /// Cancels what runs and waits, at most `bound`, until it ended and its audience was told. `false` when the bound
+    /// passed, or called from inside a turn or an operation (which could only be ended by the caller itself, after it:
+    /// refused at once). The request ends on a worker; the caller waits on a one-shot hand-off of its own, never as a
+    /// lattice worker, and must not be one. For threads outside the lattice.
+    pub(crate) fn stop(self: &Arc<Self>, bound: Duration) -> bool {
+        if Holding::by_this_thread(Arc::as_ptr(self).addr()) {
+            return false;
+        }
+        let idle = Handoff::new();
+        let told = Arc::clone(&idle);
+        self.defer(move |owner| {
+            match owner {
+                Some(owner) => owner.shut(told),
+                // Closed already: nothing runs.
+                None => told.send(()),
+            }
+            Vec::new()
+        });
+        idle.wait(bound).is_ok()
+    }
+
     /// Takes the owner out, for its teardown, while it is idle: now if the claim is free, else once the holder or the
     /// next to take the claim ran the request. `None` when a request is in flight, it is taken already, or
     /// [`OPERATION_BOUND`] passed; the mailbox is closed from here on. For threads outside the lattice.
@@ -630,6 +656,12 @@ mod tests {
         repost: usize,
         /// The turn panics, after it took in what arrived.
         panics: bool,
+        /// `shut` ends the request in flight (its listener is told); else it ignores the cancel.
+        obeys_shut: bool,
+        /// The number of times `shut` was called.
+        shuts: Arc<AtomicUsize>,
+        /// The listener of the request `shut` ends.
+        listener: Option<Arc<Done>>,
     }
 
     struct Done {
@@ -659,6 +691,9 @@ mod tests {
                 busy: false,
                 repost: 0,
                 panics: false,
+                obeys_shut: true,
+                shuts: Arc::new(AtomicUsize::new(0)),
+                listener: None,
             }
         }
     }
@@ -729,6 +764,19 @@ mod tests {
                 .mailbox()
                 .is_some_and(|mailbox| mailbox.with(|_| ()).is_some());
             finished.admitted.send(admitted);
+        }
+
+        fn shut(&mut self, idle: Arc<Handoff<()>>) {
+            self.shuts.fetch_add(1, Ordering::SeqCst);
+            if self.busy && !self.obeys_shut {
+                // A request that never acknowledges the cancel: the signal never comes.
+                return;
+            }
+            if self.busy {
+                self.busy = false;
+                self.done = self.listener.take();
+            }
+            idle.send(());
         }
 
         fn idle(&self) -> bool {
@@ -998,6 +1046,65 @@ mod tests {
             .expect("the refusals gave the claim back");
         assert!(mailbox.ask(true, |_| ()).is_some());
         assert!(mailbox.close().is_some());
+    }
+
+    #[test]
+    fn a_stop_with_a_request_in_flight_cancels_it_tells_the_listener_once_and_leaves_the_owner_idle() {
+        let (mailbox, address) = threaded(Probe::new);
+        let admitted = Handoff::new();
+        let shuts = mailbox
+            .with(|probe| {
+                probe.busy = true;
+                probe.listener = Some(Arc::new(Done {
+                    address: Arc::clone(&address),
+                    admitted: Arc::clone(&admitted),
+                    panics: false,
+                }));
+                Arc::clone(&probe.shuts)
+            })
+            .expect("free");
+        assert!(mailbox.stop(BOUND), "the request did not end");
+        assert_eq!(shuts.load(Ordering::SeqCst), 1);
+        assert!(admitted.wait(BOUND).is_ok(), "the listener was not told");
+        let owner = mailbox.close().expect("the owner is idle after the stop");
+        assert!(!owner.busy);
+        assert!(owner.listener.is_none() && owner.done.is_none(), "told more than once");
+    }
+
+    #[test]
+    fn a_stop_of_a_request_that_ignores_the_cancel_returns_at_the_bound_and_the_owner_stays() {
+        let (mailbox, _address) = threaded(Probe::new);
+        mailbox
+            .with(|probe| {
+                probe.busy = true;
+                probe.obeys_shut = false;
+            })
+            .expect("free");
+        let bound = Duration::from_millis(100);
+        let start = Instant::now();
+        assert!(!mailbox.stop(bound));
+        // The waiting operation is not run twice; the owner is still busy.
+
+        assert!(start.elapsed() < BOUND, "the stop waited past its bound");
+        assert!(mailbox.close().is_none(), "the owner left while a request runs");
+    }
+
+    #[test]
+    fn a_stop_from_inside_a_turn_is_refused_at_once() {
+        let (mailbox, _address, _handoffs) = queued(Probe::new);
+        let held = Arc::clone(&mailbox);
+        let start = Instant::now();
+        let stopped = mailbox.with(move |_| held.stop(BOUND)).expect("free");
+        assert!(!stopped);
+        assert!(start.elapsed() < BOUND / 2, "the stop waited for itself");
+    }
+
+    #[test]
+    fn a_stop_with_nothing_running_returns_at_once() {
+        let (mailbox, _address) = threaded(Probe::new);
+        assert!(mailbox.stop(BOUND));
+        assert!(mailbox.close().is_some());
+        assert!(mailbox.stop(BOUND), "a closed mailbox has nothing running");
     }
 
     #[test]

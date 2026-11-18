@@ -27,8 +27,8 @@ use euhedral_inference_settings::{Auto, Settings};
 use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
 use crate::error::EngineError;
-use crate::generation::GREEDY_DEPTH;
 use crate::generation::{AdmissionError, CancelHandle, Generation, GenerationRequest, LogitsSink};
+use crate::generation::{GREEDY_DEPTH, OPERATION_BOUND};
 use crate::handoff::Handoff;
 use crate::kernels::kernel_sources;
 use crate::model::{ModelConfig, Weights};
@@ -259,6 +259,7 @@ impl RuntimeOwner {
     /// alive.
     pub fn shutdown(mut self, runtime: Arc<EngineRuntime>) -> Result<(), EngineError> {
         let teardown = self.teardown.take();
+        runtime.generation.stop(OPERATION_BOUND);
         if let Some(teardown) = &teardown {
             teardown.close();
         }
@@ -345,7 +346,9 @@ impl RuntimeOwner {
         stop_within(
             window,
             (runtime, teardown),
-            |(_, teardown)| {
+            |(runtime, teardown)| {
+                // The running request ends on the lattice's workers, so before the lattice closes.
+                runtime.generation.stop(window);
                 if let Some(teardown) = teardown {
                     teardown.close();
                 }

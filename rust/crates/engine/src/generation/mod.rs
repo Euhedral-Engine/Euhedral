@@ -20,9 +20,8 @@ mod teacher_forced;
 
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
-#[cfg(feature = "test-oracles")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use euhedral_core::generics::FrameSink;
 use euhedral_data_structures::queues::MpscQueue;
@@ -43,6 +42,7 @@ pub use acceptance::{Accepted, accept, accept_tokens};
 pub use constraint::{ConstraintError, ReasoningConstraint, TokenConstraint};
 pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
 pub use listener::GenerationListener;
+pub(crate) use mailbox::OPERATION_BOUND;
 use mailbox::{Address, Mailbox, Spawn};
 pub use request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
@@ -122,6 +122,7 @@ impl Generation {
             capacity,
             drafts,
             #[cfg(feature = "test-oracles")]
+            closing: AtomicBool::new(false),
             panic_after_admissions: AtomicU64::new(u64::MAX),
             #[cfg(feature = "test-oracles")]
             settle_after_speculation: AtomicBool::new(false),
@@ -252,6 +253,10 @@ impl Generation {
         &self,
         begin: impl FnOnce(Option<&mut Owner>) -> Result<(), Rejected> + Send + 'static,
     ) -> Result<(), AdmissionError> {
+        // A request that begins once the engine stops is refused as a closed one: the stop's cancel is an operation on
+        // the owner, so whatever begins after it sees the flag.
+        let shared = Arc::clone(&self.shared);
+        let begin = move |owner: Option<&mut Owner>| begin(owner.filter(|_| !shared.closing.load(Ordering::SeqCst)));
         let mut begin = Some(begin);
         let inline = self
             .mailbox
@@ -313,6 +318,20 @@ impl Generation {
         read: impl FnOnce(&SequenceState) -> R + Send + 'static,
     ) -> Option<R> {
         self.mailbox.ask(true, move |owner| read(owner.sequence()))
+    }
+
+    /// Cancels the request that runs, if any, and waits at most `bound` until it ended and its listener was told its
+    /// last call. Refuses new requests from now on. Runs while the lattice still works: the request ends on its
+    /// workers. `false` when the bound passed (a request is still running) or when called from inside a listener's
+    /// callback (refused at once: only that callback's return could let the request end). For the engine's owner,
+    /// outside the lattice.
+    pub(crate) fn stop(&self, bound: Duration) -> bool {
+        self.shared.closing.store(true, Ordering::SeqCst);
+        let stopped = self.mailbox.stop(bound);
+        if !stopped {
+            log::error!("a generation did not end within {bound:?} of the cancel at shutdown");
+        }
+        stopped
     }
 
     /// Ends the sequence. Nothing may be running: with a request in flight the sequence stays allocated, and says so.
