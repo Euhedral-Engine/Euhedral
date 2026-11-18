@@ -1242,3 +1242,21 @@ fn values_print_as_error_parameters() {
     assert_eq!(value("null").param_text(), "null");
     assert_eq!(&value(r#"{"a":[1,"b"],"c":{}}"#).param_text(), "{a=[1, b], c={}}");
 }
+
+#[test]
+fn numbers_in_tool_use_input_reach_the_template_exactly() {
+    let request = accepted(&msgs(
+        r#"[{"role":"user","content":"q"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"f","input":{"n":123456789012345678901234567890,"e":1e400}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"r"}]}]"#,
+    ));
+    let Message::Assistant(assistant) = &request.template.messages[1] else {
+        panic!("an assistant turn");
+    };
+    let written: Vec<String> = assistant.tool_calls[0]
+        .arguments
+        .iter()
+        .map(|(_, value)| value.to_python_json())
+        .collect();
+    assert_eq!(written, ["123456789012345678901234567890", "Infinity"]);
+}

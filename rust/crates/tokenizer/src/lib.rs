@@ -17,5 +17,6 @@ mod tokenizer;
 pub use artifact::{ArtifactTokenizerError, read_artifact_section, read_artifact_tokenizer};
 pub use chat_template::chat_template;
 pub use error::TokenizerError;
+pub use euhedral_inference_edrl::TokenizerSection;
 pub use stream::TokenStream;
 pub use tokenizer::Tokenizer;
