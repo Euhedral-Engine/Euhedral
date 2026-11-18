@@ -30,14 +30,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use euhedral_gpu::cuda::{CudaGpu, CudaKernel};
+use euhedral_gpu::cuda::{CudaGpu, CudaKernel, CudaQueue};
 use euhedral_gpu::{Enqueue, GraphHold, GraphStats, Ran, SharedGraphCache};
 use euhedral_graph::{
     EdgeKind, ExternalEdge, GraphError, GraphRuntime, LaneId, Marker, QuantumOutcome, QuantumRef, Stage, StageCx,
     StageError, StageGraph, StageGraphSpec, StageId, StageSpec, Submitted,
 };
 use euhedral_inference_cuda::launch::ops::RusteeOps;
-use euhedral_inference_cuda::{AllocationId, CudaError, KernelOps, PinnedPool};
+use euhedral_inference_cuda::{AllocationId, CudaError, KernelOps, PinnedPool, SubmitMode};
 use thiserror::Error;
 
 pub use capture_key::{CaptureKey, split_geometry};
@@ -52,7 +52,8 @@ use crate::stages::DraftSeed;
 use crate::stages::Quantum;
 use crate::stages::attention::{KvSource, takes_decode_scratch};
 use crate::stages::sampling::SelectedRows;
-use crate::stages::{QuantumError, QuantumKind, StageLaunch, fatal};
+use crate::stages::{LaneTable, QuantumError, QuantumKind, StageLaunch, fatal};
+use crate::state::SequenceId;
 use crate::workspace::BufferSlot;
 use whole::{Launches, Site, run_cached};
 
@@ -506,6 +507,43 @@ pub enum StartError {
     Panicked,
     #[error("the engine has no prefix cache to run a copy job")]
     NoCopier,
+    #[error("the pass could not run as one quantum: {0}")]
+    Batch(String),
+    #[error("the quantum's input record could not be uploaded: {0}")]
+    Prepare(String),
+    #[error("the sequence stopped offering the step before it started")]
+    Withdrawn,
+}
+
+/// What uploads a quantum's input record when the executor starts it: the owner's lane, and the pinned pool the record is
+/// staged in.
+#[derive(Clone)]
+pub struct Preparer {
+    lanes: LaneTable,
+    pool: Arc<PinnedPool>,
+    lane: Arc<CudaQueue>,
+}
+
+impl fmt::Debug for Preparer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Preparer").finish_non_exhaustive()
+    }
+}
+
+impl Preparer {
+    /// A preparer that uploads on `lane` (the owner's), staging in `pool`.
+    pub fn new(lanes: LaneTable, pool: Arc<PinnedPool>, lane: Arc<CudaQueue>) -> Self {
+        Self { lanes, pool, lane }
+    }
+
+    fn prepare(&self, quantum: &mut Quantum) -> Result<(), StartError> {
+        let (_, marker) = self
+            .lanes
+            .submit_ops(&self.lane, false, |kernels| quantum.prepare(&self.pool, kernels))
+            .map_err(|error| StartError::Prepare(error.to_string()))?;
+        quantum.prepared_after(marker);
+        Ok(())
+    }
 }
 
 /// The stage graphs of a plan on a runtime, the sequence's graph cache, and the choice of the graph a quantum runs.
@@ -526,6 +564,9 @@ pub struct Executor {
     captures: AtomicBool,
     /// Runs the sequence's prefix-cache copy jobs, when it has a cache.
     copier: Option<Copier>,
+    /// Uploads the input record of a quantum that arrives unprepared (an offered verification, prepared when its pass
+    /// starts, as the one quantum or the batch it is a part of).
+    preparer: Option<Preparer>,
 }
 
 impl fmt::Debug for Executor {
@@ -611,7 +652,52 @@ impl Executor {
             cache,
             captures: AtomicBool::new(captures_per_view > 0),
             copier: None,
+            preparer: None,
         })
+    }
+
+    /// The executor that also uploads the input record of the quanta it is given unprepared.
+    #[must_use]
+    pub fn with_preparer(mut self, preparer: Preparer) -> Executor {
+        self.preparer = Some(preparer);
+        self
+    }
+
+    /// Starts one quantum that is the batch of `members` (each a verification of its sequence, with the flag its
+    /// request is cancelled by): the batch's input record is the first member's own, and it is stopped only by `kill`.
+    /// A member refused leaves nothing queued: the record is uploaded last.
+    pub(crate) fn start_batch(
+        &self,
+        members: Vec<(SequenceId, Quantum, Arc<AtomicBool>)>,
+        kill: Arc<AtomicBool>,
+        after: &[&Started],
+    ) -> Result<Started, StartError> {
+        let Some((_, first, _)) = members.first() else {
+            return Err(StartError::Batch("a pass of no member".to_string()));
+        };
+        let (record, workspace, config, lanes) = (
+            first.record,
+            Arc::clone(&first.workspace),
+            Arc::clone(&first.config),
+            first.lanes.clone(),
+        );
+        let mut parts = Vec::with_capacity(members.len());
+        for (sequence, quantum, cancel) in members {
+            parts.push(quantum.into_part(sequence, cancel)?);
+        }
+        let mode = SubmitMode {
+            pdl: false,
+            row_exact: true,
+        };
+        let batch = Quantum::batch(parts, workspace, mode, config, lanes)?.with_input_record(record);
+        self.start(batch, kill, after)
+    }
+
+    fn prepare(&self, quantum: &mut Quantum) -> Result<(), StartError> {
+        match (&self.preparer, quantum.is_prepared()) {
+            (Some(preparer), false) => preparer.prepare(quantum),
+            _ => Ok(()),
+        }
     }
 
     /// The executor that also runs the copy jobs of the prefix cache with `copier`.
@@ -683,11 +769,14 @@ impl Executor {
         after: &[&Started],
     ) -> Result<Started, StartError> {
         quantum.validate()?;
-        let serial = quantum.id();
         let view = quantum.view();
         let variant = view.variant();
         let home = home::home_of(quantum.id(), self.clock(), self.stage_lanes);
         let eager = self.eager[variant.index()].get(home).ok_or(StartError::NoView(view))?;
+        // Nothing after this can refuse the quantum: the upload is queued last, and a quantum dropped after it would free
+        // the pinned record under the copy.
+        self.prepare(&mut quantum)?;
+        let serial = quantum.id();
         let stages = self.plan.unit_stages(view).map_or(0, <[_]>::len);
         let keyed = self
             .captures

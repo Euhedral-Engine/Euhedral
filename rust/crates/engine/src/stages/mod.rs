@@ -28,6 +28,7 @@ pub mod unmarked;
 
 use std::fmt::{self, Display};
 use std::iter::repeat_n;
+use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -634,6 +635,33 @@ pub(crate) fn lay_out(shapes: &[Shape], record_bytes: u64) -> Result<(Vec<usize>
     Ok((offsets, total, first != LogitsUse::None))
 }
 
+/// Refuses parts that are one sequence under different ids: they still share its device buffers.
+fn check_distinct_buffers<'a>(
+    refs: impl Iterator<Item = &'a SequenceRefs>,
+    shapes: &[Shape],
+) -> Result<(), QuantumError> {
+    let buffers: Vec<Vec<AllocationId>> = refs
+        .map(|refs| {
+            let mut ids = Vec::new();
+            refs.device().generations(&mut ids);
+            ids
+        })
+        .collect();
+    for (second, ids) in buffers.iter().enumerate() {
+        if let Some(first) = buffers[..second]
+            .iter()
+            .position(|other| other.iter().any(|id| ids.contains(id)))
+        {
+            return Err(QuantumError::DuplicateSequence {
+                sequence: shapes[second].sequence,
+                first,
+                second,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// How one segment of a batch ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -863,27 +891,7 @@ impl Quantum {
         let shapes: Vec<Shape> = parts.iter().map(Part::shape).collect();
         let record_bytes = input_record_bytes(workspace.rows().rows);
         let (offsets, rows, scored) = lay_out(&shapes, record_bytes)?;
-        // Two parts that are one sequence under different ids still share its device buffers.
-        let buffers: Vec<Vec<AllocationId>> = parts
-            .iter()
-            .map(|part| {
-                let mut ids = Vec::new();
-                part.refs.device().generations(&mut ids);
-                ids
-            })
-            .collect();
-        for (second, ids) in buffers.iter().enumerate() {
-            if let Some(first) = buffers[..second]
-                .iter()
-                .position(|other| other.iter().any(|id| ids.contains(id)))
-            {
-                return Err(QuantumError::DuplicateSequence {
-                    sequence: shapes[second].sequence,
-                    first,
-                    second,
-                });
-            }
-        }
+        check_distinct_buffers(parts.iter().map(|part| &part.refs), &shapes)?;
         if !mode.row_exact {
             return Err(QuantumError::RowExact {
                 kind: QuantumKind::Verify,
@@ -971,6 +979,98 @@ impl Quantum {
     /// member's own flag: the pass that runs the batch owns a flag of its own and sets it when this turns true.
     pub fn stop_requested(&self) -> bool {
         self.segments.iter().all(Segment::cancelled)
+    }
+
+    /// Whether `members` (a verification of one sequence each, with the sequence's number) can be one batch: what
+    /// [`Quantum::batch`] would refuse, found without consuming them, so that a refused pass runs its members alone.
+    pub(crate) fn check_batch(members: &[(&Quantum, SequenceId)]) -> Result<(), QuantumError> {
+        let Some((first, _)) = members.first() else {
+            return Err(QuantumError::EmptyBatch);
+        };
+        let mut shapes = Vec::with_capacity(members.len());
+        for (quantum, sequence) in members {
+            quantum.require_single("a part of a batch")?;
+            if quantum.kind != QuantumKind::Verify || !quantum.mode.row_exact {
+                return Err(QuantumError::Invalid {
+                    what: "only verifications are batched".to_string(),
+                });
+            }
+            let segment = quantum.segment();
+            shapes.push(Shape {
+                sequence: *sequence,
+                rows: quantum.rows,
+                kv_format: segment.refs.kv(KvSource::Base).map(KvView::format),
+                logits: match (&segment.selection, &segment.row_readback) {
+                    (Some(_), None) => LogitsUse::Device,
+                    (None, Some(_)) => LogitsUse::Host,
+                    (None, None) => LogitsUse::None,
+                    (Some(_), Some(_)) => LogitsUse::Both,
+                },
+                selection: segment
+                    .selection
+                    .as_ref()
+                    .map(|selection| Arc::as_ptr(selection) as usize),
+                readback: segment
+                    .row_readback
+                    .as_ref()
+                    .map(|readback| Arc::as_ptr(readback) as usize),
+            });
+        }
+        let workspace = &first.workspace;
+        let (_, rows, scored) = lay_out(&shapes, input_record_bytes(workspace.rows().rows))?;
+        check_distinct_buffers(members.iter().map(|(quantum, _)| &quantum.segment().refs), &shapes)?;
+        workspace.view(rows as u64)?;
+        workspace.rows().check_logits(if scored { rows } else { 0 } as u64)?;
+        Ok(())
+    }
+
+    /// The part of a batch this verification of `sequence` is, which `cancel` (the request's flag) cancels.
+    pub(crate) fn into_part(mut self, sequence: SequenceId, cancel: Arc<AtomicBool>) -> Result<Part, QuantumError> {
+        self.require_single("a part of a batch")?;
+        if self.kind != QuantumKind::Verify {
+            return Err(QuantumError::Invalid {
+                what: "only verifications are batched".to_string(),
+            });
+        }
+        let rows = self.rows;
+        let tokens = if self.segment().draft_token_read.is_some() {
+            vec![0u32; rows]
+        } else if self.tokens.len() == rows {
+            mem::take(&mut self.tokens)
+        } else {
+            return Err(QuantumError::TokenCount {
+                given: self.tokens.len(),
+                rows,
+            });
+        };
+        let Some(segment) = self.segments.pop() else {
+            return Err(QuantumError::EmptyBatch);
+        };
+        Ok(Part {
+            refs: segment.refs,
+            sequence,
+            start_position: segment.start_position,
+            tokens,
+            selection: segment.selection,
+            lease: segment.lease,
+            row_readback: segment.row_readback,
+            draft_token_read: segment.draft_token_read,
+            seeds_draft: segment.seeds_draft,
+            committed: segment.committed,
+            cancel: Some(cancel),
+        })
+    }
+
+    /// Takes each segment's selection lease out, in segment order, so that its owner can give it back when it has
+    /// read the keys: the leases of a batch's segments belong to different sequences, and the quantum is dropped by
+    /// whichever of them lets go last.
+    pub(crate) fn take_leases(&mut self) -> Vec<Option<SelectionLease>> {
+        self.segments.iter_mut().map(|segment| segment.lease.take()).collect()
+    }
+
+    /// Whether the input record's upload was queued ([`Quantum::prepare`]).
+    pub fn is_prepared(&self) -> bool {
+        self.uploaded
     }
 
     /// Whether the quantum has one segment, which the builders and accessors of one sequence need.

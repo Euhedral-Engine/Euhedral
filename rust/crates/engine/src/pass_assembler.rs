@@ -230,6 +230,11 @@ impl<O: PassOffer> PassAssembler<O> {
         Ok(())
     }
 
+    /// Whether `sequence` has an offer waiting for a pass.
+    pub fn has_pending(&self, sequence: SequenceId) -> bool {
+        self.pending_sequences.contains(&sequence)
+    }
+
     /// The number of offers waiting for a pass.
     pub fn pending(&self) -> usize {
         self.pending.len()

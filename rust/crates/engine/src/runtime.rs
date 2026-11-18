@@ -36,7 +36,7 @@ use crate::kernels::kernel_sources;
 use crate::model::{ArtifactProfile, ModelConfig, Speculation, Weights};
 use crate::plan::Plan;
 use crate::prefix::PrefixCacheStats;
-use crate::residency::planner::{PlanInputs, ResidencyPlan, sequences_for};
+use crate::residency::planner::{PlanInputs, ResidencyPlan, pass_rows_limit, sequences_for};
 use crate::stages::LaneTable;
 use crate::startup;
 use crate::state::SequenceState;
@@ -72,22 +72,13 @@ fn quanta_for(sequences: usize) -> usize {
     STAGE_RING_QUANTA.saturating_mul(sequences.max(1))
 }
 
-/// The rows a shared pass holds: `batching.max-tokens-per-pass`, at most a prefill chunk (which is its default).
-fn pass_rows(batching: &BatchingSettings) -> usize {
-    let chunk = batching.prefill_chunk_tokens;
-    batching
-        .max_tokens_per_pass
-        .into_value()
-        .map_or(chunk, |rows| rows.min(chunk)) as usize
-}
-
 /// How many sequences the settings size the lanes' rings for: `batching.max-sequences`, and one when it is 0, which
 /// is decided only once the model is read. A count above the rows a pass holds is refused: each sequence keeps its
 /// quanta's markers in the rings, which are created with the lanes, before the model is read, and a verification takes
 /// a row at least.
 fn ringed_sequences(batching: &BatchingSettings) -> Result<usize, EngineError> {
     let sequences = (batching.max_sequences as usize).max(1);
-    let rows = pass_rows(batching);
+    let rows = pass_rows_limit(batching);
     if sequences > rows {
         return Err(EngineError::Runtime(format!(
             "batching.max-sequences is {sequences}, more than the {rows} rows a pass holds \
@@ -115,7 +106,7 @@ pub fn resolve_sequences(
     if profile.speculation == Speculation::Dflash2 {
         return Ok(1);
     }
-    let rows = pass_rows(&settings.batching);
+    let rows = pass_rows_limit(&settings.batching);
     let verified = 1 + if profile.speculation == Speculation::Mtp {
         profile.speculative_depth()?
     } else {

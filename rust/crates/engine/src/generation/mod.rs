@@ -51,7 +51,7 @@ pub use listener::GenerationListener;
 pub(crate) use mailbox::OPERATION_BOUND;
 pub use mailbox::Spawn;
 pub(crate) use mailbox::{Address, Mailbox, Turn};
-use order::{Order, Reply};
+use order::{Order, PassCaps, Reply};
 use pool::{Lease, SequencePool};
 pub use request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
@@ -485,9 +485,14 @@ impl Generations {
                 }) as Reply
             })
             .collect();
+        let caps = match PassCaps::new(residency.pass_rows, residency.pass_parts) {
+            Ok(caps) => caps,
+            Err(why) => return Err(Box::new((EngineError::Runtime(why), sequences))),
+        };
         let order = Arc::new(Order::new(
             replies,
             input_records(residency.draft_depth) as usize,
+            caps,
             Generation::spawner(core),
         ));
         let count = sequences.len();

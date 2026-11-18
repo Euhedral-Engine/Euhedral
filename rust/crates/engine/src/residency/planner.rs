@@ -11,7 +11,7 @@
 //! is refused with the bytes it needed and the bytes there were.
 
 use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFormat, WeightLayout};
-use euhedral_inference_settings::{Auto, KvFormat, Settings};
+use euhedral_inference_settings::{Auto, BatchingSettings, KvFormat, Settings};
 
 use euhedral_memory::{
     LocationId, LocationKind, LocationSpec, OwnerSpec, Placed, PlanItem, PlanRequest, Planner, Priority, Scope,
@@ -130,6 +130,35 @@ pub struct ResidencyPlan {
     /// Pinned host bytes the prefix cache's arena may take: what `prefix-cache.size` asks, when the memory planner
     /// places it beside everything else; 0 when the cache is off or the host has no room for it.
     pub prefix_cache_bytes: u64,
+    /// The most rows one shared pass holds, which the workspace's logits rows are sized for.
+    pub pass_rows: usize,
+    /// The most sequences one shared pass holds.
+    pub pass_parts: usize,
+}
+
+/// The rows a shared pass holds by the settings: `batching.max-tokens-per-pass`, at most a prefill chunk (which is its
+/// default).
+pub fn pass_rows_limit(batching: &BatchingSettings) -> usize {
+    let chunk = batching.prefill_chunk_tokens;
+    batching
+        .max_tokens_per_pass
+        .into_value()
+        .map_or(chunk, |rows| rows.min(chunk)) as usize
+}
+
+/// What one shared pass of the verifications of `sequences` sequences of `verified` rows each holds at most: its rows
+/// and its sequences, as the settings bound them. Never zero.
+pub fn pass_bounds(batching: &BatchingSettings, sequences: usize, verified: u64) -> (usize, usize) {
+    let parts = batching
+        .max_sequences_per_pass
+        .into_value()
+        .map_or(sequences, |parts| sequences.min(parts as usize))
+        .max(1);
+    let wanted = (parts as u64).saturating_mul(verified).max(1);
+    let rows = pass_rows_limit(batching)
+        .min(usize::try_from(wanted).unwrap_or(usize::MAX))
+        .max(1);
+    (rows, parts)
 }
 
 impl ResidencyPlan {
@@ -246,9 +275,20 @@ pub fn plan_with(
     let (device, arena_bytes, weights_bytes) = place(table, &profile)?;
 
     let verified = (1 + (draft_depth as u64).min(MAX_VERIFIED)).max(DRAFT_LOGITS_ROWS);
+    // A pass of several sequences' verifications scores every row of every member: its logits rows are the pass's.
+    let (pass_rows, pass_parts) = pass_bounds(
+        &settings.batching,
+        inputs.sequences,
+        1 + (draft_depth as u64).min(MAX_VERIFIED),
+    );
+    let pass_logits = if draft_depth > 0 && pass_parts > 1 {
+        pass_rows as u64
+    } else {
+        0
+    };
     let rows = WorkspaceRows {
         rows: chunk,
-        logits_rows: verified,
+        logits_rows: verified.max(pass_logits),
     };
     let workspace_bytes = workspace::workspace_bytes_with_records(
         config,
@@ -342,6 +382,8 @@ pub fn plan_with(
         draft_depth,
         max_context_tokens: max_tokens as usize,
         prefix_cache_bytes,
+        pass_rows,
+        pass_parts,
     })
 }
 
