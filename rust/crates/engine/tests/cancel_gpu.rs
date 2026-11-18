@@ -34,7 +34,7 @@ use euhedral_inference_engine::generation::{
 use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff};
-use euhedral_inference_settings::{ModelSettings, Settings};
+use euhedral_inference_settings::{ByteSize, ModelSettings, Settings};
 
 /// The longest a device test waits for one hand-off; past it the test fails.
 const WAIT: Duration = Duration::from_secs(20 * 60);
@@ -69,6 +69,8 @@ fn start(machine: &Machine) -> (Closer, Arc<EngineRuntime>) {
     settings.kernels.graphs.captures_per_view = 8;
     // The long prompt takes many chunks of this size, whatever the default is.
     settings.batching.prefill_chunk_tokens = PREFILL_CHUNK as u32;
+    // A cached prefix would skip the chunks the mid-prefill cancel counts; cancels around a restore are `prefix_restore_gpu`'s.
+    settings.prefix_cache.size = ByteSize(0);
     let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
     let runtime = ready
         .wait(WAIT)
