@@ -136,6 +136,43 @@ fn cases() -> Vec<Case> {
         weather_call("Paris")
     );
     vec![
+        case("repeated stop", options(false, &["aa"], None), "aaa", true),
+        case(
+            "repeated stop, text before",
+            options(false, &["aa"], None),
+            "xaaa",
+            true,
+        ),
+        case(
+            "overlapping stops, completes",
+            options(false, &["bc", "abcd"], None),
+            "abcd",
+            true,
+        ),
+        case(
+            "overlapping stops, broken",
+            options(false, &["bc", "abcd"], None),
+            "abcx",
+            true,
+        ),
+        case(
+            "overlapping stops, ended inside",
+            options(false, &["bc", "abcd"], None),
+            "xabc",
+            true,
+        ),
+        case(
+            "prefix stop listed first",
+            options(false, &["ab", "abc"], None),
+            "xabc",
+            true,
+        ),
+        case(
+            "prefix stop listed first, broken",
+            options(false, &["ab", "abc"], None),
+            "xaby",
+            true,
+        ),
         case("shorter stop first", options(false, &["abc", "ab"], None), "xabc", true),
         case(
             "shorter stop first, broken",
@@ -625,6 +662,29 @@ fn a_shorter_stop_waits_for_a_longer_one_at_the_same_start() {
             }
         );
     }
+    let stops = options(false, &["abc", "ab"], None);
+    let cut = run(&stops, &["xab", "c"], true);
+    assert_eq!(cut.pieces, [text("x")]);
+    assert_eq!(cut.matched_stop.as_deref(), Some("abc"));
+    let stops = options(false, &["abcd", "c"], None);
+    let cut = run(&stops, &["abc", "d"], true);
+    assert!(cut.pieces.is_empty());
+    assert_eq!(cut.matched_stop.as_deref(), Some("abcd"));
+    assert_eq!(run_case("repeated stop").matched_stop.as_deref(), Some("aa"));
+    assert_eq!(run_case("repeated stop").pieces, []);
+    assert_eq!(
+        run_case("overlapping stops, completes").matched_stop.as_deref(),
+        Some("abcd")
+    );
+    assert_eq!(
+        run_case("overlapping stops, broken").matched_stop.as_deref(),
+        Some("bc")
+    );
+    assert_eq!(run_case("overlapping stops, broken").pieces, [text("a")]);
+    assert_eq!(
+        run_case("prefix stop listed first").matched_stop.as_deref(),
+        Some("abc")
+    );
     assert_eq!(run_case("shorter stop first").matched_stop.as_deref(), Some("abc"));
     assert_eq!(
         run_case("shorter stop first, broken").matched_stop.as_deref(),

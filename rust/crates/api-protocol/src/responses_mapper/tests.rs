@@ -590,6 +590,14 @@ fn rows() -> Vec<Row> {
             NAMES_MESSAGE,
         ),
         bad(
+            "argument name with a tag delimiter in a later item",
+            items(
+                r##"[{"role":"user","content":"x"},{"type":"function_call","call_id":"c","name":"f","arguments":"{}"},{"type":"function_call","call_id":"d","name":"f","arguments":"{\"a>b\":1}"}]"##,
+            ),
+            Some("input[2].arguments"),
+            NAMES_MESSAGE,
+        ),
+        bad(
             "arguments invalid",
             call(r##""call_id":"c","name":"f","arguments":"{""##),
             Some("input[0].arguments"),

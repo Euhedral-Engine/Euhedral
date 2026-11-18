@@ -220,14 +220,57 @@ mod tests {
         assert_eq!(filter.matched_stop(), Some("c"));
     }
 
+    /// Feeds the chunks, checking after each that the hold is shorter than the longest stop; returns the emitted
+    /// text, the matched stop and whether it matched.
+    fn feed(stops: &[&str], chunks: &[&str]) -> (String, Option<String>) {
+        let mut filter = filter(stops);
+        let longest = stops.iter().map(|stop| stop.len()).max().unwrap();
+        let mut emitted = String::new();
+        for chunk in chunks {
+            emitted.push_str(&filter.accept(chunk));
+            assert!(
+                filter.pending.len() < longest,
+                "held {:?} for {stops:?}",
+                filter.pending
+            );
+        }
+        emitted.push_str(&filter.finish());
+        (emitted, filter.matched_stop().map(str::to_string))
+    }
+
     #[test]
     fn the_hold_never_exceeds_the_longest_stop() {
         let mut filter = filter(&["abcd", "c", "xyz"]);
-        let longest = 4;
-        for chunk in ["ab", "abc", "a", "x", "xy", "abcab", "ab"] {
+        for chunk in ["ab", "ab", "a", "xy", "xy", "ab", "x"] {
             filter.accept(chunk);
-            assert!(!filter.matched() || filter.pending.is_empty());
-            assert!(filter.pending.len() < longest, "held {:?}", filter.pending);
+            assert!(!filter.matched(), "{chunk:?} completed a stop");
+            assert!(filter.pending.len() < 4, "held {:?}", filter.pending);
+        }
+    }
+
+    #[test]
+    fn every_cut_gives_the_same_result_and_a_bounded_hold() {
+        let sets: [&[&str]; 5] = [&["abc", "ab"], &["ab", "abc"], &["abcd", "c"], &["bc", "abcd"], &["aa"]];
+        let inputs = ["xabc", "xaby", "abcd", "abcx", "aaa", "xaaab", "ababcab", "abab"];
+        for stops in sets {
+            for input in inputs {
+                let whole = feed(stops, &[input]);
+                let bounds: Vec<usize> = input
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .chain([input.len()])
+                    .collect();
+                for &first in &bounds {
+                    for &second in bounds.iter().filter(|&&index| index >= first) {
+                        let chunks = [&input[..first], &input[first..second], &input[second..]];
+                        assert_eq!(
+                            feed(stops, &chunks),
+                            whole,
+                            "{stops:?} on {input:?}, cuts {first}, {second}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
