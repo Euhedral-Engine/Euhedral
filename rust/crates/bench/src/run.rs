@@ -304,6 +304,7 @@ impl Iteration<'_> {
             max_tokens: requested as u32,
             stop_tokens: self.tokenizer.eos_ids().to_vec(),
             sampling: self.options.sampling,
+            constraint: None,
             speculation: match self.options.speculation {
                 SpeculationMode::Artifact => Speculation::Artifact,
                 SpeculationMode::Off => Speculation::Off,

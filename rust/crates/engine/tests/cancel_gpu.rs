@@ -200,6 +200,7 @@ fn run_sampling(
                 stop_tokens: Vec::new(),
                 speculation,
                 sampling,
+                constraint: None,
                 listener: Box::new(Recorder {
                     tokens: Vec::new(),
                     prompt_chunks: 0,

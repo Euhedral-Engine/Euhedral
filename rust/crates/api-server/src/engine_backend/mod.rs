@@ -249,6 +249,7 @@ impl Generation for EngineGeneration {
             stop_tokens: self.codec.stop_tokens(),
             speculation: self.engine.speculation(),
             sampling: self.sampling,
+            constraint: None,
             listener: Box::new(relay),
         };
         let refusal = self.engine.generate(request, self.cancel.clone()).err().map(refused);

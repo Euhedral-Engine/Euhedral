@@ -310,6 +310,22 @@ mod tests {
     }
 
     #[test]
+    fn the_keys_of_unconstrained_greedy_and_sampled_quanta_are_pinned() {
+        // A token constraint is carried by frames and never by a quantum: these digests are what the greedy and the
+        // sampled decode keys were before the engine had constraints, so a constraint cannot have changed them.
+        let greedy = key();
+        let mut sampled = key();
+        sampled.selects = false;
+        sampled.copies_rows = Some(SelectedRows::Last);
+        sampled.buffer_generations.push(AllocationId(9));
+        assert_eq!(greedy.digest(), PINNED_GREEDY, "greedy");
+        assert_eq!(sampled.digest(), PINNED_SAMPLED, "sampled");
+    }
+
+    const PINNED_GREEDY: u128 = 306563228581387615368114981115147068506;
+    const PINNED_SAMPLED: u128 = 62231965187292840883674824957534365090;
+
+    #[test]
     fn variable_length_parts_do_not_run_into_each_other() {
         let mut a = key();
         a.replay_rows = vec![1, 2];

@@ -10,13 +10,15 @@
 //! waits for a selection that will not come.
 
 use std::mem;
+use std::ops::{Deref, DerefMut};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 
 use euhedral_core::frames::Frame;
 
+use super::constraint::{ConstraintError, TokenConstraint};
 use crate::frames::{Kind, step};
-use crate::sampling::TokenSampler;
+use crate::sampling::{TokenFilter, TokenSampler};
 use crate::stages::sampling::RowReadbackLease;
 
 /// The logits row a [`Sample`] frame selects from.
@@ -50,6 +52,63 @@ pub(crate) struct Sampled {
     pub(crate) step: u64,
     /// The token and the sampler, which the request keeps for its next selection, or why there is no token.
     pub(crate) result: Result<(u32, Box<TokenSampler>), String>,
+    /// The request's constraint, which has accepted the token, when the request has one and the selection succeeded.
+    pub(crate) constraint: Option<Guarded>,
+}
+
+/// What the preparation of a constraint's next mask tells the owner.
+pub(crate) struct Prepared {
+    /// The preparation the answer is for.
+    pub(crate) step: u64,
+    /// The constraint, ready to select from, or why it is not.
+    pub(crate) result: Result<Guarded, String>,
+}
+
+/// A constraint on its way through the request's frames and the owner. Its `Drop` may panic (it is a caller's code), and
+/// a drop on the owner's turn would unwind past the request's end and lose the outcome: it is let go of inside
+/// `catch_unwind`, wherever the constraint ends up.
+pub(crate) struct Guarded(Box<dyn TokenConstraint>);
+
+/// What takes the place of a constraint that was let go of.
+struct Gone;
+
+impl TokenFilter for Gone {
+    fn allows(&self, _id: u32) -> bool {
+        false
+    }
+}
+
+impl TokenConstraint for Gone {
+    fn accept(&mut self, _id: u32) -> Result<(), ConstraintError> {
+        Ok(())
+    }
+}
+
+impl Guarded {
+    pub(crate) fn new(constraint: Box<dyn TokenConstraint>) -> Guarded {
+        Guarded(constraint)
+    }
+}
+
+impl Deref for Guarded {
+    type Target = dyn TokenConstraint;
+
+    fn deref(&self) -> &(dyn TokenConstraint + 'static) {
+        &*self.0
+    }
+}
+
+impl DerefMut for Guarded {
+    fn deref_mut(&mut self) -> &mut (dyn TokenConstraint + 'static) {
+        &mut *self.0
+    }
+}
+
+impl Drop for Guarded {
+    fn drop(&mut self) {
+        let inner = mem::replace(&mut self.0, Box::new(Gone));
+        let _ = panic::catch_unwind(AssertUnwindSafe(move || drop(inner)));
+    }
 }
 
 /// The selections of one quantum that are waiting for their frames: `count` of them, numbered from `first`.
@@ -208,6 +267,7 @@ struct Sample<R: Row> {
     position: u64,
     row: Option<R>,
     sampler: Option<Box<TokenSampler>>,
+    constraint: Option<Guarded>,
     post: Option<Box<dyn FnOnce(Sampled) + Send>>,
 }
 
@@ -217,25 +277,48 @@ impl<R: Row> Sample<R> {
             return;
         };
         let position = self.position;
+        let mut constraint = self.constraint.take();
         let selected = panic::catch_unwind(AssertUnwindSafe(|| {
             let bytes = row
                 .bytes()
                 .ok_or_else(|| "the logits row is not in the readback".to_string())?;
-            sampler
-                .select_bf16(bytes, position, None)
-                .map_err(|error| error.to_string())
+            let filter = constraint.as_deref().map(|constraint| constraint as &dyn TokenFilter);
+            let token = sampler
+                .select_bf16(bytes, position, filter)
+                .map_err(|error| error.to_string())?;
+            // The token is committed as soon as it is chosen: the next mask depends on it.
+            if let Some(constraint) = constraint.as_deref_mut() {
+                constraint
+                    .accept(token)
+                    .map_err(|error| format!("the constraint refused token {token}: {error}"))?;
+            }
+            Ok(token)
         }))
-        .unwrap_or_else(|_| Err("the sampler panicked".to_string()));
+        .unwrap_or_else(|_| {
+            Err(if constraint.is_some() {
+                "the constraint or the sampler panicked"
+            } else {
+                "the sampler panicked"
+            }
+            .to_string())
+        });
         // The row goes back to its pool before the owner hears: its next quantum may take it at once.
         drop(row);
-        self.answer(selected.map(|token| (token, sampler)));
+        match selected {
+            Ok(token) => self.answer(Ok((token, sampler)), constraint),
+            Err(why) => {
+                drop(constraint);
+                self.answer(Err(why), None);
+            }
+        }
     }
 
-    fn answer(&mut self, result: Result<(u32, Box<TokenSampler>), String>) {
+    fn answer(&mut self, result: Result<(u32, Box<TokenSampler>), String>, constraint: Option<Guarded>) {
         if let Some(post) = self.post.take() {
             post(Sampled {
                 step: self.step,
                 result,
+                constraint,
             });
         }
     }
@@ -247,7 +330,8 @@ impl<R: Row> Drop for Sample<R> {
             // Dropped before it ran (the lattice ended, or the frame was discarded): the request must still end.
             self.row = None;
             self.sampler = None;
-            self.answer(Err("the selection was dropped before it ran".to_string()));
+            self.constraint = None;
+            self.answer(Err("the selection was dropped before it ran".to_string()), None);
         }
     }
 }
@@ -257,6 +341,7 @@ pub(crate) fn sample_frame<R: Row + 'static>(
     step_number: u64,
     position: u64,
     sampler: Box<TokenSampler>,
+    constraint: Option<Guarded>,
     row: R,
     post: impl FnOnce(Sampled) + Send + 'static,
 ) -> Box<dyn Frame> {
@@ -265,39 +350,112 @@ pub(crate) fn sample_frame<R: Row + 'static>(
         position,
         row: Some(row),
         sampler: Some(sampler),
+        constraint,
         post: Some(Box::new(post)),
     };
     step(Kind::Sample, 0, move || sample.run())
 }
 
+/// What the frame that prepares a constraint owns, and posts the answer however it ends.
+struct Prepare {
+    step: u64,
+    constraint: Option<Guarded>,
+    post: Option<Box<dyn FnOnce(Prepared) + Send>>,
+}
+
+impl Prepare {
+    fn run(mut self) {
+        let Some(mut constraint) = self.constraint.take() else {
+            return;
+        };
+        let prepared = panic::catch_unwind(AssertUnwindSafe(|| constraint.prepare()));
+        match prepared {
+            Ok(Ok(())) => self.answer(Ok(constraint)),
+            Ok(Err(error)) => {
+                drop(constraint);
+                self.answer(Err(format!("preparing the constraint: {error}")));
+            }
+            Err(_) => {
+                drop(constraint);
+                self.answer(Err("the constraint panicked while preparing".to_string()));
+            }
+        }
+    }
+
+    fn answer(&mut self, result: Result<Guarded, String>) {
+        if let Some(post) = self.post.take() {
+            post(Prepared {
+                step: self.step,
+                result,
+            });
+        }
+    }
+}
+
+impl Drop for Prepare {
+    fn drop(&mut self) {
+        if self.post.is_some() {
+            // Dropped before it ran: the request must still end.
+            self.constraint = None;
+            self.answer(Err("the preparation was dropped before it ran".to_string()));
+        }
+    }
+}
+
+/// The frame that prepares `constraint` for the next selection and calls `post` with it, or with why it is not ready.
+pub(crate) fn prepare_frame(
+    step_number: u64,
+    constraint: Guarded,
+    post: impl FnOnce(Prepared) + Send + 'static,
+) -> Box<dyn Frame> {
+    let prepare = Prepare {
+        step: step_number,
+        constraint: Some(constraint),
+        post: Some(Box::new(post)),
+    };
+    step(Kind::Prepare, 0, move || prepare.run())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
     use super::*;
+    use crate::generation::ConstraintError;
+    use crate::handoff::Handoff;
     use crate::sampling::SamplingConfig;
 
     /// What the frames under test posted: the first answer and how many came.
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct Answers {
-        first: Arc<OnceLock<Sampled>>,
+        first: Arc<Handoff<Sampled>>,
         count: Arc<AtomicUsize>,
+    }
+
+    impl Default for Answers {
+        fn default() -> Answers {
+            Answers {
+                first: Handoff::new(),
+                count: Arc::default(),
+            }
+        }
     }
 
     impl Answers {
         fn poster(&self) -> impl FnOnce(Sampled) + Send + 'static {
             let (first, count) = (Arc::clone(&self.first), Arc::clone(&self.count));
             move |sampled| {
-                count.fetch_add(1, Ordering::SeqCst);
-                let _ = first.set(sampled);
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first.send(sampled);
+                }
             }
         }
 
         /// The answer posted, which must be the only one.
-        fn only(&self) -> &Sampled {
+        fn only(&self) -> Sampled {
             assert_eq!(self.count.load(Ordering::SeqCst), 1, "one answer");
-            self.first.get().unwrap()
+            self.first.take().unwrap()
         }
     }
 
@@ -337,7 +495,7 @@ mod tests {
     fn a_frame_selects_the_row_and_hands_the_sampler_back() {
         let answers = Answers::default();
         let row = Bytes(bf16(&[0.5, 3.0, -1.0, 2.0]));
-        let mut frame = sample_frame(4, 9, sampler(4, 1), row, answers.poster());
+        let mut frame = sample_frame(4, 9, sampler(4, 1), None, row, answers.poster());
         run(&mut frame);
         let sampled = answers.only();
         assert_eq!(sampled.step, 4);
@@ -349,7 +507,7 @@ mod tests {
     #[test]
     fn a_row_of_the_wrong_width_is_an_error() {
         let answers = Answers::default();
-        let mut frame = sample_frame(0, 0, sampler(4, 1), Bytes(bf16(&[1.0, 2.0])), answers.poster());
+        let mut frame = sample_frame(0, 0, sampler(4, 1), None, Bytes(bf16(&[1.0, 2.0])), answers.poster());
         run(&mut frame);
         let sampled = answers.only();
         assert!(sampled.result.is_err());
@@ -358,7 +516,7 @@ mod tests {
     #[test]
     fn a_frame_dropped_before_it_ran_still_answers_once_with_an_error() {
         let answers = Answers::default();
-        let frame = sample_frame(2, 0, sampler(4, 1), Bytes(bf16(&[1.0; 4])), answers.poster());
+        let frame = sample_frame(2, 0, sampler(4, 1), None, Bytes(bf16(&[1.0; 4])), answers.poster());
         drop(frame);
         let sampled = answers.only();
         assert_eq!(sampled.step, 2);
@@ -368,7 +526,7 @@ mod tests {
     #[test]
     fn a_selection_that_panics_answers_with_an_error() {
         let answers = Answers::default();
-        let mut frame = sample_frame(1, 0, sampler(4, 1), Panics, answers.poster());
+        let mut frame = sample_frame(1, 0, sampler(4, 1), None, Panics, answers.poster());
         run(&mut frame);
         let sampled = answers.only();
         assert_eq!(
@@ -420,6 +578,7 @@ mod tests {
         Sampled {
             step,
             result: Ok((token, sampler(4, 1))),
+            constraint: None,
         }
     }
 
@@ -458,6 +617,7 @@ mod tests {
         let failed = Sampled {
             step: 6,
             result: Err("no token".to_string()),
+            constraint: None,
         };
         assert_eq!(join.answer(failed), Answered::Waiting);
         assert_eq!(join.failure(), Some("no token"), "known as soon as it arrives");
@@ -514,8 +674,22 @@ mod tests {
         // Two rows of one readback; the lease is held by the frames only.
         let shared = Arc::new(Bytes2(vec![bf16(&[0.0, 9.0, 1.0, 2.0]), bf16(&[9.0, 0.0, 1.0, 2.0])]));
         let answers = Answers::default();
-        let mut first = sample_frame(0, 5, sampler(4, 1), Indexed(Arc::clone(&shared), 0), answers.poster());
-        let mut second = sample_frame(1, 6, sampler(4, 1), Indexed(Arc::clone(&shared), 1), answers.poster());
+        let mut first = sample_frame(
+            0,
+            5,
+            sampler(4, 1),
+            None,
+            Indexed(Arc::clone(&shared), 0),
+            answers.poster(),
+        );
+        let mut second = sample_frame(
+            1,
+            6,
+            sampler(4, 1),
+            None,
+            Indexed(Arc::clone(&shared), 1),
+            answers.poster(),
+        );
         assert_eq!(Arc::strong_count(&shared), 3);
         // The second frame runs first.
         run(&mut second);
@@ -527,6 +701,301 @@ mod tests {
         run(&mut first);
         assert_eq!(Arc::strong_count(&shared), 1);
         assert_eq!(answers.count.load(Ordering::SeqCst), 2);
+    }
+
+    /// What a fake constraint does.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fault {
+        None,
+        RefusesTokens,
+        PanicsOnAllows,
+        PanicsOnAccept,
+        ErrorsOnPrepare,
+        PanicsOnPrepare,
+    }
+
+    /// A constraint that allows the ids of `allowed`, and counts its calls.
+    struct Fake {
+        allowed: Vec<u32>,
+        fault: Fault,
+        accepted: Arc<AtomicUsize>,
+        last: Arc<AtomicU32>,
+        prepared: Arc<AtomicUsize>,
+    }
+
+    /// What a fake constraint did, which the test reads once the frames ran.
+    #[derive(Default)]
+    struct Watch {
+        accepted: Arc<AtomicUsize>,
+        last: Arc<AtomicU32>,
+        prepared: Arc<AtomicUsize>,
+    }
+
+    impl Fake {
+        fn new(allowed: &[u32], fault: Fault) -> (Fake, Watch) {
+            let watch = Watch::default();
+            let fake = Fake {
+                allowed: allowed.to_vec(),
+                fault,
+                accepted: Arc::clone(&watch.accepted),
+                last: Arc::clone(&watch.last),
+                prepared: Arc::clone(&watch.prepared),
+            };
+            (fake, watch)
+        }
+    }
+
+    impl TokenFilter for Fake {
+        fn allows(&self, id: u32) -> bool {
+            if self.fault == Fault::PanicsOnAllows {
+                panic!("a constraint that cannot answer");
+            }
+            self.allowed.contains(&id)
+        }
+    }
+
+    impl TokenConstraint for Fake {
+        fn prepare(&mut self) -> Result<(), ConstraintError> {
+            self.prepared.fetch_add(1, Ordering::SeqCst);
+            match self.fault {
+                Fault::ErrorsOnPrepare => Err(ConstraintError::new("no mask")),
+                Fault::PanicsOnPrepare => panic!("a constraint that cannot prepare"),
+                _ => Ok(()),
+            }
+        }
+
+        fn accept(&mut self, id: u32) -> Result<(), ConstraintError> {
+            match self.fault {
+                Fault::RefusesTokens => return Err(ConstraintError::new("refused")),
+                Fault::PanicsOnAccept => panic!("a constraint that cannot accept"),
+                _ => {}
+            }
+            self.accepted.fetch_add(1, Ordering::SeqCst);
+            self.last.store(id, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn greedy_sampler(vocabulary: usize) -> Box<TokenSampler> {
+        Box::new(TokenSampler::new(SamplingConfig::greedy(0), vocabulary).unwrap())
+    }
+
+    #[test]
+    fn a_greedy_constrained_frame_takes_the_best_allowed_token_and_hands_the_constraint_back_having_accepted_it() {
+        // The row's best token (1) is not allowed: the frame takes the best of the one the constraint allows.
+        let (fake, watch) = Fake::new(&[3], Fault::None);
+        let answers = Answers::default();
+        let row = Bytes(bf16(&[0.5, 3.0, -1.0, 2.0]));
+        let mut frame = sample_frame(
+            0,
+            4,
+            greedy_sampler(4),
+            Some(Guarded::new(Box::new(fake))),
+            row,
+            answers.poster(),
+        );
+        run(&mut frame);
+        let sampled = answers.only();
+        assert_eq!(sampled.result.as_ref().unwrap().0, 3);
+        assert!(sampled.constraint.is_some(), "the constraint comes back");
+        assert_eq!(watch.accepted.load(Ordering::SeqCst), 1, "accepted once");
+        assert_eq!(watch.last.load(Ordering::SeqCst), 3, "the token that was selected");
+    }
+
+    #[test]
+    fn a_constraint_that_allows_one_token_a_step_is_followed_step_by_step() {
+        let mut constraint: Option<Guarded> = Some(Guarded::new(Box::new(Fake::new(&[2], Fault::None).0)));
+        let mut sampler = greedy_sampler(4);
+        for step in 0..3u64 {
+            let answers = Answers::default();
+            let mut frame = sample_frame(
+                step,
+                step,
+                sampler,
+                constraint.take(),
+                Bytes(bf16(&[9.0, 8.0, -5.0, 7.0])),
+                answers.poster(),
+            );
+            run(&mut frame);
+            let sampled = answers.only();
+            let (token, back) = sampled.result.unwrap();
+            assert_eq!(token, 2, "the only allowed token, however low its logit");
+            sampler = back;
+            constraint = sampled.constraint;
+            assert!(constraint.is_some());
+        }
+    }
+
+    #[test]
+    fn a_constraint_with_nothing_allowed_ends_the_selection_with_an_error() {
+        let answers = Answers::default();
+        let (fake, watch) = Fake::new(&[], Fault::None);
+        let mut frame = sample_frame(
+            0,
+            0,
+            greedy_sampler(4),
+            Some(Guarded::new(Box::new(fake))),
+            Bytes(bf16(&[1.0, 2.0, 3.0, 4.0])),
+            answers.poster(),
+        );
+        run(&mut frame);
+        let sampled = answers.only();
+        assert!(sampled.result.is_err());
+        assert!(sampled.constraint.is_none());
+        assert_eq!(watch.accepted.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_constraint_that_refuses_the_token_ends_the_selection_once_with_an_error() {
+        let answers = Answers::default();
+        let (fake, _) = Fake::new(&[1], Fault::RefusesTokens);
+        let mut frame = sample_frame(
+            0,
+            0,
+            greedy_sampler(4),
+            Some(Guarded::new(Box::new(fake))),
+            Bytes(bf16(&[1.0, 2.0, 3.0, 4.0])),
+            answers.poster(),
+        );
+        run(&mut frame);
+        let sampled = answers.only();
+        let why = sampled.result.err().unwrap();
+        assert!(why.contains("refused"), "{why}");
+        assert!(sampled.constraint.is_none());
+    }
+
+    #[test]
+    fn a_constraint_that_panics_answers_once_with_an_error_and_the_frame_does_not_hang() {
+        for fault in [Fault::PanicsOnAllows, Fault::PanicsOnAccept] {
+            let answers = Answers::default();
+            let (fake, _) = Fake::new(&[1], fault);
+            let mut frame = sample_frame(
+                0,
+                0,
+                greedy_sampler(4),
+                Some(Guarded::new(Box::new(fake))),
+                Bytes(bf16(&[1.0, 2.0, 3.0, 4.0])),
+                answers.poster(),
+            );
+            // The frame runs to its end on this thread: a panic that escaped would fail the test here, one that
+            // swallowed the answer would fail the count.
+            run(&mut frame);
+            let sampled = answers.only();
+            assert!(sampled.result.is_err());
+            assert!(sampled.constraint.is_none());
+        }
+    }
+
+    #[test]
+    fn a_selection_frame_with_a_constraint_dropped_before_it_ran_answers_once() {
+        let answers = Answers::default();
+        let (fake, _) = Fake::new(&[1], Fault::None);
+        let frame = sample_frame(
+            3,
+            0,
+            greedy_sampler(4),
+            Some(Guarded::new(Box::new(fake))),
+            Bytes(bf16(&[1.0; 4])),
+            answers.poster(),
+        );
+        drop(frame);
+        let sampled = answers.only();
+        assert_eq!(sampled.step, 3);
+        assert!(sampled.result.is_err() && sampled.constraint.is_none());
+    }
+
+    /// What a preparation frame posted.
+    #[derive(Clone)]
+    struct Prepares {
+        first: Arc<Handoff<Prepared>>,
+        count: Arc<AtomicUsize>,
+    }
+
+    impl Default for Prepares {
+        fn default() -> Prepares {
+            Prepares {
+                first: Handoff::new(),
+                count: Arc::default(),
+            }
+        }
+    }
+
+    impl Prepares {
+        fn poster(&self) -> impl FnOnce(Prepared) + Send + 'static {
+            let (first, count) = (Arc::clone(&self.first), Arc::clone(&self.count));
+            move |prepared| {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first.send(prepared);
+                }
+            }
+        }
+
+        fn only(&self) -> Prepared {
+            assert_eq!(self.count.load(Ordering::SeqCst), 1, "one answer");
+            self.first.take().unwrap()
+        }
+    }
+
+    #[test]
+    fn a_preparation_frame_prepares_once_and_hands_the_constraint_back() {
+        let (fake, watch) = Fake::new(&[1], Fault::None);
+        let posts = Prepares::default();
+        let mut frame = prepare_frame(7, Guarded::new(Box::new(fake)), posts.poster());
+        run(&mut frame);
+        let answer = posts.only();
+        assert_eq!(answer.step, 7);
+        assert!(answer.result.is_ok());
+        assert_eq!(watch.prepared.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_preparation_that_fails_panics_or_is_dropped_answers_once_with_an_error() {
+        for fault in [Fault::ErrorsOnPrepare, Fault::PanicsOnPrepare] {
+            let (fake, _) = Fake::new(&[1], fault);
+            let posts = Prepares::default();
+            let mut frame = prepare_frame(1, Guarded::new(Box::new(fake)), posts.poster());
+            run(&mut frame);
+            assert!(posts.only().result.is_err());
+        }
+        let (fake, watch) = Fake::new(&[1], Fault::None);
+        let posts = Prepares::default();
+        drop(prepare_frame(2, Guarded::new(Box::new(fake)), posts.poster()));
+        let answer = posts.only();
+        assert_eq!(answer.step, 2);
+        assert!(answer.result.is_err());
+        assert_eq!(watch.prepared.load(Ordering::SeqCst), 0, "it never ran");
+    }
+
+    /// A constraint whose `Drop` panics, as caller code may.
+    struct Bomb;
+
+    impl TokenFilter for Bomb {
+        fn allows(&self, _id: u32) -> bool {
+            true
+        }
+    }
+
+    impl TokenConstraint for Bomb {
+        fn accept(&mut self, _id: u32) -> Result<(), ConstraintError> {
+            Ok(())
+        }
+    }
+
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            panic!("a constraint that cannot be dropped");
+        }
+    }
+
+    #[test]
+    fn a_constraint_whose_drop_panics_is_let_go_of_without_unwinding() {
+        drop(Guarded::new(Box::new(Bomb)));
+        let mut constraint = Some(Guarded::new(Box::new(Bomb)));
+        assert!(constraint.take().is_some());
+        drop(constraint);
+        let posts = Prepares::default();
+        drop(prepare_frame(3, Guarded::new(Box::new(Bomb)), posts.poster()));
+        assert!(posts.only().result.is_err());
     }
 
     struct Bytes2(Vec<Vec<u8>>);

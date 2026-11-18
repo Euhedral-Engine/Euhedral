@@ -205,6 +205,7 @@ fn generate(
             stop_tokens: stop_tokens.to_vec(),
             speculation,
             sampling: SamplingConfig::greedy(0),
+            constraint: None,
             listener: Box::new(Recorder {
                 tokens: Vec::new(),
                 events: Vec::new(),

@@ -252,6 +252,7 @@ fn generate_sampled(
             stop_tokens: stop_tokens.to_vec(),
             speculation: Speculation::Off,
             sampling,
+            constraint: None,
             listener: Box::new(Recorder {
                 tokens: Vec::new(),
                 token_times: Vec::new(),
@@ -381,6 +382,7 @@ fn a_stop_token_ends_the_generation_and_leaves_no_overshoot_in_the_sequence() {
             stop_tokens: Vec::new(),
             speculation: Speculation::Off,
             sampling: SamplingConfig::greedy(0),
+            constraint: None,
             listener: Box::new(Recorder {
                 tokens: Vec::new(),
                 token_times: Vec::new(),

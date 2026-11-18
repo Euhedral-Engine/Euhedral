@@ -212,6 +212,7 @@ fn run(
                 stop_tokens: stop_tokens.to_vec(),
                 speculation,
                 sampling,
+                constraint: None,
                 listener: Box::new(Recorder {
                     tokens: Vec::new(),
                     verifications: Vec::new(),

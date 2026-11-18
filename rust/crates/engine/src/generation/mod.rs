@@ -8,6 +8,7 @@
 //! hand-off of its own.
 
 mod acceptance;
+mod constraint;
 mod draft_length;
 mod listener;
 mod mailbox;
@@ -39,6 +40,7 @@ use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
 use crate::state::SequenceState;
 use crate::workspace::Workspace;
 pub use acceptance::{Accepted, accept, accept_tokens};
+pub use constraint::{ConstraintError, ReasoningConstraint, TokenConstraint};
 pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
 pub use listener::GenerationListener;
 use mailbox::{Address, Mailbox, Spawn};

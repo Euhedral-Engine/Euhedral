@@ -153,6 +153,7 @@ fn run_on_engine(
                 Speculation::Off
             },
             sampling,
+            constraint: None,
             listener: Box::new(Reference {
                 tokens: Arc::clone(&tokens),
                 done: Arc::clone(&done),
