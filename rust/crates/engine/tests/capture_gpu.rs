@@ -1084,6 +1084,21 @@ impl Light {
         quantum.with_selection_lease(sequence.selections.acquire().unwrap())
     }
 
+    /// Appends single rows to the cache `source` until it holds `to` rows, as the owner's decodes would.
+    fn advance(&self, sequence: &mut SequenceState, source: KvSource, to: u64) {
+        let held = match source {
+            KvSource::Base => sequence.kv.committed(),
+            KvSource::Mtp => sequence.mtp_kv.as_ref().unwrap().committed(),
+        };
+        for position in held..to {
+            drop(self.bare_quantum(sequence, source, QuantumKind::Decode, 1, position, false));
+            match source {
+                KvSource::Base => sequence.kv.commit(1).unwrap(),
+                KvSource::Mtp => sequence.mtp_kv.as_mut().unwrap().commit(1).unwrap(),
+            };
+        }
+    }
+
     /// The quantum with nothing set on it, after the one reservation of the cache `source` it appends to.
     fn bare_quantum(
         &self,
@@ -1379,13 +1394,10 @@ fn the_capture_key_of_each_kind_of_quantum_is_pinned() {
     let Some(light) = light() else { return };
     let mut sequence = light.sequence_with(1024, 1, true);
     let vocabulary = light.config.vocab_size;
-    // One decode over the first rows allocates the first page; the quanta after it are inside it.
-    let first = light.quantum(&mut sequence, QuantumKind::Decode, 1, 0, false);
-    drop(first);
-    sequence.kv.commit(1).unwrap();
-    let draft_first = light.bare_quantum(&mut sequence, KvSource::Mtp, QuantumKind::Draft, 1, 0, false);
-    drop(draft_first);
-    sequence.mtp_kv.as_mut().unwrap().commit(1).unwrap();
+    // The first row allocates the first page; the quanta after it are inside it. Each cache is advanced row by row
+    // to the position of the quantum that follows.
+    light.advance(&mut sequence, KvSource::Base, 50);
+    light.advance(&mut sequence, KvSource::Mtp, 50);
     let base = |view, kind, rows, logits, geometry| CaptureKey {
         view,
         kind,
@@ -1426,6 +1438,7 @@ fn the_capture_key_of_each_kind_of_quantum_is_pinned() {
     sequence.kv.commit(1).unwrap();
 
     // Decode at 100: the third tile.
+    light.advance(&mut sequence, KvSource::Base, 100);
     let quantum = light.quantum(&mut sequence, QuantumKind::Decode, 1, 100, false);
     let key = quantum.capture_key().expect("a decode inside the page has a key");
     assert_eq!(key.split_geometry, 3 << 8);
@@ -1433,7 +1446,7 @@ fn the_capture_key_of_each_kind_of_quantum_is_pinned() {
     sequence.kv.commit(1).unwrap();
 
     // The verification the engine builds: its tokens read from the step's, and its rows seed drafting.
-    let quantum = light.quantum(&mut sequence, QuantumKind::Verify, 3, 100, true);
+    let quantum = light.quantum(&mut sequence, QuantumKind::Verify, 3, 101, true);
     let quantum = quantum.reading_draft_tokens(0).unwrap().seeding_draft().unwrap();
     let generation = quantum.selection().unwrap().generation();
     let mut key = quantum.capture_key().expect("a verification inside the page has a key");
@@ -1450,7 +1463,7 @@ fn the_capture_key_of_each_kind_of_quantum_is_pinned() {
 
     // A verification whose rows the host selects from: it copies them, and selects none.
     let readback = Arc::new(RowReadback::new(&light.library, 8, vocabulary).unwrap());
-    let quantum = light.bare_quantum(&mut sequence, KvSource::Base, QuantumKind::Verify, 4, 50, true);
+    let quantum = light.bare_quantum(&mut sequence, KvSource::Base, QuantumKind::Verify, 4, 104, true);
     let quantum = quantum.with_row_readback(Arc::clone(&readback));
     let mut key = quantum.capture_key().expect("a verification inside the page has a key");
     named(&mut key, "readback", readback.generation());
@@ -1458,7 +1471,7 @@ fn the_capture_key_of_each_kind_of_quantum_is_pinned() {
         row_exact: true,
         selects: false,
         copies_rows: Some(SelectedRows::Each),
-        ..base(View::Verify { rows: 4 }, QuantumKind::Verify, 4, 4, 2 << 8)
+        ..base(View::Verify { rows: 4 }, QuantumKind::Verify, 4, 4, 3 << 8)
     };
     assert_eq!(key, expected);
     drop(quantum);
@@ -1484,7 +1497,7 @@ fn the_capture_key_of_each_kind_of_quantum_is_pinned() {
     sequence.mtp_kv.as_mut().unwrap().commit(1).unwrap();
 
     // A prefill chunk is not captured, and a draft with no seed rows has no key.
-    let prefill = light.quantum(&mut sequence, QuantumKind::Prefill, 2, 160, false);
+    let prefill = light.quantum(&mut sequence, QuantumKind::Prefill, 2, 108, false);
     assert!(prefill.capture_key().is_none());
     let draft = light.bare_quantum(&mut sequence, KvSource::Mtp, QuantumKind::Draft, 1, 51, false);
     let draft = draft.with_selection_lease(sequence.selections.acquire().unwrap());
