@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write;
+use std::mem;
 
 /// The deepest nesting a parsed document may have.
 /// The deepest nesting of arrays and objects a document may have, and the most digits one number may have
@@ -480,7 +481,7 @@ impl Parser<'_> {
                 return None;
             }
             let key = self.string()?;
-            let lone = std::mem::take(&mut self.lone);
+            let lone = mem::take(&mut self.lone);
             if key.len() > 3 * MAX_NAME_UNITS || key.encode_utf16().count() > MAX_NAME_UNITS {
                 return None;
             }

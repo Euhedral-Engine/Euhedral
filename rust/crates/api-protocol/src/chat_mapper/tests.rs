@@ -1,7 +1,7 @@
 use super::*;
 use crate::json::JsonInteger;
 use crate::pipeline::ToolChoice;
-use crate::template::{Effort, TemplateOptions};
+use crate::template::{Effort, TemplateOptions, render};
 use crate::tool_calling::ToolCalling;
 
 fn defaults() -> Defaults {
@@ -1416,7 +1416,7 @@ fn ignored_metadata_and_neutral_values_are_accepted() {
 /// The prompt a request renders to.
 fn prompt_of(body: &str) -> String {
     let request = accepted(body);
-    crate::template::render(&request.template, &request.thinking).expect("the conversation renders")
+    render(&request.template, &request.thinking).expect("the conversation renders")
 }
 
 /// The tool-call arguments of an assistant turn with the one JSON literal `literal` as the argument `n`.
