@@ -93,7 +93,7 @@ class PromoteTests(unittest.TestCase):
             "PROMOTE_API_LOG": str(self.log),
             "INTEGRATION_BRANCH": old,
         }
-        for key in ("NEXT_BRANCH", "PROMOTE_CHECKOUT", "MIRROR_REMOTE"):
+        for key in ("NEXT_BRANCH", "PROMOTE_CHECKOUT", "MIRROR_URL"):
             env.pop(key, None)
         for key, value in (extra or {}).items():
             if value is None:
@@ -221,7 +221,7 @@ class PromoteTests(unittest.TestCase):
         git(self.root, "clone", "-q", "-b", "rust/next", str(self.bare), str(checkout))
         git(checkout, "remote", "add", "mirror", str(mirror))
         done = self.run_promote(
-            "rust/next", sha, extra={"PROMOTE_CHECKOUT": str(checkout), "MIRROR_REMOTE": "mirror"}, cwd=self.root
+            "rust/next", sha, extra={"PROMOTE_CHECKOUT": str(checkout), "MIRROR_URL": f"file://{mirror}"}, cwd=self.root
         )
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
         self.assertEqual(git(checkout, "branch", "--show-current"), "rust/next-2")
@@ -374,7 +374,7 @@ class PromoteTests(unittest.TestCase):
         sha = self.start_integration()
         self.make_upstream()
         up_head = self.advance(self.up, "upstream.txt", "upstream\n")
-        done = self.run_promote("rust/next", sha, extra={"UPSTREAM_MAIN_URL": f"file://{self.up}"})
+        done = self.run_promote("rust/next", sha, extra={"MIRROR_URL": f"file://{self.up}"})
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
         merged = self.head("main")
         self.assertEqual(git(self.bare, "rev-list", "--parents", "-n1", merged).split()[1:], [up_head, sha])
@@ -384,7 +384,7 @@ class PromoteTests(unittest.TestCase):
         sha = self.start_integration()
         self.make_upstream()
         gl_head = self.advance(self.bare, "gitlab.txt", "gitlab\n")
-        done = self.run_promote("rust/next", sha, extra={"UPSTREAM_MAIN_URL": f"file://{self.up}"})
+        done = self.run_promote("rust/next", sha, extra={"MIRROR_URL": f"file://{self.up}"})
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
         self.assertEqual(git(self.bare, "rev-list", "--parents", "-n1", self.head("main")).split()[1:], [gl_head, sha])
 
@@ -394,7 +394,7 @@ class PromoteTests(unittest.TestCase):
         self.advance(self.up, "upstream.txt", "upstream\n")
         self.advance(self.bare, "gitlab.txt", "gitlab\n")
         before = self.heads()
-        done = self.run_promote("rust/next", sha, extra={"UPSTREAM_MAIN_URL": f"file://{self.up}"})
+        done = self.run_promote("rust/next", sha, extra={"MIRROR_URL": f"file://{self.up}"})
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("have diverged", done.stderr)
         self.assertEqual(self.heads(), before)
@@ -452,6 +452,70 @@ class PromoteTests(unittest.TestCase):
         done = self.run_promote("rust/next", sha, extra=names)
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
         self.assertEqual(self.author_of(self.head("main")), "GitLab promote <promote@localhost>")
+
+    def make_mirror(self):
+        self.mirror = self.root / "mirror.git"
+        git(self.root, "clone", "-q", "--bare", str(self.bare), str(self.mirror))
+        return {"MIRROR_URL": f"file://{self.mirror}"}
+
+    def mirror_head(self, branch):
+        return git(self.mirror, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False)
+
+    def test_the_old_branch_is_deleted_on_the_mirror(self):
+        sha = self.start_integration()
+        extra = self.make_mirror()
+        self.assertEqual(self.mirror_head("rust/next"), sha)
+        done = self.run_promote("rust/next", sha, extra=extra)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertIn("deleted on the mirror", done.stdout)
+        self.assertEqual(self.mirror_head("rust/next"), "")
+        self.assertEqual(self.head("rust/next"), "")
+
+    def test_a_mirror_branch_that_moved_after_the_checks_is_left_alone_with_a_message(self):
+        sha = self.start_integration()
+        extra = self.make_mirror()
+        late = self.commit(self.seed, "elsewhere.txt", "elsewhere\n")
+        git(self.seed, "push", "-q", str(self.mirror), f"{late}:refs/heads/rust/next", "--force")
+        # a hook on GitLab's side of the run: when the old branch is deleted there, someone pushes to the mirror
+        (self.bare / "hooks").mkdir(exist_ok=True)
+        self.hook(
+            "post-receive",
+            'while read o n ref; do if [ "$ref" = refs/heads/rust/next ] && [ "$n" = 0000000000000000000000000000000000000000 ]; then '
+            f'c=$(git --git-dir={self.mirror} commit-tree "{late}^{{tree}}" -p {late} -m later); '
+            f'git --git-dir={self.mirror} update-ref refs/heads/rust/next "$c"; fi; done\n',
+        )
+        done = self.run_promote("rust/next", sha, extra=extra)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertIn("was left there", done.stdout)
+        self.assertNotEqual(self.mirror_head("rust/next"), "")
+        self.assertEqual(self.head("rust/next"), "")
+
+    def test_an_unreachable_mirror_fails_in_the_checks(self):
+        sha = self.start_integration()
+        before = self.heads()
+        done = self.run_promote("rust/next", sha, extra={"MIRROR_URL": f"file://{self.root}/nowhere.git"})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("mirror cannot be reached", done.stderr)
+        self.assertEqual(self.heads(), before)
+        self.assertEqual(self.mutating_calls(), [])
+
+    def test_a_rerun_after_the_mirror_delete_finishes(self):
+        sha = self.start_integration()
+        extra = self.make_mirror()
+        self.assertEqual(self.run_promote("rust/next", sha, extra=extra).returncode, 0)
+        done = self.run_promote("rust/next", sha, extra=extra)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(self.mirror_head("rust/next"), "")
+        self.assertEqual(self.head("rust/next-2"), sha)
+
+    def test_a_rerun_after_a_stop_before_the_mirror_delete_finishes_it(self):
+        sha = self.start_integration()
+        extra = self.make_mirror()
+        self.assertEqual(self.run_promote("rust/next", sha, extra=extra).returncode, 0)
+        git(self.seed, "push", "-q", str(self.mirror), f"{sha}:refs/heads/rust/next")  # as if the delete never happened
+        done = self.run_promote("rust/next", sha, extra=extra)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(self.mirror_head("rust/next"), "")
 
 
 if __name__ == "__main__":
