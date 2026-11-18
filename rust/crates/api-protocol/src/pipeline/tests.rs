@@ -136,6 +136,75 @@ fn cases() -> Vec<Case> {
         weather_call("Paris")
     );
     vec![
+        case("repeated stop", options(false, &["aa"], None), "aaa", true),
+        case(
+            "repeated stop, text before",
+            options(false, &["aa"], None),
+            "xaaa",
+            true,
+        ),
+        case(
+            "overlapping stops, completes",
+            options(false, &["bc", "abcd"], None),
+            "abcd",
+            true,
+        ),
+        case(
+            "overlapping stops, broken",
+            options(false, &["bc", "abcd"], None),
+            "abcx",
+            true,
+        ),
+        case(
+            "overlapping stops, ended inside",
+            options(false, &["bc", "abcd"], None),
+            "xabc",
+            true,
+        ),
+        case(
+            "prefix stop listed first",
+            options(false, &["ab", "abc"], None),
+            "xabc",
+            true,
+        ),
+        case(
+            "prefix stop listed first, broken",
+            options(false, &["ab", "abc"], None),
+            "xaby",
+            true,
+        ),
+        case("shorter stop first", options(false, &["abc", "ab"], None), "xabc", true),
+        case(
+            "shorter stop first, broken",
+            options(false, &["abc", "ab"], None),
+            "xaby",
+            true,
+        ),
+        case("longer stop first", options(false, &["abcd", "c"], None), "abcd", true),
+        case(
+            "longer stop first, broken",
+            options(false, &["abcd", "c"], None),
+            "abcx",
+            true,
+        ),
+        case(
+            "longer stop first, ended inside",
+            options(false, &["abcd", "c"], None),
+            "xabc",
+            true,
+        ),
+        case(
+            "call closed before any function",
+            options(false, &[], tools(ToolChoice::Auto, true)),
+            "<tool_call></tool_call><function=f>",
+            true,
+        ),
+        case(
+            "call closed before any function, truncated",
+            options(false, &[], tools(ToolChoice::Auto, true)),
+            "<tool_call></tool_call><function=f>",
+            false,
+        ),
         case(
             "reasoning split",
             options(true, &[], None),
@@ -328,8 +397,8 @@ fn the_pieces_do_not_depend_on_where_the_text_is_cut_in_three() {
             .map(|(index, _)| index)
             .chain([case.input.len()])
             .collect();
-        for &first in boundaries.iter().step_by(3) {
-            for &second in boundaries.iter().filter(|&&index| index >= first).step_by(5) {
+        for &first in &boundaries {
+            for &second in boundaries.iter().filter(|&&index| index >= first) {
                 let chunks = [&case.input[..first], &case.input[first..second], &case.input[second..]];
                 assert_eq!(
                     run(&case.options, &chunks, case.stop_token),
@@ -579,4 +648,68 @@ fn an_unclosed_reasoning_marker_cannot_hang_finish() {
     });
     assert_eq!(pieces, [reasoning("<think>\nno end in sight")]);
     assert!(open);
+}
+
+#[test]
+fn a_shorter_stop_waits_for_a_longer_one_at_the_same_start() {
+    for name in ["shorter stop first", "longer stop first"] {
+        assert_eq!(
+            run_case(name).pieces,
+            if name == "longer stop first" {
+                vec![]
+            } else {
+                vec![text("x")]
+            }
+        );
+    }
+    let stops = options(false, &["abc", "ab"], None);
+    let cut = run(&stops, &["xab", "c"], true);
+    assert_eq!(cut.pieces, [text("x")]);
+    assert_eq!(cut.matched_stop.as_deref(), Some("abc"));
+    let stops = options(false, &["abcd", "c"], None);
+    let cut = run(&stops, &["abc", "d"], true);
+    assert!(cut.pieces.is_empty());
+    assert_eq!(cut.matched_stop.as_deref(), Some("abcd"));
+    assert_eq!(run_case("repeated stop").matched_stop.as_deref(), Some("aa"));
+    assert_eq!(run_case("repeated stop").pieces, []);
+    assert_eq!(
+        run_case("overlapping stops, completes").matched_stop.as_deref(),
+        Some("abcd")
+    );
+    assert_eq!(
+        run_case("overlapping stops, broken").matched_stop.as_deref(),
+        Some("bc")
+    );
+    assert_eq!(run_case("overlapping stops, broken").pieces, [text("a")]);
+    assert_eq!(
+        run_case("prefix stop listed first").matched_stop.as_deref(),
+        Some("abc")
+    );
+    assert_eq!(run_case("shorter stop first").matched_stop.as_deref(), Some("abc"));
+    assert_eq!(
+        run_case("shorter stop first, broken").matched_stop.as_deref(),
+        Some("ab")
+    );
+    assert_eq!(run_case("longer stop first").matched_stop.as_deref(), Some("abcd"));
+    let broken = run_case("longer stop first, broken");
+    assert_eq!(broken.pieces, [text("ab")]);
+    assert_eq!(broken.matched_stop.as_deref(), Some("c"));
+    let ended = run_case("longer stop first, ended inside");
+    assert_eq!(ended.pieces, [text("xab")]);
+    assert_eq!(ended.matched_stop.as_deref(), Some("c"));
+}
+
+#[test]
+fn a_call_closed_before_any_function_is_rejected_wherever_the_text_is_cut() {
+    for name in [
+        "call closed before any function",
+        "call closed before any function, truncated",
+    ] {
+        let outcome = run_case(name);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("a tool call has no <function=...> tag"),
+            "{name}"
+        );
+    }
 }
