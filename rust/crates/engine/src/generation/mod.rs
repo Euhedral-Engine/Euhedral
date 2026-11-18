@@ -62,6 +62,12 @@ fn closed_error() -> AdmissionError {
     AdmissionError::Engine("the engine is closed".to_string())
 }
 
+/// The owner a request may begin on: none once the engine stops, so that the request is refused as one that found the
+/// owner closed.
+fn unless_closing<'a, T>(closing: &AtomicBool, owner: Option<&'a mut T>) -> Option<&'a mut T> {
+    owner.filter(|_| !closing.load(Ordering::SeqCst))
+}
+
 /// A request that found the owner closed.
 fn closed(audience: Audience) -> Rejected {
     Rejected::new(closed_error(), audience)
@@ -121,8 +127,8 @@ impl Generation {
             chunk: residency.rows.rows as usize,
             capacity,
             drafts,
-            #[cfg(feature = "test-oracles")]
             closing: AtomicBool::new(false),
+            #[cfg(feature = "test-oracles")]
             panic_after_admissions: AtomicU64::new(u64::MAX),
             #[cfg(feature = "test-oracles")]
             settle_after_speculation: AtomicBool::new(false),
@@ -256,7 +262,7 @@ impl Generation {
         // A request that begins once the engine stops is refused as a closed one: the stop's cancel is an operation on
         // the owner, so whatever begins after it sees the flag.
         let shared = Arc::clone(&self.shared);
-        let begin = move |owner: Option<&mut Owner>| begin(owner.filter(|_| !shared.closing.load(Ordering::SeqCst)));
+        let begin = move |owner: Option<&mut Owner>| begin(unless_closing(&shared.closing, owner));
         let mut begin = Some(begin);
         let inline = self
             .mailbox
@@ -321,10 +327,12 @@ impl Generation {
     }
 
     /// Cancels the request that runs, if any, and waits at most `bound` until it ended and its listener was told its
-    /// last call. Refuses new requests from now on. Runs while the lattice still works: the request ends on its
-    /// workers. `false` when the bound passed (a request is still running) or when called from inside a listener's
-    /// callback (refused at once: only that callback's return could let the request end). For the engine's owner,
-    /// outside the lattice.
+    /// last call (a request that ends in a stop is told `Cancelled`). Refuses new requests from now on. Runs while the
+    /// lattice still works: the request ends on its workers. `false` when the bound passed with a request still
+    /// running, and the caller must not free what it uses. Called from inside a listener's `token`, `quantum` or
+    /// `prefill_done` it returns `false` at once (the owner's turn that makes the call is what would end the request).
+    /// Called from inside `finished` it cannot be told apart, and waits the bound for that very call to return, so it
+    /// returns `false` after the bound. For the engine's owner, outside the lattice.
     pub(crate) fn stop(&self, bound: Duration) -> bool {
         self.shared.closing.store(true, Ordering::SeqCst);
         let stopped = self.mailbox.stop(bound);
@@ -340,5 +348,20 @@ impl Generation {
             Some(owner) => owner.close(),
             None => log::error!("a generation is running at shutdown: the sequence's device memory stays allocated"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_request_begins_on_an_owner_once_the_engine_stops() {
+        let closing = AtomicBool::new(false);
+        let mut owner = 7;
+        assert_eq!(unless_closing(&closing, Some(&mut owner)).copied(), Some(7));
+        closing.store(true, Ordering::SeqCst);
+        assert!(unless_closing(&closing, Some(&mut owner)).is_none());
+        assert!(unless_closing::<i32>(&closing, None).is_none());
     }
 }

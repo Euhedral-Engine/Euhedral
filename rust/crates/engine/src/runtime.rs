@@ -5,6 +5,7 @@
 //! are allocated, the weights are uploaded along their chains, and the modules are warmed. The latch is set when the
 //! model is ready, or with the error that stopped it. The calling thread waits for the latch and for nothing else.
 
+use std::cell::Cell;
 use std::fmt;
 use std::mem::{self, ManuallyDrop};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -201,15 +202,27 @@ pub struct Teardown {
     lattice: Arc<ControlPlaneLattice>,
     /// Device bytes the runtime allocated and `shutdown` has not freed.
     pub(crate) device_bytes: AtomicU64,
+    /// How long `shutdown` waits for a running request to end after its cancel: the lattice's close timeout.
+    pub(crate) cancel_bound: Duration,
 }
 
 impl Teardown {
     /// The teardown of `lattice` and the `lakes` that feed it.
     pub fn new(lattice: Arc<ControlPlaneLattice>, lakes: Vec<Arc<Lake>>) -> Arc<Teardown> {
+        Teardown::with_cancel_bound(lattice, lakes, OPERATION_BOUND)
+    }
+
+    /// [`new`](Teardown::new) with the time `shutdown` waits for a running request to end.
+    pub(crate) fn with_cancel_bound(
+        lattice: Arc<ControlPlaneLattice>,
+        lakes: Vec<Arc<Lake>>,
+        cancel_bound: Duration,
+    ) -> Arc<Teardown> {
         Arc::new(Teardown {
             lakes,
             lattice,
             device_bytes: AtomicU64::new(0),
+            cancel_bound,
         })
     }
 
@@ -259,9 +272,25 @@ impl RuntimeOwner {
     /// alive.
     pub fn shutdown(mut self, runtime: Arc<EngineRuntime>) -> Result<(), EngineError> {
         let teardown = self.teardown.take();
-        runtime.generation.stop(OPERATION_BOUND);
+        let bound = teardown
+            .as_ref()
+            .map_or(OPERATION_BOUND, |teardown| teardown.cancel_bound);
+        // The running request ends on the lattice's workers, so before the lattice closes.
+        let stopped = runtime.generation.stop(bound);
         if let Some(teardown) = &teardown {
             teardown.close();
+        }
+        if !stopped {
+            // A quantum may still be in flight: nothing it uses is freed. The runtime is forgotten, not dropped, because
+            // dropping it frees the sequence's buffers, which waits for the device.
+            if let Some(teardown) = &teardown {
+                teardown.log_leak();
+            }
+            mem::forget(runtime);
+            return Err(EngineError::Runtime(
+                "a generation did not end after its cancel: the device memory stays allocated until the process exits"
+                    .to_string(),
+            ));
         }
         match Arc::try_unwrap(runtime) {
             Ok(runtime) => {
@@ -343,42 +372,66 @@ impl RuntimeOwner {
     /// window, the device memory is not freed. A free that has begun is not interrupted.
     pub fn shutdown_within(mut self, runtime: Arc<EngineRuntime>, window: Duration) -> Result<(), EngineError> {
         let teardown = self.teardown.take();
+        let stopped = Cell::new(true);
         stop_within(
             window,
             (runtime, teardown),
             |(runtime, teardown)| {
                 // The running request ends on the lattice's workers, so before the lattice closes.
-                runtime.generation.stop(window);
+                let bound = teardown
+                    .as_ref()
+                    .map_or(window, |teardown| window.min(teardown.cancel_bound));
+                stopped.set(runtime.generation.stop(bound));
                 if let Some(teardown) = teardown {
                     teardown.close();
                 }
             },
-            |(runtime, teardown)| match Arc::try_unwrap(runtime) {
-                Ok(runtime) => {
-                    runtime.release();
-                    if let Some(teardown) = &teardown {
-                        teardown.device_bytes.store(0, Ordering::Release);
+            |(runtime, teardown)| {
+                match stopped.get() {
+                    false => {
+                        // A quantum may still be in flight: nothing it uses is freed, and dropping the runtime would.
+                        if let Some(teardown) = &teardown {
+                            teardown.log_leak();
+                        }
+                        mem::forget(runtime);
+                        Err(EngineError::Runtime(
+                            "a generation did not end after its cancel: the device memory stays allocated until the \
+                         process exits"
+                                .to_string(),
+                        ))
                     }
-                    Ok(())
+                    true => Ok((runtime, teardown)),
                 }
-                Err(_) => {
-                    if let Some(teardown) = &teardown {
-                        teardown.log_leak();
+                .and_then(|(runtime, teardown)| match Arc::try_unwrap(runtime) {
+                    Ok(runtime) => {
+                        runtime.release();
+                        if let Some(teardown) = &teardown {
+                            teardown.device_bytes.store(0, Ordering::Release);
+                        }
+                        Ok(())
                     }
-                    Err(EngineError::Runtime(
+                    Err(_) => {
+                        if let Some(teardown) = &teardown {
+                            teardown.log_leak();
+                        }
+                        Err(EngineError::Runtime(
                         "another handle to the runtime is alive: its device memory stays allocated until the process \
                          exits"
                             .to_string(),
                     ))
-                }
+                    }
+                })
             },
             |(_, teardown)| {
                 let bytes = teardown
                     .as_ref()
                     .map_or(0, |teardown| teardown.device_bytes.load(Ordering::Acquire));
-                format!(
-                    "the lattice was still closing; {bytes} bytes of device memory stay allocated until the process exits"
-                )
+                let what = if stopped.get() {
+                    "the lattice was still closing"
+                } else {
+                    "a generation did not end after its cancel"
+                };
+                format!("{what}; {bytes} bytes of device memory stay allocated until the process exits")
             },
         )
     }
@@ -761,6 +814,7 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
     if let Some(timeout) = close_timeout {
         config.shutdown_timeout = timeout;
     }
+    let cancel_bound = config.shutdown_timeout;
     let lattice = ControlPlaneLattice::new(config)
         .map_err(|error| runtime("the lattice would not start", &format!("{error:?}")))?;
 
@@ -800,9 +854,10 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         .map_err(|error| runtime("the lattice would not take the completions", &format!("{error:?}")))?;
     let pool_bytes = startup::pinned_pool_bytes(settings, &machine);
     let pool = PinnedPool::new(&library, pool_bytes);
-    let teardown = Teardown::new(
+    let teardown = Teardown::with_cancel_bound(
         Arc::clone(&lattice),
         vec![Arc::clone(&stages), Arc::clone(&host), Arc::clone(&control)],
+        cancel_bound,
     );
     Ok(Arc::new(Core {
         settings: settings.clone(),

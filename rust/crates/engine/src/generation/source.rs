@@ -135,9 +135,9 @@ pub(crate) struct Shared {
     pub(crate) capacity: u64,
     /// What speculation needs of the artifact; `None` for an artifact without the draft layer.
     pub(crate) drafts: Option<Drafts>,
-    /// A test hook: the owner panics at the end of the turn in which it has admitted this many quanta.
     /// Set when the engine stops: no request begins after it.
     pub(crate) closing: AtomicBool,
+    /// A test hook: the owner panics at the end of the turn in which it has admitted this many quanta.
     #[cfg(feature = "test-oracles")]
     pub(crate) panic_after_admissions: AtomicU64,
     /// A test hook: a speculative request ends with one decode quantum that feeds its last token, so that the state of
@@ -485,14 +485,16 @@ impl Run {
 pub(crate) enum Finished {
     Greedy(Box<dyn GenerationListener>, GenerationOutcome),
     Forced(Box<dyn LogitsSink>, GenerationOutcome),
-    /// The owner is idle and every outcome before this one was told: a shutdown waits for it.
+    /// The marker a shutdown waits for: the owner is idle, and the mailbox sends it once every outcome before it was
+    /// told.
     Idle(Arc<Handoff<()>>),
 }
 
 impl Finished {
     pub(crate) fn deliver(self) {
         match self {
-            Finished::Idle(idle) => idle.send(()),
+            // Never told as an outcome: the mailbox holds it until no delivery runs (`Turn::into_barrier`).
+            Finished::Idle(_) => {}
             Finished::Greedy(mut listener, outcome) => listener.finished(outcome),
             Finished::Forced(mut sink, outcome) => sink.finished(outcome),
         }
@@ -1739,10 +1741,19 @@ impl Turn for Owner {
         if let Some(run) = self.run.as_mut() {
             run.stop(FinishReason::Cancelled);
         }
-        if self.idle() {
-            idle.send(());
+        // Always told through the outcomes' own path, after them: also with nothing running, because a turn that ended
+        // the request may have its outcome in a list not yet told.
+        if self.run.is_none() && self.parked.is_empty() {
+            self.finished.push_back(Finished::Idle(idle));
         } else {
             self.watch = Some(idle);
+        }
+    }
+
+    fn into_barrier(finished: Finished) -> Result<Arc<Handoff<()>>, Finished> {
+        match finished {
+            Finished::Idle(idle) => Ok(idle),
+            other => Err(other),
         }
     }
 

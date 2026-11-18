@@ -45,7 +45,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::fmt::{self, Formatter};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::atomic::{AtomicBool, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -94,6 +94,10 @@ pub(crate) trait Turn: Send + 'static {
     /// outcome was told (the sending is the last of the outcomes, so after the audience's last call). With nothing
     /// running, `idle` is sent at once. The owner's own turn ends it: this only asks.
     fn shut(&mut self, idle: Arc<Handoff<()>>);
+
+    /// Whether `finished` is the marker `shut` leaves instead of an outcome: its hand-off is sent once no outcome is
+    /// being told on any thread, and not before the outcomes that came before it were.
+    fn into_barrier(finished: Self::Finished) -> Result<Arc<Handoff<()>>, Self::Finished>;
 
     /// Whether no request is in flight and nothing the owner queued on the device is still held: only then may a
     /// thread outside the frames look at the owner's state or end it.
@@ -192,6 +196,11 @@ pub(crate) struct Mailbox<O: Turn> {
     operations: Producer<Operation<O>, Multi>,
     /// Set by every post after its offer, cleared by the holder before its turn.
     pending: AtomicBool,
+    /// Outcomes taken under the claim and not yet told: counted before the claim is released, so that whoever takes the
+    /// claim next sees the tellings that are still running.
+    delivering: AtomicUsize,
+    /// The hand-off a [`stop`](Self::stop) waits on, until nothing is being told. One stop at a time.
+    barrier: Handoff<Arc<Handoff<()>>>,
     spawn: Spawn,
     /// Test hook: told whether the claim is held at the moment `pending` is loaded after a release.
     #[cfg(test)]
@@ -221,6 +230,8 @@ impl<O: Turn> Mailbox<O> {
             inbox,
             operations,
             pending: AtomicBool::new(false),
+            delivering: AtomicUsize::new(0),
+            barrier: Handoff::empty(),
             spawn,
             #[cfg(test)]
             looked: OnceLock::new(),
@@ -274,9 +285,10 @@ impl<O: Turn> Mailbox<O> {
                 if let Some(gap) = self.closed_gap.get() {
                     gap();
                 }
+                self.delivering.fetch_add(refused.len(), Ordering::SeqCst);
                 claim.release_seq_cst();
                 drop(held);
-                if let Some(payload) = Self::deliver_all(refused) {
+                if let Some(payload) = self.deliver_all(refused) {
                     self.hand_on();
                     resume_unwind(payload);
                 }
@@ -301,9 +313,10 @@ impl<O: Turn> Mailbox<O> {
             finished.extend(self.settle_operations(state));
             // The claim goes back before `pending` is loaded, and before anyone is told: a listener that starts the
             // next request from `finished` finds the owner free.
+            self.delivering.fetch_add(finished.len(), Ordering::SeqCst);
             claim.release_seq_cst();
             drop(held);
-            let delivered = Self::deliver_all(finished);
+            let delivered = self.deliver_all(finished);
             if let Some(payload) = failure.or(delivered) {
                 self.hand_on();
                 resume_unwind(payload);
@@ -385,13 +398,32 @@ impl<O: Turn> Mailbox<O> {
         finished
     }
 
-    /// Tells each outcome's audience; the first panic of a listener is returned once all were told.
-    fn deliver_all(finished: Vec<O::Finished>) -> Option<Payload> {
+    /// Tells each outcome's audience; the first panic of a listener is returned once all were told. The outcomes were
+    /// counted in `delivering` under the claim. A shutdown's marker is sent once the count is zero: no outcome is
+    /// being told on any thread.
+    fn deliver_all(&self, finished: Vec<O::Finished>) -> Option<Payload> {
+        let count = finished.len();
         let mut first = None;
+        let mut barriers = Vec::new();
         for finished in finished {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| O::deliver(finished))) {
-                first.get_or_insert(payload);
+            match O::into_barrier(finished) {
+                Ok(barrier) => barriers.push(barrier),
+                Err(finished) => {
+                    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| O::deliver(finished))) {
+                        first.get_or_insert(payload);
+                    }
+                }
             }
+        }
+        self.delivering.fetch_sub(count, Ordering::SeqCst);
+        for barrier in barriers {
+            self.barrier.send(barrier);
+        }
+        // Parked before this load, or the thread that brings the count to zero finds it parked.
+        if self.delivering.load(Ordering::SeqCst) == 0
+            && let Some(barrier) = self.barrier.take()
+        {
+            barrier.send(());
         }
         first
     }
@@ -425,9 +457,10 @@ impl<O: Turn> Mailbox<O> {
             Some(owner) if idle_only && !owner.idle() => Ok(None),
             Some(owner) => catch_unwind(AssertUnwindSafe(|| work(owner))).map(Some),
         };
+        self.delivering.fetch_add(finished.len(), Ordering::SeqCst);
         claim.release_seq_cst();
         drop(held);
-        let delivered = Self::deliver_all(finished);
+        let delivered = self.deliver_all(finished);
         self.hand_on();
         match (outcome, delivered) {
             (Err(payload), _) | (Ok(_), Some(payload)) => resume_unwind(payload),
@@ -540,9 +573,10 @@ impl<O: Turn> Mailbox<O> {
         } else {
             None
         };
+        self.delivering.fetch_add(finished.len(), Ordering::SeqCst);
         claim.release_seq_cst();
         drop(held);
-        let delivered = Self::deliver_all(finished);
+        let delivered = self.deliver_all(finished);
         self.hand_on();
         if let Some(payload) = delivered {
             resume_unwind(payload);
@@ -620,6 +654,8 @@ mod tests {
     /// How long a posted message may wait for its turn before the test fails.
     const BOUND: Duration = Duration::from_secs(1);
 
+    /// A hand-off that tells the test the delivery entered, and one that releases it.
+    type Gate = (Arc<Handoff<()>>, Arc<Handoff<()>>);
     type Work = Box<dyn FnOnce() + Send>;
     type Queued = (Arc<Mailbox<Probe>>, Arc<Address<Probe>>, Consumer<Work, Single>);
 
@@ -662,6 +698,8 @@ mod tests {
         shuts: Arc<AtomicUsize>,
         /// The listener of the request `shut` ends.
         listener: Option<Arc<Done>>,
+        /// The marker `shut` leaves after the outcomes.
+        marker: Option<Arc<Done>>,
     }
 
     struct Done {
@@ -669,6 +707,10 @@ mod tests {
         admitted: Arc<Handoff<bool>>,
         /// The delivery panics.
         panics: bool,
+        /// The delivery tells that it entered, then waits to be released: a listener that blocks in `finished`.
+        gate: Option<Gate>,
+        /// The shutdown's marker, not an outcome.
+        barrier: Option<Arc<Handoff<()>>>,
     }
 
     impl Probe {
@@ -694,6 +736,7 @@ mod tests {
                 obeys_shut: true,
                 shuts: Arc::new(AtomicUsize::new(0)),
                 listener: None,
+                marker: None,
             }
         }
     }
@@ -748,7 +791,14 @@ mod tests {
         }
 
         fn take_finished(&mut self) -> Vec<Arc<Done>> {
-            self.done.take().into_iter().collect()
+            self.done.take().into_iter().chain(self.marker.take()).collect()
+        }
+
+        fn into_barrier(finished: Arc<Done>) -> Result<Arc<Handoff<()>>, Arc<Done>> {
+            match &finished.barrier {
+                Some(barrier) => Ok(Arc::clone(barrier)),
+                None => Err(finished),
+            }
         }
 
         fn abandon(&mut self, _why: &str) -> Vec<Arc<Done>> {
@@ -758,6 +808,10 @@ mod tests {
 
         fn deliver(finished: Arc<Done>) {
             assert!(!finished.panics, "the listener panicked");
+            if let Some((entered, release)) = &finished.gate {
+                entered.send(());
+                release.wait(BOUND).expect("the test releases the listener");
+            }
             // A listener that starts the next request from here: it needs the claim.
             let admitted = finished
                 .address
@@ -776,7 +830,14 @@ mod tests {
                 self.busy = false;
                 self.done = self.listener.take();
             }
-            idle.send(());
+            // As the owner does: the marker follows the outcomes, in the same list.
+            self.marker = Some(Arc::new(Done {
+                address: Address::new(),
+                admitted: Handoff::new(),
+                panics: false,
+                gate: None,
+                barrier: Some(idle),
+            }));
         }
 
         fn idle(&self) -> bool {
@@ -946,6 +1007,8 @@ mod tests {
                     address: Arc::clone(&address),
                     admitted: Arc::clone(&admitted),
                     panics: false,
+                    gate: None,
+                    barrier: None,
                 }));
             })
             .expect("free");
@@ -1023,6 +1086,8 @@ mod tests {
                     address: Arc::clone(&address),
                     admitted: Handoff::new(),
                     panics: true,
+                    gate: None,
+                    barrier: None,
                 }));
                 // A turn that posts while it holds the claim leaves a message waiting after its release.
                 probe.address = Some(Arc::clone(&address));
@@ -1049,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_with_a_request_in_flight_cancels_it_tells_the_listener_once_and_leaves_the_owner_idle() {
+    fn a_stop_with_a_request_in_flight_cancels_it_and_returns_after_the_listener_was_told_once() {
         let (mailbox, address) = threaded(Probe::new);
         let admitted = Handoff::new();
         let shuts = mailbox
@@ -1059,16 +1124,51 @@ mod tests {
                     address: Arc::clone(&address),
                     admitted: Arc::clone(&admitted),
                     panics: false,
+                    gate: None,
+                    barrier: None,
                 }));
                 Arc::clone(&probe.shuts)
             })
             .expect("free");
         assert!(mailbox.stop(BOUND), "the request did not end");
         assert_eq!(shuts.load(Ordering::SeqCst), 1);
-        assert!(admitted.wait(BOUND).is_ok(), "the listener was not told");
+        assert!(admitted.is_set(), "stop returned before the listener was told");
         let owner = mailbox.close().expect("the owner is idle after the stop");
         assert!(!owner.busy);
         assert!(owner.listener.is_none() && owner.done.is_none(), "told more than once");
+    }
+
+    #[test]
+    fn a_stop_waits_for_an_outcome_that_another_thread_is_telling() {
+        let (mailbox, address) = threaded(Probe::new);
+        let (entered, release, told) = (Handoff::new(), Handoff::new(), Handoff::new());
+        mailbox
+            .with(|probe| {
+                // The request ends in the turn the message starts; its listener blocks in `finished`.
+                probe.last = Some(1);
+                probe.done = Some(Arc::new(Done {
+                    address: Arc::clone(&address),
+                    admitted: Arc::clone(&told),
+                    panics: false,
+                    gate: Some((Arc::clone(&entered), Arc::clone(&release))),
+                    barrier: None,
+                }));
+            })
+            .expect("free");
+        let poster = Arc::clone(&mailbox);
+        thread::spawn(move || poster.post(1));
+        entered.wait(BOUND).expect("the listener is being told");
+        let stopper = Arc::clone(&mailbox);
+        let stopped = Handoff::new();
+        let answer = Arc::clone(&stopped);
+        thread::spawn(move || answer.send(stopper.stop(BOUND)));
+        assert!(
+            stopped.wait(Duration::from_millis(200)).is_err(),
+            "the stop returned while a listener was still in `finished`"
+        );
+        release.send(());
+        assert_eq!(stopped.wait(BOUND), Ok(true));
+        assert!(told.is_set(), "the listener's call had not ended");
     }
 
     #[test]
@@ -1083,8 +1183,6 @@ mod tests {
         let bound = Duration::from_millis(100);
         let start = Instant::now();
         assert!(!mailbox.stop(bound));
-        // The waiting operation is not run twice; the owner is still busy.
-
         assert!(start.elapsed() < BOUND, "the stop waited past its bound");
         assert!(mailbox.close().is_none(), "the owner left while a request runs");
     }
@@ -1336,6 +1434,8 @@ mod tests {
                     address: Arc::clone(&address),
                     admitted: Arc::clone(&admitted),
                     panics: false,
+                    gate: None,
+                    barrier: None,
                 }));
             })
             .expect("free");
@@ -1357,6 +1457,8 @@ mod tests {
             address: Arc::clone(&address),
             admitted: Arc::clone(&admitted),
             panics: false,
+            gate: None,
+            barrier: None,
         });
         // The claim is held (by a turn) when the request is posted, and the owner is closed when it is run.
         let claim = mailbox.owner.try_claim().expect("free");
@@ -1465,6 +1567,8 @@ mod tests {
             address: Arc::clone(&address),
             admitted: Arc::clone(&admitted),
             panics: false,
+            gate: None,
+            barrier: None,
         });
         // The claim is held when the operation is posted, as for a request begun from a listener.
         let claim = mailbox.owner.try_claim().expect("free");
@@ -1494,6 +1598,8 @@ mod tests {
                     address: Arc::clone(&address),
                     admitted: Arc::clone(&admitted),
                     panics: false,
+                    gate: None,
+                    barrier: None,
                 }));
             })
             .expect("free");
