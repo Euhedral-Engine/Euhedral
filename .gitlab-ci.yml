@@ -1,5 +1,17 @@
 # GitLab twin of .github/workflows/rust.yaml and native-package.yaml (Linux only; no Windows/ARM runners, and the Intel
 # SDE AVX-512 step is left to GitHub). Jobs run in the arbiter-gated runner; the lease is set by ARBITER_ARGS.
+#
+# `promote` is the release step, played by hand in the pipeline of an integration commit whose `rust` and `native-package` jobs
+# passed (or under Deployments, environment `main`): scripts/ci-promote.sh moves main to that commit, starts the next
+# integration branch there (protected, the open merge requests moved to it, INTEGRATION_BRANCH set to it) and deletes the old
+# branch on GitLab; the push mirror deletes it on GitHub. It checks everything first and changes nothing when a check fails.
+# It only runs git and the GitLab API: it never deploys (scripts/deploy-main.py is run by hand).
+#
+# The pipeline reads these CI/CD variables of the project (Settings > CI/CD > Variables), none of them in the repository:
+#   INTEGRATION_BRANCH     the integration branch's name (rust/next; not protected); `promote` sets it
+#   PROMOTE_TOKEN          protected and masked: a project access token for `promote` (Maintainer; api, write_repository)
+#   NEXT_BRANCH            optional, given when `promote` is played: the new branch's name (default: the old number plus one,
+#                          or "-2" appended to a name without a number)
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -40,3 +52,43 @@ native-package:
   artifacts:
     when: on_failure
     paths: [api/build/test-results/test/*.xml]
+
+# Tests of scripts/ci-promote.sh against local bare repositories (no GitLab calls).
+promote-test:
+  stage: test
+  image: debian:trixie-slim
+  rules:
+    - changes: ["scripts/ci-promote.sh", "scripts/test_ci_promote.py", ".gitlab-ci.yml"]
+  variables:
+    ARBITER_ARGS: "--cpu shared:1 --mem 1G"
+    ARBITER_EST: "120"
+  script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git jq python3 >/dev/null
+    - python3 -m unittest scripts/test_ci_promote.py
+
+# The release step, by hand (see the header). It needs the pipeline's `rust` and `native-package` jobs (when their rules ran
+# them) to have passed, never runs beside another promotion, and a run from an older pipeline stops at its first check.
+promote:
+  stage: deploy
+  image: debian:trixie-slim   # git 2.47 (merge-tree --write-tree needs 2.38), curl, jq
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $INTEGRATION_BRANCH
+      when: manual
+      allow_failure: true   # the pipeline is green whether or not this is played
+  needs:
+    - job: rust
+      optional: true
+    - job: native-package
+      optional: true
+  timeout: 20m
+  resource_group: integration
+  environment:
+    name: main
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: "0"
+    ARBITER_ARGS: "--cpu shared:1 --mem 1G"
+    ARBITER_EST: "300"
+  script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl jq ca-certificates >/dev/null
+    - scripts/ci-promote.sh
