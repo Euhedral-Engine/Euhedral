@@ -113,10 +113,11 @@ impl EngineBackend {
         codec: Arc<dyn Codec>,
         sink: Arc<QueueIngestSink>,
         model_id: String,
-    ) -> EngineBackend {
+    ) -> Result<EngineBackend, String> {
         let context_length = engine.context_length();
-        let grammars = Grammars::new(codec.as_ref(), engine.vocabulary_size());
-        EngineBackend {
+        let grammars = Grammars::new(codec.as_ref(), engine.vocabulary_size())
+            .map_err(|reason| format!("the model's vocabulary cannot be enforced by a grammar: {reason}"))?;
+        Ok(EngineBackend {
             engine,
             codec,
             sink,
@@ -124,7 +125,7 @@ impl EngineBackend {
             context_length,
             grammars,
             available: Arc::new(AtomicBool::new(true)),
-        }
+        })
     }
 
     /// Stops admitting generations and refuses the frames offered from now on (their continuations are told): the lattice
@@ -156,8 +157,7 @@ impl Backend for EngineBackend {
         self.engine.report()
     }
 
-    fn refusal(&self, endpoint: Endpoint, request: &GenerationRequest) -> Option<ApiError> {
-        let _ = endpoint;
+    fn refusal(&self, _endpoint: Endpoint, request: &GenerationRequest) -> Option<ApiError> {
         sampling_problem(request)
     }
 

@@ -321,12 +321,10 @@ impl EngineStarting {
             context_length,
             vocabulary_size: runtime.config().vocab_size,
         });
-        let backend = Arc::new(EngineBackend::new(
-            engine,
-            Arc::new(self.tokenizer),
-            sink,
-            self.settings.model.name.clone(),
-        ));
+        let backend = Arc::new(
+            EngineBackend::new(engine, Arc::new(self.tokenizer), sink, self.settings.model.name.clone())
+                .map_err(StartError::Engine)?,
+        );
         Ok(EngineHost {
             owner,
             runtime,

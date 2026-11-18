@@ -149,13 +149,17 @@ fn a_greedy_json_schema_answer_parses_and_matches_the_schema() {
     let Some(served) = Served::start() else {
         return;
     };
+    let before = served.counter("euhedral_reasoning_tokens_total");
     let schema = r#"{"type":"object","properties":{"city":{"type":"string"},"population_millions":{"type":"integer"}},"required":["city","population_millions"],"additionalProperties":false}"#;
     let body = format!(
-        r#"{{"model":"qwen","messages":[{{"role":"user","content":"Name one large city in France and its population in millions."}}],"max_tokens":120,"temperature":0,"reasoning_effort":"none","response_format":{{"type":"json_schema","json_schema":{{"name":"city","strict":true,"schema":{schema}}}}}}}"#
+        r#"{{"model":"qwen","messages":[{{"role":"user","content":"Name one large city in France and its population in millions."}}],"max_tokens":1500,"temperature":0,"response_format":{{"type":"json_schema","json_schema":{{"name":"city","strict":true,"schema":{schema}}}}}}}"#
     );
     let response = served.post("/v1/chat/completions", &body);
     let answer = text(&response);
     assert_eq!(response.status, 200, "{answer}");
+    let reasoned = served.counter("euhedral_reasoning_tokens_total") - before;
+    println!("the reasoning tokens before the constrained answer: {reasoned}");
+    assert!(reasoned > 0.0, "reasoning was on: {answer}");
     let json = JsonValue::parse(answer).expect("a JSON body");
     let Some(JsonValue::Array(choices)) = json.get("choices") else {
         panic!("no choices: {answer}");

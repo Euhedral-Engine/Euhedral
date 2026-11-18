@@ -20,13 +20,10 @@
 
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter, Result as FmtResult, Write};
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use llguidance::api::{GrammarInit, ParserLimits, TopLevelGrammar};
+use llguidance::ParserFactory;
 use llguidance::earley::SlicedBiasComputer;
-use llguidance::panic_utils::catch_unwind;
-use llguidance::{Logger, Matcher, ParserFactory};
 use thiserror::Error;
 use toktrie::{ApproximateTokEnv, InferenceCapabilities, TokEnv, TokRxInfo, TokTrie};
 
@@ -39,8 +36,10 @@ use crate::tool_calling::{FunctionTool, ToolCalling};
 mod matcher;
 mod vocabulary;
 
-use matcher::{CompiledGrammars, Kind, grammar_refusal, schema_refusal};
-pub use matcher::{DEFAULT_CACHED_GRAMMARS, GrammarMatcher, MatcherError};
+pub use matcher::{
+    CompiledGrammar, DEFAULT_CACHED_GRAMMARS, GrammarCompiler, GrammarKind, GrammarMatcher, MatcherError,
+};
+use matcher::{CompiledGrammars, grammar_refusal, schema_refusal};
 pub use vocabulary::{end_ids, token_bytes};
 
 /// The skipped whitespace between JSON tokens.
@@ -326,7 +325,7 @@ impl GrammarCheck for GrammarChecker {
 
 /// Checks that grammars and JSON schemas compile over one vocabulary, the way the generation will compile them.
 pub struct GrammarChecker {
-    factory: ParserFactory,
+    factory: Arc<ParserFactory>,
     size: u32,
     end_ids: Arc<[u32]>,
     compiled: CompiledGrammars,
@@ -390,7 +389,7 @@ impl GrammarChecker {
         )
         .map_err(|error| VocabularyError(error.to_string()))?;
         Ok(GrammarChecker {
-            factory,
+            factory: Arc::new(factory),
             size,
             end_ids: end_ids.into(),
             compiled: CompiledGrammars::new(cached_grammars),
@@ -400,7 +399,7 @@ impl GrammarChecker {
     /// Whether llguidance compiles the Lark grammar; the refusal is a 400 without a parameter. A compiled grammar is
     /// kept for [`GrammarChecker::constraint`] to start from.
     pub fn check_grammar(&mut self, grammar: &str) -> Result<(), ApiError> {
-        self.check(Kind::Lark, grammar)
+        self.check(GrammarKind::Lark, grammar)
             .map_err(|refused| grammar_refusal(&refused))
     }
 
@@ -408,36 +407,26 @@ impl GrammarChecker {
     /// grammar around it; the refusal is an unenforceable schema at `param`. A compiled schema is kept for
     /// [`GrammarChecker::json_schema_constraint`] to start from.
     pub fn check_json_schema(&mut self, schema: &JsonValue, param: &str) -> Result<(), ApiError> {
-        self.check(Kind::JsonSchema, &OutputGrammar::schema_text(schema))
+        self.check(GrammarKind::JsonSchema, &OutputGrammar::schema_text(schema))
             .map_err(|refused| schema_refusal(&refused, param))
     }
 
     /// As [`GrammarChecker::check_grammar`], with llguidance's summary as the refusal, for a caller that words the
     /// refusal itself.
     pub fn check_grammar_text(&mut self, grammar: &str) -> Result<(), String> {
-        self.check(Kind::Lark, grammar)
+        self.check(GrammarKind::Lark, grammar)
     }
 
     /// As [`GrammarChecker::check_json_schema`] for a schema already in the text [`OutputGrammar::schema_text`]
     /// gives, with llguidance's summary as the refusal.
     pub fn check_schema_text(&mut self, schema: &str) -> Result<(), String> {
-        self.check(Kind::JsonSchema, schema)
+        self.check(GrammarKind::JsonSchema, schema)
     }
 
-    fn matcher(&self, grammar: &str, kind: &str) -> Matcher {
-        // A panic inside llguidance is a refusal ("panic: ..."), as on the native side.
-        let compiled = catch_unwind(AssertUnwindSafe(|| {
-            let parser = TopLevelGrammar::from_tagged_str(kind, grammar).and_then(|top| {
-                self.factory.create_parser_from_init_ext(
-                    GrammarInit::Serialized(top),
-                    Logger::new(0, 0),
-                    InferenceCapabilities::default(),
-                    ParserLimits::default(),
-                )
-            });
-            Ok(Matcher::new(parser))
-        }));
-        compiled.unwrap_or_else(|panicked| Matcher::new(Err(panicked)))
+    /// A handle that compiles grammars over this vocabulary without the checker, so that a caller that shares the
+    /// checker behind a lock compiles outside it.
+    pub fn compiler(&self) -> GrammarCompiler {
+        GrammarCompiler::new(Arc::clone(&self.factory))
     }
 }
 

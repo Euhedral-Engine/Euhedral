@@ -52,18 +52,31 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// cannot be decoded.
 struct Chars;
 
-struct CharStream;
+/// Remembers the last character, so that the tail flush the fake adds after text leaves a closed object alone.
+#[derive(Default)]
+struct CharStream {
+    last: Option<char>,
+}
 
 impl TextStream for CharStream {
     fn push(&mut self, id: u32) -> Result<String, String> {
-        match char::from_u32(id) {
-            Some(letter) if id != BAD => Ok(letter.to_string()),
-            _ => Err(format!("token {id} has no text")),
-        }
+        let text = match id {
+            TOOL_OPEN => Ok("<tool_call>".to_owned()),
+            TOOL_CLOSE => Ok("</tool_call>".to_owned()),
+            _ => match char::from_u32(id) {
+                Some(letter) if id != BAD => Ok(letter.to_string()),
+                _ => Err(format!("token {id} has no text")),
+            },
+        };
+        self.last = text.as_ref().ok().and_then(|text| text.chars().last());
+        text
     }
 
     fn finish(self: Box<Self>) -> String {
-        "!".to_owned()
+        match self.last {
+            Some('}' | '>') => String::new(),
+            _ => "!".to_owned(),
+        }
     }
 }
 
@@ -73,7 +86,7 @@ impl Codec for Chars {
     }
 
     fn stream(&self) -> Box<dyn TextStream> {
-        Box::new(CharStream)
+        Box::new(CharStream::default())
     }
 
     fn stop_tokens(&self) -> Vec<u32> {
@@ -121,6 +134,9 @@ enum Mode {
     Elsewhere(Vec<u32>, FinishReason),
     /// Refuses it with an error, but keeps the listener for the test to drop afterwards.
     RefuseKeeping(AdmissionError),
+    /// Selects these tokens as the engine does a constrained request: prepares the constraint before each token and
+    /// accepts it after, and fails the generation with the constraint's own words when it refuses.
+    Constrained(Vec<u32>),
 }
 
 struct Seen {
@@ -219,6 +235,26 @@ impl Engine for FakeEngine {
                 spawn(move || play(listener.as_mut(), &tokens, reason));
                 Ok(())
             }
+            Mode::Constrained(tokens) => {
+                let tokens = tokens.clone();
+                drop(mode);
+                let mut constraint = locked(&self.seen).last_mut().and_then(|seen| seen.constraint.take());
+                let mut taken = Vec::new();
+                let mut failure = None;
+                for id in tokens {
+                    if let Some(constraint) = constraint.as_mut() {
+                        let step = constraint.prepare().and_then(|()| constraint.accept(id));
+                        if let Err(error) = step {
+                            failure = Some(error.to_string());
+                            break;
+                        }
+                    }
+                    taken.push(id);
+                }
+                let reason = failure.map_or(FinishReason::Stop, FinishReason::Failed);
+                play(listener.as_mut(), &taken, reason);
+                Ok(())
+            }
             Mode::RefuseKeeping(error) => {
                 let error = match error {
                     AdmissionError::Engine(text) => AdmissionError::Engine(text.clone()),
@@ -291,12 +327,9 @@ impl Rig {
         let engine = FakeEngine::new(mode);
         let sink = Arc::new(QueueIngestSink::new());
         lattice.add_upstream(sink.delegate()).expect("sink attached");
-        let backend = Arc::new(EngineBackend::new(
-            engine.clone(),
-            Arc::new(Chars),
-            sink,
-            "fake-model".to_owned(),
-        ));
+        let backend = Arc::new(
+            EngineBackend::new(engine.clone(), Arc::new(Chars), sink, "fake-model".to_owned()).expect("a backend"),
+        );
         Rig {
             lattice,
             engine,
@@ -984,10 +1017,30 @@ fn a_sampled_request_the_engine_refuses_at_begin_ends_with_the_reason() {
     served.finish();
 }
 
-/// Asserts the answer is a refusal of the request itself, not an unsupported parameter.
-fn assert_not_unsupported(response: &Response) {
+/// Asserts the answer is a success.
+fn assert_served(response: &Response) {
     let body = text(response);
-    assert!(!body.contains("unsupported_parameter"), "{body}");
+    assert_eq!(response.status, 200, "{body}");
+}
+
+/// The tokens that spell `text`, a tool call's tags being one token each.
+fn spelled(text: &str) -> Vec<u32> {
+    let mut ids = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("<tool_call>") {
+            ids.push(TOOL_OPEN);
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("</tool_call>") {
+            ids.push(TOOL_CLOSE);
+            rest = after;
+        } else {
+            let mut chars = rest.chars();
+            ids.extend(chars.next().map(u32::from));
+            rest = chars.as_str();
+        }
+    }
+    ids
 }
 
 #[test]
@@ -997,11 +1050,11 @@ fn structured_output_is_constrained_on_every_surface() {
         FinishReason::Stop,
     ));
     let json = r#","reasoning_effort":"none","temperature":0,"response_format":{"type":"json_object"}"#;
-    assert_not_unsupported(&served.post(CHAT, &chat(json)));
-    let format = r#","temperature":0,"output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}"#;
-    assert_not_unsupported(&served.post(MESSAGES, &messages(format)));
-    let format = r#","temperature":0,"text":{"format":{"type":"json_object"}}"#;
-    assert_not_unsupported(&served.post(RESPONSES, &responses(format)));
+    assert_served(&served.post(CHAT, &chat(json)));
+    let format = r#","temperature":0,"thinking":{"type":"disabled"},"output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}"#;
+    assert_served(&served.post(MESSAGES, &messages(format)));
+    let format = r#","temperature":0,"reasoning":{"effort":"none"},"text":{"format":{"type":"json_object"}}"#;
+    assert_served(&served.post(RESPONSES, &responses(format)));
     let seen = locked(&served.rig.engine.seen);
     assert_eq!(seen.len(), 3);
     assert!(seen.iter().all(|seen| seen.constraint.is_some()));
@@ -1015,13 +1068,12 @@ fn structured_output_is_constrained_on_every_surface() {
 
 #[test]
 fn a_forced_tool_call_is_constrained_and_an_automatic_one_is_not() {
-    let served = Served::new(Mode::Run(
-        vec![u32::from('o'), u32::from('k'), STOP],
-        FinishReason::Stop,
-    ));
+    let mut call = spelled("<tool_call>\n<function=f>\n</function>\n</tool_call>");
+    call.push(STOP);
+    let served = Served::new(Mode::Run(call, FinishReason::Stop));
     let tool = r#","temperature":0,"reasoning_effort":"none","tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]"#;
     let forced = format!(r#"{tool},"tool_choice":"required""#);
-    assert_not_unsupported(&served.post(CHAT, &chat(&forced)));
+    assert_served(&served.post(CHAT, &chat(&forced)));
     let mut constraint = constraint_of(&served.rig.engine).expect("a constraint");
     constraint.prepare().expect("a mask");
     assert!(constraint.allows(TOOL_OPEN), "the call opens the output");
@@ -1029,7 +1081,7 @@ fn a_forced_tool_call_is_constrained_and_an_automatic_one_is_not() {
     assert!(!constraint.allows(u32::from('o')));
     locked(&served.rig.engine.seen).clear();
     let auto = format!(r#"{tool},"tool_choice":"auto""#);
-    assert_eq!(served.post(CHAT, &chat(&auto)).status, 200);
+    assert_served(&served.post(CHAT, &chat(&auto)));
     assert!(constraint_of(&served.rig.engine).is_none());
     served.finish();
 }
@@ -1038,7 +1090,7 @@ fn a_forced_tool_call_is_constrained_and_an_automatic_one_is_not() {
 fn a_reasoning_budget_is_a_constraint_on_the_thinking_tokens() {
     let served = Served::new(Mode::Run(vec![u32::from('a'), STOP], FinishReason::Stop));
     let thinking = r#","temperature":0,"thinking":{"type":"enabled","budget_tokens":32}"#;
-    assert_not_unsupported(&served.post(MESSAGES, &messages(thinking)));
+    assert_served(&served.post(MESSAGES, &messages(thinking)));
     let mut constraint = constraint_of(&served.rig.engine).expect("a constraint");
     for _ in 0..32 {
         constraint.prepare().expect("prepared");
@@ -1054,7 +1106,7 @@ fn a_reasoning_budget_is_a_constraint_on_the_thinking_tokens() {
 fn uncapped_reasoning_without_a_grammar_has_no_constraint() {
     let served = Served::new(Mode::Run(vec![u32::from('a'), STOP], FinishReason::Stop));
     let answer = served.post(CHAT, &chat(r#","temperature":0,"reasoning_effort":"high""#));
-    assert_not_unsupported(&answer);
+    assert_served(&answer);
     assert_eq!(locked(&served.rig.engine.seen).len(), 1);
     assert!(constraint_of(&served.rig.engine).is_none());
     served.finish();
@@ -1092,4 +1144,71 @@ fn an_output_that_fails_its_constraint_is_counted() {
         "{scrape}"
     );
     served.finish();
+}
+
+#[test]
+fn a_constraint_that_refuses_a_token_ends_the_request_with_a_server_error() {
+    // The engine selects `x` where the grammar needs an object: the matcher's refusal ends the generation as failed.
+    let served = Served::new(Mode::Constrained(vec![u32::from('x'), STOP]));
+    let json = r#","reasoning_effort":"none","temperature":0,"response_format":{"type":"json_object"}"#;
+    let answer = served.post(CHAT, &chat(json));
+    let body = text(&answer);
+    assert_eq!(answer.status, 500, "{body}");
+    assert!(!body.contains("unsupported"), "{body}");
+    served.finish();
+}
+
+#[test]
+fn a_constraint_that_accepts_every_token_serves_the_answer() {
+    let mut object = spelled("{}");
+    object.push(STOP);
+    let served = Served::new(Mode::Constrained(object));
+    let json = r#","reasoning_effort":"none","temperature":0,"response_format":{"type":"json_object"}"#;
+    let answer = served.post(CHAT, &chat(json));
+    let body = text(&answer);
+    assert_eq!(answer.status, 200, "{body}");
+    assert!(body.contains(r#""content":"{}""#), "{body}");
+    served.finish();
+}
+
+/// A codec whose grammars cannot be built: it names no token that ends one.
+struct NoEnd;
+
+impl Codec for NoEnd {
+    fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
+        Chars.encode(text)
+    }
+
+    fn stream(&self) -> Box<dyn TextStream> {
+        Chars.stream()
+    }
+
+    fn stop_tokens(&self) -> Vec<u32> {
+        Chars.stop_tokens()
+    }
+
+    fn think_end(&self) -> Option<u32> {
+        Chars.think_end()
+    }
+
+    fn token_bytes(&self, size: usize) -> Vec<Vec<u8>> {
+        Chars.token_bytes(size)
+    }
+
+    fn end_ids(&self) -> Vec<u32> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn a_vocabulary_the_grammar_checker_refuses_fails_the_backend_at_its_start() {
+    let sink = Arc::new(QueueIngestSink::new());
+    let failed = EngineBackend::new(
+        FakeEngine::new(Mode::Hold),
+        Arc::new(NoEnd),
+        sink,
+        "fake-model".to_owned(),
+    );
+    let reason = failed.expect_err("the backend refuses the vocabulary");
+    assert!(reason.contains("end token"), "{reason}");
 }
