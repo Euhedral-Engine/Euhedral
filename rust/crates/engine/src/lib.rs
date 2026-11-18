@@ -9,6 +9,7 @@ pub mod handoff;
 pub mod kernels;
 pub mod model;
 pub mod plan;
+pub mod prefix;
 pub mod quantum;
 pub mod residency;
 pub mod runtime;
