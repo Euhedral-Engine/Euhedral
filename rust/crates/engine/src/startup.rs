@@ -31,6 +31,7 @@ use euhedral_inference_edrl::{
 };
 use euhedral_inference_settings::Settings;
 use euhedral_io::{IoBuf, IoDone, OpenSpec, OwnedFile};
+use euhedral_memory::Claim;
 
 use crate::error::EngineError;
 use crate::frames::{Kind, step};
@@ -40,9 +41,11 @@ use crate::model::{
     LayerIndex, MTP_ATTENTION_PACK, ModelConfig, Role, TrellisParts, WeightRef, Weights, companion_name,
     trellis_logical, validate_inventory,
 };
+use crate::residency::accounting::{Consumer, PlanReservation};
 use crate::residency::budget::{self, HostBudget};
+use crate::residency::footprint;
 use crate::residency::loader::{self, LoadOutcome, Ring};
-use crate::residency::planner::{Placement, PlanInputs, ResidencyPlan, plan_with};
+use crate::residency::planner::{LocationBytes, Placement, PlanInputs, ResidencyPlan, plan_with};
 use crate::runtime::resolve_sequences;
 use crate::runtime::{Core, EngineRuntime, ReadyHandoff, StartupReport, Units, free_arrival, raw_file};
 use crate::state::SequenceState;
@@ -134,7 +137,19 @@ pub(crate) fn read_machine() -> Machine {
 struct Startup {
     core: Arc<Core>,
     ready: Option<ReadyHandoff>,
+    /// The plan's admitted reservation, once it is made: the allocations take their claims from it, and the engine
+    /// keeps what is left of it.
+    reservation: Option<PlanReservation>,
     _units: Units,
+}
+
+impl Startup {
+    /// The reservation the allocations take their claims from.
+    fn reservation(&mut self) -> Result<&mut PlanReservation, EngineError> {
+        self.reservation
+            .as_mut()
+            .ok_or_else(|| EngineError::Runtime("the plan was not admitted before its allocations".to_string()))
+    }
 }
 
 impl Startup {
@@ -201,6 +216,7 @@ pub(crate) fn run(core: Arc<Core>, ready: ReadyHandoff) {
     let startup = Startup {
         core,
         ready: Some(ready),
+        reservation: None,
         _units: units,
     };
     startup.then(control, open);
@@ -495,7 +511,7 @@ fn check_segments(
 }
 
 /// Step 3: plans residency against the device and the host. Failing here has allocated nothing on the device.
-fn plan(startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>) {
+fn plan(mut startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>) {
     let core = Arc::clone(&startup.core);
     let planned = core
         .library
@@ -517,24 +533,41 @@ fn plan(startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>)
                 PlanInputs { sequences, ..inputs },
             )
             .map_err(EngineError::from)
+        })
+        // The plan is admitted by the account: its allocations take their claims from the reservation.
+        .and_then(|plan| {
+            let reservation = core.account.admit(&plan)?;
+            let admitted = reservation.admitted();
+            log::info!(
+                "memory admitted: {} bytes on the device, {} bytes of pinned host memory",
+                admitted.device,
+                admitted.host
+            );
+            Ok((plan, reservation))
         });
     match planned {
-        Ok(plan) => startup.then(device, move |startup| allocate(startup, artifact, plan, ends)),
+        Ok((plan, reservation)) => {
+            startup.reservation = Some(reservation);
+            startup.then(device, move |startup| allocate(startup, artifact, plan, ends))
+        }
         Err(error) => startup.fail(error),
     }
 }
 
 /// Step 4: allocates the weight arena, the workspace and the sequence state, and zeroes the state on the first
 /// transfer lane. The load begins when the zeroing has run.
-fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: HashMap<String, Arc<[u32]>>) {
+fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: HashMap<String, Arc<[u32]>>) {
     let core = Arc::clone(&startup.core);
     let allocated = (|| {
+        let reservation = startup.reservation()?;
         let ring = Ring::sized(
             core.settings.host.task_parallelism,
             core.pool_bytes,
             core.host_pinned_bytes,
             core.transfer_lanes(),
         );
+        // Every allocation takes its claim before it allocates: one larger than the plan fails here, naming its consumer.
+        let weights_claim = reservation.claim(Consumer::Weights, plan.arena_bytes)?;
         let arena = DeviceBuffer::alloc(&core.library, plan.arena_bytes as usize)?;
         // Every pinned allocation of the startup happens here: the ring of the upload, and the staging the cache's
         // page tables will take. Once the chains run, the pool allocates nothing.
@@ -560,25 +593,60 @@ fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: Has
         // A drafting sequence admits the quanta of a step together, each reading a record of its own; each sequence has
         // records of its own.
         let records = input_records_for(plan.draft_depth, plan.sequences);
-        let workspace =
+        // The first scratch region is the plan's scratch: what a route needs beyond it (the NVFP4 native route's, which
+        // the plan does not count) is the runtime reserve's, with the workspace's slots and the decode scratch.
+        let planned_scratch = regions[0].min(plan.scratch_bytes);
+        let in_reserve = Workspace::allocation_bytes(&artifact.config, plan.rows, &regions, records) - planned_scratch;
+        let scratch_claim = reservation.claim(Consumer::Scratch, planned_scratch)?;
+        let reserve_claim = reservation.claim(Consumer::RuntimeReserve, in_reserve)?;
+        let mut workspace =
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
+        workspace.hold(scratch_claim);
+        workspace.hold(reserve_claim);
         let (sequences, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {
-            let sequences = (0..plan.sequences)
-                .map(|_| SequenceState::allocate(&core.library, &core.released, &artifact.config, &plan, kernels))
-                .collect::<Result<Vec<_>, _>>()?;
+            let first = first_sequence_bytes(&plan, &artifact.config);
+            let mut sequences = Vec::with_capacity(plan.sequences);
+            for index in 0..plan.sequences {
+                let mut claims = vec![reservation.claim(Consumer::Cache, plan.kv_device_bytes)?];
+                // The first sequence's state is the runtime reserve's; each one beyond it has its own share.
+                claims.push(match index {
+                    0 => reservation.claim(Consumer::RuntimeReserve, first)?,
+                    _ => reservation.claim(Consumer::ExtraSequences, plan.extra_sequence_bytes)?,
+                });
+                if plan.kv_host_bytes > 0 {
+                    claims.push(reservation.claim(Consumer::HostPages, plan.kv_host_bytes / plan.sequences as u64)?);
+                }
+                let mut state =
+                    SequenceState::allocate(&core.library, &core.released, &artifact.config, &plan, kernels)?;
+                for claim in claims {
+                    state = state.with_claim(claim);
+                }
+                sequences.push(state);
+            }
             // The sequences have one shape: the staging of all of them is taken together, once.
             if let Some(first) = sequences.first() {
                 first.prime_staging(&core.pool, sequences.len())?;
             }
             Ok::<_, EngineError>(sequences)
         })?;
-        Ok::<_, EngineError>((ring, arena, loans, workspace, sequences, marker))
+        Ok::<_, EngineError>((ring, arena, weights_claim, loans, workspace, sequences, marker))
     })();
     match allocated {
-        Ok((ring, arena, loans, workspace, sequences, marker)) => {
+        Ok((ring, arena, weights_claim, loans, workspace, sequences, marker)) => {
             // The state is zeroed when the lane reaches the marker; the load starts then.
             let frame = step(Kind::Startup, 0, move || {
-                load(startup, artifact, plan, ends, ring, arena, loans, workspace, sequences)
+                load(
+                    startup,
+                    artifact,
+                    plan,
+                    ends,
+                    ring,
+                    arena,
+                    weights_claim,
+                    loans,
+                    workspace,
+                    sequences,
+                )
             });
             core.completions.after_marker(marker, frame);
         }
@@ -598,6 +666,7 @@ fn load(
     ends: HashMap<String, Arc<[u32]>>,
     ring: Ring,
     arena: DeviceBuffer,
+    weights_claim: Claim,
     loans: Vec<PooledPinned>,
     workspace: Workspace,
     sequences: Vec<SequenceState>,
@@ -610,7 +679,17 @@ fn load(
     let done = move |outcome: LoadOutcome| {
         // The last frame of the load lets go: the next step is a frame of its own.
         startup.then(host, move |startup| {
-            assemble(startup, artifact, plan, ends, ring, workspace, sequences, outcome)
+            assemble(
+                startup,
+                artifact,
+                plan,
+                ends,
+                ring,
+                weights_claim,
+                workspace,
+                sequences,
+                outcome,
+            )
         });
     };
     loader::start(&core, file, names, pieces, chains, arena, loans, done);
@@ -627,6 +706,7 @@ fn assemble(
     plan: ResidencyPlan,
     ends: HashMap<String, Arc<[u32]>>,
     ring: Ring,
+    weights_claim: Claim,
     workspace: Workspace,
     sequences: Vec<SequenceState>,
     outcome: LoadOutcome,
@@ -638,7 +718,7 @@ fn assemble(
         Err(error) => {
             return startup.then(device, move |startup| {
                 drop(arena);
-                drop((workspace, sequences));
+                drop((workspace, sequences, weights_claim));
                 startup.fail(error);
             });
         }
@@ -647,7 +727,11 @@ fn assemble(
     let layers = artifact.config.num_hidden_layers;
     let weights = tensors(&plan, &arena, &ends, layers);
     let objects = plan.device.len();
-    let weights = Weights::new(arena, weights);
+    let weights = Weights::new(arena, weights).with_claim(weights_claim);
+    let admitted = startup
+        .reservation
+        .as_ref()
+        .map_or(LocationBytes { device: 0, host: 0 }, PlanReservation::admitted);
     let allocated =
         plan.arena_bytes + workspace.retained_bytes() + sequences.iter().map(SequenceState::device_bytes).sum::<u64>();
     let begun = core.started;
@@ -683,6 +767,7 @@ fn assemble(
                 piece_bytes: ring.piece_bytes,
                 objects,
                 allocated_bytes: allocated,
+                admitted,
                 device_bytes_in_use: in_use,
                 pinned_staging_bytes: core.pool.allocated_bytes(),
                 pinned_growth_during_load: stats.pinned_growth,
@@ -725,7 +810,23 @@ struct Finish {
 }
 
 impl Finish {
-    fn run(self, draft_ids: Option<Arc<[u32]>>) {
+    /// Takes what the generations need of the reservation: the prefix cache's claim, if the plan grants it memory.
+    fn claim_prefix(&mut self) -> Result<(PlanReservation, Option<Claim>), EngineError> {
+        let mut reservation = self.startup.reservation.take().ok_or_else(|| {
+            EngineError::Runtime("the plan was not admitted before the engine was assembled".to_string())
+        })?;
+        let claim = match self.plan.prefix_cache_bytes {
+            0 => None,
+            bytes => Some(reservation.claim(Consumer::PrefixCache, bytes)?),
+        };
+        Ok((reservation, claim))
+    }
+
+    fn run(mut self, draft_ids: Option<Arc<[u32]>>) {
+        let (reservation, prefix_claim) = match self.claim_prefix() {
+            Ok(taken) => taken,
+            Err(error) => return self.fail(error),
+        };
         let Finish {
             startup,
             plan,
@@ -737,9 +838,19 @@ impl Finish {
         } = self;
         let core = Arc::clone(&startup.core);
         // Every sequence gets an owner, and waits idle in the pool for a request.
-        match Generations::new(&core, &config, &plan, &weights, &workspace, sequences, draft_ids) {
+        match Generations::new(
+            &core,
+            &config,
+            &plan,
+            &weights,
+            &workspace,
+            sequences,
+            draft_ids,
+            prefix_claim,
+        ) {
             Ok(generations) => {
-                let runtime = EngineRuntime::assemble(core, plan, config, weights, workspace, generations, report);
+                let runtime =
+                    EngineRuntime::assemble(core, plan, config, weights, workspace, generations, reservation, report);
                 startup.succeed(runtime);
             }
             // The plan is refused: what is on the device is freed in a frame of the stages lake, which may wait.
@@ -769,6 +880,21 @@ impl Finish {
             startup.fail(error);
         }));
     }
+}
+
+/// The device bytes the first sequence's state takes beyond its cache: what `ResidencyPlan::extra_sequence_bytes` is for
+/// each one beyond it. The runtime reserve pays for it.
+fn first_sequence_bytes(plan: &ResidencyPlan, config: &ModelConfig) -> u64 {
+    let drafts = plan.draft_depth > 0;
+    let verified_rows = if drafts { 1 + plan.draft_depth as u64 } else { 0 };
+    footprint::extra_sequence_bytes(
+        config,
+        plan.kv_format,
+        plan.max_context_tokens as u64,
+        verified_rows,
+        drafts,
+        plan.rows.rows,
+    )
 }
 
 /// A pinned buffer that will hold the draft head's token ids, and where they are on the device.

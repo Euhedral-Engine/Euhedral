@@ -31,6 +31,7 @@ use euhedral_core::generics::FrameSink;
 use euhedral_data_structures::queues::MpscQueue;
 use euhedral_graph::{DEFAULT_RETRY_BACKSTOP, GraphRuntime, RetryCounts};
 use euhedral_inference_cuda::CudaLibrary;
+use euhedral_memory::Claim;
 
 use crate::error::EngineError;
 use crate::formats::{Nvfp4Linear, TrellisLinear};
@@ -38,7 +39,9 @@ use crate::frames::{Kind, step};
 use crate::model::{LayerIndex, ModelConfig, Role, Weights};
 use crate::pass_assembler::PassStatistics;
 use crate::plan::{Formats, Plan, View};
-use crate::prefix::{CacheSpec, Copier, POSITION_GRANULE, PrefixCacheHandle, PrefixCacheStats, open_prefix_cache};
+use crate::prefix::{
+    CacheSpec, Copier, POSITION_GRANULE, PrefixCacheHandle, PrefixCacheStats, open_prefix_cache_claimed,
+};
 use crate::quantum::{Executor, Preparer};
 use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
@@ -439,10 +442,16 @@ impl Generation {
 /// checkpoints. Requests that speculate neither restore nor capture (the state of a draft is not stored); the others do,
 /// on an engine whose sequences can speculate too. Nothing is
 /// opened, and nothing is logged, when the plan granted no memory (`prefix-cache.size: 0`).
-fn open_cache(core: &Arc<Core>, config: &Arc<ModelConfig>, residency: &ResidencyPlan) -> Option<PrefixCacheHandle> {
+fn open_cache(
+    core: &Arc<Core>,
+    config: &Arc<ModelConfig>,
+    residency: &ResidencyPlan,
+    claim: Option<Claim>,
+) -> Option<PrefixCacheHandle> {
     if residency.prefix_cache_bytes == 0 {
         return None;
     }
+    let claim = claim?;
     let settings = core.settings.prefix_cache;
     let chunk = residency.rows.rows;
     if chunk == 0 || !chunk.is_multiple_of(u64::from(POSITION_GRANULE)) {
@@ -467,7 +476,7 @@ fn open_cache(core: &Arc<Core>, config: &Arc<ModelConfig>, residency: &Residency
         chunk: u32::try_from(chunk).ok()?,
         device_tokens: u32::try_from(residency.kv_device_tokens).unwrap_or(u32::MAX),
     };
-    open_prefix_cache(spec, Generation::spawner(core))
+    open_prefix_cache_claimed(spec, Generation::spawner(core), claim)
 }
 
 /// The engine's sequences, each with an owner of its own, the pool that says which of them is idle, and the one order
@@ -495,6 +504,7 @@ impl fmt::Debug for Generations {
 impl Generations {
     /// Builds an owner and the graphs of the model's plan for each of `sequences`, and the one order they share. A
     /// refused plan gives every sequence back.
+    #[allow(clippy::too_many_arguments, reason = "the startup's state, moved into the owners")]
     pub(crate) fn new(
         core: &Arc<Core>,
         config: &Arc<ModelConfig>,
@@ -503,6 +513,7 @@ impl Generations {
         workspace: &Arc<Workspace>,
         sequences: Vec<SequenceState>,
         draft_ids: Option<Arc<[u32]>>,
+        prefix_claim: Option<Claim>,
     ) -> Result<Generations, Box<(EngineError, Vec<SequenceState>)>> {
         assert!(
             workspace.records() as u64 >= input_records_for(residency.draft_depth, sequences.len()),
@@ -532,7 +543,7 @@ impl Generations {
         ));
         let count = sequences.len();
         let peers: Arc<[Arc<Address<Owner>>]> = addresses.iter().map(Arc::clone).collect();
-        let prefix = open_cache(core, config, residency);
+        let prefix = open_cache(core, config, residency, prefix_claim);
         let mut generations: Vec<Generation> = Vec::with_capacity(count);
         let mut waiting = sequences.into_iter().zip(addresses).enumerate();
         while let Some((index, (sequence, address))) = waiting.next() {

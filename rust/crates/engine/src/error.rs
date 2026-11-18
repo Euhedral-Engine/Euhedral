@@ -47,6 +47,10 @@ pub enum PlanError {
     /// A setting the plan reads is out of range.
     #[error("{0}")]
     Setting(String),
+
+    /// The process's memory planner did not admit a plan the residency plan had made: the two disagree.
+    #[error("the memory planner did not admit the plan: {0}")]
+    NotAdmitted(String),
 }
 
 /// Why the engine did not start, or stopped.

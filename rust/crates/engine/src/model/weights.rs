@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use euhedral_inference_cuda::{DeviceBuffer, DevicePtr};
 use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
+use euhedral_memory::Claim;
 
 /// A layer of the model. The decoder layers count from 0; the MTP layer follows them (index 64 in the 64-layer
 /// model, as its KV cache does); the tensors that belong to no layer (embedding, heads, final norm, the MTP stem)
@@ -105,14 +106,26 @@ pub struct WeightRef {
 #[derive(Debug)]
 pub struct Weights {
     tensors: HashMap<(LayerIndex, Role), WeightRef>,
-    // Declared last: the tensors above address this memory.
+    // Declared before the claim: the tensors above address this memory.
     arena: DeviceBuffer,
+    /// The arena's bytes in the engine's memory account, released when the arena is freed.
+    claim: Option<Claim>,
 }
 
 impl Weights {
     /// The weights of `tensors`, which address `arena`.
     pub fn new(arena: DeviceBuffer, tensors: HashMap<(LayerIndex, Role), WeightRef>) -> Self {
-        Self { tensors, arena }
+        Self {
+            tensors,
+            arena,
+            claim: None,
+        }
+    }
+
+    /// The weights, with `claim` for the arena's bytes: it is held until the arena is freed.
+    pub fn with_claim(mut self, claim: Claim) -> Self {
+        self.claim = Some(claim);
+        self
     }
 
     /// The tensor of `layer` in `role`.
