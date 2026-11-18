@@ -44,6 +44,14 @@ pub enum PlanError {
         sequences: usize,
     },
 
+    /// The cache must spill to host memory and the machine does not report what it can spare.
+    #[error(
+        "the attention cache needs {needed} bytes of pinned host memory, and this machine does not report how much \
+         host memory it can spare; set memory.host-limit or memory.host-weights-limit to allow it, or lower \
+         context.max-tokens"
+    )]
+    HostBudgetUnknown { needed: u64 },
+
     /// A setting the plan reads is out of range.
     #[error("{0}")]
     Setting(String),

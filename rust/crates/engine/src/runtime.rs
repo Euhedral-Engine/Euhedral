@@ -153,7 +153,7 @@ pub(crate) struct Core {
     /// is gone. The generation's owner frees them on its lane.
     pub(crate) released: Arc<ReleasedBuffers>,
     /// Pinned host bytes the load may use.
-    pub(crate) host_pinned_bytes: u64,
+    pub(crate) host_pinned_bytes: Option<u64>,
     /// The pinned pool's size (`memory.pinned-buffer-pool`, resolved): what it keeps, and the ring's budget.
     pub(crate) pool_bytes: u64,
     pub(crate) started: Instant,

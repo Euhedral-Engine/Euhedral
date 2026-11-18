@@ -52,7 +52,7 @@ fn inputs(device_free: u64) -> PlanInputs {
     PlanInputs {
         device_free,
         multiprocessors: Some(70),
-        host_pinned_bytes: u64::MAX,
+        host_pinned_bytes: Some(u64::MAX),
         sequences: 1,
     }
 }
@@ -235,12 +235,12 @@ fn kv_spills_beyond_kv_cache_on_gpu_tokens_when_short() {
 
     // Host memory that cannot hold the pages leaves the weights to make room, which they cannot.
     let mut host_short = inputs(need_whole - 1);
-    host_short.host_pinned_bytes = spilled - 1;
+    host_short.host_pinned_bytes = Some(spilled - 1);
     assert!(matches!(
         plan_with(&config, &table, &settings, host_short),
         Err(PlanError::WeightsDoNotFit { .. })
     ));
-    host_short.host_pinned_bytes = spilled;
+    host_short.host_pinned_bytes = Some(spilled);
     assert!(plan_with(&config, &table, &settings, host_short).is_ok());
 
     // A context that already fits in kv-cache-on-gpu-tokens has nothing to spill.
@@ -504,12 +504,12 @@ fn the_host_pages_of_every_sequence_must_fit_the_host() {
         whole.device_bytes - 1
     };
     let mut host = with_sequences(two_need, 2);
-    host.host_pinned_bytes = 2 * spilled - 1;
+    host.host_pinned_bytes = Some(2 * spilled - 1);
     assert!(matches!(
         plan_with(&config, &table, &settings, host),
         Err(PlanError::WeightsDoNotFit { sequences: 2, .. })
     ));
-    host.host_pinned_bytes = 2 * spilled;
+    host.host_pinned_bytes = Some(2 * spilled);
     let plan = plan_with(&config, &table, &settings, host).unwrap();
     assert_eq!(plan.kv_host_bytes, 2 * spilled);
     assert_eq!(plan.kv_host_tokens, 98_304);
@@ -657,7 +657,7 @@ fn the_prefix_cache_arena_is_granted_only_the_host_room_left_over() {
     settings.prefix_cache.size = ByteSize::gib(1);
     let granted = |settings: &Settings, host: u64| {
         let mut inputs = inputs(64 * GIB);
-        inputs.host_pinned_bytes = host;
+        inputs.host_pinned_bytes = Some(host);
         plan_with(&config, &table, settings, inputs).unwrap().prefix_cache_bytes
     };
     assert_eq!(granted(&settings, u64::MAX), GIB);

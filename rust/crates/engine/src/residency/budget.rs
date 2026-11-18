@@ -1,10 +1,14 @@
 //! The host memory a load may use (`HostBudget`).
 //!
 //! The budget is the memory the machine can spare now: `MemAvailable`, or the headroom of the process's cgroup when
-//! that is less, less room for the operating system (10%, never closer than 4 GiB to exhaustion) and for the runtime.
+//! that is less, less room for the operating system: `memory.host-margin`, by default 10% and never closer than 4 GiB
+//! to exhaustion. The margin covers the runtime's own use too, so no separate runtime reserve is taken.
 //! `memory.host-limit` states the budget instead, in bytes, and is respected as stated: it may be smaller than the
-//! automatic one (0 means no RAM tier) or larger. Reading the files these numbers come from is the startup's work
+//! automatic one (0 means no RAM tier) or larger. When the machine's memory is unknown and nothing is stated, the
+//! budget is unknown and allows no spill. Reading the files these numbers come from is the startup's work
 //! (`startup`): this module parses their text and does the arithmetic.
+
+use euhedral_inference_settings::{Auto, ByteSize};
 
 /// A budget never closer to exhaustion than this (`HostBudget.MARGIN_FLOOR`): the room the operating system needs.
 const MARGIN_FLOOR: u64 = 4 << 30;
@@ -16,6 +20,8 @@ pub enum BudgetSource {
     Automatic,
     /// Stated by the user (`memory.host-limit`).
     Explicit,
+    /// Neither stated nor derivable: the machine does not report what it can spare.
+    Unknown,
 }
 
 /// The host memory a load may use: pinnable (page-locked) and resident (all uses).
@@ -36,10 +42,21 @@ impl HostBudget {
         }
     }
 
-    /// A budget from the memory the machine can spare: 90% of it, but never closer than 4 GiB to exhaustion
-    /// (`HostBudget.ofAvailable`).
-    pub fn of_available(available_bytes: u64) -> Self {
-        let margin = MARGIN_FLOOR.max(available_bytes / 10);
+    /// A budget with no figure: nothing may spill to the host.
+    pub fn unknown() -> Self {
+        Self {
+            pinnable_bytes: 0,
+            resident_bytes: 0,
+            source: BudgetSource::Unknown,
+        }
+    }
+
+    /// A budget from the memory the machine can spare, less `margin`: when `auto`, 10% of it but never closer than
+    /// 4 GiB to exhaustion (`HostBudget.ofAvailable`).
+    pub fn of_available(available_bytes: u64, margin: Auto<ByteSize>) -> Self {
+        let margin = margin
+            .value()
+            .map_or_else(|| MARGIN_FLOOR.max(available_bytes / 10), |size| size.bytes());
         let usable = available_bytes.saturating_sub(margin);
         Self {
             pinnable_bytes: usable,
@@ -48,22 +65,24 @@ impl HostBudget {
         }
     }
 
-    /// The budget of a machine that can spare `available` bytes now (`None`: unknown) and a runtime that keeps
-    /// `runtime_reserve` bytes for itself, or `stated` bytes (`HostBudget.of`).
-    pub fn of(stated: Option<u64>, available: Option<u64>, runtime_reserve: u64) -> Self {
-        let machine = available.map_or(u64::MAX / 4, |available| {
-            Self::of_available(available)
+    /// The budget of a machine that can spare `available` bytes now (`None`: unknown), keeping `margin` and
+    /// `runtime_reserve` bytes for the system and the runtime, or `stated` bytes (`HostBudget.of`). Nothing stated and
+    /// nothing known is [`BudgetSource::Unknown`].
+    pub fn of(stated: Option<u64>, available: Option<u64>, margin: Auto<ByteSize>, runtime_reserve: u64) -> Self {
+        let machine = available.map(|available| {
+            Self::of_available(available, margin)
                 .resident_bytes
                 .saturating_sub(runtime_reserve)
         });
-        match stated {
-            None => Self {
+        match (stated, machine) {
+            (None, None) => Self::unknown(),
+            (None, Some(machine)) => Self {
                 pinnable_bytes: machine,
                 resident_bytes: machine,
                 source: BudgetSource::Automatic,
             },
-            Some(bytes) => Self {
-                pinnable_bytes: machine,
+            (Some(bytes), machine) => Self {
+                pinnable_bytes: machine.unwrap_or(u64::MAX / 4),
                 resident_bytes: bytes,
                 source: BudgetSource::Explicit,
             },
@@ -71,11 +90,12 @@ impl HostBudget {
     }
 
     /// The pinned memory this budget allows: as stated when stated, else what the machine can spare
-    /// (`HostBudget.pinnedBytes`).
-    pub fn pinned_bytes(&self) -> u64 {
+    /// (`HostBudget.pinnedBytes`); `None` when unknown.
+    pub fn pinned_bytes(&self) -> Option<u64> {
         match self.source {
-            BudgetSource::Explicit => self.resident_bytes,
-            BudgetSource::Automatic => self.pinnable_bytes.min(self.resident_bytes),
+            BudgetSource::Explicit => Some(self.resident_bytes),
+            BudgetSource::Automatic => Some(self.pinnable_bytes.min(self.resident_bytes)),
+            BudgetSource::Unknown => None,
         }
     }
 }
@@ -142,32 +162,56 @@ mod tests {
     #[test]
     fn available_memory_keeps_ten_percent_and_never_less_than_four_gib() {
         // 100 GiB available: the 10% margin (10 GiB) is above the floor.
-        assert_eq!(HostBudget::of_available(100 * GIB).resident_bytes, 90 * GIB);
+        assert_eq!(HostBudget::of_available(100 * GIB, Auto::Auto).resident_bytes, 90 * GIB);
         // 20 GiB: 10% is 2 GiB, the 4 GiB floor applies.
-        assert_eq!(HostBudget::of_available(20 * GIB).resident_bytes, 16 * GIB);
+        assert_eq!(HostBudget::of_available(20 * GIB, Auto::Auto).resident_bytes, 16 * GIB);
         // Under the floor nothing is left.
-        assert_eq!(HostBudget::of_available(3 * GIB).resident_bytes, 0);
+        assert_eq!(HostBudget::of_available(3 * GIB, Auto::Auto).resident_bytes, 0);
+    }
+
+    #[test]
+    fn a_stated_margin_replaces_the_rule() {
+        let margin = |bytes| Auto::Value(ByteSize(bytes));
+        assert_eq!(
+            HostBudget::of_available(100 * GIB, margin(GIB)).resident_bytes,
+            99 * GIB
+        );
+        assert_eq!(HostBudget::of_available(100 * GIB, margin(0)).resident_bytes, 100 * GIB);
+        assert_eq!(HostBudget::of_available(20 * GIB, margin(30 * GIB)).resident_bytes, 0);
+        let of = HostBudget::of(None, Some(100 * GIB), margin(2 * GIB), GIB);
+        assert_eq!(of.pinned_bytes(), Some(97 * GIB));
     }
 
     #[test]
     fn a_stated_budget_is_used_as_stated_and_an_automatic_one_leaves_the_runtime_its_reserve() {
-        let automatic = HostBudget::of(None, Some(100 * GIB), GIB);
+        let automatic = HostBudget::of(None, Some(100 * GIB), Auto::Auto, GIB);
         assert_eq!(automatic.source, BudgetSource::Automatic);
-        assert_eq!(automatic.pinned_bytes(), 89 * GIB);
+        assert_eq!(automatic.pinned_bytes(), Some(89 * GIB));
 
-        let stated = HostBudget::of(Some(200 * GIB), Some(100 * GIB), GIB);
+        let stated = HostBudget::of(Some(200 * GIB), Some(100 * GIB), Auto::Auto, GIB);
         assert_eq!(stated.source, BudgetSource::Explicit);
         assert_eq!(
             stated.pinned_bytes(),
-            200 * GIB,
+            Some(200 * GIB),
             "larger than the machine can spare, used as stated"
         );
 
-        assert_eq!(HostBudget::of(Some(0), Some(100 * GIB), 0).pinned_bytes(), 0);
-        assert!(
-            HostBudget::of(None, None, 0).pinned_bytes() > 1 << 50,
-            "unknown memory is not a limit"
+        assert_eq!(
+            HostBudget::of(Some(0), Some(100 * GIB), Auto::Auto, 0).pinned_bytes(),
+            Some(0)
         );
+        assert_eq!(
+            HostBudget::of(Some(8 * GIB), None, Auto::Auto, 0).pinned_bytes(),
+            Some(8 * GIB),
+            "a stated budget needs no figure from the machine"
+        );
+    }
+
+    #[test]
+    fn nothing_stated_and_nothing_known_is_an_unknown_budget() {
+        let unknown = HostBudget::of(None, None, Auto::Auto, 0);
+        assert_eq!(unknown.source, BudgetSource::Unknown);
+        assert_eq!(unknown.pinned_bytes(), None);
     }
 
     #[test]

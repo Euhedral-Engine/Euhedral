@@ -191,8 +191,9 @@ pub struct PlanInputs {
     /// The device's streaming multiprocessors; sizes the trellis K split's partials when
     /// `kernels.trellis.target-blocks` is `auto`. `None`: the widest split the shapes allow.
     pub multiprocessors: Option<u32>,
-    /// Pinned host bytes the cache pages may take.
-    pub host_pinned_bytes: u64,
+    /// Pinned host bytes the cache pages may take. `None`: not known, and no spill is allowed (the prefix cache still
+    /// keeps its stated size).
+    pub host_pinned_bytes: Option<u64>,
     /// The sequences to size for (at least 1).
     pub sequences: usize,
 }
@@ -210,7 +211,7 @@ pub fn plan(
         .host_weights_limit
         .value()
         .or(settings.memory.host_limit.value())
-        .map_or(u64::MAX, |size| size.bytes());
+        .map_or(Some(u64::MAX), |size| Some(size.bytes()));
     plan_with(
         config,
         table,
@@ -325,7 +326,7 @@ pub fn plan_with(
     let kept = footprint::kv_bytes(config, device_pages * PAGE_TOKENS, kv_format) + region;
     let budgets = Budgets {
         device: available,
-        host: inputs.host_pinned_bytes,
+        host: inputs.host_pinned_bytes.unwrap_or(u64::MAX),
     };
     let whole = Layout {
         weights: arena_bytes,
@@ -348,6 +349,9 @@ pub fn plan_with(
         free: inputs.device_free,
         sequences: inputs.sequences,
     })?;
+    if spills && inputs.host_pinned_bytes.is_none() {
+        return Err(PlanError::HostBudgetUnknown { needed: spilled });
+    }
     let (kv_device_tokens, kv_host_tokens) = if spills {
         (device_pages * PAGE_TOKENS, host_pages * PAGE_TOKENS)
     } else {

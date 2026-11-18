@@ -273,3 +273,20 @@ fn all_errors_reported_together() {
     assert!(found[1].starts_with("server.port: "), "{found:?}");
     assert!(found[2].starts_with("batching.max-sequences: "), "{found:?}");
 }
+
+#[test]
+fn host_margin_and_staging_slots_parse_and_refuse_bad_values() {
+    let none = load(MODEL).unwrap();
+    assert_eq!(none.memory.host_margin, Auto::Auto);
+    assert_eq!(none.memory.staging_slots, Auto::Auto);
+    let auto = load(&format!("{MODEL}memory:\n  host-margin: auto\n  staging-slots: auto\n")).unwrap();
+    assert_eq!(auto.memory.host_margin, Auto::Auto);
+    assert_eq!(auto.memory.staging_slots, Auto::Auto);
+    let stated = load(&format!("{MODEL}memory:\n  host-margin: 6GiB\n  staging-slots: 8\n")).unwrap();
+    assert_eq!(stated.memory.host_margin, Auto::Value(ByteSize::gib(6)));
+    assert_eq!(stated.memory.staging_slots, Auto::Value(8));
+    let zero = load(&format!("{MODEL}memory:\n  host-margin: 0\n")).unwrap();
+    assert_eq!(zero.memory.host_margin, Auto::Value(ByteSize(0)));
+    assert!(problems(&format!("{MODEL}memory:\n  host-margin: -1\n"))[0].contains("memory.host-margin"));
+    assert!(problems(&format!("{MODEL}memory:\n  staging-slots: 0\n"))[0].contains("memory.staging-slots"));
+}
