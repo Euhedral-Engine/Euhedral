@@ -24,13 +24,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod common;
+
+use common::Closer;
 use euhedral_inference_engine::generation::{
     CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
     Verification,
 };
 use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::stages::QuantumKind;
-use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
+use euhedral_inference_engine::{EngineRuntime, Handoff};
 use euhedral_inference_settings::{ModelSettings, Settings};
 
 /// The longest a device test waits for one hand-off; past it the test fails.
@@ -57,7 +60,7 @@ fn machine() -> Option<Machine> {
     Some(Machine { artifact, library })
 }
 
-fn start(machine: &Machine) -> (Arc<EngineRuntime>, RuntimeOwner) {
+fn start(machine: &Machine) -> (Closer, Arc<EngineRuntime>) {
     let mut settings = Settings::with_model(ModelSettings {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
@@ -67,13 +70,11 @@ fn start(machine: &Machine) -> (Arc<EngineRuntime>, RuntimeOwner) {
     // The long prompt takes many chunks of this size, whatever the default is.
     settings.batching.prefill_chunk_tokens = PREFILL_CHUNK as u32;
     let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
-    (
-        ready
-            .wait(WAIT)
-            .expect("the engine reports")
-            .expect("the engine starts"),
-        owner,
-    )
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    (Closer::new(owner, &runtime), runtime)
 }
 
 /// A prompt of `length` token ids inside any vocabulary.
@@ -310,7 +311,7 @@ fn cancel_all_ways(
 /// inside a step, with captured graphs and without; after each, full generations equal one no cancel preceded.
 fn cancels_and_recovers(speculation: Speculation) {
     let Some(machine) = machine() else { return };
-    let (runtime, owner) = start(&machine);
+    let (owner, runtime) = start(&machine);
     let short = prompt(40);
     let long = prompt(LONG_PROMPT);
 
@@ -364,7 +365,7 @@ fn a_cancel_ends_a_speculative_generation_and_frees_the_sequence() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_cancel_ends_a_sampled_generation_and_frees_the_sequence() {
     let Some(machine) = machine() else { return };
-    let (runtime, owner) = start(&machine);
+    let (owner, runtime) = start(&machine);
     let short = prompt(40);
     let sampling = SamplingConfig::new(1.0, 40, 1.0, 3, false).unwrap();
     let uncut = run_sampling(
@@ -447,7 +448,7 @@ impl GenerationListener for Watcher {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn closing_the_engine_mid_decode_cancels_the_generation_and_frees_the_sequence() {
     let Some(machine) = machine() else { return };
-    let (runtime, owner) = start(&machine);
+    let (owner, runtime) = start(&machine);
 
     // A request that would run for thousands of tokens: only the close ends it.
     let (reported, done) = (Handoff::new(), Handoff::new());
@@ -479,7 +480,7 @@ fn closing_the_engine_mid_decode_cancels_the_generation_and_frees_the_sequence()
 
     // The sequence's memory went with the rest: a second engine loads and generates in the same process (the card's
     // free memory is not compared, because the card is shared).
-    let (runtime, owner) = start(&machine);
+    let (owner, runtime) = start(&machine);
     let again = run_with(&runtime, &prompt(40), Speculation::Off, Trigger::Never);
     assert_eq!(again.outcome.reason, FinishReason::Length);
     owner.shutdown(runtime).unwrap();

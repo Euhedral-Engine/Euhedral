@@ -7,8 +7,13 @@
     reason = "a test helper: a failed unwrap is the failure"
 )]
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use euhedral_inference_edrl::{HEADER_BYTES, Header, LayerType, ModelMetadata, TensorTable};
+use euhedral_inference_engine::error::EngineError;
 use euhedral_inference_engine::model::ModelConfig;
+use euhedral_inference_engine::{EngineRuntime, RuntimeOwner};
 use euhedral_inference_settings::{ModelSettings, Settings};
 
 pub fn fixture() -> &'static str {
@@ -121,4 +126,49 @@ pub fn settings(max_tokens: u32) -> Settings {
     let mut settings = Settings::with_model(ModelSettings::default());
     settings.context.max_tokens = max_tokens;
     settings
+}
+
+/// What closes a device test's engine, on every path out of the test. A test that panics unwinds through its locals: the
+/// runtime's device memory is freed only by the owner's shutdown, so without this one failure leaves the card full and
+/// every later test of the binary fails to load its weights. Bind it before the runtime (`let (closer, runtime) = ...`):
+/// the runtime's own handle is then dropped first, and the shutdown here finds the last one.
+pub struct Closer {
+    owner: Option<RuntimeOwner>,
+    runtime: Option<Arc<EngineRuntime>>,
+}
+
+impl Closer {
+    pub fn new(owner: RuntimeOwner, runtime: &Arc<EngineRuntime>) -> Closer {
+        Closer {
+            owner: Some(owner),
+            runtime: Some(Arc::clone(runtime)),
+        }
+    }
+
+    /// Shuts the engine down: the test's `runtime` is the last handle.
+    pub fn shutdown(mut self, runtime: Arc<EngineRuntime>) -> Result<(), EngineError> {
+        drop(self.runtime.take());
+        self.owner
+            .take()
+            .expect("the engine is not shut down yet")
+            .shutdown(runtime)
+    }
+
+    /// Shuts the engine down within `window`.
+    pub fn shutdown_within(mut self, runtime: Arc<EngineRuntime>, window: Duration) -> Result<(), EngineError> {
+        drop(self.runtime.take());
+        self.owner
+            .take()
+            .expect("the engine is not shut down yet")
+            .shutdown_within(runtime, window)
+    }
+}
+
+impl Drop for Closer {
+    fn drop(&mut self) {
+        // Reached with the engine still up only when the test unwound.
+        if let (Some(owner), Some(runtime)) = (self.owner.take(), self.runtime.take()) {
+            let _ = owner.shutdown(runtime);
+        }
+    }
 }

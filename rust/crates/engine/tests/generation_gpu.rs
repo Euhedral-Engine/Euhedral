@@ -45,13 +45,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
+mod common;
+
+use common::Closer;
 use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, LogitsSink,
     QuantumEvent, Speculation,
 };
 use euhedral_inference_engine::sampling::{SamplingConfig, TokenSampler};
 use euhedral_inference_engine::stages::QuantumKind;
-use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
+use euhedral_inference_engine::{EngineRuntime, Handoff};
 
 /// The longest a device test waits for one hand-off; past it the test fails.
 const WAIT: Duration = Duration::from_secs(20 * 60);
@@ -94,15 +97,13 @@ fn settings(artifact: &Path, max_tokens: u32) -> Settings {
 }
 
 /// Starts the engine and waits for the latch, as `main` does.
-fn start(machine: &Machine, max_tokens: u32) -> (Arc<EngineRuntime>, RuntimeOwner) {
+fn start(machine: &Machine, max_tokens: u32) -> (Closer, Arc<EngineRuntime>) {
     let (owner, ready) = EngineRuntime::start(&settings(&machine.artifact, max_tokens), &machine.library);
-    (
-        ready
-            .wait(WAIT)
-            .expect("the engine reports")
-            .expect("the engine starts"),
-        owner,
-    )
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    (Closer::new(owner, &runtime), runtime)
 }
 
 fn read_range(file: &mut File, range: Range<u64>) -> Vec<u8> {
@@ -304,17 +305,15 @@ fn submit(
 }
 
 /// Starts the engine with `sequences` sequences, as `batching.max-sequences` states.
-fn start_with_sequences(machine: &Machine, sequences: u32) -> (Arc<EngineRuntime>, RuntimeOwner) {
+fn start_with_sequences(machine: &Machine, sequences: u32) -> (Closer, Arc<EngineRuntime>) {
     let mut settings = settings(&machine.artifact, 4096);
     settings.batching.max_sequences = sequences;
     let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
-    (
-        ready
-            .wait(WAIT)
-            .expect("the engine reports")
-            .expect("the engine starts"),
-        owner,
-    )
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    (Closer::new(owner, &runtime), runtime)
 }
 
 fn micros(duration: Duration) -> f64 {
@@ -342,7 +341,7 @@ fn greedy_tokens_match_java_for_short_prompt() {
     assert_eq!(reference.generated.len(), 128);
     assert!(!reference.stopped_by_eos);
     let eos = tokenizer(&machine.artifact).eos_ids().to_vec();
-    let (runtime, owner) = start(&machine, 4096);
+    let (owner, runtime) = start(&machine, 4096);
 
     // Twice on one engine: the second request resets the sequence and replays the graphs the first recorded.
     for round in 0..2 {
@@ -398,7 +397,7 @@ fn greedy_tokens_match_java_for_short_prompt() {
 fn a_stop_token_ends_the_generation_and_leaves_no_overshoot_in_the_sequence() {
     let Some(machine) = machine() else { return };
     let reference = greedy_reference(&machine);
-    let (runtime, owner) = start(&machine, 4096);
+    let (owner, runtime) = start(&machine, 4096);
     let prompt_rows = reference.prompt.len() as u64;
 
     // The token the Java engine selected sixth ends the generation when it is a stop token: the quantum that already
@@ -463,7 +462,7 @@ fn context_end_stops_cleanly() {
     let Some(machine) = machine() else { return };
     let reference = greedy_reference(&machine);
     let context = 600u32;
-    let (runtime, owner) = start(&machine, context);
+    let (owner, runtime) = start(&machine, context);
     let capacity = u64::from(context);
     assert_eq!(runtime.plan().max_context_tokens as u64, capacity);
     let prompt_rows = reference.prompt.len() as u64;
@@ -555,7 +554,7 @@ fn teacher_forced_logits_bitwise_equal_java_report() {
         assert_eq!(named as u32, *token, "step {step}: the forced token of the Java report");
     }
 
-    let (runtime, owner) = start(&machine, 4096);
+    let (owner, runtime) = start(&machine, 4096);
     let done = Handoff::new();
     let waiting = Arc::clone(&done);
     let mut bytes = Vec::with_capacity(java_bytes.len());
@@ -625,7 +624,7 @@ fn teacher_forced_logits_bitwise_equal_java_report() {
 fn a_panic_in_the_owner_ends_the_request_with_a_failure_and_the_engine_serves_the_next() {
     let Some(machine) = machine() else { return };
     let reference = greedy_reference(&machine);
-    let (runtime, owner) = start(&machine, 4096);
+    let (owner, runtime) = start(&machine, 4096);
 
     // The owner panics in the turn that has admitted a third quantum, with two in flight: the request fails, the quanta
     // in flight run to their end and are discarded, and the listener is told as the last call.
@@ -658,7 +657,7 @@ fn sampled_requests_select_on_the_host_and_agree_with_greedy_at_top_k_one() {
     let Some(machine) = machine() else { return };
     let reference = greedy_reference(&machine);
     let tokens = 32;
-    let (runtime, owner) = start(&machine, 4096);
+    let (owner, runtime) = start(&machine, 4096);
     let expected = &reference.generated[..tokens as usize];
 
     // Temperature 0 is greedy: the device selects, no row is copied.
@@ -744,6 +743,7 @@ fn sampled_tokens_are_drawn_at_the_position_they_follow() {
         .wait(WAIT)
         .expect("the engine reports")
         .expect("the engine starts");
+    let owner = Closer::new(owner, &runtime);
     let prompts = [
         reference.prompt.clone(),
         reference.prompt.iter().copied().cycle().take(700).collect::<Vec<u32>>(),
@@ -780,7 +780,7 @@ fn a_sampled_first_token_can_be_the_stop_token_or_the_whole_budget() {
     let Some(machine) = machine() else { return };
     let reference = greedy_reference(&machine);
     let config = SamplingConfig::new(50.0, 40, 1.0, 5, false).unwrap();
-    let (runtime, owner) = start(&machine, 4096);
+    let (owner, runtime) = start(&machine, 4096);
     let full = generate_sampled(&runtime, &reference.prompt, 8, &[], config);
     assert_eq!(full.tokens.len(), 8);
     let first = full.tokens[0];
@@ -816,13 +816,13 @@ fn two_sequences_start_hold_a_spare_generate_the_same_tokens_and_shut_down_clean
     let prompt = greedy_reference(&machine).prompt;
     let eos = tokenizer(&machine.artifact).eos_ids().to_vec();
 
-    let (runtime, owner) = start_with_sequences(&machine, 1);
+    let (owner, runtime) = start_with_sequences(&machine, 1);
     assert_eq!(runtime.plan().sequences, 1);
     assert_eq!(runtime.sequences(), 1);
     let one = generate(&runtime, &prompt, 16, &eos);
     owner.shutdown(runtime).expect("one sequence shuts down clean");
 
-    let (runtime, owner) = start_with_sequences(&machine, 2);
+    let (owner, runtime) = start_with_sequences(&machine, 2);
     assert_eq!(runtime.plan().sequences, 2);
     assert_eq!(runtime.sequences(), 2, "every sequence has an owner");
     let two = generate(&runtime, &prompt, 16, &eos);
@@ -905,7 +905,7 @@ fn concurrent_sequences_match_alone() {
         .iter()
         .map(|text| tokenizer.encode_with_model_special_tokens(text).unwrap())
         .collect();
-    let (runtime, owner) = start_with_sequences(&machine, SEQUENCES as u32);
+    let (owner, runtime) = start_with_sequences(&machine, SEQUENCES as u32);
     assert_eq!(runtime.sequences(), SEQUENCES);
     let greedy = [SamplingConfig::greedy(0); SEQUENCES];
     let seeded: Vec<SamplingConfig> = (0..SEQUENCES).map(|index| sampled(40, 7 + index as u64)).collect();

@@ -669,6 +669,8 @@ impl Owner {
         sequence: SequenceState,
         inbox: Consumer<Message, Single>,
     ) -> Owner {
+        let address = Arc::clone(&shared.address);
+        sequence.on_settled(move || address.post(Message::Reaped));
         Owner {
             shared,
             id,
@@ -2129,6 +2131,12 @@ impl Owner {
         // Quanta that were stopped may still have work queued on the owner's lane.
         self.reap();
         if !self.parked.is_empty() {
+            return;
+        }
+        // Nothing that reads or writes the sequence is left, whoever holds it: a restore's references live on the cache's
+        // side until its job is dropped. Until then the request is not over and the sequence stays out of the pool. The
+        // last holder's drop posts to this owner (`Owner::new`), and the turn it starts comes back here.
+        if !self.sequence.settled() {
             return;
         }
         let Some(run) = self.run.take() else { return };

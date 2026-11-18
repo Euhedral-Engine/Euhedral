@@ -34,12 +34,15 @@ use std::time::{Duration, Instant};
 use euhedral_inference_bench::prompt::PromptCorpus;
 use euhedral_inference_bench::prompt::words::DEFAULT_SEED;
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
+mod common;
+
+use common::Closer;
 use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
 use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::stages::QuantumKind;
-use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
+use euhedral_inference_engine::{EngineRuntime, Handoff};
 use typed::Typed;
 
 /// The longest a device test waits for one hand-off; past it the test fails.
@@ -65,7 +68,7 @@ fn machine() -> Option<Machine> {
     Some(Machine { artifact, library })
 }
 
-fn start(machine: &Machine, max_tokens: u32) -> (Arc<EngineRuntime>, RuntimeOwner) {
+fn start(machine: &Machine, max_tokens: u32) -> (Closer, Arc<EngineRuntime>) {
     let mut settings = Settings::with_model(ModelSettings {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
@@ -73,13 +76,11 @@ fn start(machine: &Machine, max_tokens: u32) -> (Arc<EngineRuntime>, RuntimeOwne
     settings.context.max_tokens = max_tokens;
     settings.kernels.graphs.captures_per_view = 8;
     let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
-    (
-        ready
-            .wait(WAIT)
-            .expect("the engine reports")
-            .expect("the engine starts"),
-        owner,
-    )
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    (Closer::new(owner, &runtime), runtime)
 }
 
 fn read_range(file: &mut File, range: Range<u64>) -> Vec<u8> {
@@ -309,7 +310,7 @@ fn mtp_output_equals_greedy() {
     let Some(machine) = machine() else { return };
     let tokenizer = tokenizer(&machine.artifact);
     let eos = tokenizer.eos_ids().to_vec();
-    let (runtime, owner) = start(&machine, 4096);
+    let (owner, runtime) = start(&machine, 4096);
     let depth = runtime.plan().draft_depth;
     assert!(depth > 0, "the artifact drafts");
     // Each quantum of a step reads its own input record, and the record index wraps over the records the workspace holds.
@@ -373,7 +374,7 @@ fn mtp_kv_and_gdn_state_equal_greedy_after_run() {
     let Some(machine) = machine() else { return };
     let tokenizer = tokenizer(&machine.artifact);
     let prompt = chat_prompts(&tokenizer, 2000).swap_remove(0);
-    let (runtime, owner) = start(&machine, 4096);
+    let (owner, runtime) = start(&machine, 4096);
     let depth = runtime.plan().draft_depth as u64;
     // The request ends on a page boundary of the cache, so that every generated row is in a whole page and compared.
     let ends = (prompt.len() as u64).div_ceil(PAGE) * PAGE;
@@ -436,7 +437,7 @@ fn mtp_eos_inside_accepted_drafts() {
     let Some(machine) = machine() else { return };
     let tokenizer = tokenizer(&machine.artifact);
     let prompt = chat_prompts(&tokenizer, 128).swap_remove(0);
-    let (runtime, owner) = start(&machine, 4096);
+    let (owner, runtime) = start(&machine, 4096);
     let depth = runtime.plan().draft_depth;
     let reference = generate(&runtime, &prompt, 128, &[], Speculation::Artifact);
     assert_eq!(reference.tokens.len(), 128);
@@ -487,7 +488,7 @@ fn mtp_stops_at_context_capacity() {
     let tokenizer = tokenizer(&machine.artifact);
     let base = chat_prompts(&tokenizer, 128).swap_remove(0);
     let context = 600u32;
-    let (runtime, owner) = start(&machine, context);
+    let (owner, runtime) = start(&machine, context);
     let capacity = u64::from(context);
     assert_eq!(runtime.plan().max_context_tokens as u64, capacity);
 
@@ -527,7 +528,7 @@ struct LongRun {
 }
 
 fn long_run(machine: &Machine, prompt: &[u32], graphs: bool) -> LongRun {
-    let (runtime, owner) = start(machine, 4096);
+    let (owner, runtime) = start(machine, 4096);
     let depth = runtime.plan().draft_depth;
     if !graphs {
         assert!(runtime.disable_graphs_for_tests());
