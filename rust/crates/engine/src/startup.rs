@@ -43,6 +43,7 @@ use crate::model::{
 use crate::residency::budget::{self, HostBudget};
 use crate::residency::loader::{self, LoadOutcome, Ring};
 use crate::residency::planner::{Placement, PlanInputs, ResidencyPlan, plan_with};
+use crate::runtime::resolve_sequences;
 use crate::runtime::{Core, EngineRuntime, ReadyHandoff, StartupReport, Units, free_arrival, raw_file};
 use crate::state::SequenceState;
 use crate::warmup;
@@ -501,15 +502,19 @@ fn plan(startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>)
         .free_bytes()
         .map_err(EngineError::from)
         .and_then(|device_free| {
+            let inputs = PlanInputs {
+                device_free,
+                multiprocessors: Some(core.library.device().sm_count),
+                host_pinned_bytes: core.host_pinned_bytes,
+                sequences: 1,
+            };
+            let sequences = resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)?;
+            let sequences = core.hold_sequences(sequences);
             plan_with(
                 &artifact.config,
                 &artifact.table,
                 &core.settings,
-                PlanInputs {
-                    device_free,
-                    multiprocessors: Some(core.library.device().sm_count),
-                    host_pinned_bytes: core.host_pinned_bytes,
-                },
+                PlanInputs { sequences, ..inputs },
             )
             .map_err(EngineError::from)
         });
@@ -556,18 +561,23 @@ fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: Has
         let records = input_records(plan.draft_depth);
         let workspace =
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
-        let (sequence, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {
-            let sequence = SequenceState::allocate(&core.library, &core.released, &artifact.config, &plan, kernels)?;
-            sequence.prime_staging(&core.pool)?;
-            Ok::<_, EngineError>(sequence)
+        let (sequences, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {
+            let sequences = (0..plan.sequences)
+                .map(|_| SequenceState::allocate(&core.library, &core.released, &artifact.config, &plan, kernels))
+                .collect::<Result<Vec<_>, _>>()?;
+            // The sequences have one shape: the staging of all of them is taken together, once.
+            if let Some(first) = sequences.first() {
+                first.prime_staging(&core.pool, sequences.len())?;
+            }
+            Ok::<_, EngineError>(sequences)
         })?;
-        Ok::<_, EngineError>((ring, arena, loans, workspace, sequence, marker))
+        Ok::<_, EngineError>((ring, arena, loans, workspace, sequences, marker))
     })();
     match allocated {
-        Ok((ring, arena, loans, workspace, sequence, marker)) => {
+        Ok((ring, arena, loans, workspace, sequences, marker)) => {
             // The state is zeroed when the lane reaches the marker; the load starts then.
             let frame = step(Kind::Startup, 0, move || {
-                load(startup, artifact, plan, ends, ring, arena, loans, workspace, sequence)
+                load(startup, artifact, plan, ends, ring, arena, loans, workspace, sequences)
             });
             core.completions.after_marker(marker, frame);
         }
@@ -589,7 +599,7 @@ fn load(
     arena: DeviceBuffer,
     loans: Vec<PooledPinned>,
     workspace: Workspace,
-    sequence: SequenceState,
+    sequences: Vec<SequenceState>,
 ) {
     let core = Arc::clone(&startup.core);
     let pieces = loader::pieces(&plan, ring.piece_bytes);
@@ -599,7 +609,7 @@ fn load(
     let done = move |outcome: LoadOutcome| {
         // The last frame of the load lets go: the next step is a frame of its own.
         startup.then(host, move |startup| {
-            assemble(startup, artifact, plan, ends, ring, workspace, sequence, outcome)
+            assemble(startup, artifact, plan, ends, ring, workspace, sequences, outcome)
         });
     };
     loader::start(&core, file, names, pieces, chains, arena, loans, done);
@@ -617,7 +627,7 @@ fn assemble(
     ends: HashMap<String, Arc<[u32]>>,
     ring: Ring,
     workspace: Workspace,
-    sequence: SequenceState,
+    sequences: Vec<SequenceState>,
     outcome: LoadOutcome,
 ) {
     let LoadOutcome { arena, result } = outcome;
@@ -627,7 +637,7 @@ fn assemble(
         Err(error) => {
             return startup.then(device, move |startup| {
                 drop(arena);
-                drop((workspace, sequence));
+                drop((workspace, sequences));
                 startup.fail(error);
             });
         }
@@ -637,7 +647,8 @@ fn assemble(
     let weights = tensors(&plan, &arena, &ends, layers);
     let objects = plan.device.len();
     let weights = Weights::new(arena, weights);
-    let allocated = plan.arena_bytes + workspace.retained_bytes() + sequence.device_bytes();
+    let allocated =
+        plan.arena_bytes + workspace.retained_bytes() + sequences.iter().map(SequenceState::device_bytes).sum::<u64>();
     let begun = core.started;
     // The pool keeps what the load staged, up to `memory.pinned-buffer-pool` when that is stated; trimming frees
     // pinned memory, which waits for the device, so it is a frame of its own, after the load.
@@ -648,7 +659,7 @@ fn assemble(
         let ids = match draft_ids_loan(&startup.core, &plan, &weights) {
             Ok(ids) => ids,
             Err(error) => {
-                drop((weights, workspace, sequence));
+                drop((weights, workspace, sequences));
                 return startup.fail(error);
             }
         };
@@ -684,7 +695,7 @@ fn assemble(
                 config,
                 weights,
                 workspace,
-                sequence,
+                sequences,
                 report,
             };
             match ids {
@@ -708,7 +719,7 @@ struct Finish {
     config: Arc<ModelConfig>,
     weights: Weights,
     workspace: Arc<Workspace>,
-    sequence: SequenceState,
+    sequences: Vec<SequenceState>,
     report: StartupReport,
 }
 
@@ -720,21 +731,25 @@ impl Finish {
             config,
             weights,
             workspace,
-            sequence,
+            mut sequences,
             report,
         } = self;
         let core = Arc::clone(&startup.core);
-        match Generation::new(&core, &config, &plan, &weights, &workspace, sequence, draft_ids) {
+        // The first sequence is the generation's; the rest wait, allocated, for the owners that will take them.
+        let first = sequences.remove(0);
+        match Generation::new(&core, &config, &plan, &weights, &workspace, first, draft_ids) {
             Ok(generation) => {
-                let runtime = EngineRuntime::assemble(core, plan, config, weights, workspace, generation, report);
+                let runtime =
+                    EngineRuntime::assemble(core, plan, config, weights, workspace, sequences, generation, report);
                 startup.succeed(runtime);
             }
             // The plan is refused: what is on the device is freed in a frame of the stages lake, which may wait.
             Err(refused) => {
-                let (error, sequence) = *refused;
+                let (error, first) = *refused;
+                sequences.push(first);
                 let stages = Arc::clone(&core.stages);
                 let _ = stages.offer(step(Kind::Startup, 0, move || {
-                    drop((weights, workspace, sequence));
+                    drop((weights, workspace, sequences));
                     startup.fail(error);
                 }));
             }
@@ -747,12 +762,12 @@ impl Finish {
             startup,
             weights,
             workspace,
-            sequence,
+            sequences,
             ..
         } = self;
         let stages = Arc::clone(&startup.core.stages);
         let _ = stages.offer(step(Kind::Startup, 0, move || {
-            drop((weights, workspace, sequence));
+            drop((weights, workspace, sequences));
             startup.fail(error);
         }));
     }

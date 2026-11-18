@@ -266,6 +266,20 @@ fn generate_sampled(
     waiting.wait(WAIT).expect("the generation reports")
 }
 
+/// Starts the engine with `sequences` sequences, as `batching.max-sequences` states.
+fn start_with_sequences(machine: &Machine, sequences: u32) -> (Arc<EngineRuntime>, RuntimeOwner) {
+    let mut settings = settings(&machine.artifact, 4096);
+    settings.batching.max_sequences = sequences;
+    let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
+    (
+        ready
+            .wait(WAIT)
+            .expect("the engine reports")
+            .expect("the engine starts"),
+        owner,
+    )
+}
+
 fn micros(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e6
 }
@@ -755,4 +769,30 @@ fn a_sampled_first_token_can_be_the_stop_token_or_the_whole_budget() {
         assert_eq!(stopped.tokens, full.tokens[..4]);
     }
     owner.shutdown(runtime).unwrap();
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
+fn two_sequences_start_hold_a_spare_generate_the_same_tokens_and_shut_down_clean() {
+    let Some(machine) = machine() else { return };
+    let prompt = greedy_reference(&machine).prompt;
+    let eos = tokenizer(&machine.artifact).eos_ids().to_vec();
+
+    let (runtime, owner) = start_with_sequences(&machine, 1);
+    assert_eq!(runtime.plan().sequences, 1);
+    assert_eq!(runtime.spare_sequences(), 0);
+    let one = generate(&runtime, &prompt, 16, &eos);
+    owner.shutdown(runtime).expect("one sequence shuts down clean");
+
+    let (runtime, owner) = start_with_sequences(&machine, 2);
+    assert_eq!(runtime.plan().sequences, 2);
+    assert_eq!(
+        runtime.spare_sequences(),
+        1,
+        "the sequence beyond the generation's is held"
+    );
+    let two = generate(&runtime, &prompt, 16, &eos);
+    assert_eq!(two.outcome.reason, FinishReason::Length);
+    assert_eq!(two.tokens, one.tokens, "two sequences change no token of the first");
+    owner.shutdown(runtime).expect("two sequences shut down clean");
 }

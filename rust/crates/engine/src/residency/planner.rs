@@ -98,8 +98,13 @@ pub struct ResidencyPlan {
     /// Bytes of the device cache of one sequence: the pages of every attention layer, and the one staging region of
     /// the host pages.
     pub kv_device_bytes: u64,
-    /// Pinned host bytes of the cache pages past the device share.
+    /// Pinned host bytes of the cache pages past the device share, of every sequence.
     pub kv_host_bytes: u64,
+    /// The sequences the plan holds.
+    pub sequences: usize,
+    /// The device bytes each sequence beyond the first needs besides its cache ([`footprint::extra_sequence_bytes`]);
+    /// 0 for a plan of one sequence.
+    pub extra_sequence_bytes: u64,
     /// Bytes of the workspace slots at the prefill chunk's rows.
     pub workspace_bytes: u64,
     /// Bytes of the largest linear scratch (the trellis prefill route of the largest object at the chunk's rows).
@@ -107,7 +112,8 @@ pub struct ResidencyPlan {
     /// Bytes of the scratch of the tensor-core route alone, which a decode-type launch running beside another takes
     /// (`LinearFormat.decodeScratchBytes`).
     pub decode_scratch_bytes: u64,
-    /// The device bytes the plan reserves in all: the weights, the cache, the runtime's reserve and the scratch.
+    /// The device bytes the plan reserves in all: the weights, every sequence's cache, the runtime's reserve, the
+    /// scratch and the state of the sequences beyond the first.
     pub device_bytes: u64,
     /// The device bytes the plan was made against: free, at most `memory.gpu-limit`.
     pub budget_bytes: u64,
@@ -155,6 +161,8 @@ pub struct PlanInputs {
     pub multiprocessors: Option<u32>,
     /// Pinned host bytes the cache pages may take.
     pub host_pinned_bytes: u64,
+    /// The sequences to size for (at least 1).
+    pub sequences: usize,
 }
 
 /// Plans residency for `config`'s model in an artifact with `table`, on a device with `device_free` bytes free and
@@ -179,6 +187,7 @@ pub fn plan(
             device_free,
             multiprocessors: None,
             host_pinned_bytes,
+            sequences: 1,
         },
     )
 }
@@ -216,6 +225,10 @@ pub fn plan_with(
             "context.kv-cache-on-gpu-tokens must be positive".to_string(),
         ));
     }
+    if inputs.sequences == 0 {
+        return Err(PlanError::Setting("the plan needs at least one sequence".to_string()));
+    }
+    let sequences = inputs.sequences as u64;
     let chunk = u64::from(settings.batching.prefill_chunk_tokens);
     if chunk == 0 {
         return Err(PlanError::Setting(
@@ -255,7 +268,13 @@ pub fn plan_with(
     let host_pages = pages - device_pages;
     let page = footprint::page_bytes(config, kv_format);
     let region = host_pages * page;
-    let spilled = region * config.attention_layers() as u64;
+    let spilled = (region * config.attention_layers() as u64).saturating_mul(sequences);
+    let verified_rows = if draft_depth > 0 { 1 + draft_depth as u64 } else { 0 };
+    let extra = if sequences > 1 {
+        footprint::extra_sequence_bytes(config, kv_format, max_tokens, verified_rows, draft_depth > 0, chunk)
+    } else {
+        0
+    };
     let kept = footprint::kv_bytes(config, device_pages * PAGE_TOKENS, kv_format) + region;
     let budgets = Budgets {
         device: available,
@@ -267,6 +286,8 @@ pub fn plan_with(
         scratch: scratch_bytes,
         cache_device: whole_kv,
         cache_host: 0,
+        sequences,
+        extra_sequence_bytes: extra,
     };
     let split = (host_pages > 0).then_some(Layout {
         cache_device: kept,
@@ -278,6 +299,7 @@ pub fn plan_with(
         state_needed: refused.device_bytes() - arena_bytes,
         available,
         free: inputs.device_free,
+        sequences: inputs.sequences,
     })?;
     let (kv_device_tokens, kv_host_tokens) = if spills {
         (device_pages * PAGE_TOKENS, host_pages * PAGE_TOKENS)
@@ -294,6 +316,8 @@ pub fn plan_with(
         kv_host_tokens: kv_host_tokens as usize,
         kv_device_bytes,
         kv_host_bytes,
+        sequences: inputs.sequences,
+        extra_sequence_bytes: extra,
         workspace_bytes,
         scratch_bytes,
         decode_scratch_bytes,
@@ -305,6 +329,30 @@ pub fn plan_with(
         draft_depth,
         max_context_tokens: max_tokens as usize,
     })
+}
+
+/// The largest count of sequences, at most `cap`, whose plan against `inputs` (its `sequences` is not read) fits: 1
+/// when `cap` is below 1. The fit only worsens with the count, so the search halves the range. The refusal of a plan of
+/// one sequence is the answer when even one does not fit, so a device too small for the model says so here.
+pub fn sequences_for(
+    config: &ModelConfig,
+    table: &TensorTable,
+    settings: &Settings,
+    inputs: PlanInputs,
+    cap: usize,
+) -> Result<usize, PlanError> {
+    let with = |sequences: usize| plan_with(config, table, settings, PlanInputs { sequences, ..inputs });
+    with(1)?;
+    let (mut low, mut high) = (1, cap.max(1));
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        match with(middle) {
+            Ok(_) => low = middle,
+            Err(PlanError::WeightsDoNotFit { .. }) => high = middle - 1,
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(low)
 }
 
 /// An unknown or unlimited budget is given to the memory planner as this many bytes, or as the bytes the plan asks of
@@ -334,13 +382,22 @@ struct Layout {
     weights: u64,
     runtime_reserve: u64,
     scratch: u64,
+    /// The device cache of one sequence.
     cache_device: u64,
+    /// The pinned host pages of every sequence.
     cache_host: u64,
+    sequences: u64,
+    /// What each sequence beyond the first needs besides its cache.
+    extra_sequence_bytes: u64,
 }
 
 impl Layout {
     fn device_bytes(&self) -> u64 {
-        self.weights + self.runtime_reserve + self.scratch + self.cache_device
+        self.weights
+            .saturating_add(self.runtime_reserve)
+            .saturating_add(self.scratch)
+            .saturating_add(self.cache_device.saturating_mul(self.sequences))
+            .saturating_add(self.extra_sequence_bytes.saturating_mul(self.sequences - 1))
     }
 }
 
@@ -385,7 +442,12 @@ fn admit(budgets: Budgets, layout: Layout) -> Result<(), Location> {
         PlanItem::required("weights", device, layout.weights),
         PlanItem::required("runtime reserve", device, layout.runtime_reserve),
         PlanItem::required("scratch", device, layout.scratch),
-        PlanItem::required("cache", device, layout.cache_device),
+        PlanItem::required("cache", device, layout.cache_device.saturating_mul(layout.sequences)),
+        PlanItem::required(
+            "state of the sequences beyond the first",
+            device,
+            layout.extra_sequence_bytes.saturating_mul(layout.sequences - 1),
+        ),
         PlanItem::required("cache pages on the host", host, layout.cache_host),
     ];
     match planner.admit(&PlanRequest { owner, items }) {
@@ -637,6 +699,8 @@ mod tests {
             scratch: 50,
             cache_device: 400,
             cache_host: 0,
+            sequences: 1,
+            extra_sequence_bytes: 0,
         };
         let split = Layout {
             cache_device: 150,
@@ -670,6 +734,8 @@ mod tests {
             scratch: 50,
             cache_device: 400,
             cache_host: 0,
+            sequences: 1,
+            extra_sequence_bytes: 0,
         };
         for device in [u64::MAX, whole.device_bytes(), whole.device_bytes() - 1] {
             let budgets = Budgets { device, host: u64::MAX };
@@ -699,6 +765,8 @@ mod tests {
             scratch: 1 << 30,
             cache_device: 1 << 36,
             cache_host: 0,
+            sequences: 1,
+            extra_sequence_bytes: 0,
         };
         let budgets = Budgets {
             device: u64::MAX,

@@ -19,9 +19,12 @@
 
 use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::model::{ArtifactProfile, Quantization, Speculation};
+use euhedral_inference_engine::residency::footprint;
 use euhedral_inference_engine::residency::planner::{
-    ARENA_ALIGNMENT, DEFAULT_RUNTIME_RESERVE_BYTES, PlacementSource, PlanInputs, plan, plan_with,
+    ARENA_ALIGNMENT, DEFAULT_RUNTIME_RESERVE_BYTES, PlacementSource, PlanInputs, ResidencyPlan, plan, plan_with,
+    sequences_for,
 };
+use euhedral_inference_engine::runtime::resolve_sequences;
 use euhedral_inference_engine::workspace::{
     BufferSlot, WorkspaceError, WorkspaceRows, input_records, slot_bytes, workspace_bytes, workspace_bytes_with_records,
 };
@@ -50,6 +53,7 @@ fn inputs(device_free: u64) -> PlanInputs {
         device_free,
         multiprocessors: Some(70),
         host_pinned_bytes: u64::MAX,
+        sequences: 1,
     }
 }
 
@@ -154,12 +158,14 @@ fn planner_refuses_when_weights_do_not_fit() {
         state_needed,
         available,
         free,
+        sequences,
     } = error
     else {
         panic!("expected WeightsDoNotFit, got {error:?}");
     };
     assert_eq!(free, 8 * GIB);
     assert_eq!(available, 8 * GIB);
+    assert_eq!(sequences, 1);
     let arena = plan_with(&config(), &rco_table(), &settings(32_768), inputs(16 * GIB))
         .unwrap()
         .arena_bytes;
@@ -170,8 +176,13 @@ fn planner_refuses_when_weights_do_not_fit() {
         state_needed,
         available,
         free,
+        sequences,
     }
     .to_string();
+    assert!(
+        !message.contains("sequences"),
+        "a plan of one sequence blames none: {message}"
+    );
     assert!(message.contains(&weights_needed.to_string()), "{message}");
     assert!(message.contains(&available.to_string()), "{message}");
 }
@@ -385,4 +396,249 @@ fn the_cache_format_follows_the_artifact_unless_the_settings_choose() {
     // 512-byte head rows: 16 layers x 16 pages x 2 planes x 256 x 512 x 4 heads.
     assert_eq!(bf16.kv_device_bytes, 16 * 16 * 2 * 256 * 512 * 4);
     assert_eq!(auto.kv_device_bytes, 16 * 16 * 2 * 256 * 144 * 4);
+}
+
+fn with_sequences(device_free: u64, sequences: usize) -> PlanInputs {
+    PlanInputs {
+        sequences,
+        ..inputs(device_free)
+    }
+}
+
+/// The device bytes each sequence beyond the first takes in the RCO plan (it drafts 4 tokens a step), besides its cache.
+fn extra_of(plan: &ResidencyPlan) -> u64 {
+    footprint::extra_sequence_bytes(
+        &config(),
+        plan.kv_format,
+        plan.max_context_tokens as u64,
+        1 + plan.draft_depth as u64,
+        true,
+        plan.rows.rows,
+    )
+}
+
+#[test]
+fn a_plan_of_one_sequence_is_the_plan_that_knew_none() {
+    let (config, table) = (config(), rco_table());
+    let one = plan_with(&config, &table, &settings(131_072), with_sequences(16 * GIB, 1)).unwrap();
+    let unaware = PlanInputs {
+        multiprocessors: None,
+        ..with_sequences(16 * GIB, 1)
+    };
+    assert_eq!(
+        plan(&config, &table, &settings(131_072), 16 * GIB).unwrap(),
+        plan_with(&config, &table, &settings(131_072), unaware).unwrap()
+    );
+    assert_eq!(one.sequences, 1);
+    assert_eq!(one.extra_sequence_bytes, 0);
+    assert_eq!(
+        one.device_bytes,
+        one.arena_bytes + JAVA_KV_131072 + 1280 * MIB + JAVA_TRELLIS_SCRATCH_512
+    );
+    assert_eq!(one.kv_device_bytes, JAVA_KV_131072);
+}
+
+#[test]
+fn a_plan_of_no_sequence_is_refused() {
+    let error = plan_with(&config(), &rco_table(), &settings(32_768), with_sequences(16 * GIB, 0)).unwrap_err();
+    assert!(matches!(error, PlanError::Setting(_)), "{error:?}");
+}
+
+#[test]
+fn each_sequence_adds_its_cache_and_its_state() {
+    let (config, table) = (config(), rco_table());
+    let settings = settings(32_768);
+    let one = plan_with(&config, &table, &settings, with_sequences(16 * GIB, 1)).unwrap();
+    let four = plan_with(&config, &table, &settings, with_sequences(16 * GIB, 4)).unwrap();
+    let extra = extra_of(&four);
+    assert!(extra > 0);
+    assert_eq!(four.sequences, 4);
+    assert_eq!(four.extra_sequence_bytes, extra);
+    // What is shared does not grow.
+    assert_eq!(four.arena_bytes, one.arena_bytes);
+    assert_eq!(four.workspace_bytes, one.workspace_bytes);
+    assert_eq!(four.scratch_bytes, one.scratch_bytes);
+    // Each sequence's cache is the one sequence's.
+    assert_eq!(four.kv_device_bytes, one.kv_device_bytes);
+    assert_eq!(four.device_bytes, one.device_bytes + 3 * (JAVA_KV_32768 + extra));
+    assert_eq!(four.location_bytes().device, four.device_bytes);
+}
+
+#[test]
+fn the_boundary_of_a_plan_of_several_sequences_and_what_the_refusal_says() {
+    let (config, table) = (config(), rco_table());
+    let settings = settings(32_768);
+    let need = plan_with(&config, &table, &settings, with_sequences(16 * GIB, 3))
+        .unwrap()
+        .device_bytes;
+    assert!(plan_with(&config, &table, &settings, with_sequences(need, 3)).is_ok());
+    let error = plan_with(&config, &table, &settings, with_sequences(need - 1, 3)).unwrap_err();
+    assert!(
+        matches!(error, PlanError::WeightsDoNotFit { sequences: 3, .. }),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("or fewer sequences"), "{message}");
+    assert!(message.contains("batching.max-sequences"), "{message}");
+    // The same device holds one sequence.
+    assert!(plan_with(&config, &table, &settings, with_sequences(need - 1, 1)).is_ok());
+}
+
+#[test]
+fn the_host_pages_of_every_sequence_must_fit_the_host() {
+    let (config, table) = (config(), rco_table());
+    let mut settings = settings(131_072);
+    settings.context.kv_cache_on_gpu_tokens = 32_768;
+    let spilled = 1_811_939_328;
+    let two_need = {
+        let whole = plan_with(&config, &table, &settings, with_sequences(64 * GIB, 2)).unwrap();
+        // Room for the whole caches of both sequences: nothing spills.
+        assert_eq!(whole.kv_host_bytes, 0);
+        whole.device_bytes - 1
+    };
+    let mut host = with_sequences(two_need, 2);
+    host.host_pinned_bytes = 2 * spilled - 1;
+    assert!(matches!(
+        plan_with(&config, &table, &settings, host),
+        Err(PlanError::WeightsDoNotFit { sequences: 2, .. })
+    ));
+    host.host_pinned_bytes = 2 * spilled;
+    let plan = plan_with(&config, &table, &settings, host).unwrap();
+    assert_eq!(plan.kv_host_bytes, 2 * spilled);
+    assert_eq!(plan.kv_host_tokens, 98_304);
+}
+
+#[test]
+fn the_most_sequences_that_fit_is_found_and_one_more_does_not_fit() {
+    let (config, table) = (config(), rco_table());
+    let settings = settings(32_768);
+    let one = plan_with(&config, &table, &settings, with_sequences(16 * GIB, 1)).unwrap();
+    let extra = extra_of(&plan_with(&config, &table, &settings, with_sequences(16 * GIB, 2)).unwrap());
+    let each = JAVA_KV_32768 + extra;
+    // Room for 5 sequences and a byte short of a sixth.
+    let free = one.device_bytes + 4 * each + each - 1;
+    assert_eq!(sequences_for(&config, &table, &settings, inputs(free), 1000), Ok(5));
+    assert!(plan_with(&config, &table, &settings, with_sequences(free, 5)).is_ok());
+    assert!(plan_with(&config, &table, &settings, with_sequences(free, 6)).is_err());
+    // The cap wins when more would fit, and a cap below 1 is 1.
+    assert_eq!(sequences_for(&config, &table, &settings, inputs(free), 3), Ok(3));
+    assert_eq!(sequences_for(&config, &table, &settings, inputs(free), 0), Ok(1));
+    assert_eq!(sequences_for(&config, &table, &settings, inputs(64 * GIB), 7), Ok(7));
+    // Exactly one fits.
+    assert_eq!(
+        sequences_for(&config, &table, &settings, inputs(one.device_bytes), 7),
+        Ok(1)
+    );
+    // The `sequences` of the inputs is not read.
+    assert_eq!(
+        sequences_for(&config, &table, &settings, with_sequences(free, 9), 1000),
+        Ok(5)
+    );
+}
+
+#[test]
+fn a_device_too_small_for_one_sequence_is_refused_not_given_one() {
+    let (config, table) = (config(), rco_table());
+    let error = sequences_for(&config, &table, &settings(32_768), inputs(GIB), 7).unwrap_err();
+    assert!(
+        matches!(error, PlanError::WeightsDoNotFit { sequences: 1, .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn more_sequences_fit_when_each_keeps_part_of_its_cache_on_the_host() {
+    let (config, table) = (config(), rco_table());
+    let mut whole = settings(131_072);
+    let one = plan_with(&config, &table, &whole, with_sequences(16 * GIB, 1)).unwrap();
+    let free = one.device_bytes + 2 * (JAVA_KV_131072 + extra_of(&one));
+    let on_device = sequences_for(&config, &table, &whole, inputs(free), 16).unwrap();
+    whole.context.kv_cache_on_gpu_tokens = 32_768;
+    let spilled = sequences_for(&config, &table, &whole, inputs(free), 16).unwrap();
+    assert!(
+        spilled > on_device,
+        "{spilled} sequences with host pages, {on_device} without"
+    );
+}
+
+#[test]
+fn an_explicit_count_is_the_count_and_zero_is_the_most_that_fit() {
+    let (config, table) = (config(), rco_table());
+    let mut settings = settings(32_768);
+    let roomy = inputs(16 * GIB);
+    settings.batching.max_sequences = 3;
+    assert_eq!(resolve_sequences(&config, &table, &settings, roomy), Ok(3));
+    // An explicit count is not judged here: the plan refuses it with the bytes it needed.
+    settings.batching.max_sequences = 100_000;
+    assert_eq!(resolve_sequences(&config, &table, &settings, inputs(GIB)), Ok(100_000));
+
+    settings.batching.max_sequences = 0;
+    // The cap is the rows a pass holds over a verification's rows: 512 / (1 + 4 drafts).
+    assert_eq!(
+        resolve_sequences(&config, &table, &settings, inputs(1024 * GIB)),
+        Ok(102)
+    );
+    settings.batching.max_tokens_per_pass = Auto::Value(20);
+    assert_eq!(resolve_sequences(&config, &table, &settings, inputs(1024 * GIB)), Ok(4));
+    settings.batching.max_tokens_per_pass = Auto::Value(1);
+    assert_eq!(resolve_sequences(&config, &table, &settings, inputs(1024 * GIB)), Ok(1));
+    // A pass cannot hold more rows than a prefill chunk.
+    settings.batching.max_tokens_per_pass = Auto::Value(5000);
+    assert_eq!(
+        resolve_sequences(&config, &table, &settings, inputs(1024 * GIB)),
+        Ok(102)
+    );
+    // Limited by the device.
+    settings.batching.max_tokens_per_pass = Auto::Auto;
+    let one = plan_with(&config, &table, &settings, with_sequences(16 * GIB, 1)).unwrap();
+    let each = JAVA_KV_32768 + extra_of(&one);
+    assert_eq!(
+        resolve_sequences(&config, &table, &settings, inputs(one.device_bytes + 2 * each)),
+        Ok(3)
+    );
+}
+
+#[test]
+fn the_extra_state_of_a_sequence_without_drafts_is_its_gdn_state_scratch_and_selections() {
+    let config = config();
+    let plain = footprint::extra_sequence_bytes(&config, KvFormat::Nvfp4, 32_768, 0, false, 512);
+    let selections = 2 * 8;
+    // Without verification the state is the recurrent and convolution state of each GDN layer, nothing more.
+    let convolution = (config.gdn_query_key_width() + config.gdn_value_width()) as u64
+        * (config.linear_conv_kernel_dim as u64 - 1)
+        * 2;
+    let recurrent = config.linear_num_value_heads as u64
+        * config.linear_key_head_dim as u64
+        * config.linear_value_head_dim as u64
+        * 4;
+    assert_eq!(
+        footprint::gdn_bytes(&config, 0),
+        config.gdn_layers() as u64 * (recurrent + convolution)
+    );
+    assert_eq!(
+        plain,
+        footprint::gdn_bytes(&config, 0)
+            + footprint::decode_scratch_bytes(config.num_attention_heads as u64, 1)
+            + selections
+    );
+    let verified = 5;
+    let drafting = footprint::extra_sequence_bytes(&config, KvFormat::Nvfp4, 32_768, verified, true, 512);
+    let hidden = config.hidden_size as u64;
+    // 6 selections of 5 rows' keys: the drafts and two more.
+    assert_eq!(
+        drafting,
+        footprint::gdn_bytes(&config, verified)
+            + footprint::decode_scratch_bytes(config.num_attention_heads as u64, 8)
+            + 6 * verified * 8
+            + 512 * hidden * 2
+            + hidden * 2
+            + 4 * 17
+            + 128 * footprint::page_bytes(&config, KvFormat::Nvfp4)
+    );
+    // The seed rows are a prefill chunk's, and the MTP cache follows the context.
+    let longer = footprint::extra_sequence_bytes(&config, KvFormat::Nvfp4, 65_536, verified, true, 1024);
+    assert_eq!(
+        longer - drafting,
+        512 * hidden * 2 + 128 * footprint::page_bytes(&config, KvFormat::Nvfp4)
+    );
 }
