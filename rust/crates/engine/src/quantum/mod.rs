@@ -476,6 +476,8 @@ pub enum StartError {
     NoView(View),
     #[error("the workspace's owner is closed")]
     Closed,
+    #[error("starting the quantum panicked")]
+    Panicked,
 }
 
 /// The stage graphs of a plan on a runtime, the sequence's graph cache, and the choice of the graph a quantum runs.

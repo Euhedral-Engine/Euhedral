@@ -33,6 +33,7 @@
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::mem;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -124,6 +125,14 @@ impl<L: Launch> Item<L> {
     fn on_workspace(&self) -> bool {
         matches!(self, Item::Start(start) if start.on_workspace)
     }
+
+    /// The number of the job a start admits.
+    fn serial(&self) -> Option<u64> {
+        match self {
+            Item::Start(start) => Some(L::serial(&start.job)),
+            Item::Release(_) => None,
+        }
+    }
 }
 
 /// A pinned quantum and the sequence it belongs to.
@@ -163,7 +172,8 @@ impl<L: Launch> WorkspaceOwner<L> {
 
     /// Starts `job` of `sequence` behind the sequence's last quantum and, with `on_workspace`, the workspace's. `more`
     /// says the sequence admits another quantum behind this one before it may retire; without it nothing is kept.
-    /// A job that cannot start is told to the sequence's owner, with its number.
+    /// A job that cannot start now is the error returned; one that waits and then cannot start is told to the sequence's
+    /// owner, with its number. Either way the sequence's pins are let go when `more` is not set.
     pub(crate) fn admit(
         &mut self,
         sequence: SequenceId,
@@ -172,7 +182,7 @@ impl<L: Launch> WorkspaceOwner<L> {
         kill: Arc<AtomicBool>,
         on_workspace: bool,
         more: bool,
-    ) {
+    ) -> Result<(), StartError> {
         self.take_in();
         let item = Item::Start(Start {
             sequence,
@@ -184,8 +194,9 @@ impl<L: Launch> WorkspaceOwner<L> {
         });
         if self.blocked(&item, &self.waiting) {
             self.waiting.push_back(item);
+            Ok(())
         } else {
-            self.run(item);
+            self.run(item)
         }
     }
 
@@ -196,7 +207,7 @@ impl<L: Launch> WorkspaceOwner<L> {
         if self.blocked(&item, &self.waiting) {
             self.waiting.push_back(item);
         } else {
-            self.run(item);
+            self.release_now(sequence);
         }
     }
 
@@ -217,14 +228,19 @@ impl<L: Launch> WorkspaceOwner<L> {
         }
     }
 
-    fn run(&mut self, item: Item<L>) {
+    fn run(&mut self, item: Item<L>) -> Result<(), StartError> {
         match item {
             Item::Start(start) => self.start(start),
-            Item::Release(sequence) => self.release_now(sequence),
+            Item::Release(sequence) => {
+                self.release_now(sequence);
+                Ok(())
+            }
         }
     }
 
-    fn start(&mut self, start: Start<L>) {
+    /// Starts a job. One that does not start (or whose start panics) lets go of its sequence's pins: nothing is kept
+    /// for a chain that ends there, whatever `more` said.
+    fn start(&mut self, start: Start<L>) -> Result<(), StartError> {
         let Start {
             sequence,
             launcher,
@@ -233,7 +249,6 @@ impl<L: Launch> WorkspaceOwner<L> {
             on_workspace,
             more,
         } = start;
-        let serial = L::serial(&job);
         let own = self.last_of.get(sequence.0).and_then(Option::as_ref);
         let shared = self
             .last
@@ -241,14 +256,21 @@ impl<L: Launch> WorkspaceOwner<L> {
             .filter(|_| on_workspace)
             .map(|held| &held.started)
             .filter(|last| Some(L::serial_of(last)) != own.map(L::serial_of));
-        let started = match (own, shared) {
+        // A panic in the launcher is a start that failed: what waits behind this one is still started.
+        let launched = catch_unwind(AssertUnwindSafe(|| match (own, shared) {
             (Some(own), Some(shared)) => launcher.start(job, kill, &[own, shared]),
             (Some(only), None) | (None, Some(only)) => launcher.start(job, kill, &[only]),
             (None, None) => launcher.start(job, kill, &[]),
-        };
-        match started {
-            Ok(started) => self.keep(sequence, started, on_workspace, more),
-            Err(error) => self.refuse(sequence, serial, error),
+        }));
+        match launched.unwrap_or(Err(StartError::Panicked)) {
+            Ok(started) => {
+                self.keep(sequence, started, on_workspace, more);
+                Ok(())
+            }
+            Err(error) => {
+                self.release_now(sequence);
+                Err(error)
+            }
         }
     }
 
@@ -266,11 +288,12 @@ impl<L: Launch> WorkspaceOwner<L> {
             }
             // The quantum before it is let go here, after the start took its edge.
             self.last_of[sequence.0] = Some(started);
-        } else {
-            if on_workspace {
-                self.gate_on(L::serial_of(&started));
-            }
+        } else if on_workspace {
+            self.gate_on(L::serial_of(&started));
             self.last_of[sequence.0] = None;
+        } else {
+            // Nothing is kept of it, and the workspace's last, if it is this sequence's, has nothing behind it either.
+            self.release_now(sequence);
         }
     }
 
@@ -314,8 +337,11 @@ impl<L: Launch> WorkspaceOwner<L> {
         for item in mem::take(&mut self.waiting) {
             if self.blocked(&item, &kept) {
                 kept.push_back(item);
-            } else {
-                self.run(item);
+                continue;
+            }
+            let (sequence, serial) = (item.sequence(), item.serial());
+            if let (Err(error), Some(serial)) = (self.run(item), serial) {
+                self.refuse(sequence, serial, error);
             }
         }
         self.waiting = kept;
@@ -346,6 +372,7 @@ impl<L: Launch> Turn for WorkspaceOwner<L> {
         for item in mem::take(&mut self.waiting) {
             if let Item::Start(start) = item {
                 let serial = L::serial(&start.job);
+                self.release_now(start.sequence);
                 self.refuse(start.sequence, serial, StartError::Closed);
             }
         }
@@ -413,7 +440,8 @@ impl<L: Launch> Order<L> {
     }
 
     /// Starts `job` (see [`WorkspaceOwner::admit`]): now, if the owner is free, else as an operation the owner runs. Never
-    /// waits. A job that cannot start (also because the owner is closed) is told to the sequence's owner.
+    /// waits. A job that cannot start now (also because the owner is closed) is the error returned, so that the caller
+    /// admits nothing behind it; one that is deferred and cannot start is told to the sequence's owner.
     pub(crate) fn admit(
         &self,
         sequence: SequenceId,
@@ -422,22 +450,26 @@ impl<L: Launch> Order<L> {
         kill: Arc<AtomicBool>,
         on_workspace: bool,
         more: bool,
-    ) {
+    ) -> Result<(), StartError> {
         let serial = L::serial(&job);
         let launcher = Arc::clone(launcher);
         let work = move |owner: &mut WorkspaceOwner<L>| owner.admit(sequence, launcher, job, kill, on_workspace, more);
         match self.mailbox.try_with(work) {
-            Ok(Some(())) => {}
-            Ok(None) => self.refuse(sequence, serial),
+            Ok(Some(started)) => started,
+            Ok(None) => Err(StartError::Closed),
             Err(work) => {
                 let replies = Arc::clone(&self.replies);
                 self.mailbox.defer(move |owner| {
-                    match owner {
+                    let result = match owner {
                         Some(owner) => work(owner),
-                        None => refuse(&replies, sequence, serial),
+                        None => Err(StartError::Closed),
+                    };
+                    if let (Err(error), Some(reply)) = (result, replies.get(sequence.0)) {
+                        reply(serial, error);
                     }
                     Vec::new()
                 });
+                Ok(())
             }
         }
     }
@@ -463,16 +495,6 @@ impl<L: Launch> Order<L> {
     /// Takes the owner out for the engine's teardown, which drops what it still pins.
     pub(crate) fn close(&self) -> Option<WorkspaceOwner<L>> {
         self.mailbox.close()
-    }
-
-    fn refuse(&self, sequence: SequenceId, serial: u64) {
-        refuse(&self.replies, sequence, serial);
-    }
-}
-
-fn refuse(replies: &[Reply], sequence: SequenceId, serial: u64) {
-    if let Some(reply) = replies.get(sequence.0) {
-        reply(serial, StartError::Closed);
     }
 }
 
@@ -527,6 +549,7 @@ mod tests {
         log: Mutex<Vec<(u64, Vec<u64>)>>,
         pins: Arc<AtomicUsize>,
         refuse: Mutex<Vec<u64>>,
+        panics: Mutex<Vec<u64>>,
     }
 
     impl Fake {
@@ -552,6 +575,7 @@ mod tests {
         }
 
         fn start(&self, job: u64, _kill: Arc<AtomicBool>, after: &[&Pin]) -> Result<Pin, StartError> {
+            assert!(!self.panics.lock().unwrap().contains(&job), "the launcher panics");
             if self.refuse.lock().unwrap().contains(&job) {
                 return Err(StartError::NoView(View::Decode));
             }
@@ -588,8 +612,8 @@ mod tests {
         job: u64,
         on_workspace: bool,
         more: bool,
-    ) {
-        owner.admit(sequence, Arc::clone(fake), job, Arc::default(), on_workspace, more);
+    ) -> Result<(), StartError> {
+        owner.admit(sequence, Arc::clone(fake), job, Arc::default(), on_workspace, more)
     }
 
     /// Tells the owner `serial` retired, as the sequence's owner does when the gate names it.
@@ -604,10 +628,10 @@ mod tests {
     #[test]
     fn starts_follow_post_order_and_wait_on_both_edges() {
         let (mut owner, fake, _, _) = owner(2);
-        admit(&mut owner, &fake, A, 1, true, true);
-        admit(&mut owner, &fake, B, 2, true, true);
-        admit(&mut owner, &fake, A, 3, true, true);
-        admit(&mut owner, &fake, B, 4, true, true);
+        admit(&mut owner, &fake, A, 1, true, true).unwrap();
+        admit(&mut owner, &fake, B, 2, true, true).unwrap();
+        admit(&mut owner, &fake, A, 3, true, true).unwrap();
+        admit(&mut owner, &fake, B, 4, true, true).unwrap();
         // Each waits on the last on the workspace; the sequence's own is a second edge unless it is the same quantum.
         assert_eq!(
             fake.starts(),
@@ -618,12 +642,12 @@ mod tests {
     #[test]
     fn a_job_of_the_sequence_alone_does_not_wait_on_another_sequence() {
         let (mut owner, fake, _, _) = owner(2);
-        admit(&mut owner, &fake, A, 1, true, true);
-        admit(&mut owner, &fake, B, 2, false, true);
-        admit(&mut owner, &fake, B, 3, false, true);
+        admit(&mut owner, &fake, A, 1, true, true).unwrap();
+        admit(&mut owner, &fake, B, 2, false, true).unwrap();
+        admit(&mut owner, &fake, B, 3, false, true).unwrap();
         // The workspace's last stays A's: B's jobs took no edge to it, and B's second waits only on B's first.
         assert_eq!(fake.starts(), vec![(1, vec![]), (2, vec![]), (3, vec![2])]);
-        admit(&mut owner, &fake, A, 4, true, true);
+        admit(&mut owner, &fake, A, 4, true, true).unwrap();
         assert_eq!(fake.starts()[3], (4, vec![1]));
     }
 
@@ -657,7 +681,7 @@ mod tests {
             for &(job, more, release) in pattern {
                 // The sequence's owner admits the next only after the retirement of a quantum with nothing behind it.
                 expected.push((job, chain.into_iter().collect::<Vec<_>>()));
-                admit(&mut owner, &fake, A, job, true, more);
+                admit(&mut owner, &fake, A, job, true, more).unwrap();
                 chain = more.then_some(job);
                 if release {
                     owner.release(A);
@@ -677,15 +701,15 @@ mod tests {
     #[test]
     fn the_workspace_waits_for_the_quantum_nothing_is_started_behind() {
         let (mut owner, fake, _, gate) = owner(2);
-        admit(&mut owner, &fake, A, 1, true, true);
-        admit(&mut owner, &fake, B, 2, true, true);
+        admit(&mut owner, &fake, A, 1, true, true).unwrap();
+        admit(&mut owner, &fake, B, 2, true, true).unwrap();
         // A's chain ends: its last, the workspace's last, is let go so that it can retire, and the workspace is gated.
-        admit(&mut owner, &fake, A, 3, true, false);
+        admit(&mut owner, &fake, A, 3, true, false).unwrap();
         assert_eq!(gate.load(Ordering::Acquire), 3);
         // B's next, a job of B that uses only B's state (behind B's own), and a third of A's wait in post order.
-        admit(&mut owner, &fake, B, 4, true, true);
-        admit(&mut owner, &fake, B, 5, false, true);
-        admit(&mut owner, &fake, A, 6, true, true);
+        admit(&mut owner, &fake, B, 4, true, true).unwrap();
+        admit(&mut owner, &fake, B, 5, false, true).unwrap();
+        admit(&mut owner, &fake, A, 6, true, true).unwrap();
         assert_eq!(fake.starts(), vec![(1, vec![]), (2, vec![1]), (3, vec![1, 2])]);
         retire(&mut owner, 3);
         // They start with no edge to the retired quantum, B's behind B's own.
@@ -700,12 +724,12 @@ mod tests {
     #[test]
     fn a_release_lets_the_last_quantum_retire_and_gates_the_workspace_on_it() {
         let (mut owner, fake, _, gate) = owner(2);
-        admit(&mut owner, &fake, A, 1, true, true);
+        admit(&mut owner, &fake, A, 1, true, true).unwrap();
         assert_eq!(fake.alive(), 2);
         owner.release(A);
         assert_eq!(fake.alive(), 0, "nothing is pinned: the quantum can retire");
         assert_eq!(gate.load(Ordering::Acquire), 1);
-        admit(&mut owner, &fake, B, 2, true, true);
+        admit(&mut owner, &fake, B, 2, true, true).unwrap();
         assert_eq!(
             fake.starts().len(),
             1,
@@ -714,18 +738,18 @@ mod tests {
         retire(&mut owner, 1);
         assert_eq!(fake.starts()[1], (2, vec![]));
         // A release of a sequence that is not the workspace's last gates nothing.
-        admit(&mut owner, &fake, A, 3, true, true);
+        admit(&mut owner, &fake, A, 3, true, true).unwrap();
         owner.release(B);
         assert_eq!(gate.load(Ordering::Acquire), NONE);
-        admit(&mut owner, &fake, B, 4, true, true);
+        admit(&mut owner, &fake, B, 4, true, true).unwrap();
         assert_eq!(fake.starts()[3], (4, vec![3]));
     }
 
     #[test]
     fn a_release_waits_behind_its_sequences_admissions() {
         let (mut owner, fake, _, _) = owner(2);
-        admit(&mut owner, &fake, A, 1, true, false);
-        admit(&mut owner, &fake, B, 2, true, true);
+        admit(&mut owner, &fake, A, 1, true, false).unwrap();
+        admit(&mut owner, &fake, B, 2, true, true).unwrap();
         owner.release(B);
         // B's job and its release wait for A's quantum: B's pin is not dropped before its job started.
         assert_eq!(fake.starts().len(), 1);
@@ -735,17 +759,96 @@ mod tests {
     }
 
     #[test]
-    fn a_start_that_fails_is_told_to_its_sequence_with_its_number_and_leaves_the_chain_as_it_was() {
+    fn a_start_that_fails_now_is_the_calls_result_and_takes_no_place_on_the_workspace() {
         let (mut owner, fake, told, _) = owner(2);
         fake.refuse.lock().unwrap().push(2);
-        admit(&mut owner, &fake, A, 1, true, true);
-        admit(&mut owner, &fake, B, 2, true, true);
-        admit(&mut owner, &fake, A, 3, true, true);
+        admit(&mut owner, &fake, A, 1, true, true).unwrap();
+        assert!(admit(&mut owner, &fake, B, 2, true, true).is_err());
+        admit(&mut owner, &fake, A, 3, true, true).unwrap();
+        // A start that fails now is the call's result: nothing is told, and the caller admits nothing behind it.
+        assert!(told.lock().unwrap().is_empty());
+        // The refused job took no place on the workspace.
+        assert_eq!(fake.starts(), vec![(1, vec![]), (3, vec![1])]);
+    }
+
+    #[test]
+    fn a_start_that_fails_without_more_lets_go_of_the_chain_before_it() {
+        let (mut owner, fake, told, gate) = owner(1);
+        fake.refuse.lock().unwrap().push(2);
+        // Drafts are admitted with more behind them; the verification that ends the step is not.
+        admit(&mut owner, &fake, A, 1, true, true).unwrap();
+        assert_eq!(fake.alive(), 2);
+        let refused = admit(&mut owner, &fake, A, 2, true, false);
+        assert!(matches!(refused, Err(StartError::NoView(_))));
+        assert_eq!(fake.alive(), 0, "nothing stays pinned for a chain that ends");
+        assert_eq!(
+            gate.load(Ordering::Acquire),
+            1,
+            "the workspace waits for the quantum let go of"
+        );
+        assert!(
+            told.lock().unwrap().is_empty(),
+            "a start that fails now is the call's result"
+        );
+    }
+
+    #[test]
+    fn a_quantum_of_the_sequence_alone_that_ends_its_chain_lets_go_of_its_last_on_the_workspace() {
+        let (mut owner, fake, _, gate) = owner(2);
+        admit(&mut owner, &fake, A, 1, true, true).unwrap();
+        admit(&mut owner, &fake, A, 2, false, false).unwrap();
+        assert_eq!(fake.alive(), 0);
+        assert_eq!(gate.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_waiting_start_that_fails_is_told_when_the_gate_opens() {
+        let (mut owner, fake, told, _) = owner(2);
+        fake.refuse.lock().unwrap().push(2);
+        admit(&mut owner, &fake, A, 1, true, false).unwrap();
+        admit(&mut owner, &fake, B, 2, true, true).unwrap();
+        assert!(told.lock().unwrap().is_empty());
+        retire(&mut owner, 1);
         let told = told.lock().unwrap();
         assert_eq!(told.len(), 1);
         assert_eq!((told[0].0, told[0].1), (1, 2));
-        // The refused job took no place on the workspace.
-        assert_eq!(fake.starts(), vec![(1, vec![]), (3, vec![1])]);
+    }
+
+    #[test]
+    fn a_launcher_that_panics_is_a_failed_start_and_what_waits_behind_it_still_starts() {
+        let (mut owner, fake, told, _) = owner(2);
+        fake.panics.lock().unwrap().push(2);
+        admit(&mut owner, &fake, A, 1, true, false).unwrap();
+        admit(&mut owner, &fake, B, 2, true, true).unwrap();
+        admit(&mut owner, &fake, B, 3, true, true).unwrap();
+        assert_eq!(fake.starts().len(), 1);
+        retire(&mut owner, 1);
+        assert_eq!(
+            told.lock().unwrap().iter().map(|told| told.1).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(
+            fake.starts()[1],
+            (3, vec![]),
+            "the admission behind the panic was not lost"
+        );
+        // Started at once, it is the call's result.
+        let refused = admit(&mut owner, &fake, B, 2, true, true);
+        assert!(matches!(refused, Err(StartError::Panicked)));
+    }
+
+    #[test]
+    fn the_gate_opens_through_the_owner_when_the_quantum_retires() {
+        let order = Order::<Fake>::new(vec![Box::new(|_, _| {}), Box::new(|_, _| {})], 2, Box::new(|_| false));
+        let fake = Arc::new(Fake::default());
+        order.admit(A, &fake, 1, Arc::default(), true, false).unwrap();
+        order.admit(B, &fake, 2, Arc::default(), true, true).unwrap();
+        assert_eq!(fake.starts().len(), 1, "the workspace waits for the quantum 1");
+        // Another quantum's retirement opens nothing.
+        order.retired(2);
+        assert_eq!(fake.starts().len(), 1);
+        order.retired(1);
+        assert_eq!(fake.starts()[1], (2, vec![]));
     }
 
     #[test]
@@ -756,11 +859,10 @@ mod tests {
         let order = Order::<Fake>::new(vec![reply], 2, Box::new(|_| false));
         let fake = Arc::new(Fake::default());
         assert!(order.close().is_some());
-        order.admit(A, &fake, 7, Arc::default(), true, true);
-        assert_eq!(
-            told.lock().unwrap().iter().map(|told| told.1).collect::<Vec<_>>(),
-            vec![7]
-        );
+        // The refusal is the result of the call, so that the caller admits nothing behind it.
+        let refused = order.admit(A, &fake, 7, Arc::default(), true, true);
+        assert!(matches!(refused, Err(StartError::Closed)));
+        assert!(told.lock().unwrap().is_empty());
         assert!(fake.starts().is_empty());
     }
 
@@ -769,7 +871,9 @@ mod tests {
         let order = Order::<Fake>::new(vec![Box::new(|_, _| {}), Box::new(|_, _| {})], 2, Box::new(|_| false));
         let fake = Arc::new(Fake::default());
         for job in 1..=6 {
-            order.admit(SequenceId(job as usize % 2), &fake, job, Arc::default(), true, true);
+            order
+                .admit(SequenceId(job as usize % 2), &fake, job, Arc::default(), true, true)
+                .unwrap();
         }
         let starts = fake.starts();
         assert_eq!(

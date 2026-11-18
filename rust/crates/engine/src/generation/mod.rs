@@ -39,7 +39,7 @@ use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
 use crate::state::{SequenceId, SequenceState};
 use crate::workspace::Workspace;
-use crate::workspace::input_records;
+use crate::workspace::{input_records, input_records_for};
 pub use acceptance::{Accepted, accept, accept_tokens};
 pub use constraint::{ConstraintError, ReasoningConstraint, TokenConstraint};
 pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
@@ -128,6 +128,10 @@ impl Generation {
         let replies: Vec<order::Reply> = vec![Box::new(move |serial, error| {
             told.post(Message::StartFailed(Box::new(StartFailed { serial, error })));
         })];
+        assert!(
+            workspace.records() as u64 >= input_records_for(residency.draft_depth, residency.sequences),
+            "the workspace holds input records for every sequence"
+        );
         let order = Order::new(
             replies,
             input_records(residency.draft_depth) as usize,

@@ -1717,7 +1717,11 @@ impl Owner {
         run.cursor += 1;
         // It starts behind its sequence's last quantum and the workspace's, now or in a later turn of the workspace's
         // owner; a start that fails is told back as a message.
-        shared.order.admit(self.id, &shared.executor, quantum, kill, true, more);
+        // A start that fails now admits nothing behind it: the caller fails the request.
+        if let Err(error) = shared.order.admit(self.id, &shared.executor, quantum, kill, true, more) {
+            run.in_flight.retain(|flying| flying.id != id);
+            return Err(why("starting the quantum")(error));
+        }
         Ok(())
     }
 
