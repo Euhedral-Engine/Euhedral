@@ -14,6 +14,7 @@ mod copier;
 mod copy;
 mod layout;
 mod open;
+mod prompt;
 mod tree;
 
 pub use cache::{CacheParts, Hit, OpenError, PrefixCacheHandle, PrefixCacheStats, RestoreError, Submit};
@@ -22,6 +23,7 @@ pub use copier::{Copier, PinnedArena, SequenceAddresses};
 pub use copy::{CopyJob, Direction, Ended, HostArena, Piece, Resolve};
 pub use layout::{Buffer, CheckpointLayout, SlotCopy};
 pub use open::{CacheSpec, open_prefix_cache};
+pub use prompt::{PromptCheckpoints, Restored};
 pub use tree::{Match, NodeId, POSITION_GRANULE, PrefixNode, PrefixTree, ReserveError, Speculation};
 
 #[cfg(test)]

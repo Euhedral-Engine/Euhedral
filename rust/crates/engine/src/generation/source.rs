@@ -64,13 +64,16 @@ use super::teacher_forced::LogitsSink;
 use crate::frames::{Kind, step};
 use crate::handoff::Handoff;
 use crate::model::ModelConfig;
-use crate::prefix::{CopyJob, FIRST_COPY_SERIAL, PrefixCacheHandle};
+use crate::prefix::{
+    CopyJob, FIRST_COPY_SERIAL, Hit, NodeId, PrefixCacheHandle, PromptCheckpoints, RestoreError, Restored,
+    SequenceAddresses, Submit,
+};
 use crate::quantum::{Executor, StartError};
 use crate::runtime::{Core, Units};
 use crate::sampling::{SamplingConfig, SamplingError, TokenSampler};
 use crate::stages::attention::KvSource;
 use crate::stages::sampling::{RowReadbackLease, Selection};
-use crate::stages::{InputRecordRef, Quantum, QuantumError, QuantumKind, SubmitError};
+use crate::stages::{InputRecordRef, Quantum, QuantumError, QuantumKind, SequenceRefs, SubmitError};
 use crate::state::kv::KvRetained;
 use crate::state::{SequenceId, SequenceState};
 use crate::workspace::{BufferSlot, Workspace};
@@ -100,17 +103,39 @@ pub(crate) enum Message {
     Reaped,
     /// A quantum the owner admitted did not start.
     StartFailed(Box<StartFailed>),
-    /// A prefix-cache copy job of this sequence to admit (see [`Generation::copy_submit`](super::Generation)).
+    /// A prefix-cache copy job of this sequence to admit (see [`copy_submit`]).
     Copy(Box<CopyRequest>),
     /// A copy job of this sequence ended and was reported.
     CopyEnded,
+    /// The prefix cache answered the lookup of the request's prompt.
+    Looked(Option<Hit>),
+    /// The prefix cache answered the restore of the request's hit.
+    Restored(Result<u32, RestoreError>),
+    /// The prefix cache answered a capture with the node to capture under next.
+    Captured(NodeId),
 }
 
-/// A copy job and how it is admitted.
+/// What a copy job of the prefix cache is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Purpose {
+    /// The restore of a hit, which the request's first chunk follows.
+    Restore,
+    /// The capture of the state after a chunk.
+    Capture,
+}
+
+/// A copy job and what it is for.
 pub(crate) struct CopyRequest {
-    pub(crate) job: CopyJob,
-    pub(crate) kill: Arc<AtomicBool>,
-    pub(crate) more: bool,
+    job: CopyJob,
+    kill: Arc<AtomicBool>,
+    purpose: Purpose,
+}
+
+/// The `Submit` of a prefix-cache request on the sequence whose owner is at `address`: it hands the job to the owner,
+/// which admits it behind the sequence's last device work and counts it in flight until it ends, so the sequence's
+/// lease is not returned while the job still reads or writes the sequence's state. `kill` stops the job.
+fn copy_submit(address: Arc<Address<Owner>>, kill: Arc<AtomicBool>, purpose: Purpose) -> Submit {
+    Box::new(move |job| address.post(Message::Copy(Box::new(CopyRequest { job, kill, purpose }))))
 }
 
 impl fmt::Debug for Message {
@@ -124,6 +149,9 @@ impl fmt::Debug for Message {
             Message::StartFailed(failed) => write!(formatter, "Message::StartFailed({})", failed.serial),
             Message::Copy(_) => formatter.write_str("Message::Copy"),
             Message::CopyEnded => formatter.write_str("Message::CopyEnded"),
+            Message::Looked(hit) => write!(formatter, "Message::Looked({})", hit.as_ref().map_or(0, Hit::position)),
+            Message::Restored(result) => write!(formatter, "Message::Restored({result:?})"),
+            Message::Captured(_) => formatter.write_str("Message::Captured"),
         }
     }
 }
@@ -164,7 +192,6 @@ pub(crate) struct Shared {
     /// What speculation needs of the artifact; `None` for an artifact without the draft layer.
     pub(crate) drafts: Option<Drafts>,
     /// The prefix cache, when the plan granted it memory and it opened.
-    #[allow(dead_code, reason = "the generation's prefix cache steps read it")]
     pub(crate) prefix: Option<PrefixCacheHandle>,
     /// Set when the engine stops: no request begins after it.
     pub(crate) closing: AtomicBool,
@@ -226,6 +253,7 @@ impl Rejected {
             prompt_tokens: 0,
             generated: 0,
             elapsed: Duration::ZERO,
+            cached_prompt_tokens: 0,
         };
         match self.audience {
             Audience::Greedy(listener) => Finished::Greedy(listener, outcome),
@@ -374,6 +402,8 @@ pub(super) struct Flying {
     /// When the owner found it retired.
     pub(super) retired_at: Option<Instant>,
     pub(super) retired: Option<(Quantum, QuantumOutcome)>,
+    /// The chunk ends at a checkpoint: once it completed its state is captured.
+    pub(super) checkpoint: bool,
 }
 
 /// A retired quantum the owner keeps until the work it queued on its own lane has run: a quantum that was stopped before
@@ -425,6 +455,12 @@ pub(super) struct Run {
     /// Rows the context holds.
     pub(super) capacity: u64,
     _units: Units,
+    /// The request's dealings with the prefix cache; `None` for a request that does not use it.
+    pub(super) checkpoints: Option<PromptCheckpoints>,
+    /// The kill flag of the first chunk when a restore precedes it: the restore's, which a failed copy sets.
+    first_kill: Option<Arc<AtomicBool>>,
+    /// What the restore's reservation uploaded, kept until the first chunk retires.
+    carried: KvRetained,
     /// The sequence's place in the pool, given back when the run is dropped.
     lease: Lease,
 }
@@ -514,8 +550,18 @@ impl Run {
             for flying in &self.in_flight {
                 flying.kill.store(true, Ordering::Release);
             }
+            if let Some(checkpoints) = self.checkpoints.as_mut() {
+                checkpoints.stop();
+            }
         }
         self.end_chain();
+    }
+
+    /// The prompt tokens a restore put in the sequence: 0 on a miss.
+    fn cached_prompt_tokens(&self) -> usize {
+        self.checkpoints
+            .as_ref()
+            .map_or(0, |checkpoints| checkpoints.cached() as usize)
     }
 
     /// Nothing is chained behind the last quantum admitted from now on: the workspace's owner lets go of it.
@@ -760,9 +806,28 @@ impl Owner {
             }
         };
         self.start_run(units, lease, mode, prompt, max_tokens as usize, stop_tokens, cancel)?;
+        self.look_up_prompt();
         // The first mask is prepared while the prompt prefills.
         self.prepare_constraint();
         Ok(())
+    }
+
+    /// Asks the prefix cache for the longest checkpoint of the prompt, unless the request cannot use one: a request that
+    /// speculates keeps missing (its checkpoints carry the draft's state, which is not stored yet), and so does a
+    /// teacher-forced one. The prompt's first chunk waits for the answer ([`PromptCheckpoints::holds`]).
+    fn look_up_prompt(&mut self) {
+        let Some(cache) = self.shared.prefix.clone() else {
+            return;
+        };
+        let Some(run) = self.run.as_mut() else { return };
+        if !matches!(run.mode, Mode::Greedy { .. } | Mode::Sampled { .. }) {
+            return;
+        }
+        let address = Arc::clone(&self.shared.address);
+        let tokens: Arc<[u32]> = Arc::from(run.prompt.as_slice());
+        run.checkpoints = Some(PromptCheckpoints::begin(cache, tokens, move |hit| {
+            address.post(Message::Looked(hit));
+        }));
     }
 
     /// Starts a teacher-forced run. A refused run gives its sink back.
@@ -881,6 +946,9 @@ impl Owner {
             began: Instant::now(),
             capacity,
             _units: units,
+            checkpoints: None,
+            first_kill: None,
+            carried: KvRetained::default(),
             lease,
         });
         Ok(())
@@ -899,6 +967,11 @@ impl Owner {
         let run = self.run.as_ref()?;
         // The tokens the host is selecting decide the next step.
         if run.waiting_logits || run.selecting() || run.in_flight.len() >= run.depth {
+            return None;
+        }
+        // The prefix cache first: the lookup's answer, the restore's job, or a capture of the state the next chunk would
+        // overwrite.
+        if run.checkpoints.as_ref().is_some_and(PromptCheckpoints::holds) {
             return None;
         }
         let next = match run.next_step(self.shared.chunk) {
@@ -962,6 +1035,7 @@ impl Owner {
             "the owner of sequence {} panicked again: the request ends with its quanta still in flight, and the sequence leaves the pool",
             self.id.0
         );
+        let cached_prompt_tokens = run.cached_prompt_tokens();
         mem::forget(mem::take(&mut run.in_flight));
         // The quanta can no longer be accounted for, so a next request on this sequence could race them: it is not given back.
         mem::forget(run.lease);
@@ -974,6 +1048,7 @@ impl Owner {
             prompt_tokens: run.prompt.len(),
             generated: run.generated,
             elapsed: run.began.elapsed(),
+            cached_prompt_tokens,
         };
         self.finished.push_back(run.mode.into_finished(outcome));
     }
@@ -1015,18 +1090,159 @@ impl Owner {
             Message::StartFailed(failed) => self.start_failed(*failed),
             Message::Copy(request) => self.admit_copy(*request),
             Message::CopyEnded => self.copies = self.copies.saturating_sub(1),
+            Message::Looked(hit) => self.looked(hit),
+            Message::Restored(result) => self.restored(result),
+            Message::Captured(node) => {
+                if let Some(checkpoints) = self.run.as_mut().and_then(|run| run.checkpoints.as_mut()) {
+                    checkpoints.captured(node);
+                }
+            }
         }
+    }
+
+    /// The cache answered the lookup: a hit is restored into the sequence before the prompt's first chunk, a miss
+    /// prefills the prompt from its start. A hit that arrives after the request was told to stop is dropped, which
+    /// unpins it.
+    fn looked(&mut self, hit: Option<Hit>) {
+        let Some(run) = self.run.as_mut() else { return };
+        let Some(checkpoints) = run.checkpoints.as_mut() else {
+            return;
+        };
+        checkpoints.looked();
+        let Some(hit) = hit else { return };
+        if run.stopping.is_some() {
+            return;
+        }
+        if let Err(why) = self.restore(hit) {
+            self.fail(why);
+        }
+    }
+
+    /// Restores `hit` into the sequence: reserves the cache pages up to its position (and resets the sequence if it holds
+    /// an earlier request's state: the restore must not be reset after it), and asks the cache to copy the checkpoint into
+    /// them. The prompt then resumes from the hit's position, its first chunk behind the restore's job.
+    fn restore(&mut self, hit: Hit) -> Result<(), String> {
+        let shared = Arc::clone(&self.shared);
+        let core = &shared.core;
+        let position = u64::from(hit.position());
+        let reset = mem::take(&mut self.used);
+        let mut retained = KvRetained::default();
+        let (_, reserved) = core
+            .lane_table
+            .submit_ops(core.owner_lane(), false, |lane| {
+                if reset {
+                    self.sequence.reset(lane).map_err(why("resetting the sequence"))?;
+                }
+                let cache = &mut self.sequence.kv;
+                cache
+                    .reserve(lane, &core.pool, 0, position, &mut retained)
+                    .map_err(why("reserving the restored rows"))?;
+                cache.appended(position).map_err(why("the cache's frontier"))?;
+                // The rows are part of the sequence from here: the copy's job is ordered before everything that reads them.
+                cache.commit(position).map_err(why("the cache's frontier"))
+            })
+            .map_err(why("the reservation of the restored rows"))?;
+        let refs = self
+            .sequence
+            .refs(KvSource::Base)
+            .map_err(why("the sequence's references"))?
+            .ordered_after(reserved, &core.lanes);
+        let addresses =
+            SequenceAddresses::new(refs, &shared.config).ok_or("the sequence has no cache to restore into")?;
+        let Some(run) = self.run.as_mut() else { return Ok(()) };
+        let Some(checkpoints) = run.checkpoints.as_mut() else {
+            return Ok(());
+        };
+        let (submit, answer) = (Arc::clone(&shared.address), Arc::clone(&shared.address));
+        let kill = checkpoints.restore(
+            hit,
+            self.id,
+            Arc::new(addresses),
+            move |kill| copy_submit(submit, kill, Purpose::Restore),
+            move |result| answer.post(Message::Restored(result)),
+        );
+        run.first_kill = Some(kill);
+        run.offset = position as usize;
+        run.position = position;
+        run.carried = retained;
+        Ok(())
+    }
+
+    /// The cache answered the restore.
+    fn restored(&mut self, result: Result<u32, RestoreError>) {
+        let Some(run) = self.run.as_mut() else { return };
+        let Some(checkpoints) = run.checkpoints.as_mut() else {
+            return;
+        };
+        match checkpoints.restored(result) {
+            Restored::Resumed(_) => {}
+            Restored::Cancelled => run.stop(FinishReason::Cancelled),
+            // Nothing was copied: the prompt prefills from its start. A request that stops has no use for the sequence.
+            Restored::Refused(error) => {
+                if run.stopping.is_some() {
+                    return;
+                }
+                log::debug!("the prefix cache did not restore: {error}");
+                run.offset = 0;
+                run.position = 0;
+                run.first_kill = None;
+                if let Err(error) = self.sequence.kv.truncate(0) {
+                    self.fail(format!("starting the prompt over: {error}"));
+                }
+            }
+            // The sequence holds a half-written state: the request ends with the error. The chunk behind the job was
+            // stopped with it.
+            Restored::Failed(error) => self.fail(format!("restoring the prompt's prefix: {error}")),
+        }
+    }
+
+    /// Asks the cache to capture the state of a chunk that completed at a checkpoint, when it is due and the capture
+    /// before it is answered (its node is the parent of this one).
+    fn ask_capture(&mut self) {
+        let Some(run) = self.run.as_mut().filter(|run| run.stopping.is_none()) else {
+            return;
+        };
+        let Some(checkpoints) = run.checkpoints.as_mut().filter(|checkpoints| checkpoints.due()) else {
+            return;
+        };
+        let (submit, answer) = (Arc::clone(&self.shared.address), Arc::clone(&self.shared.address));
+        checkpoints.ask(
+            self.id,
+            move |kill| copy_submit(submit, kill, Purpose::Capture),
+            move |node| answer.post(Message::Captured(node)),
+        );
     }
 
     /// Admits a copy job of this sequence behind the sequence's last device work, and counts it until it ends. A job
     /// that cannot start is dropped, which reports it failed to the cache, and is not counted.
+    ///
+    /// A job that arrives once the request is told to stop is dropped: nothing is behind it, and the cache hears it did
+    /// not run (a capture then publishes nothing). Otherwise the next chunk is to start behind the job, on the sequence's
+    /// edge, which is what `more` asks of the order: a restore is always followed by the first chunk, and a capture by
+    /// the next step of the request, if it has one. The chunk is admitted only after this ([`PromptCheckpoints::holds`]).
     fn admit_copy(&mut self, request: CopyRequest) {
-        let CopyRequest { job, kill, more } = request;
+        let CopyRequest { job, kill, purpose } = request;
         let shared = Arc::clone(&self.shared);
+        let chunk = shared.chunk;
+        let Some(run) = self.run.as_mut().filter(|run| run.stopping.is_none()) else {
+            return;
+        };
+        let more = match purpose {
+            Purpose::Restore => true,
+            Purpose::Capture => run.next_step(chunk).is_some(),
+        };
         self.copies += 1;
         if let Err(error) = shared.order.admit(self.id, &shared.executor, job, kill, false, more) {
             self.copies -= 1;
             log::error!("a prefix-cache copy did not start: {error}");
+            return;
+        }
+        run.chain |= more;
+        if let Some(checkpoints) = run.checkpoints.as_mut() {
+            match purpose {
+                Purpose::Restore => checkpoints.restore_submitted(),
+                Purpose::Capture => checkpoints.capture_submitted(),
+            }
         }
     }
 
@@ -1302,7 +1518,12 @@ impl Owner {
             // The quantum that feeds the last token of a speculative request runs after the request ended.
             let live = run.stopping.is_none() || flying.role == Role::Settle;
             match outcome {
-                QuantumOutcome::Completed if live => self.completed(&mut flying, &quantum),
+                QuantumOutcome::Completed if live => {
+                    self.completed(&mut flying, &quantum);
+                    if flying.checkpoint {
+                        self.checkpoint_reached();
+                    }
+                }
                 // Behind the quantum that ended the request: its rows never become part of the sequence.
                 QuantumOutcome::Completed | QuantumOutcome::Killed if !live => {}
                 QuantumOutcome::Killed => self.fail("a quantum was stopped".to_string()),
@@ -1323,6 +1544,16 @@ impl Owner {
                 QuantumOutcome::Completed => {}
             }
             self.park(quantum, flying.retained);
+        }
+    }
+
+    /// The chunk that ends at a checkpoint completed: its state is due to be captured, unless the request ended with it.
+    fn checkpoint_reached(&mut self) {
+        let Some(run) = self.run.as_mut().filter(|run| run.stopping.is_none()) else {
+            return;
+        };
+        if let Some(checkpoints) = run.checkpoints.as_mut() {
+            checkpoints.concluded();
         }
     }
 
@@ -1546,6 +1777,7 @@ impl Owner {
     /// Admits quanta while the request has steps and room for them.
     fn admit_ready(&mut self) {
         let chunk = self.shared.chunk;
+        self.ask_capture();
         while let Some(next) = self.admissible() {
             if let Err(why) = self.admit(next) {
                 self.fail(why);
@@ -1574,6 +1806,15 @@ impl Owner {
         let start = run.position;
         let speculative = matches!(run.mode, Mode::Speculative { .. });
         let drafting = matches!(&run.mode, Mode::Speculative { state, .. } if state.drafting());
+        // A chunk that ends at a checkpoint has nothing chained behind it: it retires, and the state it leaves is captured
+        // before the next chunk starts (see `PromptCheckpoints`).
+        let end = run.offset + next_rows(next);
+        let checkpoint = matches!(next, Step::Prefill { .. })
+            && !speculative
+            && run
+                .checkpoints
+                .as_ref()
+                .is_some_and(|checkpoints| checkpoints.wants(end));
         let admission = match next {
             Step::Prefill { rows, last } => Admission {
                 role: Role::Prefill { last },
@@ -1587,7 +1828,11 @@ impl Owner {
                 last_chunk: last,
                 // A greedy request chains the next row behind the prompt; a speculative one chains the next chunk (or the
                 // catch-up of this one) and waits for the first token after the last chunk.
-                more: if speculative { !last } else { run.depth > 1 },
+                more: if speculative {
+                    !last
+                } else {
+                    run.depth > 1 && !checkpoint
+                },
             },
             Step::Decode => Admission {
                 role: Role::Decode,
@@ -1623,18 +1868,31 @@ impl Owner {
             ),
             _ => None,
         };
-        self.admit_quantum(admission, move |quantum| {
-            let quantum = match chained {
-                Some(previous) => quantum.token_from(previous)?,
-                None => quantum.with_tokens(tokens)?,
-            };
-            if drafting && matches!(next, Step::Prefill { .. }) {
-                quantum.seeding_draft()
-            } else {
-                Ok(quantum)
-            }
-        })?;
+        let refs = self.admit_quantum_taking(
+            admission,
+            move |quantum| {
+                let quantum = match chained {
+                    Some(previous) => quantum.token_from(previous)?,
+                    None => quantum.with_tokens(tokens)?,
+                };
+                if drafting && matches!(next, Step::Prefill { .. }) {
+                    quantum.seeding_draft()
+                } else {
+                    Ok(quantum)
+                }
+            },
+            checkpoint,
+        )?;
         let Some(run) = self.run.as_mut() else { return Ok(()) };
+        if let Some(refs) = refs
+            && let Some(addresses) = SequenceAddresses::new(refs, &self.shared.config)
+            && let Some(checkpoints) = run.checkpoints.as_mut()
+        {
+            checkpoints.expect(end, Arc::new(addresses));
+            if let Some(flying) = run.in_flight.back_mut() {
+                flying.checkpoint = true;
+            }
+        }
         run.position += match next {
             Step::Prefill { rows, .. } => rows as u64,
             _ => 1,
@@ -1659,9 +1917,20 @@ impl Owner {
         admission: Admission,
         shape: impl FnOnce(Quantum) -> Result<Quantum, QuantumError>,
     ) -> Result<(), String> {
+        self.admit_quantum_taking(admission, shape, false).map(drop)
+    }
+
+    /// [`admit_quantum`](Self::admit_quantum) that, when `take` is set, also returns a copy of the references the
+    /// quantum was admitted with: what a capture of the state it leaves reads.
+    fn admit_quantum_taking(
+        &mut self,
+        admission: Admission,
+        shape: impl FnOnce(Quantum) -> Result<Quantum, QuantumError>,
+        take: bool,
+    ) -> Result<Option<SequenceRefs>, String> {
         let shared = Arc::clone(&self.shared);
         let core = &shared.core;
-        let Some(run) = self.run.as_mut() else { return Ok(()) };
+        let Some(run) = self.run.as_mut() else { return Ok(None) };
         let Admission {
             role,
             kind,
@@ -1680,7 +1949,7 @@ impl Owner {
 
         // The reservation (and, for the first quantum of a request after another, the reset of the sequence) on the
         // owner's lane. Its marker orders the quantum's stages behind it.
-        let mut retained = KvRetained::default();
+        let mut retained = mem::take(&mut run.carried);
         let (_, reserved) = core
             .lane_table
             .submit_ops(core.owner_lane(), false, |lane| {
@@ -1708,6 +1977,7 @@ impl Owner {
             .map_err(why("the sequence's references"))?
             .ordered_after(reserved, &core.lanes)
             .with_replay_rows(replay);
+        let taken = take.then(|| refs.clone());
         let mode = SubmitMode {
             pdl,
             row_exact: kind == QuantumKind::Verify,
@@ -1755,7 +2025,7 @@ impl Owner {
         quantum.prepared_after(prepared);
 
         let selection = quantum.selection().cloned();
-        let kill = Arc::new(AtomicBool::new(false));
+        let kill = run.first_kill.take().unwrap_or_default();
         let admitted = Instant::now();
         let id = quantum.id();
 
@@ -1773,6 +2043,7 @@ impl Owner {
             kill: Arc::clone(&kill),
             retired_at: None,
             retired: None,
+            checkpoint: false,
         });
         if selection.is_some() {
             run.previous = selection;
@@ -1789,14 +2060,20 @@ impl Owner {
             run.in_flight.retain(|flying| flying.id != id);
             return Err(why("starting the quantum")(error));
         }
-        Ok(())
+        Ok(taken)
     }
 
     /// Ends the request when it has nothing in flight and nothing more to admit.
     fn finish_if_done(&mut self) {
         let chunk = self.shared.chunk;
         let Some(run) = self.run.as_ref() else { return };
-        if self.copies > 0 {
+        // Nothing the prefix cache was asked is left unanswered (a restore writes the sequence, a capture reads it, and an
+        // answer that arrives after the request is gone has nobody to tell), and a capture still due is made first.
+        let cache_busy = run
+            .checkpoints
+            .as_ref()
+            .is_some_and(|checkpoints| checkpoints.pending() > 0 || (run.stopping.is_none() && checkpoints.holds()));
+        if self.copies > 0 || cache_busy {
             return;
         }
         let ended = run.stopping.is_some() || run.next_step(chunk).is_none();
@@ -1814,6 +2091,7 @@ impl Owner {
             mtp.discard();
         }
         self.used = true;
+        let cached_prompt_tokens = run.cached_prompt_tokens();
         let reason = match run.stopping {
             Some(reason) => reason,
             None if run.generated >= run.wanted => FinishReason::Length,
@@ -1824,8 +2102,17 @@ impl Owner {
             prompt_tokens: run.prompt.len(),
             generated: run.generated,
             elapsed: run.began.elapsed(),
+            cached_prompt_tokens,
         };
         self.finished.push_back(run.mode.into_finished(outcome));
+    }
+}
+
+/// The prompt rows a prefill step takes: 0 for any other.
+fn next_rows(step: Step) -> usize {
+    match step {
+        Step::Prefill { rows, .. } => rows,
+        _ => 0,
     }
 }
 

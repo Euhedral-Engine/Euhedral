@@ -77,6 +77,7 @@ impl Drop for Report {
                 prompt_tokens: 0,
                 generated: 0,
                 elapsed: Duration::ZERO,
+                cached_prompt_tokens: 0,
             };
             done.send((
                 mem::take(&mut self.bytes),
@@ -180,6 +181,7 @@ mod tests {
             prompt_tokens: 4,
             generated,
             elapsed: Duration::ZERO,
+            cached_prompt_tokens: 0,
         }
     }
 
