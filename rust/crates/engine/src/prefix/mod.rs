@@ -14,6 +14,7 @@ mod copier;
 mod copy;
 mod layout;
 mod open;
+mod prompt;
 mod tree;
 
 pub use cache::{CacheParts, Hit, OpenError, PrefixCacheHandle, PrefixCacheStats, RestoreError, Submit};
@@ -22,6 +23,7 @@ pub use copier::{Copier, PinnedArena, SequenceAddresses};
 pub use copy::{CopyJob, Direction, Ended, HostArena, Piece, Resolve};
 pub use layout::{Buffer, CheckpointLayout, SlotCopy};
 pub use open::{CacheSpec, open_prefix_cache};
+pub use prompt::{PromptCheckpoints, Restored};
 pub use tree::{Match, NodeId, POSITION_GRANULE, PrefixNode, PrefixTree, ReserveError, Speculation};
 
 #[cfg(test)]
@@ -35,5 +37,12 @@ mod cache_tests;
 mod fixtures;
 #[cfg(test)]
 mod layout_tests;
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "the answers of the cache are collected by the test through the closures it gave"
+)]
+mod prompt_tests;
 #[cfg(test)]
 mod tree_tests;

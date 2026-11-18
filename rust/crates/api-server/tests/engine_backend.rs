@@ -189,6 +189,7 @@ fn outcome(reason: FinishReason, generated: usize) -> GenerationOutcome {
         prompt_tokens: 3,
         generated,
         elapsed: Duration::ZERO,
+        cached_prompt_tokens: 0,
     }
 }
 

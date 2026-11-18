@@ -106,7 +106,9 @@ pub struct CopyJob {
     direction: Direction,
     pieces: Vec<Piece>,
     host: Arc<dyn HostArena>,
-    buffers: Arc<dyn Resolve>,
+    /// The sequence's buffers; let go when the job ends, before the cache is told, so that the answer finds the sequence
+    /// at rest.
+    buffers: Option<Arc<dyn Resolve>>,
     ticket: u64,
     report: Option<Arc<Address<PrefixCache>>>,
     group_bytes: u64,
@@ -127,7 +129,7 @@ impl CopyJob {
             direction,
             pieces,
             host: link.host,
-            buffers: link.buffers,
+            buffers: Some(link.buffers),
             ticket: link.ticket,
             report: Some(link.cache),
             group_bytes: link.group_bytes,
@@ -163,7 +165,7 @@ impl CopyJob {
                 direction: self.direction,
                 pieces,
                 host: Arc::clone(&self.host),
-                buffers: Arc::clone(&self.buffers),
+                buffers: self.buffers.clone(),
                 ticket: self.ticket,
                 report: if index == last { self.report.take() } else { None },
                 group_bytes: self.group_bytes,
@@ -211,7 +213,7 @@ impl CopyJob {
 
     /// The marker a restore's copies wait for, if any.
     pub fn ready(&self) -> Option<Marker> {
-        self.buffers.ready()
+        self.buffers.as_ref().and_then(|buffers| buffers.ready())
     }
 
     /// Tells the cache how the job ended. Once: a second call, and the drop, say nothing.
@@ -240,6 +242,7 @@ impl CopyJob {
         if !self.closing {
             return;
         }
+        self.buffers = None;
         if let Some(cache) = self.report.take() {
             cache.post(Message::Done {
                 ticket: self.ticket,

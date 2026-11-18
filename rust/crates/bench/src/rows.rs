@@ -260,6 +260,7 @@ impl Drop for RowSink {
                 prompt_tokens: 0,
                 generated: 0,
                 elapsed: Duration::ZERO,
+                cached_prompt_tokens: 0,
             });
         }
     }

@@ -68,6 +68,9 @@ pub struct SequenceAddresses {
     /// By model layer: the full-attention layer's place among the cache's layers.
     attention: Vec<Option<usize>>,
     format: KvFormat,
+    /// The request the state belongs to does not speculate: it copies the base state only, whatever the engine's
+    /// sequences are able to do.
+    base_only: bool,
 }
 
 impl SequenceAddresses {
@@ -89,6 +92,17 @@ impl SequenceAddresses {
             refs,
             attention,
             format,
+            base_only: false,
+        })
+    }
+
+    /// As [`new`](Self::new), for a request that does not speculate on an engine whose sequences can: its state is the
+    /// base state alone, which is all its checkpoints hold and all a restore into it needs (the draft cache stays as
+    /// the reset left it, and no request drafts from it before the next reset).
+    pub fn base_only(refs: SequenceRefs, config: &ModelConfig) -> Option<SequenceAddresses> {
+        Some(SequenceAddresses {
+            base_only: true,
+            ..Self::new(refs, config)?
         })
     }
 }
@@ -142,7 +156,7 @@ impl Resolve for SequenceAddresses {
     }
 
     fn speculative(&self) -> bool {
-        self.refs.kv(KvSource::Mtp).is_some() || self.refs.device().scratch.draft().is_some()
+        !self.base_only && (self.refs.kv(KvSource::Mtp).is_some() || self.refs.device().scratch.draft().is_some())
     }
 
     fn ready(&self) -> Option<Marker> {
