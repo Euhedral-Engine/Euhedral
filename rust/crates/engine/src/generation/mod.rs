@@ -1,8 +1,8 @@
-//! Generation: prefill, greedy decode and teacher-forced decoding of the engine's sequence.
+//! Generation: prefill, greedy decode and teacher-forced decoding on the engine's sequences.
 //!
 //! [`EngineRuntime::generate`](crate::EngineRuntime::generate) starts a greedy request and
-//! [`EngineRuntime::teacher_forced`](crate::EngineRuntime::teacher_forced) a teacher-forced run. Both are carried by the
-//! sequence's owner, which sits in a [`Mailbox`](mailbox::Mailbox): the frames that tell it something (a quantum
+//! [`EngineRuntime::teacher_forced`](crate::EngineRuntime::teacher_forced) a teacher-forced run, each on an idle
+//! sequence from the pool. Both are carried by the sequence's owner (one for each sequence), which sits in a [`Mailbox`](mailbox::Mailbox): the frames that tell it something (a quantum
 //! retired, a logits row arrived, a parked quantum's lane work ran) post the message and run the owner's turn on their
 //! own worker if no other turn runs. The caller is told through its listener or sink, on a worker, and waits on a
 //! hand-off of its own.
@@ -14,6 +14,7 @@ mod listener;
 mod mailbox;
 mod mtp;
 mod order;
+mod pool;
 mod request;
 mod sampled;
 mod source;
@@ -22,7 +23,7 @@ mod teacher_forced;
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use euhedral_core::generics::FrameSink;
 use euhedral_data_structures::queues::MpscQueue;
@@ -46,7 +47,8 @@ pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
 pub use listener::GenerationListener;
 pub(crate) use mailbox::OPERATION_BOUND;
 use mailbox::{Address, Mailbox, Spawn};
-use order::Order;
+use order::{Order, Reply};
+use pool::{Lease, SequencePool};
 pub use request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
     Verification,
@@ -90,16 +92,26 @@ impl fmt::Debug for Generation {
 }
 
 impl Generation {
-    /// Builds the plan of the loaded model and the graphs of its views, and makes `sequence` their owner's. A refused
-    /// plan gives the sequence back. `draft_ids` are the token ids of the draft head's rows, which an artifact with a
-    /// draft layer needs to speculate.
-    pub(crate) fn new(
+    /// Builds the plan of the loaded model and the graphs of its views, and makes `sequence`, numbered `id`, their
+    /// owner's. `address` is where the owner will be (the workspace's owner tells it of quanta that did not start), and
+    /// `order` is the engine's, shared by every sequence; `sequences` is how many sequences the engine runs, which the
+    /// lanes' rings must hold the quanta of. A refused plan gives the sequence back. `draft_ids` are the token ids of
+    /// the draft head's rows, which an artifact with a draft layer needs to speculate.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the startup's state, and where this sequence sits in the engine"
+    )]
+    fn new(
         core: &Arc<Core>,
         config: &Arc<ModelConfig>,
         residency: &ResidencyPlan,
         weights: &Weights,
         workspace: &Arc<Workspace>,
         sequence: SequenceState,
+        id: SequenceId,
+        address: Arc<Address<Owner>>,
+        order: &Arc<Order<Executor>>,
+        sequences: usize,
         draft_ids: Option<Arc<[u32]>>,
     ) -> Result<Generation, Box<(EngineError, SequenceState)>> {
         let capacity = sequence.kv.planned_rows().min(residency.max_context_tokens as u64);
@@ -108,8 +120,7 @@ impl Generation {
         // cannot fail, so no message is ever dropped.
         let queue = MpscQueue::<Message>::new(GREEDY_DEPTH + 4);
         let (producer, inbox) = (queue.producer(), queue.consumer());
-        let address = Address::new();
-        let executor = match Self::executor(core, config, residency, weights, &address) {
+        let executor = match Self::executor(core, config, residency, weights, &address, sequences) {
             Ok(executor) => executor,
             Err(error) => return Err(Box::new((error, sequence))),
         };
@@ -121,28 +132,12 @@ impl Generation {
             }),
             _ => None,
         };
-        // The engine's one workspace is ordered by one owner. Its starts that fail are told to the sequence's owner, whose
-        // address exists before the owner does.
-        let id = SequenceId(0);
-        let told = Arc::clone(&address);
-        let replies: Vec<order::Reply> = vec![Box::new(move |serial, error| {
-            told.post(Message::StartFailed(Box::new(StartFailed { serial, error })));
-        })];
-        assert!(
-            workspace.records() as u64 >= input_records_for(residency.draft_depth, residency.sequences),
-            "the workspace holds input records for every sequence"
-        );
-        let order = Order::new(
-            replies,
-            input_records(residency.draft_depth) as usize,
-            Self::spawner(core),
-        );
         let shared = Arc::new(Shared {
             core: Arc::clone(core),
             config: Arc::clone(config),
             workspace: Arc::clone(workspace),
             executor: Arc::new(executor),
-            order,
+            order: Arc::clone(order),
             address: Arc::clone(&address),
             chunk: residency.rows.rows as usize,
             capacity,
@@ -182,6 +177,7 @@ impl Generation {
         residency: &ResidencyPlan,
         weights: &Weights,
         address: &Arc<Address<Owner>>,
+        sequences: usize,
     ) -> Result<Executor, EngineError> {
         let library: &Arc<CudaLibrary> = &core.library;
         let formats = Formats::new(
@@ -221,11 +217,12 @@ impl Generation {
         } else {
             0
         };
-        let needed = (biggest * STAGE_RING_QUANTA).max(step);
+        // Every sequence keeps that many in flight on the same lanes.
+        let needed = (biggest * STAGE_RING_QUANTA).max(step) * sequences.max(1);
         if needed > core.stage_ring {
             return Err(EngineError::Runtime(format!(
-                "the quanta in flight record {needed} markers on a lane and the lanes' rings of {} events do not hold \
-                 them",
+                "the quanta in flight of {sequences} sequences record {needed} markers on a lane and the lanes' rings of \
+                 {} events do not hold them",
                 core.stage_ring
             )));
         }
@@ -251,31 +248,32 @@ impl Generation {
         .map_err(|error| EngineError::Runtime(format!("the stage graphs: {error:?}")))
     }
 
-    /// Starts `request` on the engine's sequence.
-    pub(crate) fn generate(&self, request: GenerationRequest, cancel: CancelHandle) -> Result<(), AdmissionError> {
+    /// Starts `request` on this sequence, which `lease` holds until the request ends.
+    fn generate(&self, request: GenerationRequest, cancel: CancelHandle, lease: Lease) -> Result<(), AdmissionError> {
         let core = Arc::clone(&self.shared.core);
         self.start(move |owner| match owner {
-            Some(owner) => owner.begin(admit(&core), request, cancel),
+            Some(owner) => owner.begin(admit(&core), request, cancel, lease),
             None => Err(closed(Audience::Greedy(request.listener))),
         })
     }
 
-    /// Starts a teacher-forced run on the engine's sequence.
-    pub(crate) fn teacher_forced(
+    /// Starts a teacher-forced run on this sequence.
+    fn teacher_forced(
         &self,
         prefix: Vec<u32>,
         forced: Vec<u32>,
         sink: Box<dyn LogitsSink>,
+        lease: Lease,
     ) -> Result<(), AdmissionError> {
         let core = Arc::clone(&self.shared.core);
         self.start(move |owner| match owner {
-            Some(owner) => owner.begin_forced(admit(&core), prefix, forced, sink),
+            Some(owner) => owner.begin_forced(admit(&core), prefix, forced, sink, lease),
             None => Err(closed(Audience::Forced(sink))),
         })
     }
 
-    /// Starts the request `begin` makes. Whether it is admitted depends on the owner's state alone: `Busy` means a
-    /// request is running, never that a turn holds the claim. With the claim free the answer is the return value, and
+    /// Starts the request `begin` makes. Whether it is admitted was decided by the pool that gave the sequence, never by
+    /// whether a turn holds the claim. With the claim free the answer is the return value, and
     /// the first turn runs on a worker, never on the caller's thread. With the claim held the request is posted to the
     /// owner and this returns `Ok` at once (no wait: a listener calls this from a worker); a request the owner then
     /// refuses has its listener or sink told, as a failed outcome, after the claim is released.
@@ -350,31 +348,226 @@ impl Generation {
         self.mailbox.ask(true, move |owner| read(owner.sequence()))
     }
 
-    /// Cancels the request that runs, if any, and waits at most `bound` until it ended and its listener was told its
+    /// Ends the sequence. Nothing may be running: with a request in flight the sequence stays allocated, and says so.
+    /// `false` then.
+    fn close(&self) -> bool {
+        match self.mailbox.close() {
+            Some(owner) => {
+                owner.close();
+                true
+            }
+            None => {
+                log::error!("a generation is running at shutdown: the sequence's device memory stays allocated");
+                false
+            }
+        }
+    }
+
+    /// Takes the sequence back from an owner that has run nothing.
+    fn take_sequence(&self) -> Option<SequenceState> {
+        self.mailbox.close().map(Owner::release)
+    }
+}
+
+/// The engine's sequences, each with an owner of its own, the pool that says which of them is idle, and the one order
+/// they share on the workspace.
+pub(crate) struct Generations {
+    generations: Vec<Generation>,
+    pool: SequencePool,
+    order: Arc<Order<Executor>>,
+    /// A test hook: the next request admitted arms the owner's panic after this many admissions.
+    #[cfg(feature = "test-oracles")]
+    panic_next: AtomicU64,
+}
+
+impl fmt::Debug for Generations {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Generations")
+            .field("sequences", &self.generations.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Generations {
+    /// Builds an owner and the graphs of the model's plan for each of `sequences`, and the one order they share. A
+    /// refused plan gives every sequence back.
+    pub(crate) fn new(
+        core: &Arc<Core>,
+        config: &Arc<ModelConfig>,
+        residency: &ResidencyPlan,
+        weights: &Weights,
+        workspace: &Arc<Workspace>,
+        sequences: Vec<SequenceState>,
+        draft_ids: Option<Arc<[u32]>>,
+    ) -> Result<Generations, Box<(EngineError, Vec<SequenceState>)>> {
+        assert!(
+            workspace.records() as u64 >= input_records_for(residency.draft_depth, sequences.len()),
+            "the workspace holds input records for every sequence"
+        );
+        // The owners' addresses exist before the owners do: the workspace's owner tells each of its sequence's quanta
+        // that did not start.
+        let addresses: Vec<Arc<Address<Owner>>> = sequences.iter().map(|_| Address::new()).collect();
+        let replies: Vec<Reply> = addresses
+            .iter()
+            .map(|address| {
+                let told = Arc::clone(address);
+                Box::new(move |serial, error| {
+                    told.post(Message::StartFailed(Box::new(StartFailed { serial, error })));
+                }) as Reply
+            })
+            .collect();
+        let order = Arc::new(Order::new(
+            replies,
+            input_records(residency.draft_depth) as usize,
+            Generation::spawner(core),
+        ));
+        let count = sequences.len();
+        let mut generations: Vec<Generation> = Vec::with_capacity(count);
+        let mut waiting = sequences.into_iter().zip(addresses).enumerate();
+        while let Some((index, (sequence, address))) = waiting.next() {
+            let built = Generation::new(
+                core,
+                config,
+                residency,
+                weights,
+                workspace,
+                sequence,
+                SequenceId(index),
+                address,
+                &order,
+                count,
+                draft_ids.clone(),
+            );
+            match built {
+                Ok(generation) => generations.push(generation),
+                Err(refused) => {
+                    let (error, sequence) = *refused;
+                    let mut back: Vec<SequenceState> =
+                        generations.iter().filter_map(Generation::take_sequence).collect();
+                    back.push(sequence);
+                    back.extend(waiting.map(|(_, (sequence, _))| sequence));
+                    drop(order.close());
+                    return Err(Box::new((error, back)));
+                }
+            }
+        }
+        Ok(Generations {
+            pool: SequencePool::new(count),
+            generations,
+            order,
+            #[cfg(feature = "test-oracles")]
+            panic_next: AtomicU64::new(u64::MAX),
+        })
+    }
+
+    /// The number of sequences.
+    pub(crate) fn sequences(&self) -> usize {
+        self.generations.len()
+    }
+
+    /// Takes an idle sequence, or refuses with `Busy` when every sequence runs a generation.
+    fn take(&self) -> Result<(&Generation, Lease), AdmissionError> {
+        let (id, lease) = self.pool.take().ok_or(AdmissionError::Busy)?;
+        let generation = &self.generations[id.0];
+        #[cfg(feature = "test-oracles")]
+        {
+            let quanta = self.panic_next.swap(u64::MAX, Ordering::AcqRel);
+            if quanta != u64::MAX {
+                generation.panic_after_admissions(quanta);
+            }
+        }
+        Ok((generation, lease))
+    }
+
+    /// Starts `request` on an idle sequence.
+    pub(crate) fn generate(&self, request: GenerationRequest, cancel: CancelHandle) -> Result<(), AdmissionError> {
+        let (generation, lease) = self.take()?;
+        generation.generate(request, cancel, lease)
+    }
+
+    /// Starts a teacher-forced run on an idle sequence.
+    pub(crate) fn teacher_forced(
+        &self,
+        prefix: Vec<u32>,
+        forced: Vec<u32>,
+        sink: Box<dyn LogitsSink>,
+    ) -> Result<(), AdmissionError> {
+        let (generation, lease) = self.take()?;
+        generation.teacher_forced(prefix, forced, sink, lease)
+    }
+
+    /// The test hook: the owner of the sequence the next request takes panics at the end of the turn in which that
+    /// request has admitted `quanta` quanta.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn panic_after_admissions(&self, quanta: u64) {
+        self.panic_next.store(quanta, Ordering::Release);
+    }
+
+    /// The test hook: a speculative request ends with a decode quantum that feeds its last token.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn settle_after_speculation(&self, settle: bool) {
+        for generation in &self.generations {
+            generation.settle_after_speculation(settle);
+        }
+    }
+
+    /// The test hook: no sequence records graphs from now on. Only while no request runs.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn disable_graphs(&self) -> bool {
+        let disabled: Vec<bool> = self.generations.iter().map(Generation::disable_graphs).collect();
+        disabled.into_iter().all(|disabled| disabled)
+    }
+
+    /// Looks at sequence `index` while no request holds it. `None` while one does, or when there is no such sequence.
+    pub(crate) fn inspect<R: Send + 'static>(
+        &self,
+        index: usize,
+        read: impl FnOnce(&SequenceState) -> R + Send + 'static,
+    ) -> Option<R> {
+        self.generations.get(index)?.inspect(read)
+    }
+
+    /// Cancels every request that runs and waits at most `bound` in all until each ended and its listener was told its
     /// last call (a request that ends in a stop is told `Cancelled`). Refuses new requests from now on. Runs while the
-    /// lattice still works: the request ends on its workers. `false` when the bound passed with a request still
-    /// running, and the caller must not free what it uses. Called from inside a listener's `token`, `quantum` or
-    /// `prefill_done` it returns `false` at once (the owner's turn that makes the call is what would end the request).
-    /// Called from inside `finished` it cannot be told apart, and waits the bound for that very call to return, so it
-    /// returns `false` after the bound. For the engine's owner, outside the lattice.
+    /// lattice still works. `false` when the bound passed with a request still running, and the caller must not free
+    /// what it uses; called from inside a turn it returns `false` at once. For the engine's owner, outside the lattice.
     pub(crate) fn stop(&self, bound: Duration) -> bool {
-        self.shared.closing.store(true, Ordering::SeqCst);
-        let stopped = self.mailbox.stop(bound);
+        // Every owner is told to stop before any is waited for, so that the requests end side by side.
+        let deadline = Instant::now() + bound;
+        let idle: Vec<_> = self
+            .generations
+            .iter()
+            .map(|generation| {
+                generation.shared.closing.store(true, Ordering::SeqCst);
+                generation.mailbox.stopping()
+            })
+            .collect();
+        // A generation whose barrier could not be set (called from inside a turn) cannot be waited for: none is.
+        if idle.iter().any(Option::is_none) {
+            log::error!("a generation cannot be waited for from inside a turn at shutdown");
+            return false;
+        }
+        let stopped = idle
+            .into_iter()
+            .flatten()
+            .map(|idle| idle.wait(deadline.saturating_duration_since(Instant::now())).is_ok())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .all(|ended| ended);
         if !stopped {
             log::error!("a generation did not end within {bound:?} of the cancel at shutdown");
         }
         stopped
     }
 
-    /// Ends the sequence. Nothing may be running: with a request in flight the sequence stays allocated, and says so.
+    /// Ends the sequences, then the workspace's order, which they use. Nothing may be running: a sequence with a
+    /// request in flight stays allocated, says so, and keeps the order's pins.
     pub(crate) fn close(&self) {
-        match self.mailbox.close() {
-            Some(owner) => {
-                owner.close();
-                // What the workspace's owner still pins goes with it.
-                drop(self.shared.order.close());
-            }
-            None => log::error!("a generation is running at shutdown: the sequence's device memory stays allocated"),
+        let closed: Vec<bool> = self.generations.iter().map(Generation::close).collect();
+        if closed.into_iter().all(|closed| closed) {
+            // What the workspace's owner still pins goes with it.
+            drop(self.order.close());
         }
     }
 }

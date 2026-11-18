@@ -46,8 +46,8 @@ use std::time::{Duration, Instant};
 
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
 use euhedral_inference_engine::generation::{
-    AdmissionError, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, LogitsSink, QuantumEvent,
-    Speculation,
+    AdmissionError, CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, LogitsSink,
+    QuantumEvent, Speculation,
 };
 use euhedral_inference_engine::sampling::{SamplingConfig, TokenSampler};
 use euhedral_inference_engine::stages::QuantumKind;
@@ -175,6 +175,8 @@ struct Recorder {
     prefill_done: Option<Instant>,
     began: Instant,
     done: Option<Arc<Handoff<Recording>>>,
+    /// Cancels the request once it has reported this many tokens.
+    cancel_after: Option<(CancelHandle, usize)>,
 }
 
 impl GenerationListener for Recorder {
@@ -185,6 +187,13 @@ impl GenerationListener for Recorder {
     fn token(&mut self, id: u32, at: Instant) {
         self.tokens.push(id);
         self.token_times.push(at);
+        if let Some((cancel, _)) = self
+            .cancel_after
+            .as_ref()
+            .filter(|(_, after)| self.tokens.len() >= *after)
+        {
+            cancel.cancel();
+        }
     }
 
     fn quantum(&mut self, event: QuantumEvent) {
@@ -242,15 +251,40 @@ fn generate_sampled(
     stop_tokens: &[u32],
     sampling: SamplingConfig,
 ) -> Recording {
+    submit(
+        runtime,
+        prompt,
+        max_tokens,
+        stop_tokens,
+        Speculation::Off,
+        sampling,
+        None,
+    )
+    .expect("the request is admitted")
+    .wait(WAIT)
+    .expect("the generation reports")
+}
+
+/// Starts a generation and returns the hand-off its listener reports on, or why it was refused. With `cancel`, the
+/// request is cancelled by its own listener after that many tokens.
+fn submit(
+    runtime: &EngineRuntime,
+    prompt: &[u32],
+    max_tokens: u32,
+    stop_tokens: &[u32],
+    speculation: Speculation,
+    sampling: SamplingConfig,
+    cancel: Option<usize>,
+) -> Result<Arc<Handoff<Recording>>, AdmissionError> {
     let done = Handoff::new();
-    let waiting = Arc::clone(&done);
+    let handle = CancelHandle::default();
     let began = Instant::now();
-    runtime
-        .generate(GenerationRequest {
+    runtime.generate_cancellable(
+        GenerationRequest {
             prompt: prompt.to_vec(),
             max_tokens,
             stop_tokens: stop_tokens.to_vec(),
-            speculation: Speculation::Off,
+            speculation,
             sampling,
             constraint: None,
             listener: Box::new(Recorder {
@@ -259,11 +293,13 @@ fn generate_sampled(
                 events: Vec::new(),
                 prefill_done: None,
                 began,
-                done: Some(done),
+                done: Some(Arc::clone(&done)),
+                cancel_after: cancel.map(|after| (handle.clone(), after)),
             }),
-        })
-        .expect("the request is admitted");
-    waiting.wait(WAIT).expect("the generation reports")
+        },
+        handle,
+    )?;
+    Ok(done)
 }
 
 /// Starts the engine with `sequences` sequences, as `batching.max-sequences` states.
@@ -404,6 +440,7 @@ fn a_stop_token_ends_the_generation_and_leaves_no_overshoot_in_the_sequence() {
                 prefill_done: None,
                 began: Instant::now(),
                 done: None,
+                cancel_after: None,
             }),
         })
     };
@@ -780,19 +817,210 @@ fn two_sequences_start_hold_a_spare_generate_the_same_tokens_and_shut_down_clean
 
     let (runtime, owner) = start_with_sequences(&machine, 1);
     assert_eq!(runtime.plan().sequences, 1);
-    assert_eq!(runtime.spare_sequences(), 0);
+    assert_eq!(runtime.sequences(), 1);
     let one = generate(&runtime, &prompt, 16, &eos);
     owner.shutdown(runtime).expect("one sequence shuts down clean");
 
     let (runtime, owner) = start_with_sequences(&machine, 2);
     assert_eq!(runtime.plan().sequences, 2);
-    assert_eq!(
-        runtime.spare_sequences(),
-        1,
-        "the sequence beyond the generation's is held"
-    );
+    assert_eq!(runtime.sequences(), 2, "every sequence has an owner");
     let two = generate(&runtime, &prompt, 16, &eos);
     assert_eq!(two.outcome.reason, FinishReason::Length);
     assert_eq!(two.tokens, one.tokens, "two sequences change no token of the first");
     owner.shutdown(runtime).expect("two sequences shut down clean");
+}
+
+/// Four requests at once on four sequences: each produces the tokens it produces alone.
+const SEQUENCES: usize = 4;
+const CONCURRENT_TOKENS: u32 = 48;
+const CONCURRENT_PROMPTS: [&str; SEQUENCES] = [
+    "The capital of France is",
+    "Write a short poem about the sea and the lighthouse keeper.",
+    "List the planets of the solar system, from the sun outward, with one fact about each of them.",
+    "Explain in a few sentences how a heat pump moves thermal energy from a cold source to a warm sink.",
+];
+
+/// The tokens of a recording per second, from its first token to its last.
+fn decode_rate(recording: &Recording) -> f64 {
+    let (Some(first), Some(last)) = (recording.token_times.first(), recording.token_times.last()) else {
+        return 0.0;
+    };
+    (recording.tokens.len() - 1) as f64 / last.duration_since(*first).as_secs_f64().max(1e-9)
+}
+
+/// Starts every prompt at once and waits for all of them, with `cancel` and the sampling of each.
+fn together(
+    runtime: &EngineRuntime,
+    prompts: &[Vec<u32>],
+    speculation: Speculation,
+    sampling: &[SamplingConfig],
+    cancel: &[Option<usize>],
+) -> (Vec<Recording>, Duration) {
+    let began = Instant::now();
+    let running: Vec<_> = prompts
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| {
+            submit(
+                runtime,
+                prompt,
+                CONCURRENT_TOKENS,
+                &[],
+                speculation,
+                sampling[index],
+                cancel[index],
+            )
+            .expect("a sequence is idle for the request")
+        })
+        .collect();
+    // Every sequence runs a generation: one more request is refused, and only that one.
+    let refused = submit(
+        runtime,
+        &prompts[0],
+        CONCURRENT_TOKENS,
+        &[],
+        Speculation::Off,
+        SamplingConfig::greedy(0),
+        None,
+    );
+    assert_eq!(
+        refused.err(),
+        Some(AdmissionError::Busy),
+        "the fifth request finds every sequence running"
+    );
+    let recordings = running
+        .into_iter()
+        .map(|done| done.wait(WAIT).expect("the generation reports"))
+        .collect();
+    (recordings, began.elapsed())
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn concurrent_sequences_match_alone() {
+    let Some(machine) = machine() else { return };
+    let tokenizer = tokenizer(&machine.artifact);
+    let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
+        .iter()
+        .map(|text| tokenizer.encode_with_model_special_tokens(text).unwrap())
+        .collect();
+    let (runtime, owner) = start_with_sequences(&machine, SEQUENCES as u32);
+    assert_eq!(runtime.sequences(), SEQUENCES);
+    let greedy = [SamplingConfig::greedy(0); SEQUENCES];
+    let seeded: Vec<SamplingConfig> = (0..SEQUENCES).map(|index| sampled(40, 7 + index as u64)).collect();
+
+    let modes: [(&str, Speculation, &[SamplingConfig]); 4] = [
+        ("greedy", Speculation::Off, &greedy),
+        ("sampled", Speculation::Off, &seeded),
+        ("greedy+speculation", Speculation::Artifact, &greedy),
+        ("sampled+speculation", Speculation::Artifact, &seeded),
+    ];
+    let mut alone_greedy = Vec::new();
+    for (name, speculation, sampling) in modes {
+        let speculation = if speculation == Speculation::Artifact && runtime.plan().draft_depth == 0 {
+            println!("{name}: skipped, the artifact has no draft layer");
+            continue;
+        } else {
+            speculation
+        };
+        // Each request alone, in turn.
+        let alone: Vec<Recording> = prompts
+            .iter()
+            .zip(sampling)
+            .map(|(prompt, sampling)| {
+                submit(&runtime, prompt, CONCURRENT_TOKENS, &[], speculation, *sampling, None)
+                    .expect("the request is admitted")
+                    .wait(WAIT)
+                    .expect("the generation reports")
+            })
+            .collect();
+        // A round that is not measured: it records the graphs of the sequences that have not run yet.
+        let _ = together(&runtime, &prompts, speculation, sampling, &[None; SEQUENCES]);
+        let (both, wall) = together(&runtime, &prompts, speculation, sampling, &[None; SEQUENCES]);
+        for (index, (alone, both)) in alone.iter().zip(&both).enumerate() {
+            assert_eq!(both.outcome.reason, FinishReason::Length, "{name}: request {index}");
+            assert_eq!(
+                alone.tokens.len(),
+                CONCURRENT_TOKENS as usize,
+                "{name}: request {index} alone"
+            );
+            assert_eq!(
+                both.tokens, alone.tokens,
+                "{name}: request {index} changed when run together"
+            );
+        }
+        // The requests really ran side by side: every one had its first token before any had its last.
+        let first_of_all = both.iter().map(|r| *r.token_times.first().unwrap()).max().unwrap();
+        let first_to_end = both.iter().map(|r| *r.token_times.last().unwrap()).min().unwrap();
+        assert!(first_of_all < first_to_end, "{name}: the requests did not overlap");
+        let alone_rate = alone.iter().map(decode_rate).sum::<f64>() / SEQUENCES as f64;
+        let each_rate = both.iter().map(decode_rate).sum::<f64>() / SEQUENCES as f64;
+        let all_tokens = both.iter().map(|r| r.tokens.len()).sum::<usize>() as f64;
+        println!(
+            "CONCURRENT {name}: alone {alone_rate:.1} tok/s each; together {each_rate:.1} tok/s each, {:.1} tok/s in all \
+             ({:.0} ms for {all_tokens} tokens)",
+            all_tokens / wall.as_secs_f64(),
+            wall.as_secs_f64() * 1e3
+        );
+        if name == "greedy" {
+            alone_greedy = alone;
+        }
+    }
+
+    // One of the four is cancelled mid-decode: the others' tokens stay what they are alone.
+    let cancelled_at = 12;
+    let (cancelled, _) = together(
+        &runtime,
+        &prompts,
+        Speculation::Off,
+        &greedy,
+        &[None, Some(cancelled_at), None, None],
+    );
+    assert_eq!(cancelled[1].outcome.reason, FinishReason::Cancelled);
+    assert!(
+        cancelled[1].tokens.len() >= cancelled_at && cancelled[1].tokens.len() < CONCURRENT_TOKENS as usize,
+        "the cancelled request stopped mid-decode, after {} tokens",
+        cancelled[1].tokens.len()
+    );
+    assert_eq!(cancelled[1].tokens, alone_greedy[1].tokens[..cancelled[1].tokens.len()]);
+    for index in [0, 2, 3] {
+        assert_eq!(cancelled[index].outcome.reason, FinishReason::Length, "request {index}");
+        assert_eq!(
+            cancelled[index].tokens, alone_greedy[index].tokens,
+            "request {index} next to a cancel"
+        );
+    }
+
+    // One of the four fails (its owner panics at the third admission, the hook that takes the first request): the
+    // others' tokens stay what they are alone.
+    runtime.panic_after_admissions_for_tests(3);
+    let (failed, _) = together(&runtime, &prompts, Speculation::Off, &greedy, &[None; SEQUENCES]);
+    match &failed[0].outcome.reason {
+        FinishReason::Failed(why) => assert!(why.contains("panicked"), "{why}"),
+        other => panic!("the first request should have failed, ended with {other:?}"),
+    }
+    assert_eq!(failed[0].tokens, alone_greedy[0].tokens[..failed[0].tokens.len()]);
+    for index in [1, 2, 3] {
+        assert_eq!(failed[index].outcome.reason, FinishReason::Length, "request {index}");
+        assert_eq!(
+            failed[index].tokens, alone_greedy[index].tokens,
+            "request {index} next to a failure"
+        );
+    }
+
+    // Every sequence went back to the pool: all four are idle, and each is clean.
+    for index in 0..SEQUENCES {
+        let state = runtime
+            .inspect_sequence_at(index, |sequence| sequence.row_readbacks.leased())
+            .expect("the sequence is idle");
+        assert_eq!(state, 0, "sequence {index} holds no row readback");
+    }
+    let (after, _) = together(&runtime, &prompts, Speculation::Off, &greedy, &[None; SEQUENCES]);
+    for (index, recording) in after.iter().enumerate() {
+        assert_eq!(
+            recording.tokens, alone_greedy[index].tokens,
+            "request {index} after the failure"
+        );
+    }
+    owner.shutdown(runtime).expect("four sequences shut down clean");
 }
