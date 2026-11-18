@@ -4,9 +4,9 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use super::cache_tests::{CHUNK, Device, FORMAT, Rig, answer, same_state};
+use super::cache_tests::{CHUNK, Device, FORMAT, Rig, answer, same_speculative_state, same_state};
 use super::fixtures::tokens;
-use super::{Ended, Hit, NodeId, PromptCheckpoints, Resolve, RestoreError, Restored};
+use super::{Ended, Hit, NodeId, PromptCheckpoints, Resolve, RestoreError, Restored, Speculation};
 use crate::state::SequenceId;
 
 const ROWS: u64 = 8192;
@@ -21,9 +21,14 @@ struct Seen {
 
 /// Starts a request: asks for the lookup and reports the hit, if any.
 fn begin(rig: &Rig, prompt: &[u32]) -> (PromptCheckpoints, Option<Hit>) {
+    begin_as(rig, prompt, None)
+}
+
+/// As [`begin`], for a request that drafts when `kind` is set.
+fn begin_as(rig: &Rig, prompt: &[u32], kind: Option<Speculation>) -> (PromptCheckpoints, Option<Hit>) {
     let slot: Arc<Mutex<Option<Option<Hit>>>> = Arc::new(Mutex::new(None));
     let told = Arc::clone(&slot);
-    let mut checkpoints = PromptCheckpoints::begin(rig.cache.clone(), prompt.to_vec().into(), move |hit| {
+    let mut checkpoints = PromptCheckpoints::begin(rig.cache.clone(), prompt.to_vec().into(), kind, move |hit| {
         *told.lock().unwrap() = Some(hit);
     });
     assert!(checkpoints.holds(), "the first chunk waits for the lookup");
@@ -38,7 +43,12 @@ fn begin(rig: &Rig, prompt: &[u32]) -> (PromptCheckpoints, Option<Hit>) {
 /// sequence's state; each checkpoint's chunk leaves it filled (the same bytes each time, so the pages a later checkpoint
 /// shares with an earlier one agree).
 fn serve(rig: &Rig, device: &Arc<Device>, prompt: &[u32]) -> Seen {
-    let (mut checkpoints, hit) = begin(rig, prompt);
+    serve_as(rig, device, prompt, None)
+}
+
+/// As [`serve`], for a request that drafts when `kind` is set.
+fn serve_as(rig: &Rig, device: &Arc<Device>, prompt: &[u32], kind: Option<Speculation>) -> Seen {
+    let (mut checkpoints, hit) = begin_as(rig, prompt, kind);
     let len = u32::try_from(prompt.len()).unwrap();
     let mut offset = 0;
     if let Some(hit) = hit {
@@ -182,13 +192,13 @@ fn an_identical_prompt_still_prefills_its_last_tokens() {
 fn a_prompt_of_one_chunk_or_less_is_not_looked_up() {
     let (rig, _) = rig();
     for len in [1, 100, CHUNK] {
-        let checkpoints = PromptCheckpoints::begin(rig.cache.clone(), tokens(0, len).into(), |_| {
+        let checkpoints = PromptCheckpoints::begin(rig.cache.clone(), tokens(0, len).into(), None, |_| {
             panic!("a prompt that cannot match is not looked up")
         });
         assert!(!checkpoints.holds(), "{len} tokens: the first chunk starts at once");
         assert_eq!(checkpoints.pending(), 0);
     }
-    let longer = PromptCheckpoints::begin(rig.cache.clone(), tokens(0, CHUNK + 1).into(), |_| {});
+    let longer = PromptCheckpoints::begin(rig.cache.clone(), tokens(0, CHUNK + 1).into(), None, |_| {});
     assert!(longer.holds(), "a longer prompt waits for its lookup");
 }
 
@@ -385,4 +395,36 @@ fn a_job_lets_go_of_the_sequences_references_before_the_cache_answers() {
         );
         assert_eq!(Arc::strong_count(&target), 1);
     }
+}
+
+#[test]
+fn a_request_that_drafts_matches_only_checkpoints_that_hold_the_draft_state() {
+    let (rig, plain) = rig();
+    let prompt = tokens(0, 2600);
+    let first = serve(&rig, &plain, &prompt);
+    assert_eq!(first.captured, vec![1024, 2048, 2560]);
+    // The base-only checkpoints do not serve a request whose draft reads the MTP cache and the seed row: it starts
+    // cold and stores checkpoints of its own beside them.
+    let drafting = Device::new(FORMAT, ROWS);
+    let second = serve_as(&rig, &drafting, &prompt, Some(Speculation::Mtp));
+    assert_eq!((second.cached, second.captured), (0, vec![1024, 2048, 2560]));
+    // Its own checkpoints serve it, with the draft state back.
+    let target = Device::new(FORMAT, ROWS);
+    let third = serve_as(&rig, &target, &prompt, Some(Speculation::Mtp));
+    assert_eq!(third.cached, 2560);
+    assert!(third.captured.is_empty());
+    assert!(same_speculative_state(&rig.layout, 2560, &drafting, &target));
+}
+
+#[test]
+fn a_request_without_speculation_restores_the_checkpoints_of_one_that_drafts() {
+    let (rig, drafting) = rig();
+    let prompt = tokens(0, 2600);
+    let first = serve_as(&rig, &drafting, &prompt, Some(Speculation::Mtp));
+    assert_eq!(first.captured, vec![1024, 2048, 2560]);
+    let plain = Device::new(FORMAT, ROWS);
+    let second = serve(&rig, &plain, &prompt);
+    assert_eq!(second.cached, 2560, "the base state is all it needs");
+    assert!(second.captured.is_empty());
+    assert!(same_state(&rig.layout, 2560, &drafting, &plain));
 }

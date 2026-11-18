@@ -3,7 +3,7 @@
 //! library named by `euhedral.cuda.library` (`EUHEDRAL_TEST_CUDA_LIBRARY`), skipping without it. Every wait is bounded.
 //!
 //! The model is the first four layers of the RCO model (three GDN layers and one full-attention layer); no weights are
-//! loaded, and the sequences do not speculate (a speculating one is refused). Two sequences capture and restore at the same time, on different lanes, each its own bytes.
+//! loaded, and the sequences do not speculate. Two sequences capture and restore at the same time, on different lanes, each its own bytes.
 
 #![allow(clippy::print_stderr, reason = "a test reports what it skipped")]
 #![allow(
