@@ -4,10 +4,10 @@
 # `promote` is the release step, played by hand in the pipeline of the integration branch (or under Deployments, environment
 # `main`) once `rust`, `native-package` and `promote-test` have passed: scripts/ci-promote.sh moves main to that commit, starts
 # the next integration branch there (protected, the open merge requests moved to it, INTEGRATION_BRANCH set to it) and deletes
-# the old branch on GitLab. It checks everything first and changes nothing when a check fails. It only runs git and the GitLab
+# the old branch on GitLab and, over ssh with the host user's key, on GitHub (MIRROR_URL). It checks everything first and changes nothing when a check fails. It only runs git and the GitLab
 # API: it never deploys (scripts/deploy-main.py is run by hand).
-# The GitHub push mirror sends protected branches only and keeps refs that diverged: the old branch stays on GitHub and must be
-# deleted there by hand.
+# The GitHub push mirror sends protected branches only and keeps refs that diverged, so it never deletes the old branch there:
+# `promote` does, which is why it runs on the host runner (tags: [host]), whose user has the GitHub key.
 # On the integration branch the three test jobs run whenever anything since main touched their paths (`compare_to`), so a later
 # push that touches none of them cannot hide a failed earlier one. Only `promote` has `environment: main`, which is the
 # environment scope of PROMOTE_TOKEN: no other job may take that environment.
@@ -89,7 +89,7 @@ promote-test:
 # (those that its rules created), never runs beside another promotion, and a run from an older pipeline stops at its first check.
 promote:
   stage: deploy
-  image: debian:trixie-slim   # git 2.47 (merge-tree --write-tree needs 2.38), curl, jq
+  tags: [host]   # the host user has git (2.38 or newer: merge-tree --write-tree), curl, jq and the GitHub ssh key
   rules:
     - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $INTEGRATION_BRANCH
       when: manual
@@ -108,9 +108,8 @@ promote:
   variables:
     GIT_STRATEGY: clone
     GIT_DEPTH: "0"
-    UPSTREAM_MAIN_URL: "https://github.com/Euhedral-Engine/Euhedral.git"   # read by `promote` without credentials; not a secret
+    MIRROR_URL: "git@github.com:Euhedral-Engine/Euhedral.git"   # not a secret
     ARBITER_ARGS: "--cpu shared:1 --mem 1G"
     ARBITER_EST: "300"
   script:
-    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl jq ca-certificates >/dev/null
     - scripts/ci-promote.sh

@@ -13,23 +13,24 @@
 #   INTEGRATION_BRANCH   the project's CI/CD variable naming the integration branch; this script sets it to the new name
 #   NEXT_BRANCH          optional: the new branch's name (default: the old name with its trailing number plus one, or "-2"
 #                        appended to a name without one)
-#   UPSTREAM_MAIN_URL    optional: a repository read without credentials whose main is also written to by others (GitHub).
-#                        The new main is built on the newer of the two mains, so the mirror can fast-forward the upstream one;
-#                        mains that have diverged stop the promotion in the checks
+#   MIRROR_URL           optional: the GitHub repository the push mirror sends to (read and written over ssh, so the job needs a
+#                        key; not a secret). It is added as a remote of the clone. The checks prove it is reachable; the old
+#                        branch is deleted there after GitLab's, with a lease on the head it had when checked (a branch that
+#                        moved is left, with a message). Its main is read too: the new main is built on the newer of the two
+#                        mains, so the mirror can fast-forward its own; mains that have diverged stop the promotion in the checks
 #   PROMOTE_DRY_RUN      1: the same as --dry-run
 #   PROMOTE_CHECKOUT     optional: a working checkout of the project; it is checked (no uncommitted changes, refs/ci/gated),
 #                        switched to the new branch, and its copy of the old branch is deleted. Unset in CI: all of that is skipped
-#   MIRROR_REMOTE        optional: a remote of the checkout that the old branch is also deleted from by hand. Unset in CI
 #   PROMOTE_API_LOG      the script's own test: the API calls are written to this file in place of being sent (git still pushes,
 #                        so only a file:// server is accepted)
 #
-# The GitHub push mirror sends protected branches only and keeps refs that diverged: it never deletes the old branch there. That
-# branch stays on GitHub and must be deleted there by hand.
+# The GitHub push mirror sends protected branches only and keeps refs that diverged, so it never deletes the old branch: this
+# script does, through MIRROR_URL.
 #
 # The first change, after the checks, freezes the old branch (push and merge: No one), so nothing can reach it during the run. A
 # run that stopped half way can be started again (retry the job): every step that is already done is passed over. The steps, in
 # order: freeze the old branch, main, the new branch (protected), the open merge requests' target, the variable, the checkout (if
-# any), then the old branch (GitLab, the mirror remote if any, the checkout's copy if any).
+# any), then the old branch (GitLab, the mirror if any, the checkout's copy if any).
 set -euo pipefail
 
 dry=0
@@ -51,12 +52,11 @@ sha="${CI_COMMIT_SHA:?}"
 main="${CI_DEFAULT_BRANCH:-main}"
 : "${CI_API_V4_URL:?}" "${CI_PROJECT_ID:?}" "${CI_SERVER_URL:?}" "${CI_PROJECT_PATH:?}"
 : "${PROMOTE_TOKEN:?set the protected CI/CD variable PROMOTE_TOKEN (a project access token: Maintainer; api, write_repository)}"
-mirror="${MIRROR_REMOTE:-}"
-upstream="${UPSTREAM_MAIN_URL:-}"
+mirror="${MIRROR_URL:-}"
 repo="$CI_SERVER_URL/$CI_PROJECT_PATH.git"
 if [ -n "${PROMOTE_API_LOG:-}" ]; then
   case "$CI_SERVER_URL" in file://*) ;; *) fail "PROMOTE_API_LOG fakes only the API: CI_SERVER_URL must be a file:// URL, not $CI_SERVER_URL" ;; esac
-  case "$upstream" in "" | file://*) ;; *) fail "PROMOTE_API_LOG fakes only the API: UPSTREAM_MAIN_URL must be a file:// URL" ;; esac
+  case "$mirror" in "" | file://*) ;; *) fail "PROMOTE_API_LOG fakes only the API: MIRROR_URL must be a file:// URL" ;; esac
 fi
 
 next="${NEXT_BRANCH:-}"
@@ -149,6 +149,8 @@ api() {
   echo "FAIL  $m $p: HTTP $code" >&2
   return 1
 }
+# m ARGS: git against the mirror, over ssh without prompts and with a time limit
+m() { GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" timeout 60 git "$@"; }
 head_of() { g ls-remote "$repo" "refs/heads/$1" | cut -f1; }
 # levels_of BRANCH: "push merge" access levels of its protection; fails when it has none
 levels_of() {
@@ -210,16 +212,23 @@ g fetch -q "$repo" "$main"
 gl_main=$(git rev-parse FETCH_HEAD)
 main_sha=$gl_main
 base_note=""
-if [ -n "$upstream" ]; then
-  GIT_TERMINAL_PROMPT=0 git fetch -q "$upstream" "refs/heads/$main" || fail "$main cannot be read from UPSTREAM_MAIN_URL"
-  up_sha=$(git rev-parse FETCH_HEAD)
-  if git merge-base --is-ancestor "$up_sha" "$gl_main"; then
-    :
-  elif git merge-base --is-ancestor "$gl_main" "$up_sha"; then
-    main_sha=$up_sha
-    base_note=" (the upstream $main is ahead of $main here)"
-  else
-    fail "$main here (${gl_main:0:8}) and upstream (${up_sha:0:8}) have diverged: bring one into the other by hand first"
+on_mirror=""
+if [ -n "$mirror" ]; then
+  if git remote get-url promote-mirror > /dev/null 2>&1; then git remote set-url promote-mirror "$mirror"; else git remote add promote-mirror "$mirror"; fi
+  mirror_refs=$(m ls-remote promote-mirror "refs/heads/$main" "refs/heads/$old") ||
+    fail "the mirror cannot be reached from here (ssh, no prompts), so $old could not be deleted there"
+  on_mirror=$(awk -v r="refs/heads/$old" '$2 == r {print $1}' <<< "$mirror_refs")
+  if [ -n "$(awk -v r="refs/heads/$main" '$2 == r {print $1}' <<< "$mirror_refs")" ]; then
+    m fetch -q promote-mirror "refs/heads/$main" || fail "$main cannot be read from the mirror"
+    up_sha=$(git rev-parse FETCH_HEAD)
+    if git merge-base --is-ancestor "$up_sha" "$gl_main"; then
+      :
+    elif git merge-base --is-ancestor "$gl_main" "$up_sha"; then
+      main_sha=$up_sha
+      base_note=" (the mirror's $main is ahead of $main here)"
+    else
+      fail "$main here (${gl_main:0:8}) and on the mirror (${up_sha:0:8}) have diverged: bring one into the other by hand first"
+    fi
   fi
 fi
 how=""
@@ -258,12 +267,6 @@ for src in "${old_levels:+old}" next main; do
 done
 [ -n "$push_level" ] || fail "the token cannot read the branch protections: it needs the Maintainer role and the api scope"
 
-on_mirror=""
-if [ -n "$mirror" ]; then
-  git remote get-url "$mirror" > /dev/null 2>&1 || fail "MIRROR_REMOTE $mirror is not a remote of this clone"
-  on_mirror=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" timeout 60 git ls-remote "$mirror" "refs/heads/$old" | cut -f1) ||
-    fail "the mirror ($mirror) cannot be reached from here, so $old could not be deleted there"
-fi
 moving=$(list_mrs "$old" | tr '\n' ' ')
 moving=${moving% }
 
@@ -276,8 +279,9 @@ if [ -n "$checkout" ]; then
 else
   echo "plan  INTEGRATION_BRANCH=$next; no checkout switch (PROMOTE_CHECKOUT is unset)"
 fi
-echo "plan  $old deleted: $CI_SERVER_URL${on_mirror:+, the mirror remote ($mirror)}${checkout:+, the checkout}"
-echo "plan  $old stays on the GitHub mirror: delete it there by hand"
+echo "plan  $old deleted: $CI_SERVER_URL${on_mirror:+, the mirror (at ${on_mirror:0:8})}${checkout:+, the checkout}"
+[ -n "$mirror" ] || echo "plan  no MIRROR_URL: $old is not deleted on GitHub"
+[ -z "$mirror" ] || [ -n "$on_mirror" ] || echo "plan  $old is not on the mirror"
 if [ "$dry" = 1 ]; then
   echo "dry run: nothing was changed"
   exit 0
@@ -342,8 +346,11 @@ still=$(head_of "$old")
 also="404" api DELETE "/protected_branches/$(enc "$old")" > /dev/null
 echo "ok    $old deleted on $CI_SERVER_URL"
 if [ -n "$on_mirror" ]; then
-  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" timeout 60 git push -q "$mirror" --delete "$old"
-  echo "ok    $old deleted on the mirror ($mirror)"
+  if m push -q --force-with-lease="refs/heads/$old:$on_mirror" promote-mirror ":refs/heads/$old"; then
+    echo "ok    $old deleted on the mirror"
+  else
+    echo "note  $old on the mirror is no longer at ${on_mirror:0:8} (or cannot be deleted): it was left there; look at it by hand"
+  fi
 fi
 if [ -n "$checkout" ] && git rev-parse -q --verify "refs/heads/$old" > /dev/null; then
   git merge-base --is-ancestor "refs/heads/$old" "$new" ||
@@ -362,4 +369,3 @@ for b in "$main" "$next"; do
   git merge-base --is-ancestor "$want" FETCH_HEAD || fail "$b on $CI_SERVER_URL does not hold ${want:0:8}"
 done
 echo "PROMOTED $old -> $main at ${new:0:8}; the integration branch is now $next"
-echo "note  $old stays on GitHub: delete it there by hand"
