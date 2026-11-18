@@ -276,12 +276,14 @@ impl SequenceState {
         self.flight.count()
     }
 
-    /// Allocates the pinned staging the caches' reservations take (two sets per cache: one in flight, one being
-    /// reserved), so that no reservation on the request path allocates. Startup only.
-    pub fn prime_staging(&self, pool: &Arc<PinnedPool>) -> Result<(), CudaError> {
-        self.kv.prime_staging(pool, 2)?;
+    /// Allocates the pinned staging the caches' reservations take (two sets per cache and per sequence of
+    /// `sequences` of this shape: one in flight, one being reserved), so that no reservation on the request path
+    /// allocates. The sets are held together, so the pool keeps that many. Startup only.
+    pub fn prime_staging(&self, pool: &Arc<PinnedPool>, sequences: usize) -> Result<(), CudaError> {
+        let copies = 2 * sequences.max(1);
+        self.kv.prime_staging(pool, copies)?;
         if let Some(mtp) = &self.mtp_kv {
-            mtp.prime_staging(pool, 2)?;
+            mtp.prime_staging(pool, copies)?;
         }
         Ok(())
     }

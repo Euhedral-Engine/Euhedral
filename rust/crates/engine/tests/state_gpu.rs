@@ -26,6 +26,8 @@ use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, LaneOps, Pin
 use euhedral_inference_edrl::{LayerType, ModelMetadata};
 use euhedral_inference_engine::model::ModelConfig;
 use euhedral_inference_engine::residency::footprint;
+use euhedral_inference_engine::residency::planner::plan;
+use euhedral_inference_engine::state::SequenceState;
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvError, KvRetained};
@@ -33,6 +35,8 @@ use euhedral_inference_engine::state::released::ReleasedBuffers;
 use euhedral_inference_engine::workspace::{BufferSlot, Workspace, WorkspaceError, WorkspaceRows, workspace_bytes};
 use euhedral_inference_settings::KvFormat;
 use typed::Typed;
+
+mod common;
 
 fn library() -> Option<Arc<CudaLibrary>> {
     let path = test_support::require_property("euhedral.cuda.library")?;
@@ -312,29 +316,32 @@ fn gdn_state_is_zeroed_and_as_large_as_the_planner_says() {
 fn the_extra_state_of_a_sequence_is_what_its_buffers_hold() {
     let Some(library) = library() else { return };
     let lane = lane(&library);
-    let config = config();
-    let (seed_rows, context) = (512, 4096);
-    // A sequence that does not draft allocates no verification rows and one decode row.
-    let (gdn, _) = run(&lane, |ops| GdnStates::allocate(&library, &config, 0, ops));
-    let scratch = AttentionScratch::allocate(&library, &config, 1, false, seed_rows).unwrap();
-    let selections = 2 * 8;
+    let config = common::config();
+    let plan = plan(&config, &common::rco_table(), &common::settings(4096), 64 << 30).unwrap();
+    let released = Arc::new(ReleasedBuffers::new());
+    // A real sequence of the plan's shape, allocated as startup does.
+    let (state, _) = run(&lane, |ops| {
+        SequenceState::allocate(&library, &released, &config, &plan, ops)
+    });
+    let drafts = plan.draft_depth > 0;
+    let verified = if drafts { 1 + plan.draft_depth as u64 } else { 0 };
+    let selections = if drafts { (verified + 1).max(2) } else { 2 } * verified.max(1) * 8;
+    // The MTP layer's cache holds its pages once they are reserved: none yet.
+    let mtp_pages = if drafts {
+        footprint::pages_for(plan.max_context_tokens as u64) * footprint::page_bytes(&config, plan.kv_format)
+    } else {
+        0
+    };
     assert_eq!(
-        footprint::extra_sequence_bytes(&config, KvFormat::Nvfp4, context, 0, false, seed_rows),
-        gdn.device_bytes() + scratch.device_bytes() + selections
-    );
-    // One that drafts 4 tokens a step verifies 5 rows and catches up on the decode row twins' 8; the MTP layer's
-    // cache is one full-attention layer's pages.
-    let verified = 5;
-    let (gdn, _) = run(&lane, |ops| GdnStates::allocate(&library, &config, verified, ops));
-    let scratch = AttentionScratch::allocate(&library, &config, 8, true, seed_rows).unwrap();
-    let selections = (verified + 1) * verified * 8;
-    let extra = footprint::extra_sequence_bytes(&config, KvFormat::Nvfp4, context, verified, true, seed_rows);
-    assert_eq!(
-        extra,
-        gdn.device_bytes()
-            + scratch.device_bytes()
-            + selections
-            + footprint::pages_for(context) * footprint::page_bytes(&config, KvFormat::Nvfp4)
+        footprint::extra_sequence_bytes(
+            &config,
+            plan.kv_format,
+            plan.max_context_tokens as u64,
+            verified,
+            drafts,
+            (plan.rows.rows as u64).max(footprint::MINIMUM_VERIFY_ROWS),
+        ),
+        state.device_bytes() - state.kv.device_bytes() + selections + mtp_pages
     );
 }
 

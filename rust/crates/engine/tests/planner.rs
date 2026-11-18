@@ -603,6 +603,18 @@ fn the_extra_state_of_a_sequence_without_drafts_is_its_gdn_state_scratch_and_sel
     let config = config();
     let plain = footprint::extra_sequence_bytes(&config, KvFormat::Nvfp4, 32_768, 0, false, 512);
     let selections = 2 * 8;
+    // Without verification the state is the recurrent and convolution state of each GDN layer, nothing more.
+    let convolution = (config.gdn_query_key_width() + config.gdn_value_width()) as u64
+        * (config.linear_conv_kernel_dim as u64 - 1)
+        * 2;
+    let recurrent = config.linear_num_value_heads as u64
+        * config.linear_key_head_dim as u64
+        * config.linear_value_head_dim as u64
+        * 4;
+    assert_eq!(
+        footprint::gdn_bytes(&config, 0),
+        config.gdn_layers() as u64 * (recurrent + convolution)
+    );
     assert_eq!(
         plain,
         footprint::gdn_bytes(&config, 0)

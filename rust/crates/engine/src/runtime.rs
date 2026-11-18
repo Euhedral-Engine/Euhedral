@@ -5,6 +5,7 @@
 //! are allocated, the weights are uploaded along their chains, and the modules are warmed. The latch is set when the
 //! model is ready, or with the error that stopped it. The calling thread waits for the latch and for nothing else.
 
+use std::cell::Cell;
 use std::fmt;
 use std::mem::{self, ManuallyDrop};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -28,8 +29,8 @@ use euhedral_inference_settings::{Auto, BatchingSettings, Settings};
 use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
 use crate::error::{EngineError, PlanError};
-use crate::generation::GREEDY_DEPTH;
 use crate::generation::{AdmissionError, CancelHandle, Generation, GenerationRequest, LogitsSink};
+use crate::generation::{GREEDY_DEPTH, OPERATION_BOUND};
 use crate::handoff::Handoff;
 use crate::kernels::kernel_sources;
 use crate::model::{ArtifactProfile, ModelConfig, Speculation, Weights};
@@ -70,10 +71,29 @@ fn quanta_for(sequences: usize) -> usize {
     STAGE_RING_QUANTA.saturating_mul(sequences.max(1))
 }
 
+/// The rows a shared pass holds: `batching.max-tokens-per-pass`, at most a prefill chunk (which is its default).
+fn pass_rows(batching: &BatchingSettings) -> usize {
+    let chunk = batching.prefill_chunk_tokens;
+    batching
+        .max_tokens_per_pass
+        .into_value()
+        .map_or(chunk, |rows| rows.min(chunk)) as usize
+}
+
 /// How many sequences the settings size the lanes' rings for: `batching.max-sequences`, and one when it is 0, which
-/// is decided only once the model is read.
-fn ringed_sequences(batching: &BatchingSettings) -> usize {
-    (batching.max_sequences as usize).max(1)
+/// is decided only once the model is read. A count above the rows a pass holds is refused: each sequence keeps its
+/// quanta's markers in the rings, which are created with the lanes, before the model is read, and a verification takes
+/// a row at least.
+fn ringed_sequences(batching: &BatchingSettings) -> Result<usize, EngineError> {
+    let sequences = (batching.max_sequences as usize).max(1);
+    let rows = pass_rows(batching);
+    if sequences > rows {
+        return Err(EngineError::Runtime(format!(
+            "batching.max-sequences is {sequences}, more than the {rows} rows a pass holds \
+             (batching.max-tokens-per-pass, at most batching.prefill-chunk-tokens); set it lower"
+        )));
+    }
+    Ok(sequences)
 }
 
 /// The sequences to hold: `batching.max-sequences` when it is at least 1, otherwise (0, automatic) the largest count
@@ -94,12 +114,7 @@ pub fn resolve_sequences(
     if profile.speculation == Speculation::Dflash2 {
         return Ok(1);
     }
-    let chunk = settings.batching.prefill_chunk_tokens;
-    let rows = settings
-        .batching
-        .max_tokens_per_pass
-        .into_value()
-        .map_or(chunk, |rows| rows.min(chunk)) as usize;
+    let rows = pass_rows(&settings.batching);
     let verified = 1 + if profile.speculation == Speculation::Mtp {
         profile.speculative_depth()?
     } else {
@@ -273,15 +288,27 @@ pub struct Teardown {
     lattice: Arc<ControlPlaneLattice>,
     /// Device bytes the runtime allocated and `shutdown` has not freed.
     pub(crate) device_bytes: AtomicU64,
+    /// How long `shutdown` waits for a running request to end after its cancel: the lattice's close timeout.
+    pub(crate) cancel_bound: Duration,
 }
 
 impl Teardown {
     /// The teardown of `lattice` and the `lakes` that feed it.
     pub fn new(lattice: Arc<ControlPlaneLattice>, lakes: Vec<Arc<Lake>>) -> Arc<Teardown> {
+        Teardown::with_cancel_bound(lattice, lakes, OPERATION_BOUND)
+    }
+
+    /// [`new`](Teardown::new) with the time `shutdown` waits for a running request to end.
+    pub(crate) fn with_cancel_bound(
+        lattice: Arc<ControlPlaneLattice>,
+        lakes: Vec<Arc<Lake>>,
+        cancel_bound: Duration,
+    ) -> Arc<Teardown> {
         Arc::new(Teardown {
             lakes,
             lattice,
             device_bytes: AtomicU64::new(0),
+            cancel_bound,
         })
     }
 
@@ -331,8 +358,25 @@ impl RuntimeOwner {
     /// alive.
     pub fn shutdown(mut self, runtime: Arc<EngineRuntime>) -> Result<(), EngineError> {
         let teardown = self.teardown.take();
+        let bound = teardown
+            .as_ref()
+            .map_or(OPERATION_BOUND, |teardown| teardown.cancel_bound);
+        // The running request ends on the lattice's workers, so before the lattice closes.
+        let stopped = runtime.generation.stop(bound);
         if let Some(teardown) = &teardown {
             teardown.close();
+        }
+        if !stopped {
+            // A quantum may still be in flight: nothing it uses is freed. The runtime is forgotten, not dropped, because
+            // dropping it frees the sequence's buffers, which waits for the device.
+            if let Some(teardown) = &teardown {
+                teardown.log_leak();
+            }
+            mem::forget(runtime);
+            return Err(EngineError::Runtime(
+                "a generation did not end after its cancel: the device memory stays allocated until the process exits"
+                    .to_string(),
+            ));
         }
         match Arc::try_unwrap(runtime) {
             Ok(runtime) => {
@@ -414,40 +458,66 @@ impl RuntimeOwner {
     /// window, the device memory is not freed. A free that has begun is not interrupted.
     pub fn shutdown_within(mut self, runtime: Arc<EngineRuntime>, window: Duration) -> Result<(), EngineError> {
         let teardown = self.teardown.take();
+        let stopped = Cell::new(true);
         stop_within(
             window,
             (runtime, teardown),
-            |(_, teardown)| {
+            |(runtime, teardown)| {
+                // The running request ends on the lattice's workers, so before the lattice closes.
+                let bound = teardown
+                    .as_ref()
+                    .map_or(window, |teardown| window.min(teardown.cancel_bound));
+                stopped.set(runtime.generation.stop(bound));
                 if let Some(teardown) = teardown {
                     teardown.close();
                 }
             },
-            |(runtime, teardown)| match Arc::try_unwrap(runtime) {
-                Ok(runtime) => {
-                    runtime.release();
-                    if let Some(teardown) = &teardown {
-                        teardown.device_bytes.store(0, Ordering::Release);
+            |(runtime, teardown)| {
+                match stopped.get() {
+                    false => {
+                        // A quantum may still be in flight: nothing it uses is freed, and dropping the runtime would.
+                        if let Some(teardown) = &teardown {
+                            teardown.log_leak();
+                        }
+                        mem::forget(runtime);
+                        Err(EngineError::Runtime(
+                            "a generation did not end after its cancel: the device memory stays allocated until the \
+                         process exits"
+                                .to_string(),
+                        ))
                     }
-                    Ok(())
+                    true => Ok((runtime, teardown)),
                 }
-                Err(_) => {
-                    if let Some(teardown) = &teardown {
-                        teardown.log_leak();
+                .and_then(|(runtime, teardown)| match Arc::try_unwrap(runtime) {
+                    Ok(runtime) => {
+                        runtime.release();
+                        if let Some(teardown) = &teardown {
+                            teardown.device_bytes.store(0, Ordering::Release);
+                        }
+                        Ok(())
                     }
-                    Err(EngineError::Runtime(
+                    Err(_) => {
+                        if let Some(teardown) = &teardown {
+                            teardown.log_leak();
+                        }
+                        Err(EngineError::Runtime(
                         "another handle to the runtime is alive: its device memory stays allocated until the process \
                          exits"
                             .to_string(),
                     ))
-                }
+                    }
+                })
             },
             |(_, teardown)| {
                 let bytes = teardown
                     .as_ref()
                     .map_or(0, |teardown| teardown.device_bytes.load(Ordering::Acquire));
-                format!(
-                    "the lattice was still closing; {bytes} bytes of device memory stay allocated until the process exits"
-                )
+                let what = if stopped.get() {
+                    "the lattice was still closing"
+                } else {
+                    "a generation did not end after its cancel"
+                };
+                format!("{what}; {bytes} bytes of device memory stay allocated until the process exits")
             },
         )
     }
@@ -721,8 +791,10 @@ impl EngineRuntime {
         // ending) rather than freed under it.
         generation.close();
         for sequence in spare {
-            // None has had a quantum; a refusal would leave its caches allocated, as above.
-            let _ = sequence.close();
+            // None has had a quantum, so none refuses; one that did stays allocated, like the generation's.
+            if let Err(busy) = sequence.close() {
+                mem::forget(busy);
+            }
         }
         // What the caches gave up and the owner had not yet freed. A queued buffer has no holder left, and the plain
         // free waits for the device, so nothing is freed under queued work.
@@ -839,6 +911,8 @@ pub fn open_lane_set<G: Gpu>(
 /// Builds the lattice, the lakes, the lanes and the pools of a startup, on the calling thread.
 fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duration>) -> Result<Arc<Core>, EngineError> {
     let started = Instant::now();
+    // Before anything is opened: the rings the lanes are created with depend on it.
+    let sequences = ringed_sequences(&settings.batching)?;
     let library = CudaLibrary::load(library_path)?;
     let runtime = |what: &str, error: &dyn fmt::Display| EngineError::Runtime(format!("{what}: {error}"));
 
@@ -846,6 +920,7 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
     if let Some(timeout) = close_timeout {
         config.shutdown_timeout = timeout;
     }
+    let cancel_bound = config.shutdown_timeout;
     let lattice = ControlPlaneLattice::new(config)
         .map_err(|error| runtime("the lattice would not start", &format!("{error:?}")))?;
 
@@ -871,7 +946,7 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
     let machine = startup::read_machine();
     let compute = Plan::lane_width();
     let chains = startup::transfer_lanes(settings, MAX_LANES.saturating_sub(compute + 1));
-    let ring = stage_ring(quanta_for(ringed_sequences(&settings.batching)));
+    let ring = stage_ring(quanta_for(sequences));
     let set =
         open_lane_set(&gpu, compute, ring, chains).map_err(|error| runtime("the lanes would not open", &error))?;
     let lanes = set.queues;
@@ -885,9 +960,10 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         .map_err(|error| runtime("the lattice would not take the completions", &format!("{error:?}")))?;
     let pool_bytes = startup::pinned_pool_bytes(settings, &machine);
     let pool = PinnedPool::new(&library, pool_bytes);
-    let teardown = Teardown::new(
+    let teardown = Teardown::with_cancel_bound(
         Arc::clone(&lattice),
         vec![Arc::clone(&stages), Arc::clone(&host), Arc::clone(&control)],
+        cancel_bound,
     );
     Ok(Arc::new(Core {
         settings: settings.clone(),
@@ -944,11 +1020,24 @@ mod tests {
     #[test]
     fn the_rings_are_sized_for_the_stated_count_and_for_one_when_it_is_automatic() {
         let mut settings = BatchingSettings::default();
-        assert_eq!(ringed_sequences(&settings), 1);
+        assert_eq!(ringed_sequences(&settings).unwrap(), 1);
         settings.max_sequences = 0;
-        assert_eq!(ringed_sequences(&settings), 1);
+        assert_eq!(ringed_sequences(&settings).unwrap(), 1);
         settings.max_sequences = 4;
-        assert_eq!(ringed_sequences(&settings), 4);
+        assert_eq!(ringed_sequences(&settings).unwrap(), 4);
+    }
+
+    #[test]
+    fn a_count_beyond_the_rows_of_a_pass_is_refused_before_any_ring_is_sized() {
+        let mut settings = BatchingSettings::default();
+        settings.max_sequences = settings.prefill_chunk_tokens;
+        assert_eq!(ringed_sequences(&settings).unwrap(), 512);
+        settings.max_sequences = 100_000;
+        let error = ringed_sequences(&settings).unwrap_err().to_string();
+        assert!(error.contains("batching.max-sequences"), "{error}");
+        settings.max_sequences = 5;
+        settings.max_tokens_per_pass = Auto::Value(4);
+        assert!(ringed_sequences(&settings).is_err());
     }
 
     /// A stand-in for the runtime that counts its drops.

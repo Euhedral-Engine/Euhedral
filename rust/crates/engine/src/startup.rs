@@ -562,14 +562,14 @@ fn allocate(startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends: Has
         let workspace =
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
         let (sequences, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {
-            (0..plan.sequences)
-                .map(|_| {
-                    let sequence =
-                        SequenceState::allocate(&core.library, &core.released, &artifact.config, &plan, kernels)?;
-                    sequence.prime_staging(&core.pool)?;
-                    Ok::<_, EngineError>(sequence)
-                })
-                .collect::<Result<Vec<_>, _>>()
+            let sequences = (0..plan.sequences)
+                .map(|_| SequenceState::allocate(&core.library, &core.released, &artifact.config, &plan, kernels))
+                .collect::<Result<Vec<_>, _>>()?;
+            // The sequences have one shape: the staging of all of them is taken together, once.
+            if let Some(first) = sequences.first() {
+                first.prime_staging(&core.pool, sequences.len())?;
+            }
+            Ok::<_, EngineError>(sequences)
         })?;
         Ok::<_, EngineError>((ring, arena, loans, workspace, sequences, marker))
     })();

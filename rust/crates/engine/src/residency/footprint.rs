@@ -4,6 +4,7 @@
 use euhedral_inference_settings::KvFormat;
 
 use crate::model::ModelConfig;
+use crate::state::attention::DRAFT_TOKEN_SLOTS;
 
 /// Tokens in one KV page (`AttentionKvState.PAGE_TOKENS`).
 pub const PAGE_TOKENS: u64 = 256;
@@ -50,7 +51,8 @@ pub fn kv_bytes(config: &ModelConfig, tokens: u64, format: KvFormat) -> u64 {
 }
 
 /// GDN state of every GDN layer (recurrent and convolution), its verification checkpoint and its row buffers at
-/// `verified_rows` rows, at least [`MINIMUM_VERIFY_ROWS`] (`SequenceFootprint.gdnBytes`).
+/// `verified_rows` rows, at least [`MINIMUM_VERIFY_ROWS`] (`SequenceFootprint.gdnBytes`). With 0 rows there is
+/// no verification: only the state itself, no checkpoint and no row buffers.
 pub fn gdn_bytes(config: &ModelConfig, verified_rows: u64) -> u64 {
     let layers = config.gdn_layers() as u64;
     let query_key = config.gdn_query_key_width() as u64;
@@ -61,6 +63,10 @@ pub fn gdn_bytes(config: &ModelConfig, verified_rows: u64) -> u64 {
         * config.linear_key_head_dim as u64
         * config.linear_value_head_dim as u64
         * 4;
+    if verified_rows == 0 {
+        // No verification: the state allocates no checkpoint and no row buffers.
+        return layers * (recurrent + convolution);
+    }
     let rows = verified_rows.max(MINIMUM_VERIFY_ROWS);
     let heads = config.linear_num_value_heads as u64;
     let verification = recurrent
@@ -79,7 +85,7 @@ pub fn decode_scratch_bytes(query_heads: u64, rows: u64) -> u64 {
 }
 
 /// Bytes of the draft token buffer of a drafting sequence (`AttentionScratch`): one int32 per slot.
-const DRAFT_TOKENS_BYTES: u64 = 4 * 17;
+const DRAFT_TOKENS_BYTES: u64 = 4 * DRAFT_TOKEN_SLOTS;
 
 /// What one more sequence needs on the device beyond its attention KV, as `SequenceState::allocate` allocates it for a
 /// sequence that verifies `verified_rows` rows (0 when it does not draft):
