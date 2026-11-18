@@ -1,7 +1,7 @@
 use super::*;
 use crate::json::JsonInteger;
 use crate::pipeline::ToolChoice;
-use crate::template::{Effort, TemplateOptions};
+use crate::template::{Effort, TemplateOptions, render};
 use crate::tool_calling::ToolCalling;
 
 fn defaults() -> Defaults {
@@ -1411,4 +1411,52 @@ fn ignored_metadata_and_neutral_values_are_accepted() {
     accepted(&msg(
         r#""role":"user","content":"x","refusal":null,"function_call":null,"audio":null"#,
     ));
+}
+
+/// The prompt a request renders to.
+fn prompt_of(body: &str) -> String {
+    let request = accepted(body);
+    render(&request.template, &request.thinking).expect("the conversation renders")
+}
+
+/// The tool-call arguments of an assistant turn with the one JSON literal `literal` as the argument `n`.
+fn call_with_number(literal: &str) -> String {
+    msgs(&format!(
+        r#"[{{"role":"user","content":"x"}},{{"role":"assistant","content":null,"tool_calls":[
+            {{"id":"c1","type":"function","function":{{"name":"f","arguments":"{{\"n\":{literal}}}"}}}}]}},
+            {{"role":"tool","tool_call_id":"c1","content":"r"}}]"#
+    ))
+}
+
+#[test]
+fn numbers_in_tool_call_arguments_reach_the_prompt_as_python_writes_them() {
+    for (literal, written) in [
+        ("123456789012345678901234567890", "123456789012345678901234567890"),
+        ("-98765432109876543210987654321", "-98765432109876543210987654321"),
+        ("0.1", "0.1"),
+        ("2.5e-7", "2.5e-07"),
+        ("1e400", "Infinity"),
+        ("-1e400", "-Infinity"),
+    ] {
+        let prompt = prompt_of(&call_with_number(literal));
+        let expected = format!("<parameter=n>\n{written}\n</parameter>");
+        assert!(prompt.contains(&expected), "{literal} came out as: {prompt}");
+    }
+}
+
+#[test]
+fn numbers_in_tool_schemas_reach_the_prompt_as_python_writes_them() {
+    let body = with_tool(
+        r#"{"name":"f","parameters":{"type":"object","properties":{"a":{"type":"integer","default":123456789012345678901234567890},
+            "b":{"type":"number","default":0.1},"c":{"type":"number","maximum":1e400},"d":{"type":"number","minimum":-1e400}}}}"#,
+    );
+    let prompt = prompt_of(&body);
+    for written in [
+        r#""default": 123456789012345678901234567890"#,
+        r#""default": 0.1"#,
+        r#""maximum": Infinity"#,
+        r#""minimum": -Infinity"#,
+    ] {
+        assert!(prompt.contains(written), "{written} is missing from: {prompt}");
+    }
 }

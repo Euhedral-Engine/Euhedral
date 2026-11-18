@@ -11,13 +11,14 @@ use std::time::Duration;
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_inference_api_protocol::output_grammar::{end_ids, token_bytes};
+use euhedral_inference_api_protocol::template::{CONTROL_TOKENS, check_template_source};
 use euhedral_inference_engine::error::EngineError;
 use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, GenerationRequest as EngineRequest, MAX_VERIFIED, Speculation,
 };
 use euhedral_inference_engine::runtime::{EngineRuntime, ReadyHandoff, RuntimeOwner};
 use euhedral_inference_settings::{Settings, variable_name};
-use euhedral_inference_tokenizer::{TokenStream, Tokenizer, read_artifact_tokenizer};
+use euhedral_inference_tokenizer::{TokenStream, Tokenizer, TokenizerSection, chat_template, read_artifact_section};
 
 use super::{Codec, Engine, EngineBackend, TextStream};
 use crate::backend::EngineReport;
@@ -32,6 +33,8 @@ pub enum StartError {
     Setup(String),
     /// The artifact's tokenizer could not be read.
     Tokenizer(String),
+    /// The artifact's chat template, or the control tokens it renders, are not ones the engine supports.
+    Template(String),
     /// The CUDA library or the driver it needs is not usable.
     Driver(String),
     /// The engine did not load.
@@ -43,6 +46,7 @@ impl Display for StartError {
         match self {
             StartError::Setup(reason) => write!(out, "{reason}"),
             StartError::Tokenizer(reason) => write!(out, "Reading the artifact's tokenizer failed: {reason}"),
+            StartError::Template(reason) => write!(out, "The artifact's chat template cannot be used: {reason}"),
             StartError::Driver(reason) => {
                 write!(
                     out,
@@ -238,8 +242,9 @@ pub fn begin_start(
     if let Some(problem) = artifact_problem(&settings.model.artifact) {
         return Err(StartError::Setup(problem));
     }
-    let tokenizer =
-        read_artifact_tokenizer(&settings.model.artifact).map_err(|error| StartError::Tokenizer(error.to_string()))?;
+    let section =
+        read_artifact_section(&settings.model.artifact).map_err(|error| StartError::Tokenizer(error.to_string()))?;
+    let tokenizer = checked_tokenizer(&section)?;
     let (owner, ready) = EngineRuntime::start_with(settings, library, close_timeout);
     Ok(EngineStarting {
         pending: Pending {
@@ -249,6 +254,26 @@ pub fn begin_start(
         tokenizer,
         settings: settings.clone(),
     })
+}
+
+/// The tokenizer of `section`, once its chat template passes the fragment check and every control token the
+/// rendering emits encodes as one added token.
+fn checked_tokenizer(section: &TokenizerSection) -> Result<Tokenizer, StartError> {
+    let tokenizer = Tokenizer::from_section(section).map_err(|error| StartError::Tokenizer(error.to_string()))?;
+    let source = chat_template(section).map_err(|error| StartError::Template(error.to_string()))?;
+    check_template_source(source).map_err(|error| StartError::Template(error.to_string()))?;
+    for token in CONTROL_TOKENS {
+        let id = tokenizer.control_token_id(token);
+        let encoded = tokenizer
+            .encode(token)
+            .map_err(|error| StartError::Template(format!("{token} does not encode: {error}")))?;
+        if id.is_none() || encoded.as_slice() != id.as_slice() {
+            return Err(StartError::Template(format!(
+                "the tokenizer does not encode {token} as one added token"
+            )));
+        }
+    }
+    Ok(tokenizer)
 }
 
 impl Debug for EngineStarting {
@@ -387,7 +412,129 @@ mod tests {
     use euhedral_inference_engine::{Handoff, lattice_config};
     use euhedral_inference_settings::ModelSettings;
 
+    use euhedral_inference_edrl::{FOOTER_BYTES, TOKENIZER_ENTRIES, TokenizerFooter};
+    use serde_json::{Value, json};
+
     use super::*;
+
+    const CHECKPOINT_TEMPLATE: &str = include_str!("../../../api-protocol/tests/data/qwen-chat-template.jinja");
+
+    /// A byte-level tokenizer with the given added tokens (ids from 256 up), the first being the EOS.
+    fn tokenizer_json(added: &[&str]) -> Value {
+        let mut next = 256;
+        let characters: Vec<char> = (0..=255u32)
+            .map(|byte| {
+                if matches!(byte, 33..=126 | 161..=172 | 174..=255) {
+                    char::from_u32(byte).expect("a character")
+                } else {
+                    next += 1;
+                    char::from_u32(next - 1).expect("a character")
+                }
+            })
+            .collect();
+        let vocabulary: serde_json::Map<String, Value> = characters
+            .iter()
+            .enumerate()
+            .map(|(byte, character)| (character.to_string(), json!(byte)))
+            .collect();
+        let added: Vec<Value> = added
+            .iter()
+            .enumerate()
+            .map(|(index, content)| {
+                json!({"id": 256 + index, "content": content, "single_word": false, "lstrip": false,
+                       "rstrip": false, "normalized": false, "special": true})
+            })
+            .collect();
+        json!({
+            "version": "1.0",
+            "added_tokens": added,
+            "normalizer": {"type": "NFC"},
+            "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": r"\p{L}+|\p{N}|\s+|[^\s\p{L}\p{N}]+"},
+                 "behavior": "Isolated", "invert": false},
+                {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false},
+            ]},
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false},
+            "model": {"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": null,
+                      "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false,
+                      "ignore_merges": false, "vocab": vocabulary, "merges": []},
+        })
+    }
+
+    /// A section whose added tokens are `added` (`<|im_end|>` first, as the EOS) and whose template is `template`.
+    fn section(added: &[&str], template: &str) -> TokenizerSection {
+        let contents = [
+            tokenizer_json(added).to_string(),
+            json!({"eos_token": "<|im_end|>", "bos_token": null, "add_bos_token": false}).to_string(),
+            template.to_owned(),
+            json!({"bos_token_id": 256, "eos_token_id": [256]}).to_string(),
+        ];
+        let mut body = 4i32.to_be_bytes().to_vec();
+        for (name, data) in TOKENIZER_ENTRIES.iter().zip(&contents) {
+            body.extend(i32::try_from(name.len()).expect("short").to_be_bytes());
+            body.extend(name.as_bytes());
+            body.extend(i32::try_from(data.len()).expect("short").to_be_bytes());
+            body.extend(data.as_bytes());
+        }
+        let mut footer = i64::try_from(body.len()).expect("short").to_be_bytes().to_vec();
+        footer.extend(crc32fast::hash(&body).to_be_bytes());
+        footer.extend(1i32.to_be_bytes());
+        footer.extend(b"EDRLTOKN");
+        let footer: [u8; FOOTER_BYTES] = footer.try_into().expect("the footer's size");
+        let footer = TokenizerFooter::parse(&footer).expect("a footer").expect("the magic");
+        TokenizerSection::parse(body, &footer).expect("a section")
+    }
+
+    fn control_tokens() -> Vec<&'static str> {
+        let mut tokens = vec!["<|im_end|>"];
+        tokens.extend(CONTROL_TOKENS.iter().filter(|token| **token != "<|im_end|>"));
+        tokens
+    }
+
+    /// The real artifact (`euhedral.qwen.rco-artifact`) passes the startup checks; skips without the key.
+    #[test]
+    #[allow(
+        clippy::print_stdout,
+        reason = "a test prints its skip line when the machine has no artifact"
+    )]
+    fn the_real_artifact_passes_the_startup_checks() {
+        let Some(path) = test_support::require_property("euhedral.qwen.rco-artifact") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            println!("skipped: euhedral.qwen.rco-artifact names no file");
+            return;
+        }
+        let section = read_artifact_section(&path).expect("the artifact's tokenizer section");
+        if let Err(error) = checked_tokenizer(&section) {
+            panic!("the real artifact is refused: {error}");
+        }
+    }
+
+    #[test]
+    fn a_section_with_the_checkpoint_template_and_all_control_tokens_starts() {
+        assert!(checked_tokenizer(&section(&control_tokens(), CHECKPOINT_TEMPLATE)).is_ok());
+    }
+
+    #[test]
+    fn a_template_that_fails_the_fragment_check_is_refused() {
+        for template in ["{{ messages }}", ""] {
+            let error = checked_tokenizer(&section(&control_tokens(), template)).expect_err("refused");
+            assert!(matches!(error, StartError::Template(_)), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_control_token_that_is_missing_is_refused() {
+        let tokens: Vec<&str> = control_tokens()
+            .into_iter()
+            .filter(|token| *token != "<think>")
+            .collect();
+        let error = checked_tokenizer(&section(&tokens, CHECKPOINT_TEMPLATE)).expect_err("refused");
+        assert!(error.to_string().contains("<think>"), "{error}");
+    }
 
     #[test]
     fn an_error_that_is_not_nothing_loading_is_the_engines() {

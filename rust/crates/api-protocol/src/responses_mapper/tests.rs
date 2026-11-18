@@ -1,6 +1,6 @@
 use super::*;
 use crate::json::JsonInteger;
-use crate::template::{Effort, TemplateInput, TemplateOptions};
+use crate::template::{Effort, Message, TemplateInput, TemplateOptions};
 
 fn defaults() -> Defaults {
     Defaults {
@@ -1607,4 +1607,24 @@ fn param_text_writes_values_as_a_param_spells_them() {
     assert_eq!(text(r#"{"a":1,"b":[true]}"#), "{a=1, b=[true]}");
     assert_eq!(text("1e400"), "Infinity");
     assert_eq!(text("-0"), "0");
+}
+
+#[test]
+fn numbers_in_function_call_arguments_reach_the_template_exactly() {
+    let request = accepted(&items(
+        r#"[{"role":"user","content":"x"},
+            {"type":"function_call","call_id":"c1","name":"f","arguments":"{\"n\":123456789012345678901234567890,\"e\":-1e400}"},
+            {"type":"function_call_output","call_id":"c1","output":"r"}]"#,
+    ));
+    let call = request
+        .template
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            Message::Assistant(assistant) => assistant.tool_calls.first(),
+            _ => None,
+        })
+        .expect("a call");
+    let written: Vec<String> = call.arguments.iter().map(|(_, value)| value.to_python_json()).collect();
+    assert_eq!(written, ["123456789012345678901234567890", "-Infinity"]);
 }

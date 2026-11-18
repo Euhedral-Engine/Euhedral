@@ -1,7 +1,9 @@
 //! JSON values for the whole crate: the chat template's `tojson` form (Python's `json.dumps(value,
 //! ensure_ascii=False)`), the compact form of tool-call arguments, and a strict parser.
 
+use std::collections::HashSet;
 use std::fmt::Write;
+use std::mem;
 
 /// The deepest nesting a parsed document may have.
 /// The deepest nesting of arrays and objects a document may have, and the most digits one number may have
@@ -10,6 +12,8 @@ use std::fmt::Write;
 const MAX_DEPTH: usize = 500;
 const MAX_NUMBER_DIGITS: usize = 1000;
 const MAX_NAME_UNITS: usize = 50_000;
+/// The most keys of one object that the distinct reading compares one by one; past it the keys go into a set.
+const LINEAR_KEY_LIMIT: usize = 8;
 
 /// A JSON value whose objects keep their insertion order.
 #[derive(Debug, Clone, PartialEq)]
@@ -243,6 +247,7 @@ impl JsonValue {
             text,
             position: 0,
             distinct,
+            lone: Vec::new(),
         };
         parser.skip_space();
         let value = parser.value(0)?;
@@ -360,6 +365,39 @@ struct Parser<'a> {
     position: usize,
     /// A repeated object key ends the parse.
     distinct: bool,
+    /// The lone surrogates of the string last read, as the byte offset in its text where each one was replaced
+    /// and its code unit.
+    lone: Vec<(usize, u16)>,
+}
+
+/// A key as the strict reading tells keys apart: its text and where lone surrogates stood in it, so that two
+/// different lone surrogates, or one and a literal U+FFFD, are different keys.
+type KeyIdentity = (String, Vec<(usize, u16)>);
+
+/// The keys an object has had so far, for the strict reading: a short list while it is small, a set beyond.
+#[derive(Default)]
+struct SeenKeys {
+    few: Vec<KeyIdentity>,
+    many: HashSet<KeyIdentity>,
+}
+
+impl SeenKeys {
+    /// Records `key`; false when the object already had it.
+    fn insert(&mut self, key: KeyIdentity) -> bool {
+        if !self.many.is_empty() {
+            return self.many.insert(key);
+        }
+        if self.few.contains(&key) {
+            return false;
+        }
+        if self.few.len() < LINEAR_KEY_LIMIT {
+            self.few.push(key);
+        } else {
+            self.many = self.few.drain(..).collect();
+            self.many.insert(key);
+        }
+        true
+    }
 }
 
 impl Parser<'_> {
@@ -431,6 +469,7 @@ impl Parser<'_> {
         }
         self.position += 1;
         let mut members = Vec::new();
+        let mut seen = SeenKeys::default();
         self.skip_space();
         if self.peek()? == b'}' {
             self.position += 1;
@@ -442,6 +481,7 @@ impl Parser<'_> {
                 return None;
             }
             let key = self.string()?;
+            let lone = mem::take(&mut self.lone);
             if key.len() > 3 * MAX_NAME_UNITS || key.encode_utf16().count() > MAX_NAME_UNITS {
                 return None;
             }
@@ -452,10 +492,14 @@ impl Parser<'_> {
             self.position += 1;
             self.skip_space();
             let value = self.value(depth + 1)?;
-            if self.distinct && members.iter().any(|(name, _)| *name == key) {
-                return None;
+            if self.distinct {
+                if !seen.insert((key.clone(), lone)) {
+                    return None;
+                }
+                members.push((key, value));
+            } else {
+                put(&mut members, key, value);
             }
-            put(&mut members, key, value);
             self.skip_space();
             match self.peek()? {
                 b',' => self.position += 1,
@@ -536,6 +580,7 @@ impl Parser<'_> {
 
     fn string(&mut self) -> Option<String> {
         self.position += 1;
+        self.lone.clear();
         let mut text = String::new();
         loop {
             let value = self.rest().chars().next()?;
@@ -554,7 +599,11 @@ impl Parser<'_> {
                         't' => text.push('\t'),
                         'u' => {
                             let unit = self.hex4()?;
-                            text.push(self.scalar(unit)?);
+                            let scalar = self.scalar(unit)?;
+                            if scalar == '\u{fffd}' && (0xd800..0xe000).contains(&unit) {
+                                self.lone.push((text.len(), unit as u16));
+                            }
+                            text.push(scalar);
                         }
                         _ => return None,
                     }
@@ -600,6 +649,38 @@ mod tests {
         assert!(JsonValue::parse_distinct(repeated).is_none());
         assert!(JsonValue::parse_distinct(r#"{"a": {"c": 1}, "b": {"c": 2}}"#).is_some());
         assert!(JsonValue::parse_distinct(r#"{"a":1} x"#).is_none());
+    }
+
+    #[test]
+    fn distinct_lone_surrogate_keys_are_not_repeats() {
+        let read = |text: &str| JsonValue::parse_distinct(text);
+        assert!(read(r#"{"\ud800":1,"\ud801":2}"#).is_some());
+        assert!(read(r#"{"\udc00":1,"\ud800":2}"#).is_some());
+        assert!(read(r#"{"\ud800":1,"\ufffd":2}"#).is_some());
+        assert!(read(r#"{"a\ud800":1,"a\ud801b":2}"#).is_some());
+        assert!(read(r#"{"\ud800":1,"\ud800":2}"#).is_none());
+        assert!(read(r#"{"\ud83d\ude00":1,"\ud83d\ude01":2}"#).is_some());
+        assert!(read(r#"{"\ud83d\ude00":1,"\ud83d\ude00":2}"#).is_none());
+    }
+
+    #[test]
+    fn a_repeat_is_found_among_many_keys() {
+        let keys = |count: usize, last: &str| {
+            let members: Vec<String> = (0..count).map(|index| format!(r#""k{index}":{index}"#)).collect();
+            format!("{{{},{last}}}", members.join(","))
+        };
+        for count in [LINEAR_KEY_LIMIT - 1, LINEAR_KEY_LIMIT, LINEAR_KEY_LIMIT + 1, 5000] {
+            assert!(
+                JsonValue::parse_distinct(&keys(count, r#""other":0"#)).is_some(),
+                "{count}"
+            );
+            assert!(
+                JsonValue::parse_distinct(&keys(count, r#""k0":0"#)).is_none(),
+                "{count}"
+            );
+            let last = format!(r#""k{}":0"#, count - 1);
+            assert!(JsonValue::parse_distinct(&keys(count, &last)).is_none(), "{count}");
+        }
     }
 
     #[test]
