@@ -260,8 +260,7 @@ fn a_constraint_that_allows_one_token_a_step_decides_every_token_and_the_request
     let free = run(&runtime, 24, SamplingConfig::greedy(0), Speculation::Off, None);
     assert_eq!(free.outcome.reason, FinishReason::Length);
     assert_eq!(free.tokens.len(), 24);
-    drop(runtime);
-    drop(owner);
+    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
@@ -303,8 +302,7 @@ fn a_constraint_that_fails_ends_the_request_once_with_an_error_and_frees_the_seq
             "{what}: the next request runs"
         );
     }
-    drop(runtime);
-    drop(owner);
+    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
@@ -338,6 +336,5 @@ fn the_next_mask_is_prepared_while_the_next_decode_runs_and_a_row_that_retires_f
         "the decode ({admitted:?}) was admitted before the mask was ready ({ended:?})"
     );
     assert!(sequence_free(&runtime));
-    drop(runtime);
-    drop(owner);
+    owner.shutdown(runtime).unwrap();
 }
