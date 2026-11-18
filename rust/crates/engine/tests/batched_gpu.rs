@@ -1,6 +1,6 @@
 //! Batched verification on a GPU: one quantum that verifies the rows of several sequences, each against its own state,
-//! compared with each sequence verified alone. The tests are `#[ignore]`d and run locally in a memory-capped scope:
-//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test batched_gpu -- --ignored`.
+//! compared with each sequence verified alone. The tests are `#[ignore]`d: they need the card, so run them through
+//! `system-run` with a shared grant.
 //!
 //! The model is the first four layers of the RCO artifact (three GDN layers and one full-attention layer), its MTP
 //! layer, heads and embedding, loaded object by object from the artifact named by `euhedral.qwen.rco-artifact`; the
@@ -61,8 +61,8 @@ use euhedral_inference_engine::stages::attention::KvSource;
 use euhedral_inference_engine::stages::sampling::SelectionPool;
 use euhedral_inference_engine::stages::sampling::token_of;
 use euhedral_inference_engine::stages::{
-    DraftSeed, DraftTokenWrite, InputRecordRef, LaneTable, Outcome as Conclusion, Part, Quantum, QuantumKind,
-    SequenceRefs,
+    DraftSeed, DraftTokenWrite, InputRecordRef, LaneTable, Outcome as Conclusion, Part, Quantum, QuantumError,
+    QuantumKind, SequenceRefs,
 };
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
@@ -1235,16 +1235,18 @@ fn a_one_row_decode_beside_the_row_of_a_batch() {
     let mut runs = [member, other];
     let (quantum, in_batch) = batch(&world, &mut runner, &mut runs, &[Member::all(1), Member::all(3)]);
     drop(quantum);
-    let decode_equals_batch = alone.logits == in_batch[0].logits;
-    let decode_equals_verify = alone.logits == exact.logits;
-    println!(
-        "1-row decode == its row in a row-exact batch: {decode_equals_batch}; 1-row decode == 1-row verify alone: \
-         {decode_equals_verify}; 1-row verify alone == its row in the batch: {}",
-        exact.logits == in_batch[0].logits
+    // Plan question 2: a one-row decode is bit-identical to its row in a row-exact batch, and to a one-row verify.
+    assert!(
+        alone.logits == in_batch[0].logits,
+        "a one-row decode equals its row in a row-exact batch"
     );
     assert!(
         exact.logits == in_batch[0].logits,
         "a one-row verification alone equals its row in a batch"
+    );
+    assert!(
+        alone.logits == exact.logits,
+        "a one-row decode equals a one-row verification"
     );
     assert_eq!(alone.keys, in_batch[0].keys, "the selected token is the same");
     drop(runner);
@@ -1252,5 +1254,59 @@ fn a_one_row_decode_beside_the_row_of_a_batch() {
     for run in [decoded, verified, member, other] {
         run.close(&world);
     }
+    world.close();
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_batch_refuses_what_is_for_one_sequence_and_one_sequence_under_two_ids() {
+    let Some(world) = World::open() else { return };
+    let mode = SubmitMode {
+        pdl: false,
+        row_exact: true,
+    };
+    let make = |parts: Vec<Part>| {
+        Quantum::batch(
+            parts,
+            Arc::clone(&world.workspace),
+            mode,
+            Arc::clone(&world.config),
+            world.table.clone(),
+        )
+    };
+    let mut first = prefilled(&world, 300);
+    let mut second = prefilled(&world, 411);
+    let (a, keep_a, _) = first.part(&world, 0, &Member::all(2));
+    let (b, keep_b, _) = second.part(&world, 1, &Member::all(2));
+    let quantum = make(vec![a, b]).unwrap();
+    // The builders and accessors of one sequence refuse a quantum of two, whatever the build.
+    assert!(quantum.selection().is_none());
+    assert!(quantum.row_readback().is_none());
+    assert!(quantum.table_generation(KvSource::Base, 0).is_none());
+    let scored = quantum.with_logits_rows(1).unwrap();
+    assert!(
+        scored.validate().is_err(),
+        "scoring a number of rows of one sequence on a batch is refused"
+    );
+    let quantum = make(vec![
+        first.part(&world, 0, &Member::all(1)).0,
+        second.part(&world, 1, &Member::all(1)).0,
+    ])
+    .unwrap();
+    assert!(quantum.seeding_draft().is_err());
+    // One sequence under two ids shares its device buffers.
+    let (c, keep_c, _) = first.part(&world, 5, &Member::all(2));
+    let (d, keep_d, _) = first.part(&world, 6, &Member::all(2));
+    assert!(matches!(
+        make(vec![c, d]).err(),
+        Some(QuantumError::DuplicateSequence {
+            first: 0,
+            second: 1,
+            ..
+        })
+    ));
+    drop((keep_a, keep_b, keep_c, keep_d));
+    first.close(&world);
+    second.close(&world);
     world.close();
 }

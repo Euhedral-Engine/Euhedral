@@ -23,6 +23,7 @@ pub mod home;
 mod input_record;
 pub mod whole;
 
+use smallvec::SmallVec;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -116,7 +117,7 @@ impl Quantum {
         } else {
             return Err(PrepareError::NoTokens { rows: self.rows });
         };
-        let positions: Vec<u64> = self.segments().iter().map(|segment| segment.start_position).collect();
+        let positions: SmallVec<[u64; 1]> = self.segments().iter().map(|segment| segment.start_position).collect();
         let record = encode_input_record_positions(ids, &positions);
         let mut loan = pool.acquire(record.len())?;
         loan.buffer_mut().as_mut_slice()[..record.len()].copy_from_slice(&record);
@@ -165,6 +166,9 @@ impl Quantum {
     /// buffers and seed, the GDN checkpoints of a verification, the decode scratch, and the selection.
     pub fn validate(&self) -> Result<(), QuantumError> {
         let invalid = |what: String| Err(QuantumError::Invalid { what });
+        if let Some(what) = self.misuse() {
+            return invalid(what.to_string());
+        }
         for segment in self.segments() {
             let (start, rows) = (segment.start_position, segment.rows as u64);
             if let Some(source) = self.attention_source() {
