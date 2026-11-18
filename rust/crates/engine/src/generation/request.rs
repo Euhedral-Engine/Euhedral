@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+use super::constraint::TokenConstraint;
 use super::listener::GenerationListener;
 use crate::sampling::SamplingConfig;
 use crate::stages::QuantumKind;
@@ -37,6 +38,10 @@ pub struct GenerationRequest {
     /// selects on the device, as a request that never asked for sampling; any other copies the logits row to the host
     /// and selects there, one token at a time, with the draw of the seed and the token's position.
     pub sampling: SamplingConfig,
+    /// Which tokens each selection may choose. A constrained request selects on the host even when its configuration is
+    /// greedy (the best allowed token), one token at a time, and never speculates: `speculation` is read as
+    /// [`Speculation::Off`]. A constraint that fails ends the request with [`FinishReason::Failed`].
+    pub constraint: Option<Box<dyn TokenConstraint>>,
     pub listener: Box<dyn GenerationListener>,
 }
 
@@ -48,6 +53,7 @@ impl fmt::Debug for GenerationRequest {
             .field("max_tokens", &self.max_tokens)
             .field("speculation", &self.speculation)
             .field("sampling", &self.sampling)
+            .field("constrained", &self.constraint.is_some())
             .finish_non_exhaustive()
     }
 }

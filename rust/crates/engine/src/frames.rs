@@ -32,6 +32,8 @@ pub(crate) enum Kind {
     Sample,
     /// The running of the work a parked quantum waited for on the owner's lane.
     Reaped,
+    /// The preparation of a constrained request's next mask, on the host, while the device computes the row it applies to.
+    Prepare,
 }
 
 /// The id hash of a frame of `kind` on chain `chain`: distinct per kind and chain, mixed so that the chains spread

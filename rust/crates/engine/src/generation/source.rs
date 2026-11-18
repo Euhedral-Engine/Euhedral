@@ -51,13 +51,14 @@ use euhedral_gpu::Ran;
 use euhedral_graph::QuantumOutcome;
 use euhedral_inference_cuda::{DevicePtr, PooledPinned, SubmitMode};
 
+use super::constraint::TokenConstraint;
 use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
 use super::mtp::{Joining, Speculating, Verifying};
 use super::request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
-use super::sampled::{Answered, LeasedRow, Sampled, SampledRows, sample_frame};
+use super::sampled::{Answered, LeasedRow, Prepared, Sampled, SampledRows, prepare_frame, sample_frame};
 use super::teacher_forced::LogitsSink;
 use crate::frames::{Kind, step};
 use crate::model::ModelConfig;
@@ -90,6 +91,8 @@ pub(crate) enum Message {
     Logits(LogitsCopied),
     /// The host selected the token of a sampled request (or could not).
     Sampled(Sampled),
+    /// The host prepared the next mask of a constrained request (or could not).
+    Prepared(Prepared),
     /// The work a parked quantum waited for on the owner's lane has run: the turn lets the quantum go.
     Reaped,
 }
@@ -100,6 +103,7 @@ impl fmt::Debug for Message {
             Message::Retired(_) => formatter.write_str("Message::Retired"),
             Message::Logits(copied) => write!(formatter, "Message::Logits(step {})", copied.step),
             Message::Sampled(sampled) => write!(formatter, "Message::Sampled(step {})", sampled.step),
+            Message::Prepared(prepared) => write!(formatter, "Message::Prepared(step {})", prepared.step),
             Message::Reaped => formatter.write_str("Message::Reaped"),
         }
     }
@@ -254,6 +258,33 @@ pub(super) struct Sampling {
     rows: SampledRows,
     /// The token the host selected, which the next decode feeds.
     next: Option<u32>,
+    /// The request's constraint, when it has one.
+    constraint: Option<Constraining>,
+}
+
+/// Where a constrained request's constraint is, and what waits for it. It is in one place at a time: with the owner
+/// (`held`), in the frame that prepares it (`preparing`, the number of the preparation), or in a selection's frame
+/// (the rows' join waits for that).
+struct Constraining {
+    held: Option<Box<dyn TokenConstraint>>,
+    preparing: Option<u64>,
+    /// A quantum that retired before the preparation ended: its row waits, with the position of the token it selects.
+    deferred: Option<Deferred>,
+}
+
+struct Deferred {
+    lease: RowReadbackLease,
+    position: u64,
+}
+
+impl Constraining {
+    fn new(constraint: Box<dyn TokenConstraint>) -> Constraining {
+        Constraining {
+            held: Some(constraint),
+            preparing: None,
+            deferred: None,
+        }
+    }
 }
 
 impl Mode {
@@ -412,7 +443,13 @@ impl Run {
     /// Whether the request waits for the host's selections of a quantum's rows.
     fn selecting(&self) -> bool {
         match &self.mode {
-            Mode::Sampled { state, .. } => state.rows.waiting(),
+            Mode::Sampled { state, .. } => {
+                state.rows.waiting()
+                    || state
+                        .constraint
+                        .as_ref()
+                        .is_some_and(|constraint| constraint.preparing.is_some())
+            }
             Mode::Speculative { state, .. } => state.selecting(),
             Mode::Greedy { .. } | Mode::Forced { .. } => false,
         }
@@ -571,6 +608,7 @@ impl Owner {
             stop_tokens,
             speculation,
             sampling,
+            constraint,
             listener,
         } = request;
         let units = match units {
@@ -579,7 +617,7 @@ impl Owner {
         };
         let mode = match speculation {
             // The host selects the tokens: its drafts, if it speculates, stay greedy.
-            _ if !sampling.is_greedy() => {
+            _ if !sampling.is_greedy() || constraint.is_some() => {
                 if self.sequence.row_readbacks.is_exhausted() {
                     // Refused before the prompt prefills: the last chunk would find no row to copy its logits to.
                     let error = AdmissionError::Engine("the sequence has no row readback to sample from".to_string());
@@ -587,6 +625,8 @@ impl Owner {
                 }
                 let vocabulary = self.shared.config.vocab_size;
                 let drafts = match speculation {
+                    // A constrained request never speculates.
+                    _ if constraint.is_some() => None,
                     Speculation::Off => None,
                     Speculation::Artifact => match self.shared.drafts.as_ref() {
                         Some(drafts) => Some(drafts.depth),
@@ -613,6 +653,7 @@ impl Owner {
                         state: Box::new(Sampling {
                             rows: samplers,
                             next: None,
+                            constraint: constraint.map(Constraining::new),
                         }),
                     },
                     Some(depth) => Mode::Speculative {
@@ -643,7 +684,10 @@ impl Owner {
                 }
             }
         };
-        self.start_run(units, mode, prompt, max_tokens as usize, stop_tokens, cancel)
+        self.start_run(units, mode, prompt, max_tokens as usize, stop_tokens, cancel)?;
+        // The first mask is prepared while the prompt prefills.
+        self.prepare_constraint();
+        Ok(())
     }
 
     /// Starts a teacher-forced run. A refused run gives its sink back.
@@ -874,6 +918,7 @@ impl Owner {
             }
             Message::Logits(copied) => self.deliver_row(copied),
             Message::Sampled(sampled) => self.deliver_sample(sampled),
+            Message::Prepared(prepared) => self.deliver_prepared(prepared),
             // The turn's `reap` is what the message is for.
             Message::Reaped => {}
         }
@@ -913,10 +958,21 @@ impl Owner {
             return;
         };
         let step = sampled.step;
+        let mut sampled = sampled;
+        let constraint = sampled.constraint.take();
         if rows.answer(sampled) == Answered::Stale {
             log::warn!("the answer of selection {step} is not the one awaited, and is ignored");
             return;
         }
+        // The constraint comes back with the token it accepted.
+        if let (Mode::Sampled { state, .. }, Some(constraint)) = (&mut run.mode, constraint)
+            && let Some(constraining) = &mut state.constraint
+        {
+            constraining.held = Some(constraint);
+        }
+        let Some(rows) = run.mode.sampled_rows() else {
+            return;
+        };
         // A failure ends the request at once; the answers still to come are awaited before it ends (`selecting`).
         if let Some(why) = rows.failure() {
             let why = format!("selecting the token: {why}");
@@ -951,7 +1007,75 @@ impl Owner {
             run.stop(FinishReason::Length);
         } else if let Mode::Sampled { state, .. } = &mut run.mode {
             state.next = Some(token);
+            // The decode that feeds the token runs while the next mask is prepared.
+            self.prepare_constraint();
         }
+    }
+
+    /// Publishes the frame that prepares the constraint's next mask, if the request has one and holds it.
+    fn prepare_constraint(&mut self) {
+        let Some(Run {
+            mode: Mode::Sampled { state, .. },
+            ..
+        }) = self.run.as_mut()
+        else {
+            return;
+        };
+        let Some(constraining) = &mut state.constraint else {
+            return;
+        };
+        let Some(constraint) = constraining.held.take() else {
+            return;
+        };
+        let step = self.sample_steps;
+        self.sample_steps += 1;
+        constraining.preparing = Some(step);
+        let address = Arc::clone(&self.shared.address);
+        let frame = prepare_frame(step, constraint, move |prepared| {
+            address.post(Message::Prepared(prepared))
+        });
+        self.shared.core.completions.at(Instant::now(), frame);
+    }
+
+    /// Takes in the preparation of the constraint's next mask. A row that retired meanwhile is selected from now; a
+    /// failure ends the request, which waits for no other answer from this frame. An answer for a preparation the
+    /// request no longer waits for is ignored.
+    fn deliver_prepared(&mut self, prepared: Prepared) {
+        let Some(Run {
+            mode: Mode::Sampled { state, .. },
+            stopping,
+            ..
+        }) = self.run.as_mut()
+        else {
+            return;
+        };
+        let Some(constraining) = &mut state.constraint else {
+            return;
+        };
+        if constraining.preparing != Some(prepared.step) {
+            log::warn!(
+                "the preparation {} is not the one awaited, and is ignored",
+                prepared.step
+            );
+            return;
+        }
+        constraining.preparing = None;
+        let constraint = match prepared.result {
+            Ok(constraint) => constraint,
+            Err(why) => {
+                constraining.deferred = None;
+                return self.fail(why);
+            }
+        };
+        let Some(Deferred { lease, position }) = constraining.deferred.take() else {
+            constraining.held = Some(constraint);
+            return;
+        };
+        if stopping.is_some() {
+            // The request ended while its row waited: the row goes back to its pool.
+            return;
+        }
+        self.publish_samples(lease, 1, position, Some(constraint));
     }
 
     /// Frees, in stream order on the owner's lane, the buffers the sequence's caches let go of: pages that a request
@@ -1159,12 +1283,23 @@ impl Owner {
         } else {
             flying.start + flying.rows as u64
         };
-        // The steps are the owner's, not the request's: an answer that comes late from a request that ended never
-        // matches a selection of the next one.
-        let first_step = self.sample_steps;
-        self.sample_steps += count as u64;
-        let shared = &self.shared;
         let Some(run) = self.run.as_mut() else { return };
+        let mut constraint = None;
+        if let Mode::Sampled { state, .. } = &mut run.mode
+            && let Some(constraining) = &mut state.constraint
+        {
+            match constraining.held.take() {
+                Some(held) => constraint = Some(held),
+                None => {
+                    // The mask is still being prepared: the row waits for it, and is selected from when it is.
+                    constraining.deferred = Some(Deferred {
+                        lease,
+                        position: first_position,
+                    });
+                    return;
+                }
+            }
+        }
         if let Mode::Speculative { state, .. } = &mut run.mode {
             state.joining(match flying.role {
                 Role::Verify => Joining::Verification(Verifying::of(flying)),
@@ -1173,6 +1308,24 @@ impl Owner {
                 },
             });
         }
+        self.publish_samples(lease, count, first_position, constraint);
+    }
+
+    /// Publishes the frames that select from the `count` rows of `lease`, the first at `first_position`. The constraint,
+    /// when the request has one, goes with the (only) row.
+    fn publish_samples(
+        &mut self,
+        lease: RowReadbackLease,
+        count: usize,
+        first_position: u64,
+        mut constraint: Option<Box<dyn TokenConstraint>>,
+    ) {
+        // The steps are the owner's, not the request's: an answer that comes late from a request that ended never
+        // matches a selection of the next one.
+        let first_step = self.sample_steps;
+        self.sample_steps += count as u64;
+        let shared = &self.shared;
+        let Some(run) = self.run.as_mut() else { return };
         let Some(rows) = run.mode.sampled_rows() else {
             return;
         };
@@ -1195,6 +1348,7 @@ impl Owner {
                 first_step + row as u64,
                 first_position + row as u64,
                 sampler,
+                constraint.take(),
                 LeasedRow::new(Arc::clone(&lease), row),
                 move |sampled| address.post(Message::Sampled(sampled)),
             );
