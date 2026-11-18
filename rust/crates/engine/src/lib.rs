@@ -8,6 +8,7 @@ pub mod generation;
 pub mod handoff;
 pub mod kernels;
 pub mod model;
+pub mod pass_assembler;
 pub mod plan;
 pub mod prefix;
 pub mod quantum;
