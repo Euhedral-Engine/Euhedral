@@ -539,7 +539,7 @@ impl KvCache {
                 layer_bytes: host.layer_bytes,
                 reserved_host_pages: self.reserved_host_pages(),
             }),
-            _store: Arc::clone(&self.store),
+            store: Arc::clone(&self.store),
         }
     }
 
@@ -597,13 +597,24 @@ pub struct KvView {
     ready: Option<Marker>,
     tables: Vec<Option<LayerTable>>,
     host: Option<HostView>,
-    _store: Arc<PageStore>,
+    store: Arc<PageStore>,
 }
 
 impl KvView {
     /// The format of the rows.
     pub fn format(&self) -> KvFormat {
         self.format
+    }
+
+    /// Bytes of one plane (K or V) of one page.
+    pub fn plane_page_bytes(&self) -> u64 {
+        self.plane_page_bytes
+    }
+
+    /// The device address of page `page` of layer `layer` (K plane, then V plane), when that page is on the device:
+    /// a page of the host region has none.
+    pub fn page(&self, layer: usize, page: usize) -> Option<DevicePtr> {
+        self.store.layers.get(layer)?.pages.get(page).map(|page| page.ptr())
     }
 
     /// The marker of the work that reserved the rows this view reads, which the stages that read them wait for.

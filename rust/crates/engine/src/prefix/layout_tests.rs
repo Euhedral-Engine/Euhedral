@@ -3,53 +3,12 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use euhedral_inference_settings::KvFormat;
 
-use super::fixtures::{arena, tokens};
+use super::fixtures::{arena, compact, config, tokens};
 use super::{Buffer, CheckpointLayout, NodeId, PrefixTree, SlotCopy, Speculation};
 use crate::model::{LayerKind, ModelConfig};
 use crate::residency::footprint::page_bytes;
 
 const FORMAT: KvFormat = KvFormat::Nvfp4;
-
-fn config(kinds: Vec<LayerKind>, key_heads: usize, value_heads: usize, key_dim: usize) -> ModelConfig {
-    ModelConfig {
-        vocab_size: 1,
-        hidden_size: 64,
-        num_hidden_layers: kinds.len(),
-        num_attention_heads: 1,
-        num_key_value_heads: 1,
-        attention_head_dim: 256,
-        intermediate_size: 1,
-        linear_num_key_heads: key_heads,
-        linear_num_value_heads: value_heads,
-        linear_key_head_dim: key_dim,
-        linear_value_head_dim: 16,
-        linear_conv_kernel_dim: 4,
-        rms_norm_epsilon: 1.0,
-        rope_theta: 1.0,
-        partial_rotary_factor: 1.0,
-        max_position_embeddings: 1,
-        layer_kinds: kinds,
-        num_experts: 0,
-        tie_word_embeddings: false,
-        attention_output_gate: true,
-        mtp_layer_count: 1,
-        draft_depth: None,
-    }
-}
-
-/// Eight layers, GDN on the even ones and full attention on the odd ones; small GDN state.
-fn compact() -> ModelConfig {
-    let kinds = (0..8)
-        .map(|layer| {
-            if layer % 2 == 1 {
-                LayerKind::FullAttention
-            } else {
-                LayerKind::GatedDeltaNet
-            }
-        })
-        .collect();
-    config(kinds, 2, 4, 8)
-}
 
 /// One attention layer and a GDN state of several slots, so its buffers straddle slot boundaries.
 fn wide_gdn() -> ModelConfig {

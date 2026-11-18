@@ -43,6 +43,7 @@ context:
 prefix-cache:
   size: 4GiB                                  # optional, default 4GiB: host memory for shared prompt prefixes; 0 disables
   checkpoint-tokens: 2048                     # optional, default 2048: tokens between stored checkpoints; a positive multiple of 512
+  copy-piece-bytes: 16MiB                     # optional, default 16MiB, Rust engine only: most bytes one checkpoint copy moves at a time
 
 batching:
   max-sequences: 1                            # optional, default 1: sequences held at once; 0 holds as many as fit

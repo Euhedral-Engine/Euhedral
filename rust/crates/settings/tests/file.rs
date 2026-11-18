@@ -222,6 +222,18 @@ fn limits_and_formats() {
     assert!(problems(&format!("{MODEL}server:\n  shutdown-timeout: 0s\n"))[0].contains("server.shutdown-timeout"));
     assert!(problems(&format!("{MODEL}server:\n  shutdown-timeout: 1d\n"))[0].contains("server.shutdown-timeout"));
     assert!(problems(&format!("{MODEL}prefix-cache:\n  checkpoint-tokens: 1000\n"))[0].contains("multiple of 512"));
+    assert!(
+        problems(&format!("{MODEL}prefix-cache:\n  copy-piece-bytes: 0\n"))[0]
+            .contains("prefix-cache.copy-piece-bytes")
+    );
+    assert_eq!(
+        load(&format!("{MODEL}prefix-cache:\n  copy-piece-bytes: 4MiB\n"))
+            .unwrap()
+            .prefix_cache
+            .copy_piece_bytes,
+        ByteSize::mib(4)
+    );
+    assert_eq!(load(MODEL).unwrap().prefix_cache.copy_piece_bytes, ByteSize::mib(16));
     assert!(problems(&format!("{MODEL}kernels:\n  trellis:\n    tensor-core-max-tokens: 7\n"))[0].contains("8 to"));
     assert!(problems(&format!("{MODEL}context:\n  kv-cache-format: fp8\n"))[0].contains("nvfp4, bf16 or auto"));
     assert_eq!(

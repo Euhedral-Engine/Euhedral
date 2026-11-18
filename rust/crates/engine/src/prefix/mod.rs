@@ -9,12 +9,28 @@
 #[cfg(doc)]
 use euhedral_memory::SlotArena;
 
+mod cache;
+mod copier;
+mod copy;
 mod layout;
+mod open;
 mod tree;
 
+pub use cache::{CacheParts, Hit, OpenError, PrefixCacheHandle, PrefixCacheStats, RestoreError, Submit};
+pub(crate) use copier::FIRST_COPY_SERIAL;
+pub use copier::{Copier, PinnedArena, SequenceAddresses};
+pub use copy::{CopyJob, Direction, Ended, HostArena, Piece, Resolve};
 pub use layout::{Buffer, CheckpointLayout, SlotCopy};
+pub use open::{CacheSpec, open_prefix_cache};
 pub use tree::{Match, NodeId, POSITION_GRANULE, PrefixNode, PrefixTree, ReserveError, Speculation};
 
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "the fake device and the jobs' queue are shared between the test and the closures the cache is given"
+)]
+mod cache_tests;
 #[cfg(test)]
 mod fixtures;
 #[cfg(test)]

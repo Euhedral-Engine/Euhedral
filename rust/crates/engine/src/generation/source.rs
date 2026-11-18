@@ -64,6 +64,7 @@ use super::teacher_forced::LogitsSink;
 use crate::frames::{Kind, step};
 use crate::handoff::Handoff;
 use crate::model::ModelConfig;
+use crate::prefix::{CopyJob, FIRST_COPY_SERIAL, PrefixCacheHandle};
 use crate::quantum::{Executor, StartError};
 use crate::runtime::{Core, Units};
 use crate::sampling::{SamplingConfig, SamplingError, TokenSampler};
@@ -99,6 +100,17 @@ pub(crate) enum Message {
     Reaped,
     /// A quantum the owner admitted did not start.
     StartFailed(Box<StartFailed>),
+    /// A prefix-cache copy job of this sequence to admit (see [`Generation::copy_submit`](super::Generation)).
+    Copy(Box<CopyRequest>),
+    /// A copy job of this sequence ended and was reported.
+    CopyEnded,
+}
+
+/// A copy job and how it is admitted.
+pub(crate) struct CopyRequest {
+    pub(crate) job: CopyJob,
+    pub(crate) kill: Arc<AtomicBool>,
+    pub(crate) more: bool,
 }
 
 impl fmt::Debug for Message {
@@ -110,6 +122,8 @@ impl fmt::Debug for Message {
             Message::Prepared(prepared) => write!(formatter, "Message::Prepared(step {})", prepared.step),
             Message::Reaped => formatter.write_str("Message::Reaped"),
             Message::StartFailed(failed) => write!(formatter, "Message::StartFailed({})", failed.serial),
+            Message::Copy(_) => formatter.write_str("Message::Copy"),
+            Message::CopyEnded => formatter.write_str("Message::CopyEnded"),
         }
     }
 }
@@ -149,6 +163,9 @@ pub(crate) struct Shared {
     pub(crate) capacity: u64,
     /// What speculation needs of the artifact; `None` for an artifact without the draft layer.
     pub(crate) drafts: Option<Drafts>,
+    /// The prefix cache, when the plan granted it memory and it opened.
+    #[allow(dead_code, reason = "the generation's prefix cache steps read it")]
+    pub(crate) prefix: Option<PrefixCacheHandle>,
     /// Set when the engine stops: no request begins after it.
     pub(crate) closing: AtomicBool,
     /// A test hook: the owner panics at the end of the turn in which it has admitted this many quanta.
@@ -567,6 +584,9 @@ pub(crate) struct Owner {
     watch: Option<Arc<Handoff<()>>>,
     /// The number of the next selection a sampled request publishes; it never restarts, whatever the request.
     sample_steps: u64,
+    /// The prefix cache's copy jobs of this sequence admitted and not yet ended. The sequence's lease is not returned,
+    /// and the owner is not idle, while one is in flight: a capture reads the sequence's state and a restore writes it.
+    copies: usize,
 }
 
 impl fmt::Debug for Owner {
@@ -598,6 +618,7 @@ impl Owner {
             finished: VecDeque::new(),
             watch: None,
             sample_steps: 0,
+            copies: 0,
         }
     }
 
@@ -962,7 +983,7 @@ impl Owner {
             Message::Retired(retired) => {
                 let Retired { quantum, outcome } = *retired;
                 // A quantum the workspace waited for is done: the owner of the workspace starts what waits.
-                self.shared.order.retired(quantum.id());
+                self.shared.order.retired(self.id, quantum.id());
                 let waiting = self.run.as_mut().and_then(|run| {
                     run.in_flight.iter_mut().find(|flying| {
                         flying.retired.is_none()
@@ -992,6 +1013,20 @@ impl Owner {
             // The turn's `reap` is what the message is for.
             Message::Reaped => {}
             Message::StartFailed(failed) => self.start_failed(*failed),
+            Message::Copy(request) => self.admit_copy(*request),
+            Message::CopyEnded => self.copies = self.copies.saturating_sub(1),
+        }
+    }
+
+    /// Admits a copy job of this sequence behind the sequence's last device work, and counts it until it ends. A job
+    /// that cannot start is dropped, which reports it failed to the cache, and is not counted.
+    fn admit_copy(&mut self, request: CopyRequest) {
+        let CopyRequest { job, kill, more } = request;
+        let shared = Arc::clone(&self.shared);
+        self.copies += 1;
+        if let Err(error) = shared.order.admit(self.id, &shared.executor, job, kill, false, more) {
+            self.copies -= 1;
+            log::error!("a prefix-cache copy did not start: {error}");
         }
     }
 
@@ -999,6 +1034,12 @@ impl Owner {
     /// fails.
     fn start_failed(&mut self, failed: StartFailed) {
         let StartFailed { serial, error } = failed;
+        if serial >= FIRST_COPY_SERIAL {
+            // A copy job that did not start was dropped, and so reported failed: no request fails with it.
+            self.copies = self.copies.saturating_sub(1);
+            log::error!("a prefix-cache copy did not start: {error}");
+            return;
+        }
         let Some(run) = self.run.as_mut() else { return };
         run.in_flight.retain(|flying| flying.id != serial);
         run.stop(FinishReason::Failed(format!("starting the quantum: {error}")));
@@ -1227,6 +1268,7 @@ impl Owner {
     fn then_idle(&mut self, mut told: Vec<Finished>) -> Vec<Finished> {
         if self.run.is_none()
             && self.parked.is_empty()
+            && self.copies == 0
             && let Some(idle) = self.watch.take()
         {
             told.push(Finished::Idle(idle));
@@ -1754,6 +1796,9 @@ impl Owner {
     fn finish_if_done(&mut self) {
         let chunk = self.shared.chunk;
         let Some(run) = self.run.as_ref() else { return };
+        if self.copies > 0 {
+            return;
+        }
         let ended = run.stopping.is_some() || run.next_step(chunk).is_none();
         if !run.in_flight.is_empty() || run.waiting_logits || run.selecting() || run.preparing() || !ended {
             return;
@@ -1823,7 +1868,7 @@ impl Turn for Owner {
         }
         // Always told through the outcomes' own path, after them: also with nothing running, because a turn that ended
         // the request may have its outcome in a list not yet told.
-        if self.run.is_none() && self.parked.is_empty() {
+        if self.run.is_none() && self.parked.is_empty() && self.copies == 0 {
             self.finished.push_back(Finished::Idle(idle));
         } else {
             self.watch = Some(idle);
@@ -1838,7 +1883,7 @@ impl Turn for Owner {
     }
 
     fn idle(&self) -> bool {
-        self.run.is_none() && self.parked.is_empty() && self.finished.is_empty()
+        self.run.is_none() && self.parked.is_empty() && self.copies == 0 && self.finished.is_empty()
     }
 }
 

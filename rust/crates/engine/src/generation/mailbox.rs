@@ -67,7 +67,7 @@ pub(crate) const OPERATION_BOUND: Duration = Duration::from_secs(10);
 const OPERATIONS_PER_CHUNK: usize = 4;
 
 /// Runs a closure on a worker, later, unordered; `false` when no worker will (the engine is shutting down).
-pub(crate) type Spawn = Box<dyn Fn(Box<dyn FnOnce() + Send>) -> bool + Send + Sync>;
+pub type Spawn = Box<dyn Fn(Box<dyn FnOnce() + Send>) -> bool + Send + Sync>;
 
 /// What a mailbox drives: the state of an owner, and what it does in a turn.
 pub(crate) trait Turn: Send + 'static {
