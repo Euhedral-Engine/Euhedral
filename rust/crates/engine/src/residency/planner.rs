@@ -14,7 +14,7 @@ use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFo
 use euhedral_inference_settings::{Auto, BatchingSettings, KvFormat, Settings};
 
 use euhedral_memory::{
-    LocationId, LocationKind, LocationSpec, OwnerSpec, Placed, PlanItem, PlanRequest, Planner, Priority, Scope,
+    LocationId, LocationKind, LocationSpec, OwnerSpec, Placed, PlanRequest, Planner, Priority, Scope,
 };
 
 use crate::error::PlanError;
@@ -22,6 +22,7 @@ use crate::model::{
     ArtifactProfile, LayerIndex, MTP_ATTENTION_PACK, MTP_PACK_HALVES, ModelConfig, Role, Speculation, object_key,
     trellis_logical, validate_inventory,
 };
+use crate::residency::accounting::{Consumer, ConsumerBytes, plan_items};
 use crate::residency::footprint::{self, PAGE_TOKENS};
 use crate::residency::scratch::{
     MAX_SEGMENTS, TRELLIS_BLOCK, TrellisThresholds, trellis_mma_bytes, trellis_plan_bytes,
@@ -112,6 +113,9 @@ pub struct ResidencyPlan {
     /// Bytes of the scratch of the tensor-core route alone, which a decode-type launch running beside another takes
     /// (`LinearFormat.decodeScratchBytes`).
     pub decode_scratch_bytes: u64,
+    /// The device bytes the runtime reserves beyond the weights, the cache and the scratch (`memory.runtime-reserve`):
+    /// the execution workspace, the first sequence's state and what the kernel modules take.
+    pub runtime_reserve_bytes: u64,
     /// The device bytes the plan reserves in all: the weights, every sequence's cache, the runtime's reserve, the
     /// scratch and the state of the sequences beyond the first.
     pub device_bytes: u64,
@@ -168,6 +172,21 @@ impl ResidencyPlan {
             device: self.device_bytes,
             host: self.kv_host_bytes,
         }
+    }
+
+    /// What the plan asks, by consumer: the list the memory planner admitted and the account's reservation is made of.
+    /// Its device bytes sum to `device_bytes`, its host bytes to `kv_host_bytes + prefix_cache_bytes`.
+    pub fn consumers(&self) -> Vec<ConsumerBytes> {
+        Layout {
+            weights: self.arena_bytes,
+            runtime_reserve: self.runtime_reserve_bytes,
+            scratch: self.scratch_bytes,
+            cache_device: self.kv_device_bytes,
+            cache_host: self.kv_host_bytes,
+            sequences: self.sequences as u64,
+            extra_sequence_bytes: self.extra_sequence_bytes,
+        }
+        .consumers(self.prefix_cache_bytes)
     }
 
     /// The placement named `name`.
@@ -374,6 +393,7 @@ pub fn plan_with(
         workspace_bytes,
         scratch_bytes,
         decode_scratch_bytes,
+        runtime_reserve_bytes: layout.runtime_reserve,
         device_bytes,
         budget_bytes: available,
         kv_format,
@@ -414,7 +434,7 @@ pub fn sequences_for(
 /// An unknown or unlimited budget is given to the memory planner as this many bytes, or as the bytes the plan asks of
 /// that location if that is more, so the capacity stays below `u64::MAX / 2` for any plan the sums can hold and the
 /// answer is the same as with the budget itself.
-const CAPACITY_CAP: u64 = u64::MAX / 4;
+pub(crate) const CAPACITY_CAP: u64 = u64::MAX / 4;
 
 /// The two memory spaces of a plan: pinned host memory first, so a refusal at the host is reported before one at the
 /// device. When both are short the result relies on `Planner::admit` reporting the lowest location index, which
@@ -454,6 +474,27 @@ impl Layout {
             .saturating_add(self.scratch)
             .saturating_add(self.cache_device.saturating_mul(self.sequences))
             .saturating_add(self.extra_sequence_bytes.saturating_mul(self.sequences - 1))
+    }
+
+    /// The consumers of the layout in the order the memory planner admits them, with the prefix cache's arena of
+    /// `prefix` bytes (the only item that is not required) last when there is one. The one list both the admission
+    /// of a plan and the account of its allocations read.
+    fn consumers(&self, prefix: u64) -> Vec<ConsumerBytes> {
+        let mut consumers = vec![
+            ConsumerBytes::device(Consumer::Weights, self.weights),
+            ConsumerBytes::device(Consumer::RuntimeReserve, self.runtime_reserve),
+            ConsumerBytes::device(Consumer::Scratch, self.scratch),
+            ConsumerBytes::device(Consumer::Cache, self.cache_device.saturating_mul(self.sequences)),
+            ConsumerBytes::device(
+                Consumer::ExtraSequences,
+                self.extra_sequence_bytes.saturating_mul(self.sequences - 1),
+            ),
+            ConsumerBytes::host(Consumer::HostPages, self.cache_host),
+        ];
+        if prefix > 0 {
+            consumers.push(ConsumerBytes::optional_host(Consumer::PrefixCache, prefix));
+        }
+        consumers
     }
 }
 
@@ -519,21 +560,7 @@ fn admit_with_cache(budgets: Budgets, layout: Layout, prefix: u64) -> Result<boo
     let host = LocationId(0);
     let device = LocationId(1);
     let owner = planner.open_owner(OwnerSpec::new("residency", Priority(0), Scope::Plan(0)));
-    let mut items = vec![
-        PlanItem::required("weights", device, layout.weights),
-        PlanItem::required("runtime reserve", device, layout.runtime_reserve),
-        PlanItem::required("scratch", device, layout.scratch),
-        PlanItem::required("cache", device, layout.cache_device.saturating_mul(layout.sequences)),
-        PlanItem::required(
-            "state of the sequences beyond the first",
-            device,
-            layout.extra_sequence_bytes.saturating_mul(layout.sequences - 1),
-        ),
-        PlanItem::required("cache pages on the host", host, layout.cache_host),
-    ];
-    if prefix > 0 {
-        items.push(PlanItem::optional("prefix cache", Priority(0), host, prefix));
-    }
+    let items = plan_items(&layout.consumers(prefix), host, device);
     match planner.admit(&PlanRequest { owner, items }) {
         Ok(admission) => Ok(prefix > 0 && admission.placed.last() != Some(&Placed::Dropped)),
         Err(shortfall) if shortfall.location == host => Err(Location::Host),

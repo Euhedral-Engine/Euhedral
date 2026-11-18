@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use euhedral_inference_cuda::CudaLibrary;
 use euhedral_inference_settings::{KvFormat, PrefixCacheSettings};
-use euhedral_memory::{LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope, SlotArena};
+use euhedral_memory::{Claim, LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope, SlotArena};
 
 use crate::generation::Spawn;
 use crate::model::ModelConfig;
@@ -30,7 +30,21 @@ pub struct CacheSpec<'a> {
 /// Opens the cache the plan granted memory for. `None` when it is off (no bytes granted, or a model with no checkpoint
 /// layout), and, with a warning, when the memory cannot be pinned or the settings do not fit the model: the engine then
 /// serves without it. Allocates pinned memory with the waiting allocator: startup only.
+///
+/// The arena's bytes are accounted to a planner of the cache's own: the engine does not use this, it opens the cache
+/// with [`open_prefix_cache_claimed`] and the claim of its own account.
 pub fn open_prefix_cache(spec: CacheSpec<'_>, spawn: Spawn) -> Option<PrefixCacheHandle> {
+    open_with(spec, spawn, None)
+}
+
+/// As [`open_prefix_cache`], the arena's bytes accounted to `granted`, the claim of the engine's account for the
+/// `spec.granted` bytes the plan set aside. The claim is held for as long as the cache is, and what the arena does
+/// not use of it (the slots are whole) goes back at once. It is dropped when the cache is not opened.
+pub fn open_prefix_cache_claimed(spec: CacheSpec<'_>, spawn: Spawn, granted: Claim) -> Option<PrefixCacheHandle> {
+    open_with(spec, spawn, Some(granted))
+}
+
+fn open_with(spec: CacheSpec<'_>, spawn: Spawn, granted: Option<Claim>) -> Option<PrefixCacheHandle> {
     if spec.granted == 0 || spec.config.layer_kinds.len() <= 1 {
         return None;
     }
@@ -45,23 +59,23 @@ pub fn open_prefix_cache(spec: CacheSpec<'_>, spawn: Spawn) -> Option<PrefixCach
         return None;
     }
     let bytes = u64::from(slots) * slot_bytes;
+    let claim = match granted {
+        Some(mut claim) => {
+            claim.shrink(claim.bytes().saturating_sub(bytes));
+            claim
+        }
+        None => local_claim(bytes)?,
+    };
     let host = match PinnedArena::allocate(spec.library, bytes) {
-        Ok(host) => host,
+        // The claim stays with the pinned memory, which the copy jobs share: it is released when the last holder is gone.
+        Ok(host) => host.with_claim(claim),
         Err(error) => {
             log::warn!("the prefix cache's {bytes} bytes cannot be pinned ({error}): the engine runs without it");
             return None;
         }
     };
-    // The arena's bytes are accounted to the cache's own planner: the engine's plan has already placed them.
-    let planner = Planner::new([LocationSpec {
-        kind: LocationKind::HostPinned,
-        capacity: bytes,
-        reserve: 0,
-    }]);
-    let location = planner.location(LocationKind::HostPinned)?;
-    let owner = planner.open_owner(OwnerSpec::new("prefix cache", Priority(0), Scope::Plan(0)));
-    let claim = planner.claim(owner, location, bytes, "prefix cache slots").ok()?;
-    let arena = SlotArena::new(0, slot_bytes, slots, claim);
+    // The slots' lease book accounts for no bytes: the memory is the pinned arena's.
+    let arena = SlotArena::new(0, slot_bytes, slots, local_claim(0)?);
     let parts = CacheParts {
         layout,
         arena,
@@ -82,4 +96,16 @@ pub fn open_prefix_cache(spec: CacheSpec<'_>, spawn: Spawn) -> Option<PrefixCach
             None
         }
     }
+}
+
+/// A claim of `bytes` on a planner of its own: the engine's plan has already placed the bytes.
+fn local_claim(bytes: u64) -> Option<Claim> {
+    let planner = Planner::new([LocationSpec {
+        kind: LocationKind::HostPinned,
+        capacity: bytes,
+        reserve: 0,
+    }]);
+    let location = planner.location(LocationKind::HostPinned)?;
+    let owner = planner.open_owner(OwnerSpec::new("prefix cache", Priority(0), Scope::Plan(0)));
+    planner.claim(owner, location, bytes, "prefix cache").ok()
 }

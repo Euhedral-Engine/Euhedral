@@ -16,6 +16,7 @@ use euhedral_graph::{
 use euhedral_inference_cuda::launch::ops::RusteeOps;
 use euhedral_inference_cuda::{CudaError, CudaLibrary, DevicePtr, KernelOps, PinnedBuffer};
 use euhedral_inference_settings::KvFormat;
+use euhedral_memory::Claim;
 
 use crate::frames::{Kind, id_hash};
 use crate::model::{LayerKind, ModelConfig};
@@ -35,6 +36,9 @@ pub(crate) const FIRST_COPY_SERIAL: u64 = 1 << 63;
 #[derive(Debug)]
 pub struct PinnedArena {
     buffer: PinnedBuffer,
+    /// The account's claim for the buffer's bytes, declared after the buffer so that it is released once the buffer is
+    /// freed. The copy jobs hold the arena, so an abandoned job keeps the claim as long as the memory.
+    claim: Option<Claim>,
 }
 
 impl PinnedArena {
@@ -44,7 +48,14 @@ impl PinnedArena {
             usize::try_from(bytes).map_err(|_| CudaError::Argument(format!("{bytes} bytes do not fit in memory")))?;
         Ok(PinnedArena {
             buffer: PinnedBuffer::alloc(library, bytes)?,
+            claim: None,
         })
+    }
+
+    /// The arena, accounted to `claim` for as long as it lives.
+    pub fn with_claim(mut self, claim: Claim) -> PinnedArena {
+        self.claim = Some(claim);
+        self
     }
 
     /// The arena's size in bytes.

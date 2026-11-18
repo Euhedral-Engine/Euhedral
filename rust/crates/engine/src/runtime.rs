@@ -37,7 +37,8 @@ use crate::model::{ArtifactProfile, ModelConfig, Speculation, Weights};
 use crate::pass_assembler::PassStatistics;
 use crate::plan::Plan;
 use crate::prefix::PrefixCacheStats;
-use crate::residency::planner::{PlanInputs, ResidencyPlan, pass_rows_limit, sequences_for};
+use crate::residency::accounting::{MemoryAccount, PlanReservation};
+use crate::residency::planner::{LocationBytes, PlanInputs, ResidencyPlan, pass_rows_limit, sequences_for};
 use crate::stages::LaneTable;
 use crate::startup;
 use crate::state::SequenceState;
@@ -154,6 +155,9 @@ pub(crate) struct Core {
     pub(crate) released: Arc<ReleasedBuffers>,
     /// Pinned host bytes the load may use.
     pub(crate) host_pinned_bytes: u64,
+    /// The memory planner's account: the plan is admitted against it and every allocation of the startup holds a claim
+    /// from it. Closed by the runtime's release, which reports what is still held.
+    pub(crate) account: MemoryAccount,
     /// The pinned pool's size (`memory.pinned-buffer-pool`, resolved): what it keeps, and the ring's budget.
     pub(crate) pool_bytes: u64,
     pub(crate) started: Instant,
@@ -269,6 +273,9 @@ pub struct StartupReport {
     pub objects: usize,
     /// Bytes this runtime allocated on the device: the weight arena, the workspace and the sequence state.
     pub allocated_bytes: u64,
+    /// Bytes the memory planner admitted for the plan, per location: the device bytes of the weights, the cache, the
+    /// runtime reserve and the scratch, and the pinned host bytes of the cache pages and the prefix cache's arena.
+    pub admitted: LocationBytes,
     /// Bytes in use on the device when the model became ready (the whole device's, every process).
     pub device_bytes_in_use: u64,
     /// Pinned bytes the staging pool holds at ready: the upload's ring and the cache's table staging.
@@ -279,6 +286,9 @@ pub struct StartupReport {
     pub warmed: Warmed,
 }
 
+/// What `Teardown::leaked_bytes` holds before the leak check has run.
+const NOT_CHECKED: u64 = u64::MAX;
+
 /// What stops an engine: its lakes and its lattice, and the count of device bytes that nothing has freed yet. Closing
 /// waits for the lattice's workers, so only the engine's owner does it, on `main`.
 pub struct Teardown {
@@ -286,6 +296,8 @@ pub struct Teardown {
     lattice: Arc<ControlPlaneLattice>,
     /// Device bytes the runtime allocated and `shutdown` has not freed.
     pub(crate) device_bytes: AtomicU64,
+    /// The bytes the leak check at shutdown found still claimed; [`NOT_CHECKED`] until it ran.
+    leaked_bytes: AtomicU64,
     /// How long `shutdown` waits for a running request to end after its cancel: the lattice's close timeout.
     pub(crate) cancel_bound: Duration,
 }
@@ -306,8 +318,18 @@ impl Teardown {
             lakes,
             lattice,
             device_bytes: AtomicU64::new(0),
+            leaked_bytes: AtomicU64::new(NOT_CHECKED),
             cancel_bound,
         })
+    }
+
+    /// The bytes the memory account's leak check found still claimed when the engine was shut down and its memory
+    /// freed: 0 is clean. `None` while the check has not run (the engine is running, or was not freed).
+    pub fn leaked_bytes(&self) -> Option<u64> {
+        match self.leaked_bytes.load(Ordering::Acquire) {
+            NOT_CHECKED => None,
+            bytes => Some(bytes),
+        }
     }
 
     /// Closes the lakes, then the lattice. Idempotent. Waits for the workers: never from a worker.
@@ -555,6 +577,9 @@ pub struct EngineRuntime {
     device: ManuallyDrop<DeviceState>,
     // The sequences and the graphs that run them, each with an owner. Closed by `release`.
     generations: Generations,
+    /// What the plan's reservation holds beyond the claims of the allocations (the runtime reserve nothing allocates).
+    /// Given back by `release`, before the account's leak check.
+    reservation: Option<PlanReservation>,
     report: StartupReport,
 }
 
@@ -609,6 +634,7 @@ impl EngineRuntime {
         weights: Weights,
         workspace: Arc<Workspace>,
         generations: Generations,
+        reservation: PlanReservation,
         report: StartupReport,
     ) -> EngineRuntime {
         EngineRuntime {
@@ -617,6 +643,7 @@ impl EngineRuntime {
             config,
             device: ManuallyDrop::new(DeviceState { weights, workspace }),
             generations,
+            reservation: Some(reservation),
             report,
         }
     }
@@ -749,6 +776,18 @@ impl EngineRuntime {
         self.generations.teacher_forced(prefix, forced, sink)
     }
 
+    /// What stops the engine, which also keeps the result of the leak check of the memory account once the engine is
+    /// shut down ([`Teardown::leaked_bytes`]).
+    pub fn teardown(&self) -> Arc<Teardown> {
+        Arc::clone(&self.core.teardown)
+    }
+
+    /// The bytes the memory account holds now, per location: the admitted bytes while every claim is held, less what a
+    /// claim gave back (the prefix cache's trim to whole slots).
+    pub fn memory_held(&self) -> LocationBytes {
+        self.core.account.held()
+    }
+
     /// What the startup measured.
     pub fn report(&self) -> &StartupReport {
         &self.report
@@ -818,6 +857,7 @@ impl EngineRuntime {
             device,
             generations,
             core,
+            reservation,
             ..
         } = self;
         let DeviceState { weights, workspace } = ManuallyDrop::into_inner(device);
@@ -830,6 +870,17 @@ impl EngineRuntime {
         core.released.drain(drop);
         drop(workspace);
         drop(weights);
+        // The generations hold the workspace's last handles and the prefix cache: they go before the check.
+        drop(generations);
+        // The reservation's unclaimed bytes are the account's own, not a leak: they go back before the check.
+        drop(reservation);
+        let report = core.account.close();
+        core.teardown.leaked_bytes.store(report.bytes(), Ordering::Release);
+        if report.is_clean() {
+            log::info!("memory account closed: no claim is still held");
+        } else {
+            log::error!("memory account closed with claims still held: {report}");
+        }
     }
 }
 
@@ -994,6 +1045,8 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         vec![Arc::clone(&stages), Arc::clone(&host), Arc::clone(&control)],
         cancel_bound,
     );
+    let host_pinned_bytes = startup::host_pinned_bytes(settings, &machine);
+    let account = MemoryAccount::open(library.free_bytes().unwrap_or(0), host_pinned_bytes);
     Ok(Arc::new(Core {
         settings: settings.clone(),
         library,
@@ -1010,7 +1063,8 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         compute,
         pool,
         released: Arc::new(ReleasedBuffers::new()),
-        host_pinned_bytes: startup::host_pinned_bytes(settings, &machine),
+        host_pinned_bytes,
+        account,
         pool_bytes,
         started,
         teardown,

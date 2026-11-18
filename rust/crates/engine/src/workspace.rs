@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr};
+use euhedral_memory::Claim;
 use thiserror::Error;
 
 use crate::model::ModelConfig;
@@ -246,9 +247,22 @@ pub struct Workspace {
     slots: Vec<DeviceBuffer>,
     /// The expansion scratch regions of the linear routes.
     scratch: Vec<DeviceBuffer>,
+    /// The buffers' bytes in the engine's memory account, released when the buffers are freed (declared last).
+    claims: Vec<Claim>,
 }
 
 impl Workspace {
+    /// The bytes [`Workspace::allocate_with_records`] allocates for `rows`, `records` input records and the scratch
+    /// regions `scratch_bytes`: what to claim before it runs.
+    pub fn allocation_bytes(config: &ModelConfig, rows: WorkspaceRows, scratch_bytes: &[u64], records: u64) -> u64 {
+        workspace_bytes_with_records(config, rows, records.max(INPUT_RECORDS)) + scratch_bytes.iter().sum::<u64>()
+    }
+
+    /// The workspace, with `claim` for some of its bytes: it is held until the buffers are freed.
+    pub fn hold(&mut self, claim: Claim) {
+        self.claims.push(claim);
+    }
+
     /// Allocates one buffer per slot for `rows`, and one per scratch region of `scratch_bytes`. A region of 0 bytes
     /// is not allocated. This allocates with the waiting `cudaMalloc`: startup only.
     pub fn allocate(
@@ -281,12 +295,19 @@ impl Workspace {
         for bytes in scratch_bytes.iter().copied().filter(|bytes| *bytes > 0) {
             scratch.push(DeviceBuffer::alloc(library, bytes as usize)?);
         }
-        Ok(Workspace {
+        let workspace = Workspace {
             rows,
             records,
             slots,
             scratch,
-        })
+            claims: Vec::new(),
+        };
+        debug_assert_eq!(
+            workspace.retained_bytes(),
+            Workspace::allocation_bytes(config, rows, scratch_bytes, records),
+            "the bytes claimed before the allocation are the bytes it took"
+        );
+        Ok(workspace)
     }
 
     /// The input records the workspace holds.
