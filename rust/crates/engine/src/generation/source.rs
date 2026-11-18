@@ -63,6 +63,7 @@ use super::teacher_forced::LogitsSink;
 use crate::frames::{Kind, step};
 use crate::handoff::Handoff;
 use crate::model::ModelConfig;
+use crate::prefix::PrefixCacheHandle;
 use crate::quantum::{Executor, StartError};
 use crate::runtime::{Core, Units};
 use crate::sampling::{SamplingConfig, SamplingError, TokenSampler};
@@ -148,6 +149,8 @@ pub(crate) struct Shared {
     pub(crate) capacity: u64,
     /// What speculation needs of the artifact; `None` for an artifact without the draft layer.
     pub(crate) drafts: Option<Drafts>,
+    /// The prefix cache, when the plan granted it memory and it opened.
+    pub(crate) prefix: Option<PrefixCacheHandle>,
     /// Set when the engine stops: no request begins after it.
     pub(crate) closing: AtomicBool,
     /// A test hook: the owner panics at the end of the turn in which it has admitted this many quanta.

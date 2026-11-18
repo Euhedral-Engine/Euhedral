@@ -15,9 +15,11 @@ mod copier;
 #[allow(dead_code, reason = "the runtime opens the cache once it is wired in")]
 mod copy;
 mod layout;
+mod open;
 mod tree;
 
 pub use cache::{CacheParts, Hit, OpenError, PrefixCacheHandle, PrefixCacheStats, RestoreError, Submit};
+pub(crate) use open::{CacheSpec, open_prefix_cache};
 pub use copier::{Copier, PinnedArena, SequenceAddresses};
 pub use copy::{CopyJob, Direction, Ended, HostArena, Piece, Resolve};
 pub use layout::{Buffer, CheckpointLayout, SlotCopy};

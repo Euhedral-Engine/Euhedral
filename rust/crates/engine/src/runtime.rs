@@ -224,6 +224,11 @@ impl Core {
         self.lane(LaneId((self.compute + 1 + chain) as u16))
     }
 
+    /// The id of the transfer lane of chain `chain`.
+    pub(crate) fn transfer_lane_id(&self, chain: usize) -> LaneId {
+        LaneId((self.compute + 1 + chain) as u16)
+    }
+
     /// The number of transfer lanes.
     pub(crate) fn transfer_lanes(&self) -> usize {
         self.lane_table.len() - self.compute - 1

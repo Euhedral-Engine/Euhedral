@@ -14,7 +14,7 @@ use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFo
 use euhedral_inference_settings::{Auto, KvFormat, Settings};
 
 use euhedral_memory::{
-    LocationId, LocationKind, LocationSpec, OwnerSpec, PlanItem, PlanRequest, Planner, Priority, Scope,
+    LocationId, LocationKind, LocationSpec, OwnerSpec, Placed, PlanItem, PlanRequest, Planner, Priority, Scope,
 };
 
 use crate::error::PlanError;
@@ -127,6 +127,9 @@ pub struct ResidencyPlan {
     pub draft_depth: usize,
     /// The longest context of one sequence.
     pub max_context_tokens: usize,
+    /// Pinned host bytes the prefix cache's arena may take: what `prefix-cache.size` asks, when the memory planner
+    /// places it beside everything else; 0 when the cache is off or the host has no room for it.
+    pub prefix_cache_bytes: u64,
 }
 
 impl ResidencyPlan {
@@ -312,6 +315,18 @@ pub fn plan_with(
     };
     let (kv_device_bytes, kv_host_bytes) = (layout.cache_device, layout.cache_host);
     let device_bytes = layout.device_bytes();
+    let asked = settings.prefix_cache.size.bytes();
+    let prefix_cache_bytes = if asked > 0 && config.layer_kinds.len() > 1 {
+        match admit_with_cache(budgets, layout, asked) {
+            Ok(true) => asked,
+            Ok(false) | Err(_) => {
+                log::warn!("the host has no room for the {asked}-byte prefix cache: the engine runs without it");
+                0
+            }
+        }
+    } else {
+        0
+    };
     Ok(ResidencyPlan {
         device,
         arena_bytes,
@@ -332,6 +347,7 @@ pub fn plan_with(
         profile,
         draft_depth,
         max_context_tokens: max_tokens as usize,
+        prefix_cache_bytes,
     })
 }
 
@@ -424,11 +440,17 @@ fn decide(budgets: Budgets, whole: Layout, split: Option<Layout>) -> Result<(Lay
 /// Asks the memory planner whether `layout` fits `budgets`: every consumer is required. The planner is the plan's own
 /// and holds nothing after this returns. The error is the first location that is short.
 fn admit(budgets: Budgets, layout: Layout) -> Result<(), Location> {
+    admit_with_cache(budgets, layout, 0).map(|_| ())
+}
+
+/// As [`admit`], with the prefix cache's arena of `prefix` bytes as the lowest-priority item and the only one that is
+/// not required (0: no arena): the planner drops it before it refuses the plan. Says whether the arena stays.
+fn admit_with_cache(budgets: Budgets, layout: Layout, prefix: u64) -> Result<bool, Location> {
     let planner = Planner::with_owners(
         [
             LocationSpec {
                 kind: LocationKind::HostPinned,
-                capacity: budgets.host.min(CAPACITY_CAP.max(layout.cache_host)),
+                capacity: budgets.host.min(CAPACITY_CAP.max(layout.cache_host.saturating_add(prefix))),
                 reserve: 0,
             },
             LocationSpec {
@@ -442,7 +464,7 @@ fn admit(budgets: Budgets, layout: Layout) -> Result<(), Location> {
     let host = LocationId(0);
     let device = LocationId(1);
     let owner = planner.open_owner(OwnerSpec::new("residency", Priority(0), Scope::Plan(0)));
-    let items = vec![
+    let mut items = vec![
         PlanItem::required("weights", device, layout.weights),
         PlanItem::required("runtime reserve", device, layout.runtime_reserve),
         PlanItem::required("scratch", device, layout.scratch),
@@ -454,8 +476,11 @@ fn admit(budgets: Budgets, layout: Layout) -> Result<(), Location> {
         ),
         PlanItem::required("cache pages on the host", host, layout.cache_host),
     ];
+    if prefix > 0 {
+        items.push(PlanItem::optional("prefix cache", Priority(0), host, prefix));
+    }
     match planner.admit(&PlanRequest { owner, items }) {
-        Ok(_) => Ok(()),
+        Ok(admission) => Ok(prefix > 0 && admission.placed.last() != Some(&Placed::Dropped)),
         Err(shortfall) if shortfall.location == host => Err(Location::Host),
         Err(_) => Err(Location::Device),
     }

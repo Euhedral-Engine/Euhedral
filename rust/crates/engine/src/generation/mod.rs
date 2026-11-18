@@ -34,6 +34,7 @@ use crate::formats::{Nvfp4Linear, TrellisLinear};
 use crate::frames::{Kind, step};
 use crate::model::{LayerIndex, ModelConfig, Role, Weights};
 use crate::plan::{Formats, Plan, View};
+use crate::prefix::{CacheSpec, Copier, open_prefix_cache};
 use crate::quantum::Executor;
 use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
@@ -109,7 +110,19 @@ impl Generation {
         let queue = MpscQueue::<Message>::new(GREEDY_DEPTH + 4);
         let (producer, inbox) = (queue.producer(), queue.consumer());
         let address = Address::new();
-        let executor = match Self::executor(core, config, residency, weights, &address) {
+        let prefix = open_prefix_cache(
+            CacheSpec {
+                library: &core.library,
+                config,
+                format: residency.kv_format,
+                settings: core.settings.prefix_cache,
+                granted: residency.prefix_cache_bytes,
+                chunk: residency.rows.rows as u32,
+                device_tokens: u32::try_from(residency.kv_device_tokens).unwrap_or(u32::MAX),
+            },
+            Self::spawner(core),
+        );
+        let executor = match Self::executor(core, config, residency, weights, &address, prefix.is_some()) {
             Ok(executor) => executor,
             Err(error) => return Err(Box::new((error, sequence))),
         };
@@ -147,6 +160,7 @@ impl Generation {
             chunk: residency.rows.rows as usize,
             capacity,
             drafts,
+            prefix,
             closing: AtomicBool::new(false),
             #[cfg(feature = "test-oracles")]
             panic_after_admissions: AtomicU64::new(u64::MAX),
@@ -182,6 +196,7 @@ impl Generation {
         residency: &ResidencyPlan,
         weights: &Weights,
         address: &Arc<Address<Owner>>,
+        copies: bool,
     ) -> Result<Executor, EngineError> {
         let library: &Arc<CudaLibrary> = &core.library;
         let formats = Formats::new(
@@ -237,7 +252,7 @@ impl Generation {
             retry_backstop: DEFAULT_RETRY_BACKSTOP,
         };
         let retiring = Arc::clone(address);
-        Executor::new(
+        let executor = Executor::new(
             Arc::new(plan),
             &runtime,
             core.compute_lanes(),
@@ -248,7 +263,13 @@ impl Generation {
                 retiring.post(Message::Retired(Box::new(Retired { quantum, outcome })));
             },
         )
-        .map_err(|error| EngineError::Runtime(format!("the stage graphs: {error:?}")))
+        .map_err(|error| EngineError::Runtime(format!("the stage graphs: {error:?}")))?;
+        if !copies {
+            return Ok(executor);
+        }
+        let copier = Copier::new(&runtime, core.lane_table.clone(), core.transfer_lane_id(0), SequenceId(0))
+            .map_err(|error| EngineError::Runtime(format!("the prefix cache's copy graph: {error:?}")))?;
+        Ok(executor.with_copier(copier))
     }
 
     /// Starts `request` on the engine's sequence.
@@ -371,6 +392,9 @@ impl Generation {
         match self.mailbox.close() {
             Some(owner) => {
                 owner.close();
+                if let Some(cache) = &self.shared.prefix {
+                    cache.close();
+                }
                 // What the workspace's owner still pins goes with it.
                 drop(self.shared.order.close());
             }
