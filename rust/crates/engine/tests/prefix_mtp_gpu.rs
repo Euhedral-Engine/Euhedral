@@ -141,7 +141,7 @@ fn same_mtp_rows(name: &str, warm: &MtpPages, cold: &MtpPages, repaired: &[usize
         "{name}: whole pages of the MTP cache"
     );
     assert!(
-        warm.pages.len() * PAGE > repaired,
+        repaired.iter().all(|row| warm.pages.len() * PAGE > *row),
         "{name}: the repaired row is in a whole page"
     );
     let bytes = warm.row_bytes;
