@@ -7,6 +7,7 @@
 //! Nothing here waits or owns a thread: prompts are encoded as frames on the engine's lattice, and a generation's
 //! events arrive on the engine's workers and go straight on.
 
+mod grammar;
 mod relay;
 mod start;
 
@@ -15,10 +16,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
+use euhedral_data_structures::sync::ClaimCell;
 use euhedral_inference_api_protocol::ApiError;
 use euhedral_inference_api_protocol::generation::GenerationRequest;
 use euhedral_inference_engine::generation::{
-    AdmissionError, CancelHandle, GenerationRequest as EngineRequest, Speculation,
+    AdmissionError, CancelHandle, GenerationRequest as EngineRequest, ReasoningConstraint, Speculation, TokenConstraint,
 };
 use euhedral_inference_engine::sampling::SamplingConfig;
 
@@ -27,7 +29,8 @@ use crate::backend::{
 };
 use crate::frames::once_or_refused;
 use crate::planning::Endpoint;
-use crate::refusals::{refusal, sampling_problem};
+use crate::refusals::sampling_problem;
+use grammar::Grammars;
 use relay::{Hand, Relay, Shape};
 pub use start::{EngineHost, EngineStarting, StartError, begin_start, start};
 
@@ -38,6 +41,9 @@ pub trait Engine: Send + Sync + 'static {
 
     /// The longest sequence in tokens, prompt plus completion.
     fn context_length(&self) -> usize;
+
+    /// The width of the logits row: the ids a selection may choose among.
+    fn vocabulary_size(&self) -> usize;
 
     /// How many generations the engine runs at once.
     fn sequences(&self) -> usize;
@@ -71,6 +77,13 @@ pub trait Codec: Send + Sync + 'static {
 
     /// The token that closes the model's think block, when it has one.
     fn think_end(&self) -> Option<u32>;
+
+    /// What a grammar sees of each of the `size` tokens of the vocabulary: its bytes, or `0xFF` and its name for a
+    /// token a grammar may only name, and every entry non-empty.
+    fn token_bytes(&self, size: usize) -> Vec<Vec<u8>>;
+
+    /// The tokens that end a grammar, the main end token first.
+    fn end_ids(&self) -> Vec<u32>;
 }
 
 /// The [`Backend`] over an engine and its tokenizer.
@@ -80,6 +93,7 @@ pub struct EngineBackend {
     sink: Arc<QueueIngestSink>,
     model_id: String,
     context_length: usize,
+    grammars: Grammars,
     available: Arc<AtomicBool>,
 }
 
@@ -101,12 +115,14 @@ impl EngineBackend {
         model_id: String,
     ) -> EngineBackend {
         let context_length = engine.context_length();
+        let grammars = Grammars::new(codec.as_ref(), engine.vocabulary_size());
         EngineBackend {
             engine,
             codec,
             sink,
             model_id,
             context_length,
+            grammars,
             available: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -141,7 +157,8 @@ impl Backend for EngineBackend {
     }
 
     fn refusal(&self, endpoint: Endpoint, request: &GenerationRequest) -> Option<ApiError> {
-        refusal(endpoint, request).or_else(|| sampling_problem(request))
+        let _ = endpoint;
+        sampling_problem(request)
     }
 
     fn encode_prompt(&self, prompt: String, then: Next<Result<EncodedPrompt, BackendError>>) {
@@ -163,13 +180,12 @@ impl Backend for EngineBackend {
         drop(self.sink.offer(frame));
     }
 
-    fn check_grammar(&self, _grammar: &str) -> Result<(), BackendError> {
-        // The engine has no grammar constraint, and a request that needs one is refused before this is asked.
-        Ok(())
+    fn check_grammar(&self, grammar: &str) -> Result<(), BackendError> {
+        self.grammars.check_grammar(grammar)
     }
 
-    fn check_json_schema(&self, _schema: &str) -> Result<(), BackendError> {
-        Ok(())
+    fn check_json_schema(&self, schema: &str) -> Result<(), BackendError> {
+        self.grammars.check_json_schema(schema)
     }
 
     fn open_generation(
@@ -182,12 +198,8 @@ impl Backend for EngineBackend {
                 "inference engine is shutting down".to_owned(),
             ));
         }
-        if output.grammar.is_some() || output.reasoning_budget.is_some() {
-            return Err(BackendError::Failed(
-                "the engine cannot constrain the output".to_owned(),
-            ));
-        }
-        if output.reasoning && self.codec.think_end().is_none() {
+        let think_end = self.codec.think_end();
+        if output.reasoning && think_end.is_none() {
             return Err(BackendError::Failed(
                 "the model has no think block to read reasoning from".to_owned(),
             ));
@@ -198,15 +210,40 @@ impl Backend for EngineBackend {
             SamplingConfig::new(config.temperature, config.top_k, config.top_p, config.seed, false)
                 .map_err(|error| BackendError::Failed(error.to_string()))?
         };
+        let constraint = self.constraint(&output, think_end)?;
         Ok(Arc::new(EngineGeneration {
             engine: Arc::clone(&self.engine),
             codec: Arc::clone(&self.codec),
             sampling,
             reasoning: output.reasoning,
+            constraint: ClaimCell::new(constraint),
             cancel: CancelHandle::default(),
             available: Arc::clone(&self.available),
             started: AtomicBool::new(false),
         }))
+    }
+}
+
+impl EngineBackend {
+    /// What restricts the generation's tokens: the answer's grammar; wrapped in the reasoning constraint when the
+    /// output opens as reasoning and has an answer to constrain or a budget to keep. Free, uncapped reasoning needs
+    /// none, so a greedy request keeps speculating.
+    fn constraint(
+        &self,
+        output: &OutputSpec,
+        think_end: Option<u32>,
+    ) -> Result<Option<Box<dyn TokenConstraint>>, BackendError> {
+        let answer = match &output.grammar {
+            Some(grammar) => Some(self.grammars.constraint(grammar)?),
+            None => None,
+        };
+        let capped = output.reasoning && output.reasoning_budget.is_some();
+        match think_end {
+            Some(end) if output.reasoning && (answer.is_some() || capped) => Ok(Some(Box::new(
+                ReasoningConstraint::new(end, self.codec.stop_tokens(), output.reasoning_budget, answer),
+            ))),
+            _ => Ok(answer),
+        }
     }
 }
 
@@ -223,6 +260,8 @@ struct EngineGeneration {
     codec: Arc<dyn Codec>,
     sampling: SamplingConfig,
     reasoning: bool,
+    /// Taken by the one `generate`.
+    constraint: ClaimCell<Option<Box<dyn TokenConstraint>>>,
     cancel: CancelHandle,
     available: Arc<AtomicBool>,
     started: AtomicBool,
@@ -235,6 +274,12 @@ impl Generation for EngineGeneration {
                 "a generation runs once per sequence".to_owned(),
             )));
         }
+        // `started` admits one call, so the claim is free.
+        let Some(constraint) = self.constraint.try_claim().map(|mut held| held.take()) else {
+            return listener.finished(Err(BackendError::Failed(
+                "the generation's constraint is in use".to_owned(),
+            )));
+        };
         let hand = Hand::new();
         let relay = Relay::new(
             listener,
@@ -249,7 +294,7 @@ impl Generation for EngineGeneration {
             stop_tokens: self.codec.stop_tokens(),
             speculation: self.engine.speculation(),
             sampling: self.sampling,
-            constraint: None,
+            constraint,
             listener: Box::new(relay),
         };
         let refusal = self.engine.generate(request, self.cancel.clone()).err().map(refused);

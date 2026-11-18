@@ -412,6 +412,18 @@ impl GrammarChecker {
             .map_err(|refused| schema_refusal(&refused, param))
     }
 
+    /// As [`GrammarChecker::check_grammar`], with llguidance's summary as the refusal, for a caller that words the
+    /// refusal itself.
+    pub fn check_grammar_text(&mut self, grammar: &str) -> Result<(), String> {
+        self.check(Kind::Lark, grammar)
+    }
+
+    /// As [`GrammarChecker::check_json_schema`] for a schema already in the text [`OutputGrammar::schema_text`]
+    /// gives, with llguidance's summary as the refusal.
+    pub fn check_schema_text(&mut self, schema: &str) -> Result<(), String> {
+        self.check(Kind::JsonSchema, schema)
+    }
+
     fn matcher(&self, grammar: &str, kind: &str) -> Matcher {
         // A panic inside llguidance is a refusal ("panic: ..."), as on the native side.
         let compiled = catch_unwind(AssertUnwindSafe(|| {

@@ -29,7 +29,7 @@ use euhedral_inference_api_server::{
 };
 use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, FinishReason, GenerationListener, GenerationOutcome,
-    GenerationRequest as EngineRequest, QuantumEvent, Speculation,
+    GenerationRequest as EngineRequest, QuantumEvent, Speculation, TokenConstraint,
 };
 use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::stages::QuantumKind;
@@ -39,6 +39,10 @@ use euhedral_net::{ClientConfig, Method, Request, Response, request};
 const STOP: u32 = 1;
 const THINK_END: u32 = 2;
 const BAD: u32 = u32::MAX;
+/// The ids after the characters: the two tags a tool call is written between.
+const TOOL_OPEN: u32 = 128;
+const TOOL_CLOSE: u32 = 129;
+const VOCABULARY: usize = 130;
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -79,6 +83,28 @@ impl Codec for Chars {
     fn think_end(&self) -> Option<u32> {
         Some(THINK_END)
     }
+
+    fn token_bytes(&self, size: usize) -> Vec<Vec<u8>> {
+        (0..size)
+            .map(|index| match u8::try_from(index) {
+                Ok(byte) if index == STOP as usize || index == THINK_END as usize => {
+                    let mut named = vec![0xFF];
+                    named.extend_from_slice(format!("<special {byte}>").as_bytes());
+                    named
+                }
+                Ok(byte) if byte == b'\n' || (0x20..0x7F).contains(&byte) => vec![byte],
+                _ => match index {
+                    128 => b"\xFF<tool_call>".to_vec(),
+                    129 => b"\xFF</tool_call>".to_vec(),
+                    _ => [&[0xFF][..], format!("<unused {index}>").as_bytes()].concat(),
+                },
+            })
+            .collect()
+    }
+
+    fn end_ids(&self) -> Vec<u32> {
+        vec![STOP]
+    }
 }
 
 /// What the fake engine does with the next request.
@@ -103,6 +129,7 @@ struct Seen {
     stop_tokens: Vec<u32>,
     speculation: Speculation,
     sampling: SamplingConfig,
+    constraint: Option<Box<dyn TokenConstraint>>,
 }
 
 struct FakeEngine {
@@ -168,6 +195,7 @@ impl Engine for FakeEngine {
             stop_tokens: request.stop_tokens.clone(),
             speculation: request.speculation,
             sampling: request.sampling,
+            constraint: request.constraint,
         });
         let mut listener = request.listener;
         let mut mode = locked(&self.mode);
@@ -204,6 +232,10 @@ impl Engine for FakeEngine {
 
     fn context_length(&self) -> usize {
         4096
+    }
+
+    fn vocabulary_size(&self) -> usize {
+        VOCABULARY
     }
 
     fn sequences(&self) -> usize {
@@ -585,28 +617,130 @@ fn a_generation_runs_once() {
     rig.finish();
 }
 
+/// The first constraint the engine was given, taken out for the test to drive.
+fn constraint_of(engine: &FakeEngine) -> Option<Box<dyn TokenConstraint>> {
+    locked(&engine.seen).first_mut().and_then(|seen| seen.constraint.take())
+}
+
+fn open_and_run(rig: &Rig, output: OutputSpec) -> Option<Box<dyn TokenConstraint>> {
+    let generation = rig.open(output);
+    let (_, rx) = rig.run(&generation);
+    ended(&rx);
+    constraint_of(&rig.engine)
+}
+
 #[test]
-fn opening_is_refused_when_the_engine_cannot_run_the_output() {
+fn an_answer_grammar_reaches_the_engine_as_a_constraint_over_the_tokens() {
+    let rig = Rig::new(Mode::Run(vec![u32::from('a'), STOP], FinishReason::Stop));
+    let output = OutputSpec {
+        grammar: Some("start: \"ab\"".to_owned()),
+        ..OutputSpec::text()
+    };
+    let mut constraint = open_and_run(&rig, output).expect("a constraint");
+    constraint.prepare().expect("a mask");
+    assert!(constraint.allows(u32::from('a')));
+    assert!(!constraint.allows(u32::from('b')));
+    assert!(!constraint.allows(STOP));
+    let mut row = vec![0.0_f32; VOCABULARY];
+    constraint.mask_disallowed(&mut row);
+    let allowed: Vec<usize> = (0..VOCABULARY).filter(|id| row[*id] == 0.0).collect();
+    assert_eq!(allowed, vec![usize::from(b'a')]);
+    constraint
+        .accept(u32::from('a'))
+        .expect("a is the grammar's first token");
+    constraint.prepare().expect("a mask");
+    assert!(constraint.allows(u32::from('b')));
+    assert!(constraint.accept(u32::from('a')).is_err());
+    constraint.accept(u32::from('b')).expect("b follows");
+    constraint.prepare().expect("a mask");
+    assert!(constraint.allows(STOP), "the grammar may end");
+    assert!(!constraint.allows(u32::from('c')));
+    rig.finish();
+}
+
+#[test]
+fn plain_text_and_free_reasoning_have_no_constraint_so_they_keep_speculating() {
+    let rig = Rig::new(Mode::Run(vec![u32::from('a'), STOP], FinishReason::Stop));
+    assert!(open_and_run(&rig, OutputSpec::text()).is_none());
+    locked(&rig.engine.seen).clear();
+    let free = OutputSpec {
+        reasoning: true,
+        ..OutputSpec::text()
+    };
+    assert!(open_and_run(&rig, free).is_none());
+    rig.finish();
+}
+
+#[test]
+fn a_reasoning_budget_ends_the_think_block_by_force() {
+    let rig = Rig::new(Mode::Run(vec![u32::from('a'), STOP], FinishReason::Stop));
+    let output = OutputSpec {
+        reasoning: true,
+        reasoning_budget: Some(2),
+        grammar: None,
+    };
+    let mut constraint = open_and_run(&rig, output).expect("a constraint");
+    for _ in 0..2 {
+        constraint.prepare().expect("prepared");
+        assert!(constraint.allows(u32::from('a')));
+        constraint.accept(u32::from('a')).expect("reasoning");
+    }
+    constraint.prepare().expect("prepared");
+    assert!(constraint.allows(THINK_END));
+    assert!(!constraint.allows(u32::from('a')));
+    assert!(!constraint.allows(STOP));
+    constraint.accept(THINK_END).expect("the end of thinking");
+    assert!(constraint.allows(u32::from('z')), "the answer is free");
+    rig.finish();
+}
+
+#[test]
+fn reasoning_before_an_answer_grammar_cannot_end_in_a_terminator() {
+    let rig = Rig::new(Mode::Run(vec![u32::from('a'), STOP], FinishReason::Stop));
+    let output = OutputSpec {
+        reasoning: true,
+        reasoning_budget: None,
+        grammar: Some("start: \"ab\"".to_owned()),
+    };
+    let mut constraint = open_and_run(&rig, output).expect("a constraint");
+    constraint.prepare().expect("prepared");
+    assert!(constraint.allows(u32::from('q')));
+    assert!(constraint.allows(THINK_END));
+    assert!(!constraint.allows(STOP));
+    constraint.accept(THINK_END).expect("the end of thinking");
+    constraint.prepare().expect("prepared");
+    assert!(constraint.allows(u32::from('a')));
+    assert!(!constraint.allows(u32::from('q')));
+    rig.finish();
+}
+
+#[test]
+fn a_grammar_that_does_not_compile_is_refused_by_the_check() {
     let rig = Rig::new(Mode::Hold);
-    let open = |output| rig.backend.open_generation(GenerationConfig::greedy(1), output).err();
-    assert!(matches!(
-        open(OutputSpec {
-            grammar: Some("start: \"a\"".to_owned()),
-            ..OutputSpec::text()
-        }),
-        Some(BackendError::Failed(_))
-    ));
-    assert!(matches!(
-        open(OutputSpec {
-            reasoning: true,
-            reasoning_budget: Some(8),
-            grammar: None
-        }),
-        Some(BackendError::Failed(_))
-    ));
+    assert!(rig.backend.check_grammar("start: \"ab\"").is_ok());
+    let refused = rig.backend.check_grammar("start: undefined_rule");
+    assert!(
+        matches!(refused, Err(BackendError::Unenforceable(ref reason)) if !reason.is_empty()),
+        "{refused:?}"
+    );
+    assert!(rig.backend.check_json_schema(r#"{"type":"object"}"#).is_ok());
+    let refused = rig.backend.check_json_schema(r#"{"type":"nonsense"}"#);
+    assert!(
+        matches!(refused, Err(BackendError::Unenforceable(ref reason)) if !reason.is_empty()),
+        "{refused:?}"
+    );
+    rig.finish();
+}
+
+#[test]
+fn opening_is_refused_when_the_engine_is_closing() {
+    let rig = Rig::new(Mode::Hold);
     rig.backend.close();
     assert!(!rig.backend.is_available());
-    assert!(matches!(open(OutputSpec::text()), Some(BackendError::Unavailable(_))));
+    let opened = rig
+        .backend
+        .open_generation(GenerationConfig::greedy(1), OutputSpec::text());
+    assert!(matches!(opened.err(), Some(BackendError::Unavailable(_))));
     rig.finish();
 }
 
@@ -700,6 +834,29 @@ impl Served {
             .expect("an answer")
     }
 
+    fn get(&self, target: &str) -> Response {
+        let get = Request::new(Method::Get, target).header("Host", "t");
+        let (tx, rx) = channel();
+        let config = ClientConfig {
+            time_limit: Some(PATIENCE),
+            ..ClientConfig::default()
+        };
+        request(
+            &self.io,
+            &self.client,
+            self.addr,
+            &get,
+            config,
+            Box::new(move |outcome| {
+                drop(tx.send(outcome));
+                once(|| {})
+            }),
+        );
+        rx.recv_timeout(PATIENCE + Duration::from_secs(5))
+            .expect("the client reported")
+            .expect("an answer")
+    }
+
     fn finish(self) {
         let (tx, rx) = channel();
         self.server.stop(once(move || {
@@ -726,20 +883,6 @@ fn messages(extra: &str) -> String {
 
 fn responses(extra: &str) -> String {
     format!(r#"{{"model":"fake-model","input":"Hi","max_output_tokens":8{extra}}}"#)
-}
-
-/// Asserts the answer is an `unsupported_parameter` refusal naming `param`, in the surface's error format.
-fn assert_refused(response: &Response, param: &str, anthropic: bool) {
-    let body = text(response);
-    assert_eq!(response.status, 400, "{body}");
-    let named = format!("Unsupported parameter: '{param}' is not supported by this server.");
-    assert!(body.contains(&named), "{body}");
-    if anthropic {
-        assert!(body.starts_with(r#"{"type":"error""#), "{body}");
-    } else {
-        assert!(body.contains(r#""code":"unsupported_parameter""#), "{body}");
-        assert!(body.contains(&format!(r#""param":"{param}""#)), "{body}");
-    }
 }
 
 #[test]
@@ -841,43 +984,112 @@ fn a_sampled_request_the_engine_refuses_at_begin_ends_with_the_reason() {
     served.finish();
 }
 
+/// Asserts the answer is a refusal of the request itself, not an unsupported parameter.
+fn assert_not_unsupported(response: &Response) {
+    let body = text(response);
+    assert!(!body.contains("unsupported_parameter"), "{body}");
+}
+
 #[test]
-fn structured_output_is_refused_naming_the_surfaces_field() {
-    let served = Served::new(Mode::Hold);
+fn structured_output_is_constrained_on_every_surface() {
+    let served = Served::new(Mode::Run(
+        vec![u32::from('{'), u32::from('}'), STOP],
+        FinishReason::Stop,
+    ));
     let json = r#","reasoning_effort":"none","temperature":0,"response_format":{"type":"json_object"}"#;
-    assert_refused(&served.post(CHAT, &chat(json)), "response_format", false);
+    assert_not_unsupported(&served.post(CHAT, &chat(json)));
     let format = r#","temperature":0,"output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}"#;
-    assert_refused(&served.post(MESSAGES, &messages(format)), "output_config.format", true);
+    assert_not_unsupported(&served.post(MESSAGES, &messages(format)));
     let format = r#","temperature":0,"text":{"format":{"type":"json_object"}}"#;
-    assert_refused(&served.post(RESPONSES, &responses(format)), "text.format", false);
-    assert!(locked(&served.rig.engine.seen).is_empty());
+    assert_not_unsupported(&served.post(RESPONSES, &responses(format)));
+    let seen = locked(&served.rig.engine.seen);
+    assert_eq!(seen.len(), 3);
+    assert!(seen.iter().all(|seen| seen.constraint.is_some()));
+    drop(seen);
+    let mut constraint = constraint_of(&served.rig.engine).expect("a constraint");
+    constraint.prepare().expect("a mask");
+    assert!(constraint.allows(u32::from('{')));
+    assert!(!constraint.allows(u32::from('x')));
     served.finish();
 }
 
 #[test]
-fn a_forced_tool_call_is_refused_and_an_automatic_one_is_not() {
+fn a_forced_tool_call_is_constrained_and_an_automatic_one_is_not() {
     let served = Served::new(Mode::Run(
         vec![u32::from('o'), u32::from('k'), STOP],
         FinishReason::Stop,
     ));
-    let tool =
-        r#","temperature":0,"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]"#;
+    let tool = r#","temperature":0,"reasoning_effort":"none","tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]"#;
     let forced = format!(r#"{tool},"tool_choice":"required""#);
-    assert_refused(&served.post(CHAT, &chat(&forced)), "tool_choice", false);
+    assert_not_unsupported(&served.post(CHAT, &chat(&forced)));
+    let mut constraint = constraint_of(&served.rig.engine).expect("a constraint");
+    constraint.prepare().expect("a mask");
+    assert!(constraint.allows(TOOL_OPEN), "the call opens the output");
+    assert!(!constraint.allows(TOOL_CLOSE));
+    assert!(!constraint.allows(u32::from('o')));
+    locked(&served.rig.engine.seen).clear();
     let auto = format!(r#"{tool},"tool_choice":"auto""#);
     assert_eq!(served.post(CHAT, &chat(&auto)).status, 200);
+    assert!(constraint_of(&served.rig.engine).is_none());
     served.finish();
 }
 
 #[test]
-fn a_reasoning_budget_is_refused() {
-    let served = Served::new(Mode::Hold);
+fn a_reasoning_budget_is_a_constraint_on_the_thinking_tokens() {
+    let served = Served::new(Mode::Run(vec![u32::from('a'), STOP], FinishReason::Stop));
     let thinking = r#","temperature":0,"thinking":{"type":"enabled","budget_tokens":32}"#;
-    assert_refused(
-        &served.post(MESSAGES, &messages(thinking)),
-        "thinking.budget_tokens",
-        true,
-    );
+    assert_not_unsupported(&served.post(MESSAGES, &messages(thinking)));
+    let mut constraint = constraint_of(&served.rig.engine).expect("a constraint");
+    for _ in 0..32 {
+        constraint.prepare().expect("prepared");
+        constraint.accept(u32::from('a')).expect("reasoning");
+    }
+    constraint.prepare().expect("prepared");
+    assert!(constraint.allows(THINK_END));
+    assert!(!constraint.allows(u32::from('a')));
+    served.finish();
+}
+
+#[test]
+fn uncapped_reasoning_without_a_grammar_has_no_constraint() {
+    let served = Served::new(Mode::Run(vec![u32::from('a'), STOP], FinishReason::Stop));
+    let answer = served.post(CHAT, &chat(r#","temperature":0,"reasoning_effort":"high""#));
+    assert_not_unsupported(&answer);
+    assert_eq!(locked(&served.rig.engine.seen).len(), 1);
+    assert!(constraint_of(&served.rig.engine).is_none());
+    served.finish();
+}
+
+#[test]
+fn a_schema_that_cannot_be_enforced_is_refused_before_the_engine_runs() {
+    let served = Served::new(Mode::Hold);
+    let format = r#","reasoning_effort":"none","temperature":0,"response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"nonsense"}}}"#;
+    let answer = served.post(CHAT, &chat(format));
+    let body = text(&answer);
+    assert_eq!(answer.status, 400, "{body}");
+    assert!(body.contains("The JSON Schema cannot be enforced: "), "{body}");
+    assert!(body.contains(r#""code":"unsupported_schema""#), "{body}");
     assert!(locked(&served.rig.engine.seen).is_empty());
+    served.finish();
+}
+
+#[test]
+fn an_output_that_fails_its_constraint_is_counted() {
+    // The engine ends the output without having satisfied the schema: the answer is refused and counted.
+    let served = Served::new(Mode::Run(vec![u32::from('x'), STOP], FinishReason::Stop));
+    let json = r#","reasoning_effort":"none","temperature":0,"response_format":{"type":"json_object"}"#;
+    let answer = served.post(CHAT, &chat(json));
+    let body = text(&answer);
+    assert!(body.contains("invalid_structured_output"), "{body}");
+    let scraped = served.get("/metrics");
+    let scrape = text(&scraped);
+    assert!(
+        scrape
+            .lines()
+            .any(|line| line.starts_with("euhedral_constrained_failures_total")
+                && line.contains("invalid_structured_output")
+                && line.ends_with(" 1.0")),
+        "{scrape}"
+    );
     served.finish();
 }
