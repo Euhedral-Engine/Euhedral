@@ -101,8 +101,8 @@ pub struct CopyJob {
     direction: Direction,
     pieces: Vec<Piece>,
     host: Arc<dyn HostArena>,
-    /// The sequence's buffers; let go when the job ends, before the cache is told, so that the answer finds the sequence
-    /// at rest.
+    /// The sequence's buffers; each group lets go of them when it ends, before the cache is told, so that the answer finds
+    /// the sequence at rest.
     buffers: Option<Arc<dyn Resolve>>,
     ticket: u64,
     report: Option<Arc<Address<PrefixCache>>>,
@@ -234,10 +234,12 @@ impl CopyJob {
             }
             Ended::Done => {}
         }
+        // Every group lets go of the sequence's buffers when its own work ended, not only the last: a group that held them
+        // on past the report would leave the sequence counted in flight after the request was told.
+        self.buffers = None;
         if !self.closing {
             return;
         }
-        self.buffers = None;
         if let Some(cache) = self.report.take() {
             cache.post(Message::Done {
                 ticket: self.ticket,

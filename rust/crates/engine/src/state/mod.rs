@@ -5,10 +5,10 @@ pub mod gdn;
 pub mod kv;
 pub mod released;
 
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::iter;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use thiserror::Error;
 
@@ -61,9 +61,23 @@ pub enum ReserveEpochError {
 }
 
 /// The quanta of one sequence that are in flight: admitted, and not yet dropped by the owner after their retirement.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Flight {
     count: AtomicUsize,
+    /// Set by the owner that waits for the count to reach zero ([`Flight::settled`]): the guard that brings it there
+    /// clears it and calls `wake`.
+    awaited: AtomicBool,
+    /// What tells the owner that the last guard was dropped; set once, by the owner.
+    wake: OnceLock<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl fmt::Debug for Flight {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Flight")
+            .field("count", &self.count())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Flight {
@@ -78,6 +92,24 @@ impl Flight {
     /// Quanta in flight now.
     pub fn count(&self) -> usize {
         self.count.load(Ordering::Acquire)
+    }
+
+    /// Sets what is called when the last guard is dropped after [`Flight::settled`] answered no. Once.
+    pub fn on_settled(&self, wake: impl Fn() + Send + Sync + 'static) {
+        let first = self.wake.set(Box::new(wake)).is_ok();
+        debug_assert!(first, "a flight's wake is set once, by its owner");
+    }
+
+    /// Whether nothing is in flight. When something is, the owner is woken once, by the drop of the last guard, and asks
+    /// again. The flag is set before the count is read and the guard decrements before it reads the flag (all
+    /// sequentially consistent), so one of the two sees the other: the wake is never lost.
+    pub fn settled(&self) -> bool {
+        self.awaited.store(true, Ordering::SeqCst);
+        if self.count.load(Ordering::SeqCst) == 0 {
+            self.awaited.store(false, Ordering::SeqCst);
+            return true;
+        }
+        false
     }
 }
 
@@ -95,7 +127,13 @@ impl Clone for FlightGuard {
 
 impl Drop for FlightGuard {
     fn drop(&mut self) {
-        self.flight.count.fetch_sub(1, Ordering::AcqRel);
+        let flight = &self.flight;
+        if flight.count.fetch_sub(1, Ordering::SeqCst) == 1
+            && flight.awaited.swap(false, Ordering::SeqCst)
+            && let Some(wake) = flight.wake.get()
+        {
+            wake();
+        }
     }
 }
 
@@ -280,6 +318,23 @@ impl SequenceState {
         self.flight.count()
     }
 
+    /// Whether no quantum is in flight. If one is, `wake` (set by [`SequenceState::on_settled`]) is called once when
+    /// the last of them is dropped, whatever thread drops it: the owner that ends a request asks again then.
+    pub fn settled(&self) -> bool {
+        self.flight.settled()
+    }
+
+    /// The sequence's count of quanta in flight.
+    pub fn flight(&self) -> &Flight {
+        &self.flight
+    }
+
+    /// Sets what is called when the last quantum in flight is dropped after [`SequenceState::settled`] answered no.
+    /// Once; a second call changes nothing.
+    pub fn on_settled(&self, wake: impl Fn() + Send + Sync + 'static) {
+        self.flight.on_settled(wake);
+    }
+
     /// Allocates the pinned staging the caches' reservations take (two sets per cache and per sequence of
     /// `sequences` of this shape: one in flight, one being reserved), so that no reservation on the request path
     /// allocates. The sets are held together, so the pool keeps that many. Startup only.
@@ -341,5 +396,49 @@ mod tests {
         assert_eq!(flight.count(), 1);
         drop(second);
         assert_eq!(flight.count(), 0, "the owner may free the caches");
+    }
+
+    #[test]
+    fn an_owner_that_asks_while_a_quantum_flies_is_woken_once_by_the_last_drop() {
+        let flight = Arc::new(Flight::default());
+        let woken = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&woken);
+        assert!(
+            flight
+                .wake
+                .set(Box::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }))
+                .is_ok()
+        );
+        let first = flight.begin();
+        let second = flight.begin();
+        assert!(!flight.settled(), "two quanta fly");
+        drop(first);
+        assert_eq!(woken.load(Ordering::SeqCst), 0, "one still flies");
+        drop(second);
+        assert_eq!(woken.load(Ordering::SeqCst), 1, "the last drop woke the owner");
+        assert!(flight.settled());
+        let third = flight.begin();
+        drop(third);
+        assert_eq!(woken.load(Ordering::SeqCst), 1, "nobody asked: nobody is woken");
+    }
+
+    #[test]
+    fn an_owner_that_asks_with_nothing_in_flight_is_not_woken_later() {
+        let flight = Arc::new(Flight::default());
+        let woken = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&woken);
+        assert!(
+            flight
+                .wake
+                .set(Box::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }))
+                .is_ok()
+        );
+        assert!(flight.settled());
+        drop(flight.begin());
+        assert_eq!(woken.load(Ordering::SeqCst), 0);
     }
 }

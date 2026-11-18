@@ -29,13 +29,16 @@ use std::time::{Duration, Instant};
 use euhedral_inference_bench::prompt::PromptCorpus;
 use euhedral_inference_bench::prompt::words::DEFAULT_SEED;
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
+mod common;
+
+use common::Closer;
 use euhedral_inference_engine::generation::{
     CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
     Verification,
 };
 use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::stages::QuantumKind;
-use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
+use euhedral_inference_engine::{EngineRuntime, Handoff};
 
 /// The longest a device test waits for one hand-off; past it the test fails.
 const WAIT: Duration = Duration::from_secs(20 * 60);
@@ -60,7 +63,7 @@ fn machine() -> Option<Machine> {
 /// Rows of a prompt chunk: a long prompt takes several.
 const CHUNK: u32 = 256;
 
-fn start(machine: &Machine, max_tokens: u32) -> (Arc<EngineRuntime>, RuntimeOwner) {
+fn start(machine: &Machine, max_tokens: u32) -> (Closer, Arc<EngineRuntime>) {
     let mut settings = Settings::with_model(ModelSettings {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
@@ -69,13 +72,11 @@ fn start(machine: &Machine, max_tokens: u32) -> (Arc<EngineRuntime>, RuntimeOwne
     settings.kernels.graphs.captures_per_view = 8;
     settings.batching.prefill_chunk_tokens = CHUNK;
     let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
-    (
-        ready
-            .wait(WAIT)
-            .expect("the engine reports")
-            .expect("the engine starts"),
-        owner,
-    )
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    (Closer::new(owner, &runtime), runtime)
 }
 
 fn read_range(file: &mut File, range: Range<u64>) -> Vec<u8> {
@@ -320,7 +321,7 @@ fn sampled_speculation_gives_the_tokens_of_decode_without_it() {
     let Some(machine) = machine() else { return };
     let tokenizer = tokenizer(&machine.artifact);
     let eos = tokenizer.eos_ids().to_vec();
-    let (runtime, owner) = start(&machine, 4096);
+    let (owner, runtime) = start(&machine, 4096);
     assert!(runtime.plan().draft_depth > 0, "the artifact drafts");
     let mut accepted_total = 0;
     let mut verified_total = 0;
@@ -373,7 +374,7 @@ fn sampled_speculation_gives_the_tokens_of_decode_without_it() {
 fn a_cancel_during_a_sampled_verification_frees_the_sequence_and_its_rows() {
     let Some(machine) = machine() else { return };
     let tokenizer = tokenizer(&machine.artifact);
-    let (runtime, owner) = start(&machine, 4096);
+    let (owner, runtime) = start(&machine, 4096);
     let prompt = &chat_prompts(&tokenizer, 128)[0];
     let sampling = chat(3);
     let uncut = generate(&runtime, prompt, 96, &[], Speculation::Artifact, sampling);
