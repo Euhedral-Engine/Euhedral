@@ -27,12 +27,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod common;
+
+use common::Closer;
 use euhedral_inference_engine::generation::{
     CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
     Verification,
 };
 use euhedral_inference_engine::sampling::SamplingConfig;
-use euhedral_inference_engine::{EngineRuntime, Handoff, RuntimeOwner};
+use euhedral_inference_engine::{EngineRuntime, Handoff};
 use euhedral_inference_settings::{ByteSize, ModelSettings, Settings};
 use typed::Typed;
 
@@ -71,15 +74,13 @@ fn settings(artifact: &Path, cache: ByteSize) -> Settings {
 }
 
 /// Starts the engine with a prefix cache of `cache` bytes (0: off).
-fn start(machine: &Machine, cache: ByteSize) -> (Arc<EngineRuntime>, RuntimeOwner) {
+fn start(machine: &Machine, cache: ByteSize) -> (Closer, Arc<EngineRuntime>) {
     let (owner, ready) = EngineRuntime::start(&settings(&machine.artifact, cache), &machine.library);
-    (
-        ready
-            .wait(WAIT)
-            .expect("the engine reports")
-            .expect("the engine starts"),
-        owner,
-    )
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    (Closer::new(owner, &runtime), runtime)
 }
 
 /// A prompt of `LENGTH` tokens whose first `shared` tokens are those of every prompt of `seed` 0 and whose others
@@ -316,7 +317,7 @@ fn cases() -> Vec<(&'static str, Vec<u32>, SamplingConfig, usize)> {
 fn a_speculative_restore_gives_the_tokens_and_the_drafts_of_a_cold_run() {
     let Some(machine) = machine() else { return };
     // The cold references: the cache is off.
-    let (runtime, owner) = start(&machine, ByteSize(0));
+    let (owner, runtime) = start(&machine, ByteSize(0));
     let lane = Arc::new(Typed::plain(runtime.library(), 1, 4));
     let cold: Vec<(Recording, MtpPages)> = cases()
         .iter()
@@ -331,7 +332,7 @@ fn a_speculative_restore_gives_the_tokens_and_the_drafts_of_a_cold_run() {
     drop(lane);
     owner.shutdown(runtime).expect("the engine shuts down clean");
 
-    let (runtime, owner) = start(&machine, ByteSize::gib(2));
+    let (owner, runtime) = start(&machine, ByteSize::gib(2));
     let lane = Arc::new(Typed::plain(runtime.library(), 1, 4));
     // The rows each restore computes again; a checkpoint a later restore uses may have stored one of an earlier restore's.
     let mut repaired = Vec::new();
@@ -370,13 +371,13 @@ fn a_speculative_restore_gives_the_tokens_and_the_drafts_of_a_cold_run() {
 fn a_plain_request_restores_the_checkpoints_of_a_speculative_one_but_not_the_reverse() {
     let Some(machine) = machine() else { return };
     let shared = prompt(0, LENGTH);
-    let (runtime, owner) = start(&machine, ByteSize(0));
+    let (owner, runtime) = start(&machine, ByteSize(0));
     let cold_plain = generate(&runtime, &shared, Speculation::Off, SamplingConfig::greedy(0));
     let cold_speculative = generate(&runtime, &shared, Speculation::Artifact, SamplingConfig::greedy(0));
     owner.shutdown(runtime).expect("the engine shuts down clean");
 
     // A speculative request captures checkpoints that hold the draft's state: a plain one restores them and needs none.
-    let (runtime, owner) = start(&machine, ByteSize::gib(2));
+    let (owner, runtime) = start(&machine, ByteSize::gib(2));
     let first = generate(&runtime, &shared, Speculation::Artifact, SamplingConfig::greedy(0));
     assert_eq!(first.outcome.cached_prompt_tokens, 0);
     assert_eq!(first.tokens, cold_speculative.tokens);
@@ -389,7 +390,7 @@ fn a_plain_request_restores_the_checkpoints_of_a_speculative_one_but_not_the_rev
     owner.shutdown(runtime).expect("the engine shuts down clean");
 
     // A plain request captures checkpoints without it: a speculative one cannot use them, starts cold and stores its own.
-    let (runtime, owner) = start(&machine, ByteSize::gib(2));
+    let (owner, runtime) = start(&machine, ByteSize::gib(2));
     let first = generate(&runtime, &shared, Speculation::Off, SamplingConfig::greedy(0));
     assert_eq!(first.outcome.cached_prompt_tokens, 0);
     assert_eq!(first.tokens, cold_plain.tokens);
