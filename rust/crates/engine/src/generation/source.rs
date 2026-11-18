@@ -74,8 +74,8 @@ use crate::quantum::{Executor, StartError};
 use crate::runtime::{Core, Units};
 use crate::sampling::{SamplingConfig, SamplingError, TokenSampler};
 use crate::stages::attention::KvSource;
-use crate::stages::sampling::{RowReadbackLease, Selection};
-use crate::stages::{InputRecordRef, Quantum, QuantumError, QuantumKind, SequenceRefs, SubmitError};
+use crate::stages::sampling::{RowReadbackLease, Selection, SelectionLease};
+use crate::stages::{InputRecordRef, Outcome, Quantum, QuantumError, QuantumKind, SequenceRefs, SubmitError};
 use crate::state::kv::KvRetained;
 use crate::state::{SequenceId, SequenceState};
 use crate::workspace::{BufferSlot, Workspace};
@@ -158,10 +158,95 @@ impl fmt::Debug for Message {
     }
 }
 
-/// A retired quantum and how it ended.
+/// What an owner keeps of a retired quantum until the work queued on its lane has run.
+pub(crate) enum Kept {
+    /// A quantum of the sequence alone.
+    Whole(Box<Quantum>),
+    /// A pass of several sequences, which every member's owner keeps (the last to let go frees its input record), and the
+    /// selection lease of this member's part.
+    Part {
+        batch: Arc<Quantum>,
+        _lease: Option<SelectionLease>,
+    },
+}
+
+impl Kept {
+    /// The marker of the upload of the quantum's input record.
+    fn prepared(&self) -> Option<Marker> {
+        match self {
+            Kept::Whole(quantum) => quantum.prepared,
+            Kept::Part { batch, .. } => batch.prepared,
+        }
+    }
+}
+
+/// A retired quantum (or this sequence's part of a pass) and how it ended for this sequence.
 pub(crate) struct Retired {
-    pub(crate) quantum: Quantum,
+    /// The number of the quantum that ran, which for a part is the pass's.
+    pub(crate) serial: u64,
+    pub(crate) start: u64,
+    pub(crate) kind: QuantumKind,
+    pub(crate) rows: usize,
+    /// The rows of the quantum this sequence commits when it completed.
+    pub(crate) committed: usize,
+    pub(crate) ran: Option<Ran>,
+    /// Whether the quantum is a pass of several sequences, which the owner of the workspace was told retired before this.
+    pub(crate) pass: bool,
+    pub(crate) kept: Kept,
     pub(crate) outcome: QuantumOutcome,
+}
+
+impl Retired {
+    /// A quantum of one sequence that retired.
+    pub(crate) fn whole(quantum: Quantum, outcome: QuantumOutcome) -> Retired {
+        Retired {
+            serial: quantum.id(),
+            start: quantum.start_position(),
+            kind: quantum.kind(),
+            rows: quantum.rows(),
+            committed: quantum.rows(),
+            ran: quantum.graph_run(),
+            pass: false,
+            kept: Kept::Whole(Box::new(quantum)),
+            outcome,
+        }
+    }
+
+    /// Segment `segment` of the pass `batch` that retired as `outcome`: how it ended for its own sequence (a member that
+    /// was cancelled concludes cancelled, whatever the pass did), with the lease its owner gives back.
+    pub(crate) fn part(
+        batch: &Arc<Quantum>,
+        segment: usize,
+        lease: Option<SelectionLease>,
+        outcome: &QuantumOutcome,
+    ) -> Retired {
+        let concluded = match batch.conclusion_for(segment, outcome) {
+            Ok(Outcome::Completed) => QuantumOutcome::Completed,
+            Ok(Outcome::Cancelled) => QuantumOutcome::Killed,
+            Ok(Outcome::Failed(cause)) => QuantumOutcome::DeviceFailed { cause },
+            Err(error) => QuantumOutcome::DeviceFailed {
+                cause: error.to_string(),
+            },
+        };
+        let (start, rows) = batch
+            .segments()
+            .get(segment)
+            .map_or((0, 0), |part| (part.start_position(), part.rows()));
+        Retired {
+            serial: batch.id(),
+            start,
+            kind: batch.kind(),
+            rows,
+            committed: batch.committed_rows(segment).unwrap_or(0),
+            ran: None,
+            pass: true,
+            kept: Kept::Part {
+                batch: Arc::clone(batch),
+                _lease: lease,
+            },
+            outcome: concluded,
+        }
+    }
 }
 
 /// A quantum that did not start, and why.
@@ -412,7 +497,10 @@ pub(super) struct Flying {
     pub(super) kill: Arc<AtomicBool>,
     /// When the owner found it retired.
     pub(super) retired_at: Option<Instant>,
-    pub(super) retired: Option<(Quantum, QuantumOutcome)>,
+    pub(super) retired: Option<Retired>,
+    /// The marker of the reservation made for the quantum on the owner's lane: what `retained` is held for when the
+    /// quantum never starts.
+    pub(super) reserved: Marker,
     /// The chunk ends at a checkpoint: once it completed its state is captured.
     pub(super) checkpoint: bool,
 }
@@ -424,7 +512,7 @@ struct Parked {
     marker: Marker,
     // Dropped with the entry: the quantum (none for a restore's reservation that no quantum took) and the staging of
     // the page tables the reservation uploaded.
-    _quantum: Option<Quantum>,
+    _quantum: Option<Kept>,
     _retained: KvRetained,
 }
 
@@ -473,6 +561,8 @@ pub(super) struct Run {
     pub(super) checkpoints: Option<PromptCheckpoints>,
     /// The kill flag of the first chunk when a restore precedes it: the restore's, which a failed copy sets.
     first_kill: Option<Arc<AtomicBool>>,
+    /// Whether the request has offered a step to the workspace's passes and not left them since.
+    offered: bool,
     /// What the restore's reservation uploaded, kept until the first chunk retires.
     carried: KvRetained,
     /// The restore's reservation on the owner's lane, which reads `carried`; `None` once a chunk has taken both.
@@ -571,6 +661,15 @@ impl Run {
             }
         }
         self.end_chain();
+        self.leave_passes();
+    }
+
+    /// The request offers no more steps to the workspace's passes: they stop waiting for it, and a step it still has
+    /// pending is told back as not started.
+    pub(super) fn leave_passes(&mut self) {
+        if mem::take(&mut self.offered) {
+            self.shared.order.leave(self.sequence);
+        }
     }
 
     /// The prompt tokens a restore put in the sequence: 0 on a miss.
@@ -967,6 +1066,7 @@ impl Owner {
             _units: units,
             checkpoints: None,
             first_kill: None,
+            offered: false,
             carried: KvRetained::default(),
             carried_marker: None,
             lease,
@@ -1051,6 +1151,7 @@ impl Owner {
             return self.fail(format!("the owner panicked: {message}"));
         }
         let Some(mut run) = self.run.take() else { return };
+        run.leave_passes();
         log::error!(
             "the owner of sequence {} panicked again: the request ends with its quanta still in flight, and the sequence leaves the pool",
             self.id.0
@@ -1077,29 +1178,32 @@ impl Owner {
     fn receive(&mut self, message: Message) {
         match message {
             Message::Retired(retired) => {
-                let Retired { quantum, outcome } = *retired;
-                // A quantum the workspace waited for is done: the owner of the workspace starts what waits.
-                self.shared.order.retired(self.id, quantum.id());
+                let retired = *retired;
+                // A quantum the workspace waited for is done: the owner of the workspace starts what waits. A pass was
+                // told to it before the members' owners were.
+                if !retired.pass {
+                    self.shared.order.retired(self.id, retired.serial);
+                }
                 let waiting = self.run.as_mut().and_then(|run| {
                     run.in_flight.iter_mut().find(|flying| {
                         flying.retired.is_none()
-                            && flying.start == quantum.start_position()
-                            && flying.kind == quantum.kind()
-                            && flying.rows == quantum.rows()
+                            && flying.start == retired.start
+                            && flying.kind == retired.kind
+                            && flying.rows == retired.rows
                     })
                 });
                 match waiting {
                     Some(flying) => {
                         flying.retired_at = Some(Instant::now());
-                        flying.retired = Some((quantum, outcome));
+                        flying.retired = Some(retired);
                     }
                     None => {
                         log::error!(
                             "a {:?} quantum at {} retired that the owner did not admit",
-                            quantum.kind(),
-                            quantum.start_position()
+                            retired.kind,
+                            retired.start
                         );
-                        self.park(quantum, KvRetained::default());
+                        self.park(retired.kept, KvRetained::default());
                     }
                 }
             }
@@ -1320,8 +1424,24 @@ impl Owner {
             return;
         }
         let Some(run) = self.run.as_mut() else { return };
-        run.in_flight.retain(|flying| flying.id != serial);
-        run.stop(FinishReason::Failed(format!("starting the quantum: {error}")));
+        let stopping = run.stopping.is_some();
+        self.unstart(serial);
+        let Some(run) = self.run.as_mut() else { return };
+        // A step withdrawn because the request ended is no failure of its own.
+        if !matches!(error, StartError::Withdrawn) || !stopping {
+            run.stop(FinishReason::Failed(format!("starting the quantum: {error}")));
+        }
+    }
+
+    /// Forgets the quantum numbered `id`, which did not start. What its reservation uploaded stays held until the lane has
+    /// run it.
+    fn unstart(&mut self, id: u64) {
+        let Some(run) = self.run.as_mut() else { return };
+        let Some(at) = run.in_flight.iter().position(|flying| flying.id == id) else {
+            return;
+        };
+        let Some(flying) = run.in_flight.remove(at) else { return };
+        self.keep(flying.reserved, None, flying.retained);
     }
 
     /// Hands the logits row of a teacher-forced step to the sink.
@@ -1516,13 +1636,13 @@ impl Owner {
     /// has, so that the turn that follows lets it go (and a request that waits for it ends). The marker is looked at
     /// once: reached, the quantum goes now; not, the frame is registered, and it fires even if the marker is reached
     /// the next instant.
-    fn park(&mut self, quantum: Quantum, retained: KvRetained) {
-        let Some(marker) = quantum.prepared else { return };
-        self.keep(marker, Some(quantum), retained);
+    fn park(&mut self, kept: Kept, retained: KvRetained) {
+        let Some(marker) = kept.prepared() else { return };
+        self.keep(marker, Some(kept), retained);
     }
 
     /// Keeps `quantum` and `retained` until the lane has reached `marker`, as `park` does for a quantum.
-    fn keep(&mut self, marker: Marker, quantum: Option<Quantum>, retained: KvRetained) {
+    fn keep(&mut self, marker: Marker, quantum: Option<Kept>, retained: KvRetained) {
         let core = &self.shared.core;
         if core.lanes.reached(marker) {
             return;
@@ -1581,14 +1701,14 @@ impl Owner {
             let Some(mut flying) = run.in_flight.pop_front() else {
                 return;
             };
-            let Some((quantum, outcome)) = flying.retired.take() else {
+            let Some(retired) = flying.retired.take() else {
                 return;
             };
             // The quantum that feeds the last token of a speculative request runs after the request ended.
             let live = run.stopping.is_none() || flying.role == Role::Settle;
-            match outcome {
+            match &retired.outcome {
                 QuantumOutcome::Completed if live => {
-                    self.completed(&mut flying, &quantum);
+                    self.completed(&mut flying, &retired);
                     if flying.checkpoint {
                         self.checkpoint_reached();
                     }
@@ -1612,7 +1732,7 @@ impl Owner {
                 }
                 QuantumOutcome::Completed => {}
             }
-            self.park(quantum, flying.retained);
+            self.park(retired.kept, flying.retained);
         }
     }
 
@@ -1627,8 +1747,14 @@ impl Owner {
     }
 
     /// A quantum of the live request completed.
-    fn completed(&mut self, flying: &mut Flying, quantum: &Quantum) {
+    fn completed(&mut self, flying: &mut Flying, retired: &Retired) {
         let now = Instant::now();
+        if retired.committed != flying.rows {
+            return self.fail(format!(
+                "a {:?} quantum committed {} of its {} rows",
+                flying.kind, retired.committed, flying.rows
+            ));
+        }
         // The rows of a quantum become part of its cache; a verification's accepted prefix does, once it is known.
         let rows = flying.rows as u64;
         let committed = match flying.role {
@@ -1643,7 +1769,7 @@ impl Owner {
             return self.fail(format!("committing the quantum's rows: {error}"));
         }
         let Some(run) = self.run.as_mut() else { return };
-        let ran = quantum.graph_run();
+        let ran = retired.ran;
         let event = QuantumEvent {
             kind: flying.kind,
             rows: flying.rows,
@@ -1682,7 +1808,11 @@ impl Owner {
         if let Mode::Forced { .. } = run.mode {
             let step = run.generated;
             run.waiting_logits = true;
-            if let Err(why) = self.copy_logits(step, quantum, flying.rows) {
+            let copied = match &retired.kept {
+                Kept::Whole(quantum) => self.copy_logits(step, quantum, flying.rows),
+                Kept::Part { .. } => Err("a teacher-forced step is not part of a pass".to_string()),
+            };
+            if let Err(why) = copied {
                 self.fail(why);
             }
             return;
@@ -2021,6 +2151,10 @@ impl Owner {
         if run.in_flight.is_empty() {
             run.cursor = 0;
         }
+        // A step that is not part of a speculative one is not offered: the passes do not wait for the request.
+        if matches!(role, Role::Decode | Role::Settle | Role::Prefill { .. }) {
+            run.leave_passes();
+        }
 
         // The reservation (and, for the first quantum of a request after another, the reset of the sequence) on the
         // owner's lane. Its marker orders the quantum's stages behind it.
@@ -2092,13 +2226,17 @@ impl Owner {
         // Everything the executor would refuse is refused before the record is queued for upload: a quantum dropped
         // after that would free the pinned record under the copy.
         quantum.validate().map_err(why("the quantum"))?;
-        let (_, prepared) = core
-            .lane_table
-            .submit_ops(core.owner_lane(), false, |kernels| {
-                quantum.prepare(&core.pool, kernels).map_err(why("the input record"))
-            })
-            .map_err(why("the input record's upload"))?;
-        quantum.prepared_after(prepared);
+        // A verification is offered for a pass, whose start uploads its record (its own, or the pass's).
+        let offered = role == Role::Verify;
+        if !offered {
+            let (_, prepared) = core
+                .lane_table
+                .submit_ops(core.owner_lane(), false, |kernels| {
+                    quantum.prepare(&core.pool, kernels).map_err(why("the input record"))
+                })
+                .map_err(why("the input record's upload"))?;
+            quantum.prepared_after(prepared);
+        }
 
         let selection = quantum.selection().cloned();
         // The restore's flag goes to the first chunk. On a restore of a drafting request the first quantum is the one-row
@@ -2126,6 +2264,7 @@ impl Owner {
             kill: Arc::clone(&kill),
             retired_at: None,
             retired: None,
+            reserved,
             checkpoint: false,
         });
         if selection.is_some() {
@@ -2139,8 +2278,14 @@ impl Owner {
         // It starts behind its sequence's last quantum and the workspace's, now or in a later turn of the workspace's
         // owner; a start that fails is told back as a message.
         // A start that fails now admits nothing behind it: the caller fails the request.
-        if let Err(error) = shared.order.admit(self.id, &shared.executor, quantum, kill, true, more) {
-            run.in_flight.retain(|flying| flying.id != id);
+        let started = if offered {
+            run.offered = true;
+            shared.order.offer(self.id, &shared.executor, quantum, kill)
+        } else {
+            shared.order.admit(self.id, &shared.executor, quantum, kill, true, more)
+        };
+        if let Err(error) = started {
+            self.unstart(id);
             return Err(why("starting the quantum")(error));
         }
         #[cfg(feature = "test-oracles")]
@@ -2180,7 +2325,8 @@ impl Owner {
         if !self.parked.is_empty() {
             return;
         }
-        let Some(run) = self.run.take() else { return };
+        let Some(mut run) = self.run.take() else { return };
+        run.leave_passes();
         self.sequence.kv.discard();
         if let Some(mtp) = self.sequence.mtp_kv.as_mut() {
             mtp.discard();

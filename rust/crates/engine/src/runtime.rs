@@ -34,6 +34,7 @@ use crate::generation::{GREEDY_DEPTH, OPERATION_BOUND};
 use crate::handoff::Handoff;
 use crate::kernels::kernel_sources;
 use crate::model::{ArtifactProfile, ModelConfig, Speculation, Weights};
+use crate::pass_assembler::PassStatistics;
 use crate::plan::Plan;
 use crate::prefix::PrefixCacheStats;
 use crate::residency::planner::{PlanInputs, ResidencyPlan, pass_rows_limit, sequences_for};
@@ -628,6 +629,12 @@ impl EngineRuntime {
     /// The sequences the engine holds, each of which runs one request at a time: the requests that run at once.
     pub fn sequences(&self) -> usize {
         self.generations.sequences()
+    }
+
+    /// What the engine's shared passes did since it started: the passes, their rows and parts, and the parts that shared a
+    /// pass with another sequence's.
+    pub fn pass_statistics(&self) -> PassStatistics {
+        self.generations.pass_statistics()
     }
 
     /// The prefix cache's counters; `None` when the cache is off (`prefix-cache.size: 0`).

@@ -47,7 +47,7 @@ use euhedral_data_structures::queues::{Consumer, MpscQueue, Single};
 
 use super::mailbox::{Mailbox, Spawn, Turn};
 use crate::handoff::Handoff;
-use crate::pass_assembler::{PassAssembler, PassOffer};
+use crate::pass_assembler::{PassAssembler, PassOffer, PassStatistics};
 use crate::prefix::CopyJob;
 use crate::quantum::{Executor, StartError, Started};
 use crate::stages::Quantum;
@@ -234,19 +234,6 @@ impl PassCaps {
         }
         Ok(PassCaps { rows, parts })
     }
-}
-
-/// What the passes did, as numbers: each pass counts once, however many sequences it holds.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PassStatistics {
-    /// Passes started.
-    pub(crate) passes: u64,
-    /// Rows the passes held.
-    pub(crate) rows: u64,
-    /// Sequences' parts the passes held (a pass of one has one).
-    pub(crate) segments: u64,
-    /// Parts that shared a pass with another: the verifications that were batched.
-    pub(crate) batched: u64,
 }
 
 #[derive(Debug, Default)]
@@ -1556,5 +1543,211 @@ mod tests {
         }
         assert_eq!(seen.len(), 9);
         assert_eq!(order.records(), 3);
+    }
+
+    const C: SequenceId = SequenceId(2);
+
+    fn kill() -> Arc<AtomicBool> {
+        Arc::default()
+    }
+
+    fn offer(
+        owner: &mut WorkspaceOwner<Fake>,
+        fake: &Arc<Fake>,
+        sequence: SequenceId,
+        job: u64,
+    ) -> Result<(), StartError> {
+        owner.offer(sequence, Arc::clone(fake), job, kill())
+    }
+
+    /// Two sequences' offers batched: A's step runs alone first, B's waits, and A's next step joins B's.
+    fn batched_pair() -> (WorkspaceOwner<Fake>, Arc<Fake>, Told, Arc<AtomicU64>) {
+        let (mut owner, fake, told, gate) = owner_of(3);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        assert_eq!(
+            fake.starts(),
+            vec![(1, vec![])],
+            "the first offer starts at once, alone"
+        );
+        retire(&mut owner, 1);
+        assert_eq!(fake.starts().len(), 1, "B's step waits for A to report");
+        offer(&mut owner, &fake, A, job(3, 4)).unwrap();
+        (owner, fake, told, gate)
+    }
+
+    #[test]
+    fn a_pass_of_one_starts_exactly_the_job_an_admission_starts() {
+        let (mut owner, fake, _, _) = owner_of(2);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        let (mut plain, plain_fake, _, _) = owner_of(2);
+        admit(&mut plain, &plain_fake, A, job(1, 4), true, false).unwrap();
+        assert_eq!(fake.starts(), plain_fake.starts());
+        assert!(fake.passes.lock().unwrap().is_empty(), "a pass of one is not a batch");
+        assert_eq!(
+            owner.counters.read(),
+            PassStatistics {
+                passes: 1,
+                rows: 4,
+                segments: 1,
+                batched: 0
+            }
+        );
+    }
+
+    #[test]
+    fn offers_of_several_sequences_run_as_one_job() {
+        let (_owner, fake, told, _) = batched_pair();
+        let passes = fake.passes.lock().unwrap();
+        assert_eq!(passes.len(), 1);
+        assert_eq!(passes[0].0, vec![2, 3], "in the order offered");
+        assert_eq!(fake.starts().len(), 1, "no member started alone");
+        assert!(told.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_statistics_count_passes_rows_segments_and_batched_parts() {
+        let (owner, _fake, _, _) = batched_pair();
+        assert_eq!(
+            owner.counters.read(),
+            PassStatistics {
+                passes: 2,
+                rows: 12,
+                segments: 3,
+                batched: 2
+            }
+        );
+    }
+
+    #[test]
+    fn a_batch_stops_only_when_every_member_is_cancelled() {
+        let (mut owner, fake, _, _) = owner_of(3);
+        let (a, b) = (kill(), kill());
+        owner.offer(A, Arc::clone(&fake), job(1, 4), kill()).unwrap();
+        owner.offer(B, Arc::clone(&fake), job(2, 4), Arc::clone(&b)).unwrap();
+        retire(&mut owner, 1);
+        owner.offer(A, Arc::clone(&fake), job(3, 4), Arc::clone(&a)).unwrap();
+        let batch_kill = Arc::clone(&fake.kills.lock().unwrap()[0]);
+        a.store(true, Ordering::Release);
+        owner.leave(A);
+        assert!(
+            !batch_kill.load(Ordering::Acquire),
+            "one cancelled member does not stop the others"
+        );
+        b.store(true, Ordering::Release);
+        owner.leave(B);
+        assert!(batch_kill.load(Ordering::Acquire), "all cancelled: the job stops");
+    }
+
+    #[test]
+    fn a_batch_gates_the_workspace_and_its_retirement_opens_it() {
+        let (mut owner, _fake, _, gate) = batched_pair();
+        assert_eq!(gate.load(Ordering::Acquire), PASS + 2);
+        retire(&mut owner, PASS + 2);
+        assert_eq!(gate.load(Ordering::Acquire), NONE);
+    }
+
+    #[test]
+    fn a_pass_the_launcher_refuses_to_batch_runs_each_member_alone() {
+        let (mut owner, fake, _, _) = owner_of(3);
+        fake.unbatchable.store(true, Ordering::SeqCst);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        retire(&mut owner, 1);
+        offer(&mut owner, &fake, A, job(3, 4)).unwrap();
+        assert!(fake.passes.lock().unwrap().is_empty());
+        assert_eq!(
+            fake.starts().iter().map(|(job, _)| *job).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        // The second member starts behind the first, and the next pass waits for both retirements.
+        retire(&mut owner, 2);
+        assert_eq!(
+            fake.starts().iter().map(|(job, _)| *job).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn a_batch_that_fails_to_start_tells_every_member_and_the_next_pass_forms() {
+        let (mut owner, fake, told, _) = owner_of(3);
+        fake.refuse.lock().unwrap().push(3);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        retire(&mut owner, 1);
+        offer(&mut owner, &fake, A, job(3, 4)).unwrap();
+        assert_eq!(told.lock().unwrap().len(), 2, "both members are told");
+        // The failed pass owed nothing: a new pass forms at once.
+        offer(&mut owner, &fake, A, job(4, 4)).unwrap();
+        assert_eq!(fake.starts().last().map(|(job, _)| *job), Some(4));
+    }
+
+    #[test]
+    fn a_member_that_fails_alone_still_pays_its_retirement() {
+        let (mut owner, fake, told, _) = owner_of(3);
+        fake.unbatchable.store(true, Ordering::SeqCst);
+        fake.refuse.lock().unwrap().push(2);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        retire(&mut owner, 1);
+        offer(&mut owner, &fake, A, job(3, 4)).unwrap();
+        // B's job failed to start (told), A's started; once A's retires the next pass may form.
+        assert_eq!(told.lock().unwrap().len(), 1);
+        retire(&mut owner, 3);
+        offer(&mut owner, &fake, A, job(4, 4)).unwrap();
+        assert!(
+            fake.starts().iter().any(|(job, _)| *job == 4),
+            "the pass after the failed one forms"
+        );
+    }
+
+    #[test]
+    fn a_pending_offer_that_leaves_is_returned_and_does_not_block_the_others() {
+        let (mut owner, fake, told, _) = owner_of(3);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        offer(&mut owner, &fake, C, job(3, 4)).unwrap();
+        owner.leave(B);
+        assert_eq!(*told.lock().unwrap(), vec![(1, 2, StartError::Withdrawn.to_string())]);
+        retire(&mut owner, 1);
+        owner.leave(A);
+        assert_eq!(
+            fake.starts().iter().map(|(job, _)| *job).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn a_member_whose_next_step_is_not_offered_stops_the_pass_waiting_for_it() {
+        let (mut owner, fake, _, _) = owner_of(3);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        retire(&mut owner, 1);
+        assert_eq!(fake.starts().len(), 1, "B waits for A's report");
+        owner.leave(A);
+        assert_eq!(
+            fake.starts().iter().map(|(job, _)| *job).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn a_second_offer_of_a_sequence_is_refused_and_leaves_nothing() {
+        let (mut owner, fake, _, _) = owner_of(2);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        assert!(offer(&mut owner, &fake, B, job(3, 4)).is_err());
+        assert_eq!(owner.assembler.pending(), 1, "the refused offer left nothing behind");
+    }
+
+    #[test]
+    fn closing_the_owner_refuses_the_pending_offers_and_it_goes_idle() {
+        let (mut owner, fake, told, _) = owner_of(3);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        assert!(!owner.idle());
+        owner.abandon("closed");
+        assert_eq!(*told.lock().unwrap(), vec![(1, 2, StartError::Closed.to_string())]);
+        assert!(owner.idle());
     }
 }

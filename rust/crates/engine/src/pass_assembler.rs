@@ -24,6 +24,19 @@ use std::fmt;
 
 pub use crate::state::SequenceId;
 
+/// What the passes did, as numbers: each pass counts once, however many sequences it holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PassStatistics {
+    /// Passes started.
+    pub passes: u64,
+    /// Rows the passes held.
+    pub rows: u64,
+    /// Sequences' parts the passes held (a pass of one has one).
+    pub segments: u64,
+    /// Parts that shared a pass with another: the verifications that were batched.
+    pub batched: u64,
+}
+
 /// A ready step offered for a pass.
 pub trait PassOffer {
     /// The sequence the step belongs to.
