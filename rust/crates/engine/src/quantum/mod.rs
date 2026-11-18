@@ -43,6 +43,7 @@ pub use capture_key::{CaptureKey, split_geometry};
 pub use input_record::{encode as encode_input_record, encode_into as encode_input_record_into};
 
 use crate::plan::{MAX_CAPTURED_ROWS, Plan, Variant, View};
+use crate::prefix::{CopyJob, Copier};
 use crate::stages::DraftSeed;
 use crate::stages::Quantum;
 use crate::stages::attention::{KvSource, takes_decode_scratch};
@@ -478,6 +479,8 @@ pub enum StartError {
     Closed,
     #[error("starting the quantum panicked")]
     Panicked,
+    #[error("the engine has no prefix cache to run a copy job")]
+    NoCopier,
 }
 
 /// The stage graphs of a plan on a runtime, the sequence's graph cache, and the choice of the graph a quantum runs.
@@ -496,6 +499,8 @@ pub struct Executor {
     cache: Arc<SharedGraphCache<CudaGpu, u128>>,
     /// Whether quanta that can be keyed run as graph bodies.
     captures: AtomicBool,
+    /// Runs the sequence's prefix-cache copy jobs, when it has a cache.
+    copier: Option<Copier>,
 }
 
 impl fmt::Debug for Executor {
@@ -580,7 +585,28 @@ impl Executor {
             whole,
             cache,
             captures: AtomicBool::new(captures_per_view > 0),
+            copier: None,
         })
+    }
+
+    /// The executor that also runs the copy jobs of the prefix cache with `copier`.
+    #[must_use]
+    pub fn with_copier(mut self, copier: Copier) -> Executor {
+        self.copier = Some(copier);
+        self
+    }
+
+    /// Starts the copy job `job` behind each of `after`; refused when the executor has no copier.
+    pub(crate) fn start_copy(
+        &self,
+        job: CopyJob,
+        kill: Arc<AtomicBool>,
+        after: &[&Started],
+    ) -> Result<Started, StartError> {
+        match &self.copier {
+            Some(copier) => copier.start(job, kill, after),
+            None => Err(StartError::NoCopier),
+        }
     }
 
     /// One monotonic reading, in nanoseconds, taken as a quantum starts.

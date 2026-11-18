@@ -41,6 +41,7 @@ use euhedral_data_structures::queues::{Consumer, MpscQueue, Single};
 
 use super::mailbox::{Mailbox, Spawn, Turn};
 use crate::handoff::Handoff;
+use crate::prefix::CopyJob;
 use crate::quantum::{Executor, StartError, Started};
 use crate::stages::Quantum;
 use crate::state::SequenceId;
@@ -73,20 +74,44 @@ pub(crate) trait Launch: Send + Sync + 'static {
     ) -> Result<Self::Started, StartError>;
 }
 
+/// What an [`Executor`] starts: a quantum, or one of the prefix cache's copy jobs.
+pub(crate) enum Job {
+    Quantum(Box<Quantum>),
+    Copy(CopyJob),
+}
+
+impl From<Quantum> for Job {
+    fn from(quantum: Quantum) -> Job {
+        Job::Quantum(Box::new(quantum))
+    }
+}
+
+impl From<CopyJob> for Job {
+    fn from(job: CopyJob) -> Job {
+        Job::Copy(job)
+    }
+}
+
 impl Launch for Executor {
-    type Job = Quantum;
+    type Job = Job;
     type Started = Started;
 
-    fn serial(job: &Quantum) -> u64 {
-        job.id()
+    fn serial(job: &Job) -> u64 {
+        match job {
+            Job::Quantum(quantum) => quantum.id(),
+            Job::Copy(copy) => copy.serial(),
+        }
     }
 
     fn serial_of(started: &Started) -> u64 {
         started.serial
     }
 
-    fn start(&self, job: Quantum, kill: Arc<AtomicBool>, after: &[&Started]) -> Result<Started, StartError> {
-        Executor::start(self, job, kill, after)
+    fn start(&self, job: Job, kill: Arc<AtomicBool>, after: &[&Started]) -> Result<Started, StartError> {
+        match job {
+            Job::Quantum(quantum) => Executor::start(self, *quantum, kill, after),
+            Job::Copy(copy) => self.start_copy(copy, kill, after),
+        }
     }
 }
 
@@ -446,11 +471,12 @@ impl<L: Launch> Order<L> {
         &self,
         sequence: SequenceId,
         launcher: &Arc<L>,
-        job: L::Job,
+        job: impl Into<L::Job>,
         kill: Arc<AtomicBool>,
         on_workspace: bool,
         more: bool,
     ) -> Result<(), StartError> {
+        let job = job.into();
         let serial = L::serial(&job);
         let launcher = Arc::clone(launcher);
         let work = move |owner: &mut WorkspaceOwner<L>| owner.admit(sequence, launcher, job, kill, on_workspace, more);
@@ -841,8 +867,8 @@ mod tests {
     fn the_gate_opens_through_the_owner_when_the_quantum_retires() {
         let order = Order::<Fake>::new(vec![Box::new(|_, _| {}), Box::new(|_, _| {})], 2, Box::new(|_| false));
         let fake = Arc::new(Fake::default());
-        order.admit(A, &fake, 1, Arc::default(), true, false).unwrap();
-        order.admit(B, &fake, 2, Arc::default(), true, true).unwrap();
+        order.admit(A, &fake, 1u64, Arc::default(), true, false).unwrap();
+        order.admit(B, &fake, 2u64, Arc::default(), true, true).unwrap();
         assert_eq!(fake.starts().len(), 1, "the workspace waits for the quantum 1");
         // Another quantum's retirement opens nothing.
         order.retired(2);
@@ -860,7 +886,7 @@ mod tests {
         let fake = Arc::new(Fake::default());
         assert!(order.close().is_some());
         // The refusal is the result of the call, so that the caller admits nothing behind it.
-        let refused = order.admit(A, &fake, 7, Arc::default(), true, true);
+        let refused = order.admit(A, &fake, 7u64, Arc::default(), true, true);
         assert!(matches!(refused, Err(StartError::Closed)));
         assert!(told.lock().unwrap().is_empty());
         assert!(fake.starts().is_empty());
@@ -870,7 +896,7 @@ mod tests {
     fn admissions_through_the_mailbox_start_in_post_order() {
         let order = Order::<Fake>::new(vec![Box::new(|_, _| {}), Box::new(|_, _| {})], 2, Box::new(|_| false));
         let fake = Arc::new(Fake::default());
-        for job in 1..=6 {
+        for job in 1u64..=6 {
             order
                 .admit(SequenceId(job as usize % 2), &fake, job, Arc::default(), true, true)
                 .unwrap();

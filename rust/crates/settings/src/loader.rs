@@ -499,6 +499,9 @@ fn leaves() -> Vec<Leaf> {
         fixed("prefix-cache.checkpoint-tokens", |s, t| {
             assign!(s.prefix_cache.checkpoint_tokens, checkpoint(t))
         }),
+        fixed("prefix-cache.copy-piece-bytes", |s, t| {
+            assign!(s.prefix_cache.copy_piece_bytes, size(t, 1))
+        }),
         fixed("batching.max-sequences", |s, t| {
             assign!(s.batching.max_sequences, int(t, 0, COUNT_MAX))
         }),

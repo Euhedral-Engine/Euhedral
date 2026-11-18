@@ -34,6 +34,8 @@ pub(crate) enum Kind {
     Reaped,
     /// The preparation of a constrained request's next mask, on the host, while the device computes the row it applies to.
     Prepare,
+    /// The prefix cache's copy jobs of one sequence: their stages and their completions, in the order they were admitted.
+    Copy,
 }
 
 /// The id hash of a frame of `kind` on chain `chain`: distinct per kind and chain, mixed so that the chains spread

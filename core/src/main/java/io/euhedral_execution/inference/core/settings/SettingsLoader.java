@@ -319,6 +319,8 @@ public final class SettingsLoader {
 
         m.put("prefix-cache.size", fixed(size(0)));
         m.put("prefix-cache.checkpoint-tokens", fixed(SettingsLoader::checkpoint));
+        // Read only by the Rust engine; accepted so the shared example file loads here.
+        m.put("prefix-cache.copy-piece-bytes", fixed(size(1)));
 
         m.put("batching.max-sequences", fixed(integer(0, Integer.MAX_VALUE)));
         m.put("batching.max-sequences-per-pass", optional(integer(1, Integer.MAX_VALUE)));

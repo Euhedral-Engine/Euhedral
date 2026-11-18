@@ -11,6 +11,7 @@ cache takes no device memory: the context length and the weight residency are th
 |---|---|---|
 | `prefix-cache.size` | 4GiB | Pinned host memory for the cache. 0 turns it off. Memory that cannot be pinned turns it off with a warning, and the engine serves as before. |
 | `prefix-cache.checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints. A multiple of 512, the prefill chunk. |
+| `prefix-cache.copy-piece-bytes` | 16MiB | The most bytes one copy between a sequence and the arena moves. A checkpoint is copied in pieces of at most this size, so one long copy never holds a transfer lane. Only the Rust engine reads it. |
 
 The arena is one allocation, 2 MiB aligned with `MADV_HUGEPAGE` and `MADV_COLLAPSE`, registered with `cudaHostRegister`:
 the routine that allocates the host-backed weight arena ([NVFP4_RESIDENCY.md](quantization/NVFP4_RESIDENCY.md)), because per-tensor

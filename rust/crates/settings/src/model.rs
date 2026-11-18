@@ -201,6 +201,9 @@ pub struct PrefixCacheSettings {
     pub size: ByteSize,
     /// Tokens between stored checkpoints; a positive multiple of 512.
     pub checkpoint_tokens: u32,
+    /// The most bytes one copy between a sequence's buffers and the cache's host arena moves; a checkpoint is copied in
+    /// pieces of at most this size, so a long copy never holds a transfer lane for its whole length.
+    pub copy_piece_bytes: ByteSize,
 }
 
 impl Default for PrefixCacheSettings {
@@ -208,6 +211,7 @@ impl Default for PrefixCacheSettings {
         Self {
             size: ByteSize::gib(4),
             checkpoint_tokens: 2048,
+            copy_piece_bytes: ByteSize::mib(16),
         }
     }
 }
