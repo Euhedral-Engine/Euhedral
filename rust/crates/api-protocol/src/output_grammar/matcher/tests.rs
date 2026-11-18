@@ -450,8 +450,8 @@ fn a_schema_and_a_grammar_of_the_same_text_are_two_entries() {
     let schema = JsonValue::parse(NUMBER).expect("JSON");
     let text = OutputGrammar::schema_text(&schema);
     checker.check_json_schema(&schema, "schema").expect("compiles");
-    assert!(checker.compiled.holds_kind(Kind::JsonSchema, &text));
-    assert!(!checker.compiled.holds_kind(Kind::Lark, &text));
+    assert!(checker.compiled.holds_kind(GrammarKind::JsonSchema, &text));
+    assert!(!checker.compiled.holds_kind(GrammarKind::Lark, &text));
     // The same text as a grammar is no Lark grammar: the schema's entry does not answer for it.
     assert!(checker.check_grammar(&text).is_err());
     assert_eq!(checker.compiled.compilations, 2);
@@ -471,4 +471,40 @@ fn a_refused_check_is_not_cached_and_a_zero_bound_still_checks() {
         .expect("compiles");
     assert!(none.check_grammar("start: nothing").is_err());
     assert_eq!(none.compiled.len(), 0);
+}
+
+#[test]
+fn a_grammar_compiled_outside_the_checker_is_kept_once_and_copied() {
+    let mut checker = checker();
+    let compiler = checker.compiler();
+    let grammar = "start: \"ab\"";
+    assert!(!checker.is_cached(GrammarKind::Lark, grammar));
+    assert!(checker.cached(GrammarKind::Lark, grammar).expect("no fault").is_none());
+    // Two callers compile the same grammar at once: the first to keep it wins, the second finds it kept.
+    let first = compiler.compile(GrammarKind::Lark, grammar).expect("compiles");
+    let second = compiler.compile(GrammarKind::Lark, grammar).expect("compiles");
+    let mut matcher = checker.keep(first).expect("kept");
+    assert!(feed(&mut matcher, "ab"));
+    assert!(matcher.is_accepting());
+    let mut again = checker.keep(second).expect("found kept");
+    assert!(feed(&mut again, "ab"));
+    assert_eq!(checker.compiled.len(), 1);
+    let mut copy = checker
+        .cached(GrammarKind::Lark, grammar)
+        .expect("no fault")
+        .expect("cached");
+    assert!(feed(&mut copy, "ab"), "a copy starts at the beginning");
+    assert!(compiler.compile(GrammarKind::Lark, "start: undefined").is_err());
+}
+
+#[test]
+fn a_checker_that_keeps_nothing_hands_the_compiled_grammar_to_the_caller() {
+    let mut checker = GrammarChecker::with_cache_size(&tokens(), &[END, END_TEXT], 0).expect("vocabulary");
+    let compiled = checker
+        .compiler()
+        .compile(GrammarKind::Lark, "start: \"a\"")
+        .expect("compiles");
+    let mut matcher = checker.keep(compiled).expect("the caller's own");
+    assert!(feed(&mut matcher, "a"));
+    assert_eq!(checker.compiled.len(), 0);
 }
