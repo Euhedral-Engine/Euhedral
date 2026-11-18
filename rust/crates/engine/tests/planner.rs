@@ -28,7 +28,7 @@ use euhedral_inference_engine::runtime::resolve_sequences;
 use euhedral_inference_engine::workspace::{
     BufferSlot, WorkspaceError, WorkspaceRows, input_records, slot_bytes, workspace_bytes, workspace_bytes_with_records,
 };
-use euhedral_inference_settings::{Auto, ByteSize, KvFormat};
+use euhedral_inference_settings::{Auto, ByteSize, KvFormat, Settings};
 
 mod common;
 
@@ -645,4 +645,22 @@ fn the_extra_state_of_a_sequence_without_drafts_is_its_gdn_state_scratch_and_sel
         longer - drafting,
         512 * hidden * 2 + 128 * footprint::page_bytes(&config, KvFormat::Nvfp4)
     );
+}
+
+#[test]
+fn the_prefix_cache_arena_is_granted_only_the_host_room_left_over() {
+    let (config, table) = (config(), rco_table());
+    let mut settings = settings(131_072);
+    settings.prefix_cache.size = ByteSize::gib(1);
+    let granted = |settings: &Settings, host: u64| {
+        let mut inputs = inputs(64 * GIB);
+        inputs.host_pinned_bytes = host;
+        plan_with(&config, &table, settings, inputs).unwrap().prefix_cache_bytes
+    };
+    assert_eq!(granted(&settings, u64::MAX), GIB);
+    // The arena is the plan's last item: a host too small for it drops it, and the plan is still made.
+    assert_eq!(granted(&settings, GIB - 1), 0);
+    assert_eq!(granted(&settings, GIB), GIB);
+    settings.prefix_cache.size = ByteSize(0);
+    assert_eq!(granted(&settings, u64::MAX), 0);
 }

@@ -13,7 +13,8 @@ use crate::prefix::copier::{FIRST_COPY_SERIAL, PinnedArena};
 use crate::prefix::layout::CheckpointLayout;
 
 /// What the cache is opened with.
-pub(crate) struct CacheSpec<'a> {
+#[derive(Debug)]
+pub struct CacheSpec<'a> {
     pub library: &'a Arc<CudaLibrary>,
     pub config: &'a ModelConfig,
     pub format: KvFormat,
@@ -29,7 +30,7 @@ pub(crate) struct CacheSpec<'a> {
 /// Opens the cache the plan granted memory for. `None` when it is off (no bytes granted, or a model with no checkpoint
 /// layout), and, with a warning, when the memory cannot be pinned or the settings do not fit the model: the engine then
 /// serves without it. Allocates pinned memory with the waiting allocator: startup only.
-pub(crate) fn open_prefix_cache(spec: CacheSpec<'_>, spawn: Spawn) -> Option<PrefixCacheHandle> {
+pub fn open_prefix_cache(spec: CacheSpec<'_>, spawn: Spawn) -> Option<PrefixCacheHandle> {
     if spec.granted == 0 || spec.config.layer_kinds.len() <= 1 {
         return None;
     }

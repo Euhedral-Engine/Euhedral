@@ -93,6 +93,13 @@ impl SequenceAddresses {
     }
 }
 
+impl SequenceAddresses {
+    /// The references the addresses are of.
+    pub fn refs(&self) -> &SequenceRefs {
+        &self.refs
+    }
+}
+
 /// The device address of `offset` bytes into `base`, when `bytes` more fit within `size`.
 fn within(base: Option<DevicePtr>, size: u64, offset: u64, bytes: u64) -> Option<u64> {
     let base = base.filter(|base| !base.is_null())?;
@@ -221,7 +228,7 @@ impl Copier {
     }
 
     /// Starts `job` behind each of `after`: its stage waits on the device for their sinks.
-    pub(crate) fn start(&self, job: CopyJob, kill: Arc<AtomicBool>, after: &[&Started]) -> Result<Started, StartError> {
+    pub fn start(&self, job: CopyJob, kill: Arc<AtomicBool>, after: &[&Started]) -> Result<Started, StartError> {
         let serial = job.serial();
         let external = after.iter().map(|previous| ExternalEdge {
             from: previous.reference.clone(),
