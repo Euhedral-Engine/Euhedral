@@ -75,13 +75,14 @@ fn start(machine: &Machine, cache: ByteSize) -> (Arc<EngineRuntime>, RuntimeOwne
 }
 
 /// A prompt of `LENGTH` tokens whose first `shared` tokens are those of every prompt of `seed` 0 and whose others
-/// are `seed`'s own.
+/// are `seed`'s own. Each part repeats a short pattern, so the model continues it and the draft has something to
+/// predict (random tokens are never predicted, and then no draft is accepted to tell a restored draft state by).
 fn prompt(seed: u64, shared: usize) -> Vec<u32> {
     (0..LENGTH)
         .map(|index| {
             let owner = if index < shared { 0 } else { seed };
-            let mixed =
-                (index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ owner.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            let mixed = ((index % 37) as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ owner.wrapping_mul(0xBF58_476D_1CE4_E5B9);
             1000 + (mixed >> 33) as u32 % 50_000
         })
         .collect()
