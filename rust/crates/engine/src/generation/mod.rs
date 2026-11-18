@@ -35,6 +35,7 @@ use crate::formats::{Nvfp4Linear, TrellisLinear};
 use crate::frames::{Kind, step};
 use crate::model::{LayerIndex, ModelConfig, Role, Weights};
 use crate::plan::{Formats, Plan, View};
+use crate::prefix::{Copier, PrefixCacheHandle, Submit};
 use crate::quantum::Executor;
 use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
@@ -46,7 +47,8 @@ pub use constraint::{ConstraintError, ReasoningConstraint, TokenConstraint};
 pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
 pub use listener::GenerationListener;
 pub(crate) use mailbox::OPERATION_BOUND;
-use mailbox::{Address, Mailbox, Spawn};
+pub use mailbox::Spawn;
+pub(crate) use mailbox::{Address, Mailbox, Turn};
 use order::{Order, Reply};
 use pool::{Lease, SequencePool};
 pub use request::{
@@ -54,7 +56,7 @@ pub use request::{
     Verification,
 };
 pub(crate) use source::GREEDY_DEPTH;
-use source::{Audience, Drafts, Message, Owner, Rejected, Retired, Shared, StartFailed};
+use source::{Audience, CopyRequest, Drafts, Message, Owner, Rejected, Retired, Shared, StartFailed};
 pub use teacher_forced::LogitsSink;
 
 /// The engine's admission of a request, as the answer `Owner::begin` takes.
@@ -113,6 +115,7 @@ impl Generation {
         order: &Arc<Order<Executor>>,
         sequences: usize,
         draft_ids: Option<Arc<[u32]>>,
+        prefix: Option<PrefixCacheHandle>,
     ) -> Result<Generation, Box<(EngineError, SequenceState)>> {
         let capacity = sequence.kv.planned_rows().min(residency.max_context_tokens as u64);
         // An unbounded queue, whose chunk holds the messages the protocol has in flight: the quanta in flight retire into
@@ -120,7 +123,8 @@ impl Generation {
         // cannot fail, so no message is ever dropped.
         let queue = MpscQueue::<Message>::new(GREEDY_DEPTH + 4);
         let (producer, inbox) = (queue.producer(), queue.consumer());
-        let executor = match Self::executor(core, config, residency, weights, &address, sequences) {
+        let copies = prefix.as_ref().map(|_| (id, Arc::clone(order)));
+        let executor = match Self::executor(core, config, residency, weights, &address, sequences, copies) {
             Ok(executor) => executor,
             Err(error) => return Err(Box::new((error, sequence))),
         };
@@ -142,6 +146,7 @@ impl Generation {
             chunk: residency.rows.rows as usize,
             capacity,
             drafts,
+            prefix,
             closing: AtomicBool::new(false),
             #[cfg(feature = "test-oracles")]
             panic_after_admissions: AtomicU64::new(u64::MAX),
@@ -178,6 +183,7 @@ impl Generation {
         weights: &Weights,
         address: &Arc<Address<Owner>>,
         sequences: usize,
+        copies: Option<(SequenceId, Arc<Order<Executor>>)>,
     ) -> Result<Executor, EngineError> {
         let library: &Arc<CudaLibrary> = &core.library;
         let formats = Formats::new(
@@ -234,7 +240,7 @@ impl Generation {
             retry_backstop: DEFAULT_RETRY_BACKSTOP,
         };
         let retiring = Arc::clone(address);
-        Executor::new(
+        let executor = Executor::new(
             Arc::new(plan),
             &runtime,
             core.compute_lanes(),
@@ -245,7 +251,34 @@ impl Generation {
                 retiring.post(Message::Retired(Box::new(Retired { quantum, outcome })));
             },
         )
-        .map_err(|error| EngineError::Runtime(format!("the stage graphs: {error:?}")))
+        .map_err(|error| EngineError::Runtime(format!("the stage graphs: {error:?}")))?;
+        let Some((sequence, order)) = copies else {
+            return Ok(executor);
+        };
+        // The sequence's own transfer lane (sequences share them when there are fewer lanes than sequences), so that
+        // one sequence's restore does not wait behind another's capture on a lane they would not share.
+        let lane = core.transfer_lane_id(sequence.0 % core.transfer_lanes().max(1));
+        // A copy job that ended tells the order, as a quantum's retirement does (what waits behind it starts), and then
+        // the sequence's owner, which counts it until now.
+        let owner = Arc::clone(address);
+        let ended = Box::new(move |serial| {
+            order.retired(sequence, serial);
+            owner.post(Message::CopyEnded);
+        });
+        let copier = Copier::new(&runtime, core.lane_table.clone(), lane, sequence, ended)
+            .map_err(|error| EngineError::Runtime(format!("the prefix cache's copy graph: {error:?}")))?;
+        Ok(executor.with_copier(copier))
+    }
+
+    /// The `Submit` of a prefix-cache request on this sequence: it hands the job to the sequence's owner, which admits
+    /// it behind the sequence's last device work and counts it in flight until it ends, so the sequence's lease is not
+    /// returned while the job still reads or writes the sequence's state. `kill` stops the job (a restore sets it when
+    /// the copy fails, see [`PrefixCacheHandle::restore`]); `more` is the `more` of the chunk the job follows, or of the
+    /// last chunk admitted when the job follows none.
+    #[allow(dead_code, reason = "the generation's own prefix cache steps call it")]
+    pub(crate) fn copy_submit(&self, kill: Arc<AtomicBool>, more: bool) -> Submit {
+        let address = Arc::clone(&self.shared.address);
+        Box::new(move |job| address.post(Message::Copy(Box::new(CopyRequest { job, kill, more }))))
     }
 
     /// Starts `request` on this sequence, which `lease` holds until the request ends.
@@ -375,6 +408,8 @@ pub(crate) struct Generations {
     generations: Vec<Generation>,
     pool: SequencePool,
     order: Arc<Order<Executor>>,
+    /// The prefix cache the sequences share: `None` until restore on admission, its first caller, opens it (see `Generations::new`).
+    prefix: Option<PrefixCacheHandle>,
     /// A test hook: the next request admitted arms the owner's panic after this many admissions.
     #[cfg(feature = "test-oracles")]
     panic_next: AtomicU64,
@@ -423,6 +458,10 @@ impl Generations {
             Generation::spawner(core),
         ));
         let count = sequences.len();
+        // No cache is opened yet: nothing asks it for a lookup, a capture or a restore, and an open one would pin an arena
+        // nobody uses. Restore on admission, its first caller, opens it here (`open_prefix_cache`, once, before the
+        // generations are built); the handle, its clones and its close are plumbed already.
+        let prefix: Option<PrefixCacheHandle> = None;
         let mut generations: Vec<Generation> = Vec::with_capacity(count);
         let mut waiting = sequences.into_iter().zip(addresses).enumerate();
         while let Some((index, (sequence, address))) = waiting.next() {
@@ -438,6 +477,7 @@ impl Generations {
                 &order,
                 count,
                 draft_ids.clone(),
+                prefix.clone(),
             );
             match built {
                 Ok(generation) => generations.push(generation),
@@ -447,6 +487,9 @@ impl Generations {
                         generations.iter().filter_map(Generation::take_sequence).collect();
                     back.push(sequence);
                     back.extend(waiting.map(|(_, (sequence, _))| sequence));
+                    if let Some(cache) = &prefix {
+                        cache.close(OPERATION_BOUND);
+                    }
                     drop(order.close());
                     return Err(Box::new((error, back)));
                 }
@@ -456,6 +499,7 @@ impl Generations {
             pool: SequencePool::new(count),
             generations,
             order,
+            prefix,
             #[cfg(feature = "test-oracles")]
             panic_next: AtomicU64::new(u64::MAX),
         })
@@ -565,6 +609,11 @@ impl Generations {
     /// request in flight stays allocated, says so, and keeps the order's pins.
     pub(crate) fn close(&self) {
         let closed: Vec<bool> = self.generations.iter().map(Generation::close).collect();
+        // The cache is shut once, after every owner (so no owner posts to it) and before the order its copy jobs
+        // are admitted through.
+        if let Some(cache) = &self.prefix {
+            cache.close(OPERATION_BOUND);
+        }
         if closed.into_iter().all(|closed| closed) {
             // What the workspace's owner still pins goes with it.
             drop(self.order.close());
