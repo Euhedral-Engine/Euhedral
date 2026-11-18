@@ -88,6 +88,10 @@ fn prompt(seed: u64, shared: usize) -> Vec<u32> {
         .collect()
 }
 
+fn prompt_unrelated() -> Vec<u32> {
+    prompt(99, 0)
+}
+
 #[derive(Debug)]
 struct Recording {
     tokens: Vec<u32>,
@@ -189,6 +193,18 @@ fn drafts_as_a_cold_run(name: &str, warm: &Recording, cold: &Recording) {
     let (warm_accepted, warm_drafted) = warm.accepted();
     let (cold_accepted, cold_drafted) = cold.accepted();
     println!("{name}: accepted {warm_accepted}/{warm_drafted} warm, {cold_accepted}/{cold_drafted} cold");
+    let first =
+        |recording: &Recording| -> Vec<usize> { recording.verifications.iter().take(8).map(|v| v.accepted).collect() };
+    println!(
+        "{name}: first verifications {:?} warm, {:?} cold",
+        first(warm),
+        first(cold)
+    );
+    assert_eq!(
+        first(warm),
+        first(cold),
+        "{name}: the first drafts are accepted as in a cold run"
+    );
     assert!(cold_accepted > 0, "{name}: the cold run accepts drafts");
     assert!(
         warm_accepted * 10 >= cold_accepted * 9,
@@ -231,6 +247,16 @@ fn a_speculative_restore_gives_the_tokens_and_the_drafts_of_a_cold_run() {
 
     let (runtime, owner) = start(&machine, ByteSize::gib(2));
     for ((name, prompt, sampling, restored), cold) in cases().iter().zip(&cold) {
+        if *restored > 0 {
+            // An unrelated prompt leaves its own draft cache in the sequence's buffers, so a restore that did not copy
+            // the draft state would find the wrong rows there (the same prompt's would pass for the restored ones).
+            generate(
+                &runtime,
+                &prompt_unrelated(),
+                Speculation::Artifact,
+                SamplingConfig::greedy(0),
+            );
+        }
         let warm = generate(&runtime, prompt, Speculation::Artifact, *sampling);
         assert_eq!(
             warm.outcome.cached_prompt_tokens, *restored,
