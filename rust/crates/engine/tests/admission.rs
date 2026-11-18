@@ -56,7 +56,10 @@ fn the_host_budget_draws_the_line_at_the_spilled_bytes() {
     let spilled = plan_with(&config, &table, &settings, inputs(short, Some(u64::MAX)))
         .unwrap()
         .kv_host_bytes;
-    assert!(plan_with(&config, &table, &settings, inputs(short, Some(spilled - 1))).is_err());
+    // Host memory that cannot hold the pages leaves them on the device, and the weights make the room instead.
+    let without_pages = plan_with(&config, &table, &settings, inputs(short, Some(spilled - 1))).unwrap();
+    assert_eq!(without_pages.kv_host_bytes, 0);
+    assert!(!without_pages.offload.is_empty());
     assert_eq!(
         plan_with(&config, &table, &settings, inputs(short, Some(spilled)))
             .unwrap()
@@ -80,7 +83,7 @@ fn unknown_budgets_do_not_overflow() {
     assert!(spilled.kv_host_bytes > 0);
     // Nothing fits and the host is unlimited: the refusal reports the numbers it always did.
     settings.memory.gpu_limit = Auto::Value(ByteSize(GIB));
-    let Err(PlanError::WeightsDoNotFit { available, free, .. }) =
+    let Err(PlanError::DeviceTooSmallWithOffload { available, free, .. }) =
         plan_with(&config, &table, &settings, inputs(u64::MAX, Some(u64::MAX)))
     else {
         panic!("expected a refusal");
@@ -119,7 +122,7 @@ fn an_unknown_host_budget_refuses_a_spill_and_a_stated_one_allows_it() {
     // A device too small even with the spill is the device's refusal, not the host's.
     assert!(matches!(
         plan_with(&config, &table, &settings, inputs(GIB, None)),
-        Err(PlanError::WeightsDoNotFit { .. })
+        Err(PlanError::DeviceTooSmallWithOffload { .. })
     ));
 }
 

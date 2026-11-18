@@ -33,7 +33,7 @@ use euhedral_inference_settings::Settings;
 use euhedral_io::{IoBuf, IoDone, OpenSpec, OwnedFile};
 use euhedral_memory::Claim;
 
-use crate::error::EngineError;
+use crate::error::{EngineError, PlanError};
 use crate::frames::{Kind, step};
 use crate::generation::Generations;
 use crate::handoff::Handoff;
@@ -45,6 +45,7 @@ use crate::residency::accounting::{Consumer, PlanReservation};
 use crate::residency::budget::{self, HostBudget};
 use crate::residency::footprint;
 use crate::residency::loader::{self, LoadOutcome, Ring};
+use crate::residency::offload::Offload;
 use crate::residency::planner::{LocationBytes, Placement, PlanInputs, ResidencyPlan, plan_with};
 use crate::runtime::resolve_sequences;
 use crate::runtime::{Core, EngineRuntime, ReadyHandoff, StartupReport, Units, free_arrival, raw_file};
@@ -536,6 +537,7 @@ fn plan(mut startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32
             )
             .map_err(EngineError::from)
         })
+        .and_then(|plan| refuse_offload(&plan.offload).map(|()| plan).map_err(EngineError::from))
         // The plan is admitted by the account: its allocations take their claims from the reservation.
         .and_then(|plan| {
             let reservation = core.account.admit(&plan)?;
@@ -554,6 +556,25 @@ fn plan(mut startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32
         }
         Err(error) => startup.fail(error),
     }
+}
+
+/// Refuses a plan that holds weights outside the device: the load places device objects only, so such a plan would
+/// leave objects unloaded. The refusal names the pinned host bytes the plan needs.
+fn refuse_offload(offload: &Offload) -> Result<(), PlanError> {
+    if offload.is_empty() {
+        return Ok(());
+    }
+    Err(PlanError::Unsupported(format!(
+        "the model does not fit the device: {} weights ({} in host memory, {} in the artifact file) would be held \
+         outside it, which needs {} bytes of pinned host memory ({} for the host arena and {} for the disk window); \
+         weights cannot be backed by host memory yet",
+        offload.host.len() + offload.disk.len(),
+        offload.host.len(),
+        offload.disk.len(),
+        offload.host_bytes(),
+        offload.host_arena_bytes,
+        offload.window_bytes()
+    )))
 }
 
 /// Step 4: allocates the weight arena, the workspace and the sequence state, and zeroes the state on the first
@@ -1026,6 +1047,31 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn a_plan_with_weights_outside_the_device_is_refused_naming_the_host_bytes() {
+        use crate::residency::offload::WindowGeometry;
+        assert_eq!(refuse_offload(&Offload::default()), Ok(()));
+        let offload = Offload {
+            host: vec!["text/token_embedding".to_string()],
+            disk: vec!["text/layers/0/mlp/down".to_string()],
+            staging: None,
+            window: Some(WindowGeometry {
+                slots: 8,
+                slot_bytes: 1 << 20,
+            }),
+            host_arena_bytes: 3 << 20,
+        };
+        let refusal = refuse_offload(&offload).unwrap_err().to_string();
+        assert!(
+            refusal.contains(&format!("needs {} bytes of pinned host memory", 11 << 20)),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("1 in host memory, 1 in the artifact file"),
+            "{refusal}"
+        );
+    }
 
     #[test]
     fn host_pinned_bytes_reads_the_limits_and_the_margin_and_is_unknown_without_a_figure() {

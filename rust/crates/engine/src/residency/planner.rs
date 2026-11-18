@@ -7,8 +7,10 @@
 //! reserve (the first sequence's state, the execution workspaces, the shared scratch and the kernel modules loaded
 //! after the model: `ResidencyPlanner.RESERVE_BYTES`) and the prefill scratch of the largest trellis object. When
 //! those do not fit, the cache pages past `context.kv-cache-on-gpu-tokens` move to pinned host memory, which the
-//! host budget must hold, before anything else is considered. Weights never move: a plan whose weights do not fit
-//! is refused with the bytes it needed and the bytes there were.
+//! host budget must hold, before anything else is considered. Then weights leave the device
+//! ([`offload`](crate::residency::offload)), the output head last: they are held in pinned host memory or read from
+//! the artifact file. A plan that does not fit even then is refused with the bytes it needed and the bytes there
+//! were, naming the memory that is short.
 
 use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFormat, WeightLayout};
 use euhedral_inference_settings::{Auto, BatchingSettings, KvFormat, Settings};
@@ -24,6 +26,7 @@ use crate::model::{
 };
 use crate::residency::accounting::{Consumer, ConsumerBytes, plan_items};
 use crate::residency::footprint::{self, PAGE_TOKENS};
+use crate::residency::offload::{self, Offload, OffloadInputs, Reach};
 use crate::residency::scratch::{
     MAX_SEGMENTS, TRELLIS_BLOCK, TrellisThresholds, trellis_mma_bytes, trellis_plan_bytes,
 };
@@ -57,7 +60,18 @@ pub enum PlacementSource {
     },
 }
 
-/// One object on the device: what it is, where its bytes are in the artifact and where they go in the arena.
+/// Where an object's bytes are held while the model runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tier {
+    /// In the device arena, at the placement's `offset`.
+    Device,
+    /// In the pinned host arena, at `offset` (a multiple of [`HOST_ALIGNMENT`](offload::HOST_ALIGNMENT)).
+    Host { offset: u64 },
+    /// In the artifact file, read through the disk window.
+    Disk,
+}
+
+/// One object of the model: what it is, where its bytes are in the artifact and where they are held.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placement {
     /// The artifact's name for the object (the name of the half for a split MTP projection).
@@ -71,8 +85,11 @@ pub struct Placement {
     pub file_offset: u64,
     /// The bytes the object occupies on the device.
     pub bytes: u64,
-    /// Where the object starts in the weight arena (a multiple of [`ARENA_ALIGNMENT`]).
+    /// Where the object starts in the device weight arena (a multiple of [`ARENA_ALIGNMENT`]); 0 for an object that
+    /// is not on the device, whose place is in `tier`.
     pub offset: u64,
+    /// Where the object is held.
+    pub tier: Tier,
 }
 
 impl Placement {
@@ -85,13 +102,16 @@ impl Placement {
 /// The plan: where every object goes, and how much of everything else fits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidencyPlan {
-    /// Every object the load places on the device, in artifact order (the halves of a split projection in place of
-    /// the packed one), with its arena offset.
+    /// Every object the load places, in artifact order (the halves of a split projection in place of the packed
+    /// one), with its tier and, on the device, its arena offset.
     pub device: Vec<Placement>,
-    /// The bytes of the weight arena: the placements, each aligned.
+    /// The bytes of the device weight arena: the placements on the device, each aligned.
     pub arena_bytes: u64,
-    /// The payload bytes of the objects the load places (`ResidencyPlanner.deviceNeed`).
+    /// The payload bytes of the objects on the device.
     pub weights_bytes: u64,
+    /// What leaves the device: the host and disk sets and the memory that takes their place. Empty when the plan is
+    /// resident.
+    pub offload: Offload,
     /// Tokens of the context whose cache pages are on the device.
     pub kv_device_tokens: usize,
     /// Tokens of the context whose cache pages are in pinned host memory (0 when every page is on the device).
@@ -173,12 +193,22 @@ impl ResidencyPlan {
     pub fn location_bytes(&self) -> LocationBytes {
         LocationBytes {
             device: self.device_bytes,
-            host: self.kv_host_bytes,
+            host: self.kv_host_bytes + self.offload.host_bytes(),
         }
     }
 
+    /// The payload bytes of the objects held outside the device, host and disk both.
+    pub fn offloaded_bytes(&self) -> u64 {
+        self.device
+            .iter()
+            .filter(|placement| placement.tier != Tier::Device)
+            .map(|placement| placement.bytes)
+            .sum()
+    }
+
     /// What the plan asks, by consumer: the list the memory planner admitted and the account's reservation is made of.
-    /// Its device bytes sum to `device_bytes`, its host bytes to `kv_host_bytes + prefix_cache_bytes`.
+    /// Its device bytes sum to `device_bytes`, its host bytes to `kv_host_bytes`, the offload's host bytes and
+    /// `prefix_cache_bytes`.
     pub fn consumers(&self) -> Vec<ConsumerBytes> {
         Layout {
             weights: self.arena_bytes,
@@ -188,6 +218,9 @@ impl ResidencyPlan {
             cache_host: self.kv_host_bytes,
             sequences: self.sequences as u64,
             extra_sequence_bytes: self.extra_sequence_bytes,
+            staging_ring: self.offload.staging_bytes(),
+            host_weights: self.offload.host_arena_bytes,
+            disk_window: self.offload.window_bytes(),
         }
         .consumers(self.prefix_cache_bytes)
     }
@@ -195,6 +228,11 @@ impl ResidencyPlan {
     /// The placement named `name`.
     pub fn placement(&self, name: &str) -> Option<&Placement> {
         self.device.iter().find(|placement| placement.name == name)
+    }
+
+    /// The placements held on the device.
+    pub fn on_device(&self) -> impl Iterator<Item = &Placement> {
+        self.device.iter().filter(|placement| placement.tier == Tier::Device)
     }
 }
 
@@ -256,6 +294,21 @@ pub fn plan_with(
     settings: &Settings,
     inputs: PlanInputs,
 ) -> Result<ResidencyPlan, PlanError> {
+    match plan_closest(config, table, settings, inputs)? {
+        (plan, None) => Ok(plan),
+        (_, Some(refusal)) => Err(refusal),
+    }
+}
+
+/// Plans residency against `inputs` as [`plan_with`] does, and when the plan is refused for want of memory returns the
+/// plan that came closest (everything offloadable offloaded) beside the refusal, so that what the refusal is about can
+/// be read: the sets, the cache pages and the bytes. The plan beside a refusal is never to be run.
+pub fn plan_closest(
+    config: &ModelConfig,
+    table: &TensorTable,
+    settings: &Settings,
+    inputs: PlanInputs,
+) -> Result<(ResidencyPlan, Option<PlanError>), PlanError> {
     config.check_supported()?;
     validate_inventory(config, table)?;
     let profile = ArtifactProfile::of(table, config)?;
@@ -297,7 +350,7 @@ pub fn plan_with(
         .into_value()
         .unwrap_or_else(|| profile.kv_format());
 
-    let (device, arena_bytes, weights_bytes) = place(table, &profile)?;
+    let (mut device, arena_all, _) = place(table, &profile)?;
 
     let verified = (1 + (draft_depth as u64).min(MAX_VERIFIED)).max(DRAFT_LOGITS_ROWS);
     // A pass of several sequences' verifications scores every row of every member: its logits rows are the pass's.
@@ -348,34 +401,71 @@ pub fn plan_with(
         0
     };
     let kept = footprint::kv_bytes(config, device_pages * PAGE_TOKENS, kv_format) + region;
+    let original_host = inputs.host_pinned_bytes.unwrap_or(u64::MAX);
     let budgets = Budgets {
         device: available,
-        host: inputs.host_pinned_bytes.unwrap_or(u64::MAX),
+        host: original_host,
     };
     let whole = Layout {
-        weights: arena_bytes,
+        weights: arena_all,
         runtime_reserve,
         scratch: scratch_bytes,
         cache_device: whole_kv,
         cache_host: 0,
         sequences,
         extra_sequence_bytes: extra,
+        staging_ring: 0,
+        host_weights: 0,
+        disk_window: 0,
     };
     let split = (host_pages > 0).then_some(Layout {
         cache_device: kept,
         cache_host: spilled,
         ..whole
     });
-    let (layout, spills) = decide(budgets, whole, split).map_err(|refused| PlanError::WeightsDoNotFit {
-        weights_needed: arena_bytes,
-        state_needed: refused.device_bytes() - arena_bytes,
-        available,
-        free: inputs.device_free,
-        sequences: inputs.sequences,
-    })?;
-    if spills && inputs.host_pinned_bytes.is_none() {
-        return Err(PlanError::HostBudgetUnknown { needed: spilled });
-    }
+    let staging_slots = settings
+        .memory
+        .staging_slots
+        .into_value()
+        .unwrap_or(DEFAULT_STAGING_SLOTS) as usize;
+    let head_rows = sequences.saturating_mul(1 + draft_depth as u64);
+    let (layout, spills, offload, reach) = match decide(budgets, whole, split) {
+        Ok((layout, spills)) => (layout, spills, Offload::default(), None),
+        Err(_) => {
+            // The pages go to the host first, when it holds them; then weights leave the device.
+            let (base, spills) = match split.filter(|split| split.cache_host <= budgets.host) {
+                Some(split) => (split, true),
+                None => (whole, false),
+            };
+            let objects = offload::placed_objects(&device);
+            let reach = offload::offload(
+                &objects,
+                &OffloadInputs {
+                    device_free: available,
+                    fixed_bytes: base.device_bytes() - base.weights,
+                    host_budget: original_host.saturating_sub(base.cache_host),
+                    staging_slots,
+                    head_rows,
+                },
+            );
+            let layout = Layout {
+                weights: reach.resident_bytes,
+                staging_ring: reach.offload.staging_bytes(),
+                host_weights: reach.offload.host_arena_bytes,
+                disk_window: reach.offload.window_bytes(),
+                ..base
+            };
+            (layout, spills, reach.offload.clone(), Some(reach))
+        }
+    };
+    let refusal = match &reach {
+        Some(reach) if !reach.fits() => Some(refusal_of(reach, &layout, inputs, available, max_tokens, original_host)),
+        Some(_) if inputs.host_pinned_bytes.is_none() => Some(PlanError::HostBudgetUnknown {
+            needed: layout.host_bytes(),
+        }),
+        None if spills && inputs.host_pinned_bytes.is_none() => Some(PlanError::HostBudgetUnknown { needed: spilled }),
+        _ => None,
+    };
     let (kv_device_tokens, kv_host_tokens) = if spills {
         (device_pages * PAGE_TOKENS, host_pages * PAGE_TOKENS)
     } else {
@@ -384,41 +474,103 @@ pub fn plan_with(
     let (kv_device_bytes, kv_host_bytes) = (layout.cache_device, layout.cache_host);
     let device_bytes = layout.device_bytes();
     let asked = settings.prefix_cache.size.bytes();
-    let prefix_cache_bytes = if asked > 0 && config.layer_kinds.len() > 1 {
+    let prefix_cache_bytes = if asked > 0 && config.layer_kinds.len() > 1 && refusal.is_none() {
         shrink_to_fit(budgets, layout, asked)
     } else {
         0
     };
-    Ok(ResidencyPlan {
-        device,
-        arena_bytes,
-        weights_bytes,
-        kv_device_tokens: kv_device_tokens as usize,
-        kv_host_tokens: kv_host_tokens as usize,
-        kv_device_bytes,
-        kv_host_bytes,
-        sequences: inputs.sequences,
-        extra_sequence_bytes: extra,
-        workspace_bytes,
-        scratch_bytes,
-        decode_scratch_bytes,
-        runtime_reserve_bytes: layout.runtime_reserve,
-        device_bytes,
-        budget_bytes: available,
-        kv_format,
-        rows,
-        profile,
-        draft_depth,
-        max_context_tokens: max_tokens as usize,
-        prefix_cache_bytes,
-        host_budget_bytes: inputs.host_pinned_bytes,
-        pass_rows,
-        pass_parts,
-    })
+    let weights_bytes = assign(&mut device, &offload);
+    Ok((
+        ResidencyPlan {
+            device,
+            arena_bytes: layout.weights,
+            weights_bytes,
+            offload,
+            kv_device_tokens: kv_device_tokens as usize,
+            kv_host_tokens: kv_host_tokens as usize,
+            kv_device_bytes,
+            kv_host_bytes,
+            sequences: inputs.sequences,
+            extra_sequence_bytes: extra,
+            workspace_bytes,
+            scratch_bytes,
+            decode_scratch_bytes,
+            runtime_reserve_bytes: layout.runtime_reserve,
+            device_bytes,
+            budget_bytes: available,
+            kv_format,
+            rows,
+            profile,
+            draft_depth,
+            max_context_tokens: max_tokens as usize,
+            prefix_cache_bytes,
+            host_budget_bytes: inputs.host_pinned_bytes,
+            pass_rows,
+            pass_parts,
+        },
+        refusal,
+    ))
 }
 
-/// The largest count of sequences, at most `cap`, whose plan against `inputs` (its `sequences` is not read) fits: 1
-/// when `cap` is below 1. The fit only worsens with the count, so the search halves the range. The refusal of a plan of
+/// What a plan that does not fit is refused for. The reference is the whole host budget, not what the cache pages left
+/// of it: the plan is refused for the host only when the arena and the window alone are more than the budget.
+fn refusal_of(
+    reach: &Reach,
+    layout: &Layout,
+    inputs: PlanInputs,
+    available: u64,
+    max_tokens: u64,
+    original_host: u64,
+) -> PlanError {
+    let needed = reach.host_bytes();
+    if needed > original_host {
+        return PlanError::HostTooSmall {
+            needed,
+            budget: original_host,
+        };
+    }
+    PlanError::DeviceTooSmallWithOffload {
+        weights_needed: layout.weights + layout.staging_ring,
+        state_needed: layout.device_bytes() - layout.weights - layout.staging_ring,
+        available,
+        free: inputs.device_free,
+        sequences: inputs.sequences,
+        context_tokens: max_tokens,
+    }
+}
+
+/// The slots of the staging ring when `memory.staging-slots` is `auto`.
+///
+/// Not a setting of its own: it is what `auto` means, and a machine that wants another count sets the setting.
+pub const DEFAULT_STAGING_SLOTS: u32 = 4;
+
+/// Gives every placement its tier and its place there: device objects take the arena in artifact order, each aligned to
+/// [`ARENA_ALIGNMENT`]; host objects take the host arena in artifact order, each aligned to
+/// [`HOST_ALIGNMENT`](offload::HOST_ALIGNMENT). Returns the payload bytes of the device objects.
+fn assign(placements: &mut [Placement], offload: &Offload) -> u64 {
+    let (mut device, mut host, mut payload) = (0u64, 0u64, 0u64);
+    for placement in placements {
+        if offload.holds_on_host(&placement.name) {
+            placement.offset = 0;
+            placement.tier = Tier::Host { offset: host };
+            host += placement.bytes.div_ceil(offload::HOST_ALIGNMENT) * offload::HOST_ALIGNMENT;
+        } else if offload.holds_on_disk(&placement.name) {
+            placement.offset = 0;
+            placement.tier = Tier::Disk;
+        } else {
+            placement.offset = device;
+            placement.tier = Tier::Device;
+            device += align(placement.bytes);
+            payload += placement.bytes;
+        }
+    }
+    debug_assert_eq!(host, offload.host_arena_bytes);
+    payload
+}
+
+/// The largest count of sequences, at most `cap`, whose plan against `inputs` (its `sequences` is not read) fits
+/// without offloading more of the weights than a plan of one sequence does: 1 when `cap` is below 1. The fit only
+/// worsens with the count, so the search halves the range. The refusal of a plan of
 /// one sequence is the answer when even one does not fit, so a device too small for the model says so here.
 pub fn sequences_for(
     config: &ModelConfig,
@@ -428,13 +580,20 @@ pub fn sequences_for(
     cap: usize,
 ) -> Result<usize, PlanError> {
     let with = |sequences: usize| plan_with(config, table, settings, PlanInputs { sequences, ..inputs });
-    with(1)?;
+    // More sequences never offload more than one does: what leaves the device is the cost of every token, and the
+    // sequences share it.
+    let offloaded = with(1)?.offloaded_bytes();
     let (mut low, mut high) = (1, cap.max(1));
     while low < high {
         let middle = low + (high - low).div_ceil(2);
         match with(middle) {
-            Ok(_) => low = middle,
-            Err(PlanError::WeightsDoNotFit { .. } | PlanError::HostBudgetUnknown { .. }) => high = middle - 1,
+            Ok(plan) if plan.offloaded_bytes() <= offloaded => low = middle,
+            Ok(_)
+            | Err(
+                PlanError::HostTooSmall { .. }
+                | PlanError::DeviceTooSmallWithOffload { .. }
+                | PlanError::HostBudgetUnknown { .. },
+            ) => high = middle - 1,
             Err(other) => return Err(other),
         }
     }
@@ -475,6 +634,12 @@ struct Layout {
     sequences: u64,
     /// What each sequence beyond the first needs besides its cache.
     extra_sequence_bytes: u64,
+    /// The device ring that weights outside the device are copied through.
+    staging_ring: u64,
+    /// The pinned host arena of the weights held on the host.
+    host_weights: u64,
+    /// The pinned host window of the weights read from the file.
+    disk_window: u64,
 }
 
 impl Layout {
@@ -484,6 +649,15 @@ impl Layout {
             .saturating_add(self.scratch)
             .saturating_add(self.cache_device.saturating_mul(self.sequences))
             .saturating_add(self.extra_sequence_bytes.saturating_mul(self.sequences - 1))
+            .saturating_add(self.staging_ring)
+    }
+
+    /// The pinned host bytes the plan must have: the cache pages, the weights and the window (not the prefix arena,
+    /// which the plan may drop).
+    fn host_bytes(&self) -> u64 {
+        self.cache_host
+            .saturating_add(self.host_weights)
+            .saturating_add(self.disk_window)
     }
 
     /// The consumers of the layout in the order the memory planner admits them, with the prefix cache's arena of
@@ -499,7 +673,10 @@ impl Layout {
                 Consumer::ExtraSequences,
                 self.extra_sequence_bytes.saturating_mul(self.sequences - 1),
             ),
+            ConsumerBytes::device(Consumer::StagingRing, self.staging_ring),
             ConsumerBytes::host(Consumer::HostPages, self.cache_host),
+            ConsumerBytes::host(Consumer::HostWeights, self.host_weights),
+            ConsumerBytes::host(Consumer::DiskWindow, self.disk_window),
         ];
         if prefix > 0 {
             consumers.push(ConsumerBytes::optional_host(Consumer::PrefixCache, prefix));
@@ -536,7 +713,7 @@ fn shrink_to_fit(budgets: Budgets, layout: Layout, asked: u64) -> u64 {
     if let Ok(true) = admit_with_cache(budgets, layout, asked) {
         return asked;
     }
-    let room = budgets.host.saturating_sub(layout.cache_host).min(asked);
+    let room = budgets.host.saturating_sub(layout.host_bytes()).min(asked);
     if room > 0
         && let Ok(true) = admit_with_cache(budgets, layout, room)
     {
@@ -556,7 +733,7 @@ fn admit_with_cache(budgets: Budgets, layout: Layout, prefix: u64) -> Result<boo
                 kind: LocationKind::HostPinned,
                 capacity: budgets
                     .host
-                    .min(CAPACITY_CAP.max(layout.cache_host.saturating_add(prefix))),
+                    .min(CAPACITY_CAP.max(layout.host_bytes().saturating_add(prefix))),
                 reserve: 0,
             },
             LocationSpec {
@@ -676,6 +853,7 @@ fn place(table: &TensorTable, profile: &ArtifactProfile) -> Result<(Vec<Placemen
             file_offset: entry.offset(),
             bytes: entry.bytes(),
             offset: 0,
+            tier: Tier::Device,
         };
         put(&mut placement);
         placements.push(placement);
@@ -718,6 +896,7 @@ fn split_pack(entry: &TensorEntry) -> Result<[Placement; 2], PlanError> {
         file_offset: entry.offset(),
         bytes,
         offset: 0,
+        tier: Tier::Device,
     };
     Ok([make(0), make(1)])
 }
@@ -822,6 +1001,9 @@ mod tests {
             cache_host: 0,
             sequences: 1,
             extra_sequence_bytes: 0,
+            staging_ring: 0,
+            host_weights: 0,
+            disk_window: 0,
         };
         let split = Layout {
             cache_device: 150,
@@ -857,6 +1039,9 @@ mod tests {
             cache_host: 0,
             sequences: 1,
             extra_sequence_bytes: 0,
+            staging_ring: 0,
+            host_weights: 0,
+            disk_window: 0,
         };
         for device in [u64::MAX, whole.device_bytes(), whole.device_bytes() - 1] {
             let budgets = Budgets { device, host: u64::MAX };
@@ -888,6 +1073,9 @@ mod tests {
             cache_host: 0,
             sequences: 1,
             extra_sequence_bytes: 0,
+            staging_ring: 0,
+            host_weights: 0,
+            disk_window: 0,
         };
         let budgets = Budgets {
             device: u64::MAX,

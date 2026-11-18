@@ -361,19 +361,19 @@ fn a_plan_that_does_not_fit_fails_before_device_alloc() {
     settings.memory.gpu_limit = euhedral_inference_settings::Auto::Value(ByteSize::gib(2));
     let (outcome, _guard) = start(&settings, &machine.library);
     let error = outcome.expect_err("12 GiB of weights do not fit in 2 GiB");
-    let EngineError::Plan(PlanError::WeightsDoNotFit {
-        weights_needed,
-        available,
-        ..
-    }) = &error
-    else {
-        panic!("expected a plan refusal, got {error:?}");
-    };
-    assert!(*weights_needed > 11 << 30 && *available == 2 << 30);
-    let message = error.to_string();
+    // The plan holds what cannot stay on the device in host memory or in the file, which the load cannot place yet; or
+    // the host budget or the device is too small even for that. Each is a refusal of the plan, before any allocation.
     assert!(
-        message.contains(&weights_needed.to_string()) && message.contains(&available.to_string()),
-        "{message}"
+        matches!(
+            error,
+            EngineError::Plan(
+                PlanError::HostTooSmall { .. }
+                    | PlanError::DeviceTooSmallWithOffload { .. }
+                    | PlanError::HostBudgetUnknown { .. }
+                    | PlanError::Unsupported(_)
+            )
+        ),
+        "expected a plan refusal, got {error:?}"
     );
     let after = library.free_bytes().unwrap();
     assert!(
