@@ -657,6 +657,7 @@ mod tests {
     use euhedral_data_structures::queues::MpscQueue;
 
     use crate::handoff::Handoff;
+    use crate::state::Flight;
 
     /// How long a posted message may wait for its turn before the test fails.
     const BOUND: Duration = Duration::from_secs(1);
@@ -1659,7 +1660,7 @@ mod tests {
     /// flight: the outcome is told, and the sequence is given back, then.
     struct Ending {
         inbox: Consumer<bool, Single>,
-        flight: Arc<crate::state::Flight>,
+        flight: Arc<Flight>,
         stopped: bool,
         running: bool,
         /// Whether the sequence is back in the pool.
@@ -1710,7 +1711,7 @@ mod tests {
     fn a_cancelled_request_is_told_and_its_sequence_freed_only_once_its_last_quantum_is_dropped() {
         let queue = MpscQueue::<bool>::new(8);
         let producer = queue.producer();
-        let flight = Arc::new(crate::state::Flight::default());
+        let flight = Arc::new(Flight::default());
         let (free, told) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
         let owner = Ending {
             inbox: queue.consumer(),
