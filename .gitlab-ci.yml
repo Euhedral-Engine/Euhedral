@@ -46,6 +46,8 @@ rust:
     - scripts/check-layers.sh --self-test
     - cargo fmt --all --check
     - cargo clippy --workspace --all-targets -- -D warnings
+    # A build of the server alone, which does not turn on the engine's test-only features that the workspace build does.
+    - cargo check -p euhedral-inference-server -p euhedral-inference-api-server -p euhedral-inference-bench
     - rustup target add aarch64-unknown-linux-gnu
     - cargo check --target aarch64-unknown-linux-gnu -p euhedral-inference-host-gemv
     - cargo test --workspace

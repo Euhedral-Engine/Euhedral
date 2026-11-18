@@ -413,3 +413,74 @@ fn a_cancel_ends_a_sampled_generation_and_frees_the_sequence() {
     assert_eq!(again.tokens, uncut.tokens);
     owner.shutdown(runtime).unwrap();
 }
+
+/// Tells the test thread once the generation reported `after` tokens, and when it ended.
+struct Watcher {
+    tokens: usize,
+    after: usize,
+    reported: Arc<Handoff<()>>,
+    ended: bool,
+    done: Arc<Handoff<GenerationOutcome>>,
+}
+
+impl GenerationListener for Watcher {
+    fn prefill_done(&mut self, _at: Instant) {}
+
+    fn quantum(&mut self, _event: QuantumEvent) {}
+
+    fn token(&mut self, _id: u32, _at: Instant) {
+        assert!(!self.ended, "no call follows `finished`");
+        self.tokens += 1;
+        if self.tokens == self.after {
+            self.reported.send(());
+        }
+    }
+
+    fn finished(&mut self, outcome: GenerationOutcome) {
+        assert!(!self.ended, "`finished` is called once");
+        self.ended = true;
+        self.done.send(outcome);
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn closing_the_engine_mid_decode_cancels_the_generation_and_frees_the_sequence() {
+    let Some(machine) = machine() else { return };
+    let (runtime, owner) = start(&machine);
+
+    // A request that would run for thousands of tokens: only the close ends it.
+    let (reported, done) = (Handoff::new(), Handoff::new());
+    runtime
+        .generate(GenerationRequest {
+            prompt: prompt(40),
+            max_tokens: 3000,
+            stop_tokens: Vec::new(),
+            speculation: Speculation::Off,
+            sampling: SamplingConfig::greedy(0),
+            constraint: None,
+            listener: Box::new(Watcher {
+                tokens: 0,
+                after: 4,
+                reported: Arc::clone(&reported),
+                ended: false,
+                done: Arc::clone(&done),
+            }),
+        })
+        .expect("the request is admitted");
+    reported.wait(WAIT).expect("the decode runs");
+
+    let closing = Instant::now();
+    owner.shutdown(runtime).expect("the engine shuts down");
+    println!("the close took {:?}", closing.elapsed());
+    let outcome = done.take().expect("the listener was told before the close returned");
+    assert_eq!(outcome.reason, FinishReason::Cancelled);
+    assert!(outcome.generated < 3000, "the close cut the generation");
+
+    // The sequence's memory went with the rest: a second engine loads and generates in the same process (the card's
+    // free memory is not compared, because the card is shared).
+    let (runtime, owner) = start(&machine);
+    let again = run_with(&runtime, &prompt(40), Speculation::Off, Trigger::Never);
+    assert_eq!(again.outcome.reason, FinishReason::Length);
+    owner.shutdown(runtime).unwrap();
+}
