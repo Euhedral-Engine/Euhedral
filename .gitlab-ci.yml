@@ -1,5 +1,24 @@
 # GitLab twin of .github/workflows/rust.yaml and native-package.yaml (Linux only; no Windows/ARM runners, and the Intel
 # SDE AVX-512 step is left to GitHub). Jobs run in the arbiter-gated runner; the lease is set by ARBITER_ARGS.
+#
+# `promote` is the release step, played by hand in the pipeline of the integration branch (or under Deployments, environment
+# `main`) once `rust`, `native-package` and `promote-test` have passed: scripts/ci-promote.sh moves main to that commit, starts
+# the next integration branch there (protected, the open merge requests moved to it, INTEGRATION_BRANCH set to it) and deletes
+# the old branch on GitLab. It checks everything first and changes nothing when a check fails. It only runs git and the GitLab
+# API: it never deploys (scripts/deploy-main.py is run by hand).
+# The GitHub push mirror sends protected branches only and keeps refs that diverged: the old branch stays on GitHub and must be
+# deleted there by hand.
+# On the integration branch the three test jobs run whenever anything since main touched their paths (`compare_to`), so a later
+# push that touches none of them cannot hide a failed earlier one. Only `promote` has `environment: main`, which is the
+# environment scope of PROMOTE_TOKEN: no other job may take that environment.
+#
+# The pipeline reads these CI/CD variables of the project (Settings > CI/CD > Variables), none of them in the repository:
+#   INTEGRATION_BRANCH     the integration branch's name (rust/next; not protected); `promote` sets it
+#   PROMOTE_TOKEN          protected and masked, environment scope `main`: a project access token for `promote` (Maintainer;
+#                          api, write_repository)
+#   NEXT_BRANCH            optional, given when `promote` is played: the new branch's name (default: the old number plus one,
+#                          or "-2" appended to a name without a number)
+#   PROMOTE_DRY_RUN        optional, given when `promote` is played: 1 prints the plan and changes nothing
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -13,6 +32,10 @@ variables:
 rust:
   stage: test
   rules:
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $INTEGRATION_BRANCH
+      changes:
+        paths: ["rust/**/*", "native/include/**/*", "mise.toml", ".gitlab-ci.yml"]
+        compare_to: refs/heads/main
     - changes: ["rust/**/*", "native/include/**/*", "mise.toml", ".gitlab-ci.yml"]
   script:
     - mise install rust >/dev/null && eval "$(mise env -s bash)"
@@ -32,6 +55,10 @@ rust:
 native-package:
   stage: test
   rules:
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $INTEGRATION_BRANCH
+      changes:
+        paths: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", ".gitlab-ci.yml"]
+        compare_to: refs/heads/main
     - changes: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", ".gitlab-ci.yml"]
   variables:
     ZIG_GLOBAL_CACHE_DIR: $CI_PROJECT_DIR/native/.zig-global-cache
@@ -42,3 +69,50 @@ native-package:
   artifacts:
     when: on_failure
     paths: [api/build/test-results/test/*.xml]
+
+# Tests of scripts/ci-promote.sh against local bare repositories (no GitLab calls).
+promote-test:
+  stage: test
+  image: debian:trixie-slim
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $INTEGRATION_BRANCH
+      changes:
+        paths: ["scripts/ci-promote.sh", "scripts/test_ci_promote.py", ".gitlab-ci.yml"]
+        compare_to: refs/heads/main
+    - changes: ["scripts/ci-promote.sh", "scripts/test_ci_promote.py", ".gitlab-ci.yml"]
+  variables:
+    ARBITER_ARGS: "--cpu shared:1 --mem 1G"
+    ARBITER_EST: "120"
+  script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git jq python3 >/dev/null
+    - python3 -m unittest scripts/test_ci_promote.py
+
+# The release step, by hand (see the header). It waits for the pipeline's `rust`, `native-package` and `promote-test` jobs
+# (those that its rules created), never runs beside another promotion, and a run from an older pipeline stops at its first check.
+promote:
+  stage: deploy
+  image: debian:trixie-slim   # git 2.47 (merge-tree --write-tree needs 2.38), curl, jq
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $INTEGRATION_BRANCH
+      when: manual
+      allow_failure: true   # the pipeline is green whether or not this is played
+  needs:
+    - job: rust
+      optional: true
+    - job: native-package
+      optional: true
+    - job: promote-test
+      optional: true
+  timeout: 20m
+  resource_group: integration
+  environment:
+    name: main
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: "0"
+    UPSTREAM_MAIN_URL: "https://github.com/Euhedral-Engine/Euhedral.git"   # read by `promote` without credentials; not a secret
+    ARBITER_ARGS: "--cpu shared:1 --mem 1G"
+    ARBITER_EST: "300"
+  script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl jq ca-certificates >/dev/null
+    - scripts/ci-promote.sh
