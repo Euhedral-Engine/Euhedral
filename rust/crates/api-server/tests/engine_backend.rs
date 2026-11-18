@@ -43,6 +43,8 @@ const BAD: u32 = u32::MAX;
 const TOOL_OPEN: u32 = 128;
 const TOOL_CLOSE: u32 = 129;
 const VOCABULARY: usize = 130;
+/// The prompt tokens the fake engine says it restored from the prefix cache.
+const RESTORED: usize = 2;
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -189,7 +191,7 @@ fn outcome(reason: FinishReason, generated: usize) -> GenerationOutcome {
         prompt_tokens: 3,
         generated,
         elapsed: Duration::ZERO,
-        cached_prompt_tokens: 0,
+        cached_prompt_tokens: RESTORED,
     }
 }
 
@@ -405,6 +407,10 @@ fn tokens_arrive_in_order_as_text_then_the_result_with_usage() {
     assert!(result.stop_token_reached);
     assert_eq!(result.token_ids, tokens);
     assert_eq!(result.reasoning_tokens, 0);
+    assert_eq!(
+        result.cached_prompt_tokens, RESTORED,
+        "the engine's restored position reaches the result"
+    );
     drop(heard);
     generation.close();
     rig.finish();

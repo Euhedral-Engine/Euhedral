@@ -82,6 +82,8 @@ pub struct Recorder {
     /// Drafting quanta by phase: count and summed admission-to-retirement time.
     pub draft_phases: BTreeMap<String, (u64, Duration)>,
     pub finished: Option<(Instant, Ending)>,
+    /// The prompt tokens the engine restored from its prefix cache instead of prefilling.
+    pub restored: usize,
 }
 
 impl Recorder {
@@ -94,6 +96,7 @@ impl Recorder {
             steps: Vec::new(),
             draft_phases: BTreeMap::new(),
             finished: None,
+            restored: 0,
         }
     }
 }
@@ -147,7 +150,7 @@ pub fn evaluate(scenario: &Scenario, recorder: &Recorder, is_eos: impl Fn(u32) -
                 eos_observed: None,
                 speculative: None,
                 output_sha256: None,
-                prefix_restored_tokens: None,
+                prefix_restored_tokens: (recorder.restored > 0).then_some(recorder.restored),
             },
             timings: None,
             throughput: None,
@@ -226,7 +229,7 @@ pub fn evaluate(scenario: &Scenario, recorder: &Recorder, is_eos: impl Fn(u32) -
         eos_observed: Some(eos),
         speculative,
         output_sha256: Some(output_sha256(&tokens)),
-        prefix_restored_tokens: None,
+        prefix_restored_tokens: (recorder.restored > 0).then_some(recorder.restored),
     };
 
     let prefill_time = match (prefill.first(), prefill.last()) {
@@ -267,7 +270,11 @@ pub fn evaluate(scenario: &Scenario, recorder: &Recorder, is_eos: impl Fn(u32) -
     let requested = scenario.requested_new_tokens;
     let mut status = SUCCESS;
     let mut reason = None;
-    if prompt_tokens.is_none() || prefill_tokens != prompt_tokens.unwrap_or(0) || prefill.is_empty() {
+    // What the cache restored is not prefilled: the two make the prompt. A prompt restored whole may prefill nothing.
+    if prompt_tokens.is_none()
+        || prefill_tokens + recorder.restored != prompt_tokens.unwrap_or(0)
+        || (prefill.is_empty() && recorder.restored == 0)
+    {
         status = FAILED;
         reason = Some("incomplete_prefill".to_string());
     } else {
@@ -278,7 +285,7 @@ pub fn evaluate(scenario: &Scenario, recorder: &Recorder, is_eos: impl Fn(u32) -
                     reason = Some("inconsistent_generation_boundaries".to_string());
                 }
             }
-            ScenarioKind::FirstToken => {
+            ScenarioKind::FirstToken | ScenarioKind::PrefixRepeat => {
                 if tokens.len() != 1 {
                     status = FAILED;
                     reason = Some("no_first_token".to_string());

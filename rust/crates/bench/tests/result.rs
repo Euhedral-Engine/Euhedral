@@ -364,6 +364,29 @@ fn statuses_follow_the_javas_rules() {
 }
 
 #[test]
+fn a_restored_prefix_is_not_prefilled_and_is_reported() {
+    let prefix = Scenario::new(ScenarioKind::PrefixRepeat, 512, 1).unwrap();
+    let (mut recorder, _) = generation(1, Duration::from_millis(10), Duration::ZERO);
+    // The engine restored 256 of the 512 prompt tokens and prefilled the other 256.
+    recorder.quanta[0].rows = 256;
+    assert_eq!(
+        evaluate(&prefix, &recorder, |_| false).reason.as_deref(),
+        Some("incomplete_prefill"),
+        "without a restore, 256 prefilled tokens are not the prompt"
+    );
+    recorder.restored = 256;
+    let outcome = evaluate(&prefix, &recorder, |_| false);
+    assert_eq!(outcome.status, SUCCESS);
+    assert_eq!(outcome.work.prefix_restored_tokens, Some(256));
+    assert_eq!(outcome.work.prefill_tokens, Some(256));
+    assert!(outcome.timings.unwrap().time_to_first_token.is_some());
+
+    // A miss reports no restore.
+    let (miss, _) = generation(1, Duration::from_millis(10), Duration::ZERO);
+    assert_eq!(evaluate(&prefix, &miss, |_| false).work.prefix_restored_tokens, None);
+}
+
+#[test]
 fn speculative_steps_fill_the_block_and_set_the_window() {
     let scenario = Scenario::new(ScenarioKind::SustainedDecode, 512, 9).unwrap();
     let (mut recorder, _) = generation(9, Duration::from_millis(10), Duration::ZERO);

@@ -184,7 +184,7 @@ impl GenerationListener for Relay {
                 completion_tokens: self.tokens.len(),
                 stop_token_reached: self.stopped(),
                 reasoning_tokens: self.reasoning_tokens(),
-                cached_prompt_tokens: 0,
+                cached_prompt_tokens: outcome.cached_prompt_tokens,
                 token_ids: take(&mut self.tokens),
             }),
         };

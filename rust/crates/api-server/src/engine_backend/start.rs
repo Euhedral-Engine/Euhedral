@@ -16,12 +16,13 @@ use euhedral_inference_engine::error::EngineError;
 use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, GenerationRequest as EngineRequest, MAX_VERIFIED, Speculation,
 };
+use euhedral_inference_engine::prefix::PrefixCacheStats;
 use euhedral_inference_engine::runtime::{EngineRuntime, ReadyHandoff, RuntimeOwner};
 use euhedral_inference_settings::{Settings, variable_name};
 use euhedral_inference_tokenizer::{TokenStream, Tokenizer, TokenizerSection, chat_template, read_artifact_section};
 
 use super::{Codec, Engine, EngineBackend, TextStream};
-use crate::backend::EngineReport;
+use crate::backend::{EngineReport, PrefixCacheReport};
 
 /// The settings key that names the artifact.
 const ARTIFACT_KEY: &str = "model.artifact";
@@ -129,7 +130,7 @@ impl Engine for RuntimeEngine {
             host_backed_weight_bytes: runtime.plan().location_bytes().host,
             pinned_pool_bytes: runtime.pinned_pool().held_bytes(),
             pinned_pool_overflows: 0,
-            prefix_cache: None,
+            prefix_cache: runtime.prefix_cache_stats().map(prefix_report),
         }
     }
 }
@@ -402,6 +403,25 @@ pub fn start(
     begin_start(settings, library, close_timeout)?.wait(limit)
 }
 
+/// The engine's counters as the metrics page reports them.
+fn prefix_report(stats: PrefixCacheStats) -> PrefixCacheReport {
+    PrefixCacheReport {
+        lookups: stats.lookups,
+        hits: stats.hits,
+        restored_tokens: stats.restored_tokens,
+        captures: stats.captures,
+        skipped: stats.skipped,
+        failed: stats.failed,
+        evictions: stats.evictions,
+        restores: stats.restores,
+        capture_nanos: stats.capture_nanos,
+        restore_nanos: stats.restore_nanos,
+        nodes: stats.nodes,
+        used_bytes: stats.used_bytes,
+        capacity_bytes: stats.capacity_bytes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -415,6 +435,42 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    #[test]
+    fn the_engines_prefix_counters_all_reach_the_report() {
+        let stats = PrefixCacheStats {
+            lookups: 1,
+            hits: 2,
+            restored_tokens: 3,
+            captures: 4,
+            skipped: 5,
+            failed: 6,
+            evictions: 7,
+            restores: 8,
+            capture_nanos: 9,
+            restore_nanos: 10,
+            nodes: 11,
+            used_bytes: 12,
+            capacity_bytes: 13,
+        };
+        let report = prefix_report(stats);
+        let fields = [
+            report.lookups,
+            report.hits,
+            report.restored_tokens,
+            report.captures,
+            report.skipped,
+            report.failed,
+            report.evictions,
+            report.restores,
+            report.capture_nanos,
+            report.restore_nanos,
+            report.nodes,
+            report.used_bytes,
+            report.capacity_bytes,
+        ];
+        assert_eq!(fields, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    }
 
     const CHECKPOINT_TEMPLATE: &str = include_str!("../../../api-protocol/tests/data/qwen-chat-template.jinja");
 

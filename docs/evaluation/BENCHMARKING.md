@@ -102,7 +102,7 @@ against the working directory, which is the repository root under `./gradlew :be
 | `kvDeviceMinimumTokens` | `65536` | Tokens of each sequence's attention cache kept on the GPU when the weights and the whole cache do not fit; the pages past them live in pinned host memory before any weight leaves the GPU ([ATTENTION_DECODE.md](../kernels/ATTENTION_DECODE.md#cache-pages-in-host-memory)). |
 | `cpus` | `all` | `all`, `one-per-core`, `performance`, `performance-one-per-core`, or IDs/ranges (`"2-5,8"`). |
 | `excludeCpus`, `excludeCores` | `[]` | Processor IDs or Euhedral core IDs removed from the selection. |
-| `scenarios` | default suite | Strings: `prefill:P`, `first-token:P`, `prompt-to-n:P:N`, `decode:P:N`. |
+| `scenarios` | default suite | Strings: `prefill:P`, `first-token:P`, `prompt-to-n:P:N`, `decode:P:N`; the Rust benchmark also takes `prefix:P` (below). |
 | `warmup`, `iterations` | `1`, `3` | Warmup and measured iterations per scenario. |
 | `generation` | `{"mode":"greedy","seed":1}` | `sample` mode also takes `temperature`, `topK`, `topP` (0.7, 20, 0.8). |
 | `promptSeed` | `20260925` | Seed for prompt material. |
@@ -119,6 +119,15 @@ available processor.
 
 The default suite is `prefill:32`, `prefill:256`, `prefill:1024`, `prefill:4096`,
 `first-token:1024`, `prompt-to-n:1024:64`, and `decode:32:256`.
+
+The Rust benchmark's `prefix:P` scenario (for example `prefix:2048`) measures the time to first token with a cached
+prefix. Each iteration asks for one token of the same `P`-token prompt twice, and writes two rows, `prefix-P-cold` and
+`prefix-P-repeat`, each with its own `timeToFirstToken` and its `prefixRestoredTokens`. The cold prompt's first token
+is replaced by one no earlier request of the run began with, so the cache has nothing of it; the repeat sends the same
+ids and restores the checkpoint the cold request stored. A cold row that restored a prefix, or a repeat that restored
+none, is `ineligible` (`cold_request_restored_a_prefix`, `repeat_restored_no_prefix`). A run with a prefix scenario
+has the prefix cache on for all its scenarios, at the size of the engine settings (`engineConfig`, else the default),
+and records that size in the run snapshot; run it with the prefix scenario alone. Any other run keeps the cache off.
 
 ### Forks
 

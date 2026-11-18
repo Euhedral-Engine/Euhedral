@@ -35,6 +35,7 @@ use crate::handoff::Handoff;
 use crate::kernels::kernel_sources;
 use crate::model::{ArtifactProfile, ModelConfig, Speculation, Weights};
 use crate::plan::Plan;
+use crate::prefix::PrefixCacheStats;
 use crate::residency::planner::{PlanInputs, ResidencyPlan, sequences_for};
 use crate::stages::LaneTable;
 use crate::startup;
@@ -636,6 +637,11 @@ impl EngineRuntime {
     /// The sequences the engine holds, each of which runs one request at a time: the requests that run at once.
     pub fn sequences(&self) -> usize {
         self.generations.sequences()
+    }
+
+    /// The prefix cache's counters; `None` when the cache is off (`prefix-cache.size: 0`).
+    pub fn prefix_cache_stats(&self) -> Option<PrefixCacheStats> {
+        self.generations.prefix_cache_stats()
     }
 
     /// The model's dimensions.

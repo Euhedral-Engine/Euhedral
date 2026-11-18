@@ -51,6 +51,9 @@ pub enum ScenarioKind {
     PromptToN,
     /// Sustained decode after a short prompt; eligible only if all N tokens are produced.
     SustainedDecode,
+    /// Prefill plus the first token of a prompt, asked for twice in a row: cold, then repeated, with the prefix cache
+    /// on (`maxNewTokens = 1` each).
+    PrefixRepeat,
 }
 
 impl ScenarioKind {
@@ -61,12 +64,14 @@ impl ScenarioKind {
             ScenarioKind::FirstToken => "first-token",
             ScenarioKind::PromptToN => "prompt-to-n",
             ScenarioKind::SustainedDecode => "decode",
+            ScenarioKind::PrefixRepeat => "prefix",
         }
     }
 }
 
 /// One workload: a prompt of `target_prompt_tokens` tokens followed by at most `requested_new_tokens` generated tokens
-/// in a fresh sequence. Specification syntax: `prefill:P`, `first-token:P`, `prompt-to-n:P:N`, `decode:P:N`.
+/// in a fresh sequence. Specification syntax: `prefill:P`, `first-token:P`, `prompt-to-n:P:N`, `decode:P:N`,
+/// `prefix:P`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Scenario {
     pub kind: ScenarioKind,
@@ -111,6 +116,9 @@ impl Scenario {
             ScenarioKind::FirstToken if requested_new_tokens != 1 => {
                 return invalid("first-token scenarios generate one");
             }
+            ScenarioKind::PrefixRepeat if requested_new_tokens != 1 => {
+                return invalid("prefix scenarios generate one");
+            }
             ScenarioKind::PromptToN | ScenarioKind::SustainedDecode if requested_new_tokens < 2 => {
                 return invalid(format!("{} scenarios need at least two new tokens", kind.label()));
             }
@@ -126,7 +134,7 @@ impl Scenario {
     /// The name rows carry: `prefill-32`, `decode-32-256`.
     pub fn name(&self) -> String {
         match self.kind {
-            ScenarioKind::Prefill | ScenarioKind::FirstToken => {
+            ScenarioKind::Prefill | ScenarioKind::FirstToken | ScenarioKind::PrefixRepeat => {
                 format!("{}-{}", self.kind.label(), self.target_prompt_tokens)
             }
             ScenarioKind::PromptToN | ScenarioKind::SustainedDecode => {
@@ -143,7 +151,7 @@ impl Scenario {
     /// The specification that parses back to this scenario.
     pub fn spec(&self) -> String {
         match self.kind {
-            ScenarioKind::Prefill | ScenarioKind::FirstToken => {
+            ScenarioKind::Prefill | ScenarioKind::FirstToken | ScenarioKind::PrefixRepeat => {
                 format!("{}:{}", self.kind.label(), self.target_prompt_tokens)
             }
             ScenarioKind::PromptToN | ScenarioKind::SustainedDecode => {
@@ -157,7 +165,7 @@ impl Scenario {
         }
     }
 
-    /// Parses `prefill:P`, `first-token:P`, `prompt-to-n:P:N` or `decode:P:N`.
+    /// Parses `prefill:P`, `first-token:P`, `prompt-to-n:P:N`, `decode:P:N` or `prefix:P`.
     pub fn parse(text: &str) -> Result<Scenario, ConfigError> {
         let lowered = text.trim().to_lowercase();
         let parts: Vec<&str> = lowered.split(':').collect();
@@ -170,16 +178,17 @@ impl Scenario {
             ScenarioKind::FirstToken,
             ScenarioKind::PromptToN,
             ScenarioKind::SustainedDecode,
+            ScenarioKind::PrefixRepeat,
         ];
         let Some(kind) = kinds.into_iter().find(|kind| kind.label() == parts[0]) else {
             return invalid(format!("unknown scenario kind: {text}"));
         };
         match kind {
-            ScenarioKind::Prefill | ScenarioKind::FirstToken => {
+            ScenarioKind::Prefill | ScenarioKind::FirstToken | ScenarioKind::PrefixRepeat => {
                 if parts.len() != 2 {
                     return invalid(format!("invalid scenario: {text}"));
                 }
-                let new = usize::from(kind == ScenarioKind::FirstToken);
+                let new = usize::from(kind != ScenarioKind::Prefill);
                 Scenario::new(kind, number(parts[1])?, new)
             }
             ScenarioKind::PromptToN | ScenarioKind::SustainedDecode => {
@@ -323,8 +332,8 @@ impl Options {
         }
         if prefix_cache_bytes > 0 {
             return invalid(
-                "prefixCacheBytes must be 0: the Rust engine always prefills the whole prompt, so a prefix cache would \
-                 make the engines run different work",
+                "prefixCacheBytes must be 0: a run keeps the prefix cache off, except that a prefix scenario turns it on \
+                 (with the engine settings' size) so that the repeats of the other scenarios do not run different work",
             );
         }
         let cpus = raw.cpus.as_deref().map_or("all", str::trim);
@@ -406,6 +415,14 @@ impl Options {
             speculation,
             engine_config: raw.engine_config,
         })
+    }
+
+    /// Whether the run needs the engine's prefix cache: it has a prefix scenario. The cache is on for the whole run
+    /// then, at the size of the engine settings; any other run keeps it off.
+    pub fn uses_prefix_cache(&self) -> bool {
+        self.scenarios
+            .iter()
+            .any(|scenario| scenario.kind == ScenarioKind::PrefixRepeat)
     }
 
     /// Whether the output is one JSON document (a `.json` path) and not JSONL.
