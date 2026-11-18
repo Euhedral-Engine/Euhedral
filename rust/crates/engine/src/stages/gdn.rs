@@ -211,8 +211,12 @@ impl Launch for GdnConvolution {
         for segment in quantum.segments() {
             let state = layer_state(segment, self.layer)?;
             let offset = segment.row_offset as u64;
-            let query_key = quantum.slot(self.query_key).offset(offset * u64::from(query_key_width) * 2);
-            let value_z = quantum.slot(self.value_z).offset(offset * 2 * u64::from(value_width) * 2);
+            let query_key = quantum
+                .slot(self.query_key)
+                .offset(offset * u64::from(query_key_width) * 2);
+            let value_z = quantum
+                .slot(self.value_z)
+                .offset(offset * 2 * u64::from(value_width) * 2);
             // A verification before this quantum accepted only part of its rows: rebuild this layer's state first.
             let replay = segment.refs.replay_rows(self.layer) as usize;
             if replay > 0 {

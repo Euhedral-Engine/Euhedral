@@ -51,9 +51,16 @@ mod tests {
         let offset = InputRecordRef::position_offset(ids.len()) as usize;
         assert_eq!(bytes.len(), offset + 24);
         for (index, position) in [300u64, 411, 530].iter().enumerate() {
-            assert_eq!(bytes[offset + 8 * index..offset + 8 * index + 8], position.to_ne_bytes());
+            assert_eq!(
+                bytes[offset + 8 * index..offset + 8 * index + 8],
+                position.to_ne_bytes()
+            );
         }
-        assert_eq!(encode_positions(&ids, &[9]), encode(&ids, 9), "one segment is the single record");
+        assert_eq!(
+            encode_positions(&ids, &[9]),
+            encode(&ids, 9),
+            "one segment is the single record"
+        );
     }
 
     #[test]

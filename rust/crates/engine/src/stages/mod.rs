@@ -27,6 +27,7 @@ pub mod sampling;
 pub mod unmarked;
 
 use std::fmt::{self, Display};
+use std::iter::repeat_n;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -47,8 +48,8 @@ use crate::quantum::Capture;
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
 use crate::state::{FlightGuard, KvView, SequenceDevice, SequenceId};
 use crate::workspace::{BufferSlot, Workspace, WorkspaceError, input_record_bytes};
-use euhedral_inference_settings::KvFormat;
 use attention::KvSource;
+use euhedral_inference_settings::KvFormat;
 use sampling::{RowReadback, Selection, SelectionLease};
 pub use unmarked::Unmarked;
 
@@ -392,6 +393,16 @@ impl Segment {
         self.index
     }
 
+    /// The words and readback the segment's argmax fills, if its rows select on the device.
+    pub fn selection(&self) -> Option<&Arc<Selection>> {
+        self.selection.as_ref()
+    }
+
+    /// The readback the segment's logits rows are copied to, if the host selects.
+    pub fn row_readback(&self) -> Option<&Arc<RowReadback>> {
+        self.row_readback.as_ref()
+    }
+
     /// The sequence of the segment, when the quantum is a batch.
     pub fn sequence(&self) -> Option<SequenceId> {
         self.sequence
@@ -529,7 +540,10 @@ impl Part {
                 (Some(_), Some(_)) => LogitsUse::Both,
             },
             selection: self.selection.as_ref().map(|selection| Arc::as_ptr(selection) as usize),
-            readback: self.row_readback.as_ref().map(|readback| Arc::as_ptr(readback) as usize),
+            readback: self
+                .row_readback
+                .as_ref()
+                .map(|readback| Arc::as_ptr(readback) as usize),
         }
     }
 }
@@ -571,7 +585,10 @@ pub(crate) fn lay_out(shapes: &[Shape], record_bytes: u64) -> Result<(Vec<usize>
                 what: format!("part {index} both selects on the device and reads its rows back"),
             });
         }
-        if let Some(first) = shapes[..index].iter().position(|other| other.sequence == shape.sequence) {
+        if let Some(first) = shapes[..index]
+            .iter()
+            .position(|other| other.sequence == shape.sequence)
+        {
             return Err(QuantumError::DuplicateSequence {
                 sequence: shape.sequence,
                 first,
@@ -677,7 +694,9 @@ pub enum QuantumError {
         first: usize,
         second: usize,
     },
-    #[error("part {other} of the batch scores its rows differently from part {first}: all select on the device, all read back, or none scores")]
+    #[error(
+        "part {other} of the batch scores its rows differently from part {first}: all select on the device, all read back, or none scores"
+    )]
     MixedLogits { first: usize, other: usize },
     #[error("part {other} of the batch has a cache in another format than part {first}")]
     KvFormatMismatch { first: usize, other: usize },
@@ -864,7 +883,7 @@ impl Quantum {
             }
             let part_rows = part.tokens.len();
             if part.draft_token_read.is_some() {
-                tokens.extend(std::iter::repeat_n(0u32, part_rows));
+                tokens.extend(repeat_n(0u32, part_rows));
             } else {
                 tokens.extend_from_slice(&part.tokens);
             }

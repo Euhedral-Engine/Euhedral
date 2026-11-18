@@ -160,10 +160,26 @@ impl Launch for KvAppend {
             let position = quantum.position_of(segment.index);
             match cache.format() {
                 KvFormat::Nvfp4 => kernels.attention_kv_append_nvfp4(
-                    query_key, gate, keys, values, rows_u32, query_width, key_width, start, position,
+                    query_key,
+                    gate,
+                    keys,
+                    values,
+                    rows_u32,
+                    query_width,
+                    key_width,
+                    start,
+                    position,
                 ),
                 KvFormat::Bf16 => kernels.attention_kv_append_bf16(
-                    query_key, gate, keys, values, rows_u32, query_width, key_width, start, position,
+                    query_key,
+                    gate,
+                    keys,
+                    values,
+                    rows_u32,
+                    query_width,
+                    key_width,
+                    start,
+                    position,
                 ),
             }
             .map_err(fatal)?;

@@ -41,7 +41,8 @@ use thiserror::Error;
 
 pub use capture_key::{CaptureKey, split_geometry};
 pub use input_record::{
-    encode as encode_input_record, encode_into as encode_input_record_into, encode_positions as encode_input_record_positions,
+    encode as encode_input_record, encode_into as encode_input_record_into,
+    encode_positions as encode_input_record_positions,
 };
 
 use crate::plan::{MAX_CAPTURED_ROWS, Plan, Variant, View};
@@ -108,7 +109,8 @@ impl Quantum {
         let zeros;
         let ids: &[u32] = if self.tokens.len() == self.rows {
             &self.tokens
-        } else if self.token_from.is_some() || self.segments().iter().all(|segment| segment.draft_token_read.is_some()) {
+        } else if self.token_from.is_some() || self.segments().iter().all(|segment| segment.draft_token_read.is_some())
+        {
             zeros = vec![0u32; self.rows];
             &zeros
         } else {
