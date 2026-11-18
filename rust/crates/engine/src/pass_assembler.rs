@@ -5,11 +5,18 @@
 //! reported (offered its next step or left). A pass then takes the pending offers in arrival order, up to `max_rows`
 //! rows and `max_parts` offers; a step over `max_rows` forms a pass of its own.
 //!
-//! The owner drives it: after an event that can release a pass ([`offer`](PassAssembler::offer),
-//! [`leave`](PassAssembler::leave), [`retired`](PassAssembler::retired), [`withdraw`](PassAssembler::withdraw)) it
-//! calls [`next_pass`](PassAssembler::next_pass), runs what it returns, and tells the assembler how many retirements
-//! that pass will report with [`admitted`](PassAssembler::admitted). A pass that admitted nothing owes no
-//! retirement, and the owner asks for the next pass at once.
+//! The owner drives it: after every event, including a refused [`offer`](PassAssembler::offer) (a step of no rows
+//! releases its sequence's wait), and after [`leave`](PassAssembler::leave) and [`retired`](PassAssembler::retired),
+//! it calls [`next_pass`](PassAssembler::next_pass), runs what it returns, and tells the assembler how many
+//! retirements that pass will report with [`admitted`](PassAssembler::admitted). [`withdraw`](PassAssembler::withdraw)
+//! only shrinks the pending offers and never releases a pass.
+//!
+//! Obligations of the owner:
+//! - Between `next_pass` and `admitted` it must always call `admitted`; a run that failed or was abandoned is
+//!   `admitted(0)`, after which it asks for the next pass at once. Otherwise `next_pass` returns `None` forever.
+//! - The count must be the number of retirements the pass really owes. A run that fails after `admitted` must still
+//!   call `retired` for every retirement it owes.
+//! - The caps given to `new` must be non-zero: validate the settings first, since `new` panics otherwise.
 
 use std::collections::{HashSet, VecDeque};
 use std::error::Error;
@@ -128,14 +135,20 @@ impl<O: PassOffer> PassAssembler<O> {
         Ok(())
     }
 
-    /// Releases the wait for a sequence that will not offer again. A member of the pass in flight is recorded as
-    /// departed so that its retirement does not await it.
-    pub fn leave(&mut self, sequence: SequenceId) {
-        if !self.awaiting.remove(&sequence)
-            && (self.flight.contains(&sequence) || self.forming.as_ref().is_some_and(|f| f.contains(&sequence)))
-        {
+    /// Releases the wait for a sequence that will not offer again, and returns its pending step, if it has one, so the
+    /// owner gets the step back. A member of the pass in flight is recorded as departed so that its retirement does
+    /// not await it.
+    pub fn leave(&mut self, sequence: SequenceId) -> Option<O> {
+        self.awaiting.remove(&sequence);
+        let in_pass = self.flight.contains(&sequence) || self.forming.as_ref().is_some_and(|f| f.contains(&sequence));
+        if in_pass {
             self.departed.insert(sequence);
         }
+        if !self.pending_sequences.remove(&sequence) {
+            return None;
+        }
+        let at = self.pending.iter().position(|offer| offer.sequence() == sequence)?;
+        self.pending.remove(at)
     }
 
     /// Retires one quantum of the pass in flight. Its members must report before the next pass forms, unless they
@@ -161,19 +174,21 @@ impl<O: PassOffer> PassAssembler<O> {
         Ok(())
     }
 
-    /// Removes the pending offers `selected` accepts, in arrival order.
+    /// Removes the pending offers `selected` accepts, in arrival order. Each is removed as it is chosen, so the state
+    /// stays consistent if `selected` panics.
     pub fn withdraw(&mut self, mut selected: impl FnMut(&O) -> bool) -> Vec<O> {
         let mut out = Vec::new();
-        let mut kept = VecDeque::with_capacity(self.pending.len());
-        for offer in self.pending.drain(..) {
-            if selected(&offer) {
-                self.pending_sequences.remove(&offer.sequence());
-                out.push(offer);
+        let mut at = 0;
+        while at < self.pending.len() {
+            if selected(&self.pending[at]) {
+                if let Some(offer) = self.pending.remove(at) {
+                    self.pending_sequences.remove(&offer.sequence());
+                    out.push(offer);
+                }
             } else {
-                kept.push_back(offer);
+                at += 1;
             }
         }
-        self.pending = kept;
         out
     }
 
@@ -235,6 +250,8 @@ impl<O: PassOffer> PassAssembler<O> {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::*;
 
     const A: SequenceId = SequenceId(0);
@@ -300,9 +317,10 @@ mod tests {
             result
         }
 
-        fn leave(&mut self, sequence: SequenceId) {
-            self.assembler.leave(sequence);
+        fn leave(&mut self, sequence: SequenceId) -> Option<Step> {
+            let returned = self.assembler.leave(sequence);
             self.settle();
+            returned
         }
 
         fn retired(&mut self, members: &[SequenceId]) -> Result<(), Misuse> {
@@ -358,10 +376,10 @@ mod tests {
         let mut rig = Rig::new(8, 8);
         rig.offer(A, 1).unwrap();
         rig.offer(B, 1).unwrap();
-        rig.leave(Z);
-        rig.leave(B);
+        assert!(rig.leave(Z).is_none());
         assert_eq!(rig.passes.len(), 1);
         assert_eq!(rig.assembler.pending(), 1);
+        assert_eq!(rig.assembler.awaiting(), 0);
     }
 
     #[test]
@@ -684,15 +702,138 @@ mod tests {
     }
 
     #[test]
-    fn a_member_that_leaves_while_its_pass_is_in_flight_is_released_at_retirement() {
+    fn two_retirements_owed_hold_the_next_pass_and_keep_departures() {
+        let mut assembler = PassAssembler::<Step>::new(8, 8);
+        for (serial, sequence) in [A, B].into_iter().enumerate() {
+            assembler
+                .offer(Step {
+                    sequence,
+                    rows: 1,
+                    serial,
+                })
+                .unwrap();
+        }
+        let pass = assembler.next_pass().unwrap();
+        assert_eq!(pass.len(), 2);
+        assembler.admitted(2).unwrap();
+        assembler
+            .offer(Step {
+                sequence: C,
+                rows: 1,
+                serial: 3,
+            })
+            .unwrap();
+        assert!(assembler.leave(A).is_none());
+        assembler.retired(&[B]).unwrap();
+        assert!(assembler.next_pass().is_none());
+        assert_eq!(assembler.in_flight(), 1);
+        assembler.retired(&[A]).unwrap();
+        assert_eq!(assembler.awaiting(), 1);
+        assert_eq!(assembler.in_flight(), 0);
+        assert!(assembler.next_pass().is_none());
+        assembler
+            .offer(Step {
+                sequence: B,
+                rows: 1,
+                serial: 4,
+            })
+            .unwrap();
+        assert_eq!(assembler.next_pass().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_member_that_offered_and_then_leaves_gets_its_step_back() {
         let mut rig = Rig::new(8, 8);
         rig.offer(A, 1).unwrap();
         rig.offer(B, 1).unwrap();
-        rig.leave(A);
+        rig.offer(A, 3).unwrap();
+        assert_eq!(rig.assembler.pending(), 2);
+        let back = rig.leave(A).unwrap();
+        assert_eq!((back.sequence, back.rows), (A, 3));
+        assert_eq!(rig.assembler.pending(), 1);
+        // A is released at its pass's retirement, so B's pass forms and A may offer again later.
         rig.retired(&[A]).unwrap();
-        assert_eq!(rig.passes.len(), 2);
         assert_eq!(rig.names(1), [B]);
         assert_eq!(rig.assembler.awaiting(), 0);
+        rig.offer(A, 1).unwrap();
+        assert_eq!(rig.assembler.pending(), 1);
+    }
+
+    #[test]
+    fn leaving_with_a_pending_step_returns_it_and_frees_the_slot() {
+        let mut rig = Rig::new(8, 8);
+        rig.offer(A, 1).unwrap();
+        rig.offer(B, 1).unwrap();
+        let back = rig.leave(B).unwrap();
+        assert_eq!(back.sequence, B);
+        assert_eq!(rig.assembler.pending(), 0);
+        rig.retired(&[A]).unwrap();
+        assert_eq!(rig.assembler.awaiting(), 1);
+        rig.leave(A);
+        assert_eq!(rig.assembler.awaiting(), 0);
+        rig.offer(B, 1).unwrap();
+        assert_eq!(rig.passes.len(), 2);
+    }
+
+    #[test]
+    fn a_panicking_predicate_leaves_the_pending_state_consistent() {
+        let mut rig = Rig::new(8, 8);
+        rig.offer(X, 1).unwrap();
+        rig.offer(A, 1).unwrap();
+        rig.offer(B, 1).unwrap();
+        let mut seen = 0;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            rig.assembler.withdraw(|_| {
+                seen += 1;
+                assert!(seen < 2, "boom");
+                true
+            })
+        }));
+        assert!(result.is_err());
+        // A was withdrawn and may offer again; B is still pending and still refused as a duplicate.
+        assert_eq!(rig.assembler.pending(), 1);
+        rig.offer(A, 1).unwrap();
+        assert_eq!(rig.offer(B, 1), Err(Refusal::Duplicate));
+    }
+
+    #[test]
+    fn a_failed_run_leaves_the_gate_consistent() {
+        let mut assembler = PassAssembler::<Step>::new(4, 8);
+        assembler
+            .offer(Step {
+                sequence: A,
+                rows: 1,
+                serial: 0,
+            })
+            .unwrap();
+        assert_eq!(assembler.next_pass().unwrap().len(), 1);
+        assembler.admitted(0).unwrap();
+        assert_eq!(assembler.in_flight(), 0);
+        assert_eq!(assembler.pending(), 0);
+        assembler
+            .offer(Step {
+                sequence: A,
+                rows: 1,
+                serial: 1,
+            })
+            .unwrap();
+        let pass = assembler.next_pass().unwrap();
+        assert_eq!(pass[0].sequence, A);
+        assembler.admitted(1).unwrap();
+        assert_eq!(assembler.in_flight(), 1);
+    }
+
+    #[test]
+    fn a_parts_cap_above_one_splits_after_that_many_offers() {
+        let mut rig = Rig::new(8, 2);
+        rig.offer(X, 1).unwrap();
+        rig.offer(A, 1).unwrap();
+        rig.offer(B, 1).unwrap();
+        rig.offer(C, 1).unwrap();
+        rig.retired(&[]).unwrap();
+        assert_eq!(rig.names(1), [A, B]);
+        rig.retired(&[]).unwrap();
+        assert_eq!(rig.names(2), [C]);
     }
 
     #[test]
