@@ -20,9 +20,8 @@ mod teacher_forced;
 
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
-#[cfg(feature = "test-oracles")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use euhedral_core::generics::FrameSink;
 use euhedral_data_structures::queues::MpscQueue;
@@ -43,6 +42,7 @@ pub use acceptance::{Accepted, accept, accept_tokens};
 pub use constraint::{ConstraintError, ReasoningConstraint, TokenConstraint};
 pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
 pub use listener::GenerationListener;
+pub(crate) use mailbox::OPERATION_BOUND;
 use mailbox::{Address, Mailbox, Spawn};
 pub use request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
@@ -60,6 +60,12 @@ fn admit(core: &Core) -> Result<Units, AdmissionError> {
 /// Why a request is refused once the owner is closed.
 fn closed_error() -> AdmissionError {
     AdmissionError::Engine("the engine is closed".to_string())
+}
+
+/// The owner a request may begin on: none once the engine stops, so that the request is refused as one that found the
+/// owner closed.
+fn unless_closing<'a, T>(closing: &AtomicBool, owner: Option<&'a mut T>) -> Option<&'a mut T> {
+    owner.filter(|_| !closing.load(Ordering::SeqCst))
 }
 
 /// A request that found the owner closed.
@@ -121,6 +127,7 @@ impl Generation {
             chunk: residency.rows.rows as usize,
             capacity,
             drafts,
+            closing: AtomicBool::new(false),
             #[cfg(feature = "test-oracles")]
             panic_after_admissions: AtomicU64::new(u64::MAX),
             #[cfg(feature = "test-oracles")]
@@ -252,6 +259,10 @@ impl Generation {
         &self,
         begin: impl FnOnce(Option<&mut Owner>) -> Result<(), Rejected> + Send + 'static,
     ) -> Result<(), AdmissionError> {
+        // A request that begins once the engine stops is refused as a closed one: the stop's cancel is an operation on
+        // the owner, so whatever begins after it sees the flag.
+        let shared = Arc::clone(&self.shared);
+        let begin = move |owner: Option<&mut Owner>| begin(unless_closing(&shared.closing, owner));
         let mut begin = Some(begin);
         let inline = self
             .mailbox
@@ -315,11 +326,42 @@ impl Generation {
         self.mailbox.ask(true, move |owner| read(owner.sequence()))
     }
 
+    /// Cancels the request that runs, if any, and waits at most `bound` until it ended and its listener was told its
+    /// last call (a request that ends in a stop is told `Cancelled`). Refuses new requests from now on. Runs while the
+    /// lattice still works: the request ends on its workers. `false` when the bound passed with a request still
+    /// running, and the caller must not free what it uses. Called from inside a listener's `token`, `quantum` or
+    /// `prefill_done` it returns `false` at once (the owner's turn that makes the call is what would end the request).
+    /// Called from inside `finished` it cannot be told apart, and waits the bound for that very call to return, so it
+    /// returns `false` after the bound. For the engine's owner, outside the lattice.
+    pub(crate) fn stop(&self, bound: Duration) -> bool {
+        self.shared.closing.store(true, Ordering::SeqCst);
+        let stopped = self.mailbox.stop(bound);
+        if !stopped {
+            log::error!("a generation did not end within {bound:?} of the cancel at shutdown");
+        }
+        stopped
+    }
+
     /// Ends the sequence. Nothing may be running: with a request in flight the sequence stays allocated, and says so.
     pub(crate) fn close(&self) {
         match self.mailbox.close() {
             Some(owner) => owner.close(),
             None => log::error!("a generation is running at shutdown: the sequence's device memory stays allocated"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_request_begins_on_an_owner_once_the_engine_stops() {
+        let closing = AtomicBool::new(false);
+        let mut owner = 7;
+        assert_eq!(unless_closing(&closing, Some(&mut owner)).copied(), Some(7));
+        closing.store(true, Ordering::SeqCst);
+        assert!(unless_closing(&closing, Some(&mut owner)).is_none());
+        assert!(unless_closing::<i32>(&closing, None).is_none());
     }
 }
