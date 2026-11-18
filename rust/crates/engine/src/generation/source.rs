@@ -77,7 +77,7 @@ use crate::stages::attention::KvSource;
 use crate::stages::sampling::{RowReadbackLease, Selection};
 use crate::stages::{InputRecordRef, Quantum, QuantumError, QuantumKind, SequenceRefs, SubmitError};
 use crate::state::kv::KvRetained;
-use crate::state::{SequenceId, SequenceState};
+use crate::state::{Flight, SequenceId, SequenceState};
 use crate::workspace::{BufferSlot, Workspace};
 
 /// Decode quanta that start below this position overlap their launches with the quantum before them
@@ -691,7 +691,7 @@ impl Owner {
     /// the error it is given.
     pub(crate) fn withdraw(&mut self) {
         match self.run.take() {
-            Some(run) if run.in_flight.is_empty() => {}
+            Some(run) if run.in_flight.is_empty() && may_end(self.parked.len(), self.sequence.flight()) => {}
             Some(run) => {
                 log::error!("a request with quanta in flight cannot be withdrawn");
                 self.run = Some(run);
@@ -2179,13 +2179,9 @@ impl Owner {
         }
         // Quanta that were stopped may still have work queued on the owner's lane.
         self.reap();
-        if !self.parked.is_empty() {
-            return;
-        }
-        // Nothing that reads or writes the sequence is left, whoever holds it: a restore's references live on the cache's
-        // side until its job is dropped. Until then the request is not over and the sequence stays out of the pool. The
-        // last holder's drop posts to this owner (`Owner::new`), and the turn it starts comes back here.
-        if !self.sequence.settled() {
+        // The last holder's drop of the sequence's guard posts to this owner (`Owner::new`), and the turn it starts comes
+        // back here.
+        if !may_end(self.parked.len(), self.sequence.flight()) {
             return;
         }
         let Some(run) = self.run.take() else { return };
@@ -2209,6 +2205,14 @@ impl Owner {
         };
         self.finished.push_back(run.mode.into_finished(outcome));
     }
+}
+
+/// Whether a request that has nothing more to run may end, and its sequence go back to the pool: none of its quanta is
+/// parked, and nothing else that reads or writes the sequence is left, whoever holds it (a restore's references live on
+/// the cache's side until its job is dropped). Until then the request is not over. `Flight::settled` is asked last: when
+/// it says no, the drop of the last guard wakes the owner.
+pub(super) fn may_end(parked: usize, flight: &Flight) -> bool {
+    parked == 0 && flight.settled()
 }
 
 /// The prompt rows a prefill step takes: 0 for any other.

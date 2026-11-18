@@ -738,12 +738,13 @@ fn sampled_tokens_are_drawn_at_the_position_they_follow() {
     let tokens = 24;
     let mut settings = settings(&machine.artifact, 4096);
     settings.batching.prefill_chunk_tokens = 256;
-    let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
+    let (raw, ready) = EngineRuntime::start(&settings, &machine.library);
     let runtime = ready
         .wait(WAIT)
         .expect("the engine reports")
         .expect("the engine starts");
-    let owner = Closer::new(owner, &runtime);
+    // The closer is bound first, so that on unwind the runtime's handle drops before it and its shutdown finds the last one.
+    let (owner, runtime) = (Closer::new(raw, &runtime), runtime);
     let prompts = [
         reference.prompt.clone(),
         reference.prompt.iter().copied().cycle().take(700).collect::<Vec<u32>>(),

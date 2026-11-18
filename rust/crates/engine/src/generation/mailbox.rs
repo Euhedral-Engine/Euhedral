@@ -659,6 +659,8 @@ mod tests {
     use crate::handoff::Handoff;
     use crate::state::Flight;
 
+    use super::super::source::may_end;
+
     /// How long a posted message may wait for its turn before the test fails.
     const BOUND: Duration = Duration::from_secs(1);
 
@@ -1677,7 +1679,7 @@ mod tests {
             while let Some(stop) = self.inbox.poll() {
                 self.stopped |= stop;
             }
-            if self.running && self.stopped && self.flight.settled() {
+            if self.running && self.stopped && may_end(0, &self.flight) {
                 self.running = false;
                 self.free.store(true, Ordering::SeqCst);
                 self.outcomes.push(Arc::clone(&self.told));

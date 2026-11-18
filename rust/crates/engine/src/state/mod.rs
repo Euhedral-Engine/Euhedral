@@ -96,7 +96,8 @@ impl Flight {
 
     /// Sets what is called when the last guard is dropped after [`Flight::settled`] answered no. Once.
     pub fn on_settled(&self, wake: impl Fn() + Send + Sync + 'static) {
-        let _ = self.wake.set(Box::new(wake));
+        let first = self.wake.set(Box::new(wake)).is_ok();
+        debug_assert!(first, "a flight's wake is set once, by its owner");
     }
 
     /// Whether nothing is in flight. When something is, the owner is woken once, by the drop of the last guard, and asks
@@ -321,6 +322,11 @@ impl SequenceState {
     /// the last of them is dropped, whatever thread drops it: the owner that ends a request asks again then.
     pub fn settled(&self) -> bool {
         self.flight.settled()
+    }
+
+    /// The sequence's count of quanta in flight.
+    pub fn flight(&self) -> &Flight {
+        &self.flight
     }
 
     /// Sets what is called when the last quantum in flight is dropped after [`SequenceState::settled`] answered no.
