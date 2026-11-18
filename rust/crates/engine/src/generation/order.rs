@@ -47,6 +47,7 @@ use euhedral_data_structures::queues::{Consumer, MpscQueue, Single};
 
 use super::mailbox::{Mailbox, Spawn, Turn};
 use crate::handoff::Handoff;
+use crate::pass_assembler::{PassAssembler, PassOffer, PassStatistics};
 use crate::prefix::CopyJob;
 use crate::quantum::{Executor, StartError, Started};
 use crate::stages::Quantum;
@@ -75,6 +76,26 @@ pub(crate) trait Launch: Send + Sync + 'static {
     fn start(
         &self,
         job: Self::Job,
+        kill: Arc<AtomicBool>,
+        after: &[&Self::Started],
+    ) -> Result<Self::Started, StartError>;
+
+    /// The rows `job` takes in a pass.
+    fn rows(job: &Self::Job) -> usize;
+
+    /// The class of passes `job` can join: jobs of different classes never share a pass.
+    fn class(job: &Self::Job) -> u64;
+
+    /// Whether `members` (a sequence and the job it offered each) can run as one pass: what the pass would refuse,
+    /// found without consuming them.
+    fn batchable(&self, members: &[(SequenceId, &Self::Job)]) -> bool;
+
+    /// Starts `members` (a sequence, the job it offered and the flag its request is cancelled by, each) as one job
+    /// behind each of `after`. `kill` stops the whole job: the pass sets it once every member is cancelled, never for
+    /// one.
+    fn start_pass(
+        &self,
+        members: Vec<(SequenceId, Self::Job, Arc<AtomicBool>)>,
         kill: Arc<AtomicBool>,
         after: &[&Self::Started],
     ) -> Result<Self::Started, StartError>;
@@ -119,6 +140,47 @@ impl Launch for Executor {
             Job::Copy(copy) => self.start_copy(copy, kill, after),
         }
     }
+
+    fn rows(job: &Job) -> usize {
+        match job {
+            Job::Quantum(quantum) => quantum.rows(),
+            Job::Copy(_) => 0,
+        }
+    }
+
+    fn class(job: &Job) -> u64 {
+        match job {
+            Job::Quantum(quantum) => quantum.pass_class(),
+            Job::Copy(_) => 0,
+        }
+    }
+
+    fn batchable(&self, members: &[(SequenceId, &Job)]) -> bool {
+        let quanta: Option<Vec<(&Quantum, SequenceId)>> = members
+            .iter()
+            .map(|(sequence, job)| match job {
+                Job::Quantum(quantum) => Some((&**quantum, *sequence)),
+                Job::Copy(_) => None,
+            })
+            .collect();
+        quanta.is_some_and(|quanta| Quantum::check_batch(&quanta).is_ok())
+    }
+
+    fn start_pass(
+        &self,
+        members: Vec<(SequenceId, Job, Arc<AtomicBool>)>,
+        kill: Arc<AtomicBool>,
+        after: &[&Started],
+    ) -> Result<Started, StartError> {
+        let mut quanta = Vec::with_capacity(members.len());
+        for (sequence, job, cancel) in members {
+            match job {
+                Job::Quantum(quantum) => quanta.push((sequence, *quantum, cancel)),
+                Job::Copy(_) => return Err(StartError::Batch("a copy job is not part of a pass".to_string())),
+            }
+        }
+        Executor::start_batch(self, quanta, kill, after)
+    }
 }
 
 /// Tells a sequence's owner that the quantum numbered `.0` did not start, and why.
@@ -143,6 +205,97 @@ struct Start<L: Launch> {
     kill: Arc<AtomicBool>,
     on_workspace: bool,
     more: bool,
+    /// The job is a pass of one, whose retirement the assembler awaits.
+    pass: bool,
+}
+
+/// A step a sequence's owner offered for a pass: it runs when the assembler forms a pass of it, alone or with others.
+struct Offer<L: Launch> {
+    sequence: SequenceId,
+    launcher: Arc<L>,
+    job: L::Job,
+    /// The flag the sequence's request is cancelled by.
+    kill: Arc<AtomicBool>,
+    rows: usize,
+    /// The class of passes the step can join.
+    class: u64,
+}
+
+impl<L: Launch> PassOffer for Offer<L> {
+    fn sequence(&self) -> SequenceId {
+        self.sequence
+    }
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn class(&self) -> u64 {
+        self.class
+    }
+}
+
+/// How many rows and sequences a pass holds at most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PassCaps {
+    pub(crate) rows: usize,
+    pub(crate) parts: usize,
+}
+
+impl PassCaps {
+    /// The caps of a pass, refused when either is zero (the assembler cannot form a pass of nothing).
+    pub(crate) fn new(rows: usize, parts: usize) -> Result<PassCaps, String> {
+        if rows == 0 || parts == 0 {
+            return Err(format!("a pass of {rows} rows and {parts} sequences holds nothing"));
+        }
+        Ok(PassCaps { rows, parts })
+    }
+}
+
+#[derive(Debug, Default)]
+struct Counters {
+    passes: AtomicU64,
+    rows: AtomicU64,
+    segments: AtomicU64,
+    batched: AtomicU64,
+}
+
+impl Counters {
+    fn count(&self, rows: usize, segments: usize) {
+        self.passes.fetch_add(1, Ordering::Relaxed);
+        self.rows.fetch_add(rows as u64, Ordering::Relaxed);
+        self.segments.fetch_add(segments as u64, Ordering::Relaxed);
+        if segments > 1 {
+            self.batched.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn read(&self) -> PassStatistics {
+        PassStatistics {
+            passes: self.passes.load(Ordering::Relaxed),
+            rows: self.rows.load(Ordering::Relaxed),
+            segments: self.segments.load(Ordering::Relaxed),
+            batched: self.batched.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A pass in flight: its members and the flag each is cancelled by, and the flag that stops the whole job when it is
+/// one job of several members.
+struct Flight {
+    members: Vec<(SequenceId, Arc<AtomicBool>)>,
+    kill: Option<Arc<AtomicBool>>,
+}
+
+impl Flight {
+    /// Stops the job once every member is cancelled, never for one.
+    fn reevaluate(&self) {
+        if let Some(kill) = &self.kill
+            && self.members.iter().all(|(_, cancel)| cancel.load(Ordering::Acquire))
+        {
+            kill.store(true, Ordering::Release);
+        }
+    }
 }
 
 impl<L: Launch> Item<L> {
@@ -155,6 +308,10 @@ impl<L: Launch> Item<L> {
 
     fn on_workspace(&self) -> bool {
         matches!(self, Item::Start(start) if start.on_workspace)
+    }
+
+    fn is_pass(&self) -> bool {
+        matches!(self, Item::Start(start) if start.pass)
     }
 
     /// The number of the job a start admits.
@@ -191,6 +348,11 @@ pub(crate) struct WorkspaceOwner<L: Launch> {
     ended: Vec<Option<u64>>,
     /// `ended`, for the owners that tell a job retired.
     ended_gate: Arc<[AtomicU64]>,
+    /// The verifications offered for a pass, and the rule that forms passes of them.
+    assembler: PassAssembler<Offer<L>>,
+    /// The passes in flight, by the number of the job each started.
+    flights: Vec<(u64, Flight)>,
+    counters: Arc<Counters>,
 }
 
 impl<L: Launch> WorkspaceOwner<L> {
@@ -199,8 +361,13 @@ impl<L: Launch> WorkspaceOwner<L> {
         replies: Arc<[Reply]>,
         gate: Arc<AtomicU64>,
         ended_gate: Arc<[AtomicU64]>,
+        caps: PassCaps,
+        counters: Arc<Counters>,
     ) -> WorkspaceOwner<L> {
         WorkspaceOwner {
+            assembler: PassAssembler::new(caps.rows, caps.parts),
+            flights: Vec::new(),
+            counters,
             inbox,
             ended: vec![None; replies.len()],
             ended_gate,
@@ -234,13 +401,210 @@ impl<L: Launch> WorkspaceOwner<L> {
             kill,
             on_workspace,
             more,
+            pass: false,
         });
-        if self.blocked(&item, &self.waiting) {
+        let started = if self.blocked(&item, &self.waiting) {
             self.waiting.push_back(item);
             Ok(())
         } else {
             self.run(item)
+        };
+        self.advance();
+        started
+    }
+
+    /// Offers a verification of `sequence` for a pass. It starts, alone or in a pass with the offers of other sequences,
+    /// when the assembler forms the pass and the workspace is free for it; one that cannot start then is told to the
+    /// sequence's owner, with its number, as a deferred admission is. An offer the assembler refuses (the sequence has
+    /// one pending, or the job has no rows) is the error returned, and nothing of it remains.
+    pub(crate) fn offer(
+        &mut self,
+        sequence: SequenceId,
+        launcher: Arc<L>,
+        job: L::Job,
+        kill: Arc<AtomicBool>,
+    ) -> Result<(), StartError> {
+        self.settle();
+        let rows = L::rows(&job);
+        let class = L::class(&job);
+        let offer = Offer {
+            sequence,
+            launcher,
+            job,
+            kill,
+            rows,
+            class,
+        };
+        let offered = self.assembler.offer(offer).map_err(|refusal| {
+            // The offer is gone, and so is the chain it ended: nothing starts behind the sequence's last job.
+            self.release_now(sequence);
+            StartError::Batch(refusal.to_string())
+        });
+        self.advance();
+        offered
+    }
+
+    /// `sequence` offers no more steps (its request ended or its next step is not offered): the passes stop waiting for
+    /// it. A step it has pending is returned to its owner as not started, and a pass in flight whose members are all
+    /// cancelled is stopped.
+    pub(crate) fn leave(&mut self, sequence: SequenceId) {
+        self.settle();
+        if let Some(offer) = self.assembler.leave(sequence) {
+            let serial = L::serial(&offer.job);
+            self.release_now(sequence);
+            self.refuse(sequence, serial, StartError::Withdrawn);
         }
+        for (_, flight) in &self.flights {
+            flight.reevaluate();
+        }
+        self.advance();
+    }
+
+    /// Takes in what retired, starts what waited for it, and forms the next pass.
+    fn settle(&mut self) {
+        self.take_in();
+        self.flush();
+        self.advance();
+    }
+
+    /// Whether a pass may start now: the workspace is not gated, nothing that starts behind the workspace waits, and
+    /// nothing of an offering sequence waits for its own earlier work.
+    fn pass_startable(&self) -> bool {
+        self.assembler.pending() > 0
+            && self.draining.is_none()
+            && !self.waiting.iter().any(Item::on_workspace)
+            && !self
+                .waiting
+                .iter()
+                .any(|item| self.assembler.has_pending(item.sequence()))
+            && !self
+                .ended
+                .iter()
+                .enumerate()
+                .any(|(sequence, ended)| ended.is_some() && self.assembler.has_pending(SequenceId(sequence)))
+    }
+
+    /// Forms and starts passes while the rule and the workspace allow one. A pass that did not start owes no retirement,
+    /// and the next is asked for at once.
+    fn advance(&mut self) {
+        while self.pass_startable() {
+            let Some(pass) = self.assembler.next_pass() else {
+                return;
+            };
+            let owed = self.start_pass(pass);
+            // The count is always told: a pass that failed to start owes none, and `next_pass` would give nothing again.
+            let _ = self.assembler.admitted(owed);
+            if owed > 0 {
+                return;
+            }
+        }
+    }
+
+    /// Starts a pass and returns the retirements it owes: one for a pass that runs as one job, one for each of the
+    /// members that run alone.
+    fn start_pass(&mut self, pass: Vec<Offer<L>>) -> usize {
+        let batched = pass.len() > 1 && {
+            let members: Vec<(SequenceId, &L::Job)> = pass.iter().map(|offer| (offer.sequence, &offer.job)).collect();
+            // A launcher that panics when asked cannot batch: the members run alone, each as it would without a pass.
+            catch_unwind(AssertUnwindSafe(|| pass[0].launcher.batchable(&members))).unwrap_or(false)
+        };
+        if !batched {
+            return self.start_alone(pass);
+        }
+        let rows = pass.iter().map(|offer| offer.rows).sum();
+        let serials: Vec<(SequenceId, u64)> = pass
+            .iter()
+            .map(|offer| (offer.sequence, L::serial(&offer.job)))
+            .collect();
+        let launcher = Arc::clone(&pass[0].launcher);
+        let members: Vec<(SequenceId, Arc<AtomicBool>)> = pass
+            .iter()
+            .map(|offer| (offer.sequence, Arc::clone(&offer.kill)))
+            .collect();
+        let jobs: Vec<(SequenceId, L::Job, Arc<AtomicBool>)> = pass
+            .into_iter()
+            .map(|offer| (offer.sequence, offer.job, offer.kill))
+            .collect();
+        let kill = Arc::new(AtomicBool::new(false));
+        let mut after: Vec<&L::Started> = Vec::new();
+        let mut seen: Vec<u64> = Vec::new();
+        let edges = members
+            .iter()
+            .filter_map(|(sequence, _)| self.last_of.get(sequence.0).and_then(Option::as_ref))
+            .chain(self.last.as_ref().map(|held| &held.started));
+        for started in edges {
+            let serial = L::serial_of(started);
+            if !seen.contains(&serial) {
+                seen.push(serial);
+                after.push(started);
+            }
+        }
+        let launched = catch_unwind(AssertUnwindSafe(|| {
+            launcher.start_pass(jobs, Arc::clone(&kill), &after)
+        }));
+        drop(after);
+        match launched.unwrap_or(Err(StartError::Panicked)) {
+            Ok(started) => {
+                let serial = L::serial_of(&started);
+                for (sequence, _) in &members {
+                    self.mark_ended(*sequence, serial);
+                    if let Some(own) = self.last_of.get_mut(sequence.0) {
+                        *own = None;
+                    }
+                }
+                self.gate_on(serial);
+                self.counters.count(rows, members.len());
+                let flight = Flight {
+                    members,
+                    kill: Some(kill),
+                };
+                flight.reevaluate();
+                self.flights.push((serial, flight));
+                1
+            }
+            Err(error) => {
+                let why = error.to_string();
+                for (sequence, serial) in serials {
+                    self.release_now(sequence);
+                    self.refuse(sequence, serial, StartError::Batch(why.clone()));
+                }
+                0
+            }
+        }
+    }
+
+    /// Runs the members of a pass one after the other, each as it would run with no pass: the first now, the others
+    /// when the one before retired. Returns the retirements owed.
+    fn start_alone(&mut self, pass: Vec<Offer<L>>) -> usize {
+        let mut owed = 0;
+        for offer in pass {
+            let (sequence, serial) = (offer.sequence, L::serial(&offer.job));
+            let item = Item::Start(Start {
+                sequence,
+                launcher: offer.launcher,
+                job: offer.job,
+                kill: offer.kill,
+                on_workspace: true,
+                more: false,
+                pass: true,
+            });
+            let queued = if self.blocked(&item, &self.waiting) {
+                self.waiting.push_back(item);
+                Ok(())
+            } else {
+                self.run(item)
+            };
+            match queued {
+                Ok(()) => owed += 1,
+                Err(error) => self.refuse(sequence, serial, error),
+            }
+        }
+        owed
+    }
+
+    /// Pays the retirement a pass owed for `sequence`'s job that will never start.
+    fn paid(&mut self, sequence: SequenceId) {
+        let _ = self.assembler.retired(&[sequence]);
     }
 
     /// Ends `sequence`'s chain: nothing will start behind its last quantum, so its pins are dropped and it may retire.
@@ -252,6 +616,7 @@ impl<L: Launch> WorkspaceOwner<L> {
         } else {
             self.release_now(sequence);
         }
+        self.advance();
     }
 
     /// Leaves `sequence`'s pin allocated for ever: its quanta were abandoned with the owner's accounting lost, and they
@@ -294,7 +659,10 @@ impl<L: Launch> WorkspaceOwner<L> {
             kill,
             on_workspace,
             more,
+            pass,
         } = start;
+        let rows = L::rows(&job);
+        let cancel = pass.then(|| Arc::clone(&kill));
         let own = self.last_of.get(sequence.0).and_then(Option::as_ref);
         let shared = self
             .last
@@ -310,6 +678,16 @@ impl<L: Launch> WorkspaceOwner<L> {
         }));
         match launched.unwrap_or(Err(StartError::Panicked)) {
             Ok(started) => {
+                if let Some(cancel) = cancel {
+                    self.counters.count(rows, 1);
+                    self.flights.push((
+                        L::serial_of(&started),
+                        Flight {
+                            members: vec![(sequence, cancel)],
+                            kill: None,
+                        },
+                    ));
+                }
                 self.keep(sequence, started, on_workspace, more);
                 Ok(())
             }
@@ -392,6 +770,11 @@ impl<L: Launch> WorkspaceOwner<L> {
 
     /// The job `serial` retired: what waited for it may start.
     fn retire(&mut self, serial: u64) {
+        if let Some(at) = self.flights.iter().position(|(started, _)| *started == serial) {
+            let (_, flight) = self.flights.swap_remove(at);
+            let members: Vec<SequenceId> = flight.members.iter().map(|(sequence, _)| *sequence).collect();
+            let _ = self.assembler.retired(&members);
+        }
         if self.draining == Some(serial) {
             self.draining = None;
             self.gate.store(NONE, Ordering::Release);
@@ -415,9 +798,12 @@ impl<L: Launch> WorkspaceOwner<L> {
                 kept.push_back(item);
                 continue;
             }
-            let (sequence, serial) = (item.sequence(), item.serial());
+            let (sequence, serial, pass) = (item.sequence(), item.serial(), item.is_pass());
             if let (Err(error), Some(serial)) = (self.run(item), serial) {
                 self.refuse(sequence, serial, error);
+                if pass {
+                    self.paid(sequence);
+                }
             }
         }
         self.waiting = kept;
@@ -435,8 +821,7 @@ impl<L: Launch> Turn for WorkspaceOwner<L> {
     type Finished = Arc<Handoff<()>>;
 
     fn turn(&mut self) {
-        self.take_in();
-        self.flush();
+        self.settle();
     }
 
     fn take_finished(&mut self) -> Vec<Self::Finished> {
@@ -450,7 +835,15 @@ impl<L: Launch> Turn for WorkspaceOwner<L> {
                 let serial = L::serial(&start.job);
                 self.release_now(start.sequence);
                 self.refuse(start.sequence, serial, StartError::Closed);
+                if start.pass {
+                    self.paid(start.sequence);
+                }
             }
+        }
+        for offer in self.assembler.withdraw(|_| true) {
+            let serial = L::serial(&offer.job);
+            self.release_now(offer.sequence);
+            self.refuse(offer.sequence, serial, StartError::Closed);
         }
         Vec::new()
     }
@@ -468,7 +861,7 @@ impl<L: Launch> Turn for WorkspaceOwner<L> {
     }
 
     fn idle(&self) -> bool {
-        self.waiting.is_empty()
+        self.waiting.is_empty() && self.assembler.pending() == 0
     }
 }
 
@@ -481,6 +874,7 @@ pub(crate) struct Order<L: Launch> {
     replies: Arc<[Reply]>,
     /// The input records each sequence has.
     records: usize,
+    counters: Arc<Counters>,
 }
 
 impl<L: Launch> Debug for Order<L> {
@@ -492,14 +886,23 @@ impl<L: Launch> Debug for Order<L> {
 impl<L: Launch> Order<L> {
     /// The owner for the sequences `replies` lead to (one for each, by sequence number), each with `records` input
     /// records; `spawn` runs a frame on a worker.
-    pub(crate) fn new(replies: Vec<Reply>, records: usize, spawn: Spawn) -> Order<L> {
+    pub(crate) fn new(replies: Vec<Reply>, records: usize, caps: PassCaps, spawn: Spawn) -> Order<L> {
         let queue = MpscQueue::<Message>::new(INBOX_CHUNK);
         let (producer, inbox) = (queue.producer(), queue.consumer());
         let gate = Arc::new(AtomicU64::new(NONE));
         let replies: Arc<[Reply]> = replies.into();
         let ended: Arc<[AtomicU64]> = (0..replies.len()).map(|_| AtomicU64::new(NONE)).collect();
-        let owner = WorkspaceOwner::new(inbox, Arc::clone(&replies), Arc::clone(&gate), Arc::clone(&ended));
+        let counters = Arc::new(Counters::default());
+        let owner = WorkspaceOwner::new(
+            inbox,
+            Arc::clone(&replies),
+            Arc::clone(&gate),
+            Arc::clone(&ended),
+            caps,
+            Arc::clone(&counters),
+        );
         Order {
+            counters,
             mailbox: Arc::new(Mailbox::new(owner, producer, spawn)),
             gate,
             ended,
@@ -553,6 +956,57 @@ impl<L: Launch> Order<L> {
                 Ok(())
             }
         }
+    }
+
+    /// Offers a verification of `sequence` for a pass (see [`WorkspaceOwner::offer`]): now, if the owner is free, else as
+    /// an operation the owner runs. Never waits. An offer that cannot be taken now is the error returned; one that is
+    /// deferred and cannot be taken is told to the sequence's owner. Whatever happens to the offer after this returns
+    /// `Ok`, the sequence's owner is told exactly once: its quantum retires, or it did not start.
+    pub(crate) fn offer(
+        &self,
+        sequence: SequenceId,
+        launcher: &Arc<L>,
+        job: impl Into<L::Job>,
+        kill: Arc<AtomicBool>,
+    ) -> Result<(), StartError> {
+        let job = job.into();
+        let serial = L::serial(&job);
+        let launcher = Arc::clone(launcher);
+        let work = move |owner: &mut WorkspaceOwner<L>| owner.offer(sequence, launcher, job, kill);
+        match self.mailbox.try_with(work) {
+            Ok(Some(offered)) => offered,
+            Ok(None) => Err(StartError::Closed),
+            Err(work) => {
+                let replies = Arc::clone(&self.replies);
+                self.mailbox.defer(move |owner| {
+                    let result = match owner {
+                        Some(owner) => work(owner),
+                        None => Err(StartError::Closed),
+                    };
+                    if let (Err(error), Some(reply)) = (result, replies.get(sequence.0)) {
+                        reply(serial, error);
+                    }
+                    Vec::new()
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// `sequence` offers no more steps (see [`WorkspaceOwner::leave`]). A pending offer is told back as not started.
+    pub(crate) fn leave(&self, sequence: SequenceId) {
+        self.mailbox.tell(move |owner| owner.leave(sequence));
+    }
+
+    /// Tells the owner the pass numbered `serial` retired, whichever sequences it holds: the passes' bookkeeping goes
+    /// before any member's owner learns of it.
+    pub(crate) fn pass_retired(&self, serial: u64) {
+        self.mailbox.post(Message::Retired(serial));
+    }
+
+    /// What the passes did.
+    pub(crate) fn statistics(&self) -> PassStatistics {
+        self.counters.read()
     }
 
     /// Ends `sequence`'s chain (see [`WorkspaceOwner::release`]).
@@ -635,7 +1089,23 @@ mod tests {
         pins: Arc<AtomicUsize>,
         refuse: Mutex<Vec<u64>>,
         panics: Mutex<Vec<u64>>,
+        /// Each pass that started as one job: its members, in order, and what it started behind.
+        passes: Mutex<Vec<(Vec<u64>, Vec<u64>)>>,
+        /// The kill flag of each pass that started as one job.
+        kills: Mutex<Vec<Arc<AtomicBool>>>,
+        /// Whether the launcher refuses to run passes as one job.
+        unbatchable: AtomicBool,
+        /// Whether asking the launcher if a pass can be one job panics.
+        batchable_panics: AtomicBool,
     }
+
+    /// A job of `rows` rows with the number `serial`.
+    fn job(serial: u64, rows: u64) -> u64 {
+        serial | (rows << 32)
+    }
+
+    /// The number a pass of one job has: far from the jobs'.
+    const PASS: u64 = 1_000_000;
 
     impl Fake {
         fn starts(&self) -> Vec<(u64, Vec<u64>)> {
@@ -652,7 +1122,7 @@ mod tests {
         type Started = Pin;
 
         fn serial(job: &u64) -> u64 {
-            *job
+            *job & 0xFFFF_FFFF
         }
 
         fn serial_of(started: &Pin) -> u64 {
@@ -660,6 +1130,7 @@ mod tests {
         }
 
         fn start(&self, job: u64, _kill: Arc<AtomicBool>, after: &[&Pin]) -> Result<Pin, StartError> {
+            let job = Self::serial(&job);
             assert!(!self.panics.lock().unwrap().contains(&job), "the launcher panics");
             if self.refuse.lock().unwrap().contains(&job) {
                 return Err(StartError::NoView(View::Decode));
@@ -668,11 +1139,48 @@ mod tests {
             self.log.lock().unwrap().push((job, behind));
             Ok(Pin::new(job, &self.pins))
         }
+
+        fn rows(job: &u64) -> usize {
+            (((*job >> 32) & 0xFFFF) as usize).max(1)
+        }
+
+        fn class(job: &u64) -> u64 {
+            *job >> 48
+        }
+
+        fn batchable(&self, _members: &[(SequenceId, &u64)]) -> bool {
+            assert!(!self.batchable_panics.load(Ordering::SeqCst), "the launcher panics");
+            !self.unbatchable.load(Ordering::SeqCst)
+        }
+
+        fn start_pass(
+            &self,
+            members: Vec<(SequenceId, u64, Arc<AtomicBool>)>,
+            kill: Arc<AtomicBool>,
+            after: &[&Pin],
+        ) -> Result<Pin, StartError> {
+            let serials: Vec<u64> = members.iter().map(|(_, job, _)| Self::serial(job)).collect();
+            if serials
+                .iter()
+                .any(|serial| self.refuse.lock().unwrap().contains(serial))
+            {
+                return Err(StartError::Batch("refused".to_string()));
+            }
+            let behind = after.iter().map(|started| started.serial).collect();
+            let serial = PASS + serials[0];
+            self.passes.lock().unwrap().push((serials, behind));
+            self.kills.lock().unwrap().push(kill);
+            Ok(Pin::new(serial, &self.pins))
+        }
     }
 
     type Told = Arc<Mutex<Vec<(usize, u64, String)>>>;
 
     fn owner_of(sequences: usize) -> (WorkspaceOwner<Fake>, Arc<Fake>, Told, Arc<AtomicU64>) {
+        owner_with(sequences, PassCaps::new(64, 8).unwrap())
+    }
+
+    fn owner_with(sequences: usize, caps: PassCaps) -> (WorkspaceOwner<Fake>, Arc<Fake>, Told, Arc<AtomicU64>) {
         let told: Told = Arc::default();
         let replies = (0..sequences)
             .map(|sequence| {
@@ -685,7 +1193,14 @@ mod tests {
         let queue = MpscQueue::<Message>::new(INBOX_CHUNK);
         let gate = Arc::new(AtomicU64::new(NONE));
         let ended: Arc<[AtomicU64]> = (0..sequences).map(|_| AtomicU64::new(NONE)).collect();
-        let owner = WorkspaceOwner::new(queue.consumer(), replies.into(), Arc::clone(&gate), ended);
+        let owner = WorkspaceOwner::new(
+            queue.consumer(),
+            replies.into(),
+            Arc::clone(&gate),
+            ended,
+            caps,
+            Arc::default(),
+        );
         // The queue's producing end is not needed: the tests tell the owner through `retire`.
         mem::forget(queue);
         (owner, Arc::new(Fake::default()), told, gate)
@@ -978,7 +1493,12 @@ mod tests {
 
     #[test]
     fn the_gate_opens_through_the_owner_when_the_quantum_retires() {
-        let order = Order::<Fake>::new(vec![Box::new(|_, _| {}), Box::new(|_, _| {})], 2, Box::new(|_| false));
+        let order = Order::<Fake>::new(
+            vec![Box::new(|_, _| {}), Box::new(|_, _| {})],
+            2,
+            PassCaps::new(64, 8).unwrap(),
+            Box::new(|_| false),
+        );
         let fake = Arc::new(Fake::default());
         order.admit(A, &fake, 1u64, Arc::default(), true, false).unwrap();
         order.admit(B, &fake, 2u64, Arc::default(), true, true).unwrap();
@@ -995,7 +1515,7 @@ mod tests {
         let told: Told = Arc::default();
         let log = Arc::clone(&told);
         let reply: Reply = Box::new(move |serial, error| log.lock().unwrap().push((0, serial, error.to_string())));
-        let order = Order::<Fake>::new(vec![reply], 2, Box::new(|_| false));
+        let order = Order::<Fake>::new(vec![reply], 2, PassCaps::new(64, 8).unwrap(), Box::new(|_| false));
         let fake = Arc::new(Fake::default());
         assert!(order.close().is_some());
         // The refusal is the result of the call, so that the caller admits nothing behind it.
@@ -1007,7 +1527,12 @@ mod tests {
 
     #[test]
     fn admissions_through_the_mailbox_start_in_post_order() {
-        let order = Order::<Fake>::new(vec![Box::new(|_, _| {}), Box::new(|_, _| {})], 2, Box::new(|_| false));
+        let order = Order::<Fake>::new(
+            vec![Box::new(|_, _| {}), Box::new(|_, _| {})],
+            2,
+            PassCaps::new(64, 8).unwrap(),
+            Box::new(|_| false),
+        );
         let fake = Arc::new(Fake::default());
         for job in 1u64..=6 {
             order
@@ -1030,6 +1555,7 @@ mod tests {
         let order = Order::<Fake>::new(
             vec![Box::new(|_, _| {}), Box::new(|_, _| {}), Box::new(|_, _| {})],
             3,
+            PassCaps::new(64, 8).unwrap(),
             Box::new(|_| false),
         );
         let mut seen = HashSet::new();
@@ -1043,5 +1569,305 @@ mod tests {
         }
         assert_eq!(seen.len(), 9);
         assert_eq!(order.records(), 3);
+    }
+
+    const C: SequenceId = SequenceId(2);
+
+    fn kill() -> Arc<AtomicBool> {
+        Arc::default()
+    }
+
+    fn offer(
+        owner: &mut WorkspaceOwner<Fake>,
+        fake: &Arc<Fake>,
+        sequence: SequenceId,
+        job: u64,
+    ) -> Result<(), StartError> {
+        owner.offer(sequence, Arc::clone(fake), job, kill())
+    }
+
+    /// Two sequences' offers batched: A's step runs alone first, B's waits, and A's next step joins B's.
+    fn batched_pair() -> (WorkspaceOwner<Fake>, Arc<Fake>, Told, Arc<AtomicU64>) {
+        let (mut owner, fake, told, gate) = owner_of(3);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        assert_eq!(
+            fake.starts(),
+            vec![(1, vec![])],
+            "the first offer starts at once, alone"
+        );
+        retire(&mut owner, 1);
+        assert_eq!(fake.starts().len(), 1, "B's step waits for A to report");
+        offer(&mut owner, &fake, A, job(3, 4)).unwrap();
+        (owner, fake, told, gate)
+    }
+
+    #[test]
+    fn a_pass_of_one_starts_exactly_the_job_an_admission_starts() {
+        let (mut owner, fake, _, _) = owner_of(2);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        let (mut plain, plain_fake, _, _) = owner_of(2);
+        admit(&mut plain, &plain_fake, A, job(1, 4), true, false).unwrap();
+        assert_eq!(fake.starts(), plain_fake.starts());
+        assert!(fake.passes.lock().unwrap().is_empty(), "a pass of one is not a batch");
+        assert_eq!(
+            owner.counters.read(),
+            PassStatistics {
+                passes: 1,
+                rows: 4,
+                segments: 1,
+                batched: 0
+            }
+        );
+    }
+
+    #[test]
+    fn offers_of_several_sequences_run_as_one_job() {
+        let (_owner, fake, told, _) = batched_pair();
+        let passes = fake.passes.lock().unwrap();
+        assert_eq!(passes.len(), 1);
+        assert_eq!(passes[0].0, vec![2, 3], "in the order offered");
+        assert_eq!(fake.starts().len(), 1, "no member started alone");
+        assert!(told.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_statistics_count_passes_rows_segments_and_batched_passes() {
+        let (owner, _fake, _, _) = batched_pair();
+        assert_eq!(
+            owner.counters.read(),
+            PassStatistics {
+                passes: 2,
+                rows: 12,
+                segments: 3,
+                batched: 1
+            }
+        );
+    }
+
+    #[test]
+    fn every_started_pass_is_counted_by_its_rows_and_parts() {
+        let (mut owner, fake, _, _) = owner_of(2);
+        offer(&mut owner, &fake, A, job(1, 1)).unwrap();
+        assert_eq!(
+            owner.counters.read(),
+            PassStatistics {
+                passes: 1,
+                rows: 1,
+                segments: 1,
+                batched: 0
+            }
+        );
+        // A pass the launcher refuses to batch is counted as the passes of one its members run as.
+        let (mut owner, fake, _, _) = owner_of(2);
+        fake.unbatchable.store(true, Ordering::SeqCst);
+        offer(&mut owner, &fake, A, job(1, 2)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 3)).unwrap();
+        retire(&mut owner, 1);
+        offer(&mut owner, &fake, A, job(3, 2)).unwrap();
+        retire(&mut owner, 2);
+        assert_eq!(
+            owner.counters.read(),
+            PassStatistics {
+                passes: 3,
+                rows: 7,
+                segments: 3,
+                batched: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_batch_stops_only_when_every_member_is_cancelled() {
+        let (mut owner, fake, _, _) = owner_of(3);
+        let (a, b) = (kill(), kill());
+        owner.offer(A, Arc::clone(&fake), job(1, 4), kill()).unwrap();
+        owner.offer(B, Arc::clone(&fake), job(2, 4), Arc::clone(&b)).unwrap();
+        retire(&mut owner, 1);
+        owner.offer(A, Arc::clone(&fake), job(3, 4), Arc::clone(&a)).unwrap();
+        let batch_kill = Arc::clone(&fake.kills.lock().unwrap()[0]);
+        a.store(true, Ordering::Release);
+        owner.leave(A);
+        assert!(
+            !batch_kill.load(Ordering::Acquire),
+            "one cancelled member does not stop the others"
+        );
+        b.store(true, Ordering::Release);
+        owner.leave(B);
+        assert!(batch_kill.load(Ordering::Acquire), "all cancelled: the job stops");
+    }
+
+    #[test]
+    fn a_batch_gates_the_workspace_and_its_retirement_opens_it() {
+        let (mut owner, _fake, _, gate) = batched_pair();
+        assert_eq!(gate.load(Ordering::Acquire), PASS + 2);
+        retire(&mut owner, PASS + 2);
+        assert_eq!(gate.load(Ordering::Acquire), NONE);
+    }
+
+    #[test]
+    fn offers_of_different_classes_form_separate_passes() {
+        let (mut owner, fake, told, _) = owner_of(3);
+        let class = |serial: u64, class: u64| job(serial, 4) | (class << 48);
+        offer(&mut owner, &fake, A, class(1, 1)).unwrap();
+        offer(&mut owner, &fake, C, class(3, 1)).unwrap();
+        offer(&mut owner, &fake, B, class(2, 2)).unwrap();
+        retire(&mut owner, 1);
+        offer(&mut owner, &fake, A, class(4, 1)).unwrap();
+        // C and A share a pass; B, of another class, waits behind it instead of spoiling it.
+        assert_eq!(fake.passes.lock().unwrap().len(), 1);
+        assert_eq!(fake.passes.lock().unwrap()[0].0, vec![3, 4]);
+        assert!(told.lock().unwrap().is_empty());
+        assert!(owner.assembler.has_pending(B));
+        retire(&mut owner, PASS + 3);
+        offer(&mut owner, &fake, C, class(5, 1)).unwrap();
+        offer(&mut owner, &fake, A, class(6, 1)).unwrap();
+        // B's pass forms next, with its own class: one pass of one job, then the others.
+        assert_eq!(fake.starts().last().map(|(job, _)| *job), Some(2));
+        assert!(fake.passes.lock().unwrap().len() == 1);
+        assert!(told.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_launcher_that_panics_when_asked_runs_the_members_alone() {
+        let (mut owner, fake, told, _) = owner_of(3);
+        fake.batchable_panics.store(true, Ordering::SeqCst);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        retire(&mut owner, 1);
+        offer(&mut owner, &fake, A, job(3, 4)).unwrap();
+        assert!(fake.passes.lock().unwrap().is_empty());
+        assert_eq!(
+            fake.starts().iter().map(|(job, _)| *job).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(told.lock().unwrap().is_empty());
+        // Each member still pays its retirement, so the next pass forms.
+        retire(&mut owner, 2);
+        assert_eq!(fake.starts().last().map(|(job, _)| *job), Some(3));
+    }
+
+    #[test]
+    fn the_retirement_of_a_batched_pass_lets_the_next_pass_form() {
+        let (mut owner, fake, _, _) = batched_pair();
+        offer(&mut owner, &fake, A, job(4, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(5, 4)).unwrap();
+        assert_eq!(
+            fake.passes.lock().unwrap().len(),
+            1,
+            "nothing forms while the pass runs"
+        );
+        retire(&mut owner, PASS + 2);
+        owner.settle();
+        assert_eq!(
+            fake.passes.lock().unwrap().len(),
+            2,
+            "its retirement releases the next pass"
+        );
+        assert_eq!(fake.passes.lock().unwrap()[1].0, vec![4, 5]);
+    }
+
+    #[test]
+    fn a_pass_the_launcher_refuses_to_batch_runs_each_member_alone() {
+        let (mut owner, fake, _, _) = owner_of(3);
+        fake.unbatchable.store(true, Ordering::SeqCst);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        retire(&mut owner, 1);
+        offer(&mut owner, &fake, A, job(3, 4)).unwrap();
+        assert!(fake.passes.lock().unwrap().is_empty());
+        assert_eq!(
+            fake.starts().iter().map(|(job, _)| *job).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        // The second member starts behind the first, and the next pass waits for both retirements.
+        retire(&mut owner, 2);
+        assert_eq!(
+            fake.starts().iter().map(|(job, _)| *job).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn a_batch_that_fails_to_start_tells_every_member_and_the_next_pass_forms() {
+        let (mut owner, fake, told, _) = owner_of(3);
+        fake.refuse.lock().unwrap().push(3);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        retire(&mut owner, 1);
+        offer(&mut owner, &fake, A, job(3, 4)).unwrap();
+        assert_eq!(told.lock().unwrap().len(), 2, "both members are told");
+        // The failed pass owed nothing: a new pass forms at once.
+        offer(&mut owner, &fake, A, job(4, 4)).unwrap();
+        assert_eq!(fake.starts().last().map(|(job, _)| *job), Some(4));
+    }
+
+    #[test]
+    fn a_member_that_fails_alone_still_pays_its_retirement() {
+        let (mut owner, fake, told, _) = owner_of(3);
+        fake.unbatchable.store(true, Ordering::SeqCst);
+        fake.refuse.lock().unwrap().push(2);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        retire(&mut owner, 1);
+        offer(&mut owner, &fake, A, job(3, 4)).unwrap();
+        // B's job failed to start (told), A's started; once A's retires the next pass may form.
+        assert_eq!(told.lock().unwrap().len(), 1);
+        retire(&mut owner, 3);
+        offer(&mut owner, &fake, A, job(4, 4)).unwrap();
+        assert!(
+            fake.starts().iter().any(|(job, _)| *job == 4),
+            "the pass after the failed one forms"
+        );
+    }
+
+    #[test]
+    fn a_pending_offer_that_leaves_is_returned_and_does_not_block_the_others() {
+        let (mut owner, fake, told, _) = owner_of(3);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        offer(&mut owner, &fake, C, job(3, 4)).unwrap();
+        owner.leave(B);
+        assert_eq!(*told.lock().unwrap(), vec![(1, 2, StartError::Withdrawn.to_string())]);
+        retire(&mut owner, 1);
+        owner.leave(A);
+        assert_eq!(
+            fake.starts().iter().map(|(job, _)| *job).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn a_member_whose_next_step_is_not_offered_stops_the_pass_waiting_for_it() {
+        let (mut owner, fake, _, _) = owner_of(3);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        retire(&mut owner, 1);
+        assert_eq!(fake.starts().len(), 1, "B waits for A's report");
+        owner.leave(A);
+        assert_eq!(
+            fake.starts().iter().map(|(job, _)| *job).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn a_second_offer_of_a_sequence_is_refused_and_leaves_nothing() {
+        let (mut owner, fake, _, _) = owner_of(2);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        assert!(offer(&mut owner, &fake, B, job(3, 4)).is_err());
+        assert_eq!(owner.assembler.pending(), 1, "the refused offer left nothing behind");
+    }
+
+    #[test]
+    fn closing_the_owner_refuses_the_pending_offers_and_it_goes_idle() {
+        let (mut owner, fake, told, _) = owner_of(3);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        assert!(!owner.idle());
+        owner.abandon("closed");
+        assert_eq!(*told.lock().unwrap(), vec![(1, 2, StartError::Closed.to_string())]);
+        assert!(owner.idle());
     }
 }

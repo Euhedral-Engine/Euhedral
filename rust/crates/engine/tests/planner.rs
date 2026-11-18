@@ -458,7 +458,10 @@ fn each_sequence_adds_its_cache_and_its_state() {
     assert_eq!(four.arena_bytes, one.arena_bytes);
     let records = input_records(four.draft_depth);
     let records_of = |count: u64| workspace_bytes_with_records(&config, four.rows, count * records);
-    assert_eq!(one.workspace_bytes, records_of(1));
+    assert_eq!(
+        one.workspace_bytes,
+        workspace_bytes_with_records(&config, one.rows, records)
+    );
     assert_eq!(four.workspace_bytes, records_of(4));
     assert!(four.workspace_bytes > one.workspace_bytes);
     assert_eq!(four.scratch_bytes, one.scratch_bytes);
@@ -665,4 +668,25 @@ fn the_prefix_cache_arena_is_granted_only_the_host_room_left_over() {
     assert_eq!(granted(&settings, GIB), GIB);
     settings.prefix_cache.size = ByteSize(0);
     assert_eq!(granted(&settings, u64::MAX), 0);
+}
+
+#[test]
+fn a_plan_of_several_sequences_sizes_the_logits_for_a_pass_and_counts_them() {
+    let (config, table) = (config(), rco_table());
+    let settings = settings(32_768);
+    let one = plan_with(&config, &table, &settings, with_sequences(16 * GIB, 1)).unwrap();
+    let four = plan_with(&config, &table, &settings, with_sequences(16 * GIB, 4)).unwrap();
+    let verified = 1 + one.draft_depth as u64;
+    assert!(one.draft_depth > 0);
+    assert!(one.rows.logits_rows >= verified && one.rows.logits_rows < four.rows.logits_rows);
+    assert_eq!(one.rows.logits_rows, 8, "one sequence is sized as it always was");
+    assert_eq!(one.pass_parts, 1);
+    assert_eq!(four.pass_parts, 4);
+    assert_eq!(four.pass_rows as u64, 4 * verified);
+    assert_eq!(four.rows.logits_rows, four.pass_rows as u64);
+    assert_eq!(one.rows.rows, four.rows.rows);
+    // The workspace the plan counts is the one that holds those rows.
+    assert!(
+        four.workspace_bytes > workspace_bytes_with_records(&config, one.rows, 4 * input_records(four.draft_depth))
+    );
 }

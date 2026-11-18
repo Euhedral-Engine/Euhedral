@@ -36,9 +36,10 @@ use crate::error::EngineError;
 use crate::formats::{Nvfp4Linear, TrellisLinear};
 use crate::frames::{Kind, step};
 use crate::model::{LayerIndex, ModelConfig, Role, Weights};
+use crate::pass_assembler::PassStatistics;
 use crate::plan::{Formats, Plan, View};
 use crate::prefix::{CacheSpec, Copier, POSITION_GRANULE, PrefixCacheHandle, PrefixCacheStats, open_prefix_cache};
-use crate::quantum::Executor;
+use crate::quantum::{Executor, Preparer};
 use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
 use crate::state::{SequenceId, SequenceState};
@@ -51,7 +52,7 @@ pub use listener::GenerationListener;
 pub(crate) use mailbox::OPERATION_BOUND;
 pub use mailbox::Spawn;
 pub(crate) use mailbox::{Address, Mailbox, Turn};
-use order::{Order, Reply};
+use order::{Order, PassCaps, Reply};
 use pool::{Lease, SequencePool};
 pub use request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
@@ -115,6 +116,7 @@ impl Generation {
         id: SequenceId,
         address: Arc<Address<Owner>>,
         order: &Arc<Order<Executor>>,
+        peers: &Arc<[Arc<Address<Owner>>]>,
         sequences: usize,
         draft_ids: Option<Arc<[u32]>>,
         prefix: Option<PrefixCacheHandle>,
@@ -126,7 +128,9 @@ impl Generation {
         let queue = MpscQueue::<Message>::new(GREEDY_DEPTH + 4);
         let (producer, inbox) = (queue.producer(), queue.consumer());
         let copies = prefix.as_ref().map(|_| (id, Arc::clone(order)));
-        let executor = match Self::executor(core, config, residency, weights, &address, sequences, copies) {
+        let executor = match Self::executor(
+            core, config, residency, weights, &address, order, peers, sequences, copies,
+        ) {
             Ok(executor) => executor,
             Err(error) => return Err(Box::new((error, sequence))),
         };
@@ -184,12 +188,18 @@ impl Generation {
     }
 
     /// The stage graphs of the model's plan, whose quanta retire into the owner's mailbox.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the startup's state, and where this sequence sits in the engine"
+    )]
     fn executor(
         core: &Arc<Core>,
         config: &Arc<ModelConfig>,
         residency: &ResidencyPlan,
         weights: &Weights,
         address: &Arc<Address<Owner>>,
+        order: &Arc<Order<Executor>>,
+        peers: &Arc<[Arc<Address<Owner>>]>,
         sequences: usize,
         copies: Option<(SequenceId, Arc<Order<Executor>>)>,
     ) -> Result<Executor, EngineError> {
@@ -248,18 +258,43 @@ impl Generation {
             retry_backstop: DEFAULT_RETRY_BACKSTOP,
         };
         let retiring = Arc::clone(address);
+        let (passes, peers) = (Arc::clone(order), Arc::clone(peers));
         let executor = Executor::new(
             Arc::new(plan),
             &runtime,
             core.compute_lanes(),
             Arc::clone(&core.gpu),
             core.settings.kernels.graphs.captures_per_view as usize,
-            move |quantum, outcome| {
-                // Runs the owner's turn on this worker when no other turn runs.
-                retiring.post(Message::Retired(Box::new(Retired { quantum, outcome })));
+            move |mut quantum, outcome| {
+                if quantum.segments().len() < 2 {
+                    // Runs the owner's turn on this worker when no other turn runs.
+                    retiring.post(Message::Retired(Box::new(Retired::whole(quantum, outcome))));
+                    return;
+                }
+                // A pass of several sequences: the workspace's owner is told first (what waits behind the pass starts, and
+                // the passes' rule hears of it), then each member's owner gets its own part.
+                passes.pass_retired(quantum.id());
+                let leases = quantum.take_leases();
+                let guards = quantum.take_flights();
+                let batch = Arc::new(quantum);
+                for (segment, (lease, guard)) in leases.into_iter().zip(guards).enumerate() {
+                    let sequence = batch.segments().get(segment).and_then(|part| part.sequence());
+                    let Some(owner) = sequence.and_then(|sequence| peers.get(sequence.0)) else {
+                        log::error!("a pass retired with a part of no sequence the engine holds");
+                        continue;
+                    };
+                    owner.post(Message::Retired(Box::new(Retired::part(
+                        &batch, segment, lease, guard, &outcome,
+                    ))));
+                }
             },
         )
-        .map_err(|error| EngineError::Runtime(format!("the stage graphs: {error:?}")))?;
+        .map_err(|error| EngineError::Runtime(format!("the stage graphs: {error:?}")))?
+        .with_preparer(Preparer::new(
+            core.lane_table.clone(),
+            Arc::clone(&core.pool),
+            Arc::clone(core.owner_lane()),
+        ));
         let Some((sequence, order)) = copies else {
             return Ok(executor);
         };
@@ -485,12 +520,18 @@ impl Generations {
                 }) as Reply
             })
             .collect();
+        let caps = match PassCaps::new(residency.pass_rows, residency.pass_parts) {
+            Ok(caps) => caps,
+            Err(why) => return Err(Box::new((EngineError::Runtime(why), sequences))),
+        };
         let order = Arc::new(Order::new(
             replies,
             input_records(residency.draft_depth) as usize,
+            caps,
             Generation::spawner(core),
         ));
         let count = sequences.len();
+        let peers: Arc<[Arc<Address<Owner>>]> = addresses.iter().map(Arc::clone).collect();
         let prefix = open_cache(core, config, residency);
         let mut generations: Vec<Generation> = Vec::with_capacity(count);
         let mut waiting = sequences.into_iter().zip(addresses).enumerate();
@@ -505,6 +546,7 @@ impl Generations {
                 SequenceId(index),
                 address,
                 &order,
+                &peers,
                 count,
                 draft_ids.clone(),
                 prefix.clone(),
@@ -558,6 +600,11 @@ impl Generations {
     pub(crate) fn generate(&self, request: GenerationRequest, cancel: CancelHandle) -> Result<(), AdmissionError> {
         let (generation, lease) = self.take()?;
         generation.generate(request, cancel, lease)
+    }
+
+    /// What the engine's shared passes did.
+    pub(crate) fn pass_statistics(&self) -> PassStatistics {
+        self.order.statistics()
     }
 
     /// The prefix cache's counters; `None` when the cache is off.
