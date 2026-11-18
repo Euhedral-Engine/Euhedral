@@ -1288,15 +1288,17 @@ fn a_batch_refuses_what_is_for_one_sequence_and_one_sequence_under_two_ids() {
         scored.validate().is_err(),
         "scoring a number of rows of one sequence on a batch is refused"
     );
-    let quantum = make(vec![
-        first.part(&world, 0, &Member::all(1)).0,
-        second.part(&world, 1, &Member::all(1)).0,
-    ])
-    .unwrap();
+    let mut third = prefilled(&world, 300);
+    let mut fourth = prefilled(&world, 411);
+    let (e, keep_e, _) = third.part(&world, 0, &Member::all(1));
+    let (f, keep_f, _) = fourth.part(&world, 1, &Member::all(1));
+    let quantum = make(vec![e, f]).unwrap();
     assert!(quantum.seeding_draft().is_err());
     // One sequence under two ids shares its device buffers.
-    let (c, keep_c, _) = first.part(&world, 5, &Member::all(2));
-    let (d, keep_d, _) = first.part(&world, 6, &Member::all(2));
+    let mut same = prefilled(&world, 300);
+    let (c, keep_c, _) = same.part(&world, 5, &Member::all(2));
+    same.base_next += 2;
+    let (d, keep_d, _) = same.part(&world, 6, &Member::all(2));
     assert!(matches!(
         make(vec![c, d]).err(),
         Some(QuantumError::DuplicateSequence {
@@ -1305,7 +1307,11 @@ fn a_batch_refuses_what_is_for_one_sequence_and_one_sequence_under_two_ids() {
             ..
         })
     ));
-    drop((keep_a, keep_b, keep_c, keep_d));
+    drop((scored, keep_e, keep_f, keep_c, keep_d));
+    for run in [third, fourth, same] {
+        run.close(&world);
+    }
+    drop((keep_a, keep_b));
     first.close(&world);
     second.close(&world);
     world.close();
