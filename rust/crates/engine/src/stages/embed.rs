@@ -56,14 +56,15 @@ impl Launch for Embed {
         let ids = quantum.slot(BufferSlot::TokenIds);
         let step_tokens = || {
             quantum
-                .seq
+                .segment()
+                .refs
                 .device()
                 .scratch
                 .draft()
                 .map(|draft| draft.tokens.ptr())
                 .ok_or_else(|| fatal("the sequence has no step tokens"))
         };
-        if let Some(slot) = quantum.draft_token_read {
+        if let Some(slot) = quantum.segment().draft_token_read {
             if (slot + rows) as u64 > DRAFT_TOKEN_SLOTS {
                 return Err(fatal(format!(
                     "draft token slots {slot}..{} are out of {DRAFT_TOKEN_SLOTS}",

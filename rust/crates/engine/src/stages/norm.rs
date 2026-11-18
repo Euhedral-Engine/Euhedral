@@ -97,7 +97,7 @@ impl RmsNormUnitOffset {
     }
 
     fn seeds(&self, quantum: &Quantum) -> bool {
-        self.rows == NormRows::Final && quantum.seeds_draft
+        self.rows == NormRows::Final && quantum.segment().seeds_draft
     }
 }
 
@@ -115,7 +115,7 @@ impl Launch for RmsNormUnitOffset {
         let row_bytes = hidden as u64 * 2;
         let covered = self.covered(quantum);
         let input = quantum.slot(self.input);
-        let draft = quantum.seq.device().scratch.draft();
+        let draft = quantum.segment().refs.device().scratch.draft();
         if self.seeds(quantum) {
             let draft = draft.ok_or_else(|| fatal("a quantum seeds drafting but the sequence has no draft buffers"))?;
             if quantum.rows as u64 > draft.seed_capacity {

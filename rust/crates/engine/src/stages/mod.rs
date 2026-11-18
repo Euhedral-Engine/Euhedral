@@ -38,6 +38,7 @@ use euhedral_inference_cuda::launch::Modes;
 use euhedral_inference_cuda::launch::load::KernelTable;
 use euhedral_inference_cuda::launch::ops::RusteeOps;
 use euhedral_inference_cuda::{AllocationId, CudaLibrary, DevicePtr, KernelOps, LaneOps, PooledPinned, SubmitMode};
+use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
 
 use crate::error::EngineError;
@@ -315,6 +316,64 @@ impl SequenceRefs {
     }
 }
 
+/// One sequence's part of a quantum: its rows, where they start in the sequence and in the quantum's rows, and what its
+/// stages read and fill. A quantum has one segment today.
+#[derive(Debug)]
+pub struct Segment {
+    /// The sequence the segment's rows belong to, as its stages read it.
+    pub(crate) refs: SequenceRefs,
+    /// The position of the segment's first row in its sequence.
+    pub(crate) start_position: u64,
+    /// The segment's rows.
+    pub(crate) rows: usize,
+    /// The segment's first row among the quantum's rows.
+    pub(crate) row_offset: usize,
+    /// The device words and the pinned readback the segment's argmax fills.
+    pub(crate) selection: Option<Arc<Selection>>,
+    /// The lease on `selection` when it came from the sequence's pool: the words are the quantum's until it is
+    /// dropped, after its owner read the keys.
+    pub(crate) lease: Option<SelectionLease>,
+    /// The pinned readback the segment's logits row is copied to when the host selects (a sampling request): the
+    /// segment then has no selection. The owner's lease on it is held apart from the quantum.
+    pub(crate) row_readback: Option<Arc<RowReadback>>,
+    /// The slot of the step's tokens this segment's rows read their token ids from, instead of the input record.
+    pub(crate) draft_token_read: Option<usize>,
+    /// Whether the base rows' post-final-norm hidden also seed the sequence's drafting.
+    pub(crate) seeds_draft: bool,
+}
+
+impl Segment {
+    /// The segment's rows.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// The segment's first row among the quantum's rows.
+    pub fn row_offset(&self) -> usize {
+        self.row_offset
+    }
+
+    /// The position of the segment's first row in its sequence.
+    pub fn start_position(&self) -> u64 {
+        self.start_position
+    }
+
+    /// The segment of `rows` rows starting at `start_position`, whose rows are the quantum's first.
+    fn new(refs: SequenceRefs, start_position: u64, rows: usize) -> Self {
+        Self {
+            refs,
+            start_position,
+            rows,
+            row_offset: 0,
+            selection: None,
+            lease: None,
+            row_readback: None,
+            draft_token_read: None,
+            seeds_draft: false,
+        }
+    }
+}
+
 /// Why a quantum was refused.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum QuantumError {
@@ -354,10 +413,10 @@ pub struct Quantum {
     pub(crate) id: u64,
     pub(crate) kind: QuantumKind,
     pub(crate) rows: usize,
-    pub(crate) input: InputRecordRef,
     /// The workspace the quantum's rows live in. Its view of `rows` rows was checked when the quantum was made.
     pub(crate) workspace: Arc<Workspace>,
-    pub(crate) seq: SequenceRefs,
+    /// The sequences' parts of the quantum, in row order: at least one, which only [`Quantum::new`] can build.
+    segments: SmallVec<[Segment; 1]>,
     pub(crate) mode: SubmitMode,
     pub(crate) config: Arc<ModelConfig>,
     pub(crate) lanes: LaneTable,
@@ -366,12 +425,8 @@ pub struct Quantum {
     pub(crate) unmarked: Unmarked,
     /// Logits rows the quantum scores: the rows of its final norm, its head and its selection.
     pub(crate) logits_rows: usize,
-    /// Whether the base rows' post-final-norm hidden also seed the sequence's drafting.
-    pub(crate) seeds_draft: bool,
     pub(crate) draft_seed: Option<DraftSeed>,
     pub(crate) draft_token_write: Option<DraftTokenWrite>,
-    /// The slot of the step's tokens this quantum's rows read their token ids from, instead of the input record.
-    pub(crate) draft_token_read: Option<usize>,
     /// Whether the quantum writes its last input token to slot 0 of the step's tokens as the step's current token.
     pub(crate) writes_current_token: bool,
     /// The input record the quantum's ids and start position are uploaded to (one of the workspace's records).
@@ -379,14 +434,6 @@ pub struct Quantum {
     /// The selection of the quantum before it in a chain: the quantum's one row reads its token id from that
     /// selection's keys on the device, behind the quantum that wrote them ([`Quantum::token_from`]).
     pub(crate) token_from: Option<Arc<Selection>>,
-    /// The device words and the pinned readback the quantum's argmax fills.
-    pub(crate) selection: Option<Arc<Selection>>,
-    /// The lease on `selection` when it came from the sequence's pool: the words are the quantum's until it is
-    /// dropped, after its owner read the keys.
-    pub(crate) lease: Option<SelectionLease>,
-    /// The pinned readback the quantum's logits row is copied to when the host selects (a sampling request): the
-    /// quantum then has no selection. The owner's lease on it is held apart from the quantum.
-    pub(crate) row_readback: Option<Arc<RowReadback>>,
     /// The token ids of the rows, the input record's first part ([`Quantum::with_tokens`]).
     pub(crate) tokens: Vec<u32>,
     /// The pinned copy of the input record, held until the quantum is dropped: its upload reads it.
@@ -405,6 +452,31 @@ pub struct Quantum {
 static NEXT_QUANTUM: AtomicU64 = AtomicU64::new(0);
 
 impl Quantum {
+    /// The quantum's segments, in row order. Never empty.
+    pub fn segments(&self) -> &[Segment] {
+        &self.segments
+    }
+
+    /// The quantum's one segment: what the callers of a quantum of one sequence read.
+    pub(crate) fn segment(&self) -> &Segment {
+        debug_assert_eq!(
+            self.segments.len(),
+            1,
+            "a quantum of several sequences has no one segment"
+        );
+        // A quantum is built with one segment, and nothing removes it.
+        &self.segments[0]
+    }
+
+    fn segment_mut(&mut self) -> &mut Segment {
+        debug_assert_eq!(
+            self.segments.len(),
+            1,
+            "a quantum of several sequences has no one segment"
+        );
+        &mut self.segments[0]
+    }
+
     /// The quantum's own number, distinct for every quantum made.
     pub fn id(&self) -> u64 {
         self.id
@@ -443,9 +515,8 @@ impl Quantum {
             id: NEXT_QUANTUM.fetch_add(1, Ordering::Relaxed),
             kind,
             rows,
-            input,
             workspace,
-            seq,
+            segments: smallvec![Segment::new(seq, input.start_position(), rows)],
             mode,
             config,
             unmarked: Unmarked::new(lanes.len()),
@@ -453,14 +524,9 @@ impl Quantum {
             logits_rows,
             record: 0,
             token_from: None,
-            seeds_draft: false,
             draft_seed: None,
             draft_token_write: None,
-            draft_token_read: None,
             writes_current_token: false,
-            selection: None,
-            lease: None,
-            row_readback: None,
             tokens: Vec::new(),
             staging: None,
             uploaded: false,
@@ -482,9 +548,15 @@ impl Quantum {
         if self.kind == QuantumKind::Draft {
             return Err(QuantumError::DraftSeedsItself);
         }
-        let draft = self.seq.device().scratch.draft().ok_or(QuantumError::NoDraftBuffers {
-            what: "seeding drafting",
-        })?;
+        let draft = self
+            .segment()
+            .refs
+            .device()
+            .scratch
+            .draft()
+            .ok_or(QuantumError::NoDraftBuffers {
+                what: "seeding drafting",
+            })?;
         if self.rows as u64 > draft.seed_capacity {
             return Err(QuantumError::DraftSeedRows {
                 first: 0,
@@ -492,7 +564,7 @@ impl Quantum {
                 capacity: draft.seed_capacity,
             });
         }
-        self.seeds_draft = true;
+        self.segment_mut().seeds_draft = true;
         Ok(self)
     }
 
@@ -501,9 +573,15 @@ impl Quantum {
     pub fn with_draft_seed(mut self, seed: DraftSeed) -> Result<Self, QuantumError> {
         self.require_draft("takes a draft seed")?;
         if let DraftSeed::SeedRow(first) = seed {
-            let draft = self.seq.device().scratch.draft().ok_or(QuantumError::NoDraftBuffers {
-                what: "a seed from the sequence's rows",
-            })?;
+            let draft = self
+                .segment()
+                .refs
+                .device()
+                .scratch
+                .draft()
+                .ok_or(QuantumError::NoDraftBuffers {
+                    what: "a seed from the sequence's rows",
+                })?;
             if u64::from(first) + self.rows as u64 > draft.seed_capacity {
                 return Err(QuantumError::DraftSeedRows {
                     first,
@@ -537,7 +615,7 @@ impl Quantum {
             return Err(QuantumError::DraftTokenSlots { slot, end });
         }
         self.require_draft_buffers("reading the step's tokens")?;
-        self.draft_token_read = Some(slot);
+        self.segment_mut().draft_token_read = Some(slot);
         Ok(self)
     }
 
@@ -557,7 +635,7 @@ impl Quantum {
     }
 
     fn require_draft_buffers(&self, what: &'static str) -> Result<(), QuantumError> {
-        if self.seq.device().scratch.draft().is_some() {
+        if self.segment().refs.device().scratch.draft().is_some() {
             Ok(())
         } else {
             Err(QuantumError::NoDraftBuffers { what })
@@ -575,7 +653,7 @@ impl Quantum {
     /// the chain, on the device: no id is uploaded, and the host need not have read the token. The quantum's first
     /// stage runs behind the earlier quantum's last (the chain's edge), which has written the keys.
     pub fn token_from(mut self, selection: Arc<Selection>) -> Result<Self, QuantumError> {
-        if self.rows != 1 || self.draft_token_read.is_some() {
+        if self.rows != 1 || self.segment().draft_token_read.is_some() {
             return Err(QuantumError::Invalid {
                 what: format!(
                     "a token chained from the quantum before is one row, read from the selection and not from the \
@@ -590,27 +668,28 @@ impl Quantum {
 
     /// The device words and readback the quantum's argmax fills.
     pub fn with_selection(mut self, selection: Arc<Selection>) -> Self {
-        self.selection = Some(selection);
+        self.segment_mut().selection = Some(selection);
         self
     }
 
     /// The quantum copies its logits row to `readback` inside its graph instead of selecting on the device: the host
     /// selects from the row once the quantum retired.
     pub fn with_row_readback(mut self, readback: Arc<RowReadback>) -> Self {
-        self.row_readback = Some(readback);
+        self.segment_mut().row_readback = Some(readback);
         self
     }
 
     /// The readback the quantum's logits row is copied to, if the host selects.
     pub fn row_readback(&self) -> Option<&Arc<RowReadback>> {
-        self.row_readback.as_ref()
+        self.segment().row_readback.as_ref()
     }
 
     /// The words and readback of a selection leased from the sequence's pool: the quantum holds the lease until it is
     /// dropped, so no other quantum is given the words before the owner has read the keys.
     pub fn with_selection_lease(mut self, lease: SelectionLease) -> Self {
-        self.selection = Some(Arc::clone(lease.selection()));
-        self.lease = Some(lease);
+        let segment = self.segment_mut();
+        segment.selection = Some(Arc::clone(lease.selection()));
+        segment.lease = Some(lease);
         self
     }
 
@@ -657,7 +736,7 @@ impl Quantum {
     }
 
     pub fn start_position(&self) -> u64 {
-        self.input.start_position
+        self.segment().start_position
     }
 
     pub fn logits_rows(&self) -> usize {
@@ -667,12 +746,12 @@ impl Quantum {
     /// The allocation serial of layer `layer`'s page table in the cache `source` as of admission: part of the key
     /// of a captured graph that reads the table.
     pub fn table_generation(&self, source: KvSource, layer: usize) -> Option<AllocationId> {
-        self.seq.kv(source)?.table_generation(layer)
+        self.segment().refs.kv(source)?.table_generation(layer)
     }
 
     /// The words and readback the quantum's argmax fills, if it selects.
     pub fn selection(&self) -> Option<&Arc<Selection>> {
-        self.selection.as_ref()
+        self.segment().selection.as_ref()
     }
 
     /// The device address of `slot`; for the input record, the one this quantum uploads to.

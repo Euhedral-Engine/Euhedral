@@ -55,7 +55,8 @@ impl Launch for MtpStem {
             Some(DraftSeed::Address(address)) => address,
             Some(DraftSeed::SeedRow(first)) => {
                 let draft = quantum
-                    .seq
+                    .segment()
+                    .refs
                     .device()
                     .scratch
                     .draft()

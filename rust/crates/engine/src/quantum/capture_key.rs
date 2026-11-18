@@ -234,6 +234,64 @@ mod tests {
         }
     }
 
+    /// Keys of the shapes the engine's quanta have, written out field by field. They pin how a key is hashed and
+    /// which fields it holds; the keys a quantum builds are pinned by the device test of the capture key of each kind.
+    fn kind_keys() -> Vec<(&'static str, CaptureKey)> {
+        let base = |view, kind, rows, logits| CaptureKey {
+            view,
+            kind,
+            rows,
+            logits,
+            selects: true,
+            copies_rows: None,
+            seeds_draft: false,
+            draft_seed: None,
+            draft_read: None,
+            draft_write: None,
+            writes_current_token: false,
+            input_record: 0,
+            token_from: None,
+            row_exact: false,
+            programmatic: false,
+            split_geometry: 4,
+            reserved_host_pages: [0, 0],
+            replay_rows: Vec::new(),
+            buffer_generations: vec![AllocationId(1), AllocationId(2), AllocationId(3)],
+        };
+        let decode = base(View::Decode, QuantumKind::Decode, 1, 1);
+        let verify = CaptureKey {
+            row_exact: true,
+            copies_rows: Some(SelectedRows::Each),
+            selects: false,
+            replay_rows: vec![0, 2],
+            ..base(View::Verify { rows: 4 }, QuantumKind::Verify, 4, 4)
+        };
+        let draft = CaptureKey {
+            draft_seed: Some(0x1000),
+            draft_read: Some(1),
+            draft_write: Some((2, 0x2000)),
+            reserved_host_pages: [0, 3],
+            ..base(View::Draft { rows: 1 }, QuantumKind::Draft, 1, 1)
+        };
+        vec![("decode", decode), ("verify", verify), ("draft", draft)]
+    }
+
+    #[test]
+    fn the_digest_of_each_kind_of_key_is_pinned() {
+        let digests: Vec<(&str, u128)> = kind_keys()
+            .into_iter()
+            .map(|(name, key)| (name, key.digest()))
+            .collect();
+        assert_eq!(
+            digests,
+            vec![
+                ("decode", 85177849790268152127576662262586288684u128),
+                ("verify", 70383358627103906696142758927274320253),
+                ("draft", 36910513905071537792162313324617904005),
+            ]
+        );
+    }
+
     #[test]
     fn the_two_halves_of_the_digest_differ() {
         let digest = key().digest();

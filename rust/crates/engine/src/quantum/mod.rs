@@ -106,13 +106,13 @@ impl Quantum {
         let zeros;
         let ids: &[u32] = if self.tokens.len() == self.rows {
             &self.tokens
-        } else if self.draft_token_read.is_some() || self.token_from.is_some() {
+        } else if self.segment().draft_token_read.is_some() || self.token_from.is_some() {
             zeros = vec![0u32; self.rows];
             &zeros
         } else {
             return Err(PrepareError::NoTokens { rows: self.rows });
         };
-        let record = encode_input_record(ids, self.input.start_position());
+        let record = encode_input_record(ids, self.segment().start_position);
         let mut loan = pool.acquire(record.len())?;
         loan.buffer_mut().as_mut_slice()[..record.len()].copy_from_slice(&record);
         // SAFETY: the loan is held by the quantum, which is dropped only after its device work retired, and nothing
@@ -160,10 +160,10 @@ impl Quantum {
     /// buffers and seed, the GDN checkpoints of a verification, the decode scratch, and the selection.
     pub fn validate(&self) -> Result<(), QuantumError> {
         let invalid = |what: String| Err(QuantumError::Invalid { what });
-        let start = self.input.start_position();
+        let start = self.segment().start_position;
         let rows = self.rows as u64;
         if let Some(source) = self.attention_source() {
-            let Some(view) = self.seq.kv(source) else {
+            let Some(view) = self.segment().refs.kv(source) else {
                 return invalid(format!("the quantum has no view of the {source:?} cache"));
             };
             if !view.reserves(start, rows) {
@@ -181,7 +181,7 @@ impl Quantum {
                 return invalid(format!("a layer of the {source:?} cache has no page table"));
             }
             if takes_decode_scratch(self.kind, self.rows) {
-                let held = self.seq.device().scratch.decode_rows();
+                let held = self.segment().refs.device().scratch.decode_rows();
                 if rows > held {
                     return invalid(format!(
                         "{rows} attention rows exceed the {held} the decode scratch holds"
@@ -193,13 +193,13 @@ impl Quantum {
             if self.draft_seed.is_none() {
                 return invalid("a draft quantum has no rows to seed it".to_string());
             }
-            if self.seq.device().scratch.draft().is_none() {
+            if self.segment().refs.device().scratch.draft().is_none() {
                 return invalid("a draft quantum needs the sequence's draft buffers".to_string());
             }
         }
         if self.kind == QuantumKind::Verify {
             for layer in 0..self.config.layer_kinds.len() {
-                let Some(state) = self.seq.device().gdn.layer(layer) else {
+                let Some(state) = self.segment().refs.device().gdn.layer(layer) else {
                     continue;
                 };
                 let capacity = state.speculative().map_or(0, |buffers| buffers.capacity);
@@ -216,7 +216,7 @@ impl Quantum {
             } else {
                 1
             };
-            match (&self.selection, &self.row_readback) {
+            match (&self.segment().selection, &self.segment().row_readback) {
                 (Some(_), Some(_)) => {
                     return invalid("a quantum selects on the device or on the host, not both".to_string());
                 }
@@ -238,7 +238,7 @@ impl Quantum {
                 _ => {}
             }
         }
-        if self.draft_token_write.is_some() && (self.selection.is_none() || self.logits_rows == 0) {
+        if self.draft_token_write.is_some() && (self.segment().selection.is_none() || self.logits_rows == 0) {
             return invalid("a drafted token is passed on from a selection, and the quantum has none".to_string());
         }
         Ok(())
@@ -247,15 +247,18 @@ impl Quantum {
     /// The allocation serial of every buffer the quantum's launches read or write, in a fixed order.
     pub fn buffer_generations(&self) -> Vec<AllocationId> {
         let mut generations: Vec<AllocationId> = self.workspace.generations().collect();
-        self.seq.device().generations(&mut generations);
-        if let Some(selection) = &self.selection {
+        self.segment().refs.device().generations(&mut generations);
+        if let Some(selection) = &self.segment().selection {
             generations.push(selection.generation());
         }
-        if let Some(readback) = &self.row_readback {
+        if let Some(readback) = &self.segment().row_readback {
             generations.push(readback.generation());
         }
         // Only the cache the quantum's attention reads: the MTP cache growing does not change a base quantum's graph.
-        if let Some(view) = self.attention_source().and_then(|source| self.seq.kv(source)) {
+        if let Some(view) = self
+            .attention_source()
+            .and_then(|source| self.segment().refs.kv(source))
+        {
             view.generations(&mut generations);
         }
         generations
@@ -283,15 +286,20 @@ impl Quantum {
                 None
             }
         };
-        let (start, rows) = (self.input.start_position(), self.rows as u64);
+        let (start, rows) = (self.segment().start_position, self.rows as u64);
         if let Some(source) = self.attention_source() {
-            let view = self.seq.kv(source)?;
+            let view = self.segment().refs.kv(source)?;
             if view.grew_for(start, rows) || !view.reserves(start, rows) {
                 return None;
             }
         }
         let group = (self.config.num_attention_heads / self.config.num_key_value_heads.max(1)) as u64;
-        let host_pages = |source| self.seq.kv(source).map_or(0, |view| view.reserved_host_pages());
+        let host_pages = |source| {
+            self.segment()
+                .refs
+                .kv(source)
+                .map_or(0, |view| view.reserved_host_pages())
+        };
         let source = self.attention_source();
         let slot = |slot: usize| u8::try_from(slot).ok();
         Some(CaptureKey {
@@ -299,17 +307,17 @@ impl Quantum {
             kind: self.kind,
             rows: self.rows,
             logits: self.logits_rows,
-            selects: self.selection.is_some(),
-            copies_rows: self.row_readback.as_ref().map(|_| {
+            selects: self.segment().selection.is_some(),
+            copies_rows: self.segment().row_readback.as_ref().map(|_| {
                 if self.kind == QuantumKind::Verify {
                     SelectedRows::Each
                 } else {
                     SelectedRows::Last
                 }
             }),
-            seeds_draft: self.seeds_draft,
+            seeds_draft: self.segment().seeds_draft,
             draft_seed,
-            draft_read: self.draft_token_read.and_then(slot),
+            draft_read: self.segment().draft_token_read.and_then(slot),
             draft_write: self
                 .draft_token_write
                 .and_then(|write| Some((slot(write.slot)?, write.ids.get()))),
@@ -320,7 +328,7 @@ impl Quantum {
             programmatic: self.mode.pdl,
             split_geometry: split_geometry(start, rows, group),
             reserved_host_pages: keyed_host_pages(source, host_pages(KvSource::Base), host_pages(KvSource::Mtp)),
-            replay_rows: capture_key::trimmed(self.seq.replay_layers()),
+            replay_rows: capture_key::trimmed(self.segment().refs.replay_layers()),
             buffer_generations: self.buffer_generations(),
         })
     }
