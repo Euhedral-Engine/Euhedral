@@ -59,31 +59,23 @@ fn open_with(spec: CacheSpec<'_>, spawn: Spawn, granted: Option<Claim>) -> Optio
         return None;
     }
     let bytes = u64::from(slots) * slot_bytes;
-    let host = match PinnedArena::allocate(spec.library, bytes) {
-        Ok(host) => host,
-        Err(error) => {
-            log::warn!("the prefix cache's {bytes} bytes cannot be pinned ({error}): the engine runs without it");
-            return None;
-        }
-    };
     let claim = match granted {
         Some(mut claim) => {
             claim.shrink(claim.bytes().saturating_sub(bytes));
             claim
         }
-        None => {
-            // No account but the cache's own: the engine's plan has already placed the bytes.
-            let planner = Planner::new([LocationSpec {
-                kind: LocationKind::HostPinned,
-                capacity: bytes,
-                reserve: 0,
-            }]);
-            let location = planner.location(LocationKind::HostPinned)?;
-            let owner = planner.open_owner(OwnerSpec::new("prefix cache", Priority(0), Scope::Plan(0)));
-            planner.claim(owner, location, bytes, "prefix cache slots").ok()?
+        None => local_claim(bytes)?,
+    };
+    let host = match PinnedArena::allocate(spec.library, bytes) {
+        // The claim stays with the pinned memory, which the copy jobs share: it is released when the last holder is gone.
+        Ok(host) => host.with_claim(claim),
+        Err(error) => {
+            log::warn!("the prefix cache's {bytes} bytes cannot be pinned ({error}): the engine runs without it");
+            return None;
         }
     };
-    let arena = SlotArena::new(0, slot_bytes, slots, claim);
+    // The slots' lease book accounts for no bytes: the memory is the pinned arena's.
+    let arena = SlotArena::new(0, slot_bytes, slots, local_claim(0)?);
     let parts = CacheParts {
         layout,
         arena,
@@ -104,4 +96,16 @@ fn open_with(spec: CacheSpec<'_>, spawn: Spawn, granted: Option<Claim>) -> Optio
             None
         }
     }
+}
+
+/// A claim of `bytes` on a planner of its own: the engine's plan has already placed the bytes.
+fn local_claim(bytes: u64) -> Option<Claim> {
+    let planner = Planner::new([LocationSpec {
+        kind: LocationKind::HostPinned,
+        capacity: bytes,
+        reserve: 0,
+    }]);
+    let location = planner.location(LocationKind::HostPinned)?;
+    let owner = planner.open_owner(OwnerSpec::new("prefix cache", Priority(0), Scope::Plan(0)));
+    planner.claim(owner, location, bytes, "prefix cache").ok()
 }

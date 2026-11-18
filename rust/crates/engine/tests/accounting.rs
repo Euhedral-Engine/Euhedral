@@ -10,8 +10,10 @@
 
 use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::residency::accounting::{Consumer, MemoryAccount, PlanReservation};
+use euhedral_inference_engine::residency::footprint::first_sequence_bytes;
 use euhedral_inference_engine::residency::planner::{LocationBytes, PlanInputs, ResidencyPlan, plan_with};
-use euhedral_inference_settings::ByteSize;
+use euhedral_inference_engine::workspace::{Workspace, input_records_for};
+use euhedral_inference_settings::{Auto, ByteSize, KvFormat};
 
 mod common;
 
@@ -157,4 +159,77 @@ fn a_claim_still_held_at_the_end_is_a_leak_of_its_bytes() {
     assert!(!report.is_clean());
     assert_eq!(report.bytes(), plan.kv_device_bytes);
     drop(leaked);
+}
+
+/// The claims a startup takes of a plan, in the sizes it allocates them (the workspace's scratch is the plan's).
+fn take_startup_claims(plan: &ResidencyPlan, reservation: &mut PlanReservation) -> Result<(), String> {
+    let config = config();
+    let regions = [plan.scratch_bytes, plan.decode_scratch_bytes];
+    let records = input_records_for(plan.draft_depth, plan.sequences);
+    let in_reserve = Workspace::allocation_bytes(&config, plan.rows, &regions, records) - plan.scratch_bytes;
+    let mut claims = Vec::new();
+    let mut take = |consumer, bytes| {
+        let claim = if consumer == Consumer::RuntimeReserve {
+            // The reserve is never the reason a startup is refused.
+            reservation.claim_reserve(bytes).map(|(claim, _over)| claim)
+        } else {
+            reservation.claim(consumer, bytes)
+        };
+        claims.push(claim.map_err(|error| error.to_string())?);
+        Ok::<(), String>(())
+    };
+    take(Consumer::Weights, plan.arena_bytes)?;
+    take(Consumer::Scratch, plan.scratch_bytes)?;
+    take(Consumer::RuntimeReserve, in_reserve)?;
+    for index in 0..plan.sequences {
+        take(Consumer::Cache, plan.kv_device_bytes)?;
+        if index == 0 {
+            take(Consumer::RuntimeReserve, first_sequence_bytes(plan, &config))?;
+        } else {
+            take(Consumer::ExtraSequences, plan.extra_sequence_bytes)?;
+        }
+        if plan.kv_host_bytes > 0 {
+            take(Consumer::HostPages, plan.kv_host_bytes / plan.sequences as u64)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn what_the_plan_admits_the_claims_of_the_startup_fit() {
+    let (config, table) = (config(), rco_table());
+    let mut tried = 0;
+    for context in [4096, 131_072, 262_144] {
+        for format in [KvFormat::Nvfp4, KvFormat::Bf16] {
+            for chunk in [512, 2048, 8192] {
+                for sequences in [1, 2] {
+                    let mut settings = settings(context);
+                    settings.context.kv_cache_format = Auto::Value(format);
+                    settings.batching.prefill_chunk_tokens = chunk;
+                    let Ok(plan) = plan_with(&config, &table, &settings, inputs(sequences)) else {
+                        continue;
+                    };
+                    tried += 1;
+                    let (account, mut reservation) = admit(&plan);
+                    if let Err(refused) = take_startup_claims(&plan, &mut reservation) {
+                        panic!("{context} tokens, {format:?}, chunk {chunk}, {sequences} sequences: {refused}");
+                    }
+                    drop(reservation);
+                    assert!(account.close().is_clean());
+                }
+            }
+        }
+    }
+    assert!(tried >= 12, "only {tried} of the inputs were planned");
+}
+
+#[test]
+fn the_reserve_claim_that_does_not_fit_names_the_setting() {
+    let plan = plans().remove(0);
+    let (_account, mut reservation) = admit(&plan);
+    let refused = reservation
+        .claim(Consumer::RuntimeReserve, plan.runtime_reserve_bytes + 1)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("memory.runtime-reserve"), "{refused}");
 }

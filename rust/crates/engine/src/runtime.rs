@@ -782,6 +782,12 @@ impl EngineRuntime {
         Arc::clone(&self.core.teardown)
     }
 
+    /// The bytes the memory account holds now, per location: the admitted bytes while every claim is held, less what a
+    /// claim gave back (the prefix cache's trim to whole slots).
+    pub fn memory_held(&self) -> LocationBytes {
+        self.core.account.held()
+    }
+
     /// What the startup measured.
     pub fn report(&self) -> &StartupReport {
         &self.report

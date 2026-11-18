@@ -295,13 +295,19 @@ impl Workspace {
         for bytes in scratch_bytes.iter().copied().filter(|bytes| *bytes > 0) {
             scratch.push(DeviceBuffer::alloc(library, bytes as usize)?);
         }
-        Ok(Workspace {
+        let workspace = Workspace {
             rows,
             records,
             slots,
             scratch,
             claims: Vec::new(),
-        })
+        };
+        debug_assert_eq!(
+            workspace.retained_bytes(),
+            Workspace::allocation_bytes(config, rows, scratch_bytes, records),
+            "the bytes claimed before the allocation are the bytes it took"
+        );
+        Ok(workspace)
     }
 
     /// The input records the workspace holds.

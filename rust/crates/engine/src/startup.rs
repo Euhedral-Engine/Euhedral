@@ -598,19 +598,24 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
         let planned_scratch = regions[0].min(plan.scratch_bytes);
         let in_reserve = Workspace::allocation_bytes(&artifact.config, plan.rows, &regions, records) - planned_scratch;
         let scratch_claim = reservation.claim(Consumer::Scratch, planned_scratch)?;
-        let reserve_claim = reservation.claim(Consumer::RuntimeReserve, in_reserve)?;
+        let (reserve_claim, over) = reservation.claim_reserve(in_reserve)?;
+        warn_over_reserve("the workspace", over);
         let mut workspace =
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
         workspace.hold(scratch_claim);
         workspace.hold(reserve_claim);
         let (sequences, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {
-            let first = first_sequence_bytes(&plan, &artifact.config);
+            let first = footprint::first_sequence_bytes(&plan, &artifact.config);
             let mut sequences = Vec::with_capacity(plan.sequences);
             for index in 0..plan.sequences {
                 let mut claims = vec![reservation.claim(Consumer::Cache, plan.kv_device_bytes)?];
                 // The first sequence's state is the runtime reserve's; each one beyond it has its own share.
                 claims.push(match index {
-                    0 => reservation.claim(Consumer::RuntimeReserve, first)?,
+                    0 => {
+                        let (claim, over) = reservation.claim_reserve(first)?;
+                        warn_over_reserve("the first sequence's state", over);
+                        claim
+                    }
                     _ => reservation.claim(Consumer::ExtraSequences, plan.extra_sequence_bytes)?,
                 });
                 if plan.kv_host_bytes > 0 {
@@ -882,19 +887,11 @@ impl Finish {
     }
 }
 
-/// The device bytes the first sequence's state takes beyond its cache: what `ResidencyPlan::extra_sequence_bytes` is for
-/// each one beyond it. The runtime reserve pays for it.
-fn first_sequence_bytes(plan: &ResidencyPlan, config: &ModelConfig) -> u64 {
-    let drafts = plan.draft_depth > 0;
-    let verified_rows = if drafts { 1 + plan.draft_depth as u64 } else { 0 };
-    footprint::extra_sequence_bytes(
-        config,
-        plan.kv_format,
-        plan.max_context_tokens as u64,
-        verified_rows,
-        drafts,
-        plan.rows.rows,
-    )
+/// Logs what an allocation takes beyond the runtime reserve: the plan did not count it, and the engine starts all the same.
+fn warn_over_reserve(what: &str, over: u64) {
+    if over > 0 {
+        log::warn!("{what} takes {over} bytes beyond the runtime reserve (memory.runtime-reserve)");
+    }
 }
 
 /// A pinned buffer that will hold the draft head's token ids, and where they are on the device.

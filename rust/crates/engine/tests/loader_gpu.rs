@@ -507,6 +507,17 @@ fn shutdown_reports_a_clean_leak_check() {
         admitted.host,
         runtime.plan().kv_host_bytes + runtime.plan().prefix_cache_bytes
     );
+    // At ready every claim is held: the account holds what was admitted, less what the prefix cache gave back of its
+    // grant (it keeps whole slots only).
+    let held = runtime.memory_held();
+    assert_eq!(held.device, admitted.device, "a device allocation lost its claim");
+    assert!(held.host <= admitted.host, "{held:?} of {admitted:?}");
+    let trimmed = admitted.host - held.host;
+    assert!(
+        trimmed <= runtime.plan().prefix_cache_bytes,
+        "{trimmed} bytes of the host were given back, the prefix cache's grant is {}",
+        runtime.plan().prefix_cache_bytes
+    );
     closer.shutdown(runtime).unwrap();
     assert_eq!(
         teardown.leaked_bytes(),

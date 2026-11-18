@@ -1,7 +1,7 @@
 //! The account of the engine's memory: one admitted reservation of the process's memory planner, from which every
 //! allocation of the startup takes a claim and holds it for as long as it lives.
 //!
-//! The plan names its consumers ([`ResidencyPlan::consumers`](crate::residency::planner::ResidencyPlan::consumers)):
+//! The plan names its consumers ([`ResidencyPlan::consumers`]):
 //! the same list is what the memory planner admits, so the reservation and the plan cannot differ. An allocation
 //! takes its claim from [`PlanReservation::claim`] before it allocates, so that one larger than the plan fails the
 //! startup and names its consumer. At shutdown [`MemoryAccount::close`] ends the owner of the claims: whatever one
@@ -263,12 +263,25 @@ impl PlanReservation {
             .sum()
     }
 
+    /// A claim of the runtime reserve for an allocation of `bytes`, and the bytes the reserve has not left for it. What
+    /// the reserve pays for is what the plan did not count (the workspace's slots grow with the rows of a pass), so the
+    /// allocation is never refused for it: the shortfall is the caller's to report.
+    pub fn claim_reserve(&mut self, bytes: u64) -> Result<(Claim, u64), EngineError> {
+        let left = self.left(Consumer::RuntimeReserve);
+        let taken = bytes.min(left);
+        Ok((self.claim(Consumer::RuntimeReserve, taken)?, bytes - taken))
+    }
+
     /// A claim of `bytes` of `consumer`'s share, to be held for as long as the allocation it accounts for. Refused,
     /// naming the consumer, when the plan has not that many bytes left for it: the allocation is larger than planned.
     pub fn claim(&mut self, consumer: Consumer, bytes: u64) -> Result<Claim, EngineError> {
         let refused = |left: u64| {
+            let setting = match consumer {
+                Consumer::RuntimeReserve => " (raise memory.runtime-reserve)",
+                _ => "",
+            };
             EngineError::Runtime(format!(
-                "the {consumer} needs {bytes} bytes and the plan admitted {left} bytes more for it"
+                "the {consumer} needs {bytes} bytes and the plan admitted {left} bytes more for it{setting}"
             ))
         };
         let Some(asked) = self.left.iter_mut().find(|asked| asked.consumer == consumer) else {
