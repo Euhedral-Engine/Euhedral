@@ -492,6 +492,27 @@ mod tests {
         tokens
     }
 
+    /// The real artifact (`euhedral.qwen.rco-artifact`) passes the startup checks; skips without the key.
+    #[test]
+    #[allow(
+        clippy::print_stdout,
+        reason = "a test prints its skip line when the machine has no artifact"
+    )]
+    fn the_real_artifact_passes_the_startup_checks() {
+        let Some(path) = test_support::require_property("euhedral.qwen.rco-artifact") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            println!("skipped: euhedral.qwen.rco-artifact names no file");
+            return;
+        }
+        let section = read_artifact_section(&path).expect("the artifact's tokenizer section");
+        if let Err(error) = checked_tokenizer(&section) {
+            panic!("the real artifact is refused: {error}");
+        }
+    }
+
     #[test]
     fn a_section_with_the_checkpoint_template_and_all_control_tokens_starts() {
         assert!(checked_tokenizer(&section(&control_tokens(), CHECKPOINT_TEMPLATE)).is_ok());
