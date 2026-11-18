@@ -5,7 +5,9 @@ The GitLab API is not called: PROMOTE_API_LOG makes the script write its calls t
 It needs git 2.38 or newer, jq and bash.
 """
 
+import json
 import os
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -20,6 +22,7 @@ GIT_ENV = {
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_SYSTEM": os.devnull,
 }
+TOKEN = "tok-SECRET-0123456789"
 MUTATING = ("POST ", "PUT ", "DELETE ")
 
 
@@ -86,13 +89,17 @@ class PromoteTests(unittest.TestCase):
             "CI_SERVER_URL": f"file://{self.srv}",
             "CI_PROJECT_PATH": "proj",
             "CI_DEFAULT_BRANCH": "main",
-            "PROMOTE_TOKEN": "not-a-token",
+            "PROMOTE_TOKEN": TOKEN,
             "PROMOTE_API_LOG": str(self.log),
             "INTEGRATION_BRANCH": old,
         }
         for key in ("NEXT_BRANCH", "PROMOTE_CHECKOUT", "MIRROR_REMOTE"):
             env.pop(key, None)
-        env.update(extra or {})
+        for key, value in (extra or {}).items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
         done = subprocess.run(
             ["bash", str(SCRIPT), *args], cwd=cwd or clone, env=env, capture_output=True, text=True, timeout=120
         )
@@ -231,6 +238,220 @@ class PromoteTests(unittest.TestCase):
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("uncommitted", done.stderr)
         self.assertEqual(self.heads(), before)
+
+    # -- helpers for the cases below --
+    def state(self):
+        path = Path(str(self.log) + ".state")
+        path.mkdir(exist_ok=True)
+        return path
+
+    def seed_mrs(self, *mrs):
+        (self.state() / "mrs.json").write_text(json.dumps([{"iid": i, "target_branch": t} for i, t in mrs]))
+
+    def mr_targets(self):
+        return {m["iid"]: m["target_branch"] for m in json.loads((self.state() / "mrs.json").read_text())}
+
+    def hook(self, name, body):
+        path = self.bare / "hooks" / name
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+    def reject_pushes_to(self, ref):
+        """A pre-receive hook that refuses the ref while the file reject-<ref> exists in the bare repository."""
+        self.hook("pre-receive", 'while read o n ref; do [ -f "./reject/$(echo $ref | tr / _)" ] && exit 1; done; exit 0\n')
+        (self.bare / "reject").mkdir(exist_ok=True)
+        marker = self.bare / "reject" / ref.replace("/", "_")
+        marker.touch()
+        return marker
+
+    def make_upstream(self):
+        self.up = self.root / "up.git"
+        git(self.root, "clone", "-q", "--bare", str(self.bare), str(self.up))
+
+    def advance(self, target, file, text):
+        """A commit on main of the given bare repository (GitLab's or the upstream one)."""
+        git(self.seed, "fetch", "-q", str(target), "main")
+        git(self.seed, "checkout", "-q", "-B", "main", "FETCH_HEAD")
+        self.commit(self.seed, file, text)
+        git(self.seed, "push", "-q", str(target), "main")
+        return git(self.seed, "rev-parse", "HEAD")
+
+    def author_of(self, rev):
+        return git(self.bare, "log", "-1", "--format=%an <%ae>", rev)
+
+    def is_ancestor(self, a, b):
+        return subprocess.run(["git", "merge-base", "--is-ancestor", a, b], cwd=self.bare).returncode == 0
+
+    # -- the cases --
+    def test_merge_requests_are_moved_page_by_page_and_late_ones_too(self):
+        sha = self.start_integration()
+        self.seed_mrs(*[(i, "rust/next") for i in range(1, 6)], (7, "other"))
+        done = self.run_promote("rust/next", sha, extra={"PROMOTE_MR_PAGE": "2", "PROMOTE_API_FAKE_LATE_MR": "99"})
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        targets = self.mr_targets()
+        for iid in (1, 2, 3, 4, 5, 99):
+            self.assertEqual(targets[iid], "rust/next-2", iid)
+        self.assertEqual(targets[7], "other")
+        self.assertIn("moved from rust/next to rust/next-2: 1 2 3 4 5", done.stdout)
+
+    def test_a_commit_reaching_the_old_branch_during_the_run_is_not_deleted_and_a_rerun_finishes(self):
+        sha = self.start_integration()
+        (self.bare / "late").touch()
+        self.hook(
+            "post-receive",
+            'while read o n ref; do if [ "$ref" = refs/heads/rust/next-2 ] && [ -f ./late ]; then rm ./late; '
+            'h=$(git rev-parse refs/heads/rust/next); c=$(git commit-tree "$h^{tree}" -p "$h" -m late); '
+            'git update-ref refs/heads/rust/next "$c"; fi; done\n',
+        )
+        done = self.run_promote("rust/next", sha)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("gained commits", done.stderr)
+        late = self.head("rust/next")
+        self.assertNotEqual(late, sha)
+        self.assertEqual(self.head("main"), sha)
+        # the old branch is not finished with until the new one holds what it gained
+        done = self.run_promote("rust/next", sha)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("has moved on", done.stderr)
+        git(self.seed, "fetch", "-q", "origin")
+        git(self.seed, "push", "-q", "origin", f"{late}:refs/heads/rust/next-2")
+        done = self.run_promote("rust/next", sha)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(self.head("rust/next"), "")
+        self.assertEqual(self.head("rust/next-2"), late)
+
+    def test_the_old_branch_is_frozen_first(self):
+        sha = self.start_integration()
+        self.reject_pushes_to("refs/heads/main")
+        done = self.run_promote("rust/next", sha)
+        self.assertNotEqual(done.returncode, 0)
+        frozen = json.loads((self.state() / "prot" / "rust%2Fnext").read_text())
+        self.assertEqual(frozen["push_access_levels"][0]["access_level"], 0)
+        self.assertEqual(frozen["merge_access_levels"][0]["access_level"], 0)
+
+    def test_rejected_main_push_changes_nothing_else_and_a_rerun_finishes(self):
+        sha = self.start_integration()
+        base = self.head("main")
+        marker = self.reject_pushes_to("refs/heads/main")
+        done = self.run_promote("rust/next", sha)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual((self.head("main"), self.head("rust/next"), self.head("rust/next-2")), (base, sha, ""))
+        marker.unlink()
+        done = self.run_promote("rust/next", sha)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual((self.head("main"), self.head("rust/next-2"), self.head("rust/next")), (sha, sha, ""))
+        # the new branch took the old one's rules, not the frozen ones
+        made = json.loads((self.state() / "prot" / "rust%2Fnext-2").read_text())
+        self.assertEqual(made["push_access_levels"][0]["access_level"], 40)
+
+    def test_rerun_of_a_half_done_merge_commit_run(self):
+        sha = self.start_integration()
+        self.advance_main("other.txt", "other\n")
+        marker = self.reject_pushes_to("refs/heads/rust/next-2")
+        done = self.run_promote("rust/next", sha)
+        self.assertNotEqual(done.returncode, 0)
+        merged = self.head("main")
+        self.assertEqual(len(git(self.bare, "rev-list", "--parents", "-n1", merged).split()), 3)
+        marker.unlink()
+        done = self.run_promote("rust/next", sha)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(self.head("main"), merged)  # no second merge commit
+        self.assertEqual(self.head("rust/next-2"), merged)
+        self.assertEqual(self.head("rust/next"), "")
+
+    def test_existing_next_branch_without_mains_commits_is_refused_in_the_checks(self):
+        sha = self.start_integration()
+        self.advance_main("other.txt", "other\n")
+        git(self.seed, "push", "-q", "origin", f"{sha}:refs/heads/rust/next-2")
+        before = self.heads()
+        done = self.run_promote("rust/next", sha)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("not the commits main has", done.stderr)
+        self.assertEqual(self.heads(), before)
+        self.assertEqual(self.mutating_calls(), [])
+
+    def test_upstream_main_ahead_is_the_base(self):
+        sha = self.start_integration()
+        self.make_upstream()
+        up_head = self.advance(self.up, "upstream.txt", "upstream\n")
+        done = self.run_promote("rust/next", sha, extra={"UPSTREAM_MAIN_URL": f"file://{self.up}"})
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        merged = self.head("main")
+        self.assertEqual(git(self.bare, "rev-list", "--parents", "-n1", merged).split()[1:], [up_head, sha])
+        self.assertTrue(self.is_ancestor(up_head, self.head("rust/next-2")))
+
+    def test_upstream_main_behind_keeps_gitlabs_main_as_the_base(self):
+        sha = self.start_integration()
+        self.make_upstream()
+        gl_head = self.advance(self.bare, "gitlab.txt", "gitlab\n")
+        done = self.run_promote("rust/next", sha, extra={"UPSTREAM_MAIN_URL": f"file://{self.up}"})
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(git(self.bare, "rev-list", "--parents", "-n1", self.head("main")).split()[1:], [gl_head, sha])
+
+    def test_diverged_upstream_main_stops_in_the_checks(self):
+        sha = self.start_integration()
+        self.make_upstream()
+        self.advance(self.up, "upstream.txt", "upstream\n")
+        self.advance(self.bare, "gitlab.txt", "gitlab\n")
+        before = self.heads()
+        done = self.run_promote("rust/next", sha, extra={"UPSTREAM_MAIN_URL": f"file://{self.up}"})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("have diverged", done.stderr)
+        self.assertEqual(self.heads(), before)
+        self.assertEqual(self.mutating_calls(), [])
+
+    def test_integration_branch_variable_naming_another_branch_stops(self):
+        sha = self.start_integration()
+        before = self.heads()
+        done = self.run_promote("rust/next", sha, extra={"INTEGRATION_BRANCH": "elsewhere"})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("names elsewhere", done.stderr)
+        self.assertEqual(self.heads(), before)
+
+    def test_dry_run_variable(self):
+        sha = self.start_integration()
+        before = self.heads()
+        done = self.run_promote("rust/next", sha, extra={"PROMOTE_DRY_RUN": "1"})
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertIn("dry run", done.stdout)
+        self.assertEqual(self.heads(), before)
+        self.assertEqual(self.mutating_calls(), [])
+
+    def test_the_token_never_appears_in_any_output(self):
+        sha = self.start_integration()
+        self.advance_main("other.txt", "other\n")
+        marker = self.reject_pushes_to("refs/heads/rust/next-2")
+        failed = self.run_promote("rust/next", sha)
+        marker.unlink()
+        done = self.run_promote("rust/next", sha)
+        self.assertEqual(done.returncode, 0)
+        seen = failed.stdout + failed.stderr + done.stdout + done.stderr + self.log.read_text()
+        self.assertNotIn(TOKEN, seen)
+        self.assertNotIn("SECRET", seen)
+
+    def test_a_real_server_url_is_refused_in_test_mode(self):
+        sha = self.start_integration()
+        done = self.run_promote("rust/next", sha, extra={"CI_SERVER_URL": "https://gitlab.example"})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("file:// URL", done.stderr)
+
+    def test_a_configured_identity_is_kept_and_a_missing_one_is_supplied(self):
+        sha = self.start_integration()
+        self.advance_main("other.txt", "other\n")
+        config = self.root / "gitconfig"
+        config.write_text("[user]\n\tname = Configured\n\temail = configured@localhost\n")
+        names = {key: None for key in GIT_ENV if key.startswith("GIT_AUTHOR") or key.startswith("GIT_COMMITTER")}
+        done = self.run_promote("rust/next", sha, extra={**names, "GIT_CONFIG_GLOBAL": str(config)})
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(self.author_of(self.head("main")), "Configured <configured@localhost>")
+
+    def test_a_missing_identity_is_supplied(self):
+        sha = self.start_integration()
+        self.advance_main("other.txt", "other\n")
+        names = {key: None for key in GIT_ENV if key.startswith("GIT_AUTHOR") or key.startswith("GIT_COMMITTER")}
+        done = self.run_promote("rust/next", sha, extra=names)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(self.author_of(self.head("main")), "GitLab promote <promote@localhost>")
 
 
 if __name__ == "__main__":
