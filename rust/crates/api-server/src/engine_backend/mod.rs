@@ -13,7 +13,7 @@ mod start;
 
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_data_structures::sync::ClaimCell;
@@ -220,6 +220,7 @@ impl Backend for EngineBackend {
             cancel: CancelHandle::default(),
             available: Arc::clone(&self.available),
             started: AtomicBool::new(false),
+            restored: Arc::new(AtomicUsize::new(0)),
         }))
     }
 }
@@ -265,6 +266,8 @@ struct EngineGeneration {
     cancel: CancelHandle,
     available: Arc<AtomicBool>,
     started: AtomicBool,
+    /// The prompt tokens the engine restored from its prefix cache, known from its first prefill quantum.
+    restored: Arc<AtomicUsize>,
 }
 
 impl Generation for EngineGeneration {
@@ -287,6 +290,7 @@ impl Generation for EngineGeneration {
             Shape::of(self.codec.as_ref(), self.reasoning),
             self.cancel.clone(),
             Arc::clone(&hand),
+            Arc::clone(&self.restored),
         );
         let request = EngineRequest {
             prompt: prompt.token_ids,
@@ -300,6 +304,10 @@ impl Generation for EngineGeneration {
         let refusal = self.engine.generate(request, self.cancel.clone()).err().map(refused);
         // A listener the engine let go of untold ends here, or in the relay's drop if that comes later.
         hand.answered(refusal);
+    }
+
+    fn cached_prompt_tokens(&self) -> usize {
+        self.restored.load(Ordering::Acquire)
     }
 
     fn cancel(&self) {

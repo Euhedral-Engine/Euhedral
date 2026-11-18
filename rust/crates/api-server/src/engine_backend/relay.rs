@@ -2,7 +2,7 @@
 //! end is told exactly once whatever the engine does with the request.
 
 use std::mem::take;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -84,6 +84,10 @@ pub(super) struct Relay {
     shape: Shape,
     cancel: CancelHandle,
     hand: Arc<Hand>,
+    /// The position the first prefill quantum started at, which is what the prefix cache restored: set once, before
+    /// the first token, for the generation to report while it runs.
+    restored: Arc<AtomicUsize>,
+    prefilling: bool,
     tokens: Vec<u32>,
     /// Why decoding a token failed; the generation is cancelled and ends as a failure.
     broken: Option<String>,
@@ -96,6 +100,7 @@ impl Relay {
         shape: Shape,
         cancel: CancelHandle,
         hand: Arc<Hand>,
+        restored: Arc<AtomicUsize>,
     ) -> Relay {
         Relay {
             listener: Some(listener),
@@ -103,6 +108,8 @@ impl Relay {
             shape,
             cancel,
             hand,
+            restored,
+            prefilling: false,
             tokens: Vec::new(),
             broken: None,
         }
@@ -154,6 +161,13 @@ impl GenerationListener for Relay {
     }
 
     fn quantum(&mut self, event: QuantumEvent) {
+        if event.kind == QuantumKind::Prefill && !self.prefilling {
+            self.prefilling = true;
+            self.restored.store(
+                usize::try_from(event.start_position).unwrap_or(usize::MAX),
+                Ordering::Release,
+            );
+        }
         if event.kind == QuantumKind::Prefill
             && let Some(listener) = self.listener.as_mut()
         {
@@ -184,7 +198,7 @@ impl GenerationListener for Relay {
                 completion_tokens: self.tokens.len(),
                 stop_token_reached: self.stopped(),
                 reasoning_tokens: self.reasoning_tokens(),
-                cached_prompt_tokens: 0,
+                cached_prompt_tokens: outcome.cached_prompt_tokens,
                 token_ids: take(&mut self.tokens),
             }),
         };

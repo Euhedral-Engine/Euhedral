@@ -6,6 +6,7 @@
 //! worker that finds them and hands the whole [`Recorder`] to the main thread when the request ends, so no clock is
 //! read, and nothing is allocated for the record, in the timed path of the engine beyond the events themselves.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::env::consts;
 use std::sync::Arc;
@@ -22,8 +23,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::await_value;
-use crate::config::{ConfigError, Options, Scenario, SpeculationMode};
-use crate::metrics::{self, Ending, Phase, QuantumRecord, Recorder, Step};
+use crate::config::{ConfigError, Options, Scenario, ScenarioKind, SpeculationMode};
+use crate::metrics::{self, Ending, Pass, Phase, QuantumRecord, Recorder, Step};
 use crate::prompt::Prompt;
 use crate::result::{
     self, Fork, GpuMemory, IMPLEMENTATION, Provenance, Row, SCHEMA, SCHEMA_VERSION, ScenarioRecord, TOOL, iso_instant,
@@ -55,7 +56,7 @@ pub fn prepare(options: &Options, tokenizer: &Tokenizer) -> Result<Prepared, Con
             }
         };
         for prompt in set.iter() {
-            let required = prompt.ids.len() + scenario.requested_new_tokens;
+            let required = prompt.ids.len() + scenario.tail_tokens() + scenario.requested_new_tokens;
             if required > options.max_context_tokens as usize {
                 return Err(ConfigError::Invalid(format!(
                     "{} needs {required} positions; context is {} (maxContextTokens)",
@@ -164,6 +165,7 @@ impl GenerationListener for Probe {
             FinishReason::Cancelled => Ending::Failed("the request was cancelled".to_string()),
             FinishReason::Length | FinishReason::Stop | FinishReason::ContextFull => Ending::Completed,
         };
+        recorder.restored = outcome.cached_prompt_tokens;
         recorder.finished = Some((at, ending));
         done.send(recorder);
     }
@@ -202,7 +204,7 @@ pub fn snapshot(options: &Options, runtime: &EngineRuntime) -> Value {
             "planContextTokens": plan.max_context_tokens,
             "artifact": artifact,
             "speculation": options.speculation.label(),
-            "prefixCacheBytes": 0,
+            "prefixCacheBytes": plan.prefix_cache_bytes,
             "kvDeviceTokens": plan.kv_device_tokens,
             "kvHostTokens": plan.kv_host_tokens,
         },
@@ -239,6 +241,16 @@ struct Iteration<'a> {
     tokenizer: &'a Tokenizer,
     context: &'a Context,
     engine: &'a Value,
+    /// Counts the prefix requests made, so that each cold prompt differs from every earlier one.
+    salts: Cell<usize>,
+}
+
+/// Which request of which iteration a row measures.
+#[derive(Clone, Copy)]
+struct Turn {
+    warmup: bool,
+    index: usize,
+    pass: Pass,
 }
 
 /// Runs every scenario of `options` on `runtime`: its warmup iterations, then its measured ones, each handed to
@@ -258,13 +270,18 @@ pub fn run(
         tokenizer,
         context,
         engine: &engine,
+        salts: Cell::new(0),
     };
     for (scenario, prompts) in &prepared.prompts {
         for index in 0..options.warmup {
-            sink(iteration.run(scenario, &prompts[index % prompts.len()], true, index))?;
+            for row in iteration.run(scenario, &prompts[index % prompts.len()], true, index) {
+                sink(row)?;
+            }
         }
         for index in 0..options.iterations {
-            sink(iteration.run(scenario, &prompts[index % prompts.len()], false, index))?;
+            for row in iteration.run(scenario, &prompts[index % prompts.len()], false, index) {
+                sink(row)?;
+            }
         }
     }
     Ok(())
@@ -278,8 +295,58 @@ impl Iteration<'_> {
             .flatten()
     }
 
-    /// One generation of `prompt` in a fresh sequence, measured.
-    fn run(&self, scenario: &Scenario, prompt: &Prompt, warmup: bool, index: usize) -> Row {
+    /// The rows of one iteration of `scenario` on `prompt`: one generation in a fresh sequence, measured; for a prefix
+    /// scenario two, the prompt cold and then again.
+    ///
+    /// A prefix scenario's request is the prompt (the shared part, `P` tokens) and a tail of the prompt's own first
+    /// tokens, so the cold request stores the checkpoint at `P` and the repeat restores exactly `P`.
+    ///
+    /// A cold prompt has to be one the cache has not stored, whichever iteration it is. The prompt's first token is
+    /// replaced by one that no earlier request of the run began with, so the prompt (and its length) is the scenario's
+    /// but no checkpoint of an earlier iteration is a prefix of it; the repeat sends the same ids.
+    fn run(&self, scenario: &Scenario, prompt: &Prompt, warmup: bool, index: usize) -> Vec<Row> {
+        if scenario.kind != ScenarioKind::PrefixRepeat {
+            return vec![self.once(
+                scenario,
+                prompt,
+                Turn {
+                    warmup,
+                    index,
+                    pass: Pass::Only,
+                },
+                None,
+            )];
+        }
+        let count = self.salts.get();
+        self.salts.set(count + 1);
+        let vocabulary = self.runtime.config().vocab_size.max(2);
+        let salt = u32::try_from(1 + count % (vocabulary - 1)).unwrap_or(1);
+        vec![
+            self.once(
+                scenario,
+                prompt,
+                Turn {
+                    warmup,
+                    index,
+                    pass: Pass::Cold,
+                },
+                Some(salt),
+            ),
+            self.once(
+                scenario,
+                prompt,
+                Turn {
+                    warmup,
+                    index,
+                    pass: Pass::Repeat,
+                },
+                Some(salt),
+            ),
+        ]
+    }
+
+    /// One generation of `prompt` in a fresh sequence, measured. `salt` replaces the first token of the prompt.
+    fn once(&self, scenario: &Scenario, prompt: &Prompt, turn: Turn, salt: Option<u32>) -> Row {
         let before = self.gpu_free();
         let done = Handoff::new();
         let waiting = Arc::clone(&done);
@@ -291,10 +358,17 @@ impl Iteration<'_> {
 
         // Tokenization is part of the timed generation, as it is in the Java session.
         let ids = match self.tokenizer.encode_with_model_special_tokens(&prompt.text) {
-            Ok(ids) => ids,
+            Ok(mut ids) => {
+                if let (Some(salt), Some(first)) = (salt, ids.first_mut()) {
+                    *first = salt;
+                }
+                let tail: Vec<u32> = ids.iter().copied().take(scenario.tail_tokens()).collect();
+                ids.extend(tail);
+                ids
+            }
             Err(error) => {
                 recorder.finished = Some((Instant::now(), Ending::Failed(format!("TokenizerError: {error}"))));
-                return self.row(scenario, prompt, warmup, index, &recorder, before);
+                return self.row(scenario, prompt, turn, &recorder, before);
             }
         };
         let encoded = (Instant::now(), ids.len());
@@ -324,25 +398,26 @@ impl Iteration<'_> {
                 refused
             }
         };
-        self.row(scenario, prompt, warmup, index, &recorder, before)
+        self.row(scenario, prompt, turn, &recorder, before)
     }
 
-    fn row(
-        &self,
-        scenario: &Scenario,
-        prompt: &Prompt,
-        warmup: bool,
-        index: usize,
-        recorder: &Recorder,
-        before: Option<u64>,
-    ) -> Row {
+    fn row(&self, scenario: &Scenario, prompt: &Prompt, turn: Turn, recorder: &Recorder, before: Option<u64>) -> Row {
+        let Turn { warmup, index, pass } = turn;
         let eos = self.tokenizer.eos_ids();
         let mut outcome = metrics::evaluate(scenario, recorder, |id| eos.contains(&id));
-        if outcome.status != result::FAILED && outcome.work.prompt_tokens != Some(prompt.ids.len()) {
+        if outcome.status != result::FAILED
+            && outcome.work.prompt_tokens != Some(prompt.ids.len() + scenario.tail_tokens())
+        {
             outcome.status = result::FAILED;
             outcome.reason = Some("prompt_token_count_mismatch".to_string());
             // As Java keeps the timings of this failure; a failed row reports no rate.
             outcome.throughput = None;
+        }
+        // A cold request that restored a prefix, or a repeat that restored none, did not measure what its name says.
+        let reason = metrics::prefix_ineligibility(pass, recorder.restored, prompt.ids.len());
+        if let (Some(reason), result::SUCCESS) = (reason, outcome.status) {
+            outcome.status = result::INELIGIBLE;
+            outcome.reason = Some(reason.to_string());
         }
         let gpu_memory = before.map(|before| {
             let report = self.runtime.report();
@@ -365,7 +440,7 @@ impl Iteration<'_> {
             fork: self.context.fork.clone(),
             recorded_at: iso_instant(SystemTime::now()),
             scenario: ScenarioRecord {
-                name: scenario.name(),
+                name: format!("{}{}", scenario.name(), pass.suffix()),
                 kind: scenario.kind.label().to_string(),
                 target_prompt_tokens: scenario.target_prompt_tokens,
                 requested_new_tokens: scenario.requested_new_tokens,

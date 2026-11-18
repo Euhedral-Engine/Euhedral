@@ -364,6 +364,29 @@ fn statuses_follow_the_javas_rules() {
 }
 
 #[test]
+fn a_restored_prefix_is_not_prefilled_and_is_reported() {
+    let prefix = Scenario::new(ScenarioKind::PrefixRepeat, 512, 1).unwrap();
+    let (mut recorder, _) = generation(1, Duration::from_millis(10), Duration::ZERO);
+    // The engine restored 256 of the 512 prompt tokens and prefilled the other 256.
+    recorder.quanta[0].rows = 256;
+    assert_eq!(
+        evaluate(&prefix, &recorder, |_| false).reason.as_deref(),
+        Some("incomplete_prefill"),
+        "without a restore, 256 prefilled tokens are not the prompt"
+    );
+    recorder.restored = 256;
+    let outcome = evaluate(&prefix, &recorder, |_| false);
+    assert_eq!(outcome.status, SUCCESS);
+    assert_eq!(outcome.work.prefix_restored_tokens, Some(256));
+    assert_eq!(outcome.work.prefill_tokens, Some(256));
+    assert!(outcome.timings.unwrap().time_to_first_token.is_some());
+
+    // A miss reports no restore.
+    let (miss, _) = generation(1, Duration::from_millis(10), Duration::ZERO);
+    assert_eq!(evaluate(&prefix, &miss, |_| false).work.prefix_restored_tokens, None);
+}
+
+#[test]
 fn speculative_steps_fill_the_block_and_set_the_window() {
     let scenario = Scenario::new(ScenarioKind::SustainedDecode, 512, 9).unwrap();
     let (mut recorder, _) = generation(9, Duration::from_millis(10), Duration::ZERO);
@@ -474,4 +497,33 @@ fn the_summary_reports_medians_of_measured_successes() {
         .expect(&text);
     assert!(line.contains("200.0"), "the median decode rate: {line}");
     assert!(line.contains("1000.0"), "the median prefill rate: {line}");
+}
+
+#[test]
+fn a_prefix_row_is_eligible_only_if_it_measured_what_its_name_says() {
+    use euhedral_inference_bench::metrics::{Pass, prefix_ineligibility};
+    assert_eq!(
+        prefix_ineligibility(Pass::Cold, 512, 2048),
+        Some("cold_request_restored_a_prefix")
+    );
+    assert_eq!(prefix_ineligibility(Pass::Cold, 0, 2048), None);
+    assert_eq!(
+        prefix_ineligibility(Pass::Repeat, 1024, 2048),
+        Some("repeat_did_not_restore_the_shared_prompt")
+    );
+    assert_eq!(prefix_ineligibility(Pass::Repeat, 2048, 2048), None);
+    assert_eq!(prefix_ineligibility(Pass::Only, 0, 2048), None);
+    assert_eq!(prefix_ineligibility(Pass::Only, 7, 2048), None);
+}
+
+#[test]
+fn only_a_prefix_scenario_counts_a_restore_as_part_of_the_prompt() {
+    let (mut recorder, _) = generation(1, Duration::from_millis(10), Duration::ZERO);
+    recorder.quanta[0].rows = 256;
+    recorder.restored = 256;
+    let first = Scenario::new(ScenarioKind::FirstToken, 512, 1).unwrap();
+    assert_eq!(
+        evaluate(&first, &recorder, |_| false).reason.as_deref(),
+        Some("incomplete_prefill")
+    );
 }

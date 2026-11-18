@@ -888,6 +888,25 @@ fn responses_reply_body_is_exact() {
 }
 
 #[test]
+fn responses_input_tokens_details_report_the_cached_ones() {
+    let fx = Fixture::with(limits(), Some(2));
+    fx.backend.set_script(tokens(&["Hello"], true));
+    fx.backend.set_counts(0, 3);
+    let request = format!(r#"{{"model":"{MODEL_ID}","reasoning":{{"effort":"none"}},"input":"Hi"}}"#);
+    let response = fx.post(RESPONSES, JSON, &request);
+    let prompt = prompt_tokens(&fx, 0);
+    let body = json(&response, 200);
+    assert!(
+        body.contains(&format!(
+            r#""usage":{{"input_tokens":{prompt},"input_tokens_details":{{"cached_tokens":3}},"output_tokens":2,"#
+        )),
+        "{body}"
+    );
+    assert_closed_once(&fx);
+    fx.finish();
+}
+
+#[test]
 fn chat_tool_call_reply_body_is_exact() {
     let fx = Fixture::with(limits(), Some(2));
     let generated = call("get_weather", &[("city", "Paris"), ("days", "3")]);
