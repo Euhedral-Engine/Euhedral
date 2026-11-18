@@ -23,6 +23,8 @@
 #[path = "common/typed.rs"]
 mod typed;
 
+mod common;
+
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -486,4 +488,40 @@ fn startup_works_with_workers_that_poll_one_frame_at_a_time() {
     );
     assert_eq!(runtime.weights().len(), 786);
     owner.shutdown(runtime).unwrap();
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn shutdown_reports_a_clean_leak_check() {
+    let Some(machine) = machine() else { return };
+    let settings = settings(&machine.artifact, 4096);
+    let (runtime, owner) = start(&settings, &machine.library);
+    let runtime = runtime.expect("the engine starts");
+    let closer = common::Closer::new(owner, &runtime);
+    let teardown = runtime.teardown();
+    assert_eq!(teardown.leaked_bytes(), None, "the check runs at shutdown");
+    // The startup held every allocation under the plan's reservation.
+    let admitted = runtime.report().admitted;
+    assert_eq!(admitted.device, runtime.plan().device_bytes);
+    assert_eq!(
+        admitted.host,
+        runtime.plan().kv_host_bytes + runtime.plan().prefix_cache_bytes
+    );
+    // At ready every claim is held: the account holds what was admitted, less what the prefix cache gave back of its
+    // grant (it keeps whole slots only).
+    let held = runtime.memory_held();
+    assert_eq!(held.device, admitted.device, "a device allocation lost its claim");
+    assert!(held.host <= admitted.host, "{held:?} of {admitted:?}");
+    let trimmed = admitted.host - held.host;
+    assert!(
+        trimmed <= runtime.plan().prefix_cache_bytes,
+        "{trimmed} bytes of the host were given back, the prefix cache's grant is {}",
+        runtime.plan().prefix_cache_bytes
+    );
+    closer.shutdown(runtime).unwrap();
+    assert_eq!(
+        teardown.leaked_bytes(),
+        Some(0),
+        "a claim was still held when the engine shut down"
+    );
 }

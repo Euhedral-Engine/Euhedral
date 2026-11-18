@@ -4,6 +4,7 @@
 use euhedral_inference_settings::KvFormat;
 
 use crate::model::ModelConfig;
+use crate::residency::planner::ResidencyPlan;
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
 
 /// Tokens in one KV page (`AttentionKvState.PAGE_TOKENS`).
@@ -121,4 +122,25 @@ pub fn extra_sequence_bytes(
     // The MTP layer is one full-attention layer's cache.
     total += pages_for(context_tokens) * page_bytes(config, format);
     total
+}
+
+/// The device bytes the first sequence's state takes beyond its cache when it is allocated: what
+/// `ResidencyPlan::extra_sequence_bytes` is for each one beyond it, without the MTP layer's cache, whose pages are
+/// allocated as the context grows. The runtime reserve pays for it.
+pub fn first_sequence_bytes(plan: &ResidencyPlan, config: &ModelConfig) -> u64 {
+    let drafts = plan.draft_depth > 0;
+    let verified_rows = if drafts { 1 + plan.draft_depth as u64 } else { 0 };
+    let total = extra_sequence_bytes(
+        config,
+        plan.kv_format,
+        plan.max_context_tokens as u64,
+        verified_rows,
+        drafts,
+        plan.rows.rows,
+    );
+    if drafts {
+        total - pages_for(plan.max_context_tokens as u64) * page_bytes(config, plan.kv_format)
+    } else {
+        total
+    }
 }

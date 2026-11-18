@@ -10,6 +10,7 @@ use std::iter;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use euhedral_memory::Claim;
 use thiserror::Error;
 
 use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, KernelOps, PinnedPool};
@@ -160,6 +161,8 @@ pub struct SequenceState {
     flight: Arc<Flight>,
     /// The reserve epoch of each cache at the last [`SequenceState::refs`] that appended to it.
     claimed: [AtomicU64; 2],
+    /// The sequence's bytes in the engine's memory account, released when the sequence is dropped (declared last).
+    claims: Vec<Claim>,
 }
 
 impl SequenceState {
@@ -241,7 +244,14 @@ impl SequenceState {
             row_readbacks: RowReadbackPool::none(),
             flight: Arc::new(Flight::default()),
             claimed: [AtomicU64::new(0), AtomicU64::new(0)],
+            claims: Vec::new(),
         }
+    }
+
+    /// The sequence, holding `claim` for some of its bytes until it is dropped.
+    pub fn with_claim(mut self, claim: Claim) -> SequenceState {
+        self.claims.push(claim);
+        self
     }
 
     /// The sequence with `row_readbacks` for the quanta of sampling requests.
