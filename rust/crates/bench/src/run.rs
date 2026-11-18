@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 
 use crate::await_value;
 use crate::config::{ConfigError, Options, Scenario, ScenarioKind, SpeculationMode};
-use crate::metrics::{self, Ending, Phase, QuantumRecord, Recorder, Step};
+use crate::metrics::{self, Ending, Pass, Phase, QuantumRecord, Recorder, Step};
 use crate::prompt::Prompt;
 use crate::result::{
     self, Fork, GpuMemory, IMPLEMENTATION, Provenance, Row, SCHEMA, SCHEMA_VERSION, ScenarioRecord, TOOL, iso_instant,
@@ -253,27 +253,6 @@ struct Turn {
     pass: Pass,
 }
 
-/// Which of a prefix scenario's two requests a row measures.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Pass {
-    /// The only request of every other scenario.
-    Only,
-    /// The first request of a prompt the cache has not seen.
-    Cold,
-    /// The same prompt again.
-    Repeat,
-}
-
-impl Pass {
-    fn suffix(self) -> &'static str {
-        match self {
-            Pass::Only => "",
-            Pass::Cold => "-cold",
-            Pass::Repeat => "-repeat",
-        }
-    }
-}
-
 /// Runs every scenario of `options` on `runtime`: its warmup iterations, then its measured ones, each handed to
 /// `sink` as it finishes. A `sink` error stops the run.
 pub fn run(
@@ -435,11 +414,7 @@ impl Iteration<'_> {
             outcome.throughput = None;
         }
         // A cold request that restored a prefix, or a repeat that restored none, did not measure what its name says.
-        let reason = match pass {
-            Pass::Cold if recorder.restored > 0 => Some("cold_request_restored_a_prefix"),
-            Pass::Repeat if recorder.restored != prompt.ids.len() => Some("repeat_did_not_restore_the_shared_prompt"),
-            _ => None,
-        };
+        let reason = metrics::prefix_ineligibility(pass, recorder.restored, prompt.ids.len());
         if let (Some(reason), result::SUCCESS) = (reason, outcome.status) {
             outcome.status = result::INELIGIBLE;
             outcome.reason = Some(reason.to_string());

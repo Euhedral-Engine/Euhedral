@@ -124,7 +124,7 @@ fn scenarios_parse_and_print_as_java() {
 fn what_the_engine_cannot_do_is_refused_with_the_reason() {
     let message = parse(&with(r#", "prefixCacheBytes": 1073741824"#)).unwrap_err();
     assert!(
-        message.contains("prefixCacheBytes must be 0") && message.contains("prefix scenario turns it on"),
+        message.contains("prefixCacheBytes must be 0") && message.contains("which turn it on"),
         "{message}"
     );
     assert!(parse(&with(r#", "prefixCacheBytes": 0"#)).is_ok());
@@ -279,4 +279,24 @@ fn a_prefix_scenario_turns_the_prefix_cache_on_for_the_run_and_no_other_does() {
             .unwrap()
             .uses_prefix_cache()
     );
+}
+
+#[test]
+fn a_prefix_scenario_is_refused_beside_any_other() {
+    let message = parse(&with(r#", "scenarios": ["prefix:2048", "decode:512:512"]"#)).unwrap_err();
+    assert!(message.contains("run it alone"), "{message}");
+    assert!(parse(&with(r#", "scenarios": ["prefix:2048", "prefix:4096"]"#)).is_ok());
+}
+
+#[test]
+fn a_prefix_prompt_must_end_on_a_checkpoint() {
+    let prefix = Scenario::parse("prefix:2048").unwrap();
+    assert!(prefix.check_checkpoint(2048).is_ok());
+    assert!(prefix.check_checkpoint(512).is_ok());
+    let message = prefix.check_checkpoint(1536).unwrap_err().to_string();
+    assert!(
+        message.contains("not a multiple of the checkpoint interval"),
+        "{message}"
+    );
+    assert!(Scenario::parse("decode:100:4").unwrap().check_checkpoint(2048).is_ok());
 }

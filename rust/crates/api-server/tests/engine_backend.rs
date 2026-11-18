@@ -177,7 +177,12 @@ fn quantum(kind: QuantumKind) -> QuantumEvent {
     QuantumEvent {
         kind,
         rows: 1,
-        start_position: 0,
+        // A prefill resumes where the prefix cache's checkpoint was.
+        start_position: if kind == QuantumKind::Prefill {
+            RESTORED as u64
+        } else {
+            0
+        },
         admitted: now,
         retired: now,
         replayed: false,
@@ -413,6 +418,21 @@ fn tokens_arrive_in_order_as_text_then_the_result_with_usage() {
     );
     drop(heard);
     generation.close();
+    rig.finish();
+}
+
+#[test]
+fn the_restored_prompt_tokens_are_known_while_the_generation_runs() {
+    let rig = Rig::new(Mode::Run(vec![u32::from('h'), STOP], FinishReason::Stop));
+    let generation = rig.open(OutputSpec::text());
+    assert_eq!(
+        generation.cached_prompt_tokens(),
+        0,
+        "nothing is known before the request"
+    );
+    let (_heard, rx) = rig.run(&generation);
+    ended(&rx);
+    assert_eq!(generation.cached_prompt_tokens(), RESTORED);
     rig.finish();
 }
 

@@ -121,15 +121,18 @@ The default suite is `prefill:32`, `prefill:256`, `prefill:1024`, `prefill:4096`
 `first-token:1024`, `prompt-to-n:1024:64`, and `decode:32:256`.
 
 The Rust benchmark's `prefix:P` scenario (for example `prefix:2048`) measures the time to first token with a cached
-prefix; the Java benchmark has no such scenario. A request is the `P`-token prompt plus a 16-token tail (the prompt's
+prefix. A request is the `P`-token prompt plus a 16-token tail (the prompt's
 own first tokens), because a match always leaves a token to prefill: the checkpoint at `P` is one a repeat can restore.
 Each iteration asks for one token of that request twice and writes two rows, `prefix-P-cold` and `prefix-P-repeat`,
 each with its own `timeToFirstToken` and its `prefixRestoredTokens`. The cold prompt's first token is replaced by one
 no earlier request of the run began with, so the cache has nothing of it. A cold row that restored anything, or a
 repeat that did not restore exactly `P` tokens, is `ineligible` (`cold_request_restored_a_prefix`,
-`repeat_did_not_restore_the_shared_prompt`). A run with a prefix scenario has the prefix cache on for all its
-scenarios, at the size of the engine settings (`engineConfig`, else the default), and records that size in the run
-snapshot; run it with the prefix scenario alone. Any other run keeps the cache off.
+`repeat_did_not_restore_the_shared_prompt`). A run with a prefix scenario has the prefix cache on, at the size of the engine settings (`engineConfig`, else the
+default), and records that size in the run snapshot; a prefix scenario is refused beside any other scenario, whose work
+the cache would change. `P` must be a multiple of `prefix-cache.checkpoint-tokens` (default 2048), since a restore is
+at a checkpoint; the run refuses it otherwise. Speculative requests do not use the prefix cache yet, so the run needs
+`"speculation": "off"`: with speculation on, every repeat restores nothing and its row is `ineligible`. Any other run
+keeps the cache off.
 
 ### Forks
 

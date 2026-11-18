@@ -498,3 +498,32 @@ fn the_summary_reports_medians_of_measured_successes() {
     assert!(line.contains("200.0"), "the median decode rate: {line}");
     assert!(line.contains("1000.0"), "the median prefill rate: {line}");
 }
+
+#[test]
+fn a_prefix_row_is_eligible_only_if_it_measured_what_its_name_says() {
+    use euhedral_inference_bench::metrics::{Pass, prefix_ineligibility};
+    assert_eq!(
+        prefix_ineligibility(Pass::Cold, 512, 2048),
+        Some("cold_request_restored_a_prefix")
+    );
+    assert_eq!(prefix_ineligibility(Pass::Cold, 0, 2048), None);
+    assert_eq!(
+        prefix_ineligibility(Pass::Repeat, 1024, 2048),
+        Some("repeat_did_not_restore_the_shared_prompt")
+    );
+    assert_eq!(prefix_ineligibility(Pass::Repeat, 2048, 2048), None);
+    assert_eq!(prefix_ineligibility(Pass::Only, 0, 2048), None);
+    assert_eq!(prefix_ineligibility(Pass::Only, 7, 2048), None);
+}
+
+#[test]
+fn only_a_prefix_scenario_counts_a_restore_as_part_of_the_prompt() {
+    let (mut recorder, _) = generation(1, Duration::from_millis(10), Duration::ZERO);
+    recorder.quanta[0].rows = 256;
+    recorder.restored = 256;
+    let first = Scenario::new(ScenarioKind::FirstToken, 512, 1).unwrap();
+    assert_eq!(
+        evaluate(&first, &recorder, |_| false).reason.as_deref(),
+        Some("incomplete_prefill")
+    );
+}

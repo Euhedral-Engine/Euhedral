@@ -145,6 +145,23 @@ impl Scenario {
         }
     }
 
+    /// Whether a prefix scenario's shared prompt ends on a checkpoint of a cache that stores one every `interval`
+    /// tokens: a restore can only be at a checkpoint, so a repeat restores the whole shared prompt only then.
+    pub fn check_checkpoint(&self, interval: usize) -> Result<(), ConfigError> {
+        if self.kind == ScenarioKind::PrefixRepeat
+            && interval != 0
+            && !self.target_prompt_tokens.is_multiple_of(interval)
+        {
+            return invalid(format!(
+                "{}: the prompt is {} tokens, which is not a multiple of the checkpoint interval of {interval} tokens \
+                 (prefix-cache.checkpoint-tokens): no checkpoint ends it, so a repeat cannot restore it",
+                self.spec(),
+                self.target_prompt_tokens
+            ));
+        }
+        Ok(())
+    }
+
     /// The name rows carry: `prefill-32`, `decode-32-256`.
     pub fn name(&self) -> String {
         match self.kind {
@@ -346,8 +363,8 @@ impl Options {
         }
         if prefix_cache_bytes > 0 {
             return invalid(
-                "prefixCacheBytes must be 0: a run keeps the prefix cache off, except that a prefix scenario turns it on \
-                 (with the engine settings' size) so that the repeats of the other scenarios do not run different work",
+                "prefixCacheBytes must be 0: the prefix cache is off unless the run has prefix scenarios, which turn it \
+                 on at the size of the engine settings",
             );
         }
         let cpus = raw.cpus.as_deref().map_or("all", str::trim);
@@ -378,6 +395,19 @@ impl Options {
         };
         if scenarios.is_empty() {
             return invalid("no scenarios selected");
+        }
+        let prefix = scenarios
+            .iter()
+            .any(|scenario| scenario.kind == ScenarioKind::PrefixRepeat);
+        if prefix
+            && scenarios
+                .iter()
+                .any(|scenario| scenario.kind != ScenarioKind::PrefixRepeat)
+        {
+            return invalid(
+                "a prefix scenario runs with the prefix cache on, which changes the work of any other scenario: run \
+                 it alone",
+            );
         }
         let warmup = non_negative(raw.warmup, 1, "warmup")?;
         let iterations = positive(raw.iterations, 3, "iterations")? as usize;
@@ -431,8 +461,8 @@ impl Options {
         })
     }
 
-    /// Whether the run needs the engine's prefix cache: it has a prefix scenario. The cache is on for the whole run
-    /// then, at the size of the engine settings; any other run keeps it off.
+    /// Whether the run needs the engine's prefix cache: it has prefix scenarios (and then only those). The cache is
+    /// on at the size of the engine settings; any other run keeps it off.
     pub fn uses_prefix_cache(&self) -> bool {
         self.scenarios
             .iter()
