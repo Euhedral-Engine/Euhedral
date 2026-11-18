@@ -4,9 +4,11 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use llguidance::Matcher;
+use llguidance::api::{GrammarInit, ParserLimits, TopLevelGrammar};
 use llguidance::panic_utils::catch_unwind;
+use llguidance::{Logger, Matcher, ParserFactory, TokenParser};
 use thiserror::Error;
+use toktrie::InferenceCapabilities;
 use toktrie::SimpleVob;
 
 use super::{GrammarChecker, OutputGrammar, summary};
@@ -49,6 +51,19 @@ impl GrammarMatcher {
             end_ids,
             mask: None,
             failure: None,
+        }
+    }
+
+    /// A matcher that has already failed with `message`: it refuses every step. For a caller's tests of what it does
+    /// when llguidance fails; a built matcher fails only inside llguidance.
+    pub fn failed(message: &str) -> GrammarMatcher {
+        let broken = catch_unwind::<_, TokenParser>(AssertUnwindSafe(|| panic!("{message}")));
+        GrammarMatcher {
+            matcher: Matcher::new(broken),
+            size: u32::MAX,
+            end_ids: Arc::from([]),
+            mask: None,
+            failure: Some(message.to_owned()),
         }
     }
 
@@ -143,12 +158,13 @@ impl GrammarChecker {
     /// (least recently used first out, within the cache's bound) so that a client repeating its tools or schema
     /// compiles them once; each call starts from its own copy, independent of every other.
     ///
-    /// The cache is the checker's own state, polled by whoever owns the checker one request at a time: no lock, no
-    /// wait. Compiling costs enough that the owner does it as its own frame, never inline in a request handler; a
-    /// cached grammar only copies. A grammar llguidance refuses is a 400 without a parameter and is not cached.
+    /// The cache is the checker's own state: a caller that shares the checker between workers keeps it behind a lock
+    /// held for lookups and copies only, and compiles with [`GrammarChecker::compiler`] outside it (see
+    /// [`GrammarChecker::keep`]). Compiling costs enough that it runs as its own frame, never inline in a request
+    /// handler; a cached grammar only copies. A grammar llguidance refuses is a 400 without a parameter and is not cached.
     /// A grammar already checked by [`GrammarChecker::check_grammar`] is cached and compiles no more.
     pub fn constraint(&mut self, grammar: &str) -> Result<GrammarMatcher, ApiError> {
-        match self.cloned(Kind::Lark, grammar)? {
+        match self.cloned(GrammarKind::Lark, grammar)? {
             Ok(matcher) => Ok(GrammarMatcher::new(matcher, self.size, Arc::clone(&self.end_ids))),
             Err(refused) => Err(grammar_refusal(&refused)),
         }
@@ -158,7 +174,7 @@ impl GrammarChecker {
     /// [`GrammarChecker::constraint`] under its own keys: a schema and a grammar of the same text never meet. A
     /// refusal is an unenforceable schema at `param` and is not cached.
     pub fn json_schema_constraint(&mut self, schema: &JsonValue, param: &str) -> Result<GrammarMatcher, ApiError> {
-        match self.cloned(Kind::JsonSchema, &OutputGrammar::schema_text(schema))? {
+        match self.cloned(GrammarKind::JsonSchema, &OutputGrammar::schema_text(schema))? {
             Ok(matcher) => Ok(GrammarMatcher::new(matcher, self.size, Arc::clone(&self.end_ids))),
             Err(refused) => Err(schema_refusal(&refused, param)),
         }
@@ -166,7 +182,7 @@ impl GrammarChecker {
 
     /// Whether `text` of `kind` compiles: found in the cache, else compiled now and kept unless the cache is
     /// disabled. A refusal is llguidance's, in its summary, and is not kept.
-    pub(super) fn check(&mut self, kind: Kind, text: &str) -> Result<(), String> {
+    pub(super) fn check(&mut self, kind: GrammarKind, text: &str) -> Result<(), String> {
         if self.compiled.touch(kind, text) {
             return Ok(());
         }
@@ -178,7 +194,7 @@ impl GrammarChecker {
     }
 
     /// A copy of the compiled grammar of `kind`, from the cache or compiled now and kept.
-    fn cloned(&mut self, kind: Kind, text: &str) -> Result<Result<Matcher, String>, ApiError> {
+    fn cloned(&mut self, kind: GrammarKind, text: &str) -> Result<Result<Matcher, String>, ApiError> {
         if self.compiled.touch(kind, text) {
             let template = self.compiled.latest().ok_or_else(ApiError::server_error)?;
             // A panic copying is a server fault, never the request's.
@@ -201,12 +217,12 @@ impl GrammarChecker {
     }
 
     /// Compiles `text` of `kind`: the matcher, or llguidance's refusal in its summary.
-    fn compile(&mut self, kind: Kind, text: &str) -> Result<Matcher, String> {
+    fn compile(&mut self, kind: GrammarKind, text: &str) -> Result<Matcher, String> {
         #[cfg(test)]
         {
             self.compiled.compilations += 1;
         }
-        let compiled = self.matcher(text, kind.tag());
+        let compiled = build(&self.factory, text, kind.tag());
         match compiled.get_error() {
             None => Ok(compiled),
             Some(message) => Err(summary(&message)),
@@ -214,19 +230,122 @@ impl GrammarChecker {
     }
 }
 
+/// A matcher over `factory`'s vocabulary at the start of `grammar` of the llguidance type `kind`; a refusal is in the
+/// matcher, as `Matcher::get_error`.
+pub(super) fn build(factory: &ParserFactory, grammar: &str, kind: &str) -> Matcher {
+    // A panic inside llguidance is a refusal ("panic: ..."), as on the native side.
+    let compiled = catch_unwind(AssertUnwindSafe(|| {
+        let parser = TopLevelGrammar::from_tagged_str(kind, grammar).and_then(|top| {
+            factory.create_parser_from_init_ext(
+                GrammarInit::Serialized(top),
+                Logger::new(0, 0),
+                InferenceCapabilities::default(),
+                ParserLimits::default(),
+            )
+        });
+        Ok(Matcher::new(parser))
+    }));
+    compiled.unwrap_or_else(|panicked| Matcher::new(Err(panicked)))
+}
+
+/// Compiles grammars over a checker's vocabulary without the checker: the factory is shared, so a caller that keeps
+/// the checker behind a lock compiles with no lock held and hands the result to [`GrammarChecker::keep`].
+#[derive(Clone)]
+pub struct GrammarCompiler {
+    factory: Arc<ParserFactory>,
+}
+
+impl GrammarCompiler {
+    pub(super) fn new(factory: Arc<ParserFactory>) -> GrammarCompiler {
+        GrammarCompiler { factory }
+    }
+
+    /// Compiles `text` of `kind`; a refusal is llguidance's, in its summary.
+    pub fn compile(&self, kind: GrammarKind, text: &str) -> Result<CompiledGrammar, String> {
+        let matcher = build(&self.factory, text, kind.tag());
+        match matcher.get_error() {
+            None => Ok(CompiledGrammar {
+                kind,
+                text: text.into(),
+                matcher,
+            }),
+            Some(message) => Err(summary(&message)),
+        }
+    }
+}
+
+impl Debug for GrammarCompiler {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter.debug_struct("GrammarCompiler").finish_non_exhaustive()
+    }
+}
+
+/// A grammar compiled by a [`GrammarCompiler`], not yet in a checker's cache.
+pub struct CompiledGrammar {
+    kind: GrammarKind,
+    text: Box<str>,
+    matcher: Matcher,
+}
+
+impl Debug for CompiledGrammar {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter.debug_struct("CompiledGrammar").finish_non_exhaustive()
+    }
+}
+
+impl GrammarChecker {
+    /// Whether `text` of `kind` is in the cache (and makes it the most recent). Cheap: no compiling.
+    pub fn is_cached(&mut self, kind: GrammarKind, text: &str) -> bool {
+        self.compiled.touch(kind, text)
+    }
+
+    /// A matcher copied from the cache, or `None` when `text` of `kind` is not there. Copying only, no compiling.
+    pub fn cached(&mut self, kind: GrammarKind, text: &str) -> Result<Option<GrammarMatcher>, ApiError> {
+        if !self.compiled.touch(kind, text) {
+            return Ok(None);
+        }
+        self.copy_latest().map(Some)
+    }
+
+    /// Keeps a grammar compiled outside the checker and returns a matcher at its start. When the cache already holds
+    /// the same grammar (another caller compiled it meanwhile) that entry stays and `compiled` is dropped. Copying
+    /// only, no compiling.
+    pub fn keep(&mut self, compiled: CompiledGrammar) -> Result<GrammarMatcher, ApiError> {
+        if self.compiled.is_disabled() {
+            return Ok(GrammarMatcher::new(
+                compiled.matcher,
+                self.size,
+                Arc::clone(&self.end_ids),
+            ));
+        }
+        if !self.compiled.touch(compiled.kind, &compiled.text) {
+            self.compiled.insert(compiled.kind, &compiled.text, compiled.matcher);
+        }
+        self.copy_latest()
+    }
+
+    fn copy_latest(&self) -> Result<GrammarMatcher, ApiError> {
+        let template = self.compiled.latest().ok_or_else(ApiError::server_error)?;
+        // A panic copying is a server fault, never the request's.
+        let copy =
+            catch_unwind(AssertUnwindSafe(|| Ok(template.deep_clone()))).map_err(|_| ApiError::server_error())?;
+        Ok(GrammarMatcher::new(copy, self.size, Arc::clone(&self.end_ids)))
+    }
+}
+
 /// What is compiled, which is part of a cache key: a JSON schema and a grammar of the same text are two entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Kind {
+pub enum GrammarKind {
     Lark,
     JsonSchema,
 }
 
-impl Kind {
+impl GrammarKind {
     /// The type tag llguidance is given with the text.
     fn tag(self) -> &'static str {
         match self {
-            Kind::Lark => "lark",
-            Kind::JsonSchema => "json_schema",
+            GrammarKind::Lark => "lark",
+            GrammarKind::JsonSchema => "json_schema",
         }
     }
 }
@@ -243,7 +362,7 @@ pub(super) fn schema_refusal(refused: &str, param: &str) -> ApiError {
 /// just used or inserted.
 pub(super) struct CompiledGrammars {
     capacity: usize,
-    entries: Vec<(Kind, Box<str>, Matcher)>,
+    entries: Vec<(GrammarKind, Box<str>, Matcher)>,
     /// How many times llguidance compiled a grammar, hit or refused or kept.
     #[cfg(test)]
     pub(super) compilations: usize,
@@ -264,7 +383,7 @@ impl CompiledGrammars {
     }
 
     /// Makes the entry the most recent; false when it is not kept.
-    fn touch(&mut self, kind: Kind, text: &str) -> bool {
+    fn touch(&mut self, kind: GrammarKind, text: &str) -> bool {
         let Some(index) = self.entries.iter().position(|(k, key, _)| *k == kind && &**key == text) else {
             return false;
         };
@@ -274,7 +393,7 @@ impl CompiledGrammars {
     }
 
     /// Keeps `compiled` as the most recent entry, dropping the least recent when the bound is reached.
-    fn insert(&mut self, kind: Kind, text: &str, compiled: Matcher) {
+    fn insert(&mut self, kind: GrammarKind, text: &str, compiled: Matcher) {
         if self.entries.len() >= self.capacity {
             self.entries.remove(0);
         }
@@ -292,11 +411,11 @@ impl CompiledGrammars {
 
     #[cfg(test)]
     pub(super) fn holds(&self, grammar: &str) -> bool {
-        self.holds_kind(Kind::Lark, grammar)
+        self.holds_kind(GrammarKind::Lark, grammar)
     }
 
     #[cfg(test)]
-    pub(super) fn holds_kind(&self, kind: Kind, text: &str) -> bool {
+    pub(super) fn holds_kind(&self, kind: GrammarKind, text: &str) -> bool {
         self.entries.iter().any(|(k, key, _)| *k == kind && &**key == text)
     }
 }

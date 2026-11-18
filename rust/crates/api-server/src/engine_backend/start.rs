@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
+use euhedral_inference_api_protocol::output_grammar::{end_ids, token_bytes};
 use euhedral_inference_engine::error::EngineError;
 use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, GenerationRequest as EngineRequest, MAX_VERIFIED, Speculation,
@@ -73,6 +74,7 @@ struct RuntimeEngine {
     runtime: Weak<EngineRuntime>,
     artifact: Option<String>,
     context_length: usize,
+    vocabulary_size: usize,
 }
 
 impl RuntimeEngine {
@@ -91,6 +93,10 @@ impl Engine for RuntimeEngine {
 
     fn context_length(&self) -> usize {
         self.context_length
+    }
+
+    fn vocabulary_size(&self) -> usize {
+        self.vocabulary_size
     }
 
     fn sequences(&self) -> usize {
@@ -151,6 +157,14 @@ impl Codec for Tokenizer {
 
     fn think_end(&self) -> Option<u32> {
         self.control_token_id("</think>")
+    }
+
+    fn token_bytes(&self, size: usize) -> Vec<Vec<u8>> {
+        token_bytes(self, size)
+    }
+
+    fn end_ids(&self) -> Vec<u32> {
+        end_ids(self)
     }
 }
 
@@ -305,13 +319,12 @@ impl EngineStarting {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned()),
             context_length,
+            vocabulary_size: runtime.config().vocab_size,
         });
-        let backend = Arc::new(EngineBackend::new(
-            engine,
-            Arc::new(self.tokenizer),
-            sink,
-            self.settings.model.name.clone(),
-        ));
+        let backend = Arc::new(
+            EngineBackend::new(engine, Arc::new(self.tokenizer), sink, self.settings.model.name.clone())
+                .map_err(StartError::Engine)?,
+        );
         Ok(EngineHost {
             owner,
             runtime,
