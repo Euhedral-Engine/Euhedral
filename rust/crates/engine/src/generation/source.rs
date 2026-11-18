@@ -76,6 +76,7 @@ use crate::sampling::{SamplingConfig, SamplingError, TokenSampler};
 use crate::stages::attention::KvSource;
 use crate::stages::sampling::{RowReadbackLease, Selection, SelectionLease};
 use crate::stages::{InputRecordRef, Outcome, Quantum, QuantumError, QuantumKind, SequenceRefs, SubmitError};
+use crate::state::FlightGuard;
 use crate::state::kv::KvRetained;
 use crate::state::{Flight, SequenceId, SequenceState};
 use crate::workspace::{BufferSlot, Workspace};
@@ -167,6 +168,9 @@ pub(crate) enum Kept {
     Part {
         batch: Arc<Quantum>,
         _lease: Option<SelectionLease>,
+        /// The part's count in flight on its sequence, which is its own: the sequence settles when this part is let go
+        /// of, whatever the other members do.
+        _flight: Option<FlightGuard>,
     },
 }
 
@@ -218,6 +222,7 @@ impl Retired {
         batch: &Arc<Quantum>,
         segment: usize,
         lease: Option<SelectionLease>,
+        flight: Option<FlightGuard>,
         outcome: &QuantumOutcome,
     ) -> Retired {
         let concluded = match batch.conclusion_for(segment, outcome) {
@@ -243,6 +248,7 @@ impl Retired {
             kept: Kept::Part {
                 batch: Arc::clone(batch),
                 _lease: lease,
+                _flight: flight,
             },
             outcome: concluded,
         }

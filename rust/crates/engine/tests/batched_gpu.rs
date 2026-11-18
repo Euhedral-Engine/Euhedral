@@ -1316,3 +1316,40 @@ fn a_batch_refuses_what_is_for_one_sequence_and_one_sequence_under_two_ids() {
     second.close(&world);
     world.close();
 }
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn each_member_of_a_batch_holds_its_own_count_in_flight() {
+    let Some(world) = World::open() else { return };
+    let mode = SubmitMode {
+        pdl: false,
+        row_exact: true,
+    };
+    let mut first = prefilled(&world, 300);
+    let mut second = prefilled(&world, 411);
+    let (a, keep_a, _) = first.part(&world, 0, &Member::all(2));
+    let (b, keep_b, _) = second.part(&world, 1, &Member::all(2));
+    let mut quantum = Quantum::batch(
+        vec![a, b],
+        Arc::clone(&world.workspace),
+        mode,
+        Arc::clone(&world.config),
+        world.table.clone(),
+    )
+    .unwrap();
+    assert_eq!((first.sequence.in_flight(), second.sequence.in_flight()), (1, 1));
+    // The owners of a pass take their own guards out: one member ending does not wait for another's part.
+    let mut guards = quantum.take_flights();
+    assert_eq!(guards.len(), 2);
+    let kept_by_second = guards.pop().unwrap();
+    drop(guards);
+    drop(quantum);
+    assert_eq!(first.sequence.in_flight(), 0, "the first member's sequence settles");
+    assert_eq!(second.sequence.in_flight(), 1, "the second still holds its own");
+    drop(kept_by_second);
+    assert_eq!(second.sequence.in_flight(), 0);
+    drop((keep_a, keep_b));
+    first.close(&world);
+    second.close(&world);
+    world.close();
+}

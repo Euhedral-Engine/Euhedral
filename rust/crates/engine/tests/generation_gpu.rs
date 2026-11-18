@@ -42,7 +42,7 @@ use std::mem;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
@@ -181,6 +181,9 @@ struct Recorder {
     done: Option<Arc<Handoff<Recording>>>,
     /// Cancels the request once it has reported this many tokens.
     cancel_after: Option<(CancelHandle, usize)>,
+    /// Cancels the request when one of its verifications retires after the engine has run this many batched passes:
+    /// the request's next step is then offered, with the others', to a pass it is a member of.
+    cancel_in_pass: Option<(CancelHandle, Weak<EngineRuntime>, u64)>,
 }
 
 impl GenerationListener for Recorder {
@@ -206,6 +209,13 @@ impl GenerationListener for Recorder {
 
     fn verification(&mut self, event: Verification) {
         self.verifications.push(event);
+        if let Some((cancel, runtime, passes)) = &self.cancel_in_pass
+            && runtime
+                .upgrade()
+                .is_some_and(|runtime| runtime.pass_statistics().batched >= *passes)
+        {
+            cancel.cancel();
+        }
     }
 
     fn finished(&mut self, outcome: GenerationOutcome) {
@@ -287,6 +297,34 @@ fn submit(
     sampling: SamplingConfig,
     cancel: Option<usize>,
 ) -> Result<Arc<Handoff<Recording>>, AdmissionError> {
+    submit_with(
+        runtime,
+        prompt,
+        max_tokens,
+        stop_tokens,
+        speculation,
+        sampling,
+        cancel,
+        None,
+    )
+}
+
+/// [`submit`], and with `in_pass` the engine and the number of batched passes after which a verification of the
+/// request cancels it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the arguments of a request, as the test helpers pass them"
+)]
+fn submit_with(
+    runtime: &EngineRuntime,
+    prompt: &[u32],
+    max_tokens: u32,
+    stop_tokens: &[u32],
+    speculation: Speculation,
+    sampling: SamplingConfig,
+    cancel: Option<usize>,
+    in_pass: Option<(Weak<EngineRuntime>, u64)>,
+) -> Result<Arc<Handoff<Recording>>, AdmissionError> {
     let done = Handoff::new();
     let handle = CancelHandle::default();
     let began = Instant::now();
@@ -307,6 +345,7 @@ fn submit(
                 began,
                 done: Some(Arc::clone(&done)),
                 cancel_after: cancel.map(|after| (handle.clone(), after)),
+                cancel_in_pass: in_pass.map(|(runtime, passes)| (handle.clone(), runtime, passes)),
             }),
         },
         handle,
@@ -452,6 +491,7 @@ fn a_stop_token_ends_the_generation_and_leaves_no_overshoot_in_the_sequence() {
                 began: Instant::now(),
                 done: None,
                 cancel_after: None,
+                cancel_in_pass: None,
             }),
         })
     };
@@ -869,12 +909,25 @@ fn together(
     sampling: &[SamplingConfig],
     cancel: &[Option<usize>],
 ) -> (Vec<Recording>, Duration) {
+    together_with(runtime, prompts, speculation, sampling, cancel, None)
+}
+
+/// [`together`], and with `in_pass` the request (by index) a verification of which cancels it once the engine has run
+/// that many batched passes more than it had.
+fn together_with(
+    runtime: &EngineRuntime,
+    prompts: &[Vec<u32>],
+    speculation: Speculation,
+    sampling: &[SamplingConfig],
+    cancel: &[Option<usize>],
+    in_pass: Option<(usize, &Arc<EngineRuntime>, u64)>,
+) -> (Vec<Recording>, Duration) {
     let began = Instant::now();
     let running: Vec<_> = prompts
         .iter()
         .enumerate()
         .map(|(index, prompt)| {
-            submit(
+            submit_with(
                 runtime,
                 prompt,
                 CONCURRENT_TOKENS,
@@ -882,6 +935,9 @@ fn together(
                 speculation,
                 sampling[index],
                 cancel[index],
+                in_pass
+                    .filter(|(victim, _, _)| *victim == index)
+                    .map(|(_, engine, passes)| (Arc::downgrade(engine), passes)),
             )
             .expect("a sequence is idle for the request")
         })
@@ -921,7 +977,7 @@ fn sampled_tokens_do_not_depend_on_speculation_or_on_the_sequences_sharing_a_pas
         .iter()
         .map(|text| tokenizer.encode_with_model_special_tokens(text).unwrap())
         .collect();
-    let (runtime, owner) = start_with_sequences(&machine, SEQUENCES as u32);
+    let (owner, runtime) = start_with_sequences(&machine, SEQUENCES as u32);
     let depth = runtime.plan().draft_depth;
     assert!(depth > 0, "the artifact drafts");
     let published = |seed: u64| SamplingConfig::new(1.0, 20, 0.95, seed, false).unwrap();
@@ -985,7 +1041,7 @@ fn sampled_tokens_do_not_depend_on_speculation_or_on_the_sequences_sharing_a_pas
     }
     let after = runtime.pass_statistics();
     println!(
-        "SAMPLED_PASSES together: {} passes, {} verifications, {} batched, {} rows",
+        "SAMPLED_PASSES together: {} passes, {} verifications, {} batched passes, {} rows",
         after.passes - before.passes,
         after.segments - before.segments,
         after.batched - before.batched,
@@ -1044,7 +1100,7 @@ fn speculative_decode_rates_of_one_and_of_four_requests() {
         .into_iter()
         .filter(|count| only.is_none_or(|only| only == *count))
     {
-        let (runtime, owner) = start_with_sequences(&machine, sequences as u32);
+        let (owner, runtime) = start_with_sequences(&machine, sequences as u32);
         assert!(runtime.plan().draft_depth > 0, "the artifact drafts");
         let _ = run(&runtime, 1);
         let alone = run(&runtime, 1);
@@ -1060,7 +1116,7 @@ fn speculative_decode_rates_of_one_and_of_four_requests() {
             let each: Vec<String> = together.iter().map(|r| format!("{:.1}", decode_rate(r))).collect();
             println!(
                 "RATES {SEQUENCES} requests at once: {} tok/s each, {:.1} tok/s in all; {} passes held {} verifications, \
-                 {} batched",
+                 {} batched passes",
                 each.join(" / "),
                 rate_of(&together),
                 after.passes - before.passes,
@@ -1124,7 +1180,7 @@ fn concurrent_sequences_match_alone() {
                 passes.segments - before.segments,
                 passes.batched - before.batched,
             );
-            println!("PASSES {name}: {ran} passes held {held} verifications, {batched} of them batched");
+            println!("PASSES {name}: {ran} passes held {held} verifications, {batched} batched passes");
             assert!(batched > 0, "{name}: no verification was batched");
             assert!(held > ran, "{name}: every pass held one verification");
         }
@@ -1187,14 +1243,21 @@ fn concurrent_sequences_match_alone() {
     // The same with speculation on: the cancelled member leaves its pass, and the others' verifications go on batched.
     if !alone_speculative.is_empty() {
         let before = runtime.pass_statistics();
-        let (cancelled, _) = together(
+        // The request is cancelled by the retirement of a verification of one of its batched passes, once three more
+        // batched passes have run: its next step is offered to a pass with the others' and stops there.
+        let (cancelled, _) = together_with(
             &runtime,
             &prompts,
             Speculation::Artifact,
             &greedy,
-            &[None, Some(cancelled_at), None, None],
+            &[None; SEQUENCES],
+            Some((1, &runtime, before.batched + 3)),
         );
         assert_eq!(cancelled[1].outcome.reason, FinishReason::Cancelled);
+        assert!(
+            cancelled[1].tokens.len() < CONCURRENT_TOKENS as usize,
+            "the cancelled request stopped mid-decode"
+        );
         assert_eq!(
             cancelled[1].tokens,
             alone_speculative[1].tokens[..cancelled[1].tokens.len()]

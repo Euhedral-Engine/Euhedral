@@ -83,6 +83,9 @@ pub(crate) trait Launch: Send + Sync + 'static {
     /// The rows `job` takes in a pass.
     fn rows(job: &Self::Job) -> usize;
 
+    /// The class of passes `job` can join: jobs of different classes never share a pass.
+    fn class(job: &Self::Job) -> u64;
+
     /// Whether `members` (a sequence and the job it offered each) can run as one pass: what the pass would refuse,
     /// found without consuming them.
     fn batchable(&self, members: &[(SequenceId, &Self::Job)]) -> bool;
@@ -141,6 +144,13 @@ impl Launch for Executor {
     fn rows(job: &Job) -> usize {
         match job {
             Job::Quantum(quantum) => quantum.rows(),
+            Job::Copy(_) => 0,
+        }
+    }
+
+    fn class(job: &Job) -> u64 {
+        match job {
+            Job::Quantum(quantum) => quantum.pass_class(),
             Job::Copy(_) => 0,
         }
     }
@@ -207,6 +217,8 @@ struct Offer<L: Launch> {
     /// The flag the sequence's request is cancelled by.
     kill: Arc<AtomicBool>,
     rows: usize,
+    /// The class of passes the step can join.
+    class: u64,
 }
 
 impl<L: Launch> PassOffer for Offer<L> {
@@ -216,6 +228,10 @@ impl<L: Launch> PassOffer for Offer<L> {
 
     fn rows(&self) -> usize {
         self.rows
+    }
+
+    fn class(&self) -> u64 {
+        self.class
     }
 }
 
@@ -250,7 +266,7 @@ impl Counters {
         self.rows.fetch_add(rows as u64, Ordering::Relaxed);
         self.segments.fetch_add(segments as u64, Ordering::Relaxed);
         if segments > 1 {
-            self.batched.fetch_add(segments as u64, Ordering::Relaxed);
+            self.batched.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -410,12 +426,14 @@ impl<L: Launch> WorkspaceOwner<L> {
     ) -> Result<(), StartError> {
         self.settle();
         let rows = L::rows(&job);
+        let class = L::class(&job);
         let offer = Offer {
             sequence,
             launcher,
             job,
             kill,
             rows,
+            class,
         };
         let offered = self.assembler.offer(offer).map_err(|refusal| {
             // The offer is gone, and so is the chain it ended: nothing starts behind the sequence's last job.
@@ -487,7 +505,8 @@ impl<L: Launch> WorkspaceOwner<L> {
     fn start_pass(&mut self, pass: Vec<Offer<L>>) -> usize {
         let batched = pass.len() > 1 && {
             let members: Vec<(SequenceId, &L::Job)> = pass.iter().map(|offer| (offer.sequence, &offer.job)).collect();
-            pass[0].launcher.batchable(&members)
+            // A launcher that panics when asked cannot batch: the members run alone, each as it would without a pass.
+            catch_unwind(AssertUnwindSafe(|| pass[0].launcher.batchable(&members))).unwrap_or(false)
         };
         if !batched {
             return self.start_alone(pass);
@@ -1076,6 +1095,8 @@ mod tests {
         kills: Mutex<Vec<Arc<AtomicBool>>>,
         /// Whether the launcher refuses to run passes as one job.
         unbatchable: AtomicBool,
+        /// Whether asking the launcher if a pass can be one job panics.
+        batchable_panics: AtomicBool,
     }
 
     /// A job of `rows` rows with the number `serial`.
@@ -1120,10 +1141,15 @@ mod tests {
         }
 
         fn rows(job: &u64) -> usize {
-            ((*job >> 32) as usize).max(1)
+            (((*job >> 32) & 0xFFFF) as usize).max(1)
+        }
+
+        fn class(job: &u64) -> u64 {
+            *job >> 48
         }
 
         fn batchable(&self, _members: &[(SequenceId, &u64)]) -> bool {
+            assert!(!self.batchable_panics.load(Ordering::SeqCst), "the launcher panics");
             !self.unbatchable.load(Ordering::SeqCst)
         }
 
@@ -1606,7 +1632,7 @@ mod tests {
     }
 
     #[test]
-    fn the_statistics_count_passes_rows_segments_and_batched_parts() {
+    fn the_statistics_count_passes_rows_segments_and_batched_passes() {
         let (owner, _fake, _, _) = batched_pair();
         assert_eq!(
             owner.counters.read(),
@@ -1614,7 +1640,39 @@ mod tests {
                 passes: 2,
                 rows: 12,
                 segments: 3,
-                batched: 2
+                batched: 1
+            }
+        );
+    }
+
+    #[test]
+    fn every_started_pass_is_counted_by_its_rows_and_parts() {
+        let (mut owner, fake, _, _) = owner_of(2);
+        offer(&mut owner, &fake, A, job(1, 1)).unwrap();
+        assert_eq!(
+            owner.counters.read(),
+            PassStatistics {
+                passes: 1,
+                rows: 1,
+                segments: 1,
+                batched: 0
+            }
+        );
+        // A pass the launcher refuses to batch is counted as the passes of one its members run as.
+        let (mut owner, fake, _, _) = owner_of(2);
+        fake.unbatchable.store(true, Ordering::SeqCst);
+        offer(&mut owner, &fake, A, job(1, 2)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 3)).unwrap();
+        retire(&mut owner, 1);
+        offer(&mut owner, &fake, A, job(3, 2)).unwrap();
+        retire(&mut owner, 2);
+        assert_eq!(
+            owner.counters.read(),
+            PassStatistics {
+                passes: 3,
+                rows: 7,
+                segments: 3,
+                batched: 0
             }
         );
     }
@@ -1645,6 +1703,68 @@ mod tests {
         assert_eq!(gate.load(Ordering::Acquire), PASS + 2);
         retire(&mut owner, PASS + 2);
         assert_eq!(gate.load(Ordering::Acquire), NONE);
+    }
+
+    #[test]
+    fn offers_of_different_classes_form_separate_passes() {
+        let (mut owner, fake, told, _) = owner_of(3);
+        let class = |serial: u64, class: u64| job(serial, 4) | (class << 48);
+        offer(&mut owner, &fake, A, class(1, 1)).unwrap();
+        offer(&mut owner, &fake, C, class(3, 1)).unwrap();
+        offer(&mut owner, &fake, B, class(2, 2)).unwrap();
+        retire(&mut owner, 1);
+        offer(&mut owner, &fake, A, class(4, 1)).unwrap();
+        // C and A share a pass; B, of another class, waits behind it instead of spoiling it.
+        assert_eq!(fake.passes.lock().unwrap().len(), 1);
+        assert_eq!(fake.passes.lock().unwrap()[0].0, vec![3, 4]);
+        assert!(told.lock().unwrap().is_empty());
+        assert!(owner.assembler.has_pending(B));
+        retire(&mut owner, PASS + 3);
+        offer(&mut owner, &fake, C, class(5, 1)).unwrap();
+        offer(&mut owner, &fake, A, class(6, 1)).unwrap();
+        // B's pass forms next, with its own class: one pass of one job, then the others.
+        assert_eq!(fake.starts().last().map(|(job, _)| *job), Some(2));
+        assert!(fake.passes.lock().unwrap().len() == 1);
+        assert!(told.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_launcher_that_panics_when_asked_runs_the_members_alone() {
+        let (mut owner, fake, told, _) = owner_of(3);
+        fake.batchable_panics.store(true, Ordering::SeqCst);
+        offer(&mut owner, &fake, A, job(1, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(2, 4)).unwrap();
+        retire(&mut owner, 1);
+        offer(&mut owner, &fake, A, job(3, 4)).unwrap();
+        assert!(fake.passes.lock().unwrap().is_empty());
+        assert_eq!(
+            fake.starts().iter().map(|(job, _)| *job).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(told.lock().unwrap().is_empty());
+        // Each member still pays its retirement, so the next pass forms.
+        retire(&mut owner, 2);
+        assert_eq!(fake.starts().last().map(|(job, _)| *job), Some(3));
+    }
+
+    #[test]
+    fn the_retirement_of_a_batched_pass_lets_the_next_pass_form() {
+        let (mut owner, fake, _, _) = batched_pair();
+        offer(&mut owner, &fake, A, job(4, 4)).unwrap();
+        offer(&mut owner, &fake, B, job(5, 4)).unwrap();
+        assert_eq!(
+            fake.passes.lock().unwrap().len(),
+            1,
+            "nothing forms while the pass runs"
+        );
+        retire(&mut owner, PASS + 2);
+        owner.settle();
+        assert_eq!(
+            fake.passes.lock().unwrap().len(),
+            2,
+            "its retirement releases the next pass"
+        );
+        assert_eq!(fake.passes.lock().unwrap()[1].0, vec![4, 5]);
     }
 
     #[test]

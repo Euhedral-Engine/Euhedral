@@ -24,16 +24,20 @@ use std::fmt;
 
 pub use crate::state::SequenceId;
 
-/// What the passes did, as numbers: each pass counts once, however many sequences it holds.
+/// What the passes did, as numbers: each pass counts once, however many sequences it holds. A pass is one quantum, so
+/// `passes` is the count of quanta, `segments` the sequences' parts they held and `batched` the quanta that held more
+/// than one part, as the same fields do in the Java engine's per-kind statistics. Only the steps offered to the
+/// assembler (the verifications) are counted here, as one total: the other kinds are admitted directly and are not
+/// counted, and the disk and staging byte counts are not kept.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PassStatistics {
-    /// Passes started.
+    /// Passes started (quanta).
     pub passes: u64,
     /// Rows the passes held.
     pub rows: u64,
     /// Sequences' parts the passes held (a pass of one has one).
     pub segments: u64,
-    /// Parts that shared a pass with another: the verifications that were batched.
+    /// Passes that held more than one part.
     pub batched: u64,
 }
 
@@ -43,6 +47,10 @@ pub trait PassOffer {
     fn sequence(&self) -> SequenceId;
     /// The rows the step occupies in a pass.
     fn rows(&self) -> usize;
+    /// The class of passes the step can join: only steps of one class share a pass.
+    fn class(&self) -> u64 {
+        0
+    }
 }
 
 /// An offer refused before it was queued: nothing of it remains in the assembler.
@@ -210,13 +218,20 @@ impl<O: PassOffer> PassAssembler<O> {
         if self.forming.is_some() || self.in_flight > 0 || self.pending.is_empty() || !self.awaiting.is_empty() {
             return None;
         }
+        let class = self.pending.front().map(PassOffer::class)?;
         let mut pass = Vec::new();
         let mut rows = 0usize;
-        while let Some(next) = self.pending.front() {
+        let mut at = 0;
+        while at < self.pending.len() {
+            let next = &self.pending[at];
+            if next.class() != class {
+                at += 1;
+                continue;
+            }
             if pass.len() >= self.max_parts || (!pass.is_empty() && rows + next.rows() > self.max_rows) {
                 break;
             }
-            let Some(next) = self.pending.pop_front() else { break };
+            let Some(next) = self.pending.remove(at) else { break };
             rows += next.rows();
             self.pending_sequences.remove(&next.sequence());
             pass.push(next);
@@ -282,6 +297,7 @@ mod tests {
         sequence: SequenceId,
         rows: usize,
         serial: usize,
+        class: u64,
     }
 
     impl PassOffer for Step {
@@ -290,6 +306,9 @@ mod tests {
         }
         fn rows(&self) -> usize {
             self.rows
+        }
+        fn class(&self) -> u64 {
+            self.class
         }
     }
 
@@ -315,6 +334,7 @@ mod tests {
                 sequence,
                 rows,
                 serial: self.serial,
+                class: 0,
             }
         }
 
@@ -451,6 +471,31 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_takes_only_the_offers_of_the_class_of_the_first() {
+        let mut assembler = PassAssembler::<Step>::new(8, 8);
+        for (serial, (sequence, class)) in [(A, 1), (B, 2), (X, 1)].into_iter().enumerate() {
+            assembler
+                .offer(Step {
+                    sequence,
+                    rows: 1,
+                    serial,
+                    class,
+                })
+                .unwrap();
+        }
+        let first = assembler.next_pass().unwrap();
+        assert_eq!(first.iter().map(|step| step.sequence).collect::<Vec<_>>(), vec![A, X]);
+        assert!(assembler.has_pending(B), "the other class keeps its place");
+        assembler.admitted(1).unwrap();
+        assembler.retired(&[A, X]).unwrap();
+        assert!(assembler.next_pass().is_none(), "A and X have not reported");
+        assembler.leave(A);
+        assembler.leave(X);
+        let second = assembler.next_pass().unwrap();
+        assert_eq!(second.iter().map(|step| step.sequence).collect::<Vec<_>>(), vec![B]);
+    }
+
+    #[test]
     fn a_pass_that_admits_nothing_does_not_strand_the_offers_behind_it() {
         let mut assembler = PassAssembler::<Step>::new(8, 1);
         let mut seen = Vec::new();
@@ -460,6 +505,7 @@ mod tests {
                     sequence,
                     rows: 1,
                     serial,
+                    class: 0,
                 })
                 .unwrap();
         }
@@ -579,6 +625,7 @@ mod tests {
                 sequence: A,
                 rows: 1,
                 serial: 0,
+                class: 0,
             })
             .unwrap();
         let first = assembler.next_pass().unwrap();
@@ -588,6 +635,7 @@ mod tests {
                 sequence: B,
                 rows: 1,
                 serial: 1,
+                class: 0,
             })
             .unwrap();
         assert!(assembler.next_pass().is_none());
@@ -609,6 +657,7 @@ mod tests {
                 sequence: A,
                 rows: 1,
                 serial: 0,
+                class: 0,
             })
             .unwrap();
         assembler.next_pass().unwrap();
@@ -627,6 +676,7 @@ mod tests {
                     sequence,
                     rows: 1,
                     serial,
+                    class: 0,
                 })
                 .unwrap();
         }
@@ -643,6 +693,7 @@ mod tests {
                 sequence: A,
                 rows: 1,
                 serial: 2,
+                class: 0,
             })
             .unwrap();
         assert!(assembler.next_pass().is_some());
@@ -668,6 +719,7 @@ mod tests {
                 sequence: A,
                 rows: 1,
                 serial: 0,
+                class: 0,
             })
             .unwrap();
         assembler
@@ -675,6 +727,7 @@ mod tests {
                 sequence: B,
                 rows: 1,
                 serial: 1,
+                class: 0,
             })
             .unwrap();
         assert_eq!(assembler.next_pass().unwrap().len(), 2);
@@ -726,6 +779,7 @@ mod tests {
                     sequence,
                     rows: 1,
                     serial,
+                    class: 0,
                 })
                 .unwrap();
         }
@@ -737,6 +791,7 @@ mod tests {
                 sequence: C,
                 rows: 1,
                 serial: 3,
+                class: 0,
             })
             .unwrap();
         assert!(assembler.leave(A).is_none());
@@ -752,6 +807,7 @@ mod tests {
                 sequence: B,
                 rows: 1,
                 serial: 4,
+                class: 0,
             })
             .unwrap();
         assert_eq!(assembler.next_pass().unwrap().len(), 2);
@@ -820,6 +876,7 @@ mod tests {
                 sequence: A,
                 rows: 1,
                 serial: 0,
+                class: 0,
             })
             .unwrap();
         assert_eq!(assembler.next_pass().unwrap().len(), 1);
@@ -831,6 +888,7 @@ mod tests {
                 sequence: A,
                 rows: 1,
                 serial: 1,
+                class: 0,
             })
             .unwrap();
         let pass = assembler.next_pass().unwrap();

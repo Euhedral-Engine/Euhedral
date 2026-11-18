@@ -275,15 +275,16 @@ impl Generation {
                 // the passes' rule hears of it), then each member's owner gets its own part.
                 passes.pass_retired(quantum.id());
                 let leases = quantum.take_leases();
+                let guards = quantum.take_flights();
                 let batch = Arc::new(quantum);
-                for (segment, lease) in leases.into_iter().enumerate() {
+                for (segment, (lease, guard)) in leases.into_iter().zip(guards).enumerate() {
                     let sequence = batch.segments().get(segment).and_then(|part| part.sequence());
                     let Some(owner) = sequence.and_then(|sequence| peers.get(sequence.0)) else {
                         log::error!("a pass retired with a part of no sequence the engine holds");
                         continue;
                     };
                     owner.post(Message::Retired(Box::new(Retired::part(
-                        &batch, segment, lease, &outcome,
+                        &batch, segment, lease, guard, &outcome,
                     ))));
                 }
             },

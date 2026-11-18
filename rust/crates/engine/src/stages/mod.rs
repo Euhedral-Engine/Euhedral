@@ -264,6 +264,11 @@ impl SequenceRefs {
         self
     }
 
+    /// Takes the in-flight guard out, so that its holder can let go of it when it is done with the quantum.
+    pub(crate) fn take_flight(&mut self) -> Option<FlightGuard> {
+        self.flight.take()
+    }
+
     /// The base model's cache as it is at admission (`KvCache::view`, after the reservation).
     pub fn with_kv(mut self, view: KvView) -> Self {
         self.kv = Some(view);
@@ -996,6 +1001,12 @@ impl Quantum {
                 });
             }
             let segment = quantum.segment();
+            if segment.draft_token_read.is_none() && quantum.tokens.len() != quantum.rows {
+                return Err(QuantumError::TokenCount {
+                    given: quantum.tokens.len(),
+                    rows: quantum.rows,
+                });
+            }
             shapes.push(Shape {
                 sequence: *sequence,
                 rows: quantum.rows,
@@ -1022,6 +1033,26 @@ impl Quantum {
         workspace.view(rows as u64)?;
         workspace.rows().check_logits(if scored { rows } else { 0 } as u64)?;
         Ok(())
+    }
+
+    /// The class of passes this verification can join: verifications of one class can be one batch, of different
+    /// classes never (they differ in how their logits leave the device or in the key/value format).
+    pub(crate) fn pass_class(&self) -> u64 {
+        let Some(segment) = self.segments.first() else {
+            return 0;
+        };
+        let logits = match (&segment.selection, &segment.row_readback) {
+            (Some(_), None) => 1,
+            (None, Some(_)) => 2,
+            (None, None) => 3,
+            (Some(_), Some(_)) => 4,
+        };
+        let format = match segment.refs.kv(KvSource::Base).map(KvView::format) {
+            None => 0,
+            Some(KvFormat::Nvfp4) => 1,
+            Some(KvFormat::Bf16) => 2,
+        };
+        logits | format << 8
     }
 
     /// The part of a batch this verification of `sequence` is, which `cancel` (the request's flag) cancels.
@@ -1066,6 +1097,15 @@ impl Quantum {
     /// whichever of them lets go last.
     pub(crate) fn take_leases(&mut self) -> Vec<Option<SelectionLease>> {
         self.segments.iter_mut().map(|segment| segment.lease.take()).collect()
+    }
+
+    /// Takes each segment's in-flight guard out, in segment order: a pass holds one for each sequence, and each sequence's
+    /// owner lets go of its own when it is done with its part, so that no sequence waits for another's to settle.
+    pub fn take_flights(&mut self) -> Vec<Option<FlightGuard>> {
+        self.segments
+            .iter_mut()
+            .map(|segment| segment.refs.take_flight())
+            .collect()
     }
 
     /// Whether the input record's upload was queued ([`Quantum::prepare`]).
