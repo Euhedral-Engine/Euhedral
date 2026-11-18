@@ -712,6 +712,20 @@ impl EngineRuntime {
         self.generations.copy_admitted(Arc::new(hook));
     }
 
+    /// A test hook: `hook` runs on the owner once a restore's rows are reserved, before the cache plans the restore.
+    /// It must not block. Set once per engine.
+    #[cfg(feature = "test-oracles")]
+    pub fn on_restore_reserved_for_tests(&self, hook: impl Fn() + Send + Sync + 'static) {
+        self.generations.restore_reserved(Arc::new(hook));
+    }
+
+    /// A test hook: `hook` runs on the owner for each quantum it admits, with the quantum's start position. It must not
+    /// block. Set once per engine.
+    #[cfg(feature = "test-oracles")]
+    pub fn on_quantum_admitted_for_tests(&self, hook: impl Fn(u64) + Send + Sync + 'static) {
+        self.generations.quantum_admitted(Arc::new(hook));
+    }
+
     /// A test hook: the engine records no graphs from now on, so every quantum runs stage by stage. `false` while a
     /// request runs.
     #[cfg(feature = "test-oracles")]

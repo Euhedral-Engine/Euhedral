@@ -39,16 +39,18 @@ use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter};
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::Arc;
+#[cfg(feature = "test-oracles")]
+use std::sync::OnceLock;
 #[cfg(feature = "test-oracles")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
 use euhedral_data_structures::queues::{Consumer, Single};
 use euhedral_gpu::Ran;
-use euhedral_graph::QuantumOutcome;
+use euhedral_graph::{Marker, QuantumOutcome};
 use euhedral_inference_cuda::{DevicePtr, PooledPinned, SubmitMode};
 
 use super::listener::GenerationListener;
@@ -206,6 +208,12 @@ pub(crate) struct Shared {
     /// A test hook: told, from the owner, of each prefix-cache copy job once it is admitted (`true` for a restore).
     #[cfg(feature = "test-oracles")]
     pub(crate) copy_admitted: OnceLock<Box<dyn Fn(bool) + Send + Sync>>,
+    /// A test hook: told, from the owner, once a restore's rows are reserved and before the cache is asked to plan it.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) restore_reserved: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// A test hook: told, from the owner, of each quantum once it is admitted, with its start position.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) quantum_admitted: OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
 }
 
 /// What speculation needs of the artifact's draft layer.
@@ -412,8 +420,11 @@ pub(super) struct Flying {
 /// A retired quantum the owner keeps until the work it queued on its own lane has run: a quantum that was stopped before
 /// its stages waited for its input record's upload leaves that copy reading the pinned record it holds.
 struct Parked {
-    quantum: Quantum,
-    // Dropped with the quantum: the staging of the page tables the reservation uploaded.
+    /// The owner-lane work that reads what is held; the entry goes once the lane has reached it.
+    marker: Marker,
+    // Dropped with the entry: the quantum (none for a restore's reservation that no quantum took) and the staging of
+    // the page tables the reservation uploaded.
+    _quantum: Option<Quantum>,
     _retained: KvRetained,
 }
 
@@ -464,6 +475,8 @@ pub(super) struct Run {
     first_kill: Option<Arc<AtomicBool>>,
     /// What the restore's reservation uploaded, kept until the first chunk retires.
     carried: KvRetained,
+    /// The restore's reservation on the owner's lane, which reads `carried`; `None` once a chunk has taken both.
+    carried_marker: Option<Marker>,
     /// The sequence's place in the pool, given back when the run is dropped.
     lease: Lease,
 }
@@ -952,6 +965,7 @@ impl Owner {
             checkpoints: None,
             first_kill: None,
             carried: KvRetained::default(),
+            carried_marker: None,
             lease,
         });
         Ok(())
@@ -1040,6 +1054,7 @@ impl Owner {
         );
         let cached_prompt_tokens = run.cached_prompt_tokens();
         mem::forget(mem::take(&mut run.in_flight));
+        mem::forget(mem::take(&mut run.carried));
         // The quanta can no longer be accounted for, so a next request on this sequence could race them: it is not given back.
         mem::forget(run.lease);
         if mem::take(&mut run.chain) {
@@ -1156,6 +1171,10 @@ impl Owner {
         let Some(checkpoints) = run.checkpoints.as_mut() else {
             return Ok(());
         };
+        #[cfg(feature = "test-oracles")]
+        if let Some(hook) = shared.restore_reserved.get() {
+            hook();
+        }
         let (submit, answer) = (Arc::clone(&shared.address), Arc::clone(&shared.address));
         let kill = checkpoints.restore(
             hit,
@@ -1168,6 +1187,7 @@ impl Owner {
         run.offset = position as usize;
         run.position = position;
         run.carried = retained;
+        run.carried_marker = Some(reserved);
         Ok(())
     }
 
@@ -1453,8 +1473,7 @@ impl Owner {
     /// Lets go of the quanta whose owner-lane work has run.
     fn reap(&mut self) {
         let lanes = &self.shared.core.lanes;
-        self.parked
-            .retain(|parked| parked.quantum.prepared.is_some_and(|marker| !lanes.reached(marker)));
+        self.parked.retain(|parked| !lanes.reached(parked.marker));
     }
 
     /// Keeps `quantum` until the work queued on the owner's lane for it has run. A frame posts to the owner when it
@@ -1462,12 +1481,19 @@ impl Owner {
     /// once: reached, the quantum goes now; not, the frame is registered, and it fires even if the marker is reached
     /// the next instant.
     fn park(&mut self, quantum: Quantum, retained: KvRetained) {
+        let Some(marker) = quantum.prepared else { return };
+        self.keep(marker, Some(quantum), retained);
+    }
+
+    /// Keeps `quantum` and `retained` until the lane has reached `marker`, as `park` does for a quantum.
+    fn keep(&mut self, marker: Marker, quantum: Option<Quantum>, retained: KvRetained) {
         let core = &self.shared.core;
-        let Some(marker) = quantum.prepared.filter(|marker| !core.lanes.reached(*marker)) else {
+        if core.lanes.reached(marker) {
             return;
-        };
+        }
         self.parked.push(Parked {
-            quantum,
+            marker,
+            _quantum: quantum,
             _retained: retained,
         });
         let address = Arc::clone(&self.shared.address);
@@ -1957,6 +1983,7 @@ impl Owner {
         // The reservation (and, for the first quantum of a request after another, the reset of the sequence) on the
         // owner's lane. Its marker orders the quantum's stages behind it.
         let mut retained = mem::take(&mut run.carried);
+        run.carried_marker = None;
         let (_, reserved) = core
             .lane_table
             .submit_ops(core.owner_lane(), false, |lane| {
@@ -2067,6 +2094,10 @@ impl Owner {
             run.in_flight.retain(|flying| flying.id != id);
             return Err(why("starting the quantum")(error));
         }
+        #[cfg(feature = "test-oracles")]
+        if let Some(hook) = shared.quantum_admitted.get() {
+            hook(u64::from(start));
+        }
         Ok(taken)
     }
 
@@ -2086,6 +2117,14 @@ impl Owner {
         let ended = run.stopping.is_some() || run.next_step(chunk).is_none();
         if !run.in_flight.is_empty() || run.waiting_logits || run.selecting() || run.preparing() || !ended {
             return;
+        }
+        // A restore's reservation that no chunk took (the request ended first) has its table upload queued on the owner's
+        // lane, reading the staging it holds.
+        if let Some(run) = self.run.as_mut()
+            && let Some(marker) = run.carried_marker.take()
+        {
+            let retained = mem::take(&mut run.carried);
+            self.keep(marker, None, retained);
         }
         // Quanta that were stopped may still have work queued on the owner's lane.
         self.reap();

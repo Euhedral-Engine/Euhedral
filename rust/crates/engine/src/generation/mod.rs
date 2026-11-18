@@ -21,8 +21,10 @@ mod source;
 mod teacher_forced;
 
 use std::fmt::{self, Formatter};
+use std::sync::Arc;
+#[cfg(feature = "test-oracles")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::generics::FrameSink;
@@ -35,7 +37,7 @@ use crate::formats::{Nvfp4Linear, TrellisLinear};
 use crate::frames::{Kind, step};
 use crate::model::{LayerIndex, ModelConfig, Role, Weights};
 use crate::plan::{Formats, Plan, View};
-use crate::prefix::{CacheSpec, Copier, PrefixCacheHandle, open_prefix_cache};
+use crate::prefix::{CacheSpec, Copier, POSITION_GRANULE, PrefixCacheHandle, open_prefix_cache};
 use crate::quantum::Executor;
 use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
@@ -154,6 +156,10 @@ impl Generation {
             settle_after_speculation: AtomicBool::new(false),
             #[cfg(feature = "test-oracles")]
             copy_admitted: OnceLock::new(),
+            #[cfg(feature = "test-oracles")]
+            restore_reserved: OnceLock::new(),
+            #[cfg(feature = "test-oracles")]
+            quantum_admitted: OnceLock::new(),
         });
         let mailbox = Arc::new(Mailbox::new(
             Owner::new(Arc::clone(&shared), id, sequence, inbox),
@@ -393,10 +399,6 @@ impl Generation {
     }
 }
 
-/// The tokens a prefill chunk must be a multiple of for the prefix cache to run: a checkpoint's position is a multiple of
-/// the chunk and of this.
-const CHECKPOINT_GRANULE: u64 = 256;
-
 /// Opens the prefix cache the plan granted memory for, once for the engine; `None` (and why, once, in the log) when the
 /// engine cannot use it: the chunk is not a multiple of the checkpoint granule or does not divide the interval between
 /// checkpoints. Requests that speculate neither restore nor capture (the state of a draft is not stored); the others do,
@@ -408,9 +410,9 @@ fn open_cache(core: &Arc<Core>, config: &Arc<ModelConfig>, residency: &Residency
     }
     let settings = core.settings.prefix_cache;
     let chunk = residency.rows.rows;
-    if chunk == 0 || !chunk.is_multiple_of(CHECKPOINT_GRANULE) {
+    if chunk == 0 || !chunk.is_multiple_of(u64::from(POSITION_GRANULE)) {
         log::warn!(
-            "the prefix cache is off: the prefill chunk is {chunk} tokens, and it must be a multiple of {CHECKPOINT_GRANULE}"
+            "the prefix cache is off: the prefill chunk is {chunk} tokens, and it must be a multiple of {POSITION_GRANULE}, the granule of a checkpoint's position"
         );
         return None;
     }
@@ -594,6 +596,27 @@ impl Generations {
                 .shared
                 .copy_admitted
                 .set(Box::new(move |restore| hook(restore)));
+        }
+    }
+
+    /// The test hook: `hook` is told when a sequence's owner has reserved a restore's rows, before the cache plans it.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn restore_reserved(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        for generation in &self.generations {
+            let hook = Arc::clone(&hook);
+            let _ = generation.shared.restore_reserved.set(Box::new(move || hook()));
+        }
+    }
+
+    /// The test hook: `hook` is told of every quantum a sequence's owner admits, with its start position.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn quantum_admitted(&self, hook: Arc<dyn Fn(u64) + Send + Sync>) {
+        for generation in &self.generations {
+            let hook = Arc::clone(&hook);
+            let _ = generation
+                .shared
+                .quantum_admitted
+                .set(Box::new(move |start| hook(start)));
         }
     }
 

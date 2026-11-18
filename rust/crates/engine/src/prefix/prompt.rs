@@ -95,7 +95,8 @@ impl Debug for PromptCheckpoints {
 
 impl PromptCheckpoints {
     /// Asks the cache for the longest checkpoint of `tokens`; `looked` receives the answer (and the owner then calls
-    /// [`looked`](Self::looked)).
+    /// [`looked`](Self::looked)). A prompt that cannot match one (at most a chunk long) is not looked up: `looked` is
+    /// never called, and the request starts at once ([`holds`](Self::holds) is false).
     pub fn begin(
         cache: PrefixCacheHandle,
         tokens: Arc<[u32]>,
@@ -103,18 +104,21 @@ impl PromptCheckpoints {
     ) -> PromptCheckpoints {
         let parent = cache.root();
         let asking = Arc::clone(&tokens);
+        let lookup = cache.can_match(tokens.len());
         let checkpoints = PromptCheckpoints {
             cache: cache.clone(),
             tokens,
             parent,
-            start: Start::Looking,
+            start: if lookup { Start::Looking } else { Start::Settled },
             next: Next::None,
             open: None,
-            asks: 1,
+            asks: usize::from(lookup),
             kills: Vec::new(),
             cached: 0,
         };
-        cache.lookup(asking, None, looked);
+        if lookup {
+            cache.lookup(asking, None, looked);
+        }
         checkpoints
     }
 
@@ -180,13 +184,14 @@ impl PromptCheckpoints {
         }
     }
 
-    /// Whether a checkpoint at `end` tokens of the prompt is wanted. One at the prompt's end is not: a match always leaves
-    /// a token to prefill, so nothing would ever restore it.
+    /// Whether a checkpoint at `end` tokens of the prompt is wanted. One at the prompt's end is, when the end is on the
+    /// interval: a later prompt that extends this one (the next turn of a chat) restores it. The identical prompt never
+    /// does: a match always leaves a token to prefill.
     pub fn wants(&self, end: usize) -> bool {
         u32::try_from(end)
             .ok()
             .zip(u32::try_from(self.tokens.len()).ok())
-            .is_some_and(|(end, len)| end < len && self.cache.wants_checkpoint(end, len))
+            .is_some_and(|(end, len)| end <= len && self.cache.wants_checkpoint(end, len))
     }
 
     /// The chunk that ends at `end` is admitted; `refs` are the references it was admitted with.

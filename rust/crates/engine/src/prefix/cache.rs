@@ -664,6 +664,12 @@ impl PrefixCacheHandle {
             && (end.is_multiple_of(shared.interval) || (end < len && len - end <= shared.chunk))
     }
 
+    /// Whether a prompt of `len` tokens can match a checkpoint: the smallest is one chunk long, and a match leaves a
+    /// token to prefill.
+    pub fn can_match(&self, len: usize) -> bool {
+        u32::try_from(len).map_or(true, |len| len > self.shared.chunk)
+    }
+
     /// Stops checkpoints past `tokens`: the pages beyond it are not on the device (a sequence whose cache spills to the
     /// host has nothing a copy can read there).
     pub fn limit_checkpoints(&self, tokens: u32) {

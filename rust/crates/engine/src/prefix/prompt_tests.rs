@@ -87,6 +87,13 @@ fn serve(rig: &Rig, device: &Arc<Device>, prompt: &[u32]) -> Seen {
                 |_| rig.submit(),
                 move |n| *told.lock().unwrap() = Some(n)
             ));
+            if rig.queued() == 0 {
+                // The checkpoint is stored already: the cache answers with no job, and the chunk goes on.
+                checkpoints.captured(answer(&node));
+                assert!(!checkpoints.holds());
+                offset = end;
+                continue;
+            }
             assert!(checkpoints.holds(), "nor before the capture's job is admitted");
             let job = rig.next_job();
             checkpoints.capture_submitted();
@@ -154,14 +161,35 @@ fn an_identical_prompt_still_prefills_its_last_tokens() {
     let first = serve(&rig, &device, &prompt);
     assert_eq!(
         first.captured,
-        vec![512],
-        "a checkpoint at the prompt's end would never be restored"
+        vec![512, 1024],
+        "the end is on the interval: a prompt that extends this one restores it"
     );
     let second = serve(&rig, &Device::new(FORMAT, ROWS), &prompt);
     assert_eq!(
         second.cached, 512,
         "the checkpoint at the prompt's end would leave nothing to prefill"
     );
+    let mut longer = prompt.clone();
+    longer.extend(tokens(70_000, 100));
+    let third = serve(&rig, &Device::new(FORMAT, ROWS), &longer);
+    assert_eq!(
+        third.cached, 1024,
+        "the next turn of a chat restores the whole earlier prompt"
+    );
+}
+
+#[test]
+fn a_prompt_of_one_chunk_or_less_is_not_looked_up() {
+    let (rig, _) = rig();
+    for len in [1, 100, CHUNK] {
+        let checkpoints = PromptCheckpoints::begin(rig.cache.clone(), tokens(0, len).into(), |_| {
+            panic!("a prompt that cannot match is not looked up")
+        });
+        assert!(!checkpoints.holds(), "{len} tokens: the first chunk starts at once");
+        assert_eq!(checkpoints.pending(), 0);
+    }
+    let longer = PromptCheckpoints::begin(rig.cache.clone(), tokens(0, CHUNK + 1).into(), |_| {});
+    assert!(longer.holds(), "a longer prompt waits for its lookup");
 }
 
 #[test]

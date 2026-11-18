@@ -314,6 +314,101 @@ fn a_request_cancelled_while_its_restore_runs_leaves_the_sequence_clean() {
     owner.shutdown(runtime).expect("the engine shuts down clean");
 }
 
+/// Where the request that runs on a fresh sequence is cancelled.
+#[derive(Clone, Copy, Debug)]
+enum Point {
+    /// The restore's rows are reserved and the cache has not planned the copy.
+    Reserved,
+    /// The restore's job is admitted.
+    JobAdmitted,
+    /// The first chunk is admitted behind the restore.
+    ChunkAdmitted,
+}
+
+/// A request that restores on a sequence no request has used (so its reservation grows the cache, and the page-table
+/// upload reads pinned staging) is cancelled at `point`: the sequence the next request gets back is clean.
+fn cancel_on_a_fresh_sequence(point: Point) {
+    let Some(machine) = machine() else { return };
+    let (runtime, owner) = start(&machine, 2, ByteSize::gib(2));
+    let shared = prompt(0, LENGTH);
+    let first = generate(&runtime, &shared, SamplingConfig::greedy(0));
+    assert_eq!(first.outcome.cached_prompt_tokens, 0);
+    // The long decode takes the first sequence (which captured), so the requests below run on the fresh one.
+    let busy = submit(
+        &runtime,
+        &prompt(7, 0)[..600],
+        3000,
+        SamplingConfig::greedy(0),
+        &CancelHandle::default(),
+    )
+    .expect("the long request is admitted");
+    let cancel = CancelHandle::default();
+    let armed = Arc::new(AtomicBool::new(true));
+    let fire = {
+        let (armed, cancel) = (Arc::clone(&armed), cancel.clone());
+        Arc::new(move || {
+            if armed.swap(false, Ordering::AcqRel) {
+                cancel.cancel();
+            }
+        })
+    };
+    match point {
+        Point::Reserved => {
+            let fire = Arc::clone(&fire);
+            runtime.on_restore_reserved_for_tests(move || fire());
+        }
+        Point::JobAdmitted => {
+            let fire = Arc::clone(&fire);
+            runtime.on_copy_admitted_for_tests(move |restore| {
+                if restore {
+                    fire();
+                }
+            });
+        }
+        Point::ChunkAdmitted => {
+            let fire = Arc::clone(&fire);
+            runtime.on_quantum_admitted_for_tests(move |start| {
+                if start == 2560 {
+                    fire();
+                }
+            });
+        }
+    }
+    let cancelled = submit(&runtime, &shared, GENERATED, SamplingConfig::greedy(0), &cancel)
+        .expect("the request is admitted")
+        .wait(WAIT)
+        .expect("the generation reports");
+    assert!(!armed.load(Ordering::Acquire), "{point:?}: the hook ran");
+    assert_eq!(cancelled.outcome.reason, FinishReason::Cancelled, "{point:?}");
+    assert!(cancelled.tokens.is_empty(), "{point:?}: {:?}", cancelled.tokens);
+    // The pinned staging of the reservation may be reused now: a request that runs on the same sequence (the long one
+    // still holds the other) restores the checkpoint and gives the cold run's tokens.
+    let next = generate(&runtime, &shared, SamplingConfig::greedy(0));
+    assert_eq!(next.outcome.cached_prompt_tokens, 2560, "{point:?}");
+    assert_eq!(next.tokens, first.tokens, "{point:?}");
+    let busy = busy.wait(WAIT).expect("the long request reports");
+    assert_eq!(busy.outcome.reason, FinishReason::Length);
+    owner.shutdown(runtime).expect("the engine shuts down clean");
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_request_cancelled_before_the_cache_plans_its_restore_leaves_a_fresh_sequence_clean() {
+    cancel_on_a_fresh_sequence(Point::Reserved);
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_request_cancelled_as_its_restore_is_admitted_leaves_a_fresh_sequence_clean() {
+    cancel_on_a_fresh_sequence(Point::JobAdmitted);
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_request_cancelled_with_its_first_chunk_behind_the_restore_leaves_a_fresh_sequence_clean() {
+    cancel_on_a_fresh_sequence(Point::ChunkAdmitted);
+}
+
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn closing_the_engine_while_a_capture_runs_ends_within_its_bound() {
