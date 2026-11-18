@@ -12,14 +12,13 @@
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps};
 
-use super::{Launch, Quantum, QuantumKind, eager, fatal, launch_u32};
+use super::{Launch, Quantum, QuantumKind, Segment, eager, fatal, launch_u32};
 use crate::state::gdn::{GdnSpeculative, GdnState};
 use crate::workspace::BufferSlot;
 
 /// The GDN state of `layer`.
-fn layer_state(quantum: &Quantum, layer: usize) -> Result<&GdnState, StageError> {
-    quantum
-        .segment()
+fn layer_state(segment: &Segment, layer: usize) -> Result<&GdnState, StageError> {
+    segment
         .refs
         .device()
         .gdn
@@ -207,54 +206,63 @@ fn widths(quantum: &Quantum) -> Result<(u32, u32, u32), StageError> {
 impl Launch for GdnConvolution {
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let config = &quantum.config;
-        let state = layer_state(quantum, self.layer)?;
         let (query_key_width, value_width, channels) = widths(quantum)?;
-        let query_key = quantum.slot(self.query_key);
-        let value_z = quantum.slot(self.value_z);
-        // A verification before this quantum accepted only part of its rows: rebuild this layer's state first.
-        let replay = quantum.segment().refs.replay_rows(self.layer) as usize;
-        if replay > 0 {
-            self.replay(quantum, kernels, state, replay)?;
-        }
-        if quantum.kind == QuantumKind::Verify {
-            let buffers = speculative(state, quantum.rows)?;
-            let rows = quantum.rows as u64;
+        // Each segment runs against its own sequence's state; its rows are those from its offset on.
+        for segment in quantum.segments() {
+            let state = layer_state(segment, self.layer)?;
+            let offset = segment.row_offset as u64;
+            let query_key = quantum
+                .slot(self.query_key)
+                .offset(offset * u64::from(query_key_width) * 2);
+            let value_z = quantum
+                .slot(self.value_z)
+                .offset(offset * 2 * u64::from(value_width) * 2);
+            // A verification before this quantum accepted only part of its rows: rebuild this layer's state first.
+            let replay = segment.refs.replay_rows(self.layer) as usize;
+            if replay > 0 {
+                self.replay(quantum, kernels, state, replay)?;
+            }
+            if quantum.kind == QuantumKind::Verify {
+                let buffers = speculative(state, segment.rows)?;
+                let rows = segment.rows as u64;
+                kernels
+                    .copy_device_to_device(
+                        buffers.convolution_checkpoint.ptr(),
+                        state.convolution().ptr(),
+                        state.convolution().bytes() as u64,
+                    )
+                    .map_err(fatal)?;
+                kernels
+                    .copy_device_to_device(
+                        buffers.query_key_rows.ptr(),
+                        query_key,
+                        rows * u64::from(query_key_width) * 2,
+                    )
+                    .map_err(fatal)?;
+                kernels
+                    .copy_device_to_device(
+                        buffers.value_z_rows.ptr(),
+                        value_z,
+                        rows * 2 * u64::from(value_width) * 2,
+                    )
+                    .map_err(fatal)?;
+            }
             kernels
-                .copy_device_to_device(
-                    buffers.convolution_checkpoint.ptr(),
-                    state.convolution().ptr(),
-                    state.convolution().bytes() as u64,
-                )
-                .map_err(fatal)?;
-            kernels
-                .copy_device_to_device(
-                    buffers.query_key_rows.ptr(),
+                .gdn_convolution_bf16(
                     query_key,
-                    rows * u64::from(query_key_width) * 2,
-                )
-                .map_err(fatal)?;
-            kernels
-                .copy_device_to_device(
-                    buffers.value_z_rows.ptr(),
                     value_z,
-                    rows * 2 * u64::from(value_width) * 2,
+                    self.weights,
+                    state.convolution().ptr(),
+                    quantum.slot(self.output).offset(offset * u64::from(channels) * 2),
+                    launch_u32(segment.rows, "the rows")?,
+                    query_key_width,
+                    value_width,
+                    channels,
+                    launch_u32(config.linear_conv_kernel_dim, "the convolution kernel")?,
                 )
                 .map_err(fatal)?;
         }
-        kernels
-            .gdn_convolution_bf16(
-                query_key,
-                value_z,
-                self.weights,
-                state.convolution().ptr(),
-                quantum.slot(self.output),
-                quantum.rows_u32()?,
-                query_key_width,
-                value_width,
-                channels,
-                launch_u32(config.linear_conv_kernel_dim, "the convolution kernel")?,
-            )
-            .map_err(fatal)
+        Ok(())
     }
 }
 
@@ -284,42 +292,48 @@ impl GdnRecurrence {
 impl Launch for GdnRecurrence {
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let config = &quantum.config;
-        let state = layer_state(quantum, self.layer)?;
         let value_heads = launch_u32(config.linear_num_value_heads, "the value heads")?;
-        let alpha = quantum.slot(self.alpha);
-        let beta = quantum.slot(self.beta);
-        if quantum.kind == QuantumKind::Verify {
-            let buffers = speculative(state, quantum.rows)?;
-            let control_bytes = quantum.rows as u64 * u64::from(value_heads) * 4;
+        let (_, value_width, channels) = widths(quantum)?;
+        for segment in quantum.segments() {
+            let state = layer_state(segment, self.layer)?;
+            let offset = segment.row_offset as u64;
+            let control = offset * u64::from(value_heads) * 4;
+            let alpha = quantum.slot(self.alpha).offset(control);
+            let beta = quantum.slot(self.beta).offset(control);
+            if quantum.kind == QuantumKind::Verify {
+                let buffers = speculative(state, segment.rows)?;
+                let control_bytes = segment.rows as u64 * u64::from(value_heads) * 4;
+                kernels
+                    .copy_device_to_device(
+                        buffers.recurrent_checkpoint.ptr(),
+                        state.recurrent().ptr(),
+                        state.recurrent().bytes() as u64,
+                    )
+                    .map_err(fatal)?;
+                kernels
+                    .copy_device_to_device(buffers.alpha_rows.ptr(), alpha, control_bytes)
+                    .map_err(fatal)?;
+                kernels
+                    .copy_device_to_device(buffers.beta_rows.ptr(), beta, control_bytes)
+                    .map_err(fatal)?;
+            }
             kernels
-                .copy_device_to_device(
-                    buffers.recurrent_checkpoint.ptr(),
+                .gdn_recurrence_bf16(
+                    quantum.slot(self.convolved).offset(offset * u64::from(channels) * 2),
+                    alpha,
+                    beta,
                     state.recurrent().ptr(),
-                    state.recurrent().bytes() as u64,
+                    quantum.slot(self.output).offset(offset * u64::from(value_width) * 2),
+                    launch_u32(segment.rows, "the rows")?,
+                    launch_u32(config.linear_num_key_heads, "the key heads")?,
+                    value_heads,
+                    launch_u32(config.linear_key_head_dim, "the key head dimension")?,
+                    launch_u32(config.linear_value_head_dim, "the value head dimension")?,
+                    output_scale(config.linear_key_head_dim),
                 )
                 .map_err(fatal)?;
-            kernels
-                .copy_device_to_device(buffers.alpha_rows.ptr(), alpha, control_bytes)
-                .map_err(fatal)?;
-            kernels
-                .copy_device_to_device(buffers.beta_rows.ptr(), beta, control_bytes)
-                .map_err(fatal)?;
         }
-        kernels
-            .gdn_recurrence_bf16(
-                quantum.slot(self.convolved),
-                alpha,
-                beta,
-                state.recurrent().ptr(),
-                quantum.slot(self.output),
-                quantum.rows_u32()?,
-                launch_u32(config.linear_num_key_heads, "the key heads")?,
-                value_heads,
-                launch_u32(config.linear_key_head_dim, "the key head dimension")?,
-                launch_u32(config.linear_value_head_dim, "the value head dimension")?,
-                output_scale(config.linear_key_head_dim),
-            )
-            .map_err(fatal)
+        Ok(())
     }
 }
 

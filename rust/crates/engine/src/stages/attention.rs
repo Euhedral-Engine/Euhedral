@@ -10,7 +10,7 @@ use euhedral_graph::{Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{DevicePtr, KernelOps};
 use euhedral_inference_settings::KvFormat;
 
-use super::{Launch, Quantum, QuantumKind, eager, fatal, launch_u32};
+use super::{Launch, Quantum, QuantumKind, Segment, eager, fatal, launch_u32};
 use crate::residency::footprint::DRAFT_TWIN_ROWS;
 use crate::state::KvView;
 use crate::workspace::BufferSlot;
@@ -24,12 +24,27 @@ pub enum KvSource {
     Mtp,
 }
 
-fn cache(quantum: &Quantum, source: KvSource) -> Result<&KvView, StageError> {
-    quantum
-        .segment()
+fn cache(segment: &Segment, source: KvSource) -> Result<&KvView, StageError> {
+    segment
         .refs
         .kv(source)
         .ok_or_else(|| fatal(format!("the quantum has no view of the {source:?} cache")))
+}
+
+/// The markers of the work that reserved the rows of every segment's cache `source`: the stages that read or append
+/// to it wait for them.
+fn cache_ready(quantum: &Quantum, source: KvSource) -> Vec<Marker> {
+    quantum
+        .segments()
+        .iter()
+        .filter_map(|segment| segment.refs.kv(source).and_then(KvView::ready))
+        .collect()
+}
+
+/// Bytes of one row of the attention's projected rows (query then key, or gate then value), as the stages before it
+/// leave them.
+fn projected_row_bytes(quantum: &Quantum) -> u64 {
+    (quantum.config.attention_query_width() + quantum.config.kv_width()) as u64 * 2
 }
 
 /// The rotary dimension: the head dimension times the partial rotary factor, rounded (`Math.round`).
@@ -64,23 +79,27 @@ impl Launch for QkNormRope {
             rotary_dim(config.attention_head_dim, config.partial_rotary_factor),
             "the rotary dimension",
         )?;
-        kernels
-            .attention_qk_norm_rope_bf16(
-                quantum.slot(self.input),
-                self.query_norm,
-                self.key_norm,
-                quantum.slot(self.output),
-                quantum.rows_u32()?,
-                launch_u32(config.num_attention_heads, "the query heads")?,
-                launch_u32(config.num_key_value_heads, "the key value heads")?,
-                launch_u32(config.attention_head_dim, "the head dimension")?,
-                rotary,
-                quantum.segment().start_position,
-                quantum.position(),
-                quantum.epsilon(),
-                config.rope_theta,
-            )
-            .map_err(fatal)
+        for segment in quantum.segments() {
+            let offset = segment.row_offset as u64 * projected_row_bytes(quantum);
+            kernels
+                .attention_qk_norm_rope_bf16(
+                    quantum.slot(self.input).offset(offset),
+                    self.query_norm,
+                    self.key_norm,
+                    quantum.slot(self.output).offset(offset),
+                    launch_u32(segment.rows, "the rows")?,
+                    launch_u32(config.num_attention_heads, "the query heads")?,
+                    launch_u32(config.num_key_value_heads, "the key value heads")?,
+                    launch_u32(config.attention_head_dim, "the head dimension")?,
+                    rotary,
+                    segment.start_position,
+                    quantum.position_of(segment.index),
+                    quantum.epsilon(),
+                    config.rope_theta,
+                )
+                .map_err(fatal)?;
+        }
+        Ok(())
     }
 }
 
@@ -113,62 +132,60 @@ impl KvAppend {
 
 impl Launch for KvAppend {
     fn waits(&self, quantum: &Quantum) -> Vec<Marker> {
-        quantum
-            .segment()
-            .refs
-            .kv(self.source)
-            .and_then(KvView::ready)
-            .into_iter()
-            .collect()
+        cache_ready(quantum, self.source)
     }
 
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let config = &quantum.config;
-        let cache = cache(quantum, self.source)?;
-        let start = quantum.segment().start_position;
-        let rows = quantum.rows as u64;
-        if !cache.reserves(start, rows) {
-            return Err(fatal(format!(
-                "an append of {rows} rows at {start} is not reserved: the cache held {} rows at admission",
-                cache.reserved()
-            )));
-        }
-        let (Some(keys), Some(values)) = (cache.key_table(self.layer), cache.value_table(self.layer)) else {
-            return Err(fatal(format!("layer {} of the cache has no page table", self.layer)));
-        };
-        cache.stage_in(kernels, self.layer, start, rows).map_err(fatal)?;
-        let query_key = quantum.slot(self.query_key);
-        let gate = quantum.slot(self.gate_value);
-        let rows_u32 = quantum.rows_u32()?;
         let query_width = launch_u32(config.attention_query_width(), "the query width")?;
         let key_width = launch_u32(config.kv_width(), "the key width")?;
-        let position = quantum.position();
-        match cache.format() {
-            KvFormat::Nvfp4 => kernels.attention_kv_append_nvfp4(
-                query_key,
-                gate,
-                keys,
-                values,
-                rows_u32,
-                query_width,
-                key_width,
-                start,
-                position,
-            ),
-            KvFormat::Bf16 => kernels.attention_kv_append_bf16(
-                query_key,
-                gate,
-                keys,
-                values,
-                rows_u32,
-                query_width,
-                key_width,
-                start,
-                position,
-            ),
+        for segment in quantum.segments() {
+            let cache = cache(segment, self.source)?;
+            let start = segment.start_position;
+            let rows = segment.rows as u64;
+            if !cache.reserves(start, rows) {
+                return Err(fatal(format!(
+                    "an append of {rows} rows at {start} is not reserved: the cache held {} rows at admission",
+                    cache.reserved()
+                )));
+            }
+            let (Some(keys), Some(values)) = (cache.key_table(self.layer), cache.value_table(self.layer)) else {
+                return Err(fatal(format!("layer {} of the cache has no page table", self.layer)));
+            };
+            cache.stage_in(kernels, self.layer, start, rows).map_err(fatal)?;
+            let offset = segment.row_offset as u64 * projected_row_bytes(quantum);
+            let query_key = quantum.slot(self.query_key).offset(offset);
+            let gate = quantum.slot(self.gate_value).offset(offset);
+            let rows_u32 = launch_u32(segment.rows, "the rows")?;
+            let position = quantum.position_of(segment.index);
+            match cache.format() {
+                KvFormat::Nvfp4 => kernels.attention_kv_append_nvfp4(
+                    query_key,
+                    gate,
+                    keys,
+                    values,
+                    rows_u32,
+                    query_width,
+                    key_width,
+                    start,
+                    position,
+                ),
+                KvFormat::Bf16 => kernels.attention_kv_append_bf16(
+                    query_key,
+                    gate,
+                    keys,
+                    values,
+                    rows_u32,
+                    query_width,
+                    key_width,
+                    start,
+                    position,
+                ),
+            }
+            .map_err(fatal)?;
+            cache.stage_out(kernels, self.layer, start, rows).map_err(fatal)?;
         }
-        .map_err(fatal)?;
-        cache.stage_out(kernels, self.layer, start, rows).map_err(fatal)
+        Ok(())
     }
 }
 
@@ -210,79 +227,79 @@ impl AttentionCausal {
 
 impl Launch for AttentionCausal {
     fn waits(&self, quantum: &Quantum) -> Vec<Marker> {
-        quantum
-            .segment()
-            .refs
-            .kv(self.source)
-            .and_then(KvView::ready)
-            .into_iter()
-            .collect()
+        cache_ready(quantum, self.source)
     }
 
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let config = &quantum.config;
-        let cache = cache(quantum, self.source)?;
-        let start = quantum.segment().start_position;
-        let (Some(keys), Some(values)) = (cache.key_table(self.layer), cache.value_table(self.layer)) else {
-            return Err(fatal(format!("layer {} of the cache has no page table", self.layer)));
-        };
-        // The append stage queued these rows earlier on the quantum's lane: readable here, not yet committed.
-        let cache_length = u32::try_from(start + quantum.rows as u64)
-            .map_err(|_| fatal(format!("{} keys exceed a launch", start + quantum.rows as u64)))?;
-        let scratch = if takes_decode_scratch(quantum.kind, quantum.rows) {
-            let scratch = &quantum.segment().refs.device().scratch;
-            if quantum.rows as u64 > scratch.decode_rows() {
-                return Err(fatal(format!(
-                    "{} attention rows exceed the {} the decode scratch holds",
-                    quantum.rows,
-                    scratch.decode_rows()
-                )));
-            }
-            scratch.decode().ptr()
-        } else {
-            DevicePtr::NULL
-        };
-        let query_key = quantum.slot(self.query_key);
-        let gate = quantum.slot(self.gate_value);
-        let output = quantum.slot(self.output);
-        let rows_u32 = quantum.rows_u32()?;
         let query_heads = launch_u32(config.num_attention_heads, "the query heads")?;
         let key_heads = launch_u32(config.num_key_value_heads, "the key value heads")?;
         let head_dim = launch_u32(config.attention_head_dim, "the head dimension")?;
-        let position = quantum.position();
-        match cache.format() {
-            KvFormat::Nvfp4 => kernels.attention_causal_nvfp4(
-                query_key,
-                gate,
-                keys,
-                values,
-                output,
-                rows_u32,
-                query_heads,
-                key_heads,
-                head_dim,
-                cache_length,
-                start,
-                position,
-                scratch,
-            ),
-            KvFormat::Bf16 => kernels.attention_causal_bf16(
-                query_key,
-                gate,
-                keys,
-                values,
-                output,
-                rows_u32,
-                query_heads,
-                key_heads,
-                head_dim,
-                cache_length,
-                start,
-                position,
-                scratch,
-            ),
+        for segment in quantum.segments() {
+            let cache = cache(segment, self.source)?;
+            let start = segment.start_position;
+            let (Some(keys), Some(values)) = (cache.key_table(self.layer), cache.value_table(self.layer)) else {
+                return Err(fatal(format!("layer {} of the cache has no page table", self.layer)));
+            };
+            // The append stage queued these rows earlier on the quantum's lane: readable here, not yet committed.
+            let cache_length = u32::try_from(start + segment.rows as u64)
+                .map_err(|_| fatal(format!("{} keys exceed a launch", start + segment.rows as u64)))?;
+            let scratch = if takes_decode_scratch(quantum.kind, segment.rows) {
+                let scratch = &segment.refs.device().scratch;
+                if segment.rows as u64 > scratch.decode_rows() {
+                    return Err(fatal(format!(
+                        "{} attention rows exceed the {} the decode scratch holds",
+                        segment.rows,
+                        scratch.decode_rows()
+                    )));
+                }
+                scratch.decode().ptr()
+            } else {
+                DevicePtr::NULL
+            };
+            let offset = segment.row_offset as u64 * projected_row_bytes(quantum);
+            let query_key = quantum.slot(self.query_key).offset(offset);
+            let gate = quantum.slot(self.gate_value).offset(offset);
+            let output = quantum
+                .slot(self.output)
+                .offset(segment.row_offset as u64 * config.attention_query_width() as u64 * 2);
+            let rows_u32 = launch_u32(segment.rows, "the rows")?;
+            let position = quantum.position_of(segment.index);
+            match cache.format() {
+                KvFormat::Nvfp4 => kernels.attention_causal_nvfp4(
+                    query_key,
+                    gate,
+                    keys,
+                    values,
+                    output,
+                    rows_u32,
+                    query_heads,
+                    key_heads,
+                    head_dim,
+                    cache_length,
+                    start,
+                    position,
+                    scratch,
+                ),
+                KvFormat::Bf16 => kernels.attention_causal_bf16(
+                    query_key,
+                    gate,
+                    keys,
+                    values,
+                    output,
+                    rows_u32,
+                    query_heads,
+                    key_heads,
+                    head_dim,
+                    cache_length,
+                    start,
+                    position,
+                    scratch,
+                ),
+            }
+            .map_err(fatal)?;
         }
-        .map_err(fatal)
+        Ok(())
     }
 }
 

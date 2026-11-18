@@ -23,6 +23,7 @@ pub mod home;
 mod input_record;
 pub mod whole;
 
+use smallvec::SmallVec;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -40,7 +41,10 @@ use euhedral_inference_cuda::{AllocationId, CudaError, KernelOps, PinnedPool};
 use thiserror::Error;
 
 pub use capture_key::{CaptureKey, split_geometry};
-pub use input_record::{encode as encode_input_record, encode_into as encode_input_record_into};
+pub use input_record::{
+    encode as encode_input_record, encode_into as encode_input_record_into,
+    encode_positions as encode_input_record_positions,
+};
 
 use crate::plan::{MAX_CAPTURED_ROWS, Plan, Variant, View};
 use crate::prefix::{Copier, CopyJob};
@@ -106,13 +110,15 @@ impl Quantum {
         let zeros;
         let ids: &[u32] = if self.tokens.len() == self.rows {
             &self.tokens
-        } else if self.segment().draft_token_read.is_some() || self.token_from.is_some() {
+        } else if self.token_from.is_some() || self.segments().iter().all(|segment| segment.draft_token_read.is_some())
+        {
             zeros = vec![0u32; self.rows];
             &zeros
         } else {
             return Err(PrepareError::NoTokens { rows: self.rows });
         };
-        let record = encode_input_record(ids, self.segment().start_position);
+        let positions: SmallVec<[u64; 1]> = self.segments().iter().map(|segment| segment.start_position).collect();
+        let record = encode_input_record_positions(ids, &positions);
         let mut loan = pool.acquire(record.len())?;
         loan.buffer_mut().as_mut_slice()[..record.len()].copy_from_slice(&record);
         // SAFETY: the loan is held by the quantum, which is dropped only after its device work retired, and nothing
@@ -160,82 +166,90 @@ impl Quantum {
     /// buffers and seed, the GDN checkpoints of a verification, the decode scratch, and the selection.
     pub fn validate(&self) -> Result<(), QuantumError> {
         let invalid = |what: String| Err(QuantumError::Invalid { what });
-        let start = self.segment().start_position;
-        let rows = self.rows as u64;
-        if let Some(source) = self.attention_source() {
-            let Some(view) = self.segment().refs.kv(source) else {
-                return invalid(format!("the quantum has no view of the {source:?} cache"));
-            };
-            if !view.reserves(start, rows) {
-                return invalid(format!(
-                    "an append of {rows} rows at {start} is not reserved: the {source:?} cache held {} rows at admission",
-                    view.reserved()
-                ));
-            }
-            let layers = if source == KvSource::Mtp {
-                1
-            } else {
-                self.config.attention_layers()
-            };
-            if (0..layers).any(|layer| view.key_table(layer).is_none()) {
-                return invalid(format!("a layer of the {source:?} cache has no page table"));
-            }
-            if takes_decode_scratch(self.kind, self.rows) {
-                let held = self.segment().refs.device().scratch.decode_rows();
-                if rows > held {
-                    return invalid(format!(
-                        "{rows} attention rows exceed the {held} the decode scratch holds"
-                    ));
-                }
-            }
+        if let Some(what) = self.misuse() {
+            return invalid(what.to_string());
         }
-        if self.kind == QuantumKind::Draft {
-            if self.draft_seed.is_none() {
-                return invalid("a draft quantum has no rows to seed it".to_string());
-            }
-            if self.segment().refs.device().scratch.draft().is_none() {
-                return invalid("a draft quantum needs the sequence's draft buffers".to_string());
-            }
-        }
-        if self.kind == QuantumKind::Verify {
-            for layer in 0..self.config.layer_kinds.len() {
-                let Some(state) = self.segment().refs.device().gdn.layer(layer) else {
-                    continue;
+        for segment in self.segments() {
+            let (start, rows) = (segment.start_position, segment.rows as u64);
+            if let Some(source) = self.attention_source() {
+                let Some(view) = segment.refs.kv(source) else {
+                    return invalid(format!("the quantum has no view of the {source:?} cache"));
                 };
-                let capacity = state.speculative().map_or(0, |buffers| buffers.capacity);
-                if rows > capacity {
+                if !view.reserves(start, rows) {
                     return invalid(format!(
-                        "a verification of {rows} rows exceeds the {capacity} the speculative buffers of layer {layer} hold"
+                        "an append of {rows} rows at {start} is not reserved: the {source:?} cache held {} rows at admission",
+                        view.reserved()
                     ));
+                }
+                let layers = if source == KvSource::Mtp {
+                    1
+                } else {
+                    self.config.attention_layers()
+                };
+                if (0..layers).any(|layer| view.key_table(layer).is_none()) {
+                    return invalid(format!("a layer of the {source:?} cache has no page table"));
+                }
+                if takes_decode_scratch(self.kind, segment.rows) {
+                    let held = segment.refs.device().scratch.decode_rows();
+                    if rows > held {
+                        return invalid(format!(
+                            "{rows} attention rows exceed the {held} the decode scratch holds"
+                        ));
+                    }
                 }
             }
-        }
-        if self.logits_rows > 0 {
-            let wanted = if self.kind == QuantumKind::Verify {
-                self.logits_rows
-            } else {
-                1
-            };
-            match (&self.segment().selection, &self.segment().row_readback) {
-                (Some(_), Some(_)) => {
-                    return invalid("a quantum selects on the device or on the host, not both".to_string());
+            if self.kind == QuantumKind::Draft {
+                if self.draft_seed.is_none() {
+                    return invalid("a draft quantum has no rows to seed it".to_string());
                 }
-                (Some(selection), None) if wanted > selection.capacity() => {
-                    return invalid(format!(
-                        "{wanted} selected rows exceed the {} the selection holds",
-                        selection.capacity()
-                    ));
+                if segment.refs.device().scratch.draft().is_none() {
+                    return invalid("a draft quantum needs the sequence's draft buffers".to_string());
                 }
-                (None, Some(readback)) if wanted > readback.capacity() => {
-                    return invalid(format!(
-                        "{wanted} copied rows exceed the {} the row readback holds",
-                        readback.capacity()
-                    ));
+            }
+            if self.kind == QuantumKind::Verify {
+                for layer in 0..self.config.layer_kinds.len() {
+                    let Some(state) = segment.refs.device().gdn.layer(layer) else {
+                        continue;
+                    };
+                    let capacity = state.speculative().map_or(0, |buffers| buffers.capacity);
+                    if rows > capacity {
+                        return invalid(format!(
+                            "a verification of {rows} rows exceeds the {capacity} the speculative buffers of layer {layer} hold"
+                        ));
+                    }
                 }
-                (None, None) => {
-                    return invalid("a quantum that scores logits has no selection words or row readback".to_string());
+            }
+            if self.logits_rows > 0 {
+                let wanted = if self.kind != QuantumKind::Verify {
+                    1
+                } else if self.segments().len() == 1 {
+                    self.logits_rows
+                } else {
+                    segment.rows
+                };
+                match (&segment.selection, &segment.row_readback) {
+                    (Some(_), Some(_)) => {
+                        return invalid("a quantum selects on the device or on the host, not both".to_string());
+                    }
+                    (Some(selection), None) if wanted > selection.capacity() => {
+                        return invalid(format!(
+                            "{wanted} selected rows exceed the {} the selection holds",
+                            selection.capacity()
+                        ));
+                    }
+                    (None, Some(readback)) if wanted > readback.capacity() => {
+                        return invalid(format!(
+                            "{wanted} copied rows exceed the {} the row readback holds",
+                            readback.capacity()
+                        ));
+                    }
+                    (None, None) => {
+                        return invalid(
+                            "a quantum that scores logits has no selection words or row readback".to_string(),
+                        );
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         if self.draft_token_write.is_some() && (self.segment().selection.is_none() || self.logits_rows == 0) {
@@ -247,19 +261,18 @@ impl Quantum {
     /// The allocation serial of every buffer the quantum's launches read or write, in a fixed order.
     pub fn buffer_generations(&self) -> Vec<AllocationId> {
         let mut generations: Vec<AllocationId> = self.workspace.generations().collect();
-        self.segment().refs.device().generations(&mut generations);
-        if let Some(selection) = &self.segment().selection {
-            generations.push(selection.generation());
-        }
-        if let Some(readback) = &self.segment().row_readback {
-            generations.push(readback.generation());
-        }
-        // Only the cache the quantum's attention reads: the MTP cache growing does not change a base quantum's graph.
-        if let Some(view) = self
-            .attention_source()
-            .and_then(|source| self.segment().refs.kv(source))
-        {
-            view.generations(&mut generations);
+        for segment in self.segments() {
+            segment.refs.device().generations(&mut generations);
+            if let Some(selection) = &segment.selection {
+                generations.push(selection.generation());
+            }
+            if let Some(readback) = &segment.row_readback {
+                generations.push(readback.generation());
+            }
+            // Only the cache the quantum's attention reads: the MTP cache growing does not change a base quantum's graph.
+            if let Some(view) = self.attention_source().and_then(|source| segment.refs.kv(source)) {
+                view.generations(&mut generations);
+            }
         }
         generations
     }
@@ -269,6 +282,10 @@ impl Quantum {
     /// quantum whose reservation had to allocate pages or upload a page table (it ran work a graph cannot repeat; the
     /// next quantum is captured).
     pub fn capture_key(&self) -> Option<CaptureKey> {
+        if self.segments().len() != 1 {
+            // A batch runs stage by stage: its segments' sizes and sequences would each have to be part of a key.
+            return None;
+        }
         let view = self.view();
         if !view.capturable() || self.rows > MAX_CAPTURED_ROWS {
             return None;

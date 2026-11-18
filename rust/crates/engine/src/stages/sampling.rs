@@ -219,55 +219,69 @@ impl Argmax {
 impl Launch for Argmax {
     fn idle(&self, quantum: &Quantum) -> bool {
         // A quantum whose rows go to the host selects there.
-        quantum.logits_rows == 0 || quantum.segment().row_readback.is_some()
+        quantum.logits_rows == 0 || quantum.segments().iter().all(|segment| segment.row_readback.is_some())
     }
 
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         if self.idle(quantum) {
             return Ok(());
         }
-        let logits_rows = quantum.logits_rows;
-        let selection = quantum
-            .segment()
-            .selection
-            .as_ref()
-            .ok_or_else(|| fatal("a quantum that selects has no selection words"))?;
         if self.vocabulary == 0 || self.vocabulary > quantum.config.vocab_size {
             return Err(fatal(format!(
                 "a vocabulary of {} entries does not fit the logits rows of {}",
                 self.vocabulary, quantum.config.vocab_size
             )));
         }
-        let (first, count) = match self.rows {
-            SelectedRows::Last => (logits_rows - 1, 1),
-            SelectedRows::Each => (0, logits_rows),
-        };
-        if count > selection.capacity() {
-            return Err(fatal(format!(
-                "{count} selected rows exceed the {} the selection holds",
-                selection.capacity()
-            )));
-        }
         let entries = launch_u32(self.vocabulary, "the vocabulary")?;
         // The slot's rows are the model's vocabulary wide, whatever head wrote fewer entries into them.
         let row_bytes = quantum.config.vocab_size as u64 * 2;
         let logits = quantum.slot(self.logits);
-        for row in 0..count {
-            kernels
-                .argmax_bf16(
-                    logits.offset((first + row) as u64 * row_bytes),
-                    entries,
-                    selection.device_keys().offset((row * KEY_BYTES) as u64),
+        let single = quantum.segments().len() == 1;
+        for segment in quantum.segments() {
+            let selection = segment
+                .selection
+                .as_ref()
+                .ok_or_else(|| fatal("a quantum that selects has no selection words"))?;
+            // A quantum of one sequence scores the rows it was given; a segment of a batch scores all its rows, at its
+            // offset among the logits rows.
+            let (scored, base) = if single {
+                (quantum.logits_rows, 0)
+            } else {
+                (segment.rows, segment.row_offset)
+            };
+            let (first, count) = match self.rows {
+                SelectedRows::Last => (scored - 1, 1),
+                SelectedRows::Each => (0, scored),
+            };
+            if count > selection.capacity() {
+                return Err(fatal(format!(
+                    "{count} selected rows exceed the {} the selection holds",
+                    selection.capacity()
+                )));
+            }
+            for row in 0..count {
+                kernels
+                    .argmax_bf16(
+                        logits.offset((base + first + row) as u64 * row_bytes),
+                        entries,
+                        selection.device_keys().offset((row * KEY_BYTES) as u64),
+                    )
+                    .map_err(fatal)?;
+            }
+            // SAFETY: the selection is held by the quantum (an `Arc`), which retires only after the marker that follows
+            // this launch is reached; the host reads the keys through atomic words, and only once that marker has been
+            // reached.
+            unsafe {
+                kernels.copy_device_to_readback_shared(
+                    selection.readback(),
+                    0,
+                    selection.device_keys(),
+                    count * KEY_BYTES,
                 )
-                .map_err(fatal)?;
+            }
+            .map_err(fatal)?;
         }
-        // SAFETY: the selection is held by the quantum (an `Arc`), which retires only after the marker that follows
-        // this launch is reached; the host reads the keys through atomic words, and only once that marker has been
-        // reached.
-        unsafe {
-            kernels.copy_device_to_readback_shared(selection.readback(), 0, selection.device_keys(), count * KEY_BYTES)
-        }
-        .map_err(fatal)
+        Ok(())
     }
 }
 
@@ -479,51 +493,58 @@ impl CopyRows {
 
 impl Launch for CopyRows {
     fn idle(&self, quantum: &Quantum) -> bool {
-        quantum.logits_rows == 0 || quantum.segment().row_readback.is_none()
+        quantum.logits_rows == 0 || quantum.segments().iter().all(|segment| segment.row_readback.is_none())
     }
 
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         if self.idle(quantum) {
             return Ok(());
         }
-        let readback = quantum
-            .segment()
-            .row_readback
-            .as_ref()
-            .ok_or_else(|| fatal("a quantum that copies rows has no readback"))?;
-        let logits_rows = quantum.logits_rows;
-        let (first, count) = match self.rows {
-            SelectedRows::Last => (logits_rows - 1, 1),
-            SelectedRows::Each => (0, logits_rows),
-        };
-        if count > readback.capacity() {
-            return Err(fatal(format!(
-                "{count} copied rows exceed the {} the readback holds",
-                readback.capacity()
-            )));
-        }
         // The slot's rows are the model's vocabulary wide, whatever head wrote fewer entries into them.
         let row_bytes = quantum.config.vocab_size * 2;
-        if row_bytes != readback.row_bytes {
-            return Err(fatal(format!(
-                "a readback of {} bytes a row does not fit the logits rows of {row_bytes}",
-                readback.row_bytes
-            )));
-        }
         let logits = quantum.slot(self.logits);
-        for row in 0..count {
-            // SAFETY: the readback is held by the quantum (an `Arc`), which retires only after the marker that follows
-            // this launch is reached, and by the lease of the owner after it; the host reads the row only once that
-            // marker has been reached, and no other copy writes the range.
-            unsafe {
-                kernels.copy_device_to_readback_shared(
-                    readback.pinned(),
-                    row * row_bytes,
-                    logits.offset(((first + row) * row_bytes) as u64),
-                    row_bytes,
-                )
+        let single = quantum.segments().len() == 1;
+        for segment in quantum.segments() {
+            let readback = segment
+                .row_readback
+                .as_ref()
+                .ok_or_else(|| fatal("a quantum that copies rows has no readback"))?;
+            // As the selection: a segment of a batch copies all its rows, from its offset among the logits rows.
+            let (scored, base) = if single {
+                (quantum.logits_rows, 0)
+            } else {
+                (segment.rows, segment.row_offset)
+            };
+            let (first, count) = match self.rows {
+                SelectedRows::Last => (scored - 1, 1),
+                SelectedRows::Each => (0, scored),
+            };
+            if count > readback.capacity() {
+                return Err(fatal(format!(
+                    "{count} copied rows exceed the {} the readback holds",
+                    readback.capacity()
+                )));
             }
-            .map_err(fatal)?;
+            if row_bytes != readback.row_bytes {
+                return Err(fatal(format!(
+                    "a readback of {} bytes a row does not fit the logits rows of {row_bytes}",
+                    readback.row_bytes
+                )));
+            }
+            for row in 0..count {
+                // SAFETY: the readback is held by the quantum (an `Arc`), which retires only after the marker that
+                // follows this launch is reached, and by the lease of the owner after it; the host reads the row only
+                // once that marker has been reached, and no other copy writes the range.
+                unsafe {
+                    kernels.copy_device_to_readback_shared(
+                        readback.pinned(),
+                        row * row_bytes,
+                        logits.offset(((base + first + row) * row_bytes) as u64),
+                        row_bytes,
+                    )
+                }
+                .map_err(fatal)?;
+            }
         }
         Ok(())
     }
