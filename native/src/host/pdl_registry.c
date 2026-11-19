@@ -4,7 +4,8 @@
 #include <stdio.h>
 
 /* Slots (a power of two); at most three quarters are filled so a probe sequence always reaches an empty slot. */
-#define SLOTS 1024u
+#define SLOT_BITS 10u
+#define SLOTS (1u << SLOT_BITS)
 #define LIMIT (SLOTS / 4u * 3u)
 
 static _Atomic(uintptr_t) slots[SLOTS];
@@ -12,7 +13,7 @@ static atomic_uint used;
 static atomic_flag reported = ATOMIC_FLAG_INIT;
 
 static unsigned int home(uintptr_t key) {
-    return (unsigned int)(((uint64_t)key * 0x9E3779B97F4A7C15ull) >> 54) & (SLOTS - 1u);
+    return (unsigned int)(((uint64_t)key * 0x9E3779B97F4A7C15ull) >> (64u - SLOT_BITS)) & (SLOTS - 1u);
 }
 
 int euhedral_pdl_registry_add(const void* function) {

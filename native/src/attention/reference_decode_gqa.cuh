@@ -160,13 +160,13 @@ extern "C" __global__ __launch_bounds__(32) void euhedral_attention_decode_gqa_n
         const __nv_bfloat16* queryKey, const unsigned char* const* keyPages, const unsigned char* const* valuePages,
         unsigned int queryHeads, unsigned int keyHeads, const unsigned long long* position, float* partial,
         unsigned long long rowStride, unsigned int from) {
+    euhedral_pdl_begin();
     const unsigned row = blockIdx.y;
     const unsigned length = (unsigned)*position + row + 1u;
     if (length < from) return;
     unsigned splits = (length + 31u) / 32u;
     if (splits > 64u) splits = 64u;
     if (blockIdx.x >= keyHeads * splits) return;
-    euhedral_pdl_begin();
     gqa_reference::decode_block(blockIdx.x, queryKey + (unsigned long long)row * (queryHeads + keyHeads) * 256u, keyPages,
             valuePages, queryHeads, keyHeads, length, partial + row * rowStride, splits);
 }
@@ -205,11 +205,11 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_merge_nvfp4
 extern "C" __global__ __launch_bounds__(128) void euhedral_attention_merge_nvfp4_rows_reference(
         const __nv_bfloat16* gateValue, __nv_bfloat16* output, const float* partial, unsigned int queryHeads,
         unsigned int keyHeads, const unsigned long long* position, unsigned long long rowStride, unsigned int from) {
+    euhedral_pdl_begin();
     const unsigned int row = blockIdx.y;
     const unsigned int length = (unsigned int)*position + row + 1u;
     unsigned int splits = length >= from ? (length + 31u) / 32u : (length + 47u) / 48u;
     if (splits > 64u) splits = 64u;
-    euhedral_pdl_begin();
     const unsigned long long width = (unsigned long long)(queryHeads + keyHeads) * 256u;
     attention_merge_head_reference(blockIdx.x, gateValue + row * width, output + (unsigned long long)row * queryHeads * 256u,
             partial + row * rowStride, splits);
