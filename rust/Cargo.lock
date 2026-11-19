@@ -519,6 +519,7 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "euhedral-core",
+ "euhedral-data-structures",
  "euhedral-gpu",
  "euhedral-graph",
  "euhedral-hashing",
