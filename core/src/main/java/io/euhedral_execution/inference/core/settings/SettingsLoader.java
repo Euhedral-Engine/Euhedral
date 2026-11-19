@@ -253,11 +253,14 @@ public final class SettingsLoader {
                 Optional.ofNullable((Path) v.get("host.native-cache")));
 
         TrellisKernelSettings td = TrellisKernelSettings.defaults();
-        KernelSettings kernels = new KernelSettings(new TrellisKernelSettings(
-                g.integer("kernels.trellis.tensor-core-max-tokens", td.tensorCoreMaxTokens()),
-                g.optionalInt("kernels.trellis.target-blocks"),
-                g.integer("kernels.trellis.whole-k-min-tokens", td.wholeKMinTokens()),
-                g.integer("kernels.trellis.wide-block-min-tokens", td.wideBlockMinTokens())));
+        KernelSettings kernels = new KernelSettings(
+                new TrellisKernelSettings(
+                        g.integer("kernels.trellis.tensor-core-max-tokens", td.tensorCoreMaxTokens()),
+                        g.optionalInt("kernels.trellis.target-blocks"),
+                        g.integer("kernels.trellis.whole-k-min-tokens", td.wholeKMinTokens()),
+                        g.integer("kernels.trellis.wide-block-min-tokens", td.wideBlockMinTokens())),
+                g.optionalInt("kernels.rms-norm-decode-slices"),
+                Optional.ofNullable(v.get("kernels.fused-verify-from")).map(SettingsLoader::keyTable));
 
         return new Settings(model, sampling, server, context, prefixCache, batching, memory, host, kernels);
     }
@@ -357,6 +360,8 @@ public final class SettingsLoader {
         // use it.
         m.put("host.max-batch-size", optional(integer(1, Integer.MAX_VALUE)));
 
+        m.put("kernels.rms-norm-decode-slices", optional(integer(1, KernelSettings.MAX_RMS_NORM_DECODE_SLICES)));
+        m.put("kernels.fused-verify-from", optional(SettingsLoader::fusedVerifyFrom));
         m.put(
                 "kernels.trellis.tensor-core-max-tokens",
                 fixed(integer(TrellisSettings.MIN_MMA_ROWS, Integer.MAX_VALUE)));
@@ -469,6 +474,36 @@ public final class SettingsLoader {
             throw new IllegalArgumentException("must be a CPU list such as 2-5,8: " + text);
         }
         return text;
+    }
+
+    private static Object fusedVerifyFrom(String text) {
+        String[] parts = text.split(",", -1);
+        if (parts.length != KernelSettings.FUSED_VERIFY_ROWS)
+            throw new IllegalArgumentException(
+                    "must list " + KernelSettings.FUSED_VERIFY_ROWS + " entries, for 0 to 8 verified rows: " + text);
+        List<Long> table = new ArrayList<>();
+        for (String part : parts) {
+            String entry = part.trim();
+            if (entry.equalsIgnoreCase("never")) {
+                table.add(KernelSettings.NEVER);
+                continue;
+            }
+            long keys;
+            try {
+                keys = Long.parseLong(entry);
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("each entry must be a whole number from 1 or never: " + text);
+            }
+            if (keys < 1 || keys > KernelSettings.NEVER)
+                throw new IllegalArgumentException("each entry must be a whole number from 1 or never: " + text);
+            table.add(keys);
+        }
+        return List.copyOf(table);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Long> keyTable(Object parsed) {
+        return (List<Long>) parsed;
     }
 
     private static Object checkpoint(String text) {

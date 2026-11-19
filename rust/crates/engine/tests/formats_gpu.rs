@@ -32,6 +32,7 @@ mod typed;
 
 use std::collections::HashMap;
 
+use euhedral_inference_cuda::launch::nvfp4::skinny_target_ctas;
 use euhedral_inference_cuda::{DeviceBuffer, HostWeightsArena};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use euhedral_inference_engine::formats::{
@@ -148,7 +149,7 @@ fn linear_bitwise_matches_reference_oracle() {
         values(&rig.linear(format, &weight, &x, 0, k, n, rows, mode))
     };
     // Above 32 rows a device without the native route runs the scalar reference: the oracle.
-    let portable = Nvfp4Linear::with_native_route(false);
+    let portable = Nvfp4Linear::with_native_route(false, 70);
     let production = Nvfp4Linear::new(&rig.library);
     let reference = nvfp4(&portable, 64, PLAIN);
     for rows in 1..=8usize {
@@ -394,7 +395,7 @@ fn kernel_tables_and_scratch_match_the_native_library() {
         (512, 5120, 248_320),
     ] {
         assert_eq!(
-            nvfp4_native_scratch_bytes(rows, k, n),
+            nvfp4_native_scratch_bytes(rows, k, n, skinny_target_ctas(rig.library.device().sm_count)),
             rig.library.nvfp4_native_scratch_bytes(rows as u32, k as u32, n as u32),
             "rows {rows} k {k} n {n}"
         );

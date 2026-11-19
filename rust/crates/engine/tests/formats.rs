@@ -32,11 +32,15 @@ mod formats {
     use std::sync::Arc;
 
     use euhedral_inference_cuda::DevicePtr;
+    use euhedral_inference_cuda::launch::nvfp4::skinny_target_ctas;
     use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
     use euhedral_inference_engine::formats::{
         Launch, LinearKernel, LinearMode, Nvfp4Linear, Nvfp4Route, ROW_EXACT_KERNELS, ScratchRegion, Table,
         TrellisLinear, TrellisOperands, TrellisShape, nvfp4_native_scratch_bytes,
     };
+    /// The grid the portable linears assume: two blocks on each of 70 multiprocessors.
+    const TARGET_CTAS: u64 = skinny_target_ctas(70);
+
     use euhedral_inference_engine::model::{Residence, TrellisParts, WeightRef};
     use euhedral_inference_engine::residency::scratch::splits;
     use euhedral_inference_settings::{Auto, TrellisKernelSettings};
@@ -492,8 +496,8 @@ mod formats {
     #[test]
     fn nvfp4_routes_by_rows() {
         let weight = nvfp4(34816, 5120, WeightLayout::RowSplitK128V1);
-        let native = Nvfp4Linear::with_native_route(true);
-        let portable = Nvfp4Linear::with_native_route(false);
+        let native = Nvfp4Linear::with_native_route(true, 70);
+        let portable = Nvfp4Linear::with_native_route(false, 70);
         // 1 to 8 rows run the decode kernels, one kernel per row count, with or without the native route.
         for rows in 1..=8usize {
             let expected = Nvfp4Route::DecodeRows { rows: rows as u32 };
@@ -532,7 +536,7 @@ mod formats {
 
     #[test]
     fn nvfp4_declines_follow_the_native_library() {
-        let native = Nvfp4Linear::with_native_route(true);
+        let native = Nvfp4Linear::with_native_route(true, 70);
         // 5248 inputs are a multiple of 128 and not of 256: no skinny kernel, no tile kernel.
         let odd = nvfp4(5120, 5248, WeightLayout::RowSplitK128V1);
         assert_eq!(
@@ -568,7 +572,7 @@ mod formats {
 
     #[test]
     fn nvfp4_routes_list_the_launches_the_library_makes() {
-        let lines = |route: Nvfp4Route, rows, k, n, sd4| route.lines(rows, k, n, sd4);
+        let lines = |route: Nvfp4Route, rows, k, n, sd4| route.lines(rows, k, n, sd4, TARGET_CTAS);
         // The lm head: 5120 inputs take the 16-row tile, 4 rows are the fourth decode kernel.
         assert_eq!(
             lines(Nvfp4Route::DecodeRows { rows: 4 }, 4, 5120, 248320, false),
@@ -609,16 +613,16 @@ mod formats {
     fn nvfp4_scratch_is_the_native_routes_and_only_from_nine_rows() {
         let weight = nvfp4(5120, 17408, WeightLayout::RowSplitK128V1);
         let none = LinearMode::default();
-        let native = Nvfp4Linear::with_native_route(true);
-        let portable = Nvfp4Linear::with_native_route(false);
+        let native = Nvfp4Linear::with_native_route(true, 70);
+        let portable = Nvfp4Linear::with_native_route(false, 70);
         use euhedral_inference_engine::formats::LinearFormat;
         for rows in 1..=8usize {
             assert_eq!(native.scratch_bytes(&weight, rows, none), 0);
         }
         // The route's own scratch, or the skinny route's at 64 rows where that is larger (65 rows and more).
         for rows in [9usize, 64, 65, 512] {
-            let own = nvfp4_native_scratch_bytes(rows as u64, 17408, 5120);
-            let skinny = nvfp4_native_scratch_bytes((rows as u64).min(64), 17408, 5120);
+            let own = nvfp4_native_scratch_bytes(rows as u64, 17408, 5120, TARGET_CTAS);
+            let skinny = nvfp4_native_scratch_bytes((rows as u64).min(64), 17408, 5120, TARGET_CTAS);
             assert_eq!(native.scratch_bytes(&weight, rows, none) as u64, own.max(skinny));
             assert!(native.scratch_bytes(&weight, rows, none) > 0);
             assert_eq!(portable.scratch_bytes(&weight, rows, none), 0);
@@ -638,14 +642,14 @@ mod formats {
             (34_816, 5120),
             (5120, 17_408),
         ];
-        let format = Nvfp4Linear::with_native_route(true);
+        let format = Nvfp4Linear::with_native_route(true, 70);
         let none = LinearMode::default();
         for (out, input) in shapes {
             let weight = nvfp4(out, input, WeightLayout::RowSplitK128V1);
             let mut needed = 0u64;
             for rows in 1..=600usize {
                 if rows >= 9 {
-                    needed = needed.max(nvfp4_native_scratch_bytes(rows as u64, input, out));
+                    needed = needed.max(nvfp4_native_scratch_bytes(rows as u64, input, out, TARGET_CTAS));
                 }
                 let granted = format.scratch_bytes(&weight, rows, none) as u64;
                 assert!(
@@ -658,10 +662,13 @@ mod formats {
         }
         // The skinny kernels' split-K partials make 64 rows need more than 65.
         let weight = nvfp4(5120, 17_408, WeightLayout::RowSplitK128V1);
-        assert!(nvfp4_native_scratch_bytes(64, 17_408, 5120) > nvfp4_native_scratch_bytes(65, 17_408, 5120));
+        assert!(
+            nvfp4_native_scratch_bytes(64, 17_408, 5120, TARGET_CTAS)
+                > nvfp4_native_scratch_bytes(65, 17_408, 5120, TARGET_CTAS)
+        );
         assert_eq!(
             format.scratch_bytes(&weight, 65, none) as u64,
-            nvfp4_native_scratch_bytes(64, 17_408, 5120)
+            nvfp4_native_scratch_bytes(64, 17_408, 5120, TARGET_CTAS)
         );
     }
 
