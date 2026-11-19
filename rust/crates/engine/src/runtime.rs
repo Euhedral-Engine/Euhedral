@@ -45,6 +45,7 @@ use crate::stages::LaneTable;
 use crate::startup;
 use crate::state::SequenceState;
 use crate::state::released::ReleasedBuffers;
+use crate::summary;
 use crate::warmup::Warmed;
 use crate::workspace::Workspace;
 #[cfg(feature = "test-oracles")]
@@ -758,6 +759,10 @@ impl EngineRuntime {
         reservation: PlanReservation,
         report: StartupReport,
     ) -> EngineRuntime {
+        let cache = generations.prefix_cache_stats().map(|stats| stats.capacity_bytes);
+        for line in summary::lines(&summary::Facts::of(&plan, &core.settings, cache)) {
+            log::info!("{line}");
+        }
         EngineRuntime {
             core,
             plan,

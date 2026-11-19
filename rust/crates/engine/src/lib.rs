@@ -18,6 +18,7 @@ pub mod sampling;
 pub mod stages;
 mod startup;
 pub mod state;
+pub mod summary;
 mod warmup;
 pub mod workspace;
 

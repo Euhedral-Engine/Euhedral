@@ -26,11 +26,13 @@ use euhedral_inference_server::signals::install;
 #[cfg(feature = "scripted")]
 use euhedral_inference_server::{DRAIN_WINDOW, SHUTDOWN_WINDOW};
 use euhedral_inference_server::{
-    EXIT_INVALID_SETTINGS, EXIT_START_FAILED, StopWindows, ignored_arguments, install_logger, load_settings, say, serve,
+    EXIT_INVALID_SETTINGS, EXIT_START_FAILED, StopWindows, ignored_arguments, install_logger, load_settings,
+    mark_process_start, say, serve,
 };
 use euhedral_inference_settings::process_env;
 
 fn main() -> ExitCode {
+    mark_process_start();
     let args: Vec<_> = env::args_os().skip(1).collect();
     let settings = match load_settings(&args, &process_env) {
         Ok(settings) => settings,
