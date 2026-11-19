@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use super::allocation::Allocation;
 use super::error::MixedError;
+use super::measured::Measured;
 use super::option::QuantOption;
 use super::priors::Priors;
 use crate::java_random::Random;
@@ -112,6 +113,12 @@ impl Synthetic {
             choices.insert(object.clone(), options[at as usize]);
         }
         Ok(Allocation::new(choices))
+    }
+
+    /// `allocation` with its true KL as a measurement.
+    pub fn measured(&self, allocation: Allocation) -> Result<Measured, MixedError> {
+        let kl = self.truth(&allocation)?;
+        Ok(Measured::new(allocation, kl))
     }
 }
 
