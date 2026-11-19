@@ -585,7 +585,7 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
         let destination = shared.base.offset(piece.arena_offset());
         let queued = shared
             .core
-            .lane_table
+            .lane_table()
             .submit_ops(shared.core.transfer_lane(chain), false, |kernels| {
                 // SAFETY: the loan stays alive, and its bytes unmodified, in the frame the completion registers
                 // below, which runs only once the lane has reached the marker, after the copy has run.
@@ -605,7 +605,7 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
                 return shared.fail(EngineError::from(error));
             }
         };
-        let completions = Arc::clone(&shared.core.completions);
+        let completions = Arc::clone(shared.core.completions());
         let chains = shared.chains;
         let done = step(Kind::UploadDone, chain, move || {
             shared.uploaded.fetch_add(piece.len as u64, Ordering::AcqRel);
