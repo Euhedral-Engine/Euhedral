@@ -152,13 +152,17 @@ impl CostTable {
         let mut prefill = 0.0;
         let mut step = BTreeMap::new();
         if let Some(fixed) = root.get("fixed") {
-            prefill = fixed.get("prefillMicrosPerToken").and_then(number).unwrap_or(0.0);
+            if let Some(value) = fixed.get("prefillMicrosPerToken") {
+                prefill = number(value).ok_or_else(|| MixedError::invalid("the fixed prefill cost is not a number"))?;
+            }
             if let Some(steps) = fixed.get("stepMicros").and_then(Value::as_object) {
                 for (rows, value) in steps {
                     let rows = rows
                         .parse::<u32>()
                         .map_err(|_| MixedError::invalid(format!("the step cost has the row count '{rows}'")))?;
-                    step.insert(rows, number(value).unwrap_or(0.0));
+                    let micros = number(value)
+                        .ok_or_else(|| MixedError::invalid(format!("the step cost of {rows} rows is not a number")))?;
+                    step.insert(rows, micros);
                 }
             }
         }
@@ -332,6 +336,23 @@ mod tests {
             f64::NEG_INFINITY
         );
         assert!(read.micros(key_of(QuantOption::Nvfp4, 4)).unwrap().is_nan());
+    }
+
+    #[test]
+    fn a_fixed_cost_that_is_not_a_number_is_refused() {
+        let entries = r#""entries" : [ ]"#;
+        for fixed in [
+            r#""prefillMicrosPerToken" : "nan""#,
+            r#""prefillMicrosPerToken" : true"#,
+            r#""stepMicros" : { "4" : "nan" }"#,
+        ] {
+            let text = format!("{{ \"fixed\" : {{ {fixed} }}, {entries} }}");
+            assert!(CostTable::parse(&text).is_err(), "{text}");
+        }
+        let fine = format!(
+            "{{ \"fixed\" : {{ \"prefillMicrosPerToken\" : 1.5, \"stepMicros\" : {{ \"4\" : 2 }} }}, {entries} }}"
+        );
+        assert!(CostTable::parse(&fine).is_ok());
     }
 
     #[test]

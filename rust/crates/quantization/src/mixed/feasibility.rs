@@ -305,12 +305,18 @@ mod tests {
     }
 
     #[test]
-    fn a_longer_context_needs_more_device_bytes_and_a_draft_depth_never_fewer() {
+    fn a_longer_context_or_a_deeper_draft_needs_more_device_bytes() {
+        assert!(device_bytes(65_536, 0, Auto::Auto) > device_bytes(4096, 0, Auto::Auto));
         // The planner pays the draft's state from the runtime reserve, which holds at its setting until the demand
-        // passes it, so a deeper draft changes the bytes only then.
-        let base = device_bytes(4096, 0, Auto::Auto);
-        assert!(device_bytes(65_536, 0, Auto::Auto) > base);
-        assert!(device_bytes(4096, 4, Auto::Auto) >= base);
+        // passes it: the depth shows only at a long context.
+        assert!(device_bytes(262_144, 4, Auto::Auto) > device_bytes(262_144, 0, Auto::Auto));
+    }
+
+    #[test]
+    fn a_negative_free_count_is_a_device_with_nothing_free() {
+        let check = judge(-1, 0).check(&Allocation::default()).unwrap();
+        assert!(!check.fits);
+        assert!(check.device_bytes > 0);
     }
 
     #[test]

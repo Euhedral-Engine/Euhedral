@@ -10,8 +10,6 @@ use super::option::QuantOption;
 pub trait Sources {
     /// The option every object an allocation does not name keeps.
     fn base(&self) -> QuantOption;
-    /// The options the artifacts store a projection in, the base's among them.
-    fn options(&self) -> &[QuantOption];
     /// The names of the choosable projection objects.
     fn projections(&self) -> &[String];
     /// The features of `object`'s linear as `option` stores it.
@@ -22,6 +20,12 @@ pub trait Sources {
 
 /// `names` ordered by layer number, then by name: the order the fidelity model numbers its objects in. The names are
 /// `text/layers/<n>/...`.
+fn total(mut counts: impl Iterator<Item = i64>) -> Result<i64, MixedError> {
+    counts
+        .try_fold(0i64, i64::checked_add)
+        .ok_or_else(|| MixedError::invalid("the bytes of the objects do not fit a 64-bit count"))
+}
+
 pub fn sorted_by_layer(names: &[String]) -> Result<Vec<String>, MixedError> {
     let mut keyed = Vec::with_capacity(names.len());
     for name in names {
@@ -69,7 +73,14 @@ impl Space {
         for (i, object) in objects.iter().enumerate() {
             index.insert(object.clone(), i);
             for (j, option) in options.iter().enumerate() {
-                bytes[i][j] = sources.bytes(*option, object)?;
+                let stored = sources.bytes(*option, object)?;
+                if stored < 0 {
+                    return Err(MixedError::invalid(format!(
+                        "{object} as {} has {stored} bytes",
+                        option.key()
+                    )));
+                }
+                bytes[i][j] = stored;
                 let shape = sources.shape(*option, object)?;
                 prefill[i][j] = costs.micros(Key {
                     shape,
@@ -182,12 +193,9 @@ impl Space {
     }
 
     /// The bytes of the objects under `choice`.
-    pub fn bytes_of(&self, choice: &[usize]) -> i64 {
-        choice
-            .iter()
-            .enumerate()
-            .map(|(i, option)| self.bytes[i][*option])
-            .sum()
+    /// The refusal when the sum does not fit a signed 64-bit count.
+    pub fn bytes_of(&self, choice: &[usize]) -> Result<i64, MixedError> {
+        total(choice.iter().enumerate().map(|(i, option)| self.bytes[i][*option]))
     }
 
     /// The option that stores `object` in the fewest bytes; the first of equals.
@@ -203,13 +211,13 @@ impl Space {
     }
 
     /// The bytes when every object takes its cheapest option.
-    pub fn minimum_bytes(&self) -> i64 {
-        (0..self.objects.len()).map(|i| self.bytes[i][self.cheapest(i)]).sum()
+    pub fn minimum_bytes(&self) -> Result<i64, MixedError> {
+        total((0..self.objects.len()).map(|i| self.bytes[i][self.cheapest(i)]))
     }
 
     /// The bytes when every object takes its dearest option.
-    pub fn maximum_bytes(&self) -> i64 {
-        (0..self.objects.len()).map(|i| self.bytes[i][self.dearest(i)]).sum()
+    pub fn maximum_bytes(&self) -> Result<i64, MixedError> {
+        total((0..self.objects.len()).map(|i| self.bytes[i][self.dearest(i)]))
     }
 
     /// The choice that gives every object `option`; the refusal when this space does not use it.
@@ -256,10 +264,6 @@ pub(crate) mod tests {
     impl Sources for TinySources {
         fn base(&self) -> QuantOption {
             QuantOption::Trellis3_0
-        }
-
-        fn options(&self) -> &[QuantOption] {
-            &[QuantOption::Nvfp4, QuantOption::Trellis3_0]
         }
 
         fn projections(&self) -> &[String] {
@@ -346,10 +350,10 @@ pub(crate) mod tests {
         assert_eq!(space.bytes()[1], [120, 90]);
         assert_eq!(space.prefill()[0], [51.2 / 512.0, 102.4 / 512.0]);
         assert_eq!(space.decode()[3], [3.0, 5.0]);
-        assert_eq!(space.minimum_bytes(), 80 + 90 + 80 + 90);
-        assert_eq!(space.maximum_bytes(), 110 + 120 + 110 + 120);
+        assert_eq!(space.minimum_bytes().unwrap(), 80 + 90 + 80 + 90);
+        assert_eq!(space.maximum_bytes().unwrap(), 110 + 120 + 110 + 120);
         assert_eq!((space.cheapest(0), space.dearest(0)), (1, 0));
-        assert_eq!(space.bytes_of(&[0, 1, 1, 0]), 110 + 90 + 80 + 120);
+        assert_eq!(space.bytes_of(&[0, 1, 1, 0]).unwrap(), 110 + 90 + 80 + 120);
     }
 
     #[test]
@@ -363,6 +367,50 @@ pub(crate) mod tests {
         .unwrap_err()
         .to_string();
         assert!(failure.contains("3 rows"), "{failure}");
+    }
+
+    struct Wrapped(TinySources, i64);
+
+    impl Sources for Wrapped {
+        fn base(&self) -> QuantOption {
+            self.0.base()
+        }
+        fn projections(&self) -> &[String] {
+            self.0.projections()
+        }
+        fn shape(&self, option: QuantOption, object: &str) -> Result<Shape, MixedError> {
+            self.0.shape(option, object)
+        }
+        fn bytes(&self, option: QuantOption, object: &str) -> Result<i64, MixedError> {
+            Ok(self.0.bytes(option, object)? * self.1)
+        }
+    }
+
+    #[test]
+    fn negative_bytes_are_refused() {
+        let failure = Space::new(
+            &Wrapped(TinySources::new(), -1),
+            &[QuantOption::Nvfp4, QuantOption::Trellis3_0],
+            &costs(),
+            4,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(failure.contains("-"), "{failure}");
+    }
+
+    #[test]
+    fn sums_that_overflow_are_refused_not_panicked() {
+        let huge = Space::new(
+            &Wrapped(TinySources::new(), i64::MAX / 150),
+            &[QuantOption::Nvfp4, QuantOption::Trellis3_0],
+            &costs(),
+            4,
+        )
+        .unwrap();
+        assert!(huge.maximum_bytes().is_err());
+        assert!(huge.bytes_of(&[0, 0, 0, 0]).is_err());
+        assert!(huge.minimum_bytes().is_err());
     }
 
     #[test]

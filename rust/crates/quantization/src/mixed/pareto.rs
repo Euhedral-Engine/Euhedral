@@ -144,11 +144,12 @@ mod tests {
         let positive = f64::from_bits(0x7ff8_0000_0000_0000);
         assert!(negative.is_nan() && positive.is_nan());
         let data = [
-            point("negative", negative, 1.0, 1.0, true),
-            point("worse", 0.5, 7.0, 7.0, true),
             point("positive", positive, 2.0, 2.0, true),
+            point("worse", 0.5, 7.0, 7.0, true),
+            point("negative", negative, 1.0, 1.0, true),
             point("better", 0.1, 8.0, 8.0, true),
         ];
-        assert_eq!(tags(&data), ["better", "worse", "negative", "positive"]);
+        // The NaNs are equal to each other, so they keep their measured order.
+        assert_eq!(tags(&data), ["better", "worse", "positive", "negative"]);
     }
 }
