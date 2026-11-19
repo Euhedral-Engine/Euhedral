@@ -630,12 +630,9 @@ fn teacher_forced_against_java(machine: &Machine, gpu_limit: Option<u64>) {
         .wait(WAIT)
         .expect("the engine reports")
         .expect("the engine starts");
-    let owner = Closer::new(owner, &runtime);
+    let (owner, runtime) = (Closer::new(owner, &runtime), runtime);
     if let Some(limit) = gpu_limit {
-        if !common::embedding_alone_is_on_the_host(&runtime, limit) {
-            owner.shutdown(runtime).unwrap();
-            return;
-        }
+        common::embedding_alone_is_on_the_host(&runtime, limit);
         assert!(runtime.report().host_backed_bytes > 0);
     }
     let done = Handoff::new();

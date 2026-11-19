@@ -7,6 +7,8 @@
     reason = "a test helper: a failed unwrap is the failure"
 )]
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +18,10 @@ use euhedral_inference_engine::residency::offload::EMBEDDING;
 use euhedral_inference_engine::residency::planner::{PlanInputs, plan_with};
 use euhedral_inference_settings::{Auto, ByteSize};
 
-use euhedral_inference_edrl::{HEADER_BYTES, Header, LayerType, ModelMetadata, TensorTable};
+use euhedral_inference_edrl::{
+    FOOTER_BYTES, HEADER_BYTES, Header, LayerType, Metadata, ModelMetadata, ReadPlan, Region, TensorTable,
+    TokenizerFooter, content_end,
+};
 use euhedral_inference_engine::error::EngineError;
 use euhedral_inference_engine::model::ModelConfig;
 use euhedral_inference_engine::{EngineRuntime, RuntimeOwner};
@@ -179,23 +184,61 @@ impl Drop for Closer {
     }
 }
 
+/// The model config and tensor table of the artifact at `path`, read from its header, metadata and table.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test reads the artifact's index before any engine runs"
+)]
+pub fn open_artifact(path: &Path) -> (ModelConfig, TensorTable) {
+    let mut file = File::open(path).unwrap();
+    let length = file.metadata().unwrap().len();
+    let mut header_bytes = [0u8; HEADER_BYTES];
+    file.read_exact(&mut header_bytes).unwrap();
+    let header = Header::parse(&header_bytes).unwrap();
+    let mut footer_bytes = [0u8; FOOTER_BYTES];
+    file.seek(SeekFrom::Start(length - FOOTER_BYTES as u64)).unwrap();
+    file.read_exact(&mut footer_bytes).unwrap();
+    let footer = TokenizerFooter::parse(&footer_bytes).unwrap();
+    let end = content_end(length, footer.as_ref()).unwrap();
+    let plan = ReadPlan::new(&header, length, footer.as_ref()).unwrap();
+    let mut read = |region: Region| {
+        let range = plan.range(region).unwrap();
+        let mut bytes = vec![0u8; (range.end - range.start) as usize];
+        file.seek(SeekFrom::Start(range.start)).unwrap();
+        file.read_exact(&mut bytes).unwrap();
+        bytes
+    };
+    let metadata = Metadata::parse(&read(Region::Metadata)).unwrap();
+    let table = TensorTable::parse(&read(Region::Table), &header, end).unwrap();
+    (ModelConfig::from(&metadata), table)
+}
+
 /// The `memory.gpu-limit` that leaves `below` bytes under the device need of the resident plan for `settings`. The
-/// plan is made on this device's multiprocessor count with no limit on the device or the host, never on the card's free
-/// memory, which other jobs change.
+/// plan is made from the header and the tensor table of the artifact `settings` names, on this device's multiprocessor
+/// count with no limit on the device or the host, never on the card's free memory, which other jobs change. A card
+/// with less free memory than that limit fails here, with the figures: a forced plan the card cannot give must not
+/// pass as a skipped test.
 pub fn limit_below_need(library: &Path, settings: &Settings, below: u64) -> u64 {
-    let sm_count = CudaLibrary::load(library).unwrap().device().sm_count;
+    let loaded = CudaLibrary::load(library).unwrap();
     let inputs = PlanInputs {
         device_free: 64 << 30,
-        multiprocessors: Some(sm_count),
+        multiprocessors: Some(loaded.device().sm_count),
         host_pinned_bytes: Some(u64::MAX),
         sequences: 1,
     };
-    let resident = plan_with(&config(), &rco_table(), settings, inputs).unwrap();
+    let (config, table) = open_artifact(&settings.model.artifact);
+    let resident = plan_with(&config, &table, settings, inputs).unwrap();
     assert!(
         resident.offload.is_empty(),
         "the unlimited plan keeps everything on the device"
     );
-    resident.device_bytes - below
+    let limit = resident.device_bytes - below;
+    let free = loaded.free_bytes().unwrap();
+    assert!(
+        free >= limit,
+        "the card has {free} bytes free, the forced limit needs {limit}: run on an idle card"
+    );
+    limit
 }
 
 /// Sets `memory.gpu-limit` to `limit`.
@@ -203,24 +246,15 @@ pub fn limit_gpu(settings: &mut Settings, limit: u64) {
     settings.memory.gpu_limit = Auto::Value(ByteSize(limit));
 }
 
-/// Whether the plan of a started engine is the one a test forced: the device budget is the limit (the card had that
-/// much free) and the embedding alone is held on the host. A card with less free memory plans another selection, which
-/// the test must not mistake for its own: it prints why and returns false.
-#[allow(clippy::print_stdout, reason = "a test reports why it skipped")]
-pub fn embedding_alone_is_on_the_host(runtime: &EngineRuntime, limit: u64) -> bool {
+/// Asserts the plan of a started engine is the one a test forced: the device budget is the limit and the embedding
+/// alone is held on the host.
+pub fn embedding_alone_is_on_the_host(runtime: &EngineRuntime, limit: u64) {
     let plan = runtime.plan();
-    if plan.budget_bytes != limit {
-        println!(
-            "skipped: the card had {} bytes for the plan, the forced limit is {limit}",
-            plan.budget_bytes
-        );
-        return false;
-    }
+    assert_eq!(plan.budget_bytes, limit, "the plan's device budget is the forced limit");
     assert_eq!(
         plan.offload.host,
         [EMBEDDING],
         "the plan holds the embedding alone on the host"
     );
     assert!(plan.offload.disk.is_empty(), "no object is left in the file");
-    true
 }

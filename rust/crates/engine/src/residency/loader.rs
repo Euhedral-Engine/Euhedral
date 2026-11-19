@@ -375,8 +375,8 @@ pub(crate) fn acquire_loans(core: &Core, ring: &Ring) -> Result<Vec<PooledPinned
         .collect()
 }
 
-/// Starts the upload of `pieces` into `arena` (and the pieces of the host objects into `host`) along `chains` chains with their `loans` (two each, from
-/// [`acquire_loans`]). `done` runs when the last frame of the load lets go, with the arena and the outcome; it must
+/// Starts the upload of `pieces` into `arena` (and the pieces of the host objects into `host`) along `chains` chains
+/// with their `loans` (two each, from [`acquire_loans`]). `done` runs when the last frame of the load lets go, with the arena and the outcome; it must
 /// hand its work to a lake, not do it.
 #[allow(
     clippy::too_many_arguments,

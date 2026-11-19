@@ -322,11 +322,8 @@ fn host_backed_bytes_match_file_sha() {
     common::limit_gpu(&mut settings, limit);
     let (runtime, owner) = start(&settings, &machine.library);
     let runtime = runtime.expect("a model that fits once the embedding is on the host starts");
-    let closer = common::Closer::new(owner, &runtime);
-    if !common::embedding_alone_is_on_the_host(&runtime, limit) {
-        closer.shutdown(runtime).unwrap();
-        return;
-    }
+    let (closer, runtime) = (common::Closer::new(owner, &runtime), runtime);
+    common::embedding_alone_is_on_the_host(&runtime, limit);
     let plan = runtime.plan();
     let report = runtime.report();
     let embedding = plan.placement("text/token_embedding").unwrap();
@@ -568,7 +565,7 @@ fn shutdown_reports_a_clean_leak_check() {
     let settings = settings(&machine.artifact, 4096);
     let (runtime, owner) = start(&settings, &machine.library);
     let runtime = runtime.expect("the engine starts");
-    let closer = common::Closer::new(owner, &runtime);
+    let (closer, runtime) = (common::Closer::new(owner, &runtime), runtime);
     let teardown = runtime.teardown();
     assert_eq!(teardown.leaked_bytes(), None, "the check runs at shutdown");
     // The startup held every allocation under the plan's reservation.
