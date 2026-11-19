@@ -877,10 +877,6 @@ enum Written {
 
 /// Whether both handles are the same file: the same device and index (the volume and file index on Windows), however
 /// the paths that opened them are spelled.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a handle's identity is one query of the open file, not file I/O: there is nothing to wait on"
-)]
 fn same_file(first: &File, second: &File) -> io::Result<bool> {
     let first = same_file::Handle::from_file(first.try_clone()?)?;
     let second = same_file::Handle::from_file(second.try_clone()?)?;
@@ -908,6 +904,7 @@ fn part_path(out: &Path) -> PathBuf {
     reason = "a channel carries the run's result to the waiting test thread"
 )]
 mod tests {
+    use std::fs;
     use std::num::NonZeroUsize;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -921,7 +918,8 @@ mod tests {
     /// A run that is dropped with its temporary output armed removes the file first and only then reports itself lost.
     #[test]
     fn a_dropped_run_removes_its_output_and_then_reports_lost() {
-        let lattice = ControlPlaneLattice::new(lattice_config(&Settings::with_model(ModelSettings::default()))).unwrap();
+        let lattice =
+            ControlPlaneLattice::new(lattice_config(&Settings::with_model(ModelSettings::default()))).unwrap();
         let host = Lake::new(
             Arc::clone(&lattice),
             NonZeroUsize::new(2).unwrap(),
@@ -930,7 +928,7 @@ mod tests {
         let _unit = host.admit().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let part = directory.path().join("out.edrl.part");
-        std::fs::write(&part, b"partial").unwrap();
+        fs::write(&part, b"partial").unwrap();
 
         let (sender, receiver) = mpsc::channel();
         let seen = part.clone();
@@ -948,7 +946,10 @@ mod tests {
 
         let (result, existed_when_told) = receiver.recv_timeout(Duration::from_secs(30)).expect("the run reports");
         assert!(matches!(result, Err(PackageError::Lost)), "{result:?}");
-        assert!(!existed_when_told, "the output is gone before the caller hears of the end");
+        assert!(
+            !existed_when_told,
+            "the output is gone before the caller hears of the end"
+        );
         host.complete_gracefully();
         lattice.close();
     }

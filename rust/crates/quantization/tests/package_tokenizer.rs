@@ -17,6 +17,8 @@
 
 use std::fs;
 use std::num::NonZeroUsize;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -459,7 +461,7 @@ fn a_source_that_reaches_the_temporary_name_by_another_spelling_is_refused_and_s
 fn a_symlink_or_hard_link_to_the_temporary_name_is_refused_and_the_source_survives() {
     let fixture = Fixture::new(&Checkpoint::standard());
     fs::rename(fixture.artifact(), fixture.path("m.edrl.part")).unwrap();
-    std::os::unix::fs::symlink(fixture.path("m.edrl.part"), fixture.path("link.edrl")).unwrap();
+    symlink(fixture.path("m.edrl.part"), fixture.path("link.edrl")).unwrap();
     assert_aliased_source_survives(&fixture, fixture.path("link.edrl"));
     fs::hard_link(fixture.path("m.edrl.part"), fixture.path("hard.edrl")).unwrap();
     assert_aliased_source_survives(&fixture, fixture.path("hard.edrl"));
