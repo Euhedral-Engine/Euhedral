@@ -1,3 +1,4 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use euhedral_inference_engine::Handoff;
@@ -66,7 +67,7 @@ fn a_step_that_unwinds_after_taking_the_call_still_ends_it() {
     let (ended, then) = recording();
     let parked = Parked::new("writer".to_owned(), then, ());
     let step = Arc::clone(&parked);
-    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
         let _taken = step.take().unwrap();
         panic!("a step failed");
     }));

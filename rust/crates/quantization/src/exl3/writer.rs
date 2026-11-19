@@ -240,6 +240,10 @@ struct Taken<W, E> {
 
 impl<W, E> Taken<W, E> {
     /// The writer and what the step parked with it, to work on while the call is still held.
+    #[allow(
+        clippy::expect_used,
+        reason = "the parts are there until the guard is consumed, and ending or passing on the call consume it"
+    )]
     fn parts(&mut self) -> (&mut W, &E) {
         let (writer, _, extra) = self.parts.as_mut().expect("a call that is held has its parts");
         (writer, &*extra)
@@ -253,6 +257,10 @@ impl<W, E> Taken<W, E> {
     }
 
     /// Hands the call over to the next step, which must end it or park it.
+    #[allow(
+        clippy::expect_used,
+        reason = "the parts are there until the guard is consumed, and ending or passing on the call consume it"
+    )]
     fn go(mut self) -> (W, EndOf<W>, E) {
         self.parts.take().expect("a call that is held has its parts")
     }
