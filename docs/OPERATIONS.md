@@ -134,9 +134,15 @@ the native library with the pinned toolchains, so it needs network access and ta
 
 ```bash
 docker build -f rust/Dockerfile -t euhedral-rust .
-docker run --rm --gpus all -p 1738:1738 -v /path/to/model.edrl:/models/model.edrl:ro \
-    -e EUHEDRAL_MODEL_NAME=qwen --stop-timeout 45 euhedral-rust
+docker run --rm --gpus all --security-opt seccomp=unconfined -p 1738:1738 \
+    -v /path/to/model.edrl:/models/model.edrl:ro -e EUHEDRAL_MODEL_NAME=qwen --stop-timeout 45 euhedral-rust
 ```
+
+The engine reads model files through io_uring, and Docker's default seccomp profile blocks the io_uring system
+calls. Without `seccomp=unconfined`, the server stops at startup with `Loading the inference engine failed: the
+asynchronous file I/O would not open: Operation not permitted (os error 1)`. A custom profile that is Docker's
+default plus `io_uring_setup`, `io_uring_enter` and `io_uring_register` also works. The host's
+`kernel.io_uring_disabled` must be 0. If it is 1 or 2, the same error appears, and a container cannot change it.
 
 The image holds the linux-x64 server bundle (`cargo xtask bundle --product linux-x64`, see `rust/README.md`) under
 `/opt/euhedral`: `bin/euhedral-server` is the entry point and finds `lib/` beside it. Settings are given as for the
