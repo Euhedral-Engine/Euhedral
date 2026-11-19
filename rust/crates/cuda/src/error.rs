@@ -34,6 +34,23 @@ pub enum CudaError {
     #[error("{call} failed: {}", describe(*.status))]
     Call { call: &'static str, status: i32 },
 
+    /// The math libraries (cuBLAS, cuSOLVER and what they link) are not all in the directory they were asked for.
+    #[error("the math libraries {missing:?} are missing from {}", .directory.display())]
+    MathLibrariesMissing { directory: PathBuf, missing: Vec<PathBuf> },
+
+    /// A call into a library that is not the CUDA library returned a nonzero status (cuBLAS, cuSOLVER).
+    #[error("{call} failed with library status {status}")]
+    Library { call: &'static str, status: i32 },
+
+    /// A solver wrote a nonzero `info` word: negative names the bad argument (`-n` is the n-th), positive is the order
+    /// of the leading minor that is not positive definite.
+    #[error("{call} reported info {info}")]
+    Info { call: &'static str, info: i32 },
+
+    /// The platform has no build of what was asked for.
+    #[error("{0}")]
+    Unsupported(&'static str),
+
     /// An allocation returned a null address.
     #[error("{call} returned a null address for {bytes} bytes")]
     NullAllocation { call: &'static str, bytes: u64 },
@@ -49,7 +66,11 @@ impl CudaError {
     pub fn loads_nothing(&self) -> bool {
         matches!(
             self,
-            CudaError::LibraryMissing(_) | CudaError::RuntimeMissing { .. } | CudaError::Load { .. }
+            CudaError::LibraryMissing(_)
+                | CudaError::RuntimeMissing { .. }
+                | CudaError::MathLibrariesMissing { .. }
+                | CudaError::Unsupported(_)
+                | CudaError::Load { .. }
         )
     }
 }

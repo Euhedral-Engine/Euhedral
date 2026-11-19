@@ -47,7 +47,7 @@ impl Dtype {
             Dtype::I2 | Dtype::F2 => 2,
             Dtype::I4 | Dtype::F4 => 4,
             Dtype::I8 => 8,
-            Dtype::Unicode(length) => 4 * length,
+            Dtype::Unicode(length) => length.saturating_mul(4),
         }
     }
 
@@ -76,7 +76,12 @@ impl Dtype {
             "<f2" => Dtype::F2,
             "<f4" => Dtype::F4,
             other => match other.strip_prefix("<U").map(str::parse::<usize>) {
-                Some(Ok(length)) => Dtype::Unicode(length),
+                // A length of zero has no element size; one whose bytes overflow cannot be addressed.
+                Some(Ok(length))
+                    if length > 0 && length.checked_mul(4).is_some_and(|bytes| bytes <= u32::MAX as usize) =>
+                {
+                    Dtype::Unicode(length)
+                }
                 _ => return Err(NpyError::Unsupported(format!("element type '{other}'"))),
             },
         };
@@ -138,7 +143,7 @@ fn byte_count(dtype: Dtype, shape: &[u64]) -> Option<u64> {
 }
 
 /// The version 1.0 header of an array: magic, version, length and the padded dictionary.
-pub fn header(dtype: Dtype, shape: &[u64]) -> Vec<u8> {
+pub fn header(dtype: Dtype, shape: &[u64]) -> Result<Vec<u8>, NpyError> {
     let mut dimensions = String::from("(");
     for (index, dimension) in shape.iter().enumerate() {
         dimensions.push_str(&dimension.to_string());
@@ -157,12 +162,13 @@ pub fn header(dtype: Dtype, shape: &[u64]) -> Vec<u8> {
     let padding = (64 - unpadded % 64) % 64;
     dictionary.extend(repeat_n(' ', padding));
     dictionary.push('\n');
+    let length = u16::try_from(dictionary.len()).map_err(|_| NpyError::Unsupported("a header beyond 64 KiB".into()))?;
     let mut bytes = Vec::with_capacity(10 + dictionary.len());
     bytes.extend_from_slice(&MAGIC);
     bytes.extend_from_slice(&[1, 0]);
-    bytes.extend_from_slice(&(dictionary.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(&length.to_le_bytes());
     bytes.extend_from_slice(dictionary.as_bytes());
-    bytes
+    Ok(bytes)
 }
 
 /// A whole `.npy` file: the header and `data`, which must be exactly the bytes of the shape.
@@ -174,7 +180,7 @@ pub fn encode(dtype: Dtype, shape: &[u64], data: &[u8]) -> Result<Vec<u8>, NpyEr
             found: data.len() as u64,
         });
     }
-    let mut bytes = header(dtype, shape);
+    let mut bytes = header(dtype, shape)?;
     bytes.extend_from_slice(data);
     Ok(bytes)
 }
@@ -189,11 +195,14 @@ pub fn encode_elements<T: Element>(shape: &[u64], values: &[T]) -> Result<Vec<u8
 }
 
 /// A whole `.npy` file holding `value` as a 0-d unicode array.
-pub fn encode_text(value: &str) -> Vec<u8> {
+pub fn encode_text(value: &str) -> Result<Vec<u8>, NpyError> {
+    if value.is_empty() {
+        return Err(NpyError::Unsupported("an empty text".into()));
+    }
     let codes: Vec<u8> = value.chars().flat_map(|c| (c as u32).to_le_bytes()).collect();
-    let mut bytes = header(Dtype::Unicode(value.chars().count()), &[]);
+    let mut bytes = header(Dtype::Unicode(value.chars().count()), &[])?;
     bytes.extend_from_slice(&codes);
-    bytes
+    Ok(bytes)
 }
 
 /// A parsed `.npy` file: the type, the shape and the data, which stays in the caller's bytes.
@@ -247,7 +256,7 @@ impl<'a> Npy<'a> {
 
     /// The number of elements.
     pub fn len(&self) -> usize {
-        self.shape.iter().product::<u64>() as usize
+        self.data.len() / self.dtype.item_size()
     }
 
     /// Whether the array has no elements.
@@ -331,7 +340,7 @@ mod tests {
 
     #[test]
     fn header_of_a_matrix_is_padded_to_64_bytes() {
-        let bytes = header(Dtype::F4, &[2, 3]);
+        let bytes = header(Dtype::F4, &[2, 3]).unwrap();
         assert_eq!(bytes.len() % 64, 0);
         assert_eq!(&bytes[..10], &[0x93, b'N', b'U', b'M', b'P', b'Y', 1, 0, 118, 0]);
         let text = from_utf8(&bytes[10..]).unwrap();
@@ -341,9 +350,9 @@ mod tests {
 
     #[test]
     fn one_dimension_has_a_trailing_comma_and_a_scalar_none() {
-        let vector = header(Dtype::I8, &[5]);
+        let vector = header(Dtype::I8, &[5]).unwrap();
         assert!(from_utf8(&vector[10..]).unwrap().contains("'shape': (5,), }"));
-        let scalar = header(Dtype::F4, &[]);
+        let scalar = header(Dtype::F4, &[]).unwrap();
         assert!(from_utf8(&scalar[10..]).unwrap().contains("'shape': (), }"));
     }
 
@@ -373,12 +382,12 @@ mod tests {
 
     #[test]
     fn text_round_trips() {
-        let bytes = encode_text("NVFP4");
+        let bytes = encode_text("NVFP4").unwrap();
         let npy = Npy::parse(&bytes).unwrap();
         assert_eq!(npy.dtype, Dtype::Unicode(5));
         assert!(npy.shape.is_empty());
         assert_eq!(npy.text().unwrap(), "NVFP4");
-        assert_eq!(Npy::parse(&encode_text("")).unwrap().text().unwrap(), "");
+        assert!(encode_text("").is_err());
     }
 
     #[test]
@@ -402,16 +411,51 @@ mod tests {
     fn broken_headers_are_errors() {
         assert!(Npy::parse(b"hello world, not an array").is_err());
         assert!(Npy::parse(&[0x93, b'N', b'U', b'M', b'P', b'Y', 1, 0, 255, 255]).is_err());
-        let mut fortran = header(Dtype::F4, &[0]);
+        let mut fortran = header(Dtype::F4, &[0]).unwrap();
         let text = String::from_utf8(fortran.split_off(10))
             .unwrap()
             .replace("False", "True ");
         fortran.extend_from_slice(text.as_bytes());
         assert!(matches!(Npy::parse(&fortran), Err(NpyError::Unsupported(_))));
-        let mut other = header(Dtype::F4, &[0]);
+        let mut other = header(Dtype::F4, &[0]).unwrap();
         let text = String::from_utf8(other.split_off(10)).unwrap().replace("<f4", "<c8");
         other.extend_from_slice(text.as_bytes());
         assert!(matches!(Npy::parse(&other), Err(NpyError::Unsupported(_))));
+    }
+
+    fn with_descr(descr: &str) -> Vec<u8> {
+        let mut bytes = header(Dtype::F4, &[0]).unwrap();
+        let text = String::from_utf8(bytes.split_off(10)).unwrap().replace("<f4", descr);
+        bytes.extend_from_slice(text.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_text_length_that_overflows_or_is_zero_is_refused() {
+        for descr in ["<U0", "<U18446744073709551615", "<U9999999999999", "<U1073741824"] {
+            assert!(
+                matches!(Npy::parse(&with_descr(descr)), Err(NpyError::Unsupported(_))),
+                "{descr}"
+            );
+        }
+        // The largest text the format holds in 32 bits of bytes still parses as a type.
+        assert_eq!(Dtype::parse("<U1073741823"), Ok(Dtype::Unicode(1_073_741_823)));
+        assert_eq!(Dtype::Unicode(usize::MAX).item_size(), usize::MAX);
+    }
+
+    #[test]
+    fn a_header_beyond_64_kib_is_an_error() {
+        let shape = vec![1u64; 30_000];
+        assert!(matches!(header(Dtype::U1, &shape), Err(NpyError::Unsupported(_))));
+        assert!(matches!(encode(Dtype::U1, &shape, &[0]), Err(NpyError::Unsupported(_))));
+    }
+
+    #[test]
+    fn len_counts_elements() {
+        let bytes = encode_elements(&[2, 3], &[0i16; 6]).unwrap();
+        let array = Npy::parse(&bytes).unwrap();
+        assert_eq!(array.len(), 6);
+        assert!(!array.is_empty());
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use std::io::{self, Write};
 
-use crc32fast::Hasher;
+use crc32fast::{Hasher, hash};
 use thiserror::Error;
 
 use crate::npy::{self, Dtype, Npy, NpyError};
@@ -66,7 +66,7 @@ impl<W: Write> NpzWriter<W> {
 
     /// Adds the member `<name>.npy` holding an array of `dtype` and `shape` whose bytes are `data`.
     pub fn add_array(&mut self, name: &str, dtype: Dtype, shape: &[u64], data: &[u8]) -> Result<(), NpzError> {
-        let header = npy::header(dtype, shape);
+        let header = npy::header(dtype, shape)?;
         let expected = shape.iter().try_fold(dtype.item_size() as u64, |total, &dimension| {
             total.checked_mul(dimension)
         });
@@ -81,7 +81,7 @@ impl<W: Write> NpzWriter<W> {
 
     /// Adds the member `<name>.npy` holding a 0-d unicode array of `value`.
     pub fn add_text(&mut self, name: &str, value: &str) -> Result<(), NpzError> {
-        let bytes = npy::encode_text(value);
+        let bytes = npy::encode_text(value)?;
         let header_length = 10 + usize::from(u16::from_le_bytes([bytes[8], bytes[9]]));
         self.add_member(name, &bytes[..header_length], &bytes[header_length..])
     }
@@ -133,7 +133,7 @@ impl<W: Write> NpzWriter<W> {
         let mut directory = Vec::new();
         for member in &self.members {
             directory.extend_from_slice(&CENTRAL_HEADER.to_le_bytes());
-            directory.extend_from_slice(&20u16.to_le_bytes());
+            directory.extend_from_slice(&10u16.to_le_bytes());
             directory.extend_from_slice(&10u16.to_le_bytes());
             directory.extend_from_slice(&UTF8_NAMES.to_le_bytes());
             directory.extend_from_slice(&0u16.to_le_bytes());
@@ -217,7 +217,7 @@ impl<'a> Npz<'a> {
             let local_extra = usize::from(u16_at(bytes, local + 28).ok_or_else(cut)?);
             let start = local + 30 + local_name + local_extra;
             let data = bytes.get(start..start + size).ok_or_else(cut)?;
-            if crc32fast::hash(data) != crc {
+            if hash(data) != crc {
                 return Err(NpzError::Checksum(name));
             }
             entries.push(Entry { name, crc, bytes: data });

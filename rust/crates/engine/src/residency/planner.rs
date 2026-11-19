@@ -38,6 +38,32 @@ use crate::workspace::{self, WorkspaceRows};
 /// workspaces, the shared scratch and the kernel modules the first launches compile.
 pub const DEFAULT_RUNTIME_RESERVE_BYTES: u64 = 1280 << 20;
 
+/// The multiprocessor count of the device the headroom was measured on.
+pub const HEADROOM_MEASURED_MULTIPROCESSORS: u32 = 70;
+
+/// What `memory.runtime-headroom: auto` means on a device of [`HEADROOM_MEASURED_MULTIPROCESSORS`] multiprocessors,
+/// and the least it means on any device: the device bytes kept above the demand that raises the runtime reserve, for
+/// what the driver takes after admission. Measured on 70 multiprocessors with drafting on, BF16 KV, 8192 tokens and
+/// the reserve at its tightest: 246 MiB lost beyond the engine's allocations after admission (118 MiB by the time the
+/// model was ready, and 128 MiB at the first prefill, the code and local memory of the trellis, attention and Gated
+/// DeltaNet kernels); this is that figure with about 30% over. The local memory grows with the multiprocessors, so a
+/// wider device scales it ([`auto_runtime_headroom`]).
+pub const DEFAULT_RUNTIME_HEADROOM_BYTES: u64 = 320 << 20;
+
+/// The headroom `auto` resolves to: [`DEFAULT_RUNTIME_HEADROOM_BYTES`] scaled by the device's multiprocessors over
+/// [`HEADROOM_MEASURED_MULTIPROCESSORS`] and rounded up, never less than the default. A count that is unknown (the
+/// plan made without a device) gets the default.
+pub fn auto_runtime_headroom(multiprocessors: Option<u32>) -> u64 {
+    let Some(count) = multiprocessors else {
+        return DEFAULT_RUNTIME_HEADROOM_BYTES;
+    };
+    let scaled = (u128::from(DEFAULT_RUNTIME_HEADROOM_BYTES) * u128::from(count))
+        .div_ceil(u128::from(HEADROOM_MEASURED_MULTIPROCESSORS));
+    u64::try_from(scaled)
+        .unwrap_or(u64::MAX)
+        .max(DEFAULT_RUNTIME_HEADROOM_BYTES)
+}
+
 /// Device allocations start on this many bytes, like the driver's.
 pub const ARENA_ALIGNMENT: u64 = 256;
 
@@ -136,8 +162,9 @@ pub struct ResidencyPlan {
     pub decode_scratch_bytes: u64,
     /// The device bytes the runtime reserves beyond the weights, the cache and the scratch (`memory.runtime-reserve`):
     /// the execution workspace, the decode scratch, the first sequence's state, the MTP layer's cache at the longest
-    /// context and what the kernel modules take. At least what the settings make the first four of these need,
-    /// whatever the setting says.
+    /// context and what the kernel modules take. At least what the settings make the first four of these need, and
+    /// `memory.runtime-headroom` above them for the kernels, whatever the setting says: the startup's claims take the
+    /// first four, so the headroom is left.
     pub runtime_reserve_bytes: u64,
     /// The device bytes the plan reserves in all: the weights, every sequence's cache, the runtime's reserve, the
     /// scratch and the state of the sequences beyond the first.
@@ -412,15 +439,25 @@ pub fn plan_closest(
     } else {
         0
     };
+    // The kernels the driver loads after admission (their code and local memory, at each one's first launch) are paid
+    // from what the claims leave. A reserve raised to the claims alone would leave them nothing, so the raised reserve
+    // keeps the headroom above them.
+    let headroom = settings
+        .memory
+        .runtime_headroom
+        .value()
+        .map_or_else(|| auto_runtime_headroom(inputs.multiprocessors), |size| size.bytes());
     let reserve_demand = workspace_bytes
         .saturating_add(decode_scratch_bytes)
         .saturating_add(first_state)
-        .saturating_add(mtp_cache);
+        .saturating_add(mtp_cache)
+        .saturating_add(headroom);
     let runtime_reserve = reserve_setting.max(reserve_demand);
     if reserve_demand > reserve_setting {
         log::info!(
             "the runtime reserve is raised from {reserve_setting} to {reserve_demand} bytes: the workspace, the decode \
-             scratch, the first sequence's state and the MTP cache need that much at these settings"
+             scratch, the first sequence's state and the MTP cache need that much at these settings, and {headroom} \
+             bytes are kept above them for the kernels loaded after admission"
         );
     }
     let extra = if sequences > 1 {

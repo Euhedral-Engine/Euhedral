@@ -5,10 +5,12 @@
 //! the registry is made. Rendering reads the words one by one, so a series that changes during a scrape is read at one
 //! moment or the next. A series is exported with its value from the start (zero before anything is recorded).
 //!
-//! The series, their names, labels, types and help are those of the server this one replaces; the process's own series
-//! (virtual machine, process, HTTP server, logging) are not part of it.
+//! The `euhedral_*` series, their names, labels, types and help are fixed; the process's series and the time of the HTTP
+//! requests follow them in the render (see `render_platform`). The virtual machine's and the logging's are not exported.
 
 mod buckets;
+mod http;
+pub mod process;
 mod render;
 mod window;
 
@@ -18,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use buckets::{DURATION_BOUNDS_NS, RATE_BOUNDS};
 
+pub use http::{RequestTimer, Uri, outcome};
 pub use render::CONTENT_TYPE;
 pub use window::{WINDOW_MS, WINDOWS, WindowMax};
 
@@ -263,6 +266,9 @@ pub struct Metrics {
     /// The indices of `speculative_accepted` in the order of their labels as text.
     drafts_by_label: Box<[usize]>,
     speculative_accepted_tokens: AtomicU64,
+    http: http::Table,
+    /// The CPU window between scrapes.
+    usage: process::UsageWindow,
 }
 
 impl Metrics {
@@ -295,6 +301,8 @@ impl Metrics {
             speculative_accepted: counters(speculative_depth + 1),
             drafts_by_label: drafts_by_label.into_boxed_slice(),
             speculative_accepted_tokens: AtomicU64::new(0),
+            http: http::Table::new(now_ms),
+            usage: process::UsageWindow::default(),
         }
     }
 

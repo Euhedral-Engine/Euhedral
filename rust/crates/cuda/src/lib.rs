@@ -4,6 +4,7 @@
 //!   the device) and carries the generated entry points ([`sys`]).
 //! - [`DeviceBuffer`], [`PinnedBuffer`] and [`HostWeightsArena`] own device, page-locked and host-weight memory.
 //! - [`PinnedPool`] recycles pinned buffers.
+//! - [`math`] loads cuBLAS and cuSOLVER and calls them on the stream a lane lends.
 //! - [`KernelOps`] and [`LaneOps`] are the operations the stages queue; [`launch`] plans and enqueues them on RustEE
 //!   lanes ([`RusteeOps`](launch::ops::RusteeOps)).
 //!
@@ -22,6 +23,7 @@ mod device;
 mod error;
 pub mod launch;
 mod library;
+pub mod math;
 mod memory;
 pub mod ops;
 mod pool;

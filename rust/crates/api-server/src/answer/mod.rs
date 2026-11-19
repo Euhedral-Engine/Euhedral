@@ -49,7 +49,7 @@ use crate::admission::{Admission, Counts, Entry, Interruption, Slot};
 use crate::backend::{Backend, BackendError, Generation, GenerationResult, TextListener};
 use crate::frames::{once, once_or_refused};
 use crate::limits::Limits;
-use crate::metrics::{Api, ConstraintFailure, FinishReason, Generation as Finished, Metrics, Outcome};
+use crate::metrics::{Api, ConstraintFailure, FinishReason, Generation as Finished, Metrics, Outcome, RequestTimer};
 use crate::planning::{Endpoint, Planned};
 use crate::router::{error_response, json};
 
@@ -133,6 +133,8 @@ struct Shared {
     /// The request ended or was interrupted: a start that has not opened its generation does not.
     cut: AtomicBool,
     me: Weak<Shared>,
+    /// The clock of the HTTP request: stopped when the last byte is handed to the connection.
+    timer: Arc<RequestTimer>,
 }
 
 impl Shared {
@@ -226,6 +228,9 @@ impl Shared {
                     // Once the head is out the client is found gone by a failed write, not by the transport's
                     // cancel flag, which a half-closed client also raises.
                     Box::new(move |opened| {
+                        if opened.is_ok() {
+                            shared.timer.opened();
+                        }
                         shared.post(Command::Head(opened));
                         no_work()
                     }),
@@ -241,7 +246,11 @@ impl Shared {
                     }),
                 );
             }
-            Effect::End(stream) => stream.end(),
+            Effect::End(stream) => {
+                // The head went out as a 200; the end is the last byte.
+                self.timer.finish(200);
+                stream.end();
+            }
         }
     }
 
@@ -580,7 +589,10 @@ impl Conclusion {
             }
         };
         if let (Some(responder), Some(response)) = (responder, response) {
-            guarded(|| responder.send(response));
+            guarded(|| {
+                shared.timer.finish(response.status);
+                responder.send(response);
+            });
         }
         match completed {
             Some(Record::Answered(done)) => guarded(|| shared.record_answer(&done, timing, ended_ns)),
@@ -745,7 +757,14 @@ impl Answerer {
     /// Takes a planned request to its answer, a whole reply or a stream: it is offered to the admission at `arrived` (the
     /// request limit counts from there) and `reply` is answered when it ends, or never if the client is gone. Returns
     /// at once.
-    pub fn answer(&self, planned: Planned, reply: Responder, surface: Surface, arrived: Instant) {
+    pub fn answer(
+        &self,
+        planned: Planned,
+        reply: Responder,
+        surface: Surface,
+        arrived: Instant,
+        timer: Arc<RequestTimer>,
+    ) {
         let api = api_of(planned.endpoint);
         let queued_ns = u64::try_from(arrived.saturating_duration_since(self.epoch).as_nanos())
             .unwrap_or(u64::MAX)
@@ -784,6 +803,7 @@ impl Answerer {
             pending: AtomicBool::new(false),
             cut: AtomicBool::new(false),
             me: me.clone(),
+            timer,
         });
         // Nothing else holds the claim yet: the request was not offered.
         if let Some(mut claim) = shared.owner.try_claim() {

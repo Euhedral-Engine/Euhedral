@@ -15,9 +15,9 @@ pub const TOKENIZER_ENTRIES: [&str; 4] = [
     "special_tokens.json",
 ];
 
-const VERSION: u32 = 1;
-const MAGIC: &[u8; 8] = b"EDRLTOKN";
-const MAX_BODY_BYTES: u64 = 1 << 30;
+pub(crate) const VERSION: u32 = 1;
+pub(crate) const MAGIC: &[u8; 8] = b"EDRLTOKN";
+pub(crate) const MAX_BODY_BYTES: u64 = 1 << 30;
 
 /// The footer at the very end of an artifact that carries a tokenizer section, big-endian:
 /// `int64 bodyLength, int32 CRC-32 of the body, int32 version (1), 8 bytes "EDRLTOKN"`. The body precedes it.

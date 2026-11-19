@@ -45,7 +45,7 @@ pub(crate) fn advance(pointer: DevicePtr, bytes: u64) -> DevicePtr {
 }
 
 /// The launch choices that depend on the card: sized from the device, or measured on one card and set by the
-/// operator. The native library's own copy of these values (`euhedral_cuda_set_dispatch`, bound in `sys`) is never
+/// operator. The native library's own copy of these values (`euhedral_cuda_set_dispatch`, not bound in `sys`) is never
 /// set from Rust: every Rust launch is planned here and goes through `RusteeOps`, not through the library's wrappers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dispatch {
