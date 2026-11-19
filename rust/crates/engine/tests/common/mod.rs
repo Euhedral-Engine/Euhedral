@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use euhedral_inference_cuda::CudaLibrary;
+use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::residency::offload::{EMBEDDING, mapped};
 use euhedral_inference_engine::residency::planner::{PlanInputs, plan_with};
 use euhedral_inference_settings::{Auto, ByteSize};
@@ -333,11 +334,31 @@ pub fn limit_to_disk(library: &Path, settings: &Settings, gpu_limit: u64, on_dis
         staged.offload.disk.is_empty(),
         "the host holds what the device does not"
     );
-    staged
+    let mut limit = staged
         .offload
         .host_arena_bytes
         .checked_sub(on_disk)
-        .expect("the host arena is larger than the bytes to leave in the file")
+        .expect("the host arena is larger than the bytes to leave in the file");
+    // The limit also holds the window the disk reads land in and the cache pages: raise it by what the plan says it is
+    // short until the plan fits and still leaves objects in the file.
+    for _ in 0..8 {
+        let limited = PlanInputs {
+            host_pinned_bytes: Some(limit),
+            ..inputs
+        };
+        match plan_with(&config, &table, &forced, limited) {
+            Err(PlanError::HostTooSmall { needed, budget, .. }) => limit += needed - budget,
+            Ok(plan) => {
+                assert!(
+                    !plan.offload.disk.is_empty(),
+                    "the limit {limit} leaves nothing in the file"
+                );
+                return limit;
+            }
+            Err(other) => panic!("the plan of the disk tier is refused: {other}"),
+        }
+    }
+    panic!("no host limit leaves {on_disk} bytes in the file")
 }
 
 /// Sets `memory.host-weights-limit` to `limit`.
