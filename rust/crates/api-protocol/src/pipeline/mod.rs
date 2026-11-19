@@ -87,7 +87,12 @@ pub enum PipelineError {
     /// cancelled the generation, do not call `finish`. After a failure `finish` returns this error again, with
     /// no `emitted` pieces, so the completion step can read it there.
     #[error("{message}")]
-    MalformedToolCall { message: String, emitted: Vec<Piece> },
+    MalformedToolCall {
+        message: String,
+        /// The high surrogate an excerpt in the message was cut after; see [`MalformedToolCall`].
+        cut: Option<u16>,
+        emitted: Vec<Piece>,
+    },
 }
 
 impl PipelineError {
@@ -95,6 +100,13 @@ impl PipelineError {
     pub fn message(&self) -> &str {
         match self {
             PipelineError::MalformedToolCall { message, .. } => message,
+        }
+    }
+
+    /// The high surrogate the message's excerpt was cut after, if it was cut inside a character.
+    pub fn cut(&self) -> Option<u16> {
+        match self {
+            PipelineError::MalformedToolCall { cut, .. } => *cut,
         }
     }
 }
@@ -110,7 +122,7 @@ pub struct TextPipeline {
     stop: StopSequenceFilter,
     parser: Option<ToolCallParser>,
     parallel: bool,
-    failure: Option<String>,
+    failure: Option<MalformedToolCall>,
     call_limit_reached: bool,
     finished: bool,
 }
@@ -197,9 +209,10 @@ impl TextPipeline {
     }
 
     fn fail(&mut self, failure: MalformedToolCall, emitted: Vec<Piece>) -> PipelineError {
-        self.failure = Some(failure.0.clone());
+        self.failure = Some(failure.clone());
         PipelineError::MalformedToolCall {
-            message: failure.0,
+            message: failure.message,
+            cut: failure.cut,
             emitted,
         }
     }
@@ -256,9 +269,10 @@ impl TextPipeline {
     }
 
     fn finish_with(&mut self, stop_token_reached: bool) -> Result<Vec<Piece>, PipelineError> {
-        if let Some(message) = &self.failure {
+        if let Some(failure) = &self.failure {
             return Err(PipelineError::MalformedToolCall {
-                message: message.clone(),
+                message: failure.message.clone(),
+                cut: failure.cut,
                 emitted: Vec::new(),
             });
         }

@@ -428,7 +428,7 @@ fn a_plan_that_does_not_fit_fails_before_device_alloc() {
                 "{message}"
             );
         }
-        PlanError::HostTooSmall { needed, budget } => {
+        PlanError::HostTooSmall { needed, budget, .. } => {
             let message = error.to_string();
             assert!(needed > budget, "{message}");
             assert!(message.contains(&format!("{} MiB", needed >> 20)), "{message}");

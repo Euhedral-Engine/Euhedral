@@ -33,6 +33,17 @@ pub(crate) fn text(value: &str) -> JsonValue {
     JsonValue::String(value.to_owned())
 }
 
+/// The arguments of a tool call: the compact JSON text the call was written as, in which an unpaired surrogate is
+/// an escape. As a string value it keeps the escape as the escape rather than as escaped text.
+pub(crate) fn arguments_text(value: &str) -> JsonValue {
+    JsonValue::from_compact_text(value)
+}
+
+/// An error message as a string value; `cut` is the high surrogate its excerpt was cut after, if any.
+pub(crate) fn message_text(value: &str, cut: Option<u16>) -> JsonValue {
+    JsonValue::from_message_text(value, cut)
+}
+
 /// A string value, or null.
 pub(crate) fn optional_text(value: Option<&str>) -> JsonValue {
     value.map_or(JsonValue::Null, text)

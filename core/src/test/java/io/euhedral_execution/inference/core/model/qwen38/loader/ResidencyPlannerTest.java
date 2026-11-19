@@ -261,6 +261,48 @@ class ResidencyPlannerTest {
     }
 
     @Test
+    void aHostThatIsShortOnlyOnceThePagesTakeTheirShareIsRefusedForTheHost() {
+        long free = WEIGHTS + ResidencyPlanner.RESERVE_BYTES + deviceShare(1) - 200 * MIB;
+        var roomy = spillPlan(free, Long.MAX_VALUE, 1);
+        assertTrue(roomy.fits());
+        assertTrue(roomy.kvHostBytes() > 0 && roomy.hostArenaBytes() + roomy.windowBytes() > 0);
+        assertEquals(roomy.hostArenaBytes() + roomy.windowBytes() + roomy.kvHostBytes(), roomy.hostNeededBytes());
+        assertFalse(roomy.refusedForHost(Long.MAX_VALUE, free));
+        // One byte short of the weights' need and the pages together, though the weights alone fit the budget.
+        long host = roomy.hostNeededBytes() - 1;
+        assertTrue(roomy.hostArenaBytes() + roomy.windowBytes() <= host);
+        var short_ = spillPlan(free, host, 1);
+        assertFalse(short_.fits());
+        assertTrue(short_.refusedForHost(host, free), "more host memory is what would help");
+        var exact = spillPlan(free, roomy.hostNeededBytes(), 1);
+        assertTrue(exact.fits());
+        assertFalse(exact.refusedForHost(roomy.hostNeededBytes(), free));
+    }
+
+    @Test
+    void aDeviceThatCannotFitIsRefusedForTheDeviceThoughTheHostIsShortToo() {
+        // Far too little device memory for what stays on the device with every weight offloaded.
+        long free = 100 * MIB;
+        var roomy = spillPlan(WEIGHTS + ResidencyPlanner.RESERVE_BYTES + deviceShare(1) - 200 * MIB, Long.MAX_VALUE, 1);
+        long host = roomy.hostNeededBytes() - 1;
+        var plan = spillPlan(free, host, 1);
+        assertFalse(plan.fits());
+        assertTrue(plan.deviceBytes() > free);
+        assertFalse(plan.refusedForHost(host, free));
+    }
+
+    @Test
+    void theHostRefusalNamesTheCachePagesOnlyWhenSomeMoved() {
+        long free = WEIGHTS + ResidencyPlanner.RESERVE_BYTES + deviceShare(1) - 200 * MIB;
+        var roomy = spillPlan(free, Long.MAX_VALUE, 1);
+        var short_ = spillPlan(free, roomy.hostNeededBytes() - 1, 1);
+        var message = short_.hostRefusalMessage(roomy.hostNeededBytes() - 1);
+        assertTrue(message.contains("cache pages") && message.contains("context.kv-cache-on-gpu-tokens"), message);
+        var plain = new ResidencyPlanner.Plan(java.util.Set.of(), java.util.Set.of(), 0, 2 * MIB, 0, false);
+        assertFalse(plain.hostRefusalMessage(MIB).contains("cache pages"));
+    }
+
+    @Test
     void aHostBudgetThatCannotHoldThePagesKeepsTheCacheOnTheDevice() {
         long free = WEIGHTS + ResidencyPlanner.RESERVE_BYTES + deviceShare(1) + MIB;
         var plan = spillPlan(free, 64 * MIB, 1);

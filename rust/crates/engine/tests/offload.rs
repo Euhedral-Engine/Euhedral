@@ -264,12 +264,12 @@ fn a_host_budget_below_the_weights_is_refused_naming_the_memory_that_is_short() 
     let Err(error) = plan_with(&config, &table, &settings, inputs(need - 3 * GIB, Some(64 * MIB))) else {
         panic!("expected a refusal");
     };
-    let PlanError::HostTooSmall { needed, budget } = error else {
+    let PlanError::HostTooSmall { needed, budget, .. } = error else {
         panic!("expected HostTooSmall, got {error:?}");
     };
     assert_eq!(budget, 64 * MIB);
     assert!(needed > budget);
-    let text = PlanError::HostTooSmall { needed, budget }.to_string();
+    let text = error.to_string();
     assert!(
         text.contains("64 MiB host budget")
             && text.contains("memory.host-weights-limit")
@@ -474,11 +474,11 @@ fn more_sequences_keep_fewer_weights_on_the_device() {
     assert!(four.device_bytes <= free && one.device_bytes <= free);
 }
 
-/// A row of the reference planner's refusals where the device kind is named although the device's figures fit: the
-/// cache pages put on the host leave the host short. The kind stays the reference's; the message carries the host
-/// figures so the shortfall is visible.
+/// A plan whose device figures fit but whose host is short once the cache pages are counted is refused for the host:
+/// more host memory is what would help. The case of a host a little above what the weights need and below what the
+/// weights and the pages need together.
 #[test]
-fn a_device_refusal_that_is_short_on_the_host_carries_the_host_figures() {
+fn a_refusal_short_on_the_host_once_the_cache_pages_are_counted_names_the_host() {
     let (config, table) = (config(), rco_table());
     let mut settings = settings(32_768);
     settings.context.kv_cache_on_gpu_tokens = 8192;
@@ -487,26 +487,42 @@ fn a_device_refusal_that_is_short_on_the_host_carries_the_host_figures() {
         .device_bytes;
     let host = 600 * MIB;
     let error = plan_with(&config, &table, &settings, inputs(need - 542_113_792, Some(host))).unwrap_err();
-    let PlanError::DeviceTooSmallWithOffload {
-        weights_needed,
-        state_needed,
-        available,
-        host: figures,
-        ..
+    let PlanError::HostTooSmall {
+        needed,
+        cache_pages,
+        budget,
     } = error
     else {
-        panic!("expected the device kind of the reference, got {error:?}");
+        panic!("expected the host refusal, got {error:?}");
     };
-    assert!(
-        weights_needed + state_needed <= available,
-        "the device's own figures fit"
-    );
-    assert_eq!(figures.budget, host);
-    assert!(figures.cache_pages > 0 && figures.weights > 0);
-    assert!(figures.needed() > host);
+    assert_eq!(budget, host);
+    assert!(cache_pages > 0 && needed - cache_pages <= host && needed > host);
     let text = error.to_string();
-    for figure in [figures.weights, figures.cache_pages, host] {
-        assert!(text.contains(&format!("{figure} bytes")), "{text}");
-    }
-    assert!(text.contains("the host is short too"), "{text}");
+    assert!(text.contains(&format!("{} MiB host budget", host >> 20)), "{text}");
+    assert!(text.contains("cache pages"), "{text}");
+}
+
+/// A plan whose device does not fit even with every weight offloaded is refused for the device, though the host is
+/// short too once the cache pages are counted; the message names the host shortfall beside it.
+#[test]
+fn a_device_that_cannot_fit_is_refused_for_the_device_though_the_host_is_short_too() {
+    let (config, table) = (config(), rco_table());
+    let mut settings = settings(32_768);
+    settings.context.kv_cache_on_gpu_tokens = 8192;
+    let need = plan_with(&config, &table, &settings, inputs(64 * GIB, Some(u64::MAX)))
+        .unwrap()
+        .device_bytes;
+    let host = 2200 * MIB;
+    let error = plan_with(
+        &config,
+        &table,
+        &settings,
+        inputs(need - (12 * GIB + 5 * MIB), Some(host)),
+    )
+    .unwrap_err();
+    let PlanError::DeviceTooSmallWithOffload { host: figures, .. } = error else {
+        panic!("expected the device refusal, got {error:?}");
+    };
+    assert!(figures.cache_pages > 0 && figures.needed() > host && figures.weights <= host);
+    assert!(error.to_string().contains("the host is short too"), "{error}");
 }
