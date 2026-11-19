@@ -90,6 +90,7 @@ NumPy. `gpu_harness.py` is the shared harness (NVRTC compilation, module loading
 | Test | Covers |
 | --- | --- |
 | `test_pdl_registry.py` | The programmatic-launch registry under a pthread harness (`pdl_registry_harness.c`): threads registering shared keys behind a barrier lose none and double none, and a full registry accepts exactly its limit. The same harness must fail against a copy of the former 64-entry registry (`fixtures/pdl_registry_old.c`). Host only. |
+| `test_pdl_wait.py` | The wait rule of programmatic launch, by source (`pdl_wait_check.py`): every kernel that calls `euhedral_pdl_begin()` does so as a top-level statement before any `return` and before any use (read or write) of a pointer parameter (address arithmetic and `const` model weights excepted), following helpers within the kernel's own translation unit; every kernel the Rust launch catalog or the C host code registers reaches the wait. A structural source parser, not libclang; the gaps are listed in its docstring. Host only, run by the CI `native-package` job. |
 | `test_dflash.py` | The DFlash2 operators against NumPy oracles with the reference's rounding points: convolution, top-16 and selector bit for bit, the linear's rows identical at every row count. |
 | `test_q3_kernels.py` | Q3 reference against FP64, contiguous decode against the reference, the 2 to 8 row twins bit for bit one-row. |
 | `test_q45_kernels.py` | Q4/Q5 reference, contiguous decode, row twins, the capped grid. |
