@@ -19,7 +19,7 @@ use euhedral_memory::{
     LocationId, LocationKind, LocationSpec, OwnerSpec, Placed, PlanRequest, Planner, Priority, Scope,
 };
 
-use crate::error::PlanError;
+use crate::error::{HostFigures, PlanError};
 use crate::model::{
     ArtifactProfile, LayerIndex, MTP_ATTENTION_PACK, MTP_PACK_HALVES, ModelConfig, Role, Speculation, object_key,
     trellis_logical, validate_inventory,
@@ -524,9 +524,10 @@ pub fn plan_closest(
     ))
 }
 
-/// What a plan that does not fit is refused for. The plan is refused for the host when the arena, the window and the
-/// cache pages put on the host together are more than the host budget: more host memory is what would help. Otherwise
-/// the device is too small.
+/// What a plan that does not fit is refused for. The device fits and the host is short (the arena, the window and the
+/// cache pages put on the host together are more than the host budget): more host memory is what would help, and the
+/// refusal is the host's. When the device does not fit even with everything offloaded, it is the device's, and its
+/// message names the host shortfall too when there is one.
 fn refusal_of(
     reach: &Reach,
     layout: &Layout,
@@ -536,7 +537,7 @@ fn refusal_of(
     original_host: u64,
 ) -> PlanError {
     let needed = reach.host_bytes().saturating_add(layout.cache_host);
-    if needed > original_host {
+    if reach.device_fits && needed > original_host {
         return PlanError::HostTooSmall {
             needed,
             cache_pages: layout.cache_host,
@@ -550,6 +551,11 @@ fn refusal_of(
         free: inputs.device_free,
         sequences: inputs.sequences,
         context_tokens: max_tokens,
+        host: HostFigures {
+            weights: reach.host_bytes(),
+            cache_pages: layout.cache_host,
+            budget: original_host,
+        },
     }
 }
 

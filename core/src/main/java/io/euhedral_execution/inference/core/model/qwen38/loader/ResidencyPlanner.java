@@ -39,6 +39,8 @@ public final class ResidencyPlanner {
     /// verification runs the scalar reference, which sweeps the weights once per row.
     static final int NVFP4_ROW_EXACT_MAX_ROWS = 32;
 
+    private static final long MIB = 1L << 20;
+
     private ResidencyPlanner() {}
 
     /// The outcome: the objects to keep in host memory and those left in the artifact file, the device bytes the
@@ -75,11 +77,34 @@ public final class ResidencyPlanner {
             return hostArenaBytes + windowBytes + kvHostBytes;
         }
 
-        /// Whether the plan is refused for want of host memory: it does not fit and the host budget `hostBudget`
-        /// holds less than the arena, the window and the cache pages together. Otherwise a refused plan is
-        /// short on the device.
-        public boolean refusedForHost(long hostBudget) {
-            return !fits && hostNeededBytes() > hostBudget;
+        /// Whether the plan is refused for want of host memory: the device fits (`deviceBytes` within
+        /// `freeBytes`) and `hostBudget` holds less than the arena, the window and the cache pages together.
+        /// A plan whose device does not fit is refused for the device, whatever the host.
+        public boolean refusedForHost(long hostBudget, long freeBytes) {
+            return !fits && deviceBytes <= freeBytes && hostNeededBytes() > hostBudget;
+        }
+
+        /// The refusal for the host: more host memory is what would help.
+        public String hostRefusalMessage(long hostBudget) {
+            long needed = (hostNeededBytes() + MIB - 1) >> 20;
+            String pages = kvHostBytes > 0 ? " and the attention cache pages moved to the host" : "";
+            String pagesNote = kvHostBytes > 0
+                    ? " (" + ((kvHostBytes + MIB - 1) >> 20) + " MiB of it the cache pages moved to the host; raise"
+                            + " context.kv-cache-on-gpu-tokens to keep more of them on the GPU)"
+                    : "";
+            return "the weights the GPU cannot hold" + pages + " need " + needed + " MiB of host memory" + pagesNote
+                    + " (the token embedding, the LM head, the host-backed weights and the disk window), more than the "
+                    + (hostBudget >> 20)
+                    + " MiB host budget; set memory.host-weights-limit or memory.host-limit higher, or a smaller max"
+                    + " context";
+        }
+
+        /// What a device refusal adds when the host is short too: empty otherwise.
+        public String hostShortNote(long hostBudget) {
+            if (hostNeededBytes() <= hostBudget) return "";
+            return "; the host is short too: the weights outside the GPU need " + (hostArenaBytes + windowBytes)
+                    + " bytes of pinned host memory (host arena and disk window) and the cache pages on the host "
+                    + kvHostBytes + " bytes, against a host budget of " + hostBudget + " bytes";
         }
     }
 

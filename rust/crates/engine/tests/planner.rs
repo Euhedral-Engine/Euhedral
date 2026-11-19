@@ -161,6 +161,7 @@ fn planner_refuses_when_weights_do_not_fit() {
         free,
         sequences,
         context_tokens,
+        host,
     } = error
     else {
         panic!("expected DeviceTooSmallWithOffload, got {error:?}");
@@ -184,6 +185,7 @@ fn planner_refuses_when_weights_do_not_fit() {
         free,
         sequences,
         context_tokens,
+        host,
     }
     .to_string();
     assert!(

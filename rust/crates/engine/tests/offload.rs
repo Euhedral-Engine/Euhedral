@@ -501,3 +501,28 @@ fn a_refusal_short_on_the_host_once_the_cache_pages_are_counted_names_the_host()
     assert!(text.contains(&format!("{} MiB host budget", host >> 20)), "{text}");
     assert!(text.contains("cache pages"), "{text}");
 }
+
+/// A plan whose device does not fit even with every weight offloaded is refused for the device, though the host is
+/// short too once the cache pages are counted; the message names the host shortfall beside it.
+#[test]
+fn a_device_that_cannot_fit_is_refused_for_the_device_though_the_host_is_short_too() {
+    let (config, table) = (config(), rco_table());
+    let mut settings = settings(32_768);
+    settings.context.kv_cache_on_gpu_tokens = 8192;
+    let need = plan_with(&config, &table, &settings, inputs(64 * GIB, Some(u64::MAX)))
+        .unwrap()
+        .device_bytes;
+    let host = 2200 * MIB;
+    let error = plan_with(
+        &config,
+        &table,
+        &settings,
+        inputs(need - (12 * GIB + 5 * MIB), Some(host)),
+    )
+    .unwrap_err();
+    let PlanError::DeviceTooSmallWithOffload { host: figures, .. } = error else {
+        panic!("expected the device refusal, got {error:?}");
+    };
+    assert!(figures.cache_pages > 0 && figures.needed() > host && figures.weights <= host);
+    assert!(error.to_string().contains("the host is short too"), "{error}");
+}

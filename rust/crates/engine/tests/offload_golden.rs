@@ -100,7 +100,7 @@ fn rows() -> Vec<Row> {
 fn the_plans_of_the_reference_planner_are_reproduced_row_for_row() {
     let (config, table) = (config(), rco_table());
     let rows = rows();
-    assert_eq!(rows.len(), 315);
+    assert_eq!(rows.len(), 316);
     let mut mismatches = Vec::new();
     let mut kinds = [0usize; 3];
     for row in &rows {
@@ -194,7 +194,7 @@ fn the_plans_of_the_reference_planner_are_reproduced_row_for_row() {
     }
     assert_eq!(
         kinds,
-        [250, 61, 4],
+        [250, 61, 5],
         "the reference's mix of fits, host and device refusals"
     );
     assert!(
