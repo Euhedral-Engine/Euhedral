@@ -24,16 +24,24 @@ fn library_name() -> &'static str {
     }
 }
 
-/// The CUDA library: `lib/` under `host.native-cache` when that is set, else `lib/` beside the executable. Both are
-/// the layout the Java server unpacks its native files into (`lib/`, `share/` and `cuda/` under one root).
+/// The CUDA library: `lib/` under `host.native-cache` when that is set, else `lib/` beside the executable, else (the
+/// bundle: `bin/euhedral-server` with `lib/` beside `bin/`) `lib/` beside the executable's directory. These are the
+/// layout the Java server unpacks its native files into (`lib/`, `share/` and `cuda/` under one root).
 pub fn library_path(settings: &Settings, executable: Option<&Path>) -> PathBuf {
-    let root = match &settings.host.native_cache {
-        Auto::Value(root) => root.clone(),
-        Auto::Auto => executable
-            .and_then(Path::parent)
-            .map_or_else(PathBuf::new, Path::to_path_buf),
-    };
-    root.join("lib").join(library_name())
+    let library = |root: &Path| root.join("lib").join(library_name());
+    if let Auto::Value(root) = &settings.host.native_cache {
+        return library(root);
+    }
+    let directory = executable
+        .and_then(Path::parent)
+        .map_or_else(PathBuf::new, Path::to_path_buf);
+    let beside = library(&directory);
+    if !beside.is_file()
+        && let Some(bundle) = directory.parent().map(library).filter(|bundled| bundled.is_file())
+    {
+        return bundle;
+    }
+    beside
 }
 
 /// The server's start error for an engine start error: the messages are the engine's.
@@ -68,7 +76,11 @@ fn started(host: EngineHost) -> Started {
 
 #[cfg(test)]
 mod tests {
+    use std::env::{temp_dir, var_os};
+    use std::fs;
+    use std::io;
     use std::path::Path;
+    use std::process::id;
 
     use euhedral_inference_settings::ModelSettings;
 
@@ -93,6 +105,26 @@ mod tests {
     fn the_library_is_beside_the_executable_otherwise() {
         let path = library_path(&settings(), Some(Path::new("bin/euhedral-server")));
         assert_eq!(path, Path::new("bin").join("lib").join(library_name()));
+    }
+
+    #[test]
+    fn a_bundled_layout_finds_the_library_beside_bin_without_a_native_cache() -> io::Result<()> {
+        let base = var_os("EUHEDRAL_SCRATCH").map_or_else(temp_dir, PathBuf::from);
+        let bundle = base.join(format!("engine-bundle-{}", id()));
+        let lib = bundle.join("lib");
+        fs::create_dir_all(&lib)?;
+        fs::create_dir_all(bundle.join("bin"))?;
+        fs::write(lib.join(library_name()), "stand-in")?;
+        let path = library_path(&settings(), Some(&bundle.join("bin").join("euhedral-server")));
+        assert_eq!(path, lib.join(library_name()));
+        assert!(path.is_file());
+        // A library beside the executable still wins.
+        fs::create_dir_all(bundle.join("bin/lib"))?;
+        fs::write(bundle.join("bin/lib").join(library_name()), "x")?;
+        let path = library_path(&settings(), Some(&bundle.join("bin").join("euhedral-server")));
+        assert_eq!(path, bundle.join("bin/lib").join(library_name()));
+        drop(fs::remove_dir_all(bundle));
+        Ok(())
     }
 
     #[test]

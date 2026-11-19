@@ -5,6 +5,9 @@
 //! the output does not drift. bindgen also needs libclang; its version is not pinned (the generated declarations do
 //! not depend on it for this header). With `--check` it regenerates into `target/` and fails when the checked-in file
 //! differs.
+//!
+//! `cargo xtask bundle --product <linux-x64|windows-x64> [--native <dir>] [--out <dir>]` builds `euhedral-server` in
+//! release and assembles a runnable bundle (see [`bundle`]).
 
 // A build tool, not a library crate: it has no clippy.toml of the no-wait bans, and its output, its `expect` and its
 // exit are its interface.
@@ -14,6 +17,8 @@
     clippy::expect_used,
     reason = "a binary: it reports on the terminal and may abort"
 )]
+
+mod bundle;
 
 use std::env;
 use std::fs;
@@ -31,7 +36,8 @@ fn main() -> ExitCode {
     let result = match arguments.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["bindings"] => bindings(false),
         ["bindings", "--check"] => bindings(true),
-        _ => Err("usage: cargo xtask bindings [--check]".to_string()),
+        ["bundle", rest @ ..] => bundle::run(rest),
+        _ => Err("usage: cargo xtask bindings [--check] | bundle --product <linux-x64|windows-x64> [--native <dir>] [--out <dir>]".to_string()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -43,7 +49,7 @@ fn main() -> ExitCode {
 }
 
 /// The repository root: this crate sits at `<root>/rust/xtask`.
-fn repository_root() -> PathBuf {
+pub(crate) fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)

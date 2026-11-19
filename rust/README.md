@@ -75,6 +75,23 @@ planned launch the family files produce. Two files turn a plan into work on a Ru
 The device tests `kernels_gpu` (ignored by default) check that every catalog kernel resolves with parameters a
 plan can pass and print the module compile and load times.
 
+## Server bundle
+
+`cargo xtask bundle --product linux-x64` (or `windows-x64`, on Windows) builds `euhedral-server` in release and
+assembles a runnable directory from it and the native product the Gradle build leaves in `build/native/<product>`
+(run `gradle nativeVerify` first; `--native <dir>` and `--out <dir>` override the product and output directories). The
+result is `build/bundle/euhedral-server-<product>/` and an archive of it (`.tar.gz` on Linux, `.zip` on Windows):
+
+```text
+bin/euhedral-server
+lib/                  the CUDA library, CUDA runtime, NVRTC and llguidance
+share/euhedral_cuda/  the kernel sources
+cuda/include/         the CUDA headers
+```
+
+Unpack it anywhere and run `bin/euhedral-server --config <file>`: with no `host.native-cache` set, the server finds
+`lib/` beside `bin/`. CI builds and uploads the linux-x64 archive next to the server jar.
+
 ## Benchmark
 
 `euhedral-bench` (crate `euhedral-inference-bench`) measures the Rust engine with the Java benchmark's configuration
