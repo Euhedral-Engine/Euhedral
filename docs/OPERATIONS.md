@@ -141,7 +141,7 @@ The image holds the linux-x64 server bundle (`cargo xtask bundle --product linux
 `/opt/euhedral`: `bin/euhedral-server` is the entry point and finds `lib/` beside it. Settings are given as for the
 Java image: `--config <mounted file>`, or variables (`docker run -e`, `--env-file`). The distroless base has no shell
 or curl, so the health check is `bin/euhedral-health-probe`, which asks `GET /health` of `127.0.0.1` on
-`EUHEDRAL_SERVER_PORT`, else `PORT`, else 1738, gives up after two seconds and exits 1 unless the answer is `200`. A
+`EUHEDRAL_SERVER_PORT`, else `PORT`, else 1738, allows two seconds each to connect, to send the request and to read the answer, and exits 1 unless the answer is `200`. A
 server that listens on another port through a settings file needs the same port in one of those variables for the
 check to follow it.
 

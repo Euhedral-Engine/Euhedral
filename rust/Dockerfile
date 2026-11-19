@@ -15,13 +15,15 @@ RUN curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.x
     && rm /tmp/zig.tar.xz
 ENV ZIG=/opt/zig/zig
 ARG RUSTUP_SHA256=4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10
-ARG RUST_VERSION=1.99.1
+# The Rust version and components come from rust/rust-toolchain.toml; the Zig and cargo-zigbuild pins must match mise.toml.
+COPY rust/rust-toolchain.toml /tmp/rust-toolchain.toml
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:/opt/zig:$PATH
 RUN curl -fsSL https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init -o /tmp/rustup-init \
     && printf '%s  %s\n' "$RUSTUP_SHA256" /tmp/rustup-init | sha256sum -c - \
     && chmod +x /tmp/rustup-init \
-    && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "$RUST_VERSION" \
-    && rm /tmp/rustup-init \
+    && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "$(sed -n 's/^channel = "\(.*\)"/\1/p' /tmp/rust-toolchain.toml)" \
+        --component rustfmt --component clippy \
+    && rm /tmp/rustup-init /tmp/rust-toolchain.toml \
     && cargo install cargo-zigbuild --version 0.23.4 --locked
 COPY . .
 # build/native/linux-x64 (the CUDA library, runtime, NVRTC, llguidance, kernel sources and headers), then the bundle
