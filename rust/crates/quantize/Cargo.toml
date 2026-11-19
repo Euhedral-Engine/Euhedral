@@ -1,0 +1,17 @@
+[package]
+name = "euhedral-inference-quantize"
+version = "0.1.0"
+description = "The quantization command line: parses the command and its flags and runs it on the quantization library."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "quantization"
+path = "src/main.rs"
+
+[dependencies]
+euhedral-inference-quantization = { path = "../quantization" }
+
+[lints]
+workspace = true

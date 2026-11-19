@@ -444,6 +444,7 @@ dependencies = [
  "euhedral-hashing",
  "euhedral-inference-edrl",
  "euhedral-inference-engine",
+ "euhedral-inference-quantization",
  "euhedral-inference-settings",
  "euhedral-inference-tokenizer",
  "euhedral-io",
@@ -509,6 +510,22 @@ dependencies = [
 [[package]]
 name = "euhedral-inference-host-gemv"
 version = "0.1.0"
+
+[[package]]
+name = "euhedral-inference-quantization"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "test-support",
+ "thiserror",
+]
+
+[[package]]
+name = "euhedral-inference-quantize"
+version = "0.1.0"
+dependencies = [
+ "euhedral-inference-quantization",
+]
 
 [[package]]
 name = "euhedral-inference-server"

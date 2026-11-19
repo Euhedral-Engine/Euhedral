@@ -7,8 +7,8 @@
 
 use euhedral_inference_tokenizer::TokenizerError;
 
-use super::splittable_random::SplittableRandom;
 use super::{Built, PromptError};
+use euhedral_inference_quantization::java_random::SplittableRandom;
 
 pub const GENERATOR: &str = "euhedral-words-v1";
 
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn words_come_from_the_list_in_draw_order() {
         let built = build(8, DEFAULT_SEED, count).unwrap();
-        // The first 16 draws for this seed are the indices in the splittable_random test.
+        // The first 16 draws for this seed are the indices in the java_random tests of the quantization crate.
         let expected: Vec<&str> = [36, 49, 6, 25, 30, 62, 47, 44]
             .iter()
             .map(|index| WORDS[*index])

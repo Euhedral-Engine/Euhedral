@@ -33,6 +33,8 @@ TOKENIZER = "euhedral-inference-tokenizer"
 ENGINE = "euhedral-inference-engine"
 API_SERVER = "euhedral-inference-api-server"
 BENCH = "euhedral-inference-bench"
+QUANTIZATION = "euhedral-inference-quantization"
+QUANTIZE = "euhedral-inference-quantize"
 SERVER = "euhedral-inference-server"
 TEST_SUPPORT = "test-support"
 XTASK = "xtask"
@@ -51,18 +53,20 @@ ALLOWED = {
     CUDA: set(),
     API_SERVER: {API_PROTOCOL, ENGINE, SETTINGS, TOKENIZER},
     ENGINE: {SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER},
-    BENCH: {ENGINE, SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER},
+    QUANTIZATION: {SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER, ENGINE},
+    QUANTIZE: {QUANTIZATION, SETTINGS, ENGINE, CUDA},
+    BENCH: {ENGINE, SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER, QUANTIZATION},
     SERVER: {API_SERVER, SETTINGS},
     XTASK: set(),
 }
 # Binaries: their main thread may block, so they do not carry the no-wait clippy.toml. Every other crate does.
-BINARIES = {BENCH, SERVER, XTASK}
+BINARIES = {BENCH, QUANTIZE, SERVER, XTASK}
 # Crates that no crate may depend on except as a dev-dependency.
 DEV_ONLY = {TEST_SUPPORT}
 
 # external crate -> crates that may depend on it.
 RUSTEE = {"euhedral-core", "euhedral-gpu", "euhedral-graph", "euhedral-io", "euhedral-memory", "euhedral-net"}
-RUSTEE_OWNERS = {ENGINE, BENCH, CUDA, API_SERVER, SERVER}
+RUSTEE_OWNERS = {ENGINE, BENCH, CUDA, API_SERVER, SERVER, QUANTIZATION, QUANTIZE}
 # Configuration is parsed in one place.
 YAML = "serde_yaml_ng"
 YAML_OWNERS = {SETTINGS}
