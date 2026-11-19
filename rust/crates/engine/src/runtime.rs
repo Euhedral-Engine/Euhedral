@@ -226,6 +226,21 @@ impl Core {
         LaneId((self.compute + 1 + chain) as u16)
     }
 
+    /// The lane the weight transfers of a staging ring run on: the last transfer lane. The upload is over when
+    /// they run, and the sequences' prefix copies keep off it when the plan stages ([`Core::copy_lanes`]).
+    pub(crate) fn staging_lane_id(&self) -> LaneId {
+        self.transfer_lane_id(self.transfer_lanes().saturating_sub(1))
+    }
+
+    /// The transfer lanes the sequences' prefix copies share: all of them, or all but the staging lane when
+    /// `staged`. There are at least two transfer lanes.
+    pub(crate) fn copy_lanes(&self, staged: bool) -> usize {
+        match staged {
+            true => self.transfer_lanes().saturating_sub(1).max(1),
+            false => self.transfer_lanes().max(1),
+        }
+    }
+
     /// The number of transfer lanes.
     pub(crate) fn transfer_lanes(&self) -> usize {
         self.lane_table.len() - self.compute - 1
@@ -273,9 +288,13 @@ pub struct StartupReport {
     pub objects: usize,
     /// Payload bytes of the objects held in pinned host memory (the host arena's contents).
     pub host_backed_bytes: u64,
+    /// Payload bytes of the objects the plan leaves in the artifact file, read through the disk window.
+    pub disk_backed_bytes: u64,
+    /// Device bytes of the staging ring the staged weights are copied into; 0 when nothing is staged.
+    pub staging_bytes: u64,
     /// The objects among them that kernels read in place over the bus (the embedding and the output head).
     pub mapped_objects: Vec<String>,
-    /// Bytes this runtime allocated on the device: the weight arena, the workspace and the sequence state.
+    /// Bytes this runtime allocated on the device: the weight arena, the staging ring, the workspace and the sequence state.
     pub allocated_bytes: u64,
     /// Bytes the memory planner admitted for the plan, per location: the device bytes of the weights, the cache, the
     /// runtime reserve and the scratch, and the pinned host bytes of the cache pages and the prefix cache's arena.
@@ -974,7 +993,11 @@ pub fn open_lane_set<G: Gpu>(
     };
     let mut specs: Vec<(&str, StreamOptions)> = Vec::with_capacity(compute + 1 + transfers);
     specs.extend((0..compute + 1).map(|_| ("stage", stage)));
-    specs.extend((0..transfers).map(|_| ("transfer", transfer)));
+    // The last transfer lane is the one the staging transfers run on: it records a marker for each, as a stage lane does.
+    specs.extend((0..transfers).map(|index| match index + 1 == transfers {
+        true => ("staging", stage),
+        false => ("transfer", transfer),
+    }));
     let shared = open_shared_lanes(gpu, &specs)?;
     let reserved: Vec<LaneId> = (compute..compute + 1 + transfers)
         .map(|lane| LaneId(lane as u16))

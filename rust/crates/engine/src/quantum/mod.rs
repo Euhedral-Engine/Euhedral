@@ -492,6 +492,67 @@ pub struct Started {
     pub root: StageId,
     /// The stage whose marker covers the quantum's device work.
     pub sink: StageId,
+    /// The unit that reads each staging slot last, which a later quantum's first copy into the slot waits for; empty for
+    /// a quantum that stages nothing.
+    pub slot_readers: Arc<[Option<StageId>]>,
+}
+
+/// The slot readers of a quantum that reads no staging slot: one empty list, shared.
+pub fn no_slot_readers() -> Arc<[Option<StageId>]> {
+    static NONE: OnceLock<Arc<[Option<StageId>]>> = OnceLock::new();
+    Arc::clone(NONE.get_or_init(|| Arc::from(Vec::new())))
+}
+
+/// What a new quantum is ordered by in a predecessor: where it entered its graph, the stage whose marker covers its
+/// device work, and the unit that reads each staging slot last.
+#[derive(Clone, Copy, Debug)]
+pub struct Predecessor<'a> {
+    pub root: StageId,
+    pub sink: StageId,
+    pub slot_readers: &'a [Option<StageId>],
+}
+
+/// An edge from a stage of the predecessor `after[predecessor]` to a stage of the new quantum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dependency {
+    pub predecessor: usize,
+    pub from_stage: StageId,
+    pub to_stage: StageId,
+}
+
+/// The edges a new quantum starts with, behind each predecessor in `after`:
+/// - its first stage waits for the predecessor's sink: the chain's token passes from one quantum to the next, and the
+///   workspace's buffers are reused;
+/// - the first transfer of each staging slot (`first_transfers`: the slot and the transfer's unit) waits for the
+///   predecessor's last reader of that slot only, so the copies overlap the predecessor's tail. A predecessor that
+///   reads no slot gives its root, which already waited for the quantum before it.
+///
+/// A predecessor the order no longer holds (retired) is not in `after` and gives nothing. A view that stages nothing
+/// has no first transfer and gets the first stage's edges alone.
+pub fn external_edges(first_transfers: &[(usize, StageId)], after: &[Predecessor<'_>]) -> SmallVec<[Dependency; 16]> {
+    let mut edges = SmallVec::new();
+    for (predecessor, previous) in after.iter().enumerate() {
+        edges.push(Dependency {
+            predecessor,
+            from_stage: previous.sink,
+            to_stage: StageId(0),
+        });
+    }
+    for (predecessor, previous) in after.iter().enumerate() {
+        for &(slot, to_stage) in first_transfers {
+            edges.push(Dependency {
+                predecessor,
+                from_stage: previous
+                    .slot_readers
+                    .get(slot)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(previous.root),
+                to_stage,
+            });
+        }
+    }
+    edges
 }
 
 /// What stops a quantum from starting.
@@ -562,6 +623,8 @@ pub struct Executor {
     cache: Arc<SharedGraphCache<CudaGpu, u128>>,
     /// Whether quanta that can be keyed run as graph bodies.
     captures: AtomicBool,
+    /// By variant, the unit that reads each staging slot last (empty for a variant that stages nothing).
+    slot_readers: Vec<Arc<[Option<StageId>]>>,
     /// Runs the sequence's prefix-cache copy jobs, when it has a cache.
     copier: Option<Copier>,
     /// Uploads the input record of a quantum that arrives unprepared (an offered verification, prepared when its pass
@@ -643,6 +706,13 @@ impl Executor {
             }
             whole.push(bodies);
         }
+        let slot_readers = Variant::ALL
+            .into_iter()
+            .map(|variant| match plan.slot_readers(variant.representative()) {
+                [] => no_slot_readers(),
+                readers => Arc::from(readers),
+            })
+            .collect();
         Ok(Executor {
             plan,
             stage_lanes,
@@ -651,6 +721,7 @@ impl Executor {
             whole,
             cache,
             captures: AtomicBool::new(captures_per_view > 0),
+            slot_readers,
             copier: None,
             preparer: None,
         })
@@ -785,6 +856,7 @@ impl Executor {
             .flatten()
             .filter(|_| self.plan.capturable(view));
         let body = keyed.and_then(|key| self.whole[variant.index()].get(home).map(|graph| (key, graph)));
+        let captured = body.is_some();
         let (graph, sink) = match body {
             Some((key, graph)) => {
                 quantum.capture = Some(Capture::new(key.digest()));
@@ -792,18 +864,32 @@ impl Executor {
             }
             None => (eager, StageId((stages - 1) as u16)),
         };
-        let external = after.iter().map(|previous| ExternalEdge {
-            from: previous.reference.clone(),
-            from_stage: previous.sink,
-            to_stage: StageId(0),
-            kind: EdgeKind::Submission,
-        });
+        // A captured body is one stage; a staged view is never captured, so its first transfers exist only in the
+        // stage-by-stage graph.
+        let first_transfers = if captured { &[] } else { self.plan.first_transfers(view) };
+        let predecessors: SmallVec<[Predecessor<'_>; 4]> = after
+            .iter()
+            .map(|previous| Predecessor {
+                root: previous.root,
+                sink: previous.sink,
+                slot_readers: &previous.slot_readers,
+            })
+            .collect();
+        let external = external_edges(first_transfers, &predecessors)
+            .into_iter()
+            .map(|edge| ExternalEdge {
+                from: after[edge.predecessor].reference.clone(),
+                from_stage: edge.from_stage,
+                to_stage: edge.to_stage,
+                kind: EdgeKind::Submission,
+            });
         let reference = graph.start(quantum, kill, external);
         Ok(Started {
             serial,
             reference,
             root: StageId(0),
             sink,
+            slot_readers: Arc::clone(&self.slot_readers[variant.index()]),
         })
     }
 }

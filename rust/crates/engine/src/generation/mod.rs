@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use euhedral_core::generics::FrameSink;
 use euhedral_data_structures::queues::MpscQueue;
 use euhedral_graph::{DEFAULT_RETRY_BACKSTOP, GraphRuntime, RetryCounts};
-use euhedral_inference_cuda::CudaLibrary;
+use euhedral_inference_cuda::{CudaLibrary, DevicePtr};
 use euhedral_memory::Claim;
 
 use crate::error::EngineError;
@@ -38,11 +38,12 @@ use crate::formats::{Nvfp4Linear, TrellisLinear};
 use crate::frames::{Kind, step};
 use crate::model::{LayerIndex, ModelConfig, Role, Weights};
 use crate::pass_assembler::PassStatistics;
-use crate::plan::{Formats, Plan, View};
+use crate::plan::{Formats, Plan, StageKind, StagingRing, View};
 use crate::prefix::{
     CacheSpec, Copier, POSITION_GRANULE, PrefixCacheHandle, PrefixCacheStats, open_prefix_cache_claimed,
 };
 use crate::quantum::{Executor, Preparer};
+use crate::residency::offload::StagingGeometry;
 use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
 use crate::state::{SequenceId, SequenceState};
@@ -97,6 +98,63 @@ impl fmt::Debug for Generation {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("Generation").finish_non_exhaustive()
     }
+}
+
+/// The staging ring of a plan whose weights are staged, over the device buffer at `base`: `None` when nothing is
+/// staged. A ring with no buffer, or a plan that stages with no pinned host arena to copy from, is an error.
+pub fn staging_ring(
+    geometry: Option<StagingGeometry>,
+    base: Option<DevicePtr>,
+    has_host_arena: bool,
+) -> Result<Option<StagingRing>, String> {
+    let Some(geometry) = geometry else {
+        return Ok(None);
+    };
+    let base = base.ok_or_else(|| "the plan stages weights and the engine allocated no staging ring".to_string())?;
+    if !has_host_arena {
+        return Err("the plan stages weights and holds no pinned host arena to copy them from".to_string());
+    }
+    Ok(Some(StagingRing {
+        base,
+        slots: geometry.slots,
+        slot_bytes: geometry.slot_bytes,
+    }))
+}
+
+/// The markers a lane's ring must hold for `sequences` sequences of `plan`: those of the stages that run on it. A
+/// quantum records a marker per stage, so the stage lanes hold the compute stages (`transfers` false) and the staging
+/// lane the weight transfers (`transfers` true), which the unstaged stage bound the rings are sized from does not count.
+pub fn markers_in_flight(plan: &Plan, sequences: usize, transfers: bool) -> usize {
+    let stages_of = |view: View| {
+        plan.stages(view).map_or(0, |entries| {
+            entries
+                .iter()
+                .filter(|entry| (entry.kind == StageKind::WeightTransfer) == transfers)
+                .count()
+        })
+    };
+    let biggest = [
+        View::Decode,
+        View::PrefillChunk,
+        View::Verify { rows: 2 },
+        View::Draft { rows: 1 },
+    ]
+    .into_iter()
+    .map(stages_of)
+    .max()
+    .unwrap_or(0);
+    // A greedy request keeps a few quanta in flight; a speculative step keeps its catch-up, drafts and verification,
+    // and the owner prepares one more behind them.
+    let step = if plan.drafts() {
+        stages_of(View::Verify {
+            rows: plan.verified_rows(),
+        }) + stages_of(View::Draft { rows: 1 }) * plan.verified_rows()
+            + biggest
+    } else {
+        0
+    };
+    // Every sequence keeps that many in flight on the same lanes.
+    (biggest * STAGE_RING_QUANTA).max(step) * sequences.max(1)
 }
 
 impl Generation {
@@ -214,8 +272,22 @@ impl Generation {
             )),
             Arc::new(Nvfp4Linear::new(library)),
         );
-        let plan = Plan::build(config, weights, residency, &formats, None, None)
-            .map_err(|error| EngineError::Runtime(format!("the execution plan: {error}")))?;
+        // The staging ring and the lane its transfers run on, when the plan holds weights that are staged.
+        let ring = staging_ring(
+            residency.offload.staging,
+            weights.staging_base(),
+            weights.host_arena().is_some(),
+        )
+        .map_err(EngineError::Runtime)?;
+        let plan = Plan::build(
+            config,
+            weights,
+            residency,
+            &formats,
+            ring.as_ref(),
+            ring.as_ref().map(|_| core.staging_lane_id()),
+        )
+        .map_err(|error| EngineError::Runtime(format!("the execution plan: {error}")))?;
         if plan.fan_out_width() > core.compute_lanes() {
             return Err(EngineError::Runtime(format!(
                 "the plan's graphs fan out {} wide and the engine made {} lanes for them",
@@ -223,35 +295,17 @@ impl Generation {
                 core.compute_lanes()
             )));
         }
-        let stages_of = |view: View| plan.stages(view).map_or(0, <[_]>::len);
-        let biggest = [
-            View::Decode,
-            View::PrefillChunk,
-            View::Verify { rows: 2 },
-            View::Draft { rows: 1 },
-        ]
-        .into_iter()
-        .map(stages_of)
-        .max()
-        .unwrap_or(0);
-        // A greedy request keeps a few quanta in flight; a speculative step keeps its catch-up, drafts and verification,
-        // and the owner prepares one more behind them.
-        let step = if plan.drafts() {
-            stages_of(View::Verify {
-                rows: plan.verified_rows(),
-            }) + stages_of(View::Draft { rows: 1 }) * plan.verified_rows()
-                + biggest
-        } else {
-            0
-        };
-        // Every sequence keeps that many in flight on the same lanes.
-        let needed = (biggest * STAGE_RING_QUANTA).max(step) * sequences.max(1);
-        if needed > core.stage_ring {
-            return Err(EngineError::Runtime(format!(
-                "the quanta in flight of {sequences} sequences record {needed} markers on a lane and the lanes' rings of \
-                 {} events do not hold them",
-                core.stage_ring
-            )));
+        for (needed, what) in [
+            (markers_in_flight(&plan, sequences, false), "stage"),
+            (markers_in_flight(&plan, sequences, true), "staging"),
+        ] {
+            if needed > core.stage_ring {
+                return Err(EngineError::Runtime(format!(
+                    "the quanta in flight of {sequences} sequences record {needed} markers on a {what} lane and the \
+                     lanes' rings of {} events do not hold them",
+                    core.stage_ring
+                )));
+            }
         }
         let runtime = GraphRuntime {
             stages: Arc::clone(&core.stages) as Arc<dyn FrameSink>,
@@ -303,7 +357,7 @@ impl Generation {
         };
         // The sequence's own transfer lane (sequences share them when there are fewer lanes than sequences), so that
         // one sequence's restore does not wait behind another's capture on a lane they would not share.
-        let lane = core.transfer_lane_id(sequence.0 % core.transfer_lanes().max(1));
+        let lane = core.transfer_lane_id(sequence.0 % core.copy_lanes(residency.offload.staging.is_some()));
         // A copy job that ended tells the order, as a quantum's retirement does (what waits behind it starts), and then
         // the sequence's owner, which counts it until now.
         let owner = Arc::clone(address);

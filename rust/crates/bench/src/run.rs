@@ -230,6 +230,9 @@ pub fn snapshot(options: &Options, runtime: &EngineRuntime) -> Value {
             "nativeLibraryPath": runtime.library().path().display().to_string(),
             "device": runtime.library().device().to_string(),
             "startupSeconds": runtime.report().ready.as_secs_f64(),
+            "hostBackedBytes": runtime.report().host_backed_bytes,
+            "diskBackedBytes": runtime.report().disk_backed_bytes,
+            "stagingBytes": runtime.report().staging_bytes,
         },
     })
 }
