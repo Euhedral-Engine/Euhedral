@@ -181,18 +181,34 @@ class Tree:
                     break
         return seen
 
+    def macro_bindings(self, name, parameters, active=()):
+        """Every way the macro is instantiated, as parameter -> argument text, following a use that sits inside
+        another macro's definition back to that macro's own uses."""
+        found = []
+        for text in self.texts.values():
+            for use in re.finditer(r"\b" + name + r"\(([^()]*)\)", text):
+                if re.search(r"#define\s+$", text[:use.start()]):
+                    continue
+                arguments = [a.strip() for a in use.group(1).split(",")]
+                outer = macro_of(text, use.start())
+                if outer is None:
+                    found.append(dict(zip(parameters, arguments)))
+                elif outer[0] != name and outer[0] not in active:
+                    for binding in self.macro_bindings(outer[0], outer[1], active + (name,)):
+                        found.append(dict(zip(parameters, [binding.get(a, a) for a in arguments])))
+        return found
+
     def macro_owners(self, function):
-        """The kernels a macro-generated function stands for, with ## pasted names spelled out."""
+        """The kernels a macro-generated function stands for, with ## pasted names spelled out. A macro used by
+        another macro is expanded through the outer one's arguments."""
         if function.macro is None:
             return [function.name]
-        macro_name, parameters = function.macro
         owners = []
-        for text in self.texts.values():
-            for use in re.finditer(r"^\s*" + macro_name + r"\(([^)]*)\)", text, re.M):
-                owner = function.name
-                for parameter, argument in zip(parameters, [a.strip() for a in use.group(1).split(",")]):
-                    owner = re.sub(r"\b" + parameter + r"\b", argument, owner)
-                owners.append(owner.replace("##", ""))
+        for binding in self.macro_bindings(*function.macro):
+            owner = function.name
+            for parameter, argument in binding.items():
+                owner = re.sub(r"\b" + parameter + r"\b", argument, owner)
+            owners.append(owner.replace("##", ""))
         return owners or [function.name]
 
 

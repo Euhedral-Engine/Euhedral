@@ -28,8 +28,8 @@ use euhedral_inference_quantization::resume::{HEADER, Header, ResumeError, Resum
 use euhedral_inference_settings::{ModelSettings, Settings};
 use euhedral_io::AsyncIo;
 
-/// The longest a test waits for a call that must finish.
-const LONGEST: Duration = Duration::from_secs(60);
+/// The wait for a call whose hang is the likely failure: long enough for a loaded machine, short enough to fail fast.
+const HANG: Duration = Duration::from_secs(10);
 
 struct World {
     lattice: Arc<ControlPlaneLattice>,
@@ -72,7 +72,7 @@ fn call<T: Send + 'static>(start: impl FnOnce(Then<T>) -> Result<(), ResumeError
         sender.send(result);
         Box::new(DummyFrame::INSTANCE)
     }))?;
-    handoff.wait(LONGEST).expect("the continuation never ran")
+    handoff.wait(HANG).expect("the continuation never ran")
 }
 
 fn step_header(step: u64) -> Header {
@@ -270,7 +270,7 @@ fn a_continuation_may_remove_the_file_it_was_started_from() {
         file.set_header(&step_header(2), Box::new(continuation)).unwrap();
         drop(file);
         gate.store(true, Ordering::SeqCst);
-        let removed = report.wait(LONGEST).expect("the removal was never reported");
+        let removed = report.wait(HANG).expect("the removal was never reported");
         assert!(removed.is_ok(), "{removed:?}");
         assert!(!path.exists());
     }
@@ -296,7 +296,7 @@ fn a_refused_later_step_is_told_to_the_continuation() {
         }),
     );
     assert!(started.is_ok(), "{started:?}");
-    let result = report.wait(LONGEST).expect("the refusal was never reported");
+    let result = report.wait(HANG).expect("the refusal was never reported");
     assert!(matches!(result, Err(ResumeError::Io(_))), "{result:?}");
     drop(file);
     world.finish();
