@@ -105,6 +105,7 @@ void* euhedral_cuda_host_weights_malloc(uint64_t byte_size) {
 #ifdef _WIN32
     void* address = _aligned_malloc(size, EUHEDRAL_HOST_WEIGHT_ALIGNMENT);
     if (address == NULL) return NULL;
+    memset(address, 0, size);  // the arena contract is zeroed memory, as on the other branch
 #else
     void* address = NULL;
     if (posix_memalign(&address, EUHEDRAL_HOST_WEIGHT_ALIGNMENT, size) != 0) return NULL;
@@ -114,7 +115,8 @@ void* euhedral_cuda_host_weights_malloc(uint64_t byte_size) {
     memset(address, 0, size);
     for (int attempt = 0; attempt < 3 && madvise(address, size, MADV_COLLAPSE) != 0; attempt++) {}
 #endif
-    if (cudaHostRegister(address, size, cudaHostRegisterMapped) != cudaSuccess) {
+    // Portable: every device, not only the current one, can address the arena.
+    if (cudaHostRegister(address, size, cudaHostRegisterMapped | cudaHostRegisterPortable) != cudaSuccess) {
 #ifdef _WIN32
         _aligned_free(address);
 #else
