@@ -273,15 +273,6 @@ impl PlanReservation {
             .sum()
     }
 
-    /// A claim of the runtime reserve for an allocation of `bytes`, and the bytes the reserve has not left for it. What
-    /// the reserve pays for is what the plan did not count (the workspace's slots grow with the rows of a pass), so the
-    /// allocation is never refused for it: the shortfall is the caller's to report.
-    pub fn claim_reserve(&mut self, bytes: u64) -> Result<(Claim, u64), EngineError> {
-        let left = self.left(Consumer::RuntimeReserve);
-        let taken = bytes.min(left);
-        Ok((self.claim(Consumer::RuntimeReserve, taken)?, bytes - taken))
-    }
-
     /// A claim of `bytes` of `consumer`'s share, to be held for as long as the allocation it accounts for. Refused,
     /// naming the consumer, when the plan has not that many bytes left for it: the allocation is larger than planned.
     pub fn claim(&mut self, consumer: Consumer, bytes: u64) -> Result<Claim, EngineError> {
