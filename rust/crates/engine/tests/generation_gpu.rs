@@ -45,6 +45,7 @@ use std::process::Command;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use euhedral_inference_cuda::launch::load::tensor_map_counts;
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
 mod common;
 
@@ -394,7 +395,14 @@ fn greedy_tokens_match_java_for_short_prompt() {
 
     // Twice on one engine: the second request resets the sequence and replays the graphs the first recorded.
     for round in 0..2 {
+        let (asked_before, encoded_before) = tensor_map_counts();
         let recording = generate(&runtime, &reference.prompt, 128, &eos);
+        let (asked, encoded) = tensor_map_counts();
+        println!(
+            "round {round}: {} tensor maps asked for, {} encoded",
+            asked - asked_before,
+            encoded - encoded_before
+        );
         assert_eq!(recording.outcome.reason, FinishReason::Length, "round {round}");
         assert_eq!(recording.outcome.prompt_tokens, reference.prompt.len());
         assert_eq!(recording.outcome.generated, 128);

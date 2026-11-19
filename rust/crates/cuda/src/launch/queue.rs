@@ -122,7 +122,10 @@ where
         ..geometry(launch)
     };
     ARGUMENTS.with_borrow_mut(|arguments| {
-        fill_arguments(arguments, launch, |map| resolved.tensor_map(&tiled_map(map)))?;
+        let maps = table.tensor_maps();
+        fill_arguments(arguments, launch, |map| {
+            maps.get_or_encode(map, |plan| resolved.tensor_map(&tiled_map(plan)))
+        })?;
         // SAFETY: the caller's contract; the arguments were checked against the kernel's parameter sizes above.
         unsafe { queue.launch(resolved.kernel(), geometry, arguments) }
             .map_err(|source| EnqueueError::Gpu { name, source })
@@ -155,8 +158,8 @@ fn zero_gaps(arguments: &mut Args, launch: &Launch) {
     arguments.clear();
 }
 
-/// Rewrites `arguments` as the launch's: the tensor maps first (the kernel's leading parameters, each encoded by
-/// `encode`, as the native wrapper has the driver encode them for each launch), then the words.
+/// Rewrites `arguments` as the launch's: the tensor maps first (the kernel's leading parameters, each from
+/// `encode`, which the queue backs with the table's cache of encoded maps), then the words.
 fn fill_arguments(
     arguments: &mut Args,
     launch: &Launch,
@@ -242,6 +245,7 @@ mod tests {
     use crate::DevicePtr;
     use crate::kernel;
     use crate::launch::catalog::Arguments;
+    use crate::launch::load::TensorMapCache;
     use crate::launch::nvfp4::{Nvfp4Layout, Nvfp4Operands, nvfp4_byte_size, plan_native};
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
@@ -477,6 +481,79 @@ mod tests {
         // The buffer is rewritten, not appended to.
         fill_arguments(&mut arguments, &launch, |map| TensorMap::fake(&tiled_map(map))).unwrap();
         assert_eq!(arguments.len(), 9);
+    }
+
+    /// Fills `arguments` for `launch` through `cache`, counting the encode calls it makes.
+    fn fill_cached(cache: &TensorMapCache, arguments: &mut Args, launch: &Launch) -> usize {
+        let mut calls = 0;
+        fill_arguments(arguments, launch, |map| {
+            cache.get_or_encode(map, |plan| {
+                calls += 1;
+                TensorMap::fake(&tiled_map(plan))
+            })
+        })
+        .unwrap();
+        calls
+    }
+
+    #[test]
+    fn a_launch_enqueued_again_encodes_no_map_and_passes_the_same_bytes() {
+        let (launch, cache) = (tile_launch(), TensorMapCache::default());
+        let (mut first, mut second, mut direct) = (Args::new(), Args::new(), Args::new());
+        assert_eq!(
+            fill_cached(&cache, &mut first, &launch),
+            3,
+            "a cold launch encodes its maps"
+        );
+        assert_eq!(
+            fill_cached(&cache, &mut second, &launch),
+            0,
+            "a warm launch encodes nothing"
+        );
+        assert_eq!(cache.encodes(), 3);
+        fill_arguments(&mut direct, &launch, |map| TensorMap::fake(&tiled_map(map))).unwrap();
+        assert_eq!(first, direct);
+        assert_eq!(
+            second, direct,
+            "the cached bytes are the bytes encoding each time gives"
+        );
+    }
+
+    #[test]
+    fn a_changed_address_or_shape_encodes_that_map_again() {
+        let (launch, cache) = (tile_launch(), TensorMapCache::default());
+        let mut arguments = Args::new();
+        fill_cached(&cache, &mut arguments, &launch);
+        let mut moved = launch;
+        let mut maps = moved.args.maps().copied().collect::<Vec<_>>();
+        maps[1].address += 0x100;
+        moved.args = maps.iter().fold(Arguments::new(), |args, map| args.tensor_map(*map));
+        for (&word, &size) in launch.args.words().iter().zip(launch.args.sizes()) {
+            moved.args = if size == 4 {
+                moved.args.u32(word as u32)
+            } else {
+                moved.args.u64(word)
+            };
+        }
+        assert_eq!(
+            fill_cached(&cache, &mut arguments, &moved),
+            1,
+            "only the moved map is encoded"
+        );
+        let mut direct = Args::new();
+        fill_arguments(&mut direct, &moved, |map| TensorMap::fake(&tiled_map(map))).unwrap();
+        assert_eq!(arguments, direct);
+        assert_eq!(
+            fill_cached(&cache, &mut arguments, &launch),
+            0,
+            "the first launch's maps are still kept"
+        );
+        let mut reshaped = maps[0];
+        reshaped.dims[1] += 1;
+        cache
+            .get_or_encode(&reshaped, |plan| TensorMap::fake(&tiled_map(plan)))
+            .unwrap();
+        assert_eq!(cache.encodes(), 5);
     }
 
     #[test]
