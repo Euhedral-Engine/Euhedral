@@ -15,10 +15,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use checkpoint_support::World;
-use euhedral_inference_quantization::exl3::Exl3Writer;
+use checkpoint_support::{Spec, World, bf16, safetensors, write};
+use euhedral_inference_quantization::exl3::{Exl3Writer, Listing};
 use exl3_support::{
-    CONFIG, GDN, MTP, layer_results, listing, miniature, mtp_results, names, open, run, tensor_names, tensor_of,
+    ATTENTION, CONFIG, GDN, MTP, all_rates, layer_results, listing, miniature, miniature_with, mtp_results, names,
+    open, run, tensor_names, tensor_of,
 };
 use serde_json::Value;
 
@@ -49,7 +50,7 @@ fn writer(fixture: &Fixture) -> Exl3Writer {
 }
 
 fn rates(bits: f64) -> HashMap<String, f64> {
-    layer_results(bits).1
+    all_rates(bits)
 }
 
 fn finish(fixture: &Fixture, writer: Exl3Writer, bits: &HashMap<String, f64>) -> (Exl3Writer, Result<(), String>) {
@@ -58,13 +59,20 @@ fn finish(fixture: &Fixture, writer: Exl3Writer, bits: &HashMap<String, f64>) ->
     (writer, result.map_err(|error| error.to_string()))
 }
 
-fn write_layer_and_mtp(fixture: &Fixture, writer: Exl3Writer) -> Exl3Writer {
-    let (results, bits) = layer_results(2.0);
-    let (writer, result) = run(|done| writer.layer(0, &results, &bits, done));
-    result.unwrap();
+fn write_layers_and_mtp(writer: Exl3Writer) -> Exl3Writer {
+    let writer = write_layers(writer);
     let (writer, result) = run(|done| writer.mtp(&mtp_results(), done));
     result.unwrap();
-    let _ = fixture;
+    writer
+}
+
+fn write_layers(mut writer: Exl3Writer) -> Exl3Writer {
+    for index in [0, 1] {
+        let (results, bits) = layer_results(index, 2.0);
+        let (next, result) = run(|done| writer.layer(index, results, &bits, done));
+        result.unwrap();
+        writer = next;
+    }
     writer
 }
 
@@ -78,14 +86,14 @@ fn json(path: &Path) -> Value {
 #[test]
 fn a_full_write_holds_every_source_tensor_in_the_layout() {
     let f = fixture(CONFIG, 1.0);
-    let writer = write_layer_and_mtp(&f, writer(&f));
+    let writer = write_layers_and_mtp(writer(&f));
     let (_, result) = finish(&f, writer, &rates(2.0));
     result.unwrap();
 
     let layer = f.out.join("model.language_model.layers.0.safetensors");
     let first = format!("{LAYER}{}", GDN[0]);
     let (dtype, shape, _) = tensor_of(&layer, &format!("{first}.trellis"));
-    assert_eq!((dtype.as_str(), shape), ("I16", vec![8, 8, 32]));
+    assert_eq!((dtype.as_str(), shape), ("I16", vec![8, 16, 32]));
     let (dtype, shape, suh) = tensor_of(&layer, &format!("{first}.suh"));
     assert_eq!((dtype.as_str(), shape), ("F16", vec![128]));
     assert_eq!(&suh[34..36], &0x3C00u16.to_le_bytes(), "the scales are the ones given");
@@ -165,7 +173,7 @@ fn a_full_write_holds_every_source_tensor_in_the_layout() {
 
     let config = json(&f.out.join("config.json"));
     assert_eq!(config["tie_word_embeddings"], false);
-    assert_eq!(config["text_config"]["num_hidden_layers"], 1);
+    assert_eq!(config["text_config"]["num_hidden_layers"], 2);
     let quantization = &config["quantization_config"];
     assert_eq!(quantization["quant_method"], "exl3");
     assert_eq!(quantization["version"], "1.6.1");
@@ -174,8 +182,8 @@ fn a_full_write_holds_every_source_tensor_in_the_layout() {
     let full = json(&f.out.join("quantization_config.json"));
     assert_eq!(
         full["tensor_storage"].as_object().unwrap().len(),
-        14,
-        "the 11 modules of the layer, the embedding, the final norm and lm_head"
+        25,
+        "the 11 modules of each layer, the embedding, the final norm and lm_head"
     );
 
     let files: BTreeSet<String> = names(&f.out).into_iter().collect();
@@ -203,7 +211,7 @@ fn finish_refuses_a_checkpoint_missing_a_layer_before_it_writes_anything() {
     assert!(result.unwrap_err().contains("not written"));
     assert!(names(&f.out).is_empty(), "{:?}", names(&f.out));
     // The writer is given back whole: the same one goes on.
-    let writer = write_layer_and_mtp(&f, writer);
+    let writer = write_layers_and_mtp(writer);
     let (_, result) = finish(&f, writer, &rates(2.0));
     result.unwrap();
     f.world.finish();
@@ -213,7 +221,7 @@ fn finish_refuses_a_checkpoint_missing_a_layer_before_it_writes_anything() {
 #[test]
 fn a_value_beyond_half_precision_in_lm_head_is_refused_and_no_file_is_left() {
     let f = fixture(CONFIG, 1.0e38);
-    let writer = write_layer_and_mtp(&f, writer(&f));
+    let writer = write_layers_and_mtp(writer(&f));
     let (_, result) = finish(&f, writer, &rates(2.0));
     assert!(result.unwrap_err().contains("lm_head.weight"));
     let files = names(&f.out);
@@ -227,14 +235,14 @@ fn a_value_beyond_half_precision_in_lm_head_is_refused_and_no_file_is_left() {
 #[test]
 fn half_integer_rates_are_declared_and_stored() {
     let f = fixture(CONFIG, 1.0);
-    let (results, bits) = layer_results(2.5);
-    let (writer, result) = run(|done| writer(&f).layer(0, &results, &bits, done));
+    let (results, bits) = layer_results(0, 2.5);
+    let (writer, result) = run(|done| writer(&f).layer(0, results, &bits, done));
     result.unwrap();
     let (_, shape, _) = tensor_of(
         &f.out.join("model.language_model.layers.0.safetensors"),
         &format!("{LAYER}{}.trellis", GDN[0]),
     );
-    assert_eq!(shape, vec![8, 8, 40]);
+    assert_eq!(shape, vec![8, 16, 40]);
     let storage = writer.tensor_storage();
     let module = &storage[format!("{LAYER}{}", GDN[0])];
     assert_eq!(module["bits_per_weight"], 2.5, "a half-integer rate is a float");
@@ -251,14 +259,14 @@ fn half_integer_rates_are_declared_and_stored() {
 #[test]
 fn a_result_that_does_not_fit_its_linear_is_refused_and_nothing_is_written() {
     let f = fixture(CONFIG, 1.0);
-    let (mut results, bits) = layer_results(2.0);
+    let (mut results, bits) = layer_results(0, 2.0);
     results.get_mut(&format!("{LAYER}{}", GDN[2])).unwrap().trellis.pop();
-    let (writer, result) = run(|done| writer(&f).layer(0, &results, &bits, done));
+    let (writer, result) = run(|done| writer(&f).layer(0, results, &bits, done));
     assert!(result.is_err());
     assert!(names(&f.out).is_empty());
-    let (mut results, bits) = layer_results(2.0);
+    let (mut results, bits) = layer_results(0, 2.0);
     results.get_mut(&format!("{LAYER}{}", GDN[1])).unwrap().svh.pop();
-    let (_, result) = run(|done| writer.layer(0, &results, &bits, done));
+    let (_, result) = run(|done| writer.layer(0, results, &bits, done));
     assert!(result.is_err());
     assert!(names(&f.out).is_empty());
     f.world.finish();
@@ -268,11 +276,11 @@ fn a_result_that_does_not_fit_its_linear_is_refused_and_nothing_is_written() {
 #[test]
 fn a_result_for_a_linear_that_is_not_quantized_is_refused() {
     let f = fixture(CONFIG, 1.0);
-    let (mut results, mut bits) = layer_results(2.0);
+    let (mut results, mut bits) = layer_results(0, 2.0);
     let stray = format!("{LAYER}linear_attn.in_proj_a");
     results.insert(stray.clone(), results[&format!("{LAYER}{}", GDN[0])].clone());
     bits.insert(stray, 2.0);
-    let (_, result) = run(|done| writer(&f).layer(0, &results, &bits, done));
+    let (_, result) = run(|done| writer(&f).layer(0, results, &bits, done));
     assert!(result.unwrap_err().to_string().contains("in_proj_a"));
     assert!(names(&f.out).is_empty());
     f.world.finish();
@@ -299,7 +307,7 @@ fn mtp_needs_exactly_its_eight_linears() {
 #[test]
 fn files_an_earlier_run_left_are_adopted() {
     let f = fixture(CONFIG, 1.0);
-    let first = write_layer_and_mtp(&f, writer(&f));
+    let first = write_layers_and_mtp(writer(&f));
     drop(first);
     // A new writer finishes the checkpoint from what is on disk.
     let (_, result) = finish(&f, writer(&f), &rates(2.0));
@@ -320,7 +328,7 @@ fn files_an_earlier_run_left_are_adopted() {
             .as_object()
             .unwrap()
             .len(),
-        14
+        25
     );
     f.world.finish();
 }
@@ -329,17 +337,17 @@ fn files_an_earlier_run_left_are_adopted() {
 #[test]
 fn an_earlier_layer_file_missing_tensors_fails_finish() {
     let f = fixture(CONFIG, 1.0);
-    let first = write_layer_and_mtp(&f, writer(&f));
+    let first = write_layers_and_mtp(writer(&f));
     drop(first);
     // Replace the layer file with one that lacks most of its tensors.
     let layer = f.out.join("model.language_model.layers.0.safetensors");
-    let spec = vec![checkpoint_support::Spec {
+    let spec = vec![Spec {
         name: "model.language_model.layers.0.input_layernorm.weight",
         dtype: "BF16",
         shape: vec![128],
-        bytes: checkpoint_support::bf16(&[1.0; 128]),
+        bytes: bf16(&[1.0; 128]),
     }];
-    checkpoint_support::write(&layer, &checkpoint_support::safetensors(&spec));
+    write(&layer, &safetensors(&spec));
     let (_, result) = finish(&f, writer(&f), &rates(2.0));
     assert!(result.unwrap_err().contains("earlier run"));
     assert!(!names(&f.out).contains(&"lm_head.safetensors".to_owned()));
@@ -350,8 +358,8 @@ fn an_earlier_layer_file_missing_tensors_fails_finish() {
 #[test]
 fn a_stray_safetensors_file_is_refused_before_the_large_files() {
     let f = fixture(CONFIG, 1.0);
-    let writer = write_layer_and_mtp(&f, writer(&f));
-    checkpoint_support::write(&f.out.join("model.language_model.layers.7.safetensors"), b"x");
+    let writer = write_layers_and_mtp(writer(&f));
+    write(&f.out.join("model.language_model.layers.7.safetensors"), b"x");
     let (_, result) = finish(&f, writer, &rates(2.0));
     assert!(result.unwrap_err().contains("layers.7"));
     let files = names(&f.out);
@@ -363,7 +371,7 @@ fn a_stray_safetensors_file_is_refused_before_the_large_files() {
 #[test]
 fn a_rate_that_differs_from_the_stored_one_is_refused() {
     let f = fixture(CONFIG, 1.0);
-    let writer = write_layer_and_mtp(&f, writer(&f));
+    let writer = write_layers_and_mtp(writer(&f));
     let (_, result) = finish(&f, writer, &rates(3.0));
     assert!(result.unwrap_err().contains("different rate"));
     assert!(!names(&f.out).contains(&"lm_head.safetensors".to_owned()));
@@ -375,7 +383,7 @@ fn a_rate_that_differs_from_the_stored_one_is_refused() {
 fn a_source_that_is_already_quantized_is_refused_before_the_large_files() {
     let quantized = CONFIG.replacen('{', r#"{"quantization_config":{"quant_method":"gptq"},"#, 1);
     let f = fixture(&quantized, 1.0);
-    let writer = write_layer_and_mtp(&f, writer(&f));
+    let writer = write_layers_and_mtp(writer(&f));
     let (_, result) = finish(&f, writer, &rates(2.0));
     assert!(result.unwrap_err().contains("already quantized"));
     assert!(!names(&f.out).contains(&"lm_head.safetensors".to_owned()));
@@ -386,9 +394,9 @@ fn a_source_that_is_already_quantized_is_refused_before_the_large_files() {
 #[test]
 fn writing_a_layer_again_replaces_it() {
     let f = fixture(CONFIG, 1.0);
-    let writer = write_layer_and_mtp(&f, writer(&f));
-    let (results, bits) = layer_results(2.0);
-    let (writer, result) = run(|done| writer.layer(0, &results, &bits, done));
+    let writer = write_layers_and_mtp(writer(&f));
+    let (results, bits) = layer_results(0, 2.0);
+    let (writer, result) = run(|done| writer.layer(0, results, &bits, done));
     result.unwrap();
     let (_, result) = finish(&f, writer, &rates(2.0));
     result.unwrap();
@@ -398,5 +406,144 @@ fn writing_a_layer_again_replaces_it() {
         total += tensor_of(&f.out.join(file.as_str().unwrap()), name).2.len() as u64;
     }
     assert_eq!(index["metadata"]["total_size"].as_u64().unwrap(), total);
+    f.world.finish();
+}
+
+// Mutants caught: a second layer written under the first one's name or prefix; the q/k norms of a full-attention layer
+// dropped or converted; a full-attention linear stored with the wrong shape.
+#[test]
+fn a_full_attention_layer_is_written_with_its_norms() {
+    let f = fixture(CONFIG, 1.0);
+    let (results, bits) = layer_results(1, 2.0);
+    let (_, result) = run(|done| writer(&f).layer(1, results, &bits, done));
+    result.unwrap();
+    assert_eq!(names(&f.out), ["model.language_model.layers.1.safetensors"]);
+    let file = f.out.join("model.language_model.layers.1.safetensors");
+    let (dtype, shape, _) = tensor_of(&file, &format!("{ATTENTION}self_attn.q_proj.trellis"));
+    assert_eq!((dtype.as_str(), shape), ("I16", vec![8, 16, 32]));
+    let (_, shape, svh) = tensor_of(&file, &format!("{ATTENTION}self_attn.q_proj.svh"));
+    assert_eq!((shape, svh.len()), (vec![256], 512));
+    for norm in ["q_norm", "k_norm"] {
+        let (dtype, shape, bytes) = tensor_of(&file, &format!("{ATTENTION}self_attn.{norm}.weight"));
+        assert_eq!((dtype.as_str(), shape), ("BF16", vec![64]), "{norm}");
+        assert_eq!(&bytes[..2], &0x3F80u16.to_le_bytes(), "{norm} keeps its source bytes");
+    }
+    assert!(
+        !tensor_names(&file).contains(&format!("{ATTENTION}self_attn.q_proj.weight")),
+        "a quantized linear keeps no BF16 weight"
+    );
+    // A layer's results belong to it: layer 0's go to no other layer.
+    let (results, bits) = layer_results(0, 2.0);
+    let (_, result) = run(|done| writer(&f).layer(1, results, &bits, done));
+    assert!(result.is_err());
+    f.world.finish();
+}
+
+// Mutants caught: an F16 source converted as if it were BF16 (its bits changed); an F16 projection refused.
+#[test]
+fn an_f16_source_projection_is_passed_through() {
+    let f = fixture(CONFIG, 1.0);
+    let writer = write_layers_and_mtp(writer(&f));
+    let (_, result) = finish(&f, writer, &rates(2.0));
+    result.unwrap();
+    let (dtype, _, bytes) = tensor_of(
+        &f.out.join("model.language_model.layers.0.safetensors"),
+        &format!("{LAYER}linear_attn.in_proj_b.weight"),
+    );
+    assert_eq!(dtype, "F16");
+    let source = tensor_of(
+        &f.source.join("model.safetensors"),
+        &format!("{LAYER}linear_attn.in_proj_b.weight"),
+    );
+    assert_eq!(bytes, source.2, "the bytes are the source's");
+    f.world.finish();
+}
+
+// Mutant caught: a source projection of another dtype being written as it is, or converted as if it were BF16.
+#[test]
+fn a_projection_that_is_neither_bf16_nor_f16_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let (source, out) = (directory.path().join("source"), directory.path().join("out"));
+    let name = format!("{LAYER}linear_attn.in_proj_a.weight");
+    miniature_with(&source, CONFIG, 1.0, &[(name, "F32")]);
+    fs::create_dir_all(&out).unwrap();
+    let world = World::start();
+    let (results, bits) = layer_results(0, 2.0);
+    let (_, result) = run(|done| open(&world, &source, &out, 2.0, 4, 8).layer(0, results, &bits, done));
+    assert!(result.unwrap_err().to_string().contains("in_proj_a.weight is F32"));
+    assert!(names(&out).is_empty());
+    world.finish();
+}
+
+// Mutants caught: a copy that stops at the last whole chunk, repeats a chunk or reads at the wrong offset (the buffer
+// of the tests is 4096 bytes).
+#[test]
+fn an_auxiliary_file_larger_than_the_buffer_is_copied_whole() {
+    let f = fixture(CONFIG, 1.0);
+    let content: Vec<u8> = (0..3 * 4096 + 123).map(|at| (at % 251) as u8).collect();
+    write(&f.source.join("tokenizer.json"), &content);
+    let writer = write_layers_and_mtp(writer(&f));
+    let (_, result) = finish(&f, writer, &rates(2.0));
+    result.unwrap();
+    assert_eq!(fs::read(f.out.join("tokenizer.json")).unwrap(), content);
+    assert!(!names(&f.out).iter().any(|file| file.ends_with(".part")));
+    f.world.finish();
+}
+
+// Mutant caught: a copy of a file that does not exist ending without an error or leaving a file.
+#[test]
+fn a_listed_source_file_that_is_gone_fails_the_copy_and_leaves_no_file() {
+    let f = fixture(CONFIG, 1.0);
+    let writer = write_layers_and_mtp(writer(&f));
+    let list = listing(&f.source, &f.out);
+    fs::remove_file(f.source.join("tokenizer.json")).unwrap();
+    let (writer, result) = run(|done| writer.finish(&rates(2.0), list, done));
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("tokenizer.json"), "{message}");
+    assert!(!names(&f.out).iter().any(|file| file.ends_with(".part")));
+    // The writer comes back and goes on with a fresh listing.
+    write(&f.source.join("tokenizer.json"), b"{}");
+    let list = listing(&f.source, &f.out);
+    let (_, result) = run(|done| writer.finish(&rates(2.0), list, done));
+    result.unwrap();
+    f.world.finish();
+}
+
+// Mutant caught: a listing of the output taken before the last layer was written being trusted, so a file the index
+// lists is not there to be checked.
+#[test]
+fn a_listing_of_the_output_that_misses_a_written_file_is_refused() {
+    let f = fixture(CONFIG, 1.0);
+    let writer = write_layers_and_mtp(writer(&f));
+    let list = Listing {
+        source: names(&f.source),
+        out: names(&f.out)
+            .into_iter()
+            .filter(|file| file != "mtp.safetensors")
+            .collect(),
+    };
+    let (writer, result) = run(|done| writer.finish(&rates(2.0), list, done));
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("mtp.safetensors"), "{message}");
+    assert!(!names(&f.out).contains(&"lm_head.safetensors".to_owned()));
+    let (_, result) = finish(&f, writer, &rates(2.0));
+    result.unwrap();
+    f.world.finish();
+}
+
+// Mutant caught: an empty listing of the source finishing a checkpoint that has no tokenizer, no license and no config.
+#[test]
+fn a_listing_of_the_source_without_config_json_is_refused() {
+    let f = fixture(CONFIG, 1.0);
+    let writer = write_layers_and_mtp(writer(&f));
+    let list = Listing {
+        source: Vec::new(),
+        out: names(&f.out),
+    };
+    let (writer, result) = run(|done| writer.finish(&rates(2.0), list, done));
+    assert!(result.unwrap_err().to_string().contains("config.json"));
+    assert!(!names(&f.out).contains(&"lm_head.safetensors".to_owned()));
+    let (_, result) = finish(&f, writer, &rates(2.0));
+    result.unwrap();
     f.world.finish();
 }

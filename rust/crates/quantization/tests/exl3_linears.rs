@@ -1,5 +1,5 @@
-//! The linears of the Swift 1.5 checkpoint: where their rows sit in the fused objects, and that the built-in shapes
-//! are the checkpoint's own. Skipped without `euhedral.quantization.checkpoint`.
+//! The linears of a Qwen 3.8 checkpoint: where their rows sit in the fused objects (on a miniature one), and that the
+//! built-in shapes are the Swift 1.5 checkpoint's own (skipped without `euhedral.quantization.checkpoint`).
 
 #![allow(
     clippy::unwrap_used,
@@ -9,24 +9,38 @@
 )]
 
 mod checkpoint_support;
+mod exl3_support;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use checkpoint_support::World;
 use euhedral_inference_quantization::checkpoint::objects::Qwen38Objects;
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
 use euhedral_inference_quantization::exl3::linears::{layer, placements, qwen38, qwen38_of};
+use exl3_support::{CONFIG, miniature};
 use test_support::require_property;
+
+fn objects_of(world: &World, directory: &Path) -> Qwen38Objects {
+    let store = Arc::new(
+        world
+            .call(|done| Safetensors::open(&world.io, directory, done))
+            .unwrap(),
+    );
+    world.call(|done| Qwen38Objects::open(store, directory, done)).unwrap()
+}
+
+/// The miniature checkpoint: a linear-attention layer and a full-attention one.
+fn synthetic(world: &World) -> (tempfile::TempDir, Qwen38Objects) {
+    let directory = tempfile::tempdir().unwrap();
+    miniature(directory.path(), CONFIG, 1.0);
+    let objects = objects_of(world, directory.path());
+    (directory, objects)
+}
 
 fn open(world: &World) -> Option<Qwen38Objects> {
     let directory = PathBuf::from(require_property("euhedral.quantization.checkpoint")?);
-    let store = Arc::new(
-        world
-            .call(|done| Safetensors::open(&world.io, &directory, done))
-            .unwrap(),
-    );
-    Some(world.call(|done| Qwen38Objects::open(store, &directory, done)).unwrap())
+    Some(objects_of(world, &directory))
 }
 
 // Mutant caught: a placement that skips a piece, or counts a piece's rows from the wrong object row, leaves a row
@@ -34,11 +48,8 @@ fn open(world: &World) -> Option<Qwen38Objects> {
 #[test]
 fn placements_cover_every_row_of_a_linear_once() {
     let world = World::start();
-    let Some(objects) = open(&world) else {
-        world.finish();
-        return;
-    };
-    for index in [0, 3] {
+    let (_directory, objects) = synthetic(&world);
+    for index in [0, 1] {
         for linear in layer(&objects, index)
             .unwrap()
             .into_iter()
@@ -61,10 +72,7 @@ fn placements_cover_every_row_of_a_linear_once() {
 #[test]
 fn the_gdn_a_and_b_projections_are_not_quantized_and_sit_in_no_object() {
     let world = World::start();
-    let Some(objects) = open(&world) else {
-        world.finish();
-        return;
-    };
+    let (_directory, objects) = synthetic(&world);
     let linears = layer(&objects, 0).unwrap();
     let small: Vec<_> = linears
         .iter()

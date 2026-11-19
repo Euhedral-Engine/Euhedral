@@ -5,8 +5,9 @@
 //! The writer is a value that moves with the work: each call takes it and gives it back, with the result, to the
 //! callback. A callback runs once, from a frame of the lattice that drives the `AsyncIo`, and must not wait. A call
 //! that cannot be done (a refusal, or a file that could not be written) gives the writer back with the error and with
-//! its record of the files written unchanged, so the call can be made again. The callback is not called if the host
-//! lake closes while a call is in flight.
+//! its record of the files written unchanged, so the call can be made again. A call that is dropped while it is in
+//! flight (a step that was accepted but never ran, because a lake closed under it) ends with
+//! [`CheckpointError::LakeClosed`] and the writer, so the callback runs once in every case.
 //!
 //! The directory of the output must exist. `AsyncIo` cannot make or list directories, so the caller makes the output
 //! directory and lists the source and output directories (as a [`Listing`]) when it calls [`Exl3Writer::finish`].
@@ -30,19 +31,21 @@ use super::layout::{
 use super::linears::{self, MTP_LINEARS};
 use crate::checkpoint::objects::Qwen38Objects;
 use crate::checkpoint::safetensors::Safetensors;
-use crate::checkpoint::writer::{DEFAULT_BUFFER_BYTES, SafetensorsWriter, Source};
+use crate::checkpoint::writer::{DEFAULT_BUFFER_BYTES, SafetensorsWriter, Source, bytes_source, copy_file, write_file};
 use crate::checkpoint::{CheckpointError, Done as ReadDone, read_file};
 
 /// What a call of the writer ends with: the writer, and whether the call worked.
-pub type Done = Arc<dyn Fn(Exl3Writer, Result<(), CheckpointError>) + Send + Sync>;
+pub type Done = EndOf<Exl3Writer>;
 
 /// The names of the files in the two directories, which the caller lists.
 #[derive(Clone, Debug, Default)]
 pub struct Listing {
-    /// The files of the source checkpoint: the auxiliary ones are copied.
+    /// The regular files of the source checkpoint (not directories): the auxiliary ones are copied, and `config.json`
+    /// must be among them.
     pub source: Vec<String>,
-    /// The files of the output directory: an earlier run's layer files are adopted, and a safetensors file that
-    /// nothing here accounts for is refused.
+    /// The files of the output directory, listed after the last layer or MTP write: an earlier run's layer files are
+    /// adopted, a safetensors file that nothing here accounts for is refused, and every file this run wrote must be
+    /// in it.
     pub out: Vec<String>,
 }
 
@@ -195,6 +198,44 @@ fn after(then: Done, next: impl FnOnce(Exl3Writer, Done) + Send + 'static) -> Do
     })
 }
 
+/// What a call ends with, for a writer of type `W`.
+type EndOf<W> = Arc<dyn Fn(W, Result<(), CheckpointError>) + Send + Sync>;
+
+/// The writer and the callback of a call, parked while an asynchronous step holds the call. The step takes them; if the
+/// step is dropped without running, the last holder's drop ends the call with [`CheckpointError::LakeClosed`], so the
+/// callback always runs. The caller of a step keeps one holder until the step is accepted, so a step that is refused
+/// reports its own error first.
+struct Parked<W, E> {
+    cell: Arc<Handoff<(W, EndOf<W>, E)>>,
+}
+
+impl<W: Send + 'static, E: Send + 'static> Parked<W, E> {
+    fn new(writer: W, then: EndOf<W>, extra: E) -> Arc<Self> {
+        let cell = Handoff::new();
+        cell.send((writer, then, extra));
+        Arc::new(Self { cell })
+    }
+
+    fn take(&self) -> Option<(W, EndOf<W>, E)> {
+        self.cell.take()
+    }
+
+    /// Ends the call with the error of a step that was refused, unless the step took the call.
+    fn refused(&self, error: CheckpointError) {
+        if let Some((writer, then, _)) = self.take() {
+            then(writer, Err(error));
+        }
+    }
+}
+
+impl<W, E> Drop for Parked<W, E> {
+    fn drop(&mut self) {
+        if let Some((writer, then, _)) = self.cell.take() {
+            then(writer, Err(CheckpointError::LakeClosed));
+        }
+    }
+}
+
 /// Writes a Qwen 3.8 checkpoint in exllamav3's EXL3 layout from quantized results and the BF16 source.
 ///
 /// - One safetensors file per decoder layer (`model.language_model.layers.<i>.safetensors`), `mtp.safetensors`,
@@ -279,11 +320,12 @@ impl Exl3Writer {
 
     /// Writes decoder layer `index`: the quantized linears (keyed by tensor name without `.weight`, as
     /// [`linears::layer`] names them, with their bits in `bits_by_linear`), the unquantized linears as F16 and every
-    /// other tensor of the layer as in the source.
+    /// other tensor of the layer as in the source. The results are taken, and each is dropped once its tensors are
+    /// made, so a layer's results are not in memory twice; a refused call drops them too.
     pub fn layer(
         self,
         index: usize,
-        quantized: &HashMap<String, Quantized>,
+        quantized: HashMap<String, Quantized>,
         bits_by_linear: &HashMap<String, f64>,
         then: Done,
     ) {
@@ -296,33 +338,31 @@ impl Exl3Writer {
     fn layer_shard(
         &self,
         index: usize,
-        quantized: &HashMap<String, Quantized>,
+        mut quantized: HashMap<String, Quantized>,
         bits_by_linear: &HashMap<String, f64>,
     ) -> Result<Shard, CheckpointError> {
         let prefix = format!("{TEXT}layers.{index}.");
         let mut shard = Shard::new(format!("{TEXT}layers.{index}.safetensors"), false);
         let mut weights = BTreeSet::new();
-        let mut budgeted = BTreeSet::new();
         for linear in linears::layer(&self.objects, index)? {
             let weight = format!("{}.weight", linear.tensor);
             if linear.quantized {
-                let (Some(result), Some(bits)) = (quantized.get(&linear.tensor), bits_by_linear.get(&linear.tensor))
+                let (Some(result), Some(bits)) = (quantized.remove(&linear.tensor), bits_by_linear.get(&linear.tensor))
                 else {
                     return Err(CheckpointError::Invalid(format!(
                         "no result or bits for {}",
                         linear.tensor
                     )));
                 };
-                for planned in quantized_tensors(&linear.tensor, linear.rows, linear.columns, *bits, result)? {
+                for planned in quantized_tensors(&linear.tensor, linear.rows, linear.columns, *bits, &result)? {
                     shard.data(planned)?;
                 }
-                budgeted.insert(linear.tensor.clone());
             } else {
                 shard.copy_as_half(self.store(), &weight)?;
             }
             weights.insert(weight);
         }
-        let mut strays: Vec<&String> = quantized.keys().filter(|key| !budgeted.contains(*key)).collect();
+        let mut strays: Vec<&String> = quantized.keys().collect();
         strays.sort();
         if let Some(stray) = strays.first() {
             return Err(CheckpointError::Invalid(format!(
@@ -401,15 +441,13 @@ impl Exl3Writer {
             listed.push((name, Stored { dtype, shape, bytes }));
         }
         let (io, host) = (Arc::clone(&self.io), Arc::clone(&self.host));
-        let cell = Handoff::new();
-        cell.send(self);
-        let waiting = Arc::clone(&cell);
-        let report = Arc::clone(&then);
+        let parked = Parked::new(self, then, (file, listed, mtp));
+        let waiting = Arc::clone(&parked);
         let started = writer.finish(
             &io,
             &host,
             Arc::new(move |result| {
-                let Some(mut writer) = waiting.take() else {
+                let Some((mut writer, then, (file, listed, mtp))) = waiting.take() else {
                     return;
                 };
                 match result {
@@ -422,10 +460,8 @@ impl Exl3Writer {
                 }
             }),
         );
-        if let Err(error) = started
-            && let Some(writer) = cell.take()
-        {
-            report(writer, Err(error));
+        if let Err(error) = started {
+            parked.refused(error);
         }
     }
 
@@ -435,7 +471,11 @@ impl Exl3Writer {
     /// both configs, once every source tensor is accounted for. Everything is checked before the large files are
     /// written: the layer and MTP files an earlier run left are adopted (each must hold exactly the tensors this
     /// writer would write), every source tensor must be written or about to be, the rates must match
-    /// `bits_by_linear`, and no safetensors file may be in the output that the index would not list.
+    /// `bits_by_linear`, no safetensors file may be in the output that the index would not list, `listing.source`
+    /// must hold `config.json` and `listing.out` every file this run wrote.
+    ///
+    /// A refusal writes nothing. A failure while writing leaves the files written so far in the output and gives the
+    /// writer back; `finish` can be called again with a new listing of the output, and rewrites those files.
     pub fn finish(self, bits_by_linear: &HashMap<String, f64>, listing: Listing, then: Done) {
         let earlier = match self.earlier_files(&listing.out) {
             Ok(earlier) => earlier,
@@ -446,11 +486,10 @@ impl Exl3Writer {
         }
         let names: Vec<String> = earlier.iter().map(|(file, _)| file.clone()).collect();
         let (io, out) = (Arc::clone(&self.io), self.out.clone());
-        let cell = Handoff::new();
-        cell.send((self, earlier, bits_by_linear.clone(), listing, Arc::clone(&then)));
-        let waiting = Arc::clone(&cell);
+        let parked = Parked::new(self, then, (earlier, bits_by_linear.clone(), listing));
+        let waiting = Arc::clone(&parked);
         let opened: ReadDone<Safetensors> = Arc::new(move |opened| {
-            let Some((mut writer, earlier, bits, listing, then)) = waiting.take() else {
+            let Some((mut writer, then, (earlier, bits, listing))) = waiting.take() else {
                 return;
             };
             let adopted = opened.and_then(|found| writer.adopt(&found, &earlier));
@@ -459,10 +498,8 @@ impl Exl3Writer {
                 Err(error) => then(writer, Err(error)),
             }
         });
-        if let Err(error) = Safetensors::open_files(&io, &out, names, opened)
-            && let Some((writer, ..)) = cell.take()
-        {
-            then(writer, Err(error));
+        if let Err(error) = Safetensors::open_files(&io, &out, names, opened) {
+            parked.refused(error);
         }
     }
 
@@ -558,11 +595,10 @@ impl Exl3Writer {
         // The source config is read before anything is written, so a source that is already quantized is refused
         // early.
         let (io, path) = (Arc::clone(&self.io), self.source.join("config.json"));
-        let cell = Handoff::new();
-        cell.send((self, jobs, Arc::clone(&then)));
-        let waiting = Arc::clone(&cell);
+        let parked = Parked::new(self, then, jobs);
+        let waiting = Arc::clone(&parked);
         let read: ReadDone<Vec<u8>> = Arc::new(move |bytes| {
-            let Some((writer, mut jobs, then)) = waiting.take() else {
+            let Some((writer, then, mut jobs)) = waiting.take() else {
                 return;
             };
             match bytes.and_then(|bytes| source_config(&bytes)) {
@@ -573,10 +609,8 @@ impl Exl3Writer {
                 Err(error) => then(writer, Err(error)),
             }
         });
-        if let Err(error) = read_file(&io, &path, read)
-            && let Some((writer, ..)) = cell.take()
-        {
-            then(writer, Err(error));
+        if let Err(error) = read_file(&io, &path, read) {
+            parked.refused(error);
         }
     }
 
@@ -586,6 +620,21 @@ impl Exl3Writer {
         bits_by_linear: &HashMap<String, f64>,
         listing: &Listing,
     ) -> Result<VecDeque<Job>, CheckpointError> {
+        if !listing.source.iter().any(|file| file == "config.json") {
+            return Err(CheckpointError::Invalid(
+                "the listing of the source has no config.json".to_owned(),
+            ));
+        }
+        let absent: Vec<&str> = self
+            .ledger
+            .files()
+            .filter(|file| !listing.out.iter().any(|listed| listed == file))
+            .collect();
+        if !absent.is_empty() {
+            return Err(CheckpointError::Invalid(format!(
+                "the listing of the output is stale: it lacks {absent:?}, which this run wrote"
+            )));
+        }
         let names = self.sorted_names();
         let head: BTreeSet<String> = [
             format!("{TEXT}embed_tokens.weight"),
@@ -674,25 +723,29 @@ impl Exl3Writer {
                 self.write_bytes(name, bytes, after(then, move |writer, then| writer.run(jobs, then)))
             }
             Job::Copy(name) => {
-                let (io, path) = (Arc::clone(&self.io), self.source.join(&name));
-                let cell = Handoff::new();
-                cell.send((self, jobs, Arc::clone(&then), name));
-                let waiting = Arc::clone(&cell);
-                let read: ReadDone<Vec<u8>> = Arc::new(move |bytes| {
-                    let Some((writer, jobs, then, name)) = waiting.take() else {
-                        return;
-                    };
-                    match bytes {
-                        Ok(bytes) => {
-                            writer.write_bytes(name, bytes, after(then, move |writer, then| writer.run(jobs, then)))
+                let (io, host) = (Arc::clone(&self.io), Arc::clone(&self.host));
+                let (from, to) = (self.source.join(&name), self.out.join(&name));
+                let buffer = self.settings.buffer_bytes;
+                let parked = Parked::new(self, then, jobs);
+                let waiting = Arc::clone(&parked);
+                let copied = copy_file(
+                    &from,
+                    &to,
+                    buffer,
+                    &io,
+                    &host,
+                    Arc::new(move |result| {
+                        let Some((writer, then, jobs)) = waiting.take() else {
+                            return;
+                        };
+                        match result {
+                            Ok(()) => writer.run(jobs, then),
+                            Err(error) => then(writer, Err(error)),
                         }
-                        Err(error) => then(writer, Err(error)),
-                    }
-                });
-                if let Err(error) = read_file(&io, &path, read)
-                    && let Some((writer, ..)) = cell.take()
-                {
-                    then(writer, Err(error));
+                    }),
+                );
+                if let Err(error) = copied {
+                    parked.refused(error);
                 }
             }
             Job::Documents(config) => match self.documents(config) {
@@ -710,25 +763,24 @@ impl Exl3Writer {
     /// Writes `bytes` as the file `name` of the output.
     fn write_bytes(self, name: String, bytes: Vec<u8>, then: Done) {
         let (io, host, path) = (Arc::clone(&self.io), Arc::clone(&self.host), self.out.join(&name));
-        let cell = Handoff::new();
-        cell.send(self);
-        let waiting = Arc::clone(&cell);
-        let report = Arc::clone(&then);
-        let started = SafetensorsWriter::write_file(
+        let (size, buffer) = (bytes.len() as u64, self.settings.buffer_bytes);
+        let parked = Parked::new(self, then, ());
+        let waiting = Arc::clone(&parked);
+        let started = write_file(
             &path,
-            bytes,
+            size,
+            bytes_source(bytes),
+            buffer,
             &io,
             &host,
             Arc::new(move |result| {
-                if let Some(writer) = waiting.take() {
+                if let Some((writer, then, ())) = waiting.take() {
                     then(writer, result);
                 }
             }),
         );
-        if let Err(error) = started
-            && let Some(writer) = cell.take()
-        {
-            report(writer, Err(error));
+        if let Err(error) = started {
+            parked.refused(error);
         }
     }
 
@@ -772,3 +824,6 @@ fn source_config(bytes: &[u8]) -> Result<Value, CheckpointError> {
         _ => Err(CheckpointError::Format("config.json is not an object".to_owned())),
     }
 }
+
+#[cfg(test)]
+mod tests;

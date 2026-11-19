@@ -130,3 +130,25 @@ fn a_file_written_again_replaces_its_entries() {
     assert_eq!(order, ["y", "x", "z"], "a rewritten file moves to the end");
     assert_eq!(index["weight_map"]["x"], "a.safetensors");
 }
+
+// A mutant that writes a made-up name for a dtype with no torch name gives a loader a dtype that does not exist.
+#[test]
+fn a_dtype_without_a_torch_name_is_stored_as_null() {
+    let mut ledger = Ledger::default();
+    let stored = |dtype: &str| Stored {
+        dtype: dtype.to_owned(),
+        shape: vec![4],
+        bytes: 8,
+    };
+    ledger.record_file(
+        "lm_head.safetensors",
+        &[
+            ("lm_head.weight".to_owned(), stored("F16")),
+            ("lm_head.bias".to_owned(), stored("Q4")),
+        ],
+    );
+    let storage = ledger.tensor_storage(0);
+    let parts = &storage["lm_head"]["stored_tensors"];
+    assert_eq!(parts["lm_head.weight"]["dtype"], "torch.float16");
+    assert!(parts["lm_head.bias"]["dtype"].is_null(), "{parts}");
+}

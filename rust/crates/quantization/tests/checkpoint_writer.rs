@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use checkpoint_support::{Spec, World, safetensors, write};
 use euhedral_inference_quantization::checkpoint::CheckpointError;
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
-use euhedral_inference_quantization::checkpoint::writer::{SafetensorsWriter, Source};
+use euhedral_inference_quantization::checkpoint::writer::{SafetensorsWriter, Source, bytes_source, write_file};
 use serde_json::Value;
 
 fn finish(world: &World, writer: SafetensorsWriter) -> Result<(), CheckpointError> {
@@ -243,7 +243,7 @@ fn a_failing_source_leaves_neither_a_part_file_nor_a_final_file() {
                 done(Ok(chunk[..1].to_vec()));
                 Ok(())
             }),
-            "the source of bad gave 1 bytes for a chunk of 2",
+            "the source of tensor bad gave 1 bytes for a chunk of 2",
         ),
         (
             "gives an oversized chunk",
@@ -252,7 +252,7 @@ fn a_failing_source_leaves_neither_a_part_file_nor_a_final_file() {
                 done(Ok(chunk));
                 Ok(())
             }),
-            "the source of bad gave 3 bytes for a chunk of 2",
+            "the source of tensor bad gave 3 bytes for a chunk of 2",
         ),
     ];
     for (what, source, message) in failures {
@@ -342,5 +342,63 @@ fn a_closed_host_lake_refuses_before_anything_is_written() {
     let refused = writer.finish(&world.io, &world.host, Arc::new(|_| panic!("nothing was started")));
     assert!(matches!(refused, Err(CheckpointError::LakeClosed)));
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    world.finish();
+}
+
+// Mutants caught: a file written in place (a stop leaves a part of it); bytes cut at a chunk boundary of the buffer; an
+// error that names no file or says "safetensors" of a file that is not one.
+#[test]
+fn write_file_writes_whole_and_names_the_file_when_it_fails() {
+    let world = World::start();
+    let directory = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..3 * 64 + 5).map(|at| at as u8).collect();
+    let path = directory.path().join("notes.txt");
+    let size = data.len() as u64;
+    world
+        .call(|done| {
+            write_file(
+                &path,
+                size,
+                bytes_source(data.clone()),
+                64,
+                &world.io,
+                &world.host,
+                done,
+            )
+        })
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), data);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1, "no part is left");
+
+    let nowhere = directory.path().join("missing").join("notes.txt");
+    let failed = world.call(|done| {
+        write_file(
+            &nowhere,
+            size,
+            bytes_source(data.clone()),
+            64,
+            &world.io,
+            &world.host,
+            done,
+        )
+    });
+    let message = failed.unwrap_err().to_string();
+    assert!(message.contains("notes.txt"), "{message}");
+    assert!(!message.contains("safetensors"), "{message}");
+
+    // A source that fails halfway: the file named is the one being written, and nothing is left.
+    let target = directory.path().join("half.txt");
+    let source: Source = Arc::new(|offset, chunk, done| {
+        if offset == 0 {
+            done(Ok(chunk));
+        } else {
+            done(Err(CheckpointError::Invalid("cut".to_owned())));
+        }
+        Ok(())
+    });
+    let failed = world.call(|done| write_file(&target, 128, source, 64, &world.io, &world.host, done));
+    assert!(failed.unwrap_err().to_string().contains("cut"));
+    assert!(!target.exists());
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1, "no part is left");
     world.finish();
 }

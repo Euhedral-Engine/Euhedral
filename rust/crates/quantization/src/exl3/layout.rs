@@ -292,8 +292,7 @@ impl Ledger {
                 };
                 let dtype = TORCH_DTYPES
                     .iter()
-                    .find_map(|(name, torch)| (*name == found.dtype).then_some(*torch))
-                    .unwrap_or("unknown");
+                    .find_map(|(name, torch)| (*name == found.dtype).then_some(*torch));
                 stored.insert(
                     format!("{key}.{part}"),
                     json!({"shape": found.shape, "n_bytes": found.bytes, "dtype": dtype}),
