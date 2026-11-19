@@ -47,8 +47,8 @@ use crate::residency::footprint;
 use crate::residency::loader::{self, LoadOutcome, Ring};
 use crate::residency::offload::{self, Offload};
 use crate::residency::planner::{LocationBytes, Placement, PlanInputs, ResidencyPlan, Tier, plan_with};
-use crate::runtime::resolve_sequences;
 use crate::runtime::{Core, EngineRuntime, ReadyHandoff, StartupReport, Units, free_arrival, raw_file};
+use crate::runtime::{lane_sizing, resolve_sequences};
 use crate::state::SequenceState;
 use crate::warmup;
 use crate::workspace::{Workspace, input_records_for};
@@ -516,41 +516,81 @@ fn check_segments(
     Ok(ends)
 }
 
-/// Step 3: plans residency against the device and the host. Failing here has allocated nothing on the device.
-fn plan(mut startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>) {
+/// Step 3a: resolves the sequence count from the free device memory, which is read after the kernels are loaded and
+/// before the lanes exist. Allocates nothing on the device. The lanes open next, in a device frame.
+fn plan(startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>) {
     let core = Arc::clone(&startup.core);
-    let free = core.library.free_bytes().map_err(EngineError::from);
-    startup.free_at_plan = free.as_ref().copied().unwrap_or(0);
-    let planned = free
-        .and_then(|device_free| {
-            let inputs = PlanInputs {
-                device_free,
-                multiprocessors: Some(core.library.device().sm_count),
-                host_pinned_bytes: core.host_pinned_bytes,
-                sequences: 1,
-            };
-            let sequences = resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)?;
-            let sequences = core.hold_sequences(sequences);
-            plan_with(
-                &artifact.config,
-                &artifact.table,
-                &core.settings,
-                PlanInputs { sequences, ..inputs },
-            )
-            .map_err(EngineError::from)
-        })
-        .and_then(|plan| refuse_offload(&plan.offload).map(|()| plan).map_err(EngineError::from))
-        // The plan is admitted by the account: its allocations take their claims from the reservation.
-        .and_then(|plan| {
-            let reservation = core.account.admit(&plan)?;
-            let admitted = reservation.admitted();
-            log::info!(
-                "memory admitted: {} bytes on the device, {} bytes of pinned host memory",
-                admitted.device,
-                admitted.host
-            );
-            Ok((plan, reservation))
-        });
+    let first = device_inputs(&core).and_then(|inputs| {
+        let first = resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)?;
+        Ok(first)
+    });
+    match first {
+        Ok(first) => startup.then(device, move |startup| open_lanes(startup, artifact, ends, first)),
+        Err(error) => startup.fail(error),
+    }
+}
+
+/// What the plan reads of the device now: the free memory (a failed read is an error, not zero).
+fn device_inputs(core: &Core) -> Result<PlanInputs, EngineError> {
+    let device_free = core.library.free_bytes().map_err(EngineError::from)?;
+    Ok(PlanInputs {
+        device_free,
+        multiprocessors: Some(core.library.device().sm_count),
+        host_pinned_bytes: core.host_pinned_bytes,
+        sequences: 1,
+    })
+}
+
+/// Step 3b, in a frame of the device lake: opens the lanes with rings for the first count, whose events take device
+/// memory, then reads the free memory again, which is the figure the plan is made from, and resolves an automatic count
+/// again ([`lane_sizing`]).
+fn open_lanes(startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>, first: usize) {
+    let core = Arc::clone(&startup.core);
+    let sized = core.open_lanes(first).and_then(|()| {
+        let inputs = device_inputs(&core)?;
+        let sizing = lane_sizing(core.settings.batching.max_sequences, first, || {
+            resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)
+        })?;
+        Ok((inputs, sizing))
+    });
+    match sized {
+        Ok((inputs, sizing)) => startup.then(host, move |startup| {
+            plan_residency(startup, artifact, ends, inputs, sizing.sequences)
+        }),
+        Err(error) => startup.fail(error),
+    }
+}
+
+/// Step 3c: plans residency against the device (as the lanes left it) and the host. Allocates nothing on the device.
+fn plan_residency(
+    mut startup: Startup,
+    artifact: Artifact,
+    ends: HashMap<String, Arc<[u32]>>,
+    inputs: PlanInputs,
+    sequences: usize,
+) {
+    let core = Arc::clone(&startup.core);
+    // The figure the plan is made from: the free memory after the lanes opened.
+    startup.free_at_plan = inputs.device_free;
+    let planned = plan_with(
+        &artifact.config,
+        &artifact.table,
+        &core.settings,
+        PlanInputs { sequences, ..inputs },
+    )
+    .map_err(EngineError::from)
+    .and_then(|plan| refuse_offload(&plan.offload).map(|()| plan).map_err(EngineError::from))
+    // The plan is admitted by the account: its allocations take their claims from the reservation.
+    .and_then(|plan| {
+        let reservation = core.account.admit(&plan)?;
+        let admitted = reservation.admitted();
+        log::info!(
+            "memory admitted: {} bytes on the device, {} bytes of pinned host memory",
+            admitted.device,
+            admitted.host
+        );
+        Ok((plan, reservation))
+    });
     match planned {
         Ok((plan, reservation)) => {
             startup.reservation = Some(reservation);
@@ -637,7 +677,7 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
         workspace.hold(scratch_claim);
         workspace.hold(reserve_claim);
-        let (sequences, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {
+        let (sequences, marker) = core.lane_table().submit_ops(core.transfer_lane(0), false, |kernels| {
             // The first sequence's state and the MTP layer's cache at the longest context, which its pages grow to.
             let first = footprint::first_sequence_bytes(&plan, &artifact.config)
                 + footprint::mtp_cache_bytes_of(&plan, &artifact.config);
@@ -696,7 +736,7 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
                     sequences,
                 )
             });
-            core.completions.after_marker(marker, frame);
+            core.completions().after_marker(marker, frame);
         }
         Err(error) => startup.fail(error),
     }
@@ -830,7 +870,7 @@ fn assemble(
         let (warmed, marker) = warmup::run(&startup.core, &artifact.config, &weights, &workspace);
         let core = Arc::clone(&startup.core);
         let free_at_plan = startup.free_at_plan;
-        let (completions, stages) = (Arc::clone(&core.completions), Arc::clone(&core.stages));
+        let (completions, stages) = (Arc::clone(core.completions()), Arc::clone(&core.stages));
         // The report and the latch wait for the lane to reach the warm-up's last launch: a completion, not a wait.
         let ready = step(Kind::Startup, 0, move || {
             let in_use = core
@@ -996,7 +1036,7 @@ impl DraftIds {
             source,
             bytes,
         } = self;
-        let queued = core.lane_table.submit_ops(core.owner_lane(), false, |kernels| {
+        let queued = core.lane_table().submit_ops(core.owner_lane(), false, |kernels| {
             // SAFETY: the loan is held by the frame that follows the copy, which runs once the lane has reached the
             // marker; nothing reads or writes the bytes before.
             unsafe { kernels.copy_device_to_readback(loan.buffer_mut(), 0, source, bytes) }
@@ -1012,7 +1052,7 @@ impl DraftIds {
                         .collect();
                     finish.run(Some(ids));
                 });
-                core.completions.after_marker(marker, frame);
+                core.completions().after_marker(marker, frame);
             }
             Err(error) => {
                 // The copy may have been queued before the call failed: the lane may still write the buffer, so it is

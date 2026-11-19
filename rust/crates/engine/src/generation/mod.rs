@@ -312,11 +312,11 @@ impl Generation {
                 core.compute_lanes()
             )));
         }
-        check_marker_rings(&plan, sequences, core.stage_ring).map_err(EngineError::Runtime)?;
+        check_marker_rings(&plan, sequences, core.stage_ring()).map_err(EngineError::Runtime)?;
         let runtime = GraphRuntime {
             stages: Arc::clone(&core.stages) as Arc<dyn FrameSink>,
-            completions: Arc::clone(&core.completions),
-            lanes: Arc::clone(&core.lanes),
+            completions: Arc::clone(core.completions()),
+            lanes: Arc::clone(core.lanes()),
             retries: Arc::new(RetryCounts::default()),
             retry_backstop: DEFAULT_RETRY_BACKSTOP,
         };
@@ -354,7 +354,7 @@ impl Generation {
         )
         .map_err(|error| EngineError::Runtime(format!("the stage graphs: {error:?}")))?
         .with_preparer(Preparer::new(
-            core.lane_table.clone(),
+            core.lane_table().clone(),
             Arc::clone(&core.pool),
             Arc::clone(core.owner_lane()),
         ));
@@ -371,7 +371,7 @@ impl Generation {
             order.retired(sequence, serial);
             owner.post(Message::CopyEnded);
         });
-        let copier = Copier::new(&runtime, core.lane_table.clone(), lane, sequence, ended)
+        let copier = Copier::new(&runtime, core.lane_table().clone(), lane, sequence, ended)
             .map_err(|error| EngineError::Runtime(format!("the prefix cache's copy graph: {error:?}")))?;
         Ok(executor.with_copier(copier))
     }

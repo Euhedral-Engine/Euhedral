@@ -38,13 +38,31 @@ use crate::workspace::{self, WorkspaceRows};
 /// workspaces, the shared scratch and the kernel modules the first launches compile.
 pub const DEFAULT_RUNTIME_RESERVE_BYTES: u64 = 1280 << 20;
 
-/// What `memory.runtime-headroom: auto` means: the device bytes kept above the demand that raises the runtime reserve,
-/// for what the driver takes after admission. Measured on a device of 70 multiprocessors with drafting on and the
-/// reserve at its tightest: the contexts, modules and warm-up launches took 118 MiB beyond the engine's allocations
-/// by the time the model was ready, and the first prefill took 128 MiB more (the code and local memory of the
-/// trellis, attention and Gated DeltaNet kernels): 246 MiB. The local memory grows with the multiprocessors, so a
-/// wider device may set it higher.
+/// The multiprocessor count of the device the headroom was measured on.
+pub const HEADROOM_MEASURED_MULTIPROCESSORS: u32 = 70;
+
+/// What `memory.runtime-headroom: auto` means on a device of [`HEADROOM_MEASURED_MULTIPROCESSORS`] multiprocessors,
+/// and the least it means on any device: the device bytes kept above the demand that raises the runtime reserve, for
+/// what the driver takes after admission. Measured on 70 multiprocessors with drafting on, BF16 KV, 8192 tokens and
+/// the reserve at its tightest: 246 MiB lost beyond the engine's allocations after admission (118 MiB by the time the
+/// model was ready, and 128 MiB at the first prefill, the code and local memory of the trellis, attention and Gated
+/// DeltaNet kernels); this is that figure with about 30% over. The local memory grows with the multiprocessors, so a
+/// wider device scales it ([`auto_runtime_headroom`]).
 pub const DEFAULT_RUNTIME_HEADROOM_BYTES: u64 = 320 << 20;
+
+/// The headroom `auto` resolves to: [`DEFAULT_RUNTIME_HEADROOM_BYTES`] scaled by the device's multiprocessors over
+/// [`HEADROOM_MEASURED_MULTIPROCESSORS`] and rounded up, never less than the default. A count that is unknown (the
+/// plan made without a device) gets the default.
+pub fn auto_runtime_headroom(multiprocessors: Option<u32>) -> u64 {
+    let Some(count) = multiprocessors else {
+        return DEFAULT_RUNTIME_HEADROOM_BYTES;
+    };
+    let scaled = (u128::from(DEFAULT_RUNTIME_HEADROOM_BYTES) * u128::from(count))
+        .div_ceil(u128::from(HEADROOM_MEASURED_MULTIPROCESSORS));
+    u64::try_from(scaled)
+        .unwrap_or(u64::MAX)
+        .max(DEFAULT_RUNTIME_HEADROOM_BYTES)
+}
 
 /// Device allocations start on this many bytes, like the driver's.
 pub const ARENA_ALIGNMENT: u64 = 256;
@@ -424,7 +442,7 @@ pub fn plan_closest(
         .memory
         .runtime_headroom
         .value()
-        .map_or(DEFAULT_RUNTIME_HEADROOM_BYTES, |size| size.bytes());
+        .map_or_else(|| auto_runtime_headroom(inputs.multiprocessors), |size| size.bytes());
     let reserve_demand = workspace_bytes
         .saturating_add(decode_scratch_bytes)
         .saturating_add(first_state)

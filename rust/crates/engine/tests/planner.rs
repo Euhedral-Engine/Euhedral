@@ -24,7 +24,7 @@ use euhedral_inference_engine::model::{ArtifactProfile, Quantization, Speculatio
 use euhedral_inference_engine::residency::footprint;
 use euhedral_inference_engine::residency::planner::{
     ARENA_ALIGNMENT, DEFAULT_RUNTIME_HEADROOM_BYTES, DEFAULT_RUNTIME_RESERVE_BYTES, PlacementSource, PlanInputs,
-    ResidencyPlan, plan, plan_closest, plan_with, sequences_for,
+    ResidencyPlan, auto_runtime_headroom, plan, plan_closest, plan_with, sequences_for,
 };
 use euhedral_inference_engine::runtime::resolve_sequences;
 use euhedral_inference_engine::workspace::{
@@ -479,6 +479,39 @@ fn a_raised_reserve_keeps_the_headroom_above_the_claims_so_a_device_of_the_plans
     // The headroom is a setting.
     let small = with_headroom(Some(64 * MIB), 64 * GIB).unwrap();
     assert_eq!(small.runtime_reserve_bytes - claims, 64 * MIB);
+}
+
+#[test]
+fn the_automatic_headroom_grows_with_the_device_multiprocessors_and_never_falls_below_the_default() {
+    assert_eq!(auto_runtime_headroom(Some(70)), DEFAULT_RUNTIME_HEADROOM_BYTES);
+    assert_eq!(auto_runtime_headroom(Some(140)), 2 * DEFAULT_RUNTIME_HEADROOM_BYTES);
+    assert_eq!(auto_runtime_headroom(None), DEFAULT_RUNTIME_HEADROOM_BYTES);
+    // A narrower device keeps the measured figure; an odd count rounds up.
+    assert_eq!(auto_runtime_headroom(Some(10)), DEFAULT_RUNTIME_HEADROOM_BYTES);
+    assert_eq!(
+        auto_runtime_headroom(Some(71)),
+        (DEFAULT_RUNTIME_HEADROOM_BYTES * 71).div_ceil(70)
+    );
+    // The plan resolves `auto` from its inputs' count.
+    let mut long = settings(262_144);
+    long.context.kv_cache_format = Auto::Value(KvFormat::Bf16);
+    long.context.kv_cache_on_gpu_tokens = 262_144;
+    // Other terms follow the count too, so the headroom is what `auto` adds to the same plan with none.
+    let headroom_on = |multiprocessors: Option<u32>| {
+        let reserve = |headroom: Auto<ByteSize>| {
+            let mut stated = long.clone();
+            stated.memory.runtime_headroom = headroom;
+            let mut inputs = inputs(64 * GIB);
+            inputs.multiprocessors = multiprocessors;
+            plan_with(&config(), &rco_table(), &stated, inputs)
+                .unwrap()
+                .runtime_reserve_bytes
+        };
+        reserve(Auto::Auto) - reserve(Auto::Value(ByteSize(0)))
+    };
+    assert_eq!(headroom_on(Some(70)), DEFAULT_RUNTIME_HEADROOM_BYTES);
+    assert_eq!(headroom_on(Some(140)), 2 * DEFAULT_RUNTIME_HEADROOM_BYTES);
+    assert_eq!(headroom_on(None), DEFAULT_RUNTIME_HEADROOM_BYTES);
 }
 
 #[test]
