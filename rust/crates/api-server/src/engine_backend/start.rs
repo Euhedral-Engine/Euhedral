@@ -120,6 +120,7 @@ impl Engine for RuntimeEngine {
             return EngineReport::default();
         };
         let depth = runtime.plan().draft_depth.min(MAX_VERIFIED);
+        let pool = runtime.pinned_pool().gauges();
         EngineReport {
             artifact: self.artifact.clone(),
             speculation: if depth > 0 { "mtp" } else { "none" }.to_owned(),
@@ -128,8 +129,8 @@ impl Engine for RuntimeEngine {
             allocated_device_bytes: runtime.report().allocated_bytes,
             free_device_bytes: runtime.library().free_bytes().unwrap_or(0),
             host_backed_weight_bytes: runtime.plan().location_bytes().host,
-            pinned_pool_bytes: runtime.pinned_pool().held_bytes(),
-            pinned_pool_overflows: 0,
+            pinned_pool_bytes: pool.held_bytes,
+            pinned_pool_overflows: pool.overflows,
             prefix_cache: runtime.prefix_cache_stats().map(prefix_report),
         }
     }

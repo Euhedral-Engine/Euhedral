@@ -53,6 +53,59 @@ impl<T> Class<T> {
     }
 }
 
+/// What a pool reports about its held buffers, read at one moment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolGauges {
+    /// Bytes of released buffers waiting for reuse.
+    pub held_bytes: u64,
+    /// Buffers the pool had no room for: each buffer the pool allocated counts once, when its first release leaves
+    /// the pool holding more than its limit. A buffer kept past the limit and reused is not counted again, so the
+    /// count does not grow with the releases. The buffers are kept anyway until [`PinnedPool::trim`] frees them.
+    pub overflows: u64,
+}
+
+/// The held-byte count, the limit and the overflow count of a pool: plain atomics, no lock.
+struct Ledger {
+    limit_bytes: u64,
+    held_bytes: AtomicU64,
+    overflows: AtomicU64,
+}
+
+impl Ledger {
+    fn new(limit_bytes: u64) -> Ledger {
+        Ledger {
+            limit_bytes,
+            held_bytes: AtomicU64::new(0),
+            overflows: AtomicU64::new(0),
+        }
+    }
+
+    /// A buffer of `bytes` was released into the pool. `fresh` is true for the first release of a buffer the pool
+    /// allocated; only that release can count an overflow, when the pool then holds more than its limit.
+    fn released(&self, bytes: u64, fresh: bool) {
+        let held = self.held_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if fresh && held > self.limit_bytes {
+            self.overflows.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A held buffer of `bytes` left the pool.
+    fn taken(&self, bytes: u64) {
+        self.held_bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    fn held_bytes(&self) -> u64 {
+        self.held_bytes.load(Ordering::Relaxed)
+    }
+
+    fn gauges(&self) -> PoolGauges {
+        PoolGauges {
+            held_bytes: self.held_bytes(),
+            overflows: self.overflows.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Pinned buffers, kept after release so the next request reuses one.
 ///
 /// Allocating pinned memory takes about a millisecond and freeing it waits for the device, so staging buffers are
@@ -67,8 +120,7 @@ impl<T> Class<T> {
 /// the resolved value.
 pub struct PinnedPool {
     library: Arc<CudaLibrary>,
-    limit_bytes: u64,
-    held_bytes: AtomicU64,
+    ledger: Ledger,
     allocated_bytes: AtomicU64,
     classes: Box<[Class<PinnedBuffer>]>,
 }
@@ -77,7 +129,7 @@ impl fmt::Debug for PinnedPool {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PinnedPool")
-            .field("limit_bytes", &self.limit_bytes)
+            .field("limit_bytes", &self.ledger.limit_bytes)
             .field("held_bytes", &self.held_bytes())
             .finish_non_exhaustive()
     }
@@ -87,8 +139,7 @@ impl PinnedPool {
     pub fn new(library: &Arc<CudaLibrary>, limit_bytes: u64) -> Arc<PinnedPool> {
         Arc::new(PinnedPool {
             library: Arc::clone(library),
-            limit_bytes,
-            held_bytes: AtomicU64::new(0),
+            ledger: Ledger::new(limit_bytes),
             allocated_bytes: AtomicU64::new(0),
             classes: (0..CLASSES).map(|_| Class::new()).collect(),
         })
@@ -101,14 +152,16 @@ impl PinnedPool {
             .checked_next_power_of_two()
             .ok_or_else(|| CudaError::Argument(format!("{bytes} bytes is too large for a pinned buffer")))?;
         let class = capacity.trailing_zeros() as usize;
+        let mut fresh = false;
         let buffer = match self.classes[class].take() {
             Some(buffer) => {
-                self.held_bytes.fetch_sub(capacity as u64, Ordering::Relaxed);
+                self.ledger.taken(capacity as u64);
                 buffer
             }
             None => {
                 let buffer = PinnedBuffer::alloc(&self.library, capacity)?;
                 self.allocated_bytes.fetch_add(capacity as u64, Ordering::Relaxed);
+                fresh = true;
                 buffer
             }
         };
@@ -116,6 +169,7 @@ impl PinnedPool {
             pool: Arc::clone(self),
             buffer: Some(buffer),
             len: bytes,
+            fresh,
         })
     }
 
@@ -127,12 +181,22 @@ impl PinnedPool {
 
     /// Bytes of released buffers waiting for reuse.
     pub fn held_bytes(&self) -> u64 {
-        self.held_bytes.load(Ordering::Relaxed)
+        self.ledger.held_bytes()
+    }
+
+    /// Releases that left the pool over its limit, since it was made (a counter).
+    pub fn overflows(&self) -> u64 {
+        self.ledger.gauges().overflows
+    }
+
+    /// The held bytes and the overflow count.
+    pub fn gauges(&self) -> PoolGauges {
+        self.ledger.gauges()
     }
 
     /// How many of the held bytes exceed the limit.
     pub fn over_limit_bytes(&self) -> u64 {
-        self.held_bytes().saturating_sub(self.limit_bytes)
+        self.held_bytes().saturating_sub(self.ledger.limit_bytes)
     }
 
     /// Frees released buffers, largest class first, until the pool holds no more than its limit; returns how many.
@@ -146,7 +210,7 @@ impl PinnedPool {
                 let Some(buffer) = self.classes[class].take() else {
                     break;
                 };
-                self.held_bytes.fetch_sub(buffer.len() as u64, Ordering::Relaxed);
+                self.ledger.taken(buffer.len() as u64);
                 self.allocated_bytes.fetch_sub(buffer.len() as u64, Ordering::Relaxed);
                 drop(buffer);
                 freed += 1;
@@ -155,13 +219,13 @@ impl PinnedPool {
         freed
     }
 
-    fn release(&self, buffer: PinnedBuffer) {
-        self.held_bytes.fetch_add(buffer.len() as u64, Ordering::Relaxed);
+    fn release(&self, buffer: PinnedBuffer, fresh: bool) {
+        self.ledger.released(buffer.len() as u64, fresh);
         let class = &self.classes[buffer.len().trailing_zeros() as usize];
         if let Err(refused) = class.give(buffer) {
             // The unbounded queue never refuses; if it does, the buffer is freed and no longer counted.
             debug_assert!(false, "an unbounded queue refused a buffer");
-            self.held_bytes.fetch_sub(refused.len() as u64, Ordering::Relaxed);
+            self.ledger.taken(refused.len() as u64);
             self.allocated_bytes.fetch_sub(refused.len() as u64, Ordering::Relaxed);
             drop(refused);
         }
@@ -175,6 +239,8 @@ pub struct PooledPinned {
     pool: Arc<PinnedPool>,
     buffer: Option<PinnedBuffer>,
     len: usize,
+    /// The pool allocated this buffer for this loan, so its release may count an overflow.
+    fresh: bool,
 }
 
 impl fmt::Debug for PooledPinned {
@@ -260,7 +326,7 @@ unsafe impl IoMemory for PooledPinned {
 impl Drop for PooledPinned {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
-            self.pool.release(buffer);
+            self.pool.release(buffer, self.fresh);
         }
     }
 }
@@ -283,6 +349,55 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn a_first_burst_over_the_limit_counts_each_buffer_the_pool_had_no_room_for() {
+        let ledger = Ledger::new(8192);
+        ledger.released(4096, true);
+        ledger.released(4096, true);
+        assert_eq!(
+            ledger.gauges(),
+            PoolGauges {
+                held_bytes: 8192,
+                overflows: 0
+            },
+            "at the limit is room"
+        );
+        ledger.released(4096, true);
+        assert_eq!(
+            ledger.gauges(),
+            PoolGauges {
+                held_bytes: 12288,
+                overflows: 1
+            }
+        );
+    }
+
+    #[test]
+    fn cycling_a_buffer_after_the_burst_counts_nothing() {
+        let ledger = Ledger::new(4096);
+        ledger.released(4096, true);
+        ledger.released(4096, true);
+        assert_eq!(ledger.gauges().overflows, 1);
+        for _ in 0..10 {
+            ledger.taken(4096);
+            ledger.released(4096, false);
+        }
+        assert_eq!(ledger.gauges().overflows, 1, "a reused buffer is not counted again");
+    }
+
+    #[test]
+    fn a_buffer_reused_from_the_pool_and_released_above_the_limit_counts_nothing() {
+        let ledger = Ledger::new(4096);
+        ledger.released(8192, false);
+        assert_eq!(
+            ledger.gauges(),
+            PoolGauges {
+                held_bytes: 8192,
+                overflows: 0
+            }
+        );
     }
 
     #[test]
