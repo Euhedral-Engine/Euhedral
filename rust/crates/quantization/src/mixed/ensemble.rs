@@ -5,8 +5,8 @@
 use super::allocation::Allocation;
 use super::error::MixedError;
 use super::fidelity::{DEFAULT_BANDS, FidelityModel};
-use super::measured::Measured;
 use super::priors::Priors;
+use super::search_state::Measured;
 use crate::java_random::Random;
 
 /// The prior perturbation of the members.
@@ -30,6 +30,13 @@ impl MemberFit {
         priors: &Priors,
         bands: usize,
     ) -> Result<FidelityModel, MixedError> {
+        if data.len() != self.resample.len() {
+            return Err(MixedError::invalid(format!(
+                "the member was drawn for {} measured candidates, not {}",
+                self.resample.len(),
+                data.len()
+            )));
+        }
         let mut resample = Vec::with_capacity(self.resample.len());
         for &at in &self.resample {
             resample.push(
@@ -186,6 +193,9 @@ impl Ensemble {
         }
         let mut sum = 0.0;
         for measured in unseen {
+            if !measured.kl.is_finite() {
+                return Err(MixedError::invalid("a measured KL is not a finite number"));
+            }
             sum += (self.mean(&measured.allocation)?.max(1e-9).ln() - measured.kl.max(1e-9).ln()).abs();
         }
         Ok(sum / unseen.len() as f64)
@@ -226,7 +236,7 @@ mod tests {
                 } else {
                     world.random(&mut random, &OPTIONS).unwrap()
                 };
-                world.measured(allocation).unwrap()
+                world.measured(allocation, 1).unwrap()
             })
             .collect()
     }
@@ -236,7 +246,7 @@ mod tests {
         let world = Synthetic::new(16, 4, 1.2, 3.0, 3);
         let mut random = Random::new(1);
         let data: Vec<Measured> = (0..80)
-            .map(|_| world.measured(front(&world, &mut random, true)).unwrap())
+            .map(|_| world.measured(front(&world, &mut random, true), 1).unwrap())
             .collect();
         let ensemble = Ensemble::fit_banded(&data, 8, 42, 1e-3, &world.priors, 4).unwrap();
         let (mut inside, mut outside) = (0.0, 0.0);
@@ -319,6 +329,12 @@ mod tests {
         assert!((gradient[2][1] - mean).abs() <= 1e-15 * mean.abs().max(1.0));
         assert_ne!(gradient[2][1], single);
         assert!(Ensemble::member_fits(10, 0, 1).is_err());
+        // A member fitted to other data than it was drawn for, and a held-out KL that is not a number.
+        let fits = Ensemble::member_fits(data.len(), 2, 1).unwrap();
+        assert!(fits[0].fit(&data[1..], 1e-3, &world.priors, 2).is_err());
+        let mut unseen = measured(&world, 3, 5, false);
+        unseen[1].kl = f64::NAN;
+        assert!(ensemble.held_out_error(&unseen).is_err());
         assert!(Ensemble::from_members(Vec::new()).is_err());
     }
 }

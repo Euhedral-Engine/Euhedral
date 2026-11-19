@@ -27,9 +27,9 @@ use std::collections::HashMap;
 
 use super::allocation::Allocation;
 use super::error::MixedError;
-use super::measured::Measured;
 use super::option::QuantOption;
 use super::priors::Priors;
+use super::search_state::Measured;
 use super::space::sorted_by_layer;
 use crate::java_random::Random;
 
@@ -175,7 +175,7 @@ impl FidelityModel {
     /// pair weight is given a random contribution of order `perturb`, so that models fitted from different seeds
     /// differ where the data does not decide.
     ///
-    /// Refuses: no band, a priors table without an object of a decoder layer or without an option every object has, a
+    /// Refuses: no band, a ridge that is not finite, a priors table without an object of a decoder layer or without an option every object has, a
     /// mean prior error that is not positive, an allocation in `data` that lacks an object or names an option the
     /// priors lack, a KL that is not finite, and data to which no bend gives a finite fit.
     pub fn fit_perturbed(
@@ -188,6 +188,9 @@ impl FidelityModel {
     ) -> Result<FidelityModel, MixedError> {
         if bands < 1 {
             return Err(MixedError::invalid("the model needs at least one band"));
+        }
+        if !ridge.is_finite() {
+            return Err(MixedError::invalid("the ridge is not a finite number"));
         }
         let names: Vec<String> = priors.objects().keys().cloned().collect();
         let layout = Layout::new(sorted_by_layer(&names)?, bands)?;
@@ -510,14 +513,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::mixed::synthetic::{FAMILIES, OPTIONS, Synthetic};
+    use crate::mixed::synthetic::{FAMILIES, OPTIONS, Synthetic, measurement};
 
     fn data(world: &Synthetic, count: usize, seed: i64) -> Vec<Measured> {
         let mut random = Random::new(seed);
         (0..count)
             .map(|_| {
                 let allocation = world.random(&mut random, &OPTIONS).unwrap();
-                world.measured(allocation).unwrap()
+                world.measured(allocation, 1).unwrap()
             })
             .collect()
     }
@@ -530,14 +533,15 @@ mod tests {
     fn the_law_of_synthetic_data_is_recovered() {
         let world = Synthetic::new(16, 4, 1.2, 3.0, 7);
         let model = FidelityModel::fit(&data(&world, 400, 1), 1e-9, &world.priors, 4).unwrap();
-        assert!((model.gamma() - 1.2).abs() <= 0.11, "gamma {}", model.gamma());
+        // Noise-free data lands on the grid point of the true bend.
+        assert_eq!(model.gamma(), 1.2);
         let mut random = Random::new(99);
         for i in 0..40 {
             let allocation = world.random(&mut random, &OPTIONS).unwrap();
             let truth = world.truth(&allocation).unwrap();
             let predicted = model.predict(&allocation).unwrap();
             assert!(
-                (predicted - truth).abs() <= 0.03 * truth,
+                (predicted - truth).abs() <= 1e-4 * truth,
                 "prediction {i}: {predicted} for {truth}"
             );
         }
@@ -547,14 +551,14 @@ mod tests {
     fn the_weights_of_a_purely_linear_law_are_recovered() {
         let world = Synthetic::new(16, 4, 1.0, 1.0, 11);
         let model = FidelityModel::fit(&data(&world, 400, 2), 1e-9, &world.priors, 4).unwrap();
-        assert!((model.gamma() - 1.0).abs() <= 0.11);
+        assert_eq!(model.gamma(), 1.0);
         for (family, name) in FAMILIES.iter().enumerate() {
             let at = model.families().iter().position(|known| known == name).unwrap();
             for band in 0..4 {
                 let estimated = model.effective_weight(at, band);
                 let truth = world.weight[family][band];
                 assert!(
-                    (estimated - truth).abs() <= 0.1 * truth,
+                    (estimated - truth).abs() <= 1e-3 * truth,
                     "{family}/{band}: {estimated} for {truth}"
                 );
             }
@@ -632,7 +636,7 @@ mod tests {
             .map(|_| {
                 let allocation = world.random(&mut random, &OPTIONS).unwrap();
                 let noisy = world.truth(&allocation).unwrap() * (0.5 * random.next_gaussian()).exp();
-                Measured::new(allocation, noisy)
+                measurement(allocation, noisy, 1, "noisy")
             })
             .collect();
         let model = FidelityModel::fit(&measured, 1e-6, &world.priors, 4).unwrap();
@@ -665,12 +669,16 @@ mod tests {
         let measured = data(&world, 20, 1);
         let fit = |data: &[Measured], bands| FidelityModel::fit(data, 1e-3, &world.priors, bands);
         assert!(fit(&measured, 0).unwrap_err().to_string().contains("band"));
+        for ridge in [f64::NAN, f64::INFINITY] {
+            let refused = FidelityModel::fit(&measured, ridge, &world.priors, 2);
+            assert!(refused.unwrap_err().to_string().contains("ridge"));
+        }
         let mut infinite = measured.clone();
         infinite[3].kl = f64::NAN;
         assert!(fit(&infinite, 2).unwrap_err().to_string().contains("finite"));
         let mut partial = BTreeMap::new();
         partial.insert(world.objects[0].clone(), QuantOption::Nvfp4);
-        let short = vec![Measured::new(Allocation::new(partial), 0.1)];
+        let short = vec![measurement(Allocation::new(partial), 0.1, 1, "partial")];
         assert!(fit(&short, 2).unwrap_err().to_string().contains(&world.objects[1]));
         let elsewhere = Priors::parse(r#"{"objects": {"mtp/fc": {"nvfp4": 0.1}}}"#).unwrap();
         let error = FidelityModel::fit(&[], 1e-3, &elsewhere, 2).unwrap_err();

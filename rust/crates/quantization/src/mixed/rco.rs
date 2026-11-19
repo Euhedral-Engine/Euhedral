@@ -47,28 +47,28 @@ const NOISE_STRIDE: i64 = 0x9E37_79B9_7F4A_7C15_u64 as i64;
 /// What is minimized: a function of the soft assignment `p[object][option]` and its gradient.
 pub trait Objective {
     /// The objective at `p`.
-    fn value(&self, p: &[Vec<f64>]) -> f64;
+    fn value(&self, p: &[Vec<f64>]) -> Result<f64, MixedError>;
 
     /// The derivative of [`value`](Self::value) with respect to every `p[object][option]`.
-    fn gradient(&self, p: &[Vec<f64>]) -> Vec<Vec<f64>>;
+    fn gradient(&self, p: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, MixedError>;
 }
 
 impl<T: Objective + ?Sized> Objective for &T {
-    fn value(&self, p: &[Vec<f64>]) -> f64 {
+    fn value(&self, p: &[Vec<f64>]) -> Result<f64, MixedError> {
         (**self).value(p)
     }
 
-    fn gradient(&self, p: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    fn gradient(&self, p: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, MixedError> {
         (**self).gradient(p)
     }
 }
 
 impl<T: Objective + ?Sized> Objective for Arc<T> {
-    fn value(&self, p: &[Vec<f64>]) -> f64 {
+    fn value(&self, p: &[Vec<f64>]) -> Result<f64, MixedError> {
         (**self).value(p)
     }
 
-    fn gradient(&self, p: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    fn gradient(&self, p: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, MixedError> {
         (**self).gradient(p)
     }
 }
@@ -165,6 +165,8 @@ pub fn run<O: Objective>(
 /// through the softmax.
 #[derive(Debug, Clone)]
 pub struct Sample {
+    step: usize,
+    index: usize,
     value: f64,
     choice: Vec<usize>,
     gradient: Vec<Vec<f64>>,
@@ -323,8 +325,8 @@ impl<O: Objective> Run<O> {
         for (row, &picked) in onehot.iter_mut().zip(&choice) {
             row[picked] = 1.0;
         }
-        let value = self.objective.value(&onehot);
-        let toward = self.objective.gradient(&onehot);
+        let value = self.objective.value(&onehot)?;
+        let toward = self.objective.gradient(&onehot)?;
         let mut gradient = zeros(&self.c);
         for i in 0..perturbed.len() {
             let y = softmax(&perturbed[i]);
@@ -337,27 +339,36 @@ impl<O: Objective> Run<O> {
             }
         }
         Ok(Sample {
+            step: self.step,
+            index,
             value,
             choice,
             gradient,
         })
     }
 
-    /// Ends the current step with its `samples`, in index order: sums their gradients, then the tangent projection,
+    /// Ends the current step with its `samples`, which may come in any order but must be exactly the current step's,
+    /// one for each index: sums their gradients, then the tangent projection,
     /// Adam, the retraction and the moment transport. True once every step is done.
     pub fn update(&mut self, samples: &[Sample]) -> Result<bool, MixedError> {
         if self.done() {
             return Ok(true);
         }
-        if samples.len() != self.settings.samples {
+        let mut ordered: Vec<&Sample> = samples.iter().collect();
+        ordered.sort_by_key(|drawn| drawn.index);
+        let complete = ordered.len() == self.settings.samples
+            && ordered
+                .iter()
+                .enumerate()
+                .all(|(at, drawn)| drawn.index == at && drawn.step == self.step);
+        if !complete {
             return Err(MixedError::invalid(format!(
-                "a step ends with {} samples, not {}",
-                self.settings.samples,
-                samples.len()
+                "step {} ends with its samples 0..{}, each drawn in that step",
+                self.step, self.settings.samples
             )));
         }
         let mut gradient = zeros(&self.c);
-        for drawn in samples {
+        for drawn in ordered {
             if drawn.value < self.best_value {
                 self.best_value = drawn.value;
                 self.best_choice = Some(drawn.choice.clone());
@@ -409,7 +420,7 @@ impl<O: Objective> Run<O> {
         for (row, &picked) in last.iter_mut().zip(&choice) {
             row[picked] = 1.0;
         }
-        let value = self.objective.value(&last);
+        let value = self.objective.value(&last)?;
         // The best assignment any sample produced is kept as well: the run has evaluated the objective at it.
         if let Some(best) = &self.best_choice
             && self.best_value < value
@@ -542,19 +553,19 @@ mod tests {
     }
 
     impl Objective for Quadratic {
-        fn value(&self, p: &[Vec<f64>]) -> f64 {
-            (0..p.len())
+        fn value(&self, p: &[Vec<f64>]) -> Result<f64, MixedError> {
+            Ok((0..p.len())
                 .map(|i| (self.expected(p, i) - self.target[i]).powi(2))
-                .sum()
+                .sum())
         }
 
-        fn gradient(&self, p: &[Vec<f64>]) -> Vec<Vec<f64>> {
-            (0..p.len())
+        fn gradient(&self, p: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, MixedError> {
+            Ok((0..p.len())
                 .map(|i| {
                     let along = 2.0 * (self.expected(p, i) - self.target[i]);
                     self.value[i].iter().map(|value| along * value).collect()
                 })
-                .collect()
+                .collect())
         }
     }
 
@@ -605,7 +616,7 @@ mod tests {
                 bytes += costs[*slot];
             }
             if bytes <= instance.budget {
-                best = best.min(instance.objective.value(&one_hot(&pick, k)));
+                best = best.min(instance.objective.value(&one_hot(&pick, k)).unwrap());
             }
         }
         best
@@ -679,16 +690,54 @@ mod tests {
         let whole = run(&instance.objective, &instance.cost, instance.budget, 1, settings, 9, 0).unwrap();
         let mut split = Run::new(&instance.objective, &instance.cost, instance.budget, 1, settings, 9, 0).unwrap();
         while !split.done() {
-            // The step's samples are drawn last first, then handed over in index order.
-            let mut drawn: Vec<(usize, Sample)> = (0..split.samples())
+            // The step's samples are drawn last first and handed over in that order.
+            let drawn: Vec<Sample> = (0..split.samples())
                 .rev()
-                .map(|index| (index, split.sample(index).unwrap()))
+                .map(|index| split.sample(index).unwrap())
                 .collect();
-            drawn.sort_by_key(|(index, _)| *index);
-            let drawn: Vec<Sample> = drawn.into_iter().map(|(_, sample)| sample).collect();
             split.update(&drawn).unwrap();
         }
         assert_eq!(split.result().unwrap(), whole);
+    }
+
+    #[test]
+    fn a_step_takes_only_its_own_samples_each_once() {
+        let instance = instance(6, 3, 4);
+        let settings = Settings::new(5, 0.1, 3, 1).unwrap();
+        let mut run = Run::new(&instance.objective, &instance.cost, instance.budget, 1, settings, 9, 0).unwrap();
+        let stale: Vec<Sample> = (0..3).map(|index| run.sample(index).unwrap()).collect();
+        run.update(&stale).unwrap();
+        // The next step refuses the samples of the one before, a missing index and a repeated one.
+        assert!(run.update(&stale).is_err());
+        let mut fresh: Vec<Sample> = (0..3).map(|index| run.sample(index).unwrap()).collect();
+        assert!(run.update(&fresh[..2]).is_err());
+        let mut repeated = fresh.clone();
+        repeated[2] = fresh[1].clone();
+        assert!(run.update(&repeated).is_err());
+        let mut mixed = fresh.clone();
+        mixed[1] = stale[1].clone();
+        assert!(run.update(&mixed).is_err());
+        fresh.reverse();
+        run.update(&fresh).unwrap();
+    }
+
+    struct Failing;
+
+    impl Objective for Failing {
+        fn value(&self, _: &[Vec<f64>]) -> Result<f64, MixedError> {
+            Err(MixedError::invalid("the objective failed"))
+        }
+
+        fn gradient(&self, _: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, MixedError> {
+            Err(MixedError::invalid("the objective failed"))
+        }
+    }
+
+    #[test]
+    fn an_objective_that_fails_ends_the_run_with_its_error() {
+        let instance = instance(4, 3, 1);
+        let error = run(Failing, &instance.cost, instance.budget, 1, Settings::default(), 1, 0).unwrap_err();
+        assert!(error.to_string().contains("the objective failed"));
     }
 
     #[test]

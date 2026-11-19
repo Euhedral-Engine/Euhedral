@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 
 use super::allocation::Allocation;
 use super::error::MixedError;
-use super::measured::Measured;
 use super::option::QuantOption;
 use super::priors::Priors;
+use super::search_state::Measured;
 use crate::java_random::Random;
 
 /// The projection families of each layer, in the order a layer lists them.
@@ -20,6 +20,21 @@ pub const OPTIONS: [QuantOption; 4] = [
     QuantOption::Trellis3_0,
     QuantOption::Trellis4_0,
 ];
+
+/// `allocation` as measured with the KL `kl` and nothing else known of it.
+pub fn measurement(allocation: Allocation, kl: f64, round: u32, origin: &str) -> Measured {
+    Measured {
+        allocation,
+        kl,
+        kl_se: 0.0,
+        bytes: 0,
+        prefill: 0.0,
+        decode: 0.0,
+        fits: true,
+        round,
+        origin: origin.to_owned(),
+    }
+}
 
 /// A synthetic space with its true law.
 #[derive(Debug, Clone)]
@@ -115,10 +130,10 @@ impl Synthetic {
         Ok(Allocation::new(choices))
     }
 
-    /// `allocation` with its true KL as a measurement.
-    pub fn measured(&self, allocation: Allocation) -> Result<Measured, MixedError> {
+    /// `allocation` with its true KL as a measurement of round `round`.
+    pub fn measured(&self, allocation: Allocation, round: u32) -> Result<Measured, MixedError> {
         let kl = self.truth(&allocation)?;
-        Ok(Measured::new(allocation, kl))
+        Ok(measurement(allocation, kl, round, "synthetic"))
     }
 }
 
