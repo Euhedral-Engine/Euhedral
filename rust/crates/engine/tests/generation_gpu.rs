@@ -441,6 +441,44 @@ fn greedy_tokens_match_java_for_short_prompt() {
     owner.shutdown(runtime).unwrap();
 }
 
+/// The greedy tokens of the short prompt with projections staged through the ring: the Java engine's, and the same on a
+/// second request.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
+fn greedy_tokens_match_java_for_short_prompt_when_staged() {
+    let Some(machine) = machine() else { return };
+    let reference = greedy_reference(&machine);
+    assert_eq!(reference.generated.len(), 128);
+    let eos = tokenizer(&machine.artifact).eos_ids().to_vec();
+    let mut engine = settings(&machine.artifact, 2048);
+    let limit = common::limit_to_stage(&machine.library, &engine, STAGED_SHORT);
+    common::limit_gpu(&mut engine, limit);
+    let (owner, ready) = EngineRuntime::start(&engine, &machine.library);
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    let (owner, runtime) = (Closer::new(owner, &runtime), runtime);
+    if !common::staged_through_a_ring(&runtime, limit) {
+        owner.shutdown(runtime).unwrap();
+        return;
+    }
+    for round in 0..2 {
+        let recording = generate(&runtime, &reference.prompt, 128, &eos);
+        assert_eq!(recording.outcome.reason, FinishReason::Length, "round {round}");
+        assert_eq!(
+            recording.tokens, reference.generated,
+            "round {round}: the staged greedy tokens are the reference's"
+        );
+        assert_eq!(
+            sequence_state(&runtime),
+            (reference.prompt.len() as u64 + 127, 0, 0),
+            "committed rows, quanta in flight, selections leased"
+        );
+    }
+    owner.shutdown(runtime).unwrap();
+}
+
 #[test]
 #[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
 fn a_stop_token_ends_the_generation_and_leaves_no_overshoot_in_the_sequence() {
@@ -581,7 +619,7 @@ fn repository_root() -> PathBuf {
 #[ignore = "needs a GPU, the native library, the RCO artifact, the Java references and python3 with numpy"]
 fn teacher_forced_logits_bitwise_equal_java_report() {
     let Some(machine) = machine() else { return };
-    teacher_forced_against_java(&machine, None);
+    teacher_forced_against_java(&machine, None, 4096, false);
 }
 
 /// The same run with the device 256 MiB short of the resident need, so the plan reads the embedding in place from pinned
@@ -591,12 +629,25 @@ fn teacher_forced_logits_bitwise_equal_java_report() {
 fn teacher_forced_logits_bitwise_equal_java_report_with_a_mapped_embedding() {
     let Some(machine) = machine() else { return };
     let limit = common::limit_below_need(&machine.library, &settings(&machine.artifact, 4096), 256 << 20);
-    teacher_forced_against_java(&machine, Some(limit));
+    teacher_forced_against_java(&machine, Some(limit), 4096, false);
 }
 
+/// Bytes the device is short of the resident need in the staged runs: projections leave the device through a ring.
+const STAGED_SHORT: u64 = 1 << 30;
+
+/// The same run, and the same 1100-token prefix, with the device short of the resident need by [`STAGED_SHORT`]: the
+/// projections that do not fit are read from pinned host memory through the staging ring, and the logits are the
+/// report's, bit for bit.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact, the Java references and python3 with numpy"]
+fn teacher_forced_logits_bitwise_equal_java_report_when_staged() {
+    let Some(machine) = machine() else { return };
+    let limit = common::limit_to_stage(&machine.library, &settings(&machine.artifact, 2048), STAGED_SHORT);
+    teacher_forced_against_java(&machine, Some(limit), 2048, true);
+}
 /// Runs the teacher-forced comparison against the Java report, under `gpu_limit` when it is given. A forced run that
 /// does not get the plan it means (the card has less free than the limit) stops with a message.
-fn teacher_forced_against_java(machine: &Machine, gpu_limit: Option<u64>) {
+fn teacher_forced_against_java(machine: &Machine, gpu_limit: Option<u64>, max_tokens: u32, staged: bool) {
     let java = machine.goldens.join("teacher-forced-rco.bin");
     let java_bytes = fs::read(&java).unwrap();
     let steps = i32::from_le_bytes(java_bytes[0..4].try_into().unwrap()) as usize;
@@ -621,7 +672,7 @@ fn teacher_forced_against_java(machine: &Machine, gpu_limit: Option<u64>) {
         assert_eq!(named as u32, *token, "step {step}: the forced token of the Java report");
     }
 
-    let mut engine = settings(&machine.artifact, 4096);
+    let mut engine = settings(&machine.artifact, max_tokens);
     if let Some(limit) = gpu_limit {
         common::limit_gpu(&mut engine, limit);
     }
@@ -632,8 +683,15 @@ fn teacher_forced_against_java(machine: &Machine, gpu_limit: Option<u64>) {
         .expect("the engine starts");
     let (owner, runtime) = (Closer::new(owner, &runtime), runtime);
     if let Some(limit) = gpu_limit {
-        common::embedding_alone_is_on_the_host(&runtime, limit);
-        assert!(runtime.report().host_backed_bytes > 0);
+        if staged {
+            if !common::staged_through_a_ring(&runtime, limit) {
+                owner.shutdown(runtime).unwrap();
+                return;
+            }
+        } else {
+            common::embedding_alone_is_on_the_host(&runtime, limit);
+            assert!(runtime.report().host_backed_bytes > 0);
+        }
     }
     let done = Handoff::new();
     let waiting = Arc::clone(&done);
@@ -1333,4 +1391,98 @@ fn concurrent_sequences_match_alone() {
         );
     }
     owner.shutdown(runtime).expect("four sequences shut down clean");
+}
+
+/// Two sequences with their draft layer on, projections staged through the one ring: each request's tokens are what
+/// they are alone. The waits are bounded.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn concurrent_sequences_match_alone_when_staged() {
+    let Some(machine) = machine() else { return };
+    let tokenizer = tokenizer(&machine.artifact);
+    let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
+        .iter()
+        .take(2)
+        .map(|text| tokenizer.encode_with_model_special_tokens(text).unwrap())
+        .collect();
+    let mut engine = settings(&machine.artifact, 2048);
+    engine.batching.max_sequences = 2;
+    let limit = common::limit_to_stage(&machine.library, &engine, STAGED_SHORT);
+    common::limit_gpu(&mut engine, limit);
+    let (owner, ready) = EngineRuntime::start(&engine, &machine.library);
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    let (owner, runtime) = (Closer::new(owner, &runtime), runtime);
+    assert_eq!(runtime.sequences(), 2, "the engine holds two sequences");
+    if !common::staged_through_a_ring(&runtime, limit) {
+        owner.shutdown(runtime).unwrap();
+        return;
+    }
+    let wait = Duration::from_secs(10 * 60);
+    let greedy = SamplingConfig::greedy(0);
+    for speculation in [Speculation::Off, Speculation::Artifact] {
+        if speculation == Speculation::Artifact && runtime.plan().draft_depth == 0 {
+            println!("speculation: skipped, the artifact has no draft layer");
+            continue;
+        }
+        let alone: Vec<Recording> = prompts
+            .iter()
+            .map(|prompt| {
+                submit(&runtime, prompt, CONCURRENT_TOKENS, &[], speculation, greedy, None)
+                    .expect("the request is admitted")
+                    .wait(wait)
+                    .expect("the generation reports")
+            })
+            .collect();
+        let running: Vec<_> = prompts
+            .iter()
+            .map(|prompt| {
+                submit(&runtime, prompt, CONCURRENT_TOKENS, &[], speculation, greedy, None)
+                    .expect("a sequence is idle for the request")
+            })
+            .collect();
+        let refused = submit(
+            &runtime,
+            &prompts[0],
+            CONCURRENT_TOKENS,
+            &[],
+            Speculation::Off,
+            greedy,
+            None,
+        );
+        assert_eq!(
+            refused.err(),
+            Some(AdmissionError::Busy),
+            "the third request finds both sequences running"
+        );
+        let both: Vec<Recording> = running
+            .into_iter()
+            .map(|done| done.wait(wait).expect("the generation reports"))
+            .collect();
+        for (index, (alone, both)) in alone.iter().zip(&both).enumerate() {
+            assert_eq!(
+                both.outcome.reason,
+                FinishReason::Length,
+                "{speculation:?}: request {index}"
+            );
+            assert_eq!(
+                alone.tokens.len(),
+                CONCURRENT_TOKENS as usize,
+                "{speculation:?}: request {index} alone"
+            );
+            assert_eq!(
+                both.tokens, alone.tokens,
+                "{speculation:?}: request {index} changed when run together"
+            );
+        }
+        let first_of_all = both.iter().map(|r| *r.token_times.first().unwrap()).max().unwrap();
+        let first_to_end = both.iter().map(|r| *r.token_times.last().unwrap()).min().unwrap();
+        assert!(
+            first_of_all < first_to_end,
+            "{speculation:?}: the requests did not overlap"
+        );
+    }
+    owner.shutdown(runtime).unwrap();
 }

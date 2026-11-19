@@ -527,7 +527,7 @@ pub struct Dependency {
 ///   predecessor's last reader of that slot only, so the copies overlap the predecessor's tail. A predecessor that
 ///   reads no slot gives its root, which already waited for the quantum before it.
 ///
-/// A predecessor the order no longer holds (retired) is not in `after` and gives nothing. A view that stages nothing
+/// `after` holds the predecessors the order still holds; one that retired is not in it and gives nothing. A view that stages nothing
 /// has no first transfer and gets the first stage's edges alone.
 pub fn external_edges(first_transfers: &[(usize, StageId)], after: &[Predecessor<'_>]) -> SmallVec<[Dependency; 16]> {
     let mut edges = SmallVec::new();

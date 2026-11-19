@@ -10,6 +10,7 @@
     reason = "a test file: a failed unwrap is the failure, and the test locks its records and waits, bounded"
 )]
 
+use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,7 +31,7 @@ use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::generation::{markers_in_flight, staging_ring};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{LayerIndex, ModelConfig, Residence, Role, WeightRef, object_key};
-use euhedral_inference_engine::plan::{Formats, Plan, StagingRing, View, WeightLookup};
+use euhedral_inference_engine::plan::{Formats, Plan, StageKind, StagingRing, View, WeightLookup};
 use euhedral_inference_engine::quantum::{Dependency, Predecessor, external_edges};
 use euhedral_inference_engine::residency::offload::StagingGeometry;
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, plan as residency};
@@ -44,6 +45,12 @@ use common::{config, rco_table, settings};
 
 const BOUND: Duration = Duration::from_secs(20);
 const SLOTS: usize = 3;
+
+type Logs = (
+    Arc<Mutex<Vec<(u32, usize)>>>,
+    Arc<Mutex<Vec<(u32, usize)>>>,
+    Arc<Mutex<HashMap<(u32, usize), Gate>>>,
+);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -185,6 +192,12 @@ fn each_slots_first_transfer_waits_for_the_predecessors_last_reader_of_that_slot
         let offer = offered(&plan, previous);
         let first = plan.first_transfers(next);
         assert_eq!(first.len(), SLOTS, "{next:?}");
+        let kinds = plan.kinds(next).expect("the view is planned");
+        assert!(
+            !matches!(kinds[0], StageKind::WeightTransfer),
+            "{next:?}: the first stage is not a transfer"
+        );
+        assert!(first.iter().all(|&(_, unit)| unit != StageId(0)), "{next:?}");
         let edges = external_edges(first, &[predecessor(&offer)]);
         assert_eq!(
             edges[0],
@@ -369,7 +382,7 @@ struct Rig {
     view: View,
     plan: Arc<Plan>,
     /// The completions hold the lanes weakly: the rig keeps them alive.
-    _lanes: Box<dyn std::any::Any>,
+    _lanes: Box<dyn Any>,
 }
 
 fn rig(view: View) -> Rig {
@@ -391,7 +404,7 @@ fn rig(view: View) -> Rig {
     let staging_lane = LaneId((compute + 2) as u16);
     let plan = Arc::new(fixture.staged(&fixture.selection(), staging_lane));
     let completions = Completions::new(&lanes.queues);
-    let keep: Box<dyn std::any::Any> = Box::new((Arc::clone(&lanes.queues), Arc::clone(&lanes.typed)));
+    let keep: Box<dyn Any> = Box::new((Arc::clone(&lanes.queues), Arc::clone(&lanes.typed)));
     let lattice = ControlPlaneLattice::new(lattice_config(&Settings::with_model(ModelSettings::default()))).unwrap();
     let lake = Lake::new(
         Arc::clone(&lattice),
@@ -404,11 +417,7 @@ fn rig(view: View) -> Rig {
     let unit = lake.admit().unwrap();
     let units = plan.unit_stages(view).unwrap().len();
     let word = gpu.alloc(4);
-    let (log, held, gates): (
-        Arc<Mutex<Vec<(u32, usize)>>>,
-        Arc<Mutex<Vec<(u32, usize)>>>,
-        Arc<Mutex<HashMap<_, _>>>,
-    ) = Default::default();
+    let (log, held, gates): Logs = Default::default();
     let stages: Vec<Arc<dyn Stage<Q, FakeQueue>>> = (0..units)
         .map(|index| {
             Arc::new(Unit {
