@@ -386,13 +386,76 @@ fn the_runtime_reserve_is_a_setting_whose_auto_is_javas() {
             .offload
             .is_empty()
     );
+    // A reserve below what the settings make the runtime need is raised to it: the workspace, the decode scratch, the
+    // first sequence's state and the MTP layer's cache are paid from the reserve and counted.
     stated.memory.runtime_reserve = Auto::Value(ByteSize(0));
+    let none = plan_with(&config, &table, &stated, inputs(16 * GIB)).unwrap();
+    assert_eq!(none.runtime_reserve_bytes, reserve_demand(&none));
     assert_eq!(
-        plan_with(&config, &table, &stated, inputs(16 * GIB))
-            .unwrap()
-            .device_bytes,
-        auto.device_bytes - 1280 * MIB
+        none.device_bytes,
+        auto.device_bytes - 1280 * MIB + none.runtime_reserve_bytes
     );
+}
+
+/// What the runtime reserve pays for in a plan, from the pieces that allocate it.
+fn reserve_demand(plan: &ResidencyPlan) -> u64 {
+    let config = config();
+    plan.workspace_bytes
+        + plan.decode_scratch_bytes
+        + footprint::first_sequence_bytes(plan, &config)
+        + footprint::mtp_cache_bytes_of(plan, &config)
+}
+
+/// The device a plan made before the reserve counted what grows with the settings would have found enough: `big`'s
+/// bytes at the default reserve.
+fn counted_before(big: &ResidencyPlan) -> u64 {
+    big.device_bytes - (big.runtime_reserve_bytes - DEFAULT_RUNTIME_RESERVE_BYTES)
+}
+
+/// Whether the plan against `device_free` holds every weight on the device.
+fn resident_on(settings: &Settings, device_free: u64) -> bool {
+    plan_with(&config(), &rco_table(), settings, inputs(device_free)).is_ok_and(|plan| plan.offload.is_empty())
+}
+
+#[test]
+fn the_defaults_keep_the_default_reserve() {
+    for tokens in [4096, 32_768, 131_072] {
+        let plan = plan_with(&config(), &rco_table(), &settings(tokens), inputs(64 * GIB)).unwrap();
+        assert_eq!(
+            plan.runtime_reserve_bytes, DEFAULT_RUNTIME_RESERVE_BYTES,
+            "{tokens} tokens"
+        );
+        assert!(
+            reserve_demand(&plan) <= DEFAULT_RUNTIME_RESERVE_BYTES,
+            "{tokens} tokens"
+        );
+    }
+}
+
+#[test]
+fn the_mtp_cache_of_a_long_bf16_context_is_counted_and_a_device_it_overflows_is_refused() {
+    let mut long = settings(262_144);
+    long.context.kv_cache_format = Auto::Value(KvFormat::Bf16);
+    long.context.kv_cache_on_gpu_tokens = 262_144;
+    let big = plan_with(&config(), &rco_table(), &long, inputs(64 * GIB)).unwrap();
+    let mtp = footprint::mtp_cache_bytes_of(&big, &config());
+    assert!(mtp > 1000 * MIB, "the layer's cache at 262144 tokens is {mtp}");
+    assert!(big.runtime_reserve_bytes > DEFAULT_RUNTIME_RESERVE_BYTES);
+    assert_eq!(big.runtime_reserve_bytes, reserve_demand(&big));
+    assert!(resident_on(&long, big.device_bytes));
+    // Enough for everything but the reserve's growth: refused resident now.
+    assert!(!resident_on(&long, counted_before(&big)));
+}
+
+#[test]
+fn a_larger_prefill_chunk_counts_its_workspace_and_a_device_that_cannot_hold_it_is_refused() {
+    let mut chunked = settings(32_768);
+    chunked.batching.prefill_chunk_tokens = 2048;
+    let big = plan_with(&config(), &rco_table(), &chunked, inputs(64 * GIB)).unwrap();
+    assert!(big.runtime_reserve_bytes > DEFAULT_RUNTIME_RESERVE_BYTES);
+    assert_eq!(big.runtime_reserve_bytes, reserve_demand(&big));
+    assert!(resident_on(&chunked, big.device_bytes));
+    assert!(!resident_on(&chunked, counted_before(&big)));
 }
 
 #[test]

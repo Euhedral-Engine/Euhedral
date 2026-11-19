@@ -134,7 +134,8 @@ pub struct ResidencyPlan {
     /// (`LinearFormat.decodeScratchBytes`).
     pub decode_scratch_bytes: u64,
     /// The device bytes the runtime reserves beyond the weights, the cache and the scratch (`memory.runtime-reserve`):
-    /// the execution workspace, the first sequence's state and what the kernel modules take.
+    /// the execution workspace, the first sequence's state, the MTP layer's cache at the longest context and what the
+    /// kernel modules take. At least what the settings make the first four need, whatever the setting says.
     pub runtime_reserve_bytes: u64,
     /// The device bytes the plan reserves in all: the weights, every sequence's cache, the runtime's reserve, the
     /// scratch and the state of the sequences beyond the first.
@@ -381,7 +382,7 @@ pub fn plan_closest(
     let available = inputs
         .device_free
         .min(settings.memory.gpu_limit.value().map_or(u64::MAX, |size| size.bytes()));
-    let runtime_reserve = settings
+    let reserve_setting = settings
         .memory
         .runtime_reserve
         .value()
@@ -395,6 +396,20 @@ pub fn plan_closest(
     let region = host_pages * page;
     let spilled = (region * config.attention_layers() as u64).saturating_mul(sequences);
     let verified_rows = if draft_depth > 0 { 1 + draft_depth as u64 } else { 0 };
+    // The runtime reserve pays for what the settings make grow: the workspace's slots (with the rows of a pass), the
+    // decode scratch, the first sequence's state and the MTP layer's cache at the longest context. When they are
+    // more than the setting, the reserve is what they need: admission counts it and the account refuses less.
+    let first_state = footprint::first_state_bytes(config, kv_format, verified_rows, draft_depth > 0, chunk);
+    let mtp_cache = if draft_depth > 0 {
+        footprint::mtp_cache_bytes(config, kv_format, max_tokens)
+    } else {
+        0
+    };
+    let reserve_demand = workspace_bytes
+        .saturating_add(decode_scratch_bytes)
+        .saturating_add(first_state)
+        .saturating_add(mtp_cache);
+    let runtime_reserve = reserve_setting.max(reserve_demand);
     let extra = if sequences > 1 {
         footprint::extra_sequence_bytes(config, kv_format, max_tokens, verified_rows, draft_depth > 0, chunk)
     } else {
