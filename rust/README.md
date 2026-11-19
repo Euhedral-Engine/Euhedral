@@ -8,7 +8,7 @@ and the CPU tests; CI runs the same on Linux and Windows (the layer check on Lin
 The rules are enforced by the compiler toolchain, not by review. Each is checked in one of three places:
 
 - **clippy ban**: `clippy-no-wait.toml` lists the banned calls and types. Every library crate has a `clippy.toml` that
-  is byte-identical to it. A library crate is every crate except `xtask` and the binaries (`bench`), whose main thread
+  is byte-identical to it. A library crate is every crate except `xtask` and the binaries (`bench`, `quantize`), whose main thread
   may block. `test-support` counts as a library: it keeps the same file and excepts itself in its source.
 - **lint**: `[workspace.lints]` in `Cargo.toml`, inherited by every crate through `[lints] workspace = true`.
 - **layer check**: `scripts/check-layers.sh` reads `cargo metadata` (no build). `--self-test` plants a violation of each
@@ -29,9 +29,9 @@ The rules are enforced by the compiler toolchain, not by review. Each is checked
 | Libraries do not print | `print_stdout`, `print_stderr` lints |
 | No `dbg!`, `todo!`, `unwrap()` or `expect()` in library code (tests may unwrap and expect) | `dbg_macro`, `todo`, `unwrap_used`, `expect_used` lints; `allow-unwrap-in-tests`, `allow-expect-in-tests` |
 | Every `unsafe` block states why it is sound | `undocumented_unsafe_blocks` lint |
-| Dependencies point one way (settings, edrl, host-gemv, test-support: none; tokenizer: edrl; cuda: none; engine: all of them; bench: engine and the leaves) | layer check |
+| Dependencies point one way (settings, edrl, host-gemv, test-support: none; tokenizer: edrl; cuda: none; engine: all of them; quantization: the leaves and the engine; quantize: quantization, settings, engine and cuda; bench: engine, the leaves and quantization) | layer check |
 | Configuration is parsed in one place: only the settings crate depends on `serde_yaml_ng` | layer check |
-| Only the engine, bench and cuda depend on `euhedral-core` or `euhedral-graph`; cuda depends on nothing of ours and externally only on `euhedral-gpu`, `euhedral-graph`, `libloading` and `thiserror` | layer check |
+| Only the engine, bench, quantization, quantize and cuda depend on `euhedral-core` or `euhedral-graph`; cuda depends on nothing of ours and externally only on `euhedral-gpu`, `euhedral-graph`, `libloading` and `thiserror` | layer check |
 | No crate depends on `level-zero*`, `opencl3`, `ocl` (hardware agnosticism) or `core_affinity` (worker CPUs are never pinned) | layer check |
 | `test-support` is a dev-dependency only | layer check |
 | Every library crate's `clippy.toml` equals `clippy-no-wait.toml` | layer check |
@@ -92,6 +92,14 @@ files.sha256          the manifest of the kernel sources
 
 Unpack it anywhere and run `bin/euhedral-server --config <file>`: with no `host.native-cache` set, the server finds
 `lib/` beside `bin/`. CI builds and uploads the linux-x64 archive next to the server jar.
+
+## Quantization
+
+`euhedral-inference-quantization` (`crates/quantization`) is the library behind the quantization tools: Java's `Random`
+and `SplittableRandom` drawn exactly as Java draws them (`java_random`), and the `.npy` and `.npz` formats (`npy`,
+`npz`). `euhedral-inference-quantize` (`crates/quantize`) is the command line, a binary called `quantization` that
+dispatches the commands of the Java tool. A command whose work is not wired yet exits with code 3; `train-blocks`,
+`train-model` and `rotate` are not part of this tool.
 
 ## Benchmark
 

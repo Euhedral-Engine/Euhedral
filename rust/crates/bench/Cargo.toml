@@ -17,6 +17,7 @@ euhedral-hashing.workspace = true
 euhedral-io.workspace = true
 euhedral-inference-edrl = { path = "../edrl" }
 euhedral-inference-engine = { path = "../engine" }
+euhedral-inference-quantization = { path = "../quantization" }
 euhedral-inference-settings = { path = "../settings" }
 euhedral-inference-tokenizer = { path = "../tokenizer" }
 serde.workspace = true
