@@ -11,7 +11,7 @@ pub use crate::error::{AnthropicErrorBody, AnthropicErrorEnvelope};
 use crate::coerce;
 use crate::error::ApiError;
 use crate::json::JsonValue;
-use crate::wire::{Members, Reader, ToJson, int, list, members, object, optional_text, push, text};
+use crate::wire::{Members, Reader, ToJson, arguments_text, int, list, members, object, optional_text, push, text};
 
 /// A Messages request (`POST /v1/messages`, and `/v1/messages/count_tokens` without `max_tokens`). Messages and the
 /// fields that take several shapes stay untyped so the mapper can report precise errors.
@@ -216,9 +216,10 @@ impl ToJson for BlockDelta {
                 object([("type", text("thinking_delta")), ("thinking", text(thinking))])
             }
             BlockDelta::TextDelta { text: value } => object([("type", text("text_delta")), ("text", text(value))]),
-            BlockDelta::InputJsonDelta { partial_json } => {
-                object([("type", text("input_json_delta")), ("partial_json", text(partial_json))])
-            }
+            BlockDelta::InputJsonDelta { partial_json } => object([
+                ("type", text("input_json_delta")),
+                ("partial_json", arguments_text(partial_json)),
+            ]),
             BlockDelta::SignatureDelta { signature } => {
                 object([("type", text("signature_delta")), ("signature", text(signature))])
             }

@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use crate::ToolDefinition;
 #[cfg(test)]
 use crate::json::JsonInteger;
-use crate::json::{JsonValue, put};
+use crate::json::{JsonValue, cut_pair_marker, put};
 use crate::pipeline::text_space::{held_tag_prefix, is_block_space, trailing_space_start};
 
 const CALL_START: &str = "<tool_call>";
@@ -260,7 +260,7 @@ fn argument_value(tool: &ToolDefinition, key: &str, raw: &str) -> Result<JsonVal
     if types.len() == 1 && types.contains("string") {
         return Ok(text());
     }
-    let Some(parsed) = JsonValue::parse(raw) else {
+    let Some(parsed) = JsonValue::parse_keeping_unpaired(raw) else {
         if types.is_empty() || types.contains("string") {
             return Ok(text());
         }
@@ -314,8 +314,9 @@ fn type_list(types: &BTreeSet<String>) -> String {
     format!("[{}]", names.join(", "))
 }
 
-/// The start of a value, for an error message: at most 80 UTF-16 code units, then `...`. A character cut in half
-/// by the limit is written as U+FFFD.
+/// The start of a value, for an error message: at most 80 UTF-16 code units, then `...`. A character cut in half by
+/// the limit leaves its high surrogate alone at the end; a message cannot hold one, so a stand-in
+/// ([`cut_pair_marker`]) takes its place and the reply writes it back as the unit.
 fn excerpt(raw: &str) -> String {
     const LIMIT: usize = 80;
     if raw.encode_utf16().count() <= LIMIT {
@@ -327,7 +328,9 @@ fn excerpt(raw: &str) -> String {
         let width = value.len_utf16();
         if units + width > LIMIT {
             if units < LIMIT {
-                cut.push('\u{fffd}');
+                let mut pair = [0; 2];
+                value.encode_utf16(&mut pair);
+                cut.push(cut_pair_marker(pair[0]));
             }
             break;
         }
@@ -353,6 +356,9 @@ fn malformed(message: &str) -> MalformedToolCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{ApiError, Surface};
+    use crate::openai::ToolCall as ReplyToolCall;
+    use crate::wire::ToJson;
 
     fn tool(parameters: Option<&str>) -> ToolDefinition {
         tool_definition("f", parameters)
@@ -373,12 +379,50 @@ mod tests {
         // 40 emoji are 80 units and fit; 50 emoji are 100 units and are cut after the 40th.
         assert_eq!(excerpt(&"😀".repeat(40)), format!("'{}'", "😀".repeat(40)));
         assert_eq!(excerpt(&"😀".repeat(50)), format!("'{}...'", "😀".repeat(40)));
-        // A pair cut in half by the limit becomes U+FFFD.
+        // A pair cut in half by the limit leaves its high surrogate alone, which the stand-in marks.
         assert_eq!(
             excerpt(&format!("a{}", "😀".repeat(50))),
-            format!("'a{}\u{fffd}...'", "😀".repeat(39))
+            format!("'a{}{}...'", "😀".repeat(39), cut_pair_marker(0xd83d))
         );
         assert_eq!(excerpt("é"), "'é'");
+    }
+
+    /// A parameter that is not of its declared type, with an emoji straddling the 80th unit of its value.
+    fn cut_pair_failure() -> MalformedToolCall {
+        let schema = r#"{"type":"object","properties":{"n":{"type":"integer"}}}"#;
+        let value = format!("{}{}", "a".repeat(79), "😀".repeat(5));
+        arguments(schema, &["n", &value]).unwrap_err()
+    }
+
+    #[test]
+    fn the_excerpt_of_a_cut_pair_is_written_as_the_unpaired_surrogate() {
+        let error = ApiError::invalid_tool_call(&cut_pair_failure().0);
+        let body = String::from_utf8(error.body(Surface::OpenAi)).unwrap();
+        assert!(
+            body.contains(r#"'{}\uD83D...'"#.replace("{}", &"a".repeat(79)).as_str()),
+            "{body}"
+        );
+        let body = String::from_utf8(error.body(Surface::Anthropic)).unwrap();
+        assert!(body.contains("\\uD83D...'"), "{body}");
+        // An excerpt that ends on a whole character has no escape.
+        let schema = r#"{"type":"object","properties":{"n":{"type":"integer"}}}"#;
+        let whole = arguments(schema, &["n", &"😀".repeat(50)]).unwrap_err();
+        let body = String::from_utf8(ApiError::invalid_tool_call(&whole.0).body(Surface::OpenAi)).unwrap();
+        assert!(!body.contains("\\u"), "{body}");
+    }
+
+    #[test]
+    fn an_unpaired_surrogate_in_an_argument_is_written_as_its_escape() {
+        let schema = r#"{"type":"object","properties":{"v":{}}}"#;
+        let arguments = arguments(schema, &["v", r#"["\ud800x", "\ud83d\ude00", "\udc00", "\\ud800"]"#]).unwrap();
+        assert_eq!(arguments, r#"{"v":["\uD800x","😀","\uDC00","\\ud800"]}"#, "{arguments}");
+        // Written again as the string value it is in a reply, the escape stays an escape of the unit and the
+        // text of an escape stays text.
+        let call = ReplyToolCall::function("c", "f", arguments);
+        assert_eq!(
+            call.to_json_string(),
+            r#"{"id":"c","type":"function","function":{"name":"f","arguments":"{\"v\":[\"\uD800x\",\"😀\",\"\uDC00\",\"\\\\ud800\"]}"}}"#
+        );
     }
 
     fn parser(parameters: Option<&str>, parallel: bool, requires_call: bool) -> ToolCallParser {

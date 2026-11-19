@@ -3,7 +3,7 @@
 use crate::json::JsonValue;
 use crate::pipeline::PipelineError;
 use crate::template::TemplateError;
-use crate::wire::{ToJson, object, optional_text, text};
+use crate::wire::{ToJson, message_text, object, optional_text, text};
 
 /// The API surface an error is answered on; each has its own error format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,7 +67,7 @@ pub struct AnthropicErrorBody {
 impl ToJson for OpenAiErrorBody {
     fn to_json(&self) -> JsonValue {
         object([
-            ("message", text(&self.message)),
+            ("message", message_text(&self.message)),
             ("type", text(&self.kind)),
             ("param", optional_text(self.param.as_deref())),
             ("code", optional_text(self.code.as_deref())),
@@ -83,7 +83,7 @@ impl ToJson for OpenAiErrorEnvelope {
 
 impl ToJson for AnthropicErrorBody {
     fn to_json(&self) -> JsonValue {
-        object([("type", text(self.kind)), ("message", text(&self.message))])
+        object([("type", text(self.kind)), ("message", message_text(&self.message))])
     }
 }
 

@@ -10,7 +10,10 @@ pub use crate::openai::{Model, ModelList};
 use crate::coerce;
 use crate::error::ApiError;
 use crate::json::{JsonValue, put};
-use crate::wire::{Members, Reader, ToJson, int, list, members, object, optional_text, push, push_some, text};
+use crate::wire::{
+    Members, Reader, ToJson, arguments_text, int, list, members, message_text, object, optional_text, push, push_some,
+    text,
+};
 
 /// A Responses request. Input items and the fields that take several shapes stay untyped JSON so the mapper can
 /// report precise errors.
@@ -433,7 +436,7 @@ impl ToJson for FunctionCallItem {
             ("status", text(&self.status)),
             ("call_id", text(&self.call_id)),
             ("name", text(&self.name)),
-            ("arguments", text(&self.arguments)),
+            ("arguments", arguments_text(&self.arguments)),
         ])
     }
 }
@@ -549,7 +552,7 @@ impl ToJson for ResponseEvent {
                 vec![
                     ("item_id", text(item_id)),
                     ("output_index", int(*output_index)),
-                    ("delta", text(delta)),
+                    ("delta", arguments_text(delta)),
                 ]
             }
             EventBody::ArgumentsDone {
@@ -559,11 +562,11 @@ impl ToJson for ResponseEvent {
             } => vec![
                 ("item_id", text(item_id)),
                 ("output_index", int(*output_index)),
-                ("arguments", text(arguments)),
+                ("arguments", arguments_text(arguments)),
             ],
             EventBody::Error { code, message, param } => vec![
                 ("code", optional_text(code.as_deref())),
-                ("message", text(message)),
+                ("message", message_text(message)),
                 ("param", optional_text(param.as_deref())),
             ],
         };
