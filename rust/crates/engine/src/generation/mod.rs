@@ -42,6 +42,8 @@ use crate::plan::{Formats, Plan, StageKind, StagingRing, View};
 use crate::prefix::{
     CacheSpec, Copier, POSITION_GRANULE, PrefixCacheHandle, PrefixCacheStats, open_prefix_cache_claimed,
 };
+#[cfg(feature = "test-oracles")]
+use crate::quantum::body_fault::{BodyFault, HoldEvent};
 use crate::quantum::{Executor, Preparer};
 use crate::residency::offload::StagingGeometry;
 use crate::residency::planner::ResidencyPlan;
@@ -741,6 +743,23 @@ impl Generations {
                 .quantum_admitted
                 .set(Box::new(move |start| hook(start)));
         }
+    }
+
+    /// The test hook: the next graph body of each sequence that runs for a new key ends as `fault`.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn fail_body(&self, fault: BodyFault) {
+        for generation in &self.generations {
+            generation.shared.executor.body_faults().arm(fault);
+        }
+    }
+
+    /// The test hook: what became of the hold of the quantum a fault was applied to, by sequence.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn body_events(&self) -> Vec<Vec<HoldEvent>> {
+        self.generations
+            .iter()
+            .map(|generation| generation.shared.executor.body_faults().events())
+            .collect()
     }
 
     /// The test hook: no sequence records graphs from now on. Only while no request runs.
