@@ -18,7 +18,7 @@ use thiserror::Error;
 use crate::launch::catalog::{
     Launch, MAX_ARGUMENTS, MAX_TENSOR_MAPS, TENSOR_MAP_BYTES, TensorMapPlan, TensorMapSwizzle,
 };
-use crate::launch::load::{KernelTable, Slot, Unavailable};
+use crate::launch::load::{KernelTable, Slot, TensorMapCache, Unavailable};
 
 thread_local! {
     /// The calling thread's argument buffer, rewritten for each launch.
@@ -122,9 +122,8 @@ where
         ..geometry(launch)
     };
     ARGUMENTS.with_borrow_mut(|arguments| {
-        let maps = table.tensor_maps();
-        fill_arguments(arguments, launch, |map| {
-            maps.get_or_encode(map, |plan| resolved.tensor_map(&tiled_map(plan)))
+        fill_cached(arguments, launch, table.tensor_maps(), |plan| {
+            resolved.tensor_map(&tiled_map(plan))
         })?;
         // SAFETY: the caller's contract; the arguments were checked against the kernel's parameter sizes above.
         unsafe { queue.launch(resolved.kernel(), geometry, arguments) }
@@ -156,6 +155,16 @@ fn zero_gaps(arguments: &mut Args, launch: &Launch) {
         arguments.push(0u64);
     }
     arguments.clear();
+}
+
+/// [`fill_arguments`] with each map taken from `maps` and encoded by `encode` only when the thread has not seen it.
+fn fill_cached(
+    arguments: &mut Args,
+    launch: &Launch,
+    maps: &TensorMapCache,
+    mut encode: impl FnMut(&TensorMapPlan) -> Result<TensorMap, GpuError>,
+) -> Result<(), EnqueueError> {
+    fill_arguments(arguments, launch, |map| maps.get_or_encode(map, &mut encode))
 }
 
 /// Rewrites `arguments` as the launch's: the tensor maps first (the kernel's leading parameters, each from
@@ -245,7 +254,6 @@ mod tests {
     use crate::DevicePtr;
     use crate::kernel;
     use crate::launch::catalog::Arguments;
-    use crate::launch::load::TensorMapCache;
     use crate::launch::nvfp4::{Nvfp4Layout, Nvfp4Operands, nvfp4_byte_size, plan_native};
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
@@ -483,14 +491,12 @@ mod tests {
         assert_eq!(arguments.len(), 9);
     }
 
-    /// Fills `arguments` for `launch` through `cache`, counting the encode calls it makes.
-    fn fill_cached(cache: &TensorMapCache, arguments: &mut Args, launch: &Launch) -> usize {
+    /// Fills `arguments` for `launch` the way an enqueue does, through `table`'s cache, counting the encode calls.
+    fn fill_counting(table: &KernelTable, arguments: &mut Args, launch: &Launch) -> usize {
         let mut calls = 0;
-        fill_arguments(arguments, launch, |map| {
-            cache.get_or_encode(map, |plan| {
-                calls += 1;
-                TensorMap::fake(&tiled_map(plan))
-            })
+        fill_cached(arguments, launch, table.tensor_maps(), |plan| {
+            calls += 1;
+            TensorMap::fake(&tiled_map(plan))
         })
         .unwrap();
         calls
@@ -498,32 +504,34 @@ mod tests {
 
     #[test]
     fn a_launch_enqueued_again_encodes_no_map_and_passes_the_same_bytes() {
-        let (launch, cache) = (tile_launch(), TensorMapCache::default());
+        let (launch, table) = (tile_launch(), KernelTable::all_unavailable(false));
         let (mut first, mut second, mut direct) = (Args::new(), Args::new(), Args::new());
         assert_eq!(
-            fill_cached(&cache, &mut first, &launch),
+            fill_counting(&table, &mut first, &launch),
             3,
             "a cold launch encodes its maps"
         );
         assert_eq!(
-            fill_cached(&cache, &mut second, &launch),
+            fill_counting(&table, &mut second, &launch),
             0,
             "a warm launch encodes nothing"
         );
-        assert_eq!(cache.encodes(), 3);
         fill_arguments(&mut direct, &launch, |map| TensorMap::fake(&tiled_map(map))).unwrap();
         assert_eq!(first, direct);
         assert_eq!(
             second, direct,
             "the cached bytes are the bytes encoding each time gives"
         );
+        // Another table has its own maps.
+        let other = KernelTable::all_unavailable(false);
+        assert_eq!(fill_counting(&other, &mut first, &launch), 3);
     }
 
     #[test]
     fn a_changed_address_or_shape_encodes_that_map_again() {
-        let (launch, cache) = (tile_launch(), TensorMapCache::default());
+        let (launch, table) = (tile_launch(), KernelTable::all_unavailable(false));
         let mut arguments = Args::new();
-        fill_cached(&cache, &mut arguments, &launch);
+        fill_counting(&table, &mut arguments, &launch);
         let mut moved = launch;
         let mut maps = moved.args.maps().copied().collect::<Vec<_>>();
         maps[1].address += 0x100;
@@ -536,7 +544,7 @@ mod tests {
             };
         }
         assert_eq!(
-            fill_cached(&cache, &mut arguments, &moved),
+            fill_counting(&table, &mut arguments, &moved),
             1,
             "only the moved map is encoded"
         );
@@ -544,16 +552,25 @@ mod tests {
         fill_arguments(&mut direct, &moved, |map| TensorMap::fake(&tiled_map(map))).unwrap();
         assert_eq!(arguments, direct);
         assert_eq!(
-            fill_cached(&cache, &mut arguments, &launch),
+            fill_counting(&table, &mut arguments, &launch),
             0,
             "the first launch's maps are still kept"
         );
-        let mut reshaped = maps[0];
-        reshaped.dims[1] += 1;
-        cache
-            .get_or_encode(&reshaped, |plan| TensorMap::fake(&tiled_map(plan)))
-            .unwrap();
-        assert_eq!(cache.encodes(), 5);
+        let mut reshaped = launch;
+        maps[0].dims[1] += 1;
+        reshaped.args = maps.iter().fold(Arguments::new(), |args, map| args.tensor_map(*map));
+        for (&word, &size) in launch.args.words().iter().zip(launch.args.sizes()) {
+            reshaped.args = if size == 4 {
+                reshaped.args.u32(word as u32)
+            } else {
+                reshaped.args.u64(word)
+            };
+        }
+        assert_eq!(
+            fill_counting(&table, &mut arguments, &reshaped),
+            1,
+            "only the reshaped map"
+        );
     }
 
     #[test]

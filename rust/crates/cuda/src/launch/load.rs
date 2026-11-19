@@ -18,7 +18,7 @@ use std::fs::{read, read_dir, read_to_string};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{Builder, scope};
 use std::time::{Duration, Instant};
 
@@ -108,8 +108,11 @@ pub struct ModuleTiming {
     pub elapsed: Duration,
 }
 
-/// The most distinct tensor maps a thread keeps; a thread that reaches it forgets them all and starts again.
-const TENSOR_MAP_CACHE_LIMIT: usize = 1 << 14;
+/// The most distinct tensor maps a thread keeps, derived from what a table can be asked for: two weight maps (codes and
+/// scales) for each of up to 1024 NVFP4 linears a model holds, and one activation map for each of up to 4096 shapes
+/// (row counts and scratch addresses). A slot holds the 128-byte map at the 64-byte alignment `TensorMap` has (256
+/// bytes) and its key (about 130 bytes), so a thread keeps at most about 2.3 MiB.
+const TENSOR_MAP_CACHE_LIMIT: usize = 2 * 1024 + 4096;
 
 thread_local! {
     /// The maps this thread has encoded, by table and plan. Only the thread itself touches them: no lock, and a thread
@@ -117,16 +120,24 @@ thread_local! {
     static ENCODED: RefCell<HashMap<(u64, TensorMapPlan), TensorMap>> = RefCell::new(HashMap::new());
 }
 
-/// The maps asked for and the maps encoded, by every table in the process (counters for measuring, read through
-/// [`tensor_map_counts`]).
-static REQUESTED: AtomicUsize = AtomicUsize::new(0);
-static ENCODED_TOTAL: AtomicUsize = AtomicUsize::new(0);
+/// Counters of the maps launches asked for and the maps encoded, by every table in the process. They exist only where
+/// they are read: tests and debug builds.
+#[cfg(any(test, debug_assertions))]
+mod counts {
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// How many tensor maps launches have asked for and how many of those were encoded (the rest came from a thread's
-/// cache), over the process's life. Before maps were kept, every one asked for was encoded.
-pub fn tensor_map_counts() -> (usize, usize) {
-    (REQUESTED.load(Ordering::Relaxed), ENCODED_TOTAL.load(Ordering::Relaxed))
+    pub(super) static REQUESTED: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static ENCODED: AtomicUsize = AtomicUsize::new(0);
+
+    /// How many tensor maps launches have asked for and how many of those were encoded (the rest came from a thread's
+    /// cache), over the process's life.
+    pub fn tensor_map_counts() -> (usize, usize) {
+        (REQUESTED.load(Ordering::Relaxed), ENCODED.load(Ordering::Relaxed))
+    }
 }
+
+#[cfg(any(test, debug_assertions))]
+pub use counts::tensor_map_counts;
 
 /// Tables made so far, to give each its own identity in the threads' caches.
 static TABLES: AtomicU64 = AtomicU64::new(0);
@@ -139,14 +150,12 @@ static TABLES: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 pub(crate) struct TensorMapCache {
     table: u64,
-    encodes: AtomicUsize,
 }
 
 impl Default for TensorMapCache {
     fn default() -> Self {
         Self {
             table: TABLES.fetch_add(1, Ordering::Relaxed),
-            encodes: AtomicUsize::new(0),
         }
     }
 }
@@ -158,26 +167,23 @@ impl TensorMapCache {
         plan: &TensorMapPlan,
         encode: impl FnOnce(&TensorMapPlan) -> Result<TensorMap, GpuError>,
     ) -> Result<TensorMap, GpuError> {
-        REQUESTED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(any(test, debug_assertions))]
+        counts::REQUESTED.fetch_add(1, Ordering::Relaxed);
         let key = (self.table, *plan);
         if let Some(map) = ENCODED.with_borrow(|encoded| encoded.get(&key).copied()) {
             return Ok(map);
         }
         let map = encode(plan)?;
-        self.encodes.fetch_add(1, Ordering::Relaxed);
-        ENCODED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        #[cfg(any(test, debug_assertions))]
+        counts::ENCODED.fetch_add(1, Ordering::Relaxed);
         ENCODED.with_borrow_mut(|encoded| {
             if encoded.len() >= TENSOR_MAP_CACHE_LIMIT {
-                encoded.clear();
+                // A fresh map, so the memory the full one held is released.
+                *encoded = HashMap::new();
             }
             encoded.insert(key, map);
         });
         Ok(map)
-    }
-
-    /// How many maps were encoded (not found in the thread's cache), by all threads.
-    pub(crate) fn encodes(&self) -> usize {
-        self.encodes.load(Ordering::Relaxed)
     }
 }
 
@@ -191,11 +197,6 @@ pub struct KernelTable {
 }
 
 impl KernelTable {
-    /// The tensor maps this table has encoded so far (each distinct map is encoded once, then reused).
-    pub fn tensor_map_encodes(&self) -> usize {
-        self.maps.encodes()
-    }
-
     /// The table's cache of encoded tensor maps.
     pub(crate) fn tensor_maps(&self) -> &TensorMapCache {
         &self.maps
