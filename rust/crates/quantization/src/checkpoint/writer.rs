@@ -546,13 +546,36 @@ pub fn write_file(
     host: &Arc<Lake>,
     then: Done<()>,
 ) -> Result<(), CheckpointError> {
-    let mut writer = SafetensorsWriter::with_buffer(file, buffer_bytes)?;
-    writer.entries.push(Entry {
-        name: file.display().to_string(),
+    let target = Target {
+        file,
         label: file.display().to_string(),
+        size,
+    };
+    write_target(target, source, buffer_bytes, io, host, then)
+}
+
+/// The file a write makes, the name its read errors give for where the bytes come from, and its size.
+struct Target<'a> {
+    file: &'a Path,
+    label: String,
+    size: u64,
+}
+
+fn write_target(
+    target: Target<'_>,
+    source: Source,
+    buffer_bytes: usize,
+    io: &Arc<AsyncIo>,
+    host: &Arc<Lake>,
+    then: Done<()>,
+) -> Result<(), CheckpointError> {
+    let mut writer = SafetensorsWriter::with_buffer(target.file, buffer_bytes)?;
+    writer.entries.push(Entry {
+        name: target.file.display().to_string(),
+        label: target.label,
         dtype: String::new(),
         shape: Vec::new(),
-        bytes: size,
+        bytes: target.size,
         source,
     });
     writer.finish_with(Vec::new(), io, host, then)
@@ -607,7 +630,12 @@ pub(crate) fn copy_file(
                         read_exact(&reader, Arc::clone(&file), offset, chunk.len(), context.clone(), next)
                     });
                     let report = Arc::clone(&then);
-                    if let Err(error) = write_file(&to, size, source, buffer_bytes, &io, &host, then) {
+                    let target = Target {
+                        file: &to,
+                        label: label.clone(),
+                        size,
+                    };
+                    if let Err(error) = write_target(target, source, buffer_bytes, &io, &host, then) {
                         report(Err(error));
                     }
                 }),

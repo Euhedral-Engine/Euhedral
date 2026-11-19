@@ -22,6 +22,7 @@ use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
 use euhedral_inference_quantization::exl3::Quantized;
 use euhedral_inference_quantization::exl3::{Done, Exl3Settings, Exl3Writer, Listing};
 
+use euhedral_io::AsyncIo;
 use serde_json::Value;
 
 use crate::checkpoint_support::{Spec, World, bf16, safetensors, write};
@@ -51,18 +52,24 @@ pub fn listing(source: &Path, out: &Path) -> Listing {
 }
 
 pub fn open(world: &World, source: &Path, out: &Path, bits: f64, rows: u64, columns: u64) -> Exl3Writer {
+    open_over(world, Arc::clone(&world.io), source, out, bits, rows, columns)
+}
+
+/// A writer whose files are read and written through `io`, which need not be the world's.
+pub fn open_over(
+    world: &World,
+    io: Arc<AsyncIo>,
+    source: &Path,
+    out: &Path,
+    bits: f64,
+    rows: u64,
+    columns: u64,
+) -> Exl3Writer {
     let store = Arc::new(world.call(|done| Safetensors::open(&world.io, source, done)).unwrap());
     let objects = world.call(|done| Qwen38Objects::open(store, source, done)).unwrap();
     let mut settings = Exl3Settings::new(bits, rows, columns);
     settings.buffer_bytes = 4096;
-    Exl3Writer::new(
-        Arc::clone(&world.io),
-        Arc::clone(&world.host),
-        objects,
-        source,
-        out,
-        settings,
-    )
+    Exl3Writer::new(io, Arc::clone(&world.host), objects, source, out, settings)
 }
 
 const LAYER: &str = "model.language_model.layers.0.";

@@ -397,7 +397,8 @@ fn write_file_writes_whole_and_names_the_file_when_it_fails() {
         Ok(())
     });
     let failed = world.call(|done| write_file(&target, 128, source, 64, &world.io, &world.host, done));
-    assert!(failed.unwrap_err().to_string().contains("cut"));
+    let message = failed.unwrap_err().to_string();
+    assert!(message.contains("cut") && message.contains("half.txt"), "{message}");
     assert!(!target.exists());
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1, "no part is left");
     world.finish();

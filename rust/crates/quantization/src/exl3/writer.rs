@@ -3,11 +3,12 @@
 //! renamed, so a stop leaves whole files and no partial one.
 //!
 //! The writer is a value that moves with the work: each call takes it and gives it back, with the result, to the
-//! callback. A callback runs once, from a frame of the lattice that drives the `AsyncIo`, and must not wait. A call
-//! that cannot be done (a refusal, or a file that could not be written) gives the writer back with the error and with
-//! its record of the files written unchanged, so the call can be made again. A call that is dropped while it is in
-//! flight (a step that was accepted but never ran, because a lake closed under it) ends with
-//! [`CheckpointError::LakeClosed`] and the writer, so the callback runs once in every case.
+//! callback. A callback runs once, from a frame of the lattice that drives the `AsyncIo` or, if that frame is dropped
+//! unrun, from wherever it is dropped, and must not wait. A call that cannot be done (a refusal, or a file that could
+//! not be written) gives the writer back with the error and with its record of the files written unchanged, so the
+//! call can be made again; the one thing it does not give back is the results a [`Exl3Writer::layer`] call took. A call
+//! that is dropped while it is in flight (a step that was accepted but never ran, because a lake closed under it) ends
+//! with [`CheckpointError::LakeClosed`] and the writer, so the callback runs once in every case.
 //!
 //! The directory of the output must exist. `AsyncIo` cannot make or list directories, so the caller makes the output
 //! directory and lists the source and output directories (as a [`Listing`]) when it calls [`Exl3Writer::finish`].
@@ -216,14 +217,56 @@ impl<W: Send + 'static, E: Send + 'static> Parked<W, E> {
         Arc::new(Self { cell })
     }
 
-    fn take(&self) -> Option<(W, EndOf<W>, E)> {
-        self.cell.take()
+    /// The call, for the step that runs. It is still the guard's until the step ends it ([`Taken::end`]) or passes it
+    /// on ([`Taken::go`]): a step that panics in between ends the call with an error as it unwinds.
+    fn take(&self) -> Option<Taken<W, E>> {
+        self.cell.take().map(|(writer, then, extra)| Taken {
+            parts: Some((writer, then, extra)),
+        })
     }
 
     /// Ends the call with the error of a step that was refused, unless the step took the call.
     fn refused(&self, error: CheckpointError) {
-        if let Some((writer, then, _)) = self.take() {
+        if let Some((writer, then, _)) = self.cell.take() {
             then(writer, Err(error));
+        }
+    }
+}
+
+/// The call while a step runs it: dropped before it is ended or passed on, it ends the call with an error.
+struct Taken<W, E> {
+    parts: Option<(W, EndOf<W>, E)>,
+}
+
+impl<W, E> Taken<W, E> {
+    /// The writer and what the step parked with it, to work on while the call is still held.
+    fn parts(&mut self) -> (&mut W, &E) {
+        let (writer, _, extra) = self.parts.as_mut().expect("a call that is held has its parts");
+        (writer, &*extra)
+    }
+
+    /// Ends the call with `result`.
+    fn end(mut self, result: Result<(), CheckpointError>) {
+        if let Some((writer, then, _)) = self.parts.take() {
+            then(writer, result);
+        }
+    }
+
+    /// Hands the call over to the next step, which must end it or park it.
+    fn go(mut self) -> (W, EndOf<W>, E) {
+        self.parts.take().expect("a call that is held has its parts")
+    }
+}
+
+impl<W, E> Drop for Taken<W, E> {
+    fn drop(&mut self) {
+        if let Some((writer, then, _)) = self.parts.take() {
+            then(
+                writer,
+                Err(CheckpointError::Invalid(
+                    "a step of the call failed before it ended".to_owned(),
+                )),
+            );
         }
     }
 }
@@ -321,7 +364,9 @@ impl Exl3Writer {
     /// Writes decoder layer `index`: the quantized linears (keyed by tensor name without `.weight`, as
     /// [`linears::layer`] names them, with their bits in `bits_by_linear`), the unquantized linears as F16 and every
     /// other tensor of the layer as in the source. The results are taken, and each is dropped once its tensors are
-    /// made, so a layer's results are not in memory twice; a refused call drops them too.
+    /// made, so a layer's results are not in memory twice.
+    /// They are spent on a call that fails, whether it was refused or the file could not be written: the caller
+    /// quantizes the layer again to repeat the call.
     pub fn layer(
         self,
         index: usize,
@@ -447,17 +492,15 @@ impl Exl3Writer {
             &io,
             &host,
             Arc::new(move |result| {
-                let Some((mut writer, then, (file, listed, mtp))) = waiting.take() else {
+                let Some(mut taken) = waiting.take() else {
                     return;
                 };
-                match result {
-                    Ok(()) => {
-                        writer.ledger.record_file(&file, &listed);
-                        writer.mtp_written |= mtp;
-                        then(writer, Ok(()));
-                    }
-                    Err(error) => then(writer, Err(error)),
+                if result.is_ok() {
+                    let (writer, (file, listed, mtp)) = taken.parts();
+                    writer.ledger.record_file(file, listed);
+                    writer.mtp_written |= *mtp;
                 }
+                taken.end(result);
             }),
         );
         if let Err(error) = started {
@@ -477,6 +520,10 @@ impl Exl3Writer {
     /// A refusal writes nothing. A failure while writing leaves the files written so far in the output and gives the
     /// writer back; `finish` can be called again with a new listing of the output, and rewrites those files.
     pub fn finish(self, bits_by_linear: &HashMap<String, f64>, listing: Listing, then: Done) {
+        // The listing is checked before an earlier file is adopted, so a refusal leaves the record as it was.
+        if let Err(error) = self.check_listing(&listing) {
+            return then(self, Err(error));
+        }
         let earlier = match self.earlier_files(&listing.out) {
             Ok(earlier) => earlier,
             Err(error) => return then(self, Err(error)),
@@ -489,18 +536,40 @@ impl Exl3Writer {
         let parked = Parked::new(self, then, (earlier, bits_by_linear.clone(), listing));
         let waiting = Arc::clone(&parked);
         let opened: ReadDone<Safetensors> = Arc::new(move |opened| {
-            let Some((mut writer, then, (earlier, bits, listing))) = waiting.take() else {
+            let Some(mut taken) = waiting.take() else {
                 return;
             };
-            let adopted = opened.and_then(|found| writer.adopt(&found, &earlier));
-            match adopted {
-                Ok(()) => writer.checked(bits, listing, then),
-                Err(error) => then(writer, Err(error)),
+            let (writer, (earlier, ..)) = taken.parts();
+            match opened.and_then(|found| writer.adopt(&found, earlier)) {
+                Ok(()) => {
+                    let (writer, then, (_, bits, listing)) = taken.go();
+                    writer.checked(bits, listing, then);
+                }
+                Err(error) => taken.end(Err(error)),
             }
         });
         if let Err(error) = Safetensors::open_files(&io, &out, names, opened) {
             parked.refused(error);
         }
+    }
+
+    fn check_listing(&self, listing: &Listing) -> Result<(), CheckpointError> {
+        if !listing.source.iter().any(|file| file == "config.json") {
+            return Err(CheckpointError::Invalid(
+                "the listing of the source has no config.json".to_owned(),
+            ));
+        }
+        let absent: Vec<&str> = self
+            .ledger
+            .files()
+            .filter(|file| !listing.out.iter().any(|listed| listed == file))
+            .collect();
+        if !absent.is_empty() {
+            return Err(CheckpointError::Invalid(format!(
+                "the listing of the output is stale: it lacks {absent:?}, which this run wrote"
+            )));
+        }
+        Ok(())
     }
 
     /// The files an earlier run left in the output that this writer has not written, with the tensors each must hold.
@@ -598,15 +667,16 @@ impl Exl3Writer {
         let parked = Parked::new(self, then, jobs);
         let waiting = Arc::clone(&parked);
         let read: ReadDone<Vec<u8>> = Arc::new(move |bytes| {
-            let Some((writer, then, mut jobs)) = waiting.take() else {
+            let Some(taken) = waiting.take() else {
                 return;
             };
             match bytes.and_then(|bytes| source_config(&bytes)) {
                 Ok(config) => {
+                    let (writer, then, mut jobs) = taken.go();
                     jobs.push_back(Job::Documents(config));
                     writer.run(jobs, then);
                 }
-                Err(error) => then(writer, Err(error)),
+                Err(error) => taken.end(Err(error)),
             }
         });
         if let Err(error) = read_file(&io, &path, read) {
@@ -620,21 +690,6 @@ impl Exl3Writer {
         bits_by_linear: &HashMap<String, f64>,
         listing: &Listing,
     ) -> Result<VecDeque<Job>, CheckpointError> {
-        if !listing.source.iter().any(|file| file == "config.json") {
-            return Err(CheckpointError::Invalid(
-                "the listing of the source has no config.json".to_owned(),
-            ));
-        }
-        let absent: Vec<&str> = self
-            .ledger
-            .files()
-            .filter(|file| !listing.out.iter().any(|listed| listed == file))
-            .collect();
-        if !absent.is_empty() {
-            return Err(CheckpointError::Invalid(format!(
-                "the listing of the output is stale: it lacks {absent:?}, which this run wrote"
-            )));
-        }
         let names = self.sorted_names();
         let head: BTreeSet<String> = [
             format!("{TEXT}embed_tokens.weight"),
@@ -735,12 +790,15 @@ impl Exl3Writer {
                     &io,
                     &host,
                     Arc::new(move |result| {
-                        let Some((writer, then, jobs)) = waiting.take() else {
+                        let Some(taken) = waiting.take() else {
                             return;
                         };
                         match result {
-                            Ok(()) => writer.run(jobs, then),
-                            Err(error) => then(writer, Err(error)),
+                            Ok(()) => {
+                                let (writer, then, jobs) = taken.go();
+                                writer.run(jobs, then);
+                            }
+                            Err(error) => taken.end(Err(error)),
                         }
                     }),
                 );
@@ -774,8 +832,8 @@ impl Exl3Writer {
             &io,
             &host,
             Arc::new(move |result| {
-                if let Some((writer, then, ())) = waiting.take() {
-                    then(writer, result);
+                if let Some(taken) = waiting.take() {
+                    taken.end(result);
                 }
             }),
         );

@@ -14,12 +14,18 @@ mod exl3_support;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use checkpoint_support::{Spec, World, bf16, safetensors, write};
+use euhedral_core::generics::LatticeSource;
+use euhedral_inference_engine::Handoff;
+use euhedral_inference_quantization::checkpoint::CheckpointError;
 use euhedral_inference_quantization::exl3::{Exl3Writer, Listing};
+use euhedral_io::AsyncIo;
 use exl3_support::{
     ATTENTION, CONFIG, GDN, MTP, all_rates, layer_results, listing, miniature, miniature_with, mtp_results, names,
-    open, run, tensor_names, tensor_of,
+    open, open_over, run, tensor_names, tensor_of,
 };
 use serde_json::Value;
 
@@ -522,20 +528,24 @@ fn a_listing_of_the_output_that_misses_a_written_file_is_refused() {
             .filter(|file| file != "mtp.safetensors")
             .collect(),
     };
+    let before = writer.tensor_storage();
     let (writer, result) = run(|done| writer.finish(&rates(2.0), list, done));
     let message = result.unwrap_err().to_string();
     assert!(message.contains("mtp.safetensors"), "{message}");
+    assert_eq!(writer.tensor_storage(), before, "a refusal leaves the record as it was");
     assert!(!names(&f.out).contains(&"lm_head.safetensors".to_owned()));
     let (_, result) = finish(&f, writer, &rates(2.0));
     result.unwrap();
     f.world.finish();
 }
 
-// Mutant caught: an empty listing of the source finishing a checkpoint that has no tokenizer, no license and no config.
+// Mutants caught: an empty listing of the source finishing a checkpoint that has no tokenizer, no license and no
+// config; the listing checked after an earlier run's files are adopted, which leaves them in the record of a refusal.
 #[test]
-fn a_listing_of_the_source_without_config_json_is_refused() {
+fn a_listing_of_the_source_without_config_json_is_refused_and_adopts_nothing() {
     let f = fixture(CONFIG, 1.0);
-    let writer = write_layers_and_mtp(writer(&f));
+    drop(write_layers_and_mtp(writer(&f)));
+    let writer = writer(&f);
     let list = Listing {
         source: Vec::new(),
         out: names(&f.out),
@@ -543,7 +553,42 @@ fn a_listing_of_the_source_without_config_json_is_refused() {
     let (writer, result) = run(|done| writer.finish(&rates(2.0), list, done));
     assert!(result.unwrap_err().to_string().contains("config.json"));
     assert!(!names(&f.out).contains(&"lm_head.safetensors".to_owned()));
+    assert_eq!(writer.tensor_storage(), serde_json::json!({}), "nothing was adopted");
     let (_, result) = finish(&f, writer, &rates(2.0));
     result.unwrap();
+    f.world.finish();
+}
+
+// Mutants caught: a guard that does not end the call when an accepted step is dropped unrun (the caller waits for
+// ever); one that ends it twice; one that does not give the writer back.
+#[test]
+fn a_completion_frame_dropped_unrun_ends_the_call_once_with_the_writer() {
+    let f = fixture(CONFIG, 1.0);
+    drop(write_layers_and_mtp(writer(&f)));
+    // No lattice drives this `AsyncIo`: the test pulls its frames itself.
+    let lonely = AsyncIo::open().unwrap();
+    let writer = open_over(&f.world, Arc::clone(&lonely), &f.source, &f.out, 2.0, 4, 8);
+    let ended = Handoff::new();
+    let sender = Arc::clone(&ended);
+    let list = listing(&f.source, &f.out);
+    writer.finish(
+        &rates(2.0),
+        list,
+        Arc::new(move |writer, result| sender.send((writer, result.map_err(|error| error.to_string())))),
+    );
+    assert!(ended.take().is_none(), "the call is still in flight");
+    let begun = Instant::now();
+    let mut frames = Vec::new();
+    while frames.is_empty() {
+        assert!(begun.elapsed() < Duration::from_secs(20), "no completion came");
+        lonely.reap();
+        lonely.pull(&mut |frame| frames.push(frame), &mut |_| false, 1);
+    }
+    frames.truncate(1);
+    drop(frames);
+    let (writer, result) = ended.take().expect("the call did not end when its frame was dropped");
+    assert_eq!(result.unwrap_err(), CheckpointError::LakeClosed.to_string());
+    assert!(names(&f.out).iter().all(|file| file != "lm_head.safetensors"));
+    drop(writer);
     f.world.finish();
 }
