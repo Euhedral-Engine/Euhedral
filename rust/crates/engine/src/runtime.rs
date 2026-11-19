@@ -28,6 +28,7 @@ use euhedral_inference_edrl::TensorTable;
 use euhedral_inference_settings::{Auto, BatchingSettings, Settings};
 use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
+use crate::composite::Composite;
 use crate::error::{EngineError, PlanError};
 use crate::generation::{AdmissionError, CancelHandle, GenerationRequest, Generations, LogitsSink};
 use crate::generation::{GREEDY_DEPTH, OPERATION_BOUND};
@@ -731,11 +732,28 @@ impl EngineRuntime {
         library: &Path,
         close_timeout: Option<Duration>,
     ) -> (RuntimeOwner, ReadyHandoff) {
+        Self::start_composite(settings, library, close_timeout, Composite::default())
+    }
+
+    /// [`start_with`](EngineRuntime::start_with) over weights some of whose objects come from other artifacts:
+    /// `composite` names them, and the model loads from the composite table, each payload read from its own file. An
+    /// empty `composite` starts the model of `model.artifact` alone, as `start_with` does.
+    pub fn start_composite(
+        settings: &Settings,
+        library: &Path,
+        close_timeout: Option<Duration>,
+        composite: Composite,
+    ) -> (RuntimeOwner, ReadyHandoff) {
+        let composite = if composite.is_empty() {
+            Composite::default()
+        } else {
+            composite
+        };
         let ready = Handoff::new();
         match build(settings, library, close_timeout) {
             Ok(core) => {
                 let owner = RuntimeOwner::over(Arc::clone(&core.teardown));
-                startup::run(core, Arc::clone(&ready));
+                startup::run(core, Arc::clone(&ready), composite);
                 (owner, ready)
             }
             Err(error) => {

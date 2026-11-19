@@ -319,7 +319,10 @@ type Done = Box<dyn FnOnce(LoadOutcome) + Send + Sync>;
 /// What the chains share. Its last owner reports the outcome when it drops.
 struct Shared {
     core: Arc<Core>,
-    file: Arc<OwnedFile>,
+    /// The files the pieces are read from.
+    files: Arc<[Arc<OwnedFile>]>,
+    /// The file of each placement, an index into `files`; empty when every piece reads from the first.
+    file_of: Arc<[usize]>,
     pieces: Arc<[Piece]>,
     names: Arc<[String]>,
     chains: usize,
@@ -343,6 +346,12 @@ impl Shared {
 
     fn has_failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
+    }
+
+    /// The file `piece` is read from.
+    fn file(&self, piece: &Piece) -> &Arc<OwnedFile> {
+        let index = self.file_of.get(piece.placement).copied().unwrap_or(0);
+        &self.files[index]
     }
 }
 
@@ -387,7 +396,8 @@ pub(crate) fn acquire_loans(core: &Core, ring: &Ring) -> Result<Vec<PooledPinned
 )]
 pub(crate) fn start(
     core: &Arc<Core>,
-    file: Arc<OwnedFile>,
+    files: Arc<[Arc<OwnedFile>]>,
+    file_of: Arc<[usize]>,
     names: Arc<[String]>,
     pieces: Vec<Piece>,
     chains: usize,
@@ -398,7 +408,8 @@ pub(crate) fn start(
 ) {
     let shared = Arc::new(Shared {
         core: Arc::clone(core),
-        file,
+        files,
+        file_of,
         names,
         base: arena.ptr(),
         host,
@@ -447,7 +458,7 @@ fn issue(shared: Arc<Shared>, chain: usize, index: usize, mut loan: PooledPinned
     if let Err(error) = loan.set_len(piece.len) {
         return shared.fail(EngineError::Cuda(error));
     }
-    let raw = raw_file(&shared.file);
+    let raw = raw_file(shared.file(&piece));
     let next = Arc::clone(&shared);
     let then = Box::new(move |done: IoDoneOwned<PooledPinned>| -> Box<dyn Frame> {
         step(Kind::UploadRead, chain, move || read_done(next, chain, index, done))
@@ -474,7 +485,7 @@ fn issue_in_place(shared: Arc<Shared>, chain: usize, index: usize, arena_offset:
             shared.names[piece.placement]
         )));
     };
-    let raw = raw_file(&shared.file);
+    let raw = raw_file(shared.file(&piece));
     let next = Arc::clone(&shared);
     let then = Box::new(move |done: IoDoneOwned<ArenaRange>| -> Box<dyn Frame> {
         step(Kind::UploadRead, chain, move || {
