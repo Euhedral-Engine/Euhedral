@@ -12,6 +12,7 @@
 
 use std::ffi::{c_int, c_void};
 use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::mem::replace;
 use std::path::Path;
 use std::ptr::{from_ref, null_mut, with_exposed_provenance_mut};
 use std::sync::Arc;
@@ -156,8 +157,8 @@ impl MathLibraries {
     /// cuSPARSE and nvJitLink. The CUDA driver must already be usable by this process (load the [`CudaLibrary`](crate::CudaLibrary) first).
     pub fn load(directory: &Path) -> Result<Arc<MathLibraries>, CudaError> {
         if LIBRARIES.is_empty() {
-            return Err(CudaError::Argument(
-                "cuBLAS and cuSOLVER are loaded on Linux x86-64 only".to_string(),
+            return Err(CudaError::Unsupported(
+                "cuBLAS and cuSOLVER are loaded on Linux x86-64 only",
             ));
         }
         let mut libraries = Vec::with_capacity(LIBRARIES.len());
@@ -177,8 +178,8 @@ impl MathLibraries {
             libraries.push(library);
         }
         if !missing.is_empty() {
-            return Err(CudaError::RuntimeMissing {
-                library: directory.to_path_buf(),
+            return Err(CudaError::MathLibrariesMissing {
+                directory: directory.to_path_buf(),
                 missing,
             });
         }
@@ -206,20 +207,40 @@ impl MathLibraries {
     /// Creates the cuBLAS and cuSOLVER handles of one lane.
     ///
     /// Call it from the lane's own submission, where the device's context is current, and keep the result with the
-    /// lane's state.
-    pub fn lane_handles(self: &Arc<Self>) -> Result<LaneHandles, CudaError> {
+    /// lane's state. When the second handle cannot be made, the first comes back with the error in [`HandlesFailed`],
+    /// so no submission drops it (destroying a handle can wait for the device).
+    pub fn lane_handles(self: &Arc<Self>) -> Result<LaneHandles, HandlesFailed> {
         let mut blas = null_mut();
         // SAFETY: the pointer refers to a live local the call writes a handle to.
-        status("cublasCreate_v2", unsafe { (self.cublas_create)(&mut blas) })?;
+        let created = status("cublasCreate_v2", unsafe { (self.cublas_create)(&mut blas) });
+        if let Err(error) = created {
+            return Err(HandlesFailed { error, leftover: None });
+        }
         let mut handles = LaneHandles {
             libraries: Arc::clone(self),
             blas,
             solver: null_mut(),
         };
-        // SAFETY: as above; on failure `handles` drops and destroys the cuBLAS handle.
-        status("cusolverDnCreate", unsafe { (self.solver_create)(&mut handles.solver) })?;
-        Ok(handles)
+        // SAFETY: as above.
+        let created = status("cusolverDnCreate", unsafe { (self.solver_create)(&mut handles.solver) });
+        match created {
+            Ok(()) => Ok(handles),
+            Err(error) => Err(HandlesFailed {
+                error,
+                leftover: Some(handles),
+            }),
+        }
     }
+}
+
+/// Why [`MathLibraries::lane_handles`] failed, with the handle it had already made, if any. Close the leftover at
+/// shutdown with [`LaneHandles::close`].
+#[derive(Debug)]
+pub struct HandlesFailed {
+    /// The failed call.
+    pub error: CudaError,
+    /// The cuBLAS handle made before the failure, still to be closed.
+    pub leftover: Option<LaneHandles>,
 }
 
 /// The entry point `name` of `library`.
@@ -237,20 +258,25 @@ fn status(call: &'static str, status: c_int) -> Result<(), CudaError> {
     if status == 0 {
         Ok(())
     } else {
-        Err(CudaError::Call { call, status })
+        Err(CudaError::Library { call, status })
     }
 }
 
 /// Reads the `info` word a factorisation or solve wrote, after the queue has retired it: zero is success, a negative
 /// value names the bad argument and a positive one is the order of the leading minor that is not positive definite.
 pub fn check_info(call: &'static str, info: i32) -> Result<(), CudaError> {
-    status(call, info)
+    if info == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Info { call, info })
+    }
 }
 
 /// One lane's cuBLAS and cuSOLVER handles.
 ///
-/// Used by one submission at a time (the lane's), but it may move between the threads that submit. Dropping it
-/// destroys the handles, which can wait for the device: drop it at shutdown, not on a running lane.
+/// Used by one submission at a time (the lane's), but it may move between the threads that submit. Destroying the
+/// handles can wait for the whole device: at shutdown call [`close`](Self::close), which reports a failure; a plain
+/// drop does the same and ignores it. Never drop one on a running lane.
 pub struct LaneHandles {
     libraries: Arc<MathLibraries>,
     blas: Handle,
@@ -258,7 +284,9 @@ pub struct LaneHandles {
 }
 
 // SAFETY: a handle may be used from any thread as long as one thread uses it at a time, which `&mut self` on every call
-// guarantees. The pointers are not shared.
+// guarantees. The pointers are not shared. A handle is used with streams of one device context only, and with a stream
+// of the lane it belongs to, or after the work enqueued on any other stream has retired (the `# Safety` of each call
+// says so): the type does not check this.
 unsafe impl Send for LaneHandles {}
 
 impl Debug for LaneHandles {
@@ -267,22 +295,36 @@ impl Debug for LaneHandles {
     }
 }
 
-impl Drop for LaneHandles {
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "no non-blocking form: destroying a handle waits for the device; handles are dropped at shutdown"
-    )]
-    fn drop(&mut self) {
-        // SAFETY: the handles came from the matching create calls and are destroyed once; the libraries are kept alive
-        // by `self.libraries`.
-        unsafe {
-            if !self.solver.is_null() {
-                (self.libraries.solver_destroy)(self.solver);
-            }
-            if !self.blas.is_null() {
-                (self.libraries.cublas_destroy)(self.blas);
-            }
+impl LaneHandles {
+    /// Destroys the handles, in order, and reports the first failure. This waits for the device: for shutdown.
+    pub fn close(mut self) -> Result<(), CudaError> {
+        self.destroy()
+    }
+
+    fn destroy(&mut self) -> Result<(), CudaError> {
+        let (blas, solver) = (
+            replace(&mut self.blas, null_mut()),
+            replace(&mut self.solver, null_mut()),
+        );
+        let mut first = Ok(());
+        if !solver.is_null() {
+            // SAFETY: the handle came from the create call and is destroyed once; the libraries stay loaded through
+            // `self.libraries`.
+            first = status("cusolverDnDestroy", unsafe { (self.libraries.solver_destroy)(solver) });
         }
+        if !blas.is_null() {
+            // SAFETY: as above.
+            let second = status("cublasDestroy_v2", unsafe { (self.libraries.cublas_destroy)(blas) });
+            first = first.and(second);
+        }
+        first
+    }
+}
+
+impl Drop for LaneHandles {
+    fn drop(&mut self) {
+        // A failure at drop has nowhere to go; `close` reports it.
+        drop(self.destroy());
     }
 }
 
@@ -333,7 +375,8 @@ impl LaneHandles {
         }
     }
 
-    /// Chooses whether FP32 products use the TF32 tensor cores, for the calls that follow on this lane.
+    /// Chooses whether FP32 products use the TF32 tensor cores. The choice stays on this handle, so it applies to every
+    /// later FP32 GEMM on this lane until it is changed.
     pub fn set_math_mode(&mut self, mode: MathMode) -> Result<(), CudaError> {
         // SAFETY: the handle is live.
         status("cublasSetMathMode", unsafe {
@@ -345,6 +388,8 @@ impl LaneHandles {
     /// FP32, or BF16 with `output`.
     ///
     /// # Safety
+    /// Every stream passed must come from the lane this handle belongs to, or the work enqueued on any other stream
+    /// must have retired first; the device context must be the same.
     /// The three operands must be live device allocations of the sizes `product` and the leading dimensions imply, and
     /// stay live and untouched by other work until the queue retires this one; `A` and `B` hold BF16, `C` the
     /// element type `output` names.
@@ -393,6 +438,8 @@ impl LaneHandles {
     /// Enqueues the FP32 product `C = alpha * op(A) op(B) + beta * C` on `stream`.
     ///
     /// # Safety
+    /// Every stream passed must come from the lane this handle belongs to, or the work enqueued on any other stream
+    /// must have retired first; the device context must be the same.
     /// As [`gemm_bf16`](Self::gemm_bf16), with all three operands FP32.
     pub unsafe fn gemm_fp32(
         &mut self,
@@ -429,6 +476,8 @@ impl LaneHandles {
     /// for an `n` by `n` matrix. The answer is on the host when the call returns.
     ///
     /// # Safety
+    /// Every stream passed must come from the lane this handle belongs to, or the work enqueued on any other stream
+    /// must have retired first; the device context must be the same.
     /// `matrix` must be a live device allocation of `n * n` floats (it is not read).
     pub unsafe fn solver_workspace(
         &mut self,
@@ -457,6 +506,8 @@ impl LaneHandles {
     /// work, with [`check_info`].
     ///
     /// # Safety
+    /// Every stream passed must come from the lane this handle belongs to, or the work enqueued on any other stream
+    /// must have retired first; the device context must be the same.
     /// `matrix` must be a live device allocation of `n * n` floats, `workspace` one of `workspace_floats` floats
     /// (at least [`solver_workspace`](Self::solver_workspace)) and `info` one of an int; all stay live and untouched by
     /// other work until the queue retires this one.
@@ -498,6 +549,8 @@ impl LaneHandles {
     /// after the queue retires the work.
     ///
     /// # Safety
+    /// Every stream passed must come from the lane this handle belongs to, or the work enqueued on any other stream
+    /// must have retired first; the device context must be the same.
     /// `factor` must be a live device allocation of `n * n` floats, `b` one of `n * columns` floats and `info` one of an
     /// int; all stay live and untouched by other work until the queue retires this one.
     #[allow(clippy::too_many_arguments, reason = "the library's own parameters")]
@@ -538,18 +591,10 @@ mod tests {
         if LIBRARIES.is_empty() {
             return;
         }
-        let Err(CudaError::RuntimeMissing { missing, .. }) = MathLibraries::load(Path::new("no-such-directory")) else {
+        let Err(CudaError::MathLibrariesMissing { missing, .. }) = MathLibraries::load(Path::new("no-such-directory"))
+        else {
             panic!("an empty directory must be refused as missing libraries");
         };
         assert_eq!(missing.len(), LIBRARIES.len());
-    }
-
-    #[test]
-    fn info_zero_is_success_and_anything_else_is_a_failed_call() {
-        assert!(check_info("cusolverDnSpotrf", 0).is_ok());
-        assert!(matches!(
-            check_info("cusolverDnSpotrf", 3),
-            Err(CudaError::Call { status: 3, .. })
-        ));
     }
 }

@@ -4,7 +4,7 @@
 //! The CUDA library comes from `euhedral.cuda.library` (`EUHEDRAL_TEST_CUDA_LIBRARY`) and the directory of the math
 //! libraries from `euhedral.quantization.cuda-libraries` (`EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES`); a test skips
 //! with a message when either is absent.
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -24,7 +24,7 @@ use euhedral_gpu::cuda::{CudaGpu, CudaQueue};
 use euhedral_gpu::{Lane, LaneStream, SharedLanes, StreamOptions, open_shared_lanes};
 use euhedral_graph::{LaneId, Marker};
 use euhedral_inference_cuda::math::{
-    Fill, GemmOutput, LaneHandles, MathLibraries, Matrix, Operation, Product, check_info,
+    Fill, GemmOutput, LaneHandles, MathLibraries, MathMode, Matrix, Operation, Product, check_info,
 };
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer};
 
@@ -77,6 +77,12 @@ impl Rig {
         buffer
     }
 
+    fn upload_i32(&self, value: i32) -> DeviceBuffer {
+        let buffer = self.buffer(4);
+        buffer.copy_from_host(0, &value.to_le_bytes()).expect("upload");
+        buffer
+    }
+
     fn upload_bf16(&self, values: &[u16]) -> DeviceBuffer {
         let buffer = self.buffer(values.len() * 2);
         buffer
@@ -109,6 +115,9 @@ fn to_bf16(value: f32) -> u16 {
 fn from_bf16(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
+
+/// What an info buffer holds before a call writes it: a call that does not write it shows.
+const SENTINEL: i32 = 777;
 
 /// Deterministic values in [-1, 1).
 fn values(count: usize, seed: u64) -> Vec<f32> {
@@ -178,6 +187,14 @@ fn gemm_matches_a_host_product_within_the_fp32_accumulation_bound() {
     let b_device = rig.upload_bf16(&b_bits);
     let c32 = rig.buffer(m * n * 4);
     let c16 = rig.buffer(m * n * 2);
+    // A product scaled by alpha = 0.5 added to a filled C with beta = 1.
+    let scaled = Product {
+        alpha: 0.5,
+        beta: 1.0,
+        ..product
+    };
+    let before = values(m * n, 9);
+    let c_scaled = rig.upload_f32(&before);
     let operands = |c: &DeviceBuffer| {
         (
             Matrix {
@@ -210,6 +227,9 @@ fn gemm_matches_a_host_product_within_the_fp32_accumulation_bound() {
             let (a, b, c) = operands(&c16);
             // SAFETY: as above.
             unsafe { handles.gemm_bf16(&stream, &product, a, b, c, GemmOutput::Bf16) }.expect("gemm");
+            let (a, b, c) = operands(&c_scaled);
+            // SAFETY: as above.
+            unsafe { handles.gemm_bf16(&stream, &scaled, a, b, c, GemmOutput::Fp32) }.expect("gemm");
             Ok(())
         })
         .expect("submit");
@@ -225,6 +245,18 @@ fn gemm_matches_a_host_product_within_the_fp32_accumulation_bound() {
             exact[index]
         );
     }
+    // alpha and beta: 0.5 * product + C, the half of the accumulation bound and one rounding of the sum.
+    let got = download_f32(&c_scaled, m * n);
+    for index in 0..m * n {
+        let expected = 0.5 * exact[index] + f64::from(before[index]);
+        let bound = 0.5 * accumulation_bound(k, scale[index]) + expected.abs() * f64::powi(2.0, -23);
+        assert!(
+            (f64::from(got[index]) - expected).abs() <= bound,
+            "scaled element {index}: {} against {expected}",
+            got[index]
+        );
+    }
+    handles.take().expect("handles").close().expect("the handles close");
     let mut bytes = vec![0u8; m * n * 2];
     c16.copy_to_host(0, &mut bytes).unwrap();
     for index in 0..m * n {
@@ -265,6 +297,7 @@ fn sgemm_matches_a_host_product_within_the_fp32_accumulation_bound() {
         .submit_marked(|queue| {
             let stream = queue.raw_stream().expect("the lane lends a stream");
             let handles = handles.insert(rig.math.lane_handles().expect("handles"));
+            handles.set_math_mode(MathMode::Default).expect("the math mode");
             // SAFETY: the operands are live device allocations of the sizes the product implies and stay so until the
             // results are read after the retirement.
             unsafe {
@@ -300,6 +333,7 @@ fn sgemm_matches_a_host_product_within_the_fp32_accumulation_bound() {
             exact[index]
         );
     }
+    handles.take().expect("handles").close().expect("the handles close");
 }
 
 /// The symmetric positive definite matrix the solver tests factor: tridiagonal, 4 on the diagonal, 1 beside it.
@@ -349,7 +383,18 @@ fn invert(a: &[f32], n: usize) -> Vec<f64> {
 
 #[test]
 #[ignore = "needs a GPU, the native library and the math libraries"]
-fn cholesky_factor_inverse_and_solve_agree_with_the_host_and_report_info() {
+fn cholesky_with_the_lower_triangle_agrees_with_the_host_and_reports_info() {
+    cholesky_round_trip(Fill::Lower);
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the math libraries"]
+fn cholesky_with_the_upper_triangle_agrees_with_the_host_and_reports_info() {
+    cholesky_round_trip(Fill::Upper);
+}
+
+/// Factors, inverts and solves with `fill`, and checks each answer and each info word against the host.
+fn cholesky_round_trip(fill: Fill) {
     let Some(rig) = rig() else { return };
     let n = 6usize;
     let columns = 2usize;
@@ -371,7 +416,7 @@ fn cholesky_factor_inverse_and_solve_agree_with_the_host_and_report_info() {
     let for_solve = rig.upload_f32(&a);
     let rhs = rig.upload_f32(&b);
     let bad = rig.upload_f32(&indefinite);
-    let infos: Vec<DeviceBuffer> = (0..4).map(|_| rig.buffer(4)).collect();
+    let infos: Vec<DeviceBuffer> = (0..5).map(|_| rig.upload_i32(SENTINEL)).collect();
     let mut handles: Option<LaneHandles> = None;
 
     // The workspace size is known on the host when the query returns; the buffer is allocated after it.
@@ -381,9 +426,9 @@ fn cholesky_factor_inverse_and_solve_agree_with_the_host_and_report_info() {
             let stream = queue.raw_stream().expect("the lane lends a stream");
             let handles = handles.insert(rig.math.lane_handles().expect("handles"));
             // SAFETY: the matrix is a live device allocation of n * n floats; the query does not read it.
-            let potrf = unsafe { handles.solver_workspace(&stream, false, Fill::Lower, n as i32, for_solve.ptr()) };
+            let potrf = unsafe { handles.solver_workspace(&stream, false, fill, n as i32, for_solve.ptr()) };
             // SAFETY: as above.
-            let potri = unsafe { handles.solver_workspace(&stream, true, Fill::Lower, n as i32, for_solve.ptr()) };
+            let potri = unsafe { handles.solver_workspace(&stream, true, fill, n as i32, for_solve.ptr()) };
             Ok(potrf.expect("potrf size").max(potri.expect("potri size")))
         })
         .expect("submit");
@@ -403,54 +448,27 @@ fn cholesky_factor_inverse_and_solve_agree_with_the_host_and_report_info() {
             unsafe {
                 let space = workspace.ptr();
                 handles
-                    .cholesky(
-                        &stream,
-                        false,
-                        Fill::Lower,
-                        n,
-                        for_inverse.ptr(),
-                        space,
-                        w,
-                        infos[0].ptr(),
-                    )
+                    .cholesky(&stream, false, fill, n, for_inverse.ptr(), space, w, infos[0].ptr())
                     .expect("potrf");
                 handles
-                    .cholesky(
-                        &stream,
-                        true,
-                        Fill::Lower,
-                        n,
-                        for_inverse.ptr(),
-                        space,
-                        w,
-                        infos[1].ptr(),
-                    )
+                    .cholesky(&stream, true, fill, n, for_inverse.ptr(), space, w, infos[1].ptr())
                     .expect("potri");
                 handles
-                    .cholesky(
-                        &stream,
-                        false,
-                        Fill::Lower,
-                        n,
-                        for_solve.ptr(),
-                        space,
-                        w,
-                        infos[2].ptr(),
-                    )
+                    .cholesky(&stream, false, fill, n, for_solve.ptr(), space, w, infos[2].ptr())
                     .expect("potrf");
                 handles
                     .solve_cholesky(
                         &stream,
-                        Fill::Lower,
+                        fill,
                         n,
                         columns as i32,
                         for_solve.ptr(),
                         rhs.ptr(),
-                        infos[2].ptr(),
+                        infos[3].ptr(),
                     )
                     .expect("potrs");
                 handles
-                    .cholesky(&stream, false, Fill::Lower, n, bad.ptr(), space, w, infos[3].ptr())
+                    .cholesky(&stream, false, fill, n, bad.ptr(), space, w, infos[4].ptr())
                     .expect("potrf on an indefinite matrix is accepted");
             }
             Ok(())
@@ -458,20 +476,21 @@ fn cholesky_factor_inverse_and_solve_agree_with_the_host_and_report_info() {
         .expect("submit");
     rig.retired(marker);
 
-    for (index, info) in infos.iter().enumerate().take(3) {
+    for (index, info) in infos.iter().enumerate().take(4) {
         check_info("cusolver", download_i32(info)).unwrap_or_else(|error| panic!("info {index}: {error}"));
     }
-    let failed = download_i32(&infos[3]);
+    let failed = download_i32(&infos[4]);
     assert_eq!(
         failed, 3,
         "the third leading minor of the indefinite matrix is not positive"
     );
     assert!(check_info("cusolverDnSpotrf", failed).is_err());
 
-    // The inverse is in the lower triangle.
+    // The inverse is in the triangle `fill` names.
     let got = download_f32(&for_inverse, n * n);
     for j in 0..n {
-        for i in j..n {
+        let rows = if fill == Fill::Lower { j..n } else { 0..j + 1 };
+        for i in rows {
             let (value, expected) = (f64::from(got[i + j * n]), inverse[i + j * n]);
             assert!(
                 (value - expected).abs() < 1e-5,
@@ -487,4 +506,5 @@ fn cholesky_factor_inverse_and_solve_agree_with_the_host_and_report_info() {
             "solution {index}: {value} against {expected}"
         );
     }
+    handles.take().expect("handles").close().expect("the handles close");
 }
