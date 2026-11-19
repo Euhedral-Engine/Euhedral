@@ -194,6 +194,34 @@ impl SafetensorsWriter {
     /// If `host` closes before the data is made durable, or before a failed file can be removed, the error says that
     /// the `.part` file was left. `Err` started nothing.
     pub fn finish(self, io: &Arc<AsyncIo>, host: &Arc<Lake>, then: Done<()>) -> Result<(), CheckpointError> {
+        let json = self.header();
+        let mut head = Vec::with_capacity(8 + json.len());
+        head.extend_from_slice(&(json.len() as u64).to_le_bytes());
+        head.extend_from_slice(&json);
+        self.finish_with(head, io, host, then)
+    }
+
+    /// Writes `bytes` as the whole of `file`, the way [`finish`](Self::finish) writes a safetensors file: as
+    /// `<file>.part`, made durable and renamed once complete, nothing left behind on failure. `then` and the errors
+    /// are as for `finish`. `Err` started nothing.
+    pub fn write_file(
+        file: &Path,
+        bytes: Vec<u8>,
+        io: &Arc<AsyncIo>,
+        host: &Arc<Lake>,
+        then: Done<()>,
+    ) -> Result<(), CheckpointError> {
+        Self::new(file).finish_with(bytes, io, host, then)
+    }
+
+    /// The write chain: `head` first, then the tensors' data.
+    fn finish_with(
+        self,
+        head: Vec<u8>,
+        io: &Arc<AsyncIo>,
+        host: &Arc<Lake>,
+        then: Done<()>,
+    ) -> Result<(), CheckpointError> {
         let unit = host.admit().map_err(|_| CheckpointError::LakeClosed)?;
         let mut part: OsString = self.file.clone().into_os_string();
         part.push(".part");
@@ -201,10 +229,6 @@ impl SafetensorsWriter {
         let name = self.file_name();
         let largest = self.entries.iter().map(|entry| entry.bytes).max().unwrap_or(0);
         let buffer = usize::try_from(largest).map_or(self.buffer_bytes, |largest| largest.min(self.buffer_bytes));
-        let json = self.header();
-        let mut head = Vec::with_capacity(8 + json.len());
-        head.extend_from_slice(&(json.len() as u64).to_le_bytes());
-        head.extend_from_slice(&json);
         let spec = OpenSpec {
             read: false,
             write: true,
@@ -294,6 +318,11 @@ impl Writing {
     /// Writes the header, then the data.
     fn begin(self, file: OwnedFile, head: Vec<u8>) {
         let filled = head.len();
+        if filled == 0 {
+            // An empty file has nothing to write first.
+            Step { file, writing: self }.next();
+            return;
+        }
         Step { file, writing: self }.submit(head, filled, false);
     }
 
