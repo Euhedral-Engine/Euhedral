@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use euhedral_inference_edrl::{
-    Header, LayerType, Metadata, ReadPlan, Region, TensorTable, TokenizerFooter, TokenizerSection, content_end,
+    ArtifactPlan, Header, LayerType, Metadata, ObjectSpec, PAYLOAD_ALIGNMENT, ReadPlan, Region, TensorTable,
+    TokenizerFooter, TokenizerSection, TokenizerTexts, content_end, encode_metadata, encode_table,
+    encode_tokenizer_section,
 };
 use serde_json::Value;
 
@@ -97,6 +99,48 @@ fn real_artifact_inventory_matches_python() {
         &footer,
     )
     .unwrap();
+
+    // Encoding what was read gives back the bytes it was read from.
+    assert_eq!(
+        header.encode().as_slice(),
+        read_range(&mut file, probe.range(Region::Header).unwrap())
+    );
+    assert_eq!(
+        encode_metadata(&metadata).unwrap(),
+        read_range(&mut file, plan.range(Region::Metadata).unwrap())
+    );
+    assert_eq!(
+        encode_table(table.entries()).unwrap(),
+        read_range(&mut file, plan.range(Region::Table).unwrap())
+    );
+    let texts = TokenizerTexts {
+        tokenizer: section.text("tokenizer.json").unwrap(),
+        tokenizer_config: section.text("tokenizer_config.json").unwrap(),
+        chat_template: section.text("chat_template.jinja").unwrap(),
+        special_tokens: section.text("special_tokens.json").unwrap(),
+    };
+    let content = content_end(file_len, Some(&footer)).unwrap();
+    assert_eq!(
+        encode_tokenizer_section(&texts).unwrap(),
+        read_range(&mut file, content..file_len)
+    );
+    let specs: Vec<ObjectSpec> = table
+        .entries()
+        .iter()
+        .map(|entry| ObjectSpec {
+            name: entry.name().to_owned(),
+            shape: entry.shape().to_vec(),
+            dtype: entry.dtype(),
+            format: entry.format(),
+            layout: entry.layout(),
+            bytes: entry.bytes(),
+        })
+        .collect();
+    // The planner places the payloads where the converter did.
+    let planned = ArtifactPlan::new(header.metadata_size(), &specs, PAYLOAD_ALIGNMENT).unwrap();
+    assert_eq!(planned.header(), &header);
+    assert_eq!(planned.entries(), table.entries());
+    assert_eq!(planned.content_end(), content);
 
     // The RCO artifact: 64 layers, full attention on 3, 7, ..., 63, draft depth 4.
     assert_eq!(metadata.num_hidden_layers, 64);

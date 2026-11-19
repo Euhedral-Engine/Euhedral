@@ -1,0 +1,8 @@
+name: tiny-artifacts
+commit: 73db9fbc8f3bd3c60e444b444479c8d6f35ee82f
+date: 2026-11-19T14:11:26.103965033Z
+inputs: TinyArtifacts.write(seed 1, companions) and write(seed 2, no companions), CompactArtifactWriter
+reproducible: not checked (made once)
+files (name, bytes, format):
+  nvfp4.edrl, 25765, compact .edrl artifact, seed 2, no companions
+  trellis.edrl, 30645, compact .edrl artifact, seed 1, trellis companions on the projections

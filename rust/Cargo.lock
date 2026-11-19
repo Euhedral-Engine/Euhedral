@@ -475,6 +475,7 @@ name = "euhedral-inference-edrl"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "euhedral-inference-edrl",
  "serde_json",
  "test-support",
  "thiserror",

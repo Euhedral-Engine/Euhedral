@@ -16,6 +16,11 @@ pub enum TensorDataType {
 }
 
 impl TensorDataType {
+    /// The ordinal the table stores.
+    pub fn ordinal(self) -> i32 {
+        self as i32
+    }
+
     pub(crate) fn from_ordinal(ordinal: i32) -> Result<Self, EdrlError> {
         Ok(match ordinal {
             0 => Self::Bf16,
@@ -45,6 +50,11 @@ pub enum WeightFormat {
 }
 
 impl WeightFormat {
+    /// The ordinal the table stores.
+    pub fn ordinal(self) -> i32 {
+        self as i32
+    }
+
     pub(crate) fn from_ordinal(ordinal: i32) -> Result<Self, EdrlError> {
         Ok(match ordinal {
             0 => Self::Bf16,
@@ -73,6 +83,11 @@ pub enum WeightLayout {
 }
 
 impl WeightLayout {
+    /// The ordinal the table stores.
+    pub fn ordinal(self) -> i32 {
+        self as i32
+    }
+
     pub(crate) fn from_ordinal(ordinal: i32) -> Result<Self, EdrlError> {
         Ok(match ordinal {
             0 => Self::ContiguousLeV1,
@@ -163,7 +178,7 @@ fn matrix(shape: &[u64]) -> Result<(u64, u64), Refusal> {
     }
 }
 
-fn direct_size(shape: &[u64], dtype: TensorDataType, format: WeightFormat) -> Result<u64, Refusal> {
+pub(crate) fn direct_size(shape: &[u64], dtype: TensorDataType, format: WeightFormat) -> Result<u64, Refusal> {
     let word_bytes = match format {
         WeightFormat::Bf16 | WeightFormat::Fp16 => 2,
         WeightFormat::Fp32 | WeightFormat::I32 => 4,
@@ -199,7 +214,7 @@ fn direct_size(shape: &[u64], dtype: TensorDataType, format: WeightFormat) -> Re
 
 /// Q3, Q4 or Q5 at 64-value groups, row-split at K=128: base plane, high plane, then FP16 scales, each plane
 /// starting on a 256-byte boundary.
-fn grouped_size(shape: &[u64], dtype: TensorDataType, format: WeightFormat) -> Result<u64, Refusal> {
+pub(crate) fn grouped_size(shape: &[u64], dtype: TensorDataType, format: WeightFormat) -> Result<u64, Refusal> {
     if dtype != TensorDataType::Bf16 {
         return Err("grouped compact storage requires BF16 source metadata".into());
     }
