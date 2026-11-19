@@ -430,3 +430,51 @@ fn an_output_that_cannot_take_its_name_leaves_no_temporary_file() {
     assert_eq!(fs::read(fixture.artifact()).unwrap(), fixture.content);
     assert!(out.join("keep").exists());
 }
+
+/// Packages `source_name` (a path that reaches the file `m.edrl.part` by another way) to `m.edrl` and checks that the
+/// run is refused and the file is untouched.
+fn assert_aliased_source_survives(fixture: &Fixture, source: PathBuf) {
+    let run = Run::start();
+    let request = PackageRequest::to_output(source, fixture.path("checkpoint"), fixture.path("m.edrl"));
+    assert!(run.package(request).is_err());
+    assert_eq!(
+        fs::read(fixture.path("m.edrl.part")).unwrap(),
+        fixture.content,
+        "the source is untouched"
+    );
+    assert!(!fixture.path("m.edrl").exists());
+}
+
+#[test]
+fn a_source_that_reaches_the_temporary_name_by_another_spelling_is_refused_and_survives() {
+    let fixture = Fixture::new(&Checkpoint::standard());
+    fs::rename(fixture.artifact(), fixture.path("m.edrl.part")).unwrap();
+    fs::create_dir(fixture.path("sub")).unwrap();
+    assert_aliased_source_survives(&fixture, fixture.path("sub").join("..").join("m.edrl.part"));
+    assert_aliased_source_survives(&fixture, fixture.path(".").join("m.edrl.part"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_or_hard_link_to_the_temporary_name_is_refused_and_the_source_survives() {
+    let fixture = Fixture::new(&Checkpoint::standard());
+    fs::rename(fixture.artifact(), fixture.path("m.edrl.part")).unwrap();
+    std::os::unix::fs::symlink(fixture.path("m.edrl.part"), fixture.path("link.edrl")).unwrap();
+    assert_aliased_source_survives(&fixture, fixture.path("link.edrl"));
+    fs::hard_link(fixture.path("m.edrl.part"), fixture.path("hard.edrl")).unwrap();
+    assert_aliased_source_survives(&fixture, fixture.path("hard.edrl"));
+}
+
+#[test]
+fn a_stale_temporary_output_of_an_earlier_run_is_replaced_not_extended() {
+    let run = Run::start();
+    let fixture = Fixture::new(&Checkpoint::standard());
+    let twin = fixture.path("twin.edrl");
+    fs::copy(fixture.artifact(), &twin).unwrap();
+    run.package(PackageRequest::in_place(twin.clone(), fixture.path("checkpoint")))
+        .unwrap();
+    fs::write(fixture.path("out.edrl.part"), vec![7u8; fixture.content.len() * 3]).unwrap();
+    run.package(fixture.to_output()).unwrap();
+    assert_eq!(fs::read(fixture.path("out.edrl")).unwrap(), fs::read(twin).unwrap());
+    assert!(!fixture.path("out.edrl.part").exists());
+}

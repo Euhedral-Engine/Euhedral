@@ -1,6 +1,7 @@
 //! Why packaging a tokenizer failed.
 
 use std::io;
+use std::path::PathBuf;
 
 use euhedral_inference_edrl::EdrlError;
 
@@ -47,6 +48,17 @@ pub enum PackageError {
     /// A step of the run was dropped before it ran: the I/O refused it or the host lake closed.
     #[error("the run ended before it finished: a step was dropped")]
     Lost,
+    /// An artifact written in place was cut back to its content and the section did not land: it has no tokenizer
+    /// section now, and running the command again writes it.
+    #[error("the artifact was cut and has no tokenizer section now; run the command again to write it ({0})")]
+    Cut(Box<PackageError>),
+    /// The run failed and the temporary output could not be removed: the file is left.
+    #[error("{cause}; the temporary output {} could not be removed and was left ({removal})", part.display())]
+    PartLeft {
+        part: PathBuf,
+        removal: io::Error,
+        cause: Box<PackageError>,
+    },
     /// The host lake would not take a frame of the run.
     #[error("the host lake refused work: {0}")]
     Lake(String),

@@ -132,10 +132,10 @@ pub fn package_tokenizer(
         io,
         host: Arc::clone(&host),
         request,
-        completion: Completion { done: Some(done) },
-        part: PartGuard {
+        end: RunEnd {
             host: Arc::clone(&host),
             part: None,
+            completion: Some(Completion { done: Some(done) }),
         },
         _unit: unit,
     };
@@ -168,56 +168,102 @@ struct Job {
     io: Arc<AsyncIo>,
     host: Arc<Lake>,
     request: PackageRequest,
-    completion: Completion,
-    part: PartGuard,
+    /// The run's end: the callback, and the temporary output to remove before it is called.
+    end: RunEnd,
     _unit: UnitGuard,
 }
 
-/// The temporary output, once it exists. A run that is dropped while it is armed (a refused step, a lake that closed)
-/// removes the file, so no run leaves one behind; a run that ends on its own disarms it first.
-struct PartGuard {
+/// How a run ends. It owns the callback and, once there is one, the temporary output, so that the callback is called
+/// only after the output is removed: a run that is dropped while an output is armed (a refused step, a lake that
+/// closed) removes the file and then reports itself lost, so no run leaves a `.part` behind and a caller that starts
+/// again never has its new `.part` deleted by the old run.
+struct RunEnd {
     host: Arc<Lake>,
     part: Option<PathBuf>,
+    completion: Option<Completion>,
 }
 
-impl PartGuard {
+impl RunEnd {
     fn arm(&mut self, part: PathBuf) {
         self.part = Some(part);
     }
 
-    fn disarm(&mut self) -> Option<PathBuf> {
-        self.part.take()
+    fn disarm(&mut self) {
+        self.part = None;
+    }
+
+    /// Reports the end of the run; the output, if armed, was moved into place or is not this run's to remove.
+    fn finish(&mut self, result: Result<Packaged, PackageError>) {
+        self.part = None;
+        if let Some(completion) = self.completion.take() {
+            completion.finish(result);
+        }
+    }
+
+    /// Removes the armed output, then reports `error`. A removal the lake refuses drops the frame and, with it,
+    /// the continuation, which reports all the same.
+    fn remove_then_fail(&mut self, error: PackageError) {
+        let (Some(part), Some(completion)) = (self.part.take(), self.completion.take()) else {
+            if let Some(completion) = self.completion.take() {
+                completion.finish(Err(error));
+            }
+            return;
+        };
+        let failing = Failing {
+            part: part.clone(),
+            completion: Some(completion),
+            error: Some(error),
+        };
+        let _ = durable::remove(
+            &self.host,
+            &part,
+            Box::new(move |removed| {
+                failing.report(removed);
+                idle()
+            }),
+        );
     }
 }
 
-impl Drop for PartGuard {
+impl Drop for RunEnd {
     fn drop(&mut self) {
-        if let Some(part) = self.part.take() {
-            // A refused removal leaves the file; nothing more can be done from a drop.
-            let _ = durable::remove(&self.host, &part, Box::new(|_| idle()));
-        }
+        self.remove_then_fail(PackageError::Lost);
     }
 }
 
 /// A failure on its way out: the error reaches the callback when the removal ends, or, if the removal is refused and its
-/// frame dropped, when this is dropped, so the real error is never replaced by `Lost`.
+/// frame dropped, when this is dropped, so the real error is never replaced by `Lost`. A removal that failed is told
+/// with the error, naming the file that was left.
 struct Failing {
+    part: PathBuf,
     completion: Option<Completion>,
     error: Option<PackageError>,
 }
 
 impl Failing {
-    fn report(mut self) {
-        if let (Some(completion), Some(error)) = (self.completion.take(), self.error.take()) {
-            completion.finish(Err(error));
-        }
+    fn report(mut self, removed: io::Result<()>) {
+        let (Some(completion), Some(error)) = (self.completion.take(), self.error.take()) else {
+            return;
+        };
+        completion.finish(Err(match removed {
+            Ok(()) => error,
+            Err(removal) => PackageError::PartLeft {
+                part: self.part.clone(),
+                removal,
+                cause: Box::new(error),
+            },
+        }));
     }
 }
 
 impl Drop for Failing {
     fn drop(&mut self) {
         if let (Some(completion), Some(error)) = (self.completion.take(), self.error.take()) {
-            completion.finish(Err(error));
+            completion.finish(Err(PackageError::PartLeft {
+                part: self.part.clone(),
+                removal: io::Error::other("the removal was not run: the host lake is closed"),
+                cause: Box::new(error),
+            }));
         }
     }
 }
@@ -386,8 +432,8 @@ fn copy(io: &Arc<AsyncIo>, source: SharedFile, target: SharedFile, from: u64, en
 }
 
 impl Job {
-    fn fail(self, error: PackageError) {
-        self.completion.finish(Err(error));
+    fn fail(mut self, error: PackageError) {
+        self.end.finish(Err(error));
     }
 
     /// Reads `name` of the checkpoint; a missing file is `None` when `optional`.
@@ -544,10 +590,11 @@ impl Job {
             Some(out) => {
                 let part = part_path(&out);
                 let io = Arc::clone(&self.io);
+                // Opened without truncating: the name may be another name of the source, which the run must not cut.
                 let spec = OpenSpec {
                     read: false,
                     write: true,
-                    create: Create::Truncate,
+                    create: Create::IfMissing,
                     ..OpenSpec::default()
                 };
                 open(
@@ -559,15 +606,70 @@ impl Job {
                             what: "cannot create the output",
                             source: error,
                         }),
-                        Ok(target) => {
-                            let mut job = self;
-                            job.part.arm(part.clone());
-                            job.copy_content(source, target, part, out, content_end, section);
-                        }
+                        Ok(target) => self.start_output(source, target, part, out, content_end, section),
                     }),
                 );
             }
         }
+    }
+
+    /// The temporary output is open: it is refused if it is the source itself, else cut to empty and filled.
+    fn start_output(
+        self,
+        source: SharedFile,
+        target: SharedFile,
+        part: PathBuf,
+        out: PathBuf,
+        content_end: u64,
+        section: Vec<u8>,
+    ) {
+        let mut job = self;
+        match same_file(&source, &target) {
+            Ok(false) => {}
+            Ok(true) => {
+                // The file existed already, as the source: nothing of it is this run's to remove.
+                return job.fail(PackageError::Io {
+                    what: "invalid request",
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "the artifact is the temporary name of the output (the same file): the run would overwrite its own source",
+                    ),
+                });
+            }
+            // Whether it is the source is unknown, so nothing is removed.
+            Err(error) => {
+                return job.fail(PackageError::Io {
+                    what: "cannot compare the output with the artifact",
+                    source: error,
+                });
+            }
+        }
+        job.end.arm(part.clone());
+        let host = Arc::clone(&job.host);
+        let file = Arc::clone(&target);
+        let written = Written::Part {
+            part: part.clone(),
+            out: out.clone(),
+        };
+        // A stale `.part` of an earlier run goes: the copy starts from an empty file.
+        let _ = durable::truncate(
+            &host,
+            &file,
+            0,
+            Box::new(move |cut| {
+                match cut {
+                    Ok(()) => job.copy_content(source, target, part, out, content_end, section),
+                    Err(error) => job.fail_written(
+                        &written,
+                        PackageError::Io {
+                            what: "cannot empty the output",
+                            source: error,
+                        },
+                    ),
+                }
+                idle()
+            }),
+        );
     }
 
     fn open_artifact_for_writing(self, artifact: PathBuf, content_end: u64, section: Vec<u8>) {
@@ -704,9 +806,9 @@ impl Job {
     }
 
     /// An output is complete: it takes its name; an artifact written in place is.
-    fn finish(self, written: Written, content_bytes: u64, section_bytes: u64) {
+    fn finish(mut self, written: Written, content_bytes: u64, section_bytes: u64) {
         match written {
-            Written::InPlace(artifact) => self.completion.finish(Ok(Packaged {
+            Written::InPlace(artifact) => self.end.finish(Ok(Packaged {
                 target: artifact,
                 content_bytes,
                 section_bytes,
@@ -725,8 +827,8 @@ impl Job {
                         match renamed {
                             Ok(()) => {
                                 let mut job = self;
-                                job.part.disarm();
-                                job.completion.finish(Ok(Packaged {
+                                job.end.disarm();
+                                job.end.finish(Ok(Packaged {
                                     target,
                                     content_bytes,
                                     section_bytes,
@@ -747,28 +849,12 @@ impl Job {
         }
     }
 
-    /// Fails the run; an output that was begun is removed first, so a failed run leaves none.
-    fn fail_written(self, written: &Written, error: PackageError) {
+    /// Fails the run; an output that was begun is removed first, so a failed run leaves none. An artifact written in
+    /// place was cut before its section was written: the error says so.
+    fn fail_written(mut self, written: &Written, error: PackageError) {
         match written {
-            Written::InPlace(_) => self.fail(error),
-            Written::Part { part, .. } => {
-                let mut job = self;
-                job.part.disarm();
-                let host = Arc::clone(&job.host);
-                let failing = Failing {
-                    completion: Some(job.completion),
-                    error: Some(error),
-                };
-                // A removal the lake refuses drops `failing`, which reports the error all the same.
-                let _ = durable::remove(
-                    &host,
-                    part,
-                    Box::new(move |_| {
-                        failing.report();
-                        idle()
-                    }),
-                );
-            }
+            Written::InPlace(_) => self.fail(PackageError::Cut(Box::new(error))),
+            Written::Part { .. } => self.end.remove_then_fail(error),
         }
     }
 }
@@ -789,8 +875,81 @@ enum Written {
     Part { part: PathBuf, out: PathBuf },
 }
 
+/// Whether both handles are the same file: the same device and index (the volume and file index on Windows), however
+/// the paths that opened them are spelled.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a handle's identity is one query of the open file, not file I/O: there is nothing to wait on"
+)]
+fn same_file(first: &File, second: &File) -> io::Result<bool> {
+    let first = same_file::Handle::from_file(first.try_clone()?)?;
+    let second = same_file::Handle::from_file(second.try_clone()?)?;
+    Ok(first == second)
+}
+
 fn part_path(out: &Path) -> PathBuf {
     let mut name = out.as_os_str().to_owned();
     name.push(PART_SUFFIX);
     PathBuf::from(name)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test: a failed unwrap is the failure"
+)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, waiting call: the test thread waits on the hand-off for the run it started, and writes its files"
+)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "a channel carries the run's result to the waiting test thread"
+)]
+mod tests {
+    use std::num::NonZeroUsize;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use euhedral_core::control_plane::ControlPlaneLattice;
+    use euhedral_inference_engine::lattice_config;
+    use euhedral_inference_settings::{ModelSettings, Settings};
+
+    use super::*;
+
+    /// A run that is dropped with its temporary output armed removes the file first and only then reports itself lost.
+    #[test]
+    fn a_dropped_run_removes_its_output_and_then_reports_lost() {
+        let lattice = ControlPlaneLattice::new(lattice_config(&Settings::with_model(ModelSettings::default()))).unwrap();
+        let host = Lake::new(
+            Arc::clone(&lattice),
+            NonZeroUsize::new(2).unwrap(),
+            Duration::from_secs(1),
+        );
+        let _unit = host.admit().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let part = directory.path().join("out.edrl.part");
+        std::fs::write(&part, b"partial").unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let seen = part.clone();
+        let mut end = RunEnd {
+            host: Arc::clone(&host),
+            part: None,
+            completion: Some(Completion {
+                done: Some(Box::new(move |result| {
+                    sender.send((result, seen.exists())).unwrap();
+                })),
+            }),
+        };
+        end.arm(part.clone());
+        drop(end);
+
+        let (result, existed_when_told) = receiver.recv_timeout(Duration::from_secs(30)).expect("the run reports");
+        assert!(matches!(result, Err(PackageError::Lost)), "{result:?}");
+        assert!(!existed_when_told, "the output is gone before the caller hears of the end");
+        host.complete_gracefully();
+        lattice.close();
+    }
 }

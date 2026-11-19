@@ -12,7 +12,8 @@ use std::process::{Command, Output};
 
 use euhedral_inference_edrl::tiny::TinyArtifact;
 use euhedral_inference_edrl::{FOOTER_BYTES, TokenizerFooter};
-use serde_json::json;
+use serde_json::{Map, json};
+use tempfile::tempdir;
 
 const TEMPLATE: &str = include_str!("../../api-protocol/tests/data/qwen-chat-template.jinja");
 
@@ -35,7 +36,7 @@ fn byte_chars() -> Vec<char> {
 }
 
 fn tokenizer_json(kind: &str) -> String {
-    let mut vocab = serde_json::Map::new();
+    let mut vocab = Map::new();
     for (byte, character) in byte_chars().iter().enumerate() {
         vocab.insert(character.to_string(), json!(byte));
     }
@@ -89,7 +90,7 @@ fn quantization(args: &[&str]) -> Output {
 
 #[test]
 fn the_command_packages_in_place_and_to_an_output_with_the_same_bytes() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempdir().unwrap();
     let checkpoint = directory.path().join("checkpoint");
     write_checkpoint(&checkpoint);
     // The tiny artifact carries a tokenizer section of its own; the content is what precedes it.
@@ -135,7 +136,7 @@ fn the_command_packages_in_place_and_to_an_output_with_the_same_bytes() {
 
 #[test]
 fn a_checkpoint_without_a_tokenizer_fails_with_a_message_and_a_nonzero_code() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempdir().unwrap();
     let artifact = directory.path().join("a.edrl");
     fs::write(&artifact, TinyArtifact::new(3, true).bytes().unwrap()).unwrap();
     let before = fs::read(&artifact).unwrap();
