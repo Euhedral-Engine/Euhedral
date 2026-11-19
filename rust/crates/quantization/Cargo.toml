@@ -19,11 +19,13 @@ euhedral-inference-engine = { path = "../engine" }
 euhedral-inference-settings = { path = "../settings" }
 euhedral-io.workspace = true
 serde_json = { workspace = true }
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 euhedral-gpu = { workspace = true, features = ["fake"] }
 tempfile.workspace = true
+euhedral-inference-edrl = { path = "../edrl", features = ["test-util"] }
 test-support = { path = "../test-support" }
 
 [lints]

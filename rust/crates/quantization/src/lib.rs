@@ -11,11 +11,14 @@
 //! - [`rows`]: the work on the logits rows of one teacher-forced run, as frames of the `host` lake.
 //! - [`mixed`]: the mixed allocation search's data: options, allocations, priors, the cost table, the knapsack, the
 //!   Pareto front and the residency check.
+//! - [`assemble`]: the source artifacts of a mixed artifact, opened and checked, and the artifact an allocation makes of
+//!   them, written through `AsyncIo`.
 //! - [`checkpoint`]: the safetensors reader and writer and the fused objects of a Qwen 3.8 checkpoint, on `AsyncIo`.
 //! - [`recipe`]: the storage format of each quantized object of an artifact.
 //! - [`resume`]: the file a long run overwrites in place and resumes from, and [`durable`], the durability barrier,
 //!   truncation and removal it is built on.
 
+pub mod assemble;
 pub mod checkpoint;
 pub mod durable;
 pub mod java_random;

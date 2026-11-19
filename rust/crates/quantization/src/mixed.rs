@@ -5,7 +5,7 @@
 //! Nothing here opens a file: every reader takes the text of a file and every writer returns the text to write, so
 //! the caller reads and writes through the runtime's asynchronous I/O.
 //!
-//! The objects a search chooses over come from the source artifacts, which a later module owns. What the search needs
+//! The objects a search chooses over come from the source artifacts, which [`assemble`](crate::assemble) opens. What the search needs
 //! of them is the narrow [`Sources`] trait.
 
 mod allocation;

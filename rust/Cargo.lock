@@ -529,6 +529,7 @@ dependencies = [
  "euhedral-inference-settings",
  "euhedral-io",
  "serde_json",
+ "sha2",
  "tempfile",
  "test-support",
  "thiserror",
