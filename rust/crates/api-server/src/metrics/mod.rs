@@ -5,8 +5,8 @@
 //! the registry is made. Rendering reads the words one by one, so a series that changes during a scrape is read at one
 //! moment or the next. A series is exported with its value from the start (zero before anything is recorded).
 //!
-//! The series, their names, labels, types and help are those of the server this one replaces; the process's own series
-//! (virtual machine, process, HTTP server, logging) are not part of it.
+//! The `euhedral_*` series, their names, labels, types and help are fixed; the process's series and the time of the HTTP
+//! requests follow them in the render (see `render_platform`). The virtual machine's and the logging's are not exported.
 
 mod buckets;
 mod http;
@@ -267,9 +267,8 @@ pub struct Metrics {
     drafts_by_label: Box<[usize]>,
     speculative_accepted_tokens: AtomicU64,
     http: http::Table,
-    /// The process's CPU time and uptime, in nanoseconds, at the last scrape.
-    last_cpu_ns: AtomicU64,
-    last_wall_ns: AtomicU64,
+    /// The CPU window between scrapes.
+    usage: process::UsageWindow,
 }
 
 impl Metrics {
@@ -303,8 +302,7 @@ impl Metrics {
             drafts_by_label: drafts_by_label.into_boxed_slice(),
             speculative_accepted_tokens: AtomicU64::new(0),
             http: http::Table::new(now_ms),
-            last_cpu_ns: AtomicU64::new(0),
-            last_wall_ns: AtomicU64::new(0),
+            usage: process::UsageWindow::default(),
         }
     }
 

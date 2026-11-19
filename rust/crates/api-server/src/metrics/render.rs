@@ -511,17 +511,8 @@ impl Metrics {
     /// and 1; `None` when the platform cannot say.
     fn cpu_usage(&self, reading: &process::Reading) -> Option<f64> {
         let (cpu, uptime) = (reading.cpu_seconds?, reading.uptime_seconds?);
-        let cpu_ns = (cpu * SECONDS) as u64;
-        let wall_ns = (uptime * SECONDS) as u64;
-        let before_cpu = self.last_cpu_ns.swap(cpu_ns, Ordering::Relaxed);
-        let before_wall = self.last_wall_ns.swap(wall_ns, Ordering::Relaxed);
-        let elapsed = wall_ns.saturating_sub(before_wall);
-        if elapsed == 0 {
-            return Some(0.0);
-        }
-        let cpus = available_parallelism().map_or(1, usize::from) as f64;
-        let used = cpu_ns.saturating_sub(before_cpu) as f64;
-        Some((used / (elapsed as f64 * cpus)).clamp(0.0, 1.0))
+        let cpus = available_parallelism().map_or(1, usize::from);
+        Some(self.usage.take((cpu * SECONDS) as u64, (uptime * SECONDS) as u64, cpus))
     }
 
     fn http_requests(&self, page: &mut Page<'_>, now_ms: i64) {
@@ -548,7 +539,7 @@ impl Metrics {
                     None => page.sample(name, &[], &pairs, value),
                 }
             };
-        // The help is a single space, as the server this one replaces writes it.
+        // The help is a single space.
         page.family(name, Kind::Summary, " ");
         let count = format!("{name}_count");
         let sum = format!("{name}_sum");

@@ -1,5 +1,6 @@
-//! The time of every HTTP request by route template, method and status: from the head read to the last byte handed to
-//! the connection. Like the other series it is recorded with atomics in a table laid out when the registry is made, so
+//! The time of every HTTP request by route template, method and status: from the request reaching the router to the last
+//! byte handed to the connection. (The server hands the router a request whose head and body are both read, and gives it
+//! no earlier time, so the read itself is not in the time.) Like the other series it is recorded with atomics in a table laid out when the registry is made, so
 //! the labels are bounded by construction: a path that is no route is one label value, whatever its text.
 
 use std::sync::Arc;
@@ -59,31 +60,46 @@ impl Uri {
     }
 }
 
-/// The methods the table tells apart; any other is counted under `Other`.
-const METHODS: [&str; 5] = ["GET", "HEAD", "OPTIONS", "POST", "OTHER"];
+/// The methods the table tells apart; a method that is none of them is counted under `OTHER`.
+const METHODS: [&str; 10] = [
+    "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH", "OTHER",
+];
 
 fn method_index(method: &Method) -> usize {
     match method {
         Method::Get => 0,
         Method::Head => 1,
-        Method::Options => 2,
-        Method::Post => 3,
-        _ => 4,
+        Method::Post => 2,
+        Method::Put => 3,
+        Method::Delete => 4,
+        Method::Connect => 5,
+        Method::Options => 6,
+        Method::Trace => 7,
+        Method::Patch => 8,
+        Method::Other(_) => 9,
     }
 }
 
-/// The statuses the table tells apart: every one the server answers with. Any other is counted under the first of its
-/// class, so the table stays small and the classes (the `outcome` label) stay right.
-const STATUSES: [u16; 15] = [
-    200, 400, 401, 403, 404, 405, 406, 408, 413, 415, 422, 429, 500, 503, 529,
-];
+/// The statuses the table tells apart: `200` and every client and server error code. The server answers with nothing
+/// else; a status outside them is not recorded rather than counted under another code.
+const FIRST_ERROR: u16 = 400;
+const LAST_ERROR: u16 = 599;
+const STATUS_COUNT: usize = 1 + (LAST_ERROR - FIRST_ERROR + 1) as usize;
 
-fn status_index(status: u16) -> usize {
-    if let Some(at) = STATUSES.iter().position(|each| *each == status) {
-        return at;
+fn status_index(status: u16) -> Option<usize> {
+    match status {
+        200 => Some(0),
+        FIRST_ERROR..=LAST_ERROR => Some(1 + usize::from(status - FIRST_ERROR)),
+        _ => None,
     }
-    let class = status / 100;
-    STATUSES.iter().position(|each| each / 100 == class).unwrap_or(0)
+}
+
+fn status_of(index: usize) -> u16 {
+    if index == 0 {
+        200
+    } else {
+        FIRST_ERROR + (index - 1) as u16
+    }
 }
 
 /// The class of a status, the `outcome` label.
@@ -114,7 +130,7 @@ pub(super) struct Table {
 
 impl Table {
     pub(super) fn new(now_ms: i64) -> Table {
-        let size = Uri::ALL.len() * METHODS.len() * STATUSES.len();
+        let size = Uri::ALL.len() * METHODS.len() * STATUS_COUNT;
         Table {
             cells: (0..size)
                 .map(|_| Cell {
@@ -127,11 +143,14 @@ impl Table {
     }
 
     fn cell(&self, uri: Uri, method: usize, status: usize) -> &Cell {
-        &self.cells[(uri.index() * METHODS.len() + method) * STATUSES.len() + status]
+        &self.cells[(uri.index() * METHODS.len() + method) * STATUS_COUNT + status]
     }
 
     fn record(&self, uri: Uri, method: &Method, status: u16, nanos: u64, now_ms: i64) {
-        let cell = self.cell(uri, method_index(method), status_index(status));
+        let Some(status) = status_index(status) else {
+            return;
+        };
+        let cell = self.cell(uri, method_index(method), status);
         cell.count.fetch_add(1, Ordering::Relaxed);
         cell.sum_ns.fetch_add(nanos, Ordering::Relaxed);
         cell.max_ns.record(nanos, now_ms);
@@ -141,9 +160,9 @@ impl Table {
     pub(super) fn seen(&self) -> impl Iterator<Item = (Uri, &'static str, u16, &Cell)> {
         Uri::ALL.into_iter().flat_map(move |uri| {
             (0..METHODS.len()).flat_map(move |method| {
-                (0..STATUSES.len()).filter_map(move |status| {
+                (0..STATUS_COUNT).filter_map(move |status| {
                     let cell = self.cell(uri, method, status);
-                    (cell.count.load(Ordering::Relaxed) > 0).then_some((uri, METHODS[method], STATUSES[status], cell))
+                    (cell.count.load(Ordering::Relaxed) > 0).then_some((uri, METHODS[method], status_of(status), cell))
                 })
             })
         })
@@ -151,7 +170,8 @@ impl Table {
 }
 
 /// The clock of one request. It is finished once, by whoever hands the last byte to the connection; a request that is
-/// dropped unfinished (the client left before an answer) is not recorded.
+/// dropped unfinished before any head went out (the client left before an answer) is not recorded; one whose stream
+/// was cut after its head is recorded when it is dropped.
 #[derive(Debug)]
 pub struct RequestTimer {
     metrics: Arc<Metrics>,
@@ -159,6 +179,8 @@ pub struct RequestTimer {
     method: Method,
     started: Instant,
     finished: AtomicBool,
+    /// The head of a streamed reply went out: the status is `200` whatever follows.
+    opened: AtomicBool,
 }
 
 impl RequestTimer {
@@ -170,7 +192,14 @@ impl RequestTimer {
             method,
             started: Instant::now(),
             finished: AtomicBool::new(false),
+            opened: AtomicBool::new(false),
         }
+    }
+
+    /// The head of a streamed reply went out. From here the request is recorded as a `200` even if the stream is cut
+    /// before its end.
+    pub fn opened(&self) {
+        self.opened.store(true, Ordering::Release);
     }
 
     /// Records the request as answered with `status`; a second call does nothing.
@@ -182,5 +211,15 @@ impl RequestTimer {
         self.metrics
             .http
             .record(self.uri, &self.method, status, nanos, Metrics::wall_clock_ms());
+    }
+}
+
+impl Drop for RequestTimer {
+    /// A stream that was cut after its head (the client left, a write failed, the reader was too slow) is timed to the
+    /// moment it was let go.
+    fn drop(&mut self) {
+        if self.opened.load(Ordering::Acquire) {
+            self.finish(200);
+        }
     }
 }

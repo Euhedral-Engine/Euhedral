@@ -228,6 +228,9 @@ impl Shared {
                     // Once the head is out the client is found gone by a failed write, not by the transport's
                     // cancel flag, which a half-closed client also raises.
                     Box::new(move |opened| {
+                        if opened.is_ok() {
+                            shared.timer.opened();
+                        }
                         shared.post(Command::Head(opened));
                         no_work()
                     }),

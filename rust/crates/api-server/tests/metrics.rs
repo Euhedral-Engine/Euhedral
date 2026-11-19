@@ -12,6 +12,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use common::{Fixture, PATIENCE, Raw, assert_json, headers, small_limits, text};
+use euhedral_inference_api_server::Limits;
 use euhedral_inference_api_server::metrics::{Api, ConstraintFailure, Outcome};
 use euhedral_inference_api_server::scripted::Script;
 use euhedral_inference_api_server::{Counts, EngineReport, PrefixCacheReport};
@@ -145,18 +146,20 @@ fn the_engine_reports_at_every_scrape() {
 #[test]
 fn head_options_and_other_methods_answer_as_for_any_get_route() {
     let fixture = Fixture::start();
+    let before = fixture.get("/metrics");
     let head = fixture.call(&Fixture::req(Method::Head, "/metrics"));
     assert_eq!(head.status, 200);
     assert!(head.body.is_empty());
     assert_eq!(head.headers.get("content-type"), Some(TYPE));
-    let get = fixture.get("/metrics");
-    // The two scrapes differ (the uptime, the timings of the requests before), so only the form of the length is known.
-    assert!(
-        head.headers
-            .get("content-length")
-            .is_some_and(|length| length.parse::<usize>().is_ok_and(|n| n > 0))
-    );
-    assert!(!get.body.is_empty());
+    // The scrape that follows differs (the uptime and the timing of the HEAD itself), so the length is bounded rather than equal:
+    // the body of the HEAD is the one before it plus the series of the request before it.
+    let length: usize = head
+        .headers
+        .get("content-length")
+        .and_then(|length| length.parse().ok())
+        .expect("a length");
+    let before = before.body.len();
+    assert!(length > before && length < before + 4096, "{length} after {before}");
     let options = fixture.call(&Fixture::req(Method::Options, "/metrics"));
     assert_eq!(options.status, 200);
     assert_eq!(options.headers.get("allow"), Some("GET,HEAD,OPTIONS"));
@@ -179,7 +182,7 @@ fn an_accept_that_excludes_the_text_is_refused_and_a_scraper_s_is_not() {
     fixture.finish();
 }
 
-fn roomy_limits() -> euhedral_inference_api_server::Limits {
+fn roomy_limits() -> Limits {
     let mut limits = small_limits();
     limits.max_body_bytes = 1 << 20;
     limits
@@ -213,14 +216,18 @@ fn the_process_series_are_well_formed_and_the_uptime_does_not_go_back() {
     let first = text(&fixture.get("/metrics")).to_owned();
     sleep(Duration::from_millis(30));
     let second = text(&fixture.get("/metrics")).to_owned();
-    for name in [
+    let mut names = vec![
         "process_cpu_time_ns_total",
         "process_cpu_usage",
-        "process_files_max_files",
         "process_files_open_files",
         "process_start_time_seconds",
         "process_uptime_seconds",
-    ] {
+    ];
+    // The limit of open files is read where the system has one to read.
+    if cfg!(target_os = "linux") {
+        names.push("process_files_max_files");
+    }
+    for name in names {
         assert!(second.contains(&format!("# TYPE {name} ")), "{name}\n{second}");
     }
     assert!(second.contains("# TYPE process_cpu_time_ns_total counter\n"));
@@ -235,8 +242,11 @@ fn the_process_series_are_well_formed_and_the_uptime_does_not_go_back() {
     let before = sample_value(&first, &uptime).expect("an uptime");
     let after = sample_value(&second, &uptime).expect("an uptime");
     assert!(before >= 0.0 && after >= before, "{before} then {after}");
-    let started = sample_value(&second, &format!("process_start_time_seconds{{{APP}}} ")).expect("a start time");
+    // A restart is a change of the start time: it is the same at every scrape.
+    let start = format!("process_start_time_seconds{{{APP}}} ");
+    let started = sample_value(&second, &start).expect("a start time");
     assert!(started > 1.0e9, "{started}");
+    assert_eq!(sample_value(&first, &start), Some(started));
     fixture.finish();
 }
 
@@ -352,5 +362,55 @@ fn a_stream_still_open_is_not_yet_in_the_timings() {
     let scrape = text(&fixture.get("/metrics")).to_owned();
     assert!(!scrape.contains("uri=\"/v1/chat/completions\""), "{scrape}");
     drop(raw);
+    fixture.finish();
+}
+
+#[test]
+fn a_stream_cut_after_its_head_is_timed_once() {
+    let fixture = Fixture::with(roomy_limits(), Some(2));
+    fixture.backend.set_max_active(1);
+    fixture.backend.set_context_length(1 << 30);
+    fixture.backend.set_script(Script::Endless);
+    let body = r#"{"model":"euhedral-test-model","stream":true,"reasoning_effort":"none","max_tokens":100000000,"messages":[{"role":"user","content":"Hi"}]}"#;
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut raw = Raw::connect(fixture.addr);
+    raw.send(&request);
+    raw.read_until("tok0");
+    drop(raw);
+    let end = Instant::now() + PATIENCE;
+    let counted = format!(
+        "http_server_requests_seconds_count{{{APP},error=\"none\",exception=\"none\",method=\"POST\",outcome=\"SUCCESS\",status=\"200\",uri=\"/v1/chat/completions\"}} 1\n"
+    );
+    loop {
+        let scrape = text(&fixture.get("/metrics")).to_owned();
+        if scrape.contains(&counted) {
+            break;
+        }
+        assert!(Instant::now() < end, "{scrape}");
+        sleep(Duration::from_millis(5));
+    }
+    // Once, however long it takes to settle.
+    sleep(Duration::from_millis(100));
+    assert!(text(&fixture.get("/metrics")).contains(&counted));
+    fixture.finish();
+}
+
+#[test]
+fn each_method_has_its_own_label() {
+    let fixture = Fixture::start();
+    assert_eq!(fixture.call(&Fixture::req(Method::Put, "/v1/models")).status, 405);
+    assert_eq!(fixture.call(&Fixture::req(Method::Delete, "/v1/models")).status, 405);
+    let body = text(&fixture.get("/metrics")).to_owned();
+    for method in ["PUT", "DELETE"] {
+        assert!(
+            body.contains(&format!(
+                "method=\"{method}\",outcome=\"CLIENT_ERROR\",status=\"405\",uri=\"/v1/models\""
+            )),
+            "{body}"
+        );
+    }
     fixture.finish();
 }

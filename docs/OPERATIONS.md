@@ -204,11 +204,13 @@ Absent when the cache is off ([PREFIX_CACHE.md](PREFIX_CACHE.md)).
 | `euhedral_engine_host_backed_weight_bytes` | gauge | Weights held in pinned host memory and streamed in |
 
 The process's metrics (`process_uptime_seconds`, `process_start_time_seconds`, `process_cpu_time_ns_total`,
-`process_cpu_usage`, `process_files_open_files`, `process_files_max_files`) come from the operating system; a value the platform cannot
-report is left out rather than written as zero (the file limit has no series on Windows). The time of every request
-(`http_server_requests_seconds`, with `_count`, `_sum` and `_max`) is labelled by route template (`uri`, for example
-`/v1/models/{model}`), method, status and outcome; every path that is no route is `uri="/**"`. A streamed
-reply is timed to its last byte. The JVM's metrics (`jvm_*`) and `http_server_requests_active_seconds` belong to the Java server: the Rust server has none.
+`process_cpu_usage`, `process_files_open_files`, `process_files_max_files`) come from the operating system; a value the
+platform cannot report is left out rather than written as zero. On Windows the file limit has no series. The time of
+every request (`http_server_requests_seconds`, with `_count`, `_sum` and `_max`) is labelled by route template (`uri`,
+for example `/v1/models/{model}`), method, status and outcome; every path that is no route is `uri="/**"`. A request is
+timed from the moment the router has it (its head and body already read) to the last byte handed to the connection; a
+stream cut after its head is timed to the moment it was cut, as a `200`. The JVM's metrics (`jvm_*`) and
+`http_server_requests_active_seconds` belong to the Java server: the Rust server has none.
 
 ### Examples
 
