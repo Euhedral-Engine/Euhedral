@@ -1023,7 +1023,7 @@ const SPECS: [KernelSpec; 148] = [
 /// The parameters of one tensor map, as the C code passes them to `cuTensorMapEncodeTiled` (`byte_map`,
 /// `nvfp4_linear.c`). Every map is over bytes (`UINT8`) with unit element strides, no interleave, 128-byte L2
 /// promotion and no out-of-bounds fill; those do not vary and are not fields.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TensorMapPlan {
     /// The global address (`CUdeviceptr`).
     pub address: u64,
@@ -1039,7 +1039,7 @@ pub struct TensorMapPlan {
 }
 
 /// The swizzle of a tensor map (`CUtensorMapSwizzle`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TensorMapSwizzle {
     None,
     B64,
