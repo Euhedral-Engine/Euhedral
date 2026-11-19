@@ -29,7 +29,6 @@ thiserror.workspace = true
 euhedral-inference-edrl = { path = "../edrl", features = ["test-util"] }
 euhedral-gpu = { workspace = true, features = ["fake"] }
 tempfile.workspace = true
-euhedral-inference-edrl = { path = "../edrl", features = ["test-util"] }
 test-support = { path = "../test-support" }
 
 [lints]

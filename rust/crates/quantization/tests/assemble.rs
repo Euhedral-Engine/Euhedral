@@ -126,7 +126,10 @@ fn a_shared_object_that_differs_is_refused_by_name() {
     };
     artifacts.insert(OTHER, fixture.put("other.edrl", &other));
     let error = fixture.open(&artifacts).unwrap_err().to_string();
-    assert!(error.contains("differs between nvfp4 and trellis-3.0"), "{error}");
+    assert!(
+        error.contains("text/draft_head_token_ids differs between nvfp4 and trellis-3.0"),
+        "{error}"
+    );
     assert!(!PROJECTIONS.iter().any(|name| error.contains(name)), "{error}");
     fixture.world.finish();
 }
@@ -176,6 +179,72 @@ fn the_view_takes_chosen_objects_from_their_source_and_drops_the_replaced_compan
     // The base's order: the chosen object keeps its place.
     let at = |name: &str| names.iter().position(|each| *each == name).unwrap();
     assert!(at(PROJECTIONS[0]) < at(chosen) && at(chosen) < at(PROJECTIONS[2]));
+    fixture.world.finish();
+}
+
+#[test]
+fn an_object_chosen_from_a_source_brings_its_companions() {
+    let fixture = Fixture::new();
+    let artifacts = BTreeMap::from([
+        (BASE, fixture.put("base.edrl", &TinyArtifact::new(1, false))),
+        (OTHER, fixture.put("other.edrl", &TinyArtifact::new(2, true))),
+    ]);
+    let sources = fixture.open(&artifacts).unwrap();
+    let chosen = PROJECTIONS[0];
+    let composite = view(&sources, &allocation(&[(chosen, OTHER)]), None).unwrap();
+    let names: Vec<&str> = composite.pieces.iter().map(|piece| piece.entry.name()).collect();
+    let at = names.iter().position(|name| *name == chosen).unwrap();
+    // The object, then its companions, all from the source that was chosen.
+    assert_eq!(
+        names[at + 1..at + 4],
+        [".suh", ".svh", ".segments"].map(|suffix| format!("{chosen}{suffix}"))
+    );
+    assert!(composite.pieces[at..at + 4].iter().all(|piece| piece.option == OTHER));
+    assert_eq!(names.len(), 12 + 3);
+    fixture.world.finish();
+}
+
+#[test]
+fn a_projection_of_another_shape_is_refused_by_name() {
+    let fixture = Fixture::new();
+    let mut artifacts = fixture.two();
+    let other = TinyArtifact {
+        widened: PROJECTIONS[1],
+        ..TinyArtifact::new(2, false)
+    };
+    artifacts.insert(OTHER, fixture.put("other.edrl", &other));
+    let error = fixture.open(&artifacts).unwrap_err().to_string();
+    assert!(error.contains(PROJECTIONS[1]) && error.contains("shape"), "{error}");
+    fixture.world.finish();
+}
+
+#[test]
+fn a_source_that_is_the_temporary_name_of_the_output_is_refused_and_left_alone() {
+    let fixture = Fixture::new();
+    let mut artifacts = fixture.two();
+    let part = fixture.put("mixed.edrl.part", &TinyArtifact::new(1, true));
+    artifacts.insert(BASE, part.clone());
+    let before = fs::read(&part).unwrap();
+    let sources = fixture.open(&artifacts).unwrap();
+    let composite = view(&sources, &allocation(&[]), None).unwrap();
+    let out = fixture.dir.path().join("mixed.edrl");
+    let error = fixture.write(&composite, &out, 1 << 20).unwrap_err().to_string();
+    assert!(error.contains("a source"), "{error}");
+    assert_eq!(fs::read(&part).unwrap(), before);
+    assert!(!out.exists());
+    fixture.world.finish();
+}
+
+#[test]
+fn a_view_without_a_tokenizer_cannot_be_written() {
+    let fixture = Fixture::new();
+    let sources = fixture.open(&fixture.two()).unwrap();
+    let mut composite = view(&sources, &allocation(&[]), None).unwrap();
+    composite.tokenizer = None;
+    let out = fixture.dir.path().join("out.edrl");
+    let error = fixture.write(&composite, &out, 1 << 20).unwrap_err().to_string();
+    assert!(error.contains("tokenizer"), "{error}");
+    assert!(!out.exists() && !fixture.dir.path().join("out.edrl.part").exists());
     fixture.world.finish();
 }
 
@@ -307,9 +376,9 @@ fn the_request_takes_its_flags_and_refuses_the_rest() {
     let good = "--allocation a.json --source nvfp4=n.edrl --source trellis-3.0=t.edrl --base trellis-3.0 --out o.edrl";
     let request = Request::parse(&words(good)).unwrap();
     assert_eq!(request.sources.len(), 2);
-    assert_eq!((request.draft_depth, request.copy_buffer_mib), (None, 64));
+    assert_eq!((request.draft_depth, request.copy_buffer_mib), (None, None));
     let request = Request::parse(&words(&format!("{good} --draft-depth 2 --copy-buffer-mib 8"))).unwrap();
-    assert_eq!((request.draft_depth, request.copy_buffer_mib), (Some(2), 8));
+    assert_eq!((request.draft_depth, request.copy_buffer_mib), (Some(2), Some(8)));
     for bad in [
         format!("{good} --draft-depth 0"),
         format!("{good} --draft-depth {}", MAX_DRAFT_DEPTH + 1),
@@ -340,14 +409,29 @@ fn the_command_reads_the_allocation_and_writes_the_artifact() {
         base: BASE,
         out: out.clone(),
         draft_depth: Some(2),
-        copy_buffer_mib: 1,
+        copy_buffer_mib: Some(1),
     };
-    let assembled = call(|done| run(&fixture.world.io, &fixture.world.host, request, done)).unwrap();
+    let assembled = call(|done| run(&fixture.world.io, &fixture.world.host, request, 100, done)).unwrap();
     let written = fixture.table(&out);
     let total: u64 = written.table().entries().iter().map(|entry| entry.bytes()).sum();
     assert_eq!(assembled.resident_bytes, total);
     assert_eq!(written.metadata().draft_depth, Some(2));
     let other = fixture.table(&artifacts[&OTHER]);
     assert_eq!(payload(&written, PROJECTIONS[3]), payload(&other, PROJECTIONS[3]));
+    fixture.world.finish();
+}
+
+#[test]
+fn a_stale_temporary_file_is_replaced() {
+    let fixture = Fixture::new();
+    let sources = fixture.open(&fixture.two()).unwrap();
+    let composite = view(&sources, &allocation(&[]), None).unwrap();
+    let out = fixture.dir.path().join("out.edrl");
+    let reference = fixture.dir.path().join("reference.edrl");
+    fixture.write(&composite, &reference, 1 << 20).unwrap();
+    let stale = vec![0xAB; fs::read(&reference).unwrap().len() * 2];
+    fs::write(fixture.dir.path().join("out.edrl.part"), stale).unwrap();
+    fixture.write(&composite, &out, 1 << 20).unwrap();
+    assert_eq!(fs::read(&out).unwrap(), fs::read(&reference).unwrap());
     fixture.world.finish();
 }

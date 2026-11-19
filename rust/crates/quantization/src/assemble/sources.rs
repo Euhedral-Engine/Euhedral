@@ -26,9 +26,6 @@ use crate::mixed::{MixedError, QuantOption, Shape, Sources, shape_of};
 /// The suffixes of an object's companions, which travel with it: trellis sign vectors and segment ends.
 pub const COMPANION_SUFFIXES: [&str; 3] = [".suh", ".svh", ".segments"];
 
-/// The size of the reads that hash a payload: 1 MiB.
-pub const DEFAULT_HASH_CHUNK_BYTES: usize = 1 << 20;
-
 const LAYERS: &str = "text/layers/";
 const DRAFTER_LAYER: &str = "mtp/layer/";
 
@@ -438,7 +435,7 @@ impl Verifying {
     }
 
     /// `mine` is the digest of the object in `option`'s source: gets the base's, then compares.
-    fn then_base(mut self, option: QuantOption, name: String, mine: [u8; 32]) {
+    fn then_base(self, option: QuantOption, name: String, mine: [u8; 32]) {
         if let Some(theirs) = self.base_digests.get(&name).copied() {
             return self.compared(option, &name, mine, theirs);
         }
@@ -451,7 +448,6 @@ impl Verifying {
         let (io, chunk) = (Arc::clone(&self.io), self.hash_chunk_bytes);
         let report = Arc::clone(&self.done);
         let label = format!("{name} of {}", base.key());
-        self.base_digests.shrink_to_fit();
         cell.send((self, name));
         let waiting = Arc::clone(&cell);
         Hashing::start(

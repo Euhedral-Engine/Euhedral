@@ -28,9 +28,9 @@ use crate::mixed::MixedError;
 
 pub use artifact::ArtifactFile;
 pub use command::{Assembled, Request, run};
-pub use sources::{COMPANION_SUFFIXES, DEFAULT_HASH_CHUNK_BYTES, SourceSet};
+pub use sources::{COMPANION_SUFFIXES, SourceSet};
 pub use view::{Piece, View, view};
-pub use write::{DEFAULT_COPY_BUFFER_MIB, write};
+pub use write::write;
 
 /// Where a result goes: called once, from a frame, and must not wait.
 pub type Done<T> = Arc<dyn Fn(Result<T, AssembleError>) + Send + Sync>;

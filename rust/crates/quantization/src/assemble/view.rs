@@ -25,12 +25,12 @@ pub struct Piece {
 }
 
 /// The assembled artifact before it is written: the metadata, the objects in the base's order, and the base's
-/// tokenizer.
+/// tokenizer (when it has one: writing the artifact needs it).
 #[derive(Debug, Clone)]
 pub struct View {
     pub metadata: ModelMetadata,
     pub pieces: Vec<Piece>,
-    pub tokenizer: TokenizerSection,
+    pub tokenizer: Option<TokenizerSection>,
 }
 
 impl View {
@@ -44,7 +44,7 @@ impl View {
 /// sources of their options. `draft_depth`, when given, is the stored MTP draft depth; otherwise the base's stays.
 ///
 /// Refused, naming the object or the option: an object that is unknown, is not a projection or is one of the MTP
-/// layer's, an option without a source, a base that carries no tokenizer.
+/// layer's, an option without a source.
 pub fn view(sources: &SourceSet, allocation: &Allocation, draft_depth: Option<u8>) -> Result<View, AssembleError> {
     let base = sources.base();
     let choosable: HashSet<&str> = sources.projections().iter().map(String::as_str).collect();
@@ -72,10 +72,7 @@ pub fn view(sources: &SourceSet, allocation: &Allocation, draft_depth: Option<u8
         }
         chosen.insert(name, *option);
     }
-    let tokenizer = base_file
-        .tokenizer()
-        .cloned()
-        .ok_or_else(|| AssembleError::invalid(format!("{} carries no tokenizer", base_file.path().display())))?;
+    let tokenizer = base_file.tokenizer().cloned();
     let mut pieces = Vec::new();
     for entry in base_file.table().entries() {
         let name = entry.name();

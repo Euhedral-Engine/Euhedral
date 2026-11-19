@@ -6,7 +6,8 @@
 //! read into a buffer, written, and the buffer is read into again.
 
 use std::ffi::OsString;
-use std::io::Error as IoError;
+use std::fs::File;
+use std::io::{Error as IoError, ErrorKind};
 use std::mem::take;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use euhedral_inference_edrl::{
 };
 use euhedral_inference_engine::Handoff;
 use euhedral_io::{AsyncIo, Create, IoBuf, IoDone, OpenSpec, OwnedFile};
+use same_file::Handle;
 
 use super::chunks::read_chunk;
 use super::view::View;
@@ -26,9 +28,6 @@ use crate::checkpoint::CheckpointError;
 use crate::checkpoint::io::{raw_file, submit_error};
 use crate::durable;
 use crate::step::{Kind, idle, step};
-
-/// The default size of the copy buffer, in MiB.
-pub const DEFAULT_COPY_BUFFER_MIB: u64 = 64;
 
 /// One payload to copy.
 struct Job {
@@ -41,7 +40,9 @@ struct Job {
 
 /// Writes `view` as an artifact file at `out`, copying payloads in chunks of at most `copy_buffer_bytes`. `done` gets
 /// the result once the file is complete under its final name, or has failed and left no `.part` file. The durability
-/// and removal calls run as frames of `host`, which is held admitted until the end. `Err` started nothing.
+/// and removal calls run as frames of `host`, which is held admitted until the end. If `host` closes before the data
+/// is made durable, or before a failed file can be removed, the error says that the `.part` file was left. A source
+/// that is the `.part` file itself (under any name) is refused and left as it is. `Err` started nothing.
 pub fn write(
     io: &Arc<AsyncIo>,
     host: &Arc<Lake>,
@@ -76,10 +77,14 @@ pub fn write(
     head.extend_from_slice(&plan.header().encode());
     head.extend_from_slice(&metadata);
     head.extend_from_slice(&table);
+    let tokenizer = view
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| AssembleError::invalid("the base carries no tokenizer, which an artifact is written with"))?;
     let texts: Vec<&str> = TOKENIZER_ENTRIES
         .iter()
         .map(|name| {
-            view.tokenizer
+            tokenizer
                 .text(name)
                 .ok_or_else(|| AssembleError::invalid(format!("the tokenizer section has no {name}")))
         })
@@ -109,10 +114,12 @@ pub fn write(
     let mut part: OsString = out.as_os_str().to_owned();
     part.push(".part");
     let part = PathBuf::from(part);
+    // Opened without truncating: a source may be another name of this file, which the run must not cut. Read as well,
+    // so that the identity of the file can be queried on every platform.
     let spec = OpenSpec {
-        read: false,
+        read: true,
         write: true,
-        create: Create::Truncate,
+        create: Create::IfMissing,
         ..OpenSpec::default()
     };
     let writing = Writing {
@@ -136,7 +143,7 @@ pub fn write(
         spec,
         Box::new(move |opened| {
             step(Kind::Resolve, move || match opened {
-                Ok(file) => writing.begin(file, head),
+                Ok(file) => writing.start(file, head),
                 Err(error) => writing.end(Err(
                     CheckpointError::io(format!("cannot create {context}"), error).into()
                 )),
@@ -167,8 +174,76 @@ struct Writing {
 }
 
 impl Writing {
-    fn begin(mut self, file: OwnedFile, head: Vec<u8>) {
+    /// The `.part` file is open: it is refused if a source is the same file, else cut to empty and filled.
+    fn start(mut self, file: OwnedFile, head: Vec<u8>) {
+        match self.is_a_source(&file) {
+            Ok(false) => {}
+            Ok(true) => {
+                // The file is a source, not this run's: it is left as it is.
+                let refusal = format!(
+                    "{} is a source and the temporary name of the output: the run would overwrite its own source",
+                    self.part.display()
+                );
+                return self.end(Err(AssembleError::invalid(refusal)));
+            }
+            Err(error) => {
+                let context = format!("cannot compare {} with the sources", self.part.display());
+                return self.fail_with(file, CheckpointError::io(context, error).into());
+            }
+        }
+        let Ok(cut) = file.try_clone().map(durable::share) else {
+            let error = IoError::other("the handle cannot be duplicated");
+            return self.fail_with(file, CheckpointError::io("cannot empty the .part file", error).into());
+        };
         self.file = Some(file);
+        let cell = Handoff::new();
+        let host = Arc::clone(&self.host);
+        cell.send(self);
+        let waiting = Arc::clone(&cell);
+        let started = durable::truncate_and_close(
+            &host,
+            cut,
+            0,
+            Box::new(move |emptied| {
+                if let Some(writing) = waiting.take() {
+                    match emptied {
+                        Ok(()) => writing.begin(head),
+                        Err(error) => {
+                            let context = format!("cannot empty {}", writing.part.display());
+                            writing.fail(CheckpointError::io(context, error).into());
+                        }
+                    }
+                }
+                idle()
+            }),
+        );
+        if started.is_err()
+            && let Some(writing) = cell.take()
+        {
+            let context = format!("cannot empty {}: the host lake is closed", writing.part.display());
+            writing.end(Err(CheckpointError::io(context, IoError::from(ErrorKind::Other)).into()));
+        }
+    }
+
+    /// Whether `file` is one of the sources.
+    fn is_a_source(&self, file: &OwnedFile) -> Result<bool, IoError> {
+        let target = Handle::from_file(File::from(file.try_clone()?))?;
+        for job in &self.jobs {
+            if Handle::from_file(File::from(job.file.try_clone()?))? == target {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Ends the chain with `error` for a file that is not stored yet.
+    fn fail_with(mut self, file: OwnedFile, error: AssembleError) {
+        self.file = Some(file);
+        self.fail(error);
+    }
+
+    /// Writes the head, then the data.
+    fn begin(self, head: Vec<u8>) {
         let filled = head.len();
         self.put(head, filled, 0, false);
     }
@@ -309,16 +384,15 @@ impl Writing {
         };
         let shared = durable::share(file);
         let host = Arc::clone(&self.host);
-        let held = Arc::clone(&shared);
         let cell = Handoff::new();
         cell.send(self);
         let waiting = Arc::clone(&cell);
-        let started = durable::sync(
+        // The call gives up its reference before the completion runs, so the file is closed before it is renamed (a
+        // file that is open cannot be renamed on Windows).
+        let started = durable::sync_and_close(
             &host,
-            &shared,
+            shared,
             Box::new(move |synced| {
-                // The file is closed before it is renamed: a file that is open cannot be renamed on Windows.
-                drop(held);
                 let Some(writing) = waiting.take() else {
                     return idle();
                 };
@@ -332,7 +406,6 @@ impl Writing {
                 idle()
             }),
         );
-        drop(shared);
         if started.is_err()
             && let Some(writing) = cell.take()
         {
