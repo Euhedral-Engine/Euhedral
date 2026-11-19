@@ -75,6 +75,14 @@ planned launch the family files produce. Two files turn a plan into work on a Ru
 The device tests `kernels_gpu` (ignored by default) check that every catalog kernel resolves with parameters a
 plan can pass and print the module compile and load times.
 
+## cuBLAS and cuSOLVER
+
+`crates/cuda/src/math.rs` loads NVIDIA's cuBLAS, cuSOLVER, cuSPARSE and nvJitLink libraries from a directory the caller
+names (`MathLibraries::load`), and gives each lane one `LaneHandles` whose calls (BF16 and FP32 GEMM, the Cholesky
+factor, inverse and solve) enqueue on the stream the lane lends. Nothing waits; the `info` word of a factorisation is
+read after the queue retires the work. The device tests (`math_gpu`) take the directory from
+`euhedral.quantization.cuda-libraries` (`EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES`) and skip without it.
+
 ## Benchmark
 
 `euhedral-bench` (crate `euhedral-inference-bench`) measures the Rust engine with the Java benchmark's configuration
