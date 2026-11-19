@@ -24,6 +24,24 @@ fn finish(world: &World, writer: SafetensorsWriter) -> Result<(), CheckpointErro
     world.call(|done| writer.finish(&world.io, &world.host, done))
 }
 
+/// Like `finish`, and also the number of times the callback ran, once the lattice has drained.
+fn finish_counted(world: World, writer: SafetensorsWriter) -> (Result<(), CheckpointError>, u64) {
+    let calls = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&calls);
+    let result = world.call(|done| {
+        writer.finish(
+            &world.io,
+            &world.host,
+            Arc::new(move |result| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                done(result);
+            }),
+        )
+    });
+    world.finish();
+    (result, calls.load(Ordering::SeqCst))
+}
+
 fn header_of(file: &[u8]) -> Value {
     let length = u64::from_le_bytes(file[..8].try_into().unwrap()) as usize;
     assert_eq!(length % 8, 0, "the header is padded to a multiple of 8");
@@ -71,7 +89,6 @@ fn what_is_written_reads_back_and_no_part_file_is_left() {
         .unwrap();
     assert_eq!(writer.data_bytes(), 12);
     finish(&world, writer).unwrap();
-
     assert!(!directory.path().join("model.safetensors.part").exists());
     let file = fs::read(&path).unwrap();
     let header = header_of(&file);
@@ -162,7 +179,12 @@ fn inconsistent_tensors_are_refused_when_added() {
     assert!(message(writer.add("c", "F8", &[2], vec![0; 4])).contains("dtype"));
     assert!(message(writer.add("d", "I64", &[u64::MAX, 2], vec![])).contains("too large"));
     assert!(message(writer.add("__metadata__", "U8", &[1], vec![0])).contains("__metadata__"));
-    assert!(SafetensorsWriter::with_buffer(&directory.path().join("x"), 0).is_err());
+    for size in [0, 12, 1001] {
+        assert!(
+            SafetensorsWriter::with_buffer(&directory.path().join("x"), size).is_err(),
+            "{size}"
+        );
+    }
     // Refused tensors leave no trace: only `a` is in the header.
     let header = String::from_utf8(writer.header()).unwrap();
     assert_eq!(header.matches("data_offsets").count(), 1);
@@ -199,20 +221,21 @@ fn the_header_is_padded_on_its_encoded_length_and_names_are_escaped() {
 
 #[test]
 fn a_failing_source_leaves_neither_a_part_file_nor_a_final_file() {
-    let world = World::start();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("model.safetensors");
-    let failures: [(&str, Source); 3] = [
+    let failures: [(&str, Source, &str); 4] = [
         (
             "reports a failure",
             Arc::new(|_, _, done| {
                 done(Err(CheckpointError::Invalid("boom".to_owned())));
                 Ok(())
             }),
+            "cannot read tensor bad: boom",
         ),
         (
             "refuses to start",
             Arc::new(|_, _, _| Err(CheckpointError::Invalid("boom".to_owned()))),
+            "cannot read tensor bad: boom",
         ),
         (
             "gives a short chunk",
@@ -220,18 +243,50 @@ fn a_failing_source_leaves_neither_a_part_file_nor_a_final_file() {
                 done(Ok(chunk[..1].to_vec()));
                 Ok(())
             }),
+            "the source of bad gave 1 bytes for a chunk of 2",
+        ),
+        (
+            "gives an oversized chunk",
+            Arc::new(|_, mut chunk, done| {
+                chunk.push(0);
+                done(Ok(chunk));
+                Ok(())
+            }),
+            "the source of bad gave 3 bytes for a chunk of 2",
         ),
     ];
-    for (what, source) in failures {
+    for (what, source, message) in failures {
+        let world = World::start();
         let mut writer = SafetensorsWriter::new(&path);
         writer.add("ok", "F16", &[1], vec![0; 2]).unwrap();
         writer.add_source("bad", "F16", &[1], 2, source).unwrap();
-        let error = finish(&world, writer).unwrap_err();
+        let (result, calls) = finish_counted(world, writer);
+        assert_eq!(result.unwrap_err().to_string(), message, "{what}");
+        assert_eq!(calls, 1, "{what}: the callback runs once");
         assert!(!directory.path().join("model.safetensors.part").exists(), "{what}");
         assert!(!path.exists(), "{what}");
-        assert!(!error.to_string().is_empty(), "{what}");
     }
-    world.finish();
+}
+
+#[test]
+fn a_failure_after_the_data_was_written_removes_the_part_file_and_reports_once() {
+    let world = World::start();
+    let directory = tempfile::tempdir().unwrap();
+    // A target that is a directory with something in it: the data is written, synced and closed, and the rename fails.
+    let path = directory.path().join("model.safetensors");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("keep"), b"kept").unwrap();
+    let mut writer = SafetensorsWriter::new(&path);
+    writer.add("a", "U8", &[1], vec![1]).unwrap();
+    let (result, calls) = finish_counted(world, writer);
+    let error = result.unwrap_err();
+    assert!(
+        matches!(&error, CheckpointError::Io { context, .. } if context.contains("cannot rename")),
+        "{error}"
+    );
+    assert_eq!(calls, 1);
+    assert!(!directory.path().join("model.safetensors.part").exists());
+    assert_eq!(fs::read(path.join("keep")).unwrap(), b"kept");
 }
 
 #[test]
@@ -287,4 +342,5 @@ fn a_closed_host_lake_refuses_before_anything_is_written() {
     let refused = writer.finish(&world.io, &world.host, Arc::new(|_| panic!("nothing was started")));
     assert!(matches!(refused, Err(CheckpointError::LakeClosed)));
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    world.finish();
 }

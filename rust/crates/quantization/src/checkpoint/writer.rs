@@ -40,7 +40,8 @@ const ELEMENT_BYTES: [(&str, u64); 8] = [
 /// the chunk's, with the bytes `[offset, offset + buffer.len())` of the tensor and give it back through `done`, once,
 /// from a frame (not from the reap of an `AsyncIo`). It may do so before it returns or later, after reads of its own.
 /// It must not wait. `Err` started nothing and never calls `done`. The next chunk is asked for only after the
-/// previous one has been written, so a tensor is never resident whole.
+/// previous one has been written, so a tensor is never resident whole. Chunks start at multiples of the writer's
+/// buffer size, which is a multiple of 8.
 pub type Source = Arc<dyn Fn(u64, Vec<u8>, Done<Vec<u8>>) -> Result<(), CheckpointError> + Send + Sync>;
 
 struct Entry {
@@ -83,11 +84,13 @@ impl SafetensorsWriter {
         }
     }
 
-    /// A writer of `file` that copies the tensors through a buffer of `buffer_bytes` bytes.
+    /// A writer of `file` that copies the tensors through a buffer of `buffer_bytes` bytes. Each tensor is asked for in
+    /// chunks that start at multiples of `buffer_bytes` (the last one may be shorter), and the size must be a multiple
+    /// of 8 so that no chunk splits an element.
     pub fn with_buffer(file: &Path, buffer_bytes: usize) -> Result<Self, CheckpointError> {
-        if buffer_bytes < 1 {
+        if buffer_bytes == 0 || buffer_bytes % 8 != 0 {
             return Err(CheckpointError::Invalid(format!(
-                "buffer must hold a byte: {buffer_bytes}"
+                "the buffer must be a positive multiple of 8 bytes, so a chunk never splits an element: {buffer_bytes}"
             )));
         }
         Ok(Self {
@@ -188,7 +191,8 @@ impl SafetensorsWriter {
 
     /// Writes the file: `then` gets the result once it is complete under its final name, or has failed and left no
     /// `.part` file. The durability and removal calls run as frames of `host`, which is held admitted until the end.
-    /// `Err` started nothing.
+    /// If `host` closes before the data is made durable, or before a failed file can be removed, the error says that
+    /// the `.part` file was left. `Err` started nothing.
     pub fn finish(self, io: &Arc<AsyncIo>, host: &Arc<Lake>, then: Done<()>) -> Result<(), CheckpointError> {
         let unit = host.admit().map_err(|_| CheckpointError::LakeClosed)?;
         let mut part: OsString = self.file.clone().into_os_string();
@@ -395,6 +399,7 @@ impl Step {
         let n = (writing.buffer_bytes as u64).min(entry.bytes - writing.at) as usize;
         let source = Arc::clone(&entry.source);
         let name = entry.name.clone();
+        let named = name.clone();
         let at = writing.at;
         let mut buffer = take(&mut writing.buffer);
         buffer.resize(n, 0);
@@ -419,7 +424,7 @@ impl Step {
                 }
                 Err(error) => {
                     drop(file);
-                    writing.fail(error);
+                    writing.fail(CheckpointError::Invalid(format!("cannot read tensor {name}: {error}")));
                 }
             }
         });
@@ -427,7 +432,7 @@ impl Step {
             && let Some(Step { file, writing }) = cell.take()
         {
             drop(file);
-            writing.fail(error);
+            writing.fail(CheckpointError::Invalid(format!("cannot read tensor {named}: {error}")));
         }
     }
 }
@@ -464,7 +469,14 @@ impl Writing {
         if started.is_err()
             && let Some(writing) = cell.take()
         {
-            writing.end(Err(CheckpointError::LakeClosed));
+            let context = format!(
+                "cannot sync {}: the .part file is complete and was left",
+                writing.part.display()
+            );
+            writing.end(Err(CheckpointError::io(
+                context,
+                IoError::other("the host lake is closed"),
+            )));
         }
     }
 
