@@ -12,61 +12,52 @@
 )]
 
 use std::f64::consts::TAU;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use euhedral_gpu::cuda::{CudaGpu, CudaModule, CudaQueue};
+use euhedral_gpu::cuda::{CudaGpu, CudaLaneEnqueue, CudaModule, CudaQueue};
 use euhedral_gpu::{GpuError, Lane, SharedLanes, StreamOptions, open_shared_lanes};
 use euhedral_graph::LaneId;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer};
-use euhedral_inference_quantization::kernels::{Module, ModuleOptions, Modules};
+use euhedral_inference_quantization::kernels::{Compiled, Module, ModuleOptions, Modules};
 use euhedral_inference_quantization::trellis::{Step, TrellisError, TrellisKernels};
 
-pub struct Rig {
+/// The engine library, one lane and the compiled module, with the waiting for the lane.
+pub struct Device {
     pub library: Arc<CudaLibrary>,
-    pub kernels: TrellisKernels<CudaModule>,
     lanes: SharedLanes<CudaQueue>,
     lane: Arc<CudaQueue>,
     // The device stays open for the lanes.
     _gpu: Arc<CudaGpu>,
 }
 
-/// The rig, or a panic naming the missing setting: a device test that skips is no check.
-pub fn rig() -> Rig {
+/// The device and the compiled `module`, or a panic naming the missing setting: a device test that skips is no check.
+pub fn device(module: Module, name: &'static str) -> (Device, Arc<Compiled<CudaModule>>) {
     let path = test_support::gradle_property("euhedral.cuda.library")
         .expect("set euhedral.cuda.library (EUHEDRAL_TEST_CUDA_LIBRARY) to the engine library");
     let library = CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads");
     let options = ModuleOptions::beside(&library).expect("the product directory");
     let gpu = CudaGpu::open(0).expect("the device opens");
     let mut modules = Modules::<CudaModule>::open(&gpu, options).expect("the compiler gives machine code");
-    let compiled = modules.load(Module::Trellis).unwrap_or_else(|error| panic!("{error}"));
-    let kernels = TrellisKernels::new(&compiled).expect("the trellis kernels resolve");
-    let lanes = open_shared_lanes(&gpu, &[("trellis", StreamOptions::default())]).expect("a lane opens");
+    let compiled = modules.load(module).unwrap_or_else(|error| panic!("{error}"));
+    let lanes = open_shared_lanes(&gpu, &[(name, StreamOptions::default())]).expect("a lane opens");
     let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
-    Rig {
+    let device = Device {
         library,
-        kernels,
         lanes,
         lane,
         _gpu: gpu,
-    }
+    };
+    (device, compiled)
 }
 
-impl Rig {
-    /// Runs `steps` on the lane and returns when the lane has retired them.
-    pub fn run(&self, steps: &[Step]) {
-        let ((), marker) = self
-            .lane
-            .submit_marked(|queue| {
-                // SAFETY: the steps name live buffers of the test, which outlive the wait below.
-                unsafe { self.kernels.enqueue(queue, steps) }.map_err(|error| match error {
-                    TrellisError::Gpu(gpu) => gpu,
-                    other => GpuError::Invalid(other.to_string()),
-                })
-            })
-            .expect("submit");
+impl Device {
+    /// Runs `body` on one submission of the lane and returns when the lane has retired it.
+    pub fn submit_and_wait(&self, body: impl FnOnce(&mut CudaLaneEnqueue<'_>) -> Result<(), GpuError>) {
+        let ((), marker) = self.lane.submit_marked(body).expect("submit");
         let start = Instant::now();
         while !self.lanes.queues.reached(marker) {
             assert!(start.elapsed() < Duration::from_secs(60), "the lane did not retire");
@@ -100,6 +91,39 @@ impl Rig {
         let bytes = self.download(buffer, count * 4);
         let (words, _) = bytes.as_chunks::<4>();
         words.iter().map(|word| f32::from_le_bytes(*word)).collect()
+    }
+}
+
+pub struct Rig {
+    device: Device,
+    pub kernels: TrellisKernels<CudaModule>,
+}
+
+impl Deref for Rig {
+    type Target = Device;
+
+    fn deref(&self) -> &Device {
+        &self.device
+    }
+}
+
+/// The trellis rig.
+pub fn rig() -> Rig {
+    let (device, compiled) = device(Module::Trellis, "trellis");
+    let kernels = TrellisKernels::new(&compiled).expect("the trellis kernels resolve");
+    Rig { device, kernels }
+}
+
+impl Rig {
+    /// Runs `steps` on the lane and returns when the lane has retired them.
+    pub fn run(&self, steps: &[Step]) {
+        self.submit_and_wait(|queue| {
+            // SAFETY: the steps name live buffers of the test, which outlive the wait.
+            unsafe { self.kernels.enqueue(queue, steps) }.map_err(|error| match error {
+                TrellisError::Gpu(gpu) => gpu,
+                other => GpuError::Invalid(other.to_string()),
+            })
+        });
     }
 }
 

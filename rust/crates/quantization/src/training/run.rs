@@ -6,7 +6,7 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 use euhedral_gpu::{Gpu, LaneEnqueue, Module as GpuModule};
 
 use super::{Step, TrainError};
-use crate::kernels::Compiled;
+use crate::kernels::{Compiled, Module, enqueue_steps};
 
 /// The kernels of the compiled training module.
 pub struct TrainKernels<M: GpuModule> {
@@ -46,19 +46,8 @@ impl<M: GpuModule> TrainKernels<M> {
     where
         E: LaneEnqueue<Kernel = <M::Gpu as Gpu>::Kernel>,
     {
-        let resolved = steps
-            .iter()
-            .map(|step| {
-                self.kernels
-                    .get(step.kernel)
-                    .ok_or_else(|| TrainError::NoKernel(step.kernel.to_owned()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for (step, kernel) in steps.iter().zip(resolved) {
-            // SAFETY: the caller vouches for the addresses; only the planners build a step, with the arguments in
-            // the kernel's parameter order.
-            unsafe { lane.launch(kernel, step.launch, &step.args) }?;
-        }
+        // SAFETY: the caller vouches for the addresses.
+        unsafe { enqueue_steps(Module::Train, &self.kernels, lane, steps) }?;
         Ok(())
     }
 }

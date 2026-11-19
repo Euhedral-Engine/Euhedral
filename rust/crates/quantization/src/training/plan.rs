@@ -10,26 +10,14 @@ const THREADS: u32 = 256;
 /// The widest head the rotary kernels hold in shared memory.
 const MOST_HEAD: u32 = 512;
 
-fn kernel_name(name: &str) -> Result<&'static str, TrainError> {
-    Module::Train
-        .kernels()
-        .iter()
-        .copied()
-        .find(|listed| *listed == name)
-        .ok_or_else(|| TrainError::NoKernel(name.to_owned()))
-}
-
 fn step(kernel: &str, blocks: u32, threads: u32, args: Args) -> Result<Step, TrainError> {
-    Ok(Step {
-        kernel: kernel_name(kernel)?,
-        launch: Launch {
-            grid: Dim3::x(blocks),
-            block: Dim3::x(threads),
-            shared_bytes: 0,
-            programmatic: false,
-        },
-        args,
-    })
+    let launch = Launch {
+        grid: Dim3::x(blocks),
+        block: Dim3::x(threads),
+        shared_bytes: 0,
+        programmatic: false,
+    };
+    Step::new(Module::Train, kernel, launch, args).ok_or_else(|| TrainError::NoKernel(kernel.to_owned()))
 }
 
 pub(super) fn address(name: &'static str, value: u64) -> Result<u64, TrainError> {
@@ -56,11 +44,19 @@ pub(super) fn dimension(name: &'static str, value: u32) -> Result<i32, TrainErro
     }
 }
 
+/// The refusal of `value`, saturated to what the error holds.
+fn out_of_range(name: &'static str, value: u64) -> TrainError {
+    TrainError::OutOfRange {
+        name,
+        value: i64::try_from(value).unwrap_or(i64::MAX),
+    }
+}
+
 /// `value` as the kernel's positive signed 64-bit count.
 fn count64(name: &'static str, value: u64) -> Result<i64, TrainError> {
     match i64::try_from(value) {
         Ok(signed) if signed > 0 => Ok(signed),
-        _ => Err(TrainError::OutOfRange { name, value: -1 }),
+        _ => Err(out_of_range(name, value)),
     }
 }
 
@@ -69,7 +65,7 @@ fn elementwise(name: &'static str, count: u64) -> Result<u32, TrainError> {
     let blocks = count.div_ceil(u64::from(THREADS));
     match i32::try_from(blocks) {
         Ok(_) => Ok(blocks as u32),
-        Err(_) => Err(TrainError::OutOfRange { name, value: -1 }),
+        Err(_) => Err(out_of_range(name, count)),
     }
 }
 
@@ -78,7 +74,7 @@ fn blocks(name: &'static str, rows: u32, per_row: u32) -> Result<u32, TrainError
     let total = u64::from(rows) * u64::from(per_row);
     match i32::try_from(total) {
         Ok(_) => Ok(total as u32),
-        Err(_) => Err(TrainError::OutOfRange { name, value: -1 }),
+        Err(_) => Err(out_of_range(name, total)),
     }
 }
 
@@ -227,7 +223,7 @@ pub struct Heads {
     pub rows: u32,
     /// Query heads per row; the key heads follow them.
     pub q_heads: u32,
-    /// Key heads per row.
+    /// Key heads per row; at least one, like the query heads.
     pub kv_heads: u32,
     /// The width of a head.
     pub head: u32,
@@ -243,10 +239,7 @@ impl Heads {
     fn blocks(&self) -> Result<u32, TrainError> {
         dimension("rows", self.rows)?;
         dimension("q_heads", self.q_heads)?;
-        let kv = i32::try_from(self.kv_heads).map_err(|_| TrainError::OutOfRange {
-            name: "kv_heads",
-            value: i64::from(self.kv_heads),
-        })?;
+        dimension("kv_heads", self.kv_heads)?;
         dimension("head", self.head)?;
         if !self.head.is_multiple_of(32) || self.head > MOST_HEAD {
             return Err(TrainError::HeadDimension(self.head));
@@ -257,17 +250,11 @@ impl Heads {
                 head: self.head,
             });
         }
-        let heads = self.q_heads.checked_add(kv as u32).ok_or(TrainError::OutOfRange {
-            name: "heads",
-            value: -1,
-        })?;
-        if u64::from(heads) * u64::from(self.head) > i32::MAX as u64 {
-            return Err(TrainError::OutOfRange {
-                name: "heads",
-                value: i64::from(heads),
-            });
+        let heads = u64::from(self.q_heads) + u64::from(self.kv_heads);
+        if heads * u64::from(self.head) > i32::MAX as u64 {
+            return Err(out_of_range("heads", heads));
         }
-        blocks("rows", self.rows, heads)
+        blocks("rows", self.rows, heads as u32)
     }
 }
 

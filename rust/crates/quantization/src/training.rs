@@ -18,10 +18,10 @@ mod run;
 use euhedral_gpu::GpuError;
 use thiserror::Error;
 
-pub use crate::trellis::Step;
+pub use crate::kernels::{Step, StepError};
 pub use gemm::{
-    Gemm, Matrices, plan_linear, plan_linear_input_gradient, plan_linear_weight_gradient, plan_product,
-    plan_product_left_transposed, plan_product_transposed,
+    Gemm, Matrices, plan_linear, plan_linear_input_gradient, plan_product, plan_product_left_transposed,
+    plan_product_transposed,
 };
 pub use plan::{
     AdamSettings, Heads, plan_adam, plan_bf16_to_float, plan_copy, plan_fill, plan_gate_backward, plan_gate_forward,
@@ -51,6 +51,9 @@ pub enum TrainError {
     /// The module has no kernel of this name.
     #[error("the training module has no kernel {0}")]
     NoKernel(String),
+    /// A step could not be enqueued.
+    #[error(transparent)]
+    Step(#[from] StepError),
     /// The device, the driver or a library failed.
     #[error("device failure: {0}")]
     Gpu(String),

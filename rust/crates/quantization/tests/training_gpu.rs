@@ -16,25 +16,22 @@
 
 mod support;
 
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread::sleep;
-use std::time::{Duration, Instant};
 
-use euhedral_gpu::cuda::{CudaGpu, CudaModule, CudaQueue};
-use euhedral_gpu::{GpuError, Lane, LaneStream, SharedLanes, StreamOptions, open_shared_lanes};
-use euhedral_graph::LaneId;
+use euhedral_gpu::cuda::CudaModule;
+use euhedral_gpu::{GpuError, LaneStream};
+use euhedral_inference_cuda::DeviceBuffer;
 use euhedral_inference_cuda::math::MathLibraries;
-use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer};
-use euhedral_inference_quantization::kernels::{Module, ModuleOptions, Modules};
+use euhedral_inference_quantization::kernels::Module;
 use euhedral_inference_quantization::training::{
     AdamSettings, Gemm, Heads, Matrices, Step, TrainKernels, plan_adam, plan_bf16_to_float, plan_copy, plan_fill,
-    plan_gate_backward, plan_gate_forward, plan_linear, plan_linear_input_gradient, plan_linear_weight_gradient,
-    plan_product, plan_product_left_transposed, plan_product_transposed, plan_qk_norm_rope_backward,
-    plan_qk_norm_rope_forward, plan_rms_norm_backward, plan_rms_norm_forward, plan_swiglu_backward,
-    plan_swiglu_forward, plan_zero,
+    plan_gate_backward, plan_gate_forward, plan_linear, plan_linear_input_gradient, plan_product,
+    plan_product_left_transposed, plan_product_transposed, plan_qk_norm_rope_backward, plan_qk_norm_rope_forward,
+    plan_rms_norm_backward, plan_rms_norm_forward, plan_swiglu_backward, plan_swiglu_forward, plan_zero,
 };
-use support::gaussians;
+use support::{Device, device, gaussians};
 
 /// One piece of work on the lane, in order.
 enum Work {
@@ -43,66 +40,48 @@ enum Work {
 }
 
 struct Rig {
-    library: Arc<CudaLibrary>,
+    device: Device,
     math: Arc<MathLibraries>,
     kernels: TrainKernels<CudaModule>,
-    lanes: SharedLanes<CudaQueue>,
-    lane: Arc<CudaQueue>,
-    _gpu: Arc<CudaGpu>,
+}
+
+impl Deref for Rig {
+    type Target = Device;
+
+    fn deref(&self) -> &Device {
+        &self.device
+    }
 }
 
 fn rig() -> Rig {
-    let path = test_support::gradle_property("euhedral.cuda.library")
-        .expect("set euhedral.cuda.library (EUHEDRAL_TEST_CUDA_LIBRARY) to the engine library");
     let directory = test_support::gradle_property("euhedral.quantization.cuda-libraries")
         .expect("set euhedral.quantization.cuda-libraries (EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES)");
-    let library = CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads");
     let math = MathLibraries::load(&PathBuf::from(directory)).expect("the math libraries load");
-    let options = ModuleOptions::beside(&library).expect("the product directory");
-    let gpu = CudaGpu::open(0).expect("the device opens");
-    let mut modules = Modules::<CudaModule>::open(&gpu, options).expect("the compiler gives machine code");
-    let compiled = modules.load(Module::Train).unwrap_or_else(|error| panic!("{error}"));
+    let (device, compiled) = device(Module::Train, "train");
     let kernels = TrainKernels::new(&compiled);
-    let lanes = open_shared_lanes(&gpu, &[("train", StreamOptions::default())]).expect("a lane opens");
-    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
-    Rig {
-        library,
-        math,
-        kernels,
-        lanes,
-        lane,
-        _gpu: gpu,
-    }
+    Rig { device, math, kernels }
 }
 
 impl Rig {
     /// Runs `work` in order on one submission and returns when the lane has retired it.
     fn run(&self, work: &[Work]) {
         let mut handles = self.math.lane_handles().expect("handles");
-        let ((), marker) = self
-            .lane
-            .submit_marked(|queue| {
-                for item in work {
-                    match item {
-                        // SAFETY: the steps name live buffers of the test, which outlive the wait below.
-                        Work::Steps(steps) => unsafe { self.kernels.enqueue(queue, steps) }
-                            .map_err(|error| GpuError::Invalid(error.to_string()))?,
-                        Work::Product(gemm) => {
-                            let stream = queue.raw_stream().expect("the lane lends a stream");
-                            // SAFETY: as above, on the lane's own stream and handles.
-                            unsafe { gemm.enqueue(&mut handles, &stream) }
-                                .map_err(|error| GpuError::Invalid(error.to_string()))?;
-                        }
+        self.submit_and_wait(|queue| {
+            for item in work {
+                match item {
+                    // SAFETY: the steps name live buffers of the test, which outlive the wait.
+                    Work::Steps(steps) => unsafe { self.kernels.enqueue(queue, steps) }
+                        .map_err(|error| GpuError::Invalid(error.to_string()))?,
+                    Work::Product(gemm) => {
+                        let stream = queue.raw_stream().expect("the lane lends a stream");
+                        // SAFETY: as above, on the lane's own stream and handles.
+                        unsafe { gemm.enqueue(&mut handles, &stream) }
+                            .map_err(|error| GpuError::Invalid(error.to_string()))?;
                     }
                 }
-                Ok(())
-            })
-            .expect("submit");
-        let start = Instant::now();
-        while !self.lanes.queues.reached(marker) {
-            assert!(start.elapsed() < Duration::from_secs(60), "the lane did not retire");
-            sleep(Duration::from_micros(100));
-        }
+            }
+            Ok(())
+        });
         handles.close().expect("the handles close");
     }
 
@@ -257,6 +236,43 @@ fn rms_norm_forward_and_backward_match_the_host_for_both_offsets() {
         let by_w = numeric_gradient(&|v| reference(&xd, v), &wd, &r);
         assert_close(&by_w, &rig.download(&dw_buffer, width), 1e-3, "dw");
     }
+}
+
+#[test]
+#[ignore = "needs a GPU, the bundled NVRTC and the math libraries"]
+fn rms_norm_epsilon_matters_for_a_row_whose_mean_square_is_near_it() {
+    let rig = rig();
+    let (rows, width, eps) = (3usize, 64usize, 1e-6f32);
+    // Row one is scaled so that its mean square, about 1e-6, is comparable to the epsilon.
+    let mut x = scaled(rows * width, 7, 1.0);
+    x[width..2 * width].iter_mut().for_each(|v| *v *= 1e-3);
+    let w = scaled(width, 8, 0.3);
+    let (xb, wb) = (rig.upload(&x), rig.upload(&w));
+    let (y, inverse) = (rig.zeros(rows * width), rig.zeros(rows));
+    let steps = plan_rms_norm_forward(
+        xb.addr(),
+        wb.addr(),
+        y.addr(),
+        inverse.addr(),
+        rows as u32,
+        width as u32,
+        eps,
+        1.0,
+    )
+    .unwrap();
+    rig.run(&[Work::Steps(steps)]);
+    let (xd, wd) = (wide(&x), wide(&w));
+    let inverses: Vec<f64> = xd
+        .chunks(width)
+        .map(|row| 1.0 / (row.iter().map(|v| v * v).sum::<f64>() / width as f64 + f64::from(eps)).sqrt())
+        .collect();
+    let expected: Vec<f64> = xd
+        .chunks(width)
+        .zip(&inverses)
+        .flat_map(|(row, inv)| row.iter().zip(&wd).map(move |(v, w)| v * inv * (1.0 + w)))
+        .collect();
+    assert_close(&inverses, &rig.download(&inverse, rows), 1e-5, "inverse");
+    assert_close(&expected, &rig.download(&y, rows * width), 1e-5, "forward");
 }
 
 #[test]
@@ -484,25 +500,23 @@ fn gate_forward_and_backward_match_the_host_on_a_wider_gate_row() {
 
 #[test]
 #[ignore = "needs a GPU, the bundled NVRTC and the math libraries"]
-fn linear_and_its_gradients_match_the_host_products() {
+fn linear_and_its_input_gradient_match_the_host_products() {
     let rig = rig();
     let (rows, inputs, outputs) = (5usize, 24usize, 16usize);
     let x = scaled(rows * inputs, 15, 1.0);
     let w = scaled(outputs * inputs, 16, 0.3);
     let dy = scaled(rows * outputs, 17, 1.0);
     let (xb, wb, dyb) = (rig.upload(&x), rig.upload(&w), rig.upload(&dy));
-    let (y, y_sum, dx, dw) = (
+    let (y, y_sum, dx) = (
         rig.zeros(rows * outputs),
         rig.upload(&vec![1.0; rows * outputs]),
         rig.upload(&vec![0.25; rows * inputs]),
-        rig.upload(&vec![9.0; outputs * inputs]),
     );
     let (r, i, o) = (rows as u32, inputs as u32, outputs as u32);
     rig.run(&[
         Work::Product(plan_linear(xb.addr(), wb.addr(), y.addr(), r, i, o, false).unwrap()),
         Work::Product(plan_linear(xb.addr(), wb.addr(), y_sum.addr(), r, i, o, true).unwrap()),
         Work::Product(plan_linear_input_gradient(dyb.addr(), wb.addr(), dx.addr(), r, i, o).unwrap()),
-        Work::Product(plan_linear_weight_gradient(dyb.addr(), xb.addr(), dw.addr(), r, i, o).unwrap()),
     ]);
     let (xd, wd, dyd) = (wide(&x), wide(&w), wide(&dy));
     let forward = matmul(&xd, &transpose(&wd, outputs, inputs), rows, outputs, inputs);
@@ -519,13 +533,6 @@ fn linear_and_its_gradients_match_the_host_products() {
         .map(|v| v + 0.25)
         .collect();
     assert_close(&input_gradient, &rig.download(&dx, rows * inputs), 1e-5, "dx adds");
-    let weight_gradient = matmul(&transpose(&dyd, rows, outputs), &xd, outputs, inputs, rows);
-    assert_close(
-        &weight_gradient,
-        &rig.download(&dw, outputs * inputs),
-        1e-5,
-        "dw overwrites",
-    );
 }
 
 #[test]
@@ -665,6 +672,52 @@ fn adam_follows_the_bias_corrected_update_and_zeroes_the_gradient() {
     assert_close(&pe, &rig.download(&p, count), 1e-5, "parameters");
     assert_close(&me, &rig.download(&m, count), 1e-5, "first moment");
     assert_close(&ve, &rig.download(&v, count), 1e-5, "second moment");
+}
+
+#[test]
+#[ignore = "needs a GPU, the bundled NVRTC and the math libraries"]
+fn adam_epsilon_and_weight_decay_show_in_the_change_of_the_parameters() {
+    let rig = rig();
+    let count = 100usize;
+    // Gradients about as small as the epsilon, and a decay large enough to be seen at the tolerance.
+    let settings = AdamSettings {
+        rate: 0.1,
+        beta1: 0.9,
+        beta2: 0.999,
+        eps: 1e-8,
+        decay: 0.5,
+    };
+    let p0 = scaled(count, 24, 0.05);
+    let (g0, g1) = (scaled(count, 25, 1e-8), scaled(count, 26, 1e-8));
+    let (p, g, m, v) = (rig.upload(&p0), rig.upload(&g0), rig.zeros(count), rig.zeros(count));
+    for (step, gradient) in [(1, &g0), (2, &g1)] {
+        g.copy_from_host(0, &gradient.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
+            .unwrap();
+        let steps = plan_adam(p.addr(), g.addr(), m.addr(), v.addr(), count as u64, &settings, step).unwrap();
+        rig.run(&[Work::Steps(steps)]);
+    }
+    let (b1, b2) = (f64::from(settings.beta1), f64::from(settings.beta2));
+    let (rate, eps, decay) = (
+        f64::from(settings.rate),
+        f64::from(settings.eps),
+        f64::from(settings.decay),
+    );
+    let (mut pe, mut me, mut ve) = (wide(&p0), vec![0.0; count], vec![0.0; count]);
+    for (step, gradient) in [(1, wide(&g0)), (2, wide(&g1))] {
+        for i in 0..count {
+            me[i] = b1 * me[i] + (1.0 - b1) * gradient[i];
+            ve[i] = b2 * ve[i] + (1.0 - b2) * gradient[i] * gradient[i];
+            let (m_hat, v_hat) = (me[i] / (1.0 - b1.powi(step)), ve[i] / (1.0 - b2.powi(step)));
+            pe[i] -= rate * (m_hat / (v_hat.sqrt() + eps) + decay * pe[i]);
+        }
+    }
+    let change = |values: &[f64]| -> Vec<f64> { values.iter().zip(&p0).map(|(v, p)| v - f64::from(*p)).collect() };
+    assert_close(
+        &change(&pe),
+        &change(&rig.download(&p, count)),
+        1e-5,
+        "change of the parameters",
+    );
 }
 
 #[test]

@@ -66,23 +66,24 @@ fn operand(name: &'static str, pointer: u64, leading: u32, columns: u32) -> Resu
     Ok((pointer, signed))
 }
 
+/// A product whose `shape` is cuBLAS's `m`, `n` and `k`, each with the name of the caller's dimension it came from.
 #[allow(clippy::too_many_arguments, reason = "a product's own parameters")]
 fn product(
     operations: (Operation, Operation),
-    shape: (u32, u32, u32),
+    shape: [(&'static str, u32); 3],
     scales: (f32, f32),
     a: (u64, i32),
     b: (u64, i32),
     c: (u64, i32),
 ) -> Result<Gemm, TrainError> {
-    let (m, n, k) = shape;
+    let [m, n, k] = shape;
     Ok(Gemm {
         product: Product {
             a_operation: operations.0,
             b_operation: operations.1,
-            m: dimension("m", m)?,
-            n: dimension("n", n)?,
-            k: dimension("k", k)?,
+            m: dimension(m.0, m.1)?,
+            n: dimension(n.0, n.1)?,
+            k: dimension(k.0, k.1)?,
             alpha: scales.0,
             beta: scales.1,
         },
@@ -104,7 +105,7 @@ pub fn plan_linear(
 ) -> Result<Gemm, TrainError> {
     product(
         (Operation::Transpose, Operation::None),
-        (outputs, rows, inputs),
+        [("outputs", outputs), ("rows", rows), ("inputs", inputs)],
         (1.0, if accumulate { 1.0 } else { 0.0 }),
         operand("w", w, inputs, inputs)?,
         operand("x", x, inputs, inputs)?,
@@ -123,30 +124,11 @@ pub fn plan_linear_input_gradient(
 ) -> Result<Gemm, TrainError> {
     product(
         (Operation::None, Operation::None),
-        (inputs, rows, outputs),
+        [("inputs", inputs), ("rows", rows), ("outputs", outputs)],
         (1.0, 1.0),
         operand("w", w, inputs, inputs)?,
         operand("dy", dy, outputs, outputs)?,
         operand("dx", dx, inputs, inputs)?,
-    )
-}
-
-/// `dw [out, in] = dy^T x`, overwriting `dw`.
-pub fn plan_linear_weight_gradient(
-    dy: u64,
-    x: u64,
-    dw: u64,
-    rows: u32,
-    inputs: u32,
-    outputs: u32,
-) -> Result<Gemm, TrainError> {
-    product(
-        (Operation::None, Operation::Transpose),
-        (inputs, outputs, rows),
-        (1.0, 0.0),
-        operand("x", x, inputs, inputs)?,
-        operand("dy", dy, outputs, outputs)?,
-        operand("dw", dw, inputs, inputs)?,
     )
 }
 
@@ -165,7 +147,7 @@ pub struct Matrices {
 pub fn plan_product(matrices: &Matrices, m: u32, n: u32, k: u32, alpha: f32, beta: f32) -> Result<Gemm, TrainError> {
     product(
         (Operation::None, Operation::None),
-        (n, m, k),
+        [("n", n), ("m", m), ("k", k)],
         (alpha, beta),
         operand("b", matrices.b.0, matrices.b.1, n)?,
         operand("a", matrices.a.0, matrices.a.1, k)?,
@@ -184,7 +166,7 @@ pub fn plan_product_transposed(
 ) -> Result<Gemm, TrainError> {
     product(
         (Operation::Transpose, Operation::None),
-        (n, m, k),
+        [("n", n), ("m", m), ("k", k)],
         (alpha, beta),
         operand("b", matrices.b.0, matrices.b.1, k)?,
         operand("a", matrices.a.0, matrices.a.1, k)?,
@@ -203,7 +185,7 @@ pub fn plan_product_left_transposed(
 ) -> Result<Gemm, TrainError> {
     product(
         (Operation::None, Operation::Transpose),
-        (n, m, k),
+        [("n", n), ("m", m), ("k", k)],
         (alpha, beta),
         operand("b", matrices.b.0, matrices.b.1, n)?,
         operand("a", matrices.a.0, matrices.a.1, m)?,

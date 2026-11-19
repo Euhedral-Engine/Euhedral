@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use euhedral_gpu::cuda::{CudaGpu, CudaModule, Nvrtc, Target};
-use euhedral_gpu::{CompileOptions, Gpu, GpuError, Module as GpuModule};
+use euhedral_gpu::{Args, CompileOptions, Gpu, GpuError, LaneEnqueue, Launch, Module as GpuModule};
 use euhedral_inference_cuda::CudaLibrary;
 use euhedral_inference_cuda::launch::load::{DEFAULT_COMPILE_STACK_BYTES, KernelSources, LoadError, on_compile_stack};
 use thiserror::Error;
@@ -222,6 +222,107 @@ const TRELLIS: [&str; 64] = [
     "clean_row_scales",
     "scale_scalar",
 ];
+
+/// One kernel launch of a module: the kernel's name, its geometry and its arguments. Only the planners build one, so
+/// its arguments always match the kernel's parameter list, and the module it names is the one that lists the kernel.
+#[derive(Clone, Debug)]
+pub struct Step {
+    module: Module,
+    kernel: &'static str,
+    launch: Launch,
+    args: Args,
+}
+
+impl Step {
+    /// A launch of the kernel `name` of `module`, or `None` when the module's table does not list it.
+    pub(crate) fn new(module: Module, name: &str, launch: Launch, args: Args) -> Option<Self> {
+        let kernel = module.kernels().iter().copied().find(|listed| *listed == name)?;
+        Some(Self {
+            module,
+            kernel,
+            launch,
+            args,
+        })
+    }
+
+    /// The same step with `bytes` of dynamic shared memory.
+    pub(crate) fn with_shared_bytes(mut self, bytes: u32) -> Self {
+        self.launch.shared_bytes = bytes;
+        self
+    }
+
+    /// The module the kernel belongs to.
+    pub fn module(&self) -> Module {
+        self.module
+    }
+
+    /// The kernel's symbol name.
+    pub fn kernel(&self) -> &'static str {
+        self.kernel
+    }
+
+    /// The grid, block and dynamic shared memory.
+    pub fn launch(&self) -> &Launch {
+        &self.launch
+    }
+
+    /// The arguments, in the kernel's parameter order.
+    pub fn args(&self) -> &Args {
+        &self.args
+    }
+}
+
+/// Why steps could not be enqueued.
+#[derive(Debug, Error)]
+pub enum StepError {
+    /// A step names a kernel of another module than the one being enqueued.
+    #[error("step for {kernel} belongs to {}, not the module being run", module.file())]
+    WrongModule { module: Module, kernel: &'static str },
+    /// The module has no resolved kernel of this name.
+    #[error("no resolved kernel {0}")]
+    NoKernel(&'static str),
+    /// The lane refused a launch.
+    #[error("device failure: {0}")]
+    Gpu(#[from] GpuError),
+}
+
+/// Enqueues `steps` of `module` in order on `lane`, resolving each by name in `kernels`. Every step is looked up
+/// before the first launch, so a step that does not belong leaves nothing on the lane.
+///
+/// On a lane failure the steps before it are already on the lane: their addresses must stay valid until the lane
+/// retires them.
+///
+/// # Safety
+/// Every address in the steps is valid for the access its kernel makes until the work retires, and no other work
+/// uses those ranges meanwhile.
+pub(crate) unsafe fn enqueue_steps<E, K>(
+    module: Module,
+    kernels: &HashMap<&'static str, K>,
+    lane: &mut E,
+    steps: &[Step],
+) -> Result<(), StepError>
+where
+    E: LaneEnqueue<Kernel = K>,
+{
+    let resolved = steps
+        .iter()
+        .map(|step| {
+            if step.module != module {
+                return Err(StepError::WrongModule {
+                    module: step.module,
+                    kernel: step.kernel,
+                });
+            }
+            kernels.get(step.kernel).ok_or(StepError::NoKernel(step.kernel))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (step, kernel) in steps.iter().zip(resolved) {
+        // SAFETY: the caller vouches for the addresses; only the planners build a step, with the arguments in the
+        // kernel's parameter order.
+        unsafe { lane.launch(kernel, step.launch, &step.args) }?;
+    }
+    Ok(())
+}
 
 /// Where the compiler and the headers are, where compiled modules are cached, and the stack a compile runs on.
 #[derive(Clone, Debug)]
