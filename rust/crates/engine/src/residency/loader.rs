@@ -22,10 +22,11 @@
 //! and its `Drop` reports the outcome, wherever that frame ran. A failure sets a flag, so the chains stop starting
 //! reads, and the first error is the one reported.
 
+use std::collections::HashMap;
 use std::io;
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
@@ -35,6 +36,7 @@ use euhedral_io::{IoDoneOwned, OwnedFile};
 
 use crate::error::EngineError;
 use crate::frames::{Kind, step};
+use crate::residency::p2e2::{P2e2Geometry, P2e2Validation};
 use crate::residency::planner::{Placement, PlacementSource, ResidencyPlan, Tier, nvfp4};
 use crate::runtime::{Core, raw_file};
 use crate::stages::SubmitError;
@@ -49,6 +51,10 @@ pub enum Check {
     /// An NVFP4 trailer: for an SD4 layout the 16-entry scale table (no NaN), then the global scale, a finite
     /// non-negative little-endian FP32.
     Nvfp4Trailer { sd4: bool },
+    /// A piece of a P2E2 tensor of `rows` rows of `k` codes in `bytes` bytes, starting `from` bytes into it. The
+    /// tensor's check needs all its pieces (see [`P2e2Validation`]): the pieces' scans are put together as they land
+    /// and the last one's verdict is the tensor's.
+    P2e2 { from: u64, rows: u64, k: u64, bytes: u64 },
 }
 
 /// Where a piece's bytes go.
@@ -104,6 +110,12 @@ pub fn pieces(plan: &ResidencyPlan, piece_bytes: u64) -> Vec<Piece> {
                 let len = (copy.len - done).min(piece_bytes);
                 let check = match copy.check {
                     Check::Nvfp4Scales { from } => Check::Nvfp4Scales { from: from + done },
+                    Check::P2e2 { from, rows, k, bytes } => Check::P2e2 {
+                        from: from + done,
+                        rows,
+                        k,
+                        bytes,
+                    },
                     other => other,
                 };
                 out.push(Piece {
@@ -215,18 +227,39 @@ fn copies(placement: &Placement) -> Vec<Copy> {
 }
 
 fn whole(placement: &Placement) -> Vec<Copy> {
+    let check = match (
+        placement.format,
+        placement.layout,
+        placement.shape.as_slice(),
+        &placement.source,
+    ) {
+        (WeightFormat::Q3G64Fp16, WeightLayout::RowSplitP2e2V1, [rows, k], PlacementSource::Object) => Check::P2e2 {
+            from: 0,
+            rows: *rows,
+            k: *k,
+            bytes: placement.bytes,
+        },
+        _ => Check::None,
+    };
     vec![Copy {
         file_offset: placement.file_offset,
         arena_offset: 0,
         len: placement.bytes,
-        check: Check::None,
+        check,
     }]
 }
 
-/// Applies `check` to a piece's bytes.
+/// Applies `check` to a piece's bytes. What needs the tensor's other pieces is left to the load's
+/// [`P2e2Validation`] of the tensor: here a P2E2 piece is only read as words of a tensor of its shape.
 pub fn check_piece(check: Check, bytes: &[u8]) -> Result<(), String> {
     match check {
         Check::None => Ok(()),
+        Check::P2e2 {
+            from,
+            rows,
+            k,
+            bytes: size,
+        } => P2e2Geometry::new(rows, k, size)?.scan(from, bytes).map(drop),
         Check::Nvfp4Scales { from } => match bytes.iter().position(|byte| byte & 0x7f == 0x7f) {
             Some(at) => Err(format!("NVFP4 block scale at byte {} is NaN", from + at as u64)),
             None => Ok(()),
@@ -330,12 +363,39 @@ struct Shared {
     pinned_at_start: u64,
     arena: Option<DeviceBuffer>,
     done: Option<Done>,
+    /// The P2E2 tensors being checked, by placement.
+    p2e2: Mutex<HashMap<usize, Arc<Mutex<P2e2Validation>>>>,
 }
 
 impl Shared {
     fn fail(&self, error: EngineError) {
         self.failed.store(true, Ordering::Release);
         let _ = self.error.set(error);
+    }
+
+    /// Checks a piece's bytes: its own, and for a P2E2 tensor the tensor's once the piece is the last to land.
+    fn verify(&self, piece: Piece, bytes: &[u8]) -> Result<(), String> {
+        let Check::P2e2 {
+            from,
+            rows,
+            k,
+            bytes: size,
+        } = piece.check
+        else {
+            return check_piece(piece.check, bytes);
+        };
+        let geometry = P2e2Geometry::new(rows, k, size)?;
+        let scan = geometry.scan(from, bytes)?;
+        let validation = {
+            let mut tensors = self.p2e2.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(
+                tensors
+                    .entry(piece.placement)
+                    .or_insert_with(|| Arc::new(Mutex::new(P2e2Validation::new(geometry)))),
+            )
+        };
+        let mut validation = validation.lock().unwrap_or_else(PoisonError::into_inner);
+        validation.absorb(scan)
     }
 
     fn has_failed(&self) -> bool {
@@ -409,6 +469,7 @@ pub(crate) fn start(
         arena: Some(arena),
         done: Some(Box::new(done)),
         pieces: pieces.into(),
+        p2e2: Mutex::new(HashMap::new()),
     });
     let mut loans = loans.into_iter();
     for chain in 0..chains {
@@ -509,7 +570,7 @@ fn in_place_done(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPi
     }
     let host = Arc::clone(&shared.core);
     let frame = step(Kind::UploadCheck, chain, move || {
-        match check_piece(piece.check, range.as_slice()) {
+        match shared.verify(piece, range.as_slice()) {
             Ok(()) => finish(shared, loan),
             Err(reason) => {
                 let name = shared.names[piece.placement].clone();
@@ -564,7 +625,7 @@ fn read_done(shared: Arc<Shared>, chain: usize, index: usize, done: IoDoneOwned<
     let host = Arc::clone(&shared.core);
     let frame = step(Kind::UploadCheck, chain, move || {
         let bytes = &loan.buffer().as_slice()[..piece.len];
-        match check_piece(piece.check, bytes) {
+        match shared.verify(piece, bytes) {
             Ok(()) => copy(shared, chain, index, loan),
             Err(reason) => {
                 let name = shared.names[piece.placement].clone();
