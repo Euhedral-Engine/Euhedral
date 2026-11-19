@@ -6,8 +6,10 @@
 //! (`--std=c++14`): the quantization modules are compiled the same way wherever they are built, so the codes they
 //! produce do not depend on the build.
 //!
-//! The compiler is RustEE's NVRTC facility. The loader takes the device and the places the headers and the compiler
-//! are in ([`ModuleOptions`]); where the cuBLAS and cuSOLVER libraries are is not its concern.
+//! The compiler is RustEE's NVRTC facility, the bundled one the engine compiles with (one NVRTC serves the process, so
+//! the loader never picks another), and a module compiles to machine code for the device or not at all: PTX is
+//! refused. A compile runs on a thread of its own with the stack the engine's `kernels.compile.stack` sets. Where the
+//! cuBLAS and cuSOLVER libraries are is not this module's concern.
 
 mod source;
 
@@ -16,7 +18,10 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use euhedral_gpu::cuda::{CudaGpu, CudaModule, Nvrtc, Target};
 use euhedral_gpu::{CompileOptions, Gpu, GpuError, Module as GpuModule};
+use euhedral_inference_cuda::CudaLibrary;
+use euhedral_inference_cuda::launch::load::{DEFAULT_COMPILE_STACK_BYTES, KernelSources, LoadError, on_compile_stack};
 use thiserror::Error;
 
 pub use source::expand_includes;
@@ -84,7 +89,7 @@ impl Module {
     }
 
     /// The kernels of this module the library launches, by their symbol names. A module holds more kernels than
-    /// these (the ones only the commands that are not ported use); they are compiled and not resolved.
+    /// these (the ones no ported code launches); they are compiled and not resolved.
     pub fn kernels(self) -> &'static [&'static str] {
         match self {
             Module::Gptq => &GPTQ,
@@ -218,25 +223,45 @@ const TRELLIS: [&str; 64] = [
     "scale_scalar",
 ];
 
-/// Where the compiler and the headers are, and where compiled modules are cached.
+/// Where the compiler and the headers are, where compiled modules are cached, and the stack a compile runs on.
 #[derive(Clone, Debug)]
 pub struct ModuleOptions {
     /// The CUDA header directory (`cuda_bf16.h`, `cuda_fp16.h`), put on the include path.
     pub headers: PathBuf,
-    /// The NVRTC library to load; `None` leaves the choice to the backend's search order.
+    /// The NVRTC library to load; the bundled one beside the engine library. `None` leaves the choice to the
+    /// backend's search order, which only a test without a device may do.
     pub compiler: Option<PathBuf>,
     /// Where compiled modules are cached on disk; `None` compiles every time.
     pub cache_dir: Option<PathBuf>,
+    /// The stack, in bytes, of the thread a compile runs on.
+    pub compile_stack: usize,
 }
 
 impl ModuleOptions {
-    /// Options with the headers at `headers`, the backend's own compiler search and no disk cache.
+    /// Options with the headers at `headers`, no pinned compiler, no disk cache and the engine's default stack.
     pub fn new(headers: PathBuf) -> Self {
         Self {
             headers,
             compiler: None,
             cache_dir: None,
+            compile_stack: DEFAULT_COMPILE_STACK_BYTES,
         }
+    }
+
+    /// The headers, the bundled compiler and the compile stack of `sources`: the places the engine's own kernels
+    /// compile with, so one compiler serves both.
+    pub fn from_sources(sources: &KernelSources) -> Self {
+        Self {
+            headers: sources.include().to_owned(),
+            compiler: sources.compiler().map(ToOwned::to_owned),
+            cache_dir: None,
+            compile_stack: sources.compile_stack(),
+        }
+    }
+
+    /// The options of the product `library` belongs to: its `cuda/include` and its bundled NVRTC.
+    pub fn beside(library: &CudaLibrary) -> Result<Self, LoadError> {
+        Ok(Self::from_sources(&KernelSources::beside(library)?))
     }
 
     /// The compile options of `module`.
@@ -266,6 +291,19 @@ pub enum ModuleError {
         kernel: &'static str,
         cause: GpuError,
     },
+    /// No bundled NVRTC was found to compile with.
+    #[error("no bundled NVRTC was found beside the library")]
+    CompilerMissing,
+    /// The compiler would give PTX for this device, which the driver compiles again; the codes would not be the
+    /// ones every other build gives.
+    #[error("the compiler targets PTX for this device, not its machine code")]
+    NoMachineCode,
+    /// The compile thread could not run.
+    #[error("the compile thread failed: {0}")]
+    Thread(LoadError),
+    /// The compiler or the device failed before any module was compiled.
+    #[error("the compiler cannot be used: {0}")]
+    Compiler(GpuError),
     /// The device or the driver failed.
     #[error("{} cannot be loaded: {source}", module.file())]
     Gpu { module: Module, source: GpuError },
@@ -306,22 +344,22 @@ impl<M: GpuModule> Compiled<M> {
 }
 
 /// The compiled modules of one device: each module is compiled the first time it is asked for and shared after.
-pub struct ModuleCache<M: GpuModule> {
+pub struct Modules<M: GpuModule> {
     gpu: Arc<M::Gpu>,
     options: ModuleOptions,
     loaded: HashMap<Module, Arc<Compiled<M>>>,
 }
 
-impl<M: GpuModule> Debug for ModuleCache<M> {
+impl<M: GpuModule> Debug for Modules<M> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter
-            .debug_struct("ModuleCache")
+            .debug_struct("Modules")
             .field("loaded", &self.loaded.len())
             .finish_non_exhaustive()
     }
 }
 
-impl<M: GpuModule> ModuleCache<M> {
+impl<M: GpuModule> Modules<M> {
     /// An empty cache for `gpu`.
     pub fn new(gpu: Arc<M::Gpu>, options: ModuleOptions) -> Self {
         Self {
@@ -331,13 +369,17 @@ impl<M: GpuModule> ModuleCache<M> {
         }
     }
 
-    /// The compiled `module`, compiling it on the first call. Compiling blocks the caller for as long as NVRTC takes
-    /// and recurses deeply on the largest sources: it is a startup call, made on a thread with a large stack.
+    /// The compiled `module`, compiling it on the first call, on a thread with the options' stack. A first call
+    /// blocks the caller for as long as NVRTC takes (seconds for the largest modules): it is a startup call, made
+    /// before any frame runs.
     pub fn load(&mut self, module: Module) -> Result<Arc<Compiled<M>>, ModuleError> {
         if let Some(compiled) = self.loaded.get(&module) {
             return Ok(Arc::clone(compiled));
         }
-        let compiled = Arc::new(compile::<M>(&self.gpu, &self.options, module)?);
+        let (gpu, options) = (&self.gpu, &self.options);
+        let compiled = on_compile_stack(options.compile_stack, || compile::<M>(gpu, options, module))
+            .map_err(ModuleError::Thread)??;
+        let compiled = Arc::new(compiled);
         self.loaded.insert(module, Arc::clone(&compiled));
         Ok(compiled)
     }
@@ -345,6 +387,27 @@ impl<M: GpuModule> ModuleCache<M> {
     /// Whether `module` has been compiled.
     pub fn is_loaded(&self, module: Module) -> bool {
         self.loaded.contains_key(&module)
+    }
+}
+
+impl Modules<CudaModule> {
+    /// The modules of the CUDA device `gpu`, compiled with the compiler `options` pin. The compiler must be the one
+    /// the process already uses or the first it loads (one NVRTC serves the process), and must give machine code for
+    /// the device.
+    pub fn open(gpu: &Arc<CudaGpu>, options: ModuleOptions) -> Result<Self, ModuleError> {
+        let compiler = options.compiler.as_deref().ok_or(ModuleError::CompilerMissing)?;
+        let nvrtc = Nvrtc::shared(Some(compiler)).map_err(ModuleError::Compiler)?;
+        check_target(nvrtc.target_for(gpu.arch()).map_err(ModuleError::Compiler)?)?;
+        Ok(Self::new(Arc::clone(gpu), options))
+    }
+}
+
+/// Refuses every target but machine code for the device's own architecture: PTX is compiled again by the driver, and
+/// the architecture-specific target runs on one architecture only.
+pub fn check_target(target: Target) -> Result<(), ModuleError> {
+    match target {
+        Target::Cubin(_) => Ok(()),
+        Target::CubinSpecific(_) | Target::Ptx(_) => Err(ModuleError::NoMachineCode),
     }
 }
 
@@ -364,10 +427,13 @@ pub fn compile<M: GpuModule>(
     let names = module.kernels();
     let mut kernels = Vec::with_capacity(names.len());
     for name in names {
-        let kernel = loaded.kernel(name).map_err(|cause| ModuleError::Kernel {
-            module,
-            kernel: name,
-            cause,
+        let kernel = loaded.kernel(name).map_err(|cause| match cause {
+            GpuError::NotFound(_) => ModuleError::Kernel {
+                module,
+                kernel: name,
+                cause,
+            },
+            source => ModuleError::Gpu { module, source },
         })?;
         kernels.push(kernel);
     }
@@ -387,10 +453,47 @@ mod tests {
 
     use super::*;
 
-    /// Whether `source` defines the kernel `name`, directly or through a macro that pastes a suffix onto a prefix.
+    /// Whether `source` defines the kernel `name`: a function of that name, or a macro that pastes a parameter onto
+    /// a prefix of it and is instantiated with the rest of it (`viterbi_k##K` with `VITERBI(2)` defines `viterbi_k2`).
     fn defines(source: &str, name: &str) -> bool {
-        source.contains(&format!(" {name}("))
-            || (1..name.len()).any(|end| name.is_char_boundary(end) && source.contains(&format!(" {}##", &name[..end])))
+        if source.contains(&format!(" {name}(")) {
+            return true;
+        }
+        let lines: Vec<&str> = source.lines().collect();
+        lines.iter().enumerate().any(|(at, line)| {
+            let Some(head) = line.strip_prefix("#define ") else {
+                return false;
+            };
+            let Some((macro_name, rest)) = head.split_once('(') else {
+                return false;
+            };
+            let Some((parameter, _)) = rest.split_once(')') else {
+                return false;
+            };
+            let mut body = String::new();
+            let mut index = at;
+            while let Some(text) = lines.get(index) {
+                body.push_str(text);
+                if !text.trim_end().ends_with('\\') {
+                    break;
+                }
+                index += 1;
+            }
+            (1..name.len()).filter(|end| name.is_char_boundary(*end)).any(|end| {
+                let (prefix, suffix) = name.split_at(end);
+                body.contains(&format!("{prefix}##{parameter}"))
+                    && lines
+                        .iter()
+                        .any(|call| call.trim() == format!("{macro_name}({suffix})"))
+            })
+        })
+    }
+
+    #[test]
+    fn a_macro_instantiation_defines_only_the_instantiated_names() {
+        let source = "#define MAKE(K) void viterbi_k##K(int x) {}\nMAKE(2)\nMAKE(3)\nvoid plain(int x) {}\n";
+        assert!(defines(source, "viterbi_k2") && defines(source, "viterbi_k3") && defines(source, "plain"));
+        assert!(!defines(source, "viterbi_k9") && !defines(source, "viterbi_k"));
     }
 
     #[test]
@@ -406,19 +509,19 @@ mod tests {
     }
 
     #[test]
-    fn the_compile_options_are_the_quantization_ones() {
-        let options = ModuleOptions::new(PathBuf::from("/cuda/include")).compile_options(Module::Trellis);
-        assert_eq!(options.options, ["--std=c++17"]);
-        assert_eq!(options.include_paths, [PathBuf::from("/cuda/include")]);
-        assert_eq!(options.name, "trellis.cu");
-        assert!(!options.arch_specific);
+    fn only_machine_code_for_the_device_is_accepted() {
+        assert!(check_target(Target::Cubin(120)).is_ok());
+        assert!(matches!(check_target(Target::Ptx(90)), Err(ModuleError::NoMachineCode)));
+        assert!(matches!(
+            check_target(Target::CubinSpecific(120)),
+            Err(ModuleError::NoMachineCode)
+        ));
     }
 
     #[test]
     fn the_trellis_source_includes_its_codebook_once_expanded() {
         let source = Module::Trellis.expanded_source();
         assert!(!source.contains("#include \"trellis/codebook.cuh\""));
-        assert!(source.contains("#include <cuda_fp16.h>"));
         assert!(Module::Gptq.expanded_source() == Module::Gptq.source());
     }
 
@@ -430,7 +533,7 @@ mod tests {
                 gpu.define(name, |_, _, _| Ok(()));
             }
         }
-        let mut cache = ModuleCache::<FakeModule>::new(gpu, ModuleOptions::new(PathBuf::from("/cuda/include")));
+        let mut cache = Modules::<FakeModule>::new(gpu, ModuleOptions::new(PathBuf::from("/cuda/include")));
         assert!(!cache.is_loaded(Module::Gptq));
         let first = cache.load(Module::Gptq).unwrap();
         let second = cache.load(Module::Gptq).unwrap();

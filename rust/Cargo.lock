@@ -518,6 +518,7 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "euhedral-gpu",
+ "euhedral-inference-cuda",
  "test-support",
  "thiserror",
 ]
