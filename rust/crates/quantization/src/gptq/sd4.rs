@@ -186,7 +186,12 @@ mod tests {
             let bounded = bounds(&costs, &energy, &counts, below);
             nearest
                 .iter()
-                .map(|&o| entries.iter().map(|&c| bounded[o][usize::from(c)]).fold(f64::INFINITY, f64::min))
+                .map(|&o| {
+                    entries
+                        .iter()
+                        .map(|&c| bounded[o][usize::from(c)])
+                        .fold(f64::INFINITY, f64::min)
+                })
                 .sum()
         };
         assert_eq!(total(&table), 0.0, "{table:?}");

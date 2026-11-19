@@ -136,7 +136,11 @@ impl QuantState {
         let scale_bytes = if self.is_nvfp4() { 1 } else { 2 };
         for (member, expected, found) in [
             ("codes", self.rows * self.columns, self.codes.len() as u64),
-            ("scales", self.rows * self.groups() * scale_bytes, self.scales.len() as u64),
+            (
+                "scales",
+                self.rows * self.groups() * scale_bytes,
+                self.scales.len() as u64,
+            ),
         ] {
             if expected != found {
                 return Err(StateError::Size {
@@ -176,7 +180,9 @@ mod tests {
             codes: (0..64).map(|i| (i % 16) as u8).collect(),
             scales: vec![1, 2, 3, 4],
             global_scale: 0.0141369,
-            table: Some([88, 98, 101, 103, 105, 107, 109, 112, 113, 115, 117, 120, 122, 123, 124, 126]),
+            table: Some([
+                88, 98, 101, 103, 105, 107, 109, 112, 113, 115, 117, 120, 122, 123, 124, 126,
+            ]),
         }
     }
 
@@ -195,7 +201,15 @@ mod tests {
         let names: Vec<&str> = archive.entries().iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(
             names,
-            ["format_name.npy", "layout.npy", "shape.npy", "codes.npy", "scales.npy", "global_scale.npy", "table.npy"]
+            [
+                "format_name.npy",
+                "layout.npy",
+                "shape.npy",
+                "codes.npy",
+                "scales.npy",
+                "global_scale.npy",
+                "table.npy"
+            ]
         );
         let bytes = grouped().to_npz().unwrap();
         assert!(Npz::parse(&bytes).unwrap().array("table").is_err());

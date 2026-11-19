@@ -22,7 +22,7 @@ use std::sync::Arc;
 use euhedral_core::frames::Frame;
 use euhedral_gpu::cuda::{CudaKernel, CudaModule, CudaStream};
 use euhedral_gpu::{
-    Args, Dim3, GpuError, Launch, LaneEnqueue, LaneStream, OnceFrame, RetireError, RetireTicket, Stream,
+    Args, Dim3, GpuError, LaneEnqueue, LaneStream, Launch, OnceFrame, RetireError, RetireTicket, Stream,
     retire_into_with,
 };
 use euhedral_graph::Completions;
@@ -324,9 +324,7 @@ fn resume<S: Send + 'static, T: Send + 'static>(
 }
 
 fn finish<S: Send + 'static, T: Send + 'static>(stream: CudaStream, link: Link<S, T>, result: Result<T, GptqError>) {
-    let Link {
-        parts, state, done, ..
-    } = link;
+    let Link { parts, state, done, .. } = link;
     done(Finished {
         lane: GptqLane { stream, parts },
         scratch: Scratch(Box::new(state)),
@@ -581,7 +579,9 @@ fn factor_decompose(
     let importance = state.diagonal.read_f32();
     let order = column_order(&importance, state.act_order);
     let position = positions(&order);
-    state.diagonal.fill_f32(&damped_diagonal(&importance, &order, state.damp));
+    state
+        .diagonal
+        .fill_f32(&damped_diagonal(&importance, &order, state.damp));
     state.order.fill_u32(&order);
     state.prepared = Some((importance, order, position));
 
@@ -1080,7 +1080,14 @@ fn round_choose<Q: LaneEnqueue<Kernel = CudaKernel>>(
             .arg(state.scales.addr() + 2 * g as u64)
             .arg(state.decodes.addr() + 4 * g as u64)
             .arg(groups);
-        launch(queue, &kernels.grouped_choose, grid(state.n as u64, 128)?, 128, 0, &args)
+        launch(
+            queue,
+            &kernels.grouped_choose,
+            grid(state.n as u64, 128)?,
+            128,
+            0,
+            &args,
+        )
     }
 }
 

@@ -19,10 +19,10 @@ use euhedral_gpu::{Gpu, StreamOptions};
 use euhedral_graph::Completions;
 use euhedral_inference_cuda::math::MathLibraries;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer};
+use euhedral_inference_quantization::gptq::format::Format;
 use euhedral_inference_quantization::gptq::{
     Factor, Finished, GptqError, GptqKernels, GptqLane, GptqSettings, Refused, TensorScales,
 };
-use euhedral_inference_quantization::gptq::format::Format;
 use euhedral_inference_quantization::gptq::{RoundRequest, state::QuantState};
 use euhedral_inference_quantization::kernels::{ModuleOptions, Modules};
 
@@ -47,7 +47,9 @@ pub fn rig(settings: GptqSettings) -> Rig {
     let options = ModuleOptions::beside(&library).expect("the product directory");
     let mut modules = Modules::<CudaModule>::open(&gpu, options).expect("the compiler gives machine code");
     let kernels = GptqKernels::load(&mut modules).expect("gptq.cu compiles");
-    let (pool, mut streams) = gpu.open_lanes(&["gptq"], StreamOptions::default()).expect("a lane opens");
+    let (pool, mut streams) = gpu
+        .open_lanes(&["gptq"], StreamOptions::default())
+        .expect("a lane opens");
     let mut stream = streams.remove(0);
     let completions = Completions::new(&pool);
     let mut handles = None;
@@ -57,8 +59,15 @@ pub fn rig(settings: GptqSettings) -> Rig {
     })
     .expect("the handles are made on the lane");
     let handles = handles.unwrap().expect("the math handles");
-    let lane = GptqLane::new(stream, handles, kernels, Arc::clone(&library), Arc::clone(&completions), settings)
-        .expect("the lane");
+    let lane = GptqLane::new(
+        stream,
+        handles,
+        kernels,
+        Arc::clone(&library),
+        Arc::clone(&completions),
+        settings,
+    )
+    .expect("the lane");
     Rig {
         library,
         completions,
@@ -112,7 +121,13 @@ impl Rig {
         result
     }
 
-    pub fn factor(&mut self, hessian: &DeviceBuffer, k: usize, damp: f32, act_order: bool) -> Result<Factor, GptqError> {
+    pub fn factor(
+        &mut self,
+        hessian: &DeviceBuffer,
+        k: usize,
+        damp: f32,
+        act_order: bool,
+    ) -> Result<Factor, GptqError> {
         let address = hessian.addr();
         self.run(move |lane, done| lane.factor(address, k, damp, act_order, done))
     }

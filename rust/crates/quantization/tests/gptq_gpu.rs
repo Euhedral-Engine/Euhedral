@@ -14,7 +14,10 @@
     clippy::expect_used,
     reason = "a test file: a failed unwrap is the failure"
 )]
-#![allow(clippy::print_stdout, reason = "the agreement and the error ratios are the test's output")]
+#![allow(
+    clippy::print_stdout,
+    reason = "the agreement and the error ratios are the test's output"
+)]
 #![allow(clippy::disallowed_methods, reason = "a test: reads its fixture files")]
 
 mod gptq_rig;
@@ -47,7 +50,15 @@ fn half(bits: u16) -> f32 {
 }
 
 /// The decoded weights of a stored rounding, as the kernels compute them.
-fn decode(format: &Format, codes: &[u8], scales: &[u8], global: f32, table: Option<[u8; 16]>, n: usize, k: usize) -> Vec<f32> {
+fn decode(
+    format: &Format,
+    codes: &[u8],
+    scales: &[u8],
+    global: f32,
+    table: Option<[u8; 16]>,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
     let groups = k / format.group;
     let mut out = vec![0.0; n * k];
     for r in 0..n {
@@ -113,7 +124,9 @@ fn rounds_like_the_pytorch_reference() {
     for case in cases["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let format = Format::of(case["format"].as_str().unwrap(), case["layout"].as_str().unwrap(), None).unwrap();
-        let factor = rig.factor(&hessian, k, damp, case["act_order"].as_bool().unwrap()).unwrap();
+        let factor = rig
+            .factor(&hessian, k, damp, case["act_order"].as_bool().unwrap())
+            .unwrap();
         let tensor = if format.nvfp4 {
             rig.tensor_scales(&weight, n, &factor, &format).unwrap()
         } else {
@@ -136,7 +149,12 @@ fn rounds_like_the_pytorch_reference() {
         if format.nvfp4 {
             assert_eq!(state.global_scale, expected_global, "{name}");
             if format.sd4 {
-                let table: Vec<u8> = case["table"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u8).collect();
+                let table: Vec<u8> = case["table"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_u64().unwrap() as u8)
+                    .collect();
                 assert_eq!(state.table.map(|t| t.to_vec()), Some(table), "{name} table");
             }
         }
@@ -144,7 +162,15 @@ fn rounds_like_the_pytorch_reference() {
         let scales_file = fixture(&format!("{name}-scales.npy"));
         let (codes, scales) = (Npy::parse(&codes_file).unwrap(), Npy::parse(&scales_file).unwrap());
         let expected = decode(&format, codes.data, scales.data, expected_global, state.table, n, k);
-        let actual = decode(&format, &state.codes, &state.scales, state.global_scale, state.table, n, k);
+        let actual = decode(
+            &format,
+            &state.codes,
+            &state.scales,
+            state.global_scale,
+            state.table,
+            n,
+            k,
+        );
         let agree = codes.data.iter().zip(&state.codes).filter(|(a, b)| a == b).count();
         let python = output_error(&w, &expected, &h, n, k);
         let native = output_error(&w, &actual, &h, n, k);
