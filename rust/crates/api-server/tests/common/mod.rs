@@ -208,12 +208,32 @@ pub fn assert_json(response: &Response, status: u16, body: &str) {
 /// A plain socket to the server, for what the client cannot do: send a request in parts, hold a connection open.
 pub struct Raw {
     stream: TcpStream,
+    /// The start of a multi-byte character whose end has not arrived yet.
+    held: Vec<u8>,
+}
+
+/// The text of `held` followed by `fresh`, without a character cut by the end of a read: the cut start stays in `held`
+/// for the next read, so the text has the bytes of the wire, whatever the sizes of the reads.
+pub fn utf8_text(held: &mut Vec<u8>, fresh: &[u8]) -> String {
+    held.extend_from_slice(fresh);
+    let whole = match from_utf8(held) {
+        Ok(text) => held.len().min(text.len()),
+        Err(error) if error.error_len().is_none() => error.valid_up_to(),
+        Err(_) => held.len(),
+    };
+    let rest = held.split_off(whole);
+    let text = String::from_utf8_lossy(held).into_owned();
+    *held = rest;
+    text
 }
 
 impl Raw {
     pub fn connect(addr: SocketAddr) -> Raw {
         let stream = TcpStream::connect_timeout(&addr, PATIENCE).expect("a connection");
-        Raw { stream }
+        Raw {
+            stream,
+            held: Vec::new(),
+        }
     }
 
     pub fn send(&mut self, bytes: &str) {
@@ -237,7 +257,7 @@ impl Raw {
         };
         match read {
             Ok(0) => None,
-            Ok(count) => Some(String::from_utf8_lossy(&buffer[..count]).into_owned()),
+            Ok(count) => Some(utf8_text(&mut self.held, &buffer[..count])),
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Some(String::new()),
             Err(error) if error.kind() == ErrorKind::ConnectionReset => None,
             Err(error) => panic!("a read failed: {error}"),
