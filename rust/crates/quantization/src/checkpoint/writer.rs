@@ -6,9 +6,10 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::fmt::Write as _;
+use std::fmt::{Debug, Formatter, Result as FmtResult, Write as _};
 use std::fs::{self, File};
 use std::io::Error as IoError;
+use std::mem::take;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -53,8 +54,8 @@ pub struct SafetensorsWriter {
     data_bytes: u64,
 }
 
-impl std::fmt::Debug for SafetensorsWriter {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for SafetensorsWriter {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter
             .debug_struct("SafetensorsWriter")
             .field("file", &self.file)
@@ -79,7 +80,9 @@ impl SafetensorsWriter {
     /// A writer of `file` that copies the tensors through a buffer of `buffer_bytes` bytes.
     pub fn with_buffer(file: &Path, buffer_bytes: usize) -> Result<Self, CheckpointError> {
         if buffer_bytes < 1 {
-            return Err(CheckpointError::Invalid(format!("buffer must hold a byte: {buffer_bytes}")));
+            return Err(CheckpointError::Invalid(format!(
+                "buffer must hold a byte: {buffer_bytes}"
+            )));
         }
         Ok(Self {
             buffer_bytes,
@@ -306,7 +309,9 @@ impl Step {
                             file,
                             CheckpointError::Format(format!("a write moved {moved} of {filled} bytes")),
                         ),
-                        Err(error) => writing.fail(file, CheckpointError::io("cannot write the safetensors file", error)),
+                        Err(error) => {
+                            writing.fail(file, CheckpointError::io("cannot write the safetensors file", error))
+                        }
                     }
                 })
             }),
@@ -330,7 +335,7 @@ impl Step {
         }
         let entry = &mut writing.entries[writing.entry];
         let n = (writing.buffer_bytes as u64).min(entry.bytes - writing.at) as usize;
-        let mut buffer = std::mem::take(&mut writing.buffer);
+        let mut buffer = take(&mut writing.buffer);
         if buffer.len() < n {
             buffer.resize(n, 0);
         }
@@ -348,7 +353,10 @@ impl Writing {
     /// Makes the data durable, closes the file and renames it to its final name.
     fn finish(self, file: OwnedFile) {
         // `AsyncIo` has no fsync yet: the data is made durable by one call on a duplicate of the handle, on this frame.
-        let synced = file.try_clone().map(File::from).and_then(|duplicate| duplicate.sync_data());
+        let synced = file
+            .try_clone()
+            .map(File::from)
+            .and_then(|duplicate| duplicate.sync_data());
         drop(file);
         if let Err(error) = synced {
             let context = format!("cannot sync {}", self.part.display());
@@ -371,7 +379,10 @@ impl Writing {
                     Ok(()) => then(Ok(())),
                     Err(error) => {
                         discard(&cleanup);
-                        then(Err(CheckpointError::io(format!("cannot rename {}", cleanup.display()), error)));
+                        then(Err(CheckpointError::io(
+                            format!("cannot rename {}", cleanup.display()),
+                            error,
+                        )));
                     }
                 })
             }),

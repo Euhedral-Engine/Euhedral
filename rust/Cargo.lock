@@ -517,6 +517,11 @@ name = "euhedral-inference-quantization"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "euhedral-core",
+ "euhedral-io",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "test-support",
  "thiserror",
 ]

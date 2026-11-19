@@ -96,7 +96,8 @@ impl Config {
             .map(|kind| kind.as_str() == Some("full_attention"))
             .collect();
         let head_dim = number("head_dim")?;
-        let rotary_dim = (head_dim as f64 * real(text.get("partial_rotary_factor"), "partial_rotary_factor")?).round() as u64;
+        let rotary_dim =
+            (head_dim as f64 * real(text.get("partial_rotary_factor"), "partial_rotary_factor")?).round() as u64;
         Ok(Config {
             hidden: number("hidden_size")?,
             intermediate: number("intermediate_size")?,
@@ -111,7 +112,10 @@ impl Config {
             value_dim: number("linear_value_head_dim")?,
             conv_kernel: number("linear_conv_kernel_dim")?,
             eps: real(text.get("rms_norm_eps"), "rms_norm_eps")?,
-            theta: real(text.get("rope_parameters").and_then(|rope| rope.get("rope_theta")), "rope_theta")?,
+            theta: real(
+                text.get("rope_parameters").and_then(|rope| rope.get("rope_theta")),
+                "rope_theta",
+            )?,
             vocabulary: number("vocab_size")?,
             full_attention,
         })
@@ -141,10 +145,14 @@ impl Qwen38Objects {
             io,
             &checkpoint.join("config.json"),
             Arc::new(move |bytes| {
-                then(bytes.and_then(|bytes| Config::parse(&bytes)).map(|config| Qwen38Objects {
-                    store: Arc::clone(&store),
-                    config,
-                }));
+                then(
+                    bytes
+                        .and_then(|bytes| Config::parse(&bytes))
+                        .map(|config| Qwen38Objects {
+                            store: Arc::clone(&store),
+                            config,
+                        }),
+                );
             }),
         )
     }
@@ -161,7 +169,13 @@ impl Qwen38Objects {
             .get(index)
             .ok_or_else(|| CheckpointError::Invalid(format!("the model has no layer {index}")))?;
         let roles = if full {
-            ["attention/query_key", "attention/gate_value", "attention/output", "mlp/gate_up", "mlp/down"]
+            [
+                "attention/query_key",
+                "attention/gate_value",
+                "attention/output",
+                "mlp/gate_up",
+                "mlp/down",
+            ]
         } else {
             ["gdn/query_key", "gdn/value_z", "gdn/output", "mlp/gate_up", "mlp/down"]
         };
@@ -274,7 +288,10 @@ impl Qwen38Objects {
         for piece in &pieces {
             let tensor = self.store.tensor(&piece.tensor)?;
             if tensor.dtype != "BF16" || tensor.shape.len() != 2 {
-                return Err(CheckpointError::Invalid(format!("{} is not a BF16 matrix", piece.tensor)));
+                return Err(CheckpointError::Invalid(format!(
+                    "{} is not a BF16 matrix",
+                    piece.tensor
+                )));
             }
             if columns.is_some_and(|columns| columns != tensor.shape[1]) {
                 return Err(CheckpointError::Invalid(format!("{name}: mixed widths")));
@@ -329,7 +346,12 @@ impl Qwen38Objects {
     }
 
     /// Reads object `source` into one `Vec` of its bytes.
-    pub fn read_bytes(&self, io: &Arc<AsyncIo>, source: &ObjectSource, then: Done<Vec<u8>>) -> Result<(), CheckpointError> {
+    pub fn read_bytes(
+        &self,
+        io: &Arc<AsyncIo>,
+        source: &ObjectSource,
+        then: Done<Vec<u8>>,
+    ) -> Result<(), CheckpointError> {
         let mut region = |range: Range<u64>| vec![0u8; (range.end - range.start) as usize];
         self.read(
             io,

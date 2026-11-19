@@ -85,7 +85,10 @@ pub fn header_length(shard: &str, prefix: &[u8]) -> Result<u64, CheckpointError>
         .map_err(|_| CheckpointError::Format(format!("{shard}: the file ends inside its header size")))?;
     let length = u64::from_le_bytes(bytes);
     if length == 0 || length > MAX_HEADER_BYTES {
-        return Err(CheckpointError::Format(format!("{shard}: bad header size {}", length as i64)));
+        return Err(CheckpointError::Format(format!(
+            "{shard}: bad header size {}",
+            length as i64
+        )));
     }
     Ok(length)
 }
@@ -93,8 +96,11 @@ pub fn header_length(shard: &str, prefix: &[u8]) -> Result<u64, CheckpointError>
 /// The tensors a shard's JSON header describes; `shard` is the index of the shard and `name` its file name.
 pub fn parse_header(name: &str, shard: usize, header: &[u8]) -> Result<Vec<Tensor>, CheckpointError> {
     let bad = |what: String| CheckpointError::Format(format!("{name}: {what}"));
-    let root: Value = serde_json::from_slice(header).map_err(|error| bad(format!("the header is not JSON: {error}")))?;
-    let entries = root.as_object().ok_or_else(|| bad("the header is not an object".to_owned()))?;
+    let root: Value =
+        serde_json::from_slice(header).map_err(|error| bad(format!("the header is not JSON: {error}")))?;
+    let entries = root
+        .as_object()
+        .ok_or_else(|| bad("the header is not an object".to_owned()))?;
     let data = 8 + header.len() as u64;
     let mut tensors = Vec::with_capacity(entries.len());
     for (tensor, node) in entries {
@@ -279,7 +285,8 @@ impl Safetensors {
                     // The reads already submitted still end. The ones that were not are failed here, and the last
                     // reference to the gather delivers.
                     for rest in index..count {
-                        let reason = CheckpointError::io(&gather.names[rest], IoError::new(error.kind(), error.to_string()));
+                        let reason =
+                            CheckpointError::io(&gather.names[rest], IoError::new(error.kind(), error.to_string()));
                         let _ = gather.slots[rest].0.set(Outcome::Failed(reason));
                     }
                     break;
@@ -337,7 +344,10 @@ impl<B> Gather<B> {
             let result = match slot.0.into_inner() {
                 Some(Outcome::Done(done)) => io::finish(done, lengths[index], &names[index]),
                 Some(Outcome::Failed(error)) => Err(error),
-                None => Err(CheckpointError::Invalid(format!("{}: the read never ended", names[index]))),
+                None => Err(CheckpointError::Invalid(format!(
+                    "{}: the read never ended",
+                    names[index]
+                ))),
             };
             match result {
                 Ok(memory) => memories.push(memory),

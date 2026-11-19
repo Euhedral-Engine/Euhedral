@@ -144,7 +144,14 @@ impl Recipe {
         let (format, layout) = if self.quantization == Quantization::Q3 {
             (q3, ROW_SPLIT)
         } else {
-            ("NVFP4", if self.compressed && !drafting(name) { SD4 } else { ROW_SPLIT })
+            (
+                "NVFP4",
+                if self.compressed && !drafting(name) {
+                    SD4
+                } else {
+                    ROW_SPLIT
+                },
+            )
         };
         // Compressed q3 stores its Q3 tensors other than the MLP down projections in P2E2, which holds -3..3.
         let lowest = (self.quantization == Quantization::Q3
@@ -170,14 +177,21 @@ fn q3_format(name: &str) -> Result<&'static str, RecipeError> {
         return Ok("Q3G64_F16S");
     }
     let unknown = || RecipeError::UnknownObject(name.to_owned());
-    let (layer, role) = name.strip_prefix("text/layers/").and_then(|rest| rest.split_once('/')).ok_or_else(unknown)?;
+    let (layer, role) = name
+        .strip_prefix("text/layers/")
+        .and_then(|rest| rest.split_once('/'))
+        .ok_or_else(unknown)?;
     let layer: u32 = layer.parse().map_err(|_| unknown())?;
     match role {
         "attention/query_key" | "gdn/query_key" | "gdn/value_z" => Ok("Q4G64_F16S"),
         "attention/gate_value" => Ok("Q5G64_F16S"),
         "attention/output" | "gdn/output" | "mlp/gate_up" => Ok("Q3G64_F16S"),
         // The MLP down projections of the first and last six layers carry most of their family's error.
-        "mlp/down" => Ok(if layer < 6 || layer >= 58 { "Q4G64_F16S" } else { "Q3G64_F16S" }),
+        "mlp/down" => Ok(if !(6..58).contains(&layer) {
+            "Q4G64_F16S"
+        } else {
+            "Q3G64_F16S"
+        }),
         _ => Err(unknown()),
     }
 }
