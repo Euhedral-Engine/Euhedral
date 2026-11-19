@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use euhedral_graph::Lake;
 use euhedral_io::{Continuation, OwnedFile};
+use same_file::Handle;
 use thiserror::Error;
 
 use crate::step::{Kind, step};
@@ -40,10 +41,10 @@ pub fn share(file: OwnedFile) -> SharedFile {
 }
 
 /// Runs `work` as a frame of `host`, then offers the frame `then` makes of its result to `host`.
-fn on_host(
+fn on_host<T: Send + 'static>(
     host: &Arc<Lake>,
-    work: impl FnOnce() -> io::Result<()> + Send + 'static,
-    then: Done,
+    work: impl FnOnce() -> io::Result<T> + Send + 'static,
+    then: Continuation<io::Result<T>>,
 ) -> Result<(), LakeClosed> {
     let next = Arc::clone(host);
     let frame = step(Kind::Durable, move || {
@@ -97,6 +98,43 @@ pub fn remove(host: &Arc<Lake>, path: &Path, then: Done) -> Result<(), LakeClose
     let work = move || match fs::remove_file(&path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         other => other,
+    };
+    on_host(host, work, then)
+}
+
+/// Which of two names a file is another name of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Clash {
+    /// The file that was open.
+    Open,
+    /// The path.
+    Path,
+}
+
+/// Finds whether `open`, or the file at `path` (if there is one), is the same file as any of `sources`, by identity
+/// (device and index, volume and index), not by name. `open` is checked first: if it clashes, the answer is
+/// [`Clash::Open`].
+pub fn clash(
+    host: &Arc<Lake>,
+    open: SharedFile,
+    path: &Path,
+    sources: Vec<Arc<OwnedFile>>,
+    then: Continuation<io::Result<Option<Clash>>>,
+) -> Result<(), LakeClosed> {
+    let path: PathBuf = path.to_owned();
+    let work = move || {
+        let mut known = Vec::with_capacity(sources.len());
+        for source in &sources {
+            known.push(Handle::from_file(File::from(source.try_clone()?))?);
+        }
+        if known.contains(&Handle::from_file(open.try_clone()?)?) {
+            return Ok(Some(Clash::Open));
+        }
+        match Handle::from_path(&path) {
+            Ok(named) => Ok(known.contains(&named).then_some(Clash::Path)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     };
     on_host(host, work, then)
 }

@@ -6,7 +6,6 @@
 //! read into a buffer, written, and the buffer is read into again.
 
 use std::ffi::OsString;
-use std::fs::File;
 use std::io::{Error as IoError, ErrorKind};
 use std::mem::take;
 use std::path::{Path, PathBuf};
@@ -19,14 +18,13 @@ use euhedral_inference_edrl::{
 };
 use euhedral_inference_engine::Handoff;
 use euhedral_io::{AsyncIo, Create, IoBuf, IoDone, OpenSpec, OwnedFile};
-use same_file::Handle;
 
 use super::chunks::read_chunk;
 use super::view::View;
 use super::{AssembleError, Done};
 use crate::checkpoint::CheckpointError;
 use crate::checkpoint::io::{raw_file, submit_error};
-use crate::durable;
+use crate::durable::{self, Clash};
 use crate::step::{Kind, idle, step};
 
 /// One payload to copy.
@@ -130,6 +128,7 @@ pub fn write(
         target: out.to_path_buf(),
         file: None,
         jobs,
+        sources: view.sources.clone(),
         job: 0,
         at: 0,
         chunk: copy_buffer_bytes,
@@ -164,6 +163,8 @@ struct Writing {
     /// The `.part` file while it is open.
     file: Option<OwnedFile>,
     jobs: Vec<Job>,
+    /// Every source file, until the comparison with the `.part` file takes them.
+    sources: Vec<Arc<OwnedFile>>,
     job: usize,
     at: u64,
     chunk: usize,
@@ -174,11 +175,52 @@ struct Writing {
 }
 
 impl Writing {
-    /// The `.part` file is open: it is refused if a source is the same file, else cut to empty and filled.
+    /// The `.part` file is open: the host lake compares it, and the output name if a file has it, with every source.
+    /// The file is refused if either is a source, which is left as it is; else it is cut to empty and filled.
     fn start(mut self, file: OwnedFile, head: Vec<u8>) {
-        match self.is_a_source(&file) {
-            Ok(false) => {}
-            Ok(true) => {
+        let Ok(copy) = file.try_clone().map(durable::share) else {
+            let error = IoError::other("the handle cannot be duplicated");
+            let context = format!(
+                "cannot compare {} with the sources: the file was left",
+                self.part.display()
+            );
+            return self.end(Err(CheckpointError::io(context, error).into()));
+        };
+        self.file = Some(file);
+        let sources = take(&mut self.sources);
+        let target = self.target.clone();
+        let cell = Handoff::new();
+        let host = Arc::clone(&self.host);
+        cell.send(self);
+        let waiting = Arc::clone(&cell);
+        let started = durable::clash(
+            &host,
+            copy,
+            &target,
+            sources,
+            Box::new(move |found| {
+                if let Some(writing) = waiting.take() {
+                    writing.checked(found, head);
+                }
+                idle()
+            }),
+        );
+        if started.is_err()
+            && let Some(writing) = cell.take()
+        {
+            let context = format!(
+                "cannot compare {} with the sources: the host lake is closed, the file was left",
+                writing.part.display()
+            );
+            writing.end(Err(CheckpointError::io(context, IoError::from(ErrorKind::Other)).into()));
+        }
+    }
+
+    /// The sources are compared: refuse, or go on to empty the `.part` file.
+    fn checked(mut self, found: Result<Option<Clash>, IoError>, head: Vec<u8>) {
+        match found {
+            Ok(None) => {}
+            Ok(Some(Clash::Open)) => {
                 // The file is a source, not this run's: it is left as it is.
                 let refusal = format!(
                     "{} is a source and the temporary name of the output: the run would overwrite its own source",
@@ -186,11 +228,23 @@ impl Writing {
                 );
                 return self.end(Err(AssembleError::invalid(refusal)));
             }
+            Ok(Some(Clash::Path)) => {
+                // The `.part` file is this run's own: it is removed.
+                let refusal = format!("{} is a source: the run would overwrite it", self.target.display());
+                return self.fail(AssembleError::invalid(refusal));
+            }
             Err(error) => {
-                let context = format!("cannot compare {} with the sources", self.part.display());
-                return self.fail_with(file, CheckpointError::io(context, error).into());
+                // Which file the name is, is not known: nothing is removed.
+                let context = format!(
+                    "cannot compare {} with the sources: the file was left",
+                    self.part.display()
+                );
+                return self.end(Err(CheckpointError::io(context, error).into()));
             }
         }
+        let Some(file) = self.file.take() else {
+            return self.end(Err(AssembleError::invalid("the .part file is not open")));
+        };
         let Ok(cut) = file.try_clone().map(durable::share) else {
             let error = IoError::other("the handle cannot be duplicated");
             return self.fail_with(file, CheckpointError::io("cannot empty the .part file", error).into());
@@ -220,20 +274,12 @@ impl Writing {
         if started.is_err()
             && let Some(writing) = cell.take()
         {
-            let context = format!("cannot empty {}: the host lake is closed", writing.part.display());
+            let context = format!(
+                "cannot empty {}: the host lake is closed, the file was left",
+                writing.part.display()
+            );
             writing.end(Err(CheckpointError::io(context, IoError::from(ErrorKind::Other)).into()));
         }
-    }
-
-    /// Whether `file` is one of the sources.
-    fn is_a_source(&self, file: &OwnedFile) -> Result<bool, IoError> {
-        let target = Handle::from_file(File::from(file.try_clone()?))?;
-        for job in &self.jobs {
-            if Handle::from_file(File::from(job.file.try_clone()?))? == target {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     /// Ends the chain with `error` for a file that is not stored yet.

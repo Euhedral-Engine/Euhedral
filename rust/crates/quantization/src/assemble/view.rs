@@ -31,6 +31,8 @@ pub struct View {
     pub metadata: ModelMetadata,
     pub pieces: Vec<Piece>,
     pub tokenizer: Option<TokenizerSection>,
+    /// Every source file, held open, whether or not a piece comes from it (the base included), each once.
+    pub sources: Vec<Arc<OwnedFile>>,
 }
 
 impl View {
@@ -90,10 +92,18 @@ pub fn view(sources: &SourceSet, allocation: &Allocation, draft_depth: Option<u8
     if draft_depth.is_some() {
         metadata.draft_depth = draft_depth;
     }
+    let mut files: Vec<Arc<OwnedFile>> = Vec::new();
+    for option in options {
+        let file = sources.artifact(option)?.file();
+        if !files.iter().any(|known| Arc::ptr_eq(known, file)) {
+            files.push(Arc::clone(file));
+        }
+    }
     Ok(View {
         metadata,
         pieces,
         tokenizer,
+        sources: files,
     })
 }
 

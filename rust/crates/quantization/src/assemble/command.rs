@@ -127,9 +127,10 @@ pub fn run(
         return Err(AssembleError::invalid("the read size must be at least one byte"));
     }
     let copy = match request.copy_buffer_mib {
-        Some(mib) => {
-            usize::try_from(mib << 20).map_err(|_| AssembleError::invalid("the copy buffer does not fit in memory"))?
-        }
+        Some(mib) => mib
+            .checked_mul(1 << 20)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| AssembleError::invalid("the copy buffer does not fit in memory"))?,
         None => chunk_bytes,
     };
     let sizes = Sizes {

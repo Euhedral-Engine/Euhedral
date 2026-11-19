@@ -236,6 +236,38 @@ fn a_source_that_is_the_temporary_name_of_the_output_is_refused_and_left_alone()
 }
 
 #[test]
+fn a_source_that_supplies_nothing_and_is_the_temporary_name_is_refused_and_left_alone() {
+    let fixture = Fixture::new();
+    let mut artifacts = fixture.two();
+    let part = fixture.put("mixed.edrl.part", &TinyArtifact::new(2, false));
+    artifacts.insert(OTHER, part.clone());
+    let before = fs::read(&part).unwrap();
+    let sources = fixture.open(&artifacts).unwrap();
+    let composite = view(&sources, &allocation(&[]), None).unwrap();
+    let out = fixture.dir.path().join("mixed.edrl");
+    let error = fixture.write(&composite, &out, 1 << 20).unwrap_err().to_string();
+    assert!(error.contains("a source"), "{error}");
+    assert_eq!(fs::read(&part).unwrap(), before);
+    assert!(!out.exists());
+    fixture.world.finish();
+}
+
+#[test]
+fn an_output_that_is_a_source_is_refused_and_the_source_and_the_temporary_file_are_left_clean() {
+    let fixture = Fixture::new();
+    let artifacts = fixture.two();
+    let base = artifacts[&BASE].clone();
+    let before = fs::read(&base).unwrap();
+    let sources = fixture.open(&artifacts).unwrap();
+    let composite = view(&sources, &allocation(&[]), None).unwrap();
+    let error = fixture.write(&composite, &base, 1 << 20).unwrap_err().to_string();
+    assert!(error.contains("is a source"), "{error}");
+    assert_eq!(fs::read(&base).unwrap(), before);
+    assert!(!fixture.dir.path().join("base.edrl.part").exists());
+    fixture.world.finish();
+}
+
+#[test]
 fn a_view_without_a_tokenizer_cannot_be_written() {
     let fixture = Fixture::new();
     let sources = fixture.open(&fixture.two()).unwrap();
