@@ -7,6 +7,7 @@
 //! - [`npy`] and [`npz`]: the NumPy array and archive formats the calibration state and the fixtures use. Both work
 //!   on bytes the caller supplies or takes; neither opens a file.
 
+pub mod gptq;
 pub mod java_random;
 pub mod kernels;
 pub mod npy;
