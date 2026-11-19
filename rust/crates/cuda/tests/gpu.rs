@@ -88,6 +88,7 @@ fn pinned_pool_reuses_released_buffers_even_past_its_limit() {
     assert_eq!(second.buffer().as_ptr(), address, "a released buffer is reused");
     assert_eq!(pool.held_bytes(), 0);
     drop(second);
+    assert_eq!(pool.overflows(), 0, "the pool held less than its limit");
 
     // Past the limit: the buffers stay in their classes and are reused; only trim frees them.
     let tight_over = PinnedPool::new(&library, 8192);
@@ -98,6 +99,11 @@ fn pinned_pool_reuses_released_buffers_even_past_its_limit() {
     let addresses_over = [a.buffer().as_ptr(), b.buffer().as_ptr()];
     drop((a, b));
     assert_eq!(tight_over.over_limit_bytes(), 8192);
+    assert_eq!(
+        tight_over.overflows(),
+        1,
+        "the second new buffer left the pool over its limit"
+    );
     let (c, d) = (
         tight_over.acquire(5000).expect("c"),
         tight_over.acquire(5000).expect("d"),
@@ -111,6 +117,11 @@ fn pinned_pool_reuses_released_buffers_even_past_its_limit() {
         "buffers released past the limit are reused by the next acquires"
     );
     drop((c, d));
+    assert_eq!(
+        tight_over.overflows(),
+        1,
+        "releasing reused buffers over the limit counts nothing"
+    );
     assert_eq!(tight_over.trim(), 1, "trim frees down to the limit");
     assert_eq!(tight_over.held_bytes(), 8192);
 }
