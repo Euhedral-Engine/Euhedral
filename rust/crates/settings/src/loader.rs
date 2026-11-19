@@ -578,7 +578,10 @@ fn leaves() -> Vec<Leaf> {
             assign!(s.host.native_cache, auto_or(t, |t| Ok(PathBuf::from(t))))
         }),
         optional("kernels.rms-norm-decode-slices", |s, t| {
-            assign!(s.kernels.rms_norm_decode_slices, auto_or(t, |t| int(t, 1, MAX_RMS_NORM_SLICES)))
+            assign!(
+                s.kernels.rms_norm_decode_slices,
+                auto_or(t, |t| int(t, 1, MAX_RMS_NORM_SLICES))
+            )
         }),
         optional("kernels.fused-verify-from", |s, t| {
             assign!(s.kernels.fused_verify_from, auto_or(t, FusedVerifyFrom::parse))

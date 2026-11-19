@@ -320,8 +320,12 @@ fn the_dispatch_kernel_settings_default_to_auto_and_parse() {
     );
     assert!(problems(&format!("{MODEL}kernels:\n  rms-norm-decode-slices: 0\n"))[0].contains("rms-norm-decode-slices"));
     // The slices are a grid extent, which the device limits to 65535.
-    assert!(problems(&format!("{MODEL}kernels:\n  rms-norm-decode-slices: 65536\n"))[0].contains("rms-norm-decode-slices"));
-    let widest = load(&format!("{MODEL}kernels:\n  rms-norm-decode-slices: 65535\n")).unwrap().kernels;
+    assert!(
+        problems(&format!("{MODEL}kernels:\n  rms-norm-decode-slices: 65536\n"))[0].contains("rms-norm-decode-slices")
+    );
+    let widest = load(&format!("{MODEL}kernels:\n  rms-norm-decode-slices: 65535\n"))
+        .unwrap()
+        .kernels;
     assert_eq!(widest.rms_norm_decode_slices, Auto::Value(65535));
     for bad in [
         "1,2,3",
