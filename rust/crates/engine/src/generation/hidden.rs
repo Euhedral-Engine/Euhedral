@@ -17,6 +17,10 @@ use super::mailbox::Address;
 use super::source::{Message, Owner};
 use crate::frames::{Kind, step};
 
+/// The most quanta whose rows wait in pinned memory for the sink: past it the request admits no quantum until the sink
+/// has taken some, so a slow sink holds back the request instead of piling up pinned memory.
+const MAX_QUEUED: usize = 2;
+
 /// Receives the hidden rows of a generation. Every call runs as a frame on a worker of the engine's lattice, one at a
 /// time and in order, before the generation's end is reported, and must not wait.
 pub trait HiddenSink: Send {
@@ -57,10 +61,20 @@ impl Hidden {
         self.copying || !self.queue.is_empty() || self.sink.is_none()
     }
 
+    /// Whether the sink is so far behind that no further rows are copied: the next quantum waits.
+    pub(super) fn full(&self) -> bool {
+        self.copying || self.queue.len() >= MAX_QUEUED
+    }
+
     /// Takes in rows whose copy reached pinned memory.
     pub(super) fn arrived(&mut self, rows: HiddenRows) {
         self.copying = false;
         self.queue.push_back(rows);
+        debug_assert!(
+            self.queue.len() <= MAX_QUEUED,
+            "{} rows wait for the sink, past the {MAX_QUEUED} the owner allows",
+            self.queue.len()
+        );
     }
 
     /// The sink came back from a delivery.

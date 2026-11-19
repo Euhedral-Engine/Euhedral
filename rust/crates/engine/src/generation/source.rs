@@ -884,14 +884,11 @@ impl Owner {
         };
         if hidden.is_some() {
             if !matches!(speculation, Speculation::Off) {
-                let error =
-                    AdmissionError::Engine("a request that hands out hidden rows does not speculate".to_string());
+                let error = AdmissionError::HiddenWithSpeculation;
                 return Err(Rejected::new(error, Audience::Greedy(listener)));
             }
             if self.shared.drafts.is_none() {
-                let error = AdmissionError::Engine(
-                    "the artifact has no draft layer whose seed rows hold the hidden rows".to_string(),
-                );
+                let error = AdmissionError::HiddenUnavailable;
                 return Err(Rejected::new(error, Audience::Greedy(listener)));
             }
         }
@@ -1137,8 +1134,8 @@ impl Owner {
     fn admissible(&self) -> Option<Step> {
         let run = self.run.as_ref()?;
         // The tokens the host is selecting decide the next step.
-        // A hidden request's next quantum overwrites the rows being copied.
-        let copying = run.hidden.as_ref().is_some_and(|hidden| hidden.copying);
+        // A hidden request's next quantum overwrites the rows being copied, and waits for a sink that is far behind.
+        let copying = run.hidden.as_ref().is_some_and(Hidden::full);
         if run.waiting_logits || copying || run.selecting() || run.in_flight.len() >= run.depth {
             return None;
         }

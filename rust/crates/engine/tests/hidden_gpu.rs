@@ -19,14 +19,15 @@
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 mod common;
 
 use common::Closer;
 use euhedral_inference_engine::generation::{
-    CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, HiddenSink, QuantumEvent,
-    Speculation,
+    AdmissionError, CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, HiddenSink,
+    QuantumEvent, Speculation,
 };
 use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::{EngineRuntime, Handoff};
@@ -113,12 +114,15 @@ struct Delivered {
 
 /// Keeps what it hears, and hands it over when the engine lets go of it at the generation's end.
 struct Collector {
+    pause: Duration,
     heard: Vec<Delivered>,
     done: Option<Arc<Handoff<Vec<Delivered>>>>,
 }
 
 impl HiddenSink for Collector {
     fn rows(&mut self, first_position: u64, rows: usize, hidden: &[u8], logits: Option<&[u8]>) {
+        // A sink that is slow holds the rows it was given while the engine goes on.
+        thread::sleep(self.pause);
         self.heard.push(Delivered {
             first_position,
             rows,
@@ -187,12 +191,24 @@ fn hidden(
     max_tokens: u32,
     sampling: SamplingConfig,
 ) -> (Recording, Vec<Delivered>) {
+    hidden_slowly(runtime, prompt, max_tokens, sampling, Duration::ZERO)
+}
+
+/// As [`hidden`], with a sink that takes `pause` for every call.
+fn hidden_slowly(
+    runtime: &EngineRuntime,
+    prompt: &[u32],
+    max_tokens: u32,
+    sampling: SamplingConfig,
+    pause: Duration,
+) -> (Recording, Vec<Delivered>) {
     let done = Handoff::new();
     let heard = Handoff::new();
     runtime
         .generate_hidden(
             request(prompt, max_tokens, Speculation::Off, sampling, &done),
             Collector {
+                pause,
                 heard: Vec::new(),
                 done: Some(Arc::clone(&heard)),
             },
@@ -246,6 +262,11 @@ fn hidden_rows_are_the_seed_rows_the_catch_up_reads() {
     // A request that drafts runs its verification on the row of the token it has, and the seed rows then hold that
     // row's post-final-norm hidden state, which the next catch-up reads. The hidden request decodes the same row.
     let ids = prompt(40);
+    // A request that drafts and generates nothing ends after its prompt chunk, whose rows the catch-up reads.
+    let prefilled = plain(&runtime, &ids, 0, Speculation::Artifact, greedy());
+    assert_eq!(prefilled.outcome.reason, FinishReason::Length);
+    let chunk_hidden_bytes = runtime.config().hidden_size * 2;
+    let chunk_reads = seed_rows(&runtime, 40, chunk_hidden_bytes);
     let speculative = plain(&runtime, &ids, 2, Speculation::Artifact, greedy());
     assert_eq!(speculative.outcome.reason, FinishReason::Length);
     let hidden_bytes = runtime.config().hidden_size * 2;
@@ -255,6 +276,10 @@ fn hidden_rows_are_the_seed_rows_the_catch_up_reads() {
     assert_eq!(speculative.tokens, hidden_run.tokens, "the tokens are the same");
     let positions: Vec<(u64, usize)> = heard.iter().map(|call| (call.first_position, call.rows)).collect();
     assert_eq!(positions, [(0, 40), (40, 1)], "the prompt chunk, then the decode row");
+    assert_eq!(
+        heard[0].hidden, chunk_reads,
+        "the prompt chunk's rows handed out are the rows the catch-up reads"
+    );
     assert_eq!(
         heard[1].hidden, catch_up_reads,
         "the decode row handed out is the row the catch-up reads"
@@ -329,5 +354,42 @@ fn sampled_tokens_are_the_same_with_the_sink_on_and_off() {
         assert_eq!(rows, 100 + 23, "{name}: a row for every prompt token and every decode");
         println!("{name}: {} tokens equal", on.tokens.len());
     }
+    owner.shutdown(runtime).unwrap();
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_request_that_speculates_is_refused() {
+    let Some(machine) = machine() else { return };
+    let (owner, runtime) = start(&machine);
+
+    let done = Handoff::new();
+    let refused = runtime.generate_hidden(
+        request(&prompt(8), 4, Speculation::Artifact, greedy(), &done),
+        Collector {
+            pause: Duration::ZERO,
+            heard: Vec::new(),
+            done: None,
+        },
+        CancelHandle::default(),
+    );
+    assert_eq!(refused.unwrap_err(), AdmissionError::HiddenWithSpeculation);
+    owner.shutdown(runtime).unwrap();
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_slow_sink_holds_the_request_back_and_hears_every_row_in_order() {
+    let Some(machine) = machine() else { return };
+    let (owner, runtime) = start(&machine);
+
+    // Each call takes far longer than a quantum: the owner may keep at most two quanta's rows waiting (a debug assertion
+    // of the engine fails the request otherwise).
+    let ids = prompt(20);
+    let (recording, heard) = hidden_slowly(&runtime, &ids, 12, greedy(), Duration::from_millis(150));
+    assert_eq!(recording.outcome.reason, FinishReason::Length);
+    let positions: Vec<u64> = heard.iter().map(|call| call.first_position).collect();
+    let expected: Vec<u64> = std::iter::once(0).chain(20..31).collect();
+    assert_eq!(positions, expected, "every quantum's rows, once, in order");
     owner.shutdown(runtime).unwrap();
 }
