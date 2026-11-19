@@ -399,12 +399,58 @@ impl Default for HostSettings {
 /// Kernel thresholds (`kernels`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KernelSettings {
+    /// Slices of the output pass of a one-row RMS norm (a decode step); `auto` is 40 on every card, the value chosen with the
+    /// sliced kernel; 1 to 65535.
+    pub rms_norm_decode_slices: Auto<u32>,
+    /// The fewest keys at which the fused verifier kernel serves each count of verified rows; `auto` is the table
+    /// measured on an RTX 5070 Ti.
+    pub fused_verify_from: Auto<FusedVerifyFrom>,
     /// The trellis kernels.
     pub trellis: TrellisKernelSettings,
     /// The CUDA graphs of captured quanta.
     pub graphs: GraphKernelSettings,
     /// The runtime compilation of kernel sources.
     pub compile: CompileKernelSettings,
+}
+
+/// How many verified-row counts [`FusedVerifyFrom`] covers: 0 to 8.
+pub const FUSED_VERIFY_ROWS: usize = 9;
+
+/// The fewest keys at which the fused verifier kernel beats its row twins, by verified rows 0 to 8
+/// (`kernels.fused-verify-from`); [`u32::MAX`] is never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FusedVerifyFrom(pub [u32; FUSED_VERIFY_ROWS]);
+
+impl FusedVerifyFrom {
+    /// Parses nine comma-separated key counts, each a whole number from 1 or `never`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut keys = [u32::MAX; FUSED_VERIFY_ROWS];
+        let mut count = 0;
+        for part in text.split(',') {
+            let part = part.trim();
+            let value = if part.eq_ignore_ascii_case("never") {
+                u32::MAX
+            } else {
+                part.parse::<u32>()
+                    .ok()
+                    .filter(|&value| value >= 1)
+                    .ok_or_else(|| format!("each entry must be a whole number from 1 or never: {text}"))?
+            };
+            if count == FUSED_VERIFY_ROWS {
+                return Err(format!(
+                    "must list {FUSED_VERIFY_ROWS} entries, for 0 to 8 verified rows: {text}"
+                ));
+            }
+            keys[count] = value;
+            count += 1;
+        }
+        if count != FUSED_VERIFY_ROWS {
+            return Err(format!(
+                "must list {FUSED_VERIFY_ROWS} entries, for 0 to 8 verified rows: {text}"
+            ));
+        }
+        Ok(Self(keys))
+    }
 }
 
 /// The runtime compilation of kernel sources (`kernels.compile`).

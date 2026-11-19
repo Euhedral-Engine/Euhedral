@@ -11,6 +11,11 @@ pub struct EuhedralCuda {
     pub euhedral_cuda_set_include_directory: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int,
+    pub euhedral_cuda_set_dispatch: unsafe extern "C" fn(
+        rms_norm_decode_slices: u32,
+        fused_verify_from: *const u32,
+        count: u32,
+    ) -> ::std::os::raw::c_int,
     pub euhedral_cuda_malloc: unsafe extern "C" fn(
         byte_size: u64,
     ) -> *mut ::std::os::raw::c_void,
@@ -651,6 +656,9 @@ impl EuhedralCuda {
         let euhedral_cuda_set_include_directory = __library
             .get(b"euhedral_cuda_set_include_directory\0")
             .map(|sym| *sym)?;
+        let euhedral_cuda_set_dispatch = __library
+            .get(b"euhedral_cuda_set_dispatch\0")
+            .map(|sym| *sym)?;
         let euhedral_cuda_malloc = __library
             .get(b"euhedral_cuda_malloc\0")
             .map(|sym| *sym)?;
@@ -958,6 +966,7 @@ impl EuhedralCuda {
         Ok(EuhedralCuda {
             __library,
             euhedral_cuda_set_include_directory,
+            euhedral_cuda_set_dispatch,
             euhedral_cuda_malloc,
             euhedral_cuda_free,
             euhedral_cuda_malloc_async,
@@ -1067,6 +1076,19 @@ impl EuhedralCuda {
         path: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int {
         (self.euhedral_cuda_set_include_directory)(path)
+    }
+    pub unsafe fn euhedral_cuda_set_dispatch(
+        &self,
+        rms_norm_decode_slices: u32,
+        fused_verify_from: *const u32,
+        count: u32,
+    ) -> ::std::os::raw::c_int {
+        (self
+            .euhedral_cuda_set_dispatch)(
+            rms_norm_decode_slices,
+            fused_verify_from,
+            count,
+        )
     }
     pub unsafe fn euhedral_cuda_malloc(
         &self,

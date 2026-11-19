@@ -97,12 +97,17 @@ const fn fused_shared_bytes(tiles: u32) -> u32 {
     2 * 16 * 264 * 2 + tiles * 1024 + tiles * 768 + 2 * 4 * 16 * 144 + 1024 + 8 * (12 + 4 * tiles)
 }
 
-/// `fused_from`, `qwen_layer_ops.c:66-69`: the fewest keys at which the fused verifier kernel beats the row twins, by
-/// verified rows (machine-measured, 6 query heads per KV head).
-const fn fused_from(rows: u32) -> u32 {
-    // qwen_layer_ops.c:67, verbatim.
-    const FROM: [u32; 9] = [u32::MAX, u32::MAX, 49152, 16384, 4096, 2048, 16384, 16384, 12288];
-    if rows < 9 { FROM[rows as usize] } else { u32::MAX }
+/// The verified-row counts the fused verifier table covers (0 to 8).
+pub const FUSED_ROWS: usize = 9;
+
+/// The fewest keys at which the fused verifier kernel beats the row twins, by verified rows (6 query heads per KV
+/// head): the default of `kernels.fused-verify-from`, measured on an RTX 5070 Ti. Rows that fill their 8-column mma
+/// tiles win from 2048 keys, the others only on longer caches; `u32::MAX` is never.
+pub const DEFAULT_FUSED_VERIFY_FROM: [u32; FUSED_ROWS] =
+    [u32::MAX, u32::MAX, 49152, 16384, 4096, 2048, 16384, 16384, 12288];
+
+fn fused_from_keys(table: &[u32; FUSED_ROWS], rows: u32) -> u32 {
+    table.get(rows as usize).copied().unwrap_or(u32::MAX)
 }
 
 fn launch(kernel: KernelId, grid: [u32; 3], block: u32, shared_bytes: u32, args: Arguments) -> Launch {
@@ -293,10 +298,22 @@ pub fn plan_causal(
     modes: Modes,
     sink: &mut impl FnMut(Launch),
 ) -> Result<(), PlanError> {
+    plan_causal_with(format, shape, modes, &DEFAULT_FUSED_VERIFY_FROM, sink)
+}
+
+/// [`plan_causal`] with `fused_from`, the fewest keys at which the fused verifier kernel serves each count of verified
+/// rows (`kernels.fused-verify-from`); the default table is [`DEFAULT_FUSED_VERIFY_FROM`].
+pub fn plan_causal_with(
+    format: CacheFormat,
+    shape: &CausalShape,
+    modes: Modes,
+    fused_from: &[u32; FUSED_ROWS],
+    sink: &mut impl FnMut(Launch),
+) -> Result<(), PlanError> {
     if shape.position.is_null() {
         return Err(PlanError::InvalidArgument);
     }
-    plan_causal_at(format.kernels(), shape, 0, modes, sink)
+    plan_causal_at(format.kernels(), shape, 0, modes, fused_from, sink)
 }
 
 fn plan_causal_at(
@@ -304,6 +321,7 @@ fn plan_causal_at(
     shape: &CausalShape,
     position_offset: u64,
     modes: Modes,
+    fused_from: &[u32; FUSED_ROWS],
     sink: &mut impl FnMut(Launch),
 ) -> Result<(), PlanError> {
     let s = shape;
@@ -326,7 +344,7 @@ fn plan_causal_at(
         && position_offset == 0
         && !modes.exact_numerics
     {
-        plan_row_twins(kernels, s, sink);
+        plan_row_twins(kernels, s, fused_from, sink);
         return Ok(());
     }
     // qwen_layer_ops.c:736-746: row-exact: one-row decode per row, pointers advanced by the row's byte widths.
@@ -342,7 +360,14 @@ fn plan_causal_at(
                 start: s.start.wrapping_add(u64::from(row)),
                 ..*s
             };
-            plan_causal_at(kernels, &one, position_offset.wrapping_add(u64::from(row)), modes, sink)?;
+            plan_causal_at(
+                kernels,
+                &one,
+                position_offset.wrapping_add(u64::from(row)),
+                modes,
+                fused_from,
+                sink,
+            )?;
         }
         return Ok(());
     }
@@ -373,7 +398,7 @@ fn plan_causal_at(
 
 /// `qwen_layer_ops.c:700-734`: row j is one-row decode at position `start + j`, all rows in one launch each for
 /// decode, the fused verifier, GQA decode and merge.
-fn plan_row_twins(kernels: &Kernels, s: &CausalShape, sink: &mut impl FnMut(Launch)) {
+fn plan_row_twins(kernels: &Kernels, s: &CausalShape, fused_from: &[u32; FUSED_ROWS], sink: &mut impl FnMut(Launch)) {
     let rows = s.rows;
     let (query_heads, key_heads) = (s.query_heads, s.key_heads);
     let group = query_heads / key_heads;
@@ -411,7 +436,7 @@ fn plan_row_twins(kernels: &Kernels, s: &CausalShape, sink: &mut impl FnMut(Laun
         // :719-720: the fused kernel serves the rows that share the last row's split partition.
         let tiles = (rows.wrapping_mul(group).wrapping_add(7) / 8).max(2);
         let fused_kernel = match kernels.fused {
-            Some(fused) if tiles <= 6 && last >= fused_from(rows) => Some(fused[(tiles - 2) as usize]),
+            Some(fused) if tiles <= 6 && last >= fused_from_keys(fused_from, rows) => Some(fused[(tiles - 2) as usize]),
             _ => None,
         };
         if let Some(kernel) = fused_kernel {
@@ -981,6 +1006,28 @@ mod tests {
             assert!(fused(rows, g6, from), "rows {rows} at {from}");
             assert!(fused(rows, g6, from + 1), "rows {rows} above {from}");
         }
+    }
+
+    #[test]
+    fn a_configured_fused_table_moves_where_the_fused_kernel_starts() {
+        // Rows 4, group 6: the default starts the fused kernel at 4096 keys. A table that starts it at 2048 chooses it at
+        // 3000 keys, and one that never starts it keeps the row twins at 5000. (The fused kernel serves only the keys
+        // from 2048 on, whatever the table says.)
+        let fused = |table: &[u32; FUSED_ROWS], last: u64| {
+            let s = shape(4, last - 4);
+            let mut out = Vec::new();
+            plan_causal_with(CacheFormat::Nvfp4, &s, RELAXED, table, &mut |launch| out.push(launch)).unwrap();
+            out.iter().any(|l| l.kernel.name().contains("fused"))
+        };
+        let mut early = DEFAULT_FUSED_VERIFY_FROM;
+        early[4] = 2048;
+        assert!(!fused(&DEFAULT_FUSED_VERIFY_FROM, 3000));
+        assert!(!fused(&early, 2047));
+        assert!(fused(&early, 3000));
+        let mut never = DEFAULT_FUSED_VERIFY_FROM;
+        never[4] = u32::MAX;
+        assert!(fused(&DEFAULT_FUSED_VERIFY_FROM, 5000));
+        assert!(!fused(&never, 5000));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 #include "cuda_kernel_loader.h"
+#include "dispatch_tuning.h"
 #include "submission.h"
 #include "euhedral_cuda.h"
 #include <cuda_runtime_api.h>
@@ -61,11 +62,10 @@ struct attention_kernels {
 static uint32_t fused_shared_bytes(uint32_t tiles) {
     return 2u * 16u * 264u * 2u + tiles * 1024u + tiles * 768u + 2u * 4u * 16u * 144u + 1024u + 8u * (12u + 4u * tiles);
 }
-/* Fewest keys at which the fused verifier kernel is faster than the row twins, by verified rows (6 query heads per KV
- * head, RTX 5070 Ti): rows that fill their 8-column mma tiles win from 2048 keys, the others only on longer caches. */
+/* Fewest keys at which the fused verifier kernel is faster than the row twins, by verified rows: the setting
+ * kernels.fused-verify-from (dispatch_tuning.c). */
 static uint32_t fused_from(uint32_t rows) {
-    static const uint32_t from[9] = {UINT32_MAX, UINT32_MAX, 49152u, 16384u, 4096u, 2048u, 16384u, 16384u, 12288u};
-    return rows < 9u ? from[rows] : UINT32_MAX;
+    return euhedral_dispatch_fused_from(rows);
 }
 static struct attention_kernels nvfp4_attention, bf16_attention;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
