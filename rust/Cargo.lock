@@ -518,9 +518,12 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "euhedral-core",
+ "euhedral-graph",
+ "euhedral-hashing",
+ "euhedral-inference-engine",
+ "euhedral-inference-settings",
  "euhedral-io",
  "serde_json",
- "sha2",
  "tempfile",
  "test-support",
  "thiserror",

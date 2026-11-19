@@ -7,9 +7,14 @@
 //!   on bytes the caller supplies or takes; neither opens a file.
 //! - [`checkpoint`]: the safetensors reader and writer and the fused objects of a Qwen 3.8 checkpoint, on `AsyncIo`.
 //! - [`recipe`]: the storage format of each quantized object of an artifact.
+//! - [`resume`]: the file a long run overwrites in place and resumes from, and [`durable`], the durability barrier,
+//!   truncation and removal it is built on.
 
 pub mod checkpoint;
+pub mod durable;
 pub mod java_random;
 pub mod npy;
 pub mod npz;
 pub mod recipe;
+pub mod resume;
+pub mod step;

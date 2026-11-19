@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
-use euhedral_io::{AsyncIo, IoMemory};
+use euhedral_io::IoMemory;
 use serde_json::Value;
 
 use super::io::read_file;
@@ -46,9 +46,9 @@ pub struct ObjectSource {
 }
 
 impl ObjectSource {
-    /// The size of the object in bytes.
-    pub fn bytes(&self) -> u64 {
-        self.rows * self.columns * 2
+    /// The size of the object in bytes, or `None` when it does not fit in 64 bits.
+    pub fn bytes(&self) -> Option<u64> {
+        self.rows.checked_mul(self.columns)?.checked_mul(2)
     }
 }
 
@@ -135,14 +135,10 @@ impl Qwen38Objects {
     }
 
     /// Reads `config.json` of `checkpoint`; `then` gets the objects of `store`. `Err` started nothing.
-    pub fn open(
-        io: &Arc<AsyncIo>,
-        store: Arc<Safetensors>,
-        checkpoint: &Path,
-        then: Done<Qwen38Objects>,
-    ) -> Result<(), CheckpointError> {
+    pub fn open(store: Arc<Safetensors>, checkpoint: &Path, then: Done<Qwen38Objects>) -> Result<(), CheckpointError> {
+        let io = Arc::clone(store.io());
         read_file(
-            io,
+            &io,
             &checkpoint.join("config.json"),
             Arc::new(move |bytes| {
                 then(
@@ -284,7 +280,7 @@ impl Qwen38Objects {
 
     fn fuse(&self, name: &str, pieces: Vec<Piece>) -> Result<ObjectSource, CheckpointError> {
         let mut columns = None;
-        let mut rows = 0;
+        let mut rows = 0u64;
         for piece in &pieces {
             let tensor = self.store.tensor(&piece.tensor)?;
             if tensor.dtype != "BF16" || tensor.shape.len() != 2 {
@@ -297,18 +293,28 @@ impl Qwen38Objects {
                 return Err(CheckpointError::Invalid(format!("{name}: mixed widths")));
             }
             columns = Some(tensor.shape[1]);
-            if piece.first_row + piece.rows > tensor.shape[0] {
+            if piece
+                .first_row
+                .checked_add(piece.rows)
+                .is_none_or(|end| end > tensor.shape[0])
+            {
                 return Err(CheckpointError::Invalid(format!("{name}: rows out of range")));
             }
-            rows += piece.rows;
+            rows = rows
+                .checked_add(piece.rows)
+                .ok_or_else(|| CheckpointError::Invalid(format!("{name}: too many rows")))?;
         }
         let columns = columns.ok_or_else(|| CheckpointError::Invalid(format!("{name}: no pieces")))?;
-        Ok(ObjectSource {
+        let source = ObjectSource {
             name: name.to_owned(),
             pieces,
             rows,
             columns,
-        })
+        };
+        source
+            .bytes()
+            .ok_or_else(|| CheckpointError::Invalid(format!("{name}: the object is too large")))?;
+        Ok(source)
     }
 
     /// Reads object `source` (BF16, row-major [rows, columns]): `region(range)` supplies the memory for the bytes
@@ -317,16 +323,17 @@ impl Qwen38Objects {
     /// nothing.
     pub fn read<B: IoMemory>(
         &self,
-        io: &Arc<AsyncIo>,
         source: &ObjectSource,
         region: &mut dyn FnMut(Range<u64>) -> B,
         then: Done<Vec<B>>,
     ) -> Result<(), CheckpointError> {
-        let row_bytes = source.columns * 2;
+        let too_large = || CheckpointError::Invalid(format!("{}: the object is too large", source.name));
+        let row_bytes = source.columns.checked_mul(2).ok_or_else(too_large)?;
+        source.bytes().ok_or_else(too_large)?;
         let mut at = 0;
         let mut ranges = Vec::with_capacity(source.pieces.len());
         for piece in &source.pieces {
-            let bytes = piece.rows * row_bytes;
+            let bytes = piece.rows.checked_mul(row_bytes).ok_or_else(too_large)?;
             let memory = region(at..at + bytes);
             if memory.len() as u64 != bytes {
                 return Err(CheckpointError::Invalid(format!(
@@ -337,24 +344,18 @@ impl Qwen38Objects {
             }
             ranges.push(ReadRange {
                 tensor: piece.tensor.clone(),
-                skip: piece.first_row * row_bytes,
+                skip: piece.first_row.checked_mul(row_bytes).ok_or_else(too_large)?,
                 memory,
             });
-            at += bytes;
+            at = at.checked_add(bytes).ok_or_else(too_large)?;
         }
-        self.store.read_ranges(io, ranges, then)
+        self.store.read_ranges(ranges, then)
     }
 
     /// Reads object `source` into one `Vec` of its bytes.
-    pub fn read_bytes(
-        &self,
-        io: &Arc<AsyncIo>,
-        source: &ObjectSource,
-        then: Done<Vec<u8>>,
-    ) -> Result<(), CheckpointError> {
+    pub fn read_bytes(&self, source: &ObjectSource, then: Done<Vec<u8>>) -> Result<(), CheckpointError> {
         let mut region = |range: Range<u64>| vec![0u8; (range.end - range.start) as usize];
         self.read(
-            io,
             source,
             &mut region,
             Arc::new(move |pieces| then(pieces.map(|pieces| pieces.concat()))),

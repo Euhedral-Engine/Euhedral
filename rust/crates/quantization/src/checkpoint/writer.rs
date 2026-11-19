@@ -7,16 +7,19 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt::{Debug, Formatter, Result as FmtResult, Write as _};
-use std::fs::{self, File};
 use std::io::Error as IoError;
 use std::mem::take;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use euhedral_graph::{Lake, UnitGuard};
+use euhedral_inference_engine::Handoff;
 use euhedral_io::{AsyncIo, Create, IoBuf, IoDone, OpenSpec, OwnedFile};
 
-use super::io::{raw_file, submit_error, work};
-use super::{CheckpointError, Done, report};
+use super::io::{raw_file, submit_error};
+use super::{CheckpointError, Done};
+use crate::durable;
+use crate::step::{Kind, idle, step};
 
 /// The size of the buffer the tensors are copied to the file through: 16 MiB.
 pub const DEFAULT_BUFFER_BYTES: usize = 16 << 20;
@@ -33,9 +36,12 @@ const ELEMENT_BYTES: [(&str, u64); 8] = [
     ("I8", 1),
 ];
 
-/// Supplies a tensor's bytes: fills `destination` with the bytes `[offset, offset + destination.len())`. It runs in a
-/// frame, so it must not wait.
-pub type Source = Box<dyn FnMut(u64, &mut [u8]) -> Result<(), IoError> + Send>;
+/// Supplies a tensor's bytes, one chunk at a time: `source(offset, buffer, done)` must fill `buffer`, whose length is
+/// the chunk's, with the bytes `[offset, offset + buffer.len())` of the tensor and give it back through `done`, once,
+/// from a frame (not from the reap of an `AsyncIo`). It may do so before it returns or later, after reads of its own.
+/// It must not wait. `Err` started nothing and never calls `done`. The next chunk is asked for only after the
+/// previous one has been written, so a tensor is never resident whole.
+pub type Source = Arc<dyn Fn(u64, Vec<u8>, Done<Vec<u8>>) -> Result<(), CheckpointError> + Send + Sync>;
 
 struct Entry {
     name: String,
@@ -98,9 +104,14 @@ impl SafetensorsWriter {
             dtype,
             shape,
             bytes,
-            Box::new(move |offset, destination| {
-                let from = usize::try_from(offset).map_err(|_| IoError::other("offset beyond memory"))?;
-                destination.copy_from_slice(&data[from..from + destination.len()]);
+            Arc::new(move |offset, mut chunk, done| {
+                let range = usize::try_from(offset)
+                    .ok()
+                    .and_then(|from| Some(from..from.checked_add(chunk.len())?))
+                    .and_then(|range| data.get(range))
+                    .ok_or_else(|| CheckpointError::Invalid("a chunk beyond the tensor".to_owned()))?;
+                chunk.copy_from_slice(range);
+                done(Ok(chunk));
                 Ok(())
             }),
         )
@@ -115,6 +126,11 @@ impl SafetensorsWriter {
         bytes: u64,
         source: Source,
     ) -> Result<(), CheckpointError> {
+        if name == "__metadata__" {
+            return Err(CheckpointError::Invalid(
+                "__metadata__ is the header's own entry, not a tensor name".to_owned(),
+            ));
+        }
         let Some((_, width)) = ELEMENT_BYTES.iter().find(|(known, _)| *known == dtype) else {
             return Err(CheckpointError::Invalid(format!("{name}: unsupported dtype {dtype}")));
         };
@@ -171,8 +187,10 @@ impl SafetensorsWriter {
     }
 
     /// Writes the file: `then` gets the result once it is complete under its final name, or has failed and left no
-    /// `.part` file. `Err` started nothing.
-    pub fn finish(self, io: &Arc<AsyncIo>, then: Done<()>) -> Result<(), CheckpointError> {
+    /// `.part` file. The durability and removal calls run as frames of `host`, which is held admitted until the end.
+    /// `Err` started nothing.
+    pub fn finish(self, io: &Arc<AsyncIo>, host: &Arc<Lake>, then: Done<()>) -> Result<(), CheckpointError> {
+        let unit = host.admit().map_err(|_| CheckpointError::LakeClosed)?;
         let mut part: OsString = self.file.clone().into_os_string();
         part.push(".part");
         let part = PathBuf::from(part);
@@ -191,6 +209,8 @@ impl SafetensorsWriter {
         };
         let writing = Writing {
             io: Arc::clone(io),
+            host: Arc::clone(host),
+            unit,
             part: part.clone(),
             target: self.file,
             entries: self.entries,
@@ -206,9 +226,9 @@ impl SafetensorsWriter {
             &part,
             spec,
             Box::new(move |opened| {
-                work(move || match opened {
+                step(Kind::Resolve, move || match opened {
                     Ok(file) => writing.begin(file, head),
-                    Err(error) => (writing.then)(Err(CheckpointError::io(format!("cannot create {context}"), error))),
+                    Err(error) => writing.end(Err(CheckpointError::io(format!("cannot create {context}"), error))),
                 })
             }),
         )
@@ -244,6 +264,9 @@ fn quote(out: &mut String, text: &str) {
 /// The chain that writes the header and then the tensors' chunks, one write at a time.
 struct Writing {
     io: Arc<AsyncIo>,
+    host: Arc<Lake>,
+    /// Keeps the host lake admitted until the chain has ended.
+    unit: UnitGuard,
     part: PathBuf,
     target: PathBuf,
     entries: Vec<Entry>,
@@ -263,11 +286,6 @@ struct Step {
     writing: Writing,
 }
 
-/// Removes a `.part` file. `AsyncIo` has no unlink, so this is one short call on the frame that found the failure.
-fn discard(part: &Path) {
-    let _ = fs::remove_file(part);
-}
-
 impl Writing {
     /// Writes the header, then the data.
     fn begin(self, file: OwnedFile, head: Vec<u8>) {
@@ -275,11 +293,43 @@ impl Writing {
         Step { file, writing: self }.submit(head, filled, false);
     }
 
-    /// Ends the chain with `error`, leaving no `.part` file.
-    fn fail(self, file: OwnedFile, error: CheckpointError) {
-        drop(file);
-        discard(&self.part);
-        (self.then)(Err(error));
+    /// Hands the result over and lets the lake go.
+    fn end(self, result: Result<(), CheckpointError>) {
+        let Writing { then, unit, .. } = self;
+        then(result);
+        drop(unit);
+    }
+
+    /// Ends the chain with `error`, once the `.part` file is removed (or cannot be: the lake is closed).
+    fn fail(self, error: CheckpointError) {
+        let Writing {
+            host, unit, part, then, ..
+        } = self;
+        let pending = Handoff::new();
+        pending.send(error);
+        let (reported, held) = (Arc::clone(&pending), Arc::clone(&then));
+        let removed = durable::remove(
+            &host,
+            &part,
+            Box::new(move |removal| {
+                if let Some(error) = reported.take() {
+                    held(Err(match removal {
+                        Ok(()) => error,
+                        Err(source) => CheckpointError::io(format!("{error}; the .part file was not removed"), source),
+                    }));
+                }
+                step(Kind::Release, move || drop(unit))
+            }),
+        );
+        if removed.is_err()
+            && let Some(error) = pending.take()
+        {
+            // The lake is closed: the continuation was dropped with the refusal, and nothing can remove the file.
+            then(Err(CheckpointError::io(
+                format!("{error}; the .part file was not removed"),
+                IoError::other("the host lake is closed"),
+            )));
+        }
     }
 }
 
@@ -290,39 +340,47 @@ impl Step {
         let raw = raw_file(&file);
         let offset = writing.offset;
         let io = Arc::clone(&writing.io);
-        let then = Arc::clone(&writing.then);
-        let part = writing.part.clone();
+        let cell = Handoff::new();
+        cell.send(Step { file, writing });
+        let started = Arc::clone(&cell);
         let submitted = io.write(
             raw,
             offset,
             IoBuf { bytes, filled },
             Box::new(move |done: IoDone| {
-                work(move || {
-                    let mut writing = writing;
+                step(Kind::Resolve, move || {
+                    let Some(Step { file, mut writing }) = cell.take() else {
+                        return;
+                    };
                     writing.offset += filled as u64;
                     if chunk {
                         writing.buffer = done.buf.bytes;
                     }
                     match done.result {
                         Ok(moved) if moved == filled => Step { file, writing }.next(),
-                        Ok(moved) => writing.fail(
-                            file,
-                            CheckpointError::Format(format!("a write moved {moved} of {filled} bytes")),
-                        ),
+                        Ok(moved) => {
+                            drop(file);
+                            writing.fail(CheckpointError::Format(format!(
+                                "a write moved {moved} of {filled} bytes"
+                            )));
+                        }
                         Err(error) => {
-                            writing.fail(file, CheckpointError::io("cannot write the safetensors file", error))
+                            drop(file);
+                            writing.fail(CheckpointError::io("cannot write the safetensors file", error));
                         }
                     }
                 })
             }),
         );
-        if let Err(error) = submitted {
-            discard(&part);
-            report(&then, submit_error("the safetensors file", error));
+        if let Err(error) = submitted
+            && let Some(Step { file, writing }) = started.take()
+        {
+            drop(file);
+            writing.fail(submit_error("the safetensors file", error));
         }
     }
 
-    /// Fills the buffer with the next chunk and writes it, or finishes the file when no data is left.
+    /// Asks the tensor's source for the next chunk and writes it, or finishes the file when no data is left.
     fn next(self) {
         let Step { file, mut writing } = self;
         while writing.entry < writing.entries.len() && writing.at >= writing.entries[writing.entry].bytes {
@@ -333,63 +391,112 @@ impl Step {
             writing.finish(file);
             return;
         }
-        let entry = &mut writing.entries[writing.entry];
+        let entry = &writing.entries[writing.entry];
         let n = (writing.buffer_bytes as u64).min(entry.bytes - writing.at) as usize;
+        let source = Arc::clone(&entry.source);
+        let name = entry.name.clone();
+        let at = writing.at;
         let mut buffer = take(&mut writing.buffer);
-        if buffer.len() < n {
-            buffer.resize(n, 0);
+        buffer.resize(n, 0);
+        let cell = Handoff::new();
+        cell.send(Step { file, writing });
+        let waiting = Arc::clone(&cell);
+        let filled: Done<Vec<u8>> = Arc::new(move |result| {
+            let Some(Step { file, mut writing }) = waiting.take() else {
+                return;
+            };
+            match result {
+                Ok(bytes) if bytes.len() == n => {
+                    writing.at += n as u64;
+                    Step { file, writing }.submit(bytes, n, true);
+                }
+                Ok(bytes) => {
+                    drop(file);
+                    writing.fail(CheckpointError::Invalid(format!(
+                        "the source of {name} gave {} bytes for a chunk of {n}",
+                        bytes.len()
+                    )));
+                }
+                Err(error) => {
+                    drop(file);
+                    writing.fail(error);
+                }
+            }
+        });
+        if let Err(error) = source(at, buffer, filled)
+            && let Some(Step { file, writing }) = cell.take()
+        {
+            drop(file);
+            writing.fail(error);
         }
-        if let Err(error) = (entry.source)(writing.at, &mut buffer[..n]) {
-            let context = format!("cannot read tensor {}", entry.name);
-            writing.fail(file, CheckpointError::io(context, error));
-            return;
-        }
-        writing.at += n as u64;
-        Step { file, writing }.submit(buffer, n, true);
     }
 }
 
 impl Writing {
     /// Makes the data durable, closes the file and renames it to its final name.
     fn finish(self, file: OwnedFile) {
-        // `AsyncIo` has no fsync yet: the data is made durable by one call on a duplicate of the handle, on this frame.
-        let synced = file
-            .try_clone()
-            .map(File::from)
-            .and_then(|duplicate| duplicate.sync_data());
-        drop(file);
-        if let Err(error) = synced {
-            let context = format!("cannot sync {}", self.part.display());
-            let Writing { part, then, .. } = self;
-            discard(&part);
-            then(Err(CheckpointError::io(context, error)));
-            return;
+        let shared = durable::share(file);
+        let host = Arc::clone(&self.host);
+        let held = Arc::clone(&shared);
+        let cell = Handoff::new();
+        cell.send(self);
+        let waiting = Arc::clone(&cell);
+        let started = durable::sync(
+            &host,
+            &shared,
+            Box::new(move |synced| {
+                // The file is closed before it is renamed: a file that is open cannot be renamed on Windows.
+                drop(held);
+                let Some(writing) = waiting.take() else {
+                    return idle();
+                };
+                match synced {
+                    Ok(()) => writing.rename(),
+                    Err(error) => {
+                        let context = format!("cannot sync {}", writing.part.display());
+                        writing.fail(CheckpointError::io(context, error));
+                    }
+                }
+                idle()
+            }),
+        );
+        drop(shared);
+        if started.is_err()
+            && let Some(writing) = cell.take()
+        {
+            writing.end(Err(CheckpointError::LakeClosed));
         }
-        let Writing {
-            io, part, target, then, ..
-        } = self;
-        let failed = Arc::clone(&then);
-        let from = part.clone();
-        let cleanup = part.clone();
+    }
+
+    /// Renames the finished `.part` file to its final name.
+    fn rename(self) {
+        let io = Arc::clone(&self.io);
+        let (part, target) = (self.part.clone(), self.target.clone());
+        let cell = Handoff::new();
+        cell.send(self);
+        let waiting = Arc::clone(&cell);
         let renamed = io.rename(
             &part,
             &target,
             Box::new(move |result| {
-                work(move || match result {
-                    Ok(()) => then(Ok(())),
-                    Err(error) => {
-                        discard(&cleanup);
-                        then(Err(CheckpointError::io(
-                            format!("cannot rename {}", cleanup.display()),
-                            error,
-                        )));
+                step(Kind::Resolve, move || {
+                    let Some(writing) = waiting.take() else {
+                        return;
+                    };
+                    match result {
+                        Ok(()) => writing.end(Ok(())),
+                        Err(error) => {
+                            let context = format!("cannot rename {}", writing.part.display());
+                            writing.fail(CheckpointError::io(context, error));
+                        }
                     }
                 })
             }),
         );
-        if let Err(error) = renamed {
-            discard(&from);
-            report(&failed, submit_error("the safetensors file", error));
+        if let Err(error) = renamed
+            && let Some(writing) = cell.take()
+        {
+            writing.fail(submit_error("the safetensors file", error));
         }
     }
 }

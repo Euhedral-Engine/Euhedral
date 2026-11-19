@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use euhedral_inference_quantization::checkpoint::CheckpointError;
-use euhedral_inference_quantization::checkpoint::objects::{Config, MTP_OBJECTS, Piece, Qwen38Objects};
+use euhedral_inference_quantization::checkpoint::objects::{Config, MTP_OBJECTS, ObjectSource, Piece, Qwen38Objects};
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
 use euhedral_io::AsyncIo;
 use support::{Spec, bf16, drive, safetensors, write};
@@ -78,15 +78,15 @@ fn open(directory: &Path, specs: &[Spec]) -> (Arc<AsyncIo>, Qwen38Objects) {
     write(&directory.join("config.json"), CONFIG.as_bytes());
     let io = AsyncIo::open().unwrap();
     let store = Arc::new(drive(&io, |done| Safetensors::open(&io, directory, done)).unwrap());
-    let objects = drive(&io, |done| Qwen38Objects::open(&io, store, directory, done)).unwrap();
+    let objects = drive(&io, |done| Qwen38Objects::open(store, directory, done)).unwrap();
     (io, objects)
 }
 
 /// The first element of each row of an object's bytes.
 fn row_values(objects: &Qwen38Objects, io: &Arc<AsyncIo>, name: &str) -> Vec<f32> {
     let source = objects.object(name).unwrap();
-    let bytes = drive(io, |done| objects.read_bytes(io, &source, done)).unwrap();
-    assert_eq!(bytes.len() as u64, source.bytes(), "{name}");
+    let bytes = drive(io, |done| objects.read_bytes(&source, done)).unwrap();
+    assert_eq!(Some(bytes.len() as u64), source.bytes(), "{name}");
     bytes
         .chunks_exact(source.columns as usize * 2)
         .map(|row| f32::from_bits(u32::from(u16::from_le_bytes([row[0], row[1]])) << 16))
@@ -222,7 +222,7 @@ fn read_hands_each_piece_the_region_asked_for_in_order() {
         asked.push(range.clone());
         vec![0xAAu8; (range.end - range.start) as usize]
     };
-    let pieces = drive(&io, |done| objects.read(&io, &source, &mut region, done)).unwrap();
+    let pieces = drive(&io, |done| objects.read(&source, &mut region, done)).unwrap();
     assert_eq!(asked, [0..48, 48..96]);
     assert_eq!(pieces.len(), 2);
     assert_eq!(pieces[1][..2], bf16(&[50.0]));
@@ -231,7 +231,6 @@ fn read_hands_each_piece_the_region_asked_for_in_order() {
     let mut wrong = |_: Range<u64>| vec![0u8; 3];
     assert!(matches!(
         objects.read(
-            &io,
             &source,
             &mut wrong,
             Arc::new(|_: Result<Vec<Vec<u8>>, _>| panic!("nothing was started"))
@@ -287,4 +286,30 @@ fn what_cannot_be_fused_is_refused() {
 
 fn message_of(objects: &Qwen38Objects, name: &str) -> String {
     objects.object(name).unwrap_err().to_string()
+}
+
+#[test]
+fn an_object_too_large_to_count_is_refused_not_wrapped() {
+    let directory = tempfile::tempdir().unwrap();
+    let (_io, objects) = open(directory.path(), &tensors());
+    let huge = ObjectSource {
+        name: "huge".to_owned(),
+        pieces: vec![Piece {
+            tensor: "lm_head.weight".to_owned(),
+            first_row: 0,
+            rows: 1 << 62,
+        }],
+        rows: 1 << 62,
+        columns: 4,
+    };
+    assert_eq!(huge.bytes(), None);
+    let mut region = |_: Range<u64>| Vec::<u8>::new();
+    let refused = objects.read(
+        &huge,
+        &mut region,
+        Arc::new(|_: Result<Vec<Vec<u8>>, _>| panic!("nothing was started")),
+    );
+    assert!(matches!(refused, Err(CheckpointError::Invalid(message)) if message.contains("too large")));
+    let fits = objects.object("text/output_head").unwrap();
+    assert_eq!(fits.bytes(), Some(16 * 4 * 2));
 }

@@ -5,7 +5,8 @@
 //! - [`writer`]: one safetensors file, written as `<name>.part` and renamed when complete.
 //! - [`objects`]: the quantized objects of a Qwen 3.8 checkpoint as row ranges of its BF16 tensors.
 //!
-//! Every operation that touches a file goes through `AsyncIo` and reports through a [`Done`] callback. The callback is
+//! Every operation that touches a file goes through `AsyncIo` (the writer's durability barrier and cleanup, which it
+//! has no call for yet, go through [`durable`](crate::durable) on a host lake) and reports through a [`Done`] callback. The callback is
 //! called once, from a frame of the lattice that drives the `AsyncIo`, and must not wait: it hands the result on (to a
 //! lake, a hand-off) and returns. A function that returns `Err` started nothing and never calls its callback.
 
@@ -40,6 +41,9 @@ pub enum CheckpointError {
     /// A request that cannot be served: a range outside its tensor, a duplicate name, an unknown dtype.
     #[error("{0}")]
     Invalid(String),
+    /// The host lake would not take the call: it is closed, or no unit of it is admitted.
+    #[error("the host lake is closed: nothing was started")]
+    LakeClosed,
 }
 
 impl CheckpointError {

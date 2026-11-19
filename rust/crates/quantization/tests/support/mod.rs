@@ -10,12 +10,17 @@
 )]
 
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::LatticeSource;
+use euhedral_graph::Lake;
+use euhedral_inference_engine::{Handoff, lattice_config};
 use euhedral_inference_quantization::checkpoint::{CheckpointError, Done};
+use euhedral_inference_settings::{ModelSettings, Settings};
 use euhedral_io::AsyncIo;
 use serde_json::{Map, Value, json};
 
@@ -92,5 +97,40 @@ pub fn drive<T: Send + 'static>(
             let _ = frame.execute();
             frame.do_finally();
         }
+    }
+}
+
+/// A lattice that drives an `AsyncIo`, and a lake on it: what the calls that run durability steps need.
+pub struct World {
+    lattice: Arc<ControlPlaneLattice>,
+    pub io: Arc<AsyncIo>,
+    pub host: Arc<Lake>,
+}
+
+impl World {
+    pub fn start() -> World {
+        let settings = Settings::with_model(ModelSettings::default());
+        let lattice = ControlPlaneLattice::new(lattice_config(&settings)).unwrap();
+        let io = AsyncIo::open().unwrap();
+        lattice.add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>).unwrap();
+        let host = Lake::new(Arc::clone(&lattice), NonZeroUsize::new(2).unwrap(), LONGEST);
+        World { lattice, io, host }
+    }
+
+    /// Starts a call and waits, outside the lattice, for the value its callback is given.
+    pub fn call<T: Send + 'static>(
+        &self,
+        start: impl FnOnce(Done<T>) -> Result<(), CheckpointError>,
+    ) -> Result<T, CheckpointError> {
+        let handoff = Handoff::new();
+        let sender = Arc::clone(&handoff);
+        start(Arc::new(move |result| sender.send(result)))?;
+        handoff.wait(LONGEST).expect("the callback never ran")
+    }
+
+    pub fn finish(self) {
+        self.host.complete_gracefully();
+        self.io.complete();
+        self.lattice.close();
     }
 }

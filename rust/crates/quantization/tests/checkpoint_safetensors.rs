@@ -29,7 +29,7 @@ fn read(
     skip: u64,
     len: usize,
 ) -> Result<Vec<u8>, CheckpointError> {
-    drive(io, |done| store.read(io, name, skip, vec![0u8; len], done))
+    drive(io, |done| store.read(name, skip, vec![0u8; len], done))
 }
 
 fn single() -> Vec<u8> {
@@ -65,9 +65,9 @@ fn a_single_file_checkpoint_reads_whole_tensors_and_row_ranges() {
     let a = store.tensor("a").unwrap();
     assert_eq!(
         (a.dtype.as_str(), a.shape.as_slice(), a.bytes, a.elements()),
-        ("BF16", &[3, 2][..], 12, 6)
+        ("BF16", &[3, 2][..], 12, Some(6))
     );
-    assert_eq!(store.tensor("scalar").unwrap().elements(), 1);
+    assert_eq!(store.tensor("scalar").unwrap().elements(), Some(1));
     assert!(store.contains("b"));
     assert!(!store.contains("c"));
     let mut names: Vec<_> = store.names().collect();
@@ -81,7 +81,7 @@ fn a_single_file_checkpoint_reads_whole_tensors_and_row_ranges() {
         [3u16, 4, 5, 6].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()
     );
 
-    let b = drive(&io, |done| store.read_tensor(&io, "b", vec![0u8; 8], done)).unwrap();
+    let b = drive(&io, |done| store.read_tensor("b", vec![0u8; 8], done)).unwrap();
     assert_eq!(f32::from_le_bytes(b[4..8].try_into().unwrap()), -2.0);
     let scalar = read(&io, &store, "scalar", 0, 4).unwrap();
     assert_eq!(i32::from_le_bytes(scalar.try_into().unwrap()), 7);
@@ -141,7 +141,7 @@ fn many_ranges_in_flight_come_back_in_order() {
             })
             .collect::<Vec<_>>()
     };
-    let memories = drive(&io, |done| store.read_ranges(&io, ranges(()), done)).unwrap();
+    let memories = drive(&io, |done| store.read_ranges(ranges(()), done)).unwrap();
     assert_eq!(memories.len(), 64);
     for (index, memory) in memories.iter().enumerate() {
         let piece = 63 - index;
@@ -162,7 +162,7 @@ fn a_request_outside_its_tensor_or_for_nothing_is_refused_before_anything_is_rea
         Err(CheckpointError::Invalid(_))
     ));
     assert!(matches!(read(&io, &store, "a", 0, 0), Err(CheckpointError::Invalid(_))));
-    let wrong = drive(&io, |done| store.read_tensor(&io, "a", vec![0u8; 8], done));
+    let wrong = drive(&io, |done| store.read_tensor("a", vec![0u8; 8], done));
     assert!(matches!(wrong, Err(CheckpointError::Invalid(message)) if message.contains("holds 12 bytes, not 8")));
     // One bad range among good ones: nothing is submitted.
     let ranges = vec![
@@ -178,11 +178,11 @@ fn a_request_outside_its_tensor_or_for_nothing_is_refused_before_anything_is_rea
         },
     ];
     assert!(matches!(
-        drive(&io, |done| store.read_ranges(&io, ranges, done)),
+        drive(&io, |done| store.read_ranges(ranges, done)),
         Err(CheckpointError::Invalid(_))
     ));
     let none = Vec::<ReadRange<Vec<u8>>>::new();
-    assert!(drive(&io, |done| store.read_ranges(&io, none, done)).is_err());
+    assert!(drive(&io, |done| store.read_ranges(none, done)).is_err());
 }
 
 #[test]
@@ -229,13 +229,59 @@ fn a_missing_checkpoint_and_a_missing_shard_are_io_errors() {
 }
 
 #[test]
-fn a_file_that_ends_inside_a_tensor_fails_the_read() {
+fn a_file_that_shrinks_after_it_was_opened_fails_the_read() {
     let directory = tempfile::tempdir().unwrap();
-    let mut file = single();
-    file.truncate(file.len() - 6);
-    write(&directory.path().join("model.safetensors"), &file);
+    let path = directory.path().join("model.safetensors");
+    let file = single();
+    write(&path, &file);
     let io = AsyncIo::open().unwrap();
     let store = open(&io, directory.path()).unwrap();
+    write(&path, &file[..file.len() - 6]);
     assert!(read(&io, &store, "scalar", 0, 4).is_err());
     assert_eq!(read(&io, &store, "a", 0, 12).unwrap().len(), 12);
+}
+
+/// A shard whose header is `json` followed by `data` bytes.
+fn shard(json: &str, data: usize) -> Vec<u8> {
+    let mut file = (json.len() as u64).to_le_bytes().to_vec();
+    file.extend_from_slice(json.as_bytes());
+    file.resize(file.len() + data, 0);
+    file
+}
+
+#[test]
+fn what_the_header_claims_beyond_the_file_is_refused() {
+    let io = AsyncIo::open().unwrap();
+    let past = r#"{"t":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}"#;
+    let overflow = r#"{"t":{"dtype":"U8","shape":[5],"data_offsets":[18446744073709551610,18446744073709551615]}}"#;
+    let mut too_large = shard(past, 4);
+    too_large[..8].copy_from_slice(&1000u64.to_le_bytes());
+    let cases = [
+        ("a header larger than the file", too_large, "does not fit"),
+        ("a tensor past the end", shard(past, 2), "past the end"),
+        ("offsets that overflow", shard(overflow, 5), "overflow"),
+    ];
+    for (what, file, message) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        write(&directory.path().join("model.safetensors"), &file);
+        match open(&io, directory.path()) {
+            Err(CheckpointError::Format(found)) => assert!(found.contains(message), "{what}: {found}"),
+            other => panic!("{what}: not refused: {other:?}"),
+        }
+    }
+    // The same header with its data present opens.
+    let directory = tempfile::tempdir().unwrap();
+    write(&directory.path().join("model.safetensors"), &shard(past, 4));
+    assert!(open(&io, directory.path()).is_ok());
+}
+
+#[test]
+fn an_element_count_that_does_not_fit_is_none() {
+    let io = AsyncIo::open().unwrap();
+    let json = r#"{"t":{"dtype":"U8","shape":[4294967296,4294967296],"data_offsets":[0,0]},"s":{"dtype":"U8","shape":[3,5],"data_offsets":[0,0]}}"#;
+    let directory = tempfile::tempdir().unwrap();
+    write(&directory.path().join("model.safetensors"), &shard(json, 0));
+    let store = open(&io, directory.path()).unwrap();
+    assert_eq!(store.tensor("t").unwrap().elements(), None);
+    assert_eq!(store.tensor("s").unwrap().elements(), Some(15));
 }

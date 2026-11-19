@@ -1,68 +1,19 @@
 //! The asynchronous file steps the checkpoint readers and the writer chain: open, length, positioned read.
 
-use std::fmt;
 use std::io::Error as IoError;
 use std::path::Path;
 use std::sync::Arc;
 
-use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_io::{AsyncIo, IoDoneOwned, OpenSpec, OwnedFile, RawFile};
 
 use super::CheckpointError;
+use crate::step::{Kind, step};
 
 /// Where a result goes: called once, from a frame, and must not wait.
 pub type Done<T> = Arc<dyn Fn(Result<T, CheckpointError>) + Send + Sync>;
 
 /// What follows a step: the result of one read or open, taken once.
 pub(crate) type Next<T> = Box<dyn FnOnce(Result<T, CheckpointError>) + Send>;
-
-/// The id of the frames of this module.
-const FRAME_ID: u64 = 0x7175_616e_7463_6b70;
-
-/// A frame that runs a closure once.
-struct Work {
-    header: FrameHeader,
-    work: Option<Box<dyn FnOnce() + Send>>,
-}
-
-impl Frame for Work {
-    fn header(&self) -> &FrameHeader {
-        &self.header
-    }
-
-    fn header_mut(&mut self) -> &mut FrameHeader {
-        &mut self.header
-    }
-
-    fn execute(&mut self) -> Result<(), FrameError> {
-        if let Some(work) = self.work.take() {
-            work();
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Debug for Work {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("Work").finish_non_exhaustive()
-    }
-}
-
-/// The frame an `AsyncIo` continuation returns: it runs `work`.
-pub(crate) fn work(work: impl FnOnce() + Send + 'static) -> Box<dyn Frame> {
-    Box::new(Work {
-        header: FrameHeader::new(FRAME_ID),
-        work: Some(Box::new(work)),
-    })
-}
-
-/// A frame that does nothing: the continuation of a step that is not the last of its group.
-pub(crate) fn idle() -> Box<dyn Frame> {
-    Box::new(Work {
-        header: FrameHeader::new(FRAME_ID),
-        work: None,
-    })
-}
 
 #[cfg(unix)]
 pub(crate) fn raw_file(file: &OwnedFile) -> RawFile {
@@ -91,7 +42,9 @@ pub(crate) fn open_read(io: &AsyncIo, path: &Path, next: Next<OwnedFile>) -> Res
         path,
         OpenSpec::default(),
         Box::new(move |opened| {
-            work(move || next(opened.map_err(|error| CheckpointError::io(format!("cannot open {context}"), error))))
+            step(Kind::Resolve, move || {
+                next(opened.map_err(|error| CheckpointError::io(format!("cannot open {context}"), error)))
+            })
         }),
     )
     .map_err(|error| submit_error(&failed, error))
@@ -117,7 +70,7 @@ pub(crate) fn read_exact(
         offset,
         vec![0u8; len],
         Box::new(move |done: IoDoneOwned<Vec<u8>>| {
-            work(move || {
+            step(Kind::Resolve, move || {
                 let _open = file;
                 next(finish(done, len, &context))
             })
@@ -161,7 +114,7 @@ fn sized(io: Arc<AsyncIo>, file: Arc<OwnedFile>, context: String, then: Done<Vec
     let submitted = io.file_len(
         raw,
         Box::new(move |length| {
-            work(move || match length {
+            step(Kind::Resolve, move || match length {
                 Err(error) => then(Err(CheckpointError::io(format!("cannot size {context}"), error))),
                 Ok(0) => then(Ok(Vec::new())),
                 Ok(length) => match usize::try_from(length) {
@@ -182,4 +135,25 @@ fn sized(io: Arc<AsyncIo>, file: Arc<OwnedFile>, context: String, then: Done<Vec
     if let Err(error) = submitted {
         report(Err(submit_error(&failed, error)));
     }
+}
+
+/// The length of `file`. `file` stays open until `next` runs. `Err` started nothing, and drops `next`.
+pub(crate) fn file_length(
+    io: &AsyncIo,
+    file: Arc<OwnedFile>,
+    context: String,
+    next: Next<u64>,
+) -> Result<(), CheckpointError> {
+    let raw = raw_file(&file);
+    let failed = context.clone();
+    io.file_len(
+        raw,
+        Box::new(move |length| {
+            step(Kind::Resolve, move || {
+                let _open = file;
+                next(length.map_err(|error| CheckpointError::io(format!("cannot size {context}"), error)))
+            })
+        }),
+    )
+    .map_err(|error| submit_error(&failed, error))
 }
