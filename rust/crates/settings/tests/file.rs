@@ -290,3 +290,14 @@ fn host_margin_and_staging_slots_parse_and_refuse_bad_values() {
     assert!(problems(&format!("{MODEL}memory:\n  host-margin: -1\n"))[0].contains("memory.host-margin"));
     assert!(problems(&format!("{MODEL}memory:\n  staging-slots: 0\n"))[0].contains("memory.staging-slots"));
 }
+
+#[test]
+fn disk_window_slots_parse_and_refuse_zero() {
+    let none = load(MODEL).unwrap();
+    assert_eq!(none.memory.disk_window_slots, Auto::Auto);
+    let auto = load(&format!("{MODEL}memory:\n  disk-window-slots: auto\n")).unwrap();
+    assert_eq!(auto.memory.disk_window_slots, Auto::Auto);
+    let stated = load(&format!("{MODEL}memory:\n  disk-window-slots: 6\n")).unwrap();
+    assert_eq!(stated.memory.disk_window_slots, Auto::Value(6));
+    assert!(problems(&format!("{MODEL}memory:\n  disk-window-slots: 0\n"))[0].contains("memory.disk-window-slots"));
+}

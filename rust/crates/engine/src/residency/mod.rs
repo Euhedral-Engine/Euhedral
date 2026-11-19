@@ -2,6 +2,7 @@
 
 pub mod accounting;
 pub mod budget;
+pub mod disk;
 pub mod footprint;
 pub mod loader;
 pub mod offload;

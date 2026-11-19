@@ -36,6 +36,8 @@ pub(crate) enum Kind {
     Prepare,
     /// The prefix cache's copy jobs of one sequence: their stages and their completions, in the order they were admitted.
     Copy,
+    /// The completions of the reads of the disk window, one chain per slot.
+    DiskRead,
 }
 
 /// The id hash of a frame of `kind` on chain `chain`: distinct per kind and chain, mixed so that the chains spread

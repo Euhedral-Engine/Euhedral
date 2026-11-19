@@ -334,6 +334,58 @@ unsafe impl IoMemory for PinnedBuffer {
     }
 }
 
+/// A byte range of a shared [`PinnedBuffer`]: a region `AsyncIo::read_into` can fill while other ranges of the same
+/// buffer are read or copied. It keeps the buffer alive, so the memory cannot be freed under a read that has not ended.
+///
+/// Ranges of one buffer must not overlap while both are in use: the caller that cuts them (a window of slots) owns that.
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+#[derive(Debug)]
+pub struct PinnedRange {
+    buffer: Arc<PinnedBuffer>,
+    offset: usize,
+    len: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+impl PinnedRange {
+    /// `len` bytes of `buffer` from `offset`; `None` when they pass the buffer's end.
+    ///
+    /// # Safety
+    /// While this range is alive, no other range or reference touches its bytes: the caller cuts ranges of one buffer
+    /// that do not overlap while both are in use.
+    pub unsafe fn new(buffer: &Arc<PinnedBuffer>, offset: usize, len: usize) -> Option<PinnedRange> {
+        let end = offset.checked_add(len)?;
+        (end <= buffer.len()).then(|| PinnedRange {
+            buffer: Arc::clone(buffer),
+            offset,
+            len,
+        })
+    }
+
+    /// The start of the range.
+    pub fn as_ptr(&self) -> *const u8 {
+        // SAFETY: `new` checked that the range lies inside the buffer's allocation.
+        unsafe { self.buffer.as_ptr().add(self.offset) }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+// SAFETY: the pointer addresses `len` bytes inside one live `cudaHostAlloc` allocation that this value keeps alive
+// through its `Arc`, valid for reads and writes, and that stays where it is when the value moves (the allocation is
+// outside Rust's allocator, reached by a raw pointer, so a move retags nothing). Every bit pattern is a valid byte.
+// The region is exclusively the operation's from submission until the continuation gets the value back, provided the
+// caller cut ranges that do not overlap while in use (the contract of `PinnedRange`); the value touches the region only
+// through this pointer. `len` never changes.
+unsafe impl IoMemory for PinnedRange {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.as_ptr().cast_mut()
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
 impl Drop for PinnedBuffer {
     #[allow(
         clippy::disallowed_methods,

@@ -323,6 +323,8 @@ pub struct OffloadInputs {
     pub host_budget: u64,
     /// The slots of the staging ring (`memory.staging-slots`).
     pub staging_slots: usize,
+    /// The slots of the disk window (`memory.disk-window-slots`).
+    pub window_slots: usize,
     /// The rows a verification of every sequence holds: sequences times a draft's rows.
     pub head_rows: u64,
 }
@@ -434,7 +436,7 @@ fn window_slot_bytes(largest: u64) -> u64 {
 /// does not, every object goes to the file.
 pub fn tiers(objects: &[WeightObject<'_>], selection: &[usize], inputs: &OffloadInputs, device_fits: bool) -> Reach {
     let slots = inputs.staging_slots;
-    let window_slots = 2 * slots;
+    let window_slots = inputs.window_slots;
     let budget = inputs.host_budget;
     let slot = |index: usize| align(objects[index].bytes, HOST_ALIGNMENT);
     let resident_bytes = {
@@ -713,6 +715,7 @@ mod tests {
             fixed_bytes: 0,
             host_budget: u64::MAX,
             staging_slots: SLOTS,
+            window_slots: 2 * SLOTS,
             head_rows: 5,
         }
     }

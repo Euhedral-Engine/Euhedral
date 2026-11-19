@@ -252,6 +252,8 @@ pub struct MemorySettings {
     pub host_margin: Auto<ByteSize>,
     /// Pinned staging slots for weights that stream through the host; `auto` is 4.
     pub staging_slots: Auto<u32>,
+    /// Pinned window slots the artifact is read into for weights that stay on disk; `auto` is twice `staging_slots`.
+    pub disk_window_slots: Auto<u32>,
     /// Device memory the engine may use; `auto` is what is free.
     pub gpu_limit: Auto<ByteSize>,
     /// Device memory left for other programs.
@@ -274,6 +276,7 @@ impl Default for MemorySettings {
             host_weights_limit: Auto::Auto,
             host_margin: Auto::Auto,
             staging_slots: Auto::Auto,
+            disk_window_slots: Auto::Auto,
             gpu_limit: Auto::Auto,
             gpu_reserve: ByteSize::mib(700),
             runtime_reserve: Auto::Auto,

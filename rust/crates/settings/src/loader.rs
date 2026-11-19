@@ -526,6 +526,9 @@ fn leaves() -> Vec<Leaf> {
         optional("memory.staging-slots", |s, t| {
             assign!(s.memory.staging_slots, auto_or(t, |t| int(t, 1, COUNT_MAX)))
         }),
+        optional("memory.disk-window-slots", |s, t| {
+            assign!(s.memory.disk_window_slots, auto_or(t, |t| int(t, 1, COUNT_MAX)))
+        }),
         optional("memory.gpu-limit", |s, t| {
             assign!(s.memory.gpu_limit, auto_or(t, |t| size(t, 1)))
         }),

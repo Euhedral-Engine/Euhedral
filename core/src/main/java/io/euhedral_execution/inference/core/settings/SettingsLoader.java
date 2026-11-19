@@ -332,6 +332,7 @@ public final class SettingsLoader {
         // Read only by the Rust engine; accepted so the shared example file loads here.
         m.put("memory.host-margin", optional(size(0)));
         m.put("memory.staging-slots", optional(integer(1, Integer.MAX_VALUE)));
+        m.put("memory.disk-window-slots", optional(integer(1, Integer.MAX_VALUE)));
         m.put("memory.gpu-limit", optional(size(1)));
         m.put("memory.gpu-reserve", fixed(size(0)));
         m.put("memory.pinned-buffer-pool", optional(size(0)));
