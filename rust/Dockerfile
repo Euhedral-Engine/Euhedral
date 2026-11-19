@@ -21,7 +21,7 @@ ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:/opt/zig:$
 RUN curl -fsSL https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init -o /tmp/rustup-init \
     && printf '%s  %s\n' "$RUSTUP_SHA256" /tmp/rustup-init | sha256sum -c - \
     && chmod +x /tmp/rustup-init \
-    && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "$(sed -n 's/^channel = "\(.*\)"/\1/p' /tmp/rust-toolchain.toml)" \
+    && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "$(awk -F'"' '/^channel/ {print $2}' /tmp/rust-toolchain.toml)" \
         --component rustfmt --component clippy \
     && rm /tmp/rustup-init /tmp/rust-toolchain.toml \
     && cargo install cargo-zigbuild --version 0.23.4 --locked
