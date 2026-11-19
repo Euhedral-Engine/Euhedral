@@ -13,7 +13,7 @@
 //!   the device, a tile kernel beyond. The native route declines shapes it has no kernel for.
 //! - **Anything else**, and every launch under exact numerics: the scalar reference.
 
-use euhedral_inference_cuda::launch::nvfp4::{NATIVE_MIN_ROWS, SKINNY_MAX_ROWS};
+use euhedral_inference_cuda::launch::nvfp4::{NATIVE_MIN_ROWS, SKINNY_MAX_ROWS, skinny_target_ctas};
 pub use euhedral_inference_cuda::launch::nvfp4::{Nvfp4Route, nvfp4_native_scratch_bytes, route};
 use euhedral_inference_cuda::{CudaError, CudaLibrary, DevicePtr, KernelOps};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
@@ -30,6 +30,8 @@ const ROUTE_UNAVAILABLE: i32 = -5;
 pub struct Nvfp4Linear {
     native_available: bool,
     record: bool,
+    /// The grid the skinny kernels split over K to fill: two blocks per multiprocessor of the device.
+    target_ctas: u64,
 }
 
 impl Nvfp4Linear {
@@ -38,14 +40,16 @@ impl Nvfp4Linear {
         Self {
             native_available: library.nvfp4_native_available(),
             record: false,
+            target_ctas: skinny_target_ctas(library.device().sm_count),
         }
     }
 
-    /// Linears on a device that has the native route or does not (for tests).
-    pub fn with_native_route(native_available: bool) -> Self {
+    /// Linears on a device of `sm_count` streaming multiprocessors that has the native route or does not (for tests).
+    pub fn with_native_route(native_available: bool, sm_count: u32) -> Self {
         Self {
             native_available,
             record: false,
+            target_ctas: skinny_target_ctas(sm_count),
         }
     }
 
@@ -108,7 +112,7 @@ impl LinearFormat for Nvfp4Linear {
             self.native_available,
         );
         if self.record {
-            for line in route.lines(rows, in_features, out_features, sd4) {
+            for line in route.lines(rows, in_features, out_features, sd4, self.target_ctas) {
                 ShapeRecorder::record(line);
             }
         }
@@ -149,11 +153,9 @@ impl LinearFormat for Nvfp4Linear {
         }
         let (inputs, outputs) = (u64::from(in_features), u64::from(out_features));
         let rows = rows as u64;
-        let bytes = nvfp4_native_scratch_bytes(rows, inputs, outputs).max(nvfp4_native_scratch_bytes(
-            rows.min(u64::from(SKINNY_MAX_ROWS)),
-            inputs,
-            outputs,
-        ));
+        let bytes = nvfp4_native_scratch_bytes(rows, inputs, outputs, self.target_ctas).max(
+            nvfp4_native_scratch_bytes(rows.min(u64::from(SKINNY_MAX_ROWS)), inputs, outputs, self.target_ctas),
+        );
         usize::try_from(bytes).unwrap_or(usize::MAX)
     }
 }

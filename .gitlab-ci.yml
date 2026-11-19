@@ -28,6 +28,8 @@ variables:
   ARBITER_ARGS: "--cpu shared:16 --mem 32G"
   ARBITER_EST: "1800"
   DOCKER_ARGS: "--security-opt seccomp=unconfined"
+  # apt waits forever on a stalled mirror; bound each request and retry it.
+  APT_OPTS: "-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true"
 
 rust:
   stage: test
@@ -39,7 +41,7 @@ rust:
     - changes: ["rust/**/*", "native/include/**/*", "mise.toml", ".gitlab-ci.yml"]
   script:
     - mise install rust >/dev/null && eval "$(mise env -s bash)"
-    - apt-get update -qq && apt-get install -y -qq --no-install-recommends libclang-dev >/dev/null
+    - apt-get $APT_OPTS update -qq && apt-get $APT_OPTS install -y -qq --no-install-recommends libclang-dev >/dev/null
     - cargo install bindgen-cli --version 0.72.1 --locked
     - cd rust
     - cargo xtask bindings --check
@@ -63,9 +65,11 @@ native-package:
   variables:
     ZIG_GLOBAL_CACHE_DIR: $CI_PROJECT_DIR/native/.zig-global-cache
   script:
-    - apt-get update -qq && apt-get install -y -qq llvm xz-utils python3-pip >/dev/null
+    - apt-get $APT_OPTS update -qq && apt-get $APT_OPTS install -y -qq llvm xz-utils python3-pip gcc libc6-dev >/dev/null
     - mise install >/dev/null
     - mise exec -- gradle nativeVerify :api:bootJar build
+    # Host-only native tests (no card): the programmatic-launch wait rule over the kernel sources and the registry.
+    - cd native/tests && python3 -m unittest test_pdl_wait test_pdl_registry
   artifacts:
     when: on_failure
     paths: [api/build/test-results/test/*.xml]
@@ -84,7 +88,7 @@ promote-test:
     ARBITER_ARGS: "--cpu shared:1 --mem 1G"
     ARBITER_EST: "120"
   script:
-    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git jq python3 >/dev/null
+    - apt-get $APT_OPTS update -qq && apt-get $APT_OPTS install -y -qq --no-install-recommends git jq python3 >/dev/null
     - python3 -m unittest scripts/test_ci_promote.py
 
 # The release step, by hand (see the header). It waits for the pipeline's `rust`, `native-package` and `promote-test` jobs

@@ -17,7 +17,7 @@
     reason = "a test file: a failed unwrap is the failure"
 )]
 
-use euhedral_inference_cuda::launch::nvfp4::nvfp4_native_scratch_bytes;
+use euhedral_inference_cuda::launch::nvfp4::{nvfp4_native_scratch_bytes, skinny_target_ctas};
 use euhedral_inference_edrl::WeightFormat;
 use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::model::{ArtifactProfile, Quantization, Speculation};
@@ -475,7 +475,14 @@ fn the_first_scratch_region_is_the_larger_of_the_trellis_and_the_native_scratch(
         .device
         .iter()
         .filter(|placement| placement.format == WeightFormat::Nvfp4)
-        .map(|placement| nvfp4_native_scratch_bytes(plan.rows.rows, placement.shape[1], placement.shape[0]))
+        .map(|placement| {
+            nvfp4_native_scratch_bytes(
+                plan.rows.rows,
+                placement.shape[1],
+                placement.shape[0],
+                skinny_target_ctas(70),
+            )
+        })
         .max()
         .unwrap();
     assert!(native > 0);

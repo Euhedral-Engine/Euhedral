@@ -657,18 +657,12 @@ public final class InferenceEngine implements AutoCloseable {
                     kvDeviceMinimumTokens,
                     tuning.batching().prefillChunkTokens(),
                     gpu.trellisSettings());
-            if (!plan.fits() && plan.hostArenaBytes() + plan.windowBytes() > host)
-                throw new IOException("the weights the GPU cannot hold need "
-                        + ((plan.hostArenaBytes() + plan.windowBytes()) >> 20) + " MiB of host memory (the token "
-                        + "embedding, the LM head, the host-backed weights and the disk window), more than the "
-                        + (host >> 20)
-                        + " MiB host budget; set memory.host-weights-limit or memory.host-limit higher, or a smaller max"
-                        + " context");
+            if (plan.refusedForHost(host, free)) throw new IOException(plan.hostRefusalMessage(host));
             if (!plan.fits())
                 throw new IOException((sequences == 1 ? "a context" : sequences + " sequences") + " of "
                         + maxContextTokens + " tokens does not fit in the " + (free >> 20)
                         + " MiB free on this GPU, even with the weights in host memory; set a smaller max context"
-                        + (sequences == 1 ? "" : " or fewer sequences"));
+                        + (sequences == 1 ? "" : " or fewer sequences") + plan.hostShortNote(host));
             long diskBytes = 0;
             for (var tensor : artifact.tensors())
                 if (plan.diskBacked().contains(tensor.name())) diskBytes += tensor.byteSize();

@@ -38,6 +38,19 @@ fn host_figures(host: &HostFigures) -> String {
     )
 }
 
+/// What a host refusal names beside the host budget: when cache pages were moved to the host, the setting that keeps
+/// them on the device.
+fn cache_pages_part(cache_pages: u64) -> String {
+    if cache_pages == 0 {
+        return String::new();
+    }
+    format!(
+        " ({} MiB of it the cache pages moved to the host; raise context.kv-cache-on-gpu-tokens to keep more of them on \
+         the GPU)",
+        cache_pages.div_ceil(1 << 20)
+    )
+}
+
 /// The pinned host bytes a refused plan needs, beside what the host allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostFigures {
@@ -93,15 +106,19 @@ pub enum PlanError {
         host: HostFigures,
     },
 
-    /// The weights the device cannot hold need more pinned host memory than the host budget allows.
+    /// The weights the device cannot hold and the cache pages moved to the host need more pinned host memory than the
+    /// host budget allows. `needed` counts the host arena, the disk window and the cache pages on the host, of which
+    /// `cache_pages` are the cache pages.
     #[error(
-        "the weights the GPU cannot hold need {} MiB of host memory (the token embedding, the LM head, the \
-         host-backed weights and the disk window), more than the {} MiB host budget; set memory.host-weights-limit \
-         or memory.host-limit higher, or a smaller context.max-tokens or fewer sequences (batching.max-sequences)",
-        needed / (1 << 20),
+        "the weights the GPU cannot hold{} need {} MiB of host memory{} (the token embedding, the LM head, the \
+         host-backed weights and the disk window), more than the {} MiB host budget; set memory.host-weights-limit or \
+         memory.host-limit higher, or a smaller context.max-tokens or fewer sequences (batching.max-sequences)",
+        if *.cache_pages > 0 { " and the attention cache pages moved to the host" } else { "" },
+        needed.div_ceil(1 << 20),
+        cache_pages_part(*.cache_pages),
         budget / (1 << 20)
     )]
-    HostTooSmall { needed: u64, budget: u64 },
+    HostTooSmall { needed: u64, cache_pages: u64, budget: u64 },
 
     /// The plan puts weights outside the device, and this build cannot run weights held in host memory or in the file.
     #[error(

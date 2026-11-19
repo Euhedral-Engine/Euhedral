@@ -33,7 +33,9 @@ use euhedral_core::frames::Frame;
 use euhedral_core::ingest::QueueIngestSink;
 use euhedral_data_structures::queues::{MpscQueue, Multi, Producer};
 use euhedral_data_structures::sync::ClaimCell;
-use euhedral_inference_api_protocol::pipeline::{Piece, PipelineError, PipelineOptions, TextPipeline};
+use euhedral_inference_api_protocol::pipeline::{
+    MalformedToolCall, Piece, PipelineError, PipelineOptions, TextPipeline,
+};
 use euhedral_inference_api_protocol::{ApiError, Surface};
 use euhedral_net::{Responder, no_work};
 use log::{error, info, warn};
@@ -353,8 +355,8 @@ struct Listener {
     generation: Option<Arc<dyn Generation>>,
     pipeline: TextPipeline,
     parts: Vec<Piece>,
-    /// The message of the malformed tool call that ended the output.
-    failure: Option<String>,
+    /// The malformed tool call that ended the output.
+    failure: Option<MalformedToolCall>,
     first_token_ns: u64,
     /// The pipeline panicked: the request ends with a server error.
     panicked: bool,
@@ -389,9 +391,9 @@ impl Listener {
         }
         match self.pipeline.push(text) {
             Ok(pieces) => self.parts.extend(pieces),
-            Err(PipelineError::MalformedToolCall { message, emitted }) => {
+            Err(PipelineError::MalformedToolCall { message, cut, emitted }) => {
                 self.parts.extend(emitted);
-                self.failure = Some(message);
+                self.failure = Some(MalformedToolCall { message, cut });
             }
         }
     }
@@ -430,7 +432,7 @@ impl Listener {
     }
 
     /// The text after the final flush, and how the answer ended.
-    fn settle(&mut self, result: &GenerationResult) -> Result<Settled, String> {
+    fn settle(&mut self, result: &GenerationResult) -> Result<Settled, MalformedToolCall> {
         if !self.pipeline.call_limit_reached() {
             let settled = if result.stop_token_reached && !self.pipeline.stop_matched() {
                 self.pipeline.finish()
@@ -441,13 +443,12 @@ impl Listener {
                 Ok(pieces) => self.parts.extend(pieces),
                 Err(error) => {
                     // What the model said before the call is delivered to a stream ahead of the error.
-                    let message = error.message().to_owned();
-                    let PipelineError::MalformedToolCall { emitted, .. } = error;
+                    let PipelineError::MalformedToolCall { message, cut, emitted } = error;
                     self.parts.extend(emitted);
                     if self.handoff.is_some() {
                         self.hand_over();
                     }
-                    return Err(message);
+                    return Err(MalformedToolCall { message, cut });
                 }
             }
         }

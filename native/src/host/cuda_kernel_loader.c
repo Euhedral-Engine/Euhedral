@@ -251,14 +251,12 @@ int euhedral_cuda_load_native_kernel(const void* anchor, const char* source_name
     return load_kernel(anchor, source_name, function_name, module, function, architecture);
 }
 
+#include "pdl_registry.h"
 #include "submission.h"
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define PDL_CAPACITY 64
-static _Atomic(CUfunction) pdl_functions[PDL_CAPACITY];
-static atomic_uint pdl_count;
 #ifdef _WIN32
 static __declspec(thread) int pdl_selected;
 #else
@@ -300,17 +298,7 @@ void euhedral_cuda_pdl_select(int enabled) {
 }
 
 void euhedral_cuda_pdl_register(CUfunction function) {
-    if (function == NULL) return;
-    unsigned int slot = atomic_fetch_add(&pdl_count, 1u);
-    if (slot < PDL_CAPACITY) atomic_store(&pdl_functions[slot], function);
-}
-
-static int pdl_registered(CUfunction function) {
-    unsigned int count = atomic_load(&pdl_count);
-    if (count > PDL_CAPACITY) count = PDL_CAPACITY;
-    for (unsigned int index = 0; index < count; index++)
-        if (atomic_load(&pdl_functions[index]) == function) return 1;
-    return 0;
+    euhedral_pdl_registry_add(function);
 }
 
 CUresult euhedral_launch_kernel(CUfunction function, unsigned int grid_x, unsigned int grid_y, unsigned int grid_z,
@@ -319,7 +307,7 @@ CUresult euhedral_launch_kernel(CUfunction function, unsigned int grid_x, unsign
     if (extra != NULL)
         return cuLaunchKernel(function, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_bytes, stream,
                 parameters, extra);
-    const int overlappable = stream != NULL && pdl_registered(function);
+    const int overlappable = stream != NULL && euhedral_pdl_registry_contains(function);
     return euhedral_submit_kernel(function, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_bytes, stream,
             parameters, overlappable && pdl_selected, overlappable);
 }

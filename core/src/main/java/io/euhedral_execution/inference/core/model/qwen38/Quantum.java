@@ -870,6 +870,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             this.draftTokenWrite,
             this.writesCurrentToken ? 1 : 0,
             AttentionLaunchGeometry.of(
+                    this.gpu.fusedVerifyFrom(),
                     config.numAttentionHeads() / config.numKeyValueHeads(),
                     attention.format(),
                     this.startPosition,

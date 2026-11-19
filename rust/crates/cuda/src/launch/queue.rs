@@ -254,9 +254,11 @@ mod tests {
     use crate::DevicePtr;
     use crate::kernel;
     use crate::launch::catalog::Arguments;
-    use crate::launch::nvfp4::{Nvfp4Layout, Nvfp4Operands, nvfp4_byte_size, plan_native};
+    use crate::launch::nvfp4::{Nvfp4Layout, Nvfp4Operands, nvfp4_byte_size, plan_native, skinny_target_ctas};
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
+
+    const TARGET_CTAS: u64 = skinny_target_ctas(70);
 
     thread_local! {
         /// Allocations (and growths) made by this thread.
@@ -382,7 +384,7 @@ mod tests {
             out_features,
             weights_byte_size: nvfp4_byte_size(out_features, in_features, layout),
         };
-        let plan = plan_native(&operands, at(scratch), u64::MAX, false).unwrap();
+        let plan = plan_native(&operands, at(scratch), u64::MAX, TARGET_CTAS, false).unwrap();
         let tile = plan.launches().last().unwrap();
         assert_eq!(tile.args.map_count(), 3);
         tile.args
@@ -459,7 +461,7 @@ mod tests {
             out_features,
             weights_byte_size: nvfp4_byte_size(out_features, in_features, Nvfp4Layout::Plain),
         };
-        *plan_native(&operands, at(0x4000), u64::MAX, false)
+        *plan_native(&operands, at(0x4000), u64::MAX, TARGET_CTAS, false)
             .unwrap()
             .launches()
             .last()

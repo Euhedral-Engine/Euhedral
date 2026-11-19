@@ -27,6 +27,7 @@ use euhedral_gpu::{CompileOptions, GpuError, Kernel, KernelOptions, Module as _,
 use thiserror::Error;
 
 use crate::CudaLibrary;
+use crate::launch::Dispatch;
 use crate::launch::catalog::{KERNELS, KernelId, Module, TensorMapPlan, ids};
 
 /// The stack of the thread that compiles a module, in bytes unless the caller sets another: the native loader's own
@@ -194,12 +195,18 @@ pub struct KernelTable {
     timings: Vec<ModuleTiming>,
     architecture_target: bool,
     maps: TensorMapCache,
+    dispatch: Dispatch,
 }
 
 impl KernelTable {
     /// The table's cache of encoded tensor maps.
     pub(crate) fn tensor_maps(&self) -> &TensorMapCache {
         &self.maps
+    }
+
+    /// The launch choices the planners work with.
+    pub fn dispatch(&self) -> &Dispatch {
+        &self.dispatch
     }
 
     pub fn get(&self, kernel: KernelId) -> &Slot {
@@ -217,6 +224,7 @@ impl KernelTable {
             timings: Vec::new(),
             architecture_target,
             maps: TensorMapCache::default(),
+            dispatch: Dispatch::measured(70),
         }
     }
 
@@ -277,6 +285,7 @@ pub struct KernelSources {
     compiler: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     compile_stack: usize,
+    dispatch: Dispatch,
     /// The digest of the installed tree's manifest (every source and header), which names the cache directory.
     manifest: Option<u64>,
 }
@@ -293,12 +302,13 @@ impl KernelSources {
             compiler: bundled_compiler(lib),
             cache_dir: None,
             compile_stack: DEFAULT_COMPILE_STACK_BYTES,
+            dispatch: Dispatch::measured(library.device().sm_count),
             manifest: manifest_digest(product),
         })
     }
 
     /// Sources at explicit places.
-    pub fn new(share: PathBuf, include: PathBuf, compiler: Option<PathBuf>) -> Self {
+    pub fn new(share: PathBuf, include: PathBuf, compiler: Option<PathBuf>, dispatch: Dispatch) -> Self {
         let manifest = share.parent().and_then(Path::parent).and_then(manifest_digest);
         Self {
             share,
@@ -306,6 +316,7 @@ impl KernelSources {
             compiler,
             cache_dir: None,
             compile_stack: DEFAULT_COMPILE_STACK_BYTES,
+            dispatch,
             manifest,
         }
     }
@@ -314,6 +325,14 @@ impl KernelSources {
     #[must_use]
     pub fn with_compile_stack(mut self, bytes: usize) -> Self {
         self.compile_stack = bytes;
+        self
+    }
+
+    /// The launch choices the table plans with (the engine's `kernels.rms-norm-decode-slices` and
+    /// `kernels.fused-verify-from`, and the device's multiprocessors).
+    #[must_use]
+    pub fn with_dispatch(mut self, dispatch: Dispatch) -> Self {
+        self.dispatch = dispatch;
         self
     }
 
@@ -505,6 +524,7 @@ pub fn load(gpu: &Arc<CudaGpu>, sources: &KernelSources) -> Result<KernelTable, 
         timings,
         architecture_target,
         maps: TensorMapCache::default(),
+        dispatch: sources.dispatch,
     })
 }
 
@@ -606,6 +626,7 @@ mod tests {
             PathBuf::from("/p/share/euhedral_cuda"),
             PathBuf::from("/p/cuda/include"),
             None,
+            Dispatch::measured(70),
         )
     }
 
@@ -723,6 +744,19 @@ mod tests {
     }
 
     #[test]
+    fn the_dispatch_is_the_measured_one_until_set() {
+        let measured = Dispatch::measured(70);
+        assert_eq!(measured.rms_norm_decode_slices, 40);
+        assert_eq!(measured.fused_verify_from[2], 49152);
+        assert_eq!(measured.skinny_target_ctas(), 140);
+        let set = Dispatch {
+            rms_norm_decode_slices: 8,
+            ..measured
+        };
+        assert_eq!(sources().with_dispatch(set).dispatch, set);
+    }
+
+    #[test]
     fn the_catalog_iterates_in_order_with_its_slots() {
         let table = KernelTable {
             slots: KERNELS
@@ -732,6 +766,7 @@ mod tests {
             timings: Vec::new(),
             architecture_target: false,
             maps: TensorMapCache::default(),
+            dispatch: Dispatch::measured(70),
         };
         assert_eq!(table.iter().count(), KERNELS.len());
         assert!(table.iter().enumerate().all(|(index, (id, _))| id.index() == index));
