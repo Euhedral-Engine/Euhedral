@@ -1,6 +1,6 @@
-//! The pseudo-random generators of the Java standard library, drawn exactly as Java draws them: `java.util.Random`
-//! and `java.util.SplittableRandom`. A seed picks the same numbers here as in Java, so corpora, noise and search
-//! orders are reproducible across the two.
+//! Seeded pseudo-random generators in the style of the Java standard library's `java.util.Random` and
+//! `java.util.SplittableRandom`: a seed gives the same draws every time. No test pins the sequence of a seed; a consumer
+//! that needs it adds its own.
 
 mod fdlibm;
 

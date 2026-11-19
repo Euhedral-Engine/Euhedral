@@ -175,21 +175,131 @@ fn a_registry_that_recorded_nothing_exports_every_series() {
     let mut expected: Vec<(String, String)> = SERIES.iter().map(|(n, k)| (n.to_string(), k.to_string())).collect();
     expected.sort();
     assert_eq!(declared(&text), expected);
-    // Each series has a sample line.
-    for (name, _) in SERIES {
-        assert!(text.lines().any(|line| line.starts_with(name)), "{name} has a sample");
+    // Each series has a sample under its own full name (a histogram under its `_count`), at zero.
+    for (name, kind) in SERIES {
+        let sample = if kind == "histogram" {
+            format!("{name}_count")
+        } else {
+            name.to_string()
+        };
+        let zero = if name.ends_with("_info") || name == "euhedral_engine_info" {
+            1.0
+        } else {
+            0.0
+        };
+        let wanted = if name == "euhedral_engine_context_tokens" {
+            4096.0
+        } else {
+            zero
+        };
+        assert_eq!(value(&text, &sample, &[]), wanted, "{sample}");
     }
 }
 
+/// Whether `found` is `wanted` to the precision a printed double keeps.
+fn near(found: f64, wanted: f64) -> bool {
+    (found - wanted).abs() <= 1e-9 * wanted.abs().max(1.0)
+}
+
 #[test]
-fn recordings_keep_the_same_series_and_show_in_the_samples() {
+fn every_series_reads_its_own_field() {
     let metrics = Metrics::new(3, 0);
     let idle = metrics.render("m1", 4096, &report(true), 0);
     record_everything(&metrics);
     let text = metrics.render("m1", 4096, &report(true), 0);
     assert_eq!(declared(&text), declared(&idle), "recording adds and drops no series");
-    assert_ne!(text, idle, "the recordings are in the text");
-    assert_eq!(declared(&text).len(), SERIES.len());
+    let read = |name: &str| value(&text, name, &[]);
+
+    // The engine and the prefix cache: each field of the report has its own value.
+    for (name, wanted) in [
+        ("euhedral_engine_info", 1.0),
+        ("euhedral_engine_context_tokens", 4096.0),
+        ("euhedral_engine_workers", 7.0),
+        ("euhedral_engine_device_allocated_bytes", 1_234_567_890_123.0),
+        ("euhedral_engine_device_free_bytes", 98_765_432_100.0),
+        ("euhedral_engine_host_backed_weight_bytes", 555.0),
+        ("euhedral_engine_pinned_pool_bytes", 777.0),
+        ("euhedral_engine_pinned_pool_overflows_total", 9.0),
+        ("euhedral_prefix_lookups_total", 100.0),
+        ("euhedral_prefix_hits_total", 60.0),
+        ("euhedral_prefix_restored_tokens_total", 4096.0),
+        ("euhedral_prefix_captures_total", 30.0),
+        ("euhedral_prefix_skipped_total", 3.0),
+        ("euhedral_prefix_failed_total", 1.0),
+        ("euhedral_prefix_evictions_total", 12.0),
+        ("euhedral_prefix_restores_total", 59.0),
+        ("euhedral_prefix_capture_seconds_total", 1.5),
+        ("euhedral_prefix_restore_seconds_total", 0.25),
+        ("euhedral_prefix_nodes", 17.0),
+        ("euhedral_prefix_used_bytes", (1u64 << 30) as f64),
+        ("euhedral_prefix_capacity_bytes", (1u64 << 33) as f64),
+        ("euhedral_generations_active", 2.0),
+        ("euhedral_generations_queued", 5.0),
+    ] {
+        assert_eq!(read(name), wanted, "{name}");
+    }
+
+    // The token counters are the sums of what `record_everything` gave each generation.
+    let (mut prompt, mut cached, mut completion, mut reasoning) = (0.0, 0.0, 0.0, 0.0);
+    let (mut wait_max, mut duration_max) = ([0u64; 3], [0u64; 3]);
+    let (mut to_first_max, mut prefill_max, mut decode_max) = (0u64, 0f64, 0f64);
+    for api_at in 0..3u64 {
+        for at in 0..4u64 {
+            prompt += (50 + 7 * api_at + at) as f64;
+            cached += (10 + at) as f64;
+            completion += (20 + 3 * api_at + at) as f64;
+            if at % 2 == 0 {
+                reasoning += (5 + api_at) as f64;
+            }
+            let wait = 12_345_678 * (api_at + 1);
+            let to_first = 87_654_321 * (at + 1);
+            let decoding = 1_234_567_890 * (at + 1);
+            wait_max[api_at as usize] = wait_max[api_at as usize].max(wait);
+            duration_max[api_at as usize] = duration_max[api_at as usize].max(wait + to_first + decoding);
+            to_first_max = to_first_max.max(to_first);
+            prefill_max = prefill_max.max((40 + 7 * api_at) as f64 * 1e9 / to_first as f64);
+            decode_max = decode_max.max((19 + 3 * api_at + at) as f64 * 1e9 / decoding as f64);
+        }
+    }
+    for (name, wanted) in [
+        ("euhedral_prompt_tokens_total", prompt),
+        ("euhedral_prompt_cached_tokens_total", cached),
+        ("euhedral_prompt_prefilled_tokens_total", prompt - cached),
+        ("euhedral_completion_tokens_total", completion),
+        ("euhedral_reasoning_tokens_total", reasoning),
+        ("euhedral_speculative_verifications_total", 10.0),
+        ("euhedral_speculative_accepted_tokens_total", 20.0),
+        ("euhedral_prefill_tokens_per_second_max", prefill_max),
+        ("euhedral_decode_tokens_per_second_max", decode_max),
+    ] {
+        assert!(near(read(name), wanted), "{name}: {} against {wanted}", read(name));
+    }
+    // One finish per api and reason; each api's largest times.
+    for (api_at, api) in Api::ALL.into_iter().enumerate() {
+        let label = format!("api=\"{}\"", api.label());
+        for reason in ["end", "stop_sequence", "length", "tool_calls"] {
+            let reason = format!("reason=\"{reason}\"");
+            assert_eq!(
+                value(&text, "euhedral_finishes_total", &[&label, &reason]),
+                1.0,
+                "{label} {reason}"
+            );
+        }
+        let seconds = |nanos: u64| nanos as f64 / 1e9;
+        let found = |name: &str| value(&text, name, &[&label]);
+        assert!(near(
+            found("euhedral_queue_wait_seconds_max"),
+            seconds(wait_max[api_at])
+        ));
+        assert!(near(
+            found("euhedral_request_duration_seconds_max"),
+            seconds(duration_max[api_at])
+        ));
+        assert!(near(
+            found("euhedral_time_to_first_token_seconds_max"),
+            seconds(to_first_max)
+        ));
+    }
 }
 
 #[test]

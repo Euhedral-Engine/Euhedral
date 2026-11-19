@@ -118,7 +118,7 @@ fn a_row_carries_every_field_the_comparison_tool_reads() {
         let speculated = row.work.speculative.is_some();
         let value: Value = serde_json::from_str(&row.to_json()).unwrap();
         assert!(value["warmup"].is_boolean());
-        assert!(value["status"].is_string());
+        assert_eq!(value["status"], "success");
         assert!(value["iteration"].is_u64());
         assert!(value["scenario"]["name"].is_string());
         assert!(value["scenario"]["promptSha256"].is_string());

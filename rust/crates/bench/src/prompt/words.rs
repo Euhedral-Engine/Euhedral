@@ -161,7 +161,8 @@ mod tests {
     #[test]
     fn words_come_from_the_list_in_draw_order() {
         let built = build(8, DEFAULT_SEED, count).unwrap();
-        // The first 16 draws for this seed are the indices in the java_random tests of the quantization crate.
+        // The indices are the first draws of the generator for this seed; this test fixes them, as the order the words
+        // are drawn in.
         let expected: Vec<&str> = [36, 49, 6, 25, 30, 62, 47, 44]
             .iter()
             .map(|index| WORDS[*index])
