@@ -269,7 +269,8 @@ impl JsonValue {
     }
 
     /// As [`parse`](JsonValue::parse), except that a string value with an unpaired surrogate escape keeps it, as a
-    /// [`JsonValue::Utf16String`]. Object keys still read an unpaired surrogate as U+FFFD.
+    /// [`JsonValue::Utf16String`]. An object with such a key keeps it too: the object is a
+    /// [`JsonValue::Utf16Object`], so a caller that inspects objects must match both `Object` and `Utf16Object`.
     pub fn parse_keeping_unpaired(text: &str) -> Option<JsonValue> {
         JsonValue::read(text, false, true)
     }
@@ -563,7 +564,7 @@ struct Parser<'a> {
     position: usize,
     /// A repeated object key ends the parse.
     distinct: bool,
-    /// String values keep unpaired surrogates as UTF-16 code units.
+    /// String values and object keys keep unpaired surrogates as UTF-16 code units.
     keep_unpaired: bool,
     /// The longest string value, in UTF-16 code units; a longer one ends the parse.
     max_string_units: usize,
@@ -1067,6 +1068,14 @@ mod tests {
             JsonValue::parse(r#"{"\ud800":1}"#).unwrap().to_compact_string(),
             "{\"\u{fffd}\":1}"
         );
+    }
+
+    #[test]
+    fn a_wide_object_replaces_repeated_plain_keys_and_escapes_its_lone_key() {
+        let kept = |text: &str| JsonValue::parse_keeping_unpaired(text).unwrap().to_compact_string();
+        assert_eq!(kept(r#"{"a":1,"\ud800":2,"a":3}"#), r#"{"a":3,"\uD800":2}"#);
+        // The quote and the control character in the key are escaped as in any key.
+        assert_eq!(kept(r#"{"\"\ud800\n":1}"#), r#"{"\"\uD800\n":1}"#);
     }
 
     #[test]

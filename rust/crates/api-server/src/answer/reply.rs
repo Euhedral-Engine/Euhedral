@@ -306,6 +306,12 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_input_keeps_an_unpaired_surrogate_in_a_key_as_its_escape() {
+        let input = tool_input(r#"{"v":{"\uD800":1,"a":2}}"#);
+        assert_eq!(input.to_compact_string(), r#"{"v":{"\uD800":1,"a":2}}"#);
+    }
+
+    #[test]
     fn a_signature_is_the_url_safe_unpadded_digest() {
         // SHA-256 of the empty text is e3b0c442 98fc1c14 9afbf4c8 996fb924 27ae41e4 649b934c a495991b 7852b855.
         assert_eq!(signature(""), "euhedral-47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU");
