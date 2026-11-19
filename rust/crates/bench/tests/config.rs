@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::time::{Duration, UNIX_EPOCH};
 
 use euhedral_inference_bench::config::{ConfigError, Options, Scenario, ScenarioKind, SpeculationMode};
+use euhedral_inference_bench::cpus::CpuSelection;
 use euhedral_inference_bench::prompt::PromptCorpus;
 use euhedral_inference_bench::run::generation;
 use euhedral_inference_engine::sampling::SamplingConfig;
@@ -43,14 +44,11 @@ fn parses_java_benchmark_configs() {
         }
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let result = Options::load(&path, UNIX_EPOCH);
+        let options = result.unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert!(!options.scenarios.is_empty(), "{name}");
         if name == "custom-cpus.json" {
-            // The one file that restricts the workers: refused, naming the setting.
-            let ConfigError::Invalid(message) = result.expect_err("custom-cpus.json restricts the workers");
-            assert!(message.contains("cpus must be \"all\""), "{message}");
-            assert!(message.contains(&name), "the message names the file: {message}");
-        } else {
-            let options = result.unwrap_or_else(|error| panic!("{name}: {error}"));
-            assert!(!options.scenarios.is_empty(), "{name}");
+            assert_eq!(options.cpus, CpuSelection::PerformanceOnePerCore);
+            assert_eq!(options.exclude_cores, [0]);
         }
         seen += 1;
     }
@@ -129,21 +127,27 @@ fn what_the_engine_cannot_do_is_refused_with_the_reason() {
     );
     assert!(parse(&with(r#", "prefixCacheBytes": 0"#)).is_ok());
 
-    for cpus in ["one-per-core", "performance", "performance-one-per-core", "2-5,8"] {
-        let message = parse(&with(&format!(r#", "cpus": "{cpus}""#))).unwrap_err();
-        assert!(
-            message.contains("cpus must be \"all\"") && message.contains(cpus),
-            "{message}"
-        );
+    for cpus in [
+        "one-per-core",
+        "performance",
+        "performance-one-per-core",
+        "2-5,8",
+        " all ",
+    ] {
+        assert!(parse(&with(&format!(r#", "cpus": "{cpus}""#))).is_ok(), "{cpus}");
     }
-    assert!(parse(&with(r#", "cpus": " all ""#)).is_ok());
+    for cpus in ["fast", "5-2", "1,,2"] {
+        let message = parse(&with(&format!(r#", "cpus": "{cpus}""#))).unwrap_err();
+        assert!(message.contains("cpus must be") && message.contains(cpus), "{message}");
+    }
     for key in ["excludeCpus", "excludeCores"] {
-        let message = parse(&with(&format!(r#", "{key}": [0]"#))).unwrap_err();
+        assert!(parse(&with(&format!(r#", "{key}": [0, 3]"#))).is_ok());
+        assert!(parse(&with(&format!(r#", "{key}": []"#))).is_ok());
+        let message = parse(&with(&format!(r#", "{key}": [-1]"#))).unwrap_err();
         assert!(
-            message.contains(key) && message.contains("never restricts"),
+            message.contains(key) && message.contains("must not be negative"),
             "{message}"
         );
-        assert!(parse(&with(&format!(r#", "{key}": []"#))).is_ok());
     }
 
     assert_eq!(

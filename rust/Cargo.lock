@@ -441,6 +441,7 @@ version = "0.1.0"
 dependencies = [
  "euhedral-core",
  "euhedral-graph",
+ "euhedral-hardware-utils",
  "euhedral-hashing",
  "euhedral-inference-edrl",
  "euhedral-inference-engine",
