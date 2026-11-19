@@ -12,6 +12,7 @@
 //! the artifact file. A plan that does not fit even then is refused with the bytes it needed and the bytes there
 //! were, naming the memory that is short.
 
+use euhedral_inference_cuda::launch::nvfp4::nvfp4_native_scratch_bytes;
 use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFormat, WeightLayout};
 use euhedral_inference_settings::{Auto, BatchingSettings, KvFormat, Settings};
 
@@ -134,7 +135,9 @@ pub struct ResidencyPlan {
     /// (`LinearFormat.decodeScratchBytes`).
     pub decode_scratch_bytes: u64,
     /// The device bytes the runtime reserves beyond the weights, the cache and the scratch (`memory.runtime-reserve`):
-    /// the execution workspace, the first sequence's state and what the kernel modules take.
+    /// the execution workspace, the decode scratch, the first sequence's state, the MTP layer's cache at the longest
+    /// context and what the kernel modules take. At least what the settings make the first four of these need,
+    /// whatever the setting says.
     pub runtime_reserve_bytes: u64,
     /// The device bytes the plan reserves in all: the weights, every sequence's cache, the runtime's reserve, the
     /// scratch and the state of the sequences beyond the first.
@@ -375,13 +378,14 @@ pub fn plan_closest(
     );
     let thresholds = trellis_thresholds(settings, inputs.multiprocessors);
     let widest = inputs.multiprocessors.is_none();
-    let scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::Plan);
+    let scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::Plan)
+        .max(nvfp4_native_scratch(&device, chunk));
     let decode_scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::TensorCore);
 
     let available = inputs
         .device_free
         .min(settings.memory.gpu_limit.value().map_or(u64::MAX, |size| size.bytes()));
-    let runtime_reserve = settings
+    let reserve_setting = settings
         .memory
         .runtime_reserve
         .value()
@@ -395,6 +399,26 @@ pub fn plan_closest(
     let region = host_pages * page;
     let spilled = (region * config.attention_layers() as u64).saturating_mul(sequences);
     let verified_rows = if draft_depth > 0 { 1 + draft_depth as u64 } else { 0 };
+    // The runtime reserve pays for what the settings make grow: the workspace's slots (with the rows of a pass), the
+    // decode scratch, the first sequence's state and the MTP layer's cache at the longest context. When they are
+    // more than the setting, the reserve is what they need: admission counts it and the account refuses less.
+    let first_state = footprint::first_state_bytes(config, kv_format, verified_rows, draft_depth > 0, chunk);
+    let mtp_cache = if draft_depth > 0 {
+        footprint::mtp_cache_bytes(config, kv_format, max_tokens)
+    } else {
+        0
+    };
+    let reserve_demand = workspace_bytes
+        .saturating_add(decode_scratch_bytes)
+        .saturating_add(first_state)
+        .saturating_add(mtp_cache);
+    let runtime_reserve = reserve_setting.max(reserve_demand);
+    if reserve_demand > reserve_setting {
+        log::info!(
+            "the runtime reserve is raised from {reserve_setting} to {reserve_demand} bytes: the workspace, the decode \
+             scratch, the first sequence's state and the MTP cache need that much at these settings"
+        );
+    }
     let extra = if sequences > 1 {
         footprint::extra_sequence_bytes(config, kv_format, max_tokens, verified_rows, draft_depth > 0, chunk)
     } else {
@@ -833,6 +857,20 @@ fn trellis_scratch(
     largest
 }
 
+/// The largest scratch the NVFP4 native route needs for any NVFP4 object of `placements` at `rows` rows: the one
+/// the workspace's first scratch region is sized by, when it is larger than the trellis routes'.
+fn nvfp4_native_scratch(placements: &[Placement], rows: u64) -> u64 {
+    placements
+        .iter()
+        .filter(|placement| placement.format == WeightFormat::Nvfp4)
+        .filter_map(|placement| match placement.shape.as_slice() {
+            [out, input] => Some(nvfp4_native_scratch_bytes(rows, *input, *out)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 fn align(value: u64) -> u64 {
     value.div_ceil(ARENA_ALIGNMENT) * ARENA_ALIGNMENT
 }
@@ -982,6 +1020,39 @@ pub mod nvfp4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn nvfp4(shape: &[u64]) -> Placement {
+        Placement {
+            name: "object".to_string(),
+            source: PlacementSource::Object,
+            shape: shape.to_vec(),
+            dtype: TensorDataType::Bf16,
+            format: WeightFormat::Nvfp4,
+            layout: WeightLayout::RowInterleavedNvfp4V1,
+            file_offset: 0,
+            bytes: 0,
+            offset: 0,
+            tier: Tier::Device,
+        }
+    }
+
+    /// An artifact with no trellis objects has the native route's scratch as its first region: the largest of its
+    /// NVFP4 objects at the chunk's rows, which only the NVFP4 objects decide.
+    #[test]
+    fn the_native_scratch_is_the_largest_of_the_nvfp4_objects_and_nothing_else_decides_it() {
+        let objects = [nvfp4(&[4096, 1024]), nvfp4(&[1024, 17_408]), nvfp4(&[8, 8, 8])];
+        let scratch = nvfp4_native_scratch(&objects, 512);
+        assert_eq!(
+            scratch,
+            nvfp4_native_scratch_bytes(512, 1024, 4096).max(nvfp4_native_scratch_bytes(512, 17_408, 1024))
+        );
+        assert!(scratch > 0);
+        assert!(nvfp4_native_scratch(&objects, 2048) > scratch);
+        let mut other = nvfp4(&[4096, 1024]);
+        other.format = WeightFormat::Trellis;
+        assert_eq!(nvfp4_native_scratch(&[other], 512), 0);
+        assert_eq!(nvfp4_native_scratch(&[], 512), 0);
+    }
 
     /// The decision before the memory planner made it: device bytes against the budget, the spill when the host
     /// holds it.
