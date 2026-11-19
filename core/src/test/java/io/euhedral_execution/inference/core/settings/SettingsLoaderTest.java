@@ -136,7 +136,8 @@ class SettingsLoaderTest {
         assertEquals(40, defaults.rmsNormSlices());
         assertEquals(KernelSettings.DEFAULT_FUSED_VERIFY_FROM, defaults.fusedVerifyFromOrDefault());
         KernelSettings set = load(
-                        MODEL + "kernels:\n  rms-norm-decode-slices: 16\n  fused-verify-from: never,never,1,2,3,4,5,6,7\n",
+                        MODEL
+                                + "kernels:\n  rms-norm-decode-slices: 16\n  fused-verify-from: never,never,1,2,3,4,5,6,7\n",
                         Map.of())
                 .kernels();
         assertEquals(16, set.rmsNormSlices());

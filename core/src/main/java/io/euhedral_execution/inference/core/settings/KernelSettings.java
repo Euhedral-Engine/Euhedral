@@ -34,10 +34,8 @@ public record KernelSettings(
         Objects.requireNonNull(trellis, "trellis");
         Objects.requireNonNull(rmsNormDecodeSlices, "rmsNormDecodeSlices");
         if (rmsNormDecodeSlices.isPresent()
-                && (rmsNormDecodeSlices.getAsInt() < 1
-                        || rmsNormDecodeSlices.getAsInt() > MAX_RMS_NORM_DECODE_SLICES))
-            throw new IllegalArgumentException(
-                    "rms-norm-decode-slices must be 1 to " + MAX_RMS_NORM_DECODE_SLICES);
+                && (rmsNormDecodeSlices.getAsInt() < 1 || rmsNormDecodeSlices.getAsInt() > MAX_RMS_NORM_DECODE_SLICES))
+            throw new IllegalArgumentException("rms-norm-decode-slices must be 1 to " + MAX_RMS_NORM_DECODE_SLICES);
         Objects.requireNonNull(fusedVerifyFrom, "fusedVerifyFrom");
         fusedVerifyFrom = fusedVerifyFrom.map(List::copyOf);
         fusedVerifyFrom.ifPresent(table -> {

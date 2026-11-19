@@ -28,7 +28,8 @@ class AttentionLaunchGeometryTest {
     @Test
     void thresholdsAreThoseOfTheNativeDispatch() {
         for (int rows = 2; rows <= 8; rows++)
-            assertEquals(FUSED_FROM_BY_ROWS[rows - 2], AttentionLaunchGeometry.fusedFrom(DEFAULT, rows), "rows " + rows);
+            assertEquals(
+                    FUSED_FROM_BY_ROWS[rows - 2], AttentionLaunchGeometry.fusedFrom(DEFAULT, rows), "rows " + rows);
         assertEquals(Long.MAX_VALUE, AttentionLaunchGeometry.fusedFrom(DEFAULT, 0));
         assertEquals(Long.MAX_VALUE, AttentionLaunchGeometry.fusedFrom(DEFAULT, 1));
         assertEquals(Long.MAX_VALUE, AttentionLaunchGeometry.fusedFrom(DEFAULT, 9));
@@ -104,7 +105,8 @@ class AttentionLaunchGeometryTest {
 
     @Test
     void aConfiguredTableMovesWhereTheKeyStartsTheFusedVerifier() {
-        // Four rows: the default starts the fused kernel at 4096 keys, an earlier table at 2048, a never entry not at all.
+        // Four rows: the default starts the fused kernel at 4096 keys, an earlier table at 2048, a never entry not at
+        // all.
         List<Long> early = new ArrayList<>(DEFAULT);
         early.set(4, 2048L);
         List<Long> never = new ArrayList<>(DEFAULT);

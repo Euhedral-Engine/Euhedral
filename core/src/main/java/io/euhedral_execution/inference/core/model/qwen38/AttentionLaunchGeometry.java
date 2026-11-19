@@ -7,7 +7,8 @@ import java.util.List;
 /// What the host dispatch of multi-row decode attention (`attention_causal` in
 /// `native/src/host/qwen_layer_ops.c`) chooses from a quantum's rows and positions: the split counts that size
 /// its launches, and whether the fused verifier kernel serves the rows. A captured graph replays the launches
-/// recorded for one choice, so the capture key holds all of it; the values here repeat the C code's, and the fused table is the one the native library was given.
+/// recorded for one choice, so the capture key holds all of it; the values here repeat the C code's, and the fused
+/// table is the one the native library was given.
 final class AttentionLaunchGeometry {
 
     /// Keys from which the rows use the GQA kernels, for query-head groups up to [#MAX_GROUP]
