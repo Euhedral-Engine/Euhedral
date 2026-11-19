@@ -79,7 +79,8 @@ fn dechunk(wire: &str) -> String {
     let mut out = String::new();
     let mut rest = wire;
     while let Some((size, tail)) = rest.split_once("\r\n") {
-        let size = usize::from_str_radix(size.trim(), 16).expect("a chunk size");
+        let size = usize::from_str_radix(size.trim(), 16)
+            .unwrap_or_else(|error| panic!("chunk size {size:?}: {error}; the wire was {wire:?}"));
         if size == 0 {
             break;
         }
@@ -942,6 +943,18 @@ fn the_chunking_of_the_generated_text_does_not_change_the_stream() {
     assert!(seen[0].1.starts_with("Hello"), "{:?}", seen[0].1);
     assert!(!seen[0].1.contains("STOP"));
     fx.finish();
+}
+
+#[test]
+fn a_character_cut_by_the_end_of_a_read_is_kept_for_the_next() {
+    let bytes = "wor\u{e9}ld".as_bytes();
+    let cut = bytes.iter().position(|byte| *byte == 0xc3).expect("the lead byte") + 1;
+    let mut held = Vec::new();
+    let mut text = common::utf8_text(&mut held, &bytes[..cut]);
+    assert_eq!(text, "wor");
+    text.push_str(&common::utf8_text(&mut held, &bytes[cut..]));
+    assert_eq!(text, "wor\u{e9}ld");
+    assert!(held.is_empty());
 }
 
 // Keep-alive.
