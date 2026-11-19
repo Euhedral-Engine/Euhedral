@@ -599,10 +599,10 @@ mod tests {
         for code in 0..k.pow(n as u32) {
             let (mut rest, mut bytes) = (code, 0);
             let mut pick = vec![0; n];
-            for i in 0..n {
-                pick[i] = rest % k;
+            for (slot, costs) in pick.iter_mut().zip(&instance.cost) {
+                *slot = rest % k;
                 rest /= k;
-                bytes += instance.cost[i][pick[i]];
+                bytes += costs[*slot];
             }
             if bytes <= instance.budget {
                 best = best.min(instance.objective.value(&one_hot(&pick, k)));
