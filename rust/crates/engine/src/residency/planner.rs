@@ -136,9 +136,11 @@ pub struct ResidencyPlan {
     pub decode_scratch_bytes: u64,
     /// The device bytes the runtime reserves beyond the weights, the cache and the scratch (`memory.runtime-reserve`):
     /// the execution workspace, the decode scratch, the first sequence's state, the MTP layer's cache at the longest
-    /// context and what the kernel modules take. At least what the settings make the first four of these need,
-    /// whatever the setting says.
+    /// context and what the kernel modules take. At least what the settings make these need, whatever the setting
+    /// says, and the modules besides: the startup's claims take the first four, so the modules are left.
     pub runtime_reserve_bytes: u64,
+    /// The part of the reserve the kernel modules take (`PlanInputs::module_bytes`): nothing claims it.
+    pub module_bytes: u64,
     /// The device bytes the plan reserves in all: the weights, every sequence's cache, the runtime's reserve, the
     /// scratch and the state of the sequences beyond the first.
     pub device_bytes: u64,
@@ -259,6 +261,10 @@ pub struct PlanInputs {
     pub host_pinned_bytes: Option<u64>,
     /// The sequences to size for (at least 1).
     pub sequences: usize,
+    /// The device bytes the kernel modules take beyond what `device_free` already excludes: what the driver
+    /// materialises from the loaded modules after the plan is admitted, measured on the device before planning
+    /// (`Core::module_bytes`). The runtime reserve holds them besides the demand of the settings.
+    pub module_bytes: u64,
 }
 
 /// Plans residency for `config`'s model in an artifact with `table`, on a device with `device_free` bytes free and
@@ -286,6 +292,7 @@ pub fn plan(
             multiprocessors: None,
             host_pinned_bytes,
             sequences: 1,
+            module_bytes: 0,
         },
     )
 }
@@ -408,15 +415,20 @@ pub fn plan_closest(
     } else {
         0
     };
+    // The kernel modules load into the device after the claims are taken and are paid from what the claims leave, so
+    // they are a term of the demand: a reserve raised to the claims alone would leave them nothing.
     let reserve_demand = workspace_bytes
         .saturating_add(decode_scratch_bytes)
         .saturating_add(first_state)
-        .saturating_add(mtp_cache);
+        .saturating_add(mtp_cache)
+        .saturating_add(inputs.module_bytes);
     let runtime_reserve = reserve_setting.max(reserve_demand);
     if reserve_demand > reserve_setting {
         log::info!(
             "the runtime reserve is raised from {reserve_setting} to {reserve_demand} bytes: the workspace, the decode \
-             scratch, the first sequence's state and the MTP cache need that much at these settings"
+             scratch, the first sequence's state, the MTP cache and the kernel modules ({} bytes) need that much at \
+             these settings",
+            inputs.module_bytes
         );
     }
     let extra = if sequences > 1 {
@@ -532,6 +544,7 @@ pub fn plan_closest(
             scratch_bytes,
             decode_scratch_bytes,
             runtime_reserve_bytes: layout.runtime_reserve,
+            module_bytes: inputs.module_bytes,
             device_bytes,
             budget_bytes: available,
             kv_format,

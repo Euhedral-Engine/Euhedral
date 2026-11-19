@@ -160,6 +160,9 @@ pub(crate) struct Core {
     pub(crate) released: Arc<ReleasedBuffers>,
     /// Pinned host bytes the load may use.
     pub(crate) host_pinned_bytes: Option<u64>,
+    /// The device bytes the kernel modules took when they loaded, measured before the plan: the plan's reserve holds
+    /// them besides its claims.
+    pub(crate) module_bytes: u64,
     /// The memory planner's account: the plan is admitted against it and every allocation of the startup holds a claim
     /// from it. Closed by the runtime's release, which reports what is still held.
     pub(crate) account: MemoryAccount,
@@ -306,6 +309,11 @@ pub struct StartupReport {
     pub admitted: LocationBytes,
     /// Bytes in use on the device when the model became ready (the whole device's, every process).
     pub device_bytes_in_use: u64,
+    /// The device bytes the kernel modules took when they loaded, which the plan's reserve holds besides its claims.
+    pub module_bytes: u64,
+    /// The device bytes the warm-up's launches took after the weights were loaded: what the driver materialised from
+    /// the modules, plus whatever other processes allocated meanwhile.
+    pub warmup_bytes: u64,
     /// Pinned bytes the staging pool holds at ready: the upload's ring and the cache's table staging.
     pub pinned_staging_bytes: u64,
     /// Pinned bytes the pool had to allocate while the upload ran; 0, because the ring is acquired before it.
@@ -1046,10 +1054,16 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
     // The device RustEE's lanes and kernels are on: the one the native library bound.
     let gpu = open_device(&library)?;
     let loading = Instant::now();
+    let free_before = library.free_bytes().ok();
     let sources = kernel_sources(&library, settings).map_err(|error| runtime("the kernels would not load", &error))?;
     let kernels = Arc::new(load(&gpu, &sources).map_err(|error| runtime("the kernels would not compile", &error))?);
+    // What the modules took from the device, once per startup and before the plan: the device-wide drop of the free bytes
+    // across the load. Another process allocating meanwhile only raises it, which keeps more reserve.
+    let module_bytes = free_before
+        .zip(library.free_bytes().ok())
+        .map_or(0, |(before, after)| before.saturating_sub(after));
     log::info!(
-        "the kernels compiled and loaded in {:.2} s",
+        "the kernels compiled and loaded in {:.2} s, taking {module_bytes} device bytes",
         loading.elapsed().as_secs_f64()
     );
 
@@ -1096,6 +1110,7 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         pool,
         released: Arc::new(ReleasedBuffers::new()),
         host_pinned_bytes,
+        module_bytes,
         account,
         pool_bytes,
         started,

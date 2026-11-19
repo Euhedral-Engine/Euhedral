@@ -526,6 +526,7 @@ fn plan(mut startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32
                 multiprocessors: Some(core.library.device().sm_count),
                 host_pinned_bytes: core.host_pinned_bytes,
                 sequences: 1,
+                module_bytes: core.module_bytes,
             };
             let sequences = resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)?;
             let sequences = core.hold_sequences(sequences);
@@ -825,6 +826,7 @@ fn assemble(
                 return startup.fail(error);
             }
         };
+        let free_before_warmup = startup.core.library.free_bytes().ok();
         let (warmed, marker) = warmup::run(&startup.core, &artifact.config, &weights, &workspace);
         let core = Arc::clone(&startup.core);
         let (completions, stages) = (Arc::clone(&core.completions), Arc::clone(&core.stages));
@@ -835,6 +837,10 @@ fn assemble(
                 .free_bytes()
                 .map(|free| core.library.device().total_bytes.saturating_sub(free))
                 .unwrap_or(0);
+            // What the first launches took from the device after the plan was admitted (the device's, every process).
+            let warmup_bytes = free_before_warmup
+                .zip(core.library.free_bytes().ok())
+                .map_or(0, |(before, after)| before.saturating_sub(after));
             if host_backed_bytes > 0 {
                 log::info!(
                     "weights in pinned host memory: {host_backed_bytes} bytes, {} read in place: {}",
@@ -864,6 +870,8 @@ fn assemble(
                 allocated_bytes: allocated,
                 admitted,
                 device_bytes_in_use: in_use,
+                module_bytes: core.module_bytes,
+                warmup_bytes,
                 pinned_staging_bytes: core.pool.allocated_bytes(),
                 pinned_growth_during_load: stats.pinned_growth,
                 warmed,

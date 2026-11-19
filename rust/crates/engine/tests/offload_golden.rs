@@ -111,6 +111,7 @@ fn the_plans_of_the_reference_planner_are_reproduced_row_for_row() {
             multiprocessors: Some(70),
             host_pinned_bytes: Some(row.host_budget),
             sequences,
+            module_bytes: 0,
         };
         // This engine's resident need for the row's sequence count (one for `auto`): everything on the device.
         let need_for = row.sequences.unwrap_or(1);

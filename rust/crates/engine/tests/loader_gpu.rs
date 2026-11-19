@@ -112,6 +112,13 @@ fn startup_loads_rco_and_reports_ready() {
         report.device_bytes_in_use as f64 / f64::from(1 << 30),
     );
 
+    println!(
+        "the kernel modules took {} bytes of the device; the plan's reserve is {} bytes of which {} are theirs",
+        report.module_bytes, plan.runtime_reserve_bytes, plan.module_bytes
+    );
+    println!("the warm-up took {} bytes of the device", report.warmup_bytes);
+    assert_eq!(plan.module_bytes, report.module_bytes);
+
     // The modules that need only the engine's own buffers were launched once before ready.
     println!(
         "warmed {:?}, not warmed {:?}",

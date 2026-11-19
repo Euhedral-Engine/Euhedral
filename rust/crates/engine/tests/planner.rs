@@ -56,6 +56,7 @@ fn inputs(device_free: u64) -> PlanInputs {
         multiprocessors: Some(70),
         host_pinned_bytes: Some(u64::MAX),
         sequences: 1,
+        module_bytes: 0,
     }
 }
 
@@ -406,6 +407,7 @@ fn reserve_demand(plan: &ResidencyPlan) -> u64 {
         + plan.decode_scratch_bytes
         + footprint::first_sequence_bytes(plan, &config)
         + footprint::mtp_cache_bytes_of(plan, &config)
+        + plan.module_bytes
 }
 
 /// The device bytes that hold `big` with the reserve at its default: `big`'s bytes less what the reserve was raised by.
@@ -450,6 +452,39 @@ fn the_mtp_cache_of_a_long_bf16_context_is_counted_and_a_device_it_overflows_is_
     assert!(admitted_on(&long, big.device_bytes));
     // Enough for everything but the reserve's growth: refused resident now.
     assert!(!admitted_on(&long, counted_before(&big)));
+}
+
+#[test]
+fn the_kernel_modules_are_a_term_of_the_reserve_a_device_of_the_plans_bytes_still_starts() {
+    let mut long = settings(262_144);
+    long.context.kv_cache_format = Auto::Value(KvFormat::Bf16);
+    long.context.kv_cache_on_gpu_tokens = 262_144;
+    let modules = 96 * MIB;
+    let with_modules = |device_free: u64, module_bytes: u64| {
+        let mut inputs = inputs(device_free);
+        inputs.host_pinned_bytes = Some(0);
+        inputs.module_bytes = module_bytes;
+        plan_with(&config(), &rco_table(), &long, inputs)
+    };
+    let without = with_modules(64 * GIB, 0).unwrap();
+    let plan = with_modules(64 * GIB, modules).unwrap();
+    // The reserve is raised by the modules: the claims of the startup leave them room.
+    assert_eq!(plan.module_bytes, modules);
+    assert_eq!(plan.runtime_reserve_bytes, without.runtime_reserve_bytes + modules);
+    assert_eq!(plan.device_bytes, without.device_bytes + modules);
+    let claims = reserve_demand(&plan) - plan.module_bytes;
+    assert_eq!(plan.runtime_reserve_bytes - claims, modules);
+    // A device of exactly the bytes of the plan made without them is not admitted once they are counted.
+    assert!(with_modules(without.device_bytes, 0).is_ok());
+    assert!(with_modules(without.device_bytes, modules).is_err());
+    assert!(with_modules(plan.device_bytes, modules).is_ok());
+    // A setting above the demand and the modules is kept as it is.
+    let mut roomy = long.clone();
+    roomy.memory.runtime_reserve = Auto::Value(ByteSize(plan.runtime_reserve_bytes + GIB));
+    let mut inputs = inputs(64 * GIB);
+    inputs.module_bytes = modules;
+    let kept = plan_with(&config(), &rco_table(), &roomy, inputs).unwrap();
+    assert_eq!(kept.runtime_reserve_bytes, plan.runtime_reserve_bytes + GIB);
 }
 
 #[test]
@@ -531,6 +566,7 @@ fn the_cache_format_follows_the_artifact_unless_the_settings_choose() {
 fn with_sequences(device_free: u64, sequences: usize) -> PlanInputs {
     PlanInputs {
         sequences,
+        module_bytes: 0,
         ..inputs(device_free)
     }
 }

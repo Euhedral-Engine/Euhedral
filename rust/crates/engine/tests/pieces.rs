@@ -232,6 +232,7 @@ fn embedding_offloaded() -> ResidencyPlan {
         multiprocessors: Some(70),
         host_pinned_bytes: Some(u64::MAX),
         sequences: 1,
+        module_bytes: 0,
     };
     let (config, table, settings) = (config(), rco_table(), settings(4096));
     let need = plan_with(&config, &table, &settings, inputs(64 * GIB))
