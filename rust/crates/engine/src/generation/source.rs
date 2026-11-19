@@ -1636,7 +1636,7 @@ impl Owner {
 
     /// Lets go of the quanta whose owner-lane work has run.
     fn reap(&mut self) {
-        let lanes = &self.shared.core.lanes();
+        let lanes = self.shared.core.lanes();
         self.parked.retain(|parked| !lanes.reached(parked.marker));
     }
 

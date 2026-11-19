@@ -139,6 +139,36 @@ pub(crate) struct DeviceLanes {
     stage_ring: usize,
     /// Turns the lanes' progress into frames.
     completions: Arc<Completions>,
+    /// The device memory the lanes took when they opened, as the free memory falling across the open (0 if unread).
+    bytes: u64,
+}
+
+/// The sequences a startup holds and the ring of the lanes it opens for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneSizing {
+    /// The sequences to plan for.
+    pub sequences: usize,
+    /// The events in the ring of each stage lane: sized for `first`, the count resolved before the lanes opened.
+    pub ring: usize,
+}
+
+/// The ring the lanes open with and the sequences the plan is made for. The lanes open with a ring for `first`, the
+/// count resolved from the free memory before they exist. Their events take device memory, so an automatic count
+/// (`max_sequences` 0) is resolved again (`again`) from the free memory read after they opened, and the plan holds the
+/// smaller: a ring for `first` serves any count below it. A stated count is held as stated.
+pub fn lane_sizing<E>(
+    max_sequences: u32,
+    first: usize,
+    again: impl FnOnce() -> Result<usize, E>,
+) -> Result<LaneSizing, E> {
+    let sequences = match max_sequences {
+        0 => first.min(again()?),
+        _ => first,
+    };
+    Ok(LaneSizing {
+        sequences,
+        ring: stage_ring_for(first),
+    })
 }
 
 /// What the frames of the engine share: the lattice and everything that feeds it, and the device.
@@ -234,23 +264,27 @@ impl Core {
         &self.device_lanes().completions
     }
 
-    /// Opens the lanes with rings for `sequences` sequences, and attaches the completions to the lattice. The lanes
-    /// open once the plan has resolved the sequence count, so a ring is never smaller than the quanta that count keeps
-    /// in flight. The device memory the lanes' events take is read as the free memory falling across the open.
+    /// The device bytes the lanes took when they opened.
+    pub(crate) fn lane_bytes(&self) -> u64 {
+        self.device_lanes().bytes
+    }
+
+    /// Opens the lanes with rings for `sequences` sequences, and attaches the completions to the lattice. Run in a frame
+    /// of the device lake, after the first resolve of the sequence count and before the plan is made, so that a ring is
+    /// never smaller than the quanta the plan's count keeps in flight. The device memory the events take is the free
+    /// memory falling across the open: the plan is made from the free memory read after it.
     pub(crate) fn open_lanes(&self, sequences: usize) -> Result<(), EngineError> {
         let runtime = |what: &str, error: &dyn fmt::Display| EngineError::Runtime(format!("{what}: {error}"));
         let chains = startup::transfer_lanes(&self.settings, MAX_LANES.saturating_sub(self.compute + 1));
         let ring = stage_ring(quanta_for(sequences));
-        let before = self.library.free_bytes().ok();
+        let before = self.library.free_bytes().map_err(EngineError::from)?;
         let set = open_lane_set(&self.gpu, self.compute, ring, chains)
             .map_err(|error| runtime("the lanes would not open", &error))?;
-        if let (Some(before), Ok(after)) = (before, self.library.free_bytes()) {
-            log::info!(
-                "lanes opened: {} events of {sequences} sequences take {} bytes of device memory",
-                ring,
-                before.saturating_sub(after)
-            );
-        }
+        let after = self.library.free_bytes().map_err(EngineError::from)?;
+        let bytes = before.saturating_sub(after);
+        log::info!(
+            "lanes opened: rings of {ring} events for {sequences} sequences took {bytes} bytes of device memory"
+        );
         let lanes = set.queues;
         let lane_table = LaneTable::new(set.typed, Arc::clone(&self.kernels), Arc::clone(&self.library));
         let completions = Completions::new(&lanes);
@@ -262,6 +296,7 @@ impl Core {
             lane_table,
             stage_ring: ring,
             completions,
+            bytes,
         };
         self.device_lanes
             .set(opened)
@@ -801,6 +836,12 @@ impl EngineRuntime {
         self.generations.generate(request, cancel)
     }
 
+    /// A test oracle: the events in the ring of each stage lane, and the device bytes the lanes took when they opened.
+    #[cfg(feature = "test-oracles")]
+    pub fn lane_rings_for_tests(&self) -> (usize, u64) {
+        (self.core.stage_ring(), self.core.lane_bytes())
+    }
+
     /// A test hook: the sequence's owner panics at the end of the turn in which the next request has admitted `quanta`
     /// quanta. The request ends with a failure and the engine serves the next.
     #[cfg(feature = "test-oracles")]
@@ -1072,7 +1113,8 @@ pub fn open_lane_set<G: Gpu>(
     })
 }
 
-/// Builds the lattice, the lakes, the lanes and the pools of a startup, on the calling thread.
+/// Builds the lattice, the lakes, the device with its kernels and the pools of a startup, on the calling thread. The
+/// lanes are not opened here: their rings depend on the sequences the plan resolves ([`Core::open_lanes`]).
 fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duration>) -> Result<Arc<Core>, EngineError> {
     let started = Instant::now();
     // Before anything is opened: a stated count the passes cannot hold is refused.

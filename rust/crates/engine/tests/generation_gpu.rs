@@ -53,6 +53,7 @@ use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, LogitsSink,
     QuantumEvent, Speculation, Verification,
 };
+use euhedral_inference_engine::runtime::stage_ring_for;
 use euhedral_inference_engine::sampling::{SamplingConfig, TokenSampler};
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff};
@@ -1009,6 +1010,24 @@ fn together_with(
     cancel: &[Option<usize>],
     in_pass: Option<(usize, &Arc<EngineRuntime>, u64)>,
 ) -> (Vec<Recording>, Duration) {
+    // The requests fill every sequence: one more is refused.
+    assert_eq!(
+        prompts.len(),
+        runtime.sequences(),
+        "the requests fill the sequences held"
+    );
+    together_some(runtime, prompts, speculation, sampling, cancel, in_pass)
+}
+
+/// [`together_with`] for requests that need not fill every sequence: nothing is refused for lack of one.
+fn together_some(
+    runtime: &EngineRuntime,
+    prompts: &[Vec<u32>],
+    speculation: Speculation,
+    sampling: &[SamplingConfig],
+    cancel: &[Option<usize>],
+    in_pass: Option<(usize, &Arc<EngineRuntime>, u64)>,
+) -> (Vec<Recording>, Duration) {
     let began = Instant::now();
     let running: Vec<_> = prompts
         .iter()
@@ -1217,6 +1236,24 @@ fn speculative_decode_rates_of_one_and_of_four_requests() {
     }
 }
 
+/// The lanes' cost with one sequence: the rings and the device bytes they take, and the time of the startup, to set
+/// beside the automatic count's.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn the_lanes_of_one_sequence_hold_one_sequence() {
+    let Some(machine) = machine() else { return };
+    let began = Instant::now();
+    let (owner, runtime) = start_with_sequences(&machine, 1);
+    let (ring, lane_bytes) = runtime.lane_rings_for_tests();
+    println!(
+        "LANES one: rings of {ring} events, {lane_bytes} device bytes, started in {:.2} s",
+        began.elapsed().as_secs_f64()
+    );
+    assert_eq!(runtime.sequences(), 1);
+    assert_eq!(ring, stage_ring_for(1), "the rings are sized for the one sequence");
+    owner.shutdown(runtime).expect("the engine shuts down clean");
+}
+
 /// An automatic count (`batching.max-sequences` 0) is held whole: the lanes open once the plan has resolved it, so its
 /// requests run at once and each one's tokens are those it has alone.
 #[test]
@@ -1224,11 +1261,22 @@ fn speculative_decode_rates_of_one_and_of_four_requests() {
 fn automatic_sequences_run_concurrently_and_match_alone() {
     let Some(machine) = machine() else { return };
     let tokenizer = tokenizer(&machine.artifact);
+    let began = Instant::now();
     let (owner, runtime) = start_with_sequences(&machine, 0);
     let held = runtime.sequences();
     assert!(
         held > 1,
         "the plan resolved {held} sequences, the lanes' rings held one"
+    );
+    // The rings hold the quanta of the count the lanes opened for, which the plan's count does not exceed.
+    let (ring, lane_bytes) = runtime.lane_rings_for_tests();
+    assert!(
+        ring >= stage_ring_for(held),
+        "the rings of {ring} events do not hold {held} sequences"
+    );
+    println!(
+        "LANES automatic: {held} sequences, rings of {ring} events, {lane_bytes} device bytes, started in {:.2} s",
+        began.elapsed().as_secs_f64()
     );
     let count = held.min(SEQUENCES);
     let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS[..count]
@@ -1254,7 +1302,14 @@ fn automatic_sequences_run_concurrently_and_match_alone() {
             .expect("the generation reports")
         })
         .collect();
-    let (both, _) = together(&runtime, &prompts, Speculation::Off, &sampling, &vec![None; count]);
+    let (both, _) = together_some(
+        &runtime,
+        &prompts,
+        Speculation::Off,
+        &sampling,
+        &vec![None; count],
+        None,
+    );
     for (index, (alone, both)) in alone.iter().zip(&both).enumerate() {
         assert_eq!(alone.tokens.len(), CONCURRENT_TOKENS as usize, "request {index} alone");
         assert_eq!(both.tokens, alone.tokens, "request {index} changed when run together");
