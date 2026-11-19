@@ -16,6 +16,7 @@ support the target GPU. This native layer does not install or manage NVIDIA driv
 | --- | --- |
 | `euhedral_cuda.c` | Memory allocation (device, pinned host, huge-page host weights), memory queries, streams, markers and completion events, copies. |
 | `cuda_kernel_loader.c`, `.h` | Compiles an installed CUDA module root once per process with NVRTC and loads it, on a dedicated thread with a large stack (NVRTC overflows a worker thread's). Ordinary modules compile to the device's own cubin (`sm_<major><minor>`); the modules that use arch-specific instructions (`q3_mx`, `nvfp4_native`) compile for `sm_<major><minor>a`. No PTX is left for the driver to JIT. Also holds the thread-local selections: exact numerics, row-exact execution and programmatic dependent launch. |
+| `pdl_registry.c`, `.h` | The set of kernels that may overlap their predecessor (programmatic dependent launch): a lock-free open-addressing set of 1024 slots, 768 usable; a full set refuses and reports on standard error. |
 | `q3_embedding.c` | Q3 row-split and P2E2 embedding gather to BF16 hidden states (rows may be read in place from mapped host memory). |
 | `rms_norm_bf16.c` | Standalone BF16 RMSNorm. |
 | `q3_linear_bf16.c` | Q3 decode (one row and the 2 to 8 row twins) and the P2E2 decode and expansion kernels. |
@@ -88,6 +89,7 @@ NumPy. `gpu_harness.py` is the shared harness (NVRTC compilation, module loading
 
 | Test | Covers |
 | --- | --- |
+| `test_pdl_registry.py` | The programmatic-launch registry under a pthread harness (`pdl_registry_harness.c`): threads registering shared keys behind a barrier lose none and double none, and a full registry accepts exactly its limit. The same harness must fail against a copy of the former 64-entry registry (`fixtures/pdl_registry_old.c`). Host only. |
 | `test_dflash.py` | The DFlash2 operators against NumPy oracles with the reference's rounding points: convolution, top-16 and selector bit for bit, the linear's rows identical at every row count. |
 | `test_q3_kernels.py` | Q3 reference against FP64, contiguous decode against the reference, the 2 to 8 row twins bit for bit one-row. |
 | `test_q45_kernels.py` | Q4/Q5 reference, contiguous decode, row twins, the capped grid. |

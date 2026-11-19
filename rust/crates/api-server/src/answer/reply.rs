@@ -123,6 +123,11 @@ fn chat(planned: &Planned, model: &str, done: &Completed) -> ChatCompletionRespo
     })
 }
 
+/// The input of a tool-use block: the call's arguments read back, an unpaired surrogate included.
+fn tool_input(arguments: &str) -> JsonValue {
+    JsonValue::parse_keeping_unpaired(arguments).unwrap_or(JsonValue::Object(Vec::new()))
+}
+
 /// The opaque token naming the thinking it accompanies.
 pub(super) fn signature(thinking: &str) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -157,7 +162,7 @@ fn message(planned: &Planned, model: &str, done: &Completed) -> Message {
             content.push(ContentBlock::ToolUse {
                 id: format!("toolu_{}", new_id()),
                 name: name.clone(),
-                input: JsonValue::parse(arguments).unwrap_or(JsonValue::Object(Vec::new())),
+                input: tool_input(arguments),
             });
         }
     }
@@ -292,6 +297,13 @@ fn response(planned: &Planned, model: &str, done: &Completed) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_input_keeps_an_unpaired_surrogate_as_its_escape() {
+        let input = tool_input(r#"{"a":["\uD800x","\\uD800"],"b":1}"#);
+        assert_eq!(input.to_compact_string(), r#"{"a":["\uD800x","\\uD800"],"b":1}"#);
+        assert_eq!(tool_input("not json"), JsonValue::Object(Vec::new()));
+    }
 
     #[test]
     fn a_signature_is_the_url_safe_unpadded_digest() {
