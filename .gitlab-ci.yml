@@ -29,7 +29,7 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "web"
 
 variables:
-  ARBITER_ARGS: "--cpu shared:16 --mem 32G"
+  ARBITER_ARGS: "--mem 32G"
   ARBITER_EST: "1800"
   DOCKER_ARGS: "--security-opt seccomp=unconfined"
   # apt waits forever on a stalled mirror; bound each request and retry it.
@@ -94,7 +94,7 @@ promote-test:
         compare_to: refs/heads/main
     - changes: ["scripts/ci-promote.sh", "scripts/test_ci_promote.py", ".gitlab-ci.yml"]
   variables:
-    ARBITER_ARGS: "--cpu shared:1 --mem 1G"
+    ARBITER_ARGS: "--mem 1G"
     ARBITER_EST: "120"
   script:
     - apt-get $APT_OPTS update -qq && apt-get $APT_OPTS install -y -qq --no-install-recommends git jq python3 >/dev/null
@@ -124,7 +124,7 @@ promote:
     GIT_STRATEGY: clone
     GIT_DEPTH: "0"
     MIRROR_URL: "git@github.com:Euhedral-Engine/Euhedral.git"   # not a secret
-    ARBITER_ARGS: "--cpu shared:1 --mem 1G"
+    ARBITER_ARGS: "--mem 1G"
     ARBITER_EST: "300"
   script:
     - scripts/ci-promote.sh
