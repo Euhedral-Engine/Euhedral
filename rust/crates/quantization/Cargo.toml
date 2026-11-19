@@ -22,6 +22,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 euhedral-gpu = { workspace = true, features = ["fake"] }
+euhedral-graph.workspace = true
 tempfile.workspace = true
 test-support = { path = "../test-support" }
 
