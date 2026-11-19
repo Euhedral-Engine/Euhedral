@@ -11,10 +11,13 @@
 )]
 
 use std::fs;
+use std::io;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::{DummyFrame, Frame};
@@ -227,7 +230,9 @@ fn removing_needs_the_last_handle_and_deletes_the_file() {
     world.finish();
 }
 
-/// The continuation of a call may remove the file at once: the call holds no handle while it runs.
+/// The continuation of a call may remove the file at once: the call holds no handle while it runs. The handle the call
+/// was started from is dropped before the continuation goes on (it waits for a flag, and reports a flag that never
+/// comes), so a refusal of the removal can only come from a handle the call itself kept.
 #[test]
 fn a_continuation_may_remove_the_file_it_was_started_from() {
     let directory = tempfile::tempdir().unwrap();
@@ -235,35 +240,64 @@ fn a_continuation_may_remove_the_file_it_was_started_from() {
     for round in 0..50 {
         let path = directory.path().join(format!("resume-{round}.bin"));
         let file = world.open(&path);
-        let removed = call(|removed: Then<()>| {
-            let first = file.clone();
-            let handle = file;
-            let sync_then = move |synced: Result<(), ResumeError>| {
-                synced.unwrap();
-                let removal = handle.remove(removed);
-                assert!(removal.is_ok(), "{removal:?}");
-                Box::new(DummyFrame::INSTANCE) as Box<dyn Frame>
-            };
-            let started = first.set_header(&step_header(2), Box::new(sync_then));
-            drop(first);
-            started
-        });
-        removed.unwrap();
+        let report: Arc<Handoff<Result<(), ResumeError>>> = Handoff::new();
+        let gate = Arc::new(AtomicBool::new(false));
+        let (handle, tell, open) = (file.clone(), Arc::clone(&report), Arc::clone(&gate));
+        let continuation = move |synced: Result<(), ResumeError>| {
+            let again = Arc::clone(&tell);
+            let mut result = synced;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while result.is_ok() && !open.load(Ordering::SeqCst) {
+                if Instant::now() > deadline {
+                    result = Err(ResumeError::Io(io::ErrorKind::TimedOut.into()));
+                }
+                thread::yield_now();
+            }
+            match result {
+                Ok(()) => {
+                    let removal = handle.remove(Box::new(move |removed| {
+                        again.send(removed);
+                        Box::new(DummyFrame::INSTANCE)
+                    }));
+                    if let Err(error) = removal {
+                        tell.send(Err(error));
+                    }
+                }
+                Err(error) => tell.send(Err(error)),
+            }
+            Box::new(DummyFrame::INSTANCE) as Box<dyn Frame>
+        };
+        file.set_header(&step_header(2), Box::new(continuation)).unwrap();
+        drop(file);
+        gate.store(true, Ordering::SeqCst);
+        let removed = report.wait(LONGEST).expect("the removal was never reported");
+        assert!(removed.is_ok(), "{removed:?}");
         assert!(!path.exists());
     }
     world.finish();
 }
 
 /// A step that is refused after the call started reaches the continuation as an error: the I/O engine is closed, so
-/// the write of the header is refused, and the waiter hears of it.
+/// the write of the header is refused. The call itself started (the barrier before the header is a host call), so
+/// the refusal is told to the continuation, not returned.
 #[test]
 fn a_refused_later_step_is_told_to_the_continuation() {
     let directory = tempfile::tempdir().unwrap();
     let world = World::start();
     let file = world.open(&directory.path().join("resume.bin"));
     world.io.complete();
-    let result = call(|then| file.set_header(&step_header(1), then));
-    assert!(result.is_err(), "{result:?}");
+    let report: Arc<Handoff<Result<(), ResumeError>>> = Handoff::new();
+    let tell = Arc::clone(&report);
+    let started = file.set_header(
+        &step_header(1),
+        Box::new(move |result| {
+            tell.send(result);
+            Box::new(DummyFrame::INSTANCE)
+        }),
+    );
+    assert!(started.is_ok(), "{started:?}");
+    let result = report.wait(LONGEST).expect("the refusal was never reported");
+    assert!(matches!(result, Err(ResumeError::Io(_))), "{result:?}");
     drop(file);
     world.finish();
 }

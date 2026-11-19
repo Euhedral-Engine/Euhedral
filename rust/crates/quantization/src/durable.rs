@@ -55,27 +55,39 @@ fn on_host(
 }
 
 /// Makes everything written to `file` so far durable (`fdatasync`, `FlushFileBuffers`).
+pub fn sync(host: &Arc<Lake>, file: &SharedFile, then: Done) -> Result<(), LakeClosed> {
+    sync_and_close(host, Arc::clone(file), then)
+}
+
+/// [`sync`] for a caller that gives the call its reference to the file. The call drops that reference before the
+/// completion runs, and the caller holds none when the call returns, so if it held the last one the file is closed
+/// when `then` runs. The resume file uses it so that a continuation that removes the file finds no handle of the call.
 #[expect(
     clippy::disallowed_methods,
     reason = "no-wait, blocking I/O with no AsyncIo form yet: one call, run as a host lake frame, whose completion continues the chain"
 )]
-pub fn sync(host: &Arc<Lake>, file: &SharedFile, then: Done) -> Result<(), LakeClosed> {
-    let file = Arc::clone(file);
+pub(crate) fn sync_and_close(host: &Arc<Lake>, file: SharedFile, then: Done) -> Result<(), LakeClosed> {
     on_host(host, move || file.sync_data(), then)
 }
 
 /// Cuts `file` back to `len` bytes, or extends it with zeros to `len`.
+pub fn truncate(host: &Arc<Lake>, file: &SharedFile, len: u64, then: Done) -> Result<(), LakeClosed> {
+    truncate_and_close(host, Arc::clone(file), len, then)
+}
+
+/// [`truncate`] for a caller that gives the call its reference to the file: see [`sync_and_close`], which has the same
+/// guarantee.
 #[expect(
     clippy::disallowed_methods,
     reason = "no-wait, blocking I/O with no AsyncIo form yet: one call, run as a host lake frame, whose completion continues the chain"
 )]
-pub fn truncate(host: &Arc<Lake>, file: &SharedFile, len: u64, then: Done) -> Result<(), LakeClosed> {
-    let file = Arc::clone(file);
+pub(crate) fn truncate_and_close(host: &Arc<Lake>, file: SharedFile, len: u64, then: Done) -> Result<(), LakeClosed> {
     on_host(host, move || file.set_len(len), then)
 }
 
 /// Removes the file at `path`. A file that is already gone is not an error: the removal is as done as it can be. A
-/// handle of the file that is still open is the caller's to close first (Windows refuses to remove an open file).
+/// handle of the file that is still open does not stop the removal: `AsyncIo` opens files shared for delete, so on
+/// Windows the name goes when the last handle closes.
 #[expect(
     clippy::disallowed_methods,
     reason = "no-wait, blocking I/O with no AsyncIo form yet: one call, run as a host lake frame, whose completion continues the chain"
