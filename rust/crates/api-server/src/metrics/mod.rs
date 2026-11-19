@@ -9,6 +9,8 @@
 //! (virtual machine, process, HTTP server, logging) are not part of it.
 
 mod buckets;
+mod http;
+pub mod process;
 mod render;
 mod window;
 
@@ -18,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use buckets::{DURATION_BOUNDS_NS, RATE_BOUNDS};
 
+pub use http::{RequestTimer, Uri, outcome};
 pub use render::CONTENT_TYPE;
 pub use window::{WINDOW_MS, WINDOWS, WindowMax};
 
@@ -263,6 +266,7 @@ pub struct Metrics {
     /// The indices of `speculative_accepted` in the order of their labels as text.
     drafts_by_label: Box<[usize]>,
     speculative_accepted_tokens: AtomicU64,
+    http: http::Table,
 }
 
 impl Metrics {
@@ -295,6 +299,7 @@ impl Metrics {
             speculative_accepted: counters(speculative_depth + 1),
             drafts_by_label: drafts_by_label.into_boxed_slice(),
             speculative_accepted_tokens: AtomicU64::new(0),
+            http: http::Table::new(now_ms),
         }
     }
 

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::buckets::{DURATION_BOUNDS_NS, RATE_BOUNDS};
 use super::{APPLICATION, Api, ConstraintFailure, Durations, FinishReason, Metrics, Outcome, Rates};
+use super::{http, process};
 use crate::backend::{EngineReport, PrefixCacheReport};
 
 /// The content type of the text, as the route answers it.
@@ -22,6 +23,7 @@ enum Kind {
     Counter,
     Gauge,
     Histogram,
+    Summary,
 }
 
 /// The text being written.
@@ -104,6 +106,7 @@ impl Page<'_> {
             Kind::Counter => " counter\n",
             Kind::Gauge => " gauge\n",
             Kind::Histogram => " histogram\n",
+            Kind::Summary => " summary\n",
         });
     }
 
@@ -488,4 +491,86 @@ fn prefix_cache(page: &mut Page<'_>, cache: &PrefixCacheReport) {
         "Pinned arena bytes in use",
         cache.used_bytes as f64,
     );
+}
+
+impl Metrics {
+    /// The series of the process and of the HTTP server, to follow those of `render` (their names sort after
+    /// `euhedral_`): what the operating system says about the process, and the time of the requests by route.
+    pub fn render_platform(&self, now_ms: i64) -> String {
+        let mut text = String::with_capacity(4 * 1024);
+        let mut page = Page { out: &mut text };
+        self.http_requests(&mut page, now_ms);
+        process_series(&mut page, &process::read());
+        text
+    }
+
+    fn http_requests(&self, page: &mut Page<'_>, now_ms: i64) {
+        let name = "http_server_requests_seconds";
+        let mut seen: Vec<_> = self.http.seen().collect();
+        if seen.is_empty() {
+            return;
+        }
+        let labels = |uri: &'static str, method: &'static str, status: u16| -> [(&'static str, String); 6] {
+            [
+                ("error", "none".to_owned()),
+                ("exception", "none".to_owned()),
+                ("method", method.to_owned()),
+                ("outcome", http::outcome(status).to_owned()),
+                ("status", status.to_string()),
+                ("uri", uri.to_owned()),
+            ]
+        };
+        seen.sort_by_key(|(uri, method, status, _)| (uri.label(), *method, *status));
+        page.family(name, Kind::Summary, "");
+        let count = format!("{name}_count");
+        let sum = format!("{name}_sum");
+        for (uri, method, status, cell) in &seen {
+            let owned = labels(uri.label(), method, *status);
+            let pairs: Vec<(&str, &str)> = owned.iter().map(|(key, value)| (*key, value.as_str())).collect();
+            page.whole(&count, &[], &pairs, None, cell.count.load(Ordering::Relaxed));
+            page.sample(&sum, &[], &pairs, cell.sum_ns.load(Ordering::Relaxed) as f64 / SECONDS);
+        }
+        let max = format!("{name}_max");
+        page.family(&max, Kind::Gauge, "");
+        for (uri, method, status, cell) in &seen {
+            let owned = labels(uri.label(), method, *status);
+            let pairs: Vec<(&str, &str)> = owned.iter().map(|(key, value)| (*key, value.as_str())).collect();
+            page.sample(&max, &[], &pairs, cell.max_ns.poll(now_ms) as f64 / SECONDS);
+        }
+    }
+}
+
+/// The series of the process; a reading the platform could not take has no series.
+fn process_series(page: &mut Page<'_>, reading: &process::Reading) {
+    if let Some(cpu) = reading.cpu_seconds {
+        page.counter(
+            "process_cpu_time_ns_total",
+            "The \"cpu time\" used by the process",
+            (cpu * SECONDS).round(),
+        );
+    }
+    if let Some(max) = reading.max_files {
+        page.gauge(
+            "process_files_max_files",
+            "The maximum file descriptor count",
+            max as f64,
+        );
+    }
+    if let Some(open) = reading.open_files {
+        page.gauge(
+            "process_files_open_files",
+            "The open file descriptor count",
+            open as f64,
+        );
+    }
+    if let Some(start) = reading.start_time_seconds {
+        page.gauge(
+            "process_start_time_seconds",
+            "Start time of the process since unix epoch.",
+            start,
+        );
+    }
+    if let Some(uptime) = reading.uptime_seconds {
+        page.gauge("process_uptime_seconds", "The uptime of the process", uptime);
+    }
 }
