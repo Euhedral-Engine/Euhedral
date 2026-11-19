@@ -203,8 +203,12 @@ Absent when the cache is off ([PREFIX_CACHE.md](PREFIX_CACHE.md)).
 | `euhedral_engine_device_free_bytes` | gauge | Free device memory the driver reports |
 | `euhedral_engine_host_backed_weight_bytes` | gauge | Weights held in pinned host memory and streamed in |
 
-The JVM's and the process's metrics (`jvm_*`, `process_*`, `process_uptime_seconds`), Tomcat's and HTTP server
-request timings (`http_server_requests_seconds`) come from Micrometer.
+The process's metrics (`process_uptime_seconds`, `process_start_time_seconds`, `process_cpu_time_ns_total`,
+`process_files_open_files`, `process_files_max_files`) come from the operating system; a value the platform cannot
+report is left out rather than written as zero (the file limit has no series on Windows). The time of every request
+(`http_server_requests_seconds`, with `_count`, `_sum` and `_max`) is labelled by route template (`uri`, for example
+`/v1/models/{model}`), method, status and outcome; every path that is no route is `uri="NOT_FOUND"`. A streamed
+reply is timed to its last byte. The JVM's metrics (`jvm_*`) belong to the Java server: the Rust server has none.
 
 ### Examples
 
