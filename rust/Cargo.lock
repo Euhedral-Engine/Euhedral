@@ -517,7 +517,9 @@ name = "euhedral-inference-quantization"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "euhedral-core",
  "euhedral-gpu",
+ "euhedral-graph",
  "euhedral-inference-cuda",
  "test-support",
  "thiserror",

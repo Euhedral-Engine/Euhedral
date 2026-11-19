@@ -8,7 +8,9 @@ publish.workspace = true
 
 [dependencies]
 crc32fast.workspace = true
+euhedral-core.workspace = true
 euhedral-gpu = { workspace = true, features = ["cuda"] }
+euhedral-graph.workspace = true
 euhedral-inference-cuda = { path = "../cuda" }
 thiserror.workspace = true
 
