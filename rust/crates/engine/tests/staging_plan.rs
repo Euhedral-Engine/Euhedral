@@ -8,16 +8,17 @@
 )]
 
 use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
 use std::sync::Arc;
 
 use euhedral_graph::LaneId;
-use euhedral_inference_cuda::DevicePtr;
+use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena};
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
-use euhedral_inference_engine::model::{LayerIndex, ModelConfig, Role, WeightRef, object_key};
+use euhedral_inference_engine::model::{LayerIndex, ModelConfig, Residence, Role, WeightRef, Weights, object_key};
 use euhedral_inference_engine::plan::{
     DECODE_MAX_ROWS, Formats, Plan, PlanBuildError, StageKind, StagingRing, View, WeightLookup,
 };
-use euhedral_inference_engine::residency::planner::{ResidencyPlan, Tier, plan as residency};
+use euhedral_inference_engine::residency::planner::{ResidencyPlan, plan as residency};
 use euhedral_inference_settings::TrellisKernelSettings;
 
 mod common;
@@ -67,6 +68,7 @@ fn fixture() -> Fixture {
                         layout: placement.layout,
                         ptr: DevicePtr::NULL,
                         bytes: placement.bytes,
+                        residence: Residence::Device,
                         trellis: None,
                     },
                 ))
@@ -86,18 +88,21 @@ fn fixture() -> Fixture {
 }
 
 impl Fixture {
-    /// The residency plan with the named objects moved to host memory.
-    fn held(&self, names: &BTreeSet<String>) -> ResidencyPlan {
-        let mut plan = self.resident.clone();
-        for (index, placement) in plan.device.iter_mut().enumerate() {
-            if names.contains(&placement.name) {
-                placement.tier = Tier::Host {
-                    offset: 4096 * index as u64,
+    /// The weights with the named objects held in host memory; the embedding and the head are read in place.
+    fn lookup(&self, names: &BTreeSet<String>) -> Described {
+        let mut weights = self.weights.0.clone();
+        for (index, weight) in weights.values_mut().enumerate() {
+            if names.contains(&weight.name) {
+                weight.residence = if weight.name == "text/token_embedding" || weight.name == "text/output_head" {
+                    Residence::Mapped
+                } else {
+                    Residence::Host {
+                        offset: 4096 * index as u64,
+                    }
                 };
-                plan.offload.host.push(placement.name.clone());
             }
         }
-        plan
+        Described(weights)
     }
 
     /// The names of the stageable layer projections whose name ends with one of `suffixes`.
@@ -135,8 +140,8 @@ impl Fixture {
         let ring = self.ring(names, slots);
         Plan::build(
             &self.config,
-            &self.weights,
-            &self.held(names),
+            &self.lookup(names),
+            &self.resident,
             &self.formats,
             Some(&ring),
             Some(TRANSFER_LANE),
@@ -341,8 +346,8 @@ fn an_empty_selection_changes_nothing() {
     };
     let after = Plan::build(
         &fixture.config,
-        &fixture.weights,
-        &fixture.held(&empty),
+        &fixture.lookup(&empty),
+        &fixture.resident,
         &fixture.formats,
         Some(&ring),
         Some(TRANSFER_LANE),
@@ -359,8 +364,8 @@ fn an_empty_selection_changes_nothing() {
     assert_eq!(mapped.len(), 2);
     let in_place = Plan::build(
         &fixture.config,
-        &fixture.weights,
-        &fixture.held(&mapped),
+        &fixture.lookup(&mapped),
+        &fixture.resident,
         &fixture.formats,
         Some(&ring),
         Some(TRANSFER_LANE),
@@ -620,11 +625,11 @@ fn more_uses_than_slots_and_a_weight_larger_than_a_slot_are_refused() {
     assert!(matches!(fixture.build(&chosen, 0), Err(PlanBuildError::NoSlots { .. })));
     let mut ring = fixture.ring(&chosen, 2);
     ring.slot_bytes -= 1;
-    let held = fixture.held(&chosen);
+    let held = fixture.lookup(&chosen);
     let error = Plan::build(
         &fixture.config,
-        &fixture.weights,
         &held,
+        &fixture.resident,
         &fixture.formats,
         Some(&ring),
         Some(TRANSFER_LANE),
@@ -634,8 +639,8 @@ fn more_uses_than_slots_and_a_weight_larger_than_a_slot_are_refused() {
     let ring = fixture.ring(&chosen, 2);
     let error = Plan::build(
         &fixture.config,
-        &fixture.weights,
         &held,
+        &fixture.resident,
         &fixture.formats,
         Some(&ring),
         None,
@@ -702,11 +707,30 @@ fn the_plan_names_each_slots_last_reader_and_first_transfer() {
 fn held_weights_with_no_ring_are_refused_but_objects_read_in_place_are_not() {
     let fixture = fixture();
     let chosen = set(fixture.candidates(&["/mlp/down"]));
-    let held = fixture.held(&chosen);
-    let error = Plan::build(&fixture.config, &fixture.weights, &held, &fixture.formats, None, None).unwrap_err();
+    let held = fixture.lookup(&chosen);
+    let error = Plan::build(&fixture.config, &held, &fixture.resident, &fixture.formats, None, None).unwrap_err();
     assert!(matches!(error, PlanBuildError::NoStagingRing { .. }), "{error}");
     assert!(error.to_string().starts_with("text/layers/"), "{error}");
     let mapped = set(["text/token_embedding".to_string(), "text/output_head".to_string()]);
-    let held = fixture.held(&mapped);
-    Plan::build(&fixture.config, &fixture.weights, &held, &fixture.formats, None, None).unwrap();
+    let held = fixture.lookup(&mapped);
+    Plan::build(&fixture.config, &held, &fixture.resident, &fixture.formats, None, None).unwrap();
+}
+
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn the_weights_hand_the_plan_their_host_arena_through_the_lookup_trait() {
+    let Some(library) = test_support::require_property("euhedral.cuda.library") else {
+        return;
+    };
+    let library = CudaLibrary::load(Path::new(&library)).unwrap();
+    let device = DeviceBuffer::alloc(&library, 4096).unwrap();
+    let arena = Arc::new(HostWeightsArena::alloc(&library, 1 << 20).unwrap());
+    let held = Weights::new(device, Some(arena.clone()), HashMap::new());
+    let lookup: &dyn WeightLookup = &held;
+    let seen = lookup.host_arena().expect("the arena of the weights");
+    assert!(Arc::ptr_eq(&seen, &arena));
+    let device = DeviceBuffer::alloc(&library, 4096).unwrap();
+    let none = Weights::new(device, None, HashMap::new());
+    let lookup: &dyn WeightLookup = &none;
+    assert!(lookup.host_arena().is_none());
 }

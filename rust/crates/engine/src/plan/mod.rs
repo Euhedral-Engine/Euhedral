@@ -31,7 +31,6 @@ use crate::stages::{Chain, Placed, Quantum};
 use buffers::Access;
 pub use builder::{Entry, Formats, StageKind, WeightLookup};
 use builder::{Make, Node, base_nodes, mtp_nodes};
-use staging::HostSet;
 pub use staging::StagingRing;
 pub(crate) use views::Variant;
 pub use views::{DECODE_MAX_ROWS, MAX_CAPTURED_ROWS, View};
@@ -68,8 +67,6 @@ pub enum PlanBuildError {
     WeightTooLarge { name: String, bytes: u64, slot_bytes: u64 },
     #[error("{name} is held in host memory but no stage of the plan can read it from a staging slot")]
     NotStageable { name: String },
-    #[error("{name} is held in host memory but the residency plan places no host bytes for it")]
-    NotPlacedOnHost { name: String },
     #[error("{name} is held on disk, which no plan stages yet")]
     OnDisk { name: String },
     #[error("the plan stages weights and was given no transfer lane")]
@@ -142,9 +139,10 @@ impl Plan {
     /// The plan of the model `config` describes, over its `weights`, run through `formats`. The MTP views are built
     /// when the artifact drafts with MTP (`residency.profile`).
     ///
-    /// With a `staging` ring, each use of a weight that `residency` holds in host memory reads a slot of the ring, and
-    /// a transfer of its own, on `transfer_lane`, fills the slot first. The MTP views stage nothing. With no ring, or
-    /// when `residency` holds no such weight, the plan is the one of resident weights.
+    /// With a `staging` ring, each use of a weight whose [`Residence`] is host memory reads a slot of the ring, and a
+    /// transfer of its own, on `transfer_lane`, fills the slot first; the weight's offset in the host arena is the one
+    /// its `Residence::Host` names, and the arena is the lookup's. The MTP views stage nothing. A weight on disk, or in
+    /// host memory with no ring, is refused; with none held off the device the plan is the one of resident weights.
     pub fn build<W: WeightLookup + ?Sized>(
         config: &Arc<ModelConfig>,
         weights: &W,
@@ -163,15 +161,13 @@ impl Plan {
         let drafts = residency.profile.speculation == Speculation::Mtp && residency.draft_depth > 0;
         let mut base = base_nodes(config, weights)?;
         let mut slots = 0;
-        let host = HostSet::of(residency, weights.host_arena());
         if staging.is_none()
-            && let Some(name) = host.first_held()
+            && let Some(name) = staging::first_held(&base)
         {
             return Err(PlanBuildError::NoStagingRing { name });
         }
         if let Some(ring) = staging
-            && !host.is_empty()
-            && let Some(staged) = staging::staged(&base, &host, ring)?
+            && let Some(staged) = staging::staged(&base, weights.host_arena().as_ref(), ring)?
         {
             if transfer_lane.is_none() {
                 return Err(PlanBuildError::NoTransferLane);

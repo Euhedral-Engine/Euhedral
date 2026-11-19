@@ -51,6 +51,10 @@ impl WeightLookup for Weights {
     fn weight(&self, layer: LayerIndex, role: Role) -> Option<&WeightRef> {
         self.get(layer, role)
     }
+
+    fn host_arena(&self) -> Option<Arc<HostWeightsArena>> {
+        Weights::host_arena(self).cloned()
+    }
 }
 
 /// The formats the plan's linears run through, by the format their weights are stored in.

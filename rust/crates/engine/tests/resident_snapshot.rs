@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use euhedral_inference_cuda::DevicePtr;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
-use euhedral_inference_engine::model::{LayerIndex, Role, WeightRef, object_key};
+use euhedral_inference_engine::model::{LayerIndex, Residence, Role, WeightRef, object_key};
 use euhedral_inference_engine::plan::{Formats, Plan, View, WeightLookup};
 use euhedral_inference_engine::residency::planner::plan as residency;
 use euhedral_inference_settings::TrellisKernelSettings;
@@ -90,6 +90,7 @@ fn resident_plan() -> Plan {
                         layout: placement.layout,
                         ptr: DevicePtr::NULL,
                         bytes: placement.bytes,
+                        residence: Residence::Device,
                         trellis: None,
                     },
                 ))

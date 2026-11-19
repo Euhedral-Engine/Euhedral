@@ -9,16 +9,13 @@
 //!
 //! The first transfers are listed after the view's first stage, which stays the root a quantum enters through.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use euhedral_inference_cuda::{DevicePtr, HostWeightsArena};
 
 use super::PlanBuildError;
 use super::builder::{Make, Node};
-use crate::model::WeightRef;
-use crate::residency::offload::mapped;
-use crate::residency::planner::{ResidencyPlan, Tier};
+use crate::model::{Residence, WeightRef};
 
 /// The device slots every staged weight is copied into before it is read: `slots` slots of `slot_bytes` bytes each,
 /// one after the other from `base`. A slot starts on an address the weights' formats may read from (the ring's
@@ -38,65 +35,40 @@ impl StagingRing {
     }
 }
 
-/// Where the weights that are not on the device are held.
-pub(super) struct HostSet {
-    host: HashSet<String>,
-    disk: HashSet<String>,
-    offsets: HashMap<String, u64>,
-    arena: Option<Arc<HostWeightsArena>>,
+/// Whether the weight is in host memory, to be copied to a slot before it is read.
+fn is_held(weight: &WeightRef) -> bool {
+    matches!(weight.residence, Residence::Host { .. })
 }
 
-impl HostSet {
-    /// The host and disk objects of `residency`, staged from `arena`.
-    pub(super) fn of(residency: &ResidencyPlan, arena: Option<Arc<HostWeightsArena>>) -> HostSet {
-        let offsets = residency
-            .device
-            .iter()
-            .filter_map(|placement| match placement.tier {
-                Tier::Host { offset } => Some((placement.name.clone(), offset)),
-                Tier::Device | Tier::Disk => None,
-            })
-            .collect();
-        HostSet {
-            host: residency
-                .offload
-                .host
-                .iter()
-                .filter(|name| !mapped(name))
-                .cloned()
-                .collect(),
-            disk: residency.offload.disk.iter().cloned().collect(),
-            offsets,
-            arena,
-        }
-    }
-
-    /// The first weight the plan holds off the device, in name order, if any.
-    pub(super) fn first_held(&self) -> Option<String> {
-        self.host.iter().chain(&self.disk).min().cloned()
-    }
-
-    /// Whether the plan holds no weight that a transfer stages.
-    pub(super) fn is_empty(&self) -> bool {
-        self.host.is_empty() && self.disk.is_empty()
-    }
+/// The first weight a view reads that is held off the device (in host memory to be staged, or on disk), in name order.
+pub(super) fn first_held(nodes: &[Node]) -> Option<String> {
+    nodes
+        .iter()
+        .flat_map(|node| node.make.weights())
+        .filter(|weight| matches!(weight.residence, Residence::Host { .. } | Residence::Disk { .. }))
+        .map(|weight| weight.name.clone())
+        .min()
 }
 
 /// `nodes` with each use of a staged weight reading a slot of `ring`, and the transfers that fill the slots; `None`
 /// when no node reads a staged weight, which leaves the view as it is.
-pub(super) fn staged(nodes: &[Node], host: &HostSet, ring: &StagingRing) -> Result<Option<Vec<Node>>, PlanBuildError> {
+pub(super) fn staged(
+    nodes: &[Node],
+    arena: Option<&Arc<HostWeightsArena>>,
+    ring: &StagingRing,
+) -> Result<Option<Vec<Node>>, PlanBuildError> {
     // The node of each use, in order.
     let mut uses: Vec<usize> = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
         let weights = node.make.weights();
         for weight in &weights {
-            if host.disk.contains(&weight.name) {
+            if matches!(weight.residence, Residence::Disk { .. }) {
                 return Err(PlanBuildError::OnDisk {
                     name: weight.name.clone(),
                 });
             }
         }
-        let held = weights.iter().filter(|weight| host.host.contains(&weight.name)).count();
+        let held = weights.iter().filter(|weight| is_held(weight)).count();
         if held == 0 {
             continue;
         }
@@ -105,13 +77,17 @@ pub(super) fn staged(nodes: &[Node], host: &HostSet, ring: &StagingRing) -> Resu
             Make::Linear { .. } if held == 1 && index > 0 => {
                 if ring.slots == 0 {
                     return Err(PlanBuildError::NoSlots {
-                        name: weights[0].name.clone(),
+                        name: weights
+                            .iter()
+                            .find(|weight| is_held(weight))
+                            .map(|weight| weight.name.clone())
+                            .unwrap_or_default(),
                     });
                 }
                 uses.push(index);
             }
             _ => {
-                let name = weights.iter().find(|weight| host.host.contains(&weight.name));
+                let name = weights.iter().find(|weight| is_held(weight));
                 return Err(PlanBuildError::NotStageable {
                     name: name.map(|weight| weight.name.clone()).unwrap_or_default(),
                 });
@@ -137,19 +113,15 @@ pub(super) fn staged(nodes: &[Node], host: &HostSet, ring: &StagingRing) -> Resu
                 slot_bytes: ring.slot_bytes,
             });
         }
-        let offset = host
-            .offsets
-            .get(&weight.name)
-            .copied()
-            .ok_or_else(|| PlanBuildError::NotPlacedOnHost {
-                name: weight.name.clone(),
-            })?;
+        let Residence::Host { offset } = weight.residence else {
+            unreachable!("a staged use is held in host memory");
+        };
         let slot = use_index % ring.slots;
         let id = result.len();
         result.push(Node {
             make: Make::Transfer {
                 name: weight.name.clone(),
-                source: host.arena.clone(),
+                source: arena.cloned(),
                 offset,
                 bytes: weight.bytes,
                 slot,
@@ -209,11 +181,13 @@ pub(super) fn staged(nodes: &[Node], host: &HostSet, ring: &StagingRing) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::super::buffers::Access;
     use super::super::builder::{WeightLookup, base_nodes};
     use super::super::hazards::with_hazards;
     use super::*;
-    use crate::model::{LayerIndex, LayerKind, ModelConfig, Role, object_key};
+    use crate::model::{LayerIndex, LayerKind, ModelConfig, Residence, Role, object_key};
     use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
 
     const LAYERS: usize = 8;
@@ -276,15 +250,22 @@ mod tests {
         names
     }
 
-    fn lookup() -> Lookup {
+    /// Where the object at `index` of [`names`] is in the host arena, when it is held there.
+    fn offset_of(index: usize) -> u64 {
+        4096 * index as u64
+    }
+
+    fn lookup(residence: impl Fn(&str, u64) -> Residence) -> Lookup {
         Lookup(
             names()
                 .into_iter()
-                .filter_map(|name| {
+                .enumerate()
+                .filter_map(|(index, name)| {
                     let key = object_key(&name, LAYERS)?;
                     Some((
                         key,
                         WeightRef {
+                            residence: residence(&name, offset_of(index)),
                             name,
                             shape: vec![1, 1],
                             dtype: TensorDataType::Bf16,
@@ -335,32 +316,30 @@ mod tests {
         }
     }
 
-    /// The host set of the objects whose name ends with one of `suffixes`, each at its own offset.
-    fn host(suffixes: &[&str]) -> HostSet {
-        let chosen: Vec<String> = names()
-            .into_iter()
-            .filter(|name| suffixes.iter().any(|suffix| name.ends_with(suffix)))
-            .collect();
-        HostSet {
-            offsets: chosen
-                .iter()
-                .enumerate()
-                .map(|(index, name)| (name.clone(), 4096 * index as u64))
-                .collect(),
-            host: chosen.into_iter().collect(),
-            disk: HashSet::new(),
-            arena: None,
-        }
+    /// The nodes of a view over weights of which those whose name ends with one of `held` are in host memory and
+    /// those that end with one of `disk` are on disk.
+    fn base_of(held: &[&str], disk: &[&str]) -> Vec<Node> {
+        let ends = |name: &str, suffixes: &[&str]| suffixes.iter().any(|suffix| name.ends_with(suffix));
+        let lookup = lookup(|name, offset| {
+            if ends(name, held) {
+                Residence::Host { offset }
+            } else if ends(name, disk) {
+                Residence::Disk { file_offset: offset }
+            } else if name.ends_with("token_embedding") || name.ends_with("output_head") {
+                Residence::Mapped
+            } else {
+                Residence::Device
+            }
+        });
+        base_nodes(&config(), &lookup).unwrap()
     }
 
     fn base() -> Vec<Node> {
-        base_nodes(&config(), &lookup()).unwrap()
+        base_of(&[], &[])
     }
 
-    fn staged_of(suffixes: &[&str], slots: usize) -> (Vec<Node>, HostSet) {
-        let host = host(suffixes);
-        let nodes = staged(&base(), &host, &ring(slots)).unwrap().unwrap();
-        (nodes, host)
+    fn staged_of(suffixes: &[&str], slots: usize) -> Vec<Node> {
+        staged(&base_of(suffixes, &[]), None, &ring(slots)).unwrap().unwrap()
     }
 
     /// The ids of the transfers and of the staged readers, in list order.
@@ -379,21 +358,15 @@ mod tests {
 
     #[test]
     fn an_empty_selection_stages_nothing() {
-        let nodes = base();
-        assert!(staged(&nodes, &host(&[]), &ring(3)).unwrap().is_none());
-        // Only the objects that are read in place are held on the host: nothing to stage.
-        let mapped_only = host(&["token_embedding", "output_head"]);
-        let set = HostSet {
-            host: mapped_only.host.iter().filter(|name| !mapped(name)).cloned().collect(),
-            ..mapped_only
-        };
-        assert!(staged(&nodes, &set, &ring(3)).unwrap().is_none());
+        // Objects read in place over the bus are not staged either.
+        assert!(staged(&base(), None, &ring(3)).unwrap().is_none());
+        assert_eq!(first_held(&base()), None);
     }
 
     #[test]
     fn the_consumer_reads_the_slot_its_transfer_wrote() {
         let slots = 3;
-        let (nodes, host) = staged_of(&["/gdn/output", "/mlp/down"], slots);
+        let nodes = staged_of(&["/gdn/output", "/mlp/down"], slots);
         let ring = ring(slots);
         let (transfers, readers) = accessors(&nodes);
         // Six GDN layers' outputs and eight FFN downs.
@@ -427,7 +400,10 @@ mod tests {
             );
             assert_eq!(&weight.name, name);
             assert_eq!((*bytes, weight.bytes), (BYTES, BYTES));
-            assert_eq!(*offset, host.offsets[name]);
+            assert_eq!(
+                *offset,
+                offset_of(names().iter().position(|candidate| candidate == name).unwrap())
+            );
             assert!(nodes[transfer].deps.is_empty(), "a transfer's edges are the slot's");
             assert!(nodes[reader].deps.contains(&transfer));
             assert!(transfer < reader);
@@ -453,7 +429,7 @@ mod tests {
     #[test]
     fn each_slot_is_a_workspace_buffer_whose_first_accessor_is_a_transfer_and_last_a_reader() {
         for slots in [1, 2, 3, 4] {
-            let (nodes, _) = staged_of(&["/gdn/output", "/mlp/down"], slots);
+            let nodes = staged_of(&["/gdn/output", "/mlp/down"], slots);
             let access: Vec<Access> = nodes.iter().map(|node| node.make.access()).collect();
             for slot in 0..slots {
                 let touching: Vec<usize> = (0..nodes.len())
@@ -476,7 +452,7 @@ mod tests {
     #[test]
     fn a_transfer_follows_the_last_reader_of_its_slot_and_a_reader_its_transfer() {
         let slots = 2;
-        let (nodes, _) = staged_of(&["/mlp/down"], slots);
+        let nodes = staged_of(&["/mlp/down"], slots);
         let access: Vec<Access> = nodes.iter().map(|node| node.make.access()).collect();
         let deps: Vec<Vec<usize>> = nodes.iter().map(|node| node.deps.clone()).collect();
         let regions = access
@@ -504,7 +480,7 @@ mod tests {
 
     #[test]
     fn a_ring_with_no_slot_is_refused_naming_the_weight() {
-        let error = staged(&base(), &host(&["/mlp/down"]), &ring(0)).unwrap_err();
+        let error = staged(&base_of(&["/mlp/down"], &[]), None, &ring(0)).unwrap_err();
         assert!(matches!(error, PlanBuildError::NoSlots { .. }), "{error}");
         assert_eq!(
             error.to_string(),
@@ -516,7 +492,7 @@ mod tests {
     fn a_weight_larger_than_a_slot_is_refused() {
         let mut tight = ring(3);
         tight.slot_bytes = BYTES - 1;
-        let error = staged(&base(), &host(&["/mlp/down"]), &tight).unwrap_err();
+        let error = staged(&base_of(&["/mlp/down"], &[]), None, &tight).unwrap_err();
         assert!(
             matches!(error, PlanBuildError::WeightTooLarge { bytes: BYTES, .. }),
             "{error}"
@@ -525,7 +501,7 @@ mod tests {
 
     #[test]
     fn a_host_weight_no_projection_reads_is_refused() {
-        let error = staged(&base(), &host(&["/gdn/a_projection"]), &ring(3)).unwrap_err();
+        let error = staged(&base_of(&["/gdn/a_projection"], &[]), None, &ring(3)).unwrap_err();
         assert!(matches!(error, PlanBuildError::NotStageable { .. }), "{error}");
         assert_eq!(
             error.to_string(),
@@ -534,18 +510,10 @@ mod tests {
     }
 
     #[test]
-    fn a_staged_weight_the_residency_plan_does_not_place_is_refused() {
-        let mut set = host(&["/mlp/down"]);
-        set.offsets.clear();
-        let error = staged(&base(), &set, &ring(3)).unwrap_err();
-        assert!(matches!(error, PlanBuildError::NotPlacedOnHost { .. }), "{error}");
-    }
-
-    #[test]
     fn a_disk_weight_is_refused() {
-        let mut set = host(&[]);
-        set.disk.insert("text/layers/0/mlp/down".into());
-        let error = staged(&base(), &set, &ring(3)).unwrap_err();
+        let nodes = base_of(&[], &["layers/0/mlp/down"]);
+        assert_eq!(first_held(&nodes).as_deref(), Some("text/layers/0/mlp/down"));
+        let error = staged(&nodes, None, &ring(3)).unwrap_err();
         assert!(matches!(error, PlanBuildError::OnDisk { .. }), "{error}");
         assert_eq!(
             error.to_string(),
