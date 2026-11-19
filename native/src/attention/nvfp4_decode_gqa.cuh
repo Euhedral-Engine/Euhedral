@@ -384,6 +384,7 @@ EUHEDRAL_ATTENTION_DECODE_GQA(euhedral_attention_decode_gqa_bf16, Bf16Kv)
             const unsigned char* const* keyPages, const unsigned char* const* valuePages, unsigned int queryHeads, \
             unsigned int keyHeads, const unsigned long long* position, float* partial,                             \
             unsigned long long rowStride, unsigned int from, unsigned int fused) {                                 \
+        euhedral_pdl_begin();                                                                                      \
         const unsigned row = blockIdx.y;                                                                           \
         const unsigned length = (unsigned)*position + row + 1u;                                                    \
         if (length < from) return;                                                                                 \
@@ -391,7 +392,6 @@ EUHEDRAL_ATTENTION_DECODE_GQA(euhedral_attention_decode_gqa_bf16, Bf16Kv)
         unsigned splits = (length + 31u) / 32u;                                                                    \
         if (splits > 64u) splits = 64u;                                                                            \
         if (blockIdx.x >= keyHeads * splits) return;                                                               \
-        euhedral_pdl_begin();                                                                                      \
         gqa_decode::decode_block<Kv>(blockIdx.x,                                                                   \
                 queryKey + (unsigned long long)row * (queryHeads + keyHeads) * 256u, keyPages, valuePages,         \
                 queryHeads, keyHeads, length, partial + row * rowStride, splits);                                  \

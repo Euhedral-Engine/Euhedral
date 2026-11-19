@@ -262,12 +262,12 @@ static __device__ __forceinline__ void fused_block(unsigned char* shared, const 
             unsigned int keyHeads, const unsigned long long* position, float* partial,                             \
             unsigned long long rowStride, unsigned int rows, unsigned int from) {                                  \
         extern __shared__ __align__(16) unsigned char shared[];                                                    \
+        euhedral_pdl_begin();                                                                                      \
         const unsigned length = (unsigned)*position + 1u;                                                          \
         const unsigned first = gqa_decode::first_fused_row(length, rows, from);                                     \
         if (first >= rows || (rows - first) * (queryHeads / keyHeads) > 8u * NT) return;                           \
         const unsigned splits = gqa_decode::split_count(length + rows - 1u);                                        \
         if (blockIdx.x >= keyHeads * splits) return;                                                               \
-        euhedral_pdl_begin();                                                                                      \
         gqa_fused::fused_block<NT, Kv>(shared, queryKey, keyPages, valuePages, queryHeads, keyHeads, length, rows, \
                 first, partial, rowStride, splits);                                                                \
     }
