@@ -88,7 +88,7 @@ impl SafetensorsWriter {
     /// chunks that start at multiples of `buffer_bytes` (the last one may be shorter), and the size must be a multiple
     /// of 8 so that no chunk splits an element.
     pub fn with_buffer(file: &Path, buffer_bytes: usize) -> Result<Self, CheckpointError> {
-        if buffer_bytes == 0 || buffer_bytes % 8 != 0 {
+        if buffer_bytes == 0 || !buffer_bytes.is_multiple_of(8) {
             return Err(CheckpointError::Invalid(format!(
                 "the buffer must be a positive multiple of 8 bytes, so a chunk never splits an element: {buffer_bytes}"
             )));
