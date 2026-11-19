@@ -59,9 +59,9 @@ native-package:
   rules:
     - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $INTEGRATION_BRANCH
       changes:
-        paths: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", ".gitlab-ci.yml"]
+        paths: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", "rust/**/*", ".gitlab-ci.yml"]
         compare_to: refs/heads/main
-    - changes: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", ".gitlab-ci.yml"]
+    - changes: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", "rust/**/*", ".gitlab-ci.yml"]
   variables:
     ZIG_GLOBAL_CACHE_DIR: $CI_PROJECT_DIR/native/.zig-global-cache
   script:
@@ -70,9 +70,14 @@ native-package:
     - mise exec -- gradle nativeVerify :api:bootJar build
     # Host-only native tests (no card): the programmatic-launch wait rule over the kernel sources and the registry.
     - cd native/tests && python3 -m unittest test_pdl_wait test_pdl_registry
+    # The Rust server bundle for linux-x64, from the native product just built.
+    - cd "$CI_PROJECT_DIR/rust" && mise exec -- cargo xtask bundle --product linux-x64
   artifacts:
-    when: on_failure
-    paths: [api/build/test-results/test/*.xml]
+    when: always
+    expire_in: 2 days
+    paths:
+      - api/build/test-results/test/*.xml
+      - build/bundle/euhedral-server-linux-x64.tar.gz
 
 # Tests of scripts/ci-promote.sh against local bare repositories (no GitLab calls).
 promote-test:
