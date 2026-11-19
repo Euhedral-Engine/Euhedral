@@ -15,6 +15,11 @@ scripted = ["euhedral-inference-api-server/test-support"]
 name = "euhedral-server"
 path = "src/main.rs"
 
+# The container's health check: asks `GET /health` of the local server (the image has no shell and no curl).
+[[bin]]
+name = "euhedral-health-probe"
+path = "src/health_probe.rs"
+
 [dependencies]
 euhedral-core.workspace = true
 euhedral-inference-api-server = { path = "../api-server" }

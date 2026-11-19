@@ -1,6 +1,7 @@
 .git
 .gradle
 **/build
+rust/target
 native/.zig-cache
 native/zig-out
 **/__pycache__
