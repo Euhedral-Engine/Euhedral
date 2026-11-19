@@ -1045,6 +1045,9 @@ fn fill_cache(
     (query_key, gate_value)
 }
 
+/// How often the overlapped attention rows are repeated and compared.
+const OVERLAP_REPEATS: usize = 20;
+
 /// Checks that the multi-row attention of `m` rows at `start`, on the verification's row-exact route and on the
 /// draft route (the same twins without the row-exact mode), equals `m` one-row attentions bit for bit.
 fn check_row_twins(format: KvFormat, start: u64, m: usize) {
@@ -1071,6 +1074,17 @@ fn check_row_twins(format: KvFormat, start: u64, m: usize) {
         bf16_values(&twins).iter().any(|value| *value != 0.0),
         "the attention wrote nothing"
     );
+    // The row kernels are launched as programmatic dependent launches: run again and again, every run's bytes
+    // must be the first run's, whatever the overlap with the append before and the merge after.
+    for run in 0..OVERLAP_REPEATS {
+        assert!(rig.run(&attention_append(), &verify).is_some());
+        assert!(rig.run(&attention_causal(), &verify).is_some());
+        rig.sync();
+        assert!(
+            get(&workspace, BufferSlot::AttentionContext, 0, bytes) == twins,
+            "{format:?} {m} rows at {start}: run {run} differs from the first"
+        );
+    }
 
     let draft = rig.quantum(QuantumKind::Draft, m, start, &workspace, &sequence, &config);
     assert!(rig.run(&attention_causal(), &draft).is_some());
