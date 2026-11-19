@@ -12,6 +12,9 @@ pub mod queue;
 pub mod table;
 
 use crate::DevicePtr;
+use crate::launch::attention::{DEFAULT_FUSED_VERIFY_FROM, FUSED_ROWS};
+use crate::launch::elementwise::DEFAULT_RMS_NORM_DECODE_SLICES;
+use crate::launch::nvfp4::skinny_target_ctas;
 
 /// What the native wrapper rejects: the status the C function would return instead of launching.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,4 +42,33 @@ pub struct Modes {
 pub(crate) fn advance(pointer: DevicePtr, bytes: u64) -> DevicePtr {
     // SAFETY: the address is only carried into a launch's arguments, never dereferenced on the host.
     unsafe { DevicePtr::from_raw(pointer.get().wrapping_add(bytes)) }
+}
+
+/// The launch choices that depend on the card: sized from the device, or measured on one card and set by the
+/// operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dispatch {
+    /// Streaming multiprocessors of the device; the skinny NVFP4 kernel's K split aims for two blocks per one.
+    pub sm_count: u32,
+    /// The grid-y of a one-row RMS norm (`kernels.rms-norm-decode-slices`).
+    pub rms_norm_decode_slices: u32,
+    /// The fewest keys at which the fused verifier kernel serves each count of verified rows
+    /// (`kernels.fused-verify-from`).
+    pub fused_verify_from: [u32; FUSED_ROWS],
+}
+
+impl Dispatch {
+    /// The defaults of the settings on a device of `sm_count` streaming multiprocessors.
+    pub const fn measured(sm_count: u32) -> Self {
+        Self {
+            sm_count,
+            rms_norm_decode_slices: DEFAULT_RMS_NORM_DECODE_SLICES,
+            fused_verify_from: DEFAULT_FUSED_VERIFY_FROM,
+        }
+    }
+
+    /// The blocks a skinny NVFP4 launch splits over K to reach.
+    pub const fn skinny_target_ctas(&self) -> u64 {
+        skinny_target_ctas(self.sm_count)
+    }
 }

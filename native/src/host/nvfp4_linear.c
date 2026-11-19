@@ -1,7 +1,9 @@
 #include "cuda_kernel_loader.h"
+#include "dispatch_tuning.h"
 #include "decode_shapes.h"
 #include "reference.h"
 #include <cuda_runtime_api.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -153,7 +155,18 @@ int euhedral_cuda_linear_nvfp4_bf16(const void* input, const void* weights, void
 #define NATIVE_TILE_THREADS 288u   /* nvfp4n::kThreads: eight consumer warps and a producer warp */
 #define SKINNY_MAX_ROWS 64u
 #define SKINNY_COLUMNS 64u
-#define SKINNY_TARGET_CTAS 140u  /* two per SM */
+
+/* CTAs the skinny kernel's K split aims for: two per streaming multiprocessor of the current device, read once. */
+static uint32_t skinny_target_ctas(void) {
+    static _Atomic uint32_t target = 0;
+    uint32_t known = atomic_load_explicit(&target, memory_order_relaxed);
+    if (known != 0u) return known;
+    int32_t sms = 0;
+    if (euhedral_cuda_multiprocessor_count(&sms) != EUHEDRAL_CUDA_SUCCESS || sms <= 0) return 2u;
+    known = 2u * (uint32_t)sms;
+    atomic_store_explicit(&target, known, memory_order_relaxed);
+    return known;
+}
 
 /* nvfp4n::Skinny<terms, rows / 16>::kSharedBytes: stages of (A rows + 64 weight rows) x 160 bytes. */
 static uint32_t skinny_shared_bytes(uint32_t terms, uint32_t rows) {
@@ -164,7 +177,7 @@ static uint32_t skinny_shared_bytes(uint32_t terms, uint32_t rows) {
 /* K splits for the skinny kernel: enough CTAs to keep every SM streaming weights. */
 static uint32_t skinny_splits(uint32_t in_features, uint32_t out_features) {
     uint32_t tiles = (out_features + SKINNY_COLUMNS - 1u) / SKINNY_COLUMNS, k_tiles = in_features / 256u;
-    uint32_t splits = (SKINNY_TARGET_CTAS + tiles - 1u) / tiles, limit = k_tiles / 2u;
+    uint32_t splits = (skinny_target_ctas() + tiles - 1u) / tiles, limit = k_tiles / 2u;
     if (splits > limit) splits = limit;
     return splits == 0u ? 1u : splits;
 }

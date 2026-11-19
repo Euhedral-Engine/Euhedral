@@ -7,6 +7,8 @@ const INPUT: u64 = 0x1000;
 const WEIGHTS: u64 = 0x2000;
 const OUTPUT: u64 = 0x3000;
 const SCRATCH: u64 = 0x4000;
+/// Skinny CTAs of the 70-multiprocessor reference device the expected values below were worked on.
+const TARGET_CTAS: u64 = skinny_target_ctas(70);
 
 fn at(address: u64) -> DevicePtr {
     // SAFETY: the plan only does arithmetic on the address and never dereferences it.
@@ -34,6 +36,7 @@ fn native(rows: u32, in_features: u32, out_features: u32, layout: Nvfp4Layout) -
         &operands(rows, in_features, out_features, layout),
         at(SCRATCH),
         u64::MAX,
+        TARGET_CTAS,
         false,
     )
     .unwrap()
@@ -170,13 +173,13 @@ fn refusals_before_any_launch() {
 #[test]
 fn skinny_split_counts() {
     // skinny_splits: tiles = ceil(out / 64), splits = ceil(140 / tiles) capped at k_tiles / 2, at least 1.
-    assert_eq!(skinny_splits(4096, 4096), 3); // 64 tiles: ceil(140 / 64) = 3, cap 16 / 2 = 8
-    assert_eq!(skinny_splits(4096, 8896), 2); // 139 tiles: ceil(140 / 139) = 2
-    assert_eq!(skinny_splits(4096, 8897), 1); // 140 tiles: 1
-    assert_eq!(skinny_splits(4096, 64), 8); // 1 tile: 140, capped at 8
-    assert_eq!(skinny_splits(1024, 64), 2); // cap 4 / 2
-    assert_eq!(skinny_splits(512, 64), 1); // cap 2 / 2
-    assert_eq!(skinny_splits(256, 64), 1); // cap 0, raised to 1
+    assert_eq!(skinny_splits(4096, 4096, TARGET_CTAS), 3); // 64 tiles: ceil(140 / 64) = 3, cap 16 / 2 = 8
+    assert_eq!(skinny_splits(4096, 8896, TARGET_CTAS), 2); // 139 tiles: ceil(140 / 139) = 2
+    assert_eq!(skinny_splits(4096, 8897, TARGET_CTAS), 1); // 140 tiles: 1
+    assert_eq!(skinny_splits(4096, 64, TARGET_CTAS), 8); // 1 tile: 140, capped at 8
+    assert_eq!(skinny_splits(1024, 64, TARGET_CTAS), 2); // cap 4 / 2
+    assert_eq!(skinny_splits(512, 64, TARGET_CTAS), 1); // cap 2 / 2
+    assert_eq!(skinny_splits(256, 64, TARGET_CTAS), 1); // cap 0, raised to 1
 }
 
 #[test]
@@ -238,11 +241,11 @@ fn native_skinny_without_a_split_has_no_finish_and_null_partials() {
     assert_eq!(skinny.grid, [64, 1, 1]);
     assert_eq!(skinny.args.words()[3], 0);
     // The scratch it needs is the activations alone: k = 256, 32 planes: 4096 + 4096 = 8192, plus 64 = 8256.
-    assert_eq!(nvfp4_native_scratch_bytes(16, 256, 4096), 8256);
+    assert_eq!(nvfp4_native_scratch_bytes(16, 256, 4096, TARGET_CTAS), 8256);
     let operands = operands(16, 256, 4096, Nvfp4Layout::Plain);
-    assert!(plan_native(&operands, at(SCRATCH), 8256, false).is_ok());
+    assert!(plan_native(&operands, at(SCRATCH), 8256, TARGET_CTAS, false).is_ok());
     assert_eq!(
-        plan_native(&operands, at(SCRATCH), 8255, false).unwrap_err(),
+        plan_native(&operands, at(SCRATCH), 8255, TARGET_CTAS, false).unwrap_err(),
         PlanError::InvalidArgument
     );
 }
@@ -275,9 +278,12 @@ fn native_scratch_bytes() {
     // 16 rows, 1024 by 4096: k = 1024, 32 planes: 16384 of codes, 8 * 2 * 128 * 8 = 16384 of scales, 64 of globals:
     // 32832. Two splits (64 tiles: 3, cap 4 / 2 = 2), so the partials follow at the next 256 (33024) and take
     // 4 * 2 * 16 * 4096 = 524288 bytes.
-    assert_eq!(nvfp4_native_scratch_bytes(16, 1024, 4096), 33_024 + 524_288);
+    assert_eq!(
+        nvfp4_native_scratch_bytes(16, 1024, 4096, TARGET_CTAS),
+        33_024 + 524_288
+    );
     // 65 rows is the tile route: k = 512, 130 planes: 33280 of codes, 4 * 2 * 128 * 8 = 8192 of scales, 260 of globals.
-    assert_eq!(nvfp4_native_scratch_bytes(65, 512, 256), 41_732);
+    assert_eq!(nvfp4_native_scratch_bytes(65, 512, 256, TARGET_CTAS), 41_732);
 }
 
 #[test]
@@ -328,36 +334,36 @@ fn native_tile_plan_and_its_tensor_maps() {
 #[test]
 fn native_declines_and_refuses() {
     let tile = operands(65, 512, 256, Nvfp4Layout::Plain);
-    let scratch = |size: u64| plan_native(&tile, at(SCRATCH), size, false);
+    let scratch = |size: u64| plan_native(&tile, at(SCRATCH), size, TARGET_CTAS, false);
     // The tile kernel's scratch is the activations alone: 41732 bytes.
     assert!(scratch(41_732).is_ok());
     assert_eq!(scratch(41_731).unwrap_err(), PlanError::InvalidArgument);
     assert_eq!(
-        plan_native(&tile, DevicePtr::NULL, u64::MAX, false).unwrap_err(),
+        plan_native(&tile, DevicePtr::NULL, u64::MAX, TARGET_CTAS, false).unwrap_err(),
         PlanError::InvalidArgument
     );
     // A scratch off 16 bytes declines a tile launch but not a skinny one.
     assert_eq!(
-        plan_native(&tile, at(SCRATCH + 8), u64::MAX, false).unwrap_err(),
+        plan_native(&tile, at(SCRATCH + 8), u64::MAX, TARGET_CTAS, false).unwrap_err(),
         PlanError::RouteUnavailable
     );
     let skinny = operands(16, 256, 4096, Nvfp4Layout::Plain);
-    assert!(plan_native(&skinny, at(SCRATCH + 8), u64::MAX, false).is_ok());
+    assert!(plan_native(&skinny, at(SCRATCH + 8), u64::MAX, TARGET_CTAS, false).is_ok());
     // Exact numerics, a width that is not a multiple of 128.
     assert_eq!(
-        plan_native(&tile, at(SCRATCH), u64::MAX, true).unwrap_err(),
+        plan_native(&tile, at(SCRATCH), u64::MAX, TARGET_CTAS, true).unwrap_err(),
         PlanError::RouteUnavailable
     );
     let odd = operands(16, 192, 4096, Nvfp4Layout::Plain);
     assert_eq!(
-        plan_native(&odd, at(SCRATCH), u64::MAX, false).unwrap_err(),
+        plan_native(&odd, at(SCRATCH), u64::MAX, TARGET_CTAS, false).unwrap_err(),
         PlanError::RouteUnavailable
     );
     // The tile kernels need 256 inputs (plain) or 512 (SD4): 128 inputs with 65 rows, or SD4 with 256, decline.
     for (in_features, layout) in [(128, Nvfp4Layout::Plain), (256, Nvfp4Layout::Sd4)] {
         let shape = operands(65, in_features, 256, layout);
         assert_eq!(
-            plan_native(&shape, at(SCRATCH), u64::MAX, false).unwrap_err(),
+            plan_native(&shape, at(SCRATCH), u64::MAX, TARGET_CTAS, false).unwrap_err(),
             PlanError::RouteUnavailable
         );
     }
@@ -367,6 +373,7 @@ fn native_declines_and_refuses() {
             &operands(65, 256, 256, Nvfp4Layout::Plain),
             at(SCRATCH),
             u64::MAX,
+            TARGET_CTAS,
             false
         )
         .is_ok()
@@ -375,13 +382,13 @@ fn native_declines_and_refuses() {
     let mut wrong = tile;
     wrong.weights_byte_size += 1;
     assert_eq!(
-        plan_native(&wrong, at(SCRATCH), u64::MAX, false).unwrap_err(),
+        plan_native(&wrong, at(SCRATCH), u64::MAX, TARGET_CTAS, false).unwrap_err(),
         PlanError::FormatMismatch
     );
     // 2^31 rows over 65536 outputs: 2^24 * 2^9 tiles = 2^33 blocks.
     let huge = operands(1 << 31, 512, 1 << 16, Nvfp4Layout::Plain);
     assert_eq!(
-        plan_native(&huge, at(SCRATCH), u64::MAX, false).unwrap_err(),
+        plan_native(&huge, at(SCRATCH), u64::MAX, TARGET_CTAS, false).unwrap_err(),
         PlanError::SizeOverflow
     );
 }
@@ -406,7 +413,7 @@ fn route_of_the_engine_policy() {
 #[test]
 fn lines_of_the_recorder() {
     assert_eq!(
-        Nvfp4Route::Native { skinny: true }.lines(12, 5120, 5120, false),
+        Nvfp4Route::Native { skinny: true }.lines(12, 5120, 5120, false, TARGET_CTAS),
         [
             "euhedral_nvfp4n_quantize_rows grid=12,1,1 block=128,1,1 smem=0",
             "euhedral_nvfp4n_skinny_16 grid=80,2,1 block=128,1,1 smem=61440",
@@ -440,4 +447,29 @@ fn plans_compare_by_the_launches_in_use() {
     let two = native(16, 256, 4096, Nvfp4Layout::Plain);
     let first = Nvfp4Plan::single(two.launches()[0]);
     assert_ne!(two, first);
+}
+
+#[test]
+fn the_skinny_target_is_two_blocks_per_multiprocessor() {
+    assert_eq!(skinny_target_ctas(70), 140);
+    assert_eq!(skinny_target_ctas(128), 256);
+    // 4096 x 4096 is 64 tiles: ceil(256 / 64) = 4 splits on 128 multiprocessors (3 on 70), ceil(56 / 64) = 1 on 28.
+    assert_eq!(skinny_splits(4096, 4096, skinny_target_ctas(128)), 4);
+    assert_eq!(skinny_splits(4096, 4096, skinny_target_ctas(70)), 3);
+    assert_eq!(skinny_splits(4096, 4096, skinny_target_ctas(28)), 1);
+}
+
+#[test]
+fn the_skinny_grid_and_scratch_follow_the_device() {
+    let shape = operands(16, 4096, 4096, Nvfp4Layout::Plain);
+    let grid_y = |sms: u32| {
+        let plan = plan_native(&shape, at(SCRATCH), u64::MAX, skinny_target_ctas(sms), false).unwrap();
+        plan.launches()[1].grid[1]
+    };
+    assert_eq!(grid_y(70), 3);
+    assert_eq!(grid_y(128), 4);
+    assert_eq!(grid_y(28), 1);
+    // Four splits keep four partial planes where three keep three.
+    let bytes = |sms: u32| nvfp4_native_scratch_bytes(16, 4096, 4096, skinny_target_ctas(sms));
+    assert_eq!(bytes(128) - bytes(70), 4 * 16 * 4096);
 }

@@ -32,6 +32,7 @@ mod typed;
 
 use std::collections::HashMap;
 
+use euhedral_inference_cuda::launch::nvfp4::skinny_target_ctas;
 use euhedral_inference_cuda::{DeviceBuffer, HostWeightsArena};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use euhedral_inference_engine::formats::{
@@ -394,7 +395,7 @@ fn kernel_tables_and_scratch_match_the_native_library() {
         (512, 5120, 248_320),
     ] {
         assert_eq!(
-            nvfp4_native_scratch_bytes(rows, k, n),
+            nvfp4_native_scratch_bytes(rows, k, n, skinny_target_ctas(rig.library.device().sm_count)),
             rig.library.nvfp4_native_scratch_bytes(rows as u32, k as u32, n as u32),
             "rows {rows} k {k} n {n}"
         );

@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::model::{Auto, CpuList, HostLayerCompute, KvFormat, MIN_TENSOR_CORE_ROWS, ModelSettings, Settings};
+use crate::model::{
+    Auto, CpuList, FusedVerifyFrom, HostLayerCompute, KvFormat, MIN_TENSOR_CORE_ROWS, ModelSettings, Settings,
+};
 use crate::retired;
 use crate::sizes::{ByteSize, parse_duration};
 
@@ -572,6 +574,12 @@ fn leaves() -> Vec<Leaf> {
         }),
         optional("host.native-cache", |s, t| {
             assign!(s.host.native_cache, auto_or(t, |t| Ok(PathBuf::from(t))))
+        }),
+        optional("kernels.rms-norm-decode-slices", |s, t| {
+            assign!(s.kernels.rms_norm_decode_slices, auto_or(t, |t| int(t, 1, COUNT_MAX)))
+        }),
+        optional("kernels.fused-verify-from", |s, t| {
+            assign!(s.kernels.fused_verify_from, auto_or(t, FusedVerifyFrom::parse))
         }),
         fixed("kernels.trellis.tensor-core-max-tokens", |s, t| {
             assign!(

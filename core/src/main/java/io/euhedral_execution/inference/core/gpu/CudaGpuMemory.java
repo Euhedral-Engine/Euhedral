@@ -253,6 +253,21 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 int status = (int) setIncludeDirectory.invokeExact(local.allocateFrom(headers));
                 if (status != 0) throw new GpuMemoryException("the CUDA include directory " + headers + " is invalid");
             }
+            // The card-dependent dispatch values, before the first launch.
+            MethodHandle setDispatch = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_set_dispatch",
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+            try (Arena local = Arena.ofConfined()) {
+                List<Long> fusedFrom = tuning.kernels().fusedVerifyFromOrDefault();
+                MemorySegment table = local.allocate(ValueLayout.JAVA_INT, fusedFrom.size());
+                for (int row = 0; row < fusedFrom.size(); row++)
+                    table.setAtIndex(ValueLayout.JAVA_INT, row, (int) (long) fusedFrom.get(row));
+                int status = (int) setDispatch.invokeExact(tuning.kernels().rmsNormSlices(), table, fusedFrom.size());
+                if (status != 0) throw new GpuMemoryException("the kernel dispatch settings are invalid");
+            }
             this.malloc = bind(linker, symbols, "euhedral_cuda_malloc", MALLOC);
             this.free = bind(linker, symbols, "euhedral_cuda_free", FREE);
             this.mallocAsync = bind(linker, symbols, "euhedral_cuda_malloc_async", MALLOC);

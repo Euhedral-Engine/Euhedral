@@ -301,3 +301,33 @@ fn disk_window_slots_parse_and_refuse_zero() {
     assert_eq!(stated.memory.disk_window_slots, Auto::Value(6));
     assert!(problems(&format!("{MODEL}memory:\n  disk-window-slots: 0\n"))[0].contains("memory.disk-window-slots"));
 }
+
+#[test]
+fn the_dispatch_kernel_settings_default_to_auto_and_parse() {
+    use euhedral_inference_settings::{Auto, FusedVerifyFrom};
+    let defaults = load(MODEL).unwrap().kernels;
+    assert_eq!(defaults.rms_norm_decode_slices, Auto::Auto);
+    assert_eq!(defaults.fused_verify_from, Auto::Auto);
+    let set = load(&format!(
+        "{MODEL}kernels:\n  rms-norm-decode-slices: 16\n  fused-verify-from: never,never,1,2,3,4,5,6,7\n"
+    ))
+    .unwrap()
+    .kernels;
+    assert_eq!(set.rms_norm_decode_slices, Auto::Value(16));
+    assert_eq!(
+        set.fused_verify_from,
+        Auto::Value(FusedVerifyFrom([u32::MAX, u32::MAX, 1, 2, 3, 4, 5, 6, 7]))
+    );
+    assert!(problems(&format!("{MODEL}kernels:\n  rms-norm-decode-slices: 0\n"))[0].contains("rms-norm-decode-slices"));
+    for bad in [
+        "1,2,3",
+        "1,2,3,4,5,6,7,8,9,10",
+        "never,never,0,1,2,3,4,5,6",
+        "a,b,c,d,e,f,g,h,i",
+    ] {
+        assert!(
+            problems(&format!("{MODEL}kernels:\n  fused-verify-from: \"{bad}\"\n"))[0].contains("fused-verify-from"),
+            "{bad}"
+        );
+    }
+}
