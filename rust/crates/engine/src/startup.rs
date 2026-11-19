@@ -1112,11 +1112,13 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use euhedral_inference_settings::ModelSettings;
+
     use super::*;
 
     #[test]
     fn the_transfer_lane_cap_follows_the_librarys_lane_limit() {
-        let mut settings = Settings::with_model(euhedral_inference_settings::ModelSettings::default());
+        let mut settings = Settings::with_model(ModelSettings::default());
         settings.host.task_parallelism = 1000;
         assert_eq!(transfer_lanes(&settings, 64, 4), (64 - 5) / 2);
         assert_eq!(transfer_lanes(&settings, 32, 4), (32 - 5) / 2);

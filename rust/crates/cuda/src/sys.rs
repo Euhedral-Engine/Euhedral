@@ -9,11 +9,6 @@ pub struct EuhedralCuda {
     pub euhedral_cuda_set_include_directory: unsafe extern "C" fn(
         path: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_set_dispatch: unsafe extern "C" fn(
-        rms_norm_decode_slices: u32,
-        fused_verify_from: *const u32,
-        count: u32,
-    ) -> ::std::os::raw::c_int,
     pub euhedral_cuda_malloc: unsafe extern "C" fn(
         byte_size: u64,
     ) -> *mut ::std::os::raw::c_void,
@@ -58,70 +53,13 @@ pub struct EuhedralCuda {
         host_address: *const ::std::os::raw::c_void,
         byte_size: u64,
     ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_copy_upload_to_device: unsafe extern "C" fn(
-        device_address: *mut ::std::os::raw::c_void,
-        host_address: *const ::std::os::raw::c_void,
-        byte_size: u64,
-    ) -> ::std::os::raw::c_int,
     pub euhedral_cuda_copy_device_to_host: unsafe extern "C" fn(
         host_address: *mut ::std::os::raw::c_void,
         device_address: *const ::std::os::raw::c_void,
         byte_size: u64,
     ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_copy_device_to_readback: unsafe extern "C" fn(
-        host_address: *mut ::std::os::raw::c_void,
-        device_address: *const ::std::os::raw::c_void,
-        byte_size: u64,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_copy_device_to_device: unsafe extern "C" fn(
-        destination_address: *mut ::std::os::raw::c_void,
-        source_address: *const ::std::os::raw::c_void,
-        byte_size: u64,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_copy_device_to_device_2d: unsafe extern "C" fn(
-        destination_address: *mut ::std::os::raw::c_void,
-        destination_pitch: u64,
-        source_address: *const ::std::os::raw::c_void,
-        source_pitch: u64,
-        row_bytes: u64,
-        rows: u64,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_embed_q3: unsafe extern "C" fn(
-        device_token_ids: *const i32,
-        device_embedding_weights: *const ::std::os::raw::c_void,
-        device_hidden_state: *mut ::std::os::raw::c_void,
-        token_count: u32,
-        vocabulary_size: u32,
-        hidden_size: u32,
-        embedding_byte_size: u64,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_rms_norm_bf16: unsafe extern "C" fn(
-        device_input: *const ::std::os::raw::c_void,
-        device_weight: *const ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        width: u32,
-        epsilon: f32,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_rms_norm_unit_offset_bf16: unsafe extern "C" fn(
-        device_input: *const ::std::os::raw::c_void,
-        device_weight: *const ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        width: u32,
-        epsilon: f32,
-    ) -> ::std::os::raw::c_int,
     pub euhedral_cuda_select_exact_numerics: unsafe extern "C" fn(
         exact: ::std::os::raw::c_int,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_linear_nvfp4_bf16: unsafe extern "C" fn(
-        input: *const ::std::os::raw::c_void,
-        weights: *const ::std::os::raw::c_void,
-        output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        in_features: u32,
-        out_features: u32,
-        weights_byte_size: u64,
     ) -> ::std::os::raw::c_int,
     pub euhedral_cuda_nvfp4_native_available: unsafe extern "C" fn() -> ::std::os::raw::c_int,
     pub euhedral_cuda_nvfp4_native_scratch_bytes: unsafe extern "C" fn(
@@ -129,182 +67,6 @@ pub struct EuhedralCuda {
         in_features: u32,
         out_features: u32,
     ) -> u64,
-    pub euhedral_cuda_linear_nvfp4_native_bf16: unsafe extern "C" fn(
-        input: *const ::std::os::raw::c_void,
-        weights: *const ::std::os::raw::c_void,
-        output: *mut ::std::os::raw::c_void,
-        scratch: *mut ::std::os::raw::c_void,
-        rows: u32,
-        in_features: u32,
-        out_features: u32,
-        weights_byte_size: u64,
-        scratch_byte_size: u64,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_embed_q3_p2e2: unsafe extern "C" fn(
-        device_token_ids: *const i32,
-        device_embedding_weights: *const ::std::os::raw::c_void,
-        device_hidden_state: *mut ::std::os::raw::c_void,
-        token_count: u32,
-        vocabulary_size: u32,
-        hidden_size: u32,
-        embedding_byte_size: u64,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_gdn_convolution_bf16: unsafe extern "C" fn(
-        device_query_key: *const ::std::os::raw::c_void,
-        device_value_z: *const ::std::os::raw::c_void,
-        device_convolution_weights: *const ::std::os::raw::c_void,
-        device_convolution_state: *mut ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        query_key_width: u32,
-        value_width: u32,
-        convolution_width: u32,
-        kernel_size: u32,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_gdn_recurrence_bf16: unsafe extern "C" fn(
-        device_convolved: *const ::std::os::raw::c_void,
-        device_alpha: *const f32,
-        device_beta: *const f32,
-        device_recurrent_state: *mut f32,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        key_heads: u32,
-        value_heads: u32,
-        key_head_dim: u32,
-        value_head_dim: u32,
-        output_scale: f32,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_gdn_gated_rms_norm_bf16: unsafe extern "C" fn(
-        device_recurrent: *const ::std::os::raw::c_void,
-        device_value_z: *const ::std::os::raw::c_void,
-        device_norm_weight: *const ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        value_heads: u32,
-        head_dim: u32,
-        epsilon: f32,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_residual_rms_norm_bf16: unsafe extern "C" fn(
-        residual: *const ::std::os::raw::c_void,
-        delta: *const ::std::os::raw::c_void,
-        weight: *const ::std::os::raw::c_void,
-        hidden: *mut ::std::os::raw::c_void,
-        normalized: *mut ::std::os::raw::c_void,
-        rows: u32,
-        width: u32,
-        epsilon: f32,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_gdn_project_control_fp32: unsafe extern "C" fn(
-        input: *const ::std::os::raw::c_void,
-        a_weight: *const ::std::os::raw::c_void,
-        b_weight: *const ::std::os::raw::c_void,
-        a_log: *const f32,
-        dt_bias: *const f32,
-        alpha: *mut f32,
-        beta: *mut f32,
-        rows: u32,
-        width: u32,
-        heads: u32,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_residual_add_bf16: unsafe extern "C" fn(
-        device_residual: *const ::std::os::raw::c_void,
-        device_delta: *const ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        width: u32,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_argmax_bf16: unsafe extern "C" fn(
-        device_logits: *const ::std::os::raw::c_void,
-        count: u32,
-        device_result: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_argmax_logprob_bf16: unsafe extern "C" fn(
-        device_logits: *const ::std::os::raw::c_void,
-        count: u32,
-        device_result: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_selected_token: unsafe extern "C" fn(
-        device_key: *const ::std::os::raw::c_void,
-        device_ids: *const ::std::os::raw::c_void,
-        device_token: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_swiglu_bf16: unsafe extern "C" fn(
-        device_gate_up: *const ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        intermediate_size: u32,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_zero_device_memory: unsafe extern "C" fn(
-        device_address: *mut ::std::os::raw::c_void,
-        byte_size: u64,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_attention_kv_append_nvfp4: unsafe extern "C" fn(
-        query_key: *const ::std::os::raw::c_void,
-        gate: *const ::std::os::raw::c_void,
-        keys: *mut ::std::os::raw::c_void,
-        values: *mut ::std::os::raw::c_void,
-        rows: u32,
-        query_width: u32,
-        key_width: u32,
-        start: u64,
-        position: *const ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_attention_causal_nvfp4: unsafe extern "C" fn(
-        query_key: *const ::std::os::raw::c_void,
-        gate: *const ::std::os::raw::c_void,
-        keys: *const ::std::os::raw::c_void,
-        values: *const ::std::os::raw::c_void,
-        output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        query_heads: u32,
-        key_heads: u32,
-        head_dim: u32,
-        cache_length: u32,
-        start: u64,
-        position: *const ::std::os::raw::c_void,
-        scratch: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_attention_kv_append_bf16: unsafe extern "C" fn(
-        query_key: *const ::std::os::raw::c_void,
-        gate: *const ::std::os::raw::c_void,
-        keys: *mut ::std::os::raw::c_void,
-        values: *mut ::std::os::raw::c_void,
-        rows: u32,
-        query_width: u32,
-        key_width: u32,
-        start: u64,
-        position: *const ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_attention_causal_bf16: unsafe extern "C" fn(
-        query_key: *const ::std::os::raw::c_void,
-        gate: *const ::std::os::raw::c_void,
-        keys: *const ::std::os::raw::c_void,
-        values: *const ::std::os::raw::c_void,
-        output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        query_heads: u32,
-        key_heads: u32,
-        head_dim: u32,
-        cache_length: u32,
-        start: u64,
-        position: *const ::std::os::raw::c_void,
-        scratch: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_attention_qk_norm_rope_bf16: unsafe extern "C" fn(
-        device_query_key: *const ::std::os::raw::c_void,
-        device_query_norm: *const ::std::os::raw::c_void,
-        device_key_norm: *const ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        query_heads: u32,
-        key_value_heads: u32,
-        head_dim: u32,
-        rotary_dim: u32,
-        start_position: u64,
-        position: *const ::std::os::raw::c_void,
-        epsilon: f32,
-        rope_theta: f64,
-    ) -> ::std::os::raw::c_int,
     pub euhedral_cuda_synchronize: unsafe extern "C" fn() -> ::std::os::raw::c_int,
     pub euhedral_cuda_stream_select: unsafe extern "C" fn(
         stream: u64,
@@ -313,38 +75,12 @@ pub struct EuhedralCuda {
     pub euhedral_cuda_qwen4_kernel_name: unsafe extern "C" fn(
         index: ::std::os::raw::c_int,
     ) -> *const ::std::os::raw::c_char,
-    pub euhedral_cuda_qwen4_launch: unsafe extern "C" fn(
-        kernel: i32,
-        grid_x: u32,
-        grid_y: u32,
-        grid_z: u32,
-        block_x: u32,
-        block_y: u32,
-        block_z: u32,
-        shared_bytes: u32,
-        words: *const u64,
-        sizes: *const u8,
-        count: i32,
-    ) -> ::std::os::raw::c_int,
     pub euhedral_cuda_linear_kernel_count: unsafe extern "C" fn() -> ::std::os::raw::c_int,
     pub euhedral_cuda_linear_kernel_name: unsafe extern "C" fn(
         index: ::std::os::raw::c_int,
     ) -> *const ::std::os::raw::c_char,
     pub euhedral_cuda_linear_kernel_available: unsafe extern "C" fn(
         kernel: i32,
-    ) -> ::std::os::raw::c_int,
-    pub euhedral_cuda_linear_launch: unsafe extern "C" fn(
-        kernel: i32,
-        grid_x: u32,
-        grid_y: u32,
-        grid_z: u32,
-        block_x: u32,
-        block_y: u32,
-        block_z: u32,
-        shared_bytes: u32,
-        words: *const u64,
-        sizes: *const u8,
-        count: i32,
     ) -> ::std::os::raw::c_int,
 }
 impl EuhedralCuda {
@@ -362,9 +98,6 @@ impl EuhedralCuda {
         let __library = library.into();
         let euhedral_cuda_set_include_directory = __library
             .get(b"euhedral_cuda_set_include_directory\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_set_dispatch = __library
-            .get(b"euhedral_cuda_set_dispatch\0")
             .map(|sym| *sym)?;
         let euhedral_cuda_malloc = __library
             .get(b"euhedral_cuda_malloc\0")
@@ -403,95 +136,17 @@ impl EuhedralCuda {
         let euhedral_cuda_copy_host_to_device = __library
             .get(b"euhedral_cuda_copy_host_to_device\0")
             .map(|sym| *sym)?;
-        let euhedral_cuda_copy_upload_to_device = __library
-            .get(b"euhedral_cuda_copy_upload_to_device\0")
-            .map(|sym| *sym)?;
         let euhedral_cuda_copy_device_to_host = __library
             .get(b"euhedral_cuda_copy_device_to_host\0")
             .map(|sym| *sym)?;
-        let euhedral_cuda_copy_device_to_readback = __library
-            .get(b"euhedral_cuda_copy_device_to_readback\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_copy_device_to_device = __library
-            .get(b"euhedral_cuda_copy_device_to_device\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_copy_device_to_device_2d = __library
-            .get(b"euhedral_cuda_copy_device_to_device_2d\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_embed_q3 = __library
-            .get(b"euhedral_cuda_embed_q3\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_rms_norm_bf16 = __library
-            .get(b"euhedral_cuda_rms_norm_bf16\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_rms_norm_unit_offset_bf16 = __library
-            .get(b"euhedral_cuda_rms_norm_unit_offset_bf16\0")
-            .map(|sym| *sym)?;
         let euhedral_cuda_select_exact_numerics = __library
             .get(b"euhedral_cuda_select_exact_numerics\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_linear_nvfp4_bf16 = __library
-            .get(b"euhedral_cuda_linear_nvfp4_bf16\0")
             .map(|sym| *sym)?;
         let euhedral_cuda_nvfp4_native_available = __library
             .get(b"euhedral_cuda_nvfp4_native_available\0")
             .map(|sym| *sym)?;
         let euhedral_cuda_nvfp4_native_scratch_bytes = __library
             .get(b"euhedral_cuda_nvfp4_native_scratch_bytes\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_linear_nvfp4_native_bf16 = __library
-            .get(b"euhedral_cuda_linear_nvfp4_native_bf16\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_embed_q3_p2e2 = __library
-            .get(b"euhedral_cuda_embed_q3_p2e2\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_gdn_convolution_bf16 = __library
-            .get(b"euhedral_cuda_gdn_convolution_bf16\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_gdn_recurrence_bf16 = __library
-            .get(b"euhedral_cuda_gdn_recurrence_bf16\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_gdn_gated_rms_norm_bf16 = __library
-            .get(b"euhedral_cuda_gdn_gated_rms_norm_bf16\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_residual_rms_norm_bf16 = __library
-            .get(b"euhedral_cuda_residual_rms_norm_bf16\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_gdn_project_control_fp32 = __library
-            .get(b"euhedral_cuda_gdn_project_control_fp32\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_residual_add_bf16 = __library
-            .get(b"euhedral_cuda_residual_add_bf16\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_argmax_bf16 = __library
-            .get(b"euhedral_cuda_argmax_bf16\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_argmax_logprob_bf16 = __library
-            .get(b"euhedral_cuda_argmax_logprob_bf16\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_selected_token = __library
-            .get(b"euhedral_cuda_selected_token\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_swiglu_bf16 = __library
-            .get(b"euhedral_cuda_swiglu_bf16\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_zero_device_memory = __library
-            .get(b"euhedral_cuda_zero_device_memory\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_attention_kv_append_nvfp4 = __library
-            .get(b"euhedral_cuda_attention_kv_append_nvfp4\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_attention_causal_nvfp4 = __library
-            .get(b"euhedral_cuda_attention_causal_nvfp4\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_attention_kv_append_bf16 = __library
-            .get(b"euhedral_cuda_attention_kv_append_bf16\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_attention_causal_bf16 = __library
-            .get(b"euhedral_cuda_attention_causal_bf16\0")
-            .map(|sym| *sym)?;
-        let euhedral_cuda_attention_qk_norm_rope_bf16 = __library
-            .get(b"euhedral_cuda_attention_qk_norm_rope_bf16\0")
             .map(|sym| *sym)?;
         let euhedral_cuda_synchronize = __library
             .get(b"euhedral_cuda_synchronize\0")
@@ -505,9 +160,6 @@ impl EuhedralCuda {
         let euhedral_cuda_qwen4_kernel_name = __library
             .get(b"euhedral_cuda_qwen4_kernel_name\0")
             .map(|sym| *sym)?;
-        let euhedral_cuda_qwen4_launch = __library
-            .get(b"euhedral_cuda_qwen4_launch\0")
-            .map(|sym| *sym)?;
         let euhedral_cuda_linear_kernel_count = __library
             .get(b"euhedral_cuda_linear_kernel_count\0")
             .map(|sym| *sym)?;
@@ -517,13 +169,9 @@ impl EuhedralCuda {
         let euhedral_cuda_linear_kernel_available = __library
             .get(b"euhedral_cuda_linear_kernel_available\0")
             .map(|sym| *sym)?;
-        let euhedral_cuda_linear_launch = __library
-            .get(b"euhedral_cuda_linear_launch\0")
-            .map(|sym| *sym)?;
         Ok(EuhedralCuda {
             __library,
             euhedral_cuda_set_include_directory,
-            euhedral_cuda_set_dispatch,
             euhedral_cuda_malloc,
             euhedral_cuda_free,
             euhedral_cuda_malloc_async,
@@ -537,45 +185,17 @@ impl EuhedralCuda {
             euhedral_cuda_multiprocessor_count,
             euhedral_cuda_compute_capability,
             euhedral_cuda_copy_host_to_device,
-            euhedral_cuda_copy_upload_to_device,
             euhedral_cuda_copy_device_to_host,
-            euhedral_cuda_copy_device_to_readback,
-            euhedral_cuda_copy_device_to_device,
-            euhedral_cuda_copy_device_to_device_2d,
-            euhedral_cuda_embed_q3,
-            euhedral_cuda_rms_norm_bf16,
-            euhedral_cuda_rms_norm_unit_offset_bf16,
             euhedral_cuda_select_exact_numerics,
-            euhedral_cuda_linear_nvfp4_bf16,
             euhedral_cuda_nvfp4_native_available,
             euhedral_cuda_nvfp4_native_scratch_bytes,
-            euhedral_cuda_linear_nvfp4_native_bf16,
-            euhedral_cuda_embed_q3_p2e2,
-            euhedral_cuda_gdn_convolution_bf16,
-            euhedral_cuda_gdn_recurrence_bf16,
-            euhedral_cuda_gdn_gated_rms_norm_bf16,
-            euhedral_cuda_residual_rms_norm_bf16,
-            euhedral_cuda_gdn_project_control_fp32,
-            euhedral_cuda_residual_add_bf16,
-            euhedral_cuda_argmax_bf16,
-            euhedral_cuda_argmax_logprob_bf16,
-            euhedral_cuda_selected_token,
-            euhedral_cuda_swiglu_bf16,
-            euhedral_cuda_zero_device_memory,
-            euhedral_cuda_attention_kv_append_nvfp4,
-            euhedral_cuda_attention_causal_nvfp4,
-            euhedral_cuda_attention_kv_append_bf16,
-            euhedral_cuda_attention_causal_bf16,
-            euhedral_cuda_attention_qk_norm_rope_bf16,
             euhedral_cuda_synchronize,
             euhedral_cuda_stream_select,
             euhedral_cuda_stream_clear,
             euhedral_cuda_qwen4_kernel_name,
-            euhedral_cuda_qwen4_launch,
             euhedral_cuda_linear_kernel_count,
             euhedral_cuda_linear_kernel_name,
             euhedral_cuda_linear_kernel_available,
-            euhedral_cuda_linear_launch,
         })
     }
     pub unsafe fn euhedral_cuda_set_include_directory(
@@ -583,19 +203,6 @@ impl EuhedralCuda {
         path: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int {
         (self.euhedral_cuda_set_include_directory)(path)
-    }
-    pub unsafe fn euhedral_cuda_set_dispatch(
-        &self,
-        rms_norm_decode_slices: u32,
-        fused_verify_from: *const u32,
-        count: u32,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_set_dispatch)(
-            rms_norm_decode_slices,
-            fused_verify_from,
-            count,
-        )
     }
     pub unsafe fn euhedral_cuda_malloc(
         &self,
@@ -680,19 +287,6 @@ impl EuhedralCuda {
     ) -> ::std::os::raw::c_int {
         (self.euhedral_cuda_copy_host_to_device)(device_address, host_address, byte_size)
     }
-    pub unsafe fn euhedral_cuda_copy_upload_to_device(
-        &self,
-        device_address: *mut ::std::os::raw::c_void,
-        host_address: *const ::std::os::raw::c_void,
-        byte_size: u64,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_copy_upload_to_device)(
-            device_address,
-            host_address,
-            byte_size,
-        )
-    }
     pub unsafe fn euhedral_cuda_copy_device_to_host(
         &self,
         host_address: *mut ::std::os::raw::c_void,
@@ -701,136 +295,11 @@ impl EuhedralCuda {
     ) -> ::std::os::raw::c_int {
         (self.euhedral_cuda_copy_device_to_host)(host_address, device_address, byte_size)
     }
-    pub unsafe fn euhedral_cuda_copy_device_to_readback(
-        &self,
-        host_address: *mut ::std::os::raw::c_void,
-        device_address: *const ::std::os::raw::c_void,
-        byte_size: u64,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_copy_device_to_readback)(
-            host_address,
-            device_address,
-            byte_size,
-        )
-    }
-    pub unsafe fn euhedral_cuda_copy_device_to_device(
-        &self,
-        destination_address: *mut ::std::os::raw::c_void,
-        source_address: *const ::std::os::raw::c_void,
-        byte_size: u64,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_copy_device_to_device)(
-            destination_address,
-            source_address,
-            byte_size,
-        )
-    }
-    pub unsafe fn euhedral_cuda_copy_device_to_device_2d(
-        &self,
-        destination_address: *mut ::std::os::raw::c_void,
-        destination_pitch: u64,
-        source_address: *const ::std::os::raw::c_void,
-        source_pitch: u64,
-        row_bytes: u64,
-        rows: u64,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_copy_device_to_device_2d)(
-            destination_address,
-            destination_pitch,
-            source_address,
-            source_pitch,
-            row_bytes,
-            rows,
-        )
-    }
-    pub unsafe fn euhedral_cuda_embed_q3(
-        &self,
-        device_token_ids: *const i32,
-        device_embedding_weights: *const ::std::os::raw::c_void,
-        device_hidden_state: *mut ::std::os::raw::c_void,
-        token_count: u32,
-        vocabulary_size: u32,
-        hidden_size: u32,
-        embedding_byte_size: u64,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_embed_q3)(
-            device_token_ids,
-            device_embedding_weights,
-            device_hidden_state,
-            token_count,
-            vocabulary_size,
-            hidden_size,
-            embedding_byte_size,
-        )
-    }
-    pub unsafe fn euhedral_cuda_rms_norm_bf16(
-        &self,
-        device_input: *const ::std::os::raw::c_void,
-        device_weight: *const ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        width: u32,
-        epsilon: f32,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_rms_norm_bf16)(
-            device_input,
-            device_weight,
-            device_output,
-            rows,
-            width,
-            epsilon,
-        )
-    }
-    pub unsafe fn euhedral_cuda_rms_norm_unit_offset_bf16(
-        &self,
-        device_input: *const ::std::os::raw::c_void,
-        device_weight: *const ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        width: u32,
-        epsilon: f32,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_rms_norm_unit_offset_bf16)(
-            device_input,
-            device_weight,
-            device_output,
-            rows,
-            width,
-            epsilon,
-        )
-    }
     pub unsafe fn euhedral_cuda_select_exact_numerics(
         &self,
         exact: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int {
         (self.euhedral_cuda_select_exact_numerics)(exact)
-    }
-    pub unsafe fn euhedral_cuda_linear_nvfp4_bf16(
-        &self,
-        input: *const ::std::os::raw::c_void,
-        weights: *const ::std::os::raw::c_void,
-        output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        in_features: u32,
-        out_features: u32,
-        weights_byte_size: u64,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_linear_nvfp4_bf16)(
-            input,
-            weights,
-            output,
-            rows,
-            in_features,
-            out_features,
-            weights_byte_size,
-        )
     }
     pub unsafe fn euhedral_cuda_nvfp4_native_available(&self) -> ::std::os::raw::c_int {
         (self.euhedral_cuda_nvfp4_native_available)()
@@ -842,393 +311,6 @@ impl EuhedralCuda {
         out_features: u32,
     ) -> u64 {
         (self.euhedral_cuda_nvfp4_native_scratch_bytes)(rows, in_features, out_features)
-    }
-    pub unsafe fn euhedral_cuda_linear_nvfp4_native_bf16(
-        &self,
-        input: *const ::std::os::raw::c_void,
-        weights: *const ::std::os::raw::c_void,
-        output: *mut ::std::os::raw::c_void,
-        scratch: *mut ::std::os::raw::c_void,
-        rows: u32,
-        in_features: u32,
-        out_features: u32,
-        weights_byte_size: u64,
-        scratch_byte_size: u64,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_linear_nvfp4_native_bf16)(
-            input,
-            weights,
-            output,
-            scratch,
-            rows,
-            in_features,
-            out_features,
-            weights_byte_size,
-            scratch_byte_size,
-        )
-    }
-    pub unsafe fn euhedral_cuda_embed_q3_p2e2(
-        &self,
-        device_token_ids: *const i32,
-        device_embedding_weights: *const ::std::os::raw::c_void,
-        device_hidden_state: *mut ::std::os::raw::c_void,
-        token_count: u32,
-        vocabulary_size: u32,
-        hidden_size: u32,
-        embedding_byte_size: u64,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_embed_q3_p2e2)(
-            device_token_ids,
-            device_embedding_weights,
-            device_hidden_state,
-            token_count,
-            vocabulary_size,
-            hidden_size,
-            embedding_byte_size,
-        )
-    }
-    pub unsafe fn euhedral_cuda_gdn_convolution_bf16(
-        &self,
-        device_query_key: *const ::std::os::raw::c_void,
-        device_value_z: *const ::std::os::raw::c_void,
-        device_convolution_weights: *const ::std::os::raw::c_void,
-        device_convolution_state: *mut ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        query_key_width: u32,
-        value_width: u32,
-        convolution_width: u32,
-        kernel_size: u32,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_gdn_convolution_bf16)(
-            device_query_key,
-            device_value_z,
-            device_convolution_weights,
-            device_convolution_state,
-            device_output,
-            rows,
-            query_key_width,
-            value_width,
-            convolution_width,
-            kernel_size,
-        )
-    }
-    pub unsafe fn euhedral_cuda_gdn_recurrence_bf16(
-        &self,
-        device_convolved: *const ::std::os::raw::c_void,
-        device_alpha: *const f32,
-        device_beta: *const f32,
-        device_recurrent_state: *mut f32,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        key_heads: u32,
-        value_heads: u32,
-        key_head_dim: u32,
-        value_head_dim: u32,
-        output_scale: f32,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_gdn_recurrence_bf16)(
-            device_convolved,
-            device_alpha,
-            device_beta,
-            device_recurrent_state,
-            device_output,
-            rows,
-            key_heads,
-            value_heads,
-            key_head_dim,
-            value_head_dim,
-            output_scale,
-        )
-    }
-    pub unsafe fn euhedral_cuda_gdn_gated_rms_norm_bf16(
-        &self,
-        device_recurrent: *const ::std::os::raw::c_void,
-        device_value_z: *const ::std::os::raw::c_void,
-        device_norm_weight: *const ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        value_heads: u32,
-        head_dim: u32,
-        epsilon: f32,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_gdn_gated_rms_norm_bf16)(
-            device_recurrent,
-            device_value_z,
-            device_norm_weight,
-            device_output,
-            rows,
-            value_heads,
-            head_dim,
-            epsilon,
-        )
-    }
-    pub unsafe fn euhedral_cuda_residual_rms_norm_bf16(
-        &self,
-        residual: *const ::std::os::raw::c_void,
-        delta: *const ::std::os::raw::c_void,
-        weight: *const ::std::os::raw::c_void,
-        hidden: *mut ::std::os::raw::c_void,
-        normalized: *mut ::std::os::raw::c_void,
-        rows: u32,
-        width: u32,
-        epsilon: f32,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_residual_rms_norm_bf16)(
-            residual,
-            delta,
-            weight,
-            hidden,
-            normalized,
-            rows,
-            width,
-            epsilon,
-        )
-    }
-    pub unsafe fn euhedral_cuda_gdn_project_control_fp32(
-        &self,
-        input: *const ::std::os::raw::c_void,
-        a_weight: *const ::std::os::raw::c_void,
-        b_weight: *const ::std::os::raw::c_void,
-        a_log: *const f32,
-        dt_bias: *const f32,
-        alpha: *mut f32,
-        beta: *mut f32,
-        rows: u32,
-        width: u32,
-        heads: u32,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_gdn_project_control_fp32)(
-            input,
-            a_weight,
-            b_weight,
-            a_log,
-            dt_bias,
-            alpha,
-            beta,
-            rows,
-            width,
-            heads,
-        )
-    }
-    pub unsafe fn euhedral_cuda_residual_add_bf16(
-        &self,
-        device_residual: *const ::std::os::raw::c_void,
-        device_delta: *const ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        width: u32,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_residual_add_bf16)(
-            device_residual,
-            device_delta,
-            device_output,
-            rows,
-            width,
-        )
-    }
-    pub unsafe fn euhedral_cuda_argmax_bf16(
-        &self,
-        device_logits: *const ::std::os::raw::c_void,
-        count: u32,
-        device_result: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int {
-        (self.euhedral_cuda_argmax_bf16)(device_logits, count, device_result)
-    }
-    pub unsafe fn euhedral_cuda_argmax_logprob_bf16(
-        &self,
-        device_logits: *const ::std::os::raw::c_void,
-        count: u32,
-        device_result: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int {
-        (self.euhedral_cuda_argmax_logprob_bf16)(device_logits, count, device_result)
-    }
-    pub unsafe fn euhedral_cuda_selected_token(
-        &self,
-        device_key: *const ::std::os::raw::c_void,
-        device_ids: *const ::std::os::raw::c_void,
-        device_token: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int {
-        (self.euhedral_cuda_selected_token)(device_key, device_ids, device_token)
-    }
-    pub unsafe fn euhedral_cuda_swiglu_bf16(
-        &self,
-        device_gate_up: *const ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        intermediate_size: u32,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_swiglu_bf16)(
-            device_gate_up,
-            device_output,
-            rows,
-            intermediate_size,
-        )
-    }
-    pub unsafe fn euhedral_cuda_zero_device_memory(
-        &self,
-        device_address: *mut ::std::os::raw::c_void,
-        byte_size: u64,
-    ) -> ::std::os::raw::c_int {
-        (self.euhedral_cuda_zero_device_memory)(device_address, byte_size)
-    }
-    pub unsafe fn euhedral_cuda_attention_kv_append_nvfp4(
-        &self,
-        query_key: *const ::std::os::raw::c_void,
-        gate: *const ::std::os::raw::c_void,
-        keys: *mut ::std::os::raw::c_void,
-        values: *mut ::std::os::raw::c_void,
-        rows: u32,
-        query_width: u32,
-        key_width: u32,
-        start: u64,
-        position: *const ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_attention_kv_append_nvfp4)(
-            query_key,
-            gate,
-            keys,
-            values,
-            rows,
-            query_width,
-            key_width,
-            start,
-            position,
-        )
-    }
-    pub unsafe fn euhedral_cuda_attention_causal_nvfp4(
-        &self,
-        query_key: *const ::std::os::raw::c_void,
-        gate: *const ::std::os::raw::c_void,
-        keys: *const ::std::os::raw::c_void,
-        values: *const ::std::os::raw::c_void,
-        output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        query_heads: u32,
-        key_heads: u32,
-        head_dim: u32,
-        cache_length: u32,
-        start: u64,
-        position: *const ::std::os::raw::c_void,
-        scratch: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_attention_causal_nvfp4)(
-            query_key,
-            gate,
-            keys,
-            values,
-            output,
-            rows,
-            query_heads,
-            key_heads,
-            head_dim,
-            cache_length,
-            start,
-            position,
-            scratch,
-        )
-    }
-    pub unsafe fn euhedral_cuda_attention_kv_append_bf16(
-        &self,
-        query_key: *const ::std::os::raw::c_void,
-        gate: *const ::std::os::raw::c_void,
-        keys: *mut ::std::os::raw::c_void,
-        values: *mut ::std::os::raw::c_void,
-        rows: u32,
-        query_width: u32,
-        key_width: u32,
-        start: u64,
-        position: *const ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_attention_kv_append_bf16)(
-            query_key,
-            gate,
-            keys,
-            values,
-            rows,
-            query_width,
-            key_width,
-            start,
-            position,
-        )
-    }
-    pub unsafe fn euhedral_cuda_attention_causal_bf16(
-        &self,
-        query_key: *const ::std::os::raw::c_void,
-        gate: *const ::std::os::raw::c_void,
-        keys: *const ::std::os::raw::c_void,
-        values: *const ::std::os::raw::c_void,
-        output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        query_heads: u32,
-        key_heads: u32,
-        head_dim: u32,
-        cache_length: u32,
-        start: u64,
-        position: *const ::std::os::raw::c_void,
-        scratch: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_attention_causal_bf16)(
-            query_key,
-            gate,
-            keys,
-            values,
-            output,
-            rows,
-            query_heads,
-            key_heads,
-            head_dim,
-            cache_length,
-            start,
-            position,
-            scratch,
-        )
-    }
-    pub unsafe fn euhedral_cuda_attention_qk_norm_rope_bf16(
-        &self,
-        device_query_key: *const ::std::os::raw::c_void,
-        device_query_norm: *const ::std::os::raw::c_void,
-        device_key_norm: *const ::std::os::raw::c_void,
-        device_output: *mut ::std::os::raw::c_void,
-        rows: u32,
-        query_heads: u32,
-        key_value_heads: u32,
-        head_dim: u32,
-        rotary_dim: u32,
-        start_position: u64,
-        position: *const ::std::os::raw::c_void,
-        epsilon: f32,
-        rope_theta: f64,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_attention_qk_norm_rope_bf16)(
-            device_query_key,
-            device_query_norm,
-            device_key_norm,
-            device_output,
-            rows,
-            query_heads,
-            key_value_heads,
-            head_dim,
-            rotary_dim,
-            start_position,
-            position,
-            epsilon,
-            rope_theta,
-        )
     }
     pub unsafe fn euhedral_cuda_synchronize(&self) -> ::std::os::raw::c_int {
         (self.euhedral_cuda_synchronize)()
@@ -1248,35 +330,6 @@ impl EuhedralCuda {
     ) -> *const ::std::os::raw::c_char {
         (self.euhedral_cuda_qwen4_kernel_name)(index)
     }
-    pub unsafe fn euhedral_cuda_qwen4_launch(
-        &self,
-        kernel: i32,
-        grid_x: u32,
-        grid_y: u32,
-        grid_z: u32,
-        block_x: u32,
-        block_y: u32,
-        block_z: u32,
-        shared_bytes: u32,
-        words: *const u64,
-        sizes: *const u8,
-        count: i32,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_qwen4_launch)(
-            kernel,
-            grid_x,
-            grid_y,
-            grid_z,
-            block_x,
-            block_y,
-            block_z,
-            shared_bytes,
-            words,
-            sizes,
-            count,
-        )
-    }
     pub unsafe fn euhedral_cuda_linear_kernel_count(&self) -> ::std::os::raw::c_int {
         (self.euhedral_cuda_linear_kernel_count)()
     }
@@ -1291,34 +344,5 @@ impl EuhedralCuda {
         kernel: i32,
     ) -> ::std::os::raw::c_int {
         (self.euhedral_cuda_linear_kernel_available)(kernel)
-    }
-    pub unsafe fn euhedral_cuda_linear_launch(
-        &self,
-        kernel: i32,
-        grid_x: u32,
-        grid_y: u32,
-        grid_z: u32,
-        block_x: u32,
-        block_y: u32,
-        block_z: u32,
-        shared_bytes: u32,
-        words: *const u64,
-        sizes: *const u8,
-        count: i32,
-    ) -> ::std::os::raw::c_int {
-        (self
-            .euhedral_cuda_linear_launch)(
-            kernel,
-            grid_x,
-            grid_y,
-            grid_z,
-            block_x,
-            block_y,
-            block_z,
-            shared_bytes,
-            words,
-            sizes,
-            count,
-        )
     }
 }
