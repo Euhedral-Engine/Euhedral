@@ -1572,6 +1572,44 @@ fn cancel_during_a_disk_read_ends_cleanly() {
         .expect("the engine closes within its bound");
 }
 
+/// The disk tier is torn down cleanly twice in one process: the window is freed after every quantum has retired and the
+/// reader has closed (the leak check finds no claim held), and the next start reads the file again and generates the
+/// same tokens.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and its copy on a local disk"]
+fn the_window_is_freed_at_shutdown_and_the_next_start_generates_the_same() {
+    let Some(machine) = machine() else { return };
+    let machine = disk_machine(machine.library, machine.goldens);
+    let reference = greedy_reference(&machine);
+    for cycle in 0..2 {
+        let Some((owner, runtime)) = start_on_disk(&machine, 1) else {
+            return;
+        };
+        let teardown = runtime.teardown();
+        let done = submit(
+            &runtime,
+            &reference.prompt,
+            128,
+            &[],
+            Speculation::Off,
+            SamplingConfig::greedy(0),
+            None,
+        )
+        .expect("the request is admitted")
+        .wait(Duration::from_secs(5 * 60))
+        .expect("the request reports");
+        assert_eq!(done.tokens, reference.generated, "cycle {cycle}");
+        owner
+            .shutdown_within(runtime, Duration::from_secs(120))
+            .expect("the engine closes within its bound");
+        assert_eq!(
+            teardown.leaked_bytes(),
+            Some(0),
+            "cycle {cycle}: a claim was still held after the window was freed"
+        );
+    }
+}
+
 /// Two sequences with their draft layer on, projections staged through the one ring: each request's tokens are what
 /// they are alone. The waits are bounded.
 #[test]

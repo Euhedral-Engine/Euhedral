@@ -1213,11 +1213,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::residency::offload::StagingGeometry;
+    use crate::residency::offload::{StagingGeometry, WindowGeometry};
 
     #[test]
     fn a_plan_with_weights_outside_the_device_is_refused_naming_the_host_bytes() {
-        use crate::residency::offload::WindowGeometry;
         assert_eq!(refuse_offload(&Offload::default()), Ok(()));
         let offload = Offload {
             host: vec!["text/token_embedding".to_string()],
@@ -1267,6 +1266,29 @@ mod tests {
         let mut with_disk = host(&["text/token_embedding"]);
         with_disk.disk = vec!["text/layers/0/mlp/down".to_string()];
         assert!(refuse_offload(&with_disk).is_err());
+        // Disk objects are in reach once the plan carries the ring and the window that read them.
+        with_disk.staging = Some(StagingGeometry {
+            slots: 4,
+            slot_bytes: 4096,
+        });
+        assert!(
+            refuse_offload(&with_disk).is_err(),
+            "a ring alone does not read the file"
+        );
+        with_disk.window = Some(WindowGeometry {
+            slots: 8,
+            slot_bytes: 8192,
+        });
+        assert_eq!(refuse_offload(&with_disk), Ok(()));
+        let bare = Offload {
+            disk: vec!["text/layers/0/mlp/down".to_string()],
+            window: with_disk.window,
+            ..Offload::default()
+        };
+        assert!(
+            refuse_offload(&bare).is_err(),
+            "a window without a ring has nowhere to copy to"
+        );
     }
 
     #[test]

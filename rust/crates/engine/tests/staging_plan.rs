@@ -8,17 +8,21 @@
 )]
 
 use std::collections::{BTreeSet, HashMap};
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use euhedral_graph::LaneId;
+use euhedral_graph::{Completions, LaneId};
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, DevicePtr, HostWeightsArena};
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::model::{LayerIndex, ModelConfig, Residence, Role, WeightRef, Weights, object_key};
 use euhedral_inference_engine::plan::{
     DECODE_MAX_ROWS, Formats, Plan, PlanBuildError, StageKind, StagingRing, View, WeightLookup,
 };
+use euhedral_inference_engine::residency::disk::{DiskReader, ReadDone, ReadPort, ReadSpec};
+use euhedral_inference_engine::residency::offload::WindowGeometry;
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, plan as residency};
+use euhedral_inference_engine::stages::transfer::DiskTier;
 use euhedral_inference_settings::TrellisKernelSettings;
 
 mod common;
@@ -733,4 +737,61 @@ fn the_weights_hand_the_plan_their_host_arena_through_the_lookup_trait() {
     let none = Weights::new(device, None, HashMap::new());
     let lookup: &dyn WeightLookup = &none;
     assert!(lookup.host_arena().is_none());
+}
+
+/// A port that reads nothing: the plan only names the reads.
+struct NoPort;
+
+impl ReadPort for NoPort {
+    fn start(&self, _spec: ReadSpec, _done: ReadDone) -> io::Result<()> {
+        Err(io::Error::other("a plan test reads nothing"))
+    }
+    fn has_direct(&self) -> bool {
+        false
+    }
+    fn file_len(&self) -> u64 {
+        u64::MAX
+    }
+}
+
+#[test]
+fn a_view_with_disk_uses_is_never_captured_and_the_draft_views_still_are() {
+    let fixture = fixture();
+    let chosen = set(fixture.candidates(&STAGEABLE));
+    let mut weights = fixture.weights.0.clone();
+    for (index, weight) in weights.values_mut().enumerate() {
+        if chosen.contains(&weight.name) {
+            weight.residence = Residence::Disk {
+                file_offset: 4096 * (index as u64 + 1),
+            };
+        }
+    }
+    let geometry = WindowGeometry {
+        slots: 4,
+        slot_bytes: 1 << 30,
+    };
+    let reader = DiskReader::new(Arc::new(NoPort), geometry, Box::new(|_| false));
+    let tier = DiskTier::detached(reader, geometry, Completions::without_lanes());
+    let ring = fixture.ring(&chosen, 2);
+    let plan = Plan::build_tiered(
+        &fixture.config,
+        &Described(weights),
+        &fixture.resident,
+        &fixture.formats,
+        Some(&ring),
+        Some(TRANSFER_LANE),
+        Some(&tier),
+    )
+    .unwrap();
+    for view in BASE_VIEWS {
+        assert!(!plan.disk_uses(view).is_empty(), "{view:?} reads from the disk");
+        assert!(
+            !plan.capturable(view),
+            "{view:?}: a disk read runs in the graph, not a capture"
+        );
+    }
+    for view in MTP_VIEWS {
+        assert!(plan.disk_uses(view).is_empty(), "{view:?}");
+        assert_eq!(plan.capturable(view), view.capturable(), "{view:?}");
+    }
 }
