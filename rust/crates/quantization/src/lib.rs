@@ -25,6 +25,7 @@ pub mod mixed;
 pub mod npy;
 pub mod npz;
 pub mod recipe;
+pub mod reference;
 pub mod resume;
 pub mod rows;
 pub mod step;

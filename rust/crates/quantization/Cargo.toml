@@ -17,6 +17,7 @@ euhedral-inference-cuda = { path = "../cuda" }
 euhedral-inference-edrl = { path = "../edrl" }
 euhedral-inference-engine = { path = "../engine" }
 euhedral-inference-settings = { path = "../settings" }
+euhedral-inference-tokenizer = { path = "../tokenizer" }
 euhedral-io.workspace = true
 serde_json = { workspace = true }
 thiserror.workspace = true

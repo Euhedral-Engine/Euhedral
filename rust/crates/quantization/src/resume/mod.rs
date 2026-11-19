@@ -34,6 +34,7 @@ use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
+use euhedral_core::frames::Frame;
 use euhedral_graph::{Lake, UnitGuard};
 use euhedral_io::{AsyncIo, Continuation, Create, IoBuf, IoDone, OpenSpec, OwnedFile, RawFile};
 use thiserror::Error;
@@ -199,6 +200,20 @@ impl ResumeFile {
             .on_host(durable::sync_and_close, &Slot::new(Box::new(barrier)))
     }
 
+    /// The length of the file in bytes.
+    pub fn size(&self, then: Then<u64>) -> Result<(), ResumeError> {
+        let (io, file) = (Arc::clone(&self.inner.io), raw(&self.inner.file));
+        let slot = Slot::new(then);
+        slot.submit(self.clone(), move |watch| {
+            let measured = move |len: io::Result<u64>| {
+                let (slot, held) = watch.take();
+                drop(held);
+                slot.finish(len.map_err(ResumeError::Io))
+            };
+            Ok(io.file_len(file, Box::new(measured))?)
+        })
+    }
+
     /// Writes `bytes` at `offset`; `then` is told the offset after them.
     pub fn write(&self, offset: u64, bytes: Vec<u8>, then: Then<u64>) -> Result<(), ResumeError> {
         self.clone().write_slot(offset, bytes, &Slot::new(then))
@@ -299,6 +314,31 @@ impl ResumeFile {
         })
     }
 
+    /// Ends a run whose file is the output: cuts the file back to `len` bytes, makes it durable, closes it and renames
+    /// it to `to`, replacing a file of that name. The same conditions as [`ResumeFile::remove`] apply: it is an error
+    /// ([`ResumeError::Busy`]) while another handle is open or a call on the file is in flight, and the handle this
+    /// call took is spent either way. The file is closed before it is renamed, and no handle of the call is left when
+    /// `then` runs.
+    pub fn seal(self, len: u64, to: &Path, then: Then<()>) -> Result<(), ResumeError> {
+        let Inner {
+            file,
+            io,
+            host,
+            path,
+            unit,
+        } = Arc::into_inner(self.inner).ok_or(ResumeError::Busy)?;
+        let seal = Seal {
+            file,
+            io,
+            host,
+            path,
+            to: to.to_owned(),
+            len,
+            unit,
+        };
+        seal.cut(&Slot::new(then))
+    }
+
     /// Runs a durability call and ends `slot` with its result. A unit forked from the file's keeps the lake admitted
     /// until the completion has been offered. The step owns this handle until its continuation is about to run, and
     /// the caller holds none when the call returns.
@@ -338,6 +378,104 @@ impl ResumeFile {
                 drop(unit);
             });
             offered.offer(frame).map_err(|_| ResumeError::LakeClosed)
+        })
+    }
+}
+
+/// The steps of [`ResumeFile::seal`], each started by the continuation of the one before it.
+struct Seal {
+    file: SharedFile,
+    io: Arc<AsyncIo>,
+    host: Arc<Lake>,
+    path: PathBuf,
+    to: PathBuf,
+    len: u64,
+    unit: UnitGuard,
+}
+
+impl Seal {
+    /// Ends the call with `result` on the host lake, and lets the lake go once that is offered.
+    fn end(slot: &Slot<()>, host: &Arc<Lake>, unit: UnitGuard, result: Result<(), ResumeError>) -> Box<dyn Frame> {
+        let next = slot.finish(result);
+        drop(host.offer(next));
+        step(Kind::Release, move || drop(unit))
+    }
+
+    /// Ends the call, from a continuation, with the error of the next step if that one could not start.
+    fn continued(
+        started: Result<(), ResumeError>,
+        slot: &Slot<()>,
+        host: &Arc<Lake>,
+        unit: UnitGuard,
+    ) -> Box<dyn Frame> {
+        match started {
+            Ok(()) => step(Kind::Release, move || drop(unit)),
+            Err(error) => Seal::end(slot, host, unit, Err(error)),
+        }
+    }
+
+    fn cut(self, slot: &Slot<()>) -> Result<(), ResumeError> {
+        let (host, file, len) = (Arc::clone(&self.host), Arc::clone(&self.file), self.len);
+        let kept = self.unit.fork();
+        slot.submit((), move |watch| {
+            let cut = move |result: io::Result<()>| {
+                let (slot, ()) = watch.take();
+                match result {
+                    Ok(()) => {
+                        let host = Arc::clone(&self.host);
+                        let started = self.sync(&slot);
+                        Seal::continued(started, &slot, &host, kept)
+                    }
+                    Err(error) => Seal::end(&slot, &self.host, kept, Err(error.into())),
+                }
+            };
+            Ok(durable::truncate_and_close(&host, file, len, Box::new(cut))?)
+        })
+    }
+
+    fn sync(self, slot: &Slot<()>) -> Result<(), ResumeError> {
+        let Seal {
+            file,
+            io,
+            host,
+            path,
+            to,
+            unit,
+            ..
+        } = self;
+        let (lake, kept) = (Arc::clone(&host), unit.fork());
+        slot.submit((), move |watch| {
+            let synced = move |result: io::Result<()>| {
+                let (slot, ()) = watch.take();
+                match result {
+                    Ok(()) => {
+                        let started = Seal::rename(&io, &lake, &path, &to, &slot, unit.fork());
+                        drop(unit);
+                        Seal::continued(started, &slot, &lake, kept)
+                    }
+                    Err(error) => Seal::end(&slot, &lake, kept, Err(error.into())),
+                }
+            };
+            Ok(durable::sync_and_close(&host, file, Box::new(synced))?)
+        })
+    }
+
+    /// The last step: the file is closed, so the name can change.
+    fn rename(
+        io: &Arc<AsyncIo>,
+        host: &Arc<Lake>,
+        path: &Path,
+        to: &Path,
+        slot: &Slot<()>,
+        unit: UnitGuard,
+    ) -> Result<(), ResumeError> {
+        let lake = Arc::clone(host);
+        slot.submit((), move |watch| {
+            let renamed = move |result: io::Result<()>| {
+                let (slot, ()) = watch.take();
+                Seal::end(&slot, &lake, unit, result.map_err(ResumeError::Io))
+            };
+            Ok(io.rename(path, to, Box::new(renamed))?)
         })
     }
 }

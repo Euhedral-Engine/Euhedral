@@ -411,13 +411,8 @@ impl<'a> Row<'a> {
     }
 }
 
-/// A reference file's bytes, for tests: `tokens[chunk]` and a record per forced token from `row`.
-pub fn encode(
-    context: usize,
-    vocabulary: usize,
-    tokens: &[Vec<u32>],
-    mut row: impl FnMut(usize, usize) -> (f32, f32, Vec<u16>),
-) -> Vec<u8> {
+/// The bytes before the first record: the magic, the three counts and the tokens of every chunk.
+pub fn encode_head(context: usize, vocabulary: usize, tokens: &[Vec<u32>]) -> Vec<u8> {
     let mut bytes = MAGIC.to_vec();
     for count in [context, vocabulary, tokens.len()] {
         bytes.extend_from_slice(&(count as i32).to_le_bytes());
@@ -427,6 +422,17 @@ pub fn encode(
             bytes.extend_from_slice(&(*token as i32).to_le_bytes());
         }
     }
+    bytes
+}
+
+/// A reference file's bytes, for tests: `tokens[chunk]` and a record per forced token from `row`.
+pub fn encode(
+    context: usize,
+    vocabulary: usize,
+    tokens: &[Vec<u32>],
+    mut row: impl FnMut(usize, usize) -> (f32, f32, Vec<u16>),
+) -> Vec<u8> {
+    let mut bytes = encode_head(context, vocabulary, tokens);
     let records = context - 1 - context / 2;
     for chunk in 0..tokens.len() {
         for step in 0..records {
