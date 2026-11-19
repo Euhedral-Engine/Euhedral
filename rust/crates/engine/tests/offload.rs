@@ -15,7 +15,7 @@ use euhedral_inference_engine::residency::offload::{
 use euhedral_inference_engine::residency::planner::{
     ARENA_ALIGNMENT, PlanInputs, ResidencyPlan, Tier, plan_closest, plan_with, sequences_for,
 };
-use euhedral_inference_settings::{Auto, ByteSize};
+use euhedral_inference_settings::{Auto, ByteSize, Settings};
 
 mod common;
 
@@ -172,6 +172,27 @@ fn the_staging_slots_are_the_setting() {
         auto.offload.staging.unwrap().slot_bytes,
         six.offload.staging.unwrap().slot_bytes
     );
+}
+
+#[test]
+fn the_disk_window_slots_are_the_setting_and_follow_the_staging_slots_on_auto() {
+    let (config, table) = (config(), rco_table());
+    let need = resident(4096).device_bytes;
+    let mut settings = settings(4096);
+    let free = need - 3 * GIB;
+    let slots = |settings: &Settings| {
+        plan_with(&config, &table, settings, inputs(free, Some(GIB)))
+            .unwrap()
+            .offload
+            .window
+            .unwrap()
+            .slots
+    };
+    assert_eq!(slots(&settings), 8);
+    settings.memory.staging_slots = Auto::Value(6);
+    assert_eq!(slots(&settings), 12);
+    settings.memory.disk_window_slots = Auto::Value(3);
+    assert_eq!(slots(&settings), 3);
 }
 
 #[test]

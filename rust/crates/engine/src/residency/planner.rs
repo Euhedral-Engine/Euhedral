@@ -428,6 +428,11 @@ pub fn plan_closest(
         .staging_slots
         .into_value()
         .unwrap_or(DEFAULT_STAGING_SLOTS) as usize;
+    let window_slots = settings
+        .memory
+        .disk_window_slots
+        .into_value()
+        .map_or(2 * staging_slots, |slots| slots as usize);
     let head_rows = sequences.saturating_mul(1 + draft_depth as u64);
     let (layout, spills, offload, reach) = match decide(budgets, whole, split) {
         Ok((layout, spills)) => (layout, spills, Offload::default(), None),
@@ -445,6 +450,7 @@ pub fn plan_closest(
                     fixed_bytes: base.device_bytes() - base.weights,
                     host_budget: original_host.saturating_sub(base.cache_host),
                     staging_slots,
+                    window_slots,
                     head_rows,
                 },
             );
