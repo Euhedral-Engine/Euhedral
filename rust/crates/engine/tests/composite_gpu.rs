@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use common::Closer;
 use euhedral_inference_edrl::{
-    ArtifactPlan, HEADER_BYTES, Header, ObjectSpec, PAYLOAD_ALIGNMENT, TensorEntry, WeightFormat,
+    ArtifactPlan, HEADER_BYTES, Header, MAX_DRAFT_DEPTH, ObjectSpec, PAYLOAD_ALIGNMENT, TensorEntry, WeightFormat,
 };
 use euhedral_inference_engine::generation::{
     GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
@@ -257,4 +257,27 @@ fn a_source_that_cannot_be_opened_stops_the_start_naming_it() {
         .expect_err("a missing source stops the start");
     assert!(error.to_string().contains("no-such-source.edrl"), "{error}");
     drop(owner);
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_draft_depth_the_artifact_cannot_take_stops_the_start() {
+    let Some(machine) = machine() else { return };
+    for depth in [0, MAX_DRAFT_DEPTH + 1] {
+        let composite = Composite {
+            replacements: Vec::new(),
+            draft_depth: Some(depth),
+        };
+        let (owner, ready) =
+            EngineRuntime::start_composite(&settings(&machine.artifact), &machine.library, None, composite);
+        let error = ready
+            .wait(WAIT)
+            .expect("the engine reports")
+            .expect_err("a depth outside the limits stops the start");
+        assert!(
+            error.to_string().contains(&format!("draft depth {depth} is outside")),
+            "{error}"
+        );
+        drop(owner);
+    }
 }
