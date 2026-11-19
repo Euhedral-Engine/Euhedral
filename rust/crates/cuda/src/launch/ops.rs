@@ -930,21 +930,64 @@ where
                 "the operations were made without a lane's library: use `on_lane`".to_string(),
             ));
         };
-        let stream = self
-            .queue
-            .raw_stream()
-            .ok_or_else(|| CudaError::Argument("the lane lent no stream".to_string()))?
-            .as_raw();
-        // SAFETY: the stream is live for this submission; the selection is cleared before the lent stream can end.
-        let status = unsafe {
-            library
-                .api()
-                .euhedral_cuda_stream_select(stream.expose_provenance() as u64)
-        };
-        check("euhedral_cuda_stream_select", status)?;
-        // The selection is cleared when the call returns or panics.
-        let _selection = SelectedStream(library);
-        Ok(call(library))
+        with_lent_stream(library, &*self.queue, call)
+    }
+}
+
+/// Runs `call` with the C library's stream selected for the calling thread to the stream `queue` lends, and clears the
+/// selection after.
+fn with_lent_stream<Q, R>(
+    library: &Arc<CudaLibrary>,
+    queue: &Q,
+    call: impl FnOnce(&Arc<CudaLibrary>) -> R,
+) -> Result<R, CudaError>
+where
+    Q: LaneStream<Raw = *mut c_void>,
+{
+    let stream = queue
+        .raw_stream()
+        .ok_or_else(|| CudaError::Argument("the lane lent no stream".to_string()))?
+        .as_raw();
+    // SAFETY: the stream is live for this submission; the selection is cleared before the lent stream can end.
+    let status = unsafe {
+        library
+            .api()
+            .euhedral_cuda_stream_select(stream.expose_provenance() as u64)
+    };
+    check("euhedral_cuda_stream_select", status)?;
+    // The selection is cleared when the call returns or panics.
+    let _selection = SelectedStream(library);
+    Ok(call(library))
+}
+
+impl DeviceBuffer {
+    /// Allocates `bytes` in stream order on the stream `queue` lends: the allocation is ordered with the work already
+    /// enqueued on it and with what is enqueued after. Free it with [`DeviceBuffer::free_on_lane`]; a plain drop
+    /// waits for the device.
+    pub fn alloc_on_lane<Q>(library: &Arc<CudaLibrary>, queue: &Q, bytes: usize) -> Result<DeviceBuffer, CudaError>
+    where
+        Q: LaneStream<Raw = *mut c_void>,
+    {
+        with_lent_stream(library, queue, |library| {
+            DeviceBuffer::alloc_on_selected(library, bytes)
+        })?
+    }
+
+    /// Frees a stream-ordered buffer in stream order on the stream `queue` lends, so the free waits for the work
+    /// already enqueued there and never waits for the device. A buffer that was not allocated stream-ordered is
+    /// refused (and dropped, with the plain free).
+    pub fn free_on_lane<Q>(self, library: &Arc<CudaLibrary>, queue: &Q) -> Result<(), CudaError>
+    where
+        Q: LaneStream<Raw = *mut c_void>,
+    {
+        if !self.is_stream_ordered() {
+            return Err(CudaError::Argument(
+                "a buffer from DeviceBuffer::alloc is freed with cudaFree, which waits for the device; allocate with \
+                 alloc_async to free it in stream order"
+                    .to_string(),
+            ));
+        }
+        with_lent_stream(library, queue, |_| self.free_on_selected())?
     }
 }
 

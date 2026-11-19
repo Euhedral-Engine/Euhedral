@@ -15,25 +15,36 @@ use std::time::{Duration, Instant};
 
 use euhedral_core::generics::LatticeSource;
 use euhedral_gpu::cuda::{CudaGpu, CudaModule};
-use euhedral_gpu::{Gpu, StreamOptions};
-use euhedral_graph::Completions;
+use euhedral_gpu::{Gpu, Stream, StreamOptions};
+use euhedral_graph::{Completions, LanePool};
 use euhedral_inference_cuda::math::MathLibraries;
-use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer};
+use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, PinnedPool};
 use euhedral_inference_quantization::gptq::format::Format;
+use euhedral_inference_quantization::gptq::memory::{Claims, Released, StepBytes};
 use euhedral_inference_quantization::gptq::{
-    Factor, Finished, GptqError, GptqKernels, GptqLane, GptqSettings, Refused, TensorScales,
+    DeviceRange, Factor, Finished, GptqError, GptqKernels, GptqLane, GptqSettings, LaneMemory, Refused, TensorScales,
 };
 use euhedral_inference_quantization::gptq::{RoundRequest, state::QuantState};
 use euhedral_inference_quantization::kernels::{ModuleOptions, Modules};
+use euhedral_memory::{LocationId, LocationKind, LocationSpec, OwnerId, OwnerSpec, Planner, Priority, Scope};
 
 pub struct Rig {
     pub library: Arc<CudaLibrary>,
     pub completions: Arc<Completions>,
     lane: Option<GptqLane>,
+    planner: Arc<Planner>,
+    owner: OwnerId,
+    /// Bytes the next claims are short by, device and pinned: a step must refuse a claim too small for it.
+    pub short: (u64, u64),
     // The device and the lane pool stay open for the lane.
     _gpu: Arc<CudaGpu>,
-    _pool: Arc<euhedral_graph::LanePool>,
+    _pool: Arc<LanePool>,
 }
+
+/// Bytes each planner location holds: more than any test asks for.
+const CAPACITY: u64 = 8 << 30;
+const DEVICE: LocationId = LocationId(0);
+const PINNED: LocationId = LocationId(1);
 
 /// The rig, or a panic naming the missing setting: a device test that skips is no check.
 pub fn rig(settings: GptqSettings) -> Rig {
@@ -53,25 +64,38 @@ pub fn rig(settings: GptqSettings) -> Rig {
     let mut stream = streams.remove(0);
     let completions = Completions::new(&pool);
     let mut handles = None;
-    euhedral_gpu::Stream::submit(&mut stream, |_| {
+    Stream::submit(&mut stream, |_| {
         handles = Some(math.lane_handles());
         Ok(())
     })
     .expect("the handles are made on the lane");
     let handles = handles.unwrap().expect("the math handles");
-    let lane = GptqLane::new(
-        stream,
-        handles,
-        kernels,
-        Arc::clone(&library),
-        Arc::clone(&completions),
-        settings,
-    )
-    .expect("the lane");
+    let memory = LaneMemory {
+        library: Arc::clone(&library),
+        released: Arc::new(Released::new()),
+        pinned: PinnedPool::new(&library, 256 << 20),
+    };
+    let lane = GptqLane::new(stream, handles, kernels, memory, Arc::clone(&completions), settings).expect("the lane");
+    let planner = Planner::new([
+        LocationSpec {
+            kind: LocationKind::Device { ordinal: 0 },
+            capacity: CAPACITY,
+            reserve: 0,
+        },
+        LocationSpec {
+            kind: LocationKind::HostPinned,
+            capacity: CAPACITY,
+            reserve: 0,
+        },
+    ]);
+    let owner = planner.open_owner(OwnerSpec::new("gptq-test", Priority(0), Scope::Process));
     Rig {
         library,
         completions,
         lane: Some(lane),
+        planner,
+        owner,
+        short: (0, 0),
         _gpu: gpu,
         _pool: pool,
     }
@@ -115,10 +139,50 @@ impl Rig {
             }
             assert!(Instant::now() < deadline, "the chain did not finish in a minute");
         };
-        let Finished { lane, scratch, result } = finished;
+        let Finished {
+            mut lane,
+            scratch,
+            result,
+        } = finished;
+        drop(scratch);
+        lane.reclaim().expect("the buffers are freed in stream order");
         self.lane = Some(lane);
-        scratch.release();
         result
+    }
+
+    /// Claims of exactly `bytes` from the rig's planner.
+    pub fn claims(&self, bytes: StepBytes) -> Claims {
+        let take = |location, bytes| {
+            self.planner
+                .claim(self.owner, location, bytes, "test")
+                .expect("the planner has the bytes")
+        };
+        Claims {
+            device: Some(take(DEVICE, bytes.device.saturating_sub(self.short.0))),
+            pinned: Some(take(PINNED, bytes.pinned.saturating_sub(self.short.1))),
+        }
+    }
+
+    /// The bytes the planner has not handed out, device and pinned.
+    pub fn free(&self) -> (u64, u64) {
+        (self.planner.free(DEVICE), self.planner.free(PINNED))
+    }
+
+    pub fn capacity(&self) -> u64 {
+        CAPACITY
+    }
+
+    /// Frees the buffers given up, in stream order.
+    pub fn settle(&mut self) {
+        self.lane
+            .as_mut()
+            .expect("the lane is idle")
+            .reclaim()
+            .expect("reclaim");
+    }
+
+    fn lane_mut(&mut self) -> &mut GptqLane {
+        self.lane.as_mut().expect("the lane is idle")
     }
 
     pub fn factor(
@@ -128,8 +192,10 @@ impl Rig {
         damp: f32,
         act_order: bool,
     ) -> Result<Factor, GptqError> {
-        let address = hessian.addr();
-        self.run(move |lane, done| lane.factor(address, k, damp, act_order, done))
+        let range = range_of(hessian);
+        let bytes = self.lane_mut().factor_bytes(k)?;
+        let claims = self.claims(bytes);
+        self.run(move |lane, done| lane.factor(range, k, damp, act_order, claims, done))
     }
 
     pub fn tensor_scales(
@@ -139,12 +205,16 @@ impl Rig {
         factor: &Factor,
         format: &Format,
     ) -> Result<TensorScales, GptqError> {
-        let address = weight.addr();
-        self.run(|lane, done| lane.tensor_scales(address, rows, factor, format, done))
+        let range = range_of(weight);
+        let bytes = self.lane_mut().scales_bytes(rows, factor.k(), format);
+        let claims = self.claims(bytes);
+        self.run(|lane, done| lane.tensor_scales(range, rows, factor, format, claims, done))
     }
 
     pub fn round(&mut self, request: RoundRequest<'_>) -> Result<QuantState, GptqError> {
-        self.run(|lane, done| lane.round(&request, done))
+        let bytes = self.lane_mut().round_bytes(request.n, request.factor, request.format);
+        let claims = self.claims(bytes);
+        self.run(|lane, done| lane.round(&request, claims, done))
     }
 
     pub fn upload(&self, bytes: &[u8]) -> DeviceBuffer {
@@ -152,4 +222,10 @@ impl Rig {
         buffer.copy_from_host(0, bytes).expect("upload");
         buffer
     }
+}
+
+/// The whole of `buffer` as a step's input.
+pub fn range_of(buffer: &DeviceBuffer) -> DeviceRange {
+    // SAFETY: the buffer is live device memory the test keeps until its steps are done, and nothing else touches it.
+    unsafe { DeviceRange::new(buffer.addr(), buffer.bytes() as u64) }
 }

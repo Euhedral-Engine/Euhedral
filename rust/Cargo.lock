@@ -518,9 +518,11 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "euhedral-core",
+ "euhedral-data-structures",
  "euhedral-gpu",
  "euhedral-graph",
  "euhedral-inference-cuda",
+ "euhedral-memory",
  "serde_json",
  "test-support",
  "thiserror",

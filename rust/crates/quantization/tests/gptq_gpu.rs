@@ -5,31 +5,30 @@
 //! `euhedral.quantization.cuda-libraries`; a missing setting fails the test. The kernels' NVRTC and its builtins
 //! library must be reachable (`EUHEDRAL_NVRTC`, `LD_LIBRARY_PATH`).
 //!
-//! The first test rounds the frozen fixture of a PyTorch reference of the calibration (`quantization/src/test/resources/gptq-fixture`) in
-//! every format with and without act-order. The tensor scales and the SD4 table match exactly; the codes come from a
-//! factor cuSOLVER computes in its own order, so they are compared by agreement and by the output error under H.
+//! The tests round the Hessian and the weight of the frozen calibration fixture (the Java tests own the files) and
+//! check what must hold of any GPTQ rounding: dead columns, act-order equivariance, the error under H against
+//! nearest-code rounding, the code range, the decoded output, the identity table and the SD4 table over chunks.
 #![cfg(target_os = "linux")]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "a test file: a failed unwrap is the failure"
 )]
-#![allow(
-    clippy::print_stdout,
-    reason = "the agreement and the error ratios are the test's output"
-)]
+#![allow(clippy::print_stdout, reason = "the error ratios are the test's output")]
 #![allow(clippy::disallowed_methods, reason = "a test: reads its fixture files")]
 
 mod gptq_rig;
 
+use std::array::from_fn;
 use std::fs::read;
 use std::path::PathBuf;
 
+use euhedral_inference_cuda::DeviceBuffer;
 use euhedral_inference_quantization::gptq::format::Format;
 use euhedral_inference_quantization::gptq::state::QuantState;
 use euhedral_inference_quantization::gptq::{GptqError, GptqSettings, RoundRequest, TensorScales};
 use euhedral_inference_quantization::npy::Npy;
-use gptq_rig::rig;
+use gptq_rig::{Rig, range_of, rig};
 use serde_json::Value;
 
 const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
@@ -49,6 +48,32 @@ fn half(bits: u16) -> f32 {
     }
 }
 
+/// What a stored scale multiplies a code's value by.
+fn scale_of(format: &Format, scales: &[u8], global: f32, table: Option<[u8; 16]>, at: usize) -> f32 {
+    if format.nvfp4 {
+        let stored = scales[at];
+        let e = u32::from(table.map_or(stored, |table| table[usize::from(stored)]));
+        let magnitude = if e < 8 {
+            (e & 7) as f32 / 8.0 * 0.015625
+        } else {
+            (1.0 + (e & 7) as f32 / 8.0) * f32::powi(2.0, (e >> 3) as i32 - 7)
+        };
+        magnitude * global
+    } else {
+        half(u16::from_le_bytes([scales[2 * at], scales[2 * at + 1]]))
+    }
+}
+
+/// The value of a code before its scale.
+fn value_of(format: &Format, code: u8) -> f32 {
+    if format.nvfp4 {
+        let sign = if code & 8 != 0 { -1.0 } else { 1.0 };
+        E2M1[usize::from(code & 7)] * sign
+    } else {
+        f32::from(code as i8)
+    }
+}
+
 /// The decoded weights of a stored rounding, as the kernels compute them.
 fn decode(
     format: &Format,
@@ -63,25 +88,52 @@ fn decode(
     let mut out = vec![0.0; n * k];
     for r in 0..n {
         for j in 0..k {
-            let code = codes[r * k + j];
             let at = r * groups + j / format.group;
-            out[r * k + j] = if format.nvfp4 {
-                let stored = scales[at];
-                let e4m3 = table.map_or(stored, |table| table[usize::from(stored)]);
-                let e = u32::from(e4m3);
-                let magnitude = if e < 8 {
-                    (e & 7) as f32 / 8.0 * 0.015625
-                } else {
-                    (1.0 + (e & 7) as f32 / 8.0) * f32::powi(2.0, (e >> 3) as i32 - 7)
-                };
-                let sign = if code & 8 != 0 { -1.0 } else { 1.0 };
-                E2M1[usize::from(code & 7)] * sign * (magnitude * global)
-            } else {
-                f32::from(code as i8) * half(u16::from_le_bytes([scales[2 * at], scales[2 * at + 1]]))
-            };
+            out[r * k + j] = value_of(format, codes[r * k + j]) * scale_of(format, scales, global, table, at);
         }
     }
     out
+}
+
+/// The codes that round every weight to the nearest value under the scales a rounding chose.
+fn nearest_codes(format: &Format, w: &[f32], state: &QuantState, n: usize, k: usize) -> Vec<u8> {
+    let groups = k / format.group;
+    let candidates: Vec<u8> = if format.nvfp4 {
+        (0..16).collect()
+    } else {
+        (format.qmin..=format.qmax).map(|code| code as i8 as u8).collect()
+    };
+    let mut codes = vec![0u8; n * k];
+    for r in 0..n {
+        for j in 0..k {
+            let at = r * groups + j / format.group;
+            let scale = scale_of(format, &state.scales, state.global_scale, state.table, at);
+            let target = w[r * k + j];
+            let distance = |code: &u8| (value_of(format, *code) * scale - target).abs();
+            codes[r * k + j] = *candidates
+                .iter()
+                .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+                .unwrap();
+        }
+    }
+    codes
+}
+
+fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16))
+        .collect()
+}
+
+/// The BF16 bits of values that are BF16 already.
+fn f32_to_bf16(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
+        .collect()
 }
 
 /// The sum over rows of (w - q) H (w - q)^T: the output error over the inputs H summarizes.
@@ -100,129 +152,362 @@ fn output_error(w: &[f32], q: &[f32], h: &[f32], n: usize, k: usize) -> f64 {
     total
 }
 
+const GROUPED: (&str, &str) = ("Q3G64_F16S", "row-split-k128-v1");
+const NVFP4: (&str, &str) = ("NVFP4", "row-split-k128-v1");
+const SD4: (&str, &str) = ("NVFP4", "row-split-k128-sd4-v1");
+
+fn format((name, layout): (&str, &str)) -> Format {
+    Format::of(name, layout, None).unwrap()
+}
+
+/// The fixture's weight and Hessian.
+struct Problem {
+    n: usize,
+    k: usize,
+    damp: f32,
+    w: Vec<f32>,
+    h: Vec<f32>,
+}
+
+fn problem() -> Problem {
+    let cases: Value = serde_json::from_slice(&fixture("cases.json")).unwrap();
+    let weight_file = fixture("weight_bf16.npy");
+    let hessian_file = fixture("hessian.npy");
+    Problem {
+        n: cases["rows"].as_u64().unwrap() as usize,
+        k: cases["columns"].as_u64().unwrap() as usize,
+        damp: cases["damp"].as_f64().unwrap() as f32,
+        w: bf16_to_f32(Npy::parse(&weight_file).unwrap().data),
+        h: Npy::parse(&hessian_file).unwrap().to_vec::<f32>().unwrap(),
+    }
+}
+
+/// A rounding with the decoded weights the kernel wrote.
+struct Rounded {
+    state: QuantState,
+    decoded: Vec<f32>,
+}
+
+fn floats(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+}
+
+fn round(rig: &mut Rig, p: &Problem, w: &[f32], h: &[f32], format: &Format, act_order: bool) -> Rounded {
+    let weight = rig.upload(&f32_to_bf16(w));
+    let hessian = rig.upload(&floats(h));
+    let factor = rig.factor(&hessian, p.k, p.damp, act_order).unwrap();
+    let tensor = if format.nvfp4 {
+        rig.tensor_scales(&weight, p.n, &factor, format).unwrap()
+    } else {
+        TensorScales {
+            global_scale: 0.0,
+            table: None,
+        }
+    };
+    let out = DeviceBuffer::alloc(&rig.library, 2 * p.n * p.k).unwrap();
+    let state = rig
+        .round(RoundRequest {
+            weight: range_of(&weight),
+            n: p.n,
+            factor: &factor,
+            format,
+            tensor: &tensor,
+            decoded_out: Some(range_of(&out)),
+        })
+        .unwrap();
+    let mut bytes = vec![0u8; 2 * p.n * p.k];
+    out.copy_to_host(0, &mut bytes).unwrap();
+    Rounded {
+        state,
+        decoded: bf16_to_f32(&bytes),
+    }
+}
+
+fn error_under(h: &[f32], w: &[f32], q: &[f32], p: &Problem) -> f64 {
+    output_error(w, q, h, p.n, p.k)
+}
+
 #[test]
 #[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
-fn rounds_like_the_pytorch_reference() {
-    let cases: Value = serde_json::from_slice(&fixture("cases.json")).unwrap();
-    let n = cases["rows"].as_u64().unwrap() as usize;
-    let k = cases["columns"].as_u64().unwrap() as usize;
-    let damp = cases["damp"].as_f64().unwrap() as f32;
-    let weight_file = fixture("weight_bf16.npy");
-    let weight_npy = Npy::parse(&weight_file).unwrap();
-    let hessian_file = fixture("hessian.npy");
-    let hessian_npy = Npy::parse(&hessian_file).unwrap();
-    let h = hessian_npy.to_vec::<f32>().unwrap();
-    let w: Vec<f32> = weight_npy
-        .to_vec::<i16>()
-        .unwrap()
-        .iter()
-        .map(|bits| f32::from_bits(u32::from(*bits as u16) << 16))
-        .collect();
+fn dead_columns_round_to_zero_and_the_others_do_not() {
+    let p = problem();
+    let dead = [5usize, 70, 200];
+    let mut h = p.h.clone();
+    for &c in &dead {
+        for i in 0..p.k {
+            h[c * p.k + i] = 0.0;
+            h[i * p.k + c] = 0.0;
+        }
+    }
     let mut rig = rig(GptqSettings::default());
-    let weight = rig.upload(weight_npy.data);
-    let hessian = rig.upload(hessian_npy.data);
-    for case in cases["cases"].as_array().unwrap() {
-        let name = case["name"].as_str().unwrap();
-        let format = Format::of(case["format"].as_str().unwrap(), case["layout"].as_str().unwrap(), None).unwrap();
-        let factor = rig
-            .factor(&hessian, k, damp, case["act_order"].as_bool().unwrap())
-            .unwrap();
-        let tensor = if format.nvfp4 {
-            rig.tensor_scales(&weight, n, &factor, &format).unwrap()
-        } else {
-            TensorScales {
-                global_scale: 0.0,
-                table: None,
-            }
-        };
-        let state = rig
-            .round(RoundRequest {
-                weight: weight.addr(),
-                n,
-                factor: &factor,
-                format: &format,
-                tensor: &tensor,
-                decoded_out: None,
-            })
-            .unwrap();
-        let expected_global = case["global_scale"].as_f64().unwrap() as f32;
-        if format.nvfp4 {
-            assert_eq!(state.global_scale, expected_global, "{name}");
-            if format.sd4 {
-                let table: Vec<u8> = case["table"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|v| v.as_u64().unwrap() as u8)
-                    .collect();
-                assert_eq!(state.table.map(|t| t.to_vec()), Some(table), "{name} table");
+    for (case, act_order) in [(GROUPED, false), (NVFP4, true), (SD4, false)] {
+        let format = format(case);
+        let rounded = round(&mut rig, &p, &p.w, &h, &format, act_order);
+        for r in 0..p.n {
+            for j in 0..p.k {
+                let at = r * p.k + j;
+                if dead.contains(&j) {
+                    assert_eq!(
+                        rounded.state.codes[at], 0,
+                        "{} row {r} column {j}: dead code",
+                        format.name
+                    );
+                    assert_eq!(
+                        rounded.decoded[at], 0.0,
+                        "{} row {r} column {j}: dead output",
+                        format.name
+                    );
+                }
             }
         }
-        let codes_file = fixture(&format!("{name}-codes.npy"));
-        let scales_file = fixture(&format!("{name}-scales.npy"));
-        let (codes, scales) = (Npy::parse(&codes_file).unwrap(), Npy::parse(&scales_file).unwrap());
-        let expected = decode(&format, codes.data, scales.data, expected_global, state.table, n, k);
-        let actual = decode(
-            &format,
-            &state.codes,
-            &state.scales,
-            state.global_scale,
-            state.table,
-            n,
-            k,
+        let live = (0..p.n * p.k).filter(|at| !dead.contains(&(at % p.k)));
+        let nonzero = live.filter(|&at| rounded.state.codes[at] != 0).count();
+        assert!(
+            nonzero > p.n * (p.k - dead.len()) / 2,
+            "{}: {nonzero} live codes are nonzero",
+            format.name
         );
-        let agree = codes.data.iter().zip(&state.codes).filter(|(a, b)| a == b).count();
-        let python = output_error(&w, &expected, &h, n, k);
-        let native = output_error(&w, &actual, &h, n, k);
-        let ratio = native / python;
-        println!(
-            "{name}: codes agree {:.4}, output error {native:.6e} (reference {python:.6e}), ratio {ratio:.4}",
-            agree as f64 / (n * k) as f64
-        );
-        assert!((ratio - 1.0).abs() < 0.03, "{name}: output error ratio {ratio}");
-        assert!(agree * 10 >= n * k * 9, "{name}: codes agree on {agree} of {}", n * k);
     }
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
+fn act_order_permutes_the_codes_with_the_columns() {
+    let p = problem();
+    // Columns move only inside their blocks of 16, so every group keeps its set of columns and its scales.
+    let permutation: Vec<usize> = (0..p.k).map(|j| (j / 16) * 16 + (j % 16 + 5) % 16).collect();
+    let w: Vec<f32> = (0..p.n)
+        .flat_map(|r| permutation.iter().map(move |&c| (r, c)))
+        .map(|(r, c)| p.w[r * p.k + c])
+        .collect();
+    let h: Vec<f32> = (0..p.k)
+        .flat_map(|a| permutation.iter().map(move |&b| (a, b)))
+        .map(|(a, b)| p.h[permutation[a] * p.k + b])
+        .collect();
+    let diagonal: Vec<f32> = (0..p.k).map(|j| p.h[j * p.k + j]).collect();
+    let mut sorted = diagonal.clone();
+    sorted.sort_by(f32::total_cmp);
+    assert!(
+        sorted.windows(2).all(|pair| pair[0] != pair[1]),
+        "the importances must be distinct for a unique order"
+    );
+    let mut rig = rig(GptqSettings::default());
+    for case in [GROUPED, NVFP4] {
+        let format = format(case);
+        let plain = round(&mut rig, &p, &p.w, &p.h, &format, true);
+        let moved = round(&mut rig, &p, &w, &h, &format, true);
+        for r in 0..p.n {
+            for (j, &source) in permutation.iter().enumerate() {
+                assert_eq!(
+                    moved.state.codes[r * p.k + j],
+                    plain.state.codes[r * p.k + source],
+                    "{} row {r} column {j}",
+                    format.name
+                );
+            }
+        }
+        assert_eq!(moved.state.scales, plain.state.scales, "{}: scales", format.name);
+        assert_eq!(
+            moved.state.global_scale, plain.state.global_scale,
+            "{}: global",
+            format.name
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
+fn the_error_under_h_beats_nearest_rounding_and_the_codes_stay_in_range() {
+    let p = problem();
+    let mut rig = rig(GptqSettings::default());
+    for (case, act_order) in [(GROUPED, false), (GROUPED, true), (NVFP4, false), (SD4, true)] {
+        let format = format(case);
+        let rounded = round(&mut rig, &p, &p.w, &p.h, &format, act_order);
+        let state = &rounded.state;
+        for &code in &state.codes {
+            if format.nvfp4 {
+                assert!(code < 16, "{}: code {code}", format.name);
+            } else {
+                let signed = i32::from(code as i8);
+                assert!(
+                    (format.qmin..=format.qmax).contains(&signed),
+                    "{}: code {signed}",
+                    format.name
+                );
+            }
+        }
+        let table = state.table;
+        let chosen = decode(
+            &format,
+            &state.codes,
+            &state.scales,
+            state.global_scale,
+            table,
+            p.n,
+            p.k,
+        );
+        let nearest = nearest_codes(&format, &p.w, state, p.n, p.k);
+        let rtn = decode(&format, &nearest, &state.scales, state.global_scale, table, p.n, p.k);
+        let (gptq, plain) = (error_under(&p.h, &p.w, &chosen, &p), error_under(&p.h, &p.w, &rtn, &p));
+        println!(
+            "{} act-order {act_order}: error {gptq:.6e} against nearest {plain:.6e}, ratio {:.4}",
+            format.name,
+            gptq / plain
+        );
+        assert!(
+            gptq < 0.9 * plain,
+            "{}: error {gptq} is not clearly below nearest rounding's {plain}",
+            format.name
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
+fn the_decoded_output_is_the_decode_of_the_codes_and_scales() {
+    let p = problem();
+    let mut rig = rig(GptqSettings::default());
+    for (case, act_order) in [(GROUPED, true), (NVFP4, false), (SD4, false)] {
+        let format = format(case);
+        let rounded = round(&mut rig, &p, &p.w, &p.h, &format, act_order);
+        let state = &rounded.state;
+        let expected = decode(
+            &format,
+            &state.codes,
+            &state.scales,
+            state.global_scale,
+            state.table,
+            p.n,
+            p.k,
+        );
+        let expected = bf16_to_f32(&f32_to_bf16(&expected));
+        let wrong = (0..p.n * p.k)
+            .filter(|&at| {
+                // BF16 holds 8 bits of mantissa: the kernel may round the last one differently.
+                (rounded.decoded[at] - expected[at]).abs() > expected[at].abs() / 128.0
+            })
+            .count();
+        assert_eq!(
+            wrong, 0,
+            "{}: {wrong} decoded values differ from the decode of the codes",
+            format.name
+        );
+        assert!(
+            rounded.decoded.iter().any(|value| *value != 0.0),
+            "{}: nothing was decoded",
+            format.name
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
+fn a_weight_of_zeros_has_a_zero_global_scale_and_the_identity_table() {
+    let p = problem();
+    let mut rig = rig(GptqSettings::default());
+    let zeros = vec![0.0f32; p.n * p.k];
+    let weight = rig.upload(&f32_to_bf16(&zeros));
+    let hessian = rig.upload(&floats(&p.h));
+    let factor = rig.factor(&hessian, p.k, p.damp, false).unwrap();
+    let tensor = rig.tensor_scales(&weight, p.n, &factor, &format(SD4)).unwrap();
+    assert_eq!(tensor.global_scale, 0.0);
+    let identity: Vec<u8> = (0..16).collect();
+    assert_eq!(tensor.table.map(|table| table.to_vec()), Some(identity));
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
+fn the_sd4_table_is_the_same_over_several_chunks_as_over_one() {
+    let p = problem();
+    let tables: Vec<_> = [GptqSettings::default().scale_chunk_bytes, 4 * p.k as u64 * 5]
+        .into_iter()
+        .map(|scale_chunk_bytes| {
+            // Five rows to a chunk: thirteen passes over the sixty-four rows.
+            let mut rig = rig(GptqSettings {
+                scale_chunk_bytes,
+                ..GptqSettings::default()
+            });
+            let weight = rig.upload(&f32_to_bf16(&p.w));
+            let hessian = rig.upload(&floats(&p.h));
+            let factor = rig.factor(&hessian, p.k, p.damp, true).unwrap();
+            rig.tensor_scales(&weight, p.n, &factor, &format(SD4)).unwrap()
+        })
+        .collect();
+    assert_eq!(tables[0].table, tables[1].table);
+    assert_eq!(tables[0].global_scale, tables[1].global_scale);
+    assert!(
+        tables[0]
+            .table
+            .is_some_and(|table| table != from_fn(|entry| entry as u8))
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
 fn a_matrix_that_is_not_positive_definite_is_refused_by_the_step_that_found_it() {
-    let (k, n) = (128usize, 4usize);
+    let k = 128usize;
     let mut rig = rig(GptqSettings::default());
     // A diagonal of -1 (nonzero, so no column is dead) is not positive definite even after damping.
     let mut h = vec![0.0f32; k * k];
     for i in 0..k {
         h[i * k + i] = -1.0;
     }
-    let bytes: Vec<u8> = h.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let hessian = rig.upload(&bytes);
+    let hessian = rig.upload(&floats(&h));
     let Err(GptqError::Cuda(error)) = rig.factor(&hessian, k, 0.01, false) else {
         panic!("the factor of a negative matrix was accepted");
     };
     let text = error.to_string();
-    assert!(text.contains("potrf"), "{text}");
+    assert!(
+        text.contains("potrf (H)") && !text.contains("H^-1"),
+        "the first failing step is named: {text}"
+    );
     // The lane survives the refusal: a good matrix factors on it.
     for i in 0..k {
         h[i * k + i] = 1.0;
     }
-    let bytes: Vec<u8> = h.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let good = rig.upload(&bytes);
+    let good = rig.upload(&floats(&h));
     let factor = rig.factor(&good, k, 0.01, true).unwrap();
-    assert_eq!(factor.order.len(), k);
-    let _ = n;
+    assert_eq!(factor.order().len(), k);
 }
 
 #[test]
-fn a_state_round_trips_through_its_archive_for_every_format() {
-    let state = QuantState {
-        format_name: "NVFP4".into(),
-        layout: "row-split-k128-v1".into(),
-        rows: 1,
-        columns: 16,
-        codes: vec![3; 16],
-        scales: vec![7],
-        global_scale: 0.5,
-        table: None,
+#[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
+fn a_step_takes_exactly_the_bytes_it_charges_and_gives_them_all_back() {
+    let p = problem();
+    let mut rig = rig(GptqSettings::default());
+    let capacity = rig.capacity();
+    let weight = rig.upload(&f32_to_bf16(&p.w));
+    let hessian = rig.upload(&floats(&p.h));
+    let format = format(SD4);
+    let factor = rig.factor(&hessian, p.k, p.damp, true).unwrap();
+    // The factor's upper matrix is the only memory still held: 4 * k * k device bytes.
+    assert_eq!(rig.free().0, capacity - 4 * (p.k * p.k) as u64);
+    let tensor = rig.tensor_scales(&weight, p.n, &factor, &format).unwrap();
+    let request = RoundRequest {
+        weight: range_of(&weight),
+        n: p.n,
+        factor: &factor,
+        format: &format,
+        tensor: &tensor,
+        decoded_out: None,
     };
-    assert_eq!(QuantState::from_npz(&state.to_npz().unwrap()).unwrap(), state);
+    rig.round(request).unwrap();
+    assert_eq!(rig.free(), (capacity - 4 * (p.k * p.k) as u64, capacity));
+    // A claim one byte short, of either kind, is refused by each step, and nothing stays allocated or charged.
+    for short in [(1, 0), (0, 1)] {
+        rig.short = short;
+        let refused = |step: &str, result: Result<(), GptqError>| match result {
+            Err(GptqError::Request(text)) => assert!(text.contains("claim"), "{step}: {text}"),
+            other => panic!("{step}: a claim short by {short:?} was accepted: {other:?}"),
+        };
+        refused("factor", rig.factor(&hessian, p.k, p.damp, true).map(|_| ()));
+        refused("scales", rig.tensor_scales(&weight, p.n, &factor, &format).map(|_| ()));
+        refused("round", rig.round(request).map(|_| ()));
+        rig.short = (0, 0);
+    }
+    rig.settle();
+    assert_eq!(rig.free(), (capacity - 4 * (p.k * p.k) as u64, capacity));
+    drop(factor);
+    rig.settle();
+    assert_eq!(rig.free(), (capacity, capacity));
 }

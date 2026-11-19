@@ -4,14 +4,16 @@
 //! Each of the three steps is a chain of frames on one lane. A stage submits work and ends in a readback; the
 //! retirement of that work, delivered by the lane's [`Completions`], runs the next stage, which reads what came back.
 //! Nothing waits on the device inside a frame. The lane's stream and cuBLAS and cuSOLVER handles travel with the
-//! chain from one frame to the next and come back with the result in [`Finished`], together with the scratch memory,
-//! which the caller drops off the lattice (freeing device and pinned memory waits for the device).
+//! chain from one frame to the next and come back with the result in [`Finished`], together with the scratch memory.
+//! Nothing in a frame frees device memory with a call that waits: see [`memory`].
 //!
+//! - [`memory`]: stream-ordered device buffers, pooled pinned staging and the claims that account for them.
 //! - [`format`]: the formats, the NVFP4 search's reach, the column order and the damped diagonal.
 //! - [`sd4`]: the SD4 table of an NVFP4 object, chosen from the costs the device summed.
 //! - [`state`]: one object's rounding and the `.npz` it is stored in.
 
 pub mod format;
+pub mod memory;
 pub mod sd4;
 pub mod state;
 
@@ -27,13 +29,14 @@ use euhedral_gpu::{
 };
 use euhedral_graph::Completions;
 use euhedral_inference_cuda::math::{Fill, LaneHandles, MathMode, Matrix, Operation, Product, check_info};
-use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, PinnedBuffer};
+use euhedral_inference_cuda::{CudaError, CudaLibrary, DevicePtr, PinnedPool};
 use thiserror::Error;
 
 use crate::gptq::format::{
     BLOCK, E2M1_MAX, Format, FormatError, Nvfp4Search, SEARCH_BELOW, column_order, damped_diagonal, dead_columns,
     group_of_places, positions,
 };
+use crate::gptq::memory::{Claims, Device, Host, Memory, Released, StepBytes, reclaim};
 use crate::gptq::sd4::{CODES, ENTRIES};
 use crate::gptq::state::{QuantState, StateError};
 use crate::kernels::{Compiled, Module, ModuleError, Modules};
@@ -125,11 +128,21 @@ impl GptqKernels {
     }
 }
 
+/// The memory a lane works with: the C library its stream-ordered allocator belongs to, the queue where dropped device
+/// buffers wait to be freed in stream order, and the pool the pinned staging comes from (its limit is the pinned
+/// buffer pool setting).
+#[derive(Debug, Clone)]
+pub struct LaneMemory {
+    pub library: Arc<CudaLibrary>,
+    pub released: Arc<Released>,
+    pub pinned: Arc<PinnedPool>,
+}
+
 /// Everything of a lane except its stream: what a stage uses besides the stream.
 pub struct LaneParts {
     handles: LaneHandles,
     kernels: Arc<GptqKernels>,
-    library: Arc<CudaLibrary>,
+    memory: LaneMemory,
     completions: Arc<Completions>,
     settings: GptqSettings,
 }
@@ -155,14 +168,11 @@ pub struct Refused {
     pub error: GptqError,
 }
 
-/// Memory a chain used, handed back to the caller to drop off the lattice: freeing it waits for the device.
-pub struct Scratch(Box<dyn Any + Send>);
-
-impl Scratch {
-    /// Frees the memory, waiting for the device: call it off the lattice.
-    pub fn release(self) {
-        drop(self.0);
-    }
+/// Memory a chain used. Dropping it gives its device buffers to the lane's [`Released`] queue (freed in stream order by
+/// the next step on a lane, or by [`GptqLane::reclaim`]) and its pinned staging to the pool: nothing waits for the
+/// device.
+pub struct Scratch {
+    _state: Box<dyn Any + Send>,
 }
 
 impl Debug for Scratch {
@@ -179,14 +189,51 @@ pub struct Finished<T> {
     pub result: Result<T, GptqError>,
 }
 
+/// A range of device memory a step reads or writes, with its size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceRange {
+    addr: u64,
+    bytes: u64,
+}
+
+impl DeviceRange {
+    /// `bytes` of device memory at `addr`.
+    ///
+    /// # Safety
+    /// The range must be live device memory of at least `bytes` bytes, which nothing writes (when the step reads it)
+    /// or reads (when the step writes it) and which is not freed until the step's `done` call.
+    pub unsafe fn new(addr: u64, bytes: u64) -> DeviceRange {
+        DeviceRange { addr, bytes }
+    }
+
+    pub fn addr(&self) -> u64 {
+        self.addr
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// The address, when the range holds at least `needed` bytes.
+    fn holding(&self, what: &str, needed: u64) -> Result<u64, GptqError> {
+        if self.addr == 0 || self.bytes < needed {
+            return Err(GptqError::Request(format!(
+                "the {what} needs {needed} device bytes and the range holds {}",
+                self.bytes
+            )));
+        }
+        Ok(self.addr)
+    }
+}
+
 impl GptqLane {
-    /// A lane from its stream, its handles (cuBLAS products run in full FP32, as the rounding needs) and the
-    /// completions that deliver its retirements.
+    /// A lane from its stream, its handles (cuBLAS products run in full FP32, as the rounding needs), the memory it
+    /// works with and the completions that deliver its retirements.
     pub fn new(
         stream: CudaStream,
         mut handles: LaneHandles,
         kernels: Arc<GptqKernels>,
-        library: Arc<CudaLibrary>,
+        memory: LaneMemory,
         completions: Arc<Completions>,
         settings: GptqSettings,
     ) -> Result<GptqLane, GptqError> {
@@ -196,7 +243,7 @@ impl GptqLane {
             parts: LaneParts {
                 handles,
                 kernels,
-                library,
+                memory,
                 completions,
                 settings,
             },
@@ -207,17 +254,49 @@ impl GptqLane {
     pub fn into_parts(self) -> (CudaStream, LaneHandles) {
         (self.stream, self.parts.handles)
     }
+
+    /// Frees, in stream order on this lane, the device buffers given up since the last call, and returns how many. A
+    /// step does it before it allocates; call it after the last step to free what that left.
+    pub fn reclaim(&mut self) -> Result<u64, GptqError> {
+        let memory = self.parts.memory.clone();
+        submit(&mut self.stream, |queue| {
+            Ok(reclaim(&memory.released, &memory.library, queue)?)
+        })
+    }
 }
 
 /// An object's prepared Hessian: the column order, each column's position in it, the importance (diag H, in weight
-/// order), and the upper factor of the permuted, damped inverse (column-major K x K on the device).
+/// order), and the upper factor of the permuted, damped inverse (column-major K x K on the device). Only a factor step
+/// makes one, so its parts always agree.
 #[derive(Debug, Clone)]
 pub struct Factor {
-    pub k: usize,
-    pub order: Vec<u32>,
-    pub position: Vec<u32>,
-    pub importance: Vec<f32>,
-    pub upper: Arc<DeviceBuffer>,
+    k: usize,
+    order: Vec<u32>,
+    position: Vec<u32>,
+    importance: Vec<f32>,
+    upper: Arc<Device>,
+}
+
+impl Factor {
+    /// The number of columns.
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// The columns in the order they are rounded in.
+    pub fn order(&self) -> &[u32] {
+        &self.order
+    }
+
+    /// Each column's place in that order: the inverse permutation.
+    pub fn position(&self) -> &[u32] {
+        &self.position
+    }
+
+    /// The diagonal of the Hessian, in weight order.
+    pub fn importance(&self) -> &[f32] {
+        &self.importance
+    }
 }
 
 /// An NVFP4 object's tensor-wide scales: the FP32 global scale and, for SD4, the 16-entry table.
@@ -288,13 +367,12 @@ fn arm<S: Send + 'static, T: Send + 'static>(stream: CudaStream, link: Link<S, T
         },
     );
     if let Err(RetireError {
-        mut stream,
+        stream,
         state: (mut link, _),
         error,
     }) = armed
     {
-        // Work may still be in flight against the scratch: let it end before the scratch goes back.
-        stream.quiesce();
+        // The scratch goes back with the error: its device buffers are freed in stream order behind whatever is queued.
         let cause = link.failure.take().unwrap_or(GptqError::Gpu(error));
         finish(stream, link, Err(cause));
     }
@@ -327,7 +405,9 @@ fn finish<S: Send + 'static, T: Send + 'static>(stream: CudaStream, link: Link<S
     let Link { parts, state, done, .. } = link;
     done(Finished {
         lane: GptqLane { stream, parts },
-        scratch: Scratch(Box::new(state)),
+        scratch: Scratch {
+            _state: Box::new(state),
+        },
         result,
     });
 }
@@ -353,36 +433,31 @@ fn submit<R>(
 
 // ---- memory and launches -------------------------------------------------------------------------------------
 
-fn device(library: &Arc<CudaLibrary>, bytes: usize) -> Result<DeviceBuffer, GptqError> {
-    Ok(DeviceBuffer::alloc(library, bytes.max(1))?)
-}
-
-fn pinned(library: &Arc<CudaLibrary>, bytes: usize) -> Result<PinnedBuffer, GptqError> {
-    Ok(PinnedBuffer::alloc(library, bytes.max(1))?)
-}
+/// The allocations of a step's preparation, made on the lane's stream.
+type Mem<'a, 'q> = Memory<'a, Enq<'q>>;
 
 /// A device buffer with a page-locked twin of the same size: what goes up, or what comes back.
 struct Staged {
-    host: PinnedBuffer,
-    device: DeviceBuffer,
+    host: Host,
+    device: Device,
 }
 
 impl Staged {
-    fn new(library: &Arc<CudaLibrary>, bytes: usize) -> Result<Staged, GptqError> {
+    fn new(memory: &mut Mem<'_, '_>, bytes: usize) -> Result<Staged, GptqError> {
         Ok(Staged {
-            host: pinned(library, bytes)?,
-            device: device(library, bytes)?,
+            host: memory.pinned(bytes)?,
+            device: memory.device(bytes)?,
         })
     }
 
-    fn of_u32(library: &Arc<CudaLibrary>, values: &[u32]) -> Result<Staged, GptqError> {
-        let mut staged = Staged::new(library, values.len() * 4)?;
+    fn of_u32(memory: &mut Mem<'_, '_>, values: &[u32]) -> Result<Staged, GptqError> {
+        let mut staged = Staged::new(memory, values.len() * 4)?;
         staged.fill_u32(values);
         Ok(staged)
     }
 
-    fn of_f32(library: &Arc<CudaLibrary>, values: &[f32]) -> Result<Staged, GptqError> {
-        let mut staged = Staged::new(library, values.len() * 4)?;
+    fn of_f32(memory: &mut Mem<'_, '_>, values: &[f32]) -> Result<Staged, GptqError> {
+        let mut staged = Staged::new(memory, values.len() * 4)?;
         staged.fill_f32(values);
         Ok(staged)
     }
@@ -484,30 +559,61 @@ struct FactorState {
     hessian: u64,
     diagonal: Staged,
     order: Staged,
-    upper: Arc<DeviceBuffer>,
-    workspace: DeviceBuffer,
+    upper: Arc<Device>,
+    workspace: Device,
     workspace_floats: i32,
     info: Staged,
     prepared: Option<(Vec<f32>, Vec<u32>, Vec<u32>)>,
 }
 
 impl GptqLane {
+    /// The memory [`factor`](Self::factor) of a `k` by `k` Hessian takes, to be claimed before it. It asks cuSOLVER
+    /// for the workspace it needs, which enqueues nothing.
+    pub fn factor_bytes(&mut self, k: usize) -> Result<StepBytes, GptqError> {
+        let floats = self.workspace_floats(k)?;
+        let k = k as u64;
+        let words = 4 * k;
+        Ok(StepBytes {
+            device: 4 * k * k + 2 * words + 12 + 4 * u64::try_from(floats.max(1)).unwrap_or(1),
+            pinned: 2 * words + 12,
+        })
+    }
+
+    /// The most floats of workspace any of the three cuSOLVER calls on a `k` by `k` matrix asks for.
+    fn workspace_floats(&mut self, k: usize) -> Result<i32, GptqError> {
+        let n = int(k)?;
+        let handles = &mut self.parts.handles;
+        let queries = [(false, Fill::Lower), (true, Fill::Lower), (false, Fill::Upper)];
+        submit(&mut self.stream, |queue| {
+            let raw = queue.raw_stream().ok_or(GptqError::NoStream)?;
+            let mut most = 1;
+            for (inverse, fill) in queries {
+                // SAFETY: the stream is the lane's own; the size query reads no memory, so no matrix is given.
+                let floats = unsafe { handles.solver_workspace(&raw, inverse, fill, n, DevicePtr::NULL) }?;
+                most = most.max(floats);
+            }
+            Ok(most)
+        })
+    }
+
     /// Prepares the factor of `hessian` (FP32 `[k, k]` on the device, left unchanged, and kept until `done` is called):
     /// act-order (columns by decreasing diag H, stable) or the natural order; dead columns (diag 0) get a unit diagonal,
     /// the diagonal gains `damp` times its mean; then `potrf` (lower), `potri` (lower), mirror and `potrf` (upper).
+    /// `claims` account for [`factor_bytes`](Self::factor_bytes).
     ///
     /// A matrix that is not positive definite ends with the cuSOLVER step that refused it. The three `info` words are
     /// read back together, so the later steps have run on what the failed one left; the first failure is the one
     /// reported.
     pub fn factor(
         mut self,
-        hessian: u64,
+        hessian: DeviceRange,
         k: usize,
         damp: f32,
         act_order: bool,
+        claims: Claims,
         done: impl FnOnce(Finished<Factor>) + Send + 'static,
     ) -> Result<(), Box<Refused>> {
-        let prepared = self.prepare_factor(hessian, k, damp, act_order);
+        let prepared = self.prepare_factor(hessian, k, damp, act_order, claims);
         match prepared {
             Ok(state) => {
                 start(self, state, Box::new(done), Box::new(factor_read_diagonal));
@@ -517,37 +623,36 @@ impl GptqLane {
         }
     }
 
-    fn prepare_factor(&mut self, hessian: u64, k: usize, damp: f32, act_order: bool) -> Result<FactorState, GptqError> {
-        if k == 0 || hessian == 0 {
-            return Err(GptqError::Request("a Hessian needs a device matrix and k > 0".into()));
+    fn prepare_factor(
+        &mut self,
+        hessian: DeviceRange,
+        k: usize,
+        damp: f32,
+        act_order: bool,
+        claims: Claims,
+    ) -> Result<FactorState, GptqError> {
+        if k == 0 {
+            return Err(GptqError::Request("a Hessian needs k > 0".into()));
         }
-        let n = int(k)?;
-        let library = Arc::clone(&self.parts.library);
-        let upper = Arc::new(device(&library, 4 * k * k)?);
-        let handles = &mut self.parts.handles;
-        let queries = [(false, Fill::Lower), (true, Fill::Lower), (false, Fill::Upper)];
-        let floats = submit(&mut self.stream, |queue| {
-            let raw = queue.raw_stream().ok_or(GptqError::NoStream)?;
-            let mut most = 1;
-            for (inverse, fill) in queries {
-                // SAFETY: the stream is the lane's own; the matrix is a live n by n allocation, not read.
-                let floats = unsafe { handles.solver_workspace(&raw, inverse, fill, n, upper.ptr()) }?;
-                most = most.max(floats);
-            }
-            Ok(most)
-        })?;
-        Ok(FactorState {
-            k,
-            damp,
-            act_order,
-            hessian,
-            diagonal: Staged::new(&library, 4 * k)?,
-            order: Staged::new(&library, 4 * k)?,
-            workspace: device(&library, 4 * usize::try_from(floats).unwrap_or(1))?,
-            workspace_floats: floats,
-            info: Staged::new(&library, 12)?,
-            upper,
-            prepared: None,
+        let hessian = hessian.holding("Hessian", 4 * (k as u64) * (k as u64))?;
+        let floats = self.workspace_floats(k)?;
+        let memory = self.parts.memory.clone();
+        submit(&mut self.stream, |queue| {
+            reclaim(&memory.released, &memory.library, queue)?;
+            let mut memory = Memory::new(queue, &memory.library, &memory.released, &memory.pinned, claims);
+            Ok(FactorState {
+                k,
+                damp,
+                act_order,
+                hessian,
+                diagonal: Staged::new(&mut memory, 4 * k)?,
+                order: Staged::new(&mut memory, 4 * k)?,
+                upper: Arc::new(memory.device(4 * k * k)?),
+                workspace: memory.device(4 * usize::try_from(floats).unwrap_or(1))?,
+                workspace_floats: floats,
+                info: Staged::new(&mut memory, 12)?,
+                prepared: None,
+            })
         })
     }
 }
@@ -652,7 +757,7 @@ struct Sd4Scratch {
     counts: Staged,
     weights: Staged,
     identity: Staged,
-    values: DeviceBuffer,
+    values: Device,
     chunk_rows: u64,
 }
 
@@ -668,17 +773,36 @@ struct ScalesState {
 }
 
 impl GptqLane {
+    /// The memory [`tensor_scales`](Self::tensor_scales) of `rows` rows of `k` columns takes, to be claimed before it.
+    pub fn scales_bytes(&self, rows: usize, k: usize, format: &Format) -> StepBytes {
+        let (rows, k) = (rows as u64, k as u64);
+        let mut bytes = StepBytes { device: 4, pinned: 4 };
+        if format.sd4 {
+            let table = 8 * (CODES * CODES + 2 * CODES) as u64 + 8 * k;
+            bytes.device += table + 4 * self.chunk_rows(k).min(rows) * k;
+            bytes.pinned += table;
+        }
+        bytes
+    }
+
+    /// Rows of the weight one pass of the SD4 costs converts.
+    fn chunk_rows(&self, k: u64) -> u64 {
+        (self.parts.settings.scale_chunk_bytes / (4 * k)).max(1)
+    }
+
     /// The tensor-wide scales of an NVFP4 object (BF16 `[rows, k]` on the device at `weight`, kept until `done` is
-    /// called): the global scale from the largest magnitude and, for SD4, the table chosen under diag H.
+    /// called): the global scale from the largest magnitude and, for SD4, the table chosen under diag H. `claims`
+    /// account for [`scales_bytes`](Self::scales_bytes).
     pub fn tensor_scales(
         mut self,
-        weight: u64,
+        weight: DeviceRange,
         rows: usize,
         factor: &Factor,
         format: &Format,
+        claims: Claims,
         done: impl FnOnce(Finished<TensorScales>) + Send + 'static,
     ) -> Result<(), Box<Refused>> {
-        match self.prepare_scales(weight, rows, factor, format) {
+        match self.prepare_scales(weight, rows, factor, format, claims) {
             Ok(state) => {
                 start(self, state, Box::new(done), Box::new(scales_amax));
                 Ok(())
@@ -689,45 +813,56 @@ impl GptqLane {
 
     fn prepare_scales(
         &mut self,
-        weight: u64,
+        weight: DeviceRange,
         rows: usize,
         factor: &Factor,
         format: &Format,
+        claims: Claims,
     ) -> Result<ScalesState, GptqError> {
         let k = factor.k;
         if !format.nvfp4 {
             return Err(GptqError::Request("tensor scales belong to NVFP4".into()));
         }
-        if rows == 0 || weight == 0 || k == 0 || factor.importance.len() != k {
+        if rows == 0 || k == 0 {
             return Err(GptqError::Request("the weight and its factor do not agree".into()));
         }
-        let library = Arc::clone(&self.parts.library);
+        if !k.is_multiple_of(16) {
+            return Err(GptqError::Request(format!(
+                "{k} columns do not make whole NVFP4 blocks of 16"
+            )));
+        }
+        let weight = weight.holding("weight", 2 * rows as u64 * k as u64)?;
         let settings = self.parts.settings;
-        let table = if format.sd4 {
-            let chunk_rows = (settings.scale_chunk_bytes / (4 * k as u64)).max(1);
-            let held = chunk_rows.min(rows as u64) as usize;
-            let identity: Vec<u32> = (0..k as u32).collect();
-            Some(Sd4Scratch {
-                costs: Staged::new(&library, 8 * CODES * CODES)?,
-                energy: Staged::new(&library, 8 * CODES)?,
-                counts: Staged::new(&library, 8 * CODES)?,
-                weights: Staged::of_f32(&library, &factor.importance)?,
-                identity: Staged::of_u32(&library, &identity)?,
-                values: device(&library, 4 * held * k)?,
-                chunk_rows,
+        let chunk_rows = self.chunk_rows(k as u64);
+        let memory = self.parts.memory.clone();
+        submit(&mut self.stream, |queue| {
+            reclaim(&memory.released, &memory.library, queue)?;
+            let mut memory = Memory::new(queue, &memory.library, &memory.released, &memory.pinned, claims);
+            let table = if format.sd4 {
+                let held = chunk_rows.min(rows as u64) as usize;
+                let identity: Vec<u32> = (0..k as u32).collect();
+                Some(Sd4Scratch {
+                    costs: Staged::new(&mut memory, 8 * CODES * CODES)?,
+                    energy: Staged::new(&mut memory, 8 * CODES)?,
+                    counts: Staged::new(&mut memory, 8 * CODES)?,
+                    weights: Staged::of_f32(&mut memory, &factor.importance)?,
+                    identity: Staged::of_u32(&mut memory, &identity)?,
+                    values: memory.device(4 * held * k)?,
+                    chunk_rows,
+                })
+            } else {
+                None
+            };
+            Ok(ScalesState {
+                weight,
+                rows: rows as u64,
+                k,
+                sd4: format.sd4,
+                scale_max: settings.search.scale_max(),
+                amax: Staged::new(&mut memory, 4)?,
+                global: 0.0,
+                table,
             })
-        } else {
-            None
-        };
-        Ok(ScalesState {
-            weight,
-            rows: rows as u64,
-            k,
-            sd4: format.sd4,
-            scale_max: settings.search.scale_max(),
-            amax: Staged::new(&library, 4)?,
-            global: 0.0,
-            table,
         })
     }
 }
@@ -860,13 +995,13 @@ struct RoundState {
     shared: u32,
     state_format: Format,
     table: Option<[u8; ENTRIES]>,
-    upper: Arc<DeviceBuffer>,
-    w: DeviceBuffer,
-    decoded: DeviceBuffer,
-    decodes: DeviceBuffer,
-    block: DeviceBuffer,
-    errors: DeviceBuffer,
-    values: DeviceBuffer,
+    upper: Arc<Device>,
+    w: Device,
+    decoded: Device,
+    decodes: Device,
+    block: Device,
+    errors: Device,
+    values: Device,
     codes: Staged,
     scales: Staged,
     order_up: Staged,
@@ -881,24 +1016,41 @@ struct RoundState {
 #[derive(Debug, Clone, Copy)]
 pub struct RoundRequest<'a> {
     /// BF16 `[n, k]` on the device, kept until the step is done.
-    pub weight: u64,
+    pub weight: DeviceRange,
     pub n: usize,
     pub factor: &'a Factor,
     pub format: &'a Format,
     pub tensor: &'a TensorScales,
     /// Where the decoded BF16 `[n, k]` weights go, if wanted.
-    pub decoded_out: Option<u64>,
+    pub decoded_out: Option<DeviceRange>,
 }
 
 impl GptqLane {
+    /// The memory [`round`](Self::round) of `n` rows takes, to be claimed before it.
+    pub fn round_bytes(&self, n: usize, factor: &Factor, format: &Format) -> StepBytes {
+        let (n, k, group) = (n as u64, factor.k as u64, format.group as u64);
+        let groups = k / group;
+        let dead = dead_columns(&factor.importance, &factor.order).len() as u64;
+        let scale_bytes = if format.nvfp4 { 1 } else { 2 };
+        let uploads = 4 * 4 * k + 4 * dead + if format.sd4 { ENTRIES as u64 } else { 0 };
+        let downloads = 2 * n * k + scale_bytes * n * groups;
+        let device = 4 * (2 * n * k + n * groups + 2 * n * BLOCK as u64 + n * group);
+        StepBytes {
+            device: device + uploads + downloads,
+            pinned: uploads + downloads,
+        }
+    }
+
     /// Rounds rows `[0, n)` of an object under the factor; `tensor` comes from
-    /// [`tensor_scales`](Self::tensor_scales) for NVFP4 and is ignored by the grouped formats.
+    /// [`tensor_scales`](Self::tensor_scales) for NVFP4 and is ignored by the grouped formats. `claims` account for
+    /// [`round_bytes`](Self::round_bytes).
     pub fn round(
         mut self,
         request: &RoundRequest<'_>,
+        claims: Claims,
         done: impl FnOnce(Finished<QuantState>) + Send + 'static,
     ) -> Result<(), Box<Refused>> {
-        match self.prepare_round(request) {
+        match self.prepare_round(request, claims) {
             Ok(state) => {
                 start(self, state, Box::new(done), Box::new(round_all));
                 Ok(())
@@ -907,7 +1059,7 @@ impl GptqLane {
         }
     }
 
-    fn prepare_round(&mut self, request: &RoundRequest<'_>) -> Result<RoundState, GptqError> {
+    fn prepare_round(&mut self, request: &RoundRequest<'_>, claims: Claims) -> Result<RoundState, GptqError> {
         let RoundRequest {
             weight,
             n,
@@ -918,7 +1070,7 @@ impl GptqLane {
         } = *request;
         let k = factor.k;
         let group = format.group;
-        if n == 0 || k == 0 || weight == 0 || !k.is_multiple_of(group) || factor.order.len() != k {
+        if n == 0 || k == 0 || !k.is_multiple_of(group) {
             return Err(GptqError::Request(format!(
                 "cannot round {n} rows of {k} columns in groups of {group}"
             )));
@@ -928,54 +1080,64 @@ impl GptqLane {
         }
         int(n)?;
         int(k)?;
+        let matrix = 2 * n as u64 * k as u64;
+        let weight = weight.holding("weight", matrix)?;
+        let decoded_out = decoded_out
+            .map(|out| out.holding("decoded output", matrix))
+            .transpose()?;
         let groups = k / group;
-        let library = Arc::clone(&self.parts.library);
         let dead = dead_columns(&factor.importance, &factor.order);
-        let dead_up = if dead.is_empty() {
-            None
-        } else {
-            Some((Staged::of_u32(&library, &dead)?, dead.len()))
-        };
-        let table_up = match (format.sd4, tensor.table) {
-            (true, Some(table)) => {
-                let mut staged = Staged::new(&library, ENTRIES)?;
-                staged.host.as_mut_slice().copy_from_slice(&table);
-                Some(staged)
-            }
-            _ => None,
-        };
         let scale_bytes = if format.nvfp4 { 1 } else { 2 };
-        Ok(RoundState {
-            n,
-            k,
-            group,
-            groups,
-            nvfp4: format.nvfp4,
-            qmin: format.qmin,
-            qmax: format.qmax,
-            above: self.parts.settings.search.above(),
-            global_scale: tensor.global_scale,
-            weight,
-            decoded_out,
-            order: factor.order.clone(),
-            shared: 32 * (BLOCK as u32 + 1) * 4,
-            state_format: format.clone(),
-            table: if format.sd4 { tensor.table } else { None },
-            upper: Arc::clone(&factor.upper),
-            w: device(&library, 4 * n * k)?,
-            decoded: device(&library, 4 * n * k)?,
-            decodes: device(&library, 4 * n * groups)?,
-            block: device(&library, 4 * n * BLOCK)?,
-            errors: device(&library, 4 * n * BLOCK)?,
-            values: device(&library, 4 * n * group)?,
-            codes: Staged::new(&library, 2 * n * k)?,
-            scales: Staged::new(&library, scale_bytes * n * groups)?,
-            order_up: Staged::of_u32(&library, &factor.order)?,
-            position_up: Staged::of_u32(&library, &factor.position)?,
-            group_up: Staged::of_u32(&library, &group_of_places(&factor.order, group))?,
-            weights_up: Staged::of_f32(&library, &factor.importance)?,
-            dead_up,
-            table_up,
+        let above = self.parts.settings.search.above();
+        let memory = self.parts.memory.clone();
+        submit(&mut self.stream, |queue| {
+            reclaim(&memory.released, &memory.library, queue)?;
+            let mut memory = Memory::new(queue, &memory.library, &memory.released, &memory.pinned, claims);
+            let dead_up = if dead.is_empty() {
+                None
+            } else {
+                Some((Staged::of_u32(&mut memory, &dead)?, dead.len()))
+            };
+            let table_up = match (format.sd4, tensor.table) {
+                (true, Some(table)) => {
+                    let mut staged = Staged::new(&mut memory, ENTRIES)?;
+                    staged.host.as_mut_slice().copy_from_slice(&table);
+                    Some(staged)
+                }
+                _ => None,
+            };
+            Ok(RoundState {
+                n,
+                k,
+                group,
+                groups,
+                nvfp4: format.nvfp4,
+                qmin: format.qmin,
+                qmax: format.qmax,
+                above,
+                global_scale: tensor.global_scale,
+                weight,
+                decoded_out,
+                order: factor.order.clone(),
+                shared: 32 * (BLOCK as u32 + 1) * 4,
+                state_format: format.clone(),
+                table: if format.sd4 { tensor.table } else { None },
+                upper: Arc::clone(&factor.upper),
+                w: memory.device(4 * n * k)?,
+                decoded: memory.device(4 * n * k)?,
+                decodes: memory.device(4 * n * groups)?,
+                block: memory.device(4 * n * BLOCK)?,
+                errors: memory.device(4 * n * BLOCK)?,
+                values: memory.device(4 * n * group)?,
+                codes: Staged::new(&mut memory, 2 * n * k)?,
+                scales: Staged::new(&mut memory, scale_bytes * n * groups)?,
+                order_up: Staged::of_u32(&mut memory, &factor.order)?,
+                position_up: Staged::of_u32(&mut memory, &factor.position)?,
+                group_up: Staged::of_u32(&mut memory, &group_of_places(&factor.order, group))?,
+                weights_up: Staged::of_f32(&mut memory, &factor.importance)?,
+                dead_up,
+                table_up,
+            })
         })
     }
 }
