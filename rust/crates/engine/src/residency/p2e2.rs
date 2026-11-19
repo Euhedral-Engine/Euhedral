@@ -15,6 +15,8 @@
 //! reads one piece on its own, and [`P2e2Validation::absorb`] puts the scans of a tensor's pieces together and judges the
 //! tensor when its last byte has arrived.
 
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 const SLICE: u64 = 1024;
 const PAD_WORDS: u64 = 80;
 const ALIGNMENT: u64 = 256;
@@ -40,7 +42,7 @@ impl P2e2Geometry {
     pub fn new(rows: u64, k: u64, bytes: u64) -> Result<Self, String> {
         let codes = rows
             .checked_mul(k)
-            .filter(|codes| rows > 0 && *codes > 0 && k % SLICE == 0);
+            .filter(|codes| rows > 0 && *codes > 0 && k.is_multiple_of(SLICE));
         let Some(codes) = codes else {
             return Err(format!(
                 "P2E2 layout requires a rank-2 shape whose K is a multiple of {SLICE}, not {rows} by {k}"
@@ -138,13 +140,14 @@ pub struct P2e2Scan {
     bases: Vec<u32>,
 }
 
-/// The scans of one tensor's pieces so far.
+/// The scans of one tensor's pieces so far. The pieces of a tensor land on different workers, so the state is atomic:
+/// the piece whose bytes complete the tensor sees every other piece's counts and judges it.
 #[derive(Debug)]
 pub struct P2e2Validation {
     geometry: P2e2Geometry,
-    big: Vec<u64>,
-    bases: Vec<u32>,
-    received: u64,
+    big: Vec<AtomicU64>,
+    bases: Vec<AtomicU32>,
+    received: AtomicU64,
 }
 
 impl P2e2Validation {
@@ -152,9 +155,9 @@ impl P2e2Validation {
         let rows = geometry.rows as usize;
         Self {
             geometry,
-            big: vec![0; rows],
-            bases: vec![0; rows],
-            received: 0,
+            big: (0..rows).map(|_| AtomicU64::new(0)).collect(),
+            bases: (0..rows).map(|_| AtomicU32::new(0)).collect(),
+            received: AtomicU64::new(0),
         }
     }
 
@@ -164,23 +167,24 @@ impl P2e2Validation {
 
     /// Takes in one piece's scan. When it is the tensor's last bytes the tensor is judged: the error is why it is not
     /// valid.
-    pub fn absorb(&mut self, scan: P2e2Scan) -> Result<(), String> {
+    pub fn absorb(&self, scan: P2e2Scan) -> Result<(), String> {
         for (offset, big) in scan.big.iter().enumerate() {
-            self.big[scan.first_row as usize + offset] += big;
+            self.big[scan.first_row as usize + offset].fetch_add(*big, Ordering::Relaxed);
         }
         for (offset, base) in scan.bases.iter().enumerate() {
-            self.bases[scan.first_base as usize + offset] = *base;
+            self.bases[scan.first_base as usize + offset].store(*base, Ordering::Relaxed);
         }
-        self.received += scan.bytes;
-        if self.received < self.geometry.bytes {
+        // The release of each piece's counts is acquired by the piece that completes the tensor.
+        let received = self.received.fetch_add(scan.bytes, Ordering::AcqRel) + scan.bytes;
+        if received < self.geometry.bytes {
             return Ok(());
         }
         let mut units = 0u64;
         for (row, (base, big)) in self.bases.iter().zip(&self.big).enumerate() {
-            if u64::from(*base) != units {
+            if u64::from(base.load(Ordering::Relaxed)) != units {
                 return Err(format!("P2E2 row base of row {row} does not match its primary plane"));
             }
-            units += big;
+            units += big.load(Ordering::Relaxed);
         }
         if units > self.geometry.capacity_units() {
             return Err("P2E2 payload plane is shorter than its primary plane requires".to_string());

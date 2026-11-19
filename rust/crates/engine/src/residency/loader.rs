@@ -22,11 +22,10 @@
 //! and its `Drop` reports the outcome, wherever that frame ran. A failure sets a flag, so the chains stop starting
 //! reads, and the first error is the one reported.
 
-use std::collections::HashMap;
 use std::io;
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
@@ -364,7 +363,7 @@ struct Shared {
     arena: Option<DeviceBuffer>,
     done: Option<Done>,
     /// The P2E2 tensors being checked, by placement.
-    p2e2: Mutex<HashMap<usize, Arc<Mutex<P2e2Validation>>>>,
+    p2e2: Box<[OnceLock<P2e2Validation>]>,
 }
 
 impl Shared {
@@ -386,15 +385,7 @@ impl Shared {
         };
         let geometry = P2e2Geometry::new(rows, k, size)?;
         let scan = geometry.scan(from, bytes)?;
-        let validation = {
-            let mut tensors = self.p2e2.lock().unwrap_or_else(PoisonError::into_inner);
-            Arc::clone(
-                tensors
-                    .entry(piece.placement)
-                    .or_insert_with(|| Arc::new(Mutex::new(P2e2Validation::new(geometry)))),
-            )
-        };
-        let mut validation = validation.lock().unwrap_or_else(PoisonError::into_inner);
+        let validation = self.p2e2[piece.placement].get_or_init(|| P2e2Validation::new(geometry));
         validation.absorb(scan)
     }
 
@@ -453,6 +444,7 @@ pub(crate) fn start(
     loans: Vec<PooledPinned>,
     done: impl FnOnce(LoadOutcome) + Send + Sync + 'static,
 ) {
+    let placements = pieces.iter().map(|piece| piece.placement + 1).max().unwrap_or(0);
     let shared = Arc::new(Shared {
         core: Arc::clone(core),
         file,
@@ -469,7 +461,7 @@ pub(crate) fn start(
         arena: Some(arena),
         done: Some(Box::new(done)),
         pieces: pieces.into(),
-        p2e2: Mutex::new(HashMap::new()),
+        p2e2: (0..placements).map(|_| OnceLock::new()).collect(),
     });
     let mut loans = loans.into_iter();
     for chain in 0..chains {

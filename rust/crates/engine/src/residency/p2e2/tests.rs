@@ -43,7 +43,7 @@ fn pattern(row: u64, index: u64) -> u32 {
 /// Feeds `bytes` in pieces of `piece` bytes, in the order `order` picks, and returns the verdict of each piece.
 fn in_pieces(bytes: &[u8], rows: u64, piece: usize, reverse: bool) -> Vec<Result<(), String>> {
     let geometry = P2e2Geometry::new(rows, K, bytes.len() as u64).unwrap();
-    let mut validation = P2e2Validation::new(geometry);
+    let validation = P2e2Validation::new(geometry);
     let mut starts: Vec<usize> = (0..bytes.len()).step_by(piece).collect();
     if reverse {
         starts.reverse();

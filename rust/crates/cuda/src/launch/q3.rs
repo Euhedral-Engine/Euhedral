@@ -15,9 +15,9 @@
 //!   turns rows of it into a row-split tensor for every other route.
 
 use crate::DevicePtr;
-use crate::launch::PlanError;
 use crate::launch::catalog::{Arguments, KernelId, Launch, find_const};
 use crate::launch::embedding::{align256, p2e2_geometry};
+use crate::launch::{PlanError, advance};
 
 /// The most rows of the contiguous decode kernels (`EUHEDRAL_DECODE_MAX_ROWS`, `decode_shapes.h`).
 pub const DECODE_MAX_ROWS: u32 = 8;
@@ -364,12 +364,12 @@ pub fn plan_p2e2_decode(operands: &Q3Operands, exact_numerics: bool) -> Result<Q
     while first < operands.rows {
         let count = (operands.rows - first).min(P2E2_ROWS_PER_LAUNCH);
         let args = Arguments::new()
-            .pointer(crate::launch::advance(
+            .pointer(advance(
                 operands.input,
                 u64::from(first) * u64::from(operands.in_features) * 2,
             ))
             .pointer(operands.weights)
-            .pointer(crate::launch::advance(
+            .pointer(advance(
                 operands.output,
                 u64::from(first) * u64::from(operands.out_features) * 2,
             ))
@@ -403,6 +403,7 @@ pub fn p2e2_decode_runs(operands: &Q3Operands, exact_numerics: bool) -> bool {
 
 /// The launch of `euhedral_cuda_q3_p2e2_expand` (`q3_linear_bf16.c`): rows `first_row..first_row + row_count` of the
 /// P2E2 tensor `weights` of `rows` rows become a row-split Q3 tensor of `row_count` rows at `destination`.
+#[allow(clippy::too_many_arguments, reason = "the native entry point's parameter list")]
 pub fn plan_p2e2_expand(
     weights: DevicePtr,
     weights_byte_size: u64,
@@ -583,6 +584,7 @@ fn mx_offsets(bits: Bits, weight_rows: u32, width: u32) -> (u64, u64) {
 /// `sm_count` is the device's multiprocessor count and `split_rows` the whole tensor's weight rows for a chunked run
 /// (0 otherwise). Where the C entry point declines (a shape or alignment it has no kernel for, exact numerics or
 /// row-exact execution), the refusal is [`PlanError::RouteUnavailable`] and the caller runs the decode route instead.
+#[allow(clippy::too_many_arguments, reason = "the native entry point's parameter list")]
 pub fn plan_mx(
     bits: Bits,
     operands: &Q3Operands,
@@ -634,8 +636,8 @@ pub fn plan_mx(
     }
     let plane = align256(u64::from(rows) * u64::from(width));
     let hi = scratch;
-    let lo = crate::launch::advance(scratch, plane);
-    let scales = crate::launch::advance(scratch, 2 * plane);
+    let lo = advance(scratch, plane);
+    let scales = advance(scratch, 2 * plane);
     let quantize = Launch::new(
         MX_QUANTIZE,
         [blocks as u32, 1, 1],
@@ -651,7 +653,7 @@ pub fn plan_mx(
     );
     let mut plan = Q3Plan::single(quantize);
     let partials = if splits > 1 {
-        crate::launch::advance(scales, align256(u64::from(rows) * u64::from(width / 32)))
+        advance(scales, align256(u64::from(rows) * u64::from(width / 32)))
     } else {
         DevicePtr::NULL
     };
