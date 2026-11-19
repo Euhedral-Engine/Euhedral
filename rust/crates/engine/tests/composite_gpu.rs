@@ -148,8 +148,8 @@ fn projections(entries: &[TensorEntry], count: usize) -> Vec<String> {
 }
 
 /// Writes an artifact at `path` that holds `objects` and their companions, with the payloads of `base`, in the
-/// reverse of the base's order and at other offsets, so only a read from this file finds them. With `corrupt`, the payload
-/// of each object's payload is zeros.
+/// reverse of the base's order and at other offsets, so only a read from this file finds them.
+/// With `corrupt`, each object's payload is zeros.
 fn write_source(base: &Path, path: &Path, objects: &[String], corrupt: bool) {
     let (header, metadata, entries) = index(base);
     let mut specs = Vec::new();
@@ -222,7 +222,7 @@ fn a_composite_reads_each_object_from_its_own_file_and_generates_the_bases_token
     assert_eq!(tokens, expected);
 
     // The same source with each object's payload zeroed: the engine reads the source's payload, so its tokens differ.
-    // Without this, a composite that were ignored would pass the comparison above.
+    // Without this, a composite that is ignored would pass the comparison above.
     let damaged = scratch.join("damaged.edrl");
     write_source(&machine.artifact, &damaged, &objects, true);
     let composite = Composite {

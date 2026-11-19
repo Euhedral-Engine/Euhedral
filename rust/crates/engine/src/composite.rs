@@ -92,7 +92,8 @@ pub(crate) fn composed_depth(
     let has = |prefix: &str| table.entries().iter().any(|entry| entry.name().starts_with(prefix));
     if !(has("mtp/") && has("text/draft_head")) {
         return Err(invalid(format!(
-            "the composite's draft depth {depth} needs a model with an MTP layer and a draft head, and this one has none"
+            "the composite's draft depth {depth} needs a model with an MTP layer and a draft head, and this one \
+             has none"
         )));
     }
     Ok(Some(depth))
@@ -451,6 +452,8 @@ mod tests {
         assert!(none.contains("MTP"), "{none}");
         let half = table([entry_named("mtp/fc"), norm(4096)]);
         assert!(composed_depth(None, &half, &depth(Some(3))).is_err());
+        let head_only = table([entry_named("text/draft_head"), norm(4096)]);
+        assert!(composed_depth(None, &head_only, &depth(Some(3))).is_err());
     }
 
     #[test]
