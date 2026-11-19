@@ -6,7 +6,8 @@
 //!
 //! - a quantum that starts posts its uses ([`DiskReader::enqueue`]), in the order its device work consumes them;
 //! - a read's completion posts [`DiskMessage::Arrived`] (from the frame an `AsyncIo` continuation returns);
-//! - a copy's marker completion posts [`DiskMessage::SlotFreed`], which frees the slot for the next read.
+//! - a copy's marker completion posts [`DiskMessage::SlotFreed`] with its quantum's ticket, which frees the slot for the
+//!   next read (a free that names another ticket than the one holding the slot is ignored).
 //!
 //! No device work writes a host flag and nothing waits for a read. The device never waits for the host either: a copy
 //! stage holds a [`Gate`] (taken in `pass_gate`, through [`DiskReader::claim`]) until its read is in the slot, so the
@@ -15,24 +16,27 @@
 //!
 //! **Slots.** Each slot is read one use at a time: its uses wait in a queue, in admission order and, within a quantum, in
 //! use order, which is the order the copies of that slot run. A slot is `Idle`, `Reading`, `Filled` (read, no copy
-//! claimed it yet) or `Claimed` (its copy owns the bytes until [`DiskMessage::SlotFreed`]). A read is never started
+//! claimed it yet) or `Claimed` (its copy owns the bytes until [`DiskMessage::SlotFreed`] of the same ticket). A read is never started
 //! into a slot before the previous read of it has arrived, whoever it belonged to: the kernel may still be writing.
 //!
 //! **Abandoned quanta.** [`DiskReader::abandon`] ends a quantum's uses: those not read are dropped, a read in flight is
 //! discarded when it arrives, a read that arrived and no copy claimed is dropped at once, and a copy that waits for it
-//! has its gate released (its stage then ends without running, as the quantum is over). A slot a copy already claimed
-//! stays with that copy until it is freed. A quantum abandoned before its uses were posted reads nothing. After
-//! `abandon(ticket)` no claim of that ticket may follow: the stages of an ended quantum are not asked again.
+//! has its gate failed (so a released gate always means the copy owns the slot). A slot a copy already claimed stays
+//! with that copy until it frees it. A quantum abandoned before its uses were posted reads nothing. A claim that comes
+//! after its ticket was abandoned (the stage was published between the quantum's end and its `pass_gate`) finds no use
+//! of that ticket on the slot and fails its gate at once; the slot is left alone for the quanta that follow.
 //!
 //! **Failures.** A failed (or short) read fails its quantum through the [`FailHandle`] first and then still hands the
 //! slot to its copy, so the copy of stale bytes belongs to a quantum that cannot commit. A direct read the file
-//! system refuses (`EINVAL`) is repeated once through the page cache.
+//! system refuses (`EINVAL`, or error 87 on Windows) is repeated once through the page cache.
 //!
-//! **Gates.** A gate is spent exactly once: released when its read is in, released when its quantum is abandoned,
-//! failed when the reader closes. Gates are spent after the owner's claim is released, in the order the owner decided.
+//! **Gates.** A gate is spent exactly once: released when its read is in, failed when its quantum is abandoned or the
+//! reader closes. Gates are spent after the owner's claim is released, in the order the owner decided.
 //!
 //! **Close.** [`DiskReader::close`] stops new reads, fails the gates still waiting and returns a hand-off that is sent
-//! when no read is in flight. The window is freed only after that.
+//! when no read is in flight, once for each close. The hand-off waits for reads, not for copies that claimed a slot, so
+//! the window is safe to free only when every quantum has retired as well. The caller keeps the [`DiskReader`] alive
+//! until the hand-off arrives: the reads reach the owner through a weak address, and a dropped reader loses them.
 
 #[cfg(test)]
 use std::alloc::{Layout, alloc_zeroed, dealloc};
@@ -474,10 +478,10 @@ impl ReadPort for FilePort {
         let slot = spec.slot;
         let then = Box::new(move |ended: IoDoneOwned<SlotMemory>| {
             step(Kind::DiskRead, slot, move || {
-                // The file stays open and the memory alive until the read ended and was told.
+                // The file and the memory are let go before the arrival is told: nothing touches the range after it.
                 let IoDoneOwned { buf, result, .. } = ended;
-                done(result);
                 drop((buf, file));
+                done(result);
             })
         });
         self.io.read_into(raw_file(handle), spec.offset, memory, then)
@@ -517,8 +521,8 @@ pub enum DiskMessage {
         ticket: u64,
         result: io::Result<usize>,
     },
-    /// The copy that consumed `slot` ended: the slot may be read into again.
-    SlotFreed { slot: usize },
+    /// The copy of `ticket` that consumed `slot` ended: the slot may be read into again.
+    SlotFreed { slot: usize, ticket: u64 },
     /// Stop reading; `closed` is sent when no read is in flight.
     Close { closed: Arc<Handoff<()>> },
 }
@@ -529,7 +533,7 @@ impl fmt::Debug for DiskMessage {
             DiskMessage::Enqueue { ticket, uses, .. } => write!(formatter, "Enqueue({ticket}, {} uses)", uses.len()),
             DiskMessage::Abandon { ticket } => write!(formatter, "Abandon({ticket})"),
             DiskMessage::Arrived { slot, ticket, .. } => write!(formatter, "Arrived({slot}, {ticket})"),
-            DiskMessage::SlotFreed { slot } => write!(formatter, "SlotFreed({slot})"),
+            DiskMessage::SlotFreed { slot, ticket } => write!(formatter, "SlotFreed({slot}, {ticket})"),
             DiskMessage::Close { .. } => write!(formatter, "Close"),
         }
     }
@@ -578,8 +582,10 @@ enum State {
     Filled {
         ticket: u64,
     },
-    /// The copy owns the bytes until the slot is freed.
-    Claimed,
+    /// The copy of `ticket` owns the bytes until it frees the slot.
+    Claimed {
+        ticket: u64,
+    },
 }
 
 struct Slot {
@@ -598,10 +604,17 @@ pub(crate) struct DiskOwner {
     slots: Vec<Slot>,
     /// Tickets abandoned before their uses were posted.
     early: BTreeSet<u64>,
+    /// The highest ticket registered or abandoned before registration: a ticket at or below it that the slots do not
+    /// hold is over.
+    highest: Option<u64>,
     direct_works: bool,
     closed: bool,
-    closed_signal: Option<Arc<Handoff<()>>>,
+    closed_signals: Vec<Arc<Handoff<()>>>,
     told: Vec<Finished>,
+}
+
+fn abandoned_error() -> StageError {
+    StageError::Fatal("the quantum of the copy ended before its read".into())
 }
 
 fn closed_error() -> StageError {
@@ -618,9 +631,10 @@ impl DiskOwner {
             DiskMessage::Enqueue { ticket, uses, fail } => self.enqueue(ticket, uses, fail),
             DiskMessage::Abandon { ticket } => self.abandon(ticket),
             DiskMessage::Arrived { slot, ticket, result } => self.arrive(slot, ticket, result),
-            DiskMessage::SlotFreed { slot } => {
-                let state = &mut self.slots[slot].state;
-                if matches!(state, State::Claimed | State::Filled { .. }) {
+            DiskMessage::SlotFreed { slot, ticket } => {
+                if let Some(state) = self.slots.get_mut(slot).map(|slot| &mut slot.state)
+                    && matches!(state, State::Claimed { ticket: claimed } if *claimed == ticket)
+                {
                     *state = State::Idle;
                 }
             }
@@ -629,6 +643,7 @@ impl DiskOwner {
     }
 
     fn enqueue(&mut self, ticket: u64, uses: Vec<DiskUse>, fail: FailHandle) {
+        self.highest = self.highest.max(Some(ticket));
         let abandoned = self.early.remove(&ticket);
         self.early.retain(|early| *early > ticket);
         if abandoned {
@@ -660,13 +675,14 @@ impl DiskOwner {
         // next enqueue above it.
         if !known {
             self.early.insert(ticket);
+            self.highest = self.highest.max(Some(ticket));
         }
         for slot in &mut self.slots {
             slot.queue.retain(|pending| pending.ticket != ticket);
             let mut kept = VecDeque::new();
             for (claimed, gate) in mem::take(&mut slot.claims) {
                 if claimed == ticket {
-                    self.told.push(Finished::Release(gate));
+                    self.told.push(Finished::FailGate(gate, abandoned_error()));
                 } else {
                     kept.push_back((claimed, gate));
                 }
@@ -751,7 +767,7 @@ impl DiskOwner {
         }
         if let Err(refused) = &result
             && direct
-            && refused.raw_os_error() == Some(EINVAL)
+            && refused.raw_os_error().is_some_and(refuses_alignment)
         {
             // The file system takes the direct open and refuses the read: every read goes through the page cache now.
             log::info!("direct reads of the artifact are refused ({refused}); reading through the page cache");
@@ -767,14 +783,13 @@ impl DiskOwner {
         let state = &mut self.slots[slot];
         match state.claims.front() {
             Some((claimed, _)) if *claimed == ticket => {
-                state.state = State::Claimed;
+                state.state = State::Claimed { ticket };
                 if let Some((_, gate)) = state.claims.pop_front() {
                     self.told.push(Finished::Release(gate));
                 }
             }
-            // The copy waiting is another quantum's: this read's quantum was abandoned, and nothing claims it.
-            Some(_) => state.state = State::Idle,
-            None => state.state = State::Filled { ticket },
+            // No copy of this read has claimed it yet (a copy waiting is another quantum's, and ordered after).
+            _ => state.state = State::Filled { ticket },
         }
     }
 
@@ -789,18 +804,15 @@ impl DiskOwner {
                 "a copy claimed an unknown window slot {slot}"
             )));
         };
-        if state.claims.is_empty() {
-            match state.state {
-                State::Filled { ticket: filled } if filled == ticket => {
-                    state.state = State::Claimed;
-                    return Ok(true);
-                }
-                State::Filled { .. } => {
-                    // A read nobody claimed (its quantum was abandoned): no copy reads the bytes, the slot is read again.
-                    state.state = State::Idle;
-                }
-                _ => {}
-            }
+        if matches!(state.state, State::Filled { ticket: filled } if filled == ticket) {
+            state.state = State::Claimed { ticket };
+            return Ok(true);
+        }
+        let held = state.queue.iter().any(|pending| pending.ticket == ticket)
+            || matches!(&state.state, State::Reading { pending, discard: false, .. } if pending.ticket == ticket);
+        if !held && self.highest.is_some_and(|highest| ticket <= highest) {
+            // The quantum ended before its copy asked: nothing of it is on the slot, and the slot is left alone.
+            return Err(abandoned_error());
         }
         Ok(false)
     }
@@ -837,7 +849,7 @@ impl DiskOwner {
 
     fn close(&mut self, closed: Arc<Handoff<()>>) {
         self.closed = true;
-        self.closed_signal = Some(closed);
+        self.closed_signals.push(closed);
         self.fail_waiting(&closed_error());
     }
 
@@ -852,17 +864,25 @@ impl DiskOwner {
     }
 
     fn signal_closed(&mut self) {
-        if self.closed
-            && self.in_flight() == 0
-            && let Some(closed) = self.closed_signal.take()
-        {
-            closed.send(());
+        if self.closed && self.in_flight() == 0 {
+            for closed in mem::take(&mut self.closed_signals) {
+                closed.send(());
+            }
         }
     }
 }
 
-/// `EINVAL`, the error a direct read gets for a request the file system cannot align.
-const EINVAL: i32 = 22;
+/// Whether an OS error is the one a direct read gets for a request the file system cannot align: `EINVAL` on Unix,
+/// `ERROR_INVALID_PARAMETER` on Windows.
+fn refuses_alignment(code: i32) -> bool {
+    const EINVAL: i32 = 22;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    if cfg!(windows) {
+        code == ERROR_INVALID_PARAMETER
+    } else {
+        code == EINVAL
+    }
+}
 
 impl Turn for DiskOwner {
     type Message = DiskMessage;
@@ -949,9 +969,10 @@ impl DiskReader {
                 })
                 .collect(),
             early: BTreeSet::new(),
+            highest: None,
             direct_works: true,
             closed: false,
-            closed_signal: None,
+            closed_signals: Vec::new(),
             told: Vec::new(),
         };
         let mailbox = Arc::new(Mailbox::new(owner, producer, spawn));
@@ -996,12 +1017,14 @@ impl DiskReader {
         self.mailbox.post(DiskMessage::Abandon { ticket });
     }
 
-    /// The copy that consumed `slot` ended (its marker completed): the slot may be read into again.
-    pub fn slot_freed(&self, slot: usize) {
-        self.mailbox.post(DiskMessage::SlotFreed { slot });
+    /// The copy of `ticket` that consumed `slot` ended (its marker completed): the slot may be read into again. A free
+    /// of a slot that `ticket` does not hold is ignored.
+    pub fn slot_freed(&self, slot: usize, ticket: u64) {
+        self.mailbox.post(DiskMessage::SlotFreed { slot, ticket });
     }
 
-    /// Stops reading. The hand-off is sent once no read is in flight; the window may be freed then and not before.
+    /// Stops reading. The hand-off is sent once no read is in flight (it waits for reads, not for the copies that
+    /// claimed a slot: free the window only when every quantum has retired too). Keep the reader alive until then.
     pub fn close(&self) -> Arc<Handoff<()>> {
         let closed = Handoff::new();
         self.mailbox.post(DiskMessage::Close {

@@ -56,7 +56,7 @@ memory:
   host-weights-limit: auto                    # optional, default auto: pinned host memory for host-backed weights
   host-margin: auto                           # optional, default auto: host memory kept for the system when the budget is derived from what the machine can spare (auto = the larger of 4GiB and 10% of it; 0 keeps none)
   staging-slots: auto                         # optional, default auto: pinned staging slots for weights that stream through the host (auto = 4)
-  disk-window-slots: auto                     # optional, default auto: pinned window slots the artifact is read into for weights that stay on disk (auto = twice staging-slots)
+  disk-window-slots: auto                     # optional, default auto: pinned window slots the artifact is read into for weights that stay on disk (auto = twice staging-slots; must be a whole multiple of staging-slots)
   gpu-limit: auto                             # optional, default auto: device memory the engine may use (auto = what is free)
   gpu-reserve: 700MiB                         # optional, default 700MiB: device memory left for other programs
   runtime-reserve: auto                       # optional, default auto: device memory the dense model's plan keeps beside the weights and the cache for the first sequence's state, the workspaces and the kernel modules (auto = 1280MiB)

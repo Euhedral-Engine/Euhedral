@@ -191,8 +191,27 @@ fn the_disk_window_slots_are_the_setting_and_follow_the_staging_slots_on_auto() 
     assert_eq!(slots(&settings), 8);
     settings.memory.staging_slots = Auto::Value(6);
     assert_eq!(slots(&settings), 12);
+    // One window per staging ring and a whole multiple of it are taken.
+    settings.memory.staging_slots = Auto::Value(4);
+    settings.memory.disk_window_slots = Auto::Value(4);
+    assert_eq!(slots(&settings), 4);
+    settings.memory.disk_window_slots = Auto::Value(12);
+    assert_eq!(slots(&settings), 12);
+}
+
+#[test]
+fn a_disk_window_that_is_not_a_whole_multiple_of_the_staging_slots_is_refused() {
+    let (config, table) = (config(), rco_table());
+    let need = resident(4096).device_bytes;
+    let mut settings = settings(4096);
+    settings.memory.staging_slots = Auto::Value(6);
     settings.memory.disk_window_slots = Auto::Value(3);
-    assert_eq!(slots(&settings), 3);
+    let refusal = plan_with(&config, &table, &settings, inputs(need - 3 * GIB, Some(GIB))).unwrap_err();
+    let text = refusal.to_string();
+    assert!(
+        text.contains("memory.disk-window-slots") && text.contains("memory.staging-slots"),
+        "{text}"
+    );
 }
 
 #[test]

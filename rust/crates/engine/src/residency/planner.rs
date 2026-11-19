@@ -433,6 +433,12 @@ pub fn plan_closest(
         .disk_window_slots
         .into_value()
         .map_or(2 * staging_slots, |slots| slots as usize);
+    if staging_slots == 0 || !window_slots.is_multiple_of(staging_slots) {
+        return Err(PlanError::Setting(format!(
+            "memory.disk-window-slots ({window_slots}) must be a whole multiple of memory.staging-slots \
+             ({staging_slots}): the window is read one staging ring ahead, whole rings at a time"
+        )));
+    }
     let head_rows = sequences.saturating_mul(1 + draft_depth as u64);
     let (layout, spills, offload, reach) = match decide(budgets, whole, split) {
         Ok((layout, spills)) => (layout, spills, Offload::default(), None),

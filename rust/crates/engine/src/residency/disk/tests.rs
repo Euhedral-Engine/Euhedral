@@ -1,7 +1,7 @@
 //! The disk reader over a fake port: its reads end when a test says, its gates are the graph's own.
 
 use std::collections::VecDeque;
-use std::env::{temp_dir, var_os};
+use std::env::{current_exe, var_os};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -9,18 +9,22 @@ use std::ptr::copy_nonoverlapping;
 use std::slice::from_raw_parts;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use euhedral_core::frames::FrameError;
+use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::LatticeSource;
 use euhedral_graph::testing::{FakeDevice, GateEvent, StageHarness};
 use euhedral_graph::{GateRef, Stage, StageCx, StageError, Submitted};
+use euhedral_inference_settings::{ModelSettings, Settings};
 
 use super::*;
+use crate::runtime::lattice_config;
 
 const BLOCK: u64 = HOST_ALIGNMENT;
 const FILE_BYTES: usize = 64 * 1024;
 const SLOT_BYTES: u64 = 3 * BLOCK;
+/// The error a direct read gets for a request the file system cannot align.
+const ALIGNMENT_REFUSAL: i32 = if cfg!(windows) { 87 } else { 22 };
 const BOUND: Duration = Duration::from_secs(10);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -252,7 +256,7 @@ fn uses_fill_slots_in_order_and_wait_for_the_slot_to_be_freed() {
     assert!(rig.claim(1, 1));
     assert_eq!(rig.events().len(), 1);
 
-    rig.reader.slot_freed(0);
+    rig.reader.slot_freed(0, 1);
     assert_eq!(rig.port.started().len(), 3);
     assert_eq!(rig.port.started()[2].offset, 2 * BLOCK);
     rig.port.finish(0);
@@ -317,23 +321,61 @@ impl Rig {
     }
 }
 
+/// `count` uses at distinct offsets of the file, slots `first + index` round robin over `slots`.
+fn uses_of(quantum: &str, count: usize, first: usize, offset: u64, slots: usize) -> Vec<DiskUse> {
+    (0..count)
+        .map(|index| {
+            let at = (offset + 12_288 * index as u64 + 512 * (index as u64 % 3)) % (FILE_BYTES as u64 - 2 * SLOT_BYTES);
+            use_of(
+                &format!("{quantum}/{index}"),
+                at,
+                9_000 + 100 * index as u64,
+                (first + index) % slots,
+            )
+        })
+        .collect()
+}
+
+impl Rig {
+    /// The device's side of one use: the claim (the read finished before it on even uses, after it on odd ones), the
+    /// bytes checked, the copy's end.
+    fn consume(&self, ticket: u64, use_: &DiskUse, index: usize) {
+        let pending = |rig: &Rig| rig.port.pending().iter().any(|spec| spec.slot == use_.slot);
+        if index.is_multiple_of(2) && pending(self) {
+            self.port.finish(use_.slot);
+        }
+        if !self.claim(use_.slot, ticket) {
+            assert!(pending(self), "{} was never read", use_.name);
+            self.port.finish(use_.slot);
+        }
+        let from = use_.file_offset as usize;
+        assert_eq!(
+            self.payload(use_.slot, use_.lead() as usize, use_.bytes as usize),
+            contents()[from..from + use_.bytes as usize],
+            "{}",
+            use_.name
+        );
+        self.reader.slot_freed(use_.slot, ticket);
+    }
+}
+
 #[test]
 fn successive_quanta_share_the_window_in_admission_order() {
-    let rig = Rig::new(1);
-    rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
-    rig.enqueue(2, vec![use_of("b", BLOCK, 100, 0)]);
-    assert_eq!(rig.port.started().len(), 1);
-    rig.port.finish(0);
-    assert!(rig.claim(0, 1));
-    assert_eq!(rig.port.started().len(), 1);
-    rig.reader.slot_freed(0);
-    assert_eq!(rig.port.started().len(), 2);
-    assert_eq!(rig.port.started()[1].offset, BLOCK);
-    // The second quantum's copy is held until its bytes are in.
-    assert!(!rig.claim(0, 2));
-    rig.port.finish(0);
-    assert_eq!(rig.events(), [GateEvent::Released]);
-    assert_eq!(rig.payload(0, 0, 100), contents()[BLOCK as usize..][..100]);
+    let rig = Rig::new(8);
+    // The draft after a decode: its uses start on slots the decode still has queued.
+    let first = uses_of("q1", 12, 0, 0, 8);
+    let second = uses_of("q2", 9, 3, 393_216, 8);
+    rig.enqueue(1, first.clone());
+    rig.enqueue(2, second.clone());
+    for (index, use_) in first.iter().enumerate() {
+        rig.consume(1, use_, index);
+    }
+    for (index, use_) in second.iter().enumerate() {
+        rig.consume(2, use_, index);
+    }
+    assert_eq!(rig.reader.reads_in_flight(), 0);
+    assert_eq!(rig.port.started().len(), 21);
+    assert!(rig.failures_empty());
 }
 
 #[test]
@@ -350,7 +392,7 @@ fn abandon_drops_the_failed_quantums_uses() {
     rig.port.finish(0);
     assert!(rig.claim(0, 2));
     assert_eq!(rig.payload(0, 0, 100), contents()[2 * BLOCK as usize..][..100]);
-    rig.reader.slot_freed(0);
+    rig.reader.slot_freed(0, 2);
     assert_eq!(rig.port.started().len(), 2);
     assert_eq!(rig.reader.reads_in_flight(), 0);
 }
@@ -410,7 +452,8 @@ fn a_direct_read_the_file_system_refuses_is_repeated_through_the_page_cache() {
     let rig = Rig::new(1);
     rig.enqueue(1, vec![use_of("a", 100, 100, 0), use_of("b", BLOCK, 100, 0)]);
     assert!(rig.port.pending()[0].direct);
-    rig.port.finish_with(0, Err(io::Error::from_raw_os_error(EINVAL)));
+    rig.port
+        .finish_with(0, Err(io::Error::from_raw_os_error(ALIGNMENT_REFUSAL)));
     // The same use again, now through the page cache, and nothing failed.
     let pending = rig.port.pending();
     assert_eq!(pending.len(), 1);
@@ -421,7 +464,7 @@ fn a_direct_read_the_file_system_refuses_is_repeated_through_the_page_cache() {
     assert!(rig.claim(0, 1));
     assert_eq!(rig.payload(0, 100, 100), contents()[100..200]);
     // Later reads stay buffered.
-    rig.reader.slot_freed(0);
+    rig.reader.slot_freed(0, 1);
     assert!(!rig.port.pending()[0].direct);
 }
 
@@ -431,13 +474,138 @@ fn a_held_gate_of_an_abandoned_quantum_is_released_within_a_bound() {
     rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
     assert!(!rig.claim(0, 1));
     assert!(rig.events().is_empty());
-    // The quantum ends while its copy waits for a read that never matters: the gate must go, without any arrival.
+    // The quantum ends while its copy waits for a read that never matters: the gate must go, without any arrival. It
+    // fails: a release always means the copy owns the slot.
     rig.reader.abandon(1);
-    assert_eq!(rig.events(), [GateEvent::Released]);
+    assert!(matches!(
+        rig.events().as_slice(),
+        [GateEvent::Failed(StageError::Fatal(_))]
+    ));
     // The read in flight ends later and is dropped.
     rig.port.finish(0);
     assert_eq!(rig.events().len(), 1);
     assert_eq!(rig.reader.reads_in_flight(), 0);
+}
+
+#[test]
+fn a_claim_after_its_quantum_was_abandoned_fails_at_once_and_leaves_the_slot_alone() {
+    let rig = Rig::new(1);
+    rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
+    rig.enqueue(2, vec![use_of("b", BLOCK, 100, 0)]);
+    rig.reader.abandon(1);
+    // The stage of the ended quantum was published between its end and its gate pass: its claim comes late.
+    assert!(!rig.claim(0, 1));
+    assert!(matches!(
+        rig.events().as_slice(),
+        [GateEvent::Failed(StageError::Fatal(_))]
+    ));
+    // The read in flight is dropped on arrival and quantum 2 reads and claims the slot.
+    rig.port.finish(0);
+    assert_eq!(rig.port.started().len(), 2);
+    rig.port.finish(0);
+    assert!(rig.claim(0, 2), "the next quantum's read was lost to the stale claim");
+    assert_eq!(rig.payload(0, 0, 100), contents()[BLOCK as usize..][..100]);
+}
+
+#[test]
+fn a_claim_after_the_abandoned_read_arrived_leaves_the_next_quantums_bytes() {
+    let rig = Rig::new(1);
+    rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
+    rig.enqueue(2, vec![use_of("b", BLOCK, 100, 0)]);
+    rig.port.finish(0);
+    rig.reader.abandon(1);
+    rig.port.finish(0);
+    // Quantum 2's bytes are in; the late claim of quantum 1 must not drop them.
+    assert!(!rig.claim(0, 1));
+    assert!(rig.claim(0, 2));
+    assert_eq!(rig.payload(0, 0, 100), contents()[BLOCK as usize..][..100]);
+}
+
+#[test]
+fn a_stale_free_does_not_clear_another_quantums_filled_slot() {
+    let rig = Rig::new(1);
+    rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
+    rig.enqueue(2, vec![use_of("b", BLOCK, 100, 0)]);
+    assert!(!rig.claim(0, 1));
+    rig.reader.abandon(1);
+    rig.port.finish(0);
+    rig.port.finish(0);
+    // Quantum 2's read is in and unclaimed; a free naming quantum 1 changes nothing.
+    rig.reader.slot_freed(0, 1);
+    assert!(rig.claim(0, 2), "the stale free dropped the bytes");
+    assert_eq!(rig.payload(0, 0, 100), contents()[BLOCK as usize..][..100]);
+}
+
+#[test]
+fn a_stale_free_does_not_free_another_quantums_claimed_slot() {
+    let rig = Rig::new(1);
+    rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
+    rig.enqueue(2, vec![use_of("b", BLOCK, 100, 0)]);
+    rig.enqueue(3, vec![use_of("c", 2 * BLOCK, 100, 0)]);
+    assert!(!rig.claim(0, 1));
+    rig.reader.abandon(1);
+    rig.port.finish(0);
+    rig.port.finish(0);
+    assert!(rig.claim(0, 2));
+    // The copy of quantum 2 owns the slot: a free naming quantum 1 must not start the read of quantum 3.
+    rig.reader.slot_freed(0, 1);
+    assert_eq!(rig.port.started().len(), 2);
+    assert_eq!(rig.payload(0, 0, 100), contents()[BLOCK as usize..][..100]);
+    rig.reader.slot_freed(0, 2);
+    assert_eq!(rig.port.started().len(), 3);
+}
+
+#[test]
+fn a_stale_read_is_dropped_and_the_next_quantum_gets_its_own() {
+    let rig = Rig::new(1);
+    rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
+    rig.port.finish(0);
+    rig.reader.abandon(1);
+    rig.enqueue(2, vec![use_of("b", BLOCK, 100, 0)]);
+    // The slot held the stopped quantum's read: it is dropped and the copy waits for its own.
+    assert!(!rig.claim(0, 2));
+    assert!(rig.events().is_empty());
+    assert_eq!(rig.port.started().len(), 2);
+    rig.port.finish(0);
+    assert_eq!(rig.events(), [GateEvent::Released]);
+    assert_eq!(rig.payload(0, 0, 100), contents()[BLOCK as usize..][..100]);
+}
+
+#[test]
+fn a_stopped_quantums_read_arriving_while_another_copy_waits_is_dropped() {
+    let rig = Rig::new(1);
+    rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
+    // The next quantum's copy asks before its quantum is registered, while the stopped quantum's read is out.
+    assert!(!rig.claim(0, 2));
+    rig.reader.abandon(1);
+    rig.enqueue(2, vec![use_of("b", BLOCK, 100, 0)]);
+    rig.port.finish(0);
+    assert!(
+        rig.events().is_empty(),
+        "the stopped quantum's read released the waiting copy"
+    );
+    assert_eq!(rig.port.started().len(), 2);
+    rig.port.finish(0);
+    assert_eq!(rig.events(), [GateEvent::Released]);
+    assert_eq!(rig.payload(0, 0, 100), contents()[BLOCK as usize..][..100]);
+}
+
+#[test]
+fn every_close_gets_its_hand_off() {
+    let rig = Rig::new(1);
+    rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
+    let (first, second) = (rig.reader.close(), rig.reader.close());
+    assert!(!first.is_set() && !second.is_set());
+    rig.port.finish(0);
+    assert!(first.is_set() && second.is_set());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn only_einval_is_an_alignment_refusal_on_unix() {
+    assert!(refuses_alignment(22));
+    assert!(!refuses_alignment(87));
+    assert!(!refuses_alignment(5));
 }
 
 #[test]
@@ -509,7 +677,7 @@ fn close_completes_only_when_reads_in_flight_end() {
     assert_eq!(rig.reader.reads_in_flight(), 0);
     // Nothing was started after the close.
     assert_eq!(rig.port.started().len(), 2);
-    rig.reader.slot_freed(0);
+    rig.reader.slot_freed(0, 1);
     assert_eq!(rig.port.started().len(), 2);
 }
 
@@ -561,35 +729,26 @@ fn a_window_checks_its_memory() {
 
 // The real file and ring.
 
-/// A file under `EUHEDRAL_SCRATCH` (a directory of a file system that may take direct reads), else under the system's
-/// temporary directory (which may refuse them: the reads are then buffered).
+/// A file under `EUHEDRAL_SCRATCH` (a directory of a file system that may take direct reads), else in the directory of
+/// the test binary, inside the target directory (which may refuse them: the reads are then buffered).
 fn file_in_scratch(bytes: &[u8]) -> Option<(tempfile::TempDir, PathBuf)> {
-    let base = var_os("EUHEDRAL_SCRATCH").map_or_else(temp_dir, PathBuf::from);
+    let base = match var_os("EUHEDRAL_SCRATCH") {
+        Some(base) => PathBuf::from(base),
+        None => current_exe().ok()?.parent()?.to_path_buf(),
+    };
     let dir = tempfile::Builder::new().prefix("disk-reader").tempdir_in(base).ok()?;
     let path = dir.path().join("artifact.bin");
     File::create(&path).and_then(|mut file| file.write_all(bytes)).ok()?;
     Some((dir, path))
 }
 
-/// Reaps and runs the continuations of `io` until `ended` says the reads are over.
-fn drive(io: &AsyncIo, ended: impl Fn() -> bool) {
-    let deadline = Instant::now() + BOUND;
-    while !ended() {
-        assert!(Instant::now() < deadline, "the reads did not end in time");
-        io.reap();
-        let mut frames = Vec::new();
-        io.pull(&mut |frame| frames.push(frame), &mut |_| false, 8);
-        for mut frame in frames {
-            match frame.execute() {
-                Ok(()) | Err(FrameError::Cancelled) => frame.do_finally(),
-                Err(error) => frame.do_finally_with_error(error),
-            }
-        }
-    }
-}
-
 fn read_through_the_ring(file: ArtifactFile) -> (Vec<u8>, Vec<u8>, bool) {
-    let io = Arc::new(AsyncIo::open().expect("the ring opens"));
+    let settings = Settings::with_model(ModelSettings::default());
+    let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
+    let io = AsyncIo::open().expect("the ring opens");
+    lattice
+        .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
+        .expect("the lattice takes the ring");
     let file = Arc::new(file);
     let direct = file.has_direct();
     let window = DiskWindow::on_heap(geometry(2));
@@ -609,7 +768,9 @@ fn read_through_the_ring(file: ArtifactFile) -> (Vec<u8>, Vec<u8>, bool) {
             fail,
         )
         .expect("accepted");
-    drive(&io, || reader.reads_in_flight() == 0);
+    // The lattice reaps the ring and runs the continuations; the close hand-off is sent when the reads have ended.
+    reader.close().wait(BOUND).expect("the reads ended in time");
+    lattice.close();
     assert_eq!(failures.load(Ordering::SeqCst), 0);
     let window = port.window();
     // SAFETY: both reads ended; the window is live.
@@ -638,7 +799,7 @@ fn a_direct_open_that_fails_leaves_every_read_buffered() {
     let Some((_dir, path)) = file_in_scratch(&contents()) else {
         return;
     };
-    let file = ArtifactFile::open_with(&path, |_| Err(io::Error::from_raw_os_error(EINVAL)))
+    let file = ArtifactFile::open_with(&path, |_| Err(io::Error::from_raw_os_error(ALIGNMENT_REFUSAL)))
         .expect("the buffered open does not depend on it");
     assert!(!file.has_direct());
     assert_eq!(file.len(), FILE_BYTES as u64);
