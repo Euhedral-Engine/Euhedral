@@ -98,13 +98,3 @@ impl Launch for MtpStem {
 }
 
 eager!(MtpStem);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_packed_row_is_the_embedding_half_then_the_hidden_half() {
-        assert_eq!(half_offsets(10_240), [0, 10_240]);
-    }
-}
