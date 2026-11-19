@@ -329,7 +329,10 @@ pub fn limit_to_disk(library: &Path, settings: &Settings, gpu_limit: u64, on_dis
     };
     let (config, table) = open_artifact(&settings.model.artifact);
     let staged = plan_with(&config, &table, &forced, inputs).unwrap();
-    assert!(staged.offload.disk.is_empty(), "the host holds what the device does not");
+    assert!(
+        staged.offload.disk.is_empty(),
+        "the host holds what the device does not"
+    );
     staged
         .offload
         .host_arena_bytes

@@ -301,10 +301,9 @@ impl<L: Launch> Flight<L> {
     fn reevaluate(&self) {
         if let Some(kill) = &self.kill
             && self.members.iter().all(|(_, cancel)| cancel.load(Ordering::Acquire))
+            && !kill.swap(true, Ordering::AcqRel)
         {
-            if !kill.swap(true, Ordering::AcqRel) {
-                self.launcher.killed(kill);
-            }
+            self.launcher.killed(kill);
         }
     }
 }

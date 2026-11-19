@@ -43,6 +43,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Weak};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
@@ -1488,7 +1489,7 @@ fn closing_with_reads_in_flight_frees_after_them_only() {
     )
     .expect("the request is admitted");
     // Reads are in flight while the request decodes: close without waiting for it.
-    std::thread::sleep(Duration::from_millis(1500));
+    thread::sleep(Duration::from_millis(1500));
     owner
         .shutdown_within(runtime, Duration::from_secs(120))
         .expect("the engine closes within its bound");
@@ -1546,7 +1547,11 @@ fn cancel_during_a_disk_read_ends_cleanly() {
         .expect("the request is admitted")
         .wait(Duration::from_secs(5 * 60))
         .expect("the cancelled request reports");
-        assert_eq!(cancelled.outcome.reason, FinishReason::Cancelled, "after {after} tokens");
+        assert_eq!(
+            cancelled.outcome.reason,
+            FinishReason::Cancelled,
+            "after {after} tokens"
+        );
         assert!(cancelled.tokens.len() < 512);
         let again = submit(
             &runtime,
@@ -1584,7 +1589,11 @@ fn concurrent_sequences_match_alone_when_staged() {
 fn sessions_started_together_on_the_disk_tier_match_running_alone() {
     let Some(machine) = machine() else { return };
     for count in [2, 4] {
-        concurrent_through(&disk_machine(machine.library.clone(), machine.goldens.clone()), count, true);
+        concurrent_through(
+            &disk_machine(machine.library.clone(), machine.goldens.clone()),
+            count,
+            true,
+        );
     }
 }
 

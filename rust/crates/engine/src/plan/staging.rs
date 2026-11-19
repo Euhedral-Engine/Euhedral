@@ -144,7 +144,11 @@ pub(super) fn staged(
                 destination: ring.slot(slot),
             },
             Residence::Disk { file_offset } => {
-                let tier = disk.expect("a disk use was checked to have a tier");
+                let Some(tier) = disk else {
+                    return Err(PlanBuildError::NoDiskWindow {
+                        name: weight.name.clone(),
+                    });
+                };
                 let window = tier.geometry();
                 let window_slot = slot + ring.slots * (disk_uses_of[slot] % (window.slots / ring.slots));
                 let use_ = DiskUse {
@@ -227,6 +231,7 @@ pub(super) fn staged(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io;
 
     use super::super::buffers::Access;
     use super::super::builder::{WeightLookup, base_nodes};
@@ -574,8 +579,8 @@ mod tests {
     struct NoPort;
 
     impl ReadPort for NoPort {
-        fn start(&self, _spec: ReadSpec, _done: ReadDone) -> std::io::Result<()> {
-            Err(std::io::Error::other("a plan test reads nothing"))
+        fn start(&self, _spec: ReadSpec, _done: ReadDone) -> io::Result<()> {
+            Err(io::Error::other("a plan test reads nothing"))
         }
         fn has_direct(&self) -> bool {
             false

@@ -417,9 +417,16 @@ impl Stage<Quantum> for DiskTransfer {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "the fake port and the recording release are shared between the test and the closures the reader is given"
+)]
 mod tests {
+    use std::io;
+    use std::sync::Mutex;
+
     use super::*;
-    use crate::residency::disk::ReadPort;
+    use crate::residency::disk::{ReadDone, ReadPort, ReadSpec};
     use crate::residency::offload::WindowGeometry;
 
     #[test]
@@ -431,7 +438,7 @@ mod tests {
 
     /// What a ledger told the reader, in order.
     #[derive(Default)]
-    struct Told(std::sync::Mutex<Vec<String>>);
+    struct Told(Mutex<Vec<String>>);
 
     impl Release for Told {
         fn slot_freed(&self, slot: usize, ticket: u64) {
@@ -497,10 +504,10 @@ mod tests {
 
     /// A port that records the reads it is asked for and ends none.
     #[derive(Default)]
-    struct Recording(std::sync::Mutex<Vec<u64>>);
+    struct Recording(Mutex<Vec<u64>>);
 
     impl ReadPort for Arc<Recording> {
-        fn start(&self, spec: crate::residency::disk::ReadSpec, _done: crate::residency::disk::ReadDone) -> std::io::Result<()> {
+        fn start(&self, spec: ReadSpec, _done: ReadDone) -> io::Result<()> {
             self.0.lock().unwrap().push(spec.offset);
             Ok(())
         }
@@ -530,17 +537,29 @@ mod tests {
         let kill = Arc::new(AtomicBool::new(false));
         for (first, second) in [(0x1000, 0x2000), (0x2000, 0x1000)] {
             let port = Arc::new(Recording::default());
-            let reader = DiskReader::new(Arc::new(Arc::clone(&port)), geometry, Box::new(|work| {
-                work();
-                true
-            }));
+            let reader = DiskReader::new(
+                Arc::new(Arc::clone(&port)),
+                geometry,
+                Box::new(|work| {
+                    work();
+                    true
+                }),
+            );
             let tier = DiskTier::detached(reader, geometry, Completions::without_lanes());
             // Two quanta of different sequences read the same window slot: the one that started first is read first,
             // and the other waits behind its copy.
             let a = tier.register(&[use_at(0, first)], &kill).unwrap();
             let b = tier.register(&[use_at(0, second)], &kill).unwrap();
-            assert_eq!((a.ticket(), b.ticket()), (0, 1), "tickets follow the order of registration");
-            assert_eq!(*port.0.lock().unwrap(), [first], "the second quantum's read waits for the slot");
+            assert_eq!(
+                (a.ticket(), b.ticket()),
+                (0, 1),
+                "tickets follow the order of registration"
+            );
+            assert_eq!(
+                *port.0.lock().unwrap(),
+                [first],
+                "the second quantum's read waits for the slot"
+            );
         }
     }
 }
