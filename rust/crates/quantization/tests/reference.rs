@@ -66,7 +66,12 @@ impl World {
         options: Options,
     ) -> Result<Written, ReferenceError> {
         let forcer: Arc<dyn Forcer> = Arc::clone(forcer) as Arc<dyn Forcer>;
-        write(&self.io, &self.host, forcer, out, CONTEXT, VOCABULARY, tokens, options)
+        let reference = Reference {
+            context: CONTEXT,
+            vocabulary: VOCABULARY,
+            tokens,
+        };
+        write(&self.io, &self.host, forcer, out, reference, options)
             .wait(HANG)
             .expect("the run never ended")
     }
@@ -168,9 +173,9 @@ fn expected(tokens: &[Vec<u32>]) -> Vec<u8> {
         tokens: tokens.to_vec(),
     };
     let mut bytes = encode_head(CONTEXT, VOCABULARY, tokens);
-    for chunk in 0..tokens.len() {
+    for ids in tokens {
         for step in 0..layout.records() {
-            bytes.extend(encode_record(&logits(tokens[chunk][0], step)));
+            bytes.extend(encode_record(&logits(ids[0], step)));
         }
     }
     bytes

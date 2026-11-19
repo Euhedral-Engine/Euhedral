@@ -539,7 +539,10 @@ dependencies = [
 name = "euhedral-inference-quantize"
 version = "0.1.0"
 dependencies = [
+ "euhedral-inference-cuda",
+ "euhedral-inference-engine",
  "euhedral-inference-quantization",
+ "euhedral-inference-settings",
 ]
 
 [[package]]

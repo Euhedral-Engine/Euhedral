@@ -58,7 +58,9 @@ impl ReferenceError {
 /// padded to an even count. The log-probability of entry `i` is `scale * code[i] + minimum`.
 pub fn encode_record(logits: &[u8]) -> Vec<u8> {
     let values: Vec<f32> = logits
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16))
         .collect();
     let (mut max, mut min) = (values[0], values[0]);

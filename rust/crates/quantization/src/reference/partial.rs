@@ -110,15 +110,12 @@ impl Partial {
     /// Opens the partial file of `out` for `tokens` (a chunk each, `context` tokens long, over `vocabulary`), starting
     /// it, or taking up the one a stopped run left. It is an error if `out` exists, and if the partial file was
     /// started for other tokens, another context or another vocabulary.
-    pub fn open(
-        io: &Arc<AsyncIo>,
-        host: &Arc<Lake>,
-        out: &Path,
-        context: usize,
-        vocabulary: usize,
-        tokens: Vec<Vec<u32>>,
-        then: Done<Partial>,
-    ) {
+    pub fn open(io: &Arc<AsyncIo>, host: &Arc<Lake>, out: &Path, reference: Reference, then: Done<Partial>) {
+        let Reference {
+            context,
+            vocabulary,
+            tokens,
+        } = reference;
         if let Err(error) = Self::check(context, vocabulary, &tokens) {
             then(Err(error));
             return;

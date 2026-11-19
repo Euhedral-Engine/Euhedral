@@ -13,6 +13,7 @@ use euhedral_io::AsyncIo;
 
 use super::partial::{Partial, RowFile};
 use super::{ReferenceError, encode_record};
+use crate::kld::Reference;
 use crate::rows::{Kind, frame};
 
 /// What starts the teacher-forced run of a chunk: the engine, or a stand-in in a test.
@@ -47,7 +48,7 @@ pub struct Written {
 
 type Outcome = Result<Written, ReferenceError>;
 
-/// Writes the reference of `tokens` (a chunk each) to `out`, carrying on from the partial file a stopped run left.
+/// Writes `reference` (its tokens a chunk each, its context and vocabulary) to `out`, carrying on from the partial file a stopped run left.
 /// Returns at once; the hand-off is set when the run ends, with how far it got or why it stopped. The caller waits for
 /// it, on a thread outside the lattice.
 pub fn write(
@@ -55,15 +56,13 @@ pub fn write(
     host: &Arc<Lake>,
     forcer: Arc<dyn Forcer>,
     out: &Path,
-    context: usize,
-    vocabulary: usize,
-    tokens: Vec<Vec<u32>>,
+    reference: Reference,
     options: Options,
 ) -> Arc<Handoff<Outcome>> {
     let done = Handoff::new();
     let writing = Writing {
         host: Arc::clone(host),
-        forcer,
+        forcer: Some(forcer),
         partial: None,
         options,
         done: Some(Arc::clone(&done)),
@@ -72,9 +71,7 @@ pub fn write(
         io,
         host,
         out,
-        context,
-        vocabulary,
-        tokens,
+        reference,
         Box::new(move |opened| match opened {
             Ok(partial) => writing.opened(partial),
             Err(error) => writing.end(Err(error)),
@@ -86,7 +83,8 @@ pub fn write(
 /// The run between chunks. It always ends: a run that is dropped before it ends reports that.
 struct Writing {
     host: Arc<Lake>,
-    forcer: Arc<dyn Forcer>,
+    /// Let go of before the run reports its end, so a caller that then stops the engine holds its last handle.
+    forcer: Option<Arc<dyn Forcer>>,
     partial: Option<Partial>,
     options: Options,
     done: Option<Arc<Handoff<Outcome>>>,
@@ -94,6 +92,7 @@ struct Writing {
 
 impl Drop for Writing {
     fn drop(&mut self) {
+        self.forcer = None;
         if let Some(done) = self.done.take() {
             done.send(Err(ReferenceError::Engine(
                 "the run was dropped before it ended".to_owned(),
@@ -104,6 +103,7 @@ impl Drop for Writing {
 
 impl Writing {
     fn end(mut self, result: Outcome) {
+        self.forcer = None;
         if let Some(done) = self.done.take() {
             done.send(result);
         }
@@ -114,13 +114,15 @@ impl Writing {
         self.next();
     }
 
-    fn partial(&self) -> &Partial {
-        self.partial.as_ref().expect("the partial file is open")
+    fn gone() -> ReferenceError {
+        ReferenceError::Engine("the partial file is gone".to_owned())
     }
 
     fn next(self) {
-        let completed = self.partial().completed();
-        if completed == self.partial().layout().chunks() {
+        let Some((completed, chunks)) = self.partial.as_ref().map(|p| (p.completed(), p.layout().chunks())) else {
+            return self.end(Err(Self::gone()));
+        };
+        if completed == chunks {
             self.seal();
         } else if self.options.stop_after.is_some_and(|stop| completed >= stop) {
             self.end(Ok(Written {
@@ -134,7 +136,7 @@ impl Writing {
 
     fn seal(mut self) {
         let Some(partial) = self.partial.take() else {
-            return self.end(Err(ReferenceError::Engine("the partial file is gone".to_owned())));
+            return self.end(Err(Self::gone()));
         };
         let completed = partial.completed();
         partial.finish(Box::new(move |sealed| {
@@ -155,10 +157,13 @@ impl Writing {
                 ))));
             }
         };
-        let layout = Arc::clone(self.partial().layout());
-        let rows = self.partial().rows();
+        let Some((layout, rows)) = self.partial.as_ref().map(|p| (Arc::clone(p.layout()), p.rows())) else {
+            return self.end(Err(Self::gone()));
+        };
         let (prefix, forced) = (layout.prefix(chunk).to_vec(), layout.forced(chunk).to_vec());
-        let forcer = Arc::clone(&self.forcer);
+        let Some(forcer) = self.forcer.clone() else {
+            return self.end(Err(ReferenceError::Engine("the engine is gone".to_owned())));
+        };
         let run = Arc::new(ChunkRun {
             host: Arc::clone(&self.host),
             rows: Some(rows),
@@ -174,7 +179,9 @@ impl Writing {
             run: Arc::clone(&run),
             row_bytes: 2 * layout.vocabulary,
         };
-        if let Err(why) = forcer.force(prefix, forced, Box::new(sink)) {
+        let started = forcer.force(prefix, forced, Box::new(sink));
+        drop(forcer);
+        if let Err(why) = started {
             run.fail(format!("chunk {chunk} did not start: {why}"));
         }
     }
@@ -184,7 +191,9 @@ impl Writing {
         if let Err(error) = verdict {
             return self.end(Err(error));
         }
-        let mark = self.partial().mark();
+        let Some(mark) = self.partial.as_ref().map(Partial::mark) else {
+            return self.end(Err(Self::gone()));
+        };
         mark.complete(
             chunk + 1,
             Box::new(move |recorded| match recorded {

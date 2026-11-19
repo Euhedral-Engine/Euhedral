@@ -11,7 +11,10 @@ name = "quantization"
 path = "src/main.rs"
 
 [dependencies]
+euhedral-inference-cuda = { path = "../cuda" }
+euhedral-inference-engine = { path = "../engine" }
 euhedral-inference-quantization = { path = "../quantization" }
+euhedral-inference-settings = { path = "../settings" }
 
 [lints]
 workspace = true

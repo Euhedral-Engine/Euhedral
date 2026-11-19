@@ -5,8 +5,12 @@
 //! wired yet says so and exits with [`EXIT_NOT_AVAILABLE`]; three commands are not part of this tool at all
 //! ([`Availability::Dropped`]).
 
+mod reference;
+
 /// The process exit code of a run that finished.
 pub const EXIT_OK: u8 = 0;
+/// The command ran and failed.
+pub const EXIT_FAILED: u8 = 1;
 /// The command or its flags are not valid.
 pub const EXIT_USAGE: u8 = 2;
 /// The command is known but not wired in this build.
@@ -91,8 +95,8 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "reference",
-        availability: Availability::Pending,
-        usage: "--artifact ARTIFACT --tokenizer CHECKPOINT --text FILE --out OUT.kld",
+        availability: Availability::Wired,
+        usage: "--artifact ARTIFACT [--tokenizer ARTIFACT] --text FILE --out OUT.kld [--context N] [--chunks N] [--parse-special] [--config YAML] [--cuda-library FILE]",
     },
     Command {
         name: "package-tokenizer",
@@ -138,9 +142,12 @@ pub fn run(args: &[String]) -> Outcome {
         };
     };
     match command.availability {
-        Availability::Wired => Outcome {
-            code: EXIT_OK,
-            message: String::new(),
+        Availability::Wired => match name.as_str() {
+            "reference" => reference::run(&args[1..]),
+            _ => Outcome {
+                code: EXIT_OK,
+                message: String::new(),
+            },
         },
         Availability::Pending => Outcome {
             code: EXIT_NOT_AVAILABLE,
