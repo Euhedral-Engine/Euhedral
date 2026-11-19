@@ -297,7 +297,8 @@ pub(super) fn plan_strip_error(
         .arg(int("first_row", first_row)?)
         .device(e)
         .arg(int("e_row", e_row)?);
-    step("strip_error", Dim3::x(blocks(n, 256)), 256, args)
+    // one thread per element of the 16 rows
+    step("strip_error", Dim3::x(blocks(n.saturating_mul(16), 256)), 256, args)
 }
 
 /// `y += alpha * x` over `count` floats.
@@ -408,7 +409,7 @@ mod tests {
         let gather = plan_strip_gather_sum(64, 0, 512, 16, 128).unwrap();
         assert_eq!(geometry(&gather), ((32, 1), 256));
         let error = plan_strip_error(64, 128, 512, 16, 192, 3).unwrap();
-        assert_eq!(geometry(&error), ((2, 1), 256));
+        assert_eq!(geometry(&error), ((32, 1), 256));
     }
 
     #[test]
