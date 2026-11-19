@@ -1591,3 +1591,135 @@ fn concurrent_sequences_match_alone_when_staged() {
     }
     owner.shutdown(runtime).unwrap();
 }
+
+/// The rows of a forced run and how it ended.
+type ForcedDelivery = (Vec<Vec<u8>>, GenerationOutcome);
+
+/// The rows of a teacher-forced run, kept one by one.
+struct ForcedRows {
+    rows: Vec<Vec<u8>>,
+    done: Option<Arc<Handoff<ForcedDelivery>>>,
+}
+
+impl LogitsSink for ForcedRows {
+    fn row(&mut self, step: usize, _forced: u32, logits: &[u8]) {
+        assert_eq!(step, self.rows.len(), "the rows arrive in order");
+        self.rows.push(logits.to_vec());
+    }
+
+    fn finished(&mut self, outcome: GenerationOutcome) {
+        let done = self.done.take().expect("a run finishes once");
+        done.send((mem::take(&mut self.rows), outcome));
+    }
+}
+
+/// Starts a forced run of `rows` rows per step; the handoff gives its rows and outcome.
+fn run_forced(
+    runtime: &EngineRuntime,
+    prefix: &[u32],
+    forced: &[u32],
+    rows: usize,
+) -> Result<Arc<Handoff<ForcedDelivery>>, AdmissionError> {
+    let done = Handoff::new();
+    runtime.teacher_forced_rows(
+        prefix.to_vec(),
+        forced.to_vec(),
+        rows,
+        Box::new(ForcedRows {
+            rows: Vec::new(),
+            done: Some(Arc::clone(&done)),
+        }),
+    )?;
+    Ok(done)
+}
+
+fn bf16_row(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16))
+        .collect()
+}
+
+/// The KL divergence of the softmax of `b` from that of `a`, and whether their top tokens agree.
+fn kl_and_top(a: &[f32], b: &[f32]) -> (f64, bool) {
+    let normal = |row: &[f32]| {
+        let top = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f64 = row.iter().map(|x| f64::from(x - top).exp()).sum();
+        row.iter().map(|x| f64::from(x - top) - sum.ln()).collect::<Vec<f64>>()
+    };
+    let (la, lb) = (normal(a), normal(b));
+    let kl = la.iter().zip(&lb).map(|(x, y)| x.exp() * (x - y)).sum();
+    let top = |row: &[f32]| {
+        row.iter()
+            .enumerate()
+            .fold((0, f32::MIN), |m, (i, v)| if *v > m.1 { (i, *v) } else { m })
+            .0
+    };
+    (kl, top(a) == top(b))
+}
+
+/// Several rows per pass and several sequences at once give the rows of the one-row path, within the BF16 bound; a
+/// request for more rows than the sequences are sized for is refused, and the one-row path is the default.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact, the Java references and python3 with numpy"]
+fn multi_row_teacher_forcing_matches_the_one_row_path_alone_and_batched() {
+    let Some(machine) = machine() else { return };
+    let (owner, runtime) = start_with_sequences(&machine, 2);
+    let tokenizer = tokenizer(&machine.artifact);
+    let document = fs::read_to_string(repository_root().join(
+        "benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md",
+    ))
+    .unwrap();
+    let document = tokenizer.encode(&document).unwrap();
+    let (prefix, steps) = (96, 37);
+    let first = &document[..prefix];
+    let forced_a = &document[prefix..prefix + steps];
+    let second = &document[prefix + steps..prefix + steps + prefix];
+    let forced_b = &document[2 * prefix + steps..2 * prefix + 2 * steps];
+
+    let one = |prefix: &[u32], forced: &[u32]| {
+        let (rows, outcome) = run_forced(&runtime, prefix, forced, 1).unwrap().wait(WAIT).unwrap();
+        assert_eq!(outcome.reason, FinishReason::Length);
+        rows
+    };
+    let reference_a = one(first, forced_a);
+    let reference_b = one(second, forced_b);
+    assert_eq!(reference_a.len(), steps);
+
+    let compare = |name: &str, got: &[Vec<u8>], reference: &[Vec<u8>]| {
+        assert_eq!(got.len(), reference.len(), "{name}: the same number of rows");
+        let (mut worst, mut agree) = (0.0f64, 0);
+        for (g, r) in got.iter().zip(reference) {
+            let (kl, same) = kl_and_top(&bf16_row(r), &bf16_row(g));
+            worst = worst.max(kl);
+            agree += usize::from(same);
+        }
+        println!(
+            "{name}: worst row KL {worst:.2e}, top-1 agrees on {agree} of {}",
+            got.len()
+        );
+        assert!(worst < 1e-3, "{name}: a row strays from the one-row path");
+        assert!(agree * 20 >= got.len() * 19, "{name}: top-1 agreement");
+    };
+
+    let widest = 1 + runtime.plan().draft_depth;
+    assert!(widest >= 2, "the artifact drafts, so its sequences verify several rows");
+    for rows in [2, widest] {
+        let (got, outcome) = run_forced(&runtime, first, forced_a, rows).unwrap().wait(WAIT).unwrap();
+        assert_eq!(outcome.reason, FinishReason::Length);
+        assert_eq!(outcome.generated, steps);
+        compare(&format!("{rows} rows alone"), &got, &reference_a);
+    }
+    // Two sequences at once: their verifications share passes.
+    let a = run_forced(&runtime, first, forced_a, widest).unwrap();
+    let b = run_forced(&runtime, second, forced_b, widest).unwrap();
+    compare("batched (a)", &a.wait(WAIT).unwrap().0, &reference_a);
+    compare("batched (b)", &b.wait(WAIT).unwrap().0, &reference_b);
+    // More rows than the sequences verify is refused, not run.
+    assert!(run_forced(&runtime, first, forced_a, 4096).is_err());
+    // The sequence is idle again and takes the one-row path.
+    assert_eq!(one(first, forced_a).len(), steps);
+    owner.shutdown(runtime).unwrap();
+}

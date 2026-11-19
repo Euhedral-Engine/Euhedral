@@ -227,6 +227,9 @@ pub struct BatchingSettings {
     pub max_tokens_per_pass: Auto<u32>,
     /// Rows of the longest prefill chunk.
     pub prefill_chunk_tokens: u32,
+    /// Rows of one step of a teacher-forced run that takes several rows at a time; every sequence is sized to verify
+    /// that many rows. 0 (or 1) keeps teacher-forced runs at one row a step and sizes nothing for them.
+    pub forced_rows: u32,
 }
 
 impl Default for BatchingSettings {
@@ -236,6 +239,7 @@ impl Default for BatchingSettings {
             max_sequences_per_pass: Auto::Auto,
             max_tokens_per_pass: Auto::Auto,
             prefill_chunk_tokens: 512,
+            forced_rows: 0,
         }
     }
 }

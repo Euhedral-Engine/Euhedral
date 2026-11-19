@@ -518,6 +518,9 @@ fn leaves() -> Vec<Leaf> {
         fixed("batching.prefill-chunk-tokens", |s, t| {
             assign!(s.batching.prefill_chunk_tokens, int(t, 1, COUNT_MAX))
         }),
+        fixed("batching.forced-rows", |s, t| {
+            assign!(s.batching.forced_rows, int(t, 0, COUNT_MAX))
+        }),
         optional("memory.host-limit", |s, t| {
             assign!(s.memory.host_limit, auto_or(t, |t| size(t, 0)))
         }),

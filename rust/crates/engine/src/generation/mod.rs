@@ -164,7 +164,7 @@ pub fn markers_in_flight(plan: &Plan, sequences: usize, transfers: bool) -> usiz
     .unwrap_or(0);
     // A greedy request keeps a few quanta in flight; a speculative step keeps its catch-up, drafts and verification,
     // and the owner prepares one more behind them.
-    let step = if plan.drafts() {
+    let step = if plan.drafts() || plan.verified_rows() > 0 {
         stages_of(View::Verify {
             rows: plan.verified_rows(),
         }) + stages_of(View::Draft { rows: 1 }) * plan.verified_rows()
@@ -392,12 +392,13 @@ impl Generation {
         &self,
         prefix: Vec<u32>,
         forced: Vec<u32>,
+        rows: usize,
         sink: Box<dyn LogitsSink>,
         lease: Lease,
     ) -> Result<(), AdmissionError> {
         let core = Arc::clone(&self.shared.core);
         self.start(move |owner| match owner {
-            Some(owner) => owner.begin_forced(admit(&core), prefix, forced, sink, lease),
+            Some(owner) => owner.begin_forced(admit(&core), prefix, forced, rows, sink, lease),
             None => Err(closed(Audience::Forced(sink))),
         })
     }
@@ -690,10 +691,11 @@ impl Generations {
         &self,
         prefix: Vec<u32>,
         forced: Vec<u32>,
+        rows: usize,
         sink: Box<dyn LogitsSink>,
     ) -> Result<(), AdmissionError> {
         let (generation, lease) = self.take()?;
-        generation.teacher_forced(prefix, forced, sink, lease)
+        generation.teacher_forced(prefix, forced, rows, sink, lease)
     }
 
     /// The test hook: the owner of the sequence the next request takes panics at the end of the turn in which that

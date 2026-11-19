@@ -179,6 +179,9 @@ pub struct ResidencyPlan {
     pub profile: ArtifactProfile,
     /// Drafts per verification (0 without a drafter).
     pub draft_depth: usize,
+    /// Rows of one step of a teacher-forced run that takes several rows at a time, which every sequence is sized to
+    /// verify (`batching.forced-rows`); 0 when the settings ask for none.
+    pub forced_rows: usize,
     /// The longest context of one sequence.
     pub max_context_tokens: usize,
     /// Pinned host bytes the prefix cache's arena may take: what `prefix-cache.size` asks, when the memory planner
@@ -218,7 +221,27 @@ pub fn pass_bounds(batching: &BatchingSettings, sequences: usize, verified: u64)
     (rows, parts)
 }
 
+/// The rows of a forced step the settings size the sequences for: 0 unless they ask for more than one.
+pub fn forced_rows_of(batching: &BatchingSettings) -> usize {
+    if batching.forced_rows >= 2 {
+        batching.forced_rows as usize
+    } else {
+        0
+    }
+}
+
 impl ResidencyPlan {
+    /// The rows a sequence's verification holds at most: one more than the drafts, or the rows of a forced step when
+    /// those are more; 0 when the sequence neither drafts nor forces several rows (it keeps no verification state).
+    pub fn verified_rows(&self) -> u64 {
+        let drafted = if self.draft_depth > 0 {
+            1 + self.draft_depth as u64
+        } else {
+            0
+        };
+        drafted.max(self.forced_rows as u64)
+    }
+
     /// The bytes the plan asks of each location: what `plan_with` had the memory planner admit.
     pub fn location_bytes(&self) -> LocationBytes {
         LocationBytes {
@@ -382,14 +405,22 @@ pub fn plan_closest(
 
     let (mut device, arena_all, _) = place(table, &profile)?;
 
-    let verified = (1 + (draft_depth as u64).min(MAX_VERIFIED)).max(DRAFT_LOGITS_ROWS);
+    let forced_rows = forced_rows_of(&settings.batching);
+    if forced_rows as u64 > chunk {
+        return Err(PlanError::Setting(format!(
+            "batching.forced-rows ({forced_rows}) is more than the {chunk} rows of batching.prefill-chunk-tokens"
+        )));
+    }
+    let verified = (1 + (draft_depth as u64).min(MAX_VERIFIED))
+        .max(DRAFT_LOGITS_ROWS)
+        .max(forced_rows as u64);
     // A pass of several sequences' verifications scores every row of every member: its logits rows are the pass's.
     let (pass_rows, pass_parts) = pass_bounds(
         &settings.batching,
         inputs.sequences,
-        1 + (draft_depth as u64).min(MAX_VERIFIED),
+        (1 + (draft_depth as u64).min(MAX_VERIFIED)).max(forced_rows as u64),
     );
-    let pass_logits = if draft_depth > 0 && pass_parts > 1 {
+    let pass_logits = if (draft_depth > 0 || forced_rows > 0) && pass_parts > 1 {
         pass_rows as u64
     } else {
         0
@@ -429,7 +460,7 @@ pub fn plan_closest(
     let page = footprint::page_bytes(config, kv_format);
     let region = host_pages * page;
     let spilled = (region * config.attention_layers() as u64).saturating_mul(sequences);
-    let verified_rows = if draft_depth > 0 { 1 + draft_depth as u64 } else { 0 };
+    let verified_rows = (if draft_depth > 0 { 1 + draft_depth as u64 } else { 0 }).max(forced_rows as u64);
     // The runtime reserve pays for what the settings make grow: the workspace's slots (with the rows of a pass), the
     // decode scratch, the first sequence's state and the MTP layer's cache at the longest context. When they are
     // more than the setting, the reserve is what they need: admission counts it and the account refuses less.
@@ -504,7 +535,7 @@ pub fn plan_closest(
              ({staging_slots}): the window is read one staging ring ahead, whole rings at a time"
         )));
     }
-    let head_rows = sequences.saturating_mul(1 + draft_depth as u64);
+    let head_rows = sequences.saturating_mul((1 + draft_depth as u64).max(forced_rows as u64));
     let (layout, spills, offload, reach) = match decide(budgets, whole, split) {
         Ok((layout, spills)) => (layout, spills, Offload::default(), None),
         Err(_) => {
@@ -579,6 +610,7 @@ pub fn plan_closest(
             rows,
             profile,
             draft_depth,
+            forced_rows,
             max_context_tokens: max_tokens as usize,
             prefix_cache_bytes,
             host_budget_bytes: inputs.host_pinned_bytes,
@@ -1074,6 +1106,21 @@ pub mod nvfp4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rows of a forced step size nothing unless they ask for more than one, and a pass holds as many of them as
+    /// the settings allow.
+    #[test]
+    fn forced_rows_size_the_passes_only_when_they_are_several() {
+        let mut batching = BatchingSettings::default();
+        assert_eq!(forced_rows_of(&batching), 0, "the default asks for nothing");
+        batching.forced_rows = 1;
+        assert_eq!(forced_rows_of(&batching), 0, "one row is the decode path");
+        batching.forced_rows = 8;
+        assert_eq!(forced_rows_of(&batching), 8);
+        let (rows, parts) = pass_bounds(&batching, 4, 8);
+        assert_eq!(parts, 4);
+        assert_eq!(rows, 32.min(pass_rows_limit(&batching)));
+    }
 
     fn nvfp4(shape: &[u64]) -> Placement {
         Placement {
