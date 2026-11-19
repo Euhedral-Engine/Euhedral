@@ -388,6 +388,9 @@ pub struct HostSettings {
     pub max_batch_size: Auto<u32>,
     /// Where native files are unpacked; `auto` is the user's cache directory.
     pub native_cache: Auto<PathBuf>,
+    /// The most bytes one read and write of a file copy moves (the quantization tools copy an artifact in pieces this
+    /// size).
+    pub copy_chunk_bytes: ByteSize,
 }
 
 impl Default for HostSettings {
@@ -398,6 +401,7 @@ impl Default for HostSettings {
             idle_release: Duration::from_secs(1),
             max_batch_size: Auto::Auto,
             native_cache: Auto::Auto,
+            copy_chunk_bytes: ByteSize::mib(16),
         }
     }
 }

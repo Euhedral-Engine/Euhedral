@@ -78,6 +78,7 @@ host:
   idle-release: 1s                            # optional, default 1s: idle time before workers are released; 0 never releases them
   max-batch-size: auto                        # optional, default auto: most frames a lattice worker takes from its cache at once (auto = the runtime's default); 1 or 2 makes workers poll one frame at a time, so other workers can steal what waits behind a heavy frame
   native-cache: auto                          # optional, default auto: where the jar unpacks its native files (auto = the user's cache directory)
+  copy-chunk-bytes: 16MiB                     # optional, default 16MiB: the most bytes one read and write of a file copy moves (the quantization tools copy an artifact in pieces this size)
 
 kernels:
   rms-norm-decode-slices: auto                # optional, default auto: slices of the output pass of a one-row RMS norm, a decode step (auto = 40 on every card, the value chosen with the sliced kernel; 1 to 65535, the output is the same for any count)
