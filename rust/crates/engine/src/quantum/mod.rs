@@ -18,6 +18,8 @@
 //! The host side effects of a quantum (the input record's upload, the KV reservation, the frontiers, the logits
 //! bookkeeping) are the owner's, before the body runs and after the quantum retires, so a replay does none of them.
 
+#[cfg(feature = "test-oracles")]
+pub mod body_fault;
 mod capture_key;
 pub mod home;
 mod input_record;
@@ -25,6 +27,8 @@ pub mod whole;
 
 use smallvec::SmallVec;
 use std::fmt;
+#[cfg(feature = "test-oracles")]
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,7 +59,9 @@ use crate::stages::sampling::SelectedRows;
 use crate::stages::{LaneTable, QuantumError, QuantumKind, StageLaunch, fatal};
 use crate::state::SequenceId;
 use crate::workspace::BufferSlot;
-use whole::{Launches, Site, run_cached};
+#[cfg(feature = "test-oracles")]
+use body_fault::{BodyFault, BodyFaults, HoldEvent};
+use whole::{Launches, Site, run_held};
 
 /// What a quantum that runs as a graph body carries: its key, what the run holds for the device, and how it ran.
 #[derive(Debug)]
@@ -64,6 +70,9 @@ pub(crate) struct Capture {
     /// What the run keeps alive for the device; dropped with the quantum, which the owner drops after it retired.
     hold: OnceLock<GraphHold>,
     ran: OnceLock<Ran>,
+    /// The log of the quantum a test hook applied a fault to.
+    #[cfg(feature = "test-oracles")]
+    probe: OnceLock<Arc<BodyFaults>>,
 }
 
 impl Capture {
@@ -72,6 +81,17 @@ impl Capture {
             key,
             hold: OnceLock::new(),
             ran: OnceLock::new(),
+            #[cfg(feature = "test-oracles")]
+            probe: OnceLock::new(),
+        }
+    }
+}
+
+#[cfg(feature = "test-oracles")]
+impl Drop for Capture {
+    fn drop(&mut self) {
+        if let Some(probe) = self.probe.get() {
+            probe.log(HoldEvent::Released);
         }
     }
 }
@@ -405,6 +425,9 @@ fn latest_per_lane(markers: impl IntoIterator<Item = Marker>, own: Option<LaneId
 struct QuantumLaunches<'a> {
     quantum: &'a Quantum,
     launches: &'a [Arc<dyn StageLaunch>],
+    /// A test hook's fault, applied after the first launch that has work.
+    #[cfg(feature = "test-oracles")]
+    fault: Option<BodyFault>,
 }
 
 impl Launches<CudaGpu> for QuantumLaunches<'_> {
@@ -415,6 +438,14 @@ impl Launches<CudaGpu> for QuantumLaunches<'_> {
         let kernels: &mut dyn KernelOps = &mut ops;
         for launch in self.launches.iter().filter(|launch| !launch.idle(quantum)) {
             launch.launch(quantum, kernels)?;
+            #[cfg(feature = "test-oracles")]
+            match self.fault.take() {
+                Some(BodyFault::Refuse) => {
+                    return Err(fatal("a test hook refused the quantum in the middle of its body"));
+                }
+                Some(BodyFault::Panic) => panic!("a test hook panicked in the middle of a quantum's body"),
+                None => {}
+            }
         }
         Ok(())
     }
@@ -426,6 +457,8 @@ struct Whole {
     launches: Arc<[Arc<dyn StageLaunch>]>,
     cache: Arc<SharedGraphCache<CudaGpu, u128>>,
     gpu: Arc<CudaGpu>,
+    #[cfg(feature = "test-oracles")]
+    faults: Arc<BodyFaults>,
 }
 
 impl Stage<Quantum> for Whole {
@@ -449,22 +482,47 @@ impl Stage<Quantum> for Whole {
                 .chain(busy.flat_map(|launch| launch.waits(quantum))),
             Some(id),
         );
-        let mut hold = GraphHold::new();
+        // A body runs for real only for a key the cache has not seen (a hit is a replay).
+        #[cfg(feature = "test-oracles")]
+        let fault = if self.cache.contains(&capture.key) {
+            None
+        } else {
+            self.faults.take()
+        };
         let mut launches = QuantumLaunches {
             quantum,
             launches: &self.launches,
+            #[cfg(feature = "test-oracles")]
+            fault,
         };
         let site = Site {
             gpu: &*self.gpu,
             lane: &**lane,
             waits: &waits,
         };
-        let made = run_cached(&site, &self.cache, capture.key, &mut launches, &mut hold);
-        // A run that did not start keeps nothing; one that failed may have queued work that reads what it kept.
-        if !matches!(made, Err(StageError::Retry)) {
-            let _ = capture.hold.set(hold);
-        }
-        let (ran, marker) = made?;
+        // The hold is stored even when the body fails or panics: queued work may still read what it kept.
+        #[cfg(not(feature = "test-oracles"))]
+        let (ran, marker) = run_held(&site, &self.cache, capture.key, &mut launches, &capture.hold)?;
+        #[cfg(feature = "test-oracles")]
+        let (ran, marker) = {
+            let made = catch_unwind(AssertUnwindSafe(|| {
+                run_held(&site, &self.cache, capture.key, &mut launches, &capture.hold)
+            }));
+            if let Some(fault) = fault {
+                if capture.hold.get().is_some() {
+                    // Only a body that ran is followed: the log is of this quantum's hold.
+                    let _ = capture.probe.set(Arc::clone(&self.faults));
+                    self.faults.log(HoldEvent::Stored);
+                } else {
+                    // Nothing ran (a busy lane): the fault stays armed for the next body.
+                    self.faults.arm(fault);
+                }
+            }
+            match made {
+                Ok(made) => made?,
+                Err(panic) => resume_unwind(panic),
+            }
+        };
         let _ = capture.ran.set(ran);
         Ok(Submitted::marker(marker))
     }
@@ -492,6 +550,67 @@ pub struct Started {
     pub root: StageId,
     /// The stage whose marker covers the quantum's device work.
     pub sink: StageId,
+    /// The unit that reads each staging slot last, which a later quantum's first copy into the slot waits for; empty for
+    /// a quantum that stages nothing.
+    pub slot_readers: Arc<[Option<StageId>]>,
+}
+
+/// The slot readers of a quantum that reads no staging slot: one empty list, shared.
+pub fn no_slot_readers() -> Arc<[Option<StageId>]> {
+    static NONE: OnceLock<Arc<[Option<StageId>]>> = OnceLock::new();
+    Arc::clone(NONE.get_or_init(|| Arc::from(Vec::new())))
+}
+
+/// What a new quantum is ordered by in a predecessor: where it entered its graph, the stage whose marker covers its
+/// device work, and the unit that reads each staging slot last.
+#[derive(Clone, Copy, Debug)]
+pub struct Predecessor<'a> {
+    pub root: StageId,
+    pub sink: StageId,
+    pub slot_readers: &'a [Option<StageId>],
+}
+
+/// An edge from a stage of the predecessor `after[predecessor]` to a stage of the new quantum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dependency {
+    pub predecessor: usize,
+    pub from_stage: StageId,
+    pub to_stage: StageId,
+}
+
+/// The edges a new quantum starts with, behind each predecessor in `after`:
+/// - its first stage waits for the predecessor's sink: the chain's token passes from one quantum to the next, and the
+///   workspace's buffers are reused;
+/// - the first transfer of each staging slot (`first_transfers`: the slot and the transfer's unit) waits for the
+///   predecessor's last reader of that slot only, so the copies overlap the predecessor's tail. A predecessor that
+///   reads no slot gives its root, which already waited for the quantum before it.
+///
+/// `after` holds the predecessors the order still holds; one that retired is not in it and gives nothing. A view that stages nothing
+/// has no first transfer and gets the first stage's edges alone.
+pub fn external_edges(first_transfers: &[(usize, StageId)], after: &[Predecessor<'_>]) -> SmallVec<[Dependency; 16]> {
+    let mut edges = SmallVec::new();
+    for (predecessor, previous) in after.iter().enumerate() {
+        edges.push(Dependency {
+            predecessor,
+            from_stage: previous.sink,
+            to_stage: StageId(0),
+        });
+    }
+    for (predecessor, previous) in after.iter().enumerate() {
+        for &(slot, to_stage) in first_transfers {
+            edges.push(Dependency {
+                predecessor,
+                from_stage: previous
+                    .slot_readers
+                    .get(slot)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(previous.root),
+                to_stage,
+            });
+        }
+    }
+    edges
 }
 
 /// What stops a quantum from starting.
@@ -562,11 +681,16 @@ pub struct Executor {
     cache: Arc<SharedGraphCache<CudaGpu, u128>>,
     /// Whether quanta that can be keyed run as graph bodies.
     captures: AtomicBool,
+    /// By variant, the unit that reads each staging slot last (empty for a variant that stages nothing).
+    slot_readers: Vec<Arc<[Option<StageId>]>>,
     /// Runs the sequence's prefix-cache copy jobs, when it has a cache.
     copier: Option<Copier>,
     /// Uploads the input record of a quantum that arrives unprepared (an offered verification, prepared when its pass
     /// starts, as the one quantum or the batch it is a part of).
     preparer: Option<Preparer>,
+    /// The test hook that fails a graph body.
+    #[cfg(feature = "test-oracles")]
+    faults: Arc<BodyFaults>,
 }
 
 impl fmt::Debug for Executor {
@@ -595,6 +719,8 @@ impl Executor {
             .into_iter()
             .filter(|&variant| captured(variant) && plan.stages(variant.representative()).is_some())
             .count();
+        #[cfg(feature = "test-oracles")]
+        let faults = Arc::new(BodyFaults::default());
         let cache = Arc::new(SharedGraphCache::with_capacity((captures_per_view * views).max(1)));
         cache.set_replay_as_recorded(true);
         let mut eager = Vec::with_capacity(Variant::ALL.len());
@@ -630,6 +756,8 @@ impl Executor {
                     launches,
                     cache: Arc::clone(&cache),
                     gpu: Arc::clone(&gpu),
+                    #[cfg(feature = "test-oracles")]
+                    faults: Arc::clone(&faults),
                 });
                 for home in 0..stage_lanes {
                     let again = Arc::clone(&retire);
@@ -637,12 +765,25 @@ impl Executor {
                         whole_spec(home),
                         vec![Arc::clone(&body)],
                         runtime.clone(),
-                        move |quantum, outcome| again(quantum, outcome),
+                        move |quantum, outcome| {
+                            #[cfg(feature = "test-oracles")]
+                            if let Some(probe) = quantum.capture.as_ref().and_then(|capture| capture.probe.get()) {
+                                probe.log(HoldEvent::Retired);
+                            }
+                            again(quantum, outcome)
+                        },
                     )?);
                 }
             }
             whole.push(bodies);
         }
+        let slot_readers = Variant::ALL
+            .into_iter()
+            .map(|variant| match plan.slot_readers(variant.representative()) {
+                [] => no_slot_readers(),
+                readers => Arc::from(readers),
+            })
+            .collect();
         Ok(Executor {
             plan,
             stage_lanes,
@@ -651,8 +792,11 @@ impl Executor {
             whole,
             cache,
             captures: AtomicBool::new(captures_per_view > 0),
+            slot_readers,
             copier: None,
             preparer: None,
+            #[cfg(feature = "test-oracles")]
+            faults,
         })
     }
 
@@ -730,6 +874,12 @@ impl Executor {
         &self.plan
     }
 
+    /// The test hook that fails a graph body in the middle, and logs what became of its hold.
+    #[cfg(feature = "test-oracles")]
+    pub fn body_faults(&self) -> &Arc<BodyFaults> {
+        &self.faults
+    }
+
     /// What the sequence's graph cache counted: how its quanta ran as graph bodies.
     pub fn graph_stats(&self) -> GraphStats {
         self.cache.stats()
@@ -785,6 +935,7 @@ impl Executor {
             .flatten()
             .filter(|_| self.plan.capturable(view));
         let body = keyed.and_then(|key| self.whole[variant.index()].get(home).map(|graph| (key, graph)));
+        let captured = body.is_some();
         let (graph, sink) = match body {
             Some((key, graph)) => {
                 quantum.capture = Some(Capture::new(key.digest()));
@@ -792,18 +943,32 @@ impl Executor {
             }
             None => (eager, StageId((stages - 1) as u16)),
         };
-        let external = after.iter().map(|previous| ExternalEdge {
-            from: previous.reference.clone(),
-            from_stage: previous.sink,
-            to_stage: StageId(0),
-            kind: EdgeKind::Submission,
-        });
+        // A captured body is one stage; a staged view is never captured, so its first transfers exist only in the
+        // stage-by-stage graph.
+        let first_transfers = if captured { &[] } else { self.plan.first_transfers(view) };
+        let predecessors: SmallVec<[Predecessor<'_>; 4]> = after
+            .iter()
+            .map(|previous| Predecessor {
+                root: previous.root,
+                sink: previous.sink,
+                slot_readers: &previous.slot_readers,
+            })
+            .collect();
+        let external = external_edges(first_transfers, &predecessors)
+            .into_iter()
+            .map(|edge| ExternalEdge {
+                from: after[edge.predecessor].reference.clone(),
+                from_stage: edge.from_stage,
+                to_stage: edge.to_stage,
+                kind: EdgeKind::Submission,
+            });
         let reference = graph.start(quantum, kill, external);
         Ok(Started {
             serial,
             reference,
             root: StageId(0),
             sink,
+            slot_readers: Arc::clone(&self.slot_readers[variant.index()]),
         })
     }
 }

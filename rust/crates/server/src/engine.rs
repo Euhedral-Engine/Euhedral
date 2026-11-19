@@ -24,16 +24,37 @@ fn library_name() -> &'static str {
     }
 }
 
-/// The CUDA library: `lib/` under `host.native-cache` when that is set, else `lib/` beside the executable. Both are
-/// the layout the Java server unpacks its native files into (`lib/`, `share/` and `cuda/` under one root).
+/// The places the CUDA library may be, in order: `lib/` under `host.native-cache` when that is set; else `lib/` beside
+/// the executable and, when the executable's directory is named `bin` and `share/euhedral_cuda` is a directory beside
+/// it (the bundle: `bin/euhedral-server` with `lib/` beside `bin/`), `lib/` beside that directory. These are the layout
+/// the Java server unpacks its native files into (`lib/`, `share/` and `cuda/` under one root).
+pub fn library_candidates(settings: &Settings, executable: Option<&Path>) -> Vec<PathBuf> {
+    let library = |root: &Path| root.join("lib").join(library_name());
+    if let Auto::Value(root) = &settings.host.native_cache {
+        return vec![library(root)];
+    }
+    let directory = executable
+        .and_then(Path::parent)
+        .map_or_else(PathBuf::new, Path::to_path_buf);
+    let mut candidates = vec![library(&directory)];
+    if directory.file_name().is_some_and(|name| name == "bin")
+        && let Some(root) = directory.parent()
+        && root.join("share").join("euhedral_cuda").is_dir()
+    {
+        candidates.push(library(root));
+    }
+    candidates
+}
+
+/// The CUDA library: the first of [`library_candidates`] that is a file, else the first of them.
 pub fn library_path(settings: &Settings, executable: Option<&Path>) -> PathBuf {
-    let root = match &settings.host.native_cache {
-        Auto::Value(root) => root.clone(),
-        Auto::Auto => executable
-            .and_then(Path::parent)
-            .map_or_else(PathBuf::new, Path::to_path_buf),
-    };
-    root.join("lib").join(library_name())
+    let candidates = library_candidates(settings, executable);
+    candidates
+        .iter()
+        .find(|candidate| candidate.is_file())
+        .or_else(|| candidates.first())
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// The server's start error for an engine start error: the messages are the engine's.
@@ -46,9 +67,14 @@ fn start_error(error: &EngineStartError) -> StartError {
 /// Starts the engine of `settings` and waits for it. The CUDA library is checked first, so a missing library reports
 /// the driver message before the artifact is read.
 pub fn start_engine(settings: &Settings) -> Result<Started, StartError> {
-    let library = library_path(settings, current_exe().ok().as_deref());
+    let executable = current_exe().ok();
+    let library = library_path(settings, executable.as_deref());
     if !library.is_file() {
-        let missing = EngineStartError::Driver(format!("{} is not there", library.display()));
+        let tried: Vec<String> = library_candidates(settings, executable.as_deref())
+            .iter()
+            .map(|candidate| candidate.display().to_string())
+            .collect();
+        let missing = EngineStartError::Driver(format!("{} is not there", tried.join(" or ")));
         return Err(start_error(&missing));
     }
     let host = start(settings, &library, START_LIMIT, Some(settings.server.shutdown_timeout))
@@ -68,7 +94,11 @@ fn started(host: EngineHost) -> Started {
 
 #[cfg(test)]
 mod tests {
+    use std::env::{temp_dir, var_os};
+    use std::fs;
+    use std::io;
     use std::path::Path;
+    use std::process::id;
 
     use euhedral_inference_settings::ModelSettings;
 
@@ -93,6 +123,38 @@ mod tests {
     fn the_library_is_beside_the_executable_otherwise() {
         let path = library_path(&settings(), Some(Path::new("bin/euhedral-server")));
         assert_eq!(path, Path::new("bin").join("lib").join(library_name()));
+    }
+
+    #[test]
+    fn a_bundled_layout_finds_the_library_beside_bin_without_a_native_cache() -> io::Result<()> {
+        let base = var_os("EUHEDRAL_SCRATCH").map_or_else(temp_dir, PathBuf::from);
+        let bundle = base.join(format!("engine-bundle-{}", id()));
+        let lib = bundle.join("lib");
+        fs::create_dir_all(&lib)?;
+        fs::create_dir_all(bundle.join("bin"))?;
+        fs::write(lib.join(library_name()), "stand-in")?;
+        // Without `share/euhedral_cuda` the directory above `bin` is not a bundle (`/usr/bin` never picks `/usr/lib`).
+        let path = library_path(&settings(), Some(&bundle.join("bin").join("euhedral-server")));
+        assert_eq!(path, bundle.join("bin/lib").join(library_name()));
+        fs::create_dir_all(bundle.join("share/euhedral_cuda"))?;
+        // Beside a directory not named `bin` it is not a bundle either.
+        fs::create_dir_all(bundle.join("sbin"))?;
+        let path = library_path(&settings(), Some(&bundle.join("sbin").join("euhedral-server")));
+        assert_eq!(path, bundle.join("sbin/lib").join(library_name()));
+        let path = library_path(&settings(), Some(&bundle.join("bin").join("euhedral-server")));
+        assert_eq!(path, lib.join(library_name()));
+        assert_eq!(
+            library_candidates(&settings(), Some(&bundle.join("bin").join("euhedral-server"))).len(),
+            2
+        );
+        assert!(path.is_file());
+        // A library beside the executable still wins.
+        fs::create_dir_all(bundle.join("bin/lib"))?;
+        fs::write(bundle.join("bin/lib").join(library_name()), "x")?;
+        let path = library_path(&settings(), Some(&bundle.join("bin").join("euhedral-server")));
+        assert_eq!(path, bundle.join("bin/lib").join(library_name()));
+        drop(fs::remove_dir_all(bundle));
+        Ok(())
     }
 
     #[test]

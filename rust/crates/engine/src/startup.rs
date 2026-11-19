@@ -47,8 +47,8 @@ use crate::residency::footprint;
 use crate::residency::loader::{self, LoadOutcome, Ring};
 use crate::residency::offload::{self, Offload};
 use crate::residency::planner::{LocationBytes, Placement, PlanInputs, ResidencyPlan, Tier, plan_with};
-use crate::runtime::resolve_sequences;
 use crate::runtime::{Core, EngineRuntime, ReadyHandoff, StartupReport, Units, free_arrival, raw_file};
+use crate::runtime::{lane_sizing, resolve_sequences};
 use crate::state::SequenceState;
 use crate::warmup;
 use crate::workspace::{Workspace, input_records_for};
@@ -143,6 +143,8 @@ struct Startup {
     /// The plan's admitted reservation, once it is made: the allocations take their claims from it, and the engine
     /// keeps what is left of it.
     reservation: Option<PlanReservation>,
+    /// The device's free bytes when the plan was made.
+    free_at_plan: u64,
     _units: Units,
 }
 
@@ -220,6 +222,7 @@ pub(crate) fn run(core: Arc<Core>, ready: ReadyHandoff) {
         core,
         ready: Some(ready),
         reservation: None,
+        free_at_plan: 0,
         _units: units,
     };
     startup.then(control, open);
@@ -513,42 +516,81 @@ fn check_segments(
     Ok(ends)
 }
 
-/// Step 3: plans residency against the device and the host. Failing here has allocated nothing on the device.
-fn plan(mut startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>) {
+/// Step 3a: resolves the sequence count from the free device memory, which is read after the kernels are loaded and
+/// before the lanes exist. Allocates nothing on the device. The lanes open next, in a device frame.
+fn plan(startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>) {
     let core = Arc::clone(&startup.core);
-    let planned = core
-        .library
-        .free_bytes()
-        .map_err(EngineError::from)
-        .and_then(|device_free| {
-            let inputs = PlanInputs {
-                device_free,
-                multiprocessors: Some(core.library.device().sm_count),
-                host_pinned_bytes: core.host_pinned_bytes,
-                sequences: 1,
-            };
-            let sequences = resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)?;
-            let sequences = core.hold_sequences(sequences);
-            plan_with(
-                &artifact.config,
-                &artifact.table,
-                &core.settings,
-                PlanInputs { sequences, ..inputs },
-            )
-            .map_err(EngineError::from)
-        })
-        .and_then(|plan| refuse_offload(&plan.offload).map(|()| plan).map_err(EngineError::from))
-        // The plan is admitted by the account: its allocations take their claims from the reservation.
-        .and_then(|plan| {
-            let reservation = core.account.admit(&plan)?;
-            let admitted = reservation.admitted();
-            log::info!(
-                "memory admitted: {} bytes on the device, {} bytes of pinned host memory",
-                admitted.device,
-                admitted.host
-            );
-            Ok((plan, reservation))
-        });
+    let first = device_inputs(&core).and_then(|inputs| {
+        let first = resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)?;
+        Ok(first)
+    });
+    match first {
+        Ok(first) => startup.then(device, move |startup| open_lanes(startup, artifact, ends, first)),
+        Err(error) => startup.fail(error),
+    }
+}
+
+/// What the plan reads of the device now: the free memory (a failed read is an error, not zero).
+fn device_inputs(core: &Core) -> Result<PlanInputs, EngineError> {
+    let device_free = core.library.free_bytes().map_err(EngineError::from)?;
+    Ok(PlanInputs {
+        device_free,
+        multiprocessors: Some(core.library.device().sm_count),
+        host_pinned_bytes: core.host_pinned_bytes,
+        sequences: 1,
+    })
+}
+
+/// Step 3b, in a frame of the device lake: opens the lanes with rings for the first count, whose events take device
+/// memory, then reads the free memory again, which is the figure the plan is made from, and resolves an automatic count
+/// again ([`lane_sizing`]).
+fn open_lanes(startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>, first: usize) {
+    let core = Arc::clone(&startup.core);
+    let sized = core.open_lanes(first).and_then(|()| {
+        let inputs = device_inputs(&core)?;
+        let sizing = lane_sizing(core.settings.batching.max_sequences, first, || {
+            resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)
+        })?;
+        Ok((inputs, sizing))
+    });
+    match sized {
+        Ok((inputs, sizing)) => startup.then(host, move |startup| {
+            plan_residency(startup, artifact, ends, inputs, sizing.sequences)
+        }),
+        Err(error) => startup.fail(error),
+    }
+}
+
+/// Step 3c: plans residency against the device (as the lanes left it) and the host. Allocates nothing on the device.
+fn plan_residency(
+    mut startup: Startup,
+    artifact: Artifact,
+    ends: HashMap<String, Arc<[u32]>>,
+    inputs: PlanInputs,
+    sequences: usize,
+) {
+    let core = Arc::clone(&startup.core);
+    // The figure the plan is made from: the free memory after the lanes opened.
+    startup.free_at_plan = inputs.device_free;
+    let planned = plan_with(
+        &artifact.config,
+        &artifact.table,
+        &core.settings,
+        PlanInputs { sequences, ..inputs },
+    )
+    .map_err(EngineError::from)
+    .and_then(|plan| refuse_offload(&plan.offload).map(|()| plan).map_err(EngineError::from))
+    // The plan is admitted by the account: its allocations take their claims from the reservation.
+    .and_then(|plan| {
+        let reservation = core.account.admit(&plan)?;
+        let admitted = reservation.admitted();
+        log::info!(
+            "memory admitted: {} bytes on the device, {} bytes of pinned host memory",
+            admitted.device,
+            admitted.host
+        );
+        Ok((plan, reservation))
+    });
     match planned {
         Ok((plan, reservation)) => {
             startup.reservation = Some(reservation);
@@ -558,11 +600,14 @@ fn plan(mut startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32
     }
 }
 
-/// Refuses a plan that holds weights this build cannot run from where they are. Objects read in place from pinned host
-/// memory (the embedding and the head) are loaded into the host arena and run; objects staged through the device ring
-/// or read from the artifact file would be left unloaded. The refusal names the pinned host bytes the plan needs.
+/// Refuses a plan that holds weights this build cannot run from where they are. Objects in pinned host memory are
+/// loaded into the host arena and run: the embedding and the head read in place, the others staged through the device
+/// ring the plan carries. Objects read from the artifact file would be left unloaded, and so would staged ones in a
+/// plan with no ring. The refusal names the pinned host bytes the plan needs.
 fn refuse_offload(offload: &Offload) -> Result<(), PlanError> {
-    if offload.disk.is_empty() && offload.host.iter().all(|name| offload::mapped(name)) {
+    let staged = offload.host.iter().any(|name| !offload::mapped(name));
+    let in_reach = offload.disk.is_empty() && (!staged || (offload.staging.is_some() && offload.host_arena_bytes > 0));
+    if in_reach {
         return Ok(());
     }
     Err(PlanError::WeightsOutsideDevice {
@@ -589,6 +634,18 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
         // Every allocation takes its claim before it allocates: one larger than the plan fails here, naming its consumer.
         let weights_claim = reservation.claim(Consumer::Weights, plan.arena_bytes)?;
         let arena = DeviceBuffer::alloc(&core.library, plan.arena_bytes as usize)?;
+        // The ring the staged weights are copied into: claimed before it is allocated, like every other allocation.
+        let staging = match plan.offload.staging {
+            Some(ring) => {
+                let bytes = ring.bytes();
+                let claim = reservation.claim(Consumer::StagingRing, bytes)?;
+                let size = usize::try_from(bytes).map_err(|_| {
+                    EngineError::Runtime(format!("the staging ring of {bytes} bytes does not fit memory"))
+                })?;
+                Some((DeviceBuffer::alloc(&core.library, size)?, claim))
+            }
+            None => None,
+        };
         // The host arena is one allocation made before any read, so the huge pages are likelier; the objects the plan
         // holds on the host are read into it where kernels read them.
         let host = match plan.offload.host_arena_bytes {
@@ -620,7 +677,7 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
         workspace.hold(scratch_claim);
         workspace.hold(reserve_claim);
-        let (sequences, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {
+        let (sequences, marker) = core.lane_table().submit_ops(core.transfer_lane(0), false, |kernels| {
             // The first sequence's state and the MTP layer's cache at the longest context, which its pages grow to.
             let first = footprint::first_sequence_bytes(&plan, &artifact.config)
                 + footprint::mtp_cache_bytes_of(&plan, &artifact.config);
@@ -648,10 +705,20 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
             }
             Ok::<_, EngineError>(sequences)
         })?;
-        Ok::<_, EngineError>((ring, arena, host, weights_claim, loans, workspace, sequences, marker))
+        Ok::<_, EngineError>((
+            ring,
+            arena,
+            host,
+            staging,
+            weights_claim,
+            loans,
+            workspace,
+            sequences,
+            marker,
+        ))
     })();
     match allocated {
-        Ok((ring, arena, host, weights_claim, loans, workspace, sequences, marker)) => {
+        Ok((ring, arena, host, staging, weights_claim, loans, workspace, sequences, marker)) => {
             // The state is zeroed when the lane reaches the marker; the load starts then.
             let frame = step(Kind::Startup, 0, move || {
                 load(
@@ -662,13 +729,14 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
                     ring,
                     arena,
                     host,
+                    staging,
                     weights_claim,
                     loans,
                     workspace,
                     sequences,
                 )
             });
-            core.completions.after_marker(marker, frame);
+            core.completions().after_marker(marker, frame);
         }
         Err(error) => startup.fail(error),
     }
@@ -687,6 +755,7 @@ fn load(
     ring: Ring,
     arena: DeviceBuffer,
     pinned: Option<(Arc<HostWeightsArena>, Claim)>,
+    staging: Option<(DeviceBuffer, Claim)>,
     weights_claim: Claim,
     loans: Vec<PooledPinned>,
     workspace: Workspace,
@@ -711,6 +780,7 @@ fn load(
                 ends,
                 ring,
                 (weights_claim, host_claim),
+                staging,
                 workspace,
                 sequences,
                 outcome,
@@ -732,6 +802,7 @@ fn assemble(
     ends: HashMap<String, Arc<[u32]>>,
     ring: Ring,
     claims: (Claim, Option<Claim>),
+    staging: Option<(DeviceBuffer, Claim)>,
     workspace: Workspace,
     sequences: Vec<SequenceState>,
     outcome: LoadOutcome,
@@ -742,7 +813,7 @@ fn assemble(
         // Freeing the arena waits for the device: it is a frame of the stages lake.
         Err(error) => {
             return startup.then(device, move |startup| {
-                drop((arena, host));
+                drop((arena, host, staging));
                 drop((workspace, sequences, claims));
                 startup.fail(error);
             });
@@ -754,7 +825,7 @@ fn assemble(
         Ok(weights) => weights,
         Err(error) => {
             return startup.then(device, move |startup| {
-                drop((arena, host));
+                drop((arena, host, staging));
                 drop((workspace, sequences, claims));
                 startup.fail(error);
             });
@@ -762,18 +833,26 @@ fn assemble(
     };
     let objects = plan.on_device().count();
     let host_backed_bytes = host_backed_bytes(&plan);
+    let disk_backed_bytes = disk_backed_bytes(&plan);
+    let staging_bytes = plan.offload.staging_bytes();
+    let staging_geometry = plan.offload.staging;
     let mapped_objects = mapped_objects(&plan);
     let (weights_claim, host_claim) = claims;
     let mut weights = Weights::new(arena, host, weights).with_claim(weights_claim);
     if let Some(claim) = host_claim {
         weights = weights.with_claim(claim);
     }
+    if let Some((buffer, claim)) = staging {
+        weights = weights.with_staging(buffer).with_claim(claim);
+    }
     let admitted = startup
         .reservation
         .as_ref()
         .map_or(LocationBytes { device: 0, host: 0 }, PlanReservation::admitted);
-    let allocated =
-        plan.arena_bytes + workspace.retained_bytes() + sequences.iter().map(SequenceState::device_bytes).sum::<u64>();
+    let allocated = plan.arena_bytes
+        + staging_bytes
+        + workspace.retained_bytes()
+        + sequences.iter().map(SequenceState::device_bytes).sum::<u64>();
     let begun = core.started;
     // The pool keeps what the load staged, up to `memory.pinned-buffer-pool` when that is stated; trimming frees
     // pinned memory, which waits for the device, so it is a frame of its own, after the load.
@@ -790,7 +869,8 @@ fn assemble(
         };
         let (warmed, marker) = warmup::run(&startup.core, &artifact.config, &weights, &workspace);
         let core = Arc::clone(&startup.core);
-        let (completions, stages) = (Arc::clone(&core.completions), Arc::clone(&core.stages));
+        let free_at_plan = startup.free_at_plan;
+        let (completions, stages) = (Arc::clone(core.completions()), Arc::clone(&core.stages));
         // The report and the latch wait for the lane to reach the warm-up's last launch: a completion, not a wait.
         let ready = step(Kind::Startup, 0, move || {
             let in_use = core
@@ -805,6 +885,13 @@ fn assemble(
                     mapped_objects.join(", ")
                 );
             }
+            if let Some(ring) = staging_geometry {
+                log::info!(
+                    "staging ring: {} slots of {} bytes on the device, {staging_bytes} bytes",
+                    ring.slots,
+                    ring.slot_bytes
+                );
+            }
             let report = StartupReport {
                 ready: begun.elapsed(),
                 load: stats.elapsed,
@@ -814,10 +901,13 @@ fn assemble(
                 piece_bytes: ring.piece_bytes,
                 objects,
                 host_backed_bytes,
+                disk_backed_bytes,
+                staging_bytes,
                 mapped_objects,
                 allocated_bytes: allocated,
                 admitted,
                 device_bytes_in_use: in_use,
+                free_at_plan,
                 pinned_staging_bytes: core.pool.allocated_bytes(),
                 pinned_growth_during_load: stats.pinned_growth,
                 warmed,
@@ -946,7 +1036,7 @@ impl DraftIds {
             source,
             bytes,
         } = self;
-        let queued = core.lane_table.submit_ops(core.owner_lane(), false, |kernels| {
+        let queued = core.lane_table().submit_ops(core.owner_lane(), false, |kernels| {
             // SAFETY: the loan is held by the frame that follows the copy, which runs once the lane has reached the
             // marker; nothing reads or writes the bytes before.
             unsafe { kernels.copy_device_to_readback(loan.buffer_mut(), 0, source, bytes) }
@@ -962,7 +1052,7 @@ impl DraftIds {
                         .collect();
                     finish.run(Some(ids));
                 });
-                core.completions.after_marker(marker, frame);
+                core.completions().after_marker(marker, frame);
             }
             Err(error) => {
                 // The copy may have been queued before the call failed: the lane may still write the buffer, so it is
@@ -1011,6 +1101,15 @@ fn host_backed_bytes(plan: &ResidencyPlan) -> u64 {
     plan.device
         .iter()
         .filter(|placement| matches!(placement.tier, Tier::Host { .. }))
+        .map(|placement| placement.bytes)
+        .sum()
+}
+
+/// The payload bytes of the objects the plan leaves in the artifact file.
+fn disk_backed_bytes(plan: &ResidencyPlan) -> u64 {
+    plan.device
+        .iter()
+        .filter(|placement| matches!(placement.tier, Tier::Disk))
         .map(|placement| placement.bytes)
         .sum()
 }
@@ -1111,6 +1210,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::residency::offload::StagingGeometry;
 
     #[test]
     fn a_plan_with_weights_outside_the_device_is_refused_naming_the_host_bytes() {
@@ -1151,7 +1251,16 @@ mod tests {
             refuse_offload(&host(&["text/token_embedding", "text/output_head"])),
             Ok(())
         );
+        // A staged object needs the ring the plan carries, and the arena it is read from.
         assert!(refuse_offload(&host(&["text/token_embedding", "text/layers/0/mlp/down"])).is_err());
+        let mut staged = host(&["text/token_embedding", "text/layers/0/mlp/down"]);
+        staged.staging = Some(StagingGeometry {
+            slots: 4,
+            slot_bytes: 4096,
+        });
+        assert_eq!(refuse_offload(&staged), Ok(()));
+        staged.host_arena_bytes = 0;
+        assert!(refuse_offload(&staged).is_err());
         let mut with_disk = host(&["text/token_embedding"]);
         with_disk.disk = vec!["text/layers/0/mlp/down".to_string()];
         assert!(refuse_offload(&with_disk).is_err());

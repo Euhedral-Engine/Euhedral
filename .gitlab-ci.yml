@@ -19,10 +19,14 @@
 #   NEXT_BRANCH            optional, given when `promote` is played: the new branch's name (default: the old number plus one,
 #                          or "-2" appended to a name without a number)
 #   PROMOTE_DRY_RUN        optional, given when `promote` is played: 1 prints the plan and changes nothing
+# Pipelines run for merge requests, the integration branch, main and manual runs. A push to any other branch starts none:
+# the runner is shared, and its merge request runs the same jobs.
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $INTEGRATION_BRANCH
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web"
 
 variables:
   ARBITER_ARGS: "--mem 32G"
@@ -59,9 +63,9 @@ native-package:
   rules:
     - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $INTEGRATION_BRANCH
       changes:
-        paths: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", ".gitlab-ci.yml"]
+        paths: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", "rust/**/*", ".gitlab-ci.yml"]
         compare_to: refs/heads/main
-    - changes: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", ".gitlab-ci.yml"]
+    - changes: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", "rust/**/*", ".gitlab-ci.yml"]
   variables:
     ZIG_GLOBAL_CACHE_DIR: $CI_PROJECT_DIR/native/.zig-global-cache
   script:
@@ -70,9 +74,14 @@ native-package:
     - mise exec -- gradle nativeVerify :api:bootJar build
     # Host-only native tests (no card): the programmatic-launch wait rule over the kernel sources and the registry.
     - cd native/tests && python3 -m unittest test_pdl_wait test_pdl_registry
+    # The Rust server bundle for linux-x64, from the native product just built.
+    - cd "$CI_PROJECT_DIR/rust" && mise exec -- cargo xtask bundle --product linux-x64
   artifacts:
-    when: on_failure
-    paths: [api/build/test-results/test/*.xml]
+    when: always
+    expire_in: 2 days
+    paths:
+      - api/build/test-results/test/*.xml
+      - build/bundle/euhedral-server-linux-x64.tar.gz
 
 # Tests of scripts/ci-promote.sh against local bare repositories (no GitLab calls).
 promote-test:

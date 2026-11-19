@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use euhedral_inference_cuda::CudaLibrary;
-use euhedral_inference_engine::residency::offload::EMBEDDING;
+use euhedral_inference_engine::residency::offload::{EMBEDDING, mapped};
 use euhedral_inference_engine::residency::planner::{PlanInputs, plan_with};
 use euhedral_inference_settings::{Auto, ByteSize};
 
@@ -257,4 +257,59 @@ pub fn embedding_alone_is_on_the_host(runtime: &EngineRuntime, limit: u64) {
         "the plan holds the embedding alone on the host"
     );
     assert!(plan.offload.disk.is_empty(), "no object is left in the file");
+}
+
+/// The `memory.gpu-limit` that leaves `staged` bytes under the device need of the resident plan for `settings` (its
+/// context size and its sequences), so the plan must stage projections through a ring. Made as [`limit_below_need`]:
+/// from the header and the table, with no limit on the device or the host.
+pub fn limit_to_stage(library: &Path, settings: &Settings, staged: u64) -> u64 {
+    let loaded = CudaLibrary::load(library).unwrap();
+    let inputs = PlanInputs {
+        device_free: 64 << 30,
+        multiprocessors: Some(loaded.device().sm_count),
+        host_pinned_bytes: Some(u64::MAX),
+        sequences: settings.batching.max_sequences as usize,
+    };
+    let (config, table) = open_artifact(&settings.model.artifact);
+    let resident = plan_with(&config, &table, settings, inputs).unwrap();
+    assert!(
+        resident.offload.is_empty(),
+        "the unlimited plan keeps everything on the device"
+    );
+    let limit = resident.device_bytes - staged;
+    let free = loaded.free_bytes().unwrap();
+    assert!(
+        free >= limit,
+        "the card has {free} bytes free, the forced limit needs {limit}: run on an idle card"
+    );
+    limit
+}
+
+/// Whether the plan of a started engine is the staged one a test forced: the device budget is the limit, projections
+/// are held on the host and read through the staging ring, and nothing is left in the file. A budget other than the
+/// limit (the sequences or the context differ from the ones the limit was made for) prints why and returns false, so
+/// the test skips.
+#[allow(clippy::print_stdout, reason = "a test says why it skipped")]
+pub fn staged_through_a_ring(runtime: &EngineRuntime, limit: u64) -> bool {
+    let plan = runtime.plan();
+    if plan.budget_bytes != limit {
+        println!(
+            "skipped: the plan's budget is {} bytes, not the forced limit {limit}",
+            plan.budget_bytes
+        );
+        return false;
+    }
+    let staged = plan.offload.host.iter().filter(|name| !mapped(name)).count();
+    assert!(
+        staged > 0,
+        "the plan holds projections on the host: {:?}",
+        plan.offload.host
+    );
+    assert!(plan.offload.disk.is_empty(), "no object is left in the file");
+    let ring = plan.offload.staging.expect("the plan stages through a ring");
+    let report = runtime.report();
+    assert!(report.host_backed_bytes > 0);
+    assert_eq!(report.disk_backed_bytes, 0);
+    assert!(report.staging_bytes > 0, "the startup report shows the ring: {ring:?}");
+    true
 }

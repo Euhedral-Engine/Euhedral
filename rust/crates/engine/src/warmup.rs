@@ -54,7 +54,7 @@ pub(crate) fn run(
     workspace: &Workspace,
 ) -> (Warmed, Option<Marker>) {
     let mut warmed = Warmed::default();
-    let submitted = core.lane_table.submit_ops(core.transfer_lane(0), false, |lane| {
+    let submitted = core.lane_table().submit_ops(core.transfer_lane(0), false, |lane| {
         warmed = warm(core, config, weights, workspace, lane);
         Ok::<(), CudaError>(())
     });

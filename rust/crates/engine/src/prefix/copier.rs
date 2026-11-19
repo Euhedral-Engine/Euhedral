@@ -22,7 +22,7 @@ use crate::frames::{Kind, id_hash};
 use crate::model::{LayerKind, ModelConfig};
 use crate::prefix::copy::{CopyJob, Direction, Ended, HostArena, Resolve};
 use crate::prefix::layout::Buffer;
-use crate::quantum::{StartError, Started};
+use crate::quantum::{StartError, Started, no_slot_readers};
 use crate::stages::attention::KvSource;
 use crate::stages::{LaneTable, SequenceRefs, Unmarked, fatal, submit_on};
 use crate::state::SequenceId;
@@ -294,6 +294,7 @@ impl Copier {
             reference,
             root: StageId(0),
             sink: StageId(0),
+            slot_readers: no_slot_readers(),
         }
     }
 }

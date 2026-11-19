@@ -166,10 +166,17 @@ impl Speculating {
         self.prompt_catch_up = Some(rows);
     }
 
-    /// The prompt resumes from a checkpoint at `position`, whose draft cache holds the rows below `position - 1` and
-    /// whose seed row holds the base hidden row of `position - 1`. The row `position - 1` pairs that hidden row with the
-    /// token at `position`, which the checkpoint does not know: it is re-paired first, in a catch-up of one row.
-    pub(super) fn resumed_at(&mut self, position: u32) {
+    /// The prompt resumes from a checkpoint at `position`, whose draft cache holds the rows up to `position - 1` (and
+    /// that row too, as the checkpoint paired it) and whose seed row holds the base hidden row of `position - 1`. The
+    /// row `position - 1` pairs that hidden row with the token at `position`. When the checkpoint paired it with the prompt's token (`whole`) the cache holds that row
+    /// too and the chunks go on from `position`; otherwise it is re-paired first, in a catch-up of one row.
+    pub(super) fn resumed_at(&mut self, position: u32, whole: bool) {
+        if whole {
+            self.mtp_position = u64::from(position);
+            self.prompt_catch_up = None;
+            self.resuming = false;
+            return;
+        }
         self.mtp_position = u64::from(position) - 1;
         self.prompt_catch_up = Some(1);
         self.resuming = true;
@@ -631,5 +638,35 @@ impl Owner {
         } else if run.generated >= run.wanted {
             run.stop(FinishReason::Length);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Speculating;
+
+    fn state() -> Speculating {
+        Speculating::new(3, 4096, 3000, 64)
+    }
+
+    #[test]
+    fn a_whole_restore_goes_on_from_the_checkpoint_with_no_catch_up_to_re_pair() {
+        let mut state = state();
+        state.resumed_at(2560, true);
+        assert_eq!(
+            state.prompt_catch_up, None,
+            "no one-row catch-up precedes the first chunk"
+        );
+        assert_eq!(state.mtp_position, 2560);
+        assert!(!state.resuming);
+    }
+
+    #[test]
+    fn a_restore_with_another_token_re_pairs_the_last_row_first() {
+        let mut state = state();
+        state.resumed_at(2560, false);
+        assert_eq!(state.prompt_catch_up, Some(1));
+        assert_eq!(state.mtp_position, 2559);
+        assert!(state.resuming);
     }
 }
