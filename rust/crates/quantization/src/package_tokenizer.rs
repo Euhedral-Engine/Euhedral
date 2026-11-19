@@ -136,6 +136,7 @@ pub fn package_tokenizer(
             host: Arc::clone(&host),
             part: None,
             completion: Some(Completion { done: Some(done) }),
+            cut: false,
         },
         _unit: unit,
     };
@@ -181,6 +182,8 @@ struct RunEnd {
     host: Arc<Lake>,
     part: Option<PathBuf>,
     completion: Option<Completion>,
+    /// An artifact written in place was cut back: until its section lands it has none.
+    cut: bool,
 }
 
 impl RunEnd {
@@ -203,10 +206,18 @@ impl RunEnd {
     /// Removes the armed output, then reports `error`. A removal the lake refuses drops the frame and, with it,
     /// the continuation, which reports all the same.
     fn remove_then_fail(&mut self, error: PackageError) {
-        let (Some(part), Some(completion)) = (self.part.take(), self.completion.take()) else {
-            if let Some(completion) = self.completion.take() {
-                completion.finish(Err(error));
-            }
+        let part = self.part.take();
+        let Some(completion) = self.completion.take() else {
+            return;
+        };
+        let Some(part) = part else {
+            // Nothing to remove. An artifact that was already cut has no section: the error says so.
+            let error = if self.cut {
+                PackageError::Cut(Box::new(error))
+            } else {
+                error
+            };
+            completion.finish(Err(error));
             return;
         };
         let failing = Failing {
@@ -591,8 +602,9 @@ impl Job {
                 let part = part_path(&out);
                 let io = Arc::clone(&self.io);
                 // Opened without truncating: the name may be another name of the source, which the run must not cut.
+                // Read as well, so that the identity of the file can be queried on every platform.
                 let spec = OpenSpec {
-                    read: false,
+                    read: true,
                     write: true,
                     create: Create::IfMissing,
                     ..OpenSpec::default()
@@ -624,10 +636,12 @@ impl Job {
         section: Vec<u8>,
     ) {
         let mut job = self;
+        // The file is this run's to remove unless it is the source itself.
+        job.end.arm(part.clone());
         match same_file(&source, &target) {
             Ok(false) => {}
             Ok(true) => {
-                // The file existed already, as the source: nothing of it is this run's to remove.
+                job.end.disarm();
                 return job.fail(PackageError::Io {
                     what: "invalid request",
                     source: io::Error::new(
@@ -636,15 +650,13 @@ impl Job {
                     ),
                 });
             }
-            // Whether it is the source is unknown, so nothing is removed.
             Err(error) => {
-                return job.fail(PackageError::Io {
+                return job.end.remove_then_fail(PackageError::Io {
                     what: "cannot compare the output with the artifact",
                     source: error,
                 });
             }
         }
-        job.end.arm(part.clone());
         let host = Arc::clone(&job.host);
         let file = Arc::clone(&target);
         let written = Written::Part {
@@ -698,7 +710,11 @@ impl Job {
                         content_end,
                         Box::new(move |cut| {
                             match cut {
-                                Ok(()) => self.write_section(target, Written::InPlace(artifact), content_end, section),
+                                Ok(()) => {
+                                    let mut job = self;
+                                    job.end.cut = true;
+                                    job.write_section(target, Written::InPlace(artifact), content_end, section);
+                                }
                                 Err(error) => self.fail(PackageError::Io {
                                     what: "cannot cut the artifact to its content",
                                     source: error,
@@ -935,6 +951,7 @@ mod tests {
         let mut end = RunEnd {
             host: Arc::clone(&host),
             part: None,
+            cut: false,
             completion: Some(Completion {
                 done: Some(Box::new(move |result| {
                     sender.send((result, seen.exists())).unwrap();
@@ -949,6 +966,35 @@ mod tests {
         assert!(
             !existed_when_told,
             "the output is gone before the caller hears of the end"
+        );
+        host.complete_gracefully();
+        lattice.close();
+    }
+
+    /// A run dropped after the artifact was cut says the artifact has no section, not just that it was lost.
+    #[test]
+    fn a_run_dropped_after_the_cut_reports_the_cut() {
+        let lattice =
+            ControlPlaneLattice::new(lattice_config(&Settings::with_model(ModelSettings::default()))).unwrap();
+        let host = Lake::new(
+            Arc::clone(&lattice),
+            NonZeroUsize::new(2).unwrap(),
+            Duration::from_secs(1),
+        );
+        let (sender, receiver) = mpsc::channel();
+        let end = RunEnd {
+            host: Arc::clone(&host),
+            part: None,
+            cut: true,
+            completion: Some(Completion {
+                done: Some(Box::new(move |result| sender.send(result).unwrap())),
+            }),
+        };
+        drop(end);
+        let result = receiver.recv_timeout(Duration::from_secs(30)).expect("the run reports");
+        assert!(
+            matches!(&result, Err(PackageError::Cut(cause)) if matches!(**cause, PackageError::Lost)),
+            "{result:?}"
         );
         host.complete_gracefully();
         lattice.close();
