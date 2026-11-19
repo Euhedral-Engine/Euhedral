@@ -6,16 +6,21 @@ use crate::error::EdrlError;
 /// The source element type of a tensor (`TensorDataType`); the ordinal is what the table stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TensorDataType {
-    Bf16,
-    Fp16,
-    Fp32,
-    Fp8E4m3,
-    Uint8,
-    Int8,
-    Int32,
+    Bf16 = 0,
+    Fp16 = 1,
+    Fp32 = 2,
+    Fp8E4m3 = 3,
+    Uint8 = 4,
+    Int8 = 5,
+    Int32 = 6,
 }
 
 impl TensorDataType {
+    /// The ordinal the table stores.
+    pub fn ordinal(self) -> i32 {
+        self as i32
+    }
+
     pub(crate) fn from_ordinal(ordinal: i32) -> Result<Self, EdrlError> {
         Ok(match ordinal {
             0 => Self::Bf16,
@@ -33,18 +38,23 @@ impl TensorDataType {
 /// How a payload's values are stored (`WeightFormat`); the ordinal is what the table stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WeightFormat {
-    Bf16,
-    Fp16,
-    Fp32,
-    I32,
-    Q3G64Fp16,
-    Q4G64Fp16,
-    Q5G64Fp16,
-    Nvfp4,
-    Trellis,
+    Bf16 = 0,
+    Fp16 = 1,
+    Fp32 = 2,
+    I32 = 3,
+    Q3G64Fp16 = 4,
+    Q4G64Fp16 = 5,
+    Q5G64Fp16 = 6,
+    Nvfp4 = 7,
+    Trellis = 8,
 }
 
 impl WeightFormat {
+    /// The ordinal the table stores.
+    pub fn ordinal(self) -> i32 {
+        self as i32
+    }
+
     pub(crate) fn from_ordinal(ordinal: i32) -> Result<Self, EdrlError> {
         Ok(match ordinal {
             0 => Self::Bf16,
@@ -64,15 +74,20 @@ impl WeightFormat {
 /// The persistent byte layout of a payload (`WeightLayout`); the ordinal is what the table stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WeightLayout {
-    ContiguousLeV1,
-    RowSplitK128V1,
-    RowSplitP2e2V1,
-    RowSplitK128Sd4V1,
-    RowInterleavedNvfp4V1,
-    TrellisTile16V1,
+    ContiguousLeV1 = 0,
+    RowSplitK128V1 = 1,
+    RowSplitP2e2V1 = 2,
+    RowSplitK128Sd4V1 = 3,
+    RowInterleavedNvfp4V1 = 4,
+    TrellisTile16V1 = 5,
 }
 
 impl WeightLayout {
+    /// The ordinal the table stores.
+    pub fn ordinal(self) -> i32 {
+        self as i32
+    }
+
     pub(crate) fn from_ordinal(ordinal: i32) -> Result<Self, EdrlError> {
         Ok(match ordinal {
             0 => Self::ContiguousLeV1,
@@ -163,7 +178,7 @@ fn matrix(shape: &[u64]) -> Result<(u64, u64), Refusal> {
     }
 }
 
-fn direct_size(shape: &[u64], dtype: TensorDataType, format: WeightFormat) -> Result<u64, Refusal> {
+pub(crate) fn direct_size(shape: &[u64], dtype: TensorDataType, format: WeightFormat) -> Result<u64, Refusal> {
     let word_bytes = match format {
         WeightFormat::Bf16 | WeightFormat::Fp16 => 2,
         WeightFormat::Fp32 | WeightFormat::I32 => 4,
@@ -199,7 +214,7 @@ fn direct_size(shape: &[u64], dtype: TensorDataType, format: WeightFormat) -> Re
 
 /// Q3, Q4 or Q5 at 64-value groups, row-split at K=128: base plane, high plane, then FP16 scales, each plane
 /// starting on a 256-byte boundary.
-fn grouped_size(shape: &[u64], dtype: TensorDataType, format: WeightFormat) -> Result<u64, Refusal> {
+pub(crate) fn grouped_size(shape: &[u64], dtype: TensorDataType, format: WeightFormat) -> Result<u64, Refusal> {
     if dtype != TensorDataType::Bf16 {
         return Err("grouped compact storage requires BF16 source metadata".into());
     }
@@ -352,5 +367,26 @@ impl TrellisCompanions {
             Some(last) => Err(EdrlError::invalid(format!("last segment end {last} is not n={n}"))),
             None => Err(EdrlError::invalid("segment count 0 is outside 1..8")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TensorDataType, WeightFormat, WeightLayout};
+
+    #[test]
+    fn every_ordinal_reads_back_as_its_variant() {
+        for ordinal in 0..7 {
+            assert_eq!(TensorDataType::from_ordinal(ordinal).unwrap().ordinal(), ordinal);
+        }
+        for ordinal in 0..9 {
+            assert_eq!(WeightFormat::from_ordinal(ordinal).unwrap().ordinal(), ordinal);
+        }
+        for ordinal in 0..6 {
+            assert_eq!(WeightLayout::from_ordinal(ordinal).unwrap().ordinal(), ordinal);
+        }
+        assert!(TensorDataType::from_ordinal(7).is_err());
+        assert!(WeightFormat::from_ordinal(9).is_err());
+        assert!(WeightLayout::from_ordinal(6).is_err());
     }
 }

@@ -277,7 +277,7 @@ impl Core {
     /// memory falling across the open: the plan is made from the free memory read after it.
     pub(crate) fn open_lanes(&self, sequences: usize) -> Result<(), EngineError> {
         let runtime = |what: &str, error: &dyn fmt::Display| EngineError::Runtime(format!("{what}: {error}"));
-        let chains = startup::transfer_lanes(&self.settings, MAX_LANES.saturating_sub(self.compute + 1));
+        let chains = startup::transfer_lanes(&self.settings, self.library.max_lanes(), self.compute);
         let ring = stage_ring(quanta_for(sequences));
         let before = self.library.free_bytes().map_err(EngineError::from)?;
         let set = open_lane_set(&self.gpu, self.compute, ring, chains)
@@ -1066,15 +1066,12 @@ pub fn lattice_config(settings: &Settings) -> LatticeConfig {
     config
 }
 
-/// The most lanes one RustEE pool holds.
-const MAX_LANES: usize = 64;
-
 /// The device the native library bound, opened through RustEE. The library reports the device's properties and not its
 /// ordinal, so the device is the first whose compute capability is the library's.
 pub fn open_device(library: &CudaLibrary) -> Result<Arc<CudaGpu>, EngineError> {
     let (major, minor) = library.device().compute_capability;
     let wanted = (i32::try_from(major).unwrap_or(0), i32::try_from(minor).unwrap_or(0));
-    for ordinal in 0..MAX_LANES as i32 {
+    for ordinal in 0.. {
         let Ok(candidate) = CudaGpu::open(ordinal) else { break };
         if candidate.arch() == wanted {
             return Ok(candidate);

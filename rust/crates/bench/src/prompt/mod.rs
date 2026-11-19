@@ -5,7 +5,6 @@
 //! a frozen document). `sha256` is the digest of the UTF-8 text, as the Java benchmark reports it in `promptSha256`.
 
 pub mod chat;
-pub mod splittable_random;
 pub mod words;
 
 use euhedral_inference_tokenizer::{Tokenizer, TokenizerError};

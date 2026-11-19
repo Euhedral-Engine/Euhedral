@@ -1,0 +1,17 @@
+[package]
+name = "euhedral-inference-quantization"
+version = "0.1.0"
+description = "The quantization library: the Java generators it must reproduce, the .npy and .npz formats and the pieces the quantization commands share."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+test-support = { path = "../test-support" }
+
+[lints]
+workspace = true

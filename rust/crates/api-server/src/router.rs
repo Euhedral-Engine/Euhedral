@@ -17,7 +17,7 @@ use crate::answer::Answerer;
 use crate::backend::Backend;
 use crate::health;
 use crate::limits::Limits;
-use crate::metrics::{CONTENT_TYPE as METRICS_TYPE, Metrics};
+use crate::metrics::{CONTENT_TYPE as METRICS_TYPE, Metrics, RequestTimer, Uri};
 use crate::models::Served;
 use crate::planning::{Endpoint, Planner};
 
@@ -65,6 +65,22 @@ fn route_of(path: &str) -> Option<(Route, bool)> {
         ["v1", "messages", "count_tokens"] => Some((Route::CountTokens, false)),
         ["v1", "responses"] => Some((Route::Responses, false)),
         _ => None,
+    }
+}
+
+/// The route template a path is counted under in the request timings: that of its route, or the one label of every path
+/// that is none.
+pub fn uri_of(path: &str) -> Uri {
+    match route_of(path) {
+        Some((Route::Health, _)) => Uri::Health,
+        Some((Route::Metrics, _)) => Uri::Metrics,
+        Some((Route::Models, _)) => Uri::Models,
+        Some((Route::Model(_), _)) => Uri::Model,
+        Some((Route::ChatCompletions, _)) => Uri::ChatCompletions,
+        Some((Route::Messages, _)) => Uri::Messages,
+        Some((Route::CountTokens, _)) => Uri::CountTokens,
+        Some((Route::Responses, _)) => Uri::Responses,
+        None => Uri::NotFound,
     }
 }
 
@@ -325,24 +341,30 @@ impl Router {
     fn route(&self, request: Request, reply: Responder) -> Box<dyn Frame> {
         let (path, surface) = Router::locate(&request);
         let method = request.method.as_str();
+        let timer = Arc::new(RequestTimer::start(
+            self.metrics.clone(),
+            uri_of(path),
+            request.method.clone(),
+        ));
         let response = match resolve(&request.method, path) {
             Resolution::NotFound => error_response(&ApiError::unknown_url(method, path), surface),
             Resolution::MethodNotAllowed => error_response(&ApiError::method_not_supported(method), surface),
             Resolution::Options(allow) => Response::with_status(200).header("Allow", allow),
             Resolution::Found(Route::ChatCompletions) => {
-                return self.generating(Some(Endpoint::ChatCompletions), request, reply, surface);
+                return self.generating(Some(Endpoint::ChatCompletions), request, reply, surface, timer);
             }
             Resolution::Found(Route::Messages) => {
-                return self.generating(Some(Endpoint::Messages), request, reply, surface);
+                return self.generating(Some(Endpoint::Messages), request, reply, surface, timer);
             }
             Resolution::Found(Route::Responses) => {
-                return self.generating(Some(Endpoint::Responses), request, reply, surface);
+                return self.generating(Some(Endpoint::Responses), request, reply, surface, timer);
             }
             Resolution::Found(Route::CountTokens) => {
-                return self.generating(None, request, reply, surface);
+                return self.generating(None, request, reply, surface, timer);
             }
             Resolution::Found(route) => self.serve(route, &request, surface),
         };
+        timer.finish(response.status);
         reply.send(response);
         no_work()
     }
@@ -355,9 +377,12 @@ impl Router {
         request: Request,
         reply: Responder,
         surface: Surface,
+        timer: Arc<RequestTimer>,
     ) -> Box<dyn Frame> {
         if let Err(error) = self.check_generating(&request) {
-            reply.send(error_response(&error, surface));
+            let response = error_response(&error, surface);
+            timer.finish(response.status);
+            reply.send(response);
             return no_work();
         }
         match endpoint {
@@ -368,10 +393,12 @@ impl Router {
                     endpoint,
                     request.body,
                     Box::new(move |planned| match planned {
-                        Ok(planned) => answerer.answer(planned, reply, surface, arrived),
+                        Ok(planned) => answerer.answer(planned, reply, surface, arrived, timer),
                         Err(error) => {
                             answerer.planning_failed(endpoint, &error);
-                            reply.send(error_response(&error, surface));
+                            let response = error_response(&error, surface);
+                            timer.finish(response.status);
+                            reply.send(response);
                         }
                     }),
                 )
@@ -379,10 +406,12 @@ impl Router {
             None => self.planner.count_tokens(
                 request.body,
                 Box::new(move |counted| {
-                    reply.send(match counted {
+                    let response = match counted {
                         Ok(tokens) => json(200, format!("{{\"input_tokens\":{tokens}}}").into_bytes()),
                         Err(error) => error_response(&error, surface),
-                    });
+                    };
+                    timer.finish(response.status);
+                    reply.send(response);
                 }),
             ),
         }
@@ -404,12 +433,14 @@ impl Router {
                 }
                 let counts = self.answerer.counts();
                 self.metrics.set_queue(counts.active, counts.waiting);
-                let text = self.metrics.render(
+                let now_ms = Metrics::wall_clock_ms();
+                let mut text = self.metrics.render(
                     self.backend.model_id(),
                     self.backend.context_length(),
                     &self.backend.engine_report(),
-                    Metrics::wall_clock_ms(),
+                    now_ms,
                 );
+                text.push_str(&self.metrics.render_platform(now_ms));
                 Response::with_status(200)
                     .header("Content-Type", METRICS_TYPE)
                     .with_body(text.into_bytes())

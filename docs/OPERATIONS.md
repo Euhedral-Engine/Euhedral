@@ -124,6 +124,33 @@ The port opens only after the engine has loaded, so a server that answers is rea
 `GET /health` answers `200 {"status":"up","engine":"ready","model":"..."}`, and `503` with `"engine":"closed"` once the
 engine has closed. The image's Docker health check calls it.
 
+## Container images
+
+The root `Dockerfile` builds the Java server's image. `rust/Dockerfile` builds the Rust server's, in the same
+distroless `cc` base with the same default settings file (`/etc/euhedral/config.yaml`, also `EUHEDRAL_CONFIG`), the NVIDIA
+environment, the `nonroot` user and the same health check timing. Build it from the repository root; the build compiles
+the native library with the pinned toolchains, so it needs network access and takes a while:
+
+```bash
+docker build -f rust/Dockerfile -t euhedral-rust .
+docker run --rm --gpus all --security-opt seccomp=unconfined -p 1738:1738 \
+    -v /path/to/model.edrl:/models/model.edrl:ro -e EUHEDRAL_MODEL_NAME=qwen --stop-timeout 45 euhedral-rust
+```
+
+The engine reads model files through io_uring, and Docker's default seccomp profile blocks the io_uring system
+calls. Without `seccomp=unconfined`, the server stops at startup with `Loading the inference engine failed: the
+asynchronous file I/O would not open: Operation not permitted (os error 1)`. A custom profile that is Docker's
+default plus `io_uring_setup`, `io_uring_enter` and `io_uring_register` also works. The host's
+`kernel.io_uring_disabled` must be 0. If it is 1 or 2, the same error appears, and a container cannot change it.
+
+The image holds the linux-x64 server bundle (`cargo xtask bundle --product linux-x64`, see `rust/README.md`) under
+`/opt/euhedral`: `bin/euhedral-server` is the entry point and finds `lib/` beside it. Settings are given as for the
+Java image: `--config <mounted file>`, or variables (`docker run -e`, `--env-file`). The distroless base has no shell
+or curl, so the health check is `bin/euhedral-health-probe`, which asks `GET /health` of `127.0.0.1` on
+`EUHEDRAL_SERVER_PORT`, else `PORT`, else 1738, allows two seconds each to connect, to send the request and to read the answer, and exits 1 unless the answer is `200`. A
+server that listens on another port through a settings file needs the same port in one of those variables for the
+check to follow it.
+
 ## Shutting down
 
 On `SIGTERM` or `SIGINT` the server stops accepting connections and waits up to
@@ -204,8 +231,14 @@ Absent when the cache is off ([PREFIX_CACHE.md](PREFIX_CACHE.md)).
 | `euhedral_engine_device_free_bytes` | gauge | Free device memory the driver reports |
 | `euhedral_engine_host_backed_weight_bytes` | gauge | Weights held in pinned host memory and streamed in |
 
-The JVM's and the process's metrics (`jvm_*`, `process_*`, `process_uptime_seconds`), Tomcat's and HTTP server
-request timings (`http_server_requests_seconds`) come from Micrometer.
+The process's metrics (`process_uptime_seconds`, `process_start_time_seconds`, `process_cpu_time_ns_total`,
+`process_cpu_usage`, `process_files_open_files`, `process_files_max_files`) come from the operating system; a value the
+platform cannot report is left out rather than written as zero. On Windows the file limit has no series. The time of
+every request (`http_server_requests_seconds`, with `_count`, `_sum` and `_max`) is labelled by route template (`uri`,
+for example `/v1/models/{model}`), method, status and outcome; every path that is no route is `uri="/**"`. A request is
+timed from the moment the router has it (its head and body already read) to the last byte handed to the connection; a
+stream cut after its head is timed to the moment it was cut, as a `200`. The JVM's metrics (`jvm_*`) and
+`http_server_requests_active_seconds` belong to the Java server: the Rust server has none.
 
 ### Examples
 

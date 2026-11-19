@@ -5,6 +5,7 @@ description = "The server binary: loads the settings, starts the backend, serves
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+default-run = "euhedral-server"
 
 [features]
 # A backend that follows a script instead of the engine, behind the hidden `--scripted-backend` argument, so that the
@@ -14,6 +15,11 @@ scripted = ["euhedral-inference-api-server/test-support"]
 [[bin]]
 name = "euhedral-server"
 path = "src/main.rs"
+
+# The container's health check: asks `GET /health` of the local server (the image has no shell and no curl).
+[[bin]]
+name = "euhedral-health-probe"
+path = "src/health_probe.rs"
 
 [dependencies]
 euhedral-core.workspace = true
