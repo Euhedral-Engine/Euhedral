@@ -446,6 +446,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_unpaired_surrogate_in_an_argument_key_is_written_as_its_escape() {
+        let schema = r#"{"type":"object","properties":{"v":{}}}"#;
+        let lone = arguments(schema, &["v", r#"{"\ud800":1}"#]).unwrap();
+        assert_eq!(lone, r#"{"v":{"\uD800":1}}"#);
+        let mixed = arguments(schema, &["v", r#"{"\ud83d\ude00":1,"\udc00":2}"#]).unwrap();
+        assert_eq!(mixed, r#"{"v":{"😀":1,"\uDC00":2}}"#);
+    }
+
     fn parser(parameters: Option<&str>, parallel: bool, requires_call: bool) -> ToolCallParser {
         ToolCallParser::new(vec![tool(parameters)], parallel, requires_call)
     }
