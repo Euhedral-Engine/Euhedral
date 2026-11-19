@@ -26,7 +26,7 @@ use euhedral_inference_cuda::DevicePtr;
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
-use euhedral_inference_engine::model::{LayerKind, ModelConfig, WeightRef, object_key};
+use euhedral_inference_engine::model::{LayerKind, ModelConfig, Residence, WeightRef, object_key};
 use euhedral_inference_engine::plan::{DECODE_MAX_ROWS, Formats, Plan, StageKind, View, WeightLookup};
 use euhedral_inference_engine::quantum::split_geometry;
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, plan as residency};
@@ -75,6 +75,7 @@ fn built() -> &'static Built {
                             layout: placement.layout,
                             ptr: DevicePtr::NULL,
                             bytes: placement.bytes,
+                            residence: Residence::Device,
                             trellis: None,
                         },
                     ))

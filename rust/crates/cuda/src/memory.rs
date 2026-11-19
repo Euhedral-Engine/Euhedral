@@ -421,6 +421,64 @@ impl HostWeightsArena {
     }
 }
 
+impl HostWeightsArena {
+    /// The `len` bytes at `offset` as a region a read fills in place, or `None` when they do not lie inside the arena
+    /// or are none.
+    ///
+    /// # Safety
+    /// The region must be disjoint from every other [`ArenaRange`] of this arena that is alive, and from the host's
+    /// own references to the arena ([`HostWeightsArena::as_slice`] is only called with no range being read), and the
+    /// device must not read it until the read has ended.
+    pub unsafe fn range(self: &Arc<Self>, offset: usize, len: usize) -> Option<ArenaRange> {
+        let end = offset.checked_add(len)?;
+        (len > 0 && end <= self.len).then(|| ArenaRange {
+            arena: Arc::clone(self),
+            offset,
+            len,
+        })
+    }
+}
+
+/// A region of a [`HostWeightsArena`] that `AsyncIo::read_into` fills: the file's bytes land in the arena, where
+/// kernels read them in place, with no staging copy in between. It keeps the arena alive.
+#[derive(Debug)]
+pub struct ArenaRange {
+    arena: Arc<HostWeightsArena>,
+    offset: usize,
+    len: usize,
+}
+
+impl ArenaRange {
+    /// The region's bytes. Only for a region no read is filling.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: the region lies inside the arena's live allocation (checked by `range`), and the caller reads it
+        // when no operation writes it.
+        unsafe { slice::from_raw_parts(self.arena.pointer.as_ptr().add(self.offset), self.len) }
+    }
+
+    /// Where the region starts in the arena.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+// SAFETY: the pointer addresses `len` bytes inside one live allocation (the arena, kept alive by the `Arc` the range
+// holds, whose memory stays where it is when the range moves), valid for reads and writes and zero-filled by the
+// allocator, so initialized. The region is exclusively the operation's: `HostWeightsArena::range` makes its caller
+// promise that no other range or reference overlaps it. The range touches the bytes only through this pointer, and
+// `len` never changes.
+unsafe impl IoMemory for ArenaRange {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        // SAFETY: `offset` lies inside the allocation.
+        unsafe { self.arena.pointer.as_ptr().add(self.offset) }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
 impl Drop for HostWeightsArena {
     #[allow(
         clippy::disallowed_methods,

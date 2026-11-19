@@ -30,7 +30,7 @@ use euhedral_inference_edrl::{
     WeightLayout, content_end,
 };
 use euhedral_inference_engine::formats::{LinearFormat, LinearMode, ScratchRegion};
-use euhedral_inference_engine::model::{TrellisParts, WeightRef};
+use euhedral_inference_engine::model::{Residence, TrellisParts, WeightRef};
 
 use crate::typed::Typed;
 
@@ -150,6 +150,7 @@ fn trellis_weight(
             layout: WeightLayout::TrellisTile16V1,
             ptr: buffers[0].ptr(),
             bytes: words_bytes as u64,
+            residence: Residence::Device,
             trellis: Some(TrellisParts {
                 suh: buffers[1].ptr(),
                 svh: buffers[2].ptr(),
@@ -291,6 +292,7 @@ impl Artifact {
             layout,
             ptr: buffer.ptr(),
             bytes: payload.len() as u64,
+            residence: Residence::Device,
             trellis: None,
         };
         (buffer, weight)

@@ -271,6 +271,10 @@ pub struct StartupReport {
     pub piece_bytes: u64,
     /// Objects on the device (the halves of a split projection counted for two).
     pub objects: usize,
+    /// Payload bytes of the objects held in pinned host memory (the host arena's contents).
+    pub host_backed_bytes: u64,
+    /// The objects among them that kernels read in place over the bus (the embedding and the output head).
+    pub mapped_objects: Vec<String>,
     /// Bytes this runtime allocated on the device: the weight arena, the workspace and the sequence state.
     pub allocated_bytes: u64,
     /// Bytes the memory planner admitted for the plan, per location: the device bytes of the weights, the cache, the
