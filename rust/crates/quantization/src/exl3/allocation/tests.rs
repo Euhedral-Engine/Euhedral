@@ -88,6 +88,7 @@ fn the_base_rate_is_the_largest_supported_rate_not_above_the_target() {
     assert_eq!(rates(&linears, 1, 12.0), [8.0]);
 }
 
+// A mutant that accepts a zero or NaN target loops or returns rates for nothing.
 #[test]
 fn a_target_that_is_not_positive_is_refused() {
     let linears = [linear("a", 0, 100, 1, "a")];
@@ -99,6 +100,7 @@ fn a_target_that_is_not_positive_is_refused() {
     }
 }
 
+// A mutant without the layer check underflows the distance to the far end.
 #[test]
 fn a_linear_beyond_the_stack_is_refused() {
     let linears = [linear("a", 4, 100, 1, "a")];

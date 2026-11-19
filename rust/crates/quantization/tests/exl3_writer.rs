@@ -183,6 +183,11 @@ fn a_full_write_holds_every_source_tensor_in_the_layout() {
         assert!(files.contains(copied), "{copied}");
     }
     assert!(!files.contains("old.bin"));
+    assert_eq!(
+        fs::read(f.out.join("empty.txt")).unwrap().len(),
+        0,
+        "an empty file is copied"
+    );
     assert!(
         !files.iter().any(|file| file.ends_with(".part")),
         "no partial file is left"
@@ -230,6 +235,10 @@ fn half_integer_rates_are_declared_and_stored() {
         &format!("{LAYER}{}.trellis", GDN[0]),
     );
     assert_eq!(shape, vec![8, 8, 40]);
+    let storage = writer.tensor_storage();
+    let module = &storage[format!("{LAYER}{}", GDN[0])];
+    assert_eq!(module["bits_per_weight"], 2.5, "a half-integer rate is a float");
+    assert_eq!(module["quant_format"], "exl3");
     assert_eq!(
         writer.quantization_config()["bits"],
         2.0,
@@ -288,7 +297,7 @@ fn mtp_needs_exactly_its_eight_linears() {
 // Mutants caught: an earlier layer file that is not adopted (finish then misses its tensors); one that is adopted
 // without checking its tensors.
 #[test]
-fn files_an_earlier_run_left_are_adopted_when_whole_and_refused_when_not() {
+fn files_an_earlier_run_left_are_adopted() {
     let f = fixture(CONFIG, 1.0);
     let first = write_layer_and_mtp(&f, writer(&f));
     drop(first);

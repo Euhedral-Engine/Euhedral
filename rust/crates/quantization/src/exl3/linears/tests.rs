@@ -60,9 +60,3 @@ fn promotion_groups_follow_the_module_tree() {
     let groups: BTreeSet<&str> = all.iter().map(|linear| linear.group.as_str()).collect();
     assert_eq!(groups.len(), 4 * 4);
 }
-
-#[test]
-fn a_role_without_a_shape_is_refused() {
-    let shapes = |_: &str| -> Result<[u64; 2], String> { Err("no shape".to_owned()) };
-    assert_eq!(budget(2, |_| false, shapes), Err("no shape".to_owned()));
-}

@@ -20,9 +20,7 @@ use euhedral_inference_quantization::checkpoint::CheckpointError;
 use euhedral_inference_quantization::checkpoint::objects::Qwen38Objects;
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
 use euhedral_inference_quantization::exl3::Quantized;
-use euhedral_inference_quantization::exl3::layout::half_bits;
 use euhedral_inference_quantization::exl3::{Done, Exl3Settings, Exl3Writer, Listing};
-use euhedral_inference_quantization::java_random::SplittableRandom;
 
 use crate::checkpoint_support::{Spec, World, bf16, safetensors, write};
 
@@ -65,22 +63,6 @@ pub fn open(world: &World, source: &Path, out: &Path, bits: f64, rows: u64, colu
     )
 }
 
-/// Random quantizer output for an `n x k` linear at `bits`, as the draws of a seeded generator.
-pub fn random(random: &mut SplittableRandom, n: u64, k: u64, bits: f64) -> Quantized {
-    let words = (k / 16 * (n / 16)) as usize * (bits * 16.0).round() as usize;
-    let trellis = (0..words)
-        .map(|_| random.next_int_bounded(1 << 16).unwrap() as i16)
-        .collect();
-    let mut scales = |count: u64| -> Vec<u16> {
-        (0..count)
-            .map(|_| half_bits((random.next_double() * 2.0 - 1.0) as f32))
-            .collect()
-    };
-    let suh = scales(k);
-    let svh = scales(n);
-    Quantized { trellis, suh, svh }
-}
-
 const LAYER: &str = "model.language_model.layers.0.";
 
 pub const GDN: [&str; 6] = [
@@ -118,6 +100,7 @@ pub fn miniature(directory: &Path, config: &str, lm_head_value: f32) {
     write(&directory.join("tokenizer.json"), b"{}");
     write(&directory.join("LICENSE"), b"x");
     write(&directory.join("old.bin"), b"x");
+    write(&directory.join("empty.txt"), b"");
     let mut shapes: Vec<(String, Vec<u64>)> = Vec::new();
     for name in GDN.iter().take(3) {
         shapes.push((format!("{LAYER}{name}.weight"), vec![128, 128]));

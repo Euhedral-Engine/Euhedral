@@ -60,7 +60,7 @@ fn bf16_to_half_converts_and_refuses_a_finite_value_beyond_the_range() {
 
 // The thresholds and the exponent form are where a different float printer disagrees.
 #[test]
-fn double_text_prints_as_java_does() {
+fn double_text_switches_to_the_exponent_form_outside_1e_3_to_1e7() {
     let cases = [
         (2.0, "2.0"),
         (2.5, "2.5"),

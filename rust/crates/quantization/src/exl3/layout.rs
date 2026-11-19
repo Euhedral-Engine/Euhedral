@@ -144,7 +144,7 @@ pub(super) fn quantized_names(linear: &str) -> [String; 4] {
     ["trellis", "suh", "svh", "mul1"].map(|part| format!("{linear}.{part}"))
 }
 
-/// The bits of the half-precision float nearest `value`, ties to even, as `Float.floatToFloat16` rounds. A NaN keeps
+/// The bits of the half-precision float nearest `value`, ties to even. A NaN keeps
 /// its sign and as many of its payload bits as fit.
 pub fn half_bits(value: f32) -> u16 {
     let raw = value.to_bits();
@@ -357,7 +357,7 @@ pub fn auxiliary_files<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<Stri
     chosen
 }
 
-/// `value` as `Double.toString` writes it: the shortest digits that read back as `value`, plain from `1e-3` up to
+/// `value` as the layout's JSON files write a float: the shortest digits that read back as `value`, plain from `1e-3` up to
 /// `1e7` and as `d.dddE<exponent>` outside, always with a digit after the point.
 pub fn double_text(value: f64) -> String {
     if value == 0.0 {
