@@ -692,8 +692,8 @@ pub(crate) const CAPACITY_CAP: u64 = u64::MAX / 4;
 
 /// The two memory spaces of a plan: pinned host memory first, so a refusal at the host is reported before one at the
 /// device. When both are short the result relies on `Planner::admit` reporting the lowest location index, which
-/// RustEE does not promise; the unit test `the_memory_planner_decides_as_the_hand_written_fit_did` (host and device
-/// both short in its sweep) guards it.
+/// RustEE does not promise; the unit test `a_refusal_reports_the_split_layout_only_when_the_host_holds_its_pages`
+/// (host and device both short) guards it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Location {
     Host,
@@ -1119,34 +1119,9 @@ mod tests {
         assert_eq!(nvfp4_native_scratch(&[], 512, 140), 0);
     }
 
-    /// The decision before the memory planner made it: device bytes against the budget, the spill when the host
-    /// holds it.
-    fn before(budgets: Budgets, whole: Layout, split: Option<Layout>) -> Result<(Layout, bool), Layout> {
-        let mut layout = whole;
-        let mut spills = false;
-        if layout.device_bytes() > budgets.device
-            && let Some(split) = split.filter(|split| split.cache_host <= budgets.host)
-        {
-            layout = split;
-            spills = true;
-        }
-        if layout.device_bytes() > budgets.device {
-            return Err(layout);
-        }
-        Ok((layout, spills))
-    }
-
-    fn same(a: &Result<(Layout, bool), Layout>, b: &Result<(Layout, bool), Layout>) -> bool {
-        let key = |l: &Layout| (l.weights, l.runtime_reserve, l.scratch, l.cache_device, l.cache_host);
-        match (a, b) {
-            (Ok((x, s)), Ok((y, t))) => key(x) == key(y) && s == t,
-            (Err(x), Err(y)) => key(x) == key(y),
-            _ => false,
-        }
-    }
-
-    #[test]
-    fn the_memory_planner_decides_as_the_hand_written_fit_did() {
+    /// A model of 1550 device bytes with the whole cache on the device, and the same with a part of the cache
+    /// (250 bytes of the device's 400) moved to 300 bytes of pinned host pages.
+    fn layouts() -> (Layout, Layout) {
         let whole = Layout {
             weights: 1000,
             runtime_reserve: 100,
@@ -1164,56 +1139,99 @@ mod tests {
             cache_host: 300,
             ..whole
         };
-        let hosts = [0, 299, 300, 301, 5000, u64::MAX];
-        let mut cases = 0;
-        for with_split in [None, Some(split)] {
-            for host in hosts {
-                for device in (0..=1700).step_by(1).chain([u64::MAX]) {
-                    let budgets = Budgets { device, host };
-                    let (new, old) = (decide(budgets, whole, with_split), before(budgets, whole, with_split));
-                    assert!(
-                        same(&new, &old),
-                        "device {device}, host {host}, split {}",
-                        with_split.is_some()
-                    );
-                    cases += 1;
-                }
+        (whole, split)
+    }
+
+    #[test]
+    fn the_whole_layout_is_chosen_whenever_the_device_holds_it() {
+        let (whole, split) = layouts();
+        assert_eq!(whole.device_bytes(), 1550);
+        assert_eq!(split.device_bytes(), 1300);
+        for host in [0, 300, u64::MAX] {
+            for with_split in [None, Some(split)] {
+                let budgets = Budgets { device: 1550, host };
+                let Ok((layout, spills)) = decide(budgets, whole, with_split) else {
+                    panic!("the device holds the whole layout at host {host}");
+                };
+                assert!(!spills && layout.cache_host == 0 && layout.cache_device == 400);
             }
         }
-        assert!(cases > 10_000);
+    }
+
+    #[test]
+    fn the_cache_spills_when_the_device_is_short_and_the_host_holds_the_pages() {
+        let (whole, split) = layouts();
+        for (device, host) in [(1549, 300), (1300, 300), (1300, u64::MAX), (u64::MAX - 1, u64::MAX)] {
+            let Ok((layout, spilled)) = decide(Budgets { device, host }, whole, Some(split)) else {
+                panic!("device {device}, host {host} holds the split layout");
+            };
+            let short = device < 1550;
+            assert_eq!(spilled, short, "device {device}, host {host}");
+            assert_eq!(layout.cache_host, if short { 300 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn a_refusal_reports_the_split_layout_only_when_the_host_holds_its_pages() {
+        let (whole, split) = layouts();
+        // The device is short of the split, the host holds its pages: the split's numbers are reported.
+        let Err(reported) = decide(
+            Budgets {
+                device: 1299,
+                host: 300,
+            },
+            whole,
+            Some(split),
+        ) else {
+            panic!("1299 device bytes cannot hold the split layout");
+        };
+        assert_eq!((reported.cache_device, reported.cache_host), (150, 300));
+        // The host is short of the pages by a byte: the whole layout's numbers are reported, whatever the device.
+        for device in [0, 1300, 1549] {
+            let Err(reported) = decide(Budgets { device, host: 299 }, whole, Some(split)) else {
+                panic!("299 host bytes cannot hold the pages");
+            };
+            assert_eq!(
+                (reported.cache_device, reported.cache_host),
+                (400, 0),
+                "device {device}"
+            );
+        }
+        // With no split the whole layout is refused one byte short of it.
+        let Err(reported) = decide(
+            Budgets {
+                device: 1549,
+                host: u64::MAX,
+            },
+            whole,
+            None,
+        ) else {
+            panic!("1549 device bytes cannot hold 1550");
+        };
+        assert_eq!(reported.cache_device, 400);
     }
 
     #[test]
     fn a_need_above_the_cap_is_judged_against_the_budget_itself() {
-        let whole = Layout {
-            weights: 1000,
-            runtime_reserve: u64::MAX / 4 + 1,
-            scratch: 50,
-            cache_device: 400,
-            cache_host: 0,
-            sequences: 1,
-            extra_sequence_bytes: 0,
-            staging_ring: 0,
-            host_weights: 0,
-            disk_window: 0,
-        };
-        for device in [u64::MAX, whole.device_bytes(), whole.device_bytes() - 1] {
-            let budgets = Budgets { device, host: u64::MAX };
+        let (mut whole, _) = layouts();
+        whole.runtime_reserve = u64::MAX / 4 + 1;
+        let need = whole.device_bytes();
+        for device in [u64::MAX, need] {
             assert!(
-                same(&decide(budgets, whole, None), &before(budgets, whole, None)),
+                decide(Budgets { device, host: u64::MAX }, whole, None).is_ok(),
                 "device {device}"
             );
         }
         assert!(
             decide(
                 Budgets {
-                    device: u64::MAX,
+                    device: need - 1,
                     host: u64::MAX
                 },
                 whole,
                 None
             )
-            .is_ok()
+            .is_err()
         );
     }
 
