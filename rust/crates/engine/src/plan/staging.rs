@@ -233,6 +233,9 @@ mod tests {
     use super::super::hazards::with_hazards;
     use super::*;
     use crate::model::{LayerIndex, LayerKind, ModelConfig, Residence, Role, object_key};
+    use crate::residency::disk::{DiskReader, ReadDone, ReadPort, ReadSpec};
+    use crate::residency::offload::WindowGeometry;
+    use euhedral_graph::Completions;
     use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
 
     const LAYERS: usize = 8;
@@ -566,5 +569,93 @@ mod tests {
             error.to_string(),
             "text/layers/0/mlp/down is held on disk and the plan was given no disk window"
         );
+    }
+
+    struct NoPort;
+
+    impl ReadPort for NoPort {
+        fn start(&self, _spec: ReadSpec, _done: ReadDone) -> std::io::Result<()> {
+            Err(std::io::Error::other("a plan test reads nothing"))
+        }
+        fn has_direct(&self) -> bool {
+            false
+        }
+        fn file_len(&self) -> u64 {
+            u64::MAX
+        }
+    }
+
+    /// A tier of `slots` window slots of `slot_bytes` that registers and reads nothing.
+    fn tier(slots: usize, slot_bytes: u64) -> Arc<DiskTier> {
+        let geometry = WindowGeometry { slots, slot_bytes };
+        let reader = DiskReader::new(Arc::new(NoPort), geometry, Box::new(|_| false));
+        DiskTier::detached(reader, geometry, Completions::without_lanes())
+    }
+
+    fn disk_nodes(tier: &Arc<DiskTier>, ring_slots: usize) -> Result<Vec<Node>, PlanBuildError> {
+        staged(&base_of(&[], &["/mlp/down"]), None, &ring(ring_slots), Some(tier)).map(Option::unwrap)
+    }
+
+    #[test]
+    fn disk_uses_transfer_through_the_window_in_plan_order() {
+        let (slots, window) = (3, 6);
+        let tier = tier(window, 4096);
+        let nodes = disk_nodes(&tier, slots).unwrap();
+        let mut seen = vec![0usize; slots];
+        let mut count = 0;
+        for node in &nodes {
+            let Make::DiskTransfer {
+                use_,
+                use_index,
+                slot,
+                destination,
+                ..
+            } = &node.make
+            else {
+                continue;
+            };
+            assert_eq!(*use_index, count, "the uses are numbered in plan order");
+            assert_eq!(*slot, count % slots);
+            assert_eq!(*destination, ring(slots).slot(*slot));
+            // The k-th use of a staging slot reads the window slot s + S * (k mod W/S).
+            let expected = *slot + slots * (seen[*slot] % (window / slots));
+            assert_eq!(use_.slot, expected, "use {count}");
+            assert_eq!(use_.bytes, BYTES);
+            seen[*slot] += 1;
+            count += 1;
+        }
+        assert_eq!(count, LAYERS, "a disk use for each FFN down");
+        assert!(seen.iter().any(|&uses| uses > window / slots), "the rotation wraps");
+    }
+
+    #[test]
+    fn a_disk_backed_plan_needs_a_window() {
+        let error = staged(&base_of(&[], &["/mlp/down"]), None, &ring(3), None).unwrap_err();
+        assert!(matches!(error, PlanBuildError::NoDiskWindow { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_window_that_is_not_a_whole_multiple_of_the_ring_is_refused() {
+        for window in [2, 4, 7] {
+            let error = disk_nodes(&tier(window, 4096), 3).unwrap_err();
+            assert!(
+                matches!(error, PlanBuildError::WindowSlots { window: w, staging: 3 } if w == window),
+                "{window}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_larger_than_a_window_slot_is_refused() {
+        let error = disk_nodes(&tier(6, 2048), 3).unwrap_err();
+        assert!(matches!(error, PlanBuildError::ReadTooLarge { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_disk_object_larger_than_a_ring_slot_is_refused() {
+        let mut tight = ring(3);
+        tight.slot_bytes = BYTES - 1;
+        let error = staged(&base_of(&[], &["/mlp/down"]), None, &tight, Some(&tier(6, 4096))).unwrap_err();
+        assert!(matches!(error, PlanBuildError::WeightTooLarge { .. }), "{error}");
     }
 }

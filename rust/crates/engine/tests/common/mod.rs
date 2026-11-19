@@ -313,3 +313,52 @@ pub fn staged_through_a_ring(runtime: &EngineRuntime, limit: u64) -> bool {
     assert!(report.staging_bytes > 0, "the startup report shows the ring: {ring:?}");
     true
 }
+
+/// The `memory.host-weights-limit` that, with `memory.gpu-limit` at `gpu_limit`, leaves `on_disk` bytes of the host
+/// arena without room: the plan must read the objects that no longer fit from the artifact file. Made from the header
+/// and the table, as [`limit_below_need`] is, with no limit on the host's pinned memory.
+pub fn limit_to_disk(library: &Path, settings: &Settings, gpu_limit: u64, on_disk: u64) -> u64 {
+    let loaded = CudaLibrary::load(library).unwrap();
+    let mut forced = settings.clone();
+    limit_gpu(&mut forced, gpu_limit);
+    let inputs = PlanInputs {
+        device_free: 64 << 30,
+        multiprocessors: Some(loaded.device().sm_count),
+        host_pinned_bytes: Some(u64::MAX),
+        sequences: settings.batching.max_sequences as usize,
+    };
+    let (config, table) = open_artifact(&settings.model.artifact);
+    let staged = plan_with(&config, &table, &forced, inputs).unwrap();
+    assert!(staged.offload.disk.is_empty(), "the host holds what the device does not");
+    staged
+        .offload
+        .host_arena_bytes
+        .checked_sub(on_disk)
+        .expect("the host arena is larger than the bytes to leave in the file")
+}
+
+/// Sets `memory.host-weights-limit` to `limit`.
+pub fn limit_host_weights(settings: &mut Settings, limit: u64) {
+    settings.memory.host_weights_limit = Auto::Value(ByteSize(limit));
+}
+
+/// Asserts the plan of a started engine reads objects from the artifact file through the window, as a test forced:
+/// the device budget is `gpu_limit`, objects are left on disk, and the report shows their bytes and the window.
+#[allow(clippy::print_stdout, reason = "a test says why it skipped")]
+pub fn read_through_the_window(runtime: &EngineRuntime, gpu_limit: u64) -> bool {
+    let plan = runtime.plan();
+    if plan.budget_bytes != gpu_limit {
+        println!(
+            "skipped: the plan's budget is {} bytes, not the forced limit {gpu_limit}",
+            plan.budget_bytes
+        );
+        return false;
+    }
+    assert!(!plan.offload.disk.is_empty(), "the plan leaves objects in the file");
+    assert!(plan.offload.window.is_some(), "the plan has a disk window");
+    assert!(plan.offload.staging.is_some(), "the plan stages through a ring");
+    let report = runtime.report();
+    assert!(report.disk_backed_bytes > 0);
+    assert!(report.window_bytes > 0);
+    true
+}

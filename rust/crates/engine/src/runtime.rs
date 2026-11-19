@@ -334,6 +334,8 @@ pub struct Teardown {
     /// The disk reader, until the close takes it: reads are stopped first, while the lattice still runs the frames that
     /// end them.
     disk: Handoff<DiskReader>,
+    /// The reader did not end its reads in time: nothing it reads into may be freed.
+    disk_stuck: AtomicBool,
 }
 
 impl Teardown {
@@ -355,7 +357,13 @@ impl Teardown {
             leaked_bytes: AtomicU64::new(NOT_CHECKED),
             cancel_bound,
             disk: Handoff::empty(),
+            disk_stuck: AtomicBool::new(false),
         })
+    }
+
+    /// Whether a read of the disk window was still in flight when the close gave up on it.
+    pub(crate) fn disk_stuck(&self) -> bool {
+        self.disk_stuck.load(Ordering::Acquire)
     }
 
     /// The engine reads from disk: `close` stops `reader` before the lattice stops.
@@ -380,6 +388,7 @@ impl Teardown {
         if let Some(reader) = self.disk.take()
             && reader.close().wait(self.cancel_bound).is_err()
         {
+            self.disk_stuck.store(true, Ordering::Release);
             log::error!("the disk reader did not end its reads within {:?}", self.cancel_bound);
         }
         for lake in &self.lakes {
@@ -430,9 +439,11 @@ impl RuntimeOwner {
             .as_ref()
             .map_or(OPERATION_BOUND, |teardown| teardown.cancel_bound);
         // The running request ends on the lattice's workers, so before the lattice closes.
-        let stopped = runtime.generations.stop(bound);
+        let mut stopped = runtime.generations.stop(bound);
         if let Some(teardown) = &teardown {
             teardown.close();
+            // A read that did not end would write into the window after it is freed.
+            stopped &= !teardown.disk_stuck();
         }
         if !stopped {
             // A quantum may still be in flight: nothing it uses is freed. The runtime is forgotten, not dropped, because
@@ -538,6 +549,9 @@ impl RuntimeOwner {
                 stopped.set(runtime.generations.stop(bound));
                 if let Some(teardown) = teardown {
                     teardown.close();
+                    if teardown.disk_stuck() {
+                        stopped.set(false);
+                    }
                 }
             },
             |(runtime, teardown)| {

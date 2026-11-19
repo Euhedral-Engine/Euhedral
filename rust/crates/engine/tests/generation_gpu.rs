@@ -619,7 +619,7 @@ fn repository_root() -> PathBuf {
 #[ignore = "needs a GPU, the native library, the RCO artifact, the Java references and python3 with numpy"]
 fn teacher_forced_logits_bitwise_equal_java_report() {
     let Some(machine) = machine() else { return };
-    teacher_forced_against_java(&machine, None, 4096, false);
+    teacher_forced_against_java(&machine, None, None, 4096, false);
 }
 
 /// The same run with the device 256 MiB short of the resident need, so the plan reads the embedding in place from pinned
@@ -629,7 +629,7 @@ fn teacher_forced_logits_bitwise_equal_java_report() {
 fn teacher_forced_logits_bitwise_equal_java_report_with_a_mapped_embedding() {
     let Some(machine) = machine() else { return };
     let limit = common::limit_below_need(&machine.library, &settings(&machine.artifact, 4096), 256 << 20);
-    teacher_forced_against_java(&machine, Some(limit), 4096, false);
+    teacher_forced_against_java(&machine, Some(limit), None, 4096, false);
 }
 
 /// Bytes the device is short of the resident need in the staged runs: projections leave the device through a ring.
@@ -643,11 +643,17 @@ const STAGED_SHORT: u64 = 1 << 30;
 fn teacher_forced_logits_bitwise_equal_java_report_when_staged() {
     let Some(machine) = machine() else { return };
     let limit = common::limit_to_stage(&machine.library, &settings(&machine.artifact, 2048), STAGED_SHORT);
-    teacher_forced_against_java(&machine, Some(limit), 2048, true);
+    teacher_forced_against_java(&machine, Some(limit), None, 2048, true);
 }
 /// Runs the teacher-forced comparison against the Java report, under `gpu_limit` when it is given. A forced run that
 /// does not get the plan it means (the card has less free than the limit) stops with a message.
-fn teacher_forced_against_java(machine: &Machine, gpu_limit: Option<u64>, max_tokens: u32, staged: bool) {
+fn teacher_forced_against_java(
+    machine: &Machine,
+    gpu_limit: Option<u64>,
+    host_limit: Option<u64>,
+    max_tokens: u32,
+    staged: bool,
+) {
     let java = machine.goldens.join("teacher-forced-rco.bin");
     let java_bytes = fs::read(&java).unwrap();
     let steps = i32::from_le_bytes(java_bytes[0..4].try_into().unwrap()) as usize;
@@ -676,6 +682,9 @@ fn teacher_forced_against_java(machine: &Machine, gpu_limit: Option<u64>, max_to
     if let Some(limit) = gpu_limit {
         common::limit_gpu(&mut engine, limit);
     }
+    if let Some(limit) = host_limit {
+        common::limit_host_weights(&mut engine, limit);
+    }
     let (owner, ready) = EngineRuntime::start(&engine, &machine.library);
     let runtime = ready
         .wait(WAIT)
@@ -683,7 +692,12 @@ fn teacher_forced_against_java(machine: &Machine, gpu_limit: Option<u64>, max_to
         .expect("the engine starts");
     let (owner, runtime) = (Closer::new(owner, &runtime), runtime);
     if let Some(limit) = gpu_limit {
-        if staged {
+        if host_limit.is_some() {
+            if !common::read_through_the_window(&runtime, limit) {
+                owner.shutdown(runtime).unwrap();
+                return;
+            }
+        } else if staged {
             if !common::staged_through_a_ring(&runtime, limit) {
                 owner.shutdown(runtime).unwrap();
                 return;
@@ -1393,30 +1407,217 @@ fn concurrent_sequences_match_alone() {
     owner.shutdown(runtime).expect("four sequences shut down clean");
 }
 
+/// The bytes of the host arena a disk-tier test leaves in the artifact file: about 0.6 GiB.
+const ON_DISK: u64 = 600 << 20;
+
+/// The machine of a disk-tier test: the artifact is read from the file the tier reads, which the environment may point
+/// at a copy on a local disk (`EUHEDRAL_DISK_TIER_ARTIFACT`), else from the shared artifact.
+fn disk_machine(library: PathBuf, goldens: PathBuf) -> Machine {
+    let artifact = env::var_os("EUHEDRAL_DISK_TIER_ARTIFACT")
+        .map(PathBuf::from)
+        .or_else(|| test_support::require_property("euhedral.qwen.rco-artifact").map(PathBuf::from))
+        .expect("the artifact");
+    assert!(artifact.is_file(), "the disk tier's artifact is no file");
+    Machine {
+        artifact,
+        library,
+        goldens,
+    }
+}
+
+/// The settings that leave about [`ON_DISK`] bytes in the file, and the plan they force.
+fn disk_settings(machine: &Machine, sequences: u32) -> (Settings, u64) {
+    let mut engine = settings(&machine.artifact, 4096);
+    engine.batching.max_sequences = sequences;
+    let limit = common::limit_to_stage(&machine.library, &engine, STAGED_SHORT);
+    common::limit_gpu(&mut engine, limit);
+    let host = common::limit_to_disk(&machine.library, &engine, limit, ON_DISK);
+    common::limit_host_weights(&mut engine, host);
+    (engine, limit)
+}
+
+/// Starts the engine under [`disk_settings`]; `None` when the card is not the one the limit was made for.
+fn start_on_disk(machine: &Machine, sequences: u32) -> Option<(Closer, Arc<EngineRuntime>)> {
+    let (engine, limit) = disk_settings(machine, sequences);
+    let (owner, ready) = EngineRuntime::start(&engine, &machine.library);
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    let closer = Closer::new(owner, &runtime);
+    if !common::read_through_the_window(&runtime, limit) {
+        closer.shutdown(runtime).unwrap();
+        return None;
+    }
+    Some((closer, runtime))
+}
+
+/// The logits of 192 teacher-forced steps with part of the weights read from the artifact file through the window
+/// are the report's, bit for bit: what is read from disk is what the host would have held.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact, its copy on a local disk, the references and python3 with numpy"]
+fn disk_backed_weights_compute_what_host_backed_ones_do() {
+    let Some(machine) = machine() else { return };
+    let machine = disk_machine(machine.library, machine.goldens);
+    let mut engine = settings(&machine.artifact, 2048);
+    let limit = common::limit_to_stage(&machine.library, &engine, STAGED_SHORT);
+    common::limit_gpu(&mut engine, limit);
+    let host = common::limit_to_disk(&machine.library, &engine, limit, ON_DISK);
+    teacher_forced_against_java(&machine, Some(limit), Some(host), 2048, true);
+}
+
+/// The engine closes with a request still reading: the shutdown ends within its bound, frees nothing under a read, and
+/// leaves no handle to the runtime.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and its copy on a local disk"]
+fn closing_with_reads_in_flight_frees_after_them_only() {
+    let Some(machine) = machine() else { return };
+    let machine = disk_machine(machine.library, machine.goldens);
+    let reference = greedy_reference(&machine);
+    let Some((owner, runtime)) = start_on_disk(&machine, 1) else {
+        return;
+    };
+    let done = submit(
+        &runtime,
+        &reference.prompt,
+        512,
+        &[],
+        Speculation::Off,
+        SamplingConfig::greedy(0),
+        None,
+    )
+    .expect("the request is admitted");
+    // Reads are in flight while the request decodes: close without waiting for it.
+    std::thread::sleep(Duration::from_millis(1500));
+    owner
+        .shutdown_within(runtime, Duration::from_secs(120))
+        .expect("the engine closes within its bound");
+    drop(done);
+}
+
+/// Two loads in a row, each generating the tokens of the reference within its bound, and each closing with no memory
+/// left allocated: the window and the reader of one load are gone before the next begins.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and its copy on a local disk"]
+fn every_load_generates_within_its_bound() {
+    let Some(machine) = machine() else { return };
+    let machine = disk_machine(machine.library, machine.goldens);
+    let reference = greedy_reference(&machine);
+    for cycle in 0..2 {
+        let began = Instant::now();
+        let Some((owner, runtime)) = start_on_disk(&machine, 1) else {
+            return;
+        };
+        let recording = generate(&runtime, &reference.prompt, 128, &[]);
+        assert_eq!(recording.outcome.reason, FinishReason::Length, "cycle {cycle}");
+        assert_eq!(recording.tokens, reference.generated, "cycle {cycle}");
+        owner
+            .shutdown_within(runtime, Duration::from_secs(120))
+            .expect("the engine closes within its bound");
+        assert!(
+            began.elapsed() < Duration::from_secs(20 * 60),
+            "cycle {cycle} took {:?}",
+            began.elapsed()
+        );
+    }
+}
+
+/// A request cancelled while the reader has reads for its quanta ends, and the next request on the same engine
+/// generates the reference tokens: the cancelled quanta gave their slots back.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and its copy on a local disk"]
+fn cancel_during_a_disk_read_ends_cleanly() {
+    let Some(machine) = machine() else { return };
+    let machine = disk_machine(machine.library, machine.goldens);
+    let reference = greedy_reference(&machine);
+    let Some((owner, runtime)) = start_on_disk(&machine, 1) else {
+        return;
+    };
+    for after in [1, 5] {
+        let cancelled = submit(
+            &runtime,
+            &reference.prompt,
+            512,
+            &[],
+            Speculation::Off,
+            SamplingConfig::greedy(0),
+            Some(after),
+        )
+        .expect("the request is admitted")
+        .wait(Duration::from_secs(5 * 60))
+        .expect("the cancelled request reports");
+        assert_eq!(cancelled.outcome.reason, FinishReason::Cancelled, "after {after} tokens");
+        assert!(cancelled.tokens.len() < 512);
+        let again = submit(
+            &runtime,
+            &reference.prompt,
+            128,
+            &[],
+            Speculation::Off,
+            SamplingConfig::greedy(0),
+            None,
+        )
+        .expect("the next request is admitted")
+        .wait(Duration::from_secs(5 * 60))
+        .expect("the next request reports: the cancelled one left no slot held");
+        assert_eq!(again.tokens, reference.generated, "after a cancel at {after} tokens");
+    }
+    owner
+        .shutdown_within(runtime, Duration::from_secs(120))
+        .expect("the engine closes within its bound");
+}
+
 /// Two sequences with their draft layer on, projections staged through the one ring: each request's tokens are what
 /// they are alone. The waits are bounded.
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn concurrent_sequences_match_alone_when_staged() {
     let Some(machine) = machine() else { return };
+    concurrent_through(&machine, 2, false);
+}
+
+/// Sequences started together on the disk tier, with their draft layer on, each request's tokens are what they are
+/// alone: the reads of the quanta of several sequences are registered in the order the quanta start, and one slot of
+/// the window is never the copy of two quanta at once.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and its copy on a local disk"]
+fn sessions_started_together_on_the_disk_tier_match_running_alone() {
+    let Some(machine) = machine() else { return };
+    for count in [2, 4] {
+        concurrent_through(&disk_machine(machine.library.clone(), machine.goldens.clone()), count, true);
+    }
+}
+
+/// `count` sequences generate alone and then together (the draft layer on when the artifact has one) under a forced
+/// plan: staged through the ring, or, with `disk`, with part of the weights left in the artifact file.
+fn concurrent_through(machine: &Machine, count: usize, disk: bool) {
     let tokenizer = tokenizer(&machine.artifact);
     let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
         .iter()
-        .take(2)
+        .take(count)
         .map(|text| tokenizer.encode_with_model_special_tokens(text).unwrap())
         .collect();
     let mut engine = settings(&machine.artifact, 2048);
-    engine.batching.max_sequences = 2;
+    engine.batching.max_sequences = count as u32;
     let limit = common::limit_to_stage(&machine.library, &engine, STAGED_SHORT);
     common::limit_gpu(&mut engine, limit);
+    if disk {
+        let host = common::limit_to_disk(&machine.library, &engine, limit, ON_DISK);
+        common::limit_host_weights(&mut engine, host);
+    }
     let (owner, ready) = EngineRuntime::start(&engine, &machine.library);
     let runtime = ready
         .wait(WAIT)
         .expect("the engine reports")
         .expect("the engine starts");
     let (owner, runtime) = (Closer::new(owner, &runtime), runtime);
-    assert_eq!(runtime.sequences(), 2, "the engine holds two sequences");
-    if !common::staged_through_a_ring(&runtime, limit) {
+    assert_eq!(runtime.sequences(), count, "the engine holds {count} sequences");
+    let forced = if disk {
+        common::read_through_the_window(&runtime, limit)
+    } else {
+        common::staged_through_a_ring(&runtime, limit)
+    };
+    if !forced {
         owner.shutdown(runtime).unwrap();
         return;
     }

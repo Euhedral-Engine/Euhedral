@@ -419,11 +419,128 @@ impl Stage<Quantum> for DiskTransfer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::residency::disk::ReadPort;
+    use crate::residency::offload::WindowGeometry;
 
     #[test]
     fn a_transfer_reports_what_it_copies() {
         let transfer = WeightTransfer::new("w".into(), None, 4096, 100, DevicePtr::NULL);
         assert_eq!(transfer.bytes(), 100);
         assert_eq!(transfer.destination(), DevicePtr::NULL);
+    }
+
+    /// What a ledger told the reader, in order.
+    #[derive(Default)]
+    struct Told(std::sync::Mutex<Vec<String>>);
+
+    impl Release for Told {
+        fn slot_freed(&self, slot: usize, ticket: u64) {
+            self.0.lock().unwrap().push(format!("free {slot} for {ticket}"));
+        }
+
+        fn abandon(&self, ticket: u64) {
+            self.0.lock().unwrap().push(format!("abandon {ticket}"));
+        }
+    }
+
+    impl Told {
+        fn told(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn a_copy_that_ended_hands_its_slot_back_once() {
+        let (ledger, told) = (DiskLedger::new(7, vec![2].into()), Told::default());
+        ledger.attempt(0);
+        ledger.submitted(0);
+        ledger.freed(0, &told);
+        ledger.freed(0, &told);
+        assert_eq!(told.told(), ["free 2 for 7"]);
+    }
+
+    #[test]
+    fn the_end_abandons_once_and_frees_only_the_slots_it_asked_for() {
+        let (ledger, told) = (DiskLedger::new(3, vec![0, 1, 2].into()), Told::default());
+        ledger.attempt(0);
+        ledger.submitted(0);
+        ledger.attempt(1);
+        // The third use never reached its gate: the reader has not handed it a slot.
+        ledger.end(&told);
+        ledger.end(&told);
+        assert_eq!(told.told(), ["abandon 3", "free 1 for 3"]);
+        ledger.freed(0, &told);
+        assert_eq!(told.told(), ["abandon 3", "free 1 for 3", "free 0 for 3"]);
+    }
+
+    #[test]
+    fn a_slot_never_copied_is_freed_behind_the_copy_that_still_holds_it() {
+        // Two uses of one window slot: the second asked for it and never copied, the first is still being copied.
+        let (ledger, told) = (DiskLedger::new(5, vec![4, 4].into()), Told::default());
+        ledger.attempt(0);
+        ledger.submitted(0);
+        ledger.attempt(1);
+        ledger.end(&told);
+        assert_eq!(told.told(), ["abandon 5"], "nothing frees the slot under the copy");
+        ledger.freed(0, &told);
+        assert_eq!(told.told(), ["abandon 5", "free 4 for 5", "free 4 for 5"]);
+    }
+
+    #[test]
+    fn a_failed_read_is_kept_for_the_copy_that_would_have_used_it() {
+        let ledger = DiskLedger::new(1, vec![0].into());
+        assert_eq!(ledger.failure(), None);
+        ledger.fail("short read".to_string());
+        ledger.fail("second".to_string());
+        assert_eq!(ledger.failure(), Some("short read"));
+    }
+
+    /// A port that records the reads it is asked for and ends none.
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<u64>>);
+
+    impl ReadPort for Arc<Recording> {
+        fn start(&self, spec: crate::residency::disk::ReadSpec, _done: crate::residency::disk::ReadDone) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(spec.offset);
+            Ok(())
+        }
+        fn has_direct(&self) -> bool {
+            false
+        }
+        fn file_len(&self) -> u64 {
+            u64::MAX
+        }
+    }
+
+    fn use_at(slot: usize, file_offset: u64) -> DiskUse {
+        DiskUse {
+            name: format!("w@{file_offset}"),
+            file_offset,
+            bytes: 100,
+            slot,
+        }
+    }
+
+    #[test]
+    fn quanta_register_their_reads_in_the_order_they_start() {
+        let geometry = WindowGeometry {
+            slots: 2,
+            slot_bytes: 4096,
+        };
+        let kill = Arc::new(AtomicBool::new(false));
+        for (first, second) in [(0x1000, 0x2000), (0x2000, 0x1000)] {
+            let port = Arc::new(Recording::default());
+            let reader = DiskReader::new(Arc::new(Arc::clone(&port)), geometry, Box::new(|work| {
+                work();
+                true
+            }));
+            let tier = DiskTier::detached(reader, geometry, Completions::without_lanes());
+            // Two quanta of different sequences read the same window slot: the one that started first is read first,
+            // and the other waits behind its copy.
+            let a = tier.register(&[use_at(0, first)], &kill).unwrap();
+            let b = tier.register(&[use_at(0, second)], &kill).unwrap();
+            assert_eq!((a.ticket(), b.ticket()), (0, 1), "tickets follow the order of registration");
+            assert_eq!(*port.0.lock().unwrap(), [first], "the second quantum's read waits for the slot");
+        }
     }
 }
