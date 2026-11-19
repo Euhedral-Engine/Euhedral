@@ -28,9 +28,6 @@ use euhedral_inference_quantization::resume::{HEADER, Header, ResumeError, Resum
 use euhedral_inference_settings::{ModelSettings, Settings};
 use euhedral_io::AsyncIo;
 
-/// The longest a test waits for a call that must finish.
-const LONGEST: Duration = Duration::from_secs(60);
-
 /// The wait for a call whose hang is the likely failure: long enough for a loaded machine, short enough to fail fast.
 const HANG: Duration = Duration::from_secs(10);
 
