@@ -104,6 +104,14 @@ and `SplittableRandom` drawn exactly as Java draws them (`java_random`), and the
 dispatches the commands of the Java tool. A command whose work is not wired yet exits with code 3; `train-blocks`,
 `train-model` and `rotate` are not part of this tool.
 
+## cuBLAS and cuSOLVER
+
+`crates/cuda/src/math.rs` loads NVIDIA's cuBLAS, cuSOLVER, cuSPARSE and nvJitLink libraries from a directory the caller
+names (`MathLibraries::load`), and gives each lane one `LaneHandles` whose calls (BF16 and FP32 GEMM, the Cholesky
+factor, inverse and solve) enqueue on the stream the lane lends. Nothing waits; the `info` word of a factorisation is
+read after the queue retires the work. The device tests (`math_gpu`) take the directory from
+`euhedral.quantization.cuda-libraries` (`EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES`) and skip without it.
+
 ## Benchmark
 
 `euhedral-bench` (crate `euhedral-inference-bench`) measures the Rust engine with the Java benchmark's configuration
