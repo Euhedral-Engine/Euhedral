@@ -194,6 +194,20 @@ fn run_sampling(
     cancel: &CancelHandle,
     sampling: SamplingConfig,
 ) -> Recording {
+    begin(runtime, prompt, speculation, trigger, cancel, sampling)
+        .wait(WAIT)
+        .expect("the generation reports")
+}
+
+/// Starts a generation whose listener cancels `cancel` at `trigger`, and returns the hand-off its recording arrives on.
+fn begin(
+    runtime: &EngineRuntime,
+    prompt: &[u32],
+    speculation: Speculation,
+    trigger: Trigger,
+    cancel: &CancelHandle,
+    sampling: SamplingConfig,
+) -> Arc<Handoff<Recording>> {
     let done = Handoff::new();
     runtime
         .generate_cancellable(
@@ -218,7 +232,7 @@ fn run_sampling(
             cancel.clone(),
         )
         .expect("the request is admitted");
-    done.wait(WAIT).expect("the generation reports")
+    done
 }
 
 /// A generation with a handle of its own that nobody cancels but `trigger`.
@@ -485,5 +499,91 @@ fn closing_the_engine_mid_decode_cancels_the_generation_and_frees_the_sequence()
     let (owner, runtime) = start(&machine);
     let again = run_with(&runtime, &prompt(40), Speculation::Off, Trigger::Never);
     assert_eq!(again.outcome.reason, FinishReason::Length);
+    owner.shutdown(runtime).unwrap();
+}
+
+/// Two sequences with projections staged through the one ring: a cancel of one ends it with a prefix of what it gives
+/// alone and leaves the other's tokens as they are alone; both run on after it. The waits are bounded.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn cancel_one_of_two_staged_sequences() {
+    let Some(machine) = machine() else { return };
+    let mut settings = Settings::with_model(ModelSettings {
+        artifact: machine.artifact.clone(),
+        name: "test".to_string(),
+    });
+    settings.context.max_tokens = 2048;
+    settings.kernels.graphs.captures_per_view = 8;
+    settings.batching.max_sequences = 2;
+    settings.prefix_cache.size = ByteSize(0);
+    let limit = common::limit_to_stage(&machine.library, &settings, 1 << 30);
+    common::limit_gpu(&mut settings, limit);
+    let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    let (owner, runtime) = (Closer::new(owner, &runtime), runtime);
+    assert_eq!(runtime.sequences(), 2, "the engine holds two sequences");
+    if !common::staged_through_a_ring(&runtime, limit) {
+        owner.shutdown(runtime).unwrap();
+        return;
+    }
+    let bound = Duration::from_secs(10 * 60);
+    let greedy = SamplingConfig::greedy(0);
+    let (first, second) = (prompt(40), prompt(56));
+    let alone = |prompt: &[u32]| {
+        begin(
+            &runtime,
+            prompt,
+            Speculation::Off,
+            Trigger::Never,
+            &CancelHandle::default(),
+            greedy,
+        )
+        .wait(bound)
+        .expect("the generation reports")
+    };
+    let (first_alone, second_alone) = (alone(&first), alone(&second));
+    assert_eq!(first_alone.tokens.len(), TOKENS as usize);
+    assert_eq!(second_alone.tokens.len(), TOKENS as usize);
+
+    for round in 0..2 {
+        let victim = CancelHandle::default();
+        let survivor = CancelHandle::default();
+        let cut = begin(&runtime, &first, Speculation::Off, Trigger::Token(8), &victim, greedy);
+        let kept = begin(&runtime, &second, Speculation::Off, Trigger::Never, &survivor, greedy);
+        let cut = cut.wait(bound).expect("the cancelled generation reports");
+        let kept = kept.wait(bound).expect("the other generation reports");
+        assert_cancelled(&cut, &first_alone.tokens, first.len());
+        assert!(cut.tokens.len() >= 8, "round {round}");
+        assert_eq!(kept.outcome.reason, FinishReason::Length, "round {round}");
+        assert_eq!(
+            kept.tokens, second_alone.tokens,
+            "round {round}: the other sequence's tokens are what they are alone"
+        );
+    }
+
+    // Both sequences are whole after the cancels.
+    let (a, b) = (
+        begin(
+            &runtime,
+            &first,
+            Speculation::Off,
+            Trigger::Never,
+            &CancelHandle::default(),
+            greedy,
+        ),
+        begin(
+            &runtime,
+            &second,
+            Speculation::Off,
+            Trigger::Never,
+            &CancelHandle::default(),
+            greedy,
+        ),
+    );
+    assert_eq!(a.wait(bound).expect("reports").tokens, first_alone.tokens);
+    assert_eq!(b.wait(bound).expect("reports").tokens, second_alone.tokens);
     owner.shutdown(runtime).unwrap();
 }

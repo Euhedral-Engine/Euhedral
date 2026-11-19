@@ -107,6 +107,7 @@ pub enum OpenError {
 pub struct Hit {
     matched: Option<Match>,
     position: u32,
+    paired: Option<u32>,
     leaf: NodeId,
     address: Arc<Address<PrefixCache>>,
 }
@@ -115,6 +116,12 @@ impl Hit {
     /// The tokens the hit restores: the prompt resumes from here.
     pub fn position(&self) -> u32 {
         self.position
+    }
+
+    /// The token the deepest node's last draft row was paired with: the stored prompt's token at the hit's position.
+    /// A prompt with the same token there restores the row whole.
+    pub fn paired(&self) -> Option<u32> {
+        self.paired
     }
 
     /// The deepest matched node: the parent of the next capture.
@@ -323,11 +330,13 @@ impl PrefixCache {
         let matched = self.tree.lookup(prompt, kind)?;
         let leaf = matched.leaf();
         let position = self.tree.get(leaf).map_or(0, |node| node.position());
+        let paired = self.tree.get(leaf).and_then(|node| node.paired());
         count(&self.shared.hits, 1);
         count(&self.shared.restored_tokens, u64::from(position));
         Some(Hit {
             matched: Some(matched),
             position,
+            paired,
             leaf,
             address: Arc::clone(&self.address),
         })
@@ -717,7 +726,8 @@ impl PrefixCacheHandle {
     ///
     /// 1. Its KV pages for `position` (`hit.position()`) must be reserved already: `refs.rows() >= position`, checked
     ///    here as the precondition of a capture is ([`RestoreError::Unreserved`]). With a speculation `kind` the pages
-    ///    of the draft cache below the last row of `position` must be reserved too, and the draft seed row is written.
+    ///    of the draft cache below the last row of `position` (and that row's too, when the prompt has the token the checkpoint
+    ///    paired it with, see [`Hit::paired`]) must be reserved too, and the draft seed row is written.
     /// 2. `submit` arrives once, from a worker, when the job is built: the owner admits it behind the sequence's last
     ///    device work with `on_workspace` false and **`more` set** (the first chunk follows it), and counts it in
     ///    flight until it ends. A refused restore never calls `submit`; it answers.

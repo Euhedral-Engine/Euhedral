@@ -8,6 +8,8 @@
 
 use std::fmt;
 use std::hash::Hash;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::OnceLock;
 
 use euhedral_gpu::{Enqueue, Gpu, GpuError, GraphBody, GraphHold, Lane, Ran, SharedGraphCache, Stream};
 use euhedral_graph::{Marker, StageError};
@@ -82,4 +84,31 @@ where
         GpuError::Busy => StageError::Retry,
         other => body.refused.take().unwrap_or_else(|| fatal(other)),
     })
+}
+
+/// As [`run_cached`], with the hold made here and put in `store` before the result (or a panic of the body) goes on:
+/// the hold is the quantum's, dropped after it retired, never at an unwind. A run that did not start (a retry) keeps
+/// nothing and stores nothing; one that failed or panicked may have queued work that reads what it kept, so its hold
+/// is stored.
+pub fn run_held<G, K, T>(
+    site: &Site<'_, G>,
+    cache: &SharedGraphCache<G, K>,
+    key: K,
+    launches: &mut T,
+    store: &OnceLock<GraphHold>,
+) -> Result<(Ran, Marker), StageError>
+where
+    G: Gpu,
+    K: Copy + Eq + Hash + Send,
+    T: Launches<G>,
+{
+    let mut hold = GraphHold::new();
+    let made = catch_unwind(AssertUnwindSafe(|| run_cached(site, cache, key, launches, &mut hold)));
+    if !matches!(made, Ok(Err(StageError::Retry))) {
+        let _ = store.set(hold);
+    }
+    match made {
+        Ok(made) => made,
+        Err(panic) => resume_unwind(panic),
+    }
 }
