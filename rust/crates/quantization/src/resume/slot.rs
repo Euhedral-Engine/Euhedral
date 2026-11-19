@@ -112,6 +112,7 @@ impl<T> Ending<T> {
 }
 
 impl<T> Drop for Ending<T> {
+    // This runs the caller's continuation inside a drop, on the closing lake's thread: a panic there aborts.
     fn drop(&mut self) {
         if !self.armed {
             return;
