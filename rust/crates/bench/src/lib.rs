@@ -13,6 +13,7 @@
 
 pub mod artifact;
 pub mod config;
+pub mod cpus;
 pub mod drift;
 pub mod dump;
 pub mod kld;

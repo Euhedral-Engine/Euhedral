@@ -29,6 +29,7 @@ use std::time::SystemTime;
 use euhedral_inference_bench::artifact::load_tokenizer;
 use euhedral_inference_bench::await_value;
 use euhedral_inference_bench::config::{ConfigError, Options};
+use euhedral_inference_bench::cpus::{CpuTopology, ResolvedCpus, apply};
 use euhedral_inference_bench::drift::{self, Candidate, RowStore};
 use euhedral_inference_bench::dump::{split_document, teacher_forced_report, write_report};
 use euhedral_inference_bench::kld::{KldError, Reference};
@@ -166,13 +167,17 @@ fn run_command(args: &[String], command_line: &str, started: SystemTime) -> Resu
             );
         }
     }
+    let worker_cpus = options
+        .worker_cpus(&CpuTopology::system())
+        .map_err(|ConfigError::Invalid(message)| ConfigError::Invalid(format!("{config}: {message}")))?;
+    println!("worker cpus: {worker_cpus}");
     println!("output: {}", options.output.display());
     if validate_only {
         println!("validation passed; no model was loaded");
         return Ok(0);
     }
 
-    let settings = settings_for(&options)?;
+    let settings = settings_for(&options, &worker_cpus)?;
     if options.uses_prefix_cache() {
         let interval = settings.prefix_cache.checkpoint_tokens as usize;
         for scenario in &options.scenarios {
@@ -244,7 +249,7 @@ fn run_command(args: &[String], command_line: &str, started: SystemTime) -> Resu
 
 /// The engine settings of a run: the settings file the configuration names (or the defaults), with the artifact, the
 /// context and the prefix cache the configuration chooses.
-fn settings_for(options: &Options) -> Result<Settings, Failure> {
+fn settings_for(options: &Options, worker_cpus: &ResolvedCpus) -> Result<Settings, Failure> {
     let model = ModelSettings {
         artifact: options.artifact.clone(),
         name: options
@@ -266,6 +271,7 @@ fn settings_for(options: &Options) -> Result<Settings, Failure> {
     if !options.uses_prefix_cache() {
         settings.prefix_cache.size = ByteSize::mib(0);
     }
+    apply(&mut settings, worker_cpus);
     Ok(settings)
 }
 
