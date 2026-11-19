@@ -6,6 +6,10 @@
 //! I/O it owns), hands them to the `parse` functions, and then reads each tensor payload at the offset its
 //! [`TensorEntry`] names.
 //!
+//! The same crate encodes those regions: [`encode_metadata`], [`encode_table`], [`Header::encode`] and
+//! [`encode_tokenizer_section`] produce bytes the parsers read back, and [`ArtifactPlan`] places the payloads. They
+//! write nothing: the caller puts the bytes where the plan says.
+//!
 //! The reference is the Java reader (`ArtifactReader`, `ArtifactCodec`, `TokenizerSection`): every check it makes is
 //! made here, on the same bytes. All integers are big-endian, except the payloads: the trellis `.segments`
 //! companion holds little-endian `int32` values (see [`TrellisCompanions`]).
@@ -16,7 +20,10 @@ mod header;
 mod metadata;
 mod reader;
 mod table;
+#[cfg(feature = "test-util")]
+pub mod tiny;
 mod tokenizer_section;
+mod writer;
 
 pub use error::EdrlError;
 pub use format::{TensorDataType, TrellisCompanions, WeightFormat, WeightLayout};
@@ -24,3 +31,7 @@ pub use header::{HEADER_BYTES, Header, PlannedRead, ReadPlan, Region};
 pub use metadata::{LayerType, MAX_DRAFT_DEPTH, Metadata, ModelMetadata};
 pub use table::{TensorEntry, TensorTable};
 pub use tokenizer_section::{FOOTER_BYTES, TOKENIZER_ENTRIES, TokenizerFooter, TokenizerSection, content_end};
+pub use writer::{
+    ArtifactPlan, ObjectSpec, PAYLOAD_ALIGNMENT, TokenizerTexts, encode_metadata, encode_table,
+    encode_tokenizer_section,
+};
