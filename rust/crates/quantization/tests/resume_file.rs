@@ -1,0 +1,298 @@
+//! The resume file on a real lattice, without a device: its calls start work and hand their results to continuations.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test file: a failed unwrap is the failure"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, waiting call: a test thread waits on the hand-off for the frames it started, and reads its files"
+)]
+
+use std::fs;
+use std::num::NonZeroUsize;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use euhedral_core::control_plane::ControlPlaneLattice;
+use euhedral_core::frames::DummyFrame;
+use euhedral_core::generics::LatticeSource;
+use euhedral_graph::Lake;
+use euhedral_inference_engine::{Handoff, lattice_config};
+use euhedral_inference_quantization::resume::{HEADER, Header, ResumeError, ResumeFile, Then};
+use euhedral_inference_settings::{ModelSettings, Settings};
+use euhedral_io::AsyncIo;
+
+/// The longest a test waits for a call that must finish.
+const LONGEST: Duration = Duration::from_secs(60);
+
+struct World {
+    lattice: Arc<ControlPlaneLattice>,
+    io: Arc<AsyncIo>,
+    host: Arc<Lake>,
+}
+
+impl World {
+    fn start() -> World {
+        let settings = Settings::with_model(ModelSettings::default());
+        let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
+        let io = AsyncIo::open().expect("the asynchronous I/O opens");
+        lattice
+            .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
+            .expect("the lattice takes the I/O");
+        let host = Lake::new(
+            Arc::clone(&lattice),
+            NonZeroUsize::new(2).unwrap(),
+            Duration::from_secs(1),
+        );
+        World { lattice, io, host }
+    }
+
+    fn open(&self, path: &Path) -> ResumeFile {
+        call(|then| ResumeFile::open(&self.io, &self.host, path, then)).expect("the file opens")
+    }
+
+    fn finish(self) {
+        self.host.complete_gracefully();
+        self.io.complete();
+        self.lattice.close();
+    }
+}
+
+/// Starts a call and waits, outside the lattice, for the value its continuation is given.
+fn call<T: Send + 'static>(start: impl FnOnce(Then<T>) -> Result<(), ResumeError>) -> Result<T, ResumeError> {
+    let handoff = Handoff::new();
+    let sender = Arc::clone(&handoff);
+    start(Box::new(move |result| {
+        sender.send(result);
+        Box::new(DummyFrame::INSTANCE)
+    }))?;
+    handoff.wait(LONGEST).expect("the continuation never ran")
+}
+
+fn step_header(step: u64) -> Header {
+    let mut header = Header::new();
+    header.set("step", step.to_string());
+    header
+}
+
+fn longs(values: &[i64]) -> Vec<u8> {
+    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+}
+
+/// A section written at the end of a run is what a run that opens the file again reads, and the file stays one file of
+/// the size of the last write.
+#[test]
+fn overwriting_in_place_keeps_one_file_and_the_last_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("resume.bin");
+    let world = World::start();
+    for values in [[1i64, 2, 3], [7, 8, 9]] {
+        let file = world.open(&path);
+        call(|then| file.set_header(&Header::new(), then)).unwrap();
+        let end = call(|then| file.write(HEADER, longs(&values), then)).unwrap();
+        assert_eq!(end, HEADER + 24);
+        call(|then| file.set_header(&step_header(values[0] as u64), then)).unwrap();
+    }
+    let file = world.open(&path);
+    let header = call(|then| file.header(then)).unwrap();
+    assert_eq!(header.get("step"), Some("7"));
+    let section = call(|then| file.read(HEADER, 24, then)).unwrap();
+    assert_eq!(section, longs(&[7, 8, 9]));
+    assert_eq!(fs::metadata(&path).unwrap().len(), HEADER + 24);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    world.finish();
+}
+
+#[test]
+fn a_new_file_has_an_empty_header() {
+    let directory = tempfile::tempdir().unwrap();
+    let world = World::start();
+    let file = world.open(&directory.path().join("resume.bin"));
+    assert!(call(|then| file.header(then)).unwrap().is_empty());
+    world.finish();
+}
+
+/// A header that does not fit is refused before anything is written, so the state on disk is still whole: the file's
+/// bytes are what they were.
+#[test]
+fn a_header_too_large_is_refused_and_the_file_is_unchanged() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("resume.bin");
+    let world = World::start();
+    let file = world.open(&path);
+    call(|then| file.set_header(&step_header(3), then)).unwrap();
+    call(|then| file.write(HEADER, longs(&[5, 6]), then)).unwrap();
+    let before = fs::read(&path).unwrap();
+
+    let mut oversize = step_header(4);
+    oversize.set("ids", (0..1200).map(|id| id.to_string()).collect::<Vec<_>>().join(","));
+    assert!(oversize.text_len() > HEADER as usize);
+    assert!(matches!(oversize.check(), Err(ResumeError::HeaderTooLarge { .. })));
+    let refused = call(|then| file.set_header(&oversize, then));
+    assert!(
+        matches!(refused, Err(ResumeError::HeaderTooLarge { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    world.finish();
+}
+
+/// A header whose text takes all 4096 bytes has no NUL to end it, and reads back whole.
+#[test]
+fn a_header_of_exactly_the_limit_is_written_and_read_whole() {
+    let directory = tempfile::tempdir().unwrap();
+    let world = World::start();
+    let file = world.open(&directory.path().join("resume.bin"));
+    let mut header = step_header(1);
+    let filler = HEADER as usize - header.text_len() - "pad=\n".len();
+    header.set("pad", "x".repeat(filler));
+    assert_eq!(header.text_len(), HEADER as usize);
+    call(|then| file.set_header(&header, then)).unwrap();
+    assert_eq!(call(|then| file.header(then)).unwrap(), header);
+    header.set("pad", "x".repeat(filler + 1));
+    assert!(matches!(header.check(), Err(ResumeError::HeaderTooLarge { bytes }) if bytes == HEADER as usize + 1));
+    world.finish();
+}
+
+/// Sections larger than one I/O piece, and empty ones, cross the file intact.
+#[test]
+fn sections_of_any_size_round_trip() {
+    let directory = tempfile::tempdir().unwrap();
+    let world = World::start();
+    let file = world.open(&directory.path().join("resume.bin"));
+    let big: Vec<u8> = (0..5 * 1024 * 1024 + 123u32)
+        .map(|index| (index.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    let end = call(|then| file.write(HEADER, big.clone(), then)).unwrap();
+    assert_eq!(end, HEADER + big.len() as u64);
+    assert_eq!(call(|then| file.write(end, Vec::new(), then)).unwrap(), end);
+    assert!(call(|then| file.read(end, 0, then)).unwrap().is_empty());
+    assert_eq!(call(|then| file.read(HEADER, big.len(), then)).unwrap(), big);
+    world.finish();
+}
+
+/// Reading past the end names the position where the file ends.
+#[test]
+fn reading_past_the_end_names_where_the_file_ends() {
+    let directory = tempfile::tempdir().unwrap();
+    let world = World::start();
+    let file = world.open(&directory.path().join("resume.bin"));
+    call(|then| file.write(0, vec![1; 100], then)).unwrap();
+    let short = call(|then| file.read(60, 100, then));
+    assert!(matches!(short, Err(ResumeError::ShortRead { at: 100 })), "{short:?}");
+    world.finish();
+}
+
+/// A file cut back to a length has that length, and the sections before it are untouched.
+#[test]
+fn truncating_cuts_the_file_back_and_keeps_what_precedes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("resume.bin");
+    let world = World::start();
+    let file = world.open(&path);
+    call(|then| file.write(0, (0..200u8).collect(), then)).unwrap();
+    call(|then| file.sync(then)).unwrap();
+    call(|then| file.truncate(120, then)).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), (0..120u8).collect::<Vec<_>>());
+    world.finish();
+}
+
+/// A finished run removes its file; while another handle is open the removal is refused and the file stays.
+#[test]
+fn removing_needs_the_last_handle_and_deletes_the_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("resume.bin");
+    let world = World::start();
+    let file = world.open(&path);
+    let other = file.clone();
+    call(|then| file.set_header(&step_header(1), then)).unwrap();
+    let busy = call(|then| file.remove(then));
+    assert!(matches!(busy, Err(ResumeError::Busy)), "{busy:?}");
+    assert!(path.exists());
+    call(|then| other.remove(then)).unwrap();
+    assert!(!path.exists());
+    world.finish();
+}
+
+/// A lake that no longer takes work refuses the call at once, so a caller learns of it instead of waiting.
+#[test]
+fn a_closed_host_lake_refuses_to_open_at_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let world = World::start();
+    world.host.complete_gracefully();
+    let refused = ResumeFile::open(
+        &world.io,
+        &world.host,
+        &directory.path().join("resume.bin"),
+        Box::new(|_| Box::new(DummyFrame::INSTANCE)),
+    );
+    assert!(matches!(refused, Err(ResumeError::LakeClosed)), "{refused:?}");
+    world.finish();
+}
+
+/// What Java's `Properties.store` wrote, and a few forms its `load` takes: the reader reads them as Java does.
+#[test]
+fn the_reader_takes_the_forms_a_properties_file_has() {
+    let text = "#Thu Nov 19 10:40:44 EST 2026\n\
+        ! another comment\n\
+        \n\
+        fingerprint=abc\\=def\\:ghi\n\
+        label=caf\u{e9} \\\\ back slash\n\
+        spaced   =   value with spaces  \n\
+        colon:colon value\n\
+        bare\n\
+        joined=one \\\n    \ttwo\n\
+        escapes=tab\\there\\nnew\\u00e9\\uD83D\\uDE00\n\
+        \\ lead\\ key=\\ lead\n";
+    let mut padded = text.as_bytes().to_vec();
+    padded.resize(HEADER as usize, 0);
+    let header = Header::decode(&padded).unwrap();
+    let read = |key: &str| header.get(key).map(str::to_string);
+    assert_eq!(read("fingerprint").as_deref(), Some("abc=def:ghi"));
+    assert_eq!(read("label").as_deref(), Some("caf\u{e9} \\ back slash"));
+    assert_eq!(read("spaced").as_deref(), Some("value with spaces  "));
+    assert_eq!(read("colon").as_deref(), Some("colon value"));
+    assert_eq!(read("bare").as_deref(), Some(""));
+    assert_eq!(read("joined").as_deref(), Some("one two"));
+    assert_eq!(read("escapes").as_deref(), Some("tab\there\nnew\u{e9}\u{1f600}"));
+    assert_eq!(read(" lead key").as_deref(), Some(" lead"));
+    assert_eq!(header.iter().count(), 8);
+}
+
+/// Whatever a header holds is read back as it was, and the written text never holds a NUL before its padding.
+#[test]
+fn awkward_text_round_trips_and_never_writes_a_nul() {
+    let mut header = Header::new();
+    for (key, value) in [
+        ("plain", "value"),
+        (" leading space", " leading space"),
+        ("trailing ", "trailing "),
+        ("sep=:#!", "sep=:#!"),
+        ("tab\tnew\nline\rform\u{c}", "tab\tnew\nline\rform\u{c}"),
+        ("nul", "before\0after"),
+        ("unicode", "caf\u{e9} \u{1f600} \u{4e2d}"),
+        ("slashes", "\\\\ \\u0041 \\"),
+        ("empty", ""),
+    ] {
+        header.set(key, value);
+    }
+    let bytes = header.encode().unwrap();
+    assert_eq!(bytes.len(), HEADER as usize);
+    let text_end = header.text_len();
+    assert!(bytes[..text_end].iter().all(|&byte| byte != 0));
+    assert!(bytes[text_end..].iter().all(|&byte| byte == 0));
+    assert_eq!(Header::decode(&bytes).unwrap(), header);
+}
+
+#[test]
+fn a_malformed_unicode_escape_is_an_error_naming_it() {
+    let bytes = b"key=\\u12G4\n";
+    assert!(matches!(Header::decode(bytes), Err(ResumeError::HeaderText { .. })));
+    assert!(matches!(
+        Header::decode(b"key=\\u12"),
+        Err(ResumeError::HeaderText { .. })
+    ));
+}
