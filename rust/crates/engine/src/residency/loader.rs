@@ -362,8 +362,9 @@ struct Shared {
     pinned_at_start: u64,
     arena: Option<DeviceBuffer>,
     done: Option<Done>,
-    /// The P2E2 tensors being checked, by placement.
-    p2e2: Box<[OnceLock<P2e2Validation>]>,
+    /// The P2E2 tensors being checked, by placement: built before the first piece is read, so that no piece waits for
+    /// another to make it.
+    p2e2: Box<[Option<P2e2Validation>]>,
 }
 
 impl Shared {
@@ -385,7 +386,11 @@ impl Shared {
         };
         let geometry = P2e2Geometry::new(rows, k, size)?;
         let scan = geometry.scan(from, bytes)?;
-        let validation = self.p2e2[piece.placement].get_or_init(|| P2e2Validation::new(geometry));
+        let validation = self
+            .p2e2
+            .get(piece.placement)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| format!("no P2E2 check was made ready for placement {}", piece.placement))?;
         validation.absorb(scan)
     }
 
@@ -417,6 +422,22 @@ impl Drop for Shared {
     }
 }
 
+/// The checks of the P2E2 tensors among `pieces`, by placement, each made once before any piece is read. A tensor
+/// whose shape and size do not fit has none: its pieces are refused for that when they are read.
+pub(crate) fn p2e2_validations(pieces: &[Piece]) -> Box<[Option<P2e2Validation>]> {
+    let placements = pieces.iter().map(|piece| piece.placement + 1).max().unwrap_or(0);
+    let mut validations: Vec<Option<P2e2Validation>> = (0..placements).map(|_| None).collect();
+    for piece in pieces {
+        if let Check::P2e2 { rows, k, bytes, .. } = piece.check
+            && validations[piece.placement].is_none()
+            && let Ok(geometry) = P2e2Geometry::new(rows, k, bytes)
+        {
+            validations[piece.placement] = Some(P2e2Validation::new(geometry));
+        }
+    }
+    validations.into()
+}
+
 /// Acquires the ring before the upload starts: two loans of the ring's piece size for each chain. This is the only
 /// pinned allocation of the upload; once it runs, no chain asks the pool for memory. The waiting allocation is the
 /// startup's.
@@ -444,7 +465,7 @@ pub(crate) fn start(
     loans: Vec<PooledPinned>,
     done: impl FnOnce(LoadOutcome) + Send + Sync + 'static,
 ) {
-    let placements = pieces.iter().map(|piece| piece.placement + 1).max().unwrap_or(0);
+    let p2e2 = p2e2_validations(&pieces);
     let shared = Arc::new(Shared {
         core: Arc::clone(core),
         file,
@@ -461,7 +482,7 @@ pub(crate) fn start(
         arena: Some(arena),
         done: Some(Box::new(done)),
         pieces: pieces.into(),
-        p2e2: (0..placements).map(|_| OnceLock::new()).collect(),
+        p2e2,
     });
     let mut loans = loans.into_iter();
     for chain in 0..chains {
@@ -668,4 +689,52 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
     });
     // A refused frame is dropped with this chain's handle on the load, which then ends as failed.
     let _ = stages.offer(frame);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn piece(placement: usize, from: u64, check: impl Fn(u64) -> Check) -> Piece {
+        Piece {
+            file_offset: from,
+            len: 4096,
+            target: Target::Device { arena_offset: from },
+            check: check(from),
+            placement,
+        }
+    }
+
+    #[test]
+    fn the_checks_of_the_p2e2_tensors_exist_before_any_piece_is_read() {
+        let bytes = (1024..)
+            .step_by(4)
+            .find(|bytes| P2e2Geometry::new(2, 1024, *bytes).is_ok())
+            .unwrap();
+        let compressed = |from| Check::P2e2 {
+            from,
+            rows: 2,
+            k: 1024,
+            bytes,
+        };
+        let pieces = [
+            piece(0, 0, |_| Check::None),
+            piece(1, 0, compressed),
+            piece(1, 4096, compressed),
+            piece(1, 8192, compressed),
+            // A tensor whose size does not fit its shape has no check: its pieces are refused when they are read.
+            piece(2, 0, |from| Check::P2e2 {
+                from,
+                rows: 2,
+                k: 1024,
+                bytes: 7,
+            }),
+        ];
+        let validations = p2e2_validations(&pieces);
+        assert_eq!(validations.len(), 3);
+        assert!(validations[0].is_none());
+        assert!(validations[1].is_some());
+        assert!(validations[2].is_none());
+        assert!(p2e2_validations(&[]).is_empty());
+    }
 }

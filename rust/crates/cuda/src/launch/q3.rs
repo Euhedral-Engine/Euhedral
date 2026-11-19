@@ -162,6 +162,7 @@ const MX_LINEAR: [KernelId; 3] = [
     find_const("euhedral_q4mx_linear_128x128"),
     find_const("euhedral_q5mx_linear_128x128"),
 ];
+const MX_GATE_UP_SWIGLU: KernelId = find_const("euhedral_q3mx_gate_up_swiglu_128x64");
 const MX_REDUCE: KernelId = find_const("euhedral_q3mx_reduce");
 
 /// The groups of 64 values in a row of `in_features` values, K padded to 128 (`groups`, `q3_linear_bf16.c`).
@@ -203,7 +204,7 @@ pub fn quantized_byte_size(bits: Bits, rows: u32, in_features: u32) -> Option<u6
 }
 
 /// Whether the Q3 decode kernels take the shape (`euhedral_q3_decode_shape`, `decode_shapes.h`).
-const fn q3_decode_shape(in_features: u32, out_features: u32) -> bool {
+pub const fn q3_decode_shape(in_features: u32, out_features: u32) -> bool {
     in_features != 0 && in_features.is_multiple_of(1024) && out_features != 0 && out_features.is_multiple_of(16)
 }
 
@@ -531,10 +532,12 @@ pub fn mx_scratch_bytes_upto(rows: u32, width: u32, weight_rows: u32, sm_count: 
 pub const P2E2_EXPAND_LIMIT: u64 = 128 << 20;
 
 /// The scratch a Q3, Q4 or Q5 linear of up to `rows` rows over a tensor of `out_features` by `in_features` takes,
-/// where `mx_available` says the device runs the FP8 route and `sm_count` is its multiprocessor count (`scratchBytes`
-/// of the grouped formats). A plain tensor takes the FP8 route's scratch when it runs; a P2E2 tensor of more than 8
-/// rows is expanded first, so it takes the expansion, 256-aligned, and the FP8 scratch behind it. A P2E2 tensor too
-/// large to expand whole is run in chunks, which this does not size: its answer is `None`.
+/// where `mx_available` says the device runs the FP8 route, `sm_count` is its multiprocessor count and
+/// `exact_numerics` says the library runs the exact kernels (`scratchBytes` of the grouped formats). A plain tensor
+/// takes the FP8 route's scratch when it runs; a P2E2 tensor is expanded first wherever its fused decode does not run
+/// (more than 8 rows, a shape it does not take, exact numerics), so it takes the expansion, 256-aligned, and the FP8
+/// scratch behind it. A P2E2 tensor too large to expand whole is run in chunks, which this does not size: its answer
+/// is `None`.
 pub fn linear_scratch_bytes(
     p2e2: bool,
     rows: u32,
@@ -542,8 +545,10 @@ pub fn linear_scratch_bytes(
     out_features: u32,
     mx_available: bool,
     sm_count: Option<u32>,
+    exact_numerics: bool,
 ) -> Option<u64> {
-    if rows < MX_MIN_ROWS {
+    let decodes = rows < MX_MIN_ROWS && !exact_numerics && q3_decode_shape(in_features, out_features);
+    if (!p2e2 && rows < MX_MIN_ROWS) || (p2e2 && decodes) {
         return Some(0);
     }
     let activations = |tiled_outputs: bool| {
@@ -595,6 +600,56 @@ pub fn plan_mx(
     exact_numerics: bool,
     row_exact: bool,
 ) -> Result<Q3Plan, PlanError> {
+    plan_mx_with(
+        bits,
+        false,
+        operands,
+        scratch,
+        scratch_byte_size,
+        sm_count,
+        split_rows,
+        exact_numerics,
+        row_exact,
+    )
+}
+
+/// The launches of the paired gate/up FP8 linear with SwiGLU (`euhedral_cuda_q3_mx_gate_up_swiglu_bf16`, `q3_mx.c`):
+/// the quantization of the activations, then one kernel that multiplies the gate rows and the up rows (`operands`'
+/// `out_features` is both, gate first) and writes the SwiGLU, half as many values per row. It never splits K, so its
+/// sums come in one order whatever the device, and its scratch holds the activations alone. Declines as
+/// [`plan_mx`] does.
+pub fn plan_mx_gate_up_swiglu(
+    operands: &Q3Operands,
+    scratch: DevicePtr,
+    scratch_byte_size: u64,
+    exact_numerics: bool,
+    row_exact: bool,
+) -> Result<Q3Plan, PlanError> {
+    plan_mx_with(
+        Bits::Q3,
+        true,
+        operands,
+        scratch,
+        scratch_byte_size,
+        1,
+        0,
+        exact_numerics,
+        row_exact,
+    )
+}
+
+#[allow(clippy::too_many_arguments, reason = "the native `run`'s parameter list")]
+fn plan_mx_with(
+    bits: Bits,
+    paired: bool,
+    operands: &Q3Operands,
+    scratch: DevicePtr,
+    scratch_byte_size: u64,
+    sm_count: u32,
+    split_rows: u32,
+    exact_numerics: bool,
+    row_exact: bool,
+) -> Result<Q3Plan, PlanError> {
     let Q3Operands {
         input,
         weights,
@@ -624,11 +679,15 @@ pub fn plan_mx(
     }
     if scratch == DevicePtr::NULL
         || !scratch.get().is_multiple_of(256)
-        || scratch_byte_size < mx_scratch_bytes(rows, width, weight_rows, sm_count, split_rows)
+        || scratch_byte_size < mx_scratch_bytes(rows, width, if paired { 0 } else { weight_rows }, sm_count, split_rows)
     {
         return Err(PlanError::InvalidArgument);
     }
-    let splits = mx_splits(rows, width, weight_rows, sm_count, split_rows);
+    let splits = if paired {
+        1
+    } else {
+        mx_splits(rows, width, weight_rows, sm_count, split_rows)
+    };
     let grid = u64::from(rows).div_ceil(128) * u64::from(weight_rows / 128);
     let blocks = (u64::from(rows) * u64::from(width / 32)).div_ceil(256);
     if grid > MAX_GRID || blocks > MAX_GRID {
@@ -658,7 +717,11 @@ pub fn plan_mx(
         DevicePtr::NULL
     };
     plan.push(Launch::new(
-        MX_LINEAR[bits.index()],
+        if paired {
+            MX_GATE_UP_SWIGLU
+        } else {
+            MX_LINEAR[bits.index()]
+        },
         [grid as u32, splits, 1],
         [384, 1, 1],
         MX_SHARED_BYTES,

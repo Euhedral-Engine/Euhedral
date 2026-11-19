@@ -32,7 +32,7 @@ pub enum Module {
     Nvfp4,
     /// Native Blackwell NVFP4; compiled for the architecture-specific target.
     Nvfp4Native,
-    /// The Q3, Q4 and Q5 decode kernels and the P2E2 expansion.
+    /// The Q3 decode kernels and the P2E2 decode and expansion.
     Q3,
     /// The Q4 and Q5 decode kernels.
     Q45,
@@ -226,7 +226,7 @@ const LINEAR_TABLE_LEN: usize = 11;
 /// `native/src/host/qwen4_ops.c:12-50`.
 const QWEN4_TABLE_LEN: usize = 36;
 
-const SPECS: [KernelSpec; 187] = [
+const SPECS: [KernelSpec; 188] = [
     spec(
         Family::LinearTable,
         "euhedral_trellis_prepass",
@@ -1065,6 +1065,13 @@ const SPECS: [KernelSpec; 187] = [
     spec(Family::Q3, "euhedral_q3mx_linear_128x128", Module::Q3Mx, 75264, false),
     spec(Family::Q3, "euhedral_q4mx_linear_128x128", Module::Q3Mx, 75264, false),
     spec(Family::Q3, "euhedral_q5mx_linear_128x128", Module::Q3Mx, 75264, false),
+    spec(
+        Family::Q3,
+        "euhedral_q3mx_gate_up_swiglu_128x64",
+        Module::Q3Mx,
+        75264,
+        false,
+    ),
     spec(Family::Q3, "euhedral_q3mx_reduce", Module::Q3Mx, 0, false),
     spec(Family::Q3, "euhedral_q3_reference", Module::Reference, 0, false),
     spec(Family::Q3, "euhedral_q45_reference", Module::Reference, 0, false),
@@ -1541,7 +1548,13 @@ mod tests {
             kernel!("euhedral_q5mx_linear_128x128").spec().shared_opt_in_bytes,
             75264
         );
-        assert_eq!(with, 1 + 1 + 2 + 5 + 2 + 6 + 3);
+        assert_eq!(
+            kernel!("euhedral_q3mx_gate_up_swiglu_128x64")
+                .spec()
+                .shared_opt_in_bytes,
+            75264
+        );
+        assert_eq!(with, 1 + 1 + 2 + 5 + 2 + 6 + 3 + 1);
     }
 
     #[test]

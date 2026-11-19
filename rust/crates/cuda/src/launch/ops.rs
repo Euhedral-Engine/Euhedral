@@ -36,7 +36,8 @@ use crate::launch::gdn::{
 use crate::launch::load::KernelTable;
 use crate::launch::nvfp4::{Nvfp4Operands, plan_linear, plan_native};
 use crate::launch::q3::{
-    Bits, Q3Operands, plan_linear_q3, plan_linear_q45, plan_mx, plan_p2e2_decode, plan_p2e2_expand,
+    Bits, Q3Operands, plan_linear_q3, plan_linear_q45, plan_mx, plan_mx_gate_up_swiglu, plan_p2e2_decode,
+    plan_p2e2_expand,
 };
 use crate::launch::queue::{EnqueueError, enqueue_overlapping};
 use crate::launch::table::{Geometry, plan_linear_launch, plan_qwen4_launch};
@@ -585,6 +586,39 @@ where
             scratch_bytes,
             self.table.dispatch().sm_count,
             split_rows,
+            self.modes.exact_numerics,
+            self.modes.row_exact,
+        )
+        .map_err(|error| refused(CALL, error))?;
+        self.enqueue_all(plan.launches())
+    }
+
+    fn q3_mx_gate_up_swiglu_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        scratch: DevicePtr,
+        rows: u32,
+        width: u32,
+        outputs: u32,
+        weights_bytes: u64,
+        scratch_bytes: u64,
+    ) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_q3_mx_gate_up_swiglu_bf16";
+        let operands = Q3Operands {
+            input,
+            weights,
+            output,
+            rows,
+            in_features: width,
+            out_features: outputs,
+            weights_byte_size: weights_bytes,
+        };
+        let plan = plan_mx_gate_up_swiglu(
+            &operands,
+            scratch,
+            scratch_bytes,
             self.modes.exact_numerics,
             self.modes.row_exact,
         )

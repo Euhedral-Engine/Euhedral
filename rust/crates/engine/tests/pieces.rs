@@ -9,6 +9,7 @@
 mod common;
 
 use common::{config, q3_table, rco_table, settings};
+use euhedral_inference_edrl::WeightLayout;
 use euhedral_inference_engine::residency::loader::{Check, Piece, Ring, Target, check_piece, pieces};
 use euhedral_inference_engine::residency::offload::{EMBEDDING, HOST_ALIGNMENT, OUTPUT_HEAD};
 use euhedral_inference_engine::residency::planner::{PlanInputs, ResidencyPlan, Tier, nvfp4, plan, plan_with};
@@ -356,7 +357,7 @@ fn the_pieces_of_a_p2e2_tensor_carry_its_check_from_their_offset_in_it() {
                     assert_eq!([rows, k].as_slice(), placement.shape.as_slice(), "{}", placement.name);
                 }
                 other => assert!(
-                    !matches!(placement.layout, euhedral_inference_edrl::WeightLayout::RowSplitP2e2V1),
+                    !matches!(placement.layout, WeightLayout::RowSplitP2e2V1),
                     "{}: {other:?}",
                     placement.name
                 ),

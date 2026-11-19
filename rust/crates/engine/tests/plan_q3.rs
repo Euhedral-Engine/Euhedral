@@ -16,7 +16,7 @@ use euhedral_inference_cuda::DevicePtr;
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use euhedral_inference_engine::formats::{LinearFormat, LinearMode, Nvfp4Linear, Q3Linear, TrellisLinear};
 use euhedral_inference_engine::model::{LayerIndex, Residence, Role, WeightRef, object_key};
-use euhedral_inference_engine::plan::{Formats, Plan, PlanBuildError, View, WeightLookup};
+use euhedral_inference_engine::plan::{Formats, Plan, PlanBuildError, StageKind, View, WeightLookup};
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, plan as residency};
 use euhedral_inference_settings::TrellisKernelSettings;
 
@@ -153,6 +153,45 @@ fn a_plan_with_no_grouped_format_names_the_tensor_it_refuses() {
         let error = Plan::build(&config, &weights, &residency, &formats(false), None, None).unwrap_err();
         assert!(
             matches!(&error, PlanBuildError::Format { name, .. } if name.starts_with("text/")),
+            "{error}"
+        );
+    }
+}
+
+/// A Q3 gate and up projection and its SwiGLU are one node of every base view (the stage fuses them from sixty-four
+/// rows and composes them below), and the MTP topology keeps them apart.
+#[test]
+fn the_gate_up_projection_of_a_q3_layer_is_one_node_with_its_swiglu() {
+    for compressed in [false, true] {
+        let config = Arc::new(config());
+        let residency = residency_of(compressed);
+        let weights = weights(&residency);
+        let plan = Plan::build(&config, &weights, &residency, &formats(true), None, None).unwrap();
+        for view in [View::PrefillChunk, View::Decode] {
+            let kinds = plan.kinds(view).unwrap();
+            let fused = kinds.iter().filter(|kind| **kind == StageKind::GateUpSwiglu).count();
+            assert_eq!(fused, 64, "{view:?}, compressed {compressed}");
+            assert!(!kinds.contains(&StageKind::Swiglu), "{view:?}");
+        }
+        let kinds = plan.kinds(View::Draft { rows: 3 }).unwrap();
+        assert!(!kinds.contains(&StageKind::GateUpSwiglu));
+    }
+}
+
+/// A compressed tensor of a format that has no compressed layout is refused where the plan is built.
+#[test]
+fn a_q4_or_q5_tensor_with_the_compressed_layout_is_refused_at_plan_build() {
+    for format in [WeightFormat::Q4G64Fp16, WeightFormat::Q5G64Fp16] {
+        let config = Arc::new(config());
+        let residency = residency_of(false);
+        let mut lookup = weights(&residency).0;
+        let weight = lookup.get_mut(&(LayerIndex(0), Role::Down)).unwrap();
+        weight.format = format;
+        weight.layout = WeightLayout::RowSplitP2e2V1;
+        let name = weight.name.clone();
+        let error = Plan::build(&config, &Described(lookup), &residency, &formats(true), None, None).unwrap_err();
+        assert!(
+            matches!(&error, PlanBuildError::Format { name: refused, .. } if *refused == name),
             "{error}"
         );
     }

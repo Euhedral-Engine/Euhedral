@@ -17,7 +17,7 @@ use crate::model::WeightRef;
 
 pub use embedding::Q3Embedding;
 pub use nvfp4::{Nvfp4Linear, Nvfp4Route, nvfp4_native_scratch_bytes};
-pub use q3::Q3Linear;
+pub use q3::{GATE_UP_MIN_ROWS, Q3Linear};
 pub use shapes::{KernelArguments, Launch, LinearKernel, ShapeRecorder, Table};
 pub use trellis::{ROW_EXACT_KERNELS, TrellisLinear, TrellisOperands, TrellisShape};
 
@@ -70,4 +70,33 @@ pub trait LinearFormat: Send + Sync {
     /// never takes the prefill route (`LinearFormat.decodeScratchBytes`), so it needs less. 0 for a weight this
     /// format does not run (its submission refuses it).
     fn scratch_bytes(&self, weight: &WeightRef, rows: usize, mode: LinearMode) -> usize;
+
+    /// Whether a launch of `rows` rows of the gate/up projection `weight` followed by its SwiGLU runs as one launch
+    /// of this format ([`LinearFormat::submit_gate_up_swiglu`]), by what the host knows of the launch: the shape, the
+    /// rows and the mode. A format that has no such launch (the default) answers no. The scratch it needs is
+    /// within [`LinearFormat::scratch_bytes`].
+    fn fuses_gate_up_swiglu(&self, _weight: &WeightRef, _rows: usize, _mode: LinearMode) -> bool {
+        false
+    }
+
+    /// Queues the gate/up projection `weight` of the `rows` rows at `x` with the SwiGLU after it as one launch, the
+    /// result at `y` (half as many values a row as the projection has outputs). Answers `false`, having queued
+    /// nothing, where the launch does not run fused ([`LinearFormat::fuses_gate_up_swiglu`] is no, or the device
+    /// declined it): the caller then queues the projection and the SwiGLU. Nothing waits.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the signature the plan fixes for the formats and their consumers"
+    )]
+    fn submit_gate_up_swiglu(
+        &self,
+        _kernels: &mut dyn KernelOps,
+        _weight: &WeightRef,
+        _x: DevicePtr,
+        _y: DevicePtr,
+        _rows: usize,
+        _scratch: ScratchRegion,
+        _mode: LinearMode,
+    ) -> Result<bool, CudaError> {
+        Ok(false)
+    }
 }

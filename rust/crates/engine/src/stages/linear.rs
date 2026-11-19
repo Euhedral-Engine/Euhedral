@@ -6,7 +6,7 @@ use std::sync::Arc;
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::KernelOps;
 
-use super::{Launch, Quantum, QuantumKind, eager, fatal};
+use super::{Launch, Quantum, QuantumKind, eager, fatal, launch_u32};
 use crate::formats::{LinearFormat, LinearMode, ScratchRegion};
 use crate::model::WeightRef;
 use crate::workspace::BufferSlot;
@@ -30,6 +30,7 @@ pub struct Linear {
     output: BufferSlot,
     rows: LinearRows,
     scratch_region: Option<usize>,
+    swiglu: Option<BufferSlot>,
 }
 
 impl Linear {
@@ -50,7 +51,16 @@ impl Linear {
             output,
             rows,
             scratch_region,
+            swiglu: None,
         }
+    }
+
+    /// The same projection followed by the SwiGLU of its output into `swiglu`: where the weight's format runs the
+    /// pair as one launch it does, and everywhere else the stage queues the linear and then the SwiGLU, so the slots
+    /// hold the same values either way.
+    pub fn with_swiglu(mut self, swiglu: BufferSlot) -> Self {
+        self.swiglu = Some(swiglu);
+        self
     }
 }
 
@@ -63,6 +73,7 @@ impl fmt::Debug for Linear {
             .field("output", &self.output)
             .field("rows", &self.rows)
             .field("scratch_region", &self.scratch_region)
+            .field("swiglu", &self.swiglu)
             .finish_non_exhaustive()
     }
 }
@@ -106,6 +117,22 @@ impl Launch for Linear {
                 )));
             }
         };
+        if let Some(swiglu) = self.swiglu
+            && self
+                .format
+                .submit_gate_up_swiglu(
+                    kernels,
+                    &self.weight,
+                    quantum.slot(self.input),
+                    quantum.slot(swiglu),
+                    rows,
+                    scratch,
+                    mode,
+                )
+                .map_err(fatal)?
+        {
+            return Ok(());
+        }
         self.format
             .submit(
                 kernels,
@@ -116,7 +143,18 @@ impl Launch for Linear {
                 scratch,
                 mode,
             )
-            .map_err(fatal)
+            .map_err(fatal)?;
+        match self.swiglu {
+            Some(swiglu) => kernels
+                .swiglu_bf16(
+                    quantum.slot(self.output),
+                    quantum.slot(swiglu),
+                    quantum.rows_u32()?,
+                    launch_u32(quantum.config.intermediate_size, "the intermediate size")?,
+                )
+                .map_err(fatal),
+            None => Ok(()),
+        }
     }
 }
 

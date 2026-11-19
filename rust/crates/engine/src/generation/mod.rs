@@ -31,6 +31,7 @@ use euhedral_core::generics::FrameSink;
 use euhedral_data_structures::queues::MpscQueue;
 use euhedral_graph::{DEFAULT_RETRY_BACKSTOP, GraphRuntime, RetryCounts};
 use euhedral_inference_cuda::CudaLibrary;
+use euhedral_inference_edrl::WeightFormat;
 use euhedral_memory::Claim;
 
 use crate::error::EngineError;
@@ -207,14 +208,23 @@ impl Generation {
         copies: Option<(SequenceId, Arc<Order<Executor>>)>,
     ) -> Result<Executor, EngineError> {
         let library: &Arc<CudaLibrary> = &core.library;
-        let formats = Formats::new(
+        let mut formats = Formats::new(
             Arc::new(TrellisLinear::from_settings(
                 &core.settings.kernels.trellis,
                 library.device().sm_count,
             )),
             Arc::new(Nvfp4Linear::new(library)),
-        )
-        .with_grouped(Arc::new(Q3Linear::new(library)));
+        );
+        // The grouped format asks the device for its FP8 route, which compiles a module: only an artifact that has
+        // grouped tensors pays for it.
+        if residency.device.iter().any(|placement| {
+            matches!(
+                placement.format,
+                WeightFormat::Q3G64Fp16 | WeightFormat::Q4G64Fp16 | WeightFormat::Q5G64Fp16
+            )
+        }) {
+            formats = formats.with_grouped(Arc::new(Q3Linear::new(library)));
+        }
         let plan = Plan::build(config, weights, residency, &formats, None, None)
             .map_err(|error| EngineError::Runtime(format!("the execution plan: {error}")))?;
         if plan.fan_out_width() > core.compute_lanes() {

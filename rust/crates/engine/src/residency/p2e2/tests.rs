@@ -1,3 +1,5 @@
+use std::thread;
+
 use super::*;
 
 const K: u64 = 1024;
@@ -141,4 +143,86 @@ fn a_piece_that_is_not_whole_words_is_refused() {
     let geometry = P2e2Geometry::new(2, K, bytes.len() as u64).unwrap();
     assert!(geometry.scan(2, &bytes[2..10]).is_err());
     assert!(geometry.scan(0, &bytes[..6]).is_err());
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the test runs real threads against one check to see that its verdict does not depend on their order"
+)]
+#[test]
+fn the_pieces_of_one_tensor_are_verified_at_once() {
+    let rows = 6;
+    let bytes = tensor(rows, pattern, 0);
+    let geometry = P2e2Geometry::new(rows, K, bytes.len() as u64).unwrap();
+    let starts: Vec<usize> = (0..bytes.len()).step_by(260).collect();
+    for round in 0..50 {
+        // The check exists before any piece does, as the loader makes it, and every worker takes pieces of it in turn.
+        let validation = P2e2Validation::new(geometry);
+        let verdicts = thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|worker| {
+                    let (bytes, validation, starts) = (&bytes, &validation, &starts);
+                    scope.spawn(move || {
+                        starts
+                            .iter()
+                            .skip(worker)
+                            .step_by(4)
+                            .map(|&start| {
+                                let end = (start + 260).min(bytes.len());
+                                let scan = geometry.scan(start as u64, &bytes[start..end])?;
+                                validation.absorb(scan)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(verdicts.len(), starts.len());
+        assert!(verdicts.iter().all(Result::is_ok), "round {round}: {verdicts:?}");
+    }
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the test runs real threads against one check to see that its verdict does not depend on their order"
+)]
+#[test]
+fn a_bad_tensor_is_judged_by_whichever_piece_lands_last_whatever_the_workers() {
+    let rows = 6;
+    let mut bytes = tensor(rows, pattern, 0);
+    // A row base that does not follow the primary plane.
+    let row_base = align(rows * K / 4) as usize;
+    bytes[row_base + 8] ^= 1;
+    let geometry = P2e2Geometry::new(rows, K, bytes.len() as u64).unwrap();
+    let starts: Vec<usize> = (0..bytes.len()).step_by(260).collect();
+    for _ in 0..50 {
+        let validation = P2e2Validation::new(geometry);
+        let failures: usize = thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|worker| {
+                    let (bytes, validation, starts) = (&bytes, &validation, &starts);
+                    scope.spawn(move || {
+                        starts
+                            .iter()
+                            .skip(worker)
+                            .step_by(4)
+                            .filter(|&&start| {
+                                let end = (start + 260).min(bytes.len());
+                                geometry
+                                    .scan(start as u64, &bytes[start..end])
+                                    .and_then(|scan| validation.absorb(scan))
+                                    .is_err()
+                            })
+                            .count()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|worker| worker.join().unwrap()).sum()
+        });
+        assert_eq!(failures, 1, "exactly the last piece to land judges the tensor");
+    }
 }

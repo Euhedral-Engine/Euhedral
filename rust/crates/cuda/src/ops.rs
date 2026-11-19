@@ -215,6 +215,20 @@ pub trait KernelOps {
         scratch_bytes: u64,
         split_rows: u32,
     ) -> Result<(), CudaError>;
+    /// The paired FP8 linear of a Q3 gate/up tensor with SwiGLU (gate rows, then up rows; `outputs` is both), which
+    /// never splits K: `output` takes `outputs / 2` values per row. `ROUTE_UNAVAILABLE` where the route declines.
+    fn q3_mx_gate_up_swiglu_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        scratch: DevicePtr,
+        rows: u32,
+        width: u32,
+        outputs: u32,
+        weights_bytes: u64,
+        scratch_bytes: u64,
+    ) -> Result<(), CudaError>;
     fn attention_qk_norm_rope_bf16(
         &mut self,
         query_key: DevicePtr,
@@ -646,6 +660,20 @@ mod tests {
             _: u64,
             _: u64,
             _: u32,
+        ) -> Result<(), CudaError> {
+            Ok(())
+        }
+        fn q3_mx_gate_up_swiglu_bf16(
+            &mut self,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: DevicePtr,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u64,
+            _: u64,
         ) -> Result<(), CudaError> {
             Ok(())
         }

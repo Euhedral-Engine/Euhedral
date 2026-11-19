@@ -162,7 +162,11 @@ fn ids(line: &str, tag: &str) -> Vec<u32> {
 }
 
 fn greedy_reference(machine: &Machine) -> Greedy {
-    let text = fs::read_to_string(machine.goldens.join(machine.golden)).unwrap();
+    greedy_reference_of(machine, machine.golden)
+}
+
+fn greedy_reference_of(machine: &Machine, golden: &str) -> Greedy {
+    let text = fs::read_to_string(machine.goldens.join(golden)).unwrap();
     let mut lines = text.lines();
     let prompt = ids(lines.next().unwrap(), "prompt ");
     let generated = ids(lines.next().unwrap(), "generated ");
@@ -459,17 +463,30 @@ fn greedy_tokens_match_java_for_short_prompt() {
 /// One greedy generation on the artifact, twice on one engine, against the Java engine's tokens. The Q3 artifacts carry
 /// no tokenizer, so the generation runs to the length the reference has.
 fn greedy_matches_java(machine: &Machine) {
-    let reference = greedy_reference(machine);
-    assert!(!reference.generated.is_empty());
-    let length = reference.generated.len() as u32;
     let (owner, runtime) = start(machine, 4096);
-    for round in 0..2 {
-        let recording = generate(&runtime, &reference.prompt, length, &[]);
-        assert_eq!(recording.outcome.generated, reference.generated.len(), "round {round}");
-        assert_eq!(
-            recording.tokens, reference.generated,
-            "round {round}: the greedy tokens are the Java engine's"
-        );
+    for golden in [machine.golden, machine.golden.replace(".txt", "-long.txt").as_str()] {
+        let reference = greedy_reference_of(machine, golden);
+        assert!(!reference.generated.is_empty());
+        let length = reference.generated.len() as u32;
+        for round in 0..2 {
+            let recording = generate(&runtime, &reference.prompt, length, &[]);
+            assert_eq!(
+                recording.outcome.generated,
+                reference.generated.len(),
+                "{golden} round {round}"
+            );
+            assert_eq!(
+                recording.tokens,
+                reference.generated,
+                "{golden} round {round}: the greedy tokens are the Java engine's ({} prompt tokens)",
+                reference.prompt.len()
+            );
+            println!(
+                "{golden} round {round}: {} prompt tokens, {} tokens match",
+                reference.prompt.len(),
+                length
+            );
+        }
     }
     owner.shutdown(runtime).unwrap();
 }

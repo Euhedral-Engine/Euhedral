@@ -173,7 +173,7 @@ fn the_largest_scratch_up_to_a_row_count_is_no_smaller_than_any_launch_of_fewer_
 
 #[test]
 fn the_scratch_of_a_linear() {
-    let upto = |p2e2, rows, mx| linear_scratch_bytes(p2e2, rows, 5120, 5120, mx, Some(70));
+    let upto = |p2e2, rows, mx| linear_scratch_bytes(p2e2, rows, 5120, 5120, mx, Some(70), false);
     // Up to 8 rows take no scratch, whatever the layout.
     assert_eq!(upto(false, 8, true), Some(0));
     assert_eq!(upto(true, 8, true), Some(0));
@@ -183,7 +183,10 @@ fn the_scratch_of_a_linear() {
         Some(mx_scratch_bytes_upto(512, 5120, 5120, Some(70)))
     );
     assert_eq!(upto(false, 512, false), Some(0));
-    assert_eq!(linear_scratch_bytes(false, 512, 5120, 5000, true, Some(70)), Some(0));
+    assert_eq!(
+        linear_scratch_bytes(false, 512, 5120, 5000, true, Some(70), false),
+        Some(0)
+    );
     // A P2E2 tensor takes its expansion, 256-aligned, with the FP8 scratch behind it.
     let expanded = q3_byte_size(5120, 5120);
     assert_eq!(upto(true, 512, false), Some(expanded));
@@ -191,8 +194,26 @@ fn the_scratch_of_a_linear() {
         upto(true, 512, true),
         Some(expanded + mx_scratch_bytes_upto(512, 5120, 5120, Some(70)))
     );
+    // Where the fused decode does not run, a P2E2 tensor of few rows is expanded as well: under exact numerics, and
+    // for a shape the decode kernels do not take.
+    assert_eq!(
+        linear_scratch_bytes(true, 8, 5120, 5120, true, Some(70), true),
+        Some(expanded)
+    );
+    assert_eq!(
+        linear_scratch_bytes(true, 1, 5120, 5120, false, Some(70), true),
+        Some(expanded)
+    );
+    assert_eq!(
+        linear_scratch_bytes(false, 8, 5120, 5120, true, Some(70), true),
+        Some(0)
+    );
+    assert!(linear_scratch_bytes(true, 8, 5120, 5000, true, Some(70), false) > Some(0));
     // One too large to expand whole is run in chunks and is not sized here.
-    assert_eq!(linear_scratch_bytes(true, 512, 5120, 248_320, true, Some(70)), None);
+    assert_eq!(
+        linear_scratch_bytes(true, 512, 5120, 248_320, true, Some(70), false),
+        None
+    );
 }
 
 fn mx(rows: u32, scratch: u64, scratch_bytes: u64) -> Result<Q3Plan, PlanError> {
@@ -244,6 +265,81 @@ fn the_fp8_route_without_a_split_has_no_reduction() {
     .unwrap();
     assert_eq!(plan.launches().len(), 2);
     assert_eq!(plan.launches()[1].grid, [70, 1, 1]);
+}
+
+#[test]
+fn the_paired_gate_up_never_splits_and_needs_only_the_activations() {
+    // 64 rows of width 5120 against 34816 gate and up rows: the tiles are 1 x 272 and the paired kernel never splits.
+    let paired = |scratch_bytes| {
+        plan_mx_gate_up_swiglu(
+            &operands(Bits::Q3, 64, 5120, 34816),
+            at(SCRATCH),
+            scratch_bytes,
+            false,
+            false,
+        )
+    };
+    // Two planes of 64 x 5120 bytes and the 64 x 160 scales, each 256-aligned.
+    let needed = 2 * 327_680 + 10_240;
+    assert_eq!(mx_scratch_bytes(64, 5120, 0, 170, 0), needed);
+    let plan = paired(needed).unwrap();
+    let [quantize, gate_up] = plan.launches() else {
+        panic!("{:?}", plan.launches());
+    };
+    assert_eq!(quantize.kernel.name(), "euhedral_q3mx_quantize");
+    assert_eq!((quantize.grid, quantize.block), ([40, 1, 1], [256, 1, 1]));
+    assert_eq!(gate_up.kernel.name(), "euhedral_q3mx_gate_up_swiglu_128x64");
+    assert_eq!(
+        (gate_up.grid, gate_up.block, gate_up.shared_bytes),
+        ([272, 1, 1], [384, 1, 1], MX_SHARED_BYTES)
+    );
+    let (high, low, scales) = (SCRATCH, SCRATCH + 327_680, SCRATCH + 2 * 327_680);
+    assert_eq!(
+        gate_up.args.words(),
+        [
+            high,
+            low,
+            scales,
+            WEIGHTS,
+            OUTPUT,
+            64,
+            34816,
+            5120,
+            0,
+            q3_scale_offset(34816, 5120),
+            0
+        ]
+    );
+    assert_eq!(paired(needed - 256), Err(PlanError::InvalidArgument));
+    // It declines as the other FP8 routes do.
+    let declines = |exact, row_exact| {
+        plan_mx_gate_up_swiglu(
+            &operands(Bits::Q3, 64, 5120, 34816),
+            at(SCRATCH),
+            needed,
+            exact,
+            row_exact,
+        )
+    };
+    assert_eq!(declines(true, false), Err(PlanError::RouteUnavailable));
+    assert_eq!(declines(false, true), Err(PlanError::RouteUnavailable));
+    assert_eq!(
+        plan_mx_gate_up_swiglu(&operands(Bits::Q3, 64, 5120, 34800), at(SCRATCH), needed, false, false),
+        Err(PlanError::RouteUnavailable)
+    );
+}
+
+#[test]
+fn a_linear_of_the_scratch_covers_its_paired_gate_up() {
+    for sm_count in [Some(70), Some(170), None] {
+        for rows in [64, 129, 512, 1000] {
+            let linear = linear_scratch_bytes(false, rows, 5120, 34816, true, sm_count, false).unwrap();
+            assert!(
+                mx_scratch_bytes_upto(rows, 5120, 0, sm_count) <= linear,
+                "{rows} {sm_count:?}"
+            );
+        }
+    }
 }
 
 #[test]
