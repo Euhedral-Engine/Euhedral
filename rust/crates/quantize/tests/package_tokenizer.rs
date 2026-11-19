@@ -1,8 +1,14 @@
 //! The `quantization package-tokenizer` command, run as a process on a tiny artifact and a synthetic checkpoint.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test file: a failed unwrap is the failure"
+)]
+
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use euhedral_inference_edrl::tiny::TinyArtifact;
 use euhedral_inference_edrl::{FOOTER_BYTES, TokenizerFooter};
@@ -73,7 +79,7 @@ fn write_checkpoint(directory: &Path) {
     fs::write(directory.join("chat_template.jinja"), TEMPLATE).unwrap();
 }
 
-fn quantization(args: &[&str]) -> std::process::Output {
+fn quantization(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_quantization"))
         .args(args)
         .env_remove("EUHEDRAL_CONFIG")

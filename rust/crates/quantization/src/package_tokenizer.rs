@@ -9,19 +9,19 @@
 //! final result goes to the callback. The section's body is written, made durable, and only then the footer, so an
 //! interrupted run leaves no section, and running it again repairs the artifact.
 
-use std::fmt;
+use std::fs::File;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use euhedral_core::frames::{Frame, FrameHeader};
 use euhedral_graph::{Lake, UnitGuard};
 use euhedral_inference_edrl::{FOOTER_BYTES, HEADER_BYTES, Header, TensorTable};
-use euhedral_io::{AsyncIo, Create, IoBuf, OpenSpec, OwnedFile, RawFile};
+use euhedral_io::{AsyncIo, Create, IoBuf, OpenSpec, RawFile};
 
-use crate::blocking_file::{self, Operation};
+use crate::durable::{self, SharedFile};
 use crate::package_error::PackageError;
+use crate::step::{Kind, idle, step};
 use crate::tokenizer_files::TokenizerFiles;
 
 /// The most the copy of an artifact's content moves in one read and write.
@@ -139,7 +139,7 @@ pub fn package_tokenizer(
         },
         _unit: unit,
     };
-    blocking_file::offer(&host, 3, move || job.read_checkpoint());
+    on_host(&host, move || job.read_checkpoint());
     Ok(())
 }
 
@@ -193,7 +193,8 @@ impl PartGuard {
 impl Drop for PartGuard {
     fn drop(&mut self) {
         if let Some(part) = self.part.take() {
-            blocking_file::run(&self.host, Operation::Remove, part, |_| {});
+            // A refused removal leaves the file; nothing more can be done from a drop.
+            let _ = durable::remove(&self.host, &part, Box::new(|_| idle()));
         }
     }
 }
@@ -229,59 +230,41 @@ struct Checkpoint {
     generation_config: Vec<u8>,
 }
 
-/// A frame that ends a continuation: the work was done in the closure.
-struct Ended(FrameHeader);
-
-impl Frame for Ended {
-    fn header(&self) -> &FrameHeader {
-        &self.0
-    }
-
-    fn header_mut(&mut self) -> &mut FrameHeader {
-        &mut self.0
-    }
-}
-
-impl fmt::Debug for Ended {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("Ended").finish()
-    }
-}
-
-fn ended() -> Box<dyn Frame> {
-    Box::new(Ended(FrameHeader::new(1)))
+/// Runs `work` as a frame of `host`; a lake that refuses it drops `work`, which the run reports as lost.
+fn on_host(host: &Arc<Lake>, work: impl FnOnce() + Send + 'static) {
+    drop(host.offer(step(Kind::Resolve, work)));
 }
 
 type Then<T> = Box<dyn FnOnce(io::Result<T>) + Send>;
 
 #[cfg(unix)]
-fn raw_file(file: &OwnedFile) -> RawFile {
+fn raw_file(file: &File) -> RawFile {
     use std::os::fd::AsRawFd;
 
     file.as_raw_fd()
 }
 
 #[cfg(windows)]
-fn raw_file(file: &OwnedFile) -> RawFile {
+fn raw_file(file: &File) -> RawFile {
     use std::os::windows::io::AsRawHandle;
 
     file.as_raw_handle()
 }
 
 /// Opens `path`; a submission the I/O refuses drops `then`, which the run reports as lost.
-fn open(io: &AsyncIo, path: &Path, spec: OpenSpec, then: Then<Arc<OwnedFile>>) {
+fn open(io: &AsyncIo, path: &Path, spec: OpenSpec, then: Then<SharedFile>) {
     drop(io.open_path(
         path,
         spec,
         Box::new(move |result| {
-            then(result.map(Arc::new));
-            ended()
+            then(result.map(durable::share));
+            idle()
         }),
     ));
 }
 
 /// Reads exactly `len` bytes at `offset` into the end of `got`.
-fn read_exact(io: &Arc<AsyncIo>, file: Arc<OwnedFile>, offset: u64, len: usize, mut got: Vec<u8>, then: Then<Vec<u8>>) {
+fn read_exact(io: &Arc<AsyncIo>, file: SharedFile, offset: u64, len: usize, mut got: Vec<u8>, then: Then<Vec<u8>>) {
     if got.len() >= len {
         then(Ok(got));
         return;
@@ -309,13 +292,13 @@ fn read_exact(io: &Arc<AsyncIo>, file: Arc<OwnedFile>, offset: u64, len: usize, 
                 }
                 Err(error) => then(Err(error)),
             }
-            ended()
+            idle()
         }),
     ));
 }
 
 /// Writes all of `bytes` at `offset`.
-fn write_all(io: &Arc<AsyncIo>, file: Arc<OwnedFile>, offset: u64, bytes: Vec<u8>, then: Then<()>) {
+fn write_all(io: &Arc<AsyncIo>, file: SharedFile, offset: u64, bytes: Vec<u8>, then: Then<()>) {
     if bytes.is_empty() {
         then(Ok(()));
         return;
@@ -337,7 +320,7 @@ fn write_all(io: &Arc<AsyncIo>, file: Arc<OwnedFile>, offset: u64, bytes: Vec<u8
                 }
                 Err(error) => then(Err(error)),
             }
-            ended()
+            idle()
         }),
     ));
 }
@@ -361,7 +344,7 @@ fn read_all(io: &Arc<AsyncIo>, path: &Path, then: Then<Vec<u8>>) {
                             Ok(length) => read_exact(&reader, held, 0, length, Vec::with_capacity(length), then),
                             Err(error) => then(Err(error)),
                         }
-                        ended()
+                        idle()
                     }),
                 ));
             }
@@ -370,15 +353,7 @@ fn read_all(io: &Arc<AsyncIo>, path: &Path, then: Then<Vec<u8>>) {
 }
 
 /// Copies the bytes `from..end` of `source` to the same offsets of `target`, `chunk` bytes at a time.
-fn copy(
-    io: &Arc<AsyncIo>,
-    source: Arc<OwnedFile>,
-    target: Arc<OwnedFile>,
-    from: u64,
-    end: u64,
-    chunk: usize,
-    then: Then<()>,
-) {
+fn copy(io: &Arc<AsyncIo>, source: SharedFile, target: SharedFile, from: u64, end: u64, chunk: usize, then: Then<()>) {
     if from >= end {
         then(Ok(()));
         return;
@@ -458,7 +433,7 @@ impl Job {
     /// Builds and checks the section on the host lake: loading the tokenizer is CPU work.
     fn check(self, checkpoint: Checkpoint) {
         let host = Arc::clone(&self.host);
-        blocking_file::offer(&host, 2, move || {
+        on_host(&host, move || {
             let section = TokenizerFiles::from_checkpoint(
                 checkpoint.tokenizer,
                 checkpoint.tokenizer_config,
@@ -491,7 +466,7 @@ impl Job {
         );
     }
 
-    fn read_header(self, file: Arc<OwnedFile>, section: Vec<u8>) {
+    fn read_header(self, file: SharedFile, section: Vec<u8>) {
         let io = Arc::clone(&self.io);
         let held = Arc::clone(&file);
         drop(io.file_len(
@@ -524,12 +499,12 @@ impl Job {
                         );
                     }
                 }
-                ended()
+                idle()
             }),
         ));
     }
 
-    fn read_table(self, file: Arc<OwnedFile>, header_bytes: Vec<u8>, file_len: u64, section: Vec<u8>) {
+    fn read_table(self, file: SharedFile, header_bytes: Vec<u8>, file_len: u64, section: Vec<u8>) {
         let (header, range) = match table_range(&header_bytes, file_len) {
             Ok(found) => found,
             Err(error) => return self.fail(error),
@@ -559,24 +534,12 @@ impl Job {
     }
 
     /// The first write: nothing before this point has changed a file.
-    fn write(self, source: Arc<OwnedFile>, content_end: u64, section: Vec<u8>) {
+    fn write(self, source: SharedFile, content_end: u64, section: Vec<u8>) {
         match self.request.out.clone() {
             None => {
                 drop(source);
                 let artifact = self.request.artifact.clone();
-                let host = Arc::clone(&self.host);
-                blocking_file::run(
-                    &host,
-                    Operation::SetLen(content_end),
-                    artifact.clone(),
-                    move |cut| match cut {
-                        Ok(()) => self.open_artifact_for_writing(artifact, content_end, section),
-                        Err(error) => self.fail(PackageError::Io {
-                            what: "cannot cut the artifact to its content",
-                            source: error,
-                        }),
-                    },
-                );
+                self.open_artifact_for_writing(artifact, content_end, section);
             }
             Some(out) => {
                 let part = part_path(&out);
@@ -623,15 +586,35 @@ impl Job {
                     what: "cannot open the artifact for writing",
                     source: error,
                 }),
-                Ok(target) => self.write_section(target, Written::InPlace(artifact), content_end, section),
+                Ok(target) => {
+                    // The artifact is cut back to its content, so a stale tail or a section that was cut short goes.
+                    let host = Arc::clone(&self.host);
+                    let file = Arc::clone(&target);
+                    let _ = durable::truncate(
+                        &host,
+                        &file,
+                        content_end,
+                        Box::new(move |cut| {
+                            match cut {
+                                Ok(()) => self.write_section(target, Written::InPlace(artifact), content_end, section),
+                                Err(error) => self.fail(PackageError::Io {
+                                    what: "cannot cut the artifact to its content",
+                                    source: error,
+                                }),
+                            }
+                            idle()
+                        }),
+                    );
+                    // A lake that refuses the cut drops the continuation, and the run reports itself lost.
+                }
             }),
         );
     }
 
     fn copy_content(
         self,
-        source: Arc<OwnedFile>,
-        target: Arc<OwnedFile>,
+        source: SharedFile,
+        target: SharedFile,
         part: PathBuf,
         out: PathBuf,
         content_end: u64,
@@ -663,12 +646,13 @@ impl Job {
 
     /// The body, then a barrier, then the footer, then a barrier: the footer is the last byte to land, so a run that
     /// stops earlier leaves no section.
-    fn write_section(self, target: Arc<OwnedFile>, written: Written, content_end: u64, mut section: Vec<u8>) {
+    fn write_section(self, target: SharedFile, written: Written, content_end: u64, mut section: Vec<u8>) {
         let footer = section.split_off(section.len() - FOOTER_BYTES);
         let body = section;
         let body_bytes = body.len() as u64;
         let io = Arc::clone(&self.io);
         let again = Arc::clone(&target);
+        let synced = Arc::clone(&target);
         write_all(
             &io,
             target,
@@ -676,8 +660,9 @@ impl Job {
             body,
             Box::new(move |wrote| match wrote {
                 Err(error) => self.fail_written(&written, write_failure(error)),
-                Ok(()) => self.barrier(&written.clone(), move |job, written| {
+                Ok(()) => self.barrier(&synced, &written.clone(), move |job, written| {
                     let io = Arc::clone(&job.io);
+                    let synced_footer = Arc::clone(&again);
                     write_all(
                         &io,
                         again,
@@ -685,7 +670,7 @@ impl Job {
                         footer,
                         Box::new(move |wrote| match wrote {
                             Err(error) => job.fail_written(&written, write_failure(error)),
-                            Ok(()) => job.barrier(&written.clone(), move |job, written| {
+                            Ok(()) => job.barrier(&synced_footer, &written.clone(), move |job, written| {
                                 job.finish(written, content_end, body_bytes + FOOTER_BYTES as u64);
                             }),
                         }),
@@ -695,21 +680,27 @@ impl Job {
         );
     }
 
-    /// Makes what was written durable, then continues.
-    fn barrier(self, written: &Written, next: impl FnOnce(Job, Written) + Send + 'static) {
+    /// Makes what was written to `file` durable, then continues.
+    fn barrier(self, file: &SharedFile, written: &Written, next: impl FnOnce(Job, Written) + Send + 'static) {
         let host = Arc::clone(&self.host);
-        let path = written.path().to_path_buf();
         let written = written.clone();
-        blocking_file::run(&host, Operation::Sync, path, move |synced| match synced {
-            Ok(()) => next(self, written),
-            Err(error) => self.fail_written(
-                &written,
-                PackageError::Io {
-                    what: "cannot make the artifact durable",
-                    source: error,
-                },
-            ),
-        });
+        let _ = durable::sync(
+            &host,
+            file,
+            Box::new(move |synced| {
+                match synced {
+                    Ok(()) => next(self, written),
+                    Err(error) => self.fail_written(
+                        &written,
+                        PackageError::Io {
+                            what: "cannot make the artifact durable",
+                            source: error,
+                        },
+                    ),
+                }
+                idle()
+            }),
+        );
     }
 
     /// An output is complete: it takes its name; an artifact written in place is.
@@ -749,7 +740,7 @@ impl Job {
                                 },
                             ),
                         }
-                        ended()
+                        idle()
                     }),
                 ));
             }
@@ -768,7 +759,15 @@ impl Job {
                     completion: Some(job.completion),
                     error: Some(error),
                 };
-                blocking_file::run(&host, Operation::Remove, part.clone(), move |_| failing.report());
+                // A removal the lake refuses drops `failing`, which reports the error all the same.
+                let _ = durable::remove(
+                    &host,
+                    part,
+                    Box::new(move |_| {
+                        failing.report();
+                        idle()
+                    }),
+                );
             }
         }
     }
@@ -788,15 +787,6 @@ enum Written {
     InPlace(PathBuf),
     /// An output, under its temporary name until it is complete.
     Part { part: PathBuf, out: PathBuf },
-}
-
-impl Written {
-    fn path(&self) -> &Path {
-        match self {
-            Written::InPlace(artifact) => artifact,
-            Written::Part { part, .. } => part,
-        }
-    }
 }
 
 fn part_path(out: &Path) -> PathBuf {

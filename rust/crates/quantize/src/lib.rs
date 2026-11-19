@@ -162,6 +162,8 @@ pub fn run(args: &[String]) -> Outcome {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     fn run_words(words: &[&str]) -> Outcome {
@@ -194,10 +196,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
     fn the_flags_of_package_tokenizer_are_checked_before_anything_runs() {
         let words = |words: &[&str]| words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
         let parsed = package::parse(&words(&["--artifact", "a", "--tokenizer=c", "--out", "o"])).unwrap();
-        assert_eq!(parsed.out.as_deref(), Some(std::path::Path::new("o")));
+        assert_eq!(parsed.out.as_deref(), Some(Path::new("o")));
         assert!(package::parse(&words(&["--artifact", "a"])).is_err());
         assert!(package::parse(&words(&["--artifact", "a", "--artifact", "b", "--tokenizer", "c"])).is_err());
         assert!(package::parse(&words(&["--artifact", "a", "--tokenizer", "c", "--bogus"])).is_err());
