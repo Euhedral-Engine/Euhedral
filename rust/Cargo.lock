@@ -521,6 +521,7 @@ dependencies = [
  "euhedral-gpu",
  "euhedral-graph",
  "euhedral-inference-cuda",
+ "serde_json",
  "test-support",
  "thiserror",
 ]
