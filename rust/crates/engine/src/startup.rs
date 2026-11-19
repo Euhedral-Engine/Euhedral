@@ -35,7 +35,7 @@ use euhedral_inference_settings::Settings;
 use euhedral_io::{IoBuf, IoDone, OpenSpec, OwnedFile};
 use euhedral_memory::Claim;
 
-use crate::composite::{Composed, Composite, compose, refuse_replaced_on_disk};
+use crate::composite::{Composed, Composite, compose, composed_depth, refuse_replaced_on_disk};
 use crate::error::{EngineError, PlanError};
 use crate::frames::{Kind, step};
 use crate::generation::Generations;
@@ -484,7 +484,7 @@ fn parse(startup: Startup, base: Indexed, parts: Vec<Indexed>) {
             Composed { table, source_of } = compose(&table, &startup.composite, &tables)?;
         }
         let mut config = ModelConfig::from(&metadata);
-        config.draft_depth = startup.composite.depth(config.draft_depth);
+        config.draft_depth = composed_depth(config.draft_depth, &table, &startup.composite)?;
         config.check_supported()?;
         validate_inventory(&config, &table)?;
         Ok::<_, EngineError>((table, config, source_of))

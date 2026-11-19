@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::path::PathBuf;
 
-use euhedral_inference_edrl::{TensorEntry, TensorTable, WeightFormat};
+use euhedral_inference_edrl::{MAX_DRAFT_DEPTH, TensorEntry, TensorTable, WeightFormat};
 
 use crate::error::{EngineError, PlanError};
 use crate::model::{TRELLIS_COMPANIONS, companion_name, is_companion, trellis_logical};
@@ -46,11 +46,6 @@ impl Composite {
             .iter()
             .any(|replacement| !replacement.objects.is_empty())
     }
-
-    /// The draft depth the model runs with, given the one its base stores.
-    pub(crate) fn depth(&self, stored: Option<u8>) -> Option<u8> {
-        self.draft_depth.or(stored)
-    }
 }
 
 /// The table of a composite and where each entry's payload is.
@@ -78,6 +73,31 @@ fn features(entry: &TensorEntry) -> Option<(u64, u64)> {
     }
 }
 
+/// The MTP draft depth the composite model runs with: the composite's when it gives one, else the `stored` depth of
+/// the base. A depth outside `1..=MAX_DRAFT_DEPTH`, or one for a model with no MTP layer and draft head in `table`, is
+/// refused.
+pub(crate) fn composed_depth(
+    stored: Option<u8>,
+    table: &TensorTable,
+    composite: &Composite,
+) -> Result<Option<u8>, EngineError> {
+    let Some(depth) = composite.draft_depth else {
+        return Ok(stored);
+    };
+    if !(1..=MAX_DRAFT_DEPTH).contains(&depth) {
+        return Err(invalid(format!(
+            "the composite's draft depth {depth} is outside 1 to {MAX_DRAFT_DEPTH}"
+        )));
+    }
+    let has = |prefix: &str| table.entries().iter().any(|entry| entry.name().starts_with(prefix));
+    if !(has("mtp/") && has("text/draft_head")) {
+        return Err(invalid(format!(
+            "the composite's draft depth {depth} needs a model with an MTP layer and a draft head, and this one has none"
+        )));
+    }
+    Ok(Some(depth))
+}
+
 /// Refuses a plan that holds an object a replacement supplies on the disk tier, which reads the base's file only.
 pub(crate) fn refuse_replaced_on_disk(
     placements: &[Placement],
@@ -89,7 +109,7 @@ pub(crate) fn refuse_replaced_on_disk(
     {
         Some(placement) => Err(invalid(format!(
             "'{}' comes from another artifact and the plan leaves it in the artifact file, which is read from the \
-             base alone",
+             base alone; raise the device or host budget so the plan keeps it in memory",
             placement.name
         ))),
         None => Ok(()),
@@ -391,14 +411,46 @@ mod tests {
         assert!(!depth_only.has_objects());
     }
 
+    fn entry_named(name: &str) -> TensorEntry {
+        TensorEntry::new(
+            name,
+            vec![64],
+            TensorDataType::Bf16,
+            WeightFormat::Bf16,
+            WeightLayout::ContiguousLeV1,
+            0,
+            128,
+        )
+    }
+
     #[test]
-    fn the_composites_depth_replaces_the_bases_and_none_keeps_it() {
-        let mut composite = take(&[OBJECT]);
-        assert_eq!(composite.depth(Some(2)), Some(2));
-        assert_eq!(composite.depth(None), None);
-        composite.draft_depth = Some(4);
-        assert_eq!(composite.depth(Some(2)), Some(4));
-        assert_eq!(composite.depth(None), Some(4));
+    fn the_composites_depth_replaces_the_bases_and_is_checked() {
+        let with_mtp = table([entry_named("mtp/fc"), entry_named("text/draft_head"), norm(4096)]);
+        let without = table([norm(0)]);
+        let depth = |depth: Option<u8>| Composite {
+            draft_depth: depth,
+            ..take(&[OBJECT])
+        };
+        assert_eq!(composed_depth(Some(2), &with_mtp, &depth(None)).unwrap(), Some(2));
+        assert_eq!(composed_depth(None, &without, &depth(None)).unwrap(), None);
+        assert_eq!(composed_depth(Some(2), &with_mtp, &depth(Some(4))).unwrap(), Some(4));
+        assert_eq!(composed_depth(None, &with_mtp, &depth(Some(1))).unwrap(), Some(1));
+        assert_eq!(
+            composed_depth(None, &with_mtp, &depth(Some(MAX_DRAFT_DEPTH))).unwrap(),
+            Some(MAX_DRAFT_DEPTH)
+        );
+        let zero = composed_depth(None, &with_mtp, &depth(Some(0)))
+            .unwrap_err()
+            .to_string();
+        assert!(zero.contains("depth 0"), "{zero}");
+        let over = composed_depth(None, &with_mtp, &depth(Some(MAX_DRAFT_DEPTH + 1)))
+            .unwrap_err()
+            .to_string();
+        assert!(over.contains("outside"), "{over}");
+        let none = composed_depth(None, &without, &depth(Some(3))).unwrap_err().to_string();
+        assert!(none.contains("MTP"), "{none}");
+        let half = table([entry_named("mtp/fc"), norm(4096)]);
+        assert!(composed_depth(None, &half, &depth(Some(3))).is_err());
     }
 
     #[test]
