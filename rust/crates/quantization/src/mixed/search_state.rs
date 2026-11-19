@@ -7,7 +7,7 @@ use euhedral_core::frames::Frame;
 use euhedral_data_structures::sync::ClaimCell;
 use euhedral_graph::Lake;
 use euhedral_io::{AsyncIo, Continuation};
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Number, Value, from_slice};
 use thiserror::Error;
 
 use super::allocation::Allocation;
@@ -116,8 +116,8 @@ pub struct SearchState {
 }
 
 impl SearchState {
-    /// The state in `path`, or a new one with `seed` and `free_bytes` recorded. A file that holds a search with another
-    /// `fingerprint` is refused, and the file is left alone.
+    /// The state in `path`, or a new one with `seed` and `free_bytes` recorded when the file is missing or empty. A file
+    /// that holds a search with another `fingerprint`, or anything else, is refused, and the file is left alone.
     pub fn open(
         io: &Arc<AsyncIo>,
         host: &Arc<Lake>,
@@ -135,19 +135,26 @@ impl SearchState {
             Ok(file) => {
                 let held = file.clone();
                 let next = settle.clone();
-                let header = move |header: Result<Header, ResumeError>| match header {
+                let sized = move |len: Result<u64, ResumeError>| match len {
                     Err(error) => next.finish(Err(error.into())),
-                    Ok(header) => {
-                        let identity = Identity {
-                            path: path_held,
-                            fingerprint,
-                            seed,
-                            free_bytes,
+                    Ok(len) => {
+                        let (file, again) = (held.clone(), next.clone());
+                        let header = move |header: Result<Header, ResumeError>| match header {
+                            Err(error) => again.finish(Err(error.into())),
+                            Ok(header) => {
+                                let identity = Identity {
+                                    path: path_held,
+                                    fingerprint,
+                                    seed,
+                                    free_bytes,
+                                };
+                                Self::begin(held, header, len, identity, again)
+                            }
                         };
-                        Self::begin(held, header, identity, next)
+                        next.started(file.header(Box::new(header)))
                     }
                 };
-                settle.started(file.header(Box::new(header)))
+                settle.started(file.len(Box::new(sized)))
             }
         };
         Ok(ResumeFile::open(io, host, path, Box::new(opened))?)
@@ -155,7 +162,7 @@ impl SearchState {
 
     /// The measured candidates of the search in `path`, whatever search it is: for a new search to start from what
     /// another measured (KL does not depend on the context or the budget a search fits to). A file that is not a
-    /// search state is refused; the file is not changed, though a path that did not exist is created empty.
+    /// search state is refused, and a missing one is an I/O error: the file is opened for reading only, so nothing is created or changed.
     pub fn read(
         io: &Arc<AsyncIo>,
         host: &Arc<Lake>,
@@ -184,10 +191,20 @@ impl SearchState {
                 settle.started(file.header(Box::new(header)))
             }
         };
-        Ok(ResumeFile::open(io, host, path, Box::new(opened))?)
+        Ok(ResumeFile::open_read_only(io, host, path, Box::new(opened))?)
     }
 
-    fn begin(file: ResumeFile, header: Header, identity: Identity, settle: Settle<SearchState>) -> Box<dyn Frame> {
+    fn begin(
+        file: ResumeFile,
+        header: Header,
+        len: u64,
+        identity: Identity,
+        settle: Settle<SearchState>,
+    ) -> Box<dyn Frame> {
+        if header.is_empty() && len != 0 {
+            // A file with something in it that is not a search is not ours to overwrite.
+            return settle.finish(Err(SearchError::NotSearchState { path: identity.path }));
+        }
         if header.is_empty() {
             let mut header = Header::new();
             header.set("kind", KIND);
@@ -288,13 +305,12 @@ impl SearchState {
     /// allocation is already recorded.
     pub fn add(self, candidate: Measured, then: Then<(SearchState, bool)>) -> Result<(), SearchError> {
         if self.known.contains(&candidate.allocation) {
-            // A write of no bytes ends on the host lake without touching the file.
             let file = self.file.clone();
-            let known = move |done: Result<u64, ResumeError>| match done {
+            let known = move |done: Result<(), ResumeError>| match done {
                 Ok(_) => then(Ok((self, false))),
                 Err(error) => then(Err(error.into())),
             };
-            return Ok(file.write(HEADER, Vec::new(), Box::new(known))?);
+            return Ok(file.settled(Box::new(known))?);
         }
         let body = encode(&candidate).into_bytes();
         let length = u32::try_from(body.len()).map_err(|_| SearchError::damaged("a record is over 4 GiB"))?;
@@ -330,9 +346,9 @@ impl SearchState {
     /// Records `progress` and hands the state to `then`.
     pub fn set_progress(mut self, progress: Progress, then: Then<SearchState>) -> Result<(), SearchError> {
         self.header.set("round", progress.round.to_string());
-        self.header.set("explore", java_double(progress.explore));
+        self.header.set("explore", double_text(progress.explore));
         self.header.set("stale", progress.stale.to_string());
-        self.header.set("heldOut", java_double(progress.held_out));
+        self.header.set("heldOut", double_text(progress.held_out));
         self.progress = progress;
         let (file, header) = (self.file.clone(), self.header.clone());
         let done = move |done: Result<(), ResumeError>| match done {
@@ -396,8 +412,8 @@ fn optional_double(header: &Header, key: &str) -> Result<f64, SearchError> {
     }
 }
 
-/// A double as text that `Double.parseDouble` reads back to the same value.
-fn java_double(value: f64) -> String {
+/// A double as text that [`parse_double`] reads back to the same value: NaN and the infinities by name.
+fn double_text(value: f64) -> String {
     if value.is_nan() {
         "NaN".to_string()
     } else if value.is_infinite() {
@@ -478,8 +494,11 @@ impl Loader {
     fn step(self) -> Box<dyn Frame> {
         if self.measured.len() == self.layout.count {
             return if self.at == self.layout.end {
-                let done = self.done.clone();
-                done.finish(Ok(self.measured))
+                let Loader {
+                    file, measured, done, ..
+                } = self;
+                drop(file);
+                done.finish(Ok(measured))
             } else {
                 let at = self.at;
                 let recorded = self.layout.end;
@@ -552,13 +571,12 @@ fn encode(measured: &Measured) -> String {
 fn double(value: f64) -> Value {
     match Number::from_f64(value) {
         Some(number) => Value::Number(number),
-        None => Value::String(java_double(value)),
+        None => Value::String(double_text(value)),
     }
 }
 
 fn decode(body: &[u8]) -> Result<Measured, SearchError> {
-    let root: Value =
-        serde_json::from_slice(body).map_err(|error| SearchError::damaged(format!("a record: {error}")))?;
+    let root: Value = from_slice(body).map_err(|error| SearchError::damaged(format!("a record: {error}")))?;
     let field = |name: &str| {
         root.get(name)
             .ok_or_else(|| SearchError::damaged(format!("a record has no {name}")))
