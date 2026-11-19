@@ -66,6 +66,8 @@ native-package:
     - apt-get update -qq && apt-get install -y -qq llvm xz-utils python3-pip >/dev/null
     - mise install >/dev/null
     - mise exec -- gradle nativeVerify :api:bootJar build
+    # Host-only native tests (no card): the programmatic-launch wait rule over the kernel sources and the registry.
+    - cd native/tests && python3 -m unittest test_pdl_wait test_pdl_registry
   artifacts:
     when: on_failure
     paths: [api/build/test-results/test/*.xml]
