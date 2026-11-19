@@ -49,7 +49,7 @@ use std::path::Path;
 #[cfg(test)]
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Single};
 use euhedral_graph::{Gate, StageError};
@@ -515,6 +515,11 @@ pub enum DiskMessage {
     },
     /// The quantum ended before its device work consumed all its uses.
     Abandon { ticket: u64 },
+    /// `ticket` ends when `kill` is set: a later [`DiskMessage::Killed`] of the same flag abandons it. Forgotten once
+    /// nothing else holds the flag.
+    Watch { ticket: u64, kill: Arc<AtomicBool> },
+    /// `kill` was set: the tickets watching it are abandoned.
+    Killed { kill: Arc<AtomicBool> },
     /// A read of `slot` ended.
     Arrived {
         slot: usize,
@@ -532,6 +537,8 @@ impl fmt::Debug for DiskMessage {
         match self {
             DiskMessage::Enqueue { ticket, uses, .. } => write!(formatter, "Enqueue({ticket}, {} uses)", uses.len()),
             DiskMessage::Abandon { ticket } => write!(formatter, "Abandon({ticket})"),
+            DiskMessage::Watch { ticket, .. } => write!(formatter, "Watch({ticket})"),
+            DiskMessage::Killed { .. } => write!(formatter, "Killed"),
             DiskMessage::Arrived { slot, ticket, .. } => write!(formatter, "Arrived({slot}, {ticket})"),
             DiskMessage::SlotFreed { slot, ticket } => write!(formatter, "SlotFreed({slot}, {ticket})"),
             DiskMessage::Close { .. } => write!(formatter, "Close"),
@@ -611,6 +618,8 @@ pub(crate) struct DiskOwner {
     closed: bool,
     closed_signals: Vec<Arc<Handoff<()>>>,
     told: Vec<Finished>,
+    /// The tickets that end when their kill flag is set.
+    watching: Vec<(u64, Arc<AtomicBool>)>,
 }
 
 fn abandoned_error() -> StageError {
@@ -630,6 +639,24 @@ impl DiskOwner {
         match message {
             DiskMessage::Enqueue { ticket, uses, fail } => self.enqueue(ticket, uses, fail),
             DiskMessage::Abandon { ticket } => self.abandon(ticket),
+            DiskMessage::Watch { ticket, kill } => {
+                // A flag nothing else holds can no longer be set.
+                self.watching.retain(|(_, flag)| Arc::strong_count(flag) > 1);
+                if kill.load(Ordering::Acquire) {
+                    self.abandon(ticket);
+                } else {
+                    self.watching.push((ticket, kill));
+                }
+            }
+            DiskMessage::Killed { kill } => {
+                let (killed, kept): (Vec<_>, Vec<_>) = mem::take(&mut self.watching)
+                    .into_iter()
+                    .partition(|(_, flag)| Arc::ptr_eq(flag, &kill));
+                self.watching = kept;
+                for (ticket, _) in killed {
+                    self.abandon(ticket);
+                }
+            }
             DiskMessage::Arrived { slot, ticket, result } => self.arrive(slot, ticket, result),
             DiskMessage::SlotFreed { slot, ticket } => {
                 if let Some(state) = self.slots.get_mut(slot).map(|slot| &mut slot.state)
@@ -974,6 +1001,7 @@ impl DiskReader {
             closed: false,
             closed_signals: Vec::new(),
             told: Vec::new(),
+            watching: Vec::new(),
         };
         let mailbox = Arc::new(Mailbox::new(owner, producer, spawn));
         address.set(&mailbox);
@@ -1015,6 +1043,20 @@ impl DiskReader {
     /// `ticket` stopped before its device work consumed all its uses. At any time, before or after its uses were posted.
     pub fn abandon(&self, ticket: u64) {
         self.mailbox.post(DiskMessage::Abandon { ticket });
+    }
+
+    /// `ticket` ends when `kill` is set (see [`DiskReader::killed`]). Posted with its uses, so a flag set before the
+    /// quantum started abandons it at once.
+    pub fn watch(&self, ticket: u64, kill: Arc<AtomicBool>) {
+        self.mailbox.post(DiskMessage::Watch { ticket, kill });
+    }
+
+    /// `kill` was set: every ticket watching it is abandoned, so a copy waiting for a read of its own gives its gate up
+    /// and its quantum can end. Called by whoever sets the flag, after setting it.
+    pub fn killed(&self, kill: &Arc<AtomicBool>) {
+        self.mailbox.post(DiskMessage::Killed {
+            kill: Arc::clone(kill),
+        });
     }
 
     /// The copy of `ticket` that consumed `slot` ended (its marker completed): the slot may be read into again. A free

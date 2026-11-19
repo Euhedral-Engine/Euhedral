@@ -574,6 +574,8 @@ pub enum StartError {
     Prepare(String),
     #[error("the sequence stopped offering the step before it started")]
     Withdrawn,
+    #[error("the quantum's disk reads were refused: {0}")]
+    Disk(String),
 }
 
 /// What uploads a quantum's input record when the executor starts it: the owner's lane, and the pinned pool the record is
@@ -791,6 +793,14 @@ impl Executor {
         }
     }
 
+    /// `kill` was set: the quanta it stops read nothing more from disk, so a copy that waits for a read of its own gives
+    /// its gate up and its quantum can end. Called by whoever sets the flag, after setting it.
+    pub(crate) fn killed(&self, kill: &Arc<AtomicBool>) {
+        if let Some(tier) = self.plan.disk_tier() {
+            tier.killed(kill);
+        }
+    }
+
     /// One monotonic reading, in nanoseconds, taken as a quantum starts.
     fn clock(&self) -> u64 {
         u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
@@ -844,9 +854,24 @@ impl Executor {
         let variant = view.variant();
         let home = home::home_of(quantum.id(), self.clock(), self.stage_lanes);
         let eager = self.eager[variant.index()].get(home).ok_or(StartError::NoView(view))?;
+        // The reads of a view with disk uses are registered here, in the one place quanta start, so the reader's queues
+        // and tickets follow the order the quanta start in (a staged view is never captured, so none of this is
+        // skipped for a quantum that runs as one body).
+        let ledger = match (self.plan.disk_tier(), self.plan.disk_uses(view)) {
+            (Some(tier), uses) if !uses.is_empty() => {
+                Some((Arc::clone(tier), tier.register(uses, &kill).map_err(|error| StartError::Disk(error.to_string()))?))
+            }
+            _ => None,
+        };
         // Nothing after this can refuse the quantum: the upload is queued last, and a quantum dropped after it would free
         // the pinned record under the copy.
-        self.prepare(&mut quantum)?;
+        if let Err(error) = self.prepare(&mut quantum) {
+            if let Some((tier, ledger)) = &ledger {
+                ledger.end(tier.reader());
+            }
+            return Err(error);
+        }
+        quantum.disk = ledger.map(|(_, ledger)| ledger);
         let serial = quantum.id();
         let stages = self.plan.unit_stages(view).map_or(0, <[_]>::len);
         let keyed = self
