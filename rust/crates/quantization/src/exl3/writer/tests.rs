@@ -1,17 +1,19 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use euhedral_inference_engine::Handoff;
 
 use super::{EndOf, Parked};
 use crate::checkpoint::CheckpointError;
 
-type Ended = Arc<Mutex<Vec<(String, String)>>>;
+type Ended = Arc<Handoff<(String, String)>>;
 
-/// A callback that records the writer and the outcome of each call it ends.
+/// A callback that hands over the writer and the outcome of the call it ends. A second call is a debug panic.
 fn recording() -> (Ended, EndOf<String>) {
-    let ended: Ended = Arc::default();
+    let ended: Ended = Handoff::new();
     let record = Arc::clone(&ended);
     let then: EndOf<String> = Arc::new(move |writer, result| {
         let outcome = result.map_or_else(|error| error.to_string(), |()| "ok".to_owned());
-        record.lock().unwrap().push((writer, outcome));
+        record.send((writer, outcome));
     });
     (ended, then)
 }
@@ -24,10 +26,10 @@ fn a_step_dropped_unrun_ends_the_call_with_the_writer() {
     let parked = Parked::new("writer".to_owned(), then, ());
     let step = Arc::clone(&parked);
     drop(parked);
-    assert!(ended.lock().unwrap().is_empty(), "the step still holds the call");
+    assert!(ended.take().is_none(), "the step still holds the call");
     drop(step);
     let closed = CheckpointError::LakeClosed.to_string();
-    assert_eq!(*ended.lock().unwrap(), vec![("writer".to_owned(), closed)]);
+    assert_eq!(ended.take(), Some(("writer".to_owned(), closed)));
 }
 
 // Mutant caught: a step that runs and still has the guard end the call a second time when it is dropped.
@@ -41,7 +43,7 @@ fn a_step_that_ran_does_not_end_the_call_again() {
     then(writer, Ok(()));
     drop(step);
     drop(parked);
-    assert_eq!(*ended.lock().unwrap(), vec![("writer".to_owned(), "ok".to_owned())]);
+    assert_eq!(ended.take(), Some(("writer".to_owned(), "ok".to_owned())));
 }
 
 // Mutant caught: a refused step that lets the drop report "closed" in place of the refusal's own error, or that
@@ -55,8 +57,5 @@ fn a_refused_step_reports_its_own_error_once() {
     drop(step);
     parked.refused(CheckpointError::Invalid("refused".to_owned()));
     drop(parked);
-    assert_eq!(
-        *ended.lock().unwrap(),
-        vec![("writer".to_owned(), "refused".to_owned())]
-    );
+    assert_eq!(ended.take(), Some(("writer".to_owned(), "refused".to_owned())));
 }
