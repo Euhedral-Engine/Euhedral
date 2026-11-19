@@ -439,9 +439,10 @@ fn flip(matrix: &[Vec<f32>]) -> Vec<Vec<f32>> {
 
 #[test]
 fn every_row_major_product_equals_the_host_matrix_product() {
-    // Operands are stored with padding after each row, so a leading dimension that is mistaken for a width is seen.
+    // The linear products take packed matrices; the general products below are padded after each row, so a leading
+    // dimension that is mistaken for a width is seen.
     let (rows, inputs, outputs) = (3usize, 4usize, 5usize);
-    let (x_ld, w_ld, y_ld) = (inputs + 2, inputs + 1, outputs + 3);
+    let (x_ld, w_ld, y_ld) = (inputs, inputs, outputs);
     let x_memory = whole(rows * x_ld, 1);
     let w_memory = whole(outputs * w_ld, 2);
     let y_memory = whole(rows * y_ld, 3);
@@ -489,7 +490,7 @@ fn every_row_major_product_equals_the_host_matrix_product() {
     );
 
     // dx [rows, in] += dy [rows, out] w [out, in]: the operands change roles.
-    let dy_ld = outputs + 2;
+    let dy_ld = outputs;
     let dy_memory = whole(rows * dy_ld, 4);
     let dy = rows_of(&dy_memory, dy_ld, rows, outputs);
     let dx_memory = whole(rows * x_ld, 5);
