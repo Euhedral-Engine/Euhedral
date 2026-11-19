@@ -602,7 +602,7 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
                 // one-call slot pin, or a ring that drained meanwhile. The copy is tried again when the lane's oldest
                 // marker completes, not at once: re-offering it now could only spin a worker.
                 let lane = Arc::clone(shared.core.transfer_lane(chain));
-                let completions = Arc::clone(&shared.core.completions);
+                let completions = Arc::clone(shared.core.completions());
                 let stages = Arc::clone(&shared.core.stages);
                 let retry = step(Kind::UploadCopy, chain, move || copy(shared, chain, index, loan));
                 retry_or_offer(&*lane, &completions, retry, |frame| {
