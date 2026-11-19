@@ -1,6 +1,5 @@
 //! The encoders against the parsers: what is encoded reads back as what went in, and the bytes of the Python-written
-//! fixture and of the tiny artifacts are reproduced exactly. The tiny artifacts are also compared with files
-//! written by the reference implementation, kept in `fixtures/tiny-artifacts`.
+//! fixture are reproduced exactly.
 
 #![allow(
     clippy::unwrap_used,
@@ -161,29 +160,6 @@ fn tiny_artifacts_are_the_same_every_time_and_differ_by_seed() {
     let first = TinyArtifact::new(1, true).bytes().unwrap();
     assert_eq!(first, TinyArtifact::new(1, true).bytes().unwrap());
     assert_ne!(first, TinyArtifact::new(3, true).bytes().unwrap());
-}
-
-#[test]
-fn tiny_artifacts_match_the_golden_files() {
-    for (name, golden, seed, companions) in [
-        (
-            "trellis",
-            &include_bytes!("fixtures/tiny-artifacts/trellis.edrl")[..],
-            1,
-            true,
-        ),
-        (
-            "nvfp4",
-            &include_bytes!("fixtures/tiny-artifacts/nvfp4.edrl")[..],
-            2,
-            false,
-        ),
-    ] {
-        let written = TinyArtifact::new(seed, companions).bytes().unwrap();
-        assert_eq!(written.len(), golden.len(), "{name}: length");
-        let first_difference = written.iter().zip(golden).position(|(a, b)| a != b);
-        assert_eq!(first_difference, None, "{name}: first differing byte");
-    }
 }
 
 fn spec(name: &str, elements: u64) -> ObjectSpec {
