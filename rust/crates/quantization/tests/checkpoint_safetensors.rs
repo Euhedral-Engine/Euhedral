@@ -13,10 +13,10 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use checkpoint_support::{Spec, drive, safetensors, write};
 use euhedral_inference_quantization::checkpoint::CheckpointError;
 use euhedral_inference_quantization::checkpoint::safetensors::{ReadRange, Safetensors};
 use euhedral_io::AsyncIo;
-use checkpoint_support::{Spec, drive, safetensors, write};
 
 fn open(io: &Arc<AsyncIo>, directory: &Path) -> Result<Arc<Safetensors>, CheckpointError> {
     drive(io, |done| Safetensors::open(io, directory, done)).map(Arc::new)
