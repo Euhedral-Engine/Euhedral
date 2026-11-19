@@ -19,10 +19,14 @@
 #   NEXT_BRANCH            optional, given when `promote` is played: the new branch's name (default: the old number plus one,
 #                          or "-2" appended to a name without a number)
 #   PROMOTE_DRY_RUN        optional, given when `promote` is played: 1 prints the plan and changes nothing
+# Pipelines run for merge requests, the integration branch, main and manual runs. A push to any other branch starts none:
+# the runner is shared, and its merge request runs the same jobs.
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $INTEGRATION_BRANCH
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web"
 
 variables:
   ARBITER_ARGS: "--cpu shared:16 --mem 32G"
