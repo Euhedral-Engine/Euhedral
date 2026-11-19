@@ -35,8 +35,14 @@ pub enum Consumer {
     Cache,
     /// The state of every sequence beyond the first, besides its cache.
     ExtraSequences,
+    /// The device ring that weights held outside the device are copied through before they are read.
+    StagingRing,
     /// The pinned host pages of the cache of every sequence.
     HostPages,
+    /// The pinned host arena of the weights the device does not hold, the embedding and the output head among them.
+    HostWeights,
+    /// The pinned host slots that reads of the artifact file land in.
+    DiskWindow,
     /// The prefix cache's pinned arena, the one consumer the plan may drop.
     PrefixCache,
 }
@@ -50,7 +56,10 @@ impl Consumer {
             Consumer::Scratch => "scratch",
             Consumer::Cache => "cache",
             Consumer::ExtraSequences => "state of the sequences beyond the first",
+            Consumer::StagingRing => "staging ring",
             Consumer::HostPages => "cache pages on the host",
+            Consumer::HostWeights => "weights on the host",
+            Consumer::DiskWindow => "disk window",
             Consumer::PrefixCache => "prefix cache",
         }
     }

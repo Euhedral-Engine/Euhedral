@@ -361,20 +361,39 @@ fn a_plan_that_does_not_fit_fails_before_device_alloc() {
     settings.memory.gpu_limit = euhedral_inference_settings::Auto::Value(ByteSize::gib(2));
     let (outcome, _guard) = start(&settings, &machine.library);
     let error = outcome.expect_err("12 GiB of weights do not fit in 2 GiB");
-    let EngineError::Plan(PlanError::WeightsDoNotFit {
-        weights_needed,
-        available,
-        ..
-    }) = &error
-    else {
+    // The plan holds what cannot stay on the device in host memory or in the file: the host budget is too small for
+    // that, the device is too small even for what must stay, or the plan is made and this build cannot run it. Each is a refusal of the plan before any allocation.
+    let EngineError::Plan(refusal) = &error else {
         panic!("expected a plan refusal, got {error:?}");
     };
-    assert!(*weights_needed > 11 << 30 && *available == 2 << 30);
-    let message = error.to_string();
-    assert!(
-        message.contains(&weights_needed.to_string()) && message.contains(&available.to_string()),
-        "{message}"
-    );
+    match refusal {
+        PlanError::DeviceTooSmallWithOffload {
+            weights_needed,
+            available,
+            ..
+        } => {
+            assert_eq!(*available, 2 << 30);
+            let message = error.to_string();
+            assert!(
+                message.contains(&weights_needed.to_string()) && message.contains(&available.to_string()),
+                "{message}"
+            );
+        }
+        PlanError::HostTooSmall { needed, budget } => {
+            let message = error.to_string();
+            assert!(needed > budget, "{message}");
+            assert!(message.contains(&format!("{} MiB", needed >> 20)), "{message}");
+        }
+        PlanError::WeightsOutsideDevice {
+            arena_bytes,
+            window_bytes,
+            ..
+        } => {
+            let message = error.to_string();
+            assert!(message.contains(&(arena_bytes + window_bytes).to_string()), "{message}");
+        }
+        other => panic!("expected the device, host or offload refusal, got {other:?}"),
+    }
     let after = library.free_bytes().unwrap();
     assert!(
         before.abs_diff(after) < (256 << 20),

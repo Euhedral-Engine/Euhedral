@@ -21,8 +21,8 @@ use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::model::{ArtifactProfile, Quantization, Speculation};
 use euhedral_inference_engine::residency::footprint;
 use euhedral_inference_engine::residency::planner::{
-    ARENA_ALIGNMENT, DEFAULT_RUNTIME_RESERVE_BYTES, PlacementSource, PlanInputs, ResidencyPlan, plan, plan_with,
-    sequences_for,
+    ARENA_ALIGNMENT, DEFAULT_RUNTIME_RESERVE_BYTES, PlacementSource, PlanInputs, ResidencyPlan, plan, plan_closest,
+    plan_with, sequences_for,
 };
 use euhedral_inference_engine::runtime::resolve_sequences;
 use euhedral_inference_engine::workspace::{
@@ -152,31 +152,40 @@ fn the_arena_holds_every_object_aligned_and_apart() {
 
 #[test]
 fn planner_refuses_when_weights_do_not_fit() {
-    let error = plan_with(&config(), &rco_table(), &settings(32_768), inputs(8 * GIB)).unwrap_err();
-    let PlanError::WeightsDoNotFit {
+    // 8 GiB now offloads what leaves it room; a device that cannot hold what stays is refused.
+    let error = plan_with(&config(), &rco_table(), &settings(32_768), inputs(GIB)).unwrap_err();
+    let PlanError::DeviceTooSmallWithOffload {
         weights_needed,
         state_needed,
         available,
         free,
         sequences,
+        context_tokens,
+        host,
     } = error
     else {
-        panic!("expected WeightsDoNotFit, got {error:?}");
+        panic!("expected DeviceTooSmallWithOffload, got {error:?}");
     };
-    assert_eq!(free, 8 * GIB);
-    assert_eq!(available, 8 * GIB);
+    assert_eq!(free, GIB);
+    assert_eq!(available, GIB);
     assert_eq!(sequences, 1);
+    assert_eq!(context_tokens, 32_768);
     let arena = plan_with(&config(), &rco_table(), &settings(32_768), inputs(16 * GIB))
         .unwrap()
         .arena_bytes;
-    assert_eq!(weights_needed, arena);
+    // What stays on the device is the arena the closest plan keeps and its staging ring, exactly.
+    let (closest, _) = plan_closest(&config(), &rco_table(), &settings(32_768), inputs(GIB)).unwrap();
+    assert!(closest.arena_bytes < arena);
+    assert_eq!(weights_needed, closest.arena_bytes + closest.offload.staging_bytes());
     assert_eq!(state_needed, JAVA_KV_32768 + 1280 * MIB + JAVA_TRELLIS_SCRATCH_512);
-    let message = PlanError::WeightsDoNotFit {
+    let message = PlanError::DeviceTooSmallWithOffload {
         weights_needed,
         state_needed,
         available,
         free,
         sequences,
+        context_tokens,
+        host,
     }
     .to_string();
     assert!(
@@ -185,6 +194,7 @@ fn planner_refuses_when_weights_do_not_fit() {
     );
     assert!(message.contains(&weights_needed.to_string()), "{message}");
     assert!(message.contains(&available.to_string()), "{message}");
+    assert!(message.contains("1024 MiB free on this GPU"), "{message}");
 }
 
 #[test]
@@ -217,6 +227,7 @@ fn kv_spills_beyond_kv_cache_on_gpu_tokens_when_short() {
 
     // Room for the whole cache: nothing spills.
     let roomy = plan_with(&config, &table, &settings, inputs(need_whole)).unwrap();
+    assert!(roomy.offload.is_empty());
     assert_eq!((roomy.kv_device_tokens, roomy.kv_host_tokens), (131_072, 0));
 
     // One byte short of that: the cache past 32768 tokens moves to the host.
@@ -227,30 +238,35 @@ fn kv_spills_beyond_kv_cache_on_gpu_tokens_when_short() {
     assert_eq!(short.device_bytes, need_spilled);
 
     // The boundary of the spilled plan.
-    assert!(plan_with(&config, &table, &settings, inputs(need_spilled)).is_ok());
-    assert!(matches!(
-        plan_with(&config, &table, &settings, inputs(need_spilled - 1)),
-        Err(PlanError::WeightsDoNotFit { .. })
-    ));
+    assert!(
+        plan_with(&config, &table, &settings, inputs(need_spilled))
+            .unwrap()
+            .offload
+            .is_empty()
+    );
+    // One byte short of that: the weights leave the device too, the embedding first, and the pages stay on the host.
+    let deeper = plan_with(&config, &table, &settings, inputs(need_spilled - 1)).unwrap();
+    assert_eq!(deeper.offload.host, ["text/token_embedding"]);
+    assert_eq!(deeper.kv_host_bytes, spilled);
 
-    // Host memory that cannot hold the pages leaves the weights to make room, which they cannot.
+    // Host memory that cannot hold the pages leaves the weights to make room instead: the pages stay on the device.
     let mut host_short = inputs(need_whole - 1);
     host_short.host_pinned_bytes = Some(spilled - 1);
-    assert!(matches!(
-        plan_with(&config, &table, &settings, host_short),
-        Err(PlanError::WeightsDoNotFit { .. })
-    ));
+    let moved = plan_with(&config, &table, &settings, host_short).unwrap();
+    assert_eq!((moved.kv_device_tokens, moved.kv_host_tokens), (131_072, 0));
+    assert!(!moved.offload.is_empty());
     host_short.host_pinned_bytes = Some(spilled);
-    assert!(plan_with(&config, &table, &settings, host_short).is_ok());
+    let spilling = plan_with(&config, &table, &settings, host_short).unwrap();
+    assert_eq!(spilling.kv_host_bytes, spilled);
+    assert!(spilling.offload.is_empty());
 
     // A context that already fits in kv-cache-on-gpu-tokens has nothing to spill.
     settings.context.max_tokens = 32_768;
     settings.context.kv_cache_on_gpu_tokens = 65_536;
     let small_short = arena + JAVA_KV_32768 + 1280 * MIB + JAVA_TRELLIS_SCRATCH_512 - 1;
-    assert!(matches!(
-        plan_with(&config, &table, &settings, inputs(small_short)),
-        Err(PlanError::WeightsDoNotFit { .. })
-    ));
+    let moved = plan_with(&config, &table, &settings, inputs(small_short)).unwrap();
+    assert_eq!(moved.kv_host_tokens, 0);
+    assert_eq!(moved.offload.host, ["text/token_embedding"]);
 }
 
 #[test]
@@ -310,11 +326,19 @@ fn gpu_limit_respected_and_gpu_reserve_not_used_by_the_dense_plan() {
         .device_bytes;
 
     // The plan fits exactly what is free, with no gpu-reserve taken off (Java InferenceEngine.deviceBudget).
-    assert!(plan_with(&config, &table, &base, inputs(need)).is_ok());
-    assert!(matches!(
-        plan_with(&config, &table, &base, inputs(need - 1)),
-        Err(PlanError::WeightsDoNotFit { .. })
-    ));
+    assert!(
+        plan_with(&config, &table, &base, inputs(need))
+            .unwrap()
+            .offload
+            .is_empty()
+    );
+    assert_eq!(
+        plan_with(&config, &table, &base, inputs(need - 1))
+            .unwrap()
+            .offload
+            .host,
+        ["text/token_embedding"]
+    );
     let mut reserved = base.clone();
     reserved.memory.gpu_reserve = ByteSize::gib(8);
     assert!(
@@ -327,11 +351,14 @@ fn gpu_limit_respected_and_gpu_reserve_not_used_by_the_dense_plan() {
     limited.memory.gpu_limit = Auto::Value(ByteSize(need));
     assert!(plan_with(&config, &table, &limited, inputs(64 * GIB)).is_ok());
     limited.memory.gpu_limit = Auto::Value(ByteSize(need - 1));
+    let offloaded = plan_with(&config, &table, &limited, inputs(64 * GIB)).unwrap();
+    assert_eq!(offloaded.offload.host, ["text/token_embedding"]);
+    limited.memory.gpu_limit = Auto::Value(ByteSize(GIB));
     let error = plan_with(&config, &table, &limited, inputs(64 * GIB)).unwrap_err();
-    let PlanError::WeightsDoNotFit { available, free, .. } = error else {
-        panic!("expected WeightsDoNotFit, got {error:?}");
+    let PlanError::DeviceTooSmallWithOffload { available, free, .. } = error else {
+        panic!("expected DeviceTooSmallWithOffload, got {error:?}");
     };
-    assert_eq!(available, need - 1);
+    assert_eq!(available, GIB);
     assert_eq!(free, 64 * GIB, "the free memory is reported as it was");
 }
 
@@ -353,10 +380,12 @@ fn the_runtime_reserve_is_a_setting_whose_auto_is_javas() {
     stated.memory.runtime_reserve = Auto::Value(ByteSize::mib(2000));
     let larger = plan_with(&config, &table, &stated, inputs(16 * GIB)).unwrap();
     assert_eq!(larger.device_bytes, auto.device_bytes + 720 * MIB);
-    assert!(matches!(
-        plan_with(&config, &table, &stated, inputs(larger.device_bytes - 1)),
-        Err(PlanError::WeightsDoNotFit { .. })
-    ));
+    assert!(
+        !plan_with(&config, &table, &stated, inputs(larger.device_bytes - 1))
+            .unwrap()
+            .offload
+            .is_empty()
+    );
     stated.memory.runtime_reserve = Auto::Value(ByteSize(0));
     assert_eq!(
         plan_with(&config, &table, &stated, inputs(16 * GIB))
@@ -479,14 +508,18 @@ fn the_boundary_of_a_plan_of_several_sequences_and_what_the_refusal_says() {
         .unwrap()
         .device_bytes;
     assert!(plan_with(&config, &table, &settings, with_sequences(need, 3)).is_ok());
-    let error = plan_with(&config, &table, &settings, with_sequences(need - 1, 3)).unwrap_err();
+    // One byte short: the embedding leaves the device.
+    let offloaded = plan_with(&config, &table, &settings, with_sequences(need - 1, 3)).unwrap();
+    assert_eq!(offloaded.offload.host, ["text/token_embedding"]);
+    let error = plan_with(&config, &table, &settings, with_sequences(GIB, 3)).unwrap_err();
     assert!(
-        matches!(error, PlanError::WeightsDoNotFit { sequences: 3, .. }),
+        matches!(error, PlanError::DeviceTooSmallWithOffload { sequences: 3, .. }),
         "{error:?}"
     );
     let message = error.to_string();
     assert!(message.contains("or fewer sequences"), "{message}");
     assert!(message.contains("batching.max-sequences"), "{message}");
+    assert!(message.contains("context.max-tokens"), "{message}");
     // The same device holds one sequence.
     assert!(plan_with(&config, &table, &settings, with_sequences(need - 1, 1)).is_ok());
 }
@@ -505,10 +538,10 @@ fn the_host_pages_of_every_sequence_must_fit_the_host() {
     };
     let mut host = with_sequences(two_need, 2);
     host.host_pinned_bytes = Some(2 * spilled - 1);
-    assert!(matches!(
-        plan_with(&config, &table, &settings, host),
-        Err(PlanError::WeightsDoNotFit { sequences: 2, .. })
-    ));
+    // The pages of both sequences do not fit the host: they stay on the device and the weights make the room.
+    let moved = plan_with(&config, &table, &settings, host).unwrap();
+    assert_eq!(moved.kv_host_bytes, 0);
+    assert!(!moved.offload.is_empty());
     host.host_pinned_bytes = Some(2 * spilled);
     let plan = plan_with(&config, &table, &settings, host).unwrap();
     assert_eq!(plan.kv_host_bytes, 2 * spilled);
@@ -526,7 +559,13 @@ fn the_most_sequences_that_fit_is_found_and_one_more_does_not_fit() {
     let free = one.device_bytes + 4 * each + each - 1;
     assert_eq!(sequences_for(&config, &table, &settings, inputs(free), 1000), Ok(5));
     assert!(plan_with(&config, &table, &settings, with_sequences(free, 5)).is_ok());
-    assert!(plan_with(&config, &table, &settings, with_sequences(free, 6)).is_err());
+    assert!(
+        !plan_with(&config, &table, &settings, with_sequences(free, 6))
+            .unwrap()
+            .offload
+            .is_empty(),
+        "a sixth sequence is made room for by offloading weights"
+    );
     // The cap wins when more would fit, and a cap below 1 is 1.
     assert_eq!(sequences_for(&config, &table, &settings, inputs(free), 3), Ok(3));
     assert_eq!(sequences_for(&config, &table, &settings, inputs(free), 0), Ok(1));
@@ -548,7 +587,7 @@ fn a_device_too_small_for_one_sequence_is_refused_not_given_one() {
     let (config, table) = (config(), rco_table());
     let error = sequences_for(&config, &table, &settings(32_768), inputs(GIB), 7).unwrap_err();
     assert!(
-        matches!(error, PlanError::WeightsDoNotFit { sequences: 1, .. }),
+        matches!(error, PlanError::DeviceTooSmallWithOffload { sequences: 1, .. }),
         "{error:?}"
     );
 }

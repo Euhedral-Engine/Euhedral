@@ -258,3 +258,40 @@ fn a_plan_made_with_an_unknown_host_budget_is_admitted_and_claimed_on_what_it_as
     drop(reservation);
     assert!(account.close().is_clean());
 }
+
+/// A plan that leaves weights outside the device asks the account for the staging ring on the device and for the host
+/// arena and the disk window in pinned host memory, against a host budget that is known.
+#[test]
+fn an_offloaded_plan_is_admitted_with_its_host_consumers() {
+    let (config, table, settings) = (config(), rco_table(), settings(4096));
+    let resident = plan_with(&config, &table, &settings, inputs(1)).unwrap();
+    let host_budget = 4 * GIB;
+    let short = PlanInputs {
+        device_free: resident.device_bytes - (700 << 20),
+        host_pinned_bytes: Some(host_budget),
+        ..inputs(1)
+    };
+    let plan = plan_with(&config, &table, &settings, short).unwrap();
+    assert!(!plan.offload.is_empty());
+    let host_weights = plan.offload.host_arena_bytes + plan.offload.window_bytes();
+    assert!(host_weights > 0 && host_weights <= host_budget);
+
+    let (account, reservation) = admit(&plan);
+    assert_eq!(
+        reservation.admitted().host,
+        plan.kv_host_bytes + plan.prefix_cache_bytes + host_weights
+    );
+    assert_eq!(reservation.admitted().device, plan.device_bytes);
+    assert_eq!(reservation.left(Consumer::StagingRing), plan.offload.staging_bytes());
+    assert_eq!(reservation.left(Consumer::HostWeights), plan.offload.host_arena_bytes);
+    assert_eq!(reservation.left(Consumer::DiskWindow), plan.offload.window_bytes());
+    assert_eq!(account.held(), reservation.admitted());
+    drop(reservation);
+    assert!(account.close().is_clean());
+
+    // A host budget one byte short of what the plan holds there is not admitted.
+    let mut tight = plan.clone();
+    tight.host_budget_bytes = Some(plan.kv_host_bytes + plan.prefix_cache_bytes + host_weights - 1);
+    let account = MemoryAccount::open(tight.budget_bytes);
+    assert!(matches!(account.admit(&tight), Err(PlanError::NotAdmitted(_))));
+}

@@ -8,14 +8,51 @@ use euhedral_inference_cuda::CudaError;
 use euhedral_inference_edrl::EdrlError;
 use thiserror::Error;
 
-/// What the refusal of a plan of several sequences adds: they may be what did not fit.
-fn fewer_sequences(sequences: usize) -> String {
+/// What a refusal says is too large: one context, or the contexts of several sequences.
+fn what_does_not_fit(sequences: usize) -> String {
     if sequences > 1 {
-        format!(
-            "; the plan holds {sequences} sequences: set a smaller context.max-tokens or fewer sequences (batching.max-sequences)"
-        )
+        format!("{sequences} sequences")
     } else {
-        String::new()
+        "a context".to_string()
+    }
+}
+
+/// What the refusal of a plan of several sequences adds: they may be what did not fit.
+fn or_fewer_sequences(sequences: usize) -> &'static str {
+    if sequences > 1 {
+        " or fewer sequences (batching.max-sequences)"
+    } else {
+        ""
+    }
+}
+
+/// What a device refusal adds when the host is short too: the pinned bytes the plan holds there, and the budget.
+fn host_figures(host: &HostFigures) -> String {
+    if host.needed() <= host.budget {
+        return String::new();
+    }
+    format!(
+        "; the host is short too: the weights outside the GPU need {} bytes of pinned host memory (host arena and \
+         disk window) and the cache pages on the host {} bytes, against a host budget of {} bytes",
+        host.weights, host.cache_pages, host.budget
+    )
+}
+
+/// The pinned host bytes a refused plan needs, beside what the host allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostFigures {
+    /// The host arena and the disk window of the weights that left the device.
+    pub weights: u64,
+    /// The cache pages put on the host.
+    pub cache_pages: u64,
+    /// The host budget the plan was made with.
+    pub budget: u64,
+}
+
+impl HostFigures {
+    /// All the pinned host bytes the plan needs.
+    pub fn needed(&self) -> u64 {
+        self.weights + self.cache_pages
     }
 }
 
@@ -30,25 +67,62 @@ pub enum PlanError {
     #[error("the artifact does not hold the model: {0}")]
     Inventory(String),
 
-    /// The weights alone, beside the state every sequence needs, do not fit the device budget.
+    /// The model does not fit the device even with the weights it can offload in host memory or in the artifact file:
+    /// what stays on the device (the weights that cannot leave, the staging ring, the cache and the working memory)
+    /// is more than the device has.
     #[error(
-        "the weights need {weights_needed} bytes on the device beside {state_needed} bytes of state, but only \
-         {available} bytes are available ({free} free, limited by memory.gpu-limit); weights \
-         cannot be backed by host memory yet{}", fewer_sequences(*.sequences)
+        "{} of {context_tokens} tokens does not fit in the {} MiB free on this GPU, even with the weights in host \
+         memory (the plan needs {weights_needed} bytes of weights and {state_needed} bytes of state on the device, \
+         and {available} bytes are available: {free} free, limited by memory.gpu-limit); set a smaller max \
+         context.max-tokens{}{}",
+        what_does_not_fit(*.sequences),
+        available / (1 << 20),
+        or_fewer_sequences(*.sequences),
+        host_figures(host)
     )]
-    WeightsDoNotFit {
+    DeviceTooSmallWithOffload {
+        /// The device bytes of the weights that stay and of the staging ring, at the offload that came closest.
         weights_needed: u64,
+        /// The device bytes of the cache, the runtime's reserve, the scratch and the state of every sequence.
         state_needed: u64,
         available: u64,
         free: u64,
         sequences: usize,
+        context_tokens: u64,
+        /// The host the plan used, for the message when the host is short too.
+        host: HostFigures,
     },
 
-    /// The cache must spill to host memory and the machine does not report what it can spare.
+    /// The weights the device cannot hold need more pinned host memory than the host budget allows.
     #[error(
-        "the attention cache needs {needed} bytes of pinned host memory, and this machine does not report how much \
-         host memory it can spare; set memory.host-limit or memory.host-weights-limit to allow it, or lower \
-         context.max-tokens"
+        "the weights the GPU cannot hold need {} MiB of host memory (the token embedding, the LM head, the \
+         host-backed weights and the disk window), more than the {} MiB host budget; set memory.host-weights-limit \
+         or memory.host-limit higher, or a smaller context.max-tokens or fewer sequences (batching.max-sequences)",
+        needed / (1 << 20),
+        budget / (1 << 20)
+    )]
+    HostTooSmall { needed: u64, budget: u64 },
+
+    /// The plan puts weights outside the device, and this build cannot run weights held in host memory or in the file.
+    #[error(
+        "the model does not fit the GPU: {weights} weights ({host_weights} in host memory, {disk_weights} in the \
+         artifact file) would be held outside it, which needs {} bytes of pinned host memory ({arena_bytes} for the \
+         host arena and {window_bytes} for the disk window); this build does not run host or disk weights yet",
+        arena_bytes + window_bytes
+    )]
+    WeightsOutsideDevice {
+        weights: usize,
+        host_weights: usize,
+        disk_weights: usize,
+        arena_bytes: u64,
+        window_bytes: u64,
+    },
+
+    /// The plan needs pinned host memory (cache pages or weights) and the machine does not report what it can spare.
+    #[error(
+        "the plan needs {needed} bytes of pinned host memory (cache pages and weights the device cannot hold), and \
+         this machine does not report how much host memory it can spare; set memory.host-limit or \
+         memory.host-weights-limit to allow it, or lower context.max-tokens"
     )]
     HostBudgetUnknown { needed: u64 },
 
