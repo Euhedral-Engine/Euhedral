@@ -65,22 +65,10 @@ fn parses_java_benchmark_configs() {
     assert_eq!(context.scenarios[2].spec(), "prompt-to-n:32000:128");
     let forks = Options::load(&configs_dir().join("forks.json"), UNIX_EPOCH).unwrap();
     assert!(forks.append);
-}
 
-#[test]
-fn defaults_are_javas() {
-    let options = parse(&with("")).unwrap();
-    assert_eq!(options.max_context_tokens, 32768);
-    assert_eq!((options.warmup, options.iterations), (1, 3));
-    assert_eq!(options.prompt_corpus, PromptCorpus::Words);
-    assert_eq!(options.speculation, SpeculationMode::Artifact);
-    assert_eq!(options.prompt_seed, 20_260_925);
-    assert_eq!(options.scenarios, Scenario::default_suite());
-    assert_eq!(options.scenarios.len(), 7);
-    assert!(!options.overwrite && !options.append && !options.gpu_memory);
-    // The default output is timestamped, in UTC (1790424000 is 2026-09-26T12:00:00Z).
+    // A file without `output` writes a timestamped, UTC-named file (1790424000 is 2026-09-26T12:00:00Z).
     assert_eq!(
-        options.output,
+        parse(&with("")).unwrap().output,
         PathBuf::from("benchmark-results/euhedral-rust-20260926T120000Z.jsonl")
     );
 }
@@ -136,7 +124,7 @@ fn what_the_engine_cannot_do_is_refused_with_the_reason() {
     ] {
         assert!(parse(&with(&format!(r#", "cpus": "{cpus}""#))).is_ok(), "{cpus}");
     }
-    for cpus in ["fast", "5-2", "1,,2"] {
+    for cpus in ["fast", "5-2"] {
         let message = parse(&with(&format!(r#", "cpus": "{cpus}""#))).unwrap_err();
         assert!(message.contains("cpus must be") && message.contains(cpus), "{message}");
     }

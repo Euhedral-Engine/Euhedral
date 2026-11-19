@@ -464,15 +464,10 @@ impl Options {
         })
     }
 
-    /// The worker CPUs the run asks for on `topology`, or `None` when it asks for all of them (the engine's settings
-    /// then decide). Rejects an empty result and a CPU outside the process's set.
-    pub fn worker_cpus(&self, topology: &CpuTopology) -> Result<Option<ResolvedCpus>, ConfigError> {
-        if self.cpus == CpuSelection::All && self.exclude_cpus.is_empty() && self.exclude_cores.is_empty() {
-            return Ok(None);
-        }
-        topology
-            .resolve(&self.cpus, &self.exclude_cpus, &self.exclude_cores)
-            .map(Some)
+    /// The worker CPUs the run asks for on `topology`: the selection less the exclusions (all the available CPUs for
+    /// `all`). Rejects an empty result and a CPU the process may not use.
+    pub fn worker_cpus(&self, topology: &CpuTopology) -> Result<ResolvedCpus, ConfigError> {
+        topology.resolve(&self.cpus, &self.exclude_cpus, &self.exclude_cores)
     }
 
     /// Whether the run needs the engine's prefix cache: it has prefix scenarios (and then only those). The cache is

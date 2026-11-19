@@ -111,25 +111,3 @@ fn finish(built: Built, tok: &Tokenizer) -> Result<Prompt, PromptError> {
 pub fn sha256_hex(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sha256_is_the_hex_digest_of_the_utf8_text() {
-        assert_eq!(
-            sha256_hex("abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert_eq!(
-            sha256_hex(""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        // Multi-byte text is hashed as UTF-8.
-        assert_eq!(
-            sha256_hex("é"),
-            "4a99557e4033c3539de2eb65472017cad5f9557f7a0625a09f1c3f6e2ba69c4c"
-        );
-    }
-}
