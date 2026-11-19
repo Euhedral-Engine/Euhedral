@@ -267,6 +267,9 @@ pub struct Metrics {
     drafts_by_label: Box<[usize]>,
     speculative_accepted_tokens: AtomicU64,
     http: http::Table,
+    /// The process's CPU time and uptime, in nanoseconds, at the last scrape.
+    last_cpu_ns: AtomicU64,
+    last_wall_ns: AtomicU64,
 }
 
 impl Metrics {
@@ -300,6 +303,8 @@ impl Metrics {
             drafts_by_label: drafts_by_label.into_boxed_slice(),
             speculative_accepted_tokens: AtomicU64::new(0),
             http: http::Table::new(now_ms),
+            last_cpu_ns: AtomicU64::new(0),
+            last_wall_ns: AtomicU64::new(0),
         }
     }
 

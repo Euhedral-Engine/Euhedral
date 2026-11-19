@@ -6,6 +6,7 @@
 use std::fmt::Write;
 use std::iter::repeat_n;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::available_parallelism;
 
 use super::buckets::{DURATION_BOUNDS_NS, RATE_BOUNDS};
 use super::{APPLICATION, Api, ConstraintFailure, Durations, FinishReason, Metrics, Outcome, Rates};
@@ -495,13 +496,32 @@ fn prefix_cache(page: &mut Page<'_>, cache: &PrefixCacheReport) {
 
 impl Metrics {
     /// The series of the process and of the HTTP server, to follow those of `render` (their names sort after
-    /// `euhedral_`): what the operating system says about the process, and the time of the requests by route.
+    /// `euhedral_`): the time of the requests by route, and what the operating system says about the process.
     pub fn render_platform(&self, now_ms: i64) -> String {
         let mut text = String::with_capacity(4 * 1024);
         let mut page = Page { out: &mut text };
         self.http_requests(&mut page, now_ms);
-        process_series(&mut page, &process::read());
+        let reading = process::read();
+        let usage = self.cpu_usage(&reading);
+        process_series(&mut page, &reading, usage);
         text
+    }
+
+    /// The share of the machine's CPU the process used since the last scrape (since it started, at the first), between 0
+    /// and 1; `None` when the platform cannot say.
+    fn cpu_usage(&self, reading: &process::Reading) -> Option<f64> {
+        let (cpu, uptime) = (reading.cpu_seconds?, reading.uptime_seconds?);
+        let cpu_ns = (cpu * SECONDS) as u64;
+        let wall_ns = (uptime * SECONDS) as u64;
+        let before_cpu = self.last_cpu_ns.swap(cpu_ns, Ordering::Relaxed);
+        let before_wall = self.last_wall_ns.swap(wall_ns, Ordering::Relaxed);
+        let elapsed = wall_ns.saturating_sub(before_wall);
+        if elapsed == 0 {
+            return Some(0.0);
+        }
+        let cpus = available_parallelism().map_or(1, usize::from) as f64;
+        let used = cpu_ns.saturating_sub(before_cpu) as f64;
+        Some((used / (elapsed as f64 * cpus)).clamp(0.0, 1.0))
     }
 
     fn http_requests(&self, page: &mut Page<'_>, now_ms: i64) {
@@ -510,44 +530,54 @@ impl Metrics {
         if seen.is_empty() {
             return;
         }
-        let labels = |uri: &'static str, method: &'static str, status: u16| -> [(&'static str, String); 6] {
-            [
-                ("error", "none".to_owned()),
-                ("exception", "none".to_owned()),
-                ("method", method.to_owned()),
-                ("outcome", http::outcome(status).to_owned()),
-                ("status", status.to_string()),
-                ("uri", uri.to_owned()),
-            ]
-        };
-        seen.sort_by_key(|(uri, method, status, _)| (uri.label(), *method, *status));
-        page.family(name, Kind::Summary, "");
+        // The samples run in the order of their labels as text, which are sorted by name: method, outcome, status, uri.
+        seen.sort_by_key(|(uri, method, status, _)| (*method, http::outcome(*status), status.to_string(), uri.label()));
+        let labelled =
+            |page: &mut Page<'_>, name: &str, uri: &str, method: &str, status: u16, whole: Option<u64>, value: f64| {
+                let status = status.to_string();
+                let pairs = [
+                    ("error", "none"),
+                    ("exception", "none"),
+                    ("method", method),
+                    ("outcome", http::outcome(status.parse().unwrap_or(0))),
+                    ("status", status.as_str()),
+                    ("uri", uri),
+                ];
+                match whole {
+                    Some(count) => page.whole(name, &[], &pairs, None, count),
+                    None => page.sample(name, &[], &pairs, value),
+                }
+            };
+        // The help is a single space, as the server this one replaces writes it.
+        page.family(name, Kind::Summary, " ");
         let count = format!("{name}_count");
         let sum = format!("{name}_sum");
         for (uri, method, status, cell) in &seen {
-            let owned = labels(uri.label(), method, *status);
-            let pairs: Vec<(&str, &str)> = owned.iter().map(|(key, value)| (*key, value.as_str())).collect();
-            page.whole(&count, &[], &pairs, None, cell.count.load(Ordering::Relaxed));
-            page.sample(&sum, &[], &pairs, cell.sum_ns.load(Ordering::Relaxed) as f64 / SECONDS);
+            let total = cell.count.load(Ordering::Relaxed);
+            labelled(page, &count, uri.label(), method, *status, Some(total), 0.0);
+            let seconds = cell.sum_ns.load(Ordering::Relaxed) as f64 / SECONDS;
+            labelled(page, &sum, uri.label(), method, *status, None, seconds);
         }
         let max = format!("{name}_max");
-        page.family(&max, Kind::Gauge, "");
+        page.family(&max, Kind::Gauge, " ");
         for (uri, method, status, cell) in &seen {
-            let owned = labels(uri.label(), method, *status);
-            let pairs: Vec<(&str, &str)> = owned.iter().map(|(key, value)| (*key, value.as_str())).collect();
-            page.sample(&max, &[], &pairs, cell.max_ns.poll(now_ms) as f64 / SECONDS);
+            let seconds = cell.max_ns.poll(now_ms) as f64 / SECONDS;
+            labelled(page, &max, uri.label(), method, *status, None, seconds);
         }
     }
 }
 
 /// The series of the process; a reading the platform could not take has no series.
-fn process_series(page: &mut Page<'_>, reading: &process::Reading) {
+fn process_series(page: &mut Page<'_>, reading: &process::Reading, usage: Option<f64>) {
     if let Some(cpu) = reading.cpu_seconds {
         page.counter(
             "process_cpu_time_ns_total",
             "The \"cpu time\" used by the process",
             (cpu * SECONDS).round(),
         );
+    }
+    if let Some(usage) = usage {
+        page.gauge("process_cpu_usage", "The \"recent cpu usage\" for the process", usage);
     }
     if let Some(max) = reading.max_files {
         page.gauge(

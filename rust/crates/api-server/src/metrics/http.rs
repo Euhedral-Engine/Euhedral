@@ -50,7 +50,7 @@ impl Uri {
             Uri::Messages => "/v1/messages",
             Uri::CountTokens => "/v1/messages/count_tokens",
             Uri::Responses => "/v1/responses",
-            Uri::NotFound => "NOT_FOUND",
+            Uri::NotFound => "/**",
         }
     }
 

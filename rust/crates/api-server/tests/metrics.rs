@@ -213,6 +213,19 @@ fn the_process_series_are_well_formed_and_the_uptime_does_not_go_back() {
     let first = text(&fixture.get("/metrics")).to_owned();
     sleep(Duration::from_millis(30));
     let second = text(&fixture.get("/metrics")).to_owned();
+    for name in [
+        "process_cpu_time_ns_total",
+        "process_cpu_usage",
+        "process_files_max_files",
+        "process_files_open_files",
+        "process_start_time_seconds",
+        "process_uptime_seconds",
+    ] {
+        assert!(second.contains(&format!("# TYPE {name} ")), "{name}\n{second}");
+    }
+    assert!(second.contains("# TYPE process_cpu_time_ns_total counter\n"));
+    let usage = sample_value(&second, &format!("process_cpu_usage{{{APP}}} ")).expect("a cpu usage");
+    assert!((0.0..=1.0).contains(&usage), "{usage}");
     for line in second.lines().filter(|line| line.starts_with("process_")) {
         let (series, value) = line.rsplit_once(' ').expect("a sample has a value");
         assert!(series.contains(&format!("{{{APP}}}")), "{line}");
@@ -257,12 +270,20 @@ fn every_route_is_timed_under_its_template_and_an_unknown_path_has_one_label() {
         line("GET", "SUCCESS", 200, "/v1/models", 1),
         line("GET", "SUCCESS", 200, "/v1/models/{model}", 1),
         line("GET", "CLIENT_ERROR", 404, "/v1/models/{model}", 1),
-        line("GET", "CLIENT_ERROR", 404, "NOT_FOUND", 2),
+        line("GET", "CLIENT_ERROR", 404, "/**", 2),
         line("POST", "CLIENT_ERROR", 405, "/v1/models", 1),
         line("POST", "SUCCESS", 200, "/v1/chat/completions", 1),
     ] {
         assert!(body.lines().any(|each| each == expected), "{expected}\n{body}");
     }
+    assert!(body.contains("# HELP http_server_requests_seconds  \n# TYPE http_server_requests_seconds summary\n"));
+    assert!(body.contains("# TYPE http_server_requests_seconds_max gauge\n"));
+    // The samples run by method, then outcome, status and uri, as the labels sort.
+    let at = |text: String| body.find(&text).expect("a sample");
+    assert!(at(line("GET", "CLIENT_ERROR", 404, "/**", 2)) < at(line("GET", "SUCCESS", 200, "/health", 1)));
+    assert!(
+        at(line("GET", "SUCCESS", 200, "/v1/models", 1)) < at(line("POST", "SUCCESS", 200, "/v1/chat/completions", 1))
+    );
     assert!(!body.contains("nowhere") && !body.contains("another"), "{body}");
     // The scrape that is being answered is timed after it, so the next one shows it.
     let again = fixture.get("/metrics");
