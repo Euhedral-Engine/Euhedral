@@ -23,7 +23,7 @@ use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
 use thiserror::Error;
 
 use crate::model::Speculation;
-use crate::model::{LayerIndex, LayerKind, ModelConfig, Role, WeightRef};
+use crate::model::{LayerIndex, LayerKind, ModelConfig, Residence, Role, WeightRef};
 use crate::quantum::home::lane_for;
 use crate::residency::planner::ResidencyPlan;
 use crate::stages::{Chain, Placed, Quantum};
@@ -163,6 +163,7 @@ impl Plan {
             layout: WeightLayout::ContiguousLeV1,
             ptr: DevicePtr::NULL,
             bytes: 0,
+            residence: Residence::Device,
             trellis: None,
         };
         let config = ModelConfig {

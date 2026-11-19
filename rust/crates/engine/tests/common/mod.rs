@@ -7,8 +7,14 @@
     reason = "a test helper: a failed unwrap is the failure"
 )]
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+
+use euhedral_inference_cuda::CudaLibrary;
+use euhedral_inference_engine::residency::offload::EMBEDDING;
+use euhedral_inference_engine::residency::planner::{PlanInputs, plan_with};
+use euhedral_inference_settings::{Auto, ByteSize};
 
 use euhedral_inference_edrl::{HEADER_BYTES, Header, LayerType, ModelMetadata, TensorTable};
 use euhedral_inference_engine::error::EngineError;
@@ -171,4 +177,50 @@ impl Drop for Closer {
             let _ = owner.shutdown(runtime);
         }
     }
+}
+
+/// The `memory.gpu-limit` that leaves `below` bytes under the device need of the resident plan for `settings`. The
+/// plan is made on this device's multiprocessor count with no limit on the device or the host, never on the card's free
+/// memory, which other jobs change.
+pub fn limit_below_need(library: &Path, settings: &Settings, below: u64) -> u64 {
+    let sm_count = CudaLibrary::load(library).unwrap().device().sm_count;
+    let inputs = PlanInputs {
+        device_free: 64 << 30,
+        multiprocessors: Some(sm_count),
+        host_pinned_bytes: Some(u64::MAX),
+        sequences: 1,
+    };
+    let resident = plan_with(&config(), &rco_table(), settings, inputs).unwrap();
+    assert!(
+        resident.offload.is_empty(),
+        "the unlimited plan keeps everything on the device"
+    );
+    resident.device_bytes - below
+}
+
+/// Sets `memory.gpu-limit` to `limit`.
+pub fn limit_gpu(settings: &mut Settings, limit: u64) {
+    settings.memory.gpu_limit = Auto::Value(ByteSize(limit));
+}
+
+/// Whether the plan of a started engine is the one a test forced: the device budget is the limit (the card had that
+/// much free) and the embedding alone is held on the host. A card with less free memory plans another selection, which
+/// the test must not mistake for its own: it prints why and returns false.
+#[allow(clippy::print_stdout, reason = "a test reports why it skipped")]
+pub fn embedding_alone_is_on_the_host(runtime: &EngineRuntime, limit: u64) -> bool {
+    let plan = runtime.plan();
+    if plan.budget_bytes != limit {
+        println!(
+            "skipped: the card had {} bytes for the plan, the forced limit is {limit}",
+            plan.budget_bytes
+        );
+        return false;
+    }
+    assert_eq!(
+        plan.offload.host,
+        [EMBEDDING],
+        "the plan holds the embedding alone on the host"
+    );
+    assert!(plan.offload.disk.is_empty(), "no object is left in the file");
+    true
 }

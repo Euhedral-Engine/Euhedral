@@ -52,7 +52,7 @@ use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::generation::{Accepted, accept};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{
-    LayerIndex, LayerKind, MTP_ATTENTION_PACK, ModelConfig, Role, WeightRef, object_key,
+    LayerIndex, LayerKind, MTP_ATTENTION_PACK, ModelConfig, Residence, Role, WeightRef, object_key,
 };
 use euhedral_inference_engine::plan::{Formats, Plan, WeightLookup};
 use euhedral_inference_engine::quantum::Executor;
@@ -173,6 +173,7 @@ fn load_model(artifact: &mut Artifact, library: &Arc<CudaLibrary>) -> Model {
                         layout,
                         ptr: buffer.ptr(),
                         bytes: out.len() as u64,
+                        residence: Residence::Device,
                         trellis: None,
                     },
                 );

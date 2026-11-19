@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use euhedral_core::frames::Frame;
 use euhedral_graph::Lake;
-use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, PooledPinned};
+use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, HostWeightsArena, PooledPinned};
 use euhedral_inference_edrl::{
     HEADER_BYTES, Header, Metadata, ReadPlan, Region, TensorTable, TokenizerFooter, TrellisCompanions, WeightFormat,
     WeightLayout, content_end,
@@ -38,15 +38,15 @@ use crate::frames::{Kind, step};
 use crate::generation::Generations;
 use crate::handoff::Handoff;
 use crate::model::{
-    LayerIndex, MTP_ATTENTION_PACK, ModelConfig, Role, TrellisParts, WeightRef, Weights, companion_name,
+    LayerIndex, MTP_ATTENTION_PACK, ModelConfig, Residence, Role, TrellisParts, WeightRef, Weights, companion_name,
     trellis_logical, validate_inventory,
 };
 use crate::residency::accounting::{Consumer, PlanReservation};
 use crate::residency::budget::{self, HostBudget};
 use crate::residency::footprint;
 use crate::residency::loader::{self, LoadOutcome, Ring};
-use crate::residency::offload::Offload;
-use crate::residency::planner::{LocationBytes, Placement, PlanInputs, ResidencyPlan, plan_with};
+use crate::residency::offload::{self, Offload};
+use crate::residency::planner::{LocationBytes, Placement, PlanInputs, ResidencyPlan, Tier, plan_with};
 use crate::runtime::resolve_sequences;
 use crate::runtime::{Core, EngineRuntime, ReadyHandoff, StartupReport, Units, free_arrival, raw_file};
 use crate::state::SequenceState;
@@ -558,10 +558,11 @@ fn plan(mut startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32
     }
 }
 
-/// Refuses a plan that holds weights outside the device: the load places device objects only, so such a plan would
-/// leave objects unloaded. The refusal names the pinned host bytes the plan needs.
+/// Refuses a plan that holds weights this build cannot run from where they are. Objects read in place from pinned host
+/// memory (the embedding and the head) are loaded into the host arena and run; objects staged through the device ring
+/// or read from the artifact file would be left unloaded. The refusal names the pinned host bytes the plan needs.
 fn refuse_offload(offload: &Offload) -> Result<(), PlanError> {
-    if offload.is_empty() {
+    if offload.disk.is_empty() && offload.host.iter().all(|name| offload::mapped(name)) {
         return Ok(());
     }
     Err(PlanError::WeightsOutsideDevice {
@@ -588,6 +589,18 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
         // Every allocation takes its claim before it allocates: one larger than the plan fails here, naming its consumer.
         let weights_claim = reservation.claim(Consumer::Weights, plan.arena_bytes)?;
         let arena = DeviceBuffer::alloc(&core.library, plan.arena_bytes as usize)?;
+        // The host arena is one allocation made before any read, so the huge pages are likelier; the objects the plan
+        // holds on the host are read into it where kernels read them.
+        let host = match plan.offload.host_arena_bytes {
+            0 => None,
+            bytes => {
+                let claim = reservation.claim(Consumer::HostWeights, bytes)?;
+                let usize_bytes = usize::try_from(bytes).map_err(|_| {
+                    EngineError::Runtime(format!("the host arena of {bytes} bytes does not fit memory"))
+                })?;
+                Some((Arc::new(HostWeightsArena::alloc(&core.library, usize_bytes)?), claim))
+            }
+        };
         // Every pinned allocation of the startup happens here: the ring of the upload, and the staging the cache's
         // page tables will take. Once the chains run, the pool allocates nothing.
         let loans = loader::acquire_loans(&core, &ring)?;
@@ -653,10 +666,10 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
             }
             Ok::<_, EngineError>(sequences)
         })?;
-        Ok::<_, EngineError>((ring, arena, weights_claim, loans, workspace, sequences, marker))
+        Ok::<_, EngineError>((ring, arena, host, weights_claim, loans, workspace, sequences, marker))
     })();
     match allocated {
-        Ok((ring, arena, weights_claim, loans, workspace, sequences, marker)) => {
+        Ok((ring, arena, host, weights_claim, loans, workspace, sequences, marker)) => {
             // The state is zeroed when the lane reaches the marker; the load starts then.
             let frame = step(Kind::Startup, 0, move || {
                 load(
@@ -666,6 +679,7 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
                     ends,
                     ring,
                     arena,
+                    host,
                     weights_claim,
                     loans,
                     workspace,
@@ -690,6 +704,7 @@ fn load(
     ends: HashMap<String, Arc<[u32]>>,
     ring: Ring,
     arena: DeviceBuffer,
+    pinned: Option<(Arc<HostWeightsArena>, Claim)>,
     weights_claim: Claim,
     loans: Vec<PooledPinned>,
     workspace: Workspace,
@@ -700,6 +715,10 @@ fn load(
     let file = Arc::clone(&artifact.file);
     let names: Arc<[String]> = plan.device.iter().map(|placement| placement.name.clone()).collect();
     let chains = ring.depth;
+    let (host_arena, host_claim) = match pinned {
+        Some((arena, claim)) => (Some(arena), Some(claim)),
+        None => (None, None),
+    };
     let done = move |outcome: LoadOutcome| {
         // The last frame of the load lets go: the next step is a frame of its own.
         startup.then(host, move |startup| {
@@ -709,14 +728,14 @@ fn load(
                 plan,
                 ends,
                 ring,
-                weights_claim,
+                (weights_claim, host_claim),
                 workspace,
                 sequences,
                 outcome,
             )
         });
     };
-    loader::start(&core, file, names, pieces, chains, arena, loans, done);
+    loader::start(&core, file, names, pieces, chains, arena, host_arena, loans, done);
 }
 
 /// Step 6: assembles the tensors by layer and role, warms the kernel modules and sets the latch.
@@ -730,28 +749,43 @@ fn assemble(
     plan: ResidencyPlan,
     ends: HashMap<String, Arc<[u32]>>,
     ring: Ring,
-    weights_claim: Claim,
+    claims: (Claim, Option<Claim>),
     workspace: Workspace,
     sequences: Vec<SequenceState>,
     outcome: LoadOutcome,
 ) {
-    let LoadOutcome { arena, result } = outcome;
+    let LoadOutcome { arena, host, result } = outcome;
     let stats = match result {
         Ok(stats) => stats,
         // Freeing the arena waits for the device: it is a frame of the stages lake.
         Err(error) => {
             return startup.then(device, move |startup| {
-                drop(arena);
-                drop((workspace, sequences, weights_claim));
+                drop((arena, host));
+                drop((workspace, sequences, claims));
                 startup.fail(error);
             });
         }
     };
     let core = Arc::clone(&startup.core);
     let layers = artifact.config.num_hidden_layers;
-    let weights = tensors(&plan, &arena, &ends, layers);
-    let objects = plan.device.len();
-    let weights = Weights::new(arena, weights).with_claim(weights_claim);
+    let weights = match tensors(&plan, &arena, host.as_ref(), &ends, layers) {
+        Ok(weights) => weights,
+        Err(error) => {
+            return startup.then(device, move |startup| {
+                drop((arena, host));
+                drop((workspace, sequences, claims));
+                startup.fail(error);
+            });
+        }
+    };
+    let objects = plan.on_device().count();
+    let host_backed_bytes = host_backed_bytes(&plan);
+    let mapped_objects = mapped_objects(&plan);
+    let (weights_claim, host_claim) = claims;
+    let mut weights = Weights::new(arena, host, weights).with_claim(weights_claim);
+    if let Some(claim) = host_claim {
+        weights = weights.with_claim(claim);
+    }
     let admitted = startup
         .reservation
         .as_ref()
@@ -782,6 +816,13 @@ fn assemble(
                 .free_bytes()
                 .map(|free| core.library.device().total_bytes.saturating_sub(free))
                 .unwrap_or(0);
+            if host_backed_bytes > 0 {
+                log::info!(
+                    "weights in pinned host memory: {host_backed_bytes} bytes, {} read in place: {}",
+                    mapped_objects.len(),
+                    mapped_objects.join(", ")
+                );
+            }
             let report = StartupReport {
                 ready: begun.elapsed(),
                 load: stats.elapsed,
@@ -790,6 +831,8 @@ fn assemble(
                 chains: ring.depth,
                 piece_bytes: ring.piece_bytes,
                 objects,
+                host_backed_bytes,
+                mapped_objects,
                 allocated_bytes: allocated,
                 admitted,
                 device_bytes_in_use: in_use,
@@ -988,14 +1031,40 @@ fn trim_pool(core: &Core) {
     core.pool.trim();
 }
 
-/// The tensors of the plan by layer and role, each addressing its place in `arena`.
+/// The payload bytes of the objects the plan holds in pinned host memory.
+fn host_backed_bytes(plan: &ResidencyPlan) -> u64 {
+    plan.device
+        .iter()
+        .filter(|placement| matches!(placement.tier, Tier::Host { .. }))
+        .map(|placement| placement.bytes)
+        .sum()
+}
+
+/// The names of the objects the plan holds in pinned host memory and kernels read in place.
+fn mapped_objects(plan: &ResidencyPlan) -> Vec<String> {
+    plan.device
+        .iter()
+        .filter(|placement| matches!(placement.tier, Tier::Host { .. }) && offload::mapped(&placement.name))
+        .map(|placement| placement.name.clone())
+        .collect()
+}
+
+/// The tensors of the plan by layer and role, each addressing its place: in `arena` for an object on the device, in
+/// `host` for one the plan holds on the host (a kernel reads it through the device address of the host bytes).
 fn tensors(
     plan: &ResidencyPlan,
     arena: &DeviceBuffer,
+    host: Option<&Arc<HostWeightsArena>>,
     ends: &HashMap<String, Arc<[u32]>>,
     layers: usize,
-) -> HashMap<(LayerIndex, Role), WeightRef> {
+) -> Result<HashMap<(LayerIndex, Role), WeightRef>, EngineError> {
     let base = arena.ptr();
+    let host_base = match host {
+        // SAFETY: taking the address is harmless; the weights keep the arena alive for as long as any kernel reads it,
+        // and the load has ended, so no read writes the bytes a kernel will read.
+        Some(host) => Some(unsafe { host.device_address() }?),
+        None => None,
+    };
     let by_name: HashMap<&str, &Placement> = plan
         .device
         .iter()
@@ -1004,6 +1073,29 @@ fn tensors(
     let mut tensors = HashMap::new();
     for placement in &plan.device {
         let Some(key) = placement.key(layers) else { continue };
+        let (ptr, residence) = match placement.tier {
+            Tier::Device => (base.offset(placement.offset), Residence::Device),
+            Tier::Host { offset } => {
+                let host_base = host_base.ok_or_else(|| {
+                    EngineError::Runtime(format!(
+                        "'{}' is held on the host and the plan has no host arena",
+                        placement.name
+                    ))
+                })?;
+                let residence = if offload::mapped(&placement.name) {
+                    Residence::Mapped
+                } else {
+                    Residence::Host { offset }
+                };
+                (host_base.offset(offset), residence)
+            }
+            Tier::Disk => (
+                DevicePtr::NULL,
+                Residence::Disk {
+                    file_offset: placement.file_offset,
+                },
+            ),
+        };
         let trellis = (placement.format == WeightFormat::Trellis).then(|| {
             let part = |suffix: &str| by_name.get(companion_name(&placement.name, suffix).as_str()).copied();
             let (suh, svh, segments) = (part(".suh")?, part(".svh")?, part(".segments")?);
@@ -1023,13 +1115,14 @@ fn tensors(
                 dtype: placement.dtype,
                 format: placement.format,
                 layout: placement.layout,
-                ptr: base.offset(placement.offset),
+                ptr,
                 bytes: placement.bytes,
+                residence,
                 trellis: trellis.flatten(),
             },
         );
     }
-    tensors
+    Ok(tensors)
 }
 
 #[cfg(test)]
@@ -1069,6 +1162,24 @@ mod tests {
             refusal.contains("1 in host memory, 1 in the artifact file"),
             "{refusal}"
         );
+    }
+
+    #[test]
+    fn objects_read_in_place_from_host_memory_are_not_refused_and_staged_or_disk_ones_are() {
+        let host = |names: &[&str]| Offload {
+            host: names.iter().map(ToString::to_string).collect(),
+            host_arena_bytes: 4096,
+            ..Offload::default()
+        };
+        assert_eq!(refuse_offload(&host(&["text/token_embedding"])), Ok(()));
+        assert_eq!(
+            refuse_offload(&host(&["text/token_embedding", "text/output_head"])),
+            Ok(())
+        );
+        assert!(refuse_offload(&host(&["text/token_embedding", "text/layers/0/mlp/down"])).is_err());
+        let mut with_disk = host(&["text/token_embedding"]);
+        with_disk.disk = vec!["text/layers/0/mlp/down".to_string()];
+        assert!(refuse_offload(&with_disk).is_err());
     }
 
     #[test]

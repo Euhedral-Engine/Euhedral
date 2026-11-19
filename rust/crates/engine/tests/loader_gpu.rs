@@ -35,9 +35,9 @@ use std::time::Duration;
 use euhedral_inference_cuda::{CudaLibrary, DevicePtr};
 use euhedral_inference_edrl::WeightFormat;
 use euhedral_inference_engine::error::{EngineError, PlanError};
-use euhedral_inference_engine::model::{LayerIndex, NormKind, Role};
+use euhedral_inference_engine::model::{LayerIndex, NormKind, Residence, Role};
 use euhedral_inference_engine::residency::loader::pieces;
-use euhedral_inference_engine::residency::planner::{DEFAULT_RUNTIME_RESERVE_BYTES, nvfp4};
+use euhedral_inference_engine::residency::planner::{DEFAULT_RUNTIME_RESERVE_BYTES, Tier, nvfp4};
 use euhedral_inference_engine::workspace::BufferSlot;
 use euhedral_inference_engine::{EngineRuntime, RuntimeOwner};
 use typed::Typed;
@@ -309,6 +309,58 @@ fn truncated_copy(artifact: &Path, bytes: u64) -> Truncated {
         .unwrap();
     out.flush().unwrap();
     copy
+}
+
+/// The embedding is read in place from pinned host memory when the device is 256 MiB short of the resident need: the
+/// bytes of the host arena are the file's, the report names them, and the rest of the model is on the device.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn host_backed_bytes_match_file_sha() {
+    let Some(machine) = machine() else { return };
+    let mut settings = settings(&machine.artifact, 4096);
+    let limit = common::limit_below_need(&machine.library, &settings, 256 << 20);
+    common::limit_gpu(&mut settings, limit);
+    let (runtime, owner) = start(&settings, &machine.library);
+    let runtime = runtime.expect("a model that fits once the embedding is on the host starts");
+    let closer = common::Closer::new(owner, &runtime);
+    if !common::embedding_alone_is_on_the_host(&runtime, limit) {
+        closer.shutdown(runtime).unwrap();
+        return;
+    }
+    let plan = runtime.plan();
+    let report = runtime.report();
+    let embedding = plan.placement("text/token_embedding").unwrap();
+    assert_eq!(report.host_backed_bytes, embedding.bytes);
+    assert_eq!(report.mapped_objects, ["text/token_embedding"]);
+    assert_eq!(
+        report.objects,
+        plan.device.len() - 1,
+        "every other object is on the device"
+    );
+    assert_eq!(
+        report.uploaded_bytes, plan.weights_bytes,
+        "the device copies are the plan's"
+    );
+
+    // The host arena holds the object where the plan put it, byte for byte the file's.
+    let weights = runtime.weights();
+    let arena = weights.host_arena().expect("the weights have a host arena");
+    assert_eq!(arena.len() as u64, plan.offload.host_arena_bytes);
+    let Tier::Host { offset } = embedding.tier else {
+        panic!("the embedding is on the host");
+    };
+    let held = &arena.as_slice()[offset as usize..(offset + embedding.bytes) as usize];
+    let in_file = read_file(&machine.artifact, embedding.file_offset, embedding.bytes as usize);
+    assert_eq!(sha(held), sha(&in_file), "the embedding in the host arena");
+    let tensor = weights.get(LayerIndex::GLOBAL, Role::Embedding).unwrap();
+    assert_eq!(tensor.residence, Residence::Mapped);
+    // The bytes after the object, up to the arena's end, were never written.
+    assert!(
+        arena.as_slice()[(offset + embedding.bytes) as usize..]
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+    closer.shutdown(runtime).unwrap();
 }
 
 #[test]

@@ -50,7 +50,7 @@ use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorDataType, WeightFo
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{LinearFormat, LinearMode, Q3Embedding, ScratchRegion};
 use euhedral_inference_engine::lattice_config;
-use euhedral_inference_engine::model::{ModelConfig, WeightRef};
+use euhedral_inference_engine::model::{ModelConfig, Residence, WeightRef};
 use euhedral_inference_engine::stages::attention::{AttentionCausal, KvAppend, KvSource, QkNormRope};
 use euhedral_inference_engine::stages::elementwise::{ResidualAdd, Swiglu};
 use euhedral_inference_engine::stages::embed::Embed;
@@ -610,6 +610,7 @@ fn stub_weight() -> WeightRef {
         layout: WeightLayout::ContiguousLeV1,
         ptr: DevicePtr::NULL,
         bytes: 2,
+        residence: Residence::Device,
         trellis: None,
     }
 }
