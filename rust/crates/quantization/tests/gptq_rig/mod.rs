@@ -20,7 +20,7 @@ use euhedral_graph::{Completions, LanePool};
 use euhedral_inference_cuda::math::MathLibraries;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, PinnedPool};
 use euhedral_inference_quantization::gptq::format::Format;
-use euhedral_inference_quantization::gptq::memory::{Claims, Released, StepBytes};
+use euhedral_inference_quantization::gptq::memory::{Claims, StepBytes};
 use euhedral_inference_quantization::gptq::{
     DeviceRange, Factor, Finished, GptqError, GptqKernels, GptqLane, GptqSettings, LaneMemory, Refused, TensorScales,
 };
@@ -31,6 +31,8 @@ use euhedral_memory::{LocationId, LocationKind, LocationSpec, OwnerId, OwnerSpec
 pub struct Rig {
     pub library: Arc<CudaLibrary>,
     pub completions: Arc<Completions>,
+    /// The pool the lane's pinned staging comes from.
+    pub pinned: Arc<PinnedPool>,
     lane: Option<GptqLane>,
     planner: Arc<Planner>,
     owner: OwnerId,
@@ -70,11 +72,8 @@ pub fn rig(settings: GptqSettings) -> Rig {
     })
     .expect("the handles are made on the lane");
     let handles = handles.unwrap().expect("the math handles");
-    let memory = LaneMemory {
-        library: Arc::clone(&library),
-        released: Arc::new(Released::new()),
-        pinned: PinnedPool::new(&library, 256 << 20),
-    };
+    let pinned = PinnedPool::new(&library, 256 << 20);
+    let memory = LaneMemory::new(Arc::clone(&library), Arc::clone(&pinned));
     let lane = GptqLane::new(stream, handles, kernels, memory, Arc::clone(&completions), settings).expect("the lane");
     let planner = Planner::new([
         LocationSpec {
@@ -92,6 +91,7 @@ pub fn rig(settings: GptqSettings) -> Rig {
     Rig {
         library,
         completions,
+        pinned,
         lane: Some(lane),
         planner,
         owner,
@@ -181,6 +181,32 @@ impl Rig {
             .expect("reclaim");
     }
 
+    /// Arms a retirement on the lane's stream that nobody collects, so the next chain cannot arm its own and fails.
+    pub fn block_arming(&mut self) {
+        self.lane_mut()
+            .stream_mut()
+            .arm_retirement()
+            .expect("a retirement arms");
+    }
+
+    /// Collects the retirement [`block_arming`](Self::block_arming) armed, when the stream has run up to it.
+    pub fn unblock_arming(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let stream = self.lane_mut().stream_mut();
+        let ticket = loop {
+            if let Some(ticket) = stream.poll_retired() {
+                break ticket;
+            }
+            assert!(Instant::now() < deadline, "the retirement did not arrive in a minute");
+        };
+        assert!(stream.confirm_retired(ticket).is_none());
+    }
+
+    /// Failed chains whose state the lane still holds.
+    pub fn unsettled(&mut self) -> usize {
+        self.lane_mut().unsettled()
+    }
+
     fn lane_mut(&mut self) -> &mut GptqLane {
         self.lane.as_mut().expect("the lane is idle")
     }
@@ -206,7 +232,7 @@ impl Rig {
         format: &Format,
     ) -> Result<TensorScales, GptqError> {
         let range = range_of(weight);
-        let bytes = self.lane_mut().scales_bytes(rows, factor.k(), format);
+        let bytes = self.lane_mut().scales_bytes(rows, factor.k(), format)?;
         let claims = self.claims(bytes);
         self.run(|lane, done| lane.tensor_scales(range, rows, factor, format, claims, done))
     }
@@ -215,6 +241,11 @@ impl Rig {
         let bytes = self.lane_mut().round_bytes(request.n, request.factor, request.format);
         let claims = self.claims(bytes);
         self.run(|lane, done| lane.round(&request, claims, done))
+    }
+
+    /// The bytes [`GptqLane::scales_bytes`] gives for these sizes.
+    pub fn scales_bytes(&mut self, rows: usize, k: usize, format: &Format) -> Result<StepBytes, GptqError> {
+        self.lane_mut().scales_bytes(rows, k, format)
     }
 
     pub fn upload(&self, bytes: &[u8]) -> DeviceBuffer {

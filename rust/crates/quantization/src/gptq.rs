@@ -36,7 +36,7 @@ use crate::gptq::format::{
     BLOCK, E2M1_MAX, Format, FormatError, Nvfp4Search, SEARCH_BELOW, column_order, damped_diagonal, dead_columns,
     group_of_places, positions,
 };
-use crate::gptq::memory::{Claims, Device, Host, Memory, Released, StepBytes, reclaim};
+use crate::gptq::memory::{Claims, Device, Host, Memory, Released, StepBytes, pinned_bytes, reclaim};
 use crate::gptq::sd4::{CODES, ENTRIES};
 use crate::gptq::state::{QuantState, StateError};
 use crate::kernels::{Compiled, Module, ModuleError, Modules};
@@ -59,6 +59,8 @@ pub enum GptqError {
     Request(String),
     #[error("the stream lends no driver handle")]
     NoStream,
+    #[error("the factor was made on another lane: its memory is freed on that lane's stream")]
+    ForeignFactor,
     #[error("the kernel {0} is not in the module")]
     Kernel(&'static str),
 }
@@ -130,12 +132,29 @@ impl GptqKernels {
 
 /// The memory a lane works with: the C library its stream-ordered allocator belongs to, the queue where dropped device
 /// buffers wait to be freed in stream order, and the pool the pinned staging comes from (its limit is the pinned
-/// buffer pool setting).
-#[derive(Debug, Clone)]
+/// buffer pool setting). The queue belongs to the one lane it is made for: a buffer is freed on the stream it was
+/// allocated on, so two lanes never share one.
+#[derive(Debug)]
 pub struct LaneMemory {
-    pub library: Arc<CudaLibrary>,
-    pub released: Arc<Released>,
-    pub pinned: Arc<PinnedPool>,
+    library: Arc<CudaLibrary>,
+    released: Arc<Released>,
+    pinned: Arc<PinnedPool>,
+}
+
+impl LaneMemory {
+    /// The memory of a new lane, with a queue of its own.
+    pub fn new(library: Arc<CudaLibrary>, pinned: Arc<PinnedPool>) -> LaneMemory {
+        LaneMemory {
+            library,
+            released: Arc::new(Released::new()),
+            pinned,
+        }
+    }
+
+    /// The device buffers given up and not yet freed.
+    pub fn waiting(&self) -> u64 {
+        self.released.waiting()
+    }
 }
 
 /// Everything of a lane except its stream: what a stage uses besides the stream.
@@ -145,6 +164,35 @@ pub struct LaneParts {
     memory: LaneMemory,
     completions: Arc<Completions>,
     settings: GptqSettings,
+    /// The state of chains whose retirement could not be armed, with work possibly still queued on the stream: kept
+    /// until a later retirement is confirmed.
+    unsettled: Unsettled,
+}
+
+/// State parked until the lane's stream has run the work queued before it.
+///
+/// A chain that fails to arm its retirement ends at once, but the copies and launches it enqueued are still on the
+/// stream and write into its pinned staging. That staging must not go back to the shared pool where another lane could
+/// take it: it waits here, and the lane's next confirmed retirement (which the stream's order puts behind that work)
+/// releases it.
+#[derive(Default)]
+struct Unsettled {
+    held: Vec<Box<dyn Any + Send>>,
+}
+
+impl Unsettled {
+    fn park(&mut self, state: Box<dyn Any + Send>) {
+        self.held.push(state);
+    }
+
+    /// Releases what is parked: the stream has retired everything enqueued before now.
+    fn release(&mut self) {
+        self.held.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.held.len()
+    }
 }
 
 impl Debug for LaneParts {
@@ -170,7 +218,8 @@ pub struct Refused {
 
 /// Memory a chain used. Dropping it gives its device buffers to the lane's [`Released`] queue (freed in stream order by
 /// the next step on a lane, or by [`GptqLane::reclaim`]) and its pinned staging to the pool: nothing waits for the
-/// device.
+/// device. A chain that failed to arm its retirement hands back an empty scratch: its state stays with the lane until a
+/// later retirement confirms the stream has run the work still queued for it.
 pub struct Scratch {
     _state: Box<dyn Any + Send>,
 }
@@ -246,19 +295,34 @@ impl GptqLane {
                 memory,
                 completions,
                 settings,
+                unsettled: Unsettled::default(),
             },
         })
     }
 
-    /// Takes the lane apart for shutdown: the stream and the handles are destroyed by their owner.
-    pub fn into_parts(self) -> (CudaStream, LaneHandles) {
-        (self.stream, self.parts.handles)
+    /// Takes the lane apart for shutdown: the stream and the handles are destroyed by their owner. The device buffers
+    /// given up are freed in stream order first, and the error of that, if any, comes back with the parts. A [`Factor`]
+    /// must not outlive its lane: when it is dropped after this, its memory is freed with the plain `cudaFree`.
+    pub fn into_parts(mut self) -> (CudaStream, LaneHandles, Result<u64, GptqError>) {
+        let reclaimed = self.reclaim();
+        (self.stream, self.parts.handles, reclaimed)
+    }
+
+    /// The lane's stream, for work the owner enqueues on it besides the chains. A chain that ends with work still queued
+    /// keeps its state until the stream's next confirmed retirement: see [`unsettled`](Self::unsettled).
+    pub fn stream_mut(&mut self) -> &mut CudaStream {
+        &mut self.stream
+    }
+
+    /// How many failed chains' states the lane still holds because work of theirs may be queued on the stream.
+    pub fn unsettled(&self) -> usize {
+        self.parts.unsettled.len()
     }
 
     /// Frees, in stream order on this lane, the device buffers given up since the last call, and returns how many. A
     /// step does it before it allocates; call it after the last step to free what that left.
     pub fn reclaim(&mut self) -> Result<u64, GptqError> {
-        let memory = self.parts.memory.clone();
+        let memory = &self.parts.memory;
         submit(&mut self.stream, |queue| {
             Ok(reclaim(&memory.released, &memory.library, queue)?)
         })
@@ -372,9 +436,17 @@ fn arm<S: Send + 'static, T: Send + 'static>(stream: CudaStream, link: Link<S, T
         error,
     }) = armed
     {
-        // The scratch goes back with the error: its device buffers are freed in stream order behind whatever is queued.
+        // Work may still be queued behind this failure: the state stays with the lane until a retirement is confirmed.
         let cause = link.failure.take().unwrap_or(GptqError::Gpu(error));
-        finish(stream, link, Err(cause));
+        let Link {
+            mut parts, state, done, ..
+        } = link;
+        parts.unsettled.park(Box::new(state));
+        done(Finished {
+            lane: GptqLane { stream, parts },
+            scratch: Scratch { _state: Box::new(()) },
+            result: Err(cause),
+        });
     }
 }
 
@@ -385,6 +457,8 @@ fn resume<S: Send + 'static, T: Send + 'static>(
     ticket: RetireTicket,
 ) {
     let confirmed = stream.confirm_retired(ticket);
+    // The stream has run everything enqueued before this retirement, what an earlier failed arm left included.
+    link.parts.unsettled.release();
     if let Some(failure) = link.failure.take() {
         return finish(stream, link, Err(failure));
     }
@@ -575,7 +649,7 @@ impl GptqLane {
         let words = 4 * k;
         Ok(StepBytes {
             device: 4 * k * k + 2 * words + 12 + 4 * u64::try_from(floats.max(1)).unwrap_or(1),
-            pinned: 2 * words + 12,
+            pinned: pinned_bytes([words, words, 12]),
         })
     }
 
@@ -636,7 +710,7 @@ impl GptqLane {
         }
         let hessian = hessian.holding("Hessian", 4 * (k as u64) * (k as u64))?;
         let floats = self.workspace_floats(k)?;
-        let memory = self.parts.memory.clone();
+        let memory = &self.parts.memory;
         submit(&mut self.stream, |queue| {
             reclaim(&memory.released, &memory.library, queue)?;
             let mut memory = Memory::new(queue, &memory.library, &memory.released, &memory.pinned, claims);
@@ -774,15 +848,30 @@ struct ScalesState {
 
 impl GptqLane {
     /// The memory [`tensor_scales`](Self::tensor_scales) of `rows` rows of `k` columns takes, to be claimed before it.
-    pub fn scales_bytes(&self, rows: usize, k: usize, format: &Format) -> StepBytes {
-        let (rows, k) = (rows as u64, k as u64);
-        let mut bytes = StepBytes { device: 4, pinned: 4 };
-        if format.sd4 {
-            let table = 8 * (CODES * CODES + 2 * CODES) as u64 + 8 * k;
-            bytes.device += table + 4 * self.chunk_rows(k).min(rows) * k;
-            bytes.pinned += table;
+    pub fn scales_bytes(&self, rows: usize, k: usize, format: &Format) -> Result<StepBytes, GptqError> {
+        if k == 0 {
+            return Err(GptqError::Request("a weight needs k > 0".into()));
         }
-        bytes
+        let (rows, k) = (rows as u64, k as u64);
+        let mut bytes = StepBytes {
+            device: 4,
+            pinned: pinned_bytes([4]),
+        };
+        if format.sd4 {
+            let (costs, small) = (8 * (CODES * CODES) as u64, 8 * CODES as u64);
+            bytes.device += costs + 2 * small + 8 * k + 4 * self.chunk_rows(k).min(rows) * k;
+            bytes.pinned += pinned_bytes([costs, small, small, 4 * k, 4 * k]);
+        }
+        Ok(bytes)
+    }
+
+    /// The factor, when it was made on this lane: its device memory is freed on the stream it was allocated on.
+    fn own(&self, factor: &Factor) -> Result<(), GptqError> {
+        if factor.upper.belongs_to(&self.parts.memory.released) {
+            Ok(())
+        } else {
+            Err(GptqError::ForeignFactor)
+        }
     }
 
     /// Rows of the weight one pass of the SD4 costs converts.
@@ -820,6 +909,7 @@ impl GptqLane {
         claims: Claims,
     ) -> Result<ScalesState, GptqError> {
         let k = factor.k;
+        self.own(factor)?;
         if !format.nvfp4 {
             return Err(GptqError::Request("tensor scales belong to NVFP4".into()));
         }
@@ -834,7 +924,7 @@ impl GptqLane {
         let weight = weight.holding("weight", 2 * rows as u64 * k as u64)?;
         let settings = self.parts.settings;
         let chunk_rows = self.chunk_rows(k as u64);
-        let memory = self.parts.memory.clone();
+        let memory = &self.parts.memory;
         submit(&mut self.stream, |queue| {
             reclaim(&memory.released, &memory.library, queue)?;
             let mut memory = Memory::new(queue, &memory.library, &memory.released, &memory.pinned, claims);
@@ -1032,12 +1122,17 @@ impl GptqLane {
         let groups = k / group;
         let dead = dead_columns(&factor.importance, &factor.order).len() as u64;
         let scale_bytes = if format.nvfp4 { 1 } else { 2 };
-        let uploads = 4 * 4 * k + 4 * dead + if format.sd4 { ENTRIES as u64 } else { 0 };
-        let downloads = 2 * n * k + scale_bytes * n * groups;
-        let device = 4 * (2 * n * k + n * groups + 2 * n * BLOCK as u64 + n * group);
+        let mut staged = vec![2 * n * k, scale_bytes * n * groups, 4 * k, 4 * k, 4 * k, 4 * k];
+        if dead > 0 {
+            staged.push(4 * dead);
+        }
+        if format.sd4 {
+            staged.push(ENTRIES as u64);
+        }
+        let device = 4 * (2 * n * k + n * groups + 2 * n * BLOCK as u64 + n * group) + staged.iter().sum::<u64>();
         StepBytes {
-            device: device + uploads + downloads,
-            pinned: uploads + downloads,
+            device,
+            pinned: pinned_bytes(staged),
         }
     }
 
@@ -1069,6 +1164,7 @@ impl GptqLane {
             decoded_out,
         } = *request;
         let k = factor.k;
+        self.own(factor)?;
         let group = format.group;
         if n == 0 || k == 0 || !k.is_multiple_of(group) {
             return Err(GptqError::Request(format!(
@@ -1089,7 +1185,7 @@ impl GptqLane {
         let dead = dead_columns(&factor.importance, &factor.order);
         let scale_bytes = if format.nvfp4 { 1 } else { 2 };
         let above = self.parts.settings.search.above();
-        let memory = self.parts.memory.clone();
+        let memory = &self.parts.memory;
         submit(&mut self.stream, |queue| {
             reclaim(&memory.released, &memory.library, queue)?;
             let mut memory = Memory::new(queue, &memory.library, &memory.released, &memory.pinned, claims);

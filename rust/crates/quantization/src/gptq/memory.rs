@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use euhedral_gpu::LaneStream;
+use euhedral_inference_cuda::launch::ops::FreeFailure;
 use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, DevicePtr, PinnedPool, PooledPinned};
 use euhedral_memory::Claim;
 
@@ -33,8 +34,8 @@ pub struct StepBytes {
     pub pinned: u64,
 }
 
-/// The memory planner's claims for one step, each at least as large as the step's [`StepBytes`]. A step given none is
-/// not accounted.
+/// The memory planner's claims for one step, each at least as large as the step's [`StepBytes`]. A step that allocates
+/// refuses a missing claim: no allocation is unaccounted.
 #[derive(Debug, Default)]
 pub struct Claims {
     pub device: Option<Claim>,
@@ -87,22 +88,34 @@ impl Released {
     }
 }
 
-/// Frees, in stream order on the stream `queue` lends, every buffer given up, and returns how many. The first failure
-/// is returned after the rest are freed.
+/// Frees, in stream order on the stream `queue` lends, every buffer given up, and returns how many. A buffer the stream
+/// could not free is parked again, still allocated and still charged, for the next call (a plain free would wait for
+/// every lane). The first failure is returned after the rest are freed.
 pub fn reclaim<Q: LaneStream<Raw = *mut c_void>>(
     released: &Released,
     library: &Arc<CudaLibrary>,
     queue: &Q,
 ) -> Result<u64, CudaError> {
     let mut failure = None;
+    let mut parked = Vec::new();
     let freed = released.consumer.drain_all(|held| {
         let Held { buffer, claim } = held;
-        if let Err(error) = buffer.free_on_lane(library, queue) {
-            failure.get_or_insert(error);
+        match buffer.free_on_lane(library, queue) {
+            // The free is enqueued: the bytes are the planner's again.
+            Ok(()) => drop(claim),
+            Err(FreeFailure { buffer, error }) => {
+                failure.get_or_insert(error);
+                match buffer {
+                    Some(buffer) => parked.push(Held { buffer, claim }),
+                    None => drop(claim),
+                }
+            }
         }
-        // The free is enqueued: the bytes are the planner's again.
-        drop(claim);
     });
+    let freed = freed - parked.len() as u64;
+    for held in parked {
+        released.give(held);
+    }
     failure.map_or(Ok(freed), Err)
 }
 
@@ -125,6 +138,11 @@ impl Debug for Held {
 impl Device {
     fn buffer(&self) -> Option<&DeviceBuffer> {
         self.held.as_ref().map(|held| &held.buffer)
+    }
+
+    /// Whether this buffer was allocated on the lane whose queue is `released`.
+    pub fn belongs_to(&self, released: &Arc<Released>) -> bool {
+        Arc::ptr_eq(&self.released, released)
     }
 
     /// The device address.
@@ -233,19 +251,23 @@ impl<'a, Q: LaneStream<Raw = *mut c_void>> Memory<'a, Q> {
     /// `bytes` of pooled page-locked memory.
     pub fn pinned(&mut self, bytes: usize) -> Result<Host, GptqError> {
         let bytes = bytes.max(1);
-        let claim = charge(&mut self.claims.pinned, bytes, "pinned")?;
+        let pooled = self.pool.acquire(bytes)?;
+        // The pool hands out its size class: that is what the buffer takes of the pinned memory.
+        let claim = charge(&mut self.claims.pinned, pooled.capacity(), "pinned")?;
         Ok(Host {
-            pooled: self.pool.acquire(bytes)?,
+            pooled,
             bytes,
             _claim: claim,
         })
     }
 }
 
-/// `bytes` out of `claim`, as a claim of their own; none when the step is not accounted.
+/// `bytes` out of `claim`, as a claim of their own.
 fn charge(claim: &mut Option<Claim>, bytes: usize, kind: &'static str) -> Result<Option<Claim>, GptqError> {
     let Some(claim) = claim else {
-        return Ok(None);
+        return Err(GptqError::Request(format!(
+            "the step was given no {kind} claim for the {bytes} bytes it allocates"
+        )));
     };
     let owner = claim.owner();
     claim.take(owner, bytes as u64, "gptq").map(Some).ok_or_else(|| {
@@ -253,4 +275,16 @@ fn charge(claim: &mut Option<Claim>, bytes: usize, kind: &'static str) -> Result
             "the {kind} claim has fewer than the {bytes} bytes an allocation needs"
         ))
     })
+}
+
+/// The pinned bytes of staging buffers asked for as `sizes`: each takes its pool size class, which is what a claim
+/// must cover.
+pub fn pinned_bytes(sizes: impl IntoIterator<Item = u64>) -> u64 {
+    sizes
+        .into_iter()
+        .map(|bytes| {
+            let bytes = usize::try_from(bytes.max(1)).unwrap_or(usize::MAX);
+            PinnedPool::class_bytes(bytes).map_or(u64::MAX, |class| class as u64)
+        })
+        .fold(0, u64::saturating_add)
 }

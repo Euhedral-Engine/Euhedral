@@ -5,7 +5,7 @@
 //! `euhedral.quantization.cuda-libraries`; a missing setting fails the test. The kernels' NVRTC and its builtins
 //! library must be reachable (`EUHEDRAL_NVRTC`, `LD_LIBRARY_PATH`).
 //!
-//! The tests round the Hessian and the weight of the frozen calibration fixture (the Java tests own the files) and
+//! The tests round the Hessian and the weight of the frozen calibration fixture and
 //! check what must hold of any GPTQ rounding: dead columns, act-order equivariance, the error under H against
 //! nearest-code rounding, the code range, the decoded output, the identity table and the SD4 table over chunks.
 #![cfg(target_os = "linux")]
@@ -25,6 +25,7 @@ use std::path::PathBuf;
 
 use euhedral_inference_cuda::DeviceBuffer;
 use euhedral_inference_quantization::gptq::format::Format;
+use euhedral_inference_quantization::gptq::memory::Claims;
 use euhedral_inference_quantization::gptq::state::QuantState;
 use euhedral_inference_quantization::gptq::{GptqError, GptqSettings, RoundRequest, TensorScales};
 use euhedral_inference_quantization::npy::Npy;
@@ -320,7 +321,13 @@ fn act_order_permutes_the_codes_with_the_columns() {
 fn the_error_under_h_beats_nearest_rounding_and_the_codes_stay_in_range() {
     let p = problem();
     let mut rig = rig(GptqSettings::default());
-    for (case, act_order) in [(GROUPED, false), (GROUPED, true), (NVFP4, false), (SD4, true)] {
+    // The bound of each case sits just above the ratio it was seen to give.
+    for (case, act_order, bound) in [
+        (GROUPED, false, 0.585),
+        (GROUPED, true, 0.63),
+        (NVFP4, false, 0.48),
+        (SD4, true, 0.70),
+    ] {
         let format = format(case);
         let rounded = round(&mut rig, &p, &p.w, &p.h, &format, act_order);
         let state = &rounded.state;
@@ -355,8 +362,8 @@ fn the_error_under_h_beats_nearest_rounding_and_the_codes_stay_in_range() {
             gptq / plain
         );
         assert!(
-            gptq < 0.9 * plain,
-            "{}: error {gptq} is not clearly below nearest rounding's {plain}",
+            gptq < bound * plain,
+            "{}: error {gptq} is not below {bound} of nearest rounding's {plain}",
             format.name
         );
     }
@@ -510,4 +517,115 @@ fn a_step_takes_exactly_the_bytes_it_charges_and_gives_them_all_back() {
     drop(factor);
     rig.settle();
     assert_eq!(rig.free(), (capacity, capacity));
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
+fn staging_is_charged_at_its_pool_size_class() {
+    // Forty rows of 256 columns: the codes take 20480 bytes, which the pool rounds up to 32768.
+    let p = problem();
+    let n = 40;
+    let mut rig = rig(GptqSettings::default());
+    let capacity = rig.capacity();
+    let weight = rig.upload(&f32_to_bf16(&p.w[..n * p.k]));
+    let hessian = rig.upload(&floats(&p.h));
+    let format = format(SD4);
+    let factor = rig.factor(&hessian, p.k, p.damp, true).unwrap();
+    let tensor = rig.tensor_scales(&weight, n, &factor, &format).unwrap();
+    let request = RoundRequest {
+        weight: range_of(&weight),
+        n,
+        factor: &factor,
+        format: &format,
+        tensor: &tensor,
+        decoded_out: None,
+    };
+    rig.round(request).unwrap();
+    rig.settle();
+    assert_eq!(rig.free(), (capacity - 4 * (p.k * p.k) as u64, capacity));
+    // A pinned claim one byte under the size class is refused.
+    rig.short = (0, 1);
+    assert!(matches!(rig.round(request), Err(GptqError::Request(text)) if text.contains("claim")));
+    rig.short = (0, 0);
+    drop(factor);
+    rig.settle();
+    assert_eq!(rig.free(), (capacity, capacity));
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
+fn a_step_given_no_claims_is_refused() {
+    let p = problem();
+    let mut rig = rig(GptqSettings::default());
+    let hessian = rig.upload(&floats(&p.h));
+    let range = range_of(&hessian);
+    let refused = rig.run(|lane, done| lane.factor(range, p.k, p.damp, false, Claims::default(), done));
+    assert!(matches!(refused, Err(GptqError::Request(text)) if text.contains("no ") && text.contains("claim")));
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
+fn the_sd4_size_of_a_weight_with_no_columns_is_an_error() {
+    let mut rig = rig(GptqSettings::default());
+    assert!(matches!(
+        rig.scales_bytes(64, 0, &format(SD4)),
+        Err(GptqError::Request(_))
+    ));
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
+fn a_factor_from_another_lane_is_refused() {
+    let p = problem();
+    let mut first = rig(GptqSettings::default());
+    let mut second = rig(GptqSettings::default());
+    let hessian = first.upload(&floats(&p.h));
+    let factor = first.factor(&hessian, p.k, p.damp, false).unwrap();
+    let weight = second.upload(&f32_to_bf16(&p.w));
+    let format = format(NVFP4);
+    assert!(matches!(
+        second.tensor_scales(&weight, p.n, &factor, &format),
+        Err(GptqError::ForeignFactor)
+    ));
+    let tensor = TensorScales {
+        global_scale: 1.0,
+        table: None,
+    };
+    let request = RoundRequest {
+        weight: range_of(&weight),
+        n: p.n,
+        factor: &factor,
+        format: &format,
+        tensor: &tensor,
+        decoded_out: None,
+    };
+    assert!(matches!(second.round(request), Err(GptqError::ForeignFactor)));
+    // On its own lane it works.
+    let own = first.upload(&f32_to_bf16(&p.w));
+    first.tensor_scales(&own, p.n, &factor, &format).unwrap();
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
+fn a_chain_that_cannot_arm_keeps_its_staging_until_a_retirement_is_confirmed() {
+    let p = problem();
+    let mut rig = rig(GptqSettings::default());
+    let hessian = rig.upload(&floats(&p.h));
+    assert_eq!(rig.pinned.allocated_bytes(), 0);
+    // A retirement nobody collected is outstanding: the chain's own cannot be armed, after it enqueued its copies.
+    rig.block_arming();
+    let failed = rig.factor(&hessian, p.k, p.damp, false);
+    assert!(matches!(failed, Err(GptqError::Gpu(_))), "{failed:?}");
+    assert_eq!(rig.unsettled(), 1);
+    assert!(rig.pinned.allocated_bytes() > 0, "the chain took staging");
+    assert_eq!(
+        rig.pinned.held_bytes(),
+        0,
+        "the staging went back to the pool while its download was still queued"
+    );
+    rig.unblock_arming();
+    // The next chain's confirmed retirement is behind the queued work: the staging is released then.
+    rig.factor(&hessian, p.k, p.damp, false).unwrap();
+    assert_eq!(rig.unsettled(), 0);
+    assert!(rig.pinned.held_bytes() > 0, "the staging came back to the pool");
 }

@@ -145,6 +145,11 @@ impl PinnedPool {
         })
     }
 
+    /// The bytes a buffer asked for as `bytes` really holds: its size class. `None` when no class is that large.
+    pub fn class_bytes(bytes: usize) -> Option<usize> {
+        bytes.max(MIN_CLASS_BYTES).checked_next_power_of_two()
+    }
+
     /// A buffer of at least `bytes`: a released one of its size class, or a new allocation.
     pub fn acquire(self: &Arc<Self>, bytes: usize) -> Result<PooledPinned, CudaError> {
         let capacity = bytes
