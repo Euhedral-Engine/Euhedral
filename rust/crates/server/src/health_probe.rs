@@ -10,6 +10,8 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use euhedral_inference_server::say;
+
 /// The port the server listens on when nothing sets it.
 const DEFAULT_PORT: u16 = 1738;
 /// The bound on connecting, on writing the request and on reading the answer.
@@ -61,13 +63,14 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            euhedral_inference_server::say(&message);
+            say(&message);
             ExitCode::FAILURE
         }
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, reason = "test fixture: a failed setup fails the test")]
 mod tests {
     use super::*;
     use std::net::TcpListener;

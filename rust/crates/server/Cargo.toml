@@ -5,6 +5,7 @@ description = "The server binary: loads the settings, starts the backend, serves
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+default-run = "euhedral-server"
 
 [features]
 # A backend that follows a script instead of the engine, behind the hidden `--scripted-backend` argument, so that the
