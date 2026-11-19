@@ -7,6 +7,8 @@
 //! - [`trellis`]: the trellis kernels: rates, launch planners and the enqueue of their steps.
 //! - [`npy`] and [`npz`]: the NumPy array and archive formats the calibration state and the fixtures use. Both work
 //!   on bytes the caller supplies or takes; neither opens a file.
+//! - [`forward`]: one decoder layer in BF16 on the engine's kernels, with the weights loaded for it and an observer of
+//!   each quantized linear's input.
 //! - [`kld`]: the reference logits file the scorer and the reference writer share, opened and read through `AsyncIo`.
 //! - [`rows`]: the work on the logits rows of one teacher-forced run, as frames of the `host` lake.
 //! - [`mixed`]: the mixed allocation search's data: options, allocations, priors, the cost table, the knapsack, the
@@ -18,6 +20,7 @@
 
 pub mod checkpoint;
 pub mod durable;
+pub mod forward;
 pub mod java_random;
 pub mod kernels;
 pub mod kld;

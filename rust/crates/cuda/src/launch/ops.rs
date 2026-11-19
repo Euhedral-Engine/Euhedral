@@ -15,7 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use euhedral_gpu::cuda::CudaKernel;
-use euhedral_gpu::{GpuError, LaneEnqueue, LaneStream};
+use euhedral_gpu::{Args, GpuError, LaneEnqueue, LaneStream, Launch as GpuLaunch, RawStream};
 use euhedral_graph::Marker;
 
 use crate::error::{CudaError, check};
@@ -1123,6 +1123,39 @@ where
         // The selection is cleared when the call returns or panics.
         let _selection = SelectedStream(library);
         Ok(call(library))
+    }
+}
+
+impl<Q> RusteeOps<'_, Q>
+where
+    Q: LaneEnqueue<Kernel = CudaKernel> + LaneStream<Raw = *mut c_void>,
+{
+    /// Launches `kernel`, a kernel that is not in the catalog (another module's), in order with the operations queued
+    /// through `self`.
+    ///
+    /// # Safety
+    /// As [`LaneEnqueue::launch`]: `args` match the kernel's parameters, and every address the kernel touches is valid
+    /// for that access until the work retires.
+    pub unsafe fn launch_kernel(
+        &mut self,
+        kernel: &CudaKernel,
+        geometry: GpuLaunch,
+        args: &Args,
+    ) -> Result<(), CudaError> {
+        // SAFETY: the caller's contract.
+        unsafe { self.queue.launch(kernel, geometry, args) }.map_err(|error| lane_error("launch_kernel", &error))
+    }
+
+    /// Runs `call` with the stream the lane lends, for a library call that takes the stream itself (cuBLAS through
+    /// [`LaneHandles`](crate::math::LaneHandles)). The lent stream is the one every operation of this submission goes
+    /// to, so the call is ordered with everything enqueued before it and after it; the contract of
+    /// [`LaneStream::raw_stream`] applies to what `call` does with it.
+    pub fn with_raw_stream<R>(&self, call: impl FnOnce(&RawStream<'_, *mut c_void>) -> R) -> Result<R, CudaError> {
+        let stream = self
+            .queue
+            .raw_stream()
+            .ok_or_else(|| CudaError::Argument("the lane lent no stream".to_string()))?;
+        Ok(call(&stream))
     }
 }
 
