@@ -158,5 +158,54 @@ class PdlWaitTest(unittest.TestCase):
     def test_non_ascii_sources_are_read_as_utf_8(self):
         self.assertEqual([], check("// caf\u00e9 \u2014 note\n" + ROW_KERNEL_FIXED))
 
+    def test_constructor_reads_are_uses_only_for_types_with_a_device_constructor(self):
+        head = "struct Head { const float* p; __device__ Head(const float* q) : p(q) { first = q[0]; } float first; };\n"
+        plain = "struct Plain { const float* p; };\n"
+        for form in ("const Head h(input);", "const Head h{input};"):
+            with self.subTest(form=form):
+                self.assertIn(
+                    "uses pointer parameter(s) input", "\n".join(check(head + kernel(form))))
+        self.assertEqual([], check(plain + kernel("const Plain h{input}; const float* q = input + 1;")))
+        self.assertEqual([], check(head + kernel("const float* const q(input + 1);")))
+
+    def test_a_weights_layout_with_a_constructor_stays_exempt(self):
+        source = ("struct Layout { __device__ Layout(const unsigned char* w) { v = w[0]; } unsigned char v; };\n"
+                  'extern "C" __global__ void k(const unsigned char* weights, float* out) {'
+                  " const Layout l(weights); euhedral_pdl_begin(); out[0] = l.v; }")
+        self.assertEqual([], check(source))
+
+    def test_a_template_typed_helper_parameter_is_bound_by_position(self):
+        helper = ("template <class P> __device__ void body(P a, float* o) { float v = a[0]; euhedral_pdl_begin(); o[0] = v; }\n")
+        problems = check(helper + 'extern "C" __global__ void k(const float* input, float* out) { body(input, out); }')
+        self.assertIn("uses pointer parameter(s) a", "\n".join(problems))
+
+    def test_trap_and_exit_before_the_wait_are_early_exits(self):
+        for before in ("__trap();", 'asm volatile("exit;");', 'asm("trap;");'):
+            with self.subTest(before=before):
+                self.refused(before)
+
+    def test_array_parameters_are_pointers(self):
+        source = ('extern "C" __global__ void k(const float input[], float* out) {'
+                  " float a = input[0]; euhedral_pdl_begin(); out[0] = a; }")
+        self.assertIn("uses pointer parameter(s) input", "\n".join(check(source)))
+
+    def test_a_relative_root_gives_the_same_answer(self):
+        import os
+        previous = os.getcwd()
+        os.chdir(pdl_wait_check.SOURCES.parent)
+        try:
+            self.assertEqual([], pdl_wait_check.violations("src", pdl_wait_check.CATALOG))
+        finally:
+            os.chdir(previous)
+
+    def test_the_c_only_list_applies_only_with_the_qwen_layer_host_file(self):
+        self.assertEqual([], check(kernel("")))  # no host/qwen_layer_ops.c under the root: c_only is not applied
+        directory = pathlib.Path(self.scratch) / "qwen"
+        (directory / "host").mkdir(parents=True, exist_ok=True)
+        (directory / "host" / "qwen_layer_ops.c").write_text("", encoding="utf-8")
+        (directory / "k.cuh").write_text(kernel(""), encoding="utf-8")
+        self.assertIn("euhedral_gdn_control_fp32: registered", "\n".join(pdl_wait_check.violations(directory)))
+
+
 if __name__ == "__main__":
     unittest.main()

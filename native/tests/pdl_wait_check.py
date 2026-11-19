@@ -27,7 +27,10 @@ through helpers it calls:
   6. Every kernel the Rust launch catalog registers (`true` entries) must reach the wait, and every kernel the C host
      code registers that the catalog does not list (C_ONLY below, and the names in host/dflash.c) must too.
 
-Known gaps: helpers are followed only by name (no overload resolution, no function pointers, no `using namespace`);
+Known gaps: a type with a __device__ constructor that is declared from a pointer by `T x = T(p)` or in a member
+initialiser is not seen (only `T x(p)` and `T x{p}` are); a pointer reaching a helper through a struct member or a
+reference parameter is not bound; asm blocks other than exit/trap and calls that never return are not early exits;
+helpers are followed only by name (no overload resolution, no function pointers, no `using namespace`);
 pointers reaching a kernel through __constant__ globals or struct parameters are not tracked; arithmetic arguments like
 `f(p + 1)` to a call are seen as a use, but a pointer hidden in a macro argument is not expanded; a kernel that never calls
 euhedral_pdl_begin() is checked only if the catalog or C_ONLY registers it.
@@ -92,9 +95,9 @@ def split_top_level(text):
 
 
 class Function:
-    def __init__(self, path, name, namespace, kernel, macro, pointers, body):
+    def __init__(self, path, name, namespace, kernel, macro, pointers, body, params=()):
         self.path, self.name, self.namespace, self.kernel = path, name, namespace, kernel
-        self.macro, self.pointers, self.body = macro, pointers, body
+        self.macro, self.pointers, self.body, self.params = macro, pointers, body, list(params)
 
 
 def namespaces(text):
@@ -133,16 +136,18 @@ def parse(path, text):
         if tail.end() >= len(text) or text[tail.end()] != "{":
             continue  # a declaration
         brace = tail.end()
-        pointers = []
+        pointers, params = [], []
         for param in split_top_level(text[call.end():end_params - 1]):
+            param = re.sub(r"\s*=.*$", "", re.sub(r"\[[^\]]*\]", "[]", param), flags=re.S)
             words = re.findall(r"\w+", param)
-            if "*" in param and words:
-                before_star = param[:param.rindex("*")]
-                pointers.append((words[-1], bool(re.search(r"\bconst\b", before_star))))
+            params.append(words[-1] if words else "")
+            if ("*" in param or "[]" in param) and words:
+                cut = param.rindex("*") if "*" in param else param.index("[")
+                pointers.append((words[-1], bool(re.search(r"\bconst\b", param[:cut]))))
         body = text[brace + 1:balanced(text, brace, "{", "}") - 1]
         namespace = tuple(name for start, end, name in blocks if start < match.start() < end)
         found.append(Function(path, call.group(1), namespace, match.group(1) == "global",
-                              macro_of(text, match.start()), pointers, body))
+                              macro_of(text, match.start()), pointers, body, params))
     return found
 
 
@@ -150,7 +155,7 @@ class Tree:
     """The sources under a root: per-file functions, and the translation units (a .cu with its quoted includes)."""
 
     def __init__(self, root):
-        self.root = pathlib.Path(root)
+        self.root = pathlib.Path(root).resolve()
         self.paths = sorted(p for p in self.root.rglob("*") if p.suffix in (".cu", ".cuh"))
         self.texts = {p: strip_comments(read(p)) for p in self.paths}
         self.functions = {p: parse(p, t) for p, t in self.texts.items()}
@@ -220,7 +225,16 @@ def top_level(before):
 DECL_TYPE = re.compile(r"[A-Za-z_]\w*")
 
 
-def pointer_uses(text, pointers):
+def constructor_types(tree, unit):
+    """Names of the types with a __device__ constructor in the translation unit."""
+    names = set()
+    for path in unit:
+        names.update(re.findall(r"__device__\s+(?:__forceinline__\s+|inline\s+|constexpr\s+|explicit\s+)*(\w+)\s*\(",
+                                tree.texts[path]))
+    return names
+
+
+def pointer_uses(text, pointers, constructors=()):
     """The tracked pointers that statements of `text` use beyond address arithmetic. Tracked: the pointer parameters
     (except const ones in READ_ONLY) and locals declared from tracked names by cast and offset arithmetic."""
     tracked = {name for name, const in pointers if not (const and name in READ_ONLY)}
@@ -239,6 +253,10 @@ def pointer_uses(text, pointers):
                     and not KEYWORDS.intersection(tokens) and any(DECL_TYPE.match(t) for t in tokens[:-1])
                     and tokens[-1] not in tracked):
                 right = statement[split.end():] if statement[split.start()] == "=" else statement[split.start():]
+                if (statement[split.start()] == "(" and "*" not in declared and len(tokens) >= 2
+                        and tokens[-2] in constructors):
+                    used.extend(n for n in names if n not in used)  # the constructor may read through the pointer
+                    continue
                 if _address_only(right, names, tracked):
                     tracked.add(tokens[-1])
                     continue
@@ -262,13 +280,13 @@ def _address_only(right, names, tracked):
     return True
 
 
-def own_problems(before, upto, pointers):
+def own_problems(before, upto, pointers, constructors=()):
     found = []
     if not top_level(before):
         found.append("euhedral_pdl_begin() is not a top-level statement of the kernel")
-    if re.search(r"\breturn\b", upto):
+    if re.search(r"\breturn\b|__trap\s*\(|\basm\b(?:\s+volatile)?\s*\(\s*\"\s*(?:exit|trap)\s*;?\s*\"", upto):
         found.append("returns before euhedral_pdl_begin()")
-    used = pointer_uses(upto, pointers)
+    used = pointer_uses(upto, pointers, constructors)
     if used:
         found.append(f"uses pointer parameter(s) {', '.join(used)} before euhedral_pdl_begin()")
     return found
@@ -286,30 +304,41 @@ def candidates(tree, unit, caller, callee):
     return found
 
 
-def analyze(tree, unit, function, stack=()):
-    """None when the function never reaches the wait, else its problems."""
+def analyze(tree, unit, function, stack=(), pointers=None):
+    """None when the function never reaches the wait, else its problems. `pointers` are the (name, const) pairs
+    tracked in it: its pointer parameters plus, for a helper, the parameters bound to tracked arguments of the call."""
+    pointers = function.pointers if pointers is None else pointers
+    constructors = constructor_types(tree, unit)
     body = function.body
     index = body.find(WAIT)
     if index >= 0:
-        return own_problems(body[:index], body[:index], function.pointers)
+        return own_problems(body[:index], body[:index], pointers, constructors)
+    tracked = {n for n, c in pointers if not (c and n in READ_ONLY)}
     for call in re.finditer(r"((?:\w+::)*[A-Za-z_]\w*)\s*(?:<[^;(){}]*>)?\s*\(", body):
         callee = call.group(1)
         if callee.split("::")[-1] in KEYWORDS or callee in stack:
             continue
+        open_paren = body.index("(", call.end() - 1)
+        close = balanced(body, open_paren, "(", ")")
+        arguments = split_top_level(body[open_paren + 1:close - 1])
         found = [c for c in candidates(tree, unit, function, callee) if c is not function]
-        results = [(c, analyze(tree, unit, c, stack + (callee,))) for c in found]
+        results = []
+        for c in found:
+            effective = list(c.pointers)
+            known = {n for n, _ in effective}
+            for position, argument in enumerate(arguments[:len(c.params)]):
+                name = c.params[position]
+                if name and name not in known and any(re.search(r"\b" + re.escape(t) + r"\b", argument) for t in tracked):
+                    effective.append((name, False))
+            results.append((c, analyze(tree, unit, c, stack + (callee,), effective)))
         waiting = [(c, r) for c, r in results if r is not None]
         if not waiting:
             continue
         if len(found) > 1:
             return [f"call of {callee}: {len(found)} definitions match in the translation unit"]
-        callee_function, problems = waiting[0]
-        open_paren = body.index("(", call.end() - 1)
-        close = balanced(body, open_paren, "(", ")")
-        arguments = split_top_level(body[open_paren + 1:close - 1])
-        tracked = {n for n, c in function.pointers if not (c and n in READ_ONLY)}
+        problems = waiting[0][1]
         rest = ";".join(a for a in arguments if a not in tracked)
-        return problems + own_problems(body[:call.start()], body[:call.start()] + ";" + rest, function.pointers)
+        return problems + own_problems(body[:call.start()], body[:call.start()] + ";" + rest, pointers, constructors)
     return None
 
 
@@ -341,7 +370,7 @@ def violations(source_root, catalog=None, c_only=None):
                 with_wait.update(owners)
                 for message in result:
                     problems.append(f"{path.relative_to(tree.root)}: {', '.join(owners)}: {message}")
-    wanted = set(C_ONLY if c_only is None else c_only)
+    wanted = set(C_ONLY if c_only is None else c_only) if (tree.root / "host" / "qwen_layer_ops.c").is_file() else set()
     dflash = tree.root / DFLASH_HOST
     if dflash.is_file():
         wanted |= set(re.findall(r'"(euhedral_dflash_\w+)"', read(dflash)))
