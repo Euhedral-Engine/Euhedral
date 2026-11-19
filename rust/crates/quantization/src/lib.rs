@@ -8,10 +8,13 @@
 //!   on bytes the caller supplies or takes; neither opens a file.
 //! - [`kld`]: the reference logits file the scorer and the reference writer share, opened and read through `AsyncIo`.
 //! - [`rows`]: the work on the logits rows of one teacher-forced run, as frames of the `host` lake.
+//! - [`mixed`]: the mixed allocation search's data: options, allocations, priors, the cost table, the knapsack, the
+//!   Pareto front and the residency check.
 
 pub mod java_random;
 pub mod kernels;
 pub mod kld;
+pub mod mixed;
 pub mod npy;
 pub mod npz;
 pub mod rows;
