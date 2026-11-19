@@ -23,13 +23,13 @@ pub use plan::{
 pub use rate::{Rate, TENSOR_CORE_ORDER, TILE_WEIGHTS};
 pub use run::TrellisKernels;
 
-/// One kernel launch: the kernel's name in the trellis module, its geometry and its arguments. Only the planners
-/// build one, so its arguments always match the kernel's parameter list.
+/// One kernel launch: the kernel's name in its module, its geometry and its arguments. Only the planners build one,
+/// so its arguments always match the kernel's parameter list.
 #[derive(Clone, Debug)]
 pub struct Step {
-    kernel: &'static str,
-    launch: Launch,
-    args: Args,
+    pub(crate) kernel: &'static str,
+    pub(crate) launch: Launch,
+    pub(crate) args: Args,
 }
 
 impl Step {
