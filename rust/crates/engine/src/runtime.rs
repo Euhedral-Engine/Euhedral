@@ -74,6 +74,11 @@ fn quanta_for(sequences: usize) -> usize {
     STAGE_RING_QUANTA.saturating_mul(sequences.max(1))
 }
 
+/// The events a stage lane's ring holds for `sequences` sequences.
+pub fn stage_ring_for(sequences: usize) -> usize {
+    stage_ring(quanta_for(sequences))
+}
+
 /// How many sequences the settings size the lanes' rings for: `batching.max-sequences`, and one when it is 0, which
 /// is decided only once the model is read. A count above the rows a pass holds is refused: each sequence keeps its
 /// quanta's markers in the rings, which are created with the lanes, before the model is read, and a verification takes

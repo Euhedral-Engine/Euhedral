@@ -28,14 +28,14 @@ use euhedral_graph::{
 };
 use euhedral_inference_cuda::DevicePtr;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
-use euhedral_inference_engine::generation::{markers_in_flight, staging_ring};
+use euhedral_inference_engine::generation::{check_marker_rings, markers_in_flight, staging_ring};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{LayerIndex, ModelConfig, Residence, Role, WeightRef, object_key};
-use euhedral_inference_engine::plan::{Formats, Plan, StageKind, StagingRing, View, WeightLookup};
+use euhedral_inference_engine::plan::{Formats, Plan, PlanBuildError, StageKind, StagingRing, View, WeightLookup};
 use euhedral_inference_engine::quantum::{Dependency, Predecessor, external_edges};
 use euhedral_inference_engine::residency::offload::StagingGeometry;
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, plan as residency};
-use euhedral_inference_engine::runtime::open_lane_set;
+use euhedral_inference_engine::runtime::{open_lane_set, stage_ring_for};
 use euhedral_inference_engine::stages::{Unmarked, submit_on};
 use euhedral_inference_settings::{ModelSettings, Settings, TrellisKernelSettings};
 
@@ -124,6 +124,10 @@ impl Fixture {
     }
 
     fn staged(&self, names: &BTreeSet<String>, lane: LaneId) -> Plan {
+        self.try_staged(names, lane).unwrap()
+    }
+
+    fn try_staged(&self, names: &BTreeSet<String>, lane: LaneId) -> Result<Plan, PlanBuildError> {
         let mut weights = self.weights.0.clone();
         for (index, weight) in weights.values_mut().enumerate() {
             if names.contains(&weight.name) {
@@ -153,7 +157,6 @@ impl Fixture {
             Some(&ring),
             Some(lane),
         )
-        .unwrap()
     }
 
     fn unstaged(&self) -> Plan {
@@ -248,13 +251,46 @@ fn an_mtp_draft_predecessor_gives_its_root() {
     assert_eq!(edges.len(), 1 + first.len());
 }
 
+/// Two sequences share the ring: a quantum behind both has edges from each, and from each one's own last reader.
 #[test]
-fn a_gated_workspace_gives_no_edge() {
+fn a_quantum_behind_two_predecessors_waits_for_each_ones_last_reader() {
     let fixture = fixture();
     let plan = fixture.staged(&fixture.selection(), LaneId(9));
-    let first = plan.first_transfers(View::Decode);
-    assert!(!first.is_empty());
-    assert!(external_edges(first, &[]).is_empty(), "nothing precedes the quantum");
+    let one = offered(&plan, View::Decode);
+    let mut two = offered(&plan, View::Verify { rows: 2 });
+    two.0 = StageId(one.0.0 + 7);
+    two.1 = StageId(one.1.0 + 5);
+    two.2 = one
+        .2
+        .iter()
+        .map(|reader| reader.map(|stage| StageId(stage.0 + 1)))
+        .collect();
+    assert_ne!(one.2, two.2, "the predecessors' readers differ");
+    for next in [View::Decode, View::Verify { rows: 2 }] {
+        let first = plan.first_transfers(next);
+        let edges = external_edges(first, &[predecessor(&one), predecessor(&two)]);
+        assert_eq!(edges.len(), 2 * (1 + first.len()), "{next:?}");
+        for (index, offer) in [&one, &two].into_iter().enumerate() {
+            assert!(
+                edges.contains(&Dependency {
+                    predecessor: index,
+                    from_stage: offer.1,
+                    to_stage: StageId(0)
+                }),
+                "{next:?}: the sink of predecessor {index}"
+            );
+            for &(slot, transfer) in first {
+                assert!(
+                    edges.contains(&Dependency {
+                        predecessor: index,
+                        from_stage: offer.2[slot].expect("every slot is read"),
+                        to_stage: transfer
+                    }),
+                    "{next:?}: slot {slot} waits for predecessor {index}'s last reader"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -307,6 +343,50 @@ fn the_marker_rings_hold_a_staged_views_stages() {
         total > compute_stages,
         "the staged view has {total} stages, more than the {compute_stages} the rings are sized from"
     );
+}
+
+/// With every stageable projection staged, the markers fit the rings the engine sizes for the sequences, and a ring
+/// one event short of them is refused with the lane named.
+#[test]
+fn the_marker_check_holds_every_staged_projection() {
+    let fixture = fixture();
+    let mut all: BTreeSet<String> = fixture
+        .resident
+        .device
+        .iter()
+        .filter(|placement| placement.name.starts_with("text/layers/"))
+        .map(|placement| placement.name.clone())
+        .collect();
+    // Every object the plan can stage: those it names as not stageable (norms, convolutions) stay on the device.
+    let plan = loop {
+        match fixture.try_staged(&all, LaneId(9)) {
+            Ok(plan) => break plan,
+            Err(PlanBuildError::NotStageable { name }) => assert!(all.remove(&name), "{name}"),
+            Err(error) => panic!("{error}"),
+        }
+    };
+    assert!(
+        all.len() > fixture.selection().len(),
+        "more is staged than the usual selection"
+    );
+    for sequences in [1, 2, 4] {
+        let ring = stage_ring_for(sequences);
+        let (compute, transfers) = (
+            markers_in_flight(&plan, sequences, false),
+            markers_in_flight(&plan, sequences, true),
+        );
+        assert!(transfers > 0, "{sequences} sequences");
+        assert_eq!(
+            check_marker_rings(&plan, sequences, ring),
+            Ok(()),
+            "{sequences} sequences"
+        );
+        // The transfers are fewer than the compute stages, so the stage lanes' ring bounds the staging lane's too: the
+        // staging check cannot trip before the stage check, and a ring one short of the compute markers is refused.
+        assert!(transfers < compute, "{transfers} transfers, {compute} compute markers");
+        let error = check_marker_rings(&plan, sequences, compute - 1).unwrap_err();
+        assert!(error.contains("on a stage lane"), "{error}");
+    }
 }
 
 #[test]
@@ -559,6 +639,12 @@ fn a_copy_overlaps_the_tail_of_the_previous_quantum_and_never_its_reader() {
     assert!(!rig.ran(1, late_reader), "its last reader is held");
     let second = rig.start(2, &Arc::default(), &[(&first, &offer)]);
     drop(first);
+    rig.settle_until(|| {
+        transfers
+            .iter()
+            .filter(|&&(slot, _)| slot != late_slot)
+            .all(|&(_, unit)| rig.ran(2, unit))
+    });
     rig.settle();
     for &(slot, unit) in &transfers {
         if slot == late_slot {

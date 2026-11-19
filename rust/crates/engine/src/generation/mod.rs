@@ -121,6 +121,23 @@ pub fn staging_ring(
     }))
 }
 
+/// Whether the rings of `ring` events hold the markers `sequences` sequences of `plan` keep in flight, on the stage lanes
+/// and on the staging lane. The error names the lane.
+pub fn check_marker_rings(plan: &Plan, sequences: usize, ring: usize) -> Result<(), String> {
+    for (needed, what) in [
+        (markers_in_flight(plan, sequences, false), "stage"),
+        (markers_in_flight(plan, sequences, true), "staging"),
+    ] {
+        if needed > ring {
+            return Err(format!(
+                "the quanta in flight of {sequences} sequences record {needed} markers on a {what} lane and the \
+                 lanes' rings of {ring} events do not hold them"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The markers a lane's ring must hold for `sequences` sequences of `plan`: those of the stages that run on it. A
 /// quantum records a marker per stage, so the stage lanes hold the compute stages (`transfers` false) and the staging
 /// lane the weight transfers (`transfers` true), which the unstaged stage bound the rings are sized from does not count.
@@ -295,18 +312,7 @@ impl Generation {
                 core.compute_lanes()
             )));
         }
-        for (needed, what) in [
-            (markers_in_flight(&plan, sequences, false), "stage"),
-            (markers_in_flight(&plan, sequences, true), "staging"),
-        ] {
-            if needed > core.stage_ring {
-                return Err(EngineError::Runtime(format!(
-                    "the quanta in flight of {sequences} sequences record {needed} markers on a {what} lane and the \
-                     lanes' rings of {} events do not hold them",
-                    core.stage_ring
-                )));
-            }
-        }
+        check_marker_rings(&plan, sequences, core.stage_ring).map_err(EngineError::Runtime)?;
         let runtime = GraphRuntime {
             stages: Arc::clone(&core.stages) as Arc<dyn FrameSink>,
             completions: Arc::clone(&core.completions),
