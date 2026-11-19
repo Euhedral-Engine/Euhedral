@@ -17,6 +17,8 @@
     reason = "a test file: a failed unwrap is the failure"
 )]
 
+use euhedral_inference_cuda::launch::nvfp4::nvfp4_native_scratch_bytes;
+use euhedral_inference_edrl::WeightFormat;
 use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::model::{ArtifactProfile, Quantization, Speculation};
 use euhedral_inference_engine::residency::footprint;
@@ -386,13 +388,112 @@ fn the_runtime_reserve_is_a_setting_whose_auto_is_javas() {
             .offload
             .is_empty()
     );
+    // A reserve below what the settings make the runtime need is raised to it: the workspace, the decode scratch, the
+    // first sequence's state and the MTP layer's cache are paid from the reserve and counted.
     stated.memory.runtime_reserve = Auto::Value(ByteSize(0));
+    let none = plan_with(&config, &table, &stated, inputs(16 * GIB)).unwrap();
+    assert_eq!(none.runtime_reserve_bytes, reserve_demand(&none));
     assert_eq!(
-        plan_with(&config, &table, &stated, inputs(16 * GIB))
-            .unwrap()
-            .device_bytes,
-        auto.device_bytes - 1280 * MIB
+        none.device_bytes,
+        auto.device_bytes - 1280 * MIB + none.runtime_reserve_bytes
     );
+}
+
+/// What the runtime reserve pays for in a plan, from the pieces that allocate it.
+fn reserve_demand(plan: &ResidencyPlan) -> u64 {
+    let config = config();
+    plan.workspace_bytes
+        + plan.decode_scratch_bytes
+        + footprint::first_sequence_bytes(plan, &config)
+        + footprint::mtp_cache_bytes_of(plan, &config)
+}
+
+/// The device bytes that hold `big` with the reserve at its default: `big`'s bytes less what the reserve was raised by.
+fn counted_before(big: &ResidencyPlan) -> u64 {
+    big.device_bytes - (big.runtime_reserve_bytes - DEFAULT_RUNTIME_RESERVE_BYTES)
+}
+
+/// Whether `settings` are planned against `device_free` and a host that holds nothing: the plan is admitted whole on
+/// the device or refused, it cannot offload.
+fn admitted_on(settings: &Settings, device_free: u64) -> bool {
+    let mut inputs = inputs(device_free);
+    inputs.host_pinned_bytes = Some(0);
+    plan_with(&config(), &rco_table(), settings, inputs).is_ok()
+}
+
+#[test]
+fn the_defaults_keep_the_default_reserve() {
+    for tokens in [4096, 32_768, 131_072] {
+        let plan = plan_with(&config(), &rco_table(), &settings(tokens), inputs(64 * GIB)).unwrap();
+        assert_eq!(
+            plan.runtime_reserve_bytes, DEFAULT_RUNTIME_RESERVE_BYTES,
+            "{tokens} tokens"
+        );
+        assert!(
+            reserve_demand(&plan) <= DEFAULT_RUNTIME_RESERVE_BYTES,
+            "{tokens} tokens"
+        );
+    }
+}
+
+#[test]
+fn the_mtp_cache_of_a_long_bf16_context_is_counted_and_a_device_it_overflows_is_refused_when_the_host_cannot_take_the_weights()
+ {
+    let mut long = settings(262_144);
+    long.context.kv_cache_format = Auto::Value(KvFormat::Bf16);
+    long.context.kv_cache_on_gpu_tokens = 262_144;
+    let big = plan_with(&config(), &rco_table(), &long, inputs(64 * GIB)).unwrap();
+    let mtp = footprint::mtp_cache_bytes_of(&big, &config());
+    assert!(mtp > 1000 * MIB, "the layer's cache at 262144 tokens is {mtp}");
+    assert!(big.runtime_reserve_bytes > DEFAULT_RUNTIME_RESERVE_BYTES);
+    assert_eq!(big.runtime_reserve_bytes, reserve_demand(&big));
+    assert!(admitted_on(&long, big.device_bytes));
+    // Enough for everything but the reserve's growth: refused resident now.
+    assert!(!admitted_on(&long, counted_before(&big)));
+}
+
+#[test]
+fn a_plan_without_the_mtp_layer_counts_no_mtp_cache() {
+    let table = rco_table_without(|name| name.starts_with("mtp/"));
+    let mut config = config();
+    config.mtp_layer_count = 0;
+    let mut long = settings(262_144);
+    long.context.kv_cache_format = Auto::Value(KvFormat::Bf16);
+    long.context.kv_cache_on_gpu_tokens = 262_144;
+    let plan = plan_with(&config, &table, &long, inputs(64 * GIB)).unwrap();
+    assert_eq!(plan.draft_depth, 0);
+    assert_eq!(footprint::mtp_cache_bytes_of(&plan, &config), 0);
+    assert_eq!(plan.runtime_reserve_bytes, DEFAULT_RUNTIME_RESERVE_BYTES);
+    assert!(reserve_demand(&plan) < DEFAULT_RUNTIME_RESERVE_BYTES);
+}
+
+#[test]
+fn the_first_scratch_region_is_the_larger_of_the_trellis_and_the_native_scratch() {
+    let table = rco_table();
+    let plan = plan_with(&config(), &table, &settings(4096), inputs(64 * GIB)).unwrap();
+    let native = plan
+        .device
+        .iter()
+        .filter(|placement| placement.format == WeightFormat::Nvfp4)
+        .map(|placement| nvfp4_native_scratch_bytes(plan.rows.rows, placement.shape[1], placement.shape[0]))
+        .max()
+        .unwrap();
+    assert!(native > 0);
+    assert!(plan.scratch_bytes >= native);
+    // On this artifact the trellis routes' scratch is the larger: the figures of the plan are the ones it always had.
+    assert_eq!(plan.scratch_bytes, JAVA_TRELLIS_SCRATCH_512);
+}
+
+#[test]
+fn a_larger_prefill_chunk_counts_its_workspace_and_a_device_that_cannot_hold_it_is_refused_when_the_host_cannot_take_the_weights()
+ {
+    let mut chunked = settings(32_768);
+    chunked.batching.prefill_chunk_tokens = 2048;
+    let big = plan_with(&config(), &rco_table(), &chunked, inputs(64 * GIB)).unwrap();
+    assert!(big.runtime_reserve_bytes > DEFAULT_RUNTIME_RESERVE_BYTES);
+    assert_eq!(big.runtime_reserve_bytes, reserve_demand(&big));
+    assert!(admitted_on(&chunked, big.device_bytes));
+    assert!(!admitted_on(&chunked, counted_before(&big)));
 }
 
 #[test]
