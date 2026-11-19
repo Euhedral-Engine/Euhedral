@@ -46,4 +46,4 @@ pub use library::CudaLibrary;
 pub use memory::PinnedRange;
 pub use memory::{AllocationId, ArenaRange, DeviceBuffer, DevicePtr, HostWeightsArena, PinnedBuffer};
 pub use ops::{KernelOps, LaneOps, SubmitMode};
-pub use pool::{PinnedPool, PooledPinned};
+pub use pool::{PinnedPool, PoolGauges, PooledPinned};

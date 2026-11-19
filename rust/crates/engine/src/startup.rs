@@ -604,50 +604,32 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
         // Every pinned allocation of the startup happens here: the ring of the upload, and the staging the cache's
         // page tables will take. Once the chains run, the pool allocates nothing.
         let loans = loader::acquire_loans(&core, &ring)?;
-        // The workspace's linear scratch: the larger of the trellis routes' and the NVFP4 native route's at the
-        // chunk's rows; the second region is the tensor-core route alone.
-        let chunk = plan.rows.rows;
-        let nvfp4_native = plan
-            .device
-            .iter()
-            .filter(|placement| placement.format == WeightFormat::Nvfp4)
-            .filter_map(|placement| match placement.shape.as_slice() {
-                [out, input] => Some(core.library.nvfp4_native_scratch_bytes(
-                    chunk.min(u64::from(u32::MAX)) as u32,
-                    *input as u32,
-                    *out as u32,
-                )),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
-        let regions = [plan.scratch_bytes.max(nvfp4_native), plan.decode_scratch_bytes];
+        // The workspace's linear scratch is the plan's: the larger of the trellis routes' and the NVFP4 native route's at
+        // the chunk's rows; the second region is the tensor-core route alone.
+        let regions = [plan.scratch_bytes, plan.decode_scratch_bytes];
         // A drafting sequence admits the quanta of a step together, each reading a record of its own; each sequence has
         // records of its own.
         let records = input_records_for(plan.draft_depth, plan.sequences);
-        // The first scratch region is the plan's scratch: what a route needs beyond it (the NVFP4 native route's, which
-        // the plan does not count) is the runtime reserve's, with the workspace's slots and the decode scratch.
-        let planned_scratch = regions[0].min(plan.scratch_bytes);
-        let in_reserve = Workspace::allocation_bytes(&artifact.config, plan.rows, &regions, records) - planned_scratch;
-        let scratch_claim = reservation.claim(Consumer::Scratch, planned_scratch)?;
-        let (reserve_claim, over) = reservation.claim_reserve(in_reserve)?;
-        warn_over_reserve("the workspace", over);
+        // The first scratch region is the plan's scratch; the workspace's slots and the decode scratch are the runtime
+        // reserve's, which the plan sized for them.
+        let in_reserve =
+            Workspace::allocation_bytes(&artifact.config, plan.rows, &regions, records) - plan.scratch_bytes;
+        let scratch_claim = reservation.claim(Consumer::Scratch, plan.scratch_bytes)?;
+        let reserve_claim = reservation.claim(Consumer::RuntimeReserve, in_reserve)?;
         let mut workspace =
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
         workspace.hold(scratch_claim);
         workspace.hold(reserve_claim);
         let (sequences, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {
-            let first = footprint::first_sequence_bytes(&plan, &artifact.config);
+            // The first sequence's state and the MTP layer's cache at the longest context, which its pages grow to.
+            let first = footprint::first_sequence_bytes(&plan, &artifact.config)
+                + footprint::mtp_cache_bytes_of(&plan, &artifact.config);
             let mut sequences = Vec::with_capacity(plan.sequences);
             for index in 0..plan.sequences {
                 let mut claims = vec![reservation.claim(Consumer::Cache, plan.kv_device_bytes)?];
                 // The first sequence's state is the runtime reserve's; each one beyond it has its own share.
                 claims.push(match index {
-                    0 => {
-                        let (claim, over) = reservation.claim_reserve(first)?;
-                        warn_over_reserve("the first sequence's state", over);
-                        claim
-                    }
+                    0 => reservation.claim(Consumer::RuntimeReserve, first)?,
                     _ => reservation.claim(Consumer::ExtraSequences, plan.extra_sequence_bytes)?,
                 });
                 if plan.kv_host_bytes > 0 {
@@ -946,13 +928,6 @@ impl Finish {
             drop((weights, workspace, sequences));
             startup.fail(error);
         }));
-    }
-}
-
-/// Logs what an allocation takes beyond the runtime reserve: the plan did not count it, and the engine starts all the same.
-fn warn_over_reserve(what: &str, over: u64) {
-    if over > 0 {
-        log::warn!("{what} takes {over} bytes beyond the runtime reserve (memory.runtime-reserve)");
     }
 }
 
