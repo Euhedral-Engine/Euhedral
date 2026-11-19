@@ -85,7 +85,7 @@ impl Formats {
         match weight.format {
             WeightFormat::Trellis => Ok(Arc::clone(&self.trellis)),
             WeightFormat::Nvfp4 => Ok(Arc::clone(&self.nvfp4)),
-            WeightFormat::Q3G64Fp16
+            WeightFormat::Q3G64Fp16 | WeightFormat::Q4G64Fp16 | WeightFormat::Q5G64Fp16
                 if matches!(
                     weight.layout,
                     WeightLayout::RowSplitK128V1 | WeightLayout::RowSplitP2e2V1

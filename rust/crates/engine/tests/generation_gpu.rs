@@ -66,14 +66,21 @@ struct Machine {
     artifact: PathBuf,
     library: PathBuf,
     goldens: PathBuf,
+    /// The file of `goldens` the Java engine's greedy generation of the artifact is in.
+    golden: &'static str,
 }
 
 fn machine() -> Option<Machine> {
+    machine_of("euhedral.qwen.rco-artifact", "greedy-rco.txt")
+}
+
+/// The machine for the artifact of property `key`, whose Java greedy generation is `golden` in the goldens directory.
+fn machine_of(key: &str, golden: &'static str) -> Option<Machine> {
     let library = PathBuf::from(test_support::require_property("euhedral.cuda.library")?);
-    let artifact = PathBuf::from(test_support::require_property("euhedral.qwen.rco-artifact")?);
+    let artifact = PathBuf::from(test_support::require_property(key)?);
     let goldens = PathBuf::from(test_support::require_property("euhedral.rust.goldens")?);
     if !artifact.is_file() {
-        println!("skipped: euhedral.qwen.rco-artifact names no file");
+        println!("skipped: {key} names no file");
         return None;
     }
     if !goldens.is_dir() {
@@ -84,6 +91,7 @@ fn machine() -> Option<Machine> {
         artifact,
         library,
         goldens,
+        golden,
     })
 }
 
@@ -147,7 +155,7 @@ fn ids(line: &str, tag: &str) -> Vec<u32> {
 }
 
 fn greedy_reference(machine: &Machine) -> Greedy {
-    let text = fs::read_to_string(machine.goldens.join("greedy-rco.txt")).unwrap();
+    let text = fs::read_to_string(machine.goldens.join(machine.golden)).unwrap();
     let mut lines = text.lines();
     let prompt = ids(lines.next().unwrap(), "prompt ");
     let generated = ids(lines.next().unwrap(), "generated ");
@@ -439,6 +447,42 @@ fn greedy_tokens_match_java_for_short_prompt() {
         );
     }
     owner.shutdown(runtime).unwrap();
+}
+
+/// One greedy generation on the artifact, twice on one engine, against the Java engine's tokens. The Q3 artifacts carry
+/// no tokenizer, so the generation runs to the length the reference has.
+fn greedy_matches_java(machine: &Machine) {
+    let reference = greedy_reference(machine);
+    assert!(!reference.generated.is_empty());
+    let length = reference.generated.len() as u32;
+    let (owner, runtime) = start(machine, 4096);
+    for round in 0..2 {
+        let recording = generate(&runtime, &reference.prompt, length, &[]);
+        assert_eq!(recording.outcome.generated, reference.generated.len(), "round {round}");
+        assert_eq!(
+            recording.tokens, reference.generated,
+            "round {round}: the greedy tokens are the Java engine's"
+        );
+    }
+    owner.shutdown(runtime).unwrap();
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the Q3 artifact and the Java references"]
+fn q3_greedy_tokens_match_java() {
+    let Some(machine) = machine_of("euhedral.qwen.q3-artifact", "greedy-q3.txt") else {
+        return;
+    };
+    greedy_matches_java(&machine);
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the compressed Q3 artifact and the Java references"]
+fn compressed_q3_greedy_tokens_match_java() {
+    let Some(machine) = machine_of("euhedral.qwen.q3-compressed-artifact", "greedy-q3-compressed.txt") else {
+        return;
+    };
+    greedy_matches_java(&machine);
 }
 
 #[test]
