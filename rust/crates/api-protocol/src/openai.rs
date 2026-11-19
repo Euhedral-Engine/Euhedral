@@ -10,7 +10,7 @@ use crate::coerce;
 use crate::error::ApiError;
 use crate::json::JsonValue;
 use crate::wire::{
-    Members, Reader, ToJson, int, int_list, list, members, object, optional_text, push, push_some, text,
+    Members, Reader, ToJson, arguments_text, int, int_list, list, members, object, optional_text, push, push_some, text,
 };
 
 /// A Chat Completions request. `stop`, `tools`, `tool_choice`, `reasoning_effort`, `chat_template_kwargs` and
@@ -203,7 +203,10 @@ pub struct ToolCallFunction {
 
 impl ToJson for ToolCallFunction {
     fn to_json(&self) -> JsonValue {
-        object([("name", text(&self.name)), ("arguments", text(&self.arguments))])
+        object([
+            ("name", text(&self.name)),
+            ("arguments", arguments_text(&self.arguments)),
+        ])
     }
 }
 

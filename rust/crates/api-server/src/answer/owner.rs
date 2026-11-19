@@ -19,7 +19,7 @@ use std::time::Instant;
 use euhedral_core::frames::Frame;
 use euhedral_inference_api_protocol::ApiError;
 use euhedral_inference_api_protocol::json::JsonValue;
-use euhedral_inference_api_protocol::pipeline::Piece;
+use euhedral_inference_api_protocol::pipeline::{MalformedToolCall, Piece};
 use euhedral_net::{PieceSent, ReplyStream, Responder, Response, StreamError};
 
 use super::Conclusion;
@@ -137,12 +137,12 @@ struct Streaming {
 /// that it holds what was true at the moment the generation was cancelled.
 pub(super) struct Ending {
     pub(super) result: Result<GenerationResult, BackendError>,
-    /// The message of the malformed tool call that ended the output.
-    pub(super) failure: Option<String>,
+    /// The malformed tool call that ended the output.
+    pub(super) failure: Option<MalformedToolCall>,
     /// Nobody in this request cancelled, so the engine did.
     pub(super) engine_cancelled: bool,
     /// The text after the final flush; `None` when the end was not an answer.
-    pub(super) settled: Option<Result<Settled, String>>,
+    pub(super) settled: Option<Result<Settled, MalformedToolCall>>,
     pub(super) first_token_ns: u64,
 }
 
@@ -789,8 +789,8 @@ impl Owner {
             Ok(result) => result,
             Err(error) => return failed(ApiError::server_error(), Some(error.to_string())),
         };
-        if let Some(message) = &ending.failure {
-            return failed(ApiError::invalid_tool_call(message), None);
+        if let Some(failure) = &ending.failure {
+            return failed(ApiError::invalid_tool_call_cut(&failure.message, failure.cut), None);
         }
         if ending.engine_cancelled {
             return Verdict::Error {
@@ -808,7 +808,7 @@ impl Owner {
                 result,
                 streamed_calls: 0,
             }),
-            Some(Err(message)) => failed(ApiError::invalid_tool_call(&message), None),
+            Some(Err(failure)) => failed(ApiError::invalid_tool_call_cut(&failure.message, failure.cut), None),
             None => failed(ApiError::server_error(), Some("the text was not settled".to_owned())),
         }
     }

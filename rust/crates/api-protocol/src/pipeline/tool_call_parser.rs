@@ -30,8 +30,15 @@ pub enum ToolEvent {
 }
 
 /// The model's output claims to be a tool call but is not one this request can accept; the message says why.
+///
+/// A message that quotes the start of a value ends in `...'`. When the quote was cut inside a character, `cut` is the
+/// high surrogate that was left alone: a message cannot hold it, so it is left out of the text and written back just
+/// before that `...'` when the message is written as JSON.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MalformedToolCall(pub String);
+pub struct MalformedToolCall {
+    pub message: String,
+    pub cut: Option<u16>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -260,7 +267,7 @@ fn argument_value(tool: &ToolDefinition, key: &str, raw: &str) -> Result<JsonVal
     if types.len() == 1 && types.contains("string") {
         return Ok(text());
     }
-    let Some(parsed) = JsonValue::parse(raw) else {
+    let Some(parsed) = JsonValue::parse_keeping_unpaired(raw) else {
         if types.is_empty() || types.contains("string") {
             return Ok(text());
         }
@@ -275,12 +282,15 @@ fn argument_value(tool: &ToolDefinition, key: &str, raw: &str) -> Result<JsonVal
         if types.contains("null") && literal == "None" {
             return Ok(JsonValue::Null);
         }
-        return Err(malformed(&format!(
-            "parameter {key} of {} is not valid JSON of type {}: {}",
-            tool.name,
-            type_list(&types),
-            excerpt(raw)
-        )));
+        let (quote, cut) = excerpt(raw);
+        return Err(MalformedToolCall {
+            message: format!(
+                "parameter {key} of {} is not valid JSON of type {}: {quote}",
+                tool.name,
+                type_list(&types)
+            ),
+            cut,
+        });
     };
     // Out-of-range literals parse as infinities, which no JSON arguments string can carry.
     if !parsed.is_finite() {
@@ -300,12 +310,15 @@ fn argument_value(tool: &ToolDefinition, key: &str, raw: &str) -> Result<JsonVal
     if types.contains("string") {
         return Ok(text());
     }
-    Err(malformed(&format!(
-        "parameter {key} of {} is not of type {}: {}",
-        tool.name,
-        type_list(&types),
-        excerpt(raw)
-    )))
+    let (quote, cut) = excerpt(raw);
+    Err(MalformedToolCall {
+        message: format!(
+            "parameter {key} of {} is not of type {}: {quote}",
+            tool.name,
+            type_list(&types)
+        ),
+        cut,
+    })
 }
 
 /// The declared types as a bracketed list, in alphabetical order.
@@ -314,27 +327,30 @@ fn type_list(types: &BTreeSet<String>) -> String {
     format!("[{}]", names.join(", "))
 }
 
-/// The start of a value, for an error message: at most 80 UTF-16 code units, then `...`. A character cut in half
-/// by the limit is written as U+FFFD.
-fn excerpt(raw: &str) -> String {
+/// The start of a value, for an error message: at most 80 UTF-16 code units, then `...`. A character cut in half by
+/// the limit leaves its high surrogate alone at the end; the quote leaves it out and returns it as the second part.
+fn excerpt(raw: &str) -> (String, Option<u16>) {
     const LIMIT: usize = 80;
     if raw.encode_utf16().count() <= LIMIT {
-        return format!("'{raw}'");
+        return (format!("'{raw}'"), None);
     }
     let mut cut = String::new();
+    let mut lone = None;
     let mut units = 0;
     for value in raw.chars() {
         let width = value.len_utf16();
         if units + width > LIMIT {
             if units < LIMIT {
-                cut.push('\u{fffd}');
+                let mut pair = [0; 2];
+                value.encode_utf16(&mut pair);
+                lone = Some(pair[0]);
             }
             break;
         }
         cut.push(value);
         units += width;
     }
-    format!("'{cut}...'")
+    (format!("'{cut}...'"), lone)
 }
 
 fn strip_one_newline(value: &str) -> &str {
@@ -347,12 +363,18 @@ fn skip_space(text: &str, position: usize) -> usize {
 }
 
 fn malformed(message: &str) -> MalformedToolCall {
-    MalformedToolCall(message.to_string())
+    MalformedToolCall {
+        message: message.to_string(),
+        cut: None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{ApiError, Surface};
+    use crate::openai::ToolCall as ReplyToolCall;
+    use crate::wire::ToJson;
 
     fn tool(parameters: Option<&str>) -> ToolDefinition {
         tool_definition("f", parameters)
@@ -368,17 +390,69 @@ mod tests {
 
     #[test]
     fn an_excerpt_counts_utf16_units_and_cuts_after_eighty() {
-        assert_eq!(excerpt(&"a".repeat(80)), format!("'{}'", "a".repeat(80)));
-        assert_eq!(excerpt(&"a".repeat(81)), format!("'{}...'", "a".repeat(80)));
+        let quote = |text: &str| excerpt(text);
+        assert_eq!(quote(&"a".repeat(80)), (format!("'{}'", "a".repeat(80)), None));
+        assert_eq!(quote(&"a".repeat(81)), (format!("'{}...'", "a".repeat(80)), None));
         // 40 emoji are 80 units and fit; 50 emoji are 100 units and are cut after the 40th.
-        assert_eq!(excerpt(&"😀".repeat(40)), format!("'{}'", "😀".repeat(40)));
-        assert_eq!(excerpt(&"😀".repeat(50)), format!("'{}...'", "😀".repeat(40)));
-        // A pair cut in half by the limit becomes U+FFFD.
+        assert_eq!(quote(&"😀".repeat(40)), (format!("'{}'", "😀".repeat(40)), None));
+        assert_eq!(quote(&"😀".repeat(50)), (format!("'{}...'", "😀".repeat(40)), None));
+        // A pair cut in half by the limit leaves its high surrogate alone, which is returned apart.
         assert_eq!(
-            excerpt(&format!("a{}", "😀".repeat(50))),
-            format!("'a{}\u{fffd}...'", "😀".repeat(39))
+            quote(&format!("a{}", "😀".repeat(50))),
+            (format!("'a{}...'", "😀".repeat(39)), Some(0xd83d))
         );
-        assert_eq!(excerpt("é"), "'é'");
+        assert_eq!(quote("é"), ("'é'".to_owned(), None));
+    }
+
+    /// A parameter that is not of its declared type, with an emoji straddling the 80th unit of its value.
+    fn cut_pair_failure() -> MalformedToolCall {
+        let schema = r#"{"type":"object","properties":{"n":{"type":"integer"}}}"#;
+        let value = format!("{}{}", "a".repeat(79), "😀".repeat(5));
+        arguments(schema, &["n", &value]).unwrap_err()
+    }
+
+    #[test]
+    fn the_excerpt_of_a_cut_pair_is_written_as_the_unpaired_surrogate() {
+        let error = {
+            let failure = cut_pair_failure();
+            ApiError::invalid_tool_call_cut(&failure.message, failure.cut)
+        };
+        let body = String::from_utf8(error.body(Surface::OpenAi)).unwrap();
+        assert!(
+            body.contains(r#"'{}\uD83D...'"#.replace("{}", &"a".repeat(79)).as_str()),
+            "{body}"
+        );
+        let body = String::from_utf8(error.body(Surface::Anthropic)).unwrap();
+        assert!(body.contains("\\uD83D...'"), "{body}");
+        // An excerpt that ends on a whole character has no escape.
+        let schema = r#"{"type":"object","properties":{"n":{"type":"integer"}}}"#;
+        let whole = arguments(schema, &["n", &"😀".repeat(50)]).unwrap_err();
+        let body = String::from_utf8(ApiError::invalid_tool_call_cut(&whole.message, whole.cut).body(Surface::OpenAi))
+            .unwrap();
+        assert!(!body.contains("\\u"), "{body}");
+    }
+
+    #[test]
+    fn an_unpaired_surrogate_in_an_argument_is_written_as_its_escape() {
+        let schema = r#"{"type":"object","properties":{"v":{}}}"#;
+        let arguments = arguments(schema, &["v", r#"["\ud800x", "\ud83d\ude00", "\udc00", "\\ud800"]"#]).unwrap();
+        assert_eq!(arguments, r#"{"v":["\uD800x","😀","\uDC00","\\ud800"]}"#, "{arguments}");
+        // Written again as the string value it is in a reply, the escape stays an escape of the unit and the
+        // text of an escape stays text.
+        let call = ReplyToolCall::function("c", "f", arguments);
+        assert_eq!(
+            call.to_json_string(),
+            r#"{"id":"c","type":"function","function":{"name":"f","arguments":"{\"v\":[\"\uD800x\",\"😀\",\"\uDC00\",\"\\\\ud800\"]}"}}"#
+        );
+    }
+
+    #[test]
+    fn an_unpaired_surrogate_in_an_argument_key_is_written_as_its_escape() {
+        let schema = r#"{"type":"object","properties":{"v":{}}}"#;
+        let lone = arguments(schema, &["v", r#"{"\ud800":1}"#]).unwrap();
+        assert_eq!(lone, r#"{"v":{"\uD800":1}}"#);
+        let mixed = arguments(schema, &["v", r#"{"\ud83d\ude00":1,"\udc00":2}"#]).unwrap();
+        assert_eq!(mixed, r#"{"v":{"😀":1,"\uDC00":2}}"#);
     }
 
     fn parser(parameters: Option<&str>, parallel: bool, requires_call: bool) -> ToolCallParser {
@@ -482,7 +556,10 @@ mod tests {
         assert_eq!(arguments(schema, &["b", "True"]).unwrap(), "{\"b\":true}");
         assert_eq!(arguments(schema, &["b", " FALSE "]).unwrap(), "{\"b\":false}");
         let refused = arguments(schema, &["b", "yes"]).unwrap_err();
-        assert_eq!(refused.0, "parameter b of f is not valid JSON of type [boolean]: 'yes'");
+        assert_eq!(
+            refused.message,
+            "parameter b of f is not valid JSON of type [boolean]: 'yes'"
+        );
     }
 
     #[test]
@@ -523,7 +600,7 @@ mod tests {
         let mut events = Vec::new();
         parser.accept("No call.", &mut events).unwrap();
         let error = parser.finish(true, &mut events).unwrap_err();
-        assert_eq!(error.0, "the model did not make the required function call");
+        assert_eq!(error.message, "the model did not make the required function call");
         let mut truncated = self::parser(None, true, true);
         let mut events = Vec::new();
         truncated.accept("No call.", &mut events).unwrap();
@@ -594,14 +671,14 @@ mod tests {
             let mut parser = parser(Some(schema), true, false);
             let mut events = Vec::new();
             let result = parser.accept(output, &mut events);
-            assert_eq!(result.unwrap_err().0, message, "{output}");
+            assert_eq!(result.unwrap_err().message, message, "{output}");
         }
         let required = r#"{"type":"object","properties":{"a":{}},"required":["a"]}"#;
         let mut parser = parser(Some(required), true, false);
         let error = parser
             .accept("<tool_call>\n<function=f>\n</function>\n</tool_call>", &mut Vec::new())
             .unwrap_err();
-        assert_eq!(error.0, "required parameter a of f is missing");
+        assert_eq!(error.message, "required parameter a of f is missing");
     }
 
     #[test]
@@ -611,7 +688,7 @@ mod tests {
         let mut events = Vec::new();
         stopped.accept(output, &mut events).unwrap();
         assert_eq!(
-            stopped.finish(true, &mut events).unwrap_err().0,
+            stopped.finish(true, &mut events).unwrap_err().message,
             "generation ended inside a tool call"
         );
         let mut cut = parser(None, true, false);

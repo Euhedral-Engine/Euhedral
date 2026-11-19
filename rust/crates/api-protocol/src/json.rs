@@ -5,13 +5,13 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::mem;
 
-/// The deepest nesting a parsed document may have.
-/// The deepest nesting of arrays and objects a document may have, and the most digits one number may have
-/// (the integer digits for an integer; integer, fraction and exponent digits together for a float), and the
-/// longest object key in UTF-16 code units (Jackson's characters): the limits of the reader the wire format is defined by.
+/// The deepest nesting of arrays and objects a document may have, the most digits one number may have (the
+/// integer digits for an integer; integer, fraction and exponent digits together for a float), the longest object
+/// key and the longest string value in UTF-16 code units: the limits of the reader the wire format is defined by.
 const MAX_DEPTH: usize = 500;
 const MAX_NUMBER_DIGITS: usize = 1000;
 const MAX_NAME_UNITS: usize = 50_000;
+const MAX_STRING_UNITS: usize = 100_000_000;
 /// The most keys of one object that the distinct reading compares one by one; past it the keys go into a set.
 const LINEAR_KEY_LIMIT: usize = 8;
 
@@ -25,9 +25,15 @@ pub enum JsonValue {
     /// A fractional or exponent literal; written as Python's `repr` of a float.
     Float(f64),
     String(String),
+    /// A string that holds unpaired surrogates, as UTF-16 code units: a `String` cannot. Written with each
+    /// unpaired unit as a `\uXXXX` escape in capitals and everything else as a `String` is.
+    Utf16String(Vec<u16>),
     Array(Vec<JsonValue>),
     /// Members in the order they are written.
     Object(Vec<(String, JsonValue)>),
+    /// An object with a key that holds an unpaired surrogate, every key as UTF-16 code units: a `String` cannot
+    /// hold it. Members are in the order they are written, and a key is written as a `Utf16String` is.
+    Utf16Object(Vec<(Vec<u16>, JsonValue)>),
 }
 
 /// An integer of any size, held as its canonical decimal digits: no leading zeros or plus sign, and zero is `0`
@@ -82,6 +88,7 @@ impl JsonValue {
             JsonValue::Integer(digits) => digits.as_str().to_owned(),
             JsonValue::Float(number) => compact_float(*number),
             JsonValue::String(text) => text.clone(),
+            JsonValue::Utf16String(units) => String::from_utf16_lossy(units),
             JsonValue::Array(items) => {
                 let items: Vec<String> = items.iter().map(JsonValue::param_text).collect();
                 format!("[{}]", items.join(", "))
@@ -90,6 +97,13 @@ impl JsonValue {
                 let members: Vec<String> = members
                     .iter()
                     .map(|(key, value)| format!("{key}={}", value.param_text()))
+                    .collect();
+                format!("{{{}}}", members.join(", "))
+            }
+            JsonValue::Utf16Object(members) => {
+                let members: Vec<String> = members
+                    .iter()
+                    .map(|(key, value)| format!("{}={}", String::from_utf16_lossy(key), value.param_text()))
                     .collect();
                 format!("{{{}}}", members.join(", "))
             }
@@ -112,6 +126,7 @@ impl JsonValue {
             Self::Integer(value) => out.push_str(value.as_str()),
             Self::Float(value) => out.push_str(&python_float(*value)),
             Self::String(text) => write_string(text, out),
+            Self::Utf16String(units) => write_string(&String::from_utf16_lossy(units), out),
             Self::Array(items) => {
                 out.push('[');
                 for (index, item) in items.iter().enumerate() {
@@ -129,6 +144,18 @@ impl JsonValue {
                         out.push_str(", ");
                     }
                     write_string(key, out);
+                    out.push_str(": ");
+                    value.write_python_json(out);
+                }
+                out.push('}');
+            }
+            Self::Utf16Object(members) => {
+                out.push('{');
+                for (index, (key, value)) in members.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    write_string(&String::from_utf16_lossy(key), out);
                     out.push_str(": ");
                     value.write_python_json(out);
                 }
@@ -203,6 +230,10 @@ impl JsonValue {
     pub fn get(&self, key: &str) -> Option<&JsonValue> {
         match self {
             JsonValue::Object(members) => members.iter().find(|(name, _)| name == key).map(|(_, value)| value),
+            JsonValue::Utf16Object(members) => members
+                .iter()
+                .find(|(name, _)| name.iter().copied().eq(key.encode_utf16()))
+                .map(|(_, value)| value),
             _ => None,
         }
     }
@@ -214,9 +245,9 @@ impl JsonValue {
             JsonValue::Bool(_) => "boolean",
             JsonValue::Integer(_) => "integer",
             JsonValue::Float(_) => "number",
-            JsonValue::String(_) => "string",
+            JsonValue::String(_) | JsonValue::Utf16String(_) => "string",
             JsonValue::Array(_) => "array",
-            JsonValue::Object(_) => "object",
+            JsonValue::Object(_) | JsonValue::Utf16Object(_) => "object",
         }
     }
 
@@ -226,6 +257,7 @@ impl JsonValue {
             JsonValue::Float(number) => number.is_finite(),
             JsonValue::Array(items) => items.iter().all(JsonValue::is_finite),
             JsonValue::Object(members) => members.iter().all(|(_, value)| value.is_finite()),
+            JsonValue::Utf16Object(members) => members.iter().all(|(_, value)| value.is_finite()),
             _ => true,
         }
     }
@@ -233,20 +265,34 @@ impl JsonValue {
     /// Reads one whole document strictly; `None` when `text` is not exactly one JSON value. Integers of any
     /// length keep their digits; a repeated object key replaces the earlier value in place.
     pub fn parse(text: &str) -> Option<JsonValue> {
-        JsonValue::read(text, false)
+        JsonValue::read(text, false, false)
+    }
+
+    /// As [`parse`](JsonValue::parse), except that a string value with an unpaired surrogate escape keeps it, as a
+    /// [`JsonValue::Utf16String`]. An object with such a key keeps it too: the object is a
+    /// [`JsonValue::Utf16Object`], so a caller that inspects objects must match both `Object` and `Utf16Object`.
+    pub fn parse_keeping_unpaired(text: &str) -> Option<JsonValue> {
+        JsonValue::read(text, false, true)
     }
 
     /// As [`parse`](JsonValue::parse), except that an object with a repeated key is not a document: `None`. This is
     /// the reading that decides whether a model's answer is JSON.
     pub fn parse_distinct(text: &str) -> Option<JsonValue> {
-        JsonValue::read(text, true)
+        JsonValue::read(text, true, false)
     }
 
-    fn read(text: &str, distinct: bool) -> Option<JsonValue> {
+    fn read(text: &str, distinct: bool, keep_unpaired: bool) -> Option<JsonValue> {
+        JsonValue::read_limited(text, distinct, keep_unpaired, MAX_STRING_UNITS)
+    }
+
+    /// The reading with the longest string value it accepts, in UTF-16 code units, given.
+    fn read_limited(text: &str, distinct: bool, keep_unpaired: bool, max_string_units: usize) -> Option<JsonValue> {
         let mut parser = Parser {
             text,
             position: 0,
             distinct,
+            keep_unpaired,
+            max_string_units,
             lone: Vec::new(),
         };
         parser.skip_space();
@@ -255,8 +301,60 @@ impl JsonValue {
         (parser.position == text.len()).then_some(value)
     }
 
-    /// The compact form: no spaces, escapes in capitals, other numbers in the form of Java's
-    /// `Double.toString` (`1.0E10`, positional from `1e-3` up to `1e7`).
+    /// The text of a value written in the compact form, as a string value that keeps its unpaired surrogates: the
+    /// compact form writes one as a `\uD800`-style escape, and no other escape in that range, so every such escape
+    /// in `text` stands for the unit alone. The escape is then written as is, not with its backslash escaped, when
+    /// the string is itself written. Text without such an escape is an ordinary string value.
+    ///
+    /// This relies on one invariant of the compact writer: it writes `\u` only for the control characters below
+    /// 0020 and for an unpaired surrogate, never for any other character.
+    pub fn from_compact_text(text: &str) -> JsonValue {
+        if !text.contains("\\u") {
+            return JsonValue::String(text.to_owned());
+        }
+        let mut units = Vec::with_capacity(text.len());
+        let mut found = false;
+        let mut rest = text;
+        while let Some(value) = rest.chars().next() {
+            if value == '\\' {
+                if let Some(unit) = unpaired_escape(rest) {
+                    units.push(unit);
+                    found = true;
+                    rest = &rest[6..];
+                    continue;
+                }
+                // Any other escape is two characters; the second may be a backslash that starts nothing.
+                let width = rest.chars().take(2).map(char::len_utf8).sum::<usize>();
+                units.extend(rest[..width].encode_utf16());
+                rest = &rest[width..];
+                continue;
+            }
+            let mut buffer = [0; 2];
+            units.extend_from_slice(value.encode_utf16(&mut buffer));
+            rest = &rest[value.len_utf8()..];
+        }
+        if found {
+            JsonValue::Utf16String(units)
+        } else {
+            JsonValue::String(text.to_owned())
+        }
+    }
+
+    /// The text of an error message as a string value. When `cut` is the high surrogate an excerpt left alone by
+    /// cutting a character in two, the message holds the excerpt without it, and the unit is written just before the
+    /// message's last `...'`. Without a cut, or when the message has no such place, it is an ordinary string value.
+    pub fn from_message_text(text: &str, cut: Option<u16>) -> JsonValue {
+        let Some((unit, place)) = cut.zip(text.rfind("...'")) else {
+            return JsonValue::String(text.to_owned());
+        };
+        let mut units: Vec<u16> = text[..place].encode_utf16().collect();
+        units.push(unit);
+        units.extend(text[place..].encode_utf16());
+        JsonValue::Utf16String(units)
+    }
+
+    /// The compact form: no spaces, escapes in capitals, other numbers
+    /// with a point and at least one digit after it (`1.0E10`, positional from `1e-3` up to `1e7`).
     pub fn to_compact_string(&self) -> String {
         let mut json = String::new();
         self.write_compact(&mut json);
@@ -270,6 +368,7 @@ impl JsonValue {
             JsonValue::Integer(digits) => json.push_str(digits.as_str()),
             JsonValue::Float(number) => json.push_str(&compact_float(*number)),
             JsonValue::String(text) => write_compact_string(text, json),
+            JsonValue::Utf16String(units) => write_compact_units(units, json),
             JsonValue::Array(items) => {
                 json.push('[');
                 for (index, item) in items.iter().enumerate() {
@@ -292,8 +391,31 @@ impl JsonValue {
                 }
                 json.push('}');
             }
+            JsonValue::Utf16Object(members) => {
+                json.push('{');
+                for (index, (key, value)) in members.iter().enumerate() {
+                    if index > 0 {
+                        json.push(',');
+                    }
+                    write_compact_units(key, json);
+                    json.push(':');
+                    value.write_compact(json);
+                }
+                json.push('}');
+            }
         }
     }
+}
+
+/// The surrogate code unit of a `\uXXXX` escape at the start of `text`, when it is one.
+fn unpaired_escape(text: &str) -> Option<u16> {
+    let digits = text.strip_prefix("\\u")?.get(..4)?;
+    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u16::from_str_radix(digits, 16)
+        .ok()
+        .filter(|unit| (0xd800..0xe000).contains(unit))
 }
 
 /// Appends a member, replacing the value of a key already present.
@@ -308,21 +430,101 @@ pub(crate) fn put(members: &mut Vec<(String, JsonValue)>, key: String, value: Js
 fn write_compact_string(text: &str, json: &mut String) {
     json.push('"');
     for value in text.chars() {
-        match value {
-            '"' => json.push_str("\\\""),
-            '\\' => json.push_str("\\\\"),
-            '\n' => json.push_str("\\n"),
-            '\r' => json.push_str("\\r"),
-            '\t' => json.push_str("\\t"),
-            '\u{8}' => json.push_str("\\b"),
-            '\u{c}' => json.push_str("\\f"),
-            value if value < ' ' => {
-                let _ = write!(json, "\\u{:04X}", u32::from(value));
+        write_compact_char(value, json);
+    }
+    json.push('"');
+}
+
+/// Quotes UTF-16 code units for the compact form; an unpaired surrogate is written as its escape, in capitals.
+fn write_compact_units(units: &[u16], json: &mut String) {
+    json.push('"');
+    for unit in char::decode_utf16(units.iter().copied()) {
+        match unit {
+            Ok(value) => write_compact_char(value, json),
+            Err(unpaired) => {
+                let _ = write!(json, "\\u{:04X}", unpaired.unpaired_surrogate());
             }
-            value => json.push(value),
         }
     }
     json.push('"');
+}
+
+fn write_compact_char(value: char, json: &mut String) {
+    match value {
+        '"' => json.push_str("\\\""),
+        '\\' => json.push_str("\\\\"),
+        '\n' => json.push_str("\\n"),
+        '\r' => json.push_str("\\r"),
+        '\t' => json.push_str("\\t"),
+        '\u{8}' => json.push_str("\\b"),
+        '\u{c}' => json.push_str("\\f"),
+        value if value < ' ' => {
+            let _ = write!(json, "\\u{:04X}", u32::from(value));
+        }
+        value => json.push(value),
+    }
+}
+
+/// The decimal digits and exponent a positive finite double is printed with: the shortest digits that read back as the
+/// same double, but at least two. When the shortest is a single digit, the two-digit decimal nearest the double is
+/// used instead (the smallest subnormal prints as `4.9E-324`, not `5E-324`), and when the double lies exactly halfway
+/// between two candidates, the one with the even last digit.
+fn print_digits(number: f64) -> (String, i32) {
+    let split = |scientific: &str| {
+        let (mantissa, exponent) = scientific.split_once('e').unwrap_or((scientific, "0"));
+        let digits: String = mantissa.chars().filter(|value| *value != '.').collect();
+        (digits, exponent.parse().unwrap_or(0))
+    };
+    let mut shortest = split(&format!("{number:e}"));
+    if let Some(even) = nearest_even_of_a_tie(number, &shortest.0) {
+        shortest = (even, shortest.1);
+    }
+    if shortest.0.len() == 1 {
+        let nearest = format!("{number:.1e}");
+        if nearest.parse::<f64>().is_ok_and(|read| read == number) {
+            let (digits, exponent) = split(&nearest);
+            // A zero second digit adds nothing: `1.0e-3` is the digit 1.
+            return (digits.trim_end_matches('0').to_owned(), exponent);
+        }
+    }
+    shortest
+}
+
+/// When the double lies exactly halfway between two decimals of the length of `digits`, the one of them that ends in
+/// an even digit, if it reads back as the double: the shortest digits may be the other one.
+fn nearest_even_of_a_tie(number: f64, digits: &str) -> Option<String> {
+    let length = digits.len();
+    // A tie shows as a five followed by zeros however far one looks, so a cheap look past the cut rules out nearly
+    // every double; only a double that passes is decided from its whole expansion, which has at most 767 digits.
+    let tie_at = |places: usize| -> Option<(String, String)> {
+        let exact = format!("{number:.places$e}");
+        let (mantissa, exponent) = exact.split_once('e')?;
+        let wide: String = mantissa.chars().filter(|value| *value != '.').collect();
+        let halfway = wide.as_bytes()[length] == b'5' && wide[length + 1..].bytes().all(|value| value == b'0');
+        halfway.then(|| (wide, exponent.to_owned()))
+    };
+    tie_at(length + 30)?;
+    let (wide, exponent) = tie_at(800)?;
+    let reads_back = |digits: &str| {
+        format!("{}.{}e{exponent}", &digits[..1], &digits[1..])
+            .parse::<f64>()
+            .is_ok_and(|read| read == number)
+    };
+    let lower = &wide[..length];
+    if lower.as_bytes()[length - 1].is_multiple_of(2) {
+        return reads_back(lower).then(|| lower.to_owned());
+    }
+    let mut upper = lower.as_bytes().to_vec();
+    for digit in upper.iter_mut().rev() {
+        if *digit == b'9' {
+            *digit = b'0';
+        } else {
+            *digit += 1;
+            let upper = String::from_utf8(upper).ok()?;
+            return reads_back(&upper).then_some(upper);
+        }
+    }
+    None
 }
 
 /// A double in the form above; the non-finite values are `NaN`, `Infinity` and `-Infinity`.
@@ -336,10 +538,7 @@ fn compact_float(number: f64) -> String {
     if number == 0.0 {
         return if number.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
     }
-    let scientific = format!("{:e}", number.abs());
-    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
-    let exponent: i32 = exponent.parse().unwrap_or(0);
-    let digits: String = mantissa.chars().filter(|value| *value != '.').collect();
+    let (digits, exponent) = print_digits(number.abs());
     let sign = if number < 0.0 { "-" } else { "" };
     if (-3..7).contains(&exponent) {
         let point = exponent + 1;
@@ -365,9 +564,30 @@ struct Parser<'a> {
     position: usize,
     /// A repeated object key ends the parse.
     distinct: bool,
+    /// String values and object keys keep unpaired surrogates as UTF-16 code units.
+    keep_unpaired: bool,
+    /// The longest string value, in UTF-16 code units; a longer one ends the parse.
+    max_string_units: usize,
     /// The lone surrogates of the string last read, as the byte offset in its text where each one was replaced
     /// and its code unit.
     lone: Vec<(usize, u16)>,
+}
+
+/// The UTF-16 code units of a string read with lone surrogates replaced: `lone` gives, by byte offset in `text`, the
+/// unit each replacement character stood for.
+fn units_of(text: &str, lone: &[(usize, u16)]) -> Vec<u16> {
+    let mut units = Vec::with_capacity(text.len());
+    let mut unpaired = lone.iter().copied().peekable();
+    for (offset, value) in text.char_indices() {
+        match unpaired.next_if(|(at, _)| *at == offset) {
+            Some((_, unit)) => units.push(unit),
+            None => {
+                let mut buffer = [0; 2];
+                units.extend_from_slice(value.encode_utf16(&mut buffer));
+            }
+        }
+    }
+    units
 }
 
 /// A key as the strict reading tells keys apart: its text and where lone surrogates stood in it, so that two
@@ -429,7 +649,7 @@ impl Parser<'_> {
             b'n' => self.literal("null", JsonValue::Null),
             b't' => self.literal("true", JsonValue::Bool(true)),
             b'f' => self.literal("false", JsonValue::Bool(false)),
-            b'"' => self.string().map(JsonValue::String),
+            b'"' => self.string_value(),
             b'[' => self.array(depth),
             b'{' => self.object(depth),
             b'-' | b'0'..=b'9' => self.number(),
@@ -468,7 +688,9 @@ impl Parser<'_> {
             return None;
         }
         self.position += 1;
-        let mut members = Vec::new();
+        let mut members: Vec<(String, JsonValue)> = Vec::new();
+        // When unpaired surrogates are kept: the units of each member's key that holds one, in step with `members`.
+        let mut wide: Vec<Option<Vec<u16>>> = Vec::new();
         let mut seen = SeenKeys::default();
         self.skip_space();
         if self.peek()? == b'}' {
@@ -482,6 +704,7 @@ impl Parser<'_> {
             }
             let key = self.string()?;
             let lone = mem::take(&mut self.lone);
+            let units = (self.keep_unpaired && !lone.is_empty()).then(|| units_of(&key, &lone));
             if key.len() > 3 * MAX_NAME_UNITS || key.encode_utf16().count() > MAX_NAME_UNITS {
                 return None;
             }
@@ -497,6 +720,18 @@ impl Parser<'_> {
                     return None;
                 }
                 members.push((key, value));
+                if self.keep_unpaired {
+                    wide.push(units);
+                }
+            } else if self.keep_unpaired {
+                // A key is the same key only when its units are.
+                match (0..members.len()).find(|&at| members[at].0 == key && wide[at] == units) {
+                    Some(at) => members[at].1 = value,
+                    None => {
+                        members.push((key, value));
+                        wide.push(units);
+                    }
+                }
             } else {
                 put(&mut members, key, value);
             }
@@ -505,7 +740,15 @@ impl Parser<'_> {
                 b',' => self.position += 1,
                 b'}' => {
                     self.position += 1;
-                    return Some(JsonValue::Object(members));
+                    if wide.iter().all(Option::is_none) {
+                        return Some(JsonValue::Object(members));
+                    }
+                    let members = members
+                        .into_iter()
+                        .zip(wide)
+                        .map(|((key, value), units)| (units.unwrap_or_else(|| key.encode_utf16().collect()), value))
+                        .collect();
+                    return Some(JsonValue::Utf16Object(members));
                 }
                 _ => return None,
             }
@@ -578,6 +821,15 @@ impl Parser<'_> {
         Some(unit)
     }
 
+    /// A string value: a `String`, or UTF-16 units when it holds unpaired surrogates and those are kept.
+    fn string_value(&mut self) -> Option<JsonValue> {
+        let text = self.string()?;
+        if !self.keep_unpaired || self.lone.is_empty() {
+            return Some(JsonValue::String(text));
+        }
+        Some(JsonValue::Utf16String(units_of(&text, &self.lone)))
+    }
+
     fn string(&mut self) -> Option<String> {
         self.position += 1;
         self.lone.clear();
@@ -586,7 +838,11 @@ impl Parser<'_> {
             let value = self.rest().chars().next()?;
             self.position += value.len_utf8();
             match value {
-                '"' => return Some(text),
+                '"' => {
+                    let too_long =
+                        text.len() > self.max_string_units && text.encode_utf16().count() > self.max_string_units;
+                    return (!too_long).then_some(text);
+                }
                 '\\' => {
                     let escape = self.rest().chars().next()?;
                     self.position += escape.len_utf8();
@@ -728,6 +984,152 @@ mod tests {
         for (number, expected) in cases {
             assert_eq!(compact_float(number), expected);
         }
+    }
+
+    #[test]
+    fn floats_print_with_at_least_two_digits_and_the_nearest_when_one_would_do() {
+        let ulps = |count: u64| f64::from_bits(count);
+        let cases = [
+            (ulps(1), "4.9E-324"),
+            (ulps(2), "9.9E-324"),
+            (ulps(3), "1.5E-323"),
+            (ulps(4), "2.0E-323"),
+            (ulps(5), "2.5E-323"),
+            (ulps(20), "9.9E-323"),
+            (ulps(1) * 2.0e0 * 5.0, "4.9E-323"),
+            (f64::MIN_POSITIVE, "2.2250738585072014E-308"),
+            (f64::MAX, "1.7976931348623157E308"),
+            (-f64::MAX, "-1.7976931348623157E308"),
+            // Exactly halfway between two decimals of the shortest length: the even one; and the power of two
+            // whose lower neighbour is too far to read back.
+            (f64::from_bits(4802600526882750880), "1.2240085416352812E13"),
+            (f64::from_bits(4831847899628117434), "1.0615873392895272E15"),
+            (2f64.powi(-24), "5.960464477539063E-8"),
+            (1.0e23, "1.0E23"),
+            (2.0e23, "2.0E23"),
+            (1.0e22, "1.0E22"),
+            (8.41e21, "8.41E21"),
+            (1.0e-3, "0.001"),
+            (9.999e-4, "9.999E-4"),
+            (1.0e7, "1.0E7"),
+            (9_999_999.0, "9999999.0"),
+            (9_999_999.999, "9999999.999"),
+            (100.0, "100.0"),
+            (1.0, "1.0"),
+            (-1.0e-3, "-0.001"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+        ];
+        for (number, expected) in cases {
+            assert_eq!(compact_float(number), expected, "{:e}", number);
+            assert_eq!(JsonValue::Float(number).to_compact_string(), expected);
+        }
+        assert_eq!(JsonValue::parse("5e-324").unwrap().to_compact_string(), "4.9E-324");
+        assert_eq!(JsonValue::parse("1e-323").unwrap().to_compact_string(), "9.9E-324");
+        assert_eq!(
+            JsonValue::parse("[100.0e0, 1E2]").unwrap().to_compact_string(),
+            "[100.0,100.0]"
+        );
+    }
+
+    #[test]
+    fn a_key_with_an_unpaired_surrogate_is_kept_as_its_units() {
+        let kept = |text: &str| JsonValue::parse_keeping_unpaired(text).unwrap().to_compact_string();
+        assert_eq!(kept(r#"{"\ud800":1}"#), r#"{"\uD800":1}"#);
+        assert_eq!(
+            kept(r#"{"\udc00":1,"a\ud800b":[{"\udbff":true}]}"#),
+            r#"{"\uDC00":1,"a\uD800b":[{"\uDBFF":true}]}"#
+        );
+        // A pair stays one character, and an object without a lone key stays an ordinary object.
+        assert_eq!(kept(r#"{"\ud83d\ude00":1}"#), r#"{"😀":1}"#);
+        let plain = JsonValue::parse_keeping_unpaired(r#"{"\ud83d\ude00":1}"#).unwrap();
+        assert!(matches!(plain, JsonValue::Object(_)));
+        assert_eq!(
+            plain.get("😀"),
+            Some(&JsonValue::Integer(JsonInteger::parse("1").unwrap()))
+        );
+        // Mixed objects keep their other keys as they are.
+        let mixed = JsonValue::parse_keeping_unpaired(r#"{"a":1,"\ud800":2,"😀":3}"#).unwrap();
+        assert!(matches!(mixed, JsonValue::Utf16Object(_)));
+        assert_eq!(mixed.type_name(), "object");
+        assert_eq!(mixed.get("😀").map(JsonValue::param_text), Some("3".to_owned()));
+        assert_eq!(mixed.get("a").map(JsonValue::param_text), Some("1".to_owned()));
+        assert!(mixed.get("\u{fffd}").is_none());
+        // Different lone units are different keys, and a literal U+FFFD is another; a repeat replaces in place.
+        assert_eq!(
+            kept(r#"{"\ud800":1,"\ud801":2,"\ufffd":3,"\ud800":4}"#),
+            "{\"\\uD800\":4,\"\\uD801\":2,\"\u{fffd}\":3}"
+        );
+        // The writer's output reads back to the same value.
+        let text = kept(r#"{"\ud800":{"\udc00":"\ud800"}}"#);
+        assert_eq!(kept(&text), text);
+        // The ordinary reading has no way to hold them.
+        assert_eq!(
+            JsonValue::parse(r#"{"\ud800":1}"#).unwrap().to_compact_string(),
+            "{\"\u{fffd}\":1}"
+        );
+    }
+
+    #[test]
+    fn a_wide_object_replaces_repeated_plain_keys_and_escapes_its_lone_key() {
+        let kept = |text: &str| JsonValue::parse_keeping_unpaired(text).unwrap().to_compact_string();
+        assert_eq!(kept(r#"{"a":1,"\ud800":2,"a":3}"#), r#"{"a":3,"\uD800":2}"#);
+        // The quote and the control character in the key are escaped as in any key.
+        assert_eq!(kept(r#"{"\"\ud800\n":1}"#), r#"{"\"\uD800\n":1}"#);
+    }
+
+    #[test]
+    fn unpaired_surrogates_are_kept_only_when_asked_for() {
+        let text = r#"["\ud800x", "\ud83d\ude00", "\udc00", "\ud83d\ud83d", "plain"]"#;
+        let kept = JsonValue::parse_keeping_unpaired(text).unwrap();
+        assert_eq!(
+            kept.to_compact_string(),
+            r#"["\uD800x","😀","\uDC00","\uD83D\uD83D","plain"]"#
+        );
+        let JsonValue::Array(items) = &kept else {
+            panic!("array")
+        };
+        assert_eq!(items[0], JsonValue::Utf16String(vec![0xd800, u16::from(b'x')]));
+        assert_eq!(items[1], JsonValue::String("😀".to_owned()));
+        assert_eq!(items[4], JsonValue::String("plain".to_owned()));
+        // The ordinary reading has no way to hold them.
+        let lossy = JsonValue::parse(text).unwrap();
+        assert_eq!(
+            lossy.to_compact_string(),
+            "[\"\u{fffd}x\",\"😀\",\"\u{fffd}\",\"\u{fffd}\u{fffd}\",\"plain\"]"
+        );
+        // A genuine U+FFFD next to an unpaired unit stays a character.
+        let mixed = JsonValue::parse_keeping_unpaired(r#""\ufffd\ud800\ufffd""#).unwrap();
+        assert_eq!(mixed.to_compact_string(), "\"\u{fffd}\\uD800\u{fffd}\"");
+        assert_eq!(mixed.type_name(), "string");
+    }
+
+    #[test]
+    fn the_text_of_compact_json_keeps_its_unpaired_escapes_as_escapes() {
+        let value = |text: &str| JsonValue::from_compact_text(text).to_compact_string();
+        assert_eq!(value(r#"{"a":"\uD800"}"#), r#""{\"a\":\"\uD800\"}""#);
+        assert_eq!(value(r#"{"a":"\u001F\n"}"#), r#""{\"a\":\"\\u001F\\n\"}""#);
+        // An escaped backslash before `uD800` is text, not an escape.
+        assert_eq!(value(r#"{"a":"\\uD800"}"#), r#""{\"a\":\"\\\\uD800\"}""#);
+        assert_eq!(value(r#"{"é":"\\\uDC00é"}"#), r#""{\"é\":\"\\\\\uDC00é\"}""#);
+        assert_eq!(value("no escapes é😀"), "\"no escapes é😀\"");
+        assert_eq!(value(r#"\u00e9 \uD83D"#), r#""\\u00e9 \uD83D""#);
+    }
+
+    #[test]
+    fn a_string_longer_than_the_limit_is_refused() {
+        assert_eq!(MAX_STRING_UNITS, 100_000_000);
+        let limited = |text: &str| JsonValue::read_limited(text, false, false, 10);
+        assert!(limited(&format!("\"{}\"", "a".repeat(10))).is_some());
+        assert!(limited(&format!("\"{}\"", "a".repeat(11))).is_none());
+        // Units, not bytes: five two-unit characters are the limit exactly, and two-byte ones count once.
+        assert!(limited(&format!("\"{}\"", "\u{1f600}".repeat(5))).is_some());
+        assert!(limited(&format!("\"{}\"", "\u{1f600}".repeat(6))).is_none());
+        assert!(limited(&format!("\"{}\"", "\u{e9}".repeat(10))).is_some());
+        assert!(limited(&format!("\"{}\"", "\u{e9}".repeat(11))).is_none());
+        // Escapes count by the unit they decode to.
+        assert!(limited(&format!("\"{}\"", "\\u0041".repeat(10))).is_some());
+        assert!(limited(&format!("\"{}\"", "\\u0041".repeat(11))).is_none());
     }
 
     #[test]

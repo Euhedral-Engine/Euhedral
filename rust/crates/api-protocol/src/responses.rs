@@ -10,7 +10,10 @@ pub use crate::openai::{Model, ModelList};
 use crate::coerce;
 use crate::error::ApiError;
 use crate::json::{JsonValue, put};
-use crate::wire::{Members, Reader, ToJson, int, list, members, object, optional_text, push, push_some, text};
+use crate::wire::{
+    Members, Reader, ToJson, arguments_text, int, list, members, message_text, object, optional_text, push, push_some,
+    text,
+};
 
 /// A Responses request. Input items and the fields that take several shapes stay untyped JSON so the mapper can
 /// report precise errors.
@@ -287,6 +290,8 @@ pub enum EventBody {
         code: Option<String>,
         message: String,
         param: Option<String>,
+        /// The high surrogate the excerpt at the end of `message` was cut after, if it was cut inside a character.
+        cut: Option<u16>,
     },
 }
 
@@ -297,6 +302,7 @@ impl EventBody {
             code: failure.code.map(str::to_owned),
             message: failure.message.clone(),
             param: failure.param.clone(),
+            cut: failure.cut,
         }
     }
 }
@@ -433,7 +439,7 @@ impl ToJson for FunctionCallItem {
             ("status", text(&self.status)),
             ("call_id", text(&self.call_id)),
             ("name", text(&self.name)),
-            ("arguments", text(&self.arguments)),
+            ("arguments", arguments_text(&self.arguments)),
         ])
     }
 }
@@ -549,7 +555,7 @@ impl ToJson for ResponseEvent {
                 vec![
                     ("item_id", text(item_id)),
                     ("output_index", int(*output_index)),
-                    ("delta", text(delta)),
+                    ("delta", arguments_text(delta)),
                 ]
             }
             EventBody::ArgumentsDone {
@@ -559,11 +565,16 @@ impl ToJson for ResponseEvent {
             } => vec![
                 ("item_id", text(item_id)),
                 ("output_index", int(*output_index)),
-                ("arguments", text(arguments)),
+                ("arguments", arguments_text(arguments)),
             ],
-            EventBody::Error { code, message, param } => vec![
+            EventBody::Error {
+                code,
+                message,
+                param,
+                cut,
+            } => vec![
                 ("code", optional_text(code.as_deref())),
-                ("message", text(message)),
+                ("message", message_text(message, *cut)),
                 ("param", optional_text(param.as_deref())),
             ],
         };
@@ -628,6 +639,53 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    /// A tool call's arguments with an unpaired surrogate, as the compact writer wrote them.
+    const LONE: &str = r#"{"v":"\uD800"}"#;
+    /// What a reply holds for them: the escape stays an escape of the unit, the quotes are escaped.
+    const LONE_WRITTEN: &str = r#""{\"v\":\"\uD800\"}""#;
+
+    #[test]
+    fn the_arguments_of_a_call_keep_an_unpaired_surrogate_as_its_escape() {
+        let item = FunctionCallItem::new("fc_1", "completed", "call_1", "f", LONE);
+        assert!(
+            item.to_json_string()
+                .contains(&format!(r#""arguments":{LONE_WRITTEN}"#))
+        );
+        let delta = EventBody::ArgumentsDelta {
+            item_id: "fc_1".into(),
+            output_index: 0,
+            delta: LONE.into(),
+        };
+        let delta = ResponseEvent::new("response.function_call_arguments.delta", 1, delta);
+        assert!(delta.to_json_string().contains(&format!(r#""delta":{LONE_WRITTEN}"#)));
+        let done = EventBody::ArgumentsDone {
+            item_id: "fc_1".into(),
+            output_index: 0,
+            arguments: LONE.into(),
+        };
+        let done = ResponseEvent::new("response.function_call_arguments.done", 2, done);
+        assert!(
+            done.to_json_string()
+                .contains(&format!(r#""arguments":{LONE_WRITTEN}"#))
+        );
+    }
+
+    #[test]
+    fn the_error_event_of_a_cut_excerpt_writes_the_cut_unit() {
+        let failure =
+            ApiError::invalid_tool_call_cut("parameter n of f is not of type [integer]: 'ab...'", Some(0xd83d));
+        let event = ResponseEvent::new("error", 3, EventBody::error(&failure));
+        assert!(
+            event.to_json_string().contains(r#"'ab\uD83D...'."#),
+            "{}",
+            event.to_json_string()
+        );
+        // Without a cut the same text is plain.
+        let plain = ApiError::invalid_tool_call("parameter n of f is not of type [integer]: 'ab...'");
+        let event = ResponseEvent::new("error", 3, EventBody::error(&plain));
+        assert!(!event.to_json_string().contains("\\uD83D"));
     }
 
     #[test]

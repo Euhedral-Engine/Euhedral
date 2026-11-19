@@ -552,9 +552,10 @@ pub fn plan_closest(
     ))
 }
 
-/// What a plan that does not fit is refused for. The reference is the whole host budget, not what the cache pages left
-/// of it: the plan is refused for the host only when the arena and the window alone are more than the budget. When the
-/// device is named although the host is short once the cache pages are counted, the message carries the host figures.
+/// What a plan that does not fit is refused for. The device fits and the host is short (the arena, the window and the
+/// cache pages put on the host together are more than the host budget): more host memory is what would help, and the
+/// refusal is the host's. When the device does not fit even with everything offloaded, it is the device's, and its
+/// message names the host shortfall too when there is one.
 fn refusal_of(
     reach: &Reach,
     layout: &Layout,
@@ -563,10 +564,11 @@ fn refusal_of(
     max_tokens: u64,
     original_host: u64,
 ) -> PlanError {
-    let needed = reach.host_bytes();
-    if needed > original_host {
+    let needed = reach.host_bytes().saturating_add(layout.cache_host);
+    if reach.device_fits && needed > original_host {
         return PlanError::HostTooSmall {
             needed,
+            cache_pages: layout.cache_host,
             budget: original_host,
         };
     }
@@ -578,7 +580,7 @@ fn refusal_of(
         sequences: inputs.sequences,
         context_tokens: max_tokens,
         host: HostFigures {
-            weights: needed,
+            weights: reach.host_bytes(),
             cache_pages: layout.cache_host,
             budget: original_host,
         },
