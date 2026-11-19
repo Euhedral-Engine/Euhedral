@@ -8,9 +8,14 @@ publish.workspace = true
 
 [dependencies]
 crc32fast.workspace = true
+euhedral-core.workspace = true
+euhedral-io.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
+tempfile.workspace = true
 test-support = { path = "../test-support" }
 
 [lints]
