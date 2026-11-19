@@ -39,9 +39,9 @@ pub(crate) fn arguments_text(value: &str) -> JsonValue {
     JsonValue::from_compact_text(value)
 }
 
-/// An error message as a string value.
-pub(crate) fn message_text(value: &str) -> JsonValue {
-    JsonValue::from_message_text(value)
+/// An error message as a string value; `cut` is the high surrogate its excerpt was cut after, if any.
+pub(crate) fn message_text(value: &str, cut: Option<u16>) -> JsonValue {
+    JsonValue::from_message_text(value, cut)
 }
 
 /// A string value, or null.

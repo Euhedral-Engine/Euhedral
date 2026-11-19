@@ -123,12 +123,12 @@ fn chat(planned: &Planned, model: &str, done: &Completed) -> ChatCompletionRespo
     })
 }
 
-/// The opaque token naming the thinking it accompanies.
 /// The input of a tool-use block: the call's arguments read back, an unpaired surrogate included.
 fn tool_input(arguments: &str) -> JsonValue {
     JsonValue::parse_keeping_unpaired(arguments).unwrap_or(JsonValue::Object(Vec::new()))
 }
 
+/// The opaque token naming the thinking it accompanies.
 pub(super) fn signature(thinking: &str) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let digest = Sha256::digest(thinking.as_bytes());

@@ -425,6 +425,17 @@ mod tests {
     }
 
     #[test]
+    fn the_partial_json_of_a_tool_call_keeps_an_unpaired_surrogate_as_its_escape() {
+        let delta = BlockDelta::InputJsonDelta {
+            partial_json: r#"{"v":"\uD800"}"#.into(),
+        };
+        assert_eq!(
+            to_text(&delta),
+            r#"{"type":"input_json_delta","partial_json":"{\"v\":\"\uD800\"}"}"#
+        );
+    }
+
+    #[test]
     fn a_request_with_every_known_field_deserialises() {
         let request = MessagesRequest::parse(
             r#"{"model":"m","max_tokens":64,"system":[{"type":"text","text":"s"}],

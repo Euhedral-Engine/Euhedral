@@ -254,11 +254,17 @@ impl JsonValue {
     }
 
     fn read(text: &str, distinct: bool, keep_unpaired: bool) -> Option<JsonValue> {
+        JsonValue::read_limited(text, distinct, keep_unpaired, MAX_STRING_UNITS)
+    }
+
+    /// The reading with the longest string value it accepts, in UTF-16 code units, given.
+    fn read_limited(text: &str, distinct: bool, keep_unpaired: bool, max_string_units: usize) -> Option<JsonValue> {
         let mut parser = Parser {
             text,
             position: 0,
             distinct,
             keep_unpaired,
+            max_string_units,
             lone: Vec::new(),
         };
         parser.skip_space();
@@ -271,6 +277,9 @@ impl JsonValue {
     /// compact form writes one as a `\uD800`-style escape, and no other escape in that range, so every such escape
     /// in `text` stands for the unit alone. The escape is then written as is, not with its backslash escaped, when
     /// the string is itself written. Text without such an escape is an ordinary string value.
+    ///
+    /// This relies on one invariant of the compact writer: it writes `\u` only for the control characters below
+    /// 0020 and for an unpaired surrogate, never for any other character.
     pub fn from_compact_text(text: &str) -> JsonValue {
         if !text.contains("\\u") {
             return JsonValue::String(text.to_owned());
@@ -303,34 +312,21 @@ impl JsonValue {
         }
     }
 
-    /// The text of an error message as a string value. A message built by [`cut_pair_marker`] holds a stand-in for
-    /// the high surrogate an excerpt left alone when it cut a character in two; the stand-in is read back as that
-    /// unpaired unit. Any other message is an ordinary string value.
-    pub fn from_message_text(text: &str) -> JsonValue {
-        let is_marker = |value: char| (CUT_PAIR_MARKER..CUT_PAIR_MARKER + 0x400).contains(&u32::from(value));
-        if !text.chars().any(is_marker) {
+    /// The text of an error message as a string value. When `cut` is the high surrogate an excerpt left alone by
+    /// cutting a character in two, the message holds the excerpt without it, and the unit is written just before the
+    /// message's last `...'`. Without a cut, or when the message has no such place, it is an ordinary string value.
+    pub fn from_message_text(text: &str, cut: Option<u16>) -> JsonValue {
+        let Some((unit, place)) = cut.zip(text.rfind("...'")) else {
             return JsonValue::String(text.to_owned());
-        }
-        let mut units = Vec::with_capacity(text.len());
-        let mut found = false;
-        for (offset, value) in text.char_indices() {
-            if is_marker(value) && text[offset + value.len_utf8()..].starts_with("...'") {
-                units.push((u32::from(value) - CUT_PAIR_MARKER + 0xd800) as u16);
-                found = true;
-            } else {
-                let mut buffer = [0; 2];
-                units.extend_from_slice(value.encode_utf16(&mut buffer));
-            }
-        }
-        if found {
-            JsonValue::Utf16String(units)
-        } else {
-            JsonValue::String(text.to_owned())
-        }
+        };
+        let mut units: Vec<u16> = text[..place].encode_utf16().collect();
+        units.push(unit);
+        units.extend(text[place..].encode_utf16());
+        JsonValue::Utf16String(units)
     }
 
-    /// The compact form: no spaces, escapes in capitals, other numbers in the form of Java's
-    /// `Double.toString` (`1.0E10`, positional from `1e-3` up to `1e7`).
+    /// The compact form: no spaces, escapes in capitals, other numbers
+    /// with a point and at least one digit after it (`1.0E10`, positional from `1e-3` up to `1e7`).
     pub fn to_compact_string(&self) -> String {
         let mut json = String::new();
         self.write_compact(&mut json);
@@ -369,16 +365,6 @@ impl JsonValue {
             }
         }
     }
-}
-
-/// The first of 1024 private-use characters that stand for the high surrogates 0xD800 to 0xDBFF in a message that
-/// cannot hold them.
-const CUT_PAIR_MARKER: u32 = 0xf0000;
-
-/// The stand-in, in a message, for the high surrogate `unit` that an excerpt cut off from its pair; it must be
-/// followed by `...'` for [`JsonValue::from_message_text`] to read it back.
-pub(crate) fn cut_pair_marker(unit: u16) -> char {
-    char::from_u32(CUT_PAIR_MARKER + u32::from(unit.saturating_sub(0xd800) & 0x3ff)).unwrap_or('\u{fffd}')
 }
 
 /// The surrogate code unit of a `\uXXXX` escape at the start of `text`, when it is one.
@@ -439,10 +425,11 @@ fn write_compact_char(value: char, json: &mut String) {
     }
 }
 
-/// The decimal digits and exponent of a positive finite double as the platform's `Double.toString` chooses them: the
-/// shortest digits that read back as the same double, but at least two, and when the shortest is a single digit the
-/// two-digit decimal nearest the double (the smallest subnormals are `4.9E-324`, not `5E-324`).
-fn java_digits(number: f64) -> (String, i32) {
+/// The decimal digits and exponent a positive finite double is printed with: the shortest digits that read back as the
+/// same double, but at least two. When the shortest is a single digit, the two-digit decimal nearest the double is
+/// used instead (the smallest subnormal prints as `4.9E-324`, not `5E-324`), and when the double lies exactly halfway
+/// between two candidates, the one with the even last digit.
+fn print_digits(number: f64) -> (String, i32) {
     let split = |scientific: &str| {
         let (mantissa, exponent) = scientific.split_once('e').unwrap_or((scientific, "0"));
         let digits: String = mantissa.chars().filter(|value| *value != '.').collect();
@@ -467,12 +454,17 @@ fn java_digits(number: f64) -> (String, i32) {
 /// an even digit, if it reads back as the double: the shortest digits may be the other one.
 fn nearest_even_of_a_tie(number: f64, digits: &str) -> Option<String> {
     let length = digits.len();
-    let exact = format!("{number:.*e}", length + 30);
-    let (mantissa, exponent) = exact.split_once('e')?;
-    let wide: String = mantissa.chars().filter(|value| *value != '.').collect();
-    if wide.as_bytes()[length] != b'5' || !wide[length + 1..].bytes().all(|value| value == b'0') {
-        return None;
-    }
+    // A tie shows as a five followed by zeros however far one looks, so a cheap look past the cut rules out nearly
+    // every double; only a double that passes is decided from its whole expansion, which has at most 767 digits.
+    let tie_at = |places: usize| -> Option<(String, String)> {
+        let exact = format!("{number:.places$e}");
+        let (mantissa, exponent) = exact.split_once('e')?;
+        let wide: String = mantissa.chars().filter(|value| *value != '.').collect();
+        let halfway = wide.as_bytes()[length] == b'5' && wide[length + 1..].bytes().all(|value| value == b'0');
+        halfway.then(|| (wide, exponent.to_owned()))
+    };
+    tie_at(length + 30)?;
+    let (wide, exponent) = tie_at(800)?;
     let reads_back = |digits: &str| {
         format!("{}.{}e{exponent}", &digits[..1], &digits[1..])
             .parse::<f64>()
@@ -506,7 +498,7 @@ fn compact_float(number: f64) -> String {
     if number == 0.0 {
         return if number.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
     }
-    let (digits, exponent) = java_digits(number.abs());
+    let (digits, exponent) = print_digits(number.abs());
     let sign = if number < 0.0 { "-" } else { "" };
     if (-3..7).contains(&exponent) {
         let point = exponent + 1;
@@ -534,6 +526,8 @@ struct Parser<'a> {
     distinct: bool,
     /// String values keep unpaired surrogates as UTF-16 code units.
     keep_unpaired: bool,
+    /// The longest string value, in UTF-16 code units; a longer one ends the parse.
+    max_string_units: usize,
     /// The lone surrogates of the string last read, as the byte offset in its text where each one was replaced
     /// and its code unit.
     lone: Vec<(usize, u16)>,
@@ -776,7 +770,8 @@ impl Parser<'_> {
             self.position += value.len_utf8();
             match value {
                 '"' => {
-                    let too_long = text.len() > MAX_STRING_UNITS && text.encode_utf16().count() > MAX_STRING_UNITS;
+                    let too_long =
+                        text.len() > self.max_string_units && text.encode_utf16().count() > self.max_string_units;
                     return (!too_long).then_some(text);
                 }
                 '\\' => {
@@ -1007,14 +1002,19 @@ mod tests {
     }
 
     #[test]
-    fn a_string_of_a_hundred_million_units_is_read_and_one_more_is_refused() {
-        let string = |count: usize| format!("\"{}\"", "a".repeat(count));
-        assert!(JsonValue::parse(&string(100_000_000)).is_some());
-        assert!(JsonValue::parse(&string(100_000_001)).is_none());
-        // Units, not bytes: 50 million two-unit characters are the limit exactly.
-        let astral = |count: usize| format!("\"{}\"", "\u{1f600}".repeat(count));
-        assert!(JsonValue::parse(&astral(50_000_000)).is_some());
-        assert!(JsonValue::parse(&astral(50_000_001)).is_none());
+    fn a_string_longer_than_the_limit_is_refused() {
+        assert_eq!(MAX_STRING_UNITS, 100_000_000);
+        let limited = |text: &str| JsonValue::read_limited(text, false, false, 10);
+        assert!(limited(&format!("\"{}\"", "a".repeat(10))).is_some());
+        assert!(limited(&format!("\"{}\"", "a".repeat(11))).is_none());
+        // Units, not bytes: five two-unit characters are the limit exactly, and two-byte ones count once.
+        assert!(limited(&format!("\"{}\"", "\u{1f600}".repeat(5))).is_some());
+        assert!(limited(&format!("\"{}\"", "\u{1f600}".repeat(6))).is_none());
+        assert!(limited(&format!("\"{}\"", "\u{e9}".repeat(10))).is_some());
+        assert!(limited(&format!("\"{}\"", "\u{e9}".repeat(11))).is_none());
+        // Escapes count by the unit they decode to.
+        assert!(limited(&format!("\"{}\"", "\\u0041".repeat(10))).is_some());
+        assert!(limited(&format!("\"{}\"", "\\u0041".repeat(11))).is_none());
     }
 
     #[test]

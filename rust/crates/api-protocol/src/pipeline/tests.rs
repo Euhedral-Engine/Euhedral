@@ -78,7 +78,7 @@ fn run(options: &PipelineOptions, chunks: &[&str], stop_token: bool) -> Outcome 
     for chunk in chunks {
         match pipeline.push(chunk) {
             Ok(settled) => settled.into_iter().for_each(|piece| add(&mut pieces, piece)),
-            Err(PipelineError::MalformedToolCall { message, emitted }) => {
+            Err(PipelineError::MalformedToolCall { message, emitted, .. }) => {
                 emitted.into_iter().for_each(|piece| add(&mut pieces, piece));
                 error = Some(message);
                 break;
@@ -93,7 +93,7 @@ fn run(options: &PipelineOptions, chunks: &[&str], stop_token: bool) -> Outcome 
         };
         match finished {
             Ok(settled) => settled.into_iter().for_each(|piece| add(&mut pieces, piece)),
-            Err(PipelineError::MalformedToolCall { message, emitted }) => {
+            Err(PipelineError::MalformedToolCall { message, emitted, .. }) => {
                 emitted.into_iter().for_each(|piece| add(&mut pieces, piece));
                 error = Some(message);
             }

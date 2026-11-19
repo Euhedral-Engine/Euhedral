@@ -34,6 +34,8 @@ pub struct ApiError {
     pub code: Option<&'static str>,
     pub param: Option<String>,
     pub message: String,
+    /// The high surrogate the excerpt at the end of `message` was cut after, when it was cut inside a character.
+    pub cut: Option<u16>,
 }
 
 /// OpenAI's error envelope: `{"error": {"message", "type", "param", "code"}}`, every field always present.
@@ -49,6 +51,8 @@ pub struct OpenAiErrorBody {
     pub kind: String,
     pub param: Option<String>,
     pub code: Option<String>,
+    /// The high surrogate the excerpt at the end of `message` was cut after, if it was cut inside a character.
+    pub cut: Option<u16>,
 }
 
 /// Anthropic's error envelope: `{"type": "error", "error": {"type", "message"}}`.
@@ -62,12 +66,14 @@ pub struct AnthropicErrorEnvelope {
 pub struct AnthropicErrorBody {
     pub kind: &'static str,
     pub message: String,
+    /// The high surrogate the excerpt at the end of `message` was cut after, if it was cut inside a character.
+    pub cut: Option<u16>,
 }
 
 impl ToJson for OpenAiErrorBody {
     fn to_json(&self) -> JsonValue {
         object([
-            ("message", message_text(&self.message)),
+            ("message", message_text(&self.message, self.cut)),
             ("type", text(&self.kind)),
             ("param", optional_text(self.param.as_deref())),
             ("code", optional_text(self.code.as_deref())),
@@ -83,7 +89,10 @@ impl ToJson for OpenAiErrorEnvelope {
 
 impl ToJson for AnthropicErrorBody {
     fn to_json(&self) -> JsonValue {
-        object([("type", text(self.kind)), ("message", message_text(&self.message))])
+        object([
+            ("type", text(self.kind)),
+            ("message", message_text(&self.message, self.cut)),
+        ])
     }
 }
 
@@ -111,6 +120,7 @@ impl ApiError {
             code,
             param: param.map(str::to_owned),
             message: message.into(),
+            cut: None,
         }
     }
 
@@ -193,13 +203,21 @@ impl ApiError {
     /// The model's output began a tool call that cannot be returned for the offered tools. The reason describes only
     /// the generated text and the request's own definitions.
     pub fn invalid_tool_call(reason: &str) -> ApiError {
-        ApiError::new(
+        ApiError::invalid_tool_call_cut(reason, None)
+    }
+
+    /// As [`invalid_tool_call`](ApiError::invalid_tool_call), for a reason that ends in an excerpt cut after the
+    /// high surrogate `cut`.
+    pub fn invalid_tool_call_cut(reason: &str, cut: Option<u16>) -> ApiError {
+        let mut error = ApiError::new(
             500,
             SERVER_ERROR,
             format!("The model produced an invalid tool call: {reason}."),
             None,
             Some("invalid_tool_call"),
-        )
+        );
+        error.cut = cut;
+        error
     }
 
     /// The model's output under a JSON response format is not a JSON document.
@@ -331,6 +349,7 @@ impl ApiError {
                 kind: self.kind.to_owned(),
                 param: self.param.clone(),
                 code: self.code.map(str::to_owned),
+                cut: self.cut,
             },
         }
     }
@@ -341,6 +360,7 @@ impl ApiError {
             error: AnthropicErrorBody {
                 kind: ApiError::anthropic_type(self.status),
                 message: self.message.clone(),
+                cut: self.cut,
             },
         }
     }
@@ -365,7 +385,7 @@ impl From<TemplateError> for ApiError {
 /// Output the pipeline cannot accept is a server error: the model produced an invalid tool call.
 impl From<PipelineError> for ApiError {
     fn from(error: PipelineError) -> ApiError {
-        ApiError::invalid_tool_call(error.message())
+        ApiError::invalid_tool_call_cut(error.message(), error.cut())
     }
 }
 
@@ -388,6 +408,23 @@ mod tests {
 
     fn text(error: &ApiError, surface: Surface) -> String {
         String::from_utf8(error.body(surface)).expect("utf-8")
+    }
+
+    #[test]
+    fn a_cut_excerpt_is_written_as_the_unit_and_other_messages_stay_plain() {
+        let cut = ApiError::invalid_tool_call_cut("parameter n of f is not of type [integer]: 'ab...'", Some(0xd83d));
+        let body = String::from_utf8(cut.body(Surface::OpenAi)).unwrap();
+        assert!(body.contains(r#"'ab\uD83D...'."#), "{body}");
+        // A private-use character before a `...` is text, as any other: it is written as itself.
+        let role = ApiError::invalid_request("role 'x\u{f0000}...'", Some("messages"));
+        let body = String::from_utf8(role.body(Surface::OpenAi)).unwrap();
+        assert!(body.contains("role 'x\u{f0000}...'"), "{body}");
+        let body = String::from_utf8(role.body(Surface::Anthropic)).unwrap();
+        assert!(body.contains("role 'x\u{f0000}...'"), "{body}");
+        // A tool call reason carrying one, without a cut, is plain too.
+        let call = ApiError::invalid_tool_call("parameter n of f is not of type [integer]: 'x\u{f0000}...'");
+        let body = String::from_utf8(call.body(Surface::OpenAi)).unwrap();
+        assert!(body.contains("'x\u{f0000}...'"), "{body}");
     }
 
     #[test]
@@ -763,6 +800,7 @@ mod tests {
     fn a_malformed_tool_call_is_an_internal_error_with_the_reason() {
         let failure = PipelineError::MalformedToolCall {
             message: "unknown function 'x'".to_owned(),
+            cut: None,
             emitted: vec![Piece::Text("kept".to_owned())],
         };
         let converted = ApiError::from(failure);
