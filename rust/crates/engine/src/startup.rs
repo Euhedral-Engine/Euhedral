@@ -528,7 +528,7 @@ fn plan(mut startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32
                 sequences: 1,
             };
             let sequences = resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)?;
-            let sequences = core.hold_sequences(sequences);
+            core.open_lanes(sequences)?;
             plan_with(
                 &artifact.config,
                 &artifact.table,
@@ -635,7 +635,7 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
         workspace.hold(scratch_claim);
         workspace.hold(reserve_claim);
-        let (sequences, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {
+        let (sequences, marker) = core.lane_table().submit_ops(core.transfer_lane(0), false, |kernels| {
             // The first sequence's state and the MTP layer's cache at the longest context, which its pages grow to.
             let first = footprint::first_sequence_bytes(&plan, &artifact.config)
                 + footprint::mtp_cache_bytes_of(&plan, &artifact.config);
@@ -694,7 +694,7 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
                     sequences,
                 )
             });
-            core.completions.after_marker(marker, frame);
+            core.completions().after_marker(marker, frame);
         }
         Err(error) => startup.fail(error),
     }
@@ -827,7 +827,7 @@ fn assemble(
         };
         let (warmed, marker) = warmup::run(&startup.core, &artifact.config, &weights, &workspace);
         let core = Arc::clone(&startup.core);
-        let (completions, stages) = (Arc::clone(&core.completions), Arc::clone(&core.stages));
+        let (completions, stages) = (Arc::clone(core.completions()), Arc::clone(&core.stages));
         // The report and the latch wait for the lane to reach the warm-up's last launch: a completion, not a wait.
         let ready = step(Kind::Startup, 0, move || {
             let in_use = core
@@ -992,7 +992,7 @@ impl DraftIds {
             source,
             bytes,
         } = self;
-        let queued = core.lane_table.submit_ops(core.owner_lane(), false, |kernels| {
+        let queued = core.lane_table().submit_ops(core.owner_lane(), false, |kernels| {
             // SAFETY: the loan is held by the frame that follows the copy, which runs once the lane has reached the
             // marker; nothing reads or writes the bytes before.
             unsafe { kernels.copy_device_to_readback(loan.buffer_mut(), 0, source, bytes) }
@@ -1008,7 +1008,7 @@ impl DraftIds {
                         .collect();
                     finish.run(Some(ids));
                 });
-                core.completions.after_marker(marker, frame);
+                core.completions().after_marker(marker, frame);
             }
             Err(error) => {
                 // The copy may have been queued before the call failed: the lane may still write the buffer, so it is

@@ -8,7 +8,9 @@
 )]
 
 use euhedral_inference_engine::error::PlanError;
+use euhedral_inference_engine::plan::Plan;
 use euhedral_inference_engine::residency::planner::{PlanInputs, plan_with, sequences_for};
+use euhedral_inference_engine::runtime::{resolve_sequences, stage_ring_for};
 use euhedral_inference_settings::{Auto, ByteSize};
 
 mod common;
@@ -160,4 +162,23 @@ fn the_prefix_cache_keeps_its_size_when_the_host_budget_is_unknown() {
     settings.prefix_cache.size = ByteSize::gib(1);
     let plan = plan_with(&config, &table, &settings, inputs(64 * GIB, None)).unwrap();
     assert_eq!(plan.prefix_cache_bytes, GIB);
+}
+
+#[test]
+fn an_automatic_count_with_room_for_several_sequences_holds_them_all_in_the_lanes_rings() {
+    let (table, config) = (rco_table(), config());
+    let mut settings = settings(4096);
+    settings.batching.max_sequences = 0;
+    let sequences = resolve_sequences(&config, &table, &settings, inputs(64 * GIB, Some(u64::MAX))).unwrap();
+    assert!(
+        sequences > 1,
+        "the plan has room for more than one sequence: {sequences}"
+    );
+    // The lanes open with the count the plan resolved, so their rings hold the quanta of every one of them.
+    let ring = stage_ring_for(sequences);
+    assert!(
+        ring >= Plan::stage_bound() * sequences,
+        "{sequences} sequences, ring {ring}"
+    );
+    assert!(ring > stage_ring_for(1), "the ring grows with the count: {ring}");
 }

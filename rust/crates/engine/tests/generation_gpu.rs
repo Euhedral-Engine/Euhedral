@@ -1215,6 +1215,54 @@ fn speculative_decode_rates_of_one_and_of_four_requests() {
     }
 }
 
+/// An automatic count (`batching.max-sequences` 0) is held whole: the lanes open once the plan has resolved it, so its
+/// requests run at once and each one's tokens are those it has alone.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn automatic_sequences_run_concurrently_and_match_alone() {
+    let Some(machine) = machine() else { return };
+    let tokenizer = tokenizer(&machine.artifact);
+    let (owner, runtime) = start_with_sequences(&machine, 0);
+    let held = runtime.sequences();
+    assert!(
+        held > 1,
+        "the plan resolved {held} sequences, the lanes' rings held one"
+    );
+    let count = held.min(SEQUENCES);
+    let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS[..count]
+        .iter()
+        .map(|text| tokenizer.encode_with_model_special_tokens(text).unwrap())
+        .collect();
+    let sampling = vec![SamplingConfig::greedy(0); count];
+    let alone: Vec<Recording> = prompts
+        .iter()
+        .zip(&sampling)
+        .map(|(prompt, sampling)| {
+            submit(
+                &runtime,
+                prompt,
+                CONCURRENT_TOKENS,
+                &[],
+                Speculation::Off,
+                *sampling,
+                None,
+            )
+            .expect("the request is admitted")
+            .wait(WAIT)
+            .expect("the generation reports")
+        })
+        .collect();
+    let (both, _) = together(&runtime, &prompts, Speculation::Off, &sampling, &vec![None; count]);
+    for (index, (alone, both)) in alone.iter().zip(&both).enumerate() {
+        assert_eq!(alone.tokens.len(), CONCURRENT_TOKENS as usize, "request {index} alone");
+        assert_eq!(both.tokens, alone.tokens, "request {index} changed when run together");
+    }
+    let first_of_all = both.iter().map(|r| *r.token_times.first().unwrap()).max().unwrap();
+    let first_to_end = both.iter().map(|r| *r.token_times.last().unwrap()).min().unwrap();
+    assert!(first_of_all < first_to_end, "the requests did not overlap");
+    owner.shutdown(runtime).expect("the engine shuts down clean");
+}
+
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn concurrent_sequences_match_alone() {

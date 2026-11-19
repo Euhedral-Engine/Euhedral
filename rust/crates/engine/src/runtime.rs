@@ -10,8 +10,8 @@ use std::fmt;
 use std::mem::{self, ManuallyDrop};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::config::{FragmentConfig, IdlePolicy, LatticeConfig};
@@ -22,7 +22,7 @@ use euhedral_gpu::cuda::{CudaGpu, CudaQueue};
 use euhedral_gpu::{Gpu, GpuError, Stream, StreamOptions, open_shared_lanes};
 use euhedral_graph::{Completions, DeviceQueue, Lake, LaneId, LanePool, UnitGuard};
 use euhedral_hardware_utils::util::CpuSet;
-use euhedral_inference_cuda::launch::load::load;
+use euhedral_inference_cuda::launch::load::{KernelTable, load};
 use euhedral_inference_cuda::{CudaLibrary, PinnedPool};
 use euhedral_inference_edrl::TensorTable;
 use euhedral_inference_settings::{Auto, BatchingSettings, Settings};
@@ -53,7 +53,7 @@ const TRANSFER_RING: usize = 4;
 /// The quanta whose markers a stage lane's ring must hold: those in flight, and the one the owner prepares behind them.
 pub(crate) const STAGE_RING_QUANTA: usize = GREEDY_DEPTH + 1;
 
-/// The events a stage lane's ring holds, sized before the model is read: the most markers of the lane that stay in
+/// The events a stage lane's ring holds for the sequences the plan resolved: the most markers of the lane that stay in
 /// flight, until their last consumer has waited for them. A quantum records one marker per stage it runs, a marker is
 /// waited for by the quantum itself and by the ones admitted behind it, so the ring holds the stages of the biggest view
 /// of the model the engine runs ([`Plan::stage_bound`]) for `quanta_in_flight` quanta, rounded up to a power of two.
@@ -79,12 +79,10 @@ pub fn stage_ring_for(sequences: usize) -> usize {
     stage_ring(quanta_for(sequences))
 }
 
-/// How many sequences the settings size the lanes' rings for: `batching.max-sequences`, and one when it is 0, which
-/// is decided only once the model is read. A count above the rows a pass holds is refused: each sequence keeps its
-/// quanta's markers in the rings, which are created with the lanes, before the model is read, and a verification takes
-/// a row at least.
-fn ringed_sequences(batching: &BatchingSettings) -> Result<usize, EngineError> {
-    let sequences = (batching.max_sequences as usize).max(1);
+/// Refuses a stated `batching.max-sequences` above the rows a pass holds: a verification takes a row at least, so more
+/// sequences could not run at once. Zero (automatic) is bounded by the plan ([`resolve_sequences`]).
+fn check_stated_sequences(batching: &BatchingSettings) -> Result<(), EngineError> {
+    let sequences = batching.max_sequences as usize;
     let rows = pass_rows_limit(batching);
     if sequences > rows {
         return Err(EngineError::Runtime(format!(
@@ -92,7 +90,7 @@ fn ringed_sequences(batching: &BatchingSettings) -> Result<usize, EngineError> {
              (batching.max-tokens-per-pass, at most batching.prefill-chunk-tokens); set it lower"
         )));
     }
-    Ok(sequences)
+    Ok(())
 }
 
 /// The sequences to hold: `batching.max-sequences` when it is at least 1, otherwise (0, automatic) the largest count
@@ -128,6 +126,21 @@ pub fn resolve_sequences(
     Ok(chosen)
 }
 
+/// The lanes of an engine and what watches them, opened once the plan has decided the sequences ([`Core::open_lanes`]).
+pub(crate) struct DeviceLanes {
+    /// The lanes as query queues, which the completions and the graph runtime poll. Its owner and transfer lanes are
+    /// reserved: no graph run is homed on them.
+    lanes: Arc<LanePool>,
+    /// The lanes the stage graphs run on, by lane id: the plan's compute lanes (`0..` [`Plan::lane_width`]), the
+    /// owner's lane (reservations and input records), then the transfer lanes, one per upload chain, the first of
+    /// which also zeroes the sequence state.
+    lane_table: LaneTable,
+    /// The events in the ring of each stage lane ([`stage_ring`]).
+    stage_ring: usize,
+    /// Turns the lanes' progress into frames.
+    completions: Arc<Completions>,
+}
+
 /// What the frames of the engine share: the lattice and everything that feeds it, and the device.
 pub(crate) struct Core {
     pub(crate) settings: Settings,
@@ -140,18 +153,12 @@ pub(crate) struct Core {
     /// Control: the steps of a startup and of a shutdown.
     pub(crate) control: Arc<Lake>,
     pub(crate) io: Arc<AsyncIo>,
-    pub(crate) completions: Arc<Completions>,
     /// The device RustEE's lanes and kernels are on, kept for as long as they are.
     pub(crate) gpu: Arc<CudaGpu>,
-    /// The lanes as query queues, which the completions and the graph runtime poll. Its owner and transfer lanes are
-    /// reserved: no graph run is homed on them.
-    pub(crate) lanes: Arc<LanePool>,
-    /// The lanes the stage graphs run on, by lane id: the plan's compute lanes (`0..` [`Plan::lane_width`]), the
-    /// owner's lane (reservations and input records), then the transfer
-    /// lanes, one per upload chain, the first of which also zeroes the sequence state.
-    pub(crate) lane_table: LaneTable,
-    /// The events in the ring of each stage lane ([`stage_ring`]).
-    pub(crate) stage_ring: usize,
+    /// The kernels the lanes launch.
+    kernels: Arc<KernelTable>,
+    /// What the lanes own, once they are opened: after the plan, which decides how many sequences their rings carry.
+    device_lanes: OnceLock<DeviceLanes>,
     /// The plan's compute lanes.
     pub(crate) compute: usize,
     pub(crate) pool: Arc<PinnedPool>,
@@ -201,19 +208,64 @@ pub(crate) struct Units {
 }
 
 impl Core {
-    /// `sequences`, or fewer when the lanes' rings, sized before the model was read, cannot hold the quanta that many
-    /// sequences keep in flight. Only an automatic count can exceed them: the rings are sized for the stated count, and
-    /// for one when it is automatic, because a ring's markers are device events created with the lane.
-    pub(crate) fn hold_sequences(&self, sequences: usize) -> usize {
-        let per_sequence = Plan::stage_bound().saturating_mul(STAGE_RING_QUANTA).max(1);
-        let held = sequences.min((self.stage_ring / per_sequence).max(1));
-        if held < sequences {
-            log::warn!(
-                "{sequences} sequences fit the device but the lanes' rings hold the quanta of {held}; set \
-                 batching.max-sequences to hold more"
+    fn device_lanes(&self) -> &DeviceLanes {
+        self.device_lanes
+            .get()
+            .unwrap_or_else(|| unreachable!("the lanes open at the plan, before anything uses them"))
+    }
+
+    /// The lanes as query queues, which the completions and the graph runtime poll.
+    pub(crate) fn lanes(&self) -> &Arc<LanePool> {
+        &self.device_lanes().lanes
+    }
+
+    /// The lanes the stage graphs run on, by lane id.
+    pub(crate) fn lane_table(&self) -> &LaneTable {
+        &self.device_lanes().lane_table
+    }
+
+    /// The events in the ring of each stage lane.
+    pub(crate) fn stage_ring(&self) -> usize {
+        self.device_lanes().stage_ring
+    }
+
+    /// The completions that turn lane progress into frames.
+    pub(crate) fn completions(&self) -> &Arc<Completions> {
+        &self.device_lanes().completions
+    }
+
+    /// Opens the lanes with rings for `sequences` sequences, and attaches the completions to the lattice. The lanes
+    /// open once the plan has resolved the sequence count, so a ring is never smaller than the quanta that count keeps
+    /// in flight. The device memory the lanes' events take is read as the free memory falling across the open.
+    pub(crate) fn open_lanes(&self, sequences: usize) -> Result<(), EngineError> {
+        let runtime = |what: &str, error: &dyn fmt::Display| EngineError::Runtime(format!("{what}: {error}"));
+        let chains = startup::transfer_lanes(&self.settings, MAX_LANES.saturating_sub(self.compute + 1));
+        let ring = stage_ring(quanta_for(sequences));
+        let before = self.library.free_bytes().ok();
+        let set = open_lane_set(&self.gpu, self.compute, ring, chains)
+            .map_err(|error| runtime("the lanes would not open", &error))?;
+        if let (Some(before), Ok(after)) = (before, self.library.free_bytes()) {
+            log::info!(
+                "lanes opened: {} events of {sequences} sequences take {} bytes of device memory",
+                ring,
+                before.saturating_sub(after)
             );
         }
-        held
+        let lanes = set.queues;
+        let lane_table = LaneTable::new(set.typed, Arc::clone(&self.kernels), Arc::clone(&self.library));
+        let completions = Completions::new(&lanes);
+        self.lattice
+            .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
+            .map_err(|error| runtime("the lattice would not take the completions", &format!("{error:?}")))?;
+        let opened = DeviceLanes {
+            lanes,
+            lane_table,
+            stage_ring: ring,
+            completions,
+        };
+        self.device_lanes
+            .set(opened)
+            .map_err(|_| EngineError::Runtime("the lanes were opened twice".into()))
     }
 
     /// The owner's lane: the sequence's reservations and its quanta's input records.
@@ -248,11 +300,11 @@ impl Core {
 
     /// The number of transfer lanes.
     pub(crate) fn transfer_lanes(&self) -> usize {
-        self.lane_table.len() - self.compute - 1
+        self.lane_table().len() - self.compute - 1
     }
 
     fn lane(&self, id: LaneId) -> &Arc<CudaQueue> {
-        match self.lane_table.get(id) {
+        match self.lane_table().get(id) {
             Some(lane) => lane,
             None => unreachable!("the runtime opened lane {} and the table holds it", id.0),
         }
@@ -854,7 +906,7 @@ impl EngineRuntime {
 
     /// The completions that turn lane progress into frames.
     pub fn completions(&self) -> &Arc<Completions> {
-        &self.core.completions
+        self.core.completions()
     }
 
     /// The asynchronous file I/O.
@@ -864,7 +916,7 @@ impl EngineRuntime {
 
     /// The lanes `completions` watches.
     pub fn lanes(&self) -> &Arc<LanePool> {
-        &self.core.lanes
+        self.core.lanes()
     }
 
     /// The lattice every frame runs on.
@@ -1023,8 +1075,8 @@ pub fn open_lane_set<G: Gpu>(
 /// Builds the lattice, the lakes, the lanes and the pools of a startup, on the calling thread.
 fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duration>) -> Result<Arc<Core>, EngineError> {
     let started = Instant::now();
-    // Before anything is opened: the rings the lanes are created with depend on it.
-    let sequences = ringed_sequences(&settings.batching)?;
+    // Before anything is opened: a stated count the passes cannot hold is refused.
+    check_stated_sequences(&settings.batching)?;
     let library = CudaLibrary::load(library_path)?;
     let runtime = |what: &str, error: &dyn fmt::Display| EngineError::Runtime(format!("{what}: {error}"));
 
@@ -1053,23 +1105,12 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         loading.elapsed().as_secs_f64()
     );
 
-    // The stage graphs' lanes first, so that their ids are the plan's (`0..`), then one transfer lane per upload chain,
-    // the most the settings allow; the startup uses as many as its ring needs.
     let machine = startup::read_machine();
     let compute = Plan::lane_width();
-    let chains = startup::transfer_lanes(settings, MAX_LANES.saturating_sub(compute + 1));
-    let ring = stage_ring(quanta_for(sequences));
-    let set =
-        open_lane_set(&gpu, compute, ring, chains).map_err(|error| runtime("the lanes would not open", &error))?;
-    let lanes = set.queues;
-    let lane_table = LaneTable::new(set.typed, Arc::clone(&kernels), Arc::clone(&library));
-    let completions = Completions::new(&lanes);
+    // The lanes open at the plan: their rings are sized by the sequences it resolves ([`Core::open_lanes`]).
     lattice
         .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
         .map_err(|error| runtime("the lattice would not take the file I/O", &format!("{error:?}")))?;
-    lattice
-        .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
-        .map_err(|error| runtime("the lattice would not take the completions", &format!("{error:?}")))?;
     let pool_bytes = startup::pinned_pool_bytes(settings, &machine);
     let pool = PinnedPool::new(&library, pool_bytes);
     let teardown = Teardown::with_cancel_bound(
@@ -1087,11 +1128,9 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         host,
         control,
         io,
-        completions,
         gpu,
-        lanes,
-        lane_table,
-        stage_ring: ring,
+        kernels,
+        device_lanes: OnceLock::new(),
         compute,
         pool,
         released: Arc::new(ReleasedBuffers::new()),
@@ -1133,26 +1172,22 @@ mod tests {
     }
 
     #[test]
-    fn the_rings_are_sized_for_the_stated_count_and_for_one_when_it_is_automatic() {
+    fn a_count_beyond_the_rows_of_a_pass_is_refused_before_anything_opens() {
         let mut settings = BatchingSettings::default();
-        assert_eq!(ringed_sequences(&settings).unwrap(), 1);
+        assert!(check_stated_sequences(&settings).is_ok());
         settings.max_sequences = 0;
-        assert_eq!(ringed_sequences(&settings).unwrap(), 1);
-        settings.max_sequences = 4;
-        assert_eq!(ringed_sequences(&settings).unwrap(), 4);
-    }
-
-    #[test]
-    fn a_count_beyond_the_rows_of_a_pass_is_refused_before_any_ring_is_sized() {
-        let mut settings = BatchingSettings::default();
+        assert!(
+            check_stated_sequences(&settings).is_ok(),
+            "automatic is bounded by the plan"
+        );
         settings.max_sequences = settings.prefill_chunk_tokens;
-        assert_eq!(ringed_sequences(&settings).unwrap(), 512);
+        assert!(check_stated_sequences(&settings).is_ok());
         settings.max_sequences = 100_000;
-        let error = ringed_sequences(&settings).unwrap_err().to_string();
+        let error = check_stated_sequences(&settings).unwrap_err().to_string();
         assert!(error.contains("batching.max-sequences"), "{error}");
         settings.max_sequences = 5;
         settings.max_tokens_per_pass = Auto::Value(4);
-        assert!(ringed_sequences(&settings).is_err());
+        assert!(check_stated_sequences(&settings).is_err());
     }
 
     /// A stand-in for the runtime that counts its drops.
