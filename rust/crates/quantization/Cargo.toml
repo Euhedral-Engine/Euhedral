@@ -8,6 +8,10 @@ publish.workspace = true
 
 [dependencies]
 crc32fast.workspace = true
+euhedral-inference-edrl = { path = "../edrl" }
+euhedral-inference-engine = { path = "../engine" }
+euhedral-inference-settings = { path = "../settings" }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 thiserror.workspace = true
 
 [dev-dependencies]
