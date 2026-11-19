@@ -1,9 +1,14 @@
 //! The disk reader over a fake port: its reads end when a test says, its gates are the graph's own.
 
 use std::collections::VecDeque;
+use std::env::{temp_dir, var_os};
+use std::fs::File;
 use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::ptr::copy_nonoverlapping;
+use std::slice::from_raw_parts;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::FrameError;
@@ -18,7 +23,7 @@ const FILE_BYTES: usize = 64 * 1024;
 const SLOT_BYTES: u64 = 3 * BLOCK;
 const BOUND: Duration = Duration::from_secs(10);
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -98,7 +103,7 @@ impl FakePort {
         // SAFETY: the window is a live heap region of at least `slot_bytes` per slot, and the reader reads one use of a
         // slot at a time.
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.window.slot_ptr(spec.slot).cast_mut(), bytes.len());
+            copy_nonoverlapping(bytes.as_ptr(), self.window.slot_ptr(spec.slot).cast_mut(), bytes.len());
         }
         done(Ok(bytes.len()));
     }
@@ -198,7 +203,7 @@ impl Rig {
 
     fn payload(&self, slot: usize, lead: usize, len: usize) -> Vec<u8> {
         // SAFETY: a live window; the slot's read ended before the test looks.
-        unsafe { std::slice::from_raw_parts(self.window.slot_ptr(slot).add(lead), len).to_vec() }
+        unsafe { from_raw_parts(self.window.slot_ptr(slot).add(lead), len).to_vec() }
     }
 }
 
@@ -556,14 +561,13 @@ fn a_window_checks_its_memory() {
 
 // The real file and ring.
 
-/// A file in `base`, which is a directory of a file system that may take direct reads (not the memory-backed `/tmp`).
-fn file_in_scratch(bytes: &[u8]) -> Option<(tempfile::TempDir, std::path::PathBuf)> {
-    let base = std::env::var_os("EUHEDRAL_SCRATCH")?;
+/// A file under `EUHEDRAL_SCRATCH` (a directory of a file system that may take direct reads), else under the system's
+/// temporary directory (which may refuse them: the reads are then buffered).
+fn file_in_scratch(bytes: &[u8]) -> Option<(tempfile::TempDir, PathBuf)> {
+    let base = var_os("EUHEDRAL_SCRATCH").map_or_else(temp_dir, PathBuf::from);
     let dir = tempfile::Builder::new().prefix("disk-reader").tempdir_in(base).ok()?;
     let path = dir.path().join("artifact.bin");
-    std::fs::File::create(&path)
-        .and_then(|mut file| file.write_all(bytes))
-        .ok()?;
+    File::create(&path).and_then(|mut file| file.write_all(bytes)).ok()?;
     Some((dir, path))
 }
 
@@ -581,7 +585,6 @@ fn drive(io: &AsyncIo, ended: impl Fn() -> bool) {
                 Err(error) => frame.do_finally_with_error(error),
             }
         }
-        std::thread::yield_now();
     }
 }
 
@@ -610,9 +613,8 @@ fn read_through_the_ring(file: ArtifactFile) -> (Vec<u8>, Vec<u8>, bool) {
     assert_eq!(failures.load(Ordering::SeqCst), 0);
     let window = port.window();
     // SAFETY: both reads ended; the window is live.
-    let read = |slot: usize, lead: usize, len: usize| unsafe {
-        std::slice::from_raw_parts(window.slot_ptr(slot).add(lead), len).to_vec()
-    };
+    let read =
+        |slot: usize, lead: usize, len: usize| unsafe { from_raw_parts(window.slot_ptr(slot).add(lead), len).to_vec() };
     (
         read(0, 5000 - BLOCK as usize, 9000),
         read(1, (end - 100 - (end - 100) / BLOCK * BLOCK) as usize, 100),
@@ -648,6 +650,6 @@ fn a_direct_open_that_fails_leaves_every_read_buffered() {
 
 #[test]
 fn a_missing_artifact_is_an_error() {
-    let missing = std::path::Path::new("/nonexistent-disk-reader-test/artifact.bin");
+    let missing = Path::new("/nonexistent-disk-reader-test/artifact.bin");
     assert!(ArtifactFile::open(missing).is_err());
 }

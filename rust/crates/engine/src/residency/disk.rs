@@ -34,12 +34,16 @@
 //! **Close.** [`DiskReader::close`] stops new reads, fails the gates still waiting and returns a hand-off that is sent
 //! when no read is in flight. The window is freed only after that.
 
+#[cfg(test)]
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt::{self, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem;
 use std::path::Path;
+#[cfg(test)]
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -112,18 +116,18 @@ impl DiskUse {
 #[cfg(test)]
 #[derive(Debug)]
 pub struct HeapRegion {
-    pointer: std::ptr::NonNull<u8>,
+    pointer: NonNull<u8>,
     len: usize,
 }
 
 #[cfg(test)]
 impl HeapRegion {
     fn new(len: usize) -> HeapRegion {
-        let layout = std::alloc::Layout::from_size_align(len, HOST_ALIGNMENT as usize).expect("a layout");
+        let layout = Layout::from_size_align(len, HOST_ALIGNMENT as usize).expect("a layout");
         // SAFETY: the layout has a non-zero size (the tests allocate at least a block).
-        let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+        let pointer = unsafe { alloc_zeroed(layout) };
         HeapRegion {
-            pointer: std::ptr::NonNull::new(pointer).expect("memory"),
+            pointer: NonNull::new(pointer).expect("memory"),
             len,
         }
     }
@@ -132,9 +136,9 @@ impl HeapRegion {
 #[cfg(test)]
 impl Drop for HeapRegion {
     fn drop(&mut self) {
-        let layout = std::alloc::Layout::from_size_align(self.len, HOST_ALIGNMENT as usize).expect("a layout");
+        let layout = Layout::from_size_align(self.len, HOST_ALIGNMENT as usize).expect("a layout");
         // SAFETY: allocated in `new` with this layout and freed once.
-        unsafe { std::alloc::dealloc(self.pointer.as_ptr(), layout) };
+        unsafe { dealloc(self.pointer.as_ptr(), layout) };
     }
 }
 
@@ -260,23 +264,21 @@ impl DiskWindow {
     }
 
     /// The first `len` bytes of slot `slot`, as the memory a read fills.
-    fn slot_memory(&self, slot: usize, len: usize) -> SlotMemory {
+    fn slot_memory(&self, slot: usize, len: usize) -> Option<SlotMemory> {
         assert!(slot < self.geometry.slots && len as u64 <= self.geometry.slot_bytes);
         let offset = slot * self.geometry.slot_bytes as usize;
         match &self.backing {
             Backing::Pinned(buffer) => {
                 // SAFETY: the slots are disjoint ranges of the buffer, and the reader reads one use of a slot at a
                 // time, so no two ranges are in use over the same bytes.
-                SlotMemory::Pinned(
-                    unsafe { PinnedRange::new(buffer, offset, len) }.expect("the slot lies in the buffer"),
-                )
+                unsafe { PinnedRange::new(buffer, offset, len) }.map(SlotMemory::Pinned)
             }
             #[cfg(test)]
-            Backing::Heap(region) => SlotMemory::Heap {
+            Backing::Heap(region) => Some(SlotMemory::Heap {
                 region: Arc::clone(region),
                 offset,
                 len,
-            },
+            }),
         }
     }
 }
@@ -353,6 +355,10 @@ impl ArtifactFile {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: opening a file is one short call at startup, on the calling thread before any frame runs; the reads go through AsyncIo"
+)]
 /// The artifact opened for reads through the page cache. On Windows every handle `AsyncIo` reads is overlapped.
 fn open_buffered(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
@@ -391,6 +397,10 @@ const O_DIRECT: Option<i32> = None;
 /// The artifact opened to bypass the page cache: `O_DIRECT` on Linux, `FILE_FLAG_NO_BUFFERING` (overlapped) on Windows.
 /// Refused elsewhere. The caller falls back to the buffered handle when this fails.
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: opening a file is one short call at startup, on the calling thread before any frame runs; the reads go through AsyncIo"
+)]
 fn open_direct(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -400,6 +410,10 @@ fn open_direct(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(windows)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: opening a file is one short call at startup, on the calling thread before any frame runs; the reads go through AsyncIo"
+)]
 fn open_direct(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -452,7 +466,10 @@ impl ReadPort for FilePort {
             (Some(direct), true) => direct,
             _ => &self.file.buffered,
         };
-        let memory = self.window.slot_memory(spec.slot, spec.len);
+        let memory = self
+            .window
+            .slot_memory(spec.slot, spec.len)
+            .ok_or_else(|| io::Error::other("the read does not lie in the window"))?;
         let file = Arc::clone(&self.file);
         let slot = spec.slot;
         let then = Box::new(move |ended: IoDoneOwned<SlotMemory>| {
@@ -750,9 +767,10 @@ impl DiskOwner {
         let state = &mut self.slots[slot];
         match state.claims.front() {
             Some((claimed, _)) if *claimed == ticket => {
-                let (_, gate) = state.claims.pop_front().expect("a claim");
                 state.state = State::Claimed;
-                self.told.push(Finished::Release(gate));
+                if let Some((_, gate)) = state.claims.pop_front() {
+                    self.told.push(Finished::Release(gate));
+                }
             }
             // The copy waiting is another quantum's: this read's quantum was abandoned, and nothing claims it.
             Some(_) => state.state = State::Idle,
@@ -760,24 +778,22 @@ impl DiskOwner {
         }
     }
 
-    /// The copy of `ticket`'s next use of `slot` wants its bytes: `Ready` if they are in, else `hold` is called for the
-    /// gate that is kept until they arrive.
-    fn claim(&mut self, slot: usize, ticket: u64, hold: impl FnOnce() -> Gate) -> Claimed {
-        if self.closed || slot >= self.slots.len() {
-            let error = if self.closed {
-                closed_error()
-            } else {
-                StageError::Fatal(format!("a copy claimed window slot {slot} of {}", self.slots.len()))
-            };
-            self.told.push(Finished::FailGate(hold(), error));
-            return Claimed::Held;
+    /// Whether the bytes `ticket`'s copy of `slot` wants are in (`Ok(true)`: the copy owns them now) or not yet
+    /// (`Ok(false)`: the copy must wait), or why it can never have them.
+    fn judge(&mut self, slot: usize, ticket: u64) -> Result<bool, StageError> {
+        if self.closed {
+            return Err(closed_error());
         }
-        let state = &mut self.slots[slot];
+        let Some(state) = self.slots.get_mut(slot) else {
+            return Err(StageError::Fatal(format!(
+                "a copy claimed an unknown window slot {slot}"
+            )));
+        };
         if state.claims.is_empty() {
             match state.state {
                 State::Filled { ticket: filled } if filled == ticket => {
                     state.state = State::Claimed;
-                    return Claimed::Ready;
+                    return Ok(true);
                 }
                 State::Filled { .. } => {
                     // A read nobody claimed (its quantum was abandoned): no copy reads the bytes, the slot is read again.
@@ -786,9 +802,37 @@ impl DiskOwner {
                 _ => {}
             }
         }
-        self.slots[slot].claims.push_back((ticket, hold()));
+        Ok(false)
+    }
+
+    /// The copy of `ticket`'s next use of `slot` wants its bytes: `Ready` if they are in, else `hold` is called for the
+    /// gate that is kept until they arrive.
+    fn claim(&mut self, slot: usize, ticket: u64, hold: impl FnOnce() -> Gate) -> Claimed {
+        match self.judge(slot, ticket) {
+            Ok(true) => Claimed::Ready,
+            Ok(false) => {
+                self.wait(slot, ticket, hold());
+                Claimed::Held
+            }
+            Err(error) => {
+                self.told.push(Finished::FailGate(hold(), error));
+                Claimed::Held
+            }
+        }
+    }
+
+    /// As [`claim`](Self::claim) for a copy whose gate is taken already: it is released when the bytes are in.
+    fn claim_held(&mut self, slot: usize, ticket: u64, gate: Gate) {
+        match self.judge(slot, ticket) {
+            Ok(true) => self.told.push(Finished::Release(gate)),
+            Ok(false) => self.wait(slot, ticket, gate),
+            Err(error) => self.told.push(Finished::FailGate(gate, error)),
+        }
+    }
+
+    fn wait(&mut self, slot: usize, ticket: u64, gate: Gate) {
+        self.slots[slot].claims.push_back((ticket, gate));
         self.dispatch(slot);
-        Claimed::Held
     }
 
     fn close(&mut self, closed: Arc<Handoff<()>>) {
@@ -984,40 +1028,38 @@ impl DiskReader {
     /// when the owner is busy on another thread the gate is handed to it and the call returns `Held` at once.
     pub fn claim(&self, slot: usize, ticket: u64, hold: impl FnOnce() -> Gate) -> Claimed {
         let mut hold = Some(hold);
-        let outcome = self.mailbox.try_with(|owner| {
-            let hold = hold.take().expect("one claim");
-            let claimed = owner.claim(slot, ticket, hold);
-            (claimed, mem::take(&mut owner.told))
+        let outcome = self.mailbox.try_with(|owner| match hold.take() {
+            Some(hold) => {
+                let claimed = owner.claim(slot, ticket, hold);
+                (claimed, mem::take(&mut owner.told))
+            }
+            None => (Claimed::Held, Vec::new()),
         });
         match outcome {
             Ok(Some((claimed, told))) => {
                 told.into_iter().for_each(Finished::spend);
                 claimed
             }
+            // Closed: the owner is gone, and the gate fails.
             Ok(None) => {
-                // Closed: the owner is gone.
-                let hold = hold.take().expect("not called");
-                hold().fail(closed_error());
+                if let Some(hold) = hold.take() {
+                    hold().fail(closed_error());
+                }
                 Claimed::Held
             }
+            // The owner is busy on another thread: it takes the gate and decides.
             Err(work) => {
-                // The owner is busy on another thread: it takes the gate and decides.
                 drop(work);
-                let gate = hold.take().expect("not called")();
-                self.mailbox.defer(move |owner| match owner {
-                    Some(owner) => {
-                        let mut gate = Some(gate);
-                        let claimed = owner.claim(slot, ticket, || gate.take().expect("one gate"));
-                        let mut told = mem::take(&mut owner.told);
-                        if let Some(unused) = gate {
-                            // Its read was in: the stage is published now.
-                            debug_assert_eq!(claimed, Claimed::Ready);
-                            told.push(Finished::Release(unused));
+                if let Some(hold) = hold.take() {
+                    let gate = hold();
+                    self.mailbox.defer(move |owner| match owner {
+                        Some(owner) => {
+                            owner.claim_held(slot, ticket, gate);
+                            mem::take(&mut owner.told)
                         }
-                        told
-                    }
-                    None => vec![Finished::FailGate(gate, closed_error())],
-                });
+                        None => vec![Finished::FailGate(gate, closed_error())],
+                    });
+                }
                 Claimed::Held
             }
         }
@@ -1028,4 +1070,9 @@ impl DiskReader {
 const INBOX_CHUNK: usize = 64;
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "the fake port's reads are shared between the test and the closures the reader is given, and the scratch file of the real ring is made and found outside the lattice"
+)]
 mod tests;
