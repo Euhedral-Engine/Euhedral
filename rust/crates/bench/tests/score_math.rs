@@ -9,8 +9,8 @@
 use std::time::{Duration, UNIX_EPOCH};
 
 use euhedral_inference_bench::config::ConfigError;
-use euhedral_inference_bench::kld::{self, Reference, Row};
 use euhedral_inference_bench::score::{FIELDS, percentile, score_row, standard_error, summary_lines, values_bytes};
+use euhedral_inference_quantization::kld::{self, Reference, Row};
 
 /// BF16 little-endian bytes of values that BF16 holds exactly.
 fn bf16(values: &[f32]) -> Vec<u8> {

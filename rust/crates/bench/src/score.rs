@@ -4,20 +4,20 @@
 //! Each chunk of N reference tokens is forced on a fresh sequence: a prefill of N / 2 + 1 tokens, then the forced
 //! tokens one row at a time, so that step k's logits row predicts the token the reference's record k does. The rows
 //! the engine decodes one at a time are the rows its verification of up to 8 tokens produces (row-exact). Every row is scored on the CPU, in a frame of the `host` lake, against the reference record a read
-//! has fetched ([`crate::rows`]): five values per step, in the order the `.values` file has them.
+//! has fetched (the quantization library's `rows`): five values per step, in the order the `.values` file has them.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use euhedral_inference_engine::EngineRuntime;
 use euhedral_inference_engine::generation::FinishReason;
+use euhedral_inference_quantization::kld::{FLOOR, Reference, Row};
+use euhedral_inference_quantization::rows::{self, ReferenceRows, RowInput, RowTask, RunValues};
 use euhedral_io::OwnedFile;
 
 use crate::await_value;
 use crate::config::ConfigError;
-use crate::kld::{FLOOR, Reference, Row};
 use crate::result::iso_instant;
-use crate::rows::{self, ReferenceRows, RowInput, RowTask, RunValues};
 
 /// Values per step: the candidate's NLL of the forced token, the reference's, KL(reference || candidate), top-1
 /// agreement, and the difference in probability of the forced token.

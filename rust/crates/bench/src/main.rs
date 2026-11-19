@@ -31,12 +31,12 @@ use euhedral_inference_bench::await_value;
 use euhedral_inference_bench::config::{ConfigError, Options};
 use euhedral_inference_bench::drift::{self, Candidate, RowStore};
 use euhedral_inference_bench::dump::{split_document, teacher_forced_report, write_report};
-use euhedral_inference_bench::kld::{KldError, Reference};
 use euhedral_inference_bench::result::{Fork, ResultWriter, SUCCESS, iso_instant, summary};
 use euhedral_inference_bench::run::{self, Context, prepare, provenance, run_id};
 use euhedral_inference_bench::score::{score, summary_lines, values_bytes};
-use euhedral_inference_bench::tools::{append_text, tool_settings};
+use euhedral_inference_bench::tools::{append_text, open_references, tool_settings};
 use euhedral_inference_engine::{EngineRuntime, RuntimeOwner};
+use euhedral_inference_quantization::kld::KldError;
 use euhedral_inference_settings::{ByteSize, ModelSettings, Settings, load_file, process_env};
 
 const USAGE: &str = "usage:
@@ -372,11 +372,7 @@ fn score_command(args: &[String]) -> Result<u8, Failure> {
             "score needs --cuda-library on this platform".to_string(),
         ));
     };
-    let mut opened = Vec::new();
-    for path in &references {
-        let (reference, file) = Reference::open(path)?;
-        opened.push((reference, Arc::new(file)));
-    }
+    let opened = open_references(&references)?;
     let context = opened.iter().map(|(reference, _)| reference.context).max().unwrap_or(0);
     let settings = tool_settings(&artifact, config.as_deref(), context)?;
     let (runtime, owner) = start_engine(&settings, &library)?;

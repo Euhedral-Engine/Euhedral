@@ -1,12 +1,20 @@
 //! What the quality commands share: the engine settings of a tool run, and the few blocking file calls of the
 //! binary's main thread.
 
+use std::fmt::Display;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use euhedral_core::control_plane::ControlPlaneLattice;
+use euhedral_core::generics::LatticeSource;
+use euhedral_inference_engine::lattice_config;
+use euhedral_inference_quantization::kld::{KldError, Reference};
 use euhedral_inference_settings::{ByteSize, ModelSettings, Settings, load_file, process_env};
+use euhedral_io::{AsyncIo, OwnedFile};
 
+use crate::await_value;
 use crate::config::ConfigError;
 
 fn invalid<T>(message: impl Into<String>) -> Result<T, ConfigError> {
@@ -48,4 +56,25 @@ pub fn append_text(path: &Path, text: &str) -> Result<(), ConfigError> {
         .or_else(|error| invalid(format!("{}: {error}", path.display())))?;
     file.write_all(text.as_bytes())
         .or_else(|error| invalid(format!("{}: {error}", path.display())))
+}
+
+/// Opens the references at `paths` through `AsyncIo`, on a lattice of its own that lives only for the opens: a run's
+/// context, which its engine's settings need, is known only once the references' headers are read. Waits for the
+/// opens: called by the binary's main thread only.
+pub fn open_references(paths: &[PathBuf]) -> Result<Vec<(Reference, Arc<OwnedFile>)>, KldError> {
+    let io_error = |what: &str, error: &dyn Display| KldError::Io(format!("{what}: {error}"));
+    let lattice = ControlPlaneLattice::new(lattice_config(&Settings::with_model(ModelSettings::default())))
+        .map_err(|error| io_error("the lattice for the reference files would not start", &error))?;
+    let io = AsyncIo::open().map_err(|error| io_error("the asynchronous file I/O would not open", &error))?;
+    lattice
+        .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
+        .map_err(|error| io_error("the lattice would not take the asynchronous file I/O", &error))?;
+    let pending: Vec<_> = paths.iter().map(|path| Reference::open(&io, path)).collect();
+    let opened = pending
+        .iter()
+        .map(|handoff| await_value(handoff).map(|(reference, file)| (reference, Arc::new(file))))
+        .collect();
+    io.complete();
+    lattice.close();
+    opened
 }

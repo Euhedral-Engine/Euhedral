@@ -13,11 +13,15 @@
 //! float64. Record `k` of a chunk is the reference's prediction of the token at position `context / 2 + 1 + k`.
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
-use euhedral_io::OwnedFile;
+use euhedral_inference_engine::Handoff;
+use euhedral_io::{AsyncIo, IoDoneOwned, OpenSpec, OwnedFile};
 use thiserror::Error;
+
+use crate::rows::{Kind, frame, raw_file};
 
 /// The first bytes of the file.
 pub const MAGIC: &[u8; 8] = b"_logits_";
@@ -147,78 +151,175 @@ impl Reference {
         &self.tokens[chunk][self.prefix_len()..self.prefix_len() + self.records()]
     }
 
-    /// Opens the file at `path`: the reference, and the file for `AsyncIo` to read the records from. The bytes before
-    /// the records are read here; the records are not.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "no-wait, blocking I/O: the header and the tokens are read once, on the main thread, before the run"
-    )]
-    pub fn open(path: &Path) -> Result<(Reference, OwnedFile), KldError> {
-        let io = |what: &str, error: io::Error| KldError::Io(format!("{}: {what}: {error}", path.display()));
-        let mut file = File::open(path).map_err(|error| io("cannot open", error))?;
-        let length = file
-            .metadata()
-            .map_err(|error| io("cannot read the size", error))?
-            .len();
-        let mut header = [0u8; HEADER_BYTES];
-        file.read_exact(&mut header).map_err(|error| match error.kind() {
-            io::ErrorKind::UnexpectedEof => KldError::Truncated {
-                what: "the header",
-                have: length as usize,
-                need: HEADER_BYTES,
-            },
-            _ => io("cannot read the header", error),
-        })?;
-        let (context, _, chunks) = Self::parse_header(&header)?;
-        let start = Self::records_start(context, chunks);
-        let mut head = header.to_vec();
-        head.resize(start, 0);
-        file.read_exact(&mut head[HEADER_BYTES..])
-            .map_err(|error| match error.kind() {
-                io::ErrorKind::UnexpectedEof => KldError::Truncated {
-                    what: "the chunks' tokens",
-                    have: length as usize,
-                    need: start,
-                },
-                _ => io("cannot read the chunks' tokens", error),
-            })?;
-        let reference = Self::parse(&head)?;
-        let need = start as u64 + reference.row_bytes() as u64 * (chunks * reference.records()) as u64;
-        if length < need {
-            return Err(KldError::Truncated {
-                what: "the records",
-                have: length as usize,
-                need: need as usize,
-            });
+    /// Starts opening the file at `path`. The hand-off is set with the reference and the file `AsyncIo` reads the
+    /// records from, or with why not. The header and the tokens are read, and the length of the file checked against
+    /// the records it must hold; the records are not read. Nothing waits here: the caller waits on the hand-off, from
+    /// outside the lattice.
+    pub fn open(io: &Arc<AsyncIo>, path: &Path) -> OpenedHandoff {
+        let handoff = Handoff::new();
+        let delivery = Delivery::new(&handoff, path);
+        let next = Arc::clone(io);
+        let then = Box::new(move |opened: io::Result<OwnedFile>| {
+            frame(Kind::Reading, 0, move || match opened {
+                Ok(file) => read_header(&next, file, delivery),
+                Err(error) => delivery.fail("cannot open", error),
+            })
+        });
+        if let Err(error) = io.open_path(path, OpenSpec::default(), then) {
+            // The continuation was dropped on the way out, and its delivery reported that: replace it.
+            let _ = handoff.take();
+            handoff.send(Err(KldError::Io(format!(
+                "{}: cannot start opening: {error}",
+                path.display()
+            ))));
         }
-        let records = records_file(path, file).map_err(|error| io("cannot open for asynchronous reads", error))?;
-        Ok((reference, records))
+        handoff
     }
 }
 
-/// The file `AsyncIo` reads the records from: the same file on Unix.
-#[cfg(unix)]
-fn records_file(_path: &Path, file: File) -> io::Result<OwnedFile> {
-    Ok(OwnedFile::from(file))
+/// What opening a reference gives.
+pub type Opened = Result<(Reference, OwnedFile), KldError>;
+
+/// The hand-off of an [`Opened`].
+pub type OpenedHandoff = Arc<Handoff<Opened>>;
+
+/// The way back to the caller of [`Reference::open`]. A delivery dropped without a result reports that, so the caller
+/// never waits for a read that was lost.
+struct Delivery {
+    handoff: OpenedHandoff,
+    sent: bool,
+    path: String,
 }
 
-/// The file `AsyncIo` reads the records from: on Windows a second handle opened for overlapped I/O, which `AsyncIo`
-/// requires and the synchronous header reads cannot use.
-#[cfg(windows)]
-#[allow(
-    clippy::disallowed_methods,
-    reason = "no-wait, blocking I/O: opened once, on the main thread, before the run"
-)]
-fn records_file(path: &Path, _file: File) -> io::Result<OwnedFile> {
-    use std::fs::OpenOptions;
-    use std::os::windows::fs::OpenOptionsExt;
+impl Delivery {
+    fn new(handoff: &OpenedHandoff, path: &Path) -> Delivery {
+        Delivery {
+            handoff: Arc::clone(handoff),
+            sent: false,
+            path: path.display().to_string(),
+        }
+    }
 
-    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OVERLAPPED)
-        .open(path)?;
-    Ok(OwnedFile::from(file))
+    fn handoff(&self) -> OpenedHandoff {
+        Arc::clone(&self.handoff)
+    }
+
+    fn send(mut self, result: Opened) {
+        self.sent = true;
+        self.handoff.send(result);
+    }
+
+    fn fail(self, what: &str, error: io::Error) {
+        let message = format!("{}: {what}: {error}", self.path);
+        self.send(Err(KldError::Io(message)));
+    }
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        if !self.sent {
+            self.handoff
+                .send(Err(KldError::Io(format!("{}: the read was lost", self.path))));
+        }
+    }
+}
+
+/// Reads `wanted` bytes at `offset` of `file`; `next` gets them in a frame of its own. A file that ends first is
+/// [`KldError::Truncated`] for `what`, with `before` bytes already known to be there.
+fn read_part(
+    io: &Arc<AsyncIo>,
+    file: OwnedFile,
+    offset: u64,
+    wanted: usize,
+    what: &'static str,
+    delivery: Delivery,
+    next: impl FnOnce(OwnedFile, Vec<u8>, Delivery) + Send + 'static,
+) {
+    let before = offset as usize;
+    let raw = raw_file(&file);
+    let lost = delivery.handoff();
+    let path = delivery.path.clone();
+    let then = Box::new(move |done: IoDoneOwned<Vec<u8>>| {
+        frame(Kind::Reading, offset as usize, move || match (done.result, done.buf) {
+            (Ok(read), Some(bytes)) if read == wanted => next(file, bytes, delivery),
+            (Ok(read), _) => delivery.send(Err(KldError::Truncated {
+                what,
+                have: before + read,
+                need: before + wanted,
+            })),
+            (Err(error), _) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                delivery.send(Err(KldError::Truncated {
+                    what,
+                    have: before,
+                    need: before + wanted,
+                }))
+            }
+            (Err(error), _) => delivery.fail(&format!("cannot read {what}"), error),
+        })
+    });
+    // The file is held by the continuation, which lives until the read ends.
+    if let Err(error) = io.read_into(raw, offset, vec![0u8; wanted], then) {
+        // The continuation was dropped on the way out, and its delivery reported that: replace it.
+        let _ = lost.take();
+        lost.send(Err(KldError::Io(format!(
+            "{path}: cannot start reading {what}: {error}"
+        ))));
+    }
+}
+
+/// The first step: the header says how many tokens follow.
+fn read_header(io: &Arc<AsyncIo>, file: OwnedFile, delivery: Delivery) {
+    let next = Arc::clone(io);
+    read_part(
+        io,
+        file,
+        0,
+        HEADER_BYTES,
+        "the header",
+        delivery,
+        move |file, header, delivery| match Reference::parse_header(&header) {
+            Ok((context, _, chunks)) => {
+                read_tokens(&next, file, header, Reference::records_start(context, chunks), delivery)
+            }
+            Err(error) => delivery.send(Err(error)),
+        },
+    );
+}
+
+/// The second step: the tokens, and then the length check.
+fn read_tokens(io: &Arc<AsyncIo>, file: OwnedFile, mut head: Vec<u8>, start: usize, delivery: Delivery) {
+    read_part(
+        io,
+        file,
+        HEADER_BYTES as u64,
+        start - HEADER_BYTES,
+        "the chunks' tokens",
+        delivery,
+        move |file, tokens, delivery| {
+            head.extend_from_slice(&tokens);
+            let reference = match Reference::parse(&head) {
+                Ok(reference) => reference,
+                Err(error) => return delivery.send(Err(error)),
+            };
+            let need = start as u64 + reference.row_bytes() as u64 * (reference.chunks() * reference.records()) as u64;
+            let (length, file) = file_len(file);
+            match length {
+                Ok(length) if length >= need => delivery.send(Ok((reference, file))),
+                Ok(length) => delivery.send(Err(KldError::Truncated {
+                    what: "the records",
+                    have: length as usize,
+                    need: need as usize,
+                })),
+                Err(error) => delivery.fail("cannot read the size", error),
+            }
+        },
+    );
+}
+
+/// The length of `file`, and the file back.
+fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
+    let file = File::from(file);
+    (file.metadata().map(|metadata| metadata.len()), OwnedFile::from(file))
 }
 
 /// One record: the reference's log-probabilities of a step.

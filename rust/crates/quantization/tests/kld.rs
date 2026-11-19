@@ -11,8 +11,43 @@
 )]
 
 use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
-use euhedral_inference_bench::kld::{self, KldError, Reference, Row};
+use euhedral_core::control_plane::ControlPlaneLattice;
+use euhedral_core::generics::LatticeSource;
+use euhedral_inference_engine::lattice_config;
+use euhedral_inference_settings::{ModelSettings, Settings};
+use euhedral_io::{AsyncIo, OwnedFile};
+
+use euhedral_inference_quantization::kld::{self, KldError, Reference, Row};
+
+struct Lattice {
+    lattice: Arc<ControlPlaneLattice>,
+    io: Arc<AsyncIo>,
+}
+
+fn shut(lattice: Lattice) {
+    lattice.io.complete();
+    lattice.lattice.close();
+}
+
+fn lattice() -> Lattice {
+    let settings = Settings::with_model(ModelSettings::default());
+    let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
+    let io = AsyncIo::open().expect("the asynchronous I/O opens");
+    lattice
+        .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
+        .expect("the lattice takes the I/O");
+    Lattice { lattice, io }
+}
+
+fn open(lattice: &Lattice, path: &Path) -> Result<(Reference, OwnedFile), KldError> {
+    Reference::open(&lattice.io, path)
+        .wait(Duration::from_secs(60))
+        .expect("the open finished")
+}
 
 const CONTEXT: usize = 8;
 const VOCABULARY: usize = 5;
@@ -36,12 +71,13 @@ fn file() -> Vec<u8> {
 
 #[test]
 fn kld_reader_parses_header_and_rows() {
+    let lattice = lattice();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("reference.kld");
     let bytes = file();
     fs::write(&path, &bytes).unwrap();
 
-    let (reference, _file) = Reference::open(&path).unwrap();
+    let (reference, _file) = open(&lattice, &path).unwrap();
     assert_eq!(
         (reference.context, reference.vocabulary, reference.chunks()),
         (CONTEXT, VOCABULARY, 3)
@@ -63,10 +99,12 @@ fn kld_reader_parses_header_and_rows() {
     // chunk 2: minimum -14; step 1: codes 100 + token
     assert_eq!(row.log_p(0), 0.25 * 100.0 - 14.0);
     assert_eq!(row.log_p(4), 0.25 * 104.0 - 14.0);
+    shut(lattice);
 }
 
 #[test]
 fn a_file_that_is_not_a_reference_or_is_cut_short_is_refused() {
+    let lattice = lattice();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("reference.kld");
     let bytes = file();
@@ -74,11 +112,11 @@ fn a_file_that_is_not_a_reference_or_is_cut_short_is_refused() {
     let mut wrong = bytes.clone();
     wrong[0] = b'x';
     fs::write(&path, &wrong).unwrap();
-    assert_eq!(Reference::open(&path).unwrap_err(), KldError::NotReference);
+    assert_eq!(open(&lattice, &path).unwrap_err(), KldError::NotReference);
 
     fs::write(&path, &bytes[..30]).unwrap();
     assert!(matches!(
-        Reference::open(&path).unwrap_err(),
+        open(&lattice, &path).unwrap_err(),
         KldError::Truncated {
             what: "the chunks' tokens",
             ..
@@ -87,7 +125,7 @@ fn a_file_that_is_not_a_reference_or_is_cut_short_is_refused() {
 
     fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
     assert!(matches!(
-        Reference::open(&path).unwrap_err(),
+        open(&lattice, &path).unwrap_err(),
         KldError::Truncated {
             what: "the records",
             ..
@@ -97,4 +135,14 @@ fn a_file_that_is_not_a_reference_or_is_cut_short_is_refused() {
     let mut negative = bytes;
     negative[8..12].copy_from_slice(&(-1i32).to_le_bytes());
     assert!(matches!(Reference::parse(&negative).unwrap_err(), KldError::Invalid(_)));
+    shut(lattice);
+}
+
+#[test]
+fn a_missing_file_is_an_error_and_the_hand_off_is_always_set() {
+    let lattice = lattice();
+    let directory = tempfile::tempdir().unwrap();
+    let error = open(&lattice, &directory.path().join("absent.kld")).unwrap_err();
+    assert!(matches!(error, KldError::Io(_)), "{error}");
+    shut(lattice);
 }

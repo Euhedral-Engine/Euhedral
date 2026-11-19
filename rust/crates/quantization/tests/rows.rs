@@ -19,15 +19,15 @@ use std::time::Duration;
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::LatticeSource;
 use euhedral_graph::Lake;
-use euhedral_inference_bench::await_value;
-use euhedral_inference_bench::kld::{self, Reference};
-use euhedral_inference_bench::rows::{ReferenceRows, RowInput, RowSink, RowTask};
-use euhedral_inference_bench::score::{FIELDS, score_row};
+use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::generation::{FinishReason, GenerationOutcome, LogitsSink};
 use euhedral_inference_engine::lattice_config;
+use euhedral_inference_quantization::kld::{self, Reference};
+use euhedral_inference_quantization::rows::{ReferenceRows, RowInput, RowSink, RowTask};
 use euhedral_inference_settings::{ModelSettings, Settings};
 use euhedral_io::{AsyncIo, OwnedFile};
 
+const FIELDS: usize = 2;
 const CONTEXT: usize = 40;
 const VOCABULARY: usize = 33;
 
@@ -47,6 +47,20 @@ fn logits(step: usize) -> Vec<u8> {
     )
 }
 
+/// The record's log-probability of the forced token and the logits row's first value.
+fn expected_fields(logits: &[u8], row: &kld::Row<'_>, forced: usize) -> [f64; FIELDS] {
+    [
+        row.log_p(forced),
+        f64::from(f32::from_bits(
+            u32::from(u16::from_le_bytes([logits[0], logits[1]])) << 16,
+        )),
+    ]
+}
+
+fn await_value<T>(handoff: &Handoff<T>) -> T {
+    handoff.wait(Duration::from_secs(60)).expect("the hand-off was sent")
+}
+
 struct Scoring {
     rows: ReferenceRows,
 }
@@ -62,7 +76,7 @@ impl RowTask for Scoring {
 
     fn compute(&self, input: &RowInput, out: &mut [f64]) {
         let row = kld::Row::new(&input.reference, VOCABULARY);
-        out.copy_from_slice(&score_row(&input.logits, &row, VOCABULARY, input.forced as usize));
+        out.copy_from_slice(&expected_fields(&input.logits, &row, input.forced as usize));
     }
 }
 
@@ -81,7 +95,16 @@ fn every_step_is_read_and_scored_in_frames_and_the_values_come_back_in_step_orde
         )
     });
     fs::write(&path, &bytes).unwrap();
-    let (reference, file) = Reference::open(&path).unwrap();
+    let (reference, file) = {
+        let lattice =
+            ControlPlaneLattice::new(lattice_config(&Settings::with_model(ModelSettings::default()))).unwrap();
+        let io = AsyncIo::open().unwrap();
+        lattice.add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>).unwrap();
+        let opened = await_value(&Reference::open(&io, &path)).unwrap();
+        io.complete();
+        lattice.close();
+        opened
+    };
     let file = Arc::new(file);
     let steps = reference.records();
     assert_eq!(steps, 19);
@@ -125,7 +148,7 @@ fn every_step_is_read_and_scored_in_frames_and_the_values_come_back_in_step_orde
     for step in 0..steps {
         let at = reference.row_offset(1, step) as usize;
         let row = kld::Row::new(&bytes[at..at + reference.row_bytes()], VOCABULARY);
-        let expected = score_row(&logits(step), &row, VOCABULARY, reference.forced(1)[step] as usize);
+        let expected = expected_fields(&logits(step), &row, reference.forced(1)[step] as usize);
         assert_eq!(&scored[step * FIELDS..(step + 1) * FIELDS], &expected, "step {step}");
     }
 
