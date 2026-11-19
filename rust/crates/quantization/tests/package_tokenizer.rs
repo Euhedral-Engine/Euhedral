@@ -400,3 +400,33 @@ fn the_special_tokens_keep_the_ids_the_generation_config_sets_in_a_fixed_order()
     assert_eq!(files(r#"{"top_k": 20}"#), "{}");
     assert_eq!(files("[]"), "{}");
 }
+
+#[test]
+fn an_artifact_that_is_the_temporary_name_of_the_output_is_refused_and_survives() {
+    let run = Run::start();
+    let fixture = Fixture::new(&Checkpoint::standard());
+    let part = fixture.path("m.edrl.part");
+    fs::rename(fixture.artifact(), &part).unwrap();
+    let request = PackageRequest::to_output(part.clone(), fixture.path("checkpoint"), fixture.path("m.edrl"));
+    assert!(run.package(request).is_err());
+    assert_eq!(fs::read(&part).unwrap(), fixture.content, "the source is untouched");
+    assert!(!fixture.path("m.edrl").exists());
+}
+
+#[test]
+fn an_output_that_cannot_take_its_name_leaves_no_temporary_file() {
+    let run = Run::start();
+    let fixture = Fixture::new(&Checkpoint::standard());
+    // A directory with something in it: the rename onto it fails after the whole output was written.
+    let out = fixture.path("out.edrl");
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("keep"), b"x").unwrap();
+    let error = run.package(fixture.to_output()).unwrap_err();
+    assert!(
+        matches!(error, PackageError::Io { .. }),
+        "the real error comes back: {error}"
+    );
+    assert!(!fixture.path("out.edrl.part").exists());
+    assert_eq!(fs::read(fixture.artifact()).unwrap(), fixture.content);
+    assert!(out.join("keep").exists());
+}

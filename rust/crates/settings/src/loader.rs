@@ -144,9 +144,13 @@ pub fn known_keys() -> Vec<&'static str> {
 }
 
 /// Loads the file (if any), applies the environment, validates, and builds the settings.
+///
+/// `with_model` is whether `model.artifact` and `model.name` are required: a tool that serves no model leaves them
+/// unset.
 pub(crate) fn load_optional(
     file: Option<&Path>,
     env: &dyn Fn(&str) -> Option<String>,
+    with_model: bool,
 ) -> Result<Settings, SettingsErrors> {
     let leaves = leaves();
     let mut problems = Vec::new();
@@ -161,7 +165,7 @@ pub(crate) fn load_optional(
     let mut settings = Settings::with_model(ModelSettings::default());
     for leaf in &leaves {
         let Some(text) = raw.get(leaf.key) else {
-            if leaf.kind == Kind::Required && !blank.contains(leaf.key) {
+            if leaf.kind == Kind::Required && with_model && !blank.contains(leaf.key) {
                 problems.push(SettingsError {
                     key: Some(leaf.key.to_owned()),
                     variable: Some(variable_name(leaf.key)),
@@ -579,6 +583,9 @@ fn leaves() -> Vec<Leaf> {
         }),
         optional("host.native-cache", |s, t| {
             assign!(s.host.native_cache, auto_or(t, |t| Ok(PathBuf::from(t))))
+        }),
+        fixed("host.copy-chunk-bytes", |s, t| {
+            assign!(s.host.copy_chunk_bytes, size(t, 1))
         }),
         optional("kernels.rms-norm-decode-slices", |s, t| {
             assign!(

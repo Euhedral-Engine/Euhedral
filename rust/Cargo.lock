@@ -536,7 +536,15 @@ dependencies = [
 name = "euhedral-inference-quantize"
 version = "0.1.0"
 dependencies = [
+ "euhedral-core",
+ "euhedral-graph",
+ "euhedral-inference-edrl",
+ "euhedral-inference-engine",
  "euhedral-inference-quantization",
+ "euhedral-inference-settings",
+ "euhedral-io",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -116,15 +116,30 @@ pub fn package_tokenizer(
             source: io::Error::new(io::ErrorKind::InvalidInput, "the copy chunk must be at least 1 byte"),
         });
     }
+    if let Some(out) = &request.out
+        && part_path(out) == request.artifact
+    {
+        return Err(PackageError::Io {
+            what: "invalid request",
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the artifact is the temporary name of the output: the run would overwrite its own source",
+            ),
+        });
+    }
     let unit = host.admit().map_err(|error| PackageError::Lake(error.to_string()))?;
     let job = Job {
         io,
-        host,
+        host: Arc::clone(&host),
         request,
         completion: Completion { done: Some(done) },
+        part: PartGuard {
+            host: Arc::clone(&host),
+            part: None,
+        },
         _unit: unit,
     };
-    job.read_checkpoint();
+    blocking_file::offer(&host, 3, move || job.read_checkpoint());
     Ok(())
 }
 
@@ -154,7 +169,56 @@ struct Job {
     host: Arc<Lake>,
     request: PackageRequest,
     completion: Completion,
+    part: PartGuard,
     _unit: UnitGuard,
+}
+
+/// The temporary output, once it exists. A run that is dropped while it is armed (a refused step, a lake that closed)
+/// removes the file, so no run leaves one behind; a run that ends on its own disarms it first.
+struct PartGuard {
+    host: Arc<Lake>,
+    part: Option<PathBuf>,
+}
+
+impl PartGuard {
+    fn arm(&mut self, part: PathBuf) {
+        self.part = Some(part);
+    }
+
+    fn disarm(&mut self) -> Option<PathBuf> {
+        self.part.take()
+    }
+}
+
+impl Drop for PartGuard {
+    fn drop(&mut self) {
+        if let Some(part) = self.part.take() {
+            blocking_file::run(&self.host, Operation::Remove, part, |_| {});
+        }
+    }
+}
+
+/// A failure on its way out: the error reaches the callback when the removal ends, or, if the removal is refused and its
+/// frame dropped, when this is dropped, so the real error is never replaced by `Lost`.
+struct Failing {
+    completion: Option<Completion>,
+    error: Option<PackageError>,
+}
+
+impl Failing {
+    fn report(mut self) {
+        if let (Some(completion), Some(error)) = (self.completion.take(), self.error.take()) {
+            completion.finish(Err(error));
+        }
+    }
+}
+
+impl Drop for Failing {
+    fn drop(&mut self) {
+        if let (Some(completion), Some(error)) = (self.completion.take(), self.error.take()) {
+            completion.finish(Err(error));
+        }
+    }
 }
 
 /// What the checkpoint holds.
@@ -235,6 +299,10 @@ fn read_exact(io: &Arc<AsyncIo>, file: Arc<OwnedFile>, offset: u64, len: usize, 
         Box::new(move |done| {
             match done.result {
                 Ok(0) => then(Err(io::ErrorKind::UnexpectedEof.into())),
+                Ok(moved) if got.is_empty() && moved == want => {
+                    // The first read filled the request: the buffer is the result, no copy.
+                    then(Ok(done.buf.bytes));
+                }
                 Ok(moved) => {
                     got.extend_from_slice(&done.buf.bytes[..moved]);
                     read_exact(&next.0, next.1, offset, len, got, then);
@@ -528,7 +596,11 @@ impl Job {
                             what: "cannot create the output",
                             source: error,
                         }),
-                        Ok(target) => self.copy_content(source, target, part, out, content_end, section),
+                        Ok(target) => {
+                            let mut job = self;
+                            job.part.arm(part.clone());
+                            job.copy_content(source, target, part, out, content_end, section);
+                        }
                     }),
                 );
             }
@@ -660,11 +732,15 @@ impl Job {
                     &out,
                     Box::new(move |renamed| {
                         match renamed {
-                            Ok(()) => self.completion.finish(Ok(Packaged {
-                                target,
-                                content_bytes,
-                                section_bytes,
-                            })),
+                            Ok(()) => {
+                                let mut job = self;
+                                job.part.disarm();
+                                job.completion.finish(Ok(Packaged {
+                                    target,
+                                    content_bytes,
+                                    section_bytes,
+                                }));
+                            }
                             Err(error) => self.fail_written(
                                 &cleanup,
                                 PackageError::Io {
@@ -685,8 +761,14 @@ impl Job {
         match written {
             Written::InPlace(_) => self.fail(error),
             Written::Part { part, .. } => {
-                let host = Arc::clone(&self.host);
-                blocking_file::run(&host, Operation::Remove, part.clone(), move |_| self.fail(error));
+                let mut job = self;
+                job.part.disarm();
+                let host = Arc::clone(&job.host);
+                let failing = Failing {
+                    completion: Some(job.completion),
+                    error: Some(error),
+                };
+                blocking_file::run(&host, Operation::Remove, part.clone(), move |_| failing.report());
             }
         }
     }
