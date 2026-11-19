@@ -8,10 +8,10 @@ Usage:
 
 Each fork runs one process of each engine; the order alternates per fork (Java first on odd forks, Rust first on even
 ones), so slow drift of the machine falls on both. Every process goes through the system launcher (`system-run`), which
-waits for a fair grant of the exclusive GPU and of the exclusive CPU, runs the job in its own scope capped at the memory
+waits for a fair whole-machine grant (exclusive on every resource), runs the job in its own scope capped at the memory
 limit, and `timeout` ends the job at the time limit inside that grant:
 
-  system-run --gpu exclusive --cpu exclusive --mem <memory-max> --est <est> --who <who> -- timeout <timeout> <command>
+  system-run --system --mem <memory-max> --est <est> --who <who> -- timeout <timeout> <command>
 
 This script is a timing run, the one case that takes the card exclusively, so each arm holds the GPU and all CPUs while it runs.
 (--launcher names the launcher; it is looked up on PATH by default. The grant belongs to the launcher.)
@@ -122,7 +122,7 @@ def arm_command(arm: str, config: Path, fork: int, launchers: dict[str, Path]) -
 
 def scoped(command: list[str], launcher: str, memory_max: str, timeout: str, est_seconds: int, who: str) -> list[str]:
     return [
-        launcher, "--gpu", "exclusive", "--cpu", "exclusive", "--mem", memory_max,
+        launcher, "--system", "--mem", memory_max,
         "--est", str(est_seconds), "--who", who, "--", "timeout", timeout, *command,
     ]
 
