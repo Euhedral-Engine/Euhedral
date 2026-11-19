@@ -10,12 +10,14 @@ use super::option::QuantOption;
 pub trait Sources {
     /// The option every object an allocation does not name keeps.
     fn base(&self) -> QuantOption;
+    /// The options the artifacts store a projection in, the base's among them.
+    fn options(&self) -> &[QuantOption];
     /// The names of the choosable projection objects.
     fn projections(&self) -> &[String];
     /// The features of `object`'s linear as `option` stores it.
     fn shape(&self, option: QuantOption, object: &str) -> Result<Shape, MixedError>;
     /// The bytes of `object` as `option` stores it, with the companions that travel with it.
-    fn bytes(&self, option: QuantOption, object: &str) -> Result<u64, MixedError>;
+    fn bytes(&self, option: QuantOption, object: &str) -> Result<i64, MixedError>;
 }
 
 /// `names` ordered by layer number, then by name: the order the fidelity model numbers its objects in. The names are
@@ -42,7 +44,7 @@ pub struct Space {
     base: QuantOption,
     objects: Vec<String>,
     options: Vec<QuantOption>,
-    bytes: Vec<Vec<u64>>,
+    bytes: Vec<Vec<i64>>,
     prefill: Vec<Vec<f64>>,
     decode: Vec<Vec<f64>>,
     index: HashMap<String, usize>,
@@ -60,7 +62,7 @@ impl Space {
     ) -> Result<Space, MixedError> {
         let objects = sorted_by_layer(sources.projections())?;
         let (n, k) = (objects.len(), options.len());
-        let mut bytes = vec![vec![0u64; k]; n];
+        let mut bytes = vec![vec![0i64; k]; n];
         let mut prefill = vec![vec![0.0; k]; n];
         let mut decode = vec![vec![0.0; k]; n];
         let mut index = HashMap::new();
@@ -105,7 +107,7 @@ impl Space {
     }
 
     /// The bytes of each object (rows) as each option (columns) stores it.
-    pub fn bytes(&self) -> &[Vec<u64>] {
+    pub fn bytes(&self) -> &[Vec<i64>] {
         &self.bytes
     }
 
@@ -180,7 +182,7 @@ impl Space {
     }
 
     /// The bytes of the objects under `choice`.
-    pub fn bytes_of(&self, choice: &[usize]) -> u64 {
+    pub fn bytes_of(&self, choice: &[usize]) -> i64 {
         choice
             .iter()
             .enumerate()
@@ -201,12 +203,12 @@ impl Space {
     }
 
     /// The bytes when every object takes its cheapest option.
-    pub fn minimum_bytes(&self) -> u64 {
+    pub fn minimum_bytes(&self) -> i64 {
         (0..self.objects.len()).map(|i| self.bytes[i][self.cheapest(i)]).sum()
     }
 
     /// The bytes when every object takes its dearest option.
-    pub fn maximum_bytes(&self) -> u64 {
+    pub fn maximum_bytes(&self) -> i64 {
         (0..self.objects.len()).map(|i| self.bytes[i][self.dearest(i)]).sum()
     }
 
@@ -256,6 +258,10 @@ pub(crate) mod tests {
             QuantOption::Trellis3_0
         }
 
+        fn options(&self) -> &[QuantOption] {
+            &[QuantOption::Nvfp4, QuantOption::Trellis3_0]
+        }
+
         fn projections(&self) -> &[String] {
             &self.projections
         }
@@ -264,12 +270,12 @@ pub(crate) mod tests {
             Ok(Shape { input: 64, output: 64 })
         }
 
-        fn bytes(&self, option: QuantOption, object: &str) -> Result<u64, MixedError> {
+        fn bytes(&self, option: QuantOption, object: &str) -> Result<i64, MixedError> {
             let object_bytes = if object.ends_with("down") { 10 } else { 20 };
             Ok(match option {
                 QuantOption::Nvfp4 => 100 + object_bytes,
                 QuantOption::Trellis3_0 => 70 + object_bytes,
-                other => 50 + other.key().len() as u64 + object_bytes,
+                other => 50 + other.key().len() as i64 + object_bytes,
             })
         }
     }

@@ -5,7 +5,7 @@ use euhedral_inference_edrl::TensorTable;
 use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::model::ModelConfig;
 use euhedral_inference_engine::residency::planner::{PlanInputs, plan_closest};
-use euhedral_inference_settings::Settings;
+use euhedral_inference_settings::{Auto, Settings};
 
 use super::allocation::Allocation;
 use super::error::MixedError;
@@ -14,13 +14,13 @@ use super::error::MixedError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Check {
     pub fits: bool,
-    pub device_bytes: u64,
+    pub device_bytes: i64,
 }
 
 /// A judge of allocations against a device.
-pub trait Feasibility {
+pub trait Feasibility: Send + Sync {
     /// The device bytes the checks are made against.
-    fn free_bytes(&self) -> u64;
+    fn free_bytes(&self) -> i64;
 
     /// Whether `allocation` fits.
     fn check(&self, allocation: &Allocation) -> Result<Check, MixedError>;
@@ -28,7 +28,7 @@ pub trait Feasibility {
 
 /// The tensor table of the artifact an allocation makes: every object from the source its option names, the rest from
 /// the base. It is the one piece the residency check needs that this module does not own.
-pub trait Composites {
+pub trait Composites: Send + Sync {
     fn table(&self, allocation: &Allocation) -> Result<TensorTable, MixedError>;
 }
 
@@ -36,14 +36,15 @@ pub trait Composites {
 /// sequences of up to `context` tokens, the composite drafting `draft_depth` tokens per verification (a mixed
 /// artifact stores no depth until its finalist measurement). It fits when the plan is made and nothing is held in
 /// host memory or left in the file. The plan keeps the whole context's cache on the device and is given an unlimited
-/// pinned host budget, so the verdict is about the weights; `settings` otherwise govern it, `memory.gpu-limit` among
-/// them.
+/// pinned host budget, so the verdict is about the weights. The cache is planned in the artifact's own format whatever
+/// `settings` say. `settings` otherwise govern the plan: `memory.gpu-limit` among them, so when it is set `check` judges
+/// against less than `free_bytes()` reports.
 #[derive(Debug)]
 pub struct PlannerFeasibility<C> {
     composites: C,
     config: ModelConfig,
     settings: Settings,
-    free_bytes: u64,
+    free_bytes: i64,
 }
 
 impl<C: Composites> PlannerFeasibility<C> {
@@ -51,7 +52,7 @@ impl<C: Composites> PlannerFeasibility<C> {
         composites: C,
         config: &ModelConfig,
         settings: &Settings,
-        free_bytes: u64,
+        free_bytes: i64,
         context: u32,
         draft_depth: u8,
     ) -> PlannerFeasibility<C> {
@@ -60,6 +61,7 @@ impl<C: Composites> PlannerFeasibility<C> {
         let mut settings = settings.clone();
         settings.context.max_tokens = context;
         settings.context.kv_cache_on_gpu_tokens = context;
+        settings.context.kv_cache_format = Auto::Auto;
         PlannerFeasibility {
             composites,
             config,
@@ -70,14 +72,14 @@ impl<C: Composites> PlannerFeasibility<C> {
 }
 
 impl<C: Composites> Feasibility for PlannerFeasibility<C> {
-    fn free_bytes(&self) -> u64 {
+    fn free_bytes(&self) -> i64 {
         self.free_bytes
     }
 
     fn check(&self, allocation: &Allocation) -> Result<Check, MixedError> {
         let table = self.composites.table(allocation)?;
         let inputs = PlanInputs {
-            device_free: self.free_bytes,
+            device_free: u64::try_from(self.free_bytes).unwrap_or(0),
             multiprocessors: None,
             host_pinned_bytes: Some(u64::MAX),
             sequences: 1,
@@ -85,7 +87,7 @@ impl<C: Composites> Feasibility for PlannerFeasibility<C> {
         match plan_closest(&self.config, &table, &self.settings, inputs) {
             Ok((plan, refusal)) => Ok(Check {
                 fits: refusal.is_none() && plan.offload.is_empty(),
-                device_bytes: plan.device_bytes,
+                device_bytes: i64::try_from(plan.device_bytes).unwrap_or(i64::MAX),
             }),
             Err(failure) => Err(refused(failure)),
         }
@@ -101,9 +103,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use euhedral_inference_edrl::{
-        ArtifactPlan, ModelMetadata, ObjectSpec, TensorDataType, WeightFormat, WeightLayout, encode_metadata,
+        ArtifactPlan, LayerType, ModelMetadata, ObjectSpec, TensorDataType, WeightFormat, WeightLayout, encode_metadata,
     };
-    use euhedral_inference_settings::ModelSettings;
+    use euhedral_inference_settings::{KvFormat, ModelSettings};
 
     use super::*;
     use crate::mixed::option::QuantOption;
@@ -167,7 +169,7 @@ mod tests {
     }
 
     fn metadata() -> ModelMetadata {
-        let mut metadata = euhedral_inference_edrl::ModelMetadata {
+        let mut metadata = ModelMetadata {
             vocab_size: 248_320,
             hidden_size: 5120,
             num_hidden_layers: 64,
@@ -198,9 +200,9 @@ mod tests {
         metadata.layer_types = (0..64)
             .map(|layer| {
                 if layer % 4 == 3 {
-                    euhedral_inference_edrl::LayerType::FullAttention
+                    LayerType::FullAttention
                 } else {
-                    euhedral_inference_edrl::LayerType::GatedDeltaNet
+                    LayerType::GatedDeltaNet
                 }
             })
             .collect();
@@ -233,7 +235,7 @@ mod tests {
         }
     }
 
-    fn judge(free: u64, extra: u64) -> PlannerFeasibility<Fat> {
+    fn judge(free: i64, extra: u64) -> PlannerFeasibility<Fat> {
         let config = ModelConfig::from(&metadata());
         let settings = Settings::with_model(ModelSettings::default());
         PlannerFeasibility::new(Fat { extra }, &config, &settings, free, 4096, 4)
@@ -290,5 +292,31 @@ mod tests {
         let settings = Settings::with_model(ModelSettings::default());
         let judge = PlannerFeasibility::new(Empty, &config, &settings, 64 << 30, 4096, 4);
         assert!(matches!(judge.check(&Allocation::default()), Err(MixedError::Plan(_))));
+    }
+
+    fn device_bytes(context: u32, draft_depth: u8, format: Auto<KvFormat>) -> i64 {
+        let config = ModelConfig::from(&metadata());
+        let mut settings = Settings::with_model(ModelSettings::default());
+        settings.context.kv_cache_format = format;
+        PlannerFeasibility::new(Fat { extra: 0 }, &config, &settings, 64 << 30, context, draft_depth)
+            .check(&Allocation::default())
+            .unwrap()
+            .device_bytes
+    }
+
+    #[test]
+    fn a_longer_context_needs_more_device_bytes_and_a_draft_depth_never_fewer() {
+        // The planner pays the draft's state from the runtime reserve, which holds at its setting until the demand
+        // passes it, so a deeper draft changes the bytes only then.
+        let base = device_bytes(4096, 0, Auto::Auto);
+        assert!(device_bytes(65_536, 0, Auto::Auto) > base);
+        assert!(device_bytes(4096, 4, Auto::Auto) >= base);
+    }
+
+    #[test]
+    fn a_cache_format_the_caller_set_does_not_change_the_verdict() {
+        let own = device_bytes(65_536, 4, Auto::Auto);
+        assert_eq!(device_bytes(65_536, 4, Auto::Value(KvFormat::Bf16)), own);
+        assert_eq!(device_bytes(65_536, 4, Auto::Value(KvFormat::Nvfp4)), own);
     }
 }

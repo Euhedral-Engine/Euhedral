@@ -145,23 +145,20 @@ impl CostTable {
             };
             let value = entry
                 .get("micros")
-                .and_then(Value::as_f64)
+                .and_then(number)
                 .ok_or_else(|| MixedError::invalid("a cost entry has no micros"))?;
             micros.insert(key, value);
         }
         let mut prefill = 0.0;
         let mut step = BTreeMap::new();
         if let Some(fixed) = root.get("fixed") {
-            prefill = fixed
-                .get("prefillMicrosPerToken")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
+            prefill = fixed.get("prefillMicrosPerToken").and_then(number).unwrap_or(0.0);
             if let Some(steps) = fixed.get("stepMicros").and_then(Value::as_object) {
                 for (rows, value) in steps {
                     let rows = rows
                         .parse::<u32>()
                         .map_err(|_| MixedError::invalid(format!("the step cost has the row count '{rows}'")))?;
-                    step.insert(rows, value.as_f64().unwrap_or(0.0));
+                    step.insert(rows, number(value).unwrap_or(0.0));
                 }
             }
         }
@@ -199,6 +196,18 @@ impl CostTable {
             ("fixed".to_string(), fixed),
             ("entries".to_string(), Node::Array(entries)),
         ]))
+    }
+}
+
+/// A number of the file: a JSON number, or the text `NaN`, `Infinity` or `-Infinity` that the writer gives a value
+/// JSON has no number for.
+fn number(value: &Value) -> Option<f64> {
+    match value.as_str() {
+        Some("NaN") => Some(f64::NAN),
+        Some("Infinity") => Some(f64::INFINITY),
+        Some("-Infinity") => Some(f64::NEG_INFINITY),
+        Some(_) => None,
+        None => value.as_f64(),
     }
 }
 
@@ -301,6 +310,28 @@ mod tests {
         assert_eq!(read, fixed);
         assert_eq!(read.micros(key_of(QuantOption::Nvfp4, 512)).unwrap(), 51.2);
         assert_eq!(read.render(), fixed.render());
+    }
+
+    #[test]
+    fn a_table_with_values_json_has_no_number_for_reads_back() {
+        let odd = CostTable::new(
+            BTreeMap::from([
+                (key_of(QuantOption::Nvfp4, 512), f64::INFINITY),
+                (key_of(QuantOption::Trellis3_0, 512), f64::NEG_INFINITY),
+                (key_of(QuantOption::Nvfp4, 4), f64::NAN),
+            ]),
+            f64::NAN,
+            BTreeMap::from([(4, f64::INFINITY)]),
+        );
+        let text = odd.render();
+        let read = CostTable::parse(&text).unwrap();
+        assert_eq!(read.render(), text);
+        assert_eq!(read.micros(key_of(QuantOption::Nvfp4, 512)).unwrap(), f64::INFINITY);
+        assert_eq!(
+            read.micros(key_of(QuantOption::Trellis3_0, 512)).unwrap(),
+            f64::NEG_INFINITY
+        );
+        assert!(read.micros(key_of(QuantOption::Nvfp4, 4)).unwrap().is_nan());
     }
 
     #[test]

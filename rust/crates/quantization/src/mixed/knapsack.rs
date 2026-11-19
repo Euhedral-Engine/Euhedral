@@ -77,7 +77,7 @@ pub fn solve(score: &[Vec<f64>], cost: &[Vec<i64>], budget: i64, unit: i64) -> R
     Ok(result)
 }
 
-/// `x` rounded to the nearest whole number, halves up (`Math.round`).
+/// `x` rounded to the nearest whole number, halves up.
 fn nearest(x: f64) -> i64 {
     let floor = x.floor();
     (if x - floor >= 0.5 { floor + 1.0 } else { floor }) as i64

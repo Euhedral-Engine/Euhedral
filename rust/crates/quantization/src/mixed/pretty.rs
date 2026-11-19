@@ -84,7 +84,7 @@ fn write_text(out: &mut String, text: &str) {
     out.push('"');
 }
 
-/// A double as `Double.toString` writes it: the shortest digits that read back the same, in plain notation from
+/// A double as the file format writes it: the shortest digits that read back the same, in plain notation from
 /// 1e-3 up to (not including) 1e7 and in `d.dddE±n` notation outside it, always with a digit after the point. A value
 /// that is not finite is written as a string, as the file's writer does.
 pub(crate) fn double_text(value: f64) -> String {
@@ -97,7 +97,12 @@ pub(crate) fn double_text(value: f64) -> String {
     if value == 0.0 {
         return if value.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
     }
-    let scientific = format!("{:e}", value.abs());
+    let mut scientific = format!("{:e}", value.abs());
+    if value.abs() < f64::MIN_POSITIVE && !scientific.contains('.') {
+        // A subnormal has so few digits of precision that one shortest digit is not the file's: it writes at least two,
+        // the nearest to the value.
+        scientific = format!("{:.1e}", value.abs());
+    }
     let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
     let exponent: i32 = exponent.parse().unwrap_or(0);
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
@@ -132,6 +137,9 @@ mod tests {
             (1.0, "1.0"),
             (51.2, "51.2"),
             (0.001, "0.001"),
+            (f64::from_bits(1), "4.9E-324"),
+            (f64::from_bits(2), "9.9E-324"),
+            (f64::from_bits(4), "2.0E-323"),
             (0.0001, "1.0E-4"),
             (0.00012345, "1.2345E-4"),
             (1234567.0, "1234567.0"),

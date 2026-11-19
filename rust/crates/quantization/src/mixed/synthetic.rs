@@ -36,7 +36,7 @@ pub struct Synthetic {
 }
 
 impl Synthetic {
-    /// The space of `seed`: every draw comes from one `java.util.Random`, the prior errors first, then the weights.
+    /// The space of `seed`: every draw comes from one seeded generator, the prior errors first, then the weights.
     pub fn new(layers: usize, bands: usize, gamma: f64, scale: f64, seed: i64) -> Synthetic {
         let mut random = Random::new(seed);
         let mut objects = Vec::new();

@@ -8,7 +8,7 @@ use super::pretty::{Node, render};
 
 /// The option chosen for each projection object, by object name; an object not listed keeps the base's. The file is
 /// `{"objects": {"text/layers/0/mlp/down": "trellis-3.0", ...}}`, keys sorted.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Allocation {
     choices: BTreeMap<String, QuantOption>,
 }

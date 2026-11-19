@@ -36,9 +36,15 @@ pub fn front<C: Candidate>(measured: &[C]) -> Vec<usize> {
     front
 }
 
-/// `Double.compare`: a total order with negative zero below zero and NaN above everything.
+/// A total order with negative zero below zero and every NaN, whatever its sign bit, above every number and equal to
+/// every other NaN.
 fn compare(a: f64, b: f64) -> Ordering {
-    a.total_cmp(&b)
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.total_cmp(&b),
+    }
 }
 
 fn equal<C: Candidate>(a: &C, b: &C) -> bool {
@@ -130,5 +136,19 @@ mod tests {
             point("best", 0.05, 9.0, 9.0, true),
         ];
         assert_eq!(tags(&data), ["best", "slow", "fast"]);
+    }
+
+    #[test]
+    fn a_nan_kl_sorts_after_every_number_whatever_its_sign_bit() {
+        let negative = f64::from_bits(0xfff8_0000_0000_0000);
+        let positive = f64::from_bits(0x7ff8_0000_0000_0000);
+        assert!(negative.is_nan() && positive.is_nan());
+        let data = [
+            point("negative", negative, 1.0, 1.0, true),
+            point("worse", 0.5, 7.0, 7.0, true),
+            point("positive", positive, 2.0, 2.0, true),
+            point("better", 0.1, 8.0, 8.0, true),
+        ];
+        assert_eq!(tags(&data), ["better", "worse", "negative", "positive"]);
     }
 }
