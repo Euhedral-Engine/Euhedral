@@ -31,6 +31,9 @@ pub enum JsonValue {
     Array(Vec<JsonValue>),
     /// Members in the order they are written.
     Object(Vec<(String, JsonValue)>),
+    /// An object with a key that holds an unpaired surrogate, every key as UTF-16 code units: a `String` cannot
+    /// hold it. Members are in the order they are written, and a key is written as a `Utf16String` is.
+    Utf16Object(Vec<(Vec<u16>, JsonValue)>),
 }
 
 /// An integer of any size, held as its canonical decimal digits: no leading zeros or plus sign, and zero is `0`
@@ -97,6 +100,13 @@ impl JsonValue {
                     .collect();
                 format!("{{{}}}", members.join(", "))
             }
+            JsonValue::Utf16Object(members) => {
+                let members: Vec<String> = members
+                    .iter()
+                    .map(|(key, value)| format!("{}={}", String::from_utf16_lossy(key), value.param_text()))
+                    .collect();
+                format!("{{{}}}", members.join(", "))
+            }
         }
     }
 
@@ -134,6 +144,18 @@ impl JsonValue {
                         out.push_str(", ");
                     }
                     write_string(key, out);
+                    out.push_str(": ");
+                    value.write_python_json(out);
+                }
+                out.push('}');
+            }
+            Self::Utf16Object(members) => {
+                out.push('{');
+                for (index, (key, value)) in members.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    write_string(&String::from_utf16_lossy(key), out);
                     out.push_str(": ");
                     value.write_python_json(out);
                 }
@@ -208,6 +230,10 @@ impl JsonValue {
     pub fn get(&self, key: &str) -> Option<&JsonValue> {
         match self {
             JsonValue::Object(members) => members.iter().find(|(name, _)| name == key).map(|(_, value)| value),
+            JsonValue::Utf16Object(members) => members
+                .iter()
+                .find(|(name, _)| name.iter().copied().eq(key.encode_utf16()))
+                .map(|(_, value)| value),
             _ => None,
         }
     }
@@ -221,7 +247,7 @@ impl JsonValue {
             JsonValue::Float(_) => "number",
             JsonValue::String(_) | JsonValue::Utf16String(_) => "string",
             JsonValue::Array(_) => "array",
-            JsonValue::Object(_) => "object",
+            JsonValue::Object(_) | JsonValue::Utf16Object(_) => "object",
         }
     }
 
@@ -231,6 +257,7 @@ impl JsonValue {
             JsonValue::Float(number) => number.is_finite(),
             JsonValue::Array(items) => items.iter().all(JsonValue::is_finite),
             JsonValue::Object(members) => members.iter().all(|(_, value)| value.is_finite()),
+            JsonValue::Utf16Object(members) => members.iter().all(|(_, value)| value.is_finite()),
             _ => true,
         }
     }
@@ -358,6 +385,18 @@ impl JsonValue {
                         json.push(',');
                     }
                     write_compact_string(key, json);
+                    json.push(':');
+                    value.write_compact(json);
+                }
+                json.push('}');
+            }
+            JsonValue::Utf16Object(members) => {
+                json.push('{');
+                for (index, (key, value)) in members.iter().enumerate() {
+                    if index > 0 {
+                        json.push(',');
+                    }
+                    write_compact_units(key, json);
                     json.push(':');
                     value.write_compact(json);
                 }
@@ -533,6 +572,23 @@ struct Parser<'a> {
     lone: Vec<(usize, u16)>,
 }
 
+/// The UTF-16 code units of a string read with lone surrogates replaced: `lone` gives, by byte offset in `text`, the
+/// unit each replacement character stood for.
+fn units_of(text: &str, lone: &[(usize, u16)]) -> Vec<u16> {
+    let mut units = Vec::with_capacity(text.len());
+    let mut unpaired = lone.iter().copied().peekable();
+    for (offset, value) in text.char_indices() {
+        match unpaired.next_if(|(at, _)| *at == offset) {
+            Some((_, unit)) => units.push(unit),
+            None => {
+                let mut buffer = [0; 2];
+                units.extend_from_slice(value.encode_utf16(&mut buffer));
+            }
+        }
+    }
+    units
+}
+
 /// A key as the strict reading tells keys apart: its text and where lone surrogates stood in it, so that two
 /// different lone surrogates, or one and a literal U+FFFD, are different keys.
 type KeyIdentity = (String, Vec<(usize, u16)>);
@@ -631,7 +687,9 @@ impl Parser<'_> {
             return None;
         }
         self.position += 1;
-        let mut members = Vec::new();
+        let mut members: Vec<(String, JsonValue)> = Vec::new();
+        // When unpaired surrogates are kept: the units of each member's key that holds one, in step with `members`.
+        let mut wide: Vec<Option<Vec<u16>>> = Vec::new();
         let mut seen = SeenKeys::default();
         self.skip_space();
         if self.peek()? == b'}' {
@@ -645,6 +703,7 @@ impl Parser<'_> {
             }
             let key = self.string()?;
             let lone = mem::take(&mut self.lone);
+            let units = (self.keep_unpaired && !lone.is_empty()).then(|| units_of(&key, &lone));
             if key.len() > 3 * MAX_NAME_UNITS || key.encode_utf16().count() > MAX_NAME_UNITS {
                 return None;
             }
@@ -660,6 +719,18 @@ impl Parser<'_> {
                     return None;
                 }
                 members.push((key, value));
+                if self.keep_unpaired {
+                    wide.push(units);
+                }
+            } else if self.keep_unpaired {
+                // A key is the same key only when its units are.
+                match (0..members.len()).find(|&at| members[at].0 == key && wide[at] == units) {
+                    Some(at) => members[at].1 = value,
+                    None => {
+                        members.push((key, value));
+                        wide.push(units);
+                    }
+                }
             } else {
                 put(&mut members, key, value);
             }
@@ -668,7 +739,15 @@ impl Parser<'_> {
                 b',' => self.position += 1,
                 b'}' => {
                     self.position += 1;
-                    return Some(JsonValue::Object(members));
+                    if wide.iter().all(Option::is_none) {
+                        return Some(JsonValue::Object(members));
+                    }
+                    let members = members
+                        .into_iter()
+                        .zip(wide)
+                        .map(|((key, value), units)| (units.unwrap_or_else(|| key.encode_utf16().collect()), value))
+                        .collect();
+                    return Some(JsonValue::Utf16Object(members));
                 }
                 _ => return None,
             }
@@ -747,18 +826,7 @@ impl Parser<'_> {
         if !self.keep_unpaired || self.lone.is_empty() {
             return Some(JsonValue::String(text));
         }
-        let mut units = Vec::with_capacity(text.len());
-        let mut unpaired = self.lone.iter().copied().peekable();
-        for (offset, value) in text.char_indices() {
-            match unpaired.next_if(|(at, _)| *at == offset) {
-                Some((_, unit)) => units.push(unit),
-                None => {
-                    let mut buffer = [0; 2];
-                    units.extend_from_slice(value.encode_utf16(&mut buffer));
-                }
-            }
-        }
-        Some(JsonValue::Utf16String(units))
+        Some(JsonValue::Utf16String(units_of(&text, &self.lone)))
     }
 
     fn string(&mut self) -> Option<String> {
@@ -960,6 +1028,44 @@ mod tests {
         assert_eq!(
             JsonValue::parse("[100.0e0, 1E2]").unwrap().to_compact_string(),
             "[100.0,100.0]"
+        );
+    }
+
+    #[test]
+    fn a_key_with_an_unpaired_surrogate_is_kept_as_its_units() {
+        let kept = |text: &str| JsonValue::parse_keeping_unpaired(text).unwrap().to_compact_string();
+        assert_eq!(kept(r#"{"\ud800":1}"#), r#"{"\uD800":1}"#);
+        assert_eq!(
+            kept(r#"{"\udc00":1,"a\ud800b":[{"\udbff":true}]}"#),
+            r#"{"\uDC00":1,"a\uD800b":[{"\uDBFF":true}]}"#
+        );
+        // A pair stays one character, and an object without a lone key stays an ordinary object.
+        assert_eq!(kept(r#"{"\ud83d\ude00":1}"#), r#"{"😀":1}"#);
+        let plain = JsonValue::parse_keeping_unpaired(r#"{"\ud83d\ude00":1}"#).unwrap();
+        assert!(matches!(plain, JsonValue::Object(_)));
+        assert_eq!(
+            plain.get("😀"),
+            Some(&JsonValue::Integer(JsonInteger::parse("1").unwrap()))
+        );
+        // Mixed objects keep their other keys as they are.
+        let mixed = JsonValue::parse_keeping_unpaired(r#"{"a":1,"\ud800":2,"😀":3}"#).unwrap();
+        assert!(matches!(mixed, JsonValue::Utf16Object(_)));
+        assert_eq!(mixed.type_name(), "object");
+        assert_eq!(mixed.get("😀").map(JsonValue::param_text), Some("3".to_owned()));
+        assert_eq!(mixed.get("a").map(JsonValue::param_text), Some("1".to_owned()));
+        assert!(mixed.get("\u{fffd}").is_none());
+        // Different lone units are different keys, and a literal U+FFFD is another; a repeat replaces in place.
+        assert_eq!(
+            kept(r#"{"\ud800":1,"\ud801":2,"\ufffd":3,"\ud800":4}"#),
+            "{\"\\uD800\":4,\"\\uD801\":2,\"\u{fffd}\":3}"
+        );
+        // The writer's output reads back to the same value.
+        let text = kept(r#"{"\ud800":{"\udc00":"\ud800"}}"#);
+        assert_eq!(kept(&text), text);
+        // The ordinary reading has no way to hold them.
+        assert_eq!(
+            JsonValue::parse(r#"{"\ud800":1}"#).unwrap().to_compact_string(),
+            "{\"\u{fffd}\":1}"
         );
     }
 
