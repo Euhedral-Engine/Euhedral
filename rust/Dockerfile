@@ -44,6 +44,7 @@ ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     EUHEDRAL_CONFIG=/etc/euhedral/config.yaml
 # Docker loads .env files with docker run --env-file .env (before the image name).
+# The container needs io_uring allowed by seccomp: run it with --security-opt seccomp=unconfined or a profile that allows it.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD ["/opt/euhedral/bin/euhedral-health-probe"]
 ENTRYPOINT ["/opt/euhedral/bin/euhedral-server"]
