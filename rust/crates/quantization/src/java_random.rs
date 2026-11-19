@@ -73,6 +73,11 @@ impl Random {
         (high + i64::from(self.next(27))) as f64 * DOUBLE_UNIT
     }
 
+    /// `nextFloat()`: uniform in `[0, 1)` with 24 random bits.
+    pub fn next_float(&mut self) -> f32 {
+        self.next(24) as f32 / (1 << 24) as f32
+    }
+
     /// `nextGaussian()`: the polar method, which makes two values per round and keeps the second.
     pub fn next_gaussian(&mut self) -> f64 {
         if let Some(kept) = self.next_gaussian.take() {
@@ -125,6 +130,11 @@ impl SplittableRandom {
     pub fn next_long(&mut self) -> i64 {
         let seed = self.next_seed();
         mix64(seed) as i64
+    }
+
+    /// `nextDouble()`: uniform in `[0, 1)` with 53 random bits.
+    pub fn next_double(&mut self) -> f64 {
+        (self.next_long() as u64 >> 11) as f64 * DOUBLE_UNIT
     }
 
     /// `nextBoolean()`: the sign of the next int.
