@@ -275,10 +275,9 @@ pub fn serve(
         "Listening on port {}, serving model {model}",
         server.local_addr().port()
     );
-    log::info!(
-        "Started in {:.3} seconds",
-        PROCESS_START.get_or_init(Instant::now).elapsed().as_secs_f64()
-    );
+    if let Some(start) = PROCESS_START.get() {
+        log::info!("Started in {:.3} seconds", start.elapsed().as_secs_f64());
+    }
     let code = wait_for_stop(server.local_addr());
     log::info!("{}: shutting down", signal_name(code));
     let (stopped, reported) = channel();

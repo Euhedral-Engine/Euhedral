@@ -526,3 +526,29 @@ fn a_device_that_cannot_fit_is_refused_for_the_device_though_the_host_is_short_t
     assert!(figures.cache_pages > 0 && figures.needed() > host && figures.weights <= host);
     assert!(error.to_string().contains("the host is short too"), "{error}");
 }
+
+#[test]
+fn the_summary_facts_are_the_plans() {
+    use euhedral_inference_engine::summary::Facts;
+    let (config, table, settings) = (config(), rco_table(), settings(4096));
+    let whole = resident(4096);
+    let need = whole.device_bytes;
+    let hosted = plan_with(&config, &table, &settings, inputs(need - 1, Some(u64::MAX))).unwrap();
+    for plan in [&whole, &hosted] {
+        let facts = Facts::of(plan, &settings, None);
+        assert_eq!(facts.device_bytes, plan.device_bytes);
+        assert_eq!(facts.available_bytes, plan.budget_bytes);
+        assert_eq!(facts.host_weight_bytes, plan.offload.host_arena_bytes);
+        assert_eq!(facts.context_tokens, 4096);
+        assert_eq!(facts.sequences, 1);
+        assert_eq!(facts.disk_weight_bytes, 0);
+        assert_eq!(facts.prefix_cache, None);
+    }
+    assert_eq!(Facts::of(&whole, &settings, None).host_weight_bytes, 0);
+    assert!(Facts::of(&hosted, &settings, None).host_weight_bytes > 0);
+    let cached = Facts::of(&whole, &settings, Some(1 << 30));
+    assert_eq!(
+        cached.prefix_cache,
+        Some((1 << 30, u64::from(settings.prefix_cache.checkpoint_tokens)))
+    );
+}

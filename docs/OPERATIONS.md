@@ -106,16 +106,18 @@ chain of Spring beans around them: worker CPUs this process may not run on, a co
 or than the GPU can hold with every weight in host memory, a GPU that is missing or not a Blackwell, a CUDA runtime
 the native library cannot load. A port in use is reported by Spring Boot, after the weights have loaded.
 
-A successful start logs the context and how it fits (RTX 5070 Ti, `qwen3_8_27b_q3`, the default context):
+A successful start logs the context and how it fits, the prefix cache, and the time from the process's start to the open
+port (the Rust server, RTX 5070 Ti, `qwen3_8_27b_nvfp4_trellis_rco`, the default context; the first start also compiles
+the kernels, which is most of the time):
 
 ```text
-Context 32768 tokens x 1 sequences: 13854 MiB of the 15100 MiB available on the GPU, 0 MiB of weights in host memory
-Prefix cache: 4096 MiB pinned, a checkpoint every 2048 tokens
-Listening on port 8080, serving model qwen3_8_27b_q3
-Started in 7.951 seconds
+Context 32768 tokens x 1 sequence: 13465 MiB of the 15083 MiB available on the GPU, 0 MiB of weights in host memory
+Prefix cache: 4095 MiB pinned, a checkpoint every 2048 tokens
+Listening on port 1738, serving model qwen3_8_27b_nvfp4_trellis_rco
+Started in 128.440 seconds
 ```
 
-With `qwen3_8_27b_nvfp4` and a context of 131072 the same card keeps 3485 MiB of weights in host memory.
+"Available" is the device's free memory, at most `memory.gpu-limit`. A cache that is off logs `Prefix cache: off`.
 
 The port opens only after the engine has loaded, so a server that answers is ready.
 
