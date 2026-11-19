@@ -263,6 +263,7 @@ impl Xorshift {
 fn a_transfer_never_overtakes_its_slots_reader() {
     let fixture = fixture();
     let all = fixture.candidates(&STAGEABLE);
+    let resident = fixture.unstaged();
     let mut random = Xorshift(0x9e37_79b9_7f4a_7c15);
     for case in 0..12 {
         let density = 1 + random.below(4);
@@ -273,6 +274,7 @@ fn a_transfer_never_overtakes_its_slots_reader() {
         let slots = [1, 2, 3, 5][random.below(4)];
         let plan = fixture.build(&chosen, slots).unwrap();
         for view in BASE_VIEWS {
+            check_units(&plan, &resident, view);
             let edges = plan.edges(view).unwrap();
             assert_eq!(violation(&plan, view, slots, edges), None, "case {case}, {slots} slots");
             let transfers = plan
@@ -484,6 +486,102 @@ fn transfers_run_on_the_transfer_lane_only() {
     }
 }
 
+/// The shape of a staged view's units: a transfer alone, the units tiling the nodes from the compute root to the sink,
+/// each refining a unit of the resident view, a consumer starting a unit and a slot's last reader ending one.
+fn check_units(staged: &Plan, resident: &Plan, view: View) {
+    let kinds = staged.kinds(view).unwrap();
+    let units = staged.units(view).unwrap();
+    let edges = staged.unit_edges(view).unwrap();
+    for nodes in units {
+        if nodes.iter().any(|&node| kinds[node] == StageKind::WeightTransfer) {
+            assert_eq!(nodes.len(), 1, "{view:?}: a transfer shares its unit with no stage");
+        }
+    }
+    // The units tile the nodes, the first holds the compute root and the last the sink.
+    let mut flat: Vec<usize> = units.iter().flatten().copied().collect();
+    flat.sort_unstable();
+    assert_eq!(flat, (0..kinds.len()).collect::<Vec<_>>());
+    assert_eq!(units[0][0], 0);
+    assert_eq!(kinds[0], resident.kinds(view).unwrap()[0]);
+    assert_eq!(units.last().unwrap().last(), Some(&(kinds.len() - 1)));
+    let reach = ancestors(edges);
+    let last = units.len() - 1;
+    for (unit, nodes) in units.iter().enumerate() {
+        if kinds[nodes[0]] == StageKind::WeightTransfer {
+            assert!(reach[last][unit], "{view:?}: the sink follows every transfer");
+        }
+    }
+    // Each staged unit of compute stages lies inside one unit of the resident view: fusing only got finer.
+    let plain_units = resident.units(view).unwrap();
+    let mut plain_unit_of = vec![0; kinds.len()];
+    for (unit, nodes) in plain_units.iter().enumerate() {
+        for &node in nodes {
+            plain_unit_of[node] = unit;
+        }
+    }
+    // The rank of a compute stage among the compute stages is its index in the resident view.
+    let mut rank = vec![usize::MAX; kinds.len()];
+    let mut next = 0;
+    for (node, kind) in kinds.iter().enumerate() {
+        if *kind != StageKind::WeightTransfer {
+            rank[node] = next;
+            next += 1;
+        }
+    }
+    for nodes in units {
+        if kinds[nodes[0]] == StageKind::WeightTransfer {
+            continue;
+        }
+        let plain: BTreeSet<usize> = nodes.iter().map(|&node| plain_unit_of[rank[node]]).collect();
+        assert_eq!(
+            plain.len(),
+            1,
+            "{view:?}: a staged unit crosses a unit of the resident view"
+        );
+    }
+    // A consumer starts a unit.
+    let dependencies = staged.dependencies(view).unwrap();
+    for (node, kind) in kinds.iter().enumerate() {
+        if *kind != StageKind::WeightTransfer
+            && dependencies[node]
+                .iter()
+                .any(|&d| kinds[d] == StageKind::WeightTransfer)
+        {
+            assert!(
+                units.iter().any(|nodes| nodes[0] == node),
+                "{view:?}: the consumer {node} starts a unit"
+            );
+        }
+    }
+    let kinds = staged.kinds(view).unwrap();
+    let units = staged.units(view).unwrap();
+    let dependencies = staged.dependencies(view).unwrap();
+    let consumers: Vec<usize> = (0..kinds.len())
+        .filter(|&node| {
+            kinds[node] != StageKind::WeightTransfer
+                && dependencies[node]
+                    .iter()
+                    .any(|&d| kinds[d] == StageKind::WeightTransfer)
+        })
+        .collect();
+    for (slot, reader) in staged.slot_readers(view).iter().enumerate() {
+        let Some(reader) = reader else { continue };
+        let slots = staged.slot_readers(view).len();
+        let last = consumers
+            .iter()
+            .enumerate()
+            .rfind(|(index, _)| index % slots == slot)
+            .unwrap()
+            .1;
+        let unit = &units[usize::from(reader.0)];
+        assert_eq!(
+            unit.last(),
+            Some(last),
+            "{view:?}: slot {slot}'s last reader ends its unit"
+        );
+    }
+}
+
 #[test]
 fn a_transfer_is_a_unit_of_its_own() {
     let fixture = fixture();
@@ -491,69 +589,26 @@ fn a_transfer_is_a_unit_of_its_own() {
     let staged = fixture.build(&chosen, 2).unwrap();
     let resident = fixture.unstaged();
     for view in BASE_VIEWS {
-        let kinds = staged.kinds(view).unwrap();
-        let units = staged.units(view).unwrap();
-        let edges = staged.unit_edges(view).unwrap();
-        for nodes in units {
-            if nodes.iter().any(|&node| kinds[node] == StageKind::WeightTransfer) {
-                assert_eq!(nodes.len(), 1, "{view:?}: a transfer shares its unit with no stage");
-            }
-        }
-        // The units tile the nodes, the first holds the compute root and the last the sink.
-        let mut flat: Vec<usize> = units.iter().flatten().copied().collect();
-        flat.sort_unstable();
-        assert_eq!(flat, (0..kinds.len()).collect::<Vec<_>>());
-        assert_eq!(units[0][0], 0);
-        assert_eq!(kinds[0], resident.kinds(view).unwrap()[0]);
-        assert_eq!(units.last().unwrap().last(), Some(&(kinds.len() - 1)));
-        let reach = ancestors(edges);
-        let last = units.len() - 1;
-        for (unit, nodes) in units.iter().enumerate() {
-            if kinds[nodes[0]] == StageKind::WeightTransfer {
-                assert!(reach[last][unit], "{view:?}: the sink follows every transfer");
-            }
-        }
-        // Each staged unit of compute stages lies inside one unit of the resident view: fusing only got finer.
-        let plain_units = resident.units(view).unwrap();
-        let mut plain_unit_of = vec![0; kinds.len()];
-        for (unit, nodes) in plain_units.iter().enumerate() {
-            for &node in nodes {
-                plain_unit_of[node] = unit;
-            }
-        }
-        // The rank of a compute stage among the compute stages is its index in the resident view.
-        let mut rank = vec![usize::MAX; kinds.len()];
-        let mut next = 0;
-        for (node, kind) in kinds.iter().enumerate() {
-            if *kind != StageKind::WeightTransfer {
-                rank[node] = next;
-                next += 1;
-            }
-        }
-        for nodes in units {
-            if kinds[nodes[0]] == StageKind::WeightTransfer {
-                continue;
-            }
-            let plain: BTreeSet<usize> = nodes.iter().map(|&node| plain_unit_of[rank[node]]).collect();
+        check_units(&staged, &resident, view);
+    }
+}
+
+#[test]
+fn two_projections_that_run_side_by_side_share_one_slot() {
+    let fixture = fixture();
+    let resident = fixture.unstaged();
+    let names = fixture.candidates(&["/gdn/query_key", "/gdn/value_z"]);
+    for layer in ["text/layers/0/", "text/layers/1/"] {
+        let chosen = set(names.iter().filter(|name| name.starts_with(layer)).cloned());
+        assert_eq!(chosen.len(), 2);
+        let plan = fixture.build(&chosen, 1).unwrap();
+        for view in BASE_VIEWS {
+            check_units(&plan, &resident, view);
             assert_eq!(
-                plain.len(),
-                1,
-                "{view:?}: a staged unit crosses a unit of the resident view"
+                violation(&plan, view, 1, plan.edges(view).unwrap()),
+                None,
+                "{layer} {view:?}"
             );
-        }
-        // A consumer starts a unit.
-        let dependencies = staged.dependencies(view).unwrap();
-        for (node, kind) in kinds.iter().enumerate() {
-            if *kind != StageKind::WeightTransfer
-                && dependencies[node]
-                    .iter()
-                    .any(|&d| kinds[d] == StageKind::WeightTransfer)
-            {
-                assert!(
-                    units.iter().any(|nodes| nodes[0] == node),
-                    "{view:?}: the consumer {node} starts a unit"
-                );
-            }
         }
     }
 }
@@ -562,10 +617,7 @@ fn a_transfer_is_a_unit_of_its_own() {
 fn more_uses_than_slots_and_a_weight_larger_than_a_slot_are_refused() {
     let fixture = fixture();
     let chosen = set(fixture.candidates(&["/mlp/down"]));
-    assert!(matches!(
-        fixture.build(&chosen, 0),
-        Err(PlanBuildError::TooManyUses { slots: 0, .. })
-    ));
+    assert!(matches!(fixture.build(&chosen, 0), Err(PlanBuildError::NoSlots { .. })));
     let mut ring = fixture.ring(&chosen, 2);
     ring.slot_bytes -= 1;
     let held = fixture.held(&chosen);
@@ -644,4 +696,17 @@ fn the_plan_names_each_slots_last_reader_and_first_transfer() {
             }
         }
     }
+}
+
+#[test]
+fn held_weights_with_no_ring_are_refused_but_objects_read_in_place_are_not() {
+    let fixture = fixture();
+    let chosen = set(fixture.candidates(&["/mlp/down"]));
+    let held = fixture.held(&chosen);
+    let error = Plan::build(&fixture.config, &fixture.weights, &held, &fixture.formats, None, None).unwrap_err();
+    assert!(matches!(error, PlanBuildError::NoStagingRing { .. }), "{error}");
+    assert!(error.to_string().starts_with("text/layers/"), "{error}");
+    let mapped = set(["text/token_embedding".to_string(), "text/output_head".to_string()]);
+    let held = fixture.held(&mapped);
+    Plan::build(&fixture.config, &fixture.weights, &held, &fixture.formats, None, None).unwrap();
 }

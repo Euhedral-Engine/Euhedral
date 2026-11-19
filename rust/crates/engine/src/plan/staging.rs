@@ -71,6 +71,11 @@ impl HostSet {
         }
     }
 
+    /// The first weight the plan holds off the device, in name order, if any.
+    pub(super) fn first_held(&self) -> Option<String> {
+        self.host.iter().chain(&self.disk).min().cloned()
+    }
+
     /// Whether the plan holds no weight that a transfer stages.
     pub(super) fn is_empty(&self) -> bool {
         self.host.is_empty() && self.disk.is_empty()
@@ -95,16 +100,16 @@ pub(super) fn staged(nodes: &[Node], host: &HostSet, ring: &StagingRing) -> Resu
         if held == 0 {
             continue;
         }
-        if held > ring.slots {
-            return Err(PlanBuildError::TooManyUses {
-                node: index,
-                uses: held,
-                slots: ring.slots,
-            });
-        }
         // Only a projection read through one pointer is staged; the first stage, the root of the view, reads none.
         match &node.make {
-            Make::Linear { .. } if held == 1 && index > 0 => uses.push(index),
+            Make::Linear { .. } if held == 1 && index > 0 => {
+                if ring.slots == 0 {
+                    return Err(PlanBuildError::NoSlots {
+                        name: weights[0].name.clone(),
+                    });
+                }
+                uses.push(index);
+            }
             _ => {
                 let name = weights.iter().find(|weight| host.host.contains(&weight.name));
                 return Err(PlanBuildError::NotStageable {
@@ -498,11 +503,12 @@ mod tests {
     }
 
     #[test]
-    fn a_node_that_reads_more_weights_than_there_are_slots_is_refused() {
+    fn a_ring_with_no_slot_is_refused_naming_the_weight() {
         let error = staged(&base(), &host(&["/mlp/down"]), &ring(0)).unwrap_err();
-        assert!(
-            matches!(error, PlanBuildError::TooManyUses { uses: 1, slots: 0, .. }),
-            "{error}"
+        assert!(matches!(error, PlanBuildError::NoSlots { .. }), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "text/layers/0/mlp/down is held in host memory and the staging ring has no slot"
         );
     }
 
@@ -521,6 +527,10 @@ mod tests {
     fn a_host_weight_no_projection_reads_is_refused() {
         let error = staged(&base(), &host(&["/gdn/a_projection"]), &ring(3)).unwrap_err();
         assert!(matches!(error, PlanBuildError::NotStageable { .. }), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "text/layers/0/gdn/a_projection is held in host memory but no stage of the plan can read it from a staging slot"
+        );
     }
 
     #[test]
@@ -537,5 +547,9 @@ mod tests {
         set.disk.insert("text/layers/0/mlp/down".into());
         let error = staged(&base(), &set, &ring(3)).unwrap_err();
         assert!(matches!(error, PlanBuildError::OnDisk { .. }), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "text/layers/0/mlp/down is held on disk, which no plan stages yet"
+        );
     }
 }

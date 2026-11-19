@@ -58,8 +58,12 @@ pub enum PlanBuildError {
     },
     #[error("unsupported geometry: {0}")]
     Geometry(String),
-    #[error("stage {node} reads {uses} weights held in host memory and the staging ring has {slots} slots")]
-    TooManyUses { node: usize, uses: usize, slots: usize },
+    #[error("{name} is held in host memory and the staging ring has no slot")]
+    NoSlots { name: String },
+    #[error("{name} is held in host memory and the plan was given no staging ring")]
+    NoStagingRing { name: String },
+    #[error("the plan has {count} stages in a graph, more than a graph holds")]
+    TooManyUnits { count: usize },
     #[error("{name} is {bytes} bytes and a staging slot holds {slot_bytes}")]
     WeightTooLarge { name: String, bytes: u64, slot_bytes: u64 },
     #[error("{name} is held in host memory but no stage of the plan can read it from a staging slot")]
@@ -159,17 +163,21 @@ impl Plan {
         let drafts = residency.profile.speculation == Speculation::Mtp && residency.draft_depth > 0;
         let mut base = base_nodes(config, weights)?;
         let mut slots = 0;
-        if let Some(ring) = staging {
-            let host = HostSet::of(residency, weights.host_arena());
-            if !host.is_empty()
-                && let Some(staged) = staging::staged(&base, &host, ring)?
-            {
-                if transfer_lane.is_none() {
-                    return Err(PlanBuildError::NoTransferLane);
-                }
-                base = staged;
-                slots = ring.slots;
+        let host = HostSet::of(residency, weights.host_arena());
+        if staging.is_none()
+            && let Some(name) = host.first_held()
+        {
+            return Err(PlanBuildError::NoStagingRing { name });
+        }
+        if let Some(ring) = staging
+            && !host.is_empty()
+            && let Some(staged) = staging::staged(&base, &host, ring)?
+        {
+            if transfer_lane.is_none() {
+                return Err(PlanBuildError::NoTransferLane);
             }
+            base = staged;
+            slots = ring.slots;
         }
         let base = Arc::new(base);
         let mtp = if drafts {
@@ -423,7 +431,9 @@ impl Plan {
     }
 
     /// The unit of `view` that reads each staging slot last, for the transfers of the quantum that follows to order
-    /// themselves behind; empty for a view that stages nothing. The slot a view never reads is `None`.
+    /// themselves behind; empty for a view that stages nothing. The slot a view never reads is `None`. The stage that
+    /// reads a slot last is the last of its unit, so the unit completes when the slot is free and the quantum's
+    /// remaining stages are not waited for.
     pub fn slot_readers(&self, view: View) -> &[Option<StageId>] {
         self.variant(view.variant())
             .map_or(&[], |plan| plan.slot_readers.as_slice())
@@ -561,7 +571,19 @@ impl VariantPlan {
                 }
             })
             .collect();
-        self.units = placement::fused_units(&self.edges, &lane_keys);
+        // The stage that reads a slot last ends its unit: the transfers that refill the slot in the next quantum then
+        // wait for it, not for the stages that follow.
+        let mut ends = vec![false; count];
+        let mut last_reader: Vec<Option<usize>> = vec![None; self.slots];
+        for (index, node) in self.nodes.iter().enumerate() {
+            if let Make::Staged { slot, .. } = &node.make {
+                last_reader[*slot] = Some(index);
+            }
+        }
+        for node in last_reader.into_iter().flatten() {
+            ends[node] = true;
+        }
+        self.units = placement::fused_units(&self.edges, &lane_keys, &ends);
         let mut unit_of = vec![0usize; count];
         for (unit, nodes) in self.units.iter().enumerate() {
             for &node in nodes {
@@ -597,14 +619,18 @@ impl VariantPlan {
                 }
             })
             .collect();
-        self.place_slots(&unit_of);
+        self.place_slots(&unit_of)?;
         let spec = self.node_spec_homed(0, self.width.max(1))?;
         self.spec = spec;
         Ok(())
     }
 
     /// The unit that reads each staging slot last, and the unit of each slot's first transfer.
-    fn place_slots(&mut self, unit_of: &[usize]) {
+    fn place_slots(&mut self, unit_of: &[usize]) -> Result<(), PlanBuildError> {
+        let count = self.units.len();
+        if u16::try_from(count).is_err() {
+            return Err(PlanBuildError::TooManyUnits { count });
+        }
         let unit = |node: usize| StageId(u16::try_from(unit_of[node]).unwrap_or(u16::MAX));
         let mut readers: Vec<Option<StageId>> = vec![None; self.slots];
         let mut first: Vec<(usize, StageId)> = Vec::new();
@@ -621,6 +647,7 @@ impl VariantPlan {
         }
         self.slot_readers = readers;
         self.first_transfers = first;
+        Ok(())
     }
 
     /// The graph with every stage alone, each on lane `(home + offset) mod stage_lanes`.
