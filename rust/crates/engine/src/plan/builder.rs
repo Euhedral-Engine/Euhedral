@@ -11,6 +11,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use euhedral_graph::Stage;
+use euhedral_inference_cuda::{DevicePtr, HostWeightsArena};
 use euhedral_inference_edrl::WeightFormat;
 
 use super::PlanBuildError;
@@ -26,6 +27,7 @@ use crate::stages::linear::{Linear, LinearRows};
 use crate::stages::mtp::MtpStem;
 use crate::stages::norm::{NormRows, ResidualRmsNorm, RmsNormUnitOffset};
 use crate::stages::sampling::{Argmax, CopyRows, SelectedRows, SelectedToken};
+use crate::stages::transfer::WeightTransfer;
 use crate::stages::{Launch, Quantum, StageLaunch};
 use crate::workspace::BufferSlot::{
     self, AttentionContext, AttentionQkNormalized, FfnDelta, FinalHiddenState, FinalNormalized, GateUp, GdnAlpha,
@@ -37,6 +39,12 @@ use crate::workspace::BufferSlot::{
 /// described.
 pub trait WeightLookup {
     fn weight(&self, layer: LayerIndex, role: Role) -> Option<&WeightRef>;
+
+    /// The host arena the weights held in host memory are staged from, if the lookup has one. A lookup of described
+    /// weights has none: a plan over it builds, and a transfer of it fails when it runs.
+    fn host_arena(&self) -> Option<Arc<HostWeightsArena>> {
+        None
+    }
 }
 
 impl WeightLookup for Weights {
@@ -97,6 +105,8 @@ pub enum StageKind {
     Argmax,
     CopyRows,
     SelectedToken,
+    /// The copy of a host-held weight into a staging slot.
+    WeightTransfer,
 }
 
 impl StageKind {
@@ -120,6 +130,7 @@ impl StageKind {
             StageKind::Argmax => "argmax",
             StageKind::CopyRows => "copy-rows",
             StageKind::SelectedToken => "selected-token",
+            StageKind::WeightTransfer => "weight-transfer",
         }
     }
 }
@@ -190,6 +201,20 @@ pub(crate) enum Make {
     },
     CopyRows,
     SelectedToken,
+    /// The stage `inner`, which reads the staging slot `slot` in place of its weight.
+    Staged {
+        slot: usize,
+        inner: Box<Make>,
+    },
+    /// The copy of `bytes` bytes at `offset` of the host arena into the staging slot `slot`, at `destination`.
+    Transfer {
+        name: String,
+        source: Option<Arc<HostWeightsArena>>,
+        offset: u64,
+        bytes: u64,
+        slot: usize,
+        destination: DevicePtr,
+    },
 }
 
 impl Make {
@@ -212,6 +237,36 @@ impl Make {
             Make::Argmax { .. } => StageKind::Argmax,
             Make::CopyRows => StageKind::CopyRows,
             Make::SelectedToken => StageKind::SelectedToken,
+            Make::Staged { inner, .. } => inner.kind(),
+            Make::Transfer { .. } => StageKind::WeightTransfer,
+        }
+    }
+
+    /// The weights the stage reads through a pointer of their own: those a transfer may stage.
+    pub(crate) fn weights(&self) -> Vec<&WeightRef> {
+        match self {
+            Make::Embed { table } => vec![table],
+            Make::RmsNorm { weight, .. }
+            | Make::ResidualRmsNorm { weight, .. }
+            | Make::Linear { weight, .. }
+            | Make::GdnGatedRmsNorm { weight }
+            | Make::GdnConvolution { weights: weight, .. } => vec![weight],
+            Make::GdnProjectControl { weights } => weights.iter().collect(),
+            Make::QkNormRope { query_norm, key_norm } => vec![query_norm, key_norm],
+            Make::MtpStem {
+                embedding_norm,
+                hidden_norm,
+            } => vec![embedding_norm, hidden_norm],
+            Make::Staged { inner, .. } => inner.weights(),
+            Make::ResidualAdd { .. }
+            | Make::GdnRecurrence { .. }
+            | Make::KvAppend { .. }
+            | Make::AttentionCausal { .. }
+            | Make::Swiglu
+            | Make::Argmax { .. }
+            | Make::CopyRows
+            | Make::SelectedToken
+            | Make::Transfer { .. } => Vec::new(),
         }
     }
 
@@ -245,11 +300,23 @@ impl Make {
             Make::Argmax { .. } => (vec![Logits], vec![]),
             Make::CopyRows => (vec![Logits], vec![]),
             Make::SelectedToken => (vec![], vec![]),
+            Make::Staged { slot, inner } => {
+                return Access {
+                    slot_read: Some(*slot),
+                    ..inner.access()
+                };
+            }
+            Make::Transfer { slot, .. } => {
+                return Access {
+                    slot_write: Some(*slot),
+                    ..Access::default()
+                };
+            }
         };
         Access {
             reads,
             writes,
-            scratch: None,
+            ..Access::default()
         }
     }
 
@@ -259,7 +326,10 @@ impl Make {
     /// projection.
     pub(crate) fn scratch_region(&self, variant: Variant) -> Option<usize> {
         let Make::Linear { weight, output, .. } = self else {
-            return None;
+            return match self {
+                Make::Staged { inner, .. } => inner.scratch_region(variant),
+                _ => None,
+            };
         };
         if weight.format == WeightFormat::Trellis {
             Some(usize::from(variant.decode_type() && *output == ValueZProjected))
@@ -371,6 +441,18 @@ impl Make {
                 entry(self.kind(), CopyRows::new(Logits, rows))
             }
             Make::SelectedToken => entry(self.kind(), SelectedToken),
+            Make::Staged { inner, .. } => inner.stage(variant, formats)?,
+            Make::Transfer {
+                name,
+                source,
+                offset,
+                bytes,
+                destination,
+                ..
+            } => entry(
+                self.kind(),
+                WeightTransfer::new(name, source, offset, bytes, destination),
+            ),
         })
     }
 }

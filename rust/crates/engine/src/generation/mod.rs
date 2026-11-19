@@ -214,7 +214,7 @@ impl Generation {
             )),
             Arc::new(Nvfp4Linear::new(library)),
         );
-        let plan = Plan::build(config, weights, residency, &formats)
+        let plan = Plan::build(config, weights, residency, &formats, None, None)
             .map_err(|error| EngineError::Runtime(format!("the execution plan: {error}")))?;
         if plan.fan_out_width() > core.compute_lanes() {
             return Err(EngineError::Runtime(format!(

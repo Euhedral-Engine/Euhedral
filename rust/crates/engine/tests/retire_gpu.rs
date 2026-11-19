@@ -826,7 +826,7 @@ fn plan_without_weights(config: &Arc<ModelConfig>) -> Arc<Plan> {
         Arc::new(TrellisLinear::from_settings(&TrellisKernelSettings::default(), 70)),
         Arc::new(Nvfp4Linear::with_native_route(true)),
     );
-    Arc::new(Plan::build(config, &weights, &residency, &formats).unwrap())
+    Arc::new(Plan::build(config, &weights, &residency, &formats, None, None).unwrap())
 }
 
 /// A world with the plan's lanes and the owner's, an executor on it that captures, and a decode quantum at position 1,

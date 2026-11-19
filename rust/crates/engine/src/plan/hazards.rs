@@ -6,7 +6,7 @@
 //! writes, so the stages of one region take it one after another. An edge that the dependencies already imply
 //! transitively is not added.
 
-use super::buffers::{Access, scratch_storage, slot_storage, storage_count};
+use super::buffers::{Access, ring_storage, scratch_storage, slot_storage, storage_count};
 
 /// A set of node indices.
 #[derive(Clone, Debug)]
@@ -39,10 +39,12 @@ impl Bits {
 /// The edges of each node: its dependencies, then the producers the storage hazards add (latest first).
 ///
 /// `deps[node]` lists nodes before `node`; `access[node]` what it touches. `regions` is the number of scratch
-/// regions.
-pub(crate) fn with_hazards(access: &[Access], deps: &[Vec<usize>], regions: usize) -> Vec<Vec<usize>> {
+/// regions and `slots` the number of staging slots, each a storage: a transfer that fills a slot follows the slot's
+/// last reader, and a reader follows the transfer.
+pub(crate) fn with_hazards(access: &[Access], deps: &[Vec<usize>], regions: usize, slots: usize) -> Vec<Vec<usize>> {
     let count = access.len();
-    let storages = storage_count(regions);
+    let storages = storage_count(regions, slots);
+    let ring = |slot: usize| ring_storage(regions, slot);
     let mut last_writer: Vec<Option<usize>> = vec![None; storages];
     let mut readers: Vec<Vec<usize>> = vec![Vec::new(); storages];
     let mut ancestors: Vec<Bits> = Vec::with_capacity(count);
@@ -58,12 +60,24 @@ pub(crate) fn with_hazards(access: &[Access], deps: &[Vec<usize>], regions: usiz
             reach.set(dependency);
         }
         let mut required: Vec<usize> = Vec::new();
-        for storage in touched.reads.iter().copied().filter_map(slot_storage) {
+        let reads = touched
+            .reads
+            .iter()
+            .copied()
+            .filter_map(slot_storage)
+            .chain(touched.slot_read.map(ring));
+        let writes = touched
+            .writes
+            .iter()
+            .copied()
+            .filter_map(slot_storage)
+            .chain(touched.slot_write.map(ring));
+        for storage in reads.clone() {
             if let Some(writer) = last_writer[storage] {
                 required.push(writer);
             }
         }
-        for storage in touched.writes.iter().copied().filter_map(slot_storage) {
+        for storage in writes.clone() {
             if let Some(writer) = last_writer[storage] {
                 required.push(writer);
             }
@@ -87,10 +101,10 @@ pub(crate) fn with_hazards(access: &[Access], deps: &[Vec<usize>], regions: usiz
         }
         ancestors.push(reach);
         ordered.push(edges);
-        for storage in touched.reads.iter().copied().filter_map(slot_storage) {
+        for storage in reads {
             readers[storage].push(node);
         }
-        for storage in touched.writes.iter().copied().filter_map(slot_storage) {
+        for storage in writes {
             last_writer[storage] = Some(node);
             readers[storage].clear();
         }
@@ -110,7 +124,7 @@ mod tests {
         Access {
             reads: reads.to_vec(),
             writes: writes.to_vec(),
-            scratch: None,
+            ..Access::default()
         }
     }
 
@@ -124,7 +138,7 @@ mod tests {
             access(&[], &[HiddenState]),
         ];
         let deps = vec![vec![], vec![], vec![], vec![]];
-        let edges = with_hazards(&nodes, &deps, 1);
+        let edges = with_hazards(&nodes, &deps, 1, 0);
         assert_eq!(edges[0], Vec::<usize>::new());
         assert_eq!(edges[1], vec![0], "a reader after the writer");
         assert_eq!(edges[2], vec![0]);
@@ -139,7 +153,7 @@ mod tests {
     fn an_edge_the_dependencies_imply_is_not_added() {
         // 1 depends on 0 and reads what 0 wrote: the dependency is the edge, nothing is added twice.
         let nodes = [access(&[], &[HiddenState]), access(&[HiddenState], &[InputNormalized])];
-        let edges = with_hazards(&nodes, &[vec![], vec![0]], 1);
+        let edges = with_hazards(&nodes, &[vec![], vec![0]], 1, 0);
         assert_eq!(edges[1], vec![0]);
         // 2 writes the hidden state: it must follow 1 (a reader) and 0 (the writer), but 0 is an ancestor of 1.
         let nodes = [
@@ -147,7 +161,7 @@ mod tests {
             access(&[HiddenState], &[InputNormalized]),
             access(&[], &[HiddenState]),
         ];
-        let edges = with_hazards(&nodes, &[vec![], vec![0], vec![]], 1);
+        let edges = with_hazards(&nodes, &[vec![], vec![0], vec![]], 1, 0);
         assert_eq!(edges[2], vec![1], "the reader implies the writer before it");
     }
 
@@ -158,7 +172,7 @@ mod tests {
         nodes[1].scratch = Some(1);
         nodes[2].scratch = Some(0);
         nodes[3].scratch = Some(1);
-        let edges = with_hazards(&nodes, &vec![vec![]; 4], 2);
+        let edges = with_hazards(&nodes, &vec![vec![]; 4], 2, 0);
         assert_eq!(edges[2], vec![0], "region 0 in turn");
         assert_eq!(edges[3], vec![1], "region 1 in turn");
         assert_eq!(edges[1], Vec::<usize>::new(), "the regions are independent");
@@ -167,7 +181,32 @@ mod tests {
     #[test]
     fn the_input_record_orders_nothing() {
         let nodes = [access(&[], &[TokenIds]), access(&[TokenIds], &[])];
-        let edges = with_hazards(&nodes, &[vec![], vec![]], 1);
+        let edges = with_hazards(&nodes, &[vec![], vec![]], 1, 0);
         assert_eq!(edges[1], Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_transfer_follows_the_last_reader_of_its_slot_and_a_reader_its_transfer() {
+        let transfer = |slot| Access {
+            slot_write: Some(slot),
+            ..Access::default()
+        };
+        let reader = |slot| Access {
+            slot_read: Some(slot),
+            ..Access::default()
+        };
+        // Transfers 0 and 1 fill slots 0 and 1, readers 2 and 3 use them, transfers 4 and 5 refill them.
+        let nodes = [transfer(0), transfer(1), reader(0), reader(1), transfer(0), transfer(1)];
+        let edges = with_hazards(&nodes, &vec![vec![]; 6], 1, 2);
+        assert_eq!(edges[0], Vec::<usize>::new());
+        assert_eq!(edges[1], Vec::<usize>::new(), "the slots are independent");
+        assert_eq!(edges[2], vec![0], "a reader follows its transfer");
+        assert_eq!(edges[3], vec![1]);
+        assert_eq!(
+            edges[4],
+            vec![2],
+            "a refill follows the reader, which follows the first fill"
+        );
+        assert_eq!(edges[5], vec![3]);
     }
 }
