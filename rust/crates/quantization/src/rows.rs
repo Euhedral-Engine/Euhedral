@@ -20,8 +20,14 @@ use euhedral_hashing::hasher_api;
 use euhedral_inference_engine::generation::{FinishReason, GenerationOutcome, LogitsSink};
 use euhedral_inference_engine::{EngineRuntime, Handoff};
 use euhedral_io::{AsyncIo, IoDoneOwned, OwnedFile, RawFile};
+use thiserror::Error;
 
-use crate::config::ConfigError;
+/// Why a run could not start.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RowsError {
+    #[error("{0}")]
+    Refused(String),
+}
 
 /// What a task is given for one step.
 #[derive(Debug, Default)]
@@ -113,11 +119,13 @@ impl Drop for Run {
 
 /// What a frame of this module is: the kind goes into the id hash with the step.
 #[derive(Clone, Copy)]
-enum Kind {
+pub(crate) enum Kind {
     /// A reference record arrived.
     Arrived = 1,
     /// A step's values are computed.
     Computed = 2,
+    /// A reference file was opened or a part of it read.
+    Reading = 3,
 }
 
 /// A frame that runs a closure once; its id hash is distinct per kind and step.
@@ -126,7 +134,7 @@ struct Work {
     work: Option<Box<dyn FnOnce() + Send>>,
 }
 
-fn frame(kind: Kind, step: usize, work: impl FnOnce() + Send + 'static) -> Box<dyn Frame> {
+pub(crate) fn frame(kind: Kind, step: usize, work: impl FnOnce() + Send + 'static) -> Box<dyn Frame> {
     Box::new(Work {
         header: FrameHeader::new(hasher_api::mix(((kind as u64) << 32) | step as u64 | 1 << 63)),
         work: Some(Box::new(work)),
@@ -157,14 +165,14 @@ impl fmt::Debug for Work {
 }
 
 #[cfg(unix)]
-fn raw_file(file: &OwnedFile) -> RawFile {
+pub(crate) fn raw_file(file: &OwnedFile) -> RawFile {
     use std::os::fd::AsRawFd;
 
     file.as_raw_fd()
 }
 
 #[cfg(windows)]
-fn raw_file(file: &OwnedFile) -> RawFile {
+pub(crate) fn raw_file(file: &OwnedFile) -> RawFile {
     use std::os::windows::io::AsRawHandle;
 
     file.as_raw_handle()
@@ -209,10 +217,10 @@ impl RowSink {
         host: Arc<Lake>,
         task: Arc<dyn RowTask>,
         steps: usize,
-    ) -> Result<(RowSink, EngineHandoff, ValuesHandoff), ConfigError> {
+    ) -> Result<(RowSink, EngineHandoff, ValuesHandoff), RowsError> {
         let unit = host
             .admit()
-            .map_err(|error| ConfigError::Invalid(format!("the host lake would not take work: {error}")))?;
+            .map_err(|error| RowsError::Refused(format!("the host lake would not take work: {error}")))?;
         let fields = task.fields();
         let (finished, done) = (Handoff::new(), Handoff::new());
         let (engine, values) = (Arc::clone(&finished), Arc::clone(&done));
@@ -330,11 +338,11 @@ pub fn start(
     prefix: Vec<u32>,
     forced: Vec<u32>,
     task: Arc<dyn RowTask>,
-) -> Result<(EngineHandoff, ValuesHandoff), ConfigError> {
+) -> Result<(EngineHandoff, ValuesHandoff), RowsError> {
     let (sink, engine, values) =
         RowSink::new(Arc::clone(runtime.io()), Arc::clone(runtime.host()), task, forced.len())?;
     runtime
         .teacher_forced(prefix, forced, Box::new(sink))
-        .map_err(|error| ConfigError::Invalid(format!("the run was refused: {error}")))?;
+        .map_err(|error| RowsError::Refused(format!("the run was refused: {error}")))?;
     Ok((engine, values))
 }

@@ -19,15 +19,15 @@ use std::time::Duration;
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::LatticeSource;
 use euhedral_graph::Lake;
-use euhedral_inference_bench::await_value;
-use euhedral_inference_bench::kld::{self, Reference};
-use euhedral_inference_bench::rows::{ReferenceRows, RowInput, RowSink, RowTask};
-use euhedral_inference_bench::score::{FIELDS, score_row};
+use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::generation::{FinishReason, GenerationOutcome, LogitsSink};
 use euhedral_inference_engine::lattice_config;
+use euhedral_inference_quantization::kld::{self, Reference};
+use euhedral_inference_quantization::rows::{ReferenceRows, RowInput, RowSink, RowTask};
 use euhedral_inference_settings::{ModelSettings, Settings};
-use euhedral_io::{AsyncIo, OwnedFile};
+use euhedral_io::AsyncIo;
 
+const FIELDS: usize = 2;
 const CONTEXT: usize = 40;
 const VOCABULARY: usize = 33;
 
@@ -47,6 +47,20 @@ fn logits(step: usize) -> Vec<u8> {
     )
 }
 
+/// The record's log-probability of the forced token and the logits row's first value.
+fn expected_fields(logits: &[u8], row: &kld::Row<'_>, forced: usize) -> [f64; FIELDS] {
+    [
+        row.log_p(forced),
+        f64::from(f32::from_bits(
+            u32::from(u16::from_le_bytes([logits[0], logits[1]])) << 16,
+        )),
+    ]
+}
+
+fn await_value<T>(handoff: &Handoff<T>) -> T {
+    handoff.wait(Duration::from_secs(60)).expect("the hand-off was sent")
+}
+
 struct Scoring {
     rows: ReferenceRows,
 }
@@ -62,7 +76,7 @@ impl RowTask for Scoring {
 
     fn compute(&self, input: &RowInput, out: &mut [f64]) {
         let row = kld::Row::new(&input.reference, VOCABULARY);
-        out.copy_from_slice(&score_row(&input.logits, &row, VOCABULARY, input.forced as usize));
+        out.copy_from_slice(&expected_fields(&input.logits, &row, input.forced as usize));
     }
 }
 
@@ -81,10 +95,6 @@ fn every_step_is_read_and_scored_in_frames_and_the_values_come_back_in_step_orde
         )
     });
     fs::write(&path, &bytes).unwrap();
-    let (reference, file) = Reference::open(&path).unwrap();
-    let file = Arc::new(file);
-    let steps = reference.records();
-    assert_eq!(steps, 19);
 
     let settings = Settings::with_model(ModelSettings::default());
     let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
@@ -97,6 +107,11 @@ fn every_step_is_read_and_scored_in_frames_and_the_values_come_back_in_step_orde
         NonZeroUsize::new(2).unwrap(),
         Duration::from_secs(1),
     );
+
+    let reference = await_value(&Reference::read(&io, &path)).unwrap();
+    let file = Arc::new(await_value(&kld::open_records(&io, &path)).unwrap());
+    let steps = reference.records();
+    assert_eq!(steps, 19);
 
     // Chunk 1: the reference's records of that chunk.
     let task = Arc::new(Scoring {
@@ -125,7 +140,7 @@ fn every_step_is_read_and_scored_in_frames_and_the_values_come_back_in_step_orde
     for step in 0..steps {
         let at = reference.row_offset(1, step) as usize;
         let row = kld::Row::new(&bytes[at..at + reference.row_bytes()], VOCABULARY);
-        let expected = score_row(&logits(step), &row, VOCABULARY, reference.forced(1)[step] as usize);
+        let expected = expected_fields(&logits(step), &row, reference.forced(1)[step] as usize);
         assert_eq!(&scored[step * FIELDS..(step + 1) * FIELDS], &expected, "step {step}");
     }
 
@@ -139,8 +154,6 @@ fn a_row_past_the_run_or_a_short_reference_record_fails_the_run_with_the_reason(
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("short.bin");
     fs::write(&path, vec![0u8; 100]).unwrap();
-    let file = Arc::new(OwnedFile::from(fs::File::open(&path).unwrap()));
-
     let settings = Settings::with_model(ModelSettings::default());
     let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
     let io = AsyncIo::open().expect("the asynchronous I/O opens");
@@ -153,6 +166,7 @@ fn a_row_past_the_run_or_a_short_reference_record_fails_the_run_with_the_reason(
         Duration::from_secs(1),
     );
 
+    let file = Arc::new(await_value(&kld::open_records(&io, &path)).unwrap());
     let task = Arc::new(Scoring {
         rows: ReferenceRows {
             file,

@@ -3,7 +3,7 @@
 //! with the first's.
 //!
 //! The first run is kept in memory ([`RowStore`]); the second compares each row with the first's in a frame of the
-//! `host` lake ([`crate::rows`]). Per step: the relative error of the final hidden state (before the final norm), the
+//! `host` lake (the quantization library's `rows`). Per step: the relative error of the final hidden state (before the final norm), the
 //! KL divergence of the first run's distribution from the second's, whether the top-1 token agrees, the first run's
 //! logit lead of its top-1 over the second's when they differ, and whether both rows are bitwise equal.
 
@@ -11,10 +11,10 @@ use std::sync::{Arc, OnceLock};
 
 use euhedral_inference_engine::EngineRuntime;
 use euhedral_inference_engine::generation::FinishReason;
+use euhedral_inference_quantization::rows::{self, RowInput, RowTask};
 
 use crate::await_value;
 use crate::config::ConfigError;
-use crate::rows::{self, RowInput, RowTask};
 
 /// Steps of a window of the hidden-error peak.
 pub const WINDOW: usize = 32;

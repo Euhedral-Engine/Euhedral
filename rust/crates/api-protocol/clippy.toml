@@ -31,6 +31,7 @@ disallowed-methods = [
     { path = "std::fs::OpenOptions::open", reason = "blocking I/O: use AsyncIo" },
     { path = "std::fs::read_dir", reason = "blocking I/O: use AsyncIo" },
     { path = "std::fs::metadata", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::fs::File::metadata", reason = "blocking I/O: use AsyncIo::file_len" },
     { path = "std::io::stdin", reason = "blocking I/O: a read from standard input waits" },
     { path = "std::net::TcpStream::connect", reason = "blocking I/O: use AsyncIo" },
     { path = "std::net::TcpStream::connect_timeout", reason = "blocking I/O: use AsyncIo" },

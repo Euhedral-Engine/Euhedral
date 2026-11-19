@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use euhedral_inference_engine::sampling::{SamplingConfig, SamplingError};
+use euhedral_inference_quantization::rows::RowsError;
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -39,6 +40,12 @@ pub const PREFIX_TAIL_TOKENS: usize = 16;
 pub enum ConfigError {
     #[error("{0}")]
     Invalid(String),
+}
+
+impl From<RowsError> for ConfigError {
+    fn from(error: RowsError) -> Self {
+        ConfigError::Invalid(error.to_string())
+    }
 }
 
 fn invalid<T>(message: impl Into<String>) -> Result<T, ConfigError> {
