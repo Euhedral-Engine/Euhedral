@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use euhedral_inference_cuda::{DeviceBuffer, DevicePtr};
+use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, HostWeightsArena};
 use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
 use euhedral_memory::Claim;
 
@@ -87,7 +87,20 @@ pub struct TrellisParts {
     pub suh_rows: u64,
 }
 
-/// One tensor on the device: where it is, how it is stored, and what goes with it.
+/// Where a tensor's bytes are held, and so what its pointer addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Residence {
+    /// In the device arena: the pointer is a device address.
+    Device,
+    /// In pinned host memory, read in place over the bus: the pointer is the device address of the host bytes.
+    Mapped,
+    /// In pinned host memory, at `offset` of the host arena, copied to the device before use.
+    Host { offset: u64 },
+    /// In the artifact file, at `file_offset`, read through the disk window.
+    Disk { file_offset: u64 },
+}
+
+/// One tensor: where it is, how it is stored, and what goes with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WeightRef {
     /// The artifact's name for the tensor (the name of the half for a split MTP projection).
@@ -96,8 +109,12 @@ pub struct WeightRef {
     pub dtype: TensorDataType,
     pub format: WeightFormat,
     pub layout: WeightLayout,
+    /// The address a kernel reads the tensor at; for a tensor that is not [`Residence::Device`] or
+    /// [`Residence::Mapped`], the address of nothing a kernel may read yet.
     pub ptr: DevicePtr,
     pub bytes: u64,
+    /// Where the bytes are held. The stages read `ptr` as it is until staged weights are routed.
+    pub residence: Residence,
     /// The companions of a trellis object.
     pub trellis: Option<TrellisParts>,
 }
@@ -106,26 +123,43 @@ pub struct WeightRef {
 #[derive(Debug)]
 pub struct Weights {
     tensors: HashMap<(LayerIndex, Role), WeightRef>,
-    // Declared before the claim: the tensors above address this memory.
+    // Declared before the arenas and the claims: the tensors above address this memory.
     arena: DeviceBuffer,
-    /// The arena's bytes in the engine's memory account, released when the arena is freed.
-    claim: Option<Claim>,
+    /// The pinned host arena the host-held tensors are read from, when the plan holds any.
+    host: Option<Arc<HostWeightsArena>>,
+    /// The arenas' bytes in the engine's memory account, released when the arenas are freed.
+    claims: Vec<Claim>,
 }
 
 impl Weights {
-    /// The weights of `tensors`, which address `arena`.
-    pub fn new(arena: DeviceBuffer, tensors: HashMap<(LayerIndex, Role), WeightRef>) -> Self {
+    /// The weights of `tensors`, which address `device` and, for the ones the plan holds on the host, `host`.
+    pub fn new(
+        device: DeviceBuffer,
+        host: Option<Arc<HostWeightsArena>>,
+        tensors: HashMap<(LayerIndex, Role), WeightRef>,
+    ) -> Self {
         Self {
             tensors,
-            arena,
-            claim: None,
+            arena: device,
+            host,
+            claims: Vec::new(),
         }
     }
 
-    /// The weights, with `claim` for the arena's bytes: it is held until the arena is freed.
+    /// The weights, with `claim` for the bytes of an arena: it is held until the arenas are freed.
     pub fn with_claim(mut self, claim: Claim) -> Self {
-        self.claim = Some(claim);
+        self.claims.push(claim);
         self
+    }
+
+    /// The pinned host arena, when the plan holds weights on the host.
+    pub fn host_arena(&self) -> Option<&Arc<HostWeightsArena>> {
+        self.host.as_ref()
+    }
+
+    /// The bytes the host arena holds.
+    pub fn host_bytes(&self) -> u64 {
+        self.host.as_ref().map_or(0, |arena| arena.len() as u64)
     }
 
     /// The tensor of `layer` in `role`.

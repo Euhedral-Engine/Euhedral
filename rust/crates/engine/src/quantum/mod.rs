@@ -590,7 +590,7 @@ impl Executor {
     ) -> Result<Executor, GraphError> {
         let retire: Arc<dyn Fn(Quantum, QuantumOutcome) + Send + Sync> = Arc::new(retire);
         let stage_lanes = stage_lanes.max(1);
-        let captured = |variant: Variant| captures_per_view > 0 && variant.representative().capturable();
+        let captured = |variant: Variant| captures_per_view > 0 && plan.capturable(variant.representative());
         let views = Variant::ALL
             .into_iter()
             .filter(|&variant| captured(variant) && plan.stages(variant.representative()).is_some())
@@ -782,7 +782,8 @@ impl Executor {
             .captures
             .load(Ordering::Acquire)
             .then(|| quantum.capture_key())
-            .flatten();
+            .flatten()
+            .filter(|_| self.plan.capturable(view));
         let body = keyed.and_then(|key| self.whole[variant.index()].get(home).map(|graph| (key, graph)));
         let (graph, sink) = match body {
             Some((key, graph)) => {

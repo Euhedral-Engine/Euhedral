@@ -44,6 +44,6 @@ pub use error::CudaError;
 pub use library::CudaLibrary;
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
 pub use memory::PinnedRange;
-pub use memory::{AllocationId, DeviceBuffer, DevicePtr, HostWeightsArena, PinnedBuffer};
+pub use memory::{AllocationId, ArenaRange, DeviceBuffer, DevicePtr, HostWeightsArena, PinnedBuffer};
 pub use ops::{KernelOps, LaneOps, SubmitMode};
 pub use pool::{PinnedPool, PooledPinned};

@@ -11,11 +11,21 @@ pub(crate) struct Access {
     pub writes: Vec<BufferSlot>,
     /// The scratch region the stage takes, one at a time per region.
     pub scratch: Option<usize>,
+    /// The staging slot the stage reads (a staged weight's consumer).
+    pub slot_read: Option<usize>,
+    /// The staging slot the stage fills (a weight transfer).
+    pub slot_write: Option<usize>,
 }
 
-/// The number of storages a plan with `regions` scratch regions tracks: every workspace slot, then each region.
-pub(crate) fn storage_count(regions: usize) -> usize {
-    BufferSlot::ALL.len() + regions
+/// The number of storages a plan with `regions` scratch regions and `slots` staging slots tracks: every workspace slot,
+/// then each region, then each staging slot.
+pub(crate) fn storage_count(regions: usize, slots: usize) -> usize {
+    BufferSlot::ALL.len() + regions + slots
+}
+
+/// The storage index of staging slot `slot` in a plan with `regions` scratch regions.
+pub(crate) fn ring_storage(regions: usize, slot: usize) -> usize {
+    BufferSlot::ALL.len() + regions + slot
 }
 
 /// The storage index of a slot, or `None` for the input record.
@@ -37,6 +47,7 @@ mod tests {
         assert_eq!(slot_storage(BufferSlot::TokenIds), None);
         assert_eq!(slot_storage(BufferSlot::HiddenState), Some(0));
         assert_eq!(scratch_storage(1), BufferSlot::ALL.len() + 1);
-        assert_eq!(storage_count(2), BufferSlot::ALL.len() + 2);
+        assert_eq!(storage_count(2, 3), BufferSlot::ALL.len() + 5);
+        assert_eq!(ring_storage(2, 1), BufferSlot::ALL.len() + 3);
     }
 }

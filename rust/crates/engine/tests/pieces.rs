@@ -9,8 +9,9 @@
 mod common;
 
 use common::{config, rco_table, settings};
-use euhedral_inference_engine::residency::loader::{Check, Piece, Ring, check_piece, pieces};
-use euhedral_inference_engine::residency::planner::{ResidencyPlan, nvfp4, plan};
+use euhedral_inference_engine::residency::loader::{Check, Piece, Ring, Target, check_piece, pieces};
+use euhedral_inference_engine::residency::offload::{EMBEDDING, HOST_ALIGNMENT, OUTPUT_HEAD};
+use euhedral_inference_engine::residency::planner::{PlanInputs, ResidencyPlan, Tier, nvfp4, plan, plan_with};
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -36,7 +37,7 @@ fn pieces_fill_every_object_exactly_once_in_file_order() {
     // No two pieces write the same arena byte, and every piece lies inside its placement.
     let mut ranges: Vec<(u64, u64)> = all
         .iter()
-        .map(|piece| (piece.arena_offset, piece.arena_offset + piece.len as u64))
+        .map(|piece| (piece.arena_offset(), piece.arena_offset() + piece.len as u64))
         .collect();
     ranges.sort_unstable();
     assert!(
@@ -45,8 +46,8 @@ fn pieces_fill_every_object_exactly_once_in_file_order() {
     );
     for piece in &all {
         let placement = &plan.device[piece.placement];
-        assert!(piece.arena_offset >= placement.offset);
-        assert!(piece.arena_offset + piece.len as u64 <= placement.offset + placement.bytes);
+        assert!(piece.arena_offset() >= placement.offset);
+        assert!(piece.arena_offset() + piece.len as u64 <= placement.offset + placement.bytes);
     }
     // Every object but the packed projection's halves is copied whole, byte for byte: the same bytes at the same
     // distances from the object's start in the file and in the arena.
@@ -60,7 +61,7 @@ fn pieces_fill_every_object_exactly_once_in_file_order() {
         for piece in mine {
             assert_eq!(
                 piece.file_offset - placement.file_offset,
-                piece.arena_offset - placement.offset,
+                piece.arena_offset() - placement.offset,
                 "{}",
                 placement.name
             );
@@ -135,7 +136,7 @@ fn the_packed_mtp_projection_is_read_as_its_two_halves() {
         assert_eq!(mine.len(), 3, "codes, scales and trailer");
         let by_arena = |offset: u64| {
             mine.iter()
-                .find(|piece| piece.arena_offset == placement.offset + offset)
+                .find(|piece| piece.arena_offset() == placement.offset + offset)
                 .unwrap()
         };
         // The codes of the half's rows: a straight cut of the pack's code plane.
@@ -221,4 +222,120 @@ fn the_staging_ring_follows_the_pool_budget_and_the_lanes() {
     assert!(tight.pinned_bytes() <= 40 * MIB);
     assert_eq!(Ring::sized(64, 256 * MIB, 64 * GIB, 16).depth, 16);
     assert_eq!(Ring::sized(1, 256 * MIB, 64 * GIB, 16).depth, 2, "at least two chains");
+}
+
+/// The resident plan of the RCO table at context 4096, and the plan 256 MiB under its device need: the embedding alone
+/// is read from host memory.
+fn embedding_offloaded() -> ResidencyPlan {
+    let inputs = |device_free| PlanInputs {
+        device_free,
+        multiprocessors: Some(70),
+        host_pinned_bytes: Some(u64::MAX),
+        sequences: 1,
+    };
+    let (config, table, settings) = (config(), rco_table(), settings(4096));
+    let need = plan_with(&config, &table, &settings, inputs(64 * GIB))
+        .unwrap()
+        .device_bytes;
+    let plan = plan_with(&config, &table, &settings, inputs(need - 256 * MIB)).unwrap();
+    assert_eq!(
+        plan.offload.host,
+        [EMBEDDING],
+        "the plan holds the embedding alone on the host"
+    );
+    assert!(plan.offload.disk.is_empty());
+    plan
+}
+
+#[test]
+fn host_pieces_land_at_the_plans_aligned_host_offsets_and_fill_the_arena() {
+    let plan = embedding_offloaded();
+    let all = pieces(&plan, 4 * MIB);
+    let embedding = plan.placement(EMBEDDING).unwrap();
+    let Tier::Host { offset } = embedding.tier else {
+        panic!("the embedding is on the host");
+    };
+    assert_eq!(offset % HOST_ALIGNMENT, 0);
+    let mine = of(&all, &plan, EMBEDDING);
+    assert_eq!(mine.iter().map(|piece| piece.len as u64).sum::<u64>(), embedding.bytes);
+    assert!(mine.iter().all(|piece| matches!(piece.target, Target::Host { .. })));
+    // Each piece sits where its bytes are in the file, from the object's place in the host arena.
+    for piece in &mine {
+        assert_eq!(
+            piece.arena_offset() - offset,
+            piece.file_offset - embedding.file_offset,
+            "the same distance from the object's start"
+        );
+    }
+    let end = mine
+        .iter()
+        .map(|piece| piece.arena_offset() + piece.len as u64)
+        .max()
+        .unwrap();
+    assert_eq!(end, offset + embedding.bytes);
+    // The arena is what the plan allocates: the host objects, each rounded up to the alignment.
+    assert_eq!(
+        plan.offload.host_arena_bytes,
+        embedding.bytes.div_ceil(HOST_ALIGNMENT) * HOST_ALIGNMENT
+    );
+    assert!(end <= plan.offload.host_arena_bytes);
+    // Nothing else is read into the host arena, and the device objects are untouched.
+    for piece in &all {
+        let placement = &plan.device[piece.placement];
+        match (placement.tier, piece.target) {
+            (Tier::Host { .. }, Target::Host { .. }) | (Tier::Device, Target::Device { .. }) => {}
+            other => panic!("{}: {other:?}", placement.name),
+        }
+    }
+}
+
+#[test]
+fn a_host_nvfp4_piece_carries_the_checks_of_a_device_one() {
+    let resident = rco_plan();
+    // The head, moved to the host as the plan moves it when nothing else is left to offload.
+    let mut moved = resident.clone();
+    let index = moved
+        .device
+        .iter()
+        .position(|placement| placement.name == OUTPUT_HEAD)
+        .unwrap();
+    moved.device[index].tier = Tier::Host { offset: 0 };
+    moved.device[index].offset = 0;
+    let kinds = |plan: &ResidencyPlan| -> Vec<(u64, usize, Check)> {
+        pieces(plan, MIB)
+            .iter()
+            .filter(|piece| piece.placement == index)
+            .map(|piece| (piece.file_offset, piece.len, piece.check))
+            .collect()
+    };
+    let (on_device, on_host) = (kinds(&resident), kinds(&moved));
+    assert_eq!(on_device, on_host, "the same pieces, with the same checks");
+    assert!(
+        on_host
+            .iter()
+            .any(|(_, _, check)| matches!(check, Check::Nvfp4Scales { .. }))
+    );
+    assert!(
+        on_host
+            .iter()
+            .any(|(_, _, check)| matches!(check, Check::Nvfp4Trailer { .. }))
+    );
+    assert!(
+        pieces(&moved, MIB)
+            .iter()
+            .filter(|piece| piece.placement == index)
+            .all(|piece| matches!(piece.target, Target::Host { arena_offset } if arena_offset == piece.arena_offset()))
+    );
+}
+
+#[test]
+fn an_all_device_plans_pieces_are_all_device_pieces_at_the_arena_offsets() {
+    let plan = rco_plan();
+    assert!(plan.offload.is_empty());
+    let all = pieces(&plan, 8 * MIB);
+    assert!(all.iter().all(|piece| matches!(piece.target, Target::Device { .. })));
+    for piece in &all {
+        let placement = &plan.device[piece.placement];
+        assert!(piece.arena_offset() >= placement.offset);
+    }
 }

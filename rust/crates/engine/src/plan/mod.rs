@@ -12,24 +12,26 @@ mod buffers;
 pub mod builder;
 mod hazards;
 mod placement;
+mod staging;
 pub mod views;
 
 use std::fmt;
 use std::sync::Arc;
 
-use euhedral_graph::{EdgeKind, GraphError, LaneId, Stage, StageGraphSpec, StageSpec};
+use euhedral_graph::{EdgeKind, GraphError, LaneId, Stage, StageGraphSpec, StageId, StageSpec};
 use euhedral_inference_cuda::DevicePtr;
 use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
 use thiserror::Error;
 
 use crate::model::Speculation;
-use crate::model::{LayerIndex, LayerKind, ModelConfig, Role, WeightRef};
+use crate::model::{LayerIndex, LayerKind, ModelConfig, Residence, Role, WeightRef};
 use crate::quantum::home::lane_for;
 use crate::residency::planner::ResidencyPlan;
 use crate::stages::{Chain, Placed, Quantum};
 use buffers::Access;
 pub use builder::{Entry, Formats, StageKind, WeightLookup};
-use builder::{Node, base_nodes, mtp_nodes};
+use builder::{Make, Node, base_nodes, mtp_nodes};
+pub use staging::StagingRing;
 pub(crate) use views::Variant;
 pub use views::{DECODE_MAX_ROWS, MAX_CAPTURED_ROWS, View};
 
@@ -55,6 +57,20 @@ pub enum PlanBuildError {
     },
     #[error("unsupported geometry: {0}")]
     Geometry(String),
+    #[error("{name} is held in host memory and the staging ring has no slot")]
+    NoSlots { name: String },
+    #[error("{name} is held in host memory and the plan was given no staging ring")]
+    NoStagingRing { name: String },
+    #[error("the plan has {count} stages in a graph, more than a graph holds")]
+    TooManyUnits { count: usize },
+    #[error("{name} is {bytes} bytes and a staging slot holds {slot_bytes}")]
+    WeightTooLarge { name: String, bytes: u64, slot_bytes: u64 },
+    #[error("{name} is held in host memory but no stage of the plan can read it from a staging slot")]
+    NotStageable { name: String },
+    #[error("{name} is held on disk, which no plan stages yet")]
+    OnDisk { name: String },
+    #[error("the plan stages weights and was given no transfer lane")]
+    NoTransferLane,
     #[error(transparent)]
     Graph(#[from] GraphError),
 }
@@ -77,8 +93,28 @@ struct VariantPlan {
     /// What a graph runs for each unit.
     unit_stages: Vec<Arc<dyn Stage<Quantum>>>,
     width: usize,
-    /// The lane offset of each stage from its quantum's home lane.
+    /// The lane offset of each stage from its quantum's home lane (0 for a transfer, which has a lane of its own).
     offsets: Vec<u16>,
+    /// Whether each stage is a weight transfer.
+    transfers: Vec<bool>,
+    /// The lane every transfer runs on.
+    transfer_lane: Option<LaneId>,
+    /// The staging slots the view reads (0 when it has no transfer).
+    slots: usize,
+    /// The stages that are not transfers, and the edges between them as the view has them with no transfer (`None`
+    /// when the view has no transfer: the stages and edges are then the plan's own). Lanes and width come from these.
+    compute: Option<Compute>,
+    /// For each staging slot, the unit that reads it last.
+    slot_readers: Vec<Option<StageId>>,
+    /// For each staging slot that is read, its first transfer's unit.
+    first_transfers: Vec<(usize, StageId)>,
+}
+
+/// The stages of a view that are not transfers, and the edges between them.
+struct Compute {
+    /// The index in the view of each compute stage.
+    nodes: Vec<usize>,
+    edges: Vec<Vec<usize>>,
 }
 
 /// The execution plan of a loaded model.
@@ -102,11 +138,18 @@ impl fmt::Debug for Plan {
 impl Plan {
     /// The plan of the model `config` describes, over its `weights`, run through `formats`. The MTP views are built
     /// when the artifact drafts with MTP (`residency.profile`).
+    ///
+    /// With a `staging` ring, each use of a weight whose [`Residence`] is host memory reads a slot of the ring, and a
+    /// transfer of its own, on `transfer_lane`, fills the slot first; the weight's offset in the host arena is the one
+    /// its `Residence::Host` names, and the arena is the lookup's. The MTP views stage nothing. A weight on disk, or in
+    /// host memory with no ring, is refused; with none held off the device the plan is the one of resident weights.
     pub fn build<W: WeightLookup + ?Sized>(
         config: &Arc<ModelConfig>,
         weights: &W,
         residency: &ResidencyPlan,
         formats: &Formats,
+        staging: Option<&StagingRing>,
+        transfer_lane: Option<LaneId>,
     ) -> Result<Plan, PlanBuildError> {
         if config.layer_kinds.len() != config.num_hidden_layers {
             return Err(PlanBuildError::Geometry(format!(
@@ -116,7 +159,23 @@ impl Plan {
             )));
         }
         let drafts = residency.profile.speculation == Speculation::Mtp && residency.draft_depth > 0;
-        let base = Arc::new(base_nodes(config, weights)?);
+        let mut base = base_nodes(config, weights)?;
+        let mut slots = 0;
+        if staging.is_none()
+            && let Some(name) = staging::first_held(&base)
+        {
+            return Err(PlanBuildError::NoStagingRing { name });
+        }
+        if let Some(ring) = staging
+            && let Some(staged) = staging::staged(&base, weights.host_arena().as_ref(), ring)?
+        {
+            if transfer_lane.is_none() {
+                return Err(PlanBuildError::NoTransferLane);
+            }
+            base = staged;
+            slots = ring.slots;
+        }
+        let base = Arc::new(base);
         let mtp = if drafts {
             Some(Arc::new(mtp_nodes(config, weights)?))
         } else {
@@ -130,7 +189,13 @@ impl Plan {
                 Some(Arc::clone(&base))
             };
             variants.push(match nodes {
-                Some(nodes) => Some(VariantPlan::make(variant, nodes, formats)?),
+                Some(nodes) => Some(VariantPlan::make(
+                    variant,
+                    nodes,
+                    formats,
+                    if variant.mtp() { 0 } else { slots },
+                    transfer_lane,
+                )?),
                 None => None,
             });
         }
@@ -163,6 +228,7 @@ impl Plan {
             layout: WeightLayout::ContiguousLeV1,
             ptr: DevicePtr::NULL,
             bytes: 0,
+            residence: Residence::Device,
             trellis: None,
         };
         let config = ModelConfig {
@@ -216,7 +282,7 @@ impl Plan {
                     })
                     .collect();
                 let deps: Vec<Vec<usize>> = nodes.iter().map(|node| node.deps.clone()).collect();
-                let edges = hazards::with_hazards(&access, &deps, region_count);
+                let edges = hazards::with_hazards(&access, &deps, region_count, 0);
                 width = width.max(placement::fan_out_width(&edges));
             }
         }
@@ -292,8 +358,9 @@ impl Plan {
         self.variant(view.variant()).map(|plan| plan.unit_stages.as_slice())
     }
 
-    /// The stages of `view` that run as one stage of the graph, each a list of consecutive stages (indices into
-    /// [`Plan::stages`]), in the order of the graph.
+    /// The stages of `view` that run as one stage of the graph, each a list of stages (indices into
+    /// [`Plan::stages`]) that run one after the other, in the order of the graph. A unit's stages are consecutive in a
+    /// view with no transfer; with transfers, the transfer listed among them is a unit of its own and is skipped.
     pub fn units(&self, view: View) -> Option<&[Vec<usize>]> {
         self.variant(view.variant()).map(|plan| plan.units.as_slice())
     }
@@ -353,6 +420,29 @@ impl Plan {
         self.variant(view.variant()).map(|plan| plan.entries.len() - 1)
     }
 
+    /// Whether quanta of `view` are captured into graphs: [`View::capturable`], and the view has no weight transfer. A
+    /// captured body runs on one lane, so a staged view's copies would run in line with its kernels and overlap
+    /// nothing.
+    pub fn capturable(&self, view: View) -> bool {
+        view.capturable() && self.variant(view.variant()).is_none_or(|plan| plan.compute.is_none())
+    }
+
+    /// The unit of `view` that reads each staging slot last, for the transfers of the quantum that follows to order
+    /// themselves behind; empty for a view that stages nothing. The slot a view never reads is `None`. The stage that
+    /// reads a slot last is the last of its unit, so the unit completes when the slot is free and the quantum's
+    /// remaining stages are not waited for.
+    pub fn slot_readers(&self, view: View) -> &[Option<StageId>] {
+        self.variant(view.variant())
+            .map_or(&[], |plan| plan.slot_readers.as_slice())
+    }
+
+    /// The first transfer of each staging slot of `view`: the slot and the transfer's unit. These are roots of the
+    /// view's graph, together with its first stage. Empty for a view that stages nothing.
+    pub fn first_transfers(&self, view: View) -> &[(usize, StageId)] {
+        self.variant(view.variant())
+            .map_or(&[], |plan| plan.first_transfers.as_slice())
+    }
+
     /// The rows a verification covers at most: one more than the drafts, as a view captured into graphs.
     pub fn verified_rows(&self) -> usize {
         1 + self.draft_depth
@@ -361,8 +451,15 @@ impl Plan {
 
 impl VariantPlan {
     /// The list of `variant` over `nodes`: edges, regions and stages. The lanes and the graph spec follow
-    /// ([`VariantPlan::place`]) once the plan knows its lane count.
-    fn make(variant: Variant, nodes: Arc<Vec<Node>>, formats: &Formats) -> Result<VariantPlan, PlanBuildError> {
+    /// ([`VariantPlan::place`]) once the plan knows its lane count. `slots` is the number of staging slots the list
+    /// reads (0 for a list with no transfer).
+    fn make(
+        variant: Variant,
+        nodes: Arc<Vec<Node>>,
+        formats: &Formats,
+        slots: usize,
+        transfer_lane: Option<LaneId>,
+    ) -> Result<VariantPlan, PlanBuildError> {
         let regions: Vec<Option<usize>> = nodes.iter().map(|node| node.make.scratch_region(variant)).collect();
         let region_count = regions.iter().flatten().max().map_or(1, |region| region + 1);
         let access: Vec<Access> = nodes
@@ -374,12 +471,46 @@ impl VariantPlan {
             })
             .collect();
         let deps: Vec<Vec<usize>> = nodes.iter().map(|node| node.deps.clone()).collect();
-        let edges = hazards::with_hazards(&access, &deps, region_count);
+        let edges = hazards::with_hazards(&access, &deps, region_count, slots);
         let entries = nodes
             .iter()
             .map(|node| node.make.stage(variant, formats))
             .collect::<Result<Vec<_>, _>>()?;
-        let width = placement::fan_out_width(&edges);
+        let transfers: Vec<bool> = nodes
+            .iter()
+            .map(|node| node.make.kind() == StageKind::WeightTransfer)
+            .collect();
+        // Lanes and width come from the stages that are not transfers, ordered as they are with none: a transfer
+        // runs on its own lane and must not change where the rest run.
+        let compute = transfers.iter().any(|&transfer| transfer).then(|| {
+            let kept: Vec<usize> = (0..nodes.len()).filter(|&node| !transfers[node]).collect();
+            let mut position = vec![usize::MAX; nodes.len()];
+            for (index, &node) in kept.iter().enumerate() {
+                position[node] = index;
+            }
+            let access: Vec<Access> = kept
+                .iter()
+                .map(|&node| Access {
+                    slot_read: None,
+                    ..access[node].clone()
+                })
+                .collect();
+            let deps: Vec<Vec<usize>> = kept
+                .iter()
+                .map(|&node| {
+                    deps[node]
+                        .iter()
+                        .filter(|&&dependency| !transfers[dependency])
+                        .map(|&dependency| position[dependency])
+                        .collect()
+                })
+                .collect();
+            Compute {
+                edges: hazards::with_hazards(&access, &deps, region_count, 0),
+                nodes: kept,
+            }
+        });
+        let width = placement::fan_out_width(compute.as_ref().map_or(&edges, |compute| &compute.edges));
         Ok(VariantPlan {
             nodes,
             edges,
@@ -392,21 +523,65 @@ impl VariantPlan {
             unit_stages: Vec::new(),
             width,
             offsets: Vec::new(),
+            transfers,
+            transfer_lane,
+            slots,
+            compute,
+            slot_readers: Vec::new(),
+            first_transfers: Vec::new(),
         })
     }
 
     /// Makes the graph over as many lanes as the view is wide, and its stages.
     fn place(&mut self) -> Result<(), PlanBuildError> {
-        self.path = placement::path_predecessors(&self.edges);
+        let count = self.entries.len();
+        let compute_edges = self.compute.as_ref().map_or(&self.edges, |compute| &compute.edges);
+        let path = placement::path_predecessors(compute_edges);
         for entry in &mut self.entries {
             entry.stage = Arc::new(Placed::new(Arc::clone(&entry.launch)));
         }
         // Each chain of lane continuations has one lane offset, fixed here, so the one lane a stage is allowed is the
         // lane RustEE's graph puts it on: it never picks a branch's lane at random, and the branches of a fan-out do
         // not share one. A root is at offset 0, the quantum's home lane, as Java's graph does.
-        self.offsets = placement::chain_lanes(&self.edges, self.width);
-        self.units = placement::fused_units(&self.edges, &self.offsets);
-        let mut unit_of = vec![0usize; self.entries.len()];
+        let chain = placement::chain_lanes(compute_edges, self.width);
+        match &self.compute {
+            None => {
+                self.path = path;
+                self.offsets = chain;
+            }
+            Some(compute) => {
+                self.path = vec![None; count];
+                self.offsets = vec![0; count];
+                for (index, &node) in compute.nodes.iter().enumerate() {
+                    self.path[node] = path[index].map(|predecessor| compute.nodes[predecessor]);
+                    self.offsets[node] = chain[index];
+                }
+            }
+        }
+        // A transfer's lane is not a compute lane: no stage joins it in a unit.
+        let lane_keys: Vec<u16> = (0..count)
+            .map(|node| {
+                if self.transfers[node] {
+                    u16::MAX
+                } else {
+                    self.offsets[node]
+                }
+            })
+            .collect();
+        // The stage that reads a slot last ends its unit: the transfers that refill the slot in the next quantum then
+        // wait for it, not for the stages that follow.
+        let mut ends = vec![false; count];
+        let mut last_reader: Vec<Option<usize>> = vec![None; self.slots];
+        for (index, node) in self.nodes.iter().enumerate() {
+            if let Make::Staged { slot, .. } = &node.make {
+                last_reader[*slot] = Some(index);
+            }
+        }
+        for node in last_reader.into_iter().flatten() {
+            ends[node] = true;
+        }
+        self.units = placement::fused_units(&self.edges, &lane_keys, &ends);
+        let mut unit_of = vec![0usize; count];
         for (unit, nodes) in self.units.iter().enumerate() {
             for &node in nodes {
                 unit_of[node] = unit;
@@ -441,8 +616,34 @@ impl VariantPlan {
                 }
             })
             .collect();
+        self.place_slots(&unit_of)?;
         let spec = self.node_spec_homed(0, self.width.max(1))?;
         self.spec = spec;
+        Ok(())
+    }
+
+    /// The unit that reads each staging slot last, and the unit of each slot's first transfer.
+    fn place_slots(&mut self, unit_of: &[usize]) -> Result<(), PlanBuildError> {
+        let count = self.units.len();
+        if u16::try_from(count).is_err() {
+            return Err(PlanBuildError::TooManyUnits { count });
+        }
+        let unit = |node: usize| StageId(u16::try_from(unit_of[node]).unwrap_or(u16::MAX));
+        let mut readers: Vec<Option<StageId>> = vec![None; self.slots];
+        let mut first: Vec<(usize, StageId)> = Vec::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            match &node.make {
+                Make::Staged { slot, .. } => {
+                    readers[*slot] = Some(unit(index));
+                }
+                Make::Transfer { slot, .. } if !first.iter().any(|(seen, _)| seen == slot) => {
+                    first.push((*slot, unit(index)));
+                }
+                _ => {}
+            }
+        }
+        self.slot_readers = readers;
+        self.first_transfers = first;
         Ok(())
     }
 
@@ -465,7 +666,7 @@ impl VariantPlan {
     }
 
     /// A graph of `count` stages named `names` over `edges` (the stages before each), the lane of each that of
-    /// the node `node_of` gives. Every edge is a submission edge.
+    /// the node `node_of` gives: the transfer lane for a transfer. Every edge is a submission edge.
     fn graph(
         &self,
         home: usize,
@@ -478,11 +679,15 @@ impl VariantPlan {
         let mut spec = StageGraphSpec::new();
         let ids: Vec<_> = (0..count)
             .map(|stage| {
-                let lane = lane_for(home, usize::from(self.offsets[node_of(stage)]), stage_lanes);
+                let node = node_of(stage);
+                let lane = match self.transfer_lane {
+                    Some(lane) if self.transfers[node] => lane,
+                    _ => LaneId(lane_for(home, usize::from(self.offsets[node]), stage_lanes) as u16),
+                };
                 spec.stage(StageSpec {
                     name: names[stage],
                     ordered: None,
-                    lanes: vec![LaneId(lane as u16)],
+                    lanes: vec![lane],
                 })
             })
             .collect();

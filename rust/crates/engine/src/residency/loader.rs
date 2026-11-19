@@ -14,6 +14,10 @@
 //!    marker that `Completions` finds reached;
 //! 4. the completion, which hands the loan to the read of the chain's piece two ahead.
 //!
+//! A piece of an object the plan holds in pinned host memory has no copy: its read lands straight in the object's range
+//! of the host arena ([`Target::Host`]), where kernels read it in place, and the same check runs on those bytes. The
+//! chain's loan goes along unused, to the read two pieces ahead.
+//!
 //! Nothing here owns the end of the load. The chains share one [`Shared`]; the last frame to let go of it drops it,
 //! and its `Drop` reports the outcome, wherever that frame ran. A failure sets a flag, so the chains stop starting
 //! reads, and the first error is the one reported.
@@ -25,13 +29,13 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
-use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, PooledPinned};
+use euhedral_inference_cuda::{ArenaRange, DeviceBuffer, DevicePtr, HostWeightsArena, PooledPinned};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use euhedral_io::{IoDoneOwned, OwnedFile};
 
 use crate::error::EngineError;
 use crate::frames::{Kind, step};
-use crate::residency::planner::{Placement, PlacementSource, ResidencyPlan, nvfp4};
+use crate::residency::planner::{Placement, PlacementSource, ResidencyPlan, Tier, nvfp4};
 use crate::runtime::{Core, raw_file};
 use crate::stages::SubmitError;
 
@@ -47,15 +51,33 @@ pub enum Check {
     Nvfp4Trailer { sd4: bool },
 }
 
-/// One read-and-copy: `len` bytes at `file_offset` of the artifact go to `arena_offset` of the weight arena.
+/// Where a piece's bytes go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// To `arena_offset` of the device weight arena, through a staging loan and a copy.
+    Device { arena_offset: u64 },
+    /// To `arena_offset` of the pinned host arena, read in place: no copy follows.
+    Host { arena_offset: u64 },
+}
+
+/// One read: `len` bytes at `file_offset` of the artifact go to `target`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Piece {
     pub file_offset: u64,
     pub len: usize,
-    pub arena_offset: u64,
+    pub target: Target,
     pub check: Check,
     /// The placement the bytes belong to (an index into the plan's `device`).
     pub placement: usize,
+}
+
+impl Piece {
+    /// Where the piece starts in the arena it goes to, the device's or the host's.
+    pub fn arena_offset(&self) -> u64 {
+        match self.target {
+            Target::Device { arena_offset } | Target::Host { arena_offset } => arena_offset,
+        }
+    }
 }
 
 /// A copy before it is cut into pieces.
@@ -70,6 +92,12 @@ struct Copy {
 pub fn pieces(plan: &ResidencyPlan, piece_bytes: u64) -> Vec<Piece> {
     let mut out = Vec::new();
     for (index, placement) in plan.device.iter().enumerate() {
+        // An object left in the artifact file is read when it is used, not loaded.
+        let base = match placement.tier {
+            Tier::Device => placement.offset,
+            Tier::Host { offset } => offset,
+            Tier::Disk => continue,
+        };
         for copy in copies(placement) {
             let mut done = 0;
             while done < copy.len {
@@ -81,7 +109,13 @@ pub fn pieces(plan: &ResidencyPlan, piece_bytes: u64) -> Vec<Piece> {
                 out.push(Piece {
                     file_offset: copy.file_offset + done,
                     len: len as usize,
-                    arena_offset: placement.offset + copy.arena_offset + done,
+                    target: {
+                        let arena_offset = base + copy.arena_offset + done;
+                        match placement.tier {
+                            Tier::Host { .. } => Target::Host { arena_offset },
+                            _ => Target::Device { arena_offset },
+                        }
+                    },
                     check,
                     placement: index,
                 });
@@ -261,6 +295,8 @@ impl Ring {
 pub struct LoadStats {
     pub pieces: usize,
     pub bytes: u64,
+    /// Bytes read straight into the host arena.
+    pub host_bytes: u64,
     pub elapsed: Duration,
     /// Pinned bytes the pool allocated while the chains ran; the ring is acquired before, so this is 0.
     pub pinned_growth: u64,
@@ -270,6 +306,8 @@ pub struct LoadStats {
 #[derive(Debug)]
 pub struct LoadOutcome {
     pub arena: DeviceBuffer,
+    /// The host arena, when the plan holds weights there; every byte of it is written on success.
+    pub host: Option<Arc<HostWeightsArena>>,
     pub result: Result<LoadStats, EngineError>,
 }
 
@@ -283,9 +321,11 @@ struct Shared {
     names: Arc<[String]>,
     chains: usize,
     base: DevicePtr,
+    host: Option<Arc<HostWeightsArena>>,
     failed: AtomicBool,
     error: OnceLock<EngineError>,
     uploaded: AtomicU64,
+    read_in_place: AtomicU64,
     started: Instant,
     pinned_at_start: u64,
     arena: Option<DeviceBuffer>,
@@ -313,11 +353,16 @@ impl Drop for Shared {
             None => Ok(LoadStats {
                 pieces: self.pieces.len(),
                 bytes: self.uploaded.load(Ordering::Acquire),
+                host_bytes: self.read_in_place.load(Ordering::Acquire),
                 elapsed: self.started.elapsed(),
                 pinned_growth: self.core.pool.allocated_bytes().saturating_sub(self.pinned_at_start),
             }),
         };
-        done(LoadOutcome { arena, result });
+        done(LoadOutcome {
+            arena,
+            host: self.host.take(),
+            result,
+        });
     }
 }
 
@@ -330,8 +375,8 @@ pub(crate) fn acquire_loans(core: &Core, ring: &Ring) -> Result<Vec<PooledPinned
         .collect()
 }
 
-/// Starts the upload of `pieces` into `arena` along `chains` chains with their `loans` (two each, from
-/// [`acquire_loans`]). `done` runs when the last frame of the load lets go, with the arena and the outcome; it must
+/// Starts the upload of `pieces` into `arena` (and the pieces of the host objects into `host`) along `chains` chains
+/// with their `loans` (two each, from [`acquire_loans`]). `done` runs when the last frame of the load lets go, with the arena and the outcome; it must
 /// hand its work to a lake, not do it.
 #[allow(
     clippy::too_many_arguments,
@@ -344,6 +389,7 @@ pub(crate) fn start(
     pieces: Vec<Piece>,
     chains: usize,
     arena: DeviceBuffer,
+    host: Option<Arc<HostWeightsArena>>,
     loans: Vec<PooledPinned>,
     done: impl FnOnce(LoadOutcome) + Send + Sync + 'static,
 ) {
@@ -352,10 +398,12 @@ pub(crate) fn start(
         file,
         names,
         base: arena.ptr(),
+        host,
         chains,
         failed: AtomicBool::new(false),
         error: OnceLock::new(),
         uploaded: AtomicU64::new(0),
+        read_in_place: AtomicU64::new(0),
         started: Instant::now(),
         pinned_at_start: core.pool.allocated_bytes(),
         arena: Some(arena),
@@ -390,6 +438,9 @@ fn issue(shared: Arc<Shared>, chain: usize, index: usize, mut loan: PooledPinned
         return;
     }
     let piece = shared.pieces[index];
+    if let Target::Host { arena_offset } = piece.target {
+        return issue_in_place(shared, chain, index, arena_offset, loan);
+    }
     if let Err(error) = loan.set_len(piece.len) {
         return shared.fail(EngineError::Cuda(error));
     }
@@ -400,6 +451,86 @@ fn issue(shared: Arc<Shared>, chain: usize, index: usize, mut loan: PooledPinned
     });
     if let Err(error) = shared.core.io.read_into(raw, piece.file_offset, loan, then) {
         shared.fail(io_error(&shared, piece, error));
+    }
+}
+
+/// Starts the read of a host piece straight into its range of the host arena. The chain's `loan` is not used by it: it
+/// waits in the continuation, and goes to the read two pieces ahead when this one has ended.
+fn issue_in_place(shared: Arc<Shared>, chain: usize, index: usize, arena_offset: u64, loan: PooledPinned) {
+    let piece = shared.pieces[index];
+    let range = shared.host.as_ref().and_then(|host| {
+        let offset = usize::try_from(arena_offset).ok()?;
+        // SAFETY: the plan gives each host object its own 4096-aligned place, and `pieces` cuts an object's copies
+        // into pieces that do not overlap, so no other range of the arena is alive over these bytes; nothing else
+        // touches the arena while the load runs, and the device reads it only after the load has ended.
+        unsafe { host.range(offset, piece.len) }
+    });
+    let Some(range) = range else {
+        return shared.fail(EngineError::Runtime(format!(
+            "'{}' has no place in the host arena at offset {arena_offset}",
+            shared.names[piece.placement]
+        )));
+    };
+    let raw = raw_file(&shared.file);
+    let next = Arc::clone(&shared);
+    let then = Box::new(move |done: IoDoneOwned<ArenaRange>| -> Box<dyn Frame> {
+        step(Kind::UploadRead, chain, move || {
+            in_place_done(next, chain, index, loan, done)
+        })
+    });
+    if let Err(error) = shared.core.io.read_into(raw, piece.file_offset, range, then) {
+        shared.fail(io_error(&shared, piece, error));
+    }
+}
+
+/// A host piece's read ended: check the bytes where they landed, when its format asks for it, and hand the loan on.
+fn in_place_done(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned, done: IoDoneOwned<ArenaRange>) {
+    let piece = shared.pieces[index];
+    let range = match (done.buf, done.result) {
+        (Some(range), Ok(read)) if read == piece.len => range,
+        (Some(_), Ok(read)) => {
+            return shared.fail(short_read(&shared, piece, read));
+        }
+        (_, Err(error)) => return shared.fail(io_error(&shared, piece, error)),
+        (None, Ok(_)) => {
+            return shared.fail(EngineError::Runtime(
+                "the I/O ring failed while a read may still have been writing: the host arena was abandoned"
+                    .to_string(),
+            ));
+        }
+    };
+    let finish = move |shared: Arc<Shared>, loan: PooledPinned| {
+        shared.read_in_place.fetch_add(piece.len as u64, Ordering::AcqRel);
+        let next = index + 2 * shared.chains;
+        issue(shared, chain, next, loan);
+    };
+    if piece.check == Check::None {
+        return finish(shared, loan);
+    }
+    let host = Arc::clone(&shared.core);
+    let frame = step(Kind::UploadCheck, chain, move || {
+        match check_piece(piece.check, range.as_slice()) {
+            Ok(()) => finish(shared, loan),
+            Err(reason) => {
+                let name = shared.names[piece.placement].clone();
+                shared.fail(EngineError::Payload { name, reason });
+            }
+        }
+    });
+    // A refused frame is dropped with the chain's handle on the load; the load then ends as failed or never started.
+    let _ = host.host.offer(frame);
+}
+
+fn short_read(shared: &Shared, piece: Piece, read: usize) -> EngineError {
+    EngineError::Io {
+        what: format!(
+            "reading '{}' at offset {} of the artifact",
+            shared.names[piece.placement], piece.file_offset
+        ),
+        source: io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("{read} of {} bytes arrived", piece.len),
+        ),
     }
 }
 
@@ -418,18 +549,7 @@ fn read_done(shared: Arc<Shared>, chain: usize, index: usize, done: IoDoneOwned<
     let piece = shared.pieces[index];
     let loan = match (done.buf, done.result) {
         (Some(loan), Ok(read)) if read == piece.len => loan,
-        (Some(_), Ok(read)) => {
-            return shared.fail(EngineError::Io {
-                what: format!(
-                    "reading '{}' at offset {} of the artifact",
-                    shared.names[piece.placement], piece.file_offset
-                ),
-                source: io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("{read} of {} bytes arrived", piece.len),
-                ),
-            });
-        }
+        (Some(_), Ok(read)) => return shared.fail(short_read(&shared, piece, read)),
         (_, Err(error)) => return shared.fail(io_error(&shared, piece, error)),
         (None, Ok(_)) => {
             return shared.fail(EngineError::Runtime(
@@ -462,7 +582,7 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
     let stages = Arc::clone(&shared.core.stages);
     let frame = step(Kind::UploadCopy, chain, move || {
         let piece = shared.pieces[index];
-        let destination = shared.base.offset(piece.arena_offset);
+        let destination = shared.base.offset(piece.arena_offset());
         let queued = shared
             .core
             .lane_table

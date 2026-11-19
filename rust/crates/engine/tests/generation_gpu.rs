@@ -581,6 +581,22 @@ fn repository_root() -> PathBuf {
 #[ignore = "needs a GPU, the native library, the RCO artifact, the Java references and python3 with numpy"]
 fn teacher_forced_logits_bitwise_equal_java_report() {
     let Some(machine) = machine() else { return };
+    teacher_forced_against_java(&machine, None);
+}
+
+/// The same run with the device 256 MiB short of the resident need, so the plan reads the embedding in place from pinned
+/// host memory: the logits are the report's, bit for bit.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact, the Java references and python3 with numpy"]
+fn teacher_forced_logits_bitwise_equal_java_report_with_a_mapped_embedding() {
+    let Some(machine) = machine() else { return };
+    let limit = common::limit_below_need(&machine.library, &settings(&machine.artifact, 4096), 256 << 20);
+    teacher_forced_against_java(&machine, Some(limit));
+}
+
+/// Runs the teacher-forced comparison against the Java report, under `gpu_limit` when it is given. A forced run that
+/// does not get the plan it means (the card has less free than the limit) stops with a message.
+fn teacher_forced_against_java(machine: &Machine, gpu_limit: Option<u64>) {
     let java = machine.goldens.join("teacher-forced-rco.bin");
     let java_bytes = fs::read(&java).unwrap();
     let steps = i32::from_le_bytes(java_bytes[0..4].try_into().unwrap()) as usize;
@@ -605,7 +621,20 @@ fn teacher_forced_logits_bitwise_equal_java_report() {
         assert_eq!(named as u32, *token, "step {step}: the forced token of the Java report");
     }
 
-    let (owner, runtime) = start(&machine, 4096);
+    let mut engine = settings(&machine.artifact, 4096);
+    if let Some(limit) = gpu_limit {
+        common::limit_gpu(&mut engine, limit);
+    }
+    let (owner, ready) = EngineRuntime::start(&engine, &machine.library);
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    let (owner, runtime) = (Closer::new(owner, &runtime), runtime);
+    if let Some(limit) = gpu_limit {
+        common::embedding_alone_is_on_the_host(&runtime, limit);
+        assert!(runtime.report().host_backed_bytes > 0);
+    }
     let done = Handoff::new();
     let waiting = Arc::clone(&done);
     let mut bytes = Vec::with_capacity(java_bytes.len());
