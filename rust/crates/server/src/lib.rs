@@ -35,9 +35,9 @@ use std::fmt::{self, Debug, Formatter};
 use std::io;
 use std::io::{Write, stderr};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
-use std::sync::Arc;
 use std::sync::mpsc::channel;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_inference_api_server::{ApiConfig, Backend, Limits, RequestDefaults, once, start_on};
@@ -217,6 +217,14 @@ fn listen(port: u16) -> io::Result<TcpListener> {
     }
 }
 
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+/// Marks the start of the process, which the start time of the log is counted from. The first call counts; `main` makes
+/// it before it reads anything.
+pub fn mark_process_start() {
+    PROCESS_START.get_or_init(Instant::now);
+}
+
 /// Starts the backend with `start`, serves the API on `settings.server.port`, calls `wait_for_stop` with the address
 /// the server listens on and, when it returns, stops in order (see the crate documentation). Returns the process's exit
 /// code: what `wait_for_stop` returned after a stop, [`EXIT_START_FAILED`] when the backend or the server did not start
@@ -266,6 +274,10 @@ pub fn serve(
     log::info!(
         "Listening on port {}, serving model {model}",
         server.local_addr().port()
+    );
+    log::info!(
+        "Started in {:.3} seconds",
+        PROCESS_START.get_or_init(Instant::now).elapsed().as_secs_f64()
     );
     let code = wait_for_stop(server.local_addr());
     log::info!("{}: shutting down", signal_name(code));

@@ -109,9 +109,10 @@ the native library cannot load. A port in use is reported by Spring Boot, after 
 A successful start logs the context and how it fits (RTX 5070 Ti, `qwen3_8_27b_q3`, the default context):
 
 ```text
-Context 32768 tokens: 13854 MiB of the 15100 MiB free on the GPU, 0 MiB of weights in host memory
+Context 32768 tokens x 1 sequences: 13854 MiB of the 15100 MiB available on the GPU, 0 MiB of weights in host memory
 Prefix cache: 4096 MiB pinned, a checkpoint every 2048 tokens
-Started EuhedralInferenceApplication in 7.761 seconds (process running for 7.951)
+Listening on port 8080, serving model qwen3_8_27b_q3
+Started in 7.951 seconds
 ```
 
 With `qwen3_8_27b_nvfp4` and a context of 131072 the same card keeps 3485 MiB of weights in host memory.
