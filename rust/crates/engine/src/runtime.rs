@@ -29,7 +29,7 @@ use euhedral_inference_settings::{Auto, BatchingSettings, Settings};
 use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
 use crate::error::{EngineError, PlanError};
-use crate::generation::{AdmissionError, CancelHandle, GenerationRequest, Generations, LogitsSink};
+use crate::generation::{AdmissionError, CancelHandle, GenerationRequest, Generations, HiddenSink, LogitsSink};
 use crate::generation::{GREEDY_DEPTH, OPERATION_BOUND};
 use crate::handoff::Handoff;
 use crate::kernels::kernel_sources;
@@ -846,6 +846,20 @@ impl EngineRuntime {
     /// before its first quantum.
     pub fn generate_cancellable(&self, request: GenerationRequest, cancel: CancelHandle) -> Result<(), AdmissionError> {
         self.generations.generate(request, cancel)
+    }
+
+    /// As [`EngineRuntime::generate_cancellable`], and `sink` is handed the hidden state (the output of the final norm,
+    /// which the draft layer reads) of every row the request runs, with the logits row of the rows that select a
+    /// token, as frames on the engine's lattice. The artifact needs a draft layer. The host selects the tokens, as for
+    /// a sampled request, and the request does not speculate, use the prefix cache or run ahead of the rows being
+    /// copied. The sink has heard every row when the listener hears the end.
+    pub fn generate_hidden(
+        &self,
+        request: GenerationRequest,
+        sink: impl HiddenSink + 'static,
+        cancel: CancelHandle,
+    ) -> Result<(), AdmissionError> {
+        self.generations.generate_hidden(request, Box::new(sink), cancel)
     }
 
     /// A test oracle: the events in the ring of each stage lane, and the device bytes the lanes took when they opened.
