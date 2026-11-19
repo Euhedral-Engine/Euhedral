@@ -4,7 +4,8 @@
 //! - [`java_random`]: seeded generators in the style of `java.util.Random` and `java.util.SplittableRandom`. A
 //!   consumer that needs the exact sequence of a seed adds its own test of it.
 //! - [`kernels`]: the quantization kernels as NVRTC modules, their kernel names and the loader that compiles them.
-//! - [`trellis`]: the trellis kernels: rates, launch planners and the enqueue of their steps.
+//! - [`trellis`]: the trellis kernels (rates, launch planners and the enqueue of their steps) and the quantizer that
+//!   chains them on a lane: scales, LDLQ through the Viterbi encode and the refit.
 //! - [`npy`] and [`npz`]: the NumPy array and archive formats the calibration state and the fixtures use. Both work
 //!   on bytes the caller supplies or takes; neither opens a file.
 //! - [`kld`]: the reference logits file the scorer and the reference writer share, opened and read through `AsyncIo`.
@@ -14,6 +15,7 @@
 //! - [`resume`]: the file a long run overwrites in place and resumes from, and [`durable`], the durability barrier,
 //!   truncation and removal it is built on.
 
+mod chain;
 pub mod durable;
 pub mod java_random;
 pub mod kernels;
