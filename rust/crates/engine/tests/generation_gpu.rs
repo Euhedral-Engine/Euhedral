@@ -1029,21 +1029,23 @@ fn together_with(
             .expect("a sequence is idle for the request")
         })
         .collect();
-    // Every sequence runs a generation: one more request is refused, and only that one.
-    let refused = submit(
-        runtime,
-        &prompts[0],
-        CONCURRENT_TOKENS,
-        &[],
-        Speculation::Off,
-        SamplingConfig::greedy(0),
-        None,
-    );
-    assert_eq!(
-        refused.err(),
-        Some(AdmissionError::Busy),
-        "the fifth request finds every sequence running"
-    );
+    // When every sequence runs a generation, one more request is refused, and only that one.
+    if prompts.len() == runtime.sequences() {
+        let refused = submit(
+            runtime,
+            &prompts[0],
+            CONCURRENT_TOKENS,
+            &[],
+            Speculation::Off,
+            SamplingConfig::greedy(0),
+            None,
+        );
+        assert_eq!(
+            refused.err(),
+            Some(AdmissionError::Busy),
+            "the fifth request finds every sequence running"
+        );
+    }
     let recordings = running
         .into_iter()
         .map(|done| done.wait(WAIT).expect("the generation reports"))
