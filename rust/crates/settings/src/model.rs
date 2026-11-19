@@ -399,8 +399,8 @@ impl Default for HostSettings {
 /// Kernel thresholds (`kernels`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KernelSettings {
-    /// Slices of the output pass of a one-row RMS norm (a decode step); `auto` is 40 on every card, the best measured on
-    /// an RTX 5070 Ti.
+    /// Slices of the output pass of a one-row RMS norm (a decode step); `auto` is 40 on every card, the value chosen with the
+    /// sliced kernel; 1 to 65535.
     pub rms_norm_decode_slices: Auto<u32>,
     /// The fewest keys at which the fused verifier kernel serves each count of verified rows; `auto` is the table
     /// measured on an RTX 5070 Ti.

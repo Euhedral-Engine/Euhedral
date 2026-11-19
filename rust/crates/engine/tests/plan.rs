@@ -23,6 +23,7 @@ use euhedral_graph::{
     RetryCounts, Stage, StageCx, StageError, StageGraph, Submitted,
 };
 use euhedral_inference_cuda::DevicePtr;
+use euhedral_inference_cuda::launch::attention::DEFAULT_FUSED_VERIFY_FROM;
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
@@ -50,6 +51,11 @@ struct Built {
     config: Arc<ModelConfig>,
     residency: ResidencyPlan,
     plan: Plan,
+}
+
+/// The key's split geometry under the default fused-verifier table.
+fn default_geometry(start: u64, rows: u64, group: u64) -> u64 {
+    split_geometry(start, rows, group, &DEFAULT_FUSED_VERIFY_FROM)
 }
 
 /// The RCO artifact's objects as weights with no device memory behind them, and the plan over them (built once: the
@@ -84,7 +90,7 @@ fn built() -> &'static Built {
         );
         let formats = Formats::new(
             Arc::new(TrellisLinear::from_settings(&TrellisKernelSettings::default(), 70)),
-            Arc::new(Nvfp4Linear::with_native_route(true)),
+            Arc::new(Nvfp4Linear::with_native_route(true, 70)),
         );
         let plan = Plan::build(&config, &weights, &residency, &formats, None, None).unwrap();
         Built {
@@ -374,10 +380,10 @@ fn capture_key_changes_every_48_positions_below_2048() {
     let group = 24 / 4;
     let mut distinct = BTreeSet::new();
     let mut changes = 0;
-    let mut previous = split_geometry(0, 1, group);
+    let mut previous = default_geometry(0, 1, group);
     distinct.insert(previous);
     for start in 1..2047u64 {
-        let geometry = split_geometry(start, 1, group);
+        let geometry = default_geometry(start, 1, group);
         if geometry != previous {
             assert_eq!(start % 48, 0, "the counts change on a multiple of 48 positions");
             changes += 1;
@@ -391,11 +397,11 @@ fn capture_key_changes_every_48_positions_below_2048() {
 #[test]
 fn capture_key_constant_from_2048() {
     let group = 24 / 4;
-    let wanted = split_geometry(2047, 1, group);
+    let wanted = default_geometry(2047, 1, group);
     for start in 2047..4200u64 {
-        assert_eq!(split_geometry(start, 1, group), wanted, "{start}");
+        assert_eq!(default_geometry(start, 1, group), wanted, "{start}");
     }
-    assert_eq!(split_geometry(131_070, 1, group), wanted);
+    assert_eq!(default_geometry(131_070, 1, group), wanted);
 }
 
 #[test]

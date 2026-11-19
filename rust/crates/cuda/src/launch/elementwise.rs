@@ -14,8 +14,8 @@ const RESIDUAL_ADD: KernelId = kernel!("euhedral_residual_add_bf16");
 const SWIGLU: KernelId = kernel!("euhedral_swiglu_bf16");
 const RESIDUAL_RMS_NORM: KernelId = kernel!("euhedral_residual_rms_norm_bf16");
 const RESIDUAL_RMS_NORM_ROW: KernelId = kernel!("euhedral_residual_rms_norm_row_bf16");
-/// Slices of the output pass of a one-row norm: the default of `kernels.rms-norm-decode-slices`, the best measured on an
-/// RTX 5070 Ti and used on every card.
+/// Slices of the output pass of a one-row norm: the default of `kernels.rms-norm-decode-slices`, the value chosen with the
+/// sliced kernel and used on every card.
 pub const DEFAULT_RMS_NORM_DECODE_SLICES: u32 = 40;
 
 const RMS_NORM: KernelId = kernel!("euhedral_rms_norm_bf16");

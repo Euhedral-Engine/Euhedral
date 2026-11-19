@@ -156,16 +156,21 @@ int euhedral_cuda_linear_nvfp4_bf16(const void* input, const void* weights, void
 #define SKINNY_MAX_ROWS 64u
 #define SKINNY_COLUMNS 64u
 
-/* CTAs the skinny kernel's K split aims for: two per streaming multiprocessor of the current device, read once. */
-static uint32_t skinny_target_ctas(void) {
+/* CTAs the skinny kernel's K split aims for: two per streaming multiprocessor, from the first device queried and kept
+ * after that (the library drives one device). A failed query is the caller's error and caches nothing. */
+static int skinny_target_ctas(uint32_t* target_ctas) {
     static _Atomic uint32_t target = 0;
     uint32_t known = atomic_load_explicit(&target, memory_order_relaxed);
-    if (known != 0u) return known;
-    int32_t sms = 0;
-    if (euhedral_cuda_multiprocessor_count(&sms) != EUHEDRAL_CUDA_SUCCESS || sms <= 0) return 2u;
-    known = 2u * (uint32_t)sms;
-    atomic_store_explicit(&target, known, memory_order_relaxed);
-    return known;
+    if (known == 0u) {
+        int32_t sms = 0;
+        int status = euhedral_cuda_multiprocessor_count(&sms);
+        if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+        if (sms <= 0) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+        known = 2u * (uint32_t)sms;
+        atomic_store_explicit(&target, known, memory_order_relaxed);
+    }
+    *target_ctas = known;
+    return EUHEDRAL_CUDA_SUCCESS;
 }
 
 /* nvfp4n::Skinny<terms, rows / 16>::kSharedBytes: stages of (A rows + 64 weight rows) x 160 bytes. */
@@ -175,9 +180,9 @@ static uint32_t skinny_shared_bytes(uint32_t terms, uint32_t rows) {
 }
 
 /* K splits for the skinny kernel: enough CTAs to keep every SM streaming weights. */
-static uint32_t skinny_splits(uint32_t in_features, uint32_t out_features) {
+static uint32_t skinny_splits(uint32_t in_features, uint32_t out_features, uint32_t target_ctas) {
     uint32_t tiles = (out_features + SKINNY_COLUMNS - 1u) / SKINNY_COLUMNS, k_tiles = in_features / 256u;
-    uint32_t splits = (skinny_target_ctas() + tiles - 1u) / tiles, limit = k_tiles / 2u;
+    uint32_t splits = (target_ctas + tiles - 1u) / tiles, limit = k_tiles / 2u;
     if (splits > limit) splits = limit;
     return splits == 0u ? 1u : splits;
 }
@@ -268,12 +273,20 @@ static uint64_t activation_bytes(uint32_t rows, uint32_t in_features) {
     return align256(scales + k / 128u * NATIVE_TERMS * pad * 8u) + 4ull * rows;
 }
 
-/* Scratch for one native linear: the activations, then (split-K skinny shapes) FP32 partials. */
-uint64_t euhedral_cuda_nvfp4_native_scratch_bytes(uint32_t rows, uint32_t in_features, uint32_t out_features) {
+/* The scratch of one native linear whose skinny grid aims for `target_ctas`. */
+static uint64_t native_scratch_bytes(uint32_t rows, uint32_t in_features, uint32_t out_features, uint32_t target_ctas) {
     uint64_t bytes = activation_bytes(rows, in_features);
-    if (skinny_route(rows, in_features) && skinny_splits(in_features, out_features) > 1u)
-        bytes = align256(bytes) + 4ull * skinny_splits(in_features, out_features) * rows * out_features;
+    const uint32_t splits = skinny_splits(in_features, out_features, target_ctas);
+    if (skinny_route(rows, in_features) && splits > 1u) bytes = align256(bytes) + 4ull * splits * rows * out_features;
     return bytes;
+}
+
+/* Scratch for one native linear: the activations, then (split-K skinny shapes) FP32 partials. UINT64_MAX when the
+ * device's multiprocessor count cannot be read, which no scratch satisfies. */
+uint64_t euhedral_cuda_nvfp4_native_scratch_bytes(uint32_t rows, uint32_t in_features, uint32_t out_features) {
+    uint32_t target_ctas = 0;
+    if (skinny_target_ctas(&target_ctas) != EUHEDRAL_CUDA_SUCCESS) return UINT64_MAX;
+    return native_scratch_bytes(rows, in_features, out_features, target_ctas);
 }
 
 /* A tiled tensor map over bytes (the TMA descriptors of the tile kernels). */
@@ -324,7 +337,12 @@ static int launch_native(int paired, uint64_t columns, const void* input, const 
         return EUHEDRAL_CUDA_ROUTE_UNAVAILABLE;
     CUfunction kernel = paired ? native_gate_up[layout] : native_linear[layout];
     const int skinny = !paired && skinny_route(rows, in_features);
-    if (scratch == NULL || scratch_byte_size < (skinny ? euhedral_cuda_nvfp4_native_scratch_bytes(rows, in_features, out_features)
+    uint32_t target_ctas = 0;
+    if (skinny) {
+        status = skinny_target_ctas(&target_ctas);
+        if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    }
+    if (scratch == NULL || scratch_byte_size < (skinny ? native_scratch_bytes(rows, in_features, out_features, target_ctas)
                                                        : activation_bytes(rows, in_features)))
         return EUHEDRAL_CUDA_INVALID_ARGUMENT;
     uint64_t grid = ((uint64_t)rows + 127u) / 128u * ((columns + 127u) / 128u);
@@ -340,7 +358,7 @@ static int launch_native(int paired, uint64_t columns, const void* input, const 
         /* Decode-like rows: weight streaming dominates, so 64-column CTAs, split over K when the
          * columns alone cannot occupy the GPU; each split stores FP32 partials, summed in split order
          * and converted once, so results are deterministic. */
-        const uint32_t index = rows <= 16u ? 0u : rows <= 32u ? 1u : 2u, splits = skinny_splits(in_features, out_features);
+        const uint32_t index = rows <= 16u ? 0u : rows <= 32u ? 1u : 2u, splits = skinny_splits(in_features, out_features, target_ctas);
         CUdeviceptr partials = splits > 1u ? scratch_ptr + align256(activation_bytes(rows, in_features)) : 0;
         void* skinny_params[] = {&scratch_ptr, &weights_ptr, &output_ptr, &partials, &rows_arg, &in_arg, &out_arg};
         result = euhedral_launch_kernel(native_skinny[layout][index], (out_features + SKINNY_COLUMNS - 1u) / SKINNY_COLUMNS, splits, 1,

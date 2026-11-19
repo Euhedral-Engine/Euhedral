@@ -153,6 +153,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle selectExactNumerics;
     /// Mirrors the native process-wide exact-numerics selection.
     private volatile boolean exactNumerics;
+    private final List<Long> fusedVerifyFrom;
     private final MethodHandle gdnProjectControlFp32;
     private final MethodHandle swiGluBf16;
     private final MethodHandle dflashLinearBf16;
@@ -260,8 +261,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     "euhedral_cuda_set_dispatch",
                     FunctionDescriptor.of(
                             ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+            List<Long> fusedFrom = tuning.kernels().fusedVerifyFromOrDefault();
+            this.fusedVerifyFrom = fusedFrom;
             try (Arena local = Arena.ofConfined()) {
-                List<Long> fusedFrom = tuning.kernels().fusedVerifyFromOrDefault();
                 MemorySegment table = local.allocate(ValueLayout.JAVA_INT, fusedFrom.size());
                 for (int row = 0; row < fusedFrom.size(); row++)
                     table.setAtIndex(ValueLayout.JAVA_INT, row, (int) (long) fusedFrom.get(row));
@@ -2751,6 +2753,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     @Override
     public boolean rowExactQuantizedLinears() {
         return true;
+    }
+
+    @Override
+    public List<Long> fusedVerifyFrom() {
+        return this.fusedVerifyFrom;
     }
 
     @Override

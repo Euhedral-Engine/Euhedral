@@ -77,7 +77,7 @@ fn fixture() -> Fixture {
     );
     let formats = Formats::new(
         Arc::new(TrellisLinear::from_settings(&TrellisKernelSettings::default(), 70)),
-        Arc::new(Nvfp4Linear::with_native_route(true)),
+        Arc::new(Nvfp4Linear::with_native_route(true, 70)),
     );
     Fixture {
         config,

@@ -9,6 +9,7 @@
 
 use euhedral_hashing::hasher_api::hash_bytes_with_seed;
 use euhedral_inference_cuda::AllocationId;
+use euhedral_inference_cuda::launch::attention::FUSED_ROWS;
 
 use crate::plan::View;
 use crate::stages::QuantumKind;
@@ -160,15 +161,13 @@ fn push_option<const N: usize>(bytes: &mut Vec<u8>, value: Option<[u8; N]>) {
     }
 }
 
-/// The fewest keys at which the fused verifier kernel serves rows of a verification or draft, by rows
-/// (`fused_from` in `qwen_layer_ops.c`: rows that fill their 8-column mma tiles win from 2048 keys, the others on
-/// longer caches).
-fn fused_from(rows: u64) -> u64 {
-    const FROM: [u64; 9] = [u64::MAX, u64::MAX, 49152, 16384, 4096, 2048, 16384, 16384, 12288];
-    usize::try_from(rows)
-        .ok()
-        .and_then(|rows| FROM.get(rows).copied())
-        .unwrap_or(u64::MAX)
+/// The fewest keys at which the fused verifier kernel serves `rows` rows under `table` (`kernels.fused-verify-from`);
+/// `u32::MAX` is never.
+fn fused_from(table: &[u32; FUSED_ROWS], rows: u64) -> u64 {
+    match usize::try_from(rows).ok().and_then(|rows| table.get(rows)) {
+        Some(&keys) if keys != u32::MAX => u64::from(keys),
+        _ => u64::MAX,
+    }
 }
 
 /// What the host dispatch of decode attention (`attention_causal` in `qwen_layer_ops.c`) bakes into its launches for a
@@ -180,8 +179,9 @@ fn fused_from(rows: u64) -> u64 {
 ///   whose last row reaches the keys from which the fused kernel is faster than the row twins), a different launch
 ///   from the row twin's.
 ///
-/// Every other position-dependent value is read from the input record.
-pub fn split_geometry(start: u64, rows: u64, group: u64) -> u64 {
+/// `fused_from_keys` is the kernels' `fused-verify-from` table. Every other position-dependent value is read from the
+/// input record.
+pub fn split_geometry(start: u64, rows: u64, group: u64, fused_from_keys: &[u32; FUSED_ROWS]) -> u64 {
     let first = start + 1;
     let last = start + rows;
     let from: u64 = if group <= 8 { 2048 } else { u64::MAX };
@@ -192,7 +192,7 @@ pub fn split_geometry(start: u64, rows: u64, group: u64) -> u64 {
     };
     let above = if last >= from { 64.min(last.div_ceil(32)) } else { 0 };
     let tiles = (rows * group).div_ceil(8).max(2);
-    let fused = rows > 1 && last >= from && tiles <= 6 && last >= fused_from(rows);
+    let fused = rows > 1 && last >= from && tiles <= 6 && last >= fused_from(fused_from_keys, rows);
     u64::from(fused) << 16 | below << 8 | above
 }
 
@@ -204,7 +204,28 @@ pub(crate) fn trimmed(replay: &[u32]) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    use euhedral_inference_cuda::launch::attention::DEFAULT_FUSED_VERIFY_FROM;
+
     use super::*;
+
+    fn default_geometry(start: u64, rows: u64, group: u64) -> u64 {
+        split_geometry(start, rows, group, &DEFAULT_FUSED_VERIFY_FROM)
+    }
+
+    #[test]
+    fn a_configured_table_moves_where_the_key_says_the_fused_verifier_runs() {
+        // Rows 4, group 6: fused from 4096 keys by default, from 2048 under an earlier table, never under a late one.
+        let mut early = DEFAULT_FUSED_VERIFY_FROM;
+        early[4] = 2048;
+        let mut never = DEFAULT_FUSED_VERIFY_FROM;
+        never[4] = u32::MAX;
+        let fused = |table: &[u32; FUSED_ROWS], last: u64| split_geometry(last - 4, 4, GROUP, table) >> 16 == 1;
+        assert!(!fused(&DEFAULT_FUSED_VERIFY_FROM, 3000));
+        assert!(fused(&early, 3000));
+        assert!(!fused(&early, 2047));
+        assert!(fused(&DEFAULT_FUSED_VERIFY_FROM, 5000));
+        assert!(!fused(&never, 5000));
+    }
 
     type Change = (&'static str, fn(&mut CaptureKey));
 
@@ -397,10 +418,10 @@ mod tests {
     #[test]
     fn the_split_counts_change_every_48_positions_below_2048_keys() {
         let mut changes = Vec::new();
-        let mut previous = split_geometry(0, 1, GROUP);
+        let mut previous = default_geometry(0, 1, GROUP);
         assert_eq!(previous, 1 << 8, "one key, one split of 48");
         for start in 1..2047u64 {
-            let geometry = split_geometry(start, 1, GROUP);
+            let geometry = default_geometry(start, 1, GROUP);
             if geometry != previous {
                 changes.push(start);
                 previous = geometry;
@@ -414,18 +435,18 @@ mod tests {
 
     #[test]
     fn the_split_counts_are_constant_from_2048_keys() {
-        let wanted = split_geometry(2047, 1, GROUP);
+        let wanted = default_geometry(2047, 1, GROUP);
         assert_eq!(
             wanted, 64,
             "no span below, 64 of 32 keys, and one row never takes the fused verifier"
         );
         for start in (2047..140_000u64).step_by(7) {
-            assert_eq!(split_geometry(start, 1, GROUP), wanted, "{start}");
+            assert_eq!(default_geometry(start, 1, GROUP), wanted, "{start}");
         }
         for rows in 2..=8u64 {
             // Past every fused threshold the key is constant too.
-            let beyond = split_geometry(131_000, rows, GROUP);
-            assert_eq!(beyond, split_geometry(100_000, rows, GROUP), "{rows} rows");
+            let beyond = default_geometry(131_000, rows, GROUP);
+            assert_eq!(beyond, default_geometry(100_000, rows, GROUP), "{rows} rows");
             assert_eq!(beyond & 0xffff, 64, "{rows} rows");
         }
     }
@@ -444,10 +465,10 @@ mod tests {
         ];
         for (rows, from) in thresholds {
             let mut flips = Vec::new();
-            let mut previous = split_geometry(2047, rows, GROUP) >> 16;
+            let mut previous = default_geometry(2047, rows, GROUP) >> 16;
             assert_eq!(previous, u64::from(from <= 2047 + rows), "{rows} rows");
             for start in 2048..70_000u64 {
-                let fused = split_geometry(start, rows, GROUP) >> 16;
+                let fused = default_geometry(start, rows, GROUP) >> 16;
                 if fused != previous {
                     flips.push(start);
                     previous = fused;
@@ -466,16 +487,16 @@ mod tests {
             assert_eq!(previous, 1, "{rows} rows end on the fused verifier");
         }
         // One row has no fused verifier, and a group of more than 8 has no GQA kernel at all.
-        assert_eq!(split_geometry(60_000, 1, GROUP) >> 16, 0);
-        assert_eq!(split_geometry(60_000, 4, 9) >> 16, 0);
+        assert_eq!(default_geometry(60_000, 1, GROUP) >> 16, 0);
+        assert_eq!(default_geometry(60_000, 4, 9) >> 16, 0);
     }
 
     #[test]
     fn rows_that_cross_2048_keys_have_both_counts() {
         // 2044 + 5 reaches 2049 keys: 5 rows serve the fused verifier from 2048 keys.
-        assert_eq!(split_geometry(2044, 5, GROUP), 1 << 16 | 43 << 8 | 64);
+        assert_eq!(default_geometry(2044, 5, GROUP), 1 << 16 | 43 << 8 | 64);
         // A group wider than 8 never takes the 32-key spans.
-        assert_eq!(split_geometry(5000, 1, 9), 64 << 8);
+        assert_eq!(default_geometry(5000, 1, 9), 64 << 8);
     }
 
     #[test]

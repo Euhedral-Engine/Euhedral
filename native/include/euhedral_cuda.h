@@ -29,9 +29,10 @@ extern "C" {
  * cannot be copied. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_set_include_directory(const char* path);
 /* Host dispatch values that depend on the card, set once at startup before the first launch (the defaults are the
- * values measured on an RTX 5070 Ti): the slices of a one-row RMS norm's output pass, and the fewest keys at which the
+ * values of the settings' `auto`): the slices of a one-row RMS norm's output pass, and the fewest keys at which the
  * fused verifier kernel serves each of 0 to 8 verified rows (4294967295 never; `count` must be 9). Returns
- * EUHEDRAL_CUDA_INVALID_ARGUMENT for a zero value, a null table or another count. */
+ * EUHEDRAL_CUDA_INVALID_ARGUMENT for a zero value, a slice count above 65535, a null table or another count. The
+ * native library holds these values; the Rust engine plans its launches itself and never calls this. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_set_dispatch(uint32_t rms_norm_decode_slices, const uint32_t* fused_verify_from, uint32_t count);
 EUHEDRAL_CUDA_EXPORT void* euhedral_cuda_malloc(uint64_t byte_size);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_free(void* address);

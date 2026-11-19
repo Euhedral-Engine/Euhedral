@@ -149,7 +149,7 @@ fn linear_bitwise_matches_reference_oracle() {
         values(&rig.linear(format, &weight, &x, 0, k, n, rows, mode))
     };
     // Above 32 rows a device without the native route runs the scalar reference: the oracle.
-    let portable = Nvfp4Linear::with_native_route(false);
+    let portable = Nvfp4Linear::with_native_route(false, 70);
     let production = Nvfp4Linear::new(&rig.library);
     let reference = nvfp4(&portable, 64, PLAIN);
     for rows in 1..=8usize {

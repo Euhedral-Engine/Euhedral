@@ -79,7 +79,7 @@ host:
   native-cache: auto                          # optional, default auto: where the jar unpacks its native files (auto = the user's cache directory)
 
 kernels:
-  rms-norm-decode-slices: auto                # optional, default auto: slices of the output pass of a one-row RMS norm, a decode step (auto = 40 on every card, the best measured on an RTX 5070 Ti; entries below 2048 have no effect, the fused kernel serves only from 2048 keys)
+  rms-norm-decode-slices: auto                # optional, default auto: slices of the output pass of a one-row RMS norm, a decode step (auto = 40 on every card, the value chosen with the sliced kernel; 1 to 65535, the output is the same for any count)
   fused-verify-from: auto                     # optional, default auto: the fewest keys at which the fused verifier kernel serves each of 0 to 8 verified rows, nine comma-separated whole numbers or never (auto = never,never,49152,16384,4096,2048,16384,16384,12288, measured on an RTX 5070 Ti; entries below 2048 have no effect, the fused kernel serves only from 2048 keys)
   trellis:
     tensor-core-max-tokens: 512               # optional, default 512: most rows of a non-verification launch kept on the tensor-core route; at least 8

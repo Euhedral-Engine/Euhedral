@@ -9,13 +9,16 @@ import java.util.OptionalInt;
 ///
 /// @param trellis the trellis linear kernels
 /// @param rmsNormDecodeSlices slices of the output pass of a one-row RMS norm, or empty for {@value
-///     #DEFAULT_RMS_NORM_DECODE_SLICES} (the best measured on an RTX 5070 Ti, used on every card)
+///     #DEFAULT_RMS_NORM_DECODE_SLICES} (the value chosen with the sliced kernel, used on every card)
 /// @param fusedVerifyFrom the fewest keys at which the fused verifier kernel serves each of 0 to 8 verified rows
 ///     ({@value #NEVER} is never), or empty for {@link #DEFAULT_FUSED_VERIFY_FROM}
 public record KernelSettings(
         TrellisKernelSettings trellis, OptionalInt rmsNormDecodeSlices, Optional<List<Long>> fusedVerifyFrom) {
 
     public static final int DEFAULT_RMS_NORM_DECODE_SLICES = 40;
+
+    /// The most slices: they become the y extent of a launch grid, which the device limits to 65535.
+    public static final int MAX_RMS_NORM_DECODE_SLICES = 65535;
 
     /// The key count that never starts the fused verifier kernel.
     public static final long NEVER = 0xFFFFFFFFL;
@@ -30,8 +33,11 @@ public record KernelSettings(
     public KernelSettings {
         Objects.requireNonNull(trellis, "trellis");
         Objects.requireNonNull(rmsNormDecodeSlices, "rmsNormDecodeSlices");
-        if (rmsNormDecodeSlices.isPresent() && rmsNormDecodeSlices.getAsInt() < 1)
-            throw new IllegalArgumentException("rms-norm-decode-slices must be positive");
+        if (rmsNormDecodeSlices.isPresent()
+                && (rmsNormDecodeSlices.getAsInt() < 1
+                        || rmsNormDecodeSlices.getAsInt() > MAX_RMS_NORM_DECODE_SLICES))
+            throw new IllegalArgumentException(
+                    "rms-norm-decode-slices must be 1 to " + MAX_RMS_NORM_DECODE_SLICES);
         Objects.requireNonNull(fusedVerifyFrom, "fusedVerifyFrom");
         fusedVerifyFrom = fusedVerifyFrom.map(List::copyOf);
         fusedVerifyFrom.ifPresent(table -> {

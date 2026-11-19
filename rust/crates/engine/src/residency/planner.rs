@@ -12,7 +12,7 @@
 //! the artifact file. A plan that does not fit even then is refused with the bytes it needed and the bytes there
 //! were, naming the memory that is short.
 
-use euhedral_inference_cuda::launch::nvfp4::{nvfp4_native_scratch_bytes, skinny_target_ctas};
+use euhedral_inference_cuda::launch::nvfp4::{SKINNY_MAX_ROWS, nvfp4_native_scratch_bytes, skinny_target_ctas};
 use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFormat, WeightLayout};
 use euhedral_inference_settings::{Auto, BatchingSettings, KvFormat, Settings};
 
@@ -861,15 +861,25 @@ fn trellis_scratch(
     largest
 }
 
-/// The largest scratch the NVFP4 native route needs for any NVFP4 object of `placements` at `rows` rows: the one
-/// the workspace's first scratch region is sized by, when it is larger than the trellis routes'. `target_ctas` is the skinny
-/// kernels' grid on the device, the most any device splits to where it is not known.
+/// The largest scratch the NVFP4 native route needs for any NVFP4 object of `placements` in a launch of up to `rows`
+/// rows: the one the workspace's first scratch region is sized by, when it is larger than the trellis routes'. Beyond
+/// 64 rows the tile route's scratch is smaller than the skinny route's at 64, so the answer is the larger of the two
+/// (as `Nvfp4Linear::scratch_bytes` has it). `target_ctas` is the skinny kernels' grid on the device, the most any
+/// device splits to where it is not known.
 fn nvfp4_native_scratch(placements: &[Placement], rows: u64, target_ctas: u64) -> u64 {
+    let skinny_rows = rows.min(u64::from(SKINNY_MAX_ROWS));
     placements
         .iter()
         .filter(|placement| placement.format == WeightFormat::Nvfp4)
         .filter_map(|placement| match placement.shape.as_slice() {
-            [out, input] => Some(nvfp4_native_scratch_bytes(rows, *input, *out, target_ctas)),
+            [out, input] => Some(
+                nvfp4_native_scratch_bytes(rows, *input, *out, target_ctas).max(nvfp4_native_scratch_bytes(
+                    skinny_rows,
+                    *input,
+                    *out,
+                    target_ctas,
+                )),
+            ),
             _ => None,
         })
         .max()
@@ -1055,6 +1065,13 @@ mod tests {
         );
         assert!(scratch > 0);
         assert!(nvfp4_native_scratch(&objects, 2048, target) > scratch);
+        // Past 64 rows the skinny route's partials at 64 rows are larger than the tile route's scratch: a chunk of 65
+        // rows is sized by them, as is the linear's own answer.
+        let wide = [nvfp4(&[5120, 17_408])];
+        let skinny = nvfp4_native_scratch_bytes(64, 17_408, 5120, target);
+        assert!(skinny > nvfp4_native_scratch_bytes(65, 17_408, 5120, target));
+        assert_eq!(nvfp4_native_scratch(&wide, 65, target), skinny);
+        assert_eq!(nvfp4_native_scratch(&wide, 64, target), skinny);
         // A device that is not known is sized for the widest split.
         assert!(nvfp4_native_scratch(&objects, 8, u64::MAX) >= nvfp4_native_scratch(&objects, 8, target));
         let mut other = nvfp4(&[4096, 1024]);

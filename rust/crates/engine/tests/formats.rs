@@ -496,8 +496,8 @@ mod formats {
     #[test]
     fn nvfp4_routes_by_rows() {
         let weight = nvfp4(34816, 5120, WeightLayout::RowSplitK128V1);
-        let native = Nvfp4Linear::with_native_route(true);
-        let portable = Nvfp4Linear::with_native_route(false);
+        let native = Nvfp4Linear::with_native_route(true, 70);
+        let portable = Nvfp4Linear::with_native_route(false, 70);
         // 1 to 8 rows run the decode kernels, one kernel per row count, with or without the native route.
         for rows in 1..=8usize {
             let expected = Nvfp4Route::DecodeRows { rows: rows as u32 };
@@ -536,7 +536,7 @@ mod formats {
 
     #[test]
     fn nvfp4_declines_follow_the_native_library() {
-        let native = Nvfp4Linear::with_native_route(true);
+        let native = Nvfp4Linear::with_native_route(true, 70);
         // 5248 inputs are a multiple of 128 and not of 256: no skinny kernel, no tile kernel.
         let odd = nvfp4(5120, 5248, WeightLayout::RowSplitK128V1);
         assert_eq!(
@@ -613,8 +613,8 @@ mod formats {
     fn nvfp4_scratch_is_the_native_routes_and_only_from_nine_rows() {
         let weight = nvfp4(5120, 17408, WeightLayout::RowSplitK128V1);
         let none = LinearMode::default();
-        let native = Nvfp4Linear::with_native_route(true);
-        let portable = Nvfp4Linear::with_native_route(false);
+        let native = Nvfp4Linear::with_native_route(true, 70);
+        let portable = Nvfp4Linear::with_native_route(false, 70);
         use euhedral_inference_engine::formats::LinearFormat;
         for rows in 1..=8usize {
             assert_eq!(native.scratch_bytes(&weight, rows, none), 0);
@@ -642,7 +642,7 @@ mod formats {
             (34_816, 5120),
             (5120, 17_408),
         ];
-        let format = Nvfp4Linear::with_native_route(true);
+        let format = Nvfp4Linear::with_native_route(true, 70);
         let none = LinearMode::default();
         for (out, input) in shapes {
             let weight = nvfp4(out, input, WeightLayout::RowSplitK128V1);

@@ -34,9 +34,6 @@ pub struct Nvfp4Linear {
     target_ctas: u64,
 }
 
-/// The multiprocessors a linear without a device assumes (for tests).
-const TEST_MULTIPROCESSORS: u32 = 70;
-
 impl Nvfp4Linear {
     /// Linears on `library`'s device: the native route runs where the device has it.
     pub fn new(library: &CudaLibrary) -> Self {
@@ -47,12 +44,12 @@ impl Nvfp4Linear {
         }
     }
 
-    /// Linears on a device that has the native route or does not (for tests).
-    pub fn with_native_route(native_available: bool) -> Self {
+    /// Linears on a device of `sm_count` streaming multiprocessors that has the native route or does not (for tests).
+    pub fn with_native_route(native_available: bool, sm_count: u32) -> Self {
         Self {
             native_available,
             record: false,
-            target_ctas: skinny_target_ctas(TEST_MULTIPROCESSORS),
+            target_ctas: skinny_target_ctas(sm_count),
         }
     }
 

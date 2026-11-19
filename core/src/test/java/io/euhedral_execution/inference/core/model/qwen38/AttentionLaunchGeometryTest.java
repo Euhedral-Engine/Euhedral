@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.euhedral_execution.inference.core.settings.KernelSettings;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import java.util.ArrayList;
 import java.util.List;
@@ -16,19 +17,21 @@ class AttentionLaunchGeometryTest {
     private static final int GROUP = 6;
 
     /// `fused_from` in native/src/host/qwen_layer_ops.c for rows 2 to 8.
+    private static final List<Long> DEFAULT = KernelSettings.DEFAULT_FUSED_VERIFY_FROM;
+
     private static final long[] FUSED_FROM_BY_ROWS = {49152, 16384, 4096, 2048, 16384, 16384, 12288};
 
     private static long key(KvFormat format, int rows, long last) {
-        return AttentionLaunchGeometry.of(GROUP, format, last - rows, rows);
+        return AttentionLaunchGeometry.of(DEFAULT, GROUP, format, last - rows, rows);
     }
 
     @Test
     void thresholdsAreThoseOfTheNativeDispatch() {
         for (int rows = 2; rows <= 8; rows++)
-            assertEquals(FUSED_FROM_BY_ROWS[rows - 2], AttentionLaunchGeometry.fusedFrom(rows), "rows " + rows);
-        assertEquals(Long.MAX_VALUE, AttentionLaunchGeometry.fusedFrom(0));
-        assertEquals(Long.MAX_VALUE, AttentionLaunchGeometry.fusedFrom(1));
-        assertEquals(Long.MAX_VALUE, AttentionLaunchGeometry.fusedFrom(9));
+            assertEquals(FUSED_FROM_BY_ROWS[rows - 2], AttentionLaunchGeometry.fusedFrom(DEFAULT, rows), "rows " + rows);
+        assertEquals(Long.MAX_VALUE, AttentionLaunchGeometry.fusedFrom(DEFAULT, 0));
+        assertEquals(Long.MAX_VALUE, AttentionLaunchGeometry.fusedFrom(DEFAULT, 1));
+        assertEquals(Long.MAX_VALUE, AttentionLaunchGeometry.fusedFrom(DEFAULT, 9));
     }
 
     @Test
@@ -38,7 +41,7 @@ class AttentionLaunchGeometryTest {
             for (long last = Math.max(rows, 1); last <= 70_000; last++) {
                 assertEquals(
                         last >= from,
-                        AttentionLaunchGeometry.fused(GROUP, KvFormat.NVFP4, rows, last),
+                        AttentionLaunchGeometry.fused(DEFAULT, GROUP, KvFormat.NVFP4, rows, last),
                         "rows " + rows + " last " + last);
                 assertEquals(
                         last >= from,
@@ -89,13 +92,30 @@ class AttentionLaunchGeometryTest {
     @Test
     void rowsAndCachesWithoutTheFusedKernelNeverFuse() {
         for (long last = 100; last <= 70_000; last += 7) {
-            assertFalse(AttentionLaunchGeometry.fused(GROUP, KvFormat.BF16, 4, last), "bf16 " + last);
-            assertFalse(AttentionLaunchGeometry.fused(GROUP, KvFormat.NVFP4, 1, last), "one row " + last);
-            assertFalse(AttentionLaunchGeometry.fused(GROUP, KvFormat.NVFP4, 9, last), "nine rows " + last);
+            assertFalse(AttentionLaunchGeometry.fused(DEFAULT, GROUP, KvFormat.BF16, 4, last), "bf16 " + last);
+            assertFalse(AttentionLaunchGeometry.fused(DEFAULT, GROUP, KvFormat.NVFP4, 1, last), "one row " + last);
+            assertFalse(AttentionLaunchGeometry.fused(DEFAULT, GROUP, KvFormat.NVFP4, 9, last), "nine rows " + last);
             // 8 rows of 8 query heads need 8 tiles; a group above 8 never takes the GQA kernels.
-            assertFalse(AttentionLaunchGeometry.fused(8, KvFormat.NVFP4, 8, last), "eight tiles " + last);
-            assertFalse(AttentionLaunchGeometry.fused(9, KvFormat.NVFP4, 4, last), "group nine " + last);
+            assertFalse(AttentionLaunchGeometry.fused(DEFAULT, 8, KvFormat.NVFP4, 8, last), "eight tiles " + last);
+            assertFalse(AttentionLaunchGeometry.fused(DEFAULT, 9, KvFormat.NVFP4, 4, last), "group nine " + last);
         }
-        assertTrue(AttentionLaunchGeometry.fused(GROUP, KvFormat.NVFP4, 8, 70_000));
+        assertTrue(AttentionLaunchGeometry.fused(DEFAULT, GROUP, KvFormat.NVFP4, 8, 70_000));
+    }
+
+    @Test
+    void aConfiguredTableMovesWhereTheKeyStartsTheFusedVerifier() {
+        // Four rows: the default starts the fused kernel at 4096 keys, an earlier table at 2048, a never entry not at all.
+        List<Long> early = new ArrayList<>(DEFAULT);
+        early.set(4, 2048L);
+        List<Long> never = new ArrayList<>(DEFAULT);
+        never.set(4, KernelSettings.NEVER);
+        assertFalse(AttentionLaunchGeometry.fused(DEFAULT, GROUP, KvFormat.NVFP4, 4, 3000));
+        assertTrue(AttentionLaunchGeometry.fused(early, GROUP, KvFormat.NVFP4, 4, 3000));
+        assertFalse(AttentionLaunchGeometry.fused(early, GROUP, KvFormat.NVFP4, 4, 2047));
+        assertTrue(AttentionLaunchGeometry.fused(DEFAULT, GROUP, KvFormat.NVFP4, 4, 5000));
+        assertFalse(AttentionLaunchGeometry.fused(never, GROUP, KvFormat.NVFP4, 4, 5000));
+        assertNotEquals(
+                AttentionLaunchGeometry.of(DEFAULT, GROUP, KvFormat.NVFP4, 2996, 4),
+                AttentionLaunchGeometry.of(early, GROUP, KvFormat.NVFP4, 2996, 4));
     }
 }

@@ -130,7 +130,6 @@ class SettingsLoaderTest {
         assertEquals(280, s.kernels().trellis().targetBlocks().getAsInt());
     }
 
-    /// A host limit of 0 leaves no RAM tier: every expert the device misses is read from the artifact.
     @Test
     void dispatchKernelSettingsDefaultToAutoAndParse() throws IOException {
         KernelSettings defaults = load(MODEL, Map.of()).kernels();
@@ -146,8 +145,16 @@ class SettingsLoaderTest {
                 set.fusedVerifyFromOrDefault());
         fails(MODEL + "kernels:\n  fused-verify-from: \"1,2,3\"\n", Map.of());
         fails(MODEL + "kernels:\n  rms-norm-decode-slices: 0\n", Map.of());
+        // The slices are a grid extent, which the device limits to 65535.
+        assertEquals(
+                65535,
+                load(MODEL + "kernels:\n  rms-norm-decode-slices: 65535\n", Map.of())
+                        .kernels()
+                        .rmsNormSlices());
+        fails(MODEL + "kernels:\n  rms-norm-decode-slices: 65536\n", Map.of());
     }
 
+    /// A host limit of 0 leaves no RAM tier: every expert the device misses is read from the artifact.
     @Test
     void aHostLimitOfZeroIsAccepted() throws IOException {
         Settings s = load(MODEL + "memory:\n  host-limit: 0\n", Map.of());

@@ -360,7 +360,7 @@ public final class SettingsLoader {
         // use it.
         m.put("host.max-batch-size", optional(integer(1, Integer.MAX_VALUE)));
 
-        m.put("kernels.rms-norm-decode-slices", optional(integer(1, Integer.MAX_VALUE)));
+        m.put("kernels.rms-norm-decode-slices", optional(integer(1, KernelSettings.MAX_RMS_NORM_DECODE_SLICES)));
         m.put("kernels.fused-verify-from", optional(SettingsLoader::fusedVerifyFrom));
         m.put(
                 "kernels.trellis.tensor-core-max-tokens",
