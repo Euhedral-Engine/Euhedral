@@ -1,11 +1,10 @@
-//! The header of a resume file: a map of text keys to text values, kept in the format of a Java `Properties` file so
-//! that files written before the port still resume. The text is UTF-8, `\u` escapes are read, and the rest of the
-//! 4096 bytes are NULs.
+//! The header of a resume file: a map of text keys to text values, kept as the text of a properties file (`key=value`
+//! lines), so that the files of earlier runs still resume. The text is UTF-8 and the rest of the 4096 bytes are NULs.
 //!
-//! Reading follows `Properties.load`: comment lines (`#`, `!`), blank lines, a trailing backslash joining the next line,
-//! a key ended by `=`, `:` or white space, and the escapes `\t \n \r \f \uXXXX`. Writing is `Properties.store` without the
-//! date comment, so that the same map always gives the same bytes: keys in order, the characters Java escapes escaped, and
-//! every NUL and other control character written as `\uXXXX` (a NUL in the text would end the header early).
+//! Reading takes comment lines (`#`, `!`), blank lines, a trailing backslash joining the next line, a key ended by `=`,
+//! `:` or white space, and the escapes `\t \n \r \f \uXXXX` (a surrogate pair gives one character). Writing has no date
+//! comment, so that the same map always gives the same bytes: keys in order, `\ = : # !` and the white-space controls
+//! escaped, and every NUL and other control character written as `\uXXXX` (a NUL in the text would end the header early).
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Iter;

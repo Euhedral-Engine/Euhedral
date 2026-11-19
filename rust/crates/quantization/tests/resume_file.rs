@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use euhedral_core::control_plane::ControlPlaneLattice;
-use euhedral_core::frames::DummyFrame;
+use euhedral_core::frames::{DummyFrame, Frame};
 use euhedral_core::generics::LatticeSource;
 use euhedral_graph::Lake;
 use euhedral_inference_engine::{Handoff, lattice_config};
@@ -103,6 +103,7 @@ fn overwriting_in_place_keeps_one_file_and_the_last_state() {
     assert_eq!(section, longs(&[7, 8, 9]));
     assert_eq!(fs::metadata(&path).unwrap().len(), HEADER + 24);
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    drop(file);
     world.finish();
 }
 
@@ -112,6 +113,7 @@ fn a_new_file_has_an_empty_header() {
     let world = World::start();
     let file = world.open(&directory.path().join("resume.bin"));
     assert!(call(|then| file.header(then)).unwrap().is_empty());
+    drop(file);
     world.finish();
 }
 
@@ -137,6 +139,7 @@ fn a_header_too_large_is_refused_and_the_file_is_unchanged() {
         "{refused:?}"
     );
     assert_eq!(fs::read(&path).unwrap(), before);
+    drop(file);
     world.finish();
 }
 
@@ -154,6 +157,7 @@ fn a_header_of_exactly_the_limit_is_written_and_read_whole() {
     assert_eq!(call(|then| file.header(then)).unwrap(), header);
     header.set("pad", "x".repeat(filler + 1));
     assert!(matches!(header.check(), Err(ResumeError::HeaderTooLarge { bytes }) if bytes == HEADER as usize + 1));
+    drop(file);
     world.finish();
 }
 
@@ -171,6 +175,7 @@ fn sections_of_any_size_round_trip() {
     assert_eq!(call(|then| file.write(end, Vec::new(), then)).unwrap(), end);
     assert!(call(|then| file.read(end, 0, then)).unwrap().is_empty());
     assert_eq!(call(|then| file.read(HEADER, big.len(), then)).unwrap(), big);
+    drop(file);
     world.finish();
 }
 
@@ -183,6 +188,7 @@ fn reading_past_the_end_names_where_the_file_ends() {
     call(|then| file.write(0, vec![1; 100], then)).unwrap();
     let short = call(|then| file.read(60, 100, then));
     assert!(matches!(short, Err(ResumeError::ShortRead { at: 100 })), "{short:?}");
+    drop(file);
     world.finish();
 }
 
@@ -197,23 +203,86 @@ fn truncating_cuts_the_file_back_and_keeps_what_precedes() {
     call(|then| file.sync(then)).unwrap();
     call(|then| file.truncate(120, then)).unwrap();
     assert_eq!(fs::read(&path).unwrap(), (0..120u8).collect::<Vec<_>>());
+    drop(file);
     world.finish();
 }
 
-/// A finished run removes its file; while another handle is open the removal is refused and the file stays.
+/// A finished run removes its file; while another handle is open the removal is refused and the file stays. The call
+/// that was just finished holds no handle, so the last handle always removes, however soon it asks.
 #[test]
 fn removing_needs_the_last_handle_and_deletes_the_file() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("resume.bin");
     let world = World::start();
-    let file = world.open(&path);
-    let other = file.clone();
-    call(|then| file.set_header(&step_header(1), then)).unwrap();
-    let busy = call(|then| file.remove(then));
-    assert!(matches!(busy, Err(ResumeError::Busy)), "{busy:?}");
-    assert!(path.exists());
-    call(|then| other.remove(then)).unwrap();
-    assert!(!path.exists());
+    for round in 0..50 {
+        let path = directory.path().join(format!("resume-{round}.bin"));
+        let file = world.open(&path);
+        let other = file.clone();
+        call(|then| file.set_header(&step_header(1), then)).unwrap();
+        let busy = call(|then| file.remove(then));
+        assert!(matches!(busy, Err(ResumeError::Busy)), "{busy:?}");
+        assert!(path.exists());
+        call(|then| other.remove(then)).unwrap();
+        assert!(!path.exists());
+    }
+    world.finish();
+}
+
+/// The continuation of a call may remove the file at once: the call holds no handle while it runs.
+#[test]
+fn a_continuation_may_remove_the_file_it_was_started_from() {
+    let directory = tempfile::tempdir().unwrap();
+    let world = World::start();
+    for round in 0..50 {
+        let path = directory.path().join(format!("resume-{round}.bin"));
+        let file = world.open(&path);
+        let removed = call(|removed: Then<()>| {
+            let first = file.clone();
+            let handle = file;
+            let sync_then = move |synced: Result<(), ResumeError>| {
+                synced.unwrap();
+                let removal = handle.remove(removed);
+                assert!(removal.is_ok(), "{removal:?}");
+                Box::new(DummyFrame::INSTANCE) as Box<dyn Frame>
+            };
+            let started = first.set_header(&step_header(2), Box::new(sync_then));
+            drop(first);
+            started
+        });
+        removed.unwrap();
+        assert!(!path.exists());
+    }
+    world.finish();
+}
+
+/// A step that is refused after the call started reaches the continuation as an error: the I/O engine is closed, so
+/// the write of the header is refused, and the waiter hears of it.
+#[test]
+fn a_refused_later_step_is_told_to_the_continuation() {
+    let directory = tempfile::tempdir().unwrap();
+    let world = World::start();
+    let file = world.open(&directory.path().join("resume.bin"));
+    world.io.complete();
+    let result = call(|then| file.set_header(&step_header(1), then));
+    assert!(result.is_err(), "{result:?}");
+    drop(file);
+    world.finish();
+}
+
+/// A read at or past the end names where the file ends or where the read began.
+#[test]
+fn a_read_at_or_past_the_end_names_the_position() {
+    let directory = tempfile::tempdir().unwrap();
+    let world = World::start();
+    let file = world.open(&directory.path().join("resume.bin"));
+    call(|then| file.write(0, vec![1; 100], then)).unwrap();
+    for at in [100u64, 150] {
+        let result = call(|then| file.read(at, 8, then));
+        assert!(
+            matches!(result, Err(ResumeError::ShortRead { at: found }) if found == at),
+            "{at}: {result:?}"
+        );
+    }
+    drop(file);
     world.finish();
 }
 
@@ -233,14 +302,14 @@ fn a_closed_host_lake_refuses_to_open_at_once() {
     world.finish();
 }
 
-/// What Java's `Properties.store` wrote, and a few forms its `load` takes: the reader reads them as Java does.
+/// The forms a properties file has: comments, escapes, separators, continuation lines and raw UTF-8.
 #[test]
 fn the_reader_takes_the_forms_a_properties_file_has() {
-    let text = "#Thu Nov 19 10:40:44 EST 2026\n\
+    let text = "# written by an earlier run\n\
         ! another comment\n\
         \n\
-        fingerprint=abc\\=def\\:ghi\n\
-        label=caf\u{e9} \\\\ back slash\n\
+        digest=aa\\=bb\\:cc\n\
+        name=na\u{ef}ve \\\\ path\n\
         spaced   =   value with spaces  \n\
         colon:colon value\n\
         bare\n\
@@ -251,8 +320,8 @@ fn the_reader_takes_the_forms_a_properties_file_has() {
     padded.resize(HEADER as usize, 0);
     let header = Header::decode(&padded).unwrap();
     let read = |key: &str| header.get(key).map(str::to_string);
-    assert_eq!(read("fingerprint").as_deref(), Some("abc=def:ghi"));
-    assert_eq!(read("label").as_deref(), Some("caf\u{e9} \\ back slash"));
+    assert_eq!(read("digest").as_deref(), Some("aa=bb:cc"));
+    assert_eq!(read("name").as_deref(), Some("na\u{ef}ve \\ path"));
     assert_eq!(read("spaced").as_deref(), Some("value with spaces  "));
     assert_eq!(read("colon").as_deref(), Some("colon value"));
     assert_eq!(read("bare").as_deref(), Some(""));

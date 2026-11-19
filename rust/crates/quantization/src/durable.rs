@@ -17,12 +17,18 @@ use std::sync::Arc;
 
 use euhedral_graph::Lake;
 use euhedral_io::{Continuation, OwnedFile};
+use thiserror::Error;
 
-use crate::resume::ResumeError;
 use crate::step::{Kind, step};
 
-/// What a durable call's completion is told.
-pub type Done = Continuation<Result<(), ResumeError>>;
+/// What a durable call's completion is told: whether the call worked.
+pub type Done = Continuation<io::Result<()>>;
+
+/// The host lake would not take the call, because it is closed or has no admitted unit. Nothing was started and the
+/// completion was dropped without running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+#[error("the host lake is closed: the call was not started")]
+pub struct LakeClosed;
 
 /// A file the library shares between the calls in flight on it.
 pub type SharedFile = Arc<File>;
@@ -38,43 +44,43 @@ fn on_host(
     host: &Arc<Lake>,
     work: impl FnOnce() -> io::Result<()> + Send + 'static,
     then: Done,
-) -> Result<(), ResumeError> {
+) -> Result<(), LakeClosed> {
     let next = Arc::clone(host);
     let frame = step(Kind::Durable, move || {
-        let completion = then(work().map_err(ResumeError::Io));
+        let completion = then(work());
         // A refused completion is dropped, and with it what the caller's continuation owned.
         drop(next.offer(completion));
     });
-    host.offer(frame).map_err(|_| ResumeError::LakeClosed)
+    host.offer(frame).map_err(|_| LakeClosed)
 }
 
 /// Makes everything written to `file` so far durable (`fdatasync`, `FlushFileBuffers`).
-#[allow(
+#[expect(
     clippy::disallowed_methods,
     reason = "no-wait, blocking I/O with no AsyncIo form yet: one call, run as a host lake frame, whose completion continues the chain"
 )]
-pub fn sync(host: &Arc<Lake>, file: &SharedFile, then: Done) -> Result<(), ResumeError> {
+pub fn sync(host: &Arc<Lake>, file: &SharedFile, then: Done) -> Result<(), LakeClosed> {
     let file = Arc::clone(file);
     on_host(host, move || file.sync_data(), then)
 }
 
 /// Cuts `file` back to `len` bytes, or extends it with zeros to `len`.
-#[allow(
+#[expect(
     clippy::disallowed_methods,
     reason = "no-wait, blocking I/O with no AsyncIo form yet: one call, run as a host lake frame, whose completion continues the chain"
 )]
-pub fn truncate(host: &Arc<Lake>, file: &SharedFile, len: u64, then: Done) -> Result<(), ResumeError> {
+pub fn truncate(host: &Arc<Lake>, file: &SharedFile, len: u64, then: Done) -> Result<(), LakeClosed> {
     let file = Arc::clone(file);
     on_host(host, move || file.set_len(len), then)
 }
 
 /// Removes the file at `path`. A file that is already gone is not an error: the removal is as done as it can be. A
 /// handle of the file that is still open is the caller's to close first (Windows refuses to remove an open file).
-#[allow(
+#[expect(
     clippy::disallowed_methods,
     reason = "no-wait, blocking I/O with no AsyncIo form yet: one call, run as a host lake frame, whose completion continues the chain"
 )]
-pub fn remove(host: &Arc<Lake>, path: &Path, then: Done) -> Result<(), ResumeError> {
+pub fn remove(host: &Arc<Lake>, path: &Path, then: Done) -> Result<(), LakeClosed> {
     let path: PathBuf = path.to_owned();
     let work = move || match fs::remove_file(&path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),

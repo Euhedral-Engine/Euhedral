@@ -13,4 +13,4 @@ pub mod java_random;
 pub mod npy;
 pub mod npz;
 pub mod resume;
-mod step;
+pub mod step;
