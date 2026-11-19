@@ -29,6 +29,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
+use euhedral_gpu::Lane;
+use euhedral_gpu::cuda::CudaQueue;
 use euhedral_graph::{Completions, DeviceQueue, LaneId, Marker};
 use euhedral_inference_cuda::{ArenaRange, DeviceBuffer, DevicePtr, HostWeightsArena, PooledPinned};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
@@ -595,18 +597,17 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
         let marker = match queued {
             Ok(((), marker)) => marker,
             Err(SubmitError::Busy) => {
-                // The lane's ring is full of markers that have not completed: nothing was queued, so the loan is
-                // still the copy's. The copy is tried again when the lane's oldest marker completes and a slot is
-                // free, not before: re-offering it now would only spin a worker.
+                // Nothing was queued, so the loan is still the copy's. A full ring does not arise in a normal load
+                // (each chain has its own lane and at most two loans against its markers); Busy is an awaiter's
+                // one-call slot pin, or a ring that drained meanwhile. The copy is tried again when the lane's oldest
+                // marker completes, not at once: re-offering it now could only spin a worker.
                 let lane = Arc::clone(shared.core.transfer_lane(chain));
-                let lane_id = shared.core.transfer_lane_id(chain);
                 let completions = Arc::clone(&shared.core.completions);
                 let stages = Arc::clone(&shared.core.stages);
                 let retry = step(Kind::UploadCopy, chain, move || copy(shared, chain, index, loan));
-                if let Some(retry) = retry_when_room(&*lane, lane_id, &completions, retry) {
-                    // No marker of the lane is in flight (the slot is held by something else): nothing to wait on.
-                    let _ = stages.offer(retry);
-                }
+                retry_or_offer(&*lane, &completions, retry, |frame| {
+                    let _ = stages.offer(frame);
+                });
                 return;
             }
             Err(error) => {
@@ -628,21 +629,32 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
     let _ = stages.offer(frame);
 }
 
-/// Registers `retry` to run once the lane has completed its oldest marker still in flight, which frees a slot of its
-/// ring. Nothing waits and nothing is offered meanwhile. Returns the frame when the lane has no marker in flight: there
-/// is no completion to wait for, and the caller decides what to do with it.
-fn retry_when_room(
-    lane: &dyn DeviceQueue,
-    id: LaneId,
+/// A lane the loader may wait on: its queue, and its id in the pool.
+trait RetryLane: DeviceQueue {
+    fn lane_id(&self) -> LaneId;
+}
+
+impl RetryLane for CudaQueue {
+    fn lane_id(&self) -> LaneId {
+        Lane::lane(self)
+    }
+}
+
+/// What a copy refused with `Busy` does: `retry` runs once the lane has completed its oldest marker still in flight,
+/// which frees a slot of its ring. Nothing waits and nothing is offered meanwhile. When the lane has no marker in
+/// flight there is no completion to wait for (something else holds the slot) and `retry` goes to `offer` at once, one
+/// offer per call.
+fn retry_or_offer(
+    lane: &dyn RetryLane,
     completions: &Completions,
     retry: Box<dyn Frame>,
-) -> Option<Box<dyn Frame>> {
+    offer: impl FnOnce(Box<dyn Frame>),
+) {
     let oldest = lane.completed() + 1;
     if oldest > lane.issued() {
-        return Some(retry);
+        return offer(retry);
     }
-    completions.after_marker(Marker::new(lane.id(), id, oldest), retry);
-    None
+    completions.after_marker(Marker::new(lane.id(), lane.lane_id(), oldest), retry);
 }
 
 #[cfg(test)]
@@ -673,6 +685,12 @@ mod tests {
         }
     }
 
+    impl RetryLane for Ring {
+        fn lane_id(&self) -> LaneId {
+            LaneId(0)
+        }
+    }
+
     impl DeviceQueue for Ring {
         fn id(&self) -> QueueId {
             self.id
@@ -694,6 +712,7 @@ mod tests {
         completions: Arc<Completions>,
         attempts: AtomicUsize,
         done: AtomicUsize,
+        offered: AtomicUsize,
     }
 
     fn attempt(copies: Arc<Copies>) {
@@ -704,8 +723,9 @@ mod tests {
         }
         let again = Arc::clone(&copies);
         let retry = step(Kind::UploadCopy, 0, move || attempt(again));
-        let waiting = retry_when_room(&*copies.ring, LaneId(0), &copies.completions, retry);
-        assert!(waiting.is_none(), "markers are in flight, so the retry waits for one");
+        retry_or_offer(&*copies.ring, &copies.completions, retry, |_| {
+            copies.offered.fetch_add(1, Ordering::AcqRel);
+        });
     }
 
     /// Runs every frame the completions hold ready.
@@ -738,6 +758,7 @@ mod tests {
             completions: Arc::clone(&completions),
             attempts: 0.into(),
             done: 0.into(),
+            offered: 0.into(),
         });
 
         // Six copies against a ring of two: two are queued, four are refused and wait.
@@ -764,9 +785,20 @@ mod tests {
             finished += 1;
             assert!(finished <= 6, "the load is finishing");
             ring.completed.fetch_add(1, Ordering::AcqRel);
+            if finished == 1 {
+                assert!(
+                    run_ready(&completions) > 0,
+                    "the retry runs at the first completion, not at the newest marker's"
+                );
+            }
             while run_ready(&completions) > 0 {}
         }
         assert_eq!(copies.done.load(Ordering::Acquire), 6);
+        assert_eq!(
+            copies.offered.load(Ordering::Acquire),
+            0,
+            "markers were in flight: nothing was offered"
+        );
         // At most the waiters behind the completed marker retry each time: bounded by waiters per completion.
         assert!(copies.attempts.load(Ordering::Acquire) <= 6 + 4 * 4);
     }
@@ -782,7 +814,11 @@ mod tests {
         let queues = Arc::new(LanePool::new(vec![ring.clone()]));
         let completions = Completions::new(&queues);
         let retry = step(Kind::UploadCopy, 0, || {});
-        assert!(retry_when_room(&*ring, LaneId(0), &completions, retry).is_some());
+        let offered = AtomicUsize::new(0);
+        retry_or_offer(&*ring, &completions, retry, |_| {
+            offered.fetch_add(1, Ordering::AcqRel);
+        });
+        assert_eq!(offered.load(Ordering::Acquire), 1, "offered once");
         assert_eq!(completions.pending(), 0);
     }
 }
