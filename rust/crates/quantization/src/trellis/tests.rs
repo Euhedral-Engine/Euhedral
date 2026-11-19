@@ -300,7 +300,12 @@ fn the_viterbi_kernels_that_need_it_are_opted_in_to_their_shared_memory() {
     let limit = |name: &str| compiled.kernel(name).unwrap().max_dynamic_shared_bytes();
     assert!(limit("viterbi_k2") >= rate(2.0).viterbi_shared_bytes());
     assert!(limit("viterbi_k2") > 48 * 1024);
-    assert_eq!(limit("viterbi_k3"), 48 * 1024);
+    for bits in [2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0] {
+        let rate = rate(bits);
+        let frac = if bits.fract() == 0.0 { "" } else { "_frac" };
+        let name = format!("viterbi{frac}_k{}", rate.lower());
+        assert!(limit(&name) >= rate.viterbi_shared_bytes(), "{name}");
+    }
 }
 
 #[test]
@@ -321,11 +326,33 @@ fn planned_steps_reach_the_lane_in_order_and_with_their_arguments() {
 fn a_step_for_a_kernel_the_table_lacks_is_refused() {
     let rig = rig();
     let (_compiled, kernels) = trellis_kernels(&rig);
-    let steps = vec![Step {
+    // A good step first: the lookup of every step comes before the first launch, so nothing reaches the lane.
+    let mut steps = plan_pack(rate(2.0), 8, 5, 16).unwrap();
+    steps.push(Step {
         kernel: "no_such_kernel",
         launch: Launch::linear(1, 32),
         args: Args::new(),
-    }];
+    });
     assert!(run(&rig, &kernels, &steps).is_err());
     assert!(rig.launched.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_grid_taller_than_the_device_allows_is_refused_when_planned() {
+    let too_tall = |result: Result<Vec<Step>, TrellisError>| matches!(result, Err(TrellisError::GridTooTall { .. }));
+    assert!(too_tall(plan_hadamard_columns(8, 65536, 128)));
+    assert!(plan_hadamard_columns(8, 65535, 128).is_ok());
+    let reconstruction = |k| Reconstruction {
+        words: 8,
+        suh: 16,
+        svh: 24,
+        k,
+        n: 128,
+        out: 32,
+        scratch: 40,
+    };
+    assert!(too_tall(plan_reconstruct(rate(3.0), &reconstruction(65536))));
+    assert!(plan_reconstruct(rate(3.0), &reconstruction(65408)).is_ok());
+    assert!(too_tall(plan_tile_mean_square(8, 16 * 65536, 16, 16)));
+    assert!(plan_tile_mean_square(8, 16 * 65535, 16, 16).is_ok());
 }

@@ -2,7 +2,8 @@
 //!
 //! - [`Rate`]: the bits per weight the kernels support, and what each rate needs (words, scratch, threads).
 //! - the planners (`plan_*`): from a shape and device addresses to the [`Step`]s that run it. A planner touches no
-//!   device and checks everything a launch would otherwise fault on, so the geometry is tested without a card.
+//!   device and refuses every shape a launch would fault on (including a grid beyond the device's limits), so a
+//!   planned step is never refused for its shape and the geometry is tested without a card.
 //! - [`TrellisKernels`]: the resolved kernels of the trellis module, and the enqueue of planned steps on a lane.
 //!
 //! Tiles are 16x16 weights in tensor-core element order ([`TENSOR_CORE_ORDER`]); every address is a device address.
@@ -22,15 +23,30 @@ pub use plan::{
 pub use rate::{Rate, TENSOR_CORE_ORDER, TILE_WEIGHTS};
 pub use run::TrellisKernels;
 
-/// One kernel launch: the kernel's name in the trellis module, its geometry and its arguments.
+/// One kernel launch: the kernel's name in the trellis module, its geometry and its arguments. Only the planners
+/// build one, so its arguments always match the kernel's parameter list.
 #[derive(Clone, Debug)]
 pub struct Step {
+    kernel: &'static str,
+    launch: Launch,
+    args: Args,
+}
+
+impl Step {
     /// The kernel's symbol name.
-    pub kernel: &'static str,
+    pub fn kernel(&self) -> &'static str {
+        self.kernel
+    }
+
     /// The grid, block and dynamic shared memory.
-    pub launch: Launch,
+    pub fn launch(&self) -> &Launch {
+        &self.launch
+    }
+
     /// The arguments, in the kernel's parameter order.
-    pub args: Args,
+    pub fn args(&self) -> &Args {
+        &self.args
+    }
 }
 
 /// Why a launch cannot be planned or run.
@@ -51,9 +67,9 @@ pub enum TrellisError {
     /// A strip of rows lies outside the matrix.
     #[error("a strip of 16 rows from row {first} lies outside {rows} rows")]
     StripOutside { first: u32, rows: u32 },
-    /// A strip is not 16 rows tall.
-    #[error("a strip of {0} rows, not 16")]
-    StripHeight(u32),
+    /// A launch grid would be taller than the device allows.
+    #[error("{name} {value} would make a grid taller than {most}")]
+    GridTooTall { name: &'static str, value: u64, most: u32 },
     /// A count or extent does not fit the kernel's 32-bit parameter.
     #[error("{name} {value} does not fit a 32-bit kernel parameter")]
     TooLarge { name: &'static str, value: u64 },

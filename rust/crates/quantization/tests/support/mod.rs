@@ -18,7 +18,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use euhedral_gpu::cuda::{CudaGpu, CudaModule, CudaQueue};
-use euhedral_gpu::{Lane, SharedLanes, StreamOptions, open_shared_lanes};
+use euhedral_gpu::{GpuError, Lane, SharedLanes, StreamOptions, open_shared_lanes};
 use euhedral_graph::LaneId;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer};
 use euhedral_inference_quantization::kernels::{Module, ModuleOptions, Modules};
@@ -63,7 +63,7 @@ impl Rig {
                 // SAFETY: the steps name live buffers of the test, which outlive the wait below.
                 unsafe { self.kernels.enqueue(queue, steps) }.map_err(|error| match error {
                     TrellisError::Gpu(gpu) => gpu,
-                    other => euhedral_gpu::GpuError::Invalid(other.to_string()),
+                    other => GpuError::Invalid(other.to_string()),
                 })
             })
             .expect("submit");

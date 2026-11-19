@@ -5,9 +5,6 @@ use super::TrellisError;
 /// Weights in one tile.
 pub const TILE_WEIGHTS: usize = 256;
 
-/// The most dynamic shared memory a block gets without opting in.
-pub(super) const DEFAULT_SHARED_BYTES: u32 = 48 * 1024;
-
 /// A rate in bits per weight: an integer from 2 to 6, or 2.5 or 3.5, which alternate K and K + 1 bits (K the lower
 /// rate).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

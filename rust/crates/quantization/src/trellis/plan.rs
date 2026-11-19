@@ -15,7 +15,7 @@ const MOST_ELEMENTWISE_BLOCKS: u64 = 1 << 20;
 /// The most blocks of a reduction launch: each block adds into one double, so more blocks only add contention.
 const MOST_REDUCTION_BLOCKS: u64 = 1024;
 
-fn kernel_name(name: &str) -> Result<&'static str, TrellisError> {
+pub(super) fn kernel_name(name: &str) -> Result<&'static str, TrellisError> {
     Module::Trellis
         .kernels()
         .iter()
@@ -24,7 +24,7 @@ fn kernel_name(name: &str) -> Result<&'static str, TrellisError> {
         .ok_or_else(|| TrellisError::NoKernel(name.to_owned()))
 }
 
-fn rate_kernel(kind: &str, rate: Rate) -> Result<&'static str, TrellisError> {
+pub(super) fn rate_kernel(kind: &str, rate: Rate) -> Result<&'static str, TrellisError> {
     let frac = if rate.is_half_step() { "_frac" } else { "" };
     kernel_name(&format!("{kind}{frac}_k{}", rate.lower()))
 }
@@ -73,6 +73,21 @@ fn multiple(name: &'static str, value: u32, unit: u32) -> Result<u32, TrellisErr
         });
     }
     Ok(value)
+}
+
+/// The most blocks a grid has along its second axis.
+const MOST_GRID_ROWS: u32 = 65535;
+
+/// `blocks`, when a grid can be that tall.
+fn grid_rows(name: &'static str, blocks: u32) -> Result<u32, TrellisError> {
+    if blocks > MOST_GRID_ROWS {
+        return Err(TrellisError::GridTooTall {
+            name,
+            value: u64::from(blocks),
+            most: MOST_GRID_ROWS,
+        });
+    }
+    Ok(blocks)
 }
 
 /// Blocks of an elementwise launch over `count` values, 256 threads each.
@@ -189,10 +204,11 @@ pub fn plan_hadamard_columns(x: u64, rows: u32, cols: u32) -> Result<Vec<Step>, 
     if rows == 0 || cols == 0 {
         return Ok(Vec::new());
     }
+    let grid_y = grid_rows("rows", rows)?;
     let args = Args::new().device(x).arg(rows_arg).arg(cols_arg);
     Ok(vec![step(
         "hadamard128_columns",
-        Dim3::new(cols / 128, rows, 1),
+        Dim3::new(cols / 128, grid_y, 1),
         128,
         args,
     )?])
@@ -265,10 +281,13 @@ pub fn plan_reconstruct(rate: Rate, operands: &Reconstruction) -> Result<Vec<Ste
     multiple("n", n, 128)?;
     let (k_arg, n_arg) = (int("k", k)?, int("n", n)?);
     let tiles = u64::from(k / 16) * u64::from(n / 16);
-    let tiles = u32::try_from(tiles).map_err(|_| TrellisError::TooLarge {
-        name: "tiles",
-        value: tiles,
-    })?;
+    let tiles = i32::try_from(tiles)
+        .map_err(|_| TrellisError::TooLarge {
+            name: "tiles",
+            value: tiles,
+        })?
+        .cast_unsigned();
+    let scale_grid = Dim3::new(n.div_ceil(256), grid_rows("k", k)?, 1);
     let mut steps = vec![step(
         rate_kernel("reconstruct", rate)?,
         Dim3::x(tiles),
@@ -276,7 +295,6 @@ pub fn plan_reconstruct(rate: Rate, operands: &Reconstruction) -> Result<Vec<Ste
         Args::new().device(words).arg(n_arg).device(scratch),
     )?];
     steps.extend(plan_hadamard_rows(scratch, k, n)?);
-    let scale_grid = Dim3::new(n.div_ceil(256), k, 1);
     steps.push(step(
         "scale_rows_fp16",
         scale_grid,
@@ -305,8 +323,9 @@ pub fn plan_tile_mean_square(w: u64, k: u32, n: u32, out: u64) -> Result<Vec<Ste
     let (w, out) = (address("w", w)?, address("out", out)?);
     multiple("k", k, 16)?;
     multiple("n", n, 16)?;
+    let grid_y = grid_rows("k / 16", k / 16)?;
     let args = Args::new().device(w).arg(int("n", n)?).device(out);
-    Ok(vec![step("tile_mean_square", Dim3::new(n / 16, k / 16, 1), 256, args)?])
+    Ok(vec![step("tile_mean_square", Dim3::new(n / 16, grid_y, 1), 256, args)?])
 }
 
 /// Adds `sum(a[i] * b[i])` for `i < count`, in double, to the double at `out`. The caller zeroes `out` first

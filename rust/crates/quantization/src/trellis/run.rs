@@ -5,9 +5,13 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 use euhedral_gpu::{Gpu, KernelOptions, LaneEnqueue, Module as GpuModule};
 
-use super::rate::{DEFAULT_SHARED_BYTES, Rate};
+use super::plan::rate_kernel;
+use super::rate::Rate;
 use super::{Step, TrellisError};
 use crate::kernels::Compiled;
+
+/// The rates the kernels support.
+const RATES: [f64; 7] = [2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0];
 
 /// The kernels of the compiled trellis module, with the Viterbi kernels opted in to the shared memory they use.
 pub struct TrellisKernels<M: GpuModule> {
@@ -24,37 +28,32 @@ impl<M: GpuModule> Debug for TrellisKernels<M> {
 }
 
 impl<M: GpuModule> TrellisKernels<M> {
-    /// The kernels of `compiled`, which must be the trellis module. A Viterbi kernel whose block needs more dynamic
-    /// shared memory than the default is looked up again with the limit it needs, once, here.
+    /// The kernels of `compiled`, which must be the trellis module. Every Viterbi kernel is looked up again with the
+    /// dynamic shared memory its block needs, once, here: the large ones need the opt-in, the others are unharmed.
     pub fn new(compiled: &Compiled<M>) -> Result<Self, TrellisError> {
         let mut kernels: HashMap<_, _> = compiled
             .kernels()
             .map(|(name, kernel)| (name, kernel.clone()))
             .collect();
-        for lower in 2..=6u32 {
-            let name = format!("viterbi_k{lower}");
-            let Ok(rate) = Rate::new(f64::from(lower)) else {
-                continue;
-            };
-            let shared = rate.viterbi_shared_bytes();
-            if shared <= DEFAULT_SHARED_BYTES {
-                continue;
-            }
-            let Some(listed) = kernels.keys().copied().find(|listed| *listed == name) else {
-                return Err(TrellisError::NoKernel(name));
-            };
+        for bits in RATES {
+            let rate = Rate::new(bits)?;
+            let name = rate_kernel("viterbi", rate)?;
             let opted = compiled.module().kernel_with(
-                listed,
+                name,
                 KernelOptions {
-                    max_dynamic_shared_bytes: shared,
+                    max_dynamic_shared_bytes: rate.viterbi_shared_bytes(),
                 },
             )?;
-            kernels.insert(listed, opted);
+            kernels.insert(name, opted);
         }
         Ok(Self { kernels })
     }
 
-    /// Enqueues `steps` in order on `lane`.
+    /// Enqueues `steps` in order on `lane`. Every kernel is looked up before the first launch, so a step the table
+    /// lacks leaves nothing on the lane.
+    ///
+    /// On an `Err` from the lane itself (the driver refusing a launch) the steps before it are already on the lane:
+    /// their addresses must stay valid until the lane retires them.
     ///
     /// # Safety
     /// Every address in the steps is valid for the access its kernel makes until the work retires, and no other work
@@ -63,13 +62,17 @@ impl<M: GpuModule> TrellisKernels<M> {
     where
         E: LaneEnqueue<Kernel = <M::Gpu as Gpu>::Kernel>,
     {
-        for step in steps {
-            let kernel = self
-                .kernels
-                .get(step.kernel)
-                .ok_or_else(|| TrellisError::NoKernel(step.kernel.to_owned()))?;
-            // SAFETY: the caller vouches for the addresses; the arguments were built with the kernel's parameter
-            // list by the planner that made the step.
+        let resolved = steps
+            .iter()
+            .map(|step| {
+                self.kernels
+                    .get(step.kernel)
+                    .ok_or_else(|| TrellisError::NoKernel(step.kernel.to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (step, kernel) in steps.iter().zip(resolved) {
+            // SAFETY: the caller vouches for the addresses; only the planners build a step, with the arguments in
+            // the kernel's parameter order.
             unsafe { lane.launch(kernel, step.launch, &step.args) }?;
         }
         Ok(())
