@@ -121,6 +121,84 @@ pub trait KernelOps {
         weights_bytes: u64,
         scratch_bytes: u64,
     ) -> Result<(), CudaError>;
+    fn linear_q3_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+    ) -> Result<(), CudaError>;
+    /// The Q4 (`bits` 4) or Q5 (`bits` 5) linear.
+    fn linear_quantized_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+        bits: u32,
+    ) -> Result<(), CudaError>;
+    /// The fused decode of a P2E2 Q3 tensor (up to 8 rows); [`ROUTE_UNAVAILABLE`](crate::sys::EUHEDRAL_CUDA_ROUTE_UNAVAILABLE)
+    /// where the kernels do not take the launch.
+    fn linear_q3_p2e2_decode_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+    ) -> Result<(), CudaError>;
+    /// Expands rows `first_row..first_row + row_count` of the P2E2 tensor `weights` of `rows` rows into a row-split Q3
+    /// tensor at `destination`.
+    fn q3_p2e2_expand(
+        &mut self,
+        weights: DevicePtr,
+        weights_bytes: u64,
+        rows: u32,
+        in_features: u32,
+        first_row: u32,
+        row_count: u32,
+        destination: DevicePtr,
+        destination_bytes: u64,
+    ) -> Result<(), CudaError>;
+    /// The FP8 prefill linear of a Q3, Q4 or Q5 tensor (`bits` 3, 4 or 5), quantizing the activations into `scratch`.
+    /// `split_rows`, when not zero, names the whole tensor's weight rows for a run in output-row chunks.
+    /// [`ROUTE_UNAVAILABLE`](crate::sys::EUHEDRAL_CUDA_ROUTE_UNAVAILABLE) where the route declines the launch.
+    fn linear_q3_mx_bf16(
+        &mut self,
+        bits: u32,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        scratch: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+        scratch_bytes: u64,
+        split_rows: u32,
+    ) -> Result<(), CudaError>;
+    /// The paired FP8 linear of a Q3 gate/up tensor with SwiGLU (gate rows, then up rows; `outputs` is both), which
+    /// never splits K: `output` takes `outputs / 2` values per row. `ROUTE_UNAVAILABLE` where the route declines.
+    fn q3_mx_gate_up_swiglu_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        scratch: DevicePtr,
+        rows: u32,
+        width: u32,
+        outputs: u32,
+        weights_bytes: u64,
+        scratch_bytes: u64,
+    ) -> Result<(), CudaError>;
     fn attention_qk_norm_rope_bf16(
         &mut self,
         query_key: DevicePtr,

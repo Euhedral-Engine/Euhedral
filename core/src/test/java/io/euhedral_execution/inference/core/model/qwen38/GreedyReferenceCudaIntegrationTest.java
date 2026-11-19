@@ -45,9 +45,14 @@ import org.junit.jupiter.api.Timeout;
 @ModelGroup.OwnJvm // loads the artifact named by euhedral.greedy.artifact, not one of the shared ones
 class GreedyReferenceCudaIntegrationTest {
 
+    /// The user turn of the chat prompt unless `euhedral.greedy.user` names another (a longer one, to prefill more rows).
+    static final String USER = "Explain, in a few short paragraphs, how a language model produces text one token at a time.";
+
     /// The chat prompt: one user turn, then the assistant's turn open.
-    static final String PROMPT = "<|im_start|>user\nExplain, in a few short paragraphs, how a language model "
-            + "produces text one token at a time.<|im_end|>\n<|im_start|>assistant\n";
+    static String prompt() {
+        return "<|im_start|>user\n" + System.getProperty("euhedral.greedy.user", USER)
+                + "<|im_end|>\n<|im_start|>assistant\n";
+    }
 
     @Test
     @Timeout(value = 3600, unit = TimeUnit.SECONDS)
@@ -60,7 +65,7 @@ class GreedyReferenceCudaIntegrationTest {
         int tokens = Integer.getInteger("euhedral.greedy.tokens", 128);
         QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"))));
-        int[] prompt = tokenizer.encodeWithModelSpecialTokens(PROMPT);
+        int[] prompt = tokenizer.encodeWithModelSpecialTokens(prompt());
         var data = ArtifactReader.read(artifact);
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 Qwen38Model model = Qwen38Model.load(
