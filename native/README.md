@@ -88,6 +88,7 @@ NumPy. `gpu_harness.py` is the shared harness (NVRTC compilation, module loading
 
 | Test | Covers |
 | --- | --- |
+| `test_pdl_registry.py` | The programmatic-launch registry: more than 64 registrations from several threads all found, a repeat takes no slot, a full registry refuses. Host only. |
 | `test_dflash.py` | The DFlash2 operators against NumPy oracles with the reference's rounding points: convolution, top-16 and selector bit for bit, the linear's rows identical at every row count. |
 | `test_q3_kernels.py` | Q3 reference against FP64, contiguous decode against the reference, the 2 to 8 row twins bit for bit one-row. |
 | `test_q45_kernels.py` | Q4/Q5 reference, contiguous decode, row twins, the capped grid. |
