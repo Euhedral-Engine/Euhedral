@@ -8,9 +8,11 @@ publish.workspace = true
 
 [dependencies]
 crc32fast.workspace = true
+euhedral-gpu = { workspace = true, features = ["cuda"] }
 thiserror.workspace = true
 
 [dev-dependencies]
+euhedral-gpu = { workspace = true, features = ["fake"] }
 test-support = { path = "../test-support" }
 
 [lints]

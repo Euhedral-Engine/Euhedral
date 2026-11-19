@@ -516,6 +516,7 @@ name = "euhedral-inference-quantization"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "euhedral-gpu",
  "test-support",
  "thiserror",
 ]
