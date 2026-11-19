@@ -19,7 +19,7 @@ use euhedral_memory::{
     LocationId, LocationKind, LocationSpec, OwnerSpec, Placed, PlanRequest, Planner, Priority, Scope,
 };
 
-use crate::error::PlanError;
+use crate::error::{HostFigures, PlanError};
 use crate::model::{
     ArtifactProfile, LayerIndex, MTP_ATTENTION_PACK, MTP_PACK_HALVES, ModelConfig, Role, Speculation, object_key,
     trellis_logical, validate_inventory,
@@ -513,7 +513,8 @@ pub fn plan_closest(
 }
 
 /// What a plan that does not fit is refused for. The reference is the whole host budget, not what the cache pages left
-/// of it: the plan is refused for the host only when the arena and the window alone are more than the budget.
+/// of it: the plan is refused for the host only when the arena and the window alone are more than the budget. When the
+/// device is named although the host is short once the cache pages are counted, the message carries the host figures.
 fn refusal_of(
     reach: &Reach,
     layout: &Layout,
@@ -536,6 +537,11 @@ fn refusal_of(
         free: inputs.device_free,
         sequences: inputs.sequences,
         context_tokens: max_tokens,
+        host: HostFigures {
+            weights: needed,
+            cache_pages: layout.cache_host,
+            budget: original_host,
+        },
     }
 }
 

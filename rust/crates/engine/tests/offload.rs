@@ -231,7 +231,10 @@ fn a_host_budget_below_the_weights_is_refused_naming_the_memory_that_is_short() 
     assert!(needed > budget);
     let text = PlanError::HostTooSmall { needed, budget }.to_string();
     assert!(
-        text.contains("64 MiB host budget") && text.contains("memory.host-weights-limit"),
+        text.contains("64 MiB host budget")
+            && text.contains("memory.host-weights-limit")
+            && text.contains("context.max-tokens")
+            && text.contains("batching.max-sequences"),
         "{text}"
     );
 
@@ -261,7 +264,9 @@ fn a_host_budget_below_the_weights_is_refused_naming_the_memory_that_is_short() 
     two.sequences = 2;
     let text = plan_with(&config, &table, &settings, two).unwrap_err().to_string();
     assert!(
-        text.contains("2 sequences of 4096 tokens") && text.ends_with("or fewer sequences"),
+        text.contains("2 sequences of 4096 tokens")
+            && text.contains("or fewer sequences (batching.max-sequences)")
+            && text.contains("context.max-tokens"),
         "{text}"
     );
 }
@@ -290,10 +295,13 @@ fn the_staging_slots_do_not_alter_a_resident_plan() {
 fn auto_sequences_never_offload_more_than_one_sequence_does() {
     let (config, table, settings) = (config(), rco_table(), settings(4096));
     let need = resident(4096).device_bytes;
-    let single = plan_with(&config, &table, &settings, inputs(need - 2 * GIB, Some(u64::MAX))).unwrap();
-    assert!(!single.offload.is_empty());
-    let free = need - 2 * GIB;
+    // Short by 80 MiB: the embedding leaves and the room it frees holds a second sequence, so the search has more
+    // than one to find.
+    let free = need - 80 * MIB;
+    let single = plan_with(&config, &table, &settings, inputs(free, Some(u64::MAX))).unwrap();
+    assert_eq!(single.offload.host, [EMBEDDING]);
     let found = sequences_for(&config, &table, &settings, inputs(free, Some(u64::MAX)), 102).unwrap();
+    assert!(found > 1, "the search finds {found}");
     let chosen = PlanInputs {
         sequences: found,
         ..inputs(free, Some(u64::MAX))
@@ -301,6 +309,7 @@ fn auto_sequences_never_offload_more_than_one_sequence_does() {
     // The count plans, and with no more offloaded than one sequence has.
     let at = plan_with(&config, &table, &settings, chosen).unwrap();
     assert!(at.offloaded_bytes() <= single.offloaded_bytes());
+    assert_eq!(at.offload.host, single.offload.host);
     // One more is refused or offloads more.
     let more = plan_with(
         &config,
@@ -399,4 +408,65 @@ fn a_gpu_limit_below_the_need_offloads_like_a_short_device() {
     settings.memory.gpu_limit = Auto::Value(ByteSize(need - 1));
     let plan = plan_with(&config, &table, &settings, inputs(64 * GIB, Some(u64::MAX))).unwrap();
     assert_eq!(plan.offload.host, [EMBEDDING]);
+}
+
+/// With the device short, more sequences keep fewer weights on it: each one's state takes room the weights had.
+#[test]
+fn more_sequences_keep_fewer_weights_on_the_device() {
+    let (config, table, settings) = (config(), rco_table(), settings(4096));
+    let free = resident(4096).device_bytes - 4 * GIB;
+    let with = |sequences| {
+        plan_with(
+            &config,
+            &table,
+            &settings,
+            PlanInputs {
+                sequences,
+                ..inputs(free, Some(u64::MAX))
+            },
+        )
+        .unwrap()
+    };
+    let (one, four) = (with(1), with(4));
+    assert!(!one.offload.is_empty());
+    assert!(four.offload.host.len() + four.offload.disk.len() >= one.offload.host.len() + one.offload.disk.len());
+    assert!(four.offloaded_bytes() >= one.offloaded_bytes());
+    assert!(four.device_bytes <= free && one.device_bytes <= free);
+}
+
+/// A row of the reference planner's refusals where the device kind is named although the device's figures fit: the
+/// cache pages put on the host leave the host short. The kind stays the reference's; the message carries the host
+/// figures so the shortfall is visible.
+#[test]
+fn a_device_refusal_that_is_short_on_the_host_carries_the_host_figures() {
+    let (config, table) = (config(), rco_table());
+    let mut settings = settings(32_768);
+    settings.context.kv_cache_on_gpu_tokens = 8192;
+    let need = plan_with(&config, &table, &settings, inputs(64 * GIB, Some(u64::MAX)))
+        .unwrap()
+        .device_bytes;
+    let host = 600 * MIB;
+    let error = plan_with(&config, &table, &settings, inputs(need - 542_113_792, Some(host))).unwrap_err();
+    let PlanError::DeviceTooSmallWithOffload {
+        weights_needed,
+        state_needed,
+        available,
+        host: figures,
+        ..
+    } = error
+    else {
+        panic!("expected the device kind of the reference, got {error:?}");
+    };
+    assert!(
+        weights_needed + state_needed <= available,
+        "the device's own figures fit"
+    );
+    assert_eq!(figures.budget, host);
+    assert!(figures.cache_pages > 0 && figures.weights > 0);
+    assert!(figures.needed() > host);
+    let text = error.to_string();
+    for figure in [figures.weights, figures.cache_pages, host] {
+        assert!(text.contains(&format!("{figure} bytes")), "{text}");
+    }
+    assert!(text.contains("the host is short too"), "{text}");
 }

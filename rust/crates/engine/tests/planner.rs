@@ -21,8 +21,8 @@ use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::model::{ArtifactProfile, Quantization, Speculation};
 use euhedral_inference_engine::residency::footprint;
 use euhedral_inference_engine::residency::planner::{
-    ARENA_ALIGNMENT, DEFAULT_RUNTIME_RESERVE_BYTES, PlacementSource, PlanInputs, ResidencyPlan, plan, plan_with,
-    sequences_for,
+    ARENA_ALIGNMENT, DEFAULT_RUNTIME_RESERVE_BYTES, PlacementSource, PlanInputs, ResidencyPlan, plan, plan_closest,
+    plan_with, sequences_for,
 };
 use euhedral_inference_engine::runtime::resolve_sequences;
 use euhedral_inference_engine::workspace::{
@@ -161,6 +161,7 @@ fn planner_refuses_when_weights_do_not_fit() {
         free,
         sequences,
         context_tokens,
+        host,
     } = error
     else {
         panic!("expected DeviceTooSmallWithOffload, got {error:?}");
@@ -172,10 +173,10 @@ fn planner_refuses_when_weights_do_not_fit() {
     let arena = plan_with(&config(), &rco_table(), &settings(32_768), inputs(16 * GIB))
         .unwrap()
         .arena_bytes;
-    assert!(
-        weights_needed > 0 && weights_needed < arena,
-        "what stays on the device after the offload"
-    );
+    // What stays on the device is the arena the closest plan keeps and its staging ring, exactly.
+    let (closest, _) = plan_closest(&config(), &rco_table(), &settings(32_768), inputs(GIB)).unwrap();
+    assert!(closest.arena_bytes < arena);
+    assert_eq!(weights_needed, closest.arena_bytes + closest.offload.staging_bytes());
     assert_eq!(state_needed, JAVA_KV_32768 + 1280 * MIB + JAVA_TRELLIS_SCRATCH_512);
     let message = PlanError::DeviceTooSmallWithOffload {
         weights_needed,
@@ -184,6 +185,7 @@ fn planner_refuses_when_weights_do_not_fit() {
         free,
         sequences,
         context_tokens,
+        host,
     }
     .to_string();
     assert!(
@@ -225,6 +227,7 @@ fn kv_spills_beyond_kv_cache_on_gpu_tokens_when_short() {
 
     // Room for the whole cache: nothing spills.
     let roomy = plan_with(&config, &table, &settings, inputs(need_whole)).unwrap();
+    assert!(roomy.offload.is_empty());
     assert_eq!((roomy.kv_device_tokens, roomy.kv_host_tokens), (131_072, 0));
 
     // One byte short of that: the cache past 32768 tokens moves to the host.
@@ -235,7 +238,12 @@ fn kv_spills_beyond_kv_cache_on_gpu_tokens_when_short() {
     assert_eq!(short.device_bytes, need_spilled);
 
     // The boundary of the spilled plan.
-    assert!(plan_with(&config, &table, &settings, inputs(need_spilled)).is_ok());
+    assert!(
+        plan_with(&config, &table, &settings, inputs(need_spilled))
+            .unwrap()
+            .offload
+            .is_empty()
+    );
     // One byte short of that: the weights leave the device too, the embedding first, and the pages stay on the host.
     let deeper = plan_with(&config, &table, &settings, inputs(need_spilled - 1)).unwrap();
     assert_eq!(deeper.offload.host, ["text/token_embedding"]);
@@ -318,7 +326,12 @@ fn gpu_limit_respected_and_gpu_reserve_not_used_by_the_dense_plan() {
         .device_bytes;
 
     // The plan fits exactly what is free, with no gpu-reserve taken off (Java InferenceEngine.deviceBudget).
-    assert!(plan_with(&config, &table, &base, inputs(need)).is_ok());
+    assert!(
+        plan_with(&config, &table, &base, inputs(need))
+            .unwrap()
+            .offload
+            .is_empty()
+    );
     assert_eq!(
         plan_with(&config, &table, &base, inputs(need - 1))
             .unwrap()
@@ -505,6 +518,8 @@ fn the_boundary_of_a_plan_of_several_sequences_and_what_the_refusal_says() {
     );
     let message = error.to_string();
     assert!(message.contains("or fewer sequences"), "{message}");
+    assert!(message.contains("batching.max-sequences"), "{message}");
+    assert!(message.contains("context.max-tokens"), "{message}");
     // The same device holds one sequence.
     assert!(plan_with(&config, &table, &settings, with_sequences(need - 1, 1)).is_ok());
 }

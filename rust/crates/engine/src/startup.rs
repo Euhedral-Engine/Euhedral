@@ -564,17 +564,13 @@ fn refuse_offload(offload: &Offload) -> Result<(), PlanError> {
     if offload.is_empty() {
         return Ok(());
     }
-    Err(PlanError::Unsupported(format!(
-        "the model does not fit the device: {} weights ({} in host memory, {} in the artifact file) would be held \
-         outside it, which needs {} bytes of pinned host memory ({} for the host arena and {} for the disk window); \
-         weights cannot be backed by host memory yet",
-        offload.host.len() + offload.disk.len(),
-        offload.host.len(),
-        offload.disk.len(),
-        offload.host_bytes(),
-        offload.host_arena_bytes,
-        offload.window_bytes()
-    )))
+    Err(PlanError::WeightsOutsideDevice {
+        weights: offload.host.len() + offload.disk.len(),
+        host_weights: offload.host.len(),
+        disk_weights: offload.disk.len(),
+        arena_bytes: offload.host_arena_bytes,
+        window_bytes: offload.window_bytes(),
+    })
 }
 
 /// Step 4: allocates the weight arena, the workspace and the sequence state, and zeroes the state on the first
@@ -1062,7 +1058,9 @@ mod tests {
             }),
             host_arena_bytes: 3 << 20,
         };
-        let refusal = refuse_offload(&offload).unwrap_err().to_string();
+        let error = refuse_offload(&offload).unwrap_err();
+        assert!(matches!(error, PlanError::WeightsOutsideDevice { arena_bytes, .. } if arena_bytes == 3 << 20));
+        let refusal = error.to_string();
         assert!(
             refusal.contains(&format!("needs {} bytes of pinned host memory", 11 << 20)),
             "{refusal}"

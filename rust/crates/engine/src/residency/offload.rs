@@ -576,8 +576,8 @@ mod tests {
         assert!(mapped(EMBEDDING) && mapped(OUTPUT_HEAD));
     }
 
-    /// The reference's `HostWeightSelectionTest`: 4 layers of a 10-byte and a 100-byte family, an embedding of 500 and
-    /// a head of 700.
+    /// The reference planner's weight selection over a small table: 4 layers of a 10-byte and a 100-byte family, an
+    /// embedding of 500 and a head of 700.
     #[test]
     fn the_embedding_goes_first_then_the_smallest_projections() {
         let names_of: Vec<String> = (0..4)
