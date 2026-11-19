@@ -93,8 +93,8 @@ pub(crate) fn host_pinned_bytes(settings: &Settings, machine: &Machine) -> Optio
     HostBudget::of(stated, machine.available, settings.memory.host_margin, 0).pinned_bytes()
 }
 
-/// Reads the machine's memory: what it can spare now (`HostBudget.availableBytes`: `MemAvailable`, or the least headroom
-/// of the process's cgroup and its ancestors when that is less) and what it has.
+/// Reads the machine's memory: what it can spare now (`MemAvailable`, or the least headroom of the process's cgroup and its
+/// ancestors when that is less; headroom counts the cgroup's reclaimable page cache as free) and what it has.
 #[cfg(target_os = "linux")]
 #[allow(
     clippy::disallowed_methods,
@@ -113,10 +113,24 @@ pub(crate) fn read_machine() -> Machine {
     if let Some(path) = own.as_deref().and_then(budget::cgroup_path) {
         let mut group = root.join(path.trim_start_matches('/'));
         while group.starts_with(root) {
+            let stat_path = group.join("memory.stat");
             let headroom = fs::read_to_string(group.join("memory.max"))
                 .ok()
                 .zip(fs::read_to_string(group.join("memory.current")).ok())
-                .and_then(|(max, current)| budget::cgroup_headroom(&max, &current));
+                .and_then(|(max, current)| {
+                    // Limited groups only: an unlimited one needs no stat and no warning.
+                    let limited = max.trim() != "max" && !max.trim().is_empty();
+                    let stat = limited.then(|| fs::read_to_string(&stat_path)).and_then(|read| {
+                        read.map_err(|error| {
+                            log::warn!(
+                                "{} could not be read ({error}): the page cache counts as used memory",
+                                stat_path.display()
+                            );
+                        })
+                        .ok()
+                    });
+                    budget::cgroup_headroom(&max, &current, stat.as_deref())
+                });
             least = match (least, headroom) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
