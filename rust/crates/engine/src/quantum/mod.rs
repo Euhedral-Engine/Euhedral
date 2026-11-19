@@ -60,7 +60,7 @@ use crate::stages::{LaneTable, QuantumError, QuantumKind, StageLaunch, fatal};
 use crate::state::SequenceId;
 use crate::workspace::BufferSlot;
 #[cfg(feature = "test-oracles")]
-use body_fault::{BodyFault, BodyFaults, HoldEvent};
+use body_fault::{BodyFault, BodyFaults, HoldEvent, Planned, Sighting};
 use whole::{Launches, Site, run_held};
 
 /// What a quantum that runs as a graph body carries: its key, what the run holds for the device, and how it ran.
@@ -427,24 +427,41 @@ struct QuantumLaunches<'a> {
     launches: &'a [Arc<dyn StageLaunch>],
     /// A test hook's fault, applied after the first launch that has work.
     #[cfg(feature = "test-oracles")]
-    fault: Option<BodyFault>,
+    fault: Option<Planned>,
 }
 
 impl Launches<CudaGpu> for QuantumLaunches<'_> {
     fn launch<E: Enqueue<Kernel = CudaKernel>>(&mut self, enq: &mut E) -> Result<(), StageError> {
         let quantum = self.quantum;
         let modes = quantum.lanes.modes(quantum.mode.row_exact);
+        // The passes the hook leaves alone (a probe the cache makes before it records) neither keep nor fail.
+        #[cfg(feature = "test-oracles")]
+        let applies = match &mut self.fault {
+            Some(planned) if planned.skip > 0 => {
+                planned.skip -= 1;
+                false
+            }
+            Some(planned) => {
+                // The test's value is kept by the run, so its hold is not empty.
+                if let Some(token) = &planned.token {
+                    enq.keep(Box::new(Arc::clone(token)));
+                }
+                true
+            }
+            None => false,
+        };
         let mut ops = RusteeOps::new(enq, quantum.lanes.kernels(), modes).with_pdl(quantum.mode.pdl);
         let kernels: &mut dyn KernelOps = &mut ops;
         for launch in self.launches.iter().filter(|launch| !launch.idle(quantum)) {
             launch.launch(quantum, kernels)?;
             #[cfg(feature = "test-oracles")]
-            match self.fault.take() {
-                Some(BodyFault::Refuse) => {
-                    return Err(fatal("a test hook refused the quantum in the middle of its body"));
+            if applies && let Some(planned) = self.fault.take() {
+                match planned.fault {
+                    BodyFault::Refuse => {
+                        return Err(fatal("a test hook refused the quantum in the middle of its body"));
+                    }
+                    BodyFault::Panic => panic!("a test hook panicked in the middle of a quantum's body"),
                 }
-                Some(BodyFault::Panic) => panic!("a test hook panicked in the middle of a quantum's body"),
-                None => {}
             }
         }
         Ok(())
@@ -482,18 +499,20 @@ impl Stage<Quantum> for Whole {
                 .chain(busy.flat_map(|launch| launch.waits(quantum))),
             Some(id),
         );
-        // A body runs for real only for a key the cache has not seen (a hit is a replay).
+        // The hook decides, for the key's sighting, whether the fault is for this quantum. A body runs for real at the
+        // first and the second sighting (a direct run, a recording); a replay runs none, and the fault follows its run.
         #[cfg(feature = "test-oracles")]
-        let fault = if self.cache.contains(&capture.key) {
-            None
-        } else {
-            self.faults.take()
-        };
+        let met = self.faults.meet(capture.key, self.cache.contains(&capture.key));
+        #[cfg(feature = "test-oracles")]
+        let in_body = met
+            .planned
+            .clone()
+            .filter(|planned| planned.sighting != Sighting::Replay);
         let mut launches = QuantumLaunches {
             quantum,
             launches: &self.launches,
             #[cfg(feature = "test-oracles")]
-            fault,
+            fault: in_body,
         };
         let site = Site {
             gpu: &*self.gpu,
@@ -508,15 +527,37 @@ impl Stage<Quantum> for Whole {
             let made = catch_unwind(AssertUnwindSafe(|| {
                 run_held(&site, &self.cache, capture.key, &mut launches, &capture.hold)
             }));
-            if let Some(fault) = fault {
-                if capture.hold.get().is_some() {
+            let mut replay_fault = None;
+            if capture.hold.get().is_none() {
+                // Nothing ran (a busy lane): the cache did not see the key, and the fault stays armed.
+                if met.newly_seen {
+                    self.faults.unsee(capture.key);
+                }
+                if let Some(planned) = &met.planned {
+                    self.faults.rearm(planned);
+                }
+            } else if let Some(planned) = &met.planned {
+                match &made {
+                    // A replay that ran: the fault follows it, after its work was queued.
+                    Ok(Ok((Ran::Replayed, _))) if planned.sighting == Sighting::Replay => {
+                        replay_fault = Some(planned.fault);
+                    }
+                    // Another run than the one the fault is for (no free instance: a direct run): put it back.
+                    Ok(_) if planned.sighting == Sighting::Replay => self.faults.rearm(planned),
                     // Only a body that ran is followed: the log is of this quantum's hold.
+                    _ => {}
+                }
+                if planned.sighting != Sighting::Replay || replay_fault.is_some() {
                     let _ = capture.probe.set(Arc::clone(&self.faults));
                     self.faults.log(HoldEvent::Stored);
-                } else {
-                    // Nothing ran (a busy lane): the fault stays armed for the next body.
-                    self.faults.arm(fault);
                 }
+            }
+            match replay_fault {
+                Some(BodyFault::Refuse) => {
+                    return Err(fatal("a test hook refused the quantum after its replay was queued"));
+                }
+                Some(BodyFault::Panic) => panic!("a test hook panicked after a quantum's replay was queued"),
+                None => {}
             }
             match made {
                 Ok(made) => made?,

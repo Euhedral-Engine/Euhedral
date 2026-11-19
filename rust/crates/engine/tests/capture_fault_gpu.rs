@@ -2,8 +2,9 @@
 //! time (each loads the 12 GB artifact twice), through the system arbiter:
 //! `system-run --gpu shared:16 --mem 24G --est 300 --who <name> -- cargo test -p euhedral-inference-engine --test capture_fault_gpu -- --ignored --test-threads=1`.
 //!
-//! A test hook ends the first graph body that runs for a new key (after its first launch with work) by a refusal or a
-//! panic. The run's hold must be stored in the quantum, released only after the quantum retired (its queued work ended),
+//! A test hook ends a captured quantum by a refusal or a panic: at its first sighting (a direct run), at its second (the
+//! recording pass) or at a later one (a replay, after the replay queued its work). A body fails after its first launch
+//! with work. The run's hold must be stored in the quantum, released only after the quantum retired (its queued work ended),
 //! and dropped with it; the generation fails; the sequence is free and keeps its pages; and the engine serves the next
 //! request with the tokens a fresh engine selects. The artifact comes from `euhedral.qwen.rco-artifact` and the library
 //! from `euhedral.cuda.library`.
@@ -28,10 +29,11 @@ use std::time::{Duration, Instant};
 mod common;
 
 use common::Closer;
+use euhedral_gpu::GraphStats;
 use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
-use euhedral_inference_engine::quantum::body_fault::{BodyFault, HoldEvent};
+use euhedral_inference_engine::quantum::body_fault::{BodyFault, HoldEvent, Sighting};
 use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::{EngineRuntime, Handoff};
 use euhedral_inference_settings::{ByteSize, ModelSettings, Settings};
@@ -153,41 +155,140 @@ fn hold_events(runtime: &EngineRuntime) -> Vec<HoldEvent> {
     }
 }
 
-fn fails_and_recovers(fault: BodyFault) {
+/// The graph cache's counters and the number of graphs it holds.
+fn graphs(runtime: &EngineRuntime) -> (GraphStats, usize) {
+    runtime.graph_counts_for_tests().remove(0)
+}
+
+/// What a fault is applied to, and what the test checks of the hold.
+struct Case {
+    fault: BodyFault,
+    sighting: Sighting,
+    /// Whether the body keeps a test-owned buffer in the hold of its run. A direct run's hold carries it to the quantum's
+    /// drop; a recording that failed made no graph, so its buffer goes with the recording; a replay runs no body.
+    keeps: bool,
+}
+
+/// Arms `case`, runs a generation that fails, and checks the hold, the pages, the cache and the next request.
+///
+/// Mutants of the release order each of these assertions fails on:
+/// - the hold is dropped at the unwind of a refusal or a panic, before it is stored in the quantum: the count of the
+///   kept buffer at the first event is 1 (a first sighting), or the first event is not `Stored` (the others);
+/// - the quantum is dropped, with its hold, before it retired: `Released` comes before `Retired`, and for a direct run
+///   the count at `Retired` is 1;
+/// - the hold is released when the quantum's request ends, ahead of the quantum's retirement: the same two;
+/// - the quantum is never dropped (its hold never released): fewer than three events, and the buffer's count never
+///   returns to 1;
+/// - the failed quantum is not retired, so its pages stay: the next request does not get them back, or hangs;
+/// - a failed replay drops the recording of its key: the graph count falls to 0 and the next request records again.
+fn fails_and_recovers(case: Case) {
+    let Case { fault, sighting, keeps } = case;
     let Some(machine) = machine() else { return };
     let (closer, runtime) = start(&machine);
-    runtime.fail_next_body_for_tests(fault);
+    let buffer = Arc::new(());
+    let before = graphs(&runtime);
+    assert_eq!(before.1, 0, "{fault:?} at {sighting:?}: a new engine records nothing");
+    runtime.fail_next_quantum_for_tests(fault, sighting, keeps.then_some(&buffer));
     let failed = generate(&runtime);
     assert!(
         matches!(failed.outcome.reason, FinishReason::Failed(_)),
-        "{fault:?}: the generation fails, ended with {:?}",
+        "{fault:?} at {sighting:?}: the generation fails, ended with {:?}",
         failed.outcome.reason
     );
     assert!(
         failed.tokens.len() < TOKENS as usize,
-        "{fault:?}: the failure cut the generation"
+        "{fault:?} at {sighting:?}: the failure cut the generation"
     );
     // The hold was stored with the quantum, outlived the quantum's device work, and went with the quantum.
     assert_eq!(
         hold_events(&runtime),
         [HoldEvent::Stored, HoldEvent::Retired, HoldEvent::Released],
-        "{fault:?}: the hold of the failed body"
+        "{fault:?} at {sighting:?}: the hold of the failed quantum"
     );
+    let held = runtime.body_held_counts_for_tests().remove(0);
+    if keeps && sighting == Sighting::First {
+        // The hold is not empty: the buffer of the test is alive in it at every event, until the quantum dropped.
+        assert!(
+            held.iter().all(|count| *count > 1),
+            "{fault:?} at {sighting:?}: the kept buffer is alive until the release, counts {held:?}"
+        );
+    }
+    if keeps {
+        // And nothing keeps it after the quantum: the hold dropped with the quantum.
+        let begun = Instant::now();
+        while Arc::strong_count(&buffer) > 1 && begun.elapsed() < DROP_WINDOW {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            Arc::strong_count(&buffer),
+            1,
+            "{fault:?} at {sighting:?}: the buffer is freed with the quantum's hold"
+        );
+    }
     let pages = assert_free(&runtime);
-    assert!(pages > 0, "{fault:?}: the sequence holds its cache pages");
+    assert!(
+        pages > 0,
+        "{fault:?} at {sighting:?}: the sequence holds its cache pages"
+    );
+    let failed_graphs = graphs(&runtime);
+    match sighting {
+        Sighting::Recording => {
+            // The failed recording made no graph and marked nothing unrecordable: the key stays at its second
+            // sighting, so a quantum that follows records it (a graph exists only if one did).
+            assert_eq!(
+                (failed_graphs.0.unrecordable_keys, failed_graphs.1 as u64),
+                (0, failed_graphs.0.records),
+                "{fault:?} at {sighting:?}: the failed recording left no graph and no mark, {:?}",
+                failed_graphs.0
+            );
+        }
+        Sighting::Replay => {
+            // The failure came after the replay queued its work, so the cache gave the instance back: its recording stays.
+            assert!(
+                failed_graphs.1 >= 1,
+                "{fault:?} at {sighting:?}: the graph the failed replay ran is still cached"
+            );
+            assert!(
+                failed_graphs.0.replays >= 1,
+                "{fault:?} at {sighting:?}: the quantum was a replay"
+            );
+        }
+        Sighting::First => {}
+    }
 
     // Its pages retired: the next request on the engine reuses them, and selects what a fresh engine selects.
     let after = generate(&runtime);
     assert_eq!(
         after.outcome.reason,
         FinishReason::Length,
-        "{fault:?}: the next request"
+        "{fault:?} at {sighting:?}: the next request"
     );
     assert_eq!(
         assert_free(&runtime),
         pages,
-        "{fault:?}: the next request takes the pages back"
+        "{fault:?} at {sighting:?}: the next request takes the pages back"
     );
+    let served = graphs(&runtime);
+    match sighting {
+        Sighting::Replay => {
+            // The cache serves the next request from the recording it kept: it recorded nothing again and replayed more.
+            assert_eq!(
+                served.0.records, failed_graphs.0.records,
+                "{fault:?} at {sighting:?}: the cached graph served the next request, nothing was recorded again"
+            );
+            assert!(
+                served.0.replays > failed_graphs.0.replays,
+                "{fault:?} at {sighting:?}: the next request replayed the cached graph"
+            );
+        }
+        Sighting::Recording | Sighting::First => {
+            assert!(
+                served.1 >= 1 && served.0.replays > 0,
+                "{fault:?} at {sighting:?}: the next request recorded and replayed, {:?}",
+                served.0
+            );
+        }
+    }
     closer.shutdown(runtime).unwrap();
 
     let (closer, runtime) = start(&machine);
@@ -195,7 +296,7 @@ fn fails_and_recovers(fault: BodyFault) {
     assert_eq!(fresh.outcome.reason, FinishReason::Length);
     assert_eq!(
         after.tokens, fresh.tokens,
-        "{fault:?}: the tokens after the failure equal a fresh engine's"
+        "{fault:?} at {sighting:?}: the tokens after the failure equal a fresh engine's"
     );
     closer.shutdown(runtime).unwrap();
 }
@@ -203,11 +304,59 @@ fn fails_and_recovers(fault: BodyFault) {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_captured_quantum_refused_in_the_middle_of_its_body_releases_its_hold_after_it_retired() {
-    fails_and_recovers(BodyFault::Refuse);
+    fails_and_recovers(Case {
+        fault: BodyFault::Refuse,
+        sighting: Sighting::First,
+        keeps: true,
+    });
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_captured_quantum_that_panics_in_the_middle_of_its_body_releases_its_hold_after_it_retired() {
-    fails_and_recovers(BodyFault::Panic);
+    fails_and_recovers(Case {
+        fault: BodyFault::Panic,
+        sighting: Sighting::First,
+        keeps: true,
+    });
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_quantum_refused_in_its_recording_pass_releases_its_hold_after_it_retired() {
+    fails_and_recovers(Case {
+        fault: BodyFault::Refuse,
+        sighting: Sighting::Recording,
+        keeps: true,
+    });
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_quantum_that_panics_in_its_recording_pass_releases_its_hold_after_it_retired() {
+    fails_and_recovers(Case {
+        fault: BodyFault::Panic,
+        sighting: Sighting::Recording,
+        keeps: true,
+    });
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_replay_refused_after_its_work_was_queued_releases_its_hold_after_it_retired() {
+    fails_and_recovers(Case {
+        fault: BodyFault::Refuse,
+        sighting: Sighting::Replay,
+        keeps: false,
+    });
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_replay_that_panics_after_its_work_was_queued_releases_its_hold_after_it_retired() {
+    fails_and_recovers(Case {
+        fault: BodyFault::Panic,
+        sighting: Sighting::Replay,
+        keeps: false,
+    });
 }

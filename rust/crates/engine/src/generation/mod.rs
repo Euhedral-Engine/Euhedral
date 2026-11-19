@@ -43,7 +43,7 @@ use crate::prefix::{
     CacheSpec, Copier, POSITION_GRANULE, PrefixCacheHandle, PrefixCacheStats, open_prefix_cache_claimed,
 };
 #[cfg(feature = "test-oracles")]
-use crate::quantum::body_fault::{BodyFault, HoldEvent};
+use crate::quantum::body_fault::{BodyFault, HoldEvent, Sighting};
 use crate::quantum::{Executor, Preparer};
 use crate::residency::offload::StagingGeometry;
 use crate::residency::planner::ResidencyPlan;
@@ -54,6 +54,8 @@ use crate::workspace::{input_records, input_records_for};
 pub use acceptance::{Accepted, accept, accept_tokens};
 pub use constraint::{ConstraintError, ReasoningConstraint, TokenConstraint};
 pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
+#[cfg(feature = "test-oracles")]
+use euhedral_gpu::GraphStats;
 pub use listener::GenerationListener;
 pub(crate) use mailbox::OPERATION_BOUND;
 pub use mailbox::Spawn;
@@ -747,10 +749,31 @@ impl Generations {
 
     /// The test hook: the next graph body of the first sequence that runs for a new key ends as `fault`.
     #[cfg(feature = "test-oracles")]
-    pub(crate) fn fail_body(&self, fault: BodyFault) {
+    pub(crate) fn fail_body(&self, fault: BodyFault, sighting: Sighting, token: Option<&Arc<()>>) {
         if let Some(generation) = self.generations.first() {
-            generation.shared.executor.body_faults().arm(fault);
+            generation.shared.executor.body_faults().arm_at(fault, sighting, token);
         }
+    }
+
+    /// The test hook: the strong handles of the test's value at each event of the faulted quantum's hold, by sequence.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn body_held_counts(&self) -> Vec<Vec<usize>> {
+        self.generations
+            .iter()
+            .map(|generation| generation.shared.executor.body_faults().held_counts())
+            .collect()
+    }
+
+    /// The test hook: what each sequence's graph cache counted, and how many graphs it holds.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn graph_counts(&self) -> Vec<(GraphStats, usize)> {
+        self.generations
+            .iter()
+            .map(|generation| {
+                let executor = &generation.shared.executor;
+                (executor.graph_stats(), executor.graphs().0)
+            })
+            .collect()
     }
 
     /// The test hook: what became of the hold of the quantum a fault was applied to, by sequence.
