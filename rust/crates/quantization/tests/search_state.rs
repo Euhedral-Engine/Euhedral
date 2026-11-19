@@ -344,10 +344,7 @@ fn a_header_that_covers_more_than_the_records_is_refused() {
     file_call(|then| file.set_header(&header, then)).unwrap();
     drop(file);
     let failure = world.open(&path, "f", 1, 1).unwrap_err();
-    assert!(
-        matches!(failure, SearchError::Damaged(_) | SearchError::Resume(_)),
-        "{failure}"
-    );
+    assert!(matches!(failure, SearchError::Damaged(_)), "{failure}");
 
     let file = open_file(&world, &path);
     header.set("end", (end - 2).to_string());
@@ -457,5 +454,33 @@ fn a_record_in_the_documented_text_reads() {
         origin: "explore:move".to_string(),
     };
     assert_eq!(read, vec![expected]);
+    world.finish();
+}
+
+/// What a stop during the first header write can leave, a file of zeros no longer than a header, is a new state; the
+/// same zeros under bytes past the header are some other file and are kept.
+#[test]
+fn a_torn_first_header_is_a_new_state_and_a_big_file_of_zeros_is_not() {
+    let directory = tempfile::tempdir().unwrap();
+    let torn = directory.path().join("torn.resume");
+    fs::write(&torn, vec![0u8; 1000]).unwrap();
+    let full = directory.path().join("full.resume");
+    fs::write(&full, vec![0u8; HEADER as usize]).unwrap();
+    let mut data = vec![0u8; HEADER as usize + 10];
+    data[HEADER as usize + 3] = 7;
+    let big = directory.path().join("big.resume");
+    fs::write(&big, &data).unwrap();
+    let marked = directory.path().join("marked.resume");
+    fs::write(&marked, b"\0\0not zero").unwrap();
+    let world = World::start();
+    for path in [&torn, &full] {
+        assert!(world.open(path, "f", 1, 1).unwrap().measured().is_empty());
+    }
+    for path in [&big, &marked] {
+        let failure = world.open(path, "f", 1, 1).unwrap_err();
+        assert!(matches!(failure, SearchError::NotSearchState { .. }), "{failure}");
+    }
+    assert_eq!(fs::read(&big).unwrap(), data);
+    assert_eq!(fs::read(&marked).unwrap(), b"\0\0not zero");
     world.finish();
 }

@@ -32,7 +32,7 @@ pub enum SearchError {
     )]
     DifferentSearch { path: PathBuf },
     /// A file that is not a search state was asked to be read as one.
-    #[error("{path} is not a mixed-allocation search state")]
+    #[error("{path} is not a mixed-allocation search state; if the file is yours to lose, delete it and run again")]
     NotSearchState { path: PathBuf },
     /// The header or a record does not say what a state file does.
     #[error("the search state is damaged: {0}")]
@@ -202,10 +202,29 @@ impl SearchState {
         settle: Settle<SearchState>,
     ) -> Box<dyn Frame> {
         if header.is_empty() && len != 0 {
-            // A file with something in it that is not a search is not ours to overwrite.
-            return settle.finish(Err(SearchError::NotSearchState { path: identity.path }));
+            // A file with something in it that is not a search is not ours to overwrite. The one exception is what a
+            // stop during the very first header write leaves: no more than a header's bytes, all zero.
+            if len > HEADER {
+                return settle.finish(Err(SearchError::NotSearchState { path: identity.path }));
+            }
+            let again = settle.clone();
+            let held = file.clone();
+            let read = move |bytes: Result<Vec<u8>, ResumeError>| match bytes {
+                Err(error) => again.finish(Err(error.into())),
+                Ok(bytes) if bytes.iter().all(|&byte| byte == 0) => Self::fresh(held, identity, again),
+                Ok(_) => again.finish(Err(SearchError::NotSearchState { path: identity.path })),
+            };
+            return settle.started(file.read(0, len as usize, Box::new(read)));
         }
         if header.is_empty() {
+            return Self::fresh(file, identity, settle);
+        }
+        Self::resume(file, header, identity, settle)
+    }
+
+    /// A new state: its header is the first thing written.
+    fn fresh(file: ResumeFile, identity: Identity, settle: Settle<SearchState>) -> Box<dyn Frame> {
+        {
             let mut header = Header::new();
             header.set("kind", KIND);
             header.set("fingerprint", identity.fingerprint);
@@ -228,8 +247,12 @@ impl SearchState {
                 Ok(()) => written.finish(Ok(state)),
                 Err(error) => written.finish(Err(error.into())),
             };
-            return settle.started(file.set_header(&header, Box::new(done)));
+            settle.started(file.set_header(&header, Box::new(done)))
         }
+    }
+
+    /// The state a file holds, if it is this search's.
+    fn resume(file: ResumeFile, header: Header, identity: Identity, settle: Settle<SearchState>) -> Box<dyn Frame> {
         if header.get("kind") != Some(KIND) || header.get("fingerprint") != Some(identity.fingerprint.as_str()) {
             return settle.finish(Err(SearchError::DifferentSearch { path: identity.path }));
         }

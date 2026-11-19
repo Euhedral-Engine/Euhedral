@@ -399,3 +399,67 @@ fn a_malformed_unicode_escape_is_an_error_naming_it() {
         Err(ResumeError::HeaderText { .. })
     ));
 }
+
+/// A call with nothing to wait for still ends on the host lake: its continuation does not run before the call returns.
+#[test]
+fn a_settled_call_ends_on_the_host_lake_not_inline() {
+    let directory = tempfile::tempdir().unwrap();
+    let world = World::start();
+    let file = world.open(&directory.path().join("resume.bin"));
+    let caller = thread::current().id();
+    let inline = Arc::new(AtomicBool::new(false));
+    let (flag, seen) = (Arc::clone(&inline), Arc::clone(&inline));
+    let ran_on_caller = call(|then| {
+        let started = file.settled(Box::new(move |result: Result<(), ResumeError>| {
+            flag.store(thread::current().id() == caller, Ordering::SeqCst);
+            then(result)
+        }));
+        // Returning here, before the continuation had to run, must not have run it on this thread.
+        assert!(!seen.load(Ordering::SeqCst));
+        started
+    });
+    ran_on_caller.unwrap();
+    assert!(
+        !inline.load(Ordering::SeqCst),
+        "the continuation ran on the caller's thread"
+    );
+    drop(file);
+    world.finish();
+}
+
+/// A file opened for reading only reads, reports its length, and cannot be written; a missing one is not created.
+#[test]
+fn a_read_only_open_reads_and_cannot_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("resume.bin");
+    let world = World::start();
+    let file = world.open(&path);
+    call(|then| file.write(0, longs(&[4, 5, 6]), then)).unwrap();
+    drop(file);
+
+    let file = call(|then| ResumeFile::open_read_only(&world.io, &world.host, &path, then)).unwrap();
+    assert_eq!(call(|then| file.len(then)).unwrap(), 24);
+    assert_eq!(call(|then| file.read(8, 8, then)).unwrap(), longs(&[5]));
+    let refused = call(|then| file.write(0, longs(&[9]), then));
+    assert!(matches!(refused, Err(ResumeError::Io(_))), "{refused:?}");
+    drop(file);
+    assert_eq!(fs::read(&path).unwrap(), longs(&[4, 5, 6]));
+
+    let missing = directory.path().join("missing.bin");
+    let failure = call(|then| ResumeFile::open_read_only(&world.io, &world.host, &missing, then));
+    assert!(matches!(failure, Err(ResumeError::Io(error)) if error.kind() == io::ErrorKind::NotFound));
+    assert!(!missing.exists());
+    world.finish();
+}
+
+#[test]
+fn the_length_follows_the_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let world = World::start();
+    let file = world.open(&directory.path().join("resume.bin"));
+    assert_eq!(call(|then| file.len(then)).unwrap(), 0);
+    call(|then| file.write(HEADER, longs(&[1, 2]), then)).unwrap();
+    assert_eq!(call(|then| file.len(then)).unwrap(), HEADER + 16);
+    drop(file);
+    world.finish();
+}
