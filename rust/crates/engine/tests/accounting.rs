@@ -12,7 +12,7 @@ use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::residency::accounting::{Consumer, MemoryAccount, PlanReservation};
 use euhedral_inference_engine::residency::footprint::{first_sequence_bytes, mtp_cache_bytes_of};
 use euhedral_inference_engine::residency::planner::{
-    DEFAULT_RUNTIME_RESERVE_BYTES, LocationBytes, PlanInputs, ResidencyPlan, plan_with,
+    DEFAULT_RUNTIME_HEADROOM_BYTES, DEFAULT_RUNTIME_RESERVE_BYTES, LocationBytes, PlanInputs, ResidencyPlan, plan_with,
 };
 use euhedral_inference_engine::workspace::{Workspace, input_records_for};
 use euhedral_inference_settings::{Auto, ByteSize, KvFormat};
@@ -29,7 +29,6 @@ fn inputs(sequences: usize) -> PlanInputs {
         multiprocessors: Some(70),
         host_pinned_bytes: Some(u64::MAX),
         sequences,
-        module_bytes: 0,
     }
 }
 
@@ -243,26 +242,19 @@ fn a_reserve_overrun_is_refused_not_warned_about() {
     grown.context.kv_cache_format = Auto::Value(KvFormat::Bf16);
     grown.context.kv_cache_on_gpu_tokens = 262_144;
     grown.batching.prefill_chunk_tokens = 2048;
-    let modules = 96 << 20;
-    let plan = plan_with(
-        &config,
-        &table,
-        &grown,
-        PlanInputs {
-            module_bytes: modules,
-            ..inputs(1)
-        },
-    )
-    .unwrap();
+    let plan = plan_with(&config, &table, &grown, inputs(1)).unwrap();
     assert!(plan.runtime_reserve_bytes > DEFAULT_RUNTIME_RESERVE_BYTES);
     let (_account, mut reservation) = admit(&plan);
     take_startup_claims(&plan, &mut reservation).unwrap();
-    // The startup's claims leave exactly the modules' share: they load after the claims and are paid from it, and
-    // what the plan did not count has nothing to take.
-    assert_eq!(plan.module_bytes, modules);
-    assert_eq!(reservation.left(Consumer::RuntimeReserve), modules);
-    // The modules take it, and what is beyond it is refused.
-    let _modules = reservation.claim(Consumer::RuntimeReserve, modules).unwrap();
+    // The claims of the startup leave the headroom, which the kernels the driver loads afterwards are paid from.
+    assert_eq!(
+        reservation.left(Consumer::RuntimeReserve),
+        DEFAULT_RUNTIME_HEADROOM_BYTES
+    );
+    let _kernels = reservation
+        .claim(Consumer::RuntimeReserve, DEFAULT_RUNTIME_HEADROOM_BYTES)
+        .unwrap();
+    // What the plan did not count has nothing to take.
     assert_eq!(reservation.left(Consumer::RuntimeReserve), 0);
     let refused = reservation.claim(Consumer::RuntimeReserve, 1).unwrap_err().to_string();
     assert!(refused.contains("memory.runtime-reserve"), "{refused}");

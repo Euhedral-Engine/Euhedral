@@ -261,6 +261,11 @@ pub struct MemorySettings {
     /// Device memory the dense model's plan keeps beside the weights and the cache for the first sequence's state, the
     /// workspaces and the kernel modules; `auto` is 1280 MiB.
     pub runtime_reserve: Auto<ByteSize>,
+    /// Device memory the plan keeps above what the workspace, the decode scratch, the first sequence's state and the
+    /// MTP cache need, for what the driver takes after the plan is admitted: the code and the local memory of the
+    /// kernels, loaded when each is first launched. Counted only where the demand raises the reserve; below that the
+    /// reserve's own slack pays for it. `auto` is 320 MiB.
+    pub runtime_headroom: Auto<ByteSize>,
     /// Released pinned buffers kept for reuse.
     pub pinned_buffer_pool: Auto<ByteSize>,
     /// Streaming of weights from disk.
@@ -280,6 +285,7 @@ impl Default for MemorySettings {
             gpu_limit: Auto::Auto,
             gpu_reserve: ByteSize::mib(700),
             runtime_reserve: Auto::Auto,
+            runtime_headroom: Auto::Auto,
             pinned_buffer_pool: Auto::Auto,
             weight_streaming: WeightStreamingSettings::default(),
             host_layers: HostLayersSettings::default(),

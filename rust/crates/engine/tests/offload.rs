@@ -30,7 +30,6 @@ fn inputs(device_free: u64, host: Option<u64>) -> PlanInputs {
         multiprocessors: Some(70),
         host_pinned_bytes: host,
         sequences: 1,
-        module_bytes: 0,
     }
 }
 
@@ -345,7 +344,6 @@ fn auto_sequences_never_offload_more_than_one_sequence_does() {
     assert!(found > 1, "the search finds {found}");
     let chosen = PlanInputs {
         sequences: found,
-        module_bytes: 0,
         ..inputs(free, Some(u64::MAX))
     };
     // The count plans, and with no more offloaded than one sequence has.
@@ -359,7 +357,6 @@ fn auto_sequences_never_offload_more_than_one_sequence_does() {
         &settings,
         PlanInputs {
             sequences: found + 1,
-            module_bytes: 0,
             ..chosen
         },
     );
@@ -465,7 +462,6 @@ fn more_sequences_keep_fewer_weights_on_the_device() {
             &settings,
             PlanInputs {
                 sequences,
-                module_bytes: 0,
                 ..inputs(free, Some(u64::MAX))
             },
         )

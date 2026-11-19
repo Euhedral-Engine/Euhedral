@@ -23,8 +23,8 @@ use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::model::{ArtifactProfile, Quantization, Speculation};
 use euhedral_inference_engine::residency::footprint;
 use euhedral_inference_engine::residency::planner::{
-    ARENA_ALIGNMENT, DEFAULT_RUNTIME_RESERVE_BYTES, PlacementSource, PlanInputs, ResidencyPlan, plan, plan_closest,
-    plan_with, sequences_for,
+    ARENA_ALIGNMENT, DEFAULT_RUNTIME_HEADROOM_BYTES, DEFAULT_RUNTIME_RESERVE_BYTES, PlacementSource, PlanInputs,
+    ResidencyPlan, plan, plan_closest, plan_with, sequences_for,
 };
 use euhedral_inference_engine::runtime::resolve_sequences;
 use euhedral_inference_engine::workspace::{
@@ -56,7 +56,6 @@ fn inputs(device_free: u64) -> PlanInputs {
         multiprocessors: Some(70),
         host_pinned_bytes: Some(u64::MAX),
         sequences: 1,
-        module_bytes: 0,
     }
 }
 
@@ -407,7 +406,7 @@ fn reserve_demand(plan: &ResidencyPlan) -> u64 {
         + plan.decode_scratch_bytes
         + footprint::first_sequence_bytes(plan, &config)
         + footprint::mtp_cache_bytes_of(plan, &config)
-        + plan.module_bytes
+        + DEFAULT_RUNTIME_HEADROOM_BYTES
 }
 
 /// The device bytes that hold `big` with the reserve at its default: `big`'s bytes less what the reserve was raised by.
@@ -455,36 +454,38 @@ fn the_mtp_cache_of_a_long_bf16_context_is_counted_and_a_device_it_overflows_is_
 }
 
 #[test]
-fn the_kernel_modules_are_a_term_of_the_reserve_a_device_of_the_plans_bytes_still_starts() {
+fn a_raised_reserve_keeps_the_headroom_above_the_claims_so_a_device_of_the_plans_bytes_still_starts() {
     let mut long = settings(262_144);
     long.context.kv_cache_format = Auto::Value(KvFormat::Bf16);
     long.context.kv_cache_on_gpu_tokens = 262_144;
-    let modules = 96 * MIB;
-    let with_modules = |device_free: u64, module_bytes: u64| {
+    let with_headroom = |headroom: Option<u64>, device_free: u64| {
+        let mut stated = long.clone();
+        stated.memory.runtime_headroom = headroom.map_or(Auto::Auto, |bytes| Auto::Value(ByteSize(bytes)));
         let mut inputs = inputs(device_free);
         inputs.host_pinned_bytes = Some(0);
-        inputs.module_bytes = module_bytes;
-        plan_with(&config(), &rco_table(), &long, inputs)
+        plan_with(&config(), &rco_table(), &stated, inputs)
     };
-    let without = with_modules(64 * GIB, 0).unwrap();
-    let plan = with_modules(64 * GIB, modules).unwrap();
-    // The reserve is raised by the modules: the claims of the startup leave them room.
-    assert_eq!(plan.module_bytes, modules);
-    assert_eq!(plan.runtime_reserve_bytes, without.runtime_reserve_bytes + modules);
-    assert_eq!(plan.device_bytes, without.device_bytes + modules);
-    let claims = reserve_demand(&plan) - plan.module_bytes;
-    assert_eq!(plan.runtime_reserve_bytes - claims, modules);
-    // A device of exactly the bytes of the plan made without them is not admitted once they are counted.
-    assert!(with_modules(without.device_bytes, 0).is_ok());
-    assert!(with_modules(without.device_bytes, modules).is_err());
-    assert!(with_modules(plan.device_bytes, modules).is_ok());
-    // A setting above the demand and the modules is kept as it is.
-    let mut roomy = long.clone();
-    roomy.memory.runtime_reserve = Auto::Value(ByteSize(plan.runtime_reserve_bytes + GIB));
-    let mut inputs = inputs(64 * GIB);
-    inputs.module_bytes = modules;
-    let kept = plan_with(&config(), &rco_table(), &roomy, inputs).unwrap();
-    assert_eq!(kept.runtime_reserve_bytes, plan.runtime_reserve_bytes + GIB);
+    let bare = with_headroom(Some(0), 64 * GIB).unwrap();
+    let plan = with_headroom(None, 64 * GIB).unwrap();
+    // What the startup's claims take is the demand without the headroom; the raised reserve leaves the headroom.
+    let claims = reserve_demand(&plan) - DEFAULT_RUNTIME_HEADROOM_BYTES;
+    assert_eq!(bare.runtime_reserve_bytes, claims);
+    assert_eq!(plan.runtime_reserve_bytes - claims, DEFAULT_RUNTIME_HEADROOM_BYTES);
+    assert_eq!(plan.device_bytes - bare.device_bytes, DEFAULT_RUNTIME_HEADROOM_BYTES);
+    // A device of exactly the bytes the plan made without the headroom is refused once it is kept.
+    assert!(with_headroom(Some(0), bare.device_bytes).is_ok());
+    assert!(with_headroom(None, bare.device_bytes).is_err());
+    assert!(with_headroom(None, plan.device_bytes).is_ok());
+    // The headroom is a setting.
+    let small = with_headroom(Some(64 * MIB), 64 * GIB).unwrap();
+    assert_eq!(small.runtime_reserve_bytes - claims, 64 * MIB);
+}
+
+#[test]
+fn a_reserve_the_setting_already_covers_is_not_raised_by_the_headroom() {
+    let plan = plan_with(&config(), &rco_table(), &settings(8192), inputs(64 * GIB)).unwrap();
+    assert_eq!(plan.runtime_reserve_bytes, DEFAULT_RUNTIME_RESERVE_BYTES);
+    assert!(reserve_demand(&plan) <= DEFAULT_RUNTIME_RESERVE_BYTES);
 }
 
 #[test]
@@ -566,7 +567,6 @@ fn the_cache_format_follows_the_artifact_unless_the_settings_choose() {
 fn with_sequences(device_free: u64, sequences: usize) -> PlanInputs {
     PlanInputs {
         sequences,
-        module_bytes: 0,
         ..inputs(device_free)
     }
 }

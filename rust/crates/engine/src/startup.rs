@@ -143,6 +143,8 @@ struct Startup {
     /// The plan's admitted reservation, once it is made: the allocations take their claims from it, and the engine
     /// keeps what is left of it.
     reservation: Option<PlanReservation>,
+    /// The device's free bytes when the plan was made.
+    free_at_plan: u64,
     _units: Units,
 }
 
@@ -220,6 +222,7 @@ pub(crate) fn run(core: Arc<Core>, ready: ReadyHandoff) {
         core,
         ready: Some(ready),
         reservation: None,
+        free_at_plan: 0,
         _units: units,
     };
     startup.then(control, open);
@@ -516,17 +519,15 @@ fn check_segments(
 /// Step 3: plans residency against the device and the host. Failing here has allocated nothing on the device.
 fn plan(mut startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>) {
     let core = Arc::clone(&startup.core);
-    let planned = core
-        .library
-        .free_bytes()
-        .map_err(EngineError::from)
+    let free = core.library.free_bytes().map_err(EngineError::from);
+    startup.free_at_plan = free.as_ref().copied().unwrap_or(0);
+    let planned = free
         .and_then(|device_free| {
             let inputs = PlanInputs {
                 device_free,
                 multiprocessors: Some(core.library.device().sm_count),
                 host_pinned_bytes: core.host_pinned_bytes,
                 sequences: 1,
-                module_bytes: core.module_bytes,
             };
             let sequences = resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)?;
             let sequences = core.hold_sequences(sequences);
@@ -826,9 +827,9 @@ fn assemble(
                 return startup.fail(error);
             }
         };
-        let free_before_warmup = startup.core.library.free_bytes().ok();
         let (warmed, marker) = warmup::run(&startup.core, &artifact.config, &weights, &workspace);
         let core = Arc::clone(&startup.core);
+        let free_at_plan = startup.free_at_plan;
         let (completions, stages) = (Arc::clone(&core.completions), Arc::clone(&core.stages));
         // The report and the latch wait for the lane to reach the warm-up's last launch: a completion, not a wait.
         let ready = step(Kind::Startup, 0, move || {
@@ -837,10 +838,6 @@ fn assemble(
                 .free_bytes()
                 .map(|free| core.library.device().total_bytes.saturating_sub(free))
                 .unwrap_or(0);
-            // What the first launches took from the device after the plan was admitted (the device's, every process).
-            let warmup_bytes = free_before_warmup
-                .zip(core.library.free_bytes().ok())
-                .map_or(0, |(before, after)| before.saturating_sub(after));
             if host_backed_bytes > 0 {
                 log::info!(
                     "weights in pinned host memory: {host_backed_bytes} bytes, {} read in place: {}",
@@ -870,8 +867,7 @@ fn assemble(
                 allocated_bytes: allocated,
                 admitted,
                 device_bytes_in_use: in_use,
-                module_bytes: core.module_bytes,
-                warmup_bytes,
+                free_at_plan,
                 pinned_staging_bytes: core.pool.allocated_bytes(),
                 pinned_growth_during_load: stats.pinned_growth,
                 warmed,

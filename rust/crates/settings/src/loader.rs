@@ -536,6 +536,9 @@ fn leaves() -> Vec<Leaf> {
         optional("memory.runtime-reserve", |s, t| {
             assign!(s.memory.runtime_reserve, auto_or(t, |t| size(t, 0)))
         }),
+        optional("memory.runtime-headroom", |s, t| {
+            assign!(s.memory.runtime_headroom, auto_or(t, |t| size(t, 0)))
+        }),
         optional("memory.pinned-buffer-pool", |s, t| {
             assign!(s.memory.pinned_buffer_pool, auto_or(t, |t| size(t, 0)))
         }),

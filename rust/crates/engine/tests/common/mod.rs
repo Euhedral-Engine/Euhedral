@@ -225,7 +225,6 @@ pub fn limit_below_need(library: &Path, settings: &Settings, below: u64) -> u64 
         multiprocessors: Some(loaded.device().sm_count),
         host_pinned_bytes: Some(u64::MAX),
         sequences: 1,
-        module_bytes: 0,
     };
     let (config, table) = open_artifact(&settings.model.artifact);
     let resident = plan_with(&config, &table, settings, inputs).unwrap();
@@ -270,7 +269,6 @@ pub fn limit_to_stage(library: &Path, settings: &Settings, staged: u64) -> u64 {
         multiprocessors: Some(loaded.device().sm_count),
         host_pinned_bytes: Some(u64::MAX),
         sequences: settings.batching.max_sequences as usize,
-        module_bytes: 0,
     };
     let (config, table) = open_artifact(&settings.model.artifact);
     let resident = plan_with(&config, &table, settings, inputs).unwrap();

@@ -38,6 +38,14 @@ use crate::workspace::{self, WorkspaceRows};
 /// workspaces, the shared scratch and the kernel modules the first launches compile.
 pub const DEFAULT_RUNTIME_RESERVE_BYTES: u64 = 1280 << 20;
 
+/// What `memory.runtime-headroom: auto` means: the device bytes kept above the demand that raises the runtime reserve,
+/// for what the driver takes after admission. Measured on a device of 70 multiprocessors with drafting on and the
+/// reserve at its tightest: the contexts, modules and warm-up launches took 118 MiB beyond the engine's allocations
+/// by the time the model was ready, and the first prefill took 128 MiB more (the code and local memory of the
+/// trellis, attention and Gated DeltaNet kernels): 246 MiB. The local memory grows with the multiprocessors, so a
+/// wider device may set it higher.
+pub const DEFAULT_RUNTIME_HEADROOM_BYTES: u64 = 320 << 20;
+
 /// Device allocations start on this many bytes, like the driver's.
 pub const ARENA_ALIGNMENT: u64 = 256;
 
@@ -136,11 +144,10 @@ pub struct ResidencyPlan {
     pub decode_scratch_bytes: u64,
     /// The device bytes the runtime reserves beyond the weights, the cache and the scratch (`memory.runtime-reserve`):
     /// the execution workspace, the decode scratch, the first sequence's state, the MTP layer's cache at the longest
-    /// context and what the kernel modules take. At least what the settings make these need, whatever the setting
-    /// says, and the modules besides: the startup's claims take the first four, so the modules are left.
+    /// context and what the kernel modules take. At least what the settings make the first four of these need, and
+    /// `memory.runtime-headroom` above them for the kernels, whatever the setting says: the startup's claims take the
+    /// first four, so the headroom is left.
     pub runtime_reserve_bytes: u64,
-    /// The part of the reserve the kernel modules take (`PlanInputs::module_bytes`): nothing claims it.
-    pub module_bytes: u64,
     /// The device bytes the plan reserves in all: the weights, every sequence's cache, the runtime's reserve, the
     /// scratch and the state of the sequences beyond the first.
     pub device_bytes: u64,
@@ -261,10 +268,6 @@ pub struct PlanInputs {
     pub host_pinned_bytes: Option<u64>,
     /// The sequences to size for (at least 1).
     pub sequences: usize,
-    /// The device bytes the kernel modules take beyond what `device_free` already excludes: what the driver
-    /// materialises from the loaded modules after the plan is admitted, measured on the device before planning
-    /// (`Core::module_bytes`). The runtime reserve holds them besides the demand of the settings.
-    pub module_bytes: u64,
 }
 
 /// Plans residency for `config`'s model in an artifact with `table`, on a device with `device_free` bytes free and
@@ -292,7 +295,6 @@ pub fn plan(
             multiprocessors: None,
             host_pinned_bytes,
             sequences: 1,
-            module_bytes: 0,
         },
     )
 }
@@ -415,20 +417,25 @@ pub fn plan_closest(
     } else {
         0
     };
-    // The kernel modules load into the device after the claims are taken and are paid from what the claims leave, so
-    // they are a term of the demand: a reserve raised to the claims alone would leave them nothing.
+    // The kernels the driver loads after admission (their code and local memory, at each one's first launch) are paid
+    // from what the claims leave. A reserve raised to the claims alone would leave them nothing, so the raised reserve
+    // keeps the headroom above them.
+    let headroom = settings
+        .memory
+        .runtime_headroom
+        .value()
+        .map_or(DEFAULT_RUNTIME_HEADROOM_BYTES, |size| size.bytes());
     let reserve_demand = workspace_bytes
         .saturating_add(decode_scratch_bytes)
         .saturating_add(first_state)
         .saturating_add(mtp_cache)
-        .saturating_add(inputs.module_bytes);
+        .saturating_add(headroom);
     let runtime_reserve = reserve_setting.max(reserve_demand);
     if reserve_demand > reserve_setting {
         log::info!(
             "the runtime reserve is raised from {reserve_setting} to {reserve_demand} bytes: the workspace, the decode \
-             scratch, the first sequence's state, the MTP cache and the kernel modules ({} bytes) need that much at \
-             these settings",
-            inputs.module_bytes
+             scratch, the first sequence's state and the MTP cache need that much at these settings, and {headroom} \
+             bytes are kept above them for the kernels loaded after admission"
         );
     }
     let extra = if sequences > 1 {
@@ -544,7 +551,6 @@ pub fn plan_closest(
             scratch_bytes,
             decode_scratch_bytes,
             runtime_reserve_bytes: layout.runtime_reserve,
-            module_bytes: inputs.module_bytes,
             device_bytes,
             budget_bytes: available,
             kv_format,

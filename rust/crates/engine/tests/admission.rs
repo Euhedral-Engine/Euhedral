@@ -23,7 +23,6 @@ fn inputs(device_free: u64, host_pinned_bytes: Option<u64>) -> PlanInputs {
         multiprocessors: Some(70),
         host_pinned_bytes,
         sequences: 1,
-        module_bytes: 0,
     }
 }
 
@@ -143,7 +142,6 @@ fn the_sequence_search_treats_an_unknown_host_budget_as_no_room_to_spill() {
         &settings,
         PlanInputs {
             sequences: 2,
-            module_bytes: 0,
             ..inputs(free, Some(u64::MAX))
         },
     );
