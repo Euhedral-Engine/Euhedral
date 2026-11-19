@@ -19,7 +19,7 @@ use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::LatticeSource;
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_settings::{ModelSettings, Settings};
-use euhedral_io::{AsyncIo, OwnedFile};
+use euhedral_io::AsyncIo;
 
 use euhedral_inference_quantization::kld::{self, KldError, Reference, Row};
 
@@ -43,8 +43,8 @@ fn lattice() -> Lattice {
     Lattice { lattice, io }
 }
 
-fn open(lattice: &Lattice, path: &Path) -> Result<(Reference, OwnedFile), KldError> {
-    Reference::open(&lattice.io, path)
+fn open(lattice: &Lattice, path: &Path) -> Result<Reference, KldError> {
+    Reference::read(&lattice.io, path)
         .wait(Duration::from_secs(60))
         .expect("the open finished")
 }
@@ -77,7 +77,7 @@ fn kld_reader_parses_header_and_rows() {
     let bytes = file();
     fs::write(&path, &bytes).unwrap();
 
-    let (reference, _file) = open(&lattice, &path).unwrap();
+    let reference = open(&lattice, &path).unwrap();
     assert_eq!(
         (reference.context, reference.vocabulary, reference.chunks()),
         (CONTEXT, VOCABULARY, 3)
@@ -144,5 +144,59 @@ fn a_missing_file_is_an_error_and_the_hand_off_is_always_set() {
     let directory = tempfile::tempdir().unwrap();
     let error = open(&lattice, &directory.path().join("absent.kld")).unwrap_err();
     assert!(matches!(error, KldError::Io(_)), "{error}");
+    shut(lattice);
+}
+
+#[test]
+fn a_header_that_claims_more_than_the_file_holds_is_refused_by_the_length() {
+    let lattice = lattice();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("reference.kld");
+    // 100 000 chunks of 1 000 000 tokens: 400 GB of tokens in a file of 20 bytes.
+    let mut header = b"_logits_".to_vec();
+    for count in [1_000_000i32, 5, 100_000] {
+        header.extend_from_slice(&count.to_le_bytes());
+    }
+    fs::write(&path, &header).unwrap();
+    assert_eq!(
+        open(&lattice, &path).unwrap_err(),
+        KldError::Truncated {
+            what: "the chunks' tokens",
+            have: 20,
+            need: 20 + 4 * 100_000 * 1_000_000,
+        }
+    );
+    shut(lattice);
+}
+
+#[test]
+fn a_read_that_cannot_start_reports_its_own_cause() {
+    let lattice = lattice();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("reference.kld");
+    fs::write(&path, file()).unwrap();
+    lattice.io.complete();
+    let error = open(&lattice, &path).unwrap_err();
+    assert!(
+        matches!(&error, KldError::Io(message) if message.contains("cannot start opening")),
+        "{error}"
+    );
+    lattice.lattice.close();
+}
+
+#[test]
+fn the_record_file_opens_through_the_io_that_reads_it() {
+    let lattice = lattice();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("reference.kld");
+    fs::write(&path, file()).unwrap();
+    let opened = kld::open_records(&lattice.io, &path)
+        .wait(Duration::from_secs(60))
+        .unwrap();
+    assert!(opened.is_ok());
+    let absent = kld::open_records(&lattice.io, &directory.path().join("absent"))
+        .wait(Duration::from_secs(60))
+        .unwrap();
+    assert!(matches!(absent, Err(KldError::Io(_))));
     shut(lattice);
 }

@@ -332,6 +332,10 @@ impl ArtifactFile {
 
     /// As [`open`](Self::open) with `direct` as the page-cache-bypassing open (tests force it to fail). A file system
     /// that refuses the direct open (tmpfs does) leaves every read buffered.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no-wait, blocking I/O: one fstat at startup, before any frame runs"
+    )]
     pub(crate) fn open_with(path: &Path, direct: impl FnOnce(&Path) -> io::Result<File>) -> io::Result<ArtifactFile> {
         let buffered = open_buffered(path)?;
         let len = buffered.metadata()?.len();

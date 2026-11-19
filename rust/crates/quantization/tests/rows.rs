@@ -25,7 +25,7 @@ use euhedral_inference_engine::lattice_config;
 use euhedral_inference_quantization::kld::{self, Reference};
 use euhedral_inference_quantization::rows::{ReferenceRows, RowInput, RowSink, RowTask};
 use euhedral_inference_settings::{ModelSettings, Settings};
-use euhedral_io::{AsyncIo, OwnedFile};
+use euhedral_io::AsyncIo;
 
 const FIELDS: usize = 2;
 const CONTEXT: usize = 40;
@@ -95,19 +95,6 @@ fn every_step_is_read_and_scored_in_frames_and_the_values_come_back_in_step_orde
         )
     });
     fs::write(&path, &bytes).unwrap();
-    let (reference, file) = {
-        let lattice =
-            ControlPlaneLattice::new(lattice_config(&Settings::with_model(ModelSettings::default()))).unwrap();
-        let io = AsyncIo::open().unwrap();
-        lattice.add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>).unwrap();
-        let opened = await_value(&Reference::open(&io, &path)).unwrap();
-        io.complete();
-        lattice.close();
-        opened
-    };
-    let file = Arc::new(file);
-    let steps = reference.records();
-    assert_eq!(steps, 19);
 
     let settings = Settings::with_model(ModelSettings::default());
     let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
@@ -120,6 +107,11 @@ fn every_step_is_read_and_scored_in_frames_and_the_values_come_back_in_step_orde
         NonZeroUsize::new(2).unwrap(),
         Duration::from_secs(1),
     );
+
+    let reference = await_value(&Reference::read(&io, &path)).unwrap();
+    let file = Arc::new(await_value(&kld::open_records(&io, &path)).unwrap());
+    let steps = reference.records();
+    assert_eq!(steps, 19);
 
     // Chunk 1: the reference's records of that chunk.
     let task = Arc::new(Scoring {
@@ -162,8 +154,6 @@ fn a_row_past_the_run_or_a_short_reference_record_fails_the_run_with_the_reason(
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("short.bin");
     fs::write(&path, vec![0u8; 100]).unwrap();
-    let file = Arc::new(OwnedFile::from(fs::File::open(&path).unwrap()));
-
     let settings = Settings::with_model(ModelSettings::default());
     let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
     let io = AsyncIo::open().expect("the asynchronous I/O opens");
@@ -176,6 +166,7 @@ fn a_row_past_the_run_or_a_short_reference_record_fails_the_run_with_the_reason(
         Duration::from_secs(1),
     );
 
+    let file = Arc::new(await_value(&kld::open_records(&io, &path)).unwrap());
     let task = Arc::new(Scoring {
         rows: ReferenceRows {
             file,

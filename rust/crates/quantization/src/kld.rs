@@ -1,4 +1,4 @@
-//! The reference logits file of `llama-perplexity --kl-divergence-base` (the layout the Java scorer and reference
+//! The reference logits file of `llama-perplexity --kl-divergence-base` (the layout the scorer and the reference
 //! writer share):
 //!
 //! ```text
@@ -12,7 +12,6 @@
 //! A record holds the reference's log-probabilities over a 16-nat window: `log p = scale * code + minimum`, computed in
 //! float64. Record `k` of a chunk is the reference's prediction of the token at position `context / 2 + 1 + k`.
 
-use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -60,6 +59,11 @@ impl Reference {
     /// The bytes before the first record for a file of `chunks` chunks of `context` tokens.
     pub fn records_start(context: usize, chunks: usize) -> usize {
         HEADER_BYTES + 4 * chunks * context
+    }
+
+    /// As [`Reference::records_start`], `None` when the count does not fit.
+    fn checked_records_start(context: usize, chunks: usize) -> Option<usize> {
+        chunks.checked_mul(context)?.checked_mul(4)?.checked_add(HEADER_BYTES)
     }
 
     /// The dimensions in a header: context, vocabulary, chunks.
@@ -151,66 +155,98 @@ impl Reference {
         &self.tokens[chunk][self.prefix_len()..self.prefix_len() + self.records()]
     }
 
-    /// Starts opening the file at `path`. The hand-off is set with the reference and the file `AsyncIo` reads the
-    /// records from, or with why not. The header and the tokens are read, and the length of the file checked against
-    /// the records it must hold; the records are not read. Nothing waits here: the caller waits on the hand-off, from
-    /// outside the lattice.
-    pub fn open(io: &Arc<AsyncIo>, path: &Path) -> OpenedHandoff {
+    /// Starts reading the reference at `path`: its header and tokens, and the check of the file's length against the
+    /// records it must hold. The records are not read, and the file is closed again; [`open_records`] opens the file
+    /// the records are read from, through the `AsyncIo` that reads them. The hand-off is set with the reference or with
+    /// why not. Nothing waits here: the caller waits on the hand-off, from outside the lattice.
+    pub fn read(io: &Arc<AsyncIo>, path: &Path) -> ReadHandoff {
         let handoff = Handoff::new();
-        let delivery = Delivery::new(&handoff, path);
-        let next = Arc::clone(io);
+        let sink = Sink {
+            handoff: Arc::clone(&handoff),
+            path: path.display().to_string().into(),
+        };
+        let (next, failed) = (Arc::clone(io), sink.clone());
         let then = Box::new(move |opened: io::Result<OwnedFile>| {
+            let delivery = Delivery::new(sink);
             frame(Kind::Reading, 0, move || match opened {
                 Ok(file) => read_header(&next, file, delivery),
-                Err(error) => delivery.fail("cannot open", error),
+                Err(error) => delivery.fail("cannot open", &error),
             })
         });
         if let Err(error) = io.open_path(path, OpenSpec::default(), then) {
-            // The continuation was dropped on the way out, and its delivery reported that: replace it.
-            let _ = handoff.take();
-            handoff.send(Err(KldError::Io(format!(
-                "{}: cannot start opening: {error}",
-                path.display()
-            ))));
+            failed.fail("cannot start opening", &error);
         }
         handoff
     }
 }
 
-/// What opening a reference gives.
-pub type Opened = Result<(Reference, OwnedFile), KldError>;
+/// The hand-off of [`Reference::read`].
+pub type ReadHandoff = Arc<Handoff<Result<Reference, KldError>>>;
 
-/// The hand-off of an [`Opened`].
-pub type OpenedHandoff = Arc<Handoff<Opened>>;
+/// The hand-off of [`open_records`].
+pub type RecordsHandoff = Arc<Handoff<Result<OwnedFile, KldError>>>;
 
-/// The way back to the caller of [`Reference::open`]. A delivery dropped without a result reports that, so the caller
-/// never waits for a read that was lost.
+/// Starts opening the file `path` for reading, through `io`. A file belongs to the `AsyncIo` that opened it (on Windows
+/// to its completion port), so the records are read through the `AsyncIo` this one is given.
+pub fn open_records(io: &Arc<AsyncIo>, path: &Path) -> RecordsHandoff {
+    let handoff = Handoff::new();
+    let (sink, name) = (Arc::clone(&handoff), path.display().to_string());
+    let failed = (Arc::clone(&handoff), name.clone());
+    let then = Box::new(move |opened: io::Result<OwnedFile>| {
+        let delivered = Arc::clone(&sink);
+        frame(Kind::Reading, 0, move || {
+            delivered.send(opened.map_err(|error| KldError::Io(format!("{name}: cannot open: {error}"))));
+        })
+    });
+    if let Err(error) = io.open_path(path, OpenSpec::default(), then) {
+        failed.0.send(Err(KldError::Io(format!(
+            "{}: cannot start opening: {error}",
+            failed.1
+        ))));
+    }
+    handoff
+}
+
+/// Where the result of a [`Reference::read`] goes. Plain: nothing is sent until a continuation runs, so a submission
+/// that fails reports its own cause.
+#[derive(Clone)]
+struct Sink {
+    handoff: ReadHandoff,
+    path: Arc<str>,
+}
+
+impl Sink {
+    fn fail(&self, what: &str, error: &io::Error) {
+        self.handoff
+            .send(Err(KldError::Io(format!("{}: {what}: {error}", self.path))));
+    }
+}
+
+/// The result of a read in a frame. A delivery dropped without a result reports that, so the caller never waits for a
+/// frame that was lost.
 struct Delivery {
-    handoff: OpenedHandoff,
+    sink: Sink,
     sent: bool,
-    path: String,
 }
 
 impl Delivery {
-    fn new(handoff: &OpenedHandoff, path: &Path) -> Delivery {
-        Delivery {
-            handoff: Arc::clone(handoff),
-            sent: false,
-            path: path.display().to_string(),
-        }
+    fn new(sink: Sink) -> Delivery {
+        Delivery { sink, sent: false }
     }
 
-    fn handoff(&self) -> OpenedHandoff {
-        Arc::clone(&self.handoff)
-    }
-
-    fn send(mut self, result: Opened) {
+    /// The way back, for the next step: this delivery has done its part, and the next step makes its own.
+    fn pass(mut self) -> Sink {
         self.sent = true;
-        self.handoff.send(result);
+        self.sink.clone()
     }
 
-    fn fail(self, what: &str, error: io::Error) {
-        let message = format!("{}: {what}: {error}", self.path);
+    fn send(mut self, result: Result<Reference, KldError>) {
+        self.sent = true;
+        self.sink.handoff.send(result);
+    }
+
+    fn fail(self, what: &str, error: &io::Error) {
+        let message = format!("{}: {what}: {error}", self.sink.path);
         self.send(Err(KldError::Io(message)));
     }
 }
@@ -218,29 +254,30 @@ impl Delivery {
 impl Drop for Delivery {
     fn drop(&mut self) {
         if !self.sent {
-            self.handoff
-                .send(Err(KldError::Io(format!("{}: the read was lost", self.path))));
+            self.sink
+                .handoff
+                .send(Err(KldError::Io(format!("{}: the read was lost", self.sink.path))));
         }
     }
 }
 
 /// Reads `wanted` bytes at `offset` of `file`; `next` gets them in a frame of its own. A file that ends first is
-/// [`KldError::Truncated`] for `what`, with `before` bytes already known to be there.
+/// [`KldError::Truncated`] for `what`.
 fn read_part(
     io: &Arc<AsyncIo>,
     file: OwnedFile,
     offset: u64,
     wanted: usize,
     what: &'static str,
-    delivery: Delivery,
+    sink: Sink,
     next: impl FnOnce(OwnedFile, Vec<u8>, Delivery) + Send + 'static,
 ) {
     let before = offset as usize;
     let raw = raw_file(&file);
-    let lost = delivery.handoff();
-    let path = delivery.path.clone();
+    let failed = sink.clone();
     let then = Box::new(move |done: IoDoneOwned<Vec<u8>>| {
-        frame(Kind::Reading, offset as usize, move || match (done.result, done.buf) {
+        let delivery = Delivery::new(sink);
+        frame(Kind::Reading, before, move || match (done.result, done.buf) {
             (Ok(read), Some(bytes)) if read == wanted => next(file, bytes, delivery),
             (Ok(read), _) => delivery.send(Err(KldError::Truncated {
                 what,
@@ -252,74 +289,93 @@ fn read_part(
                     what,
                     have: before,
                     need: before + wanted,
-                }))
+                }));
             }
-            (Err(error), _) => delivery.fail(&format!("cannot read {what}"), error),
+            (Err(error), _) => delivery.fail(&format!("cannot read {what}"), &error),
         })
     });
     // The file is held by the continuation, which lives until the read ends.
     if let Err(error) = io.read_into(raw, offset, vec![0u8; wanted], then) {
-        // The continuation was dropped on the way out, and its delivery reported that: replace it.
-        let _ = lost.take();
-        lost.send(Err(KldError::Io(format!(
-            "{path}: cannot start reading {what}: {error}"
-        ))));
+        failed.fail(&format!("cannot start reading {what}"), &error);
     }
 }
 
 /// The first step: the header says how many tokens follow.
 fn read_header(io: &Arc<AsyncIo>, file: OwnedFile, delivery: Delivery) {
     let next = Arc::clone(io);
+    let sink = delivery.pass();
     read_part(
         io,
         file,
         0,
         HEADER_BYTES,
         "the header",
-        delivery,
+        sink,
         move |file, header, delivery| match Reference::parse_header(&header) {
-            Ok((context, _, chunks)) => {
-                read_tokens(&next, file, header, Reference::records_start(context, chunks), delivery)
-            }
+            Ok((context, _, chunks)) => match Reference::checked_records_start(context, chunks) {
+                Some(start) => read_length(&next, file, header, start, delivery),
+                None => delivery.send(Err(KldError::Invalid(format!(
+                    "the header names {chunks} chunks of {context} tokens, more than any file holds"
+                )))),
+            },
             Err(error) => delivery.send(Err(error)),
         },
     );
 }
 
-/// The second step: the tokens, and then the length check.
-fn read_tokens(io: &Arc<AsyncIo>, file: OwnedFile, mut head: Vec<u8>, start: usize, delivery: Delivery) {
+/// The second step: the file's length, so that a header that claims more than the file holds is refused before a
+/// buffer for its tokens is allocated.
+fn read_length(io: &Arc<AsyncIo>, file: OwnedFile, header: Vec<u8>, start: usize, delivery: Delivery) {
+    let raw = raw_file(&file);
+    let next = Arc::clone(io);
+    let sink = delivery.pass();
+    let failed = sink.clone();
+    let then = Box::new(move |length: io::Result<u64>| {
+        let delivery = Delivery::new(sink);
+        frame(Kind::Reading, 1, move || match length {
+            Ok(length) if length >= start as u64 => read_tokens(&next, file, header, start, length, delivery),
+            Ok(length) => delivery.send(Err(KldError::Truncated {
+                what: "the chunks' tokens",
+                have: usize::try_from(length).unwrap_or(usize::MAX),
+                need: start,
+            })),
+            Err(error) => delivery.fail("cannot read the size", &error),
+        })
+    });
+    if let Err(error) = io.file_len(raw, then) {
+        failed.fail("cannot start reading the size", &error);
+    }
+}
+
+/// The third step: the tokens, and then the check of the length against the records.
+fn read_tokens(io: &Arc<AsyncIo>, file: OwnedFile, mut head: Vec<u8>, start: usize, length: u64, delivery: Delivery) {
+    let sink = delivery.pass();
     read_part(
         io,
         file,
         HEADER_BYTES as u64,
         start - HEADER_BYTES,
         "the chunks' tokens",
-        delivery,
-        move |file, tokens, delivery| {
+        sink,
+        move |_file, tokens, delivery| {
             head.extend_from_slice(&tokens);
             let reference = match Reference::parse(&head) {
                 Ok(reference) => reference,
                 Err(error) => return delivery.send(Err(error)),
             };
-            let need = start as u64 + reference.row_bytes() as u64 * (reference.chunks() * reference.records()) as u64;
-            let (length, file) = file_len(file);
-            match length {
-                Ok(length) if length >= need => delivery.send(Ok((reference, file))),
-                Ok(length) => delivery.send(Err(KldError::Truncated {
+            let need = (reference.row_bytes() as u64)
+                .checked_mul((reference.chunks() * reference.records()) as u64)
+                .and_then(|records| records.checked_add(start as u64));
+            match need {
+                Some(need) if length >= need => delivery.send(Ok(reference)),
+                _ => delivery.send(Err(KldError::Truncated {
                     what: "the records",
-                    have: length as usize,
-                    need: need as usize,
+                    have: usize::try_from(length).unwrap_or(usize::MAX),
+                    need: need.map_or(usize::MAX, |need| usize::try_from(need).unwrap_or(usize::MAX)),
                 })),
-                Err(error) => delivery.fail("cannot read the size", error),
             }
         },
     );
-}
-
-/// The length of `file`, and the file back.
-fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
-    let file = File::from(file);
-    (file.metadata().map(|metadata| metadata.len()), OwnedFile::from(file))
 }
 
 /// One record: the reference's log-probabilities of a step.
