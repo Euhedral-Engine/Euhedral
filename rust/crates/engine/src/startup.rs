@@ -54,8 +54,10 @@ use crate::warmup;
 use crate::workspace::{Workspace, input_records_for};
 
 /// The transfer lanes a startup makes: `host.task-parallelism`, the workers that take host work at once, at least 2
-/// and at most half of the library's lanes, which leaves the other half to the stage graphs.
-pub(crate) fn transfer_lanes(settings: &Settings, library_lanes: usize) -> usize {
+/// and at most half of the lanes the library's limit (`max_lanes`) leaves after the `compute` stage-graph lanes and one
+/// more, which leaves the other half to the stage graphs.
+pub(crate) fn transfer_lanes(settings: &Settings, max_lanes: usize, compute: usize) -> usize {
+    let library_lanes = max_lanes.saturating_sub(compute + 1);
     (settings.host.task_parallelism as usize).clamp(2, (library_lanes / 2).max(2))
 }
 
@@ -1111,6 +1113,15 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn the_transfer_lane_cap_follows_the_librarys_lane_limit() {
+        let mut settings = Settings::with_model(euhedral_inference_settings::ModelSettings::default());
+        settings.host.task_parallelism = 1000;
+        assert_eq!(transfer_lanes(&settings, 64, 4), (64 - 5) / 2);
+        assert_eq!(transfer_lanes(&settings, 32, 4), (32 - 5) / 2);
+        assert_eq!(transfer_lanes(&settings, 8, 4), 2);
+    }
 
     #[test]
     fn a_plan_with_weights_outside_the_device_is_refused_naming_the_host_bytes() {

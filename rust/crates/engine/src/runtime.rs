@@ -924,15 +924,12 @@ pub fn lattice_config(settings: &Settings) -> LatticeConfig {
     config
 }
 
-/// The most lanes one RustEE pool holds.
-const MAX_LANES: usize = 64;
-
 /// The device the native library bound, opened through RustEE. The library reports the device's properties and not its
 /// ordinal, so the device is the first whose compute capability is the library's.
 pub fn open_device(library: &CudaLibrary) -> Result<Arc<CudaGpu>, EngineError> {
     let (major, minor) = library.device().compute_capability;
     let wanted = (i32::try_from(major).unwrap_or(0), i32::try_from(minor).unwrap_or(0));
-    for ordinal in 0..MAX_LANES as i32 {
+    for ordinal in 0.. {
         let Ok(candidate) = CudaGpu::open(ordinal) else { break };
         if candidate.arch() == wanted {
             return Ok(candidate);
@@ -1029,7 +1026,7 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
     // the most the settings allow; the startup uses as many as its ring needs.
     let machine = startup::read_machine();
     let compute = Plan::lane_width();
-    let chains = startup::transfer_lanes(settings, MAX_LANES.saturating_sub(compute + 1));
+    let chains = startup::transfer_lanes(settings, library.max_lanes(), compute);
     let ring = stage_ring(quanta_for(sequences));
     let set =
         open_lane_set(&gpu, compute, ring, chains).map_err(|error| runtime("the lanes would not open", &error))?;
