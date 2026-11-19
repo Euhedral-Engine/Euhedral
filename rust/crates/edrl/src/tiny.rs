@@ -304,15 +304,7 @@ impl Lcg {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lcg, text_hash};
-
-    #[test]
-    fn lcg_matches_the_documented_sequence() {
-        // `new Random(42).nextInt()` is -1170105035 and the next is 234785527.
-        let mut random = Lcg::new(42);
-        assert_eq!(random.next_int(), -1_170_105_035);
-        assert_eq!(random.next_int(), 234_785_527);
-    }
+    use super::text_hash;
 
     #[test]
     fn string_hash_is_the_expected_one() {

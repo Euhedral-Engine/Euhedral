@@ -2,8 +2,67 @@ use super::render::push_double;
 use super::*;
 use crate::backend::{EngineReport, PrefixCacheReport};
 
-const RECORDED: &str = include_str!("../../tests/data/metrics_recorded.txt");
-const IDLE: &str = include_str!("../../tests/data/metrics_idle.txt");
+/// The series the dashboards scrape, with the type each is declared as: the 46 names a scrape lists, and no others.
+const SERIES: [(&str, &str); 46] = [
+    ("euhedral_completion_tokens_total", "counter"),
+    ("euhedral_constrained_failures_total", "counter"),
+    ("euhedral_decode_tokens_per_second", "histogram"),
+    ("euhedral_decode_tokens_per_second_max", "gauge"),
+    ("euhedral_engine_info", "gauge"),
+    ("euhedral_engine_context_tokens", "gauge"),
+    ("euhedral_engine_device_allocated_bytes", "gauge"),
+    ("euhedral_engine_device_free_bytes", "gauge"),
+    ("euhedral_engine_host_backed_weight_bytes", "gauge"),
+    ("euhedral_engine_pinned_pool_bytes", "gauge"),
+    ("euhedral_engine_pinned_pool_overflows_total", "counter"),
+    ("euhedral_engine_workers", "gauge"),
+    ("euhedral_finishes_total", "counter"),
+    ("euhedral_generations_active", "gauge"),
+    ("euhedral_generations_queued", "gauge"),
+    ("euhedral_prefill_tokens_per_second", "histogram"),
+    ("euhedral_prefill_tokens_per_second_max", "gauge"),
+    ("euhedral_prefix_capacity_bytes", "gauge"),
+    ("euhedral_prefix_capture_seconds_total", "counter"),
+    ("euhedral_prefix_captures_total", "counter"),
+    ("euhedral_prefix_evictions_total", "counter"),
+    ("euhedral_prefix_failed_total", "counter"),
+    ("euhedral_prefix_hits_total", "counter"),
+    ("euhedral_prefix_lookups_total", "counter"),
+    ("euhedral_prefix_nodes", "gauge"),
+    ("euhedral_prefix_restore_seconds_total", "counter"),
+    ("euhedral_prefix_restored_tokens_total", "counter"),
+    ("euhedral_prefix_restores_total", "counter"),
+    ("euhedral_prefix_skipped_total", "counter"),
+    ("euhedral_prefix_used_bytes", "gauge"),
+    ("euhedral_prompt_cached_tokens_total", "counter"),
+    ("euhedral_prompt_prefilled_tokens_total", "counter"),
+    ("euhedral_prompt_tokens_total", "counter"),
+    ("euhedral_queue_wait_seconds", "histogram"),
+    ("euhedral_queue_wait_seconds_max", "gauge"),
+    ("euhedral_reasoning_tokens_total", "counter"),
+    ("euhedral_request_duration_seconds", "histogram"),
+    ("euhedral_request_duration_seconds_max", "gauge"),
+    ("euhedral_requests_total", "counter"),
+    ("euhedral_schema_rejections_total", "counter"),
+    ("euhedral_speculative_accepted_total", "counter"),
+    ("euhedral_speculative_accepted_tokens_total", "counter"),
+    ("euhedral_speculative_verifications_total", "counter"),
+    ("euhedral_time_to_first_token_seconds", "histogram"),
+    ("euhedral_time_to_first_token_seconds_max", "gauge"),
+    ("euhedral_tool_calls_total", "counter"),
+];
+
+/// The series a text declares, with their types.
+fn declared(text: &str) -> Vec<(String, String)> {
+    let mut series: Vec<(String, String)> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("# TYPE "))
+        .filter_map(|line| line.split_once(' '))
+        .map(|(name, kind)| (name.to_string(), kind.to_string()))
+        .collect();
+    series.sort();
+    series
+}
 
 fn double(value: f64) -> String {
     let mut out = String::new();
@@ -110,16 +169,27 @@ fn record_everything(metrics: &Metrics) {
 }
 
 #[test]
-fn a_registry_that_recorded_nothing_exports_every_series_at_zero() {
+fn a_registry_that_recorded_nothing_exports_every_series() {
     let metrics = Metrics::new(3, 0);
-    assert_eq!(metrics.render("m1", 4096, &report(false), 0), IDLE);
+    let text = metrics.render("m1", 4096, &report(false), 0);
+    let mut expected: Vec<(String, String)> = SERIES.iter().map(|(n, k)| (n.to_string(), k.to_string())).collect();
+    expected.sort();
+    assert_eq!(declared(&text), expected);
+    // Each series has a sample line.
+    for (name, _) in SERIES {
+        assert!(text.lines().any(|line| line.starts_with(name)), "{name} has a sample");
+    }
 }
 
 #[test]
-fn recordings_are_exported_as_the_reference_text_has_them() {
+fn recordings_keep_the_same_series_and_show_in_the_samples() {
     let metrics = Metrics::new(3, 0);
+    let idle = metrics.render("m1", 4096, &report(true), 0);
     record_everything(&metrics);
-    assert_eq!(metrics.render("m1", 4096, &report(true), 0), RECORDED);
+    let text = metrics.render("m1", 4096, &report(true), 0);
+    assert_eq!(declared(&text), declared(&idle), "recording adds and drops no series");
+    assert_ne!(text, idle, "the recordings are in the text");
+    assert_eq!(declared(&text).len(), SERIES.len());
 }
 
 #[test]

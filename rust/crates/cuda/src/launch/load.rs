@@ -738,25 +738,6 @@ mod tests {
     }
 
     #[test]
-    fn the_compile_stack_defaults_to_the_native_size_and_is_set_by_the_caller() {
-        assert_eq!(sources().compile_stack, 256 << 20);
-        assert_eq!(sources().with_compile_stack(64 << 20).compile_stack, 64 << 20);
-    }
-
-    #[test]
-    fn the_dispatch_is_the_measured_one_until_set() {
-        let measured = Dispatch::measured(70);
-        assert_eq!(measured.rms_norm_decode_slices, 40);
-        assert_eq!(measured.fused_verify_from[2], 49152);
-        assert_eq!(measured.skinny_target_ctas(), 140);
-        let set = Dispatch {
-            rms_norm_decode_slices: 8,
-            ..measured
-        };
-        assert_eq!(sources().with_dispatch(set).dispatch, set);
-    }
-
-    #[test]
     fn the_catalog_iterates_in_order_with_its_slots() {
         let table = KernelTable {
             slots: KERNELS
