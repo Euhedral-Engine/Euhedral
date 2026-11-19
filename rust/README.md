@@ -93,6 +93,9 @@ files.sha256          the manifest of the kernel sources
 Unpack it anywhere and run `bin/euhedral-server --config <file>`: with no `host.native-cache` set, the server finds
 `lib/` beside `bin/`. CI builds and uploads the linux-x64 archive next to the server jar.
 
+`docker build -f rust/Dockerfile .` (from the repository root) puts the linux-x64 bundle and `euhedral-health-probe`, the
+image's health check, into the distroless image; see `docs/OPERATIONS.md`.
+
 ## Quantization
 
 `euhedral-inference-quantization` (`crates/quantization`) is the library behind the quantization tools: Java's `Random`

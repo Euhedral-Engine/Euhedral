@@ -124,6 +124,27 @@ The port opens only after the engine has loaded, so a server that answers is rea
 `GET /health` answers `200 {"status":"up","engine":"ready","model":"..."}`, and `503` with `"engine":"closed"` once the
 engine has closed. The image's Docker health check calls it.
 
+## Container images
+
+The root `Dockerfile` builds the Java server's image. `rust/Dockerfile` builds the Rust server's, in the same
+distroless `cc` base with the same default settings file (`/etc/euhedral/config.yaml`, also `EUHEDRAL_CONFIG`), the NVIDIA
+environment, the `nonroot` user and the same health check timing. Build it from the repository root; the build compiles
+the native library with the pinned toolchains, so it needs network access and takes a while:
+
+```bash
+docker build -f rust/Dockerfile -t euhedral-rust .
+docker run --rm --gpus all -p 1738:1738 -v /path/to/model.edrl:/models/model.edrl:ro \
+    -e EUHEDRAL_MODEL_NAME=qwen --stop-timeout 45 euhedral-rust
+```
+
+The image holds the linux-x64 server bundle (`cargo xtask bundle --product linux-x64`, see `rust/README.md`) under
+`/opt/euhedral`: `bin/euhedral-server` is the entry point and finds `lib/` beside it. Settings are given as for the
+Java image: `--config <mounted file>`, or variables (`docker run -e`, `--env-file`). The distroless base has no shell
+or curl, so the health check is `bin/euhedral-health-probe`, which asks `GET /health` of `127.0.0.1` on
+`EUHEDRAL_SERVER_PORT`, else `PORT`, else 1738, allows two seconds each to connect, to send the request and to read the answer, and exits 1 unless the answer is `200`. A
+server that listens on another port through a settings file needs the same port in one of those variables for the
+check to follow it.
+
 ## Shutting down
 
 On `SIGTERM` or `SIGINT` the server stops accepting connections and waits up to
