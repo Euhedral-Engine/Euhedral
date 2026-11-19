@@ -1054,9 +1054,7 @@ impl DiskReader {
     /// `kill` was set: every ticket watching it is abandoned, so a copy waiting for a read of its own gives its gate up
     /// and its quantum can end. Called by whoever sets the flag, after setting it.
     pub fn killed(&self, kill: &Arc<AtomicBool>) {
-        self.mailbox.post(DiskMessage::Killed {
-            kill: Arc::clone(kill),
-        });
+        self.mailbox.post(DiskMessage::Killed { kill: Arc::clone(kill) });
     }
 
     /// The copy of `ticket` that consumed `slot` ended (its marker completed): the slot may be read into again. A free

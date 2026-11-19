@@ -375,15 +375,14 @@ impl Launch for DiskTransfer {
 impl Stage<Quantum> for DiskTransfer {
     fn pass_gate(&self, quantum: &Quantum, gate: GateRef<'_>) -> bool {
         let Some(ledger) = quantum.disk.as_ref() else {
-            gate.hold().fail(fatal(format!("{} was started with no disk reads registered", self.name)));
+            gate.hold().fail(fatal(format!(
+                "{} was started with no disk reads registered",
+                self.name
+            )));
             return false;
         };
         ledger.attempt(self.use_index);
-        match self
-            .tier
-            .reader
-            .claim(self.window_slot, ledger.ticket, || gate.hold())
-        {
+        match self.tier.reader.claim(self.window_slot, ledger.ticket, || gate.hold()) {
             Claimed::Ready => true,
             Claimed::Held => false,
         }

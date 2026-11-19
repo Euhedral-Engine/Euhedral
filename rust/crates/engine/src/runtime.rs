@@ -38,6 +38,7 @@ use crate::pass_assembler::PassStatistics;
 use crate::plan::Plan;
 use crate::prefix::PrefixCacheStats;
 use crate::residency::accounting::{MemoryAccount, PlanReservation};
+use crate::residency::disk::DiskReader;
 use crate::residency::planner::{LocationBytes, PlanInputs, ResidencyPlan, pass_rows_limit, sequences_for};
 use crate::stages::LaneTable;
 use crate::startup;
@@ -295,6 +296,8 @@ pub struct StartupReport {
     pub host_backed_bytes: u64,
     /// Payload bytes of the objects the plan leaves in the artifact file, read through the disk window.
     pub disk_backed_bytes: u64,
+    /// Pinned host bytes of the disk window the objects left in the file are read through; 0 without any.
+    pub window_bytes: u64,
     /// Device bytes of the staging ring the staged weights are copied into; 0 when nothing is staged.
     pub staging_bytes: u64,
     /// The objects among them that kernels read in place over the bus (the embedding and the output head).
@@ -328,6 +331,9 @@ pub struct Teardown {
     leaked_bytes: AtomicU64,
     /// How long `shutdown` waits for a running request to end after its cancel: the lattice's close timeout.
     pub(crate) cancel_bound: Duration,
+    /// The disk reader, until the close takes it: reads are stopped first, while the lattice still runs the frames that
+    /// end them.
+    disk: Handoff<DiskReader>,
 }
 
 impl Teardown {
@@ -348,7 +354,13 @@ impl Teardown {
             device_bytes: AtomicU64::new(0),
             leaked_bytes: AtomicU64::new(NOT_CHECKED),
             cancel_bound,
+            disk: Handoff::empty(),
         })
+    }
+
+    /// The engine reads from disk: `close` stops `reader` before the lattice stops.
+    pub(crate) fn hold_disk(&self, reader: DiskReader) {
+        self.disk.send(reader);
     }
 
     /// The bytes the memory account's leak check found still claimed when the engine was shut down and its memory
@@ -362,6 +374,14 @@ impl Teardown {
 
     /// Closes the lakes, then the lattice. Idempotent. Waits for the workers: never from a worker.
     pub fn close(&self) {
+        // The quanta of the engine have ended by now (the owner stopped the request first), and the reads still in
+        // flight end on the lattice's frames: the reader is closed before the lattice is, and its window is freed only
+        // with the weights, after both.
+        if let Some(reader) = self.disk.take()
+            && reader.close().wait(self.cancel_bound).is_err()
+        {
+            log::error!("the disk reader did not end its reads within {:?}", self.cancel_bound);
+        }
         for lake in &self.lakes {
             lake.complete_gracefully();
         }

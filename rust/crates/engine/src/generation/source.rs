@@ -660,7 +660,9 @@ impl Run {
         if self.stopping.is_none() {
             self.stopping = Some(reason);
             for flying in &self.in_flight {
-                flying.kill.store(true, Ordering::Release);
+                if !flying.kill.swap(true, Ordering::AcqRel) {
+                    self.shared.executor.killed(&flying.kill);
+                }
             }
             if let Some(checkpoints) = self.checkpoints.as_mut() {
                 checkpoints.stop();

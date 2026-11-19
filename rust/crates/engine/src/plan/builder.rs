@@ -19,6 +19,7 @@ use super::buffers::Access;
 use super::views::Variant;
 use crate::formats::LinearFormat;
 use crate::model::{LayerIndex, LayerKind, ModelConfig, MtpRole, NormKind, Role, WeightRef, Weights};
+use crate::residency::disk::DiskUse;
 use crate::stages::attention::{AttentionCausal, KvAppend, KvSource, QkNormRope};
 use crate::stages::elementwise::{ResidualAdd, Swiglu};
 use crate::stages::embed::Embed;
@@ -27,7 +28,6 @@ use crate::stages::linear::{Linear, LinearRows};
 use crate::stages::mtp::MtpStem;
 use crate::stages::norm::{NormRows, ResidualRmsNorm, RmsNormUnitOffset};
 use crate::stages::sampling::{Argmax, CopyRows, SelectedRows, SelectedToken};
-use crate::residency::disk::DiskUse;
 use crate::stages::transfer::{DiskTier, DiskTransfer, WeightTransfer};
 use crate::stages::{Launch, Quantum, StageLaunch};
 use crate::workspace::BufferSlot::{

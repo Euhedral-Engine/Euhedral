@@ -858,9 +858,11 @@ impl Executor {
         // and tickets follow the order the quanta start in (a staged view is never captured, so none of this is
         // skipped for a quantum that runs as one body).
         let ledger = match (self.plan.disk_tier(), self.plan.disk_uses(view)) {
-            (Some(tier), uses) if !uses.is_empty() => {
-                Some((Arc::clone(tier), tier.register(uses, &kill).map_err(|error| StartError::Disk(error.to_string()))?))
-            }
+            (Some(tier), uses) if !uses.is_empty() => Some((
+                Arc::clone(tier),
+                tier.register(uses, &kill)
+                    .map_err(|error| StartError::Disk(error.to_string()))?,
+            )),
             _ => None,
         };
         // Nothing after this can refuse the quantum: the upload is queued last, and a quantum dropped after it would free

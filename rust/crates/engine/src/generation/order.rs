@@ -69,6 +69,9 @@ pub(crate) trait Launch: Send + Sync + 'static {
     /// The job's own number, distinct for every job.
     fn serial(job: &Self::Job) -> u64;
 
+    /// `kill`, a flag passed to `start`, was set: what waits for something of its own can give up.
+    fn killed(&self, _kill: &Arc<AtomicBool>) {}
+
     /// The number of the job `started` started.
     fn serial_of(started: &Self::Started) -> u64;
 
@@ -132,6 +135,10 @@ impl Launch for Executor {
 
     fn serial_of(started: &Started) -> u64 {
         started.serial
+    }
+
+    fn killed(&self, kill: &Arc<AtomicBool>) {
+        Executor::killed(self, kill);
     }
 
     fn start(&self, job: Job, kill: Arc<AtomicBool>, after: &[&Started]) -> Result<Started, StartError> {
@@ -282,18 +289,22 @@ impl Counters {
 
 /// A pass in flight: its members and the flag each is cancelled by, and the flag that stops the whole job when it is
 /// one job of several members.
-struct Flight {
+struct Flight<L: Launch> {
     members: Vec<(SequenceId, Arc<AtomicBool>)>,
     kill: Option<Arc<AtomicBool>>,
+    /// Told when `kill` is set, so work that waits on the flag can give up.
+    launcher: Arc<L>,
 }
 
-impl Flight {
+impl<L: Launch> Flight<L> {
     /// Stops the job once every member is cancelled, never for one.
     fn reevaluate(&self) {
         if let Some(kill) = &self.kill
             && self.members.iter().all(|(_, cancel)| cancel.load(Ordering::Acquire))
         {
-            kill.store(true, Ordering::Release);
+            if !kill.swap(true, Ordering::AcqRel) {
+                self.launcher.killed(kill);
+            }
         }
     }
 }
@@ -351,7 +362,7 @@ pub(crate) struct WorkspaceOwner<L: Launch> {
     /// The verifications offered for a pass, and the rule that forms passes of them.
     assembler: PassAssembler<Offer<L>>,
     /// The passes in flight, by the number of the job each started.
-    flights: Vec<(u64, Flight)>,
+    flights: Vec<(u64, Flight<L>)>,
     counters: Arc<Counters>,
 }
 
@@ -557,6 +568,7 @@ impl<L: Launch> WorkspaceOwner<L> {
                 let flight = Flight {
                     members,
                     kill: Some(kill),
+                    launcher,
                 };
                 flight.reevaluate();
                 self.flights.push((serial, flight));
@@ -685,6 +697,7 @@ impl<L: Launch> WorkspaceOwner<L> {
                         Flight {
                             members: vec![(sequence, cancel)],
                             kill: None,
+                            launcher: Arc::clone(&launcher),
                         },
                     ));
                 }

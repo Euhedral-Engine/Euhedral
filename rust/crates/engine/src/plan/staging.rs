@@ -384,7 +384,9 @@ mod tests {
     }
 
     fn staged_of(suffixes: &[&str], slots: usize) -> Vec<Node> {
-        staged(&base_of(suffixes, &[]), None, &ring(slots), None).unwrap().unwrap()
+        staged(&base_of(suffixes, &[]), None, &ring(slots), None)
+            .unwrap()
+            .unwrap()
     }
 
     /// The ids of the transfers and of the staged readers, in list order.
