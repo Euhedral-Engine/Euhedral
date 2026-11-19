@@ -164,7 +164,7 @@ pub fn markers_in_flight(plan: &Plan, sequences: usize, transfers: bool) -> usiz
     .unwrap_or(0);
     // A greedy request keeps a few quanta in flight; a speculative step keeps its catch-up, drafts and verification,
     // and the owner prepares one more behind them.
-    let step = if plan.drafts() || plan.verified_rows() > 0 {
+    let step = if plan.drafts() {
         stages_of(View::Verify {
             rows: plan.verified_rows(),
         }) + stages_of(View::Draft { rows: 1 }) * plan.verified_rows()

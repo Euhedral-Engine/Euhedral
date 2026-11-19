@@ -936,7 +936,21 @@ impl EngineRuntime {
         rows: usize,
         sink: Box<dyn LogitsSink>,
     ) -> Result<(), AdmissionError> {
-        self.generations.teacher_forced(prefix, forced, rows.max(1), sink)
+        let rows = rows.max(1);
+        if rows > 1 {
+            if sink.wants_hidden() {
+                return Err(AdmissionError::Engine(
+                    "a teacher-forced run that takes the hidden state decodes one row at a time".to_string(),
+                ));
+            }
+            let sized = self.plan().verified_rows() as usize;
+            if rows > sized {
+                return Err(AdmissionError::Engine(format!(
+                    "the sequences verify at most {sized} rows: {rows} were asked (batching.forced-rows sizes them)"
+                )));
+            }
+        }
+        self.generations.teacher_forced(prefix, forced, rows, sink)
     }
 
     /// What stops the engine, which also keeps the result of the leak check of the memory account once the engine is

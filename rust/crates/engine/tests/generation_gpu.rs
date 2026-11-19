@@ -1633,40 +1633,33 @@ fn run_forced(
     Ok(done)
 }
 
-fn bf16_row(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16))
-        .collect()
+/// A sink that wants the hidden state.
+struct WantsHidden;
+
+impl LogitsSink for WantsHidden {
+    fn wants_hidden(&self) -> bool {
+        true
+    }
+
+    fn row(&mut self, _step: usize, _forced: u32, _logits: &[u8]) {}
+
+    fn finished(&mut self, _outcome: GenerationOutcome) {}
 }
 
-/// The KL divergence of the softmax of `b` from that of `a`, and whether their top tokens agree.
-fn kl_and_top(a: &[f32], b: &[f32]) -> (f64, bool) {
-    let normal = |row: &[f32]| {
-        let top = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum: f64 = row.iter().map(|x| f64::from(x - top).exp()).sum();
-        row.iter().map(|x| f64::from(x - top) - sum.ln()).collect::<Vec<f64>>()
-    };
-    let (la, lb) = (normal(a), normal(b));
-    let kl = la.iter().zip(&lb).map(|(x, y)| x.exp() * (x - y)).sum();
-    let top = |row: &[f32]| {
-        row.iter()
-            .enumerate()
-            .fold((0, f32::MIN), |m, (i, v)| if *v > m.1 { (i, *v) } else { m })
-            .0
-    };
-    (kl, top(a) == top(b))
-}
-
-/// Several rows per pass and several sequences at once give the rows of the one-row path, within the BF16 bound; a
-/// request for more rows than the sequences are sized for is refused, and the one-row path is the default.
-#[test]
-#[ignore = "needs a GPU, the native library, the RCO artifact, the Java references and python3 with numpy"]
-fn multi_row_teacher_forcing_matches_the_one_row_path_alone_and_batched() {
+/// Runs the forced comparison on an engine whose sequences are sized as `forced_rows` says (0: by the draft depth
+/// alone): `rows` rows per step, alone and with two sequences at once, give the rows of the one-row path byte for byte,
+/// and the two sequences share passes.
+fn forced_rows_equal_the_one_row_path(forced_rows: u32, rows_of: impl Fn(usize) -> usize) {
     let Some(machine) = machine() else { return };
-    let (owner, runtime) = start_with_sequences(&machine, 2);
+    let mut engine = settings(&machine.artifact, 4096);
+    engine.batching.max_sequences = 2;
+    engine.batching.forced_rows = forced_rows;
+    let (owner, ready) = EngineRuntime::start(&engine, &machine.library);
+    let runtime = ready
+        .wait(WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    let owner = Closer::new(owner, &runtime);
     let tokenizer = tokenizer(&machine.artifact);
     let document = fs::read_to_string(repository_root().join(
         "benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md",
@@ -1688,38 +1681,59 @@ fn multi_row_teacher_forcing_matches_the_one_row_path_alone_and_batched() {
     let reference_b = one(second, forced_b);
     assert_eq!(reference_a.len(), steps);
 
-    let compare = |name: &str, got: &[Vec<u8>], reference: &[Vec<u8>]| {
-        assert_eq!(got.len(), reference.len(), "{name}: the same number of rows");
-        let (mut worst, mut agree) = (0.0f64, 0);
-        for (g, r) in got.iter().zip(reference) {
-            let (kl, same) = kl_and_top(&bf16_row(r), &bf16_row(g));
-            worst = worst.max(kl);
-            agree += usize::from(same);
-        }
-        println!(
-            "{name}: worst row KL {worst:.2e}, top-1 agrees on {agree} of {}",
-            got.len()
-        );
-        assert!(worst < 1e-3, "{name}: a row strays from the one-row path");
-        assert!(agree * 20 >= got.len() * 19, "{name}: top-1 agreement");
-    };
-
-    let widest = 1 + runtime.plan().draft_depth;
-    assert!(widest >= 2, "the artifact drafts, so its sequences verify several rows");
+    let widest = rows_of(runtime.plan().draft_depth);
+    assert!(widest >= 2, "the sequences verify several rows");
+    assert_eq!(runtime.plan().verified_rows() as usize, widest);
     for rows in [2, widest] {
         let (got, outcome) = run_forced(&runtime, first, forced_a, rows).unwrap().wait(WAIT).unwrap();
         assert_eq!(outcome.reason, FinishReason::Length);
         assert_eq!(outcome.generated, steps);
-        compare(&format!("{rows} rows alone"), &got, &reference_a);
+        assert!(got == reference_a, "{rows} rows alone differ from the one-row path");
     }
     // Two sequences at once: their verifications share passes.
+    let before = runtime.pass_statistics();
     let a = run_forced(&runtime, first, forced_a, widest).unwrap();
     let b = run_forced(&runtime, second, forced_b, widest).unwrap();
-    compare("batched (a)", &a.wait(WAIT).unwrap().0, &reference_a);
-    compare("batched (b)", &b.wait(WAIT).unwrap().0, &reference_b);
-    // More rows than the sequences verify is refused, not run.
-    assert!(run_forced(&runtime, first, forced_a, 4096).is_err());
-    // The sequence is idle again and takes the one-row path.
-    assert_eq!(one(first, forced_a).len(), steps);
+    assert!(
+        a.wait(WAIT).unwrap().0 == reference_a,
+        "batched run a differs from the one-row path"
+    );
+    assert!(
+        b.wait(WAIT).unwrap().0 == reference_b,
+        "batched run b differs from the one-row path"
+    );
+    let after = runtime.pass_statistics();
+    println!(
+        "FORCED_ROWS {widest} rows: {} passes, {} batched",
+        after.passes - before.passes,
+        after.batched - before.batched
+    );
+    assert!(after.batched > before.batched, "the two runs never shared a pass");
+
+    // More rows than the sequences verify is refused, by name, not run; so is a sink that wants the hidden state.
+    match run_forced(&runtime, first, forced_a, widest + 1) {
+        Err(AdmissionError::Engine(text)) => assert!(text.contains("verify at most"), "{text}"),
+        other => panic!("too many rows were not refused: {:?}", other.err()),
+    }
+    match runtime.teacher_forced_rows(first.to_vec(), forced_a.to_vec(), 2, Box::new(WantsHidden)) {
+        Err(AdmissionError::Engine(text)) => assert!(text.contains("hidden state"), "{text}"),
+        other => panic!("a hidden-state sink was not refused: {:?}", other.err()),
+    }
+    // The sequences are idle again and take the one-row path.
+    assert!(one(first, forced_a) == reference_a);
     owner.shutdown(runtime).unwrap();
+}
+
+/// The rows the artifact's draft depth sizes the verification for, alone and batched, equal the one-row path.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn multi_row_teacher_forcing_matches_the_one_row_path_alone_and_batched() {
+    forced_rows_equal_the_one_row_path(0, |depth| 1 + depth);
+}
+
+/// `batching.forced-rows` of 8 sizes the sequences for 8 rows, more than the draft depth gives.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn eight_forced_rows_sized_by_the_setting_equal_the_one_row_path_alone_and_batched() {
+    forced_rows_equal_the_one_row_path(8, |depth| (1 + depth).max(8));
 }
