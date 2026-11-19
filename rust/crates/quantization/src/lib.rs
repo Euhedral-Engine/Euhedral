@@ -5,6 +5,8 @@
 //!   picks the same numbers in both.
 //! - [`kernels`]: the quantization kernels as NVRTC modules, their kernel names and the loader that compiles them.
 //! - [`trellis`]: the trellis kernels: rates, launch planners and the enqueue of their steps.
+//! - [`java_random`]: seeded generators in the style of `java.util.Random` and `java.util.SplittableRandom`. A
+//!   consumer that needs the exact sequence of a seed adds its own test of it.
 //! - [`npy`] and [`npz`]: the NumPy array and archive formats the calibration state and the fixtures use. Both work
 //!   on bytes the caller supplies or takes; neither opens a file.
 //! - [`kld`]: the reference logits file the scorer and the reference writer share, opened and read through `AsyncIo`.

@@ -98,8 +98,8 @@ image's health check, into the distroless image; see `docs/OPERATIONS.md`.
 
 ## Quantization
 
-`euhedral-inference-quantization` (`crates/quantization`) is the library behind the quantization tools: Java's `Random`
-and `SplittableRandom` drawn exactly as Java draws them (`java_random`), and the `.npy` and `.npz` formats (`npy`,
+`euhedral-inference-quantization` (`crates/quantization`) is the library behind the quantization tools: seeded `Random` and
+`SplittableRandom` generators in the style of Java's (`java_random`), and the `.npy` and `.npz` formats (`npy`,
 `npz`). `euhedral-inference-quantize` (`crates/quantize`) is the command line, a binary called `quantization` that
 dispatches the commands of the Java tool. A command whose work is not wired yet exits with code 3; `train-blocks`,
 `train-model` and `rotate` are not part of this tool.

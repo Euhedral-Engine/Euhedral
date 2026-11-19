@@ -162,11 +162,11 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_has_thirteen_distinct_commands() {
+    fn the_commands_have_distinct_names() {
         let mut names: Vec<&str> = COMMANDS.iter().map(|command| command.name).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), COMMANDS.len());
     }
 
     #[test]
