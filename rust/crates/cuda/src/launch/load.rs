@@ -358,6 +358,16 @@ impl KernelSources {
         self
     }
 
+    /// The CUDA header directory the modules compile against.
+    pub fn include(&self) -> &Path {
+        &self.include
+    }
+
+    /// The stack, in bytes, of the thread that compiles.
+    pub fn compile_stack(&self) -> usize {
+        self.compile_stack
+    }
+
     /// The compiler library that will be used, when one was found beside the library.
     pub fn compiler(&self) -> Option<&Path> {
         self.compiler.as_deref()
@@ -546,38 +556,45 @@ fn module_gate(module: Module, architecture_target: bool) -> Option<Unavailable>
 type Compilations = (Vec<(Module, Compiled)>, Vec<ModuleTiming>);
 
 /// Compiles each distinct module, in first-appearance order, on a thread with the configured stack.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "startup: NVRTC needs a deep stack the caller's thread may not have, and loading waits for the compile by nature"
-)]
 fn compile_all(
     gpu: &Arc<CudaGpu>,
     sources: &KernelSources,
     architecture_target: bool,
 ) -> Result<Compilations, LoadError> {
+    on_compile_stack(sources.compile_stack, || -> Result<Compilations, LoadError> {
+        let mut modules: Vec<(Module, Compiled)> = Vec::new();
+        let mut timings = Vec::new();
+        for spec in &KERNELS {
+            if modules.iter().any(|(module, _)| *module == spec.module) {
+                continue;
+            }
+            let started = Instant::now();
+            let compiled = compile(gpu, sources, spec.module, architecture_target)?;
+            if matches!(compiled, Compiled::Module(_)) {
+                timings.push(ModuleTiming {
+                    module: spec.module,
+                    elapsed: started.elapsed(),
+                });
+            }
+            modules.push((spec.module, compiled));
+        }
+        Ok((modules, timings))
+    })?
+}
+
+/// Runs `work` on a thread of its own with a stack of `stack` bytes and waits for it: NVRTC recurses deeply on the
+/// largest sources, which the caller's thread may not have the stack for. Blocking: it is a startup call, made
+/// before any frame runs.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "startup: NVRTC needs a deep stack the caller's thread may not have, and loading waits for the compile by nature"
+)]
+pub fn on_compile_stack<T: Send>(stack: usize, work: impl FnOnce() -> T + Send) -> Result<T, LoadError> {
     scope(|scope| {
         let worker = Builder::new()
             .name("kernel-compile".to_owned())
-            .stack_size(sources.compile_stack)
-            .spawn_scoped(scope, || -> Result<Compilations, LoadError> {
-                let mut modules: Vec<(Module, Compiled)> = Vec::new();
-                let mut timings = Vec::new();
-                for spec in &KERNELS {
-                    if modules.iter().any(|(module, _)| *module == spec.module) {
-                        continue;
-                    }
-                    let started = Instant::now();
-                    let compiled = compile(gpu, sources, spec.module, architecture_target)?;
-                    if matches!(compiled, Compiled::Module(_)) {
-                        timings.push(ModuleTiming {
-                            module: spec.module,
-                            elapsed: started.elapsed(),
-                        });
-                    }
-                    modules.push((spec.module, compiled));
-                }
-                Ok((modules, timings))
-            })
+            .stack_size(stack)
+            .spawn_scoped(scope, work)
             .map_err(|error| LoadError::CompileThread(error.to_string()))?;
         worker.join().map_err(|payload| {
             let what = payload
@@ -586,7 +603,7 @@ fn compile_all(
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "a panic".to_owned());
             LoadError::CompileThread(what)
-        })?
+        })
     })
 }
 
