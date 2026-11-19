@@ -58,7 +58,7 @@ fn start(machine: &Machine) -> (Closer, Arc<EngineRuntime>) {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
     });
-    settings.context.max_tokens = 64;
+    settings.context.max_tokens = 512;
     settings.kernels.graphs.captures_per_view = 8;
     settings.batching.prefill_chunk_tokens = CHUNK;
     let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
@@ -243,25 +243,24 @@ fn hidden_rows_are_the_seed_rows_the_catch_up_reads() {
     let Some(machine) = machine() else { return };
     let (owner, runtime) = start(&machine);
 
-    // A request that drafts writes its prompt chunk's rows to the seed rows, which the catch-up reads. With one token to
-    // generate it ends there.
+    // A request that drafts runs its verification on the row of the token it has, and the seed rows then hold that
+    // row's post-final-norm hidden state, which the next catch-up reads. The hidden request decodes the same row.
     let ids = prompt(40);
-    let speculative = plain(&runtime, &ids, 1, Speculation::Artifact, greedy());
+    let speculative = plain(&runtime, &ids, 2, Speculation::Artifact, greedy());
     assert_eq!(speculative.outcome.reason, FinishReason::Length);
     let hidden_bytes = runtime.config().hidden_size * 2;
-    let catch_up_reads = seed_rows(&runtime, 40, hidden_bytes);
-    let (hidden_run, heard) = hidden(&runtime, &ids, 1, greedy());
+    let catch_up_reads = seed_rows(&runtime, 1, hidden_bytes);
+    let (hidden_run, heard) = hidden(&runtime, &ids, 2, greedy());
     assert_eq!(hidden_run.outcome.reason, FinishReason::Length);
-    assert_eq!(heard.len(), 1, "one chunk, one delivery");
-    let call = &heard[0];
-    assert_eq!((call.first_position, call.rows), (0, 40));
+    assert_eq!(speculative.tokens, hidden_run.tokens, "the tokens are the same");
+    let positions: Vec<(u64, usize)> = heard.iter().map(|call| (call.first_position, call.rows)).collect();
+    assert_eq!(positions, [(0, 40), (40, 1)], "the prompt chunk, then the decode row");
     assert_eq!(
-        call.hidden, catch_up_reads,
-        "the rows handed out are the rows the catch-up reads"
+        heard[1].hidden, catch_up_reads,
+        "the decode row handed out is the row the catch-up reads"
     );
-    assert!(call.logits.is_some(), "the last chunk selects");
-    assert_eq!(speculative.tokens, hidden_run.tokens, "the first token is the same");
-    println!("one chunk of 40 rows of {hidden_bytes} bytes equal the seed rows");
+    assert!(heard[1].logits.is_some() && heard[0].logits.is_some());
+    println!("the row of {hidden_bytes} bytes equals the seed row");
     owner.shutdown(runtime).unwrap();
 }
 
