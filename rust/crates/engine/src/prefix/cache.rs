@@ -726,7 +726,8 @@ impl PrefixCacheHandle {
     ///
     /// 1. Its KV pages for `position` (`hit.position()`) must be reserved already: `refs.rows() >= position`, checked
     ///    here as the precondition of a capture is ([`RestoreError::Unreserved`]). With a speculation `kind` the pages
-    ///    of the draft cache below the last row of `position` must be reserved too, and the draft seed row is written.
+    ///    of the draft cache below the last row of `position` (and that row's too, when the prompt has the token the checkpoint
+    ///    paired it with, see [`Hit::paired`]) must be reserved too, and the draft seed row is written.
     /// 2. `submit` arrives once, from a worker, when the job is built: the owner admits it behind the sequence's last
     ///    device work with `on_workspace` false and **`more` set** (the first chunk follows it), and counts it in
     ///    flight until it ends. A refused restore never calls `submit`; it answers.

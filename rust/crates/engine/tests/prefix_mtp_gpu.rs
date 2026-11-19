@@ -2,8 +2,8 @@
 //! speculative request restores the checkpoints an earlier one captured (the base state, the MTP cache below the last
 //! row, the token that row was paired with, and the seed row of the draft) and then produces the tokens a cold run
 //! produces, with the drafts a cold run makes: exactly, when the prompt has the token the checkpoint paired its last
-//! row with, and up to that one row's low bits when it has another. `#[ignore]`d; run one at a time in a memory-capped scope (each loads the 12 GB artifact), with the CUDA library
-//! named by `euhedral.cuda.library` and the artifact by `euhedral.qwen.rco-artifact`; a test skips without them. Every
+//! row with, and up to that one row's low bits when it has another. `#[ignore]`d; run one at a time in a
+//! memory-capped scope (each loads the 12 GB artifact), with the CUDA library named by `euhedral.cuda.library` and the artifact by `euhedral.qwen.rco-artifact`; a test skips without them. Every
 //! wait is bounded.
 //!
 //! The verifier decides every token, so tokens alone cannot tell a restored MTP cache from a wrong one: the drafts
@@ -47,6 +47,10 @@ const GENERATED: u32 = 96;
 /// The prompts' length: checkpoints fall at 1024 and 2048 (the interval) and 2560 (the last chunk boundary before the
 /// end).
 const LENGTH: usize = 2600;
+/// The position of the last checkpoint of the long prompt.
+const LAST_OF_D: usize = 3584;
+/// The length of the prompt that goes on past the next checkpoints.
+const LONG: usize = 3700;
 
 struct Machine {
     artifact: PathBuf,
@@ -88,7 +92,12 @@ fn start(machine: &Machine, cache: ByteSize) -> (Closer, Arc<EngineRuntime>) {
 /// are `seed`'s own. Each part repeats a short pattern, so the model continues it and the draft has something to
 /// predict (random tokens are never predicted, and then no draft is accepted to tell a restored draft state by).
 fn prompt(seed: u64, shared: usize) -> Vec<u32> {
-    (0..LENGTH)
+    prompt_of(seed, shared, LENGTH)
+}
+
+/// [`prompt`] of `length` tokens.
+fn prompt_of(seed: u64, shared: usize, length: usize) -> Vec<u32> {
+    (0..length)
         .map(|index| {
             let owner = if index < shared { 0 } else { seed };
             let mixed = ((index % 37) as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -174,6 +183,17 @@ fn same_mtp_rows(name: &str, warm: &MtpPages, cold: &MtpPages, repaired: &[usize
             assert_eq!(differing, 0, "{name}: MTP row {row} differs from the cold run's");
         }
     }
+}
+
+/// The bytes of row `row` of the MTP cache, both planes.
+fn row_of(pages: &MtpPages, row: usize) -> Vec<u8> {
+    let (page, inside) = (row / PAGE, row % PAGE);
+    let plane = pages.pages[page].len() / 2;
+    let bytes = pages.row_bytes;
+    [0, plane]
+        .iter()
+        .flat_map(|start| pages.pages[page][start + inside * bytes..start + (inside + 1) * bytes].to_vec())
+        .collect()
 }
 
 #[derive(Debug)]
@@ -323,6 +343,8 @@ fn cases() -> Vec<(&'static str, Vec<u32>, SamplingConfig, usize, bool)> {
     let a = prompt(0, LENGTH);
     let b = prompt(1, 2100);
     let c = prompt(2, 2560);
+    // C's own tokens, extended past the checkpoints C's prompt is too short to reach.
+    let d = prompt_of(2, 2560, LONG);
     assert_ne!(
         c[2560], a[2560],
         "the prompt that differs from the checkpoint's at its position"
@@ -345,6 +367,20 @@ fn cases() -> Vec<(&'static str, Vec<u32>, SamplingConfig, usize, bool)> {
             SamplingConfig::greedy(0),
             2560,
             false,
+        ),
+        (
+            "D greedy, C's tokens on past the next checkpoints, another token after A's checkpoint",
+            d.clone(),
+            SamplingConfig::greedy(0),
+            2560,
+            false,
+        ),
+        (
+            "D sampled, through the checkpoints D stored",
+            d,
+            sampled(13),
+            LAST_OF_D,
+            true,
         ),
     ]
 }
@@ -373,6 +409,8 @@ fn a_speculative_restore_gives_the_tokens_and_the_drafts_of_a_cold_run() {
     let lane = Arc::new(Typed::plain(runtime.library(), 1, 4));
     // The rows each restore computes again; a checkpoint a later restore uses may have stored one of an earlier restore's.
     let mut repaired = Vec::new();
+    // The cold run of the first prompt, whose row 2559 was paired with that prompt's own token at 2560.
+    let a_pages = &cold[0].1;
     for ((name, prompt, sampling, restored, whole), (cold, cold_pages)) in cases().iter().zip(&cold) {
         if *restored > 0 {
             // An unrelated prompt leaves its own draft cache in the sequence's buffers, so a restore that did not copy
@@ -396,7 +434,15 @@ fn a_speculative_restore_gives_the_tokens_and_the_drafts_of_a_cold_run() {
         if *restored > 0 {
             drafts_as_a_cold_run(name, &warm, cold, *whole);
             if !whole {
-                repaired.push(restored - 1);
+                // A row computed again from the stored hidden row is not the row a cold run of another prompt made with
+                // the other token: a restore that took the checkpoint's row whole would leave exactly those bytes.
+                let row = restored - 1;
+                assert_ne!(
+                    row_of(&mtp_pages(&runtime, &lane), row),
+                    row_of(a_pages, row),
+                    "{name}: row {row} is the row paired with the checkpoint's token"
+                );
+                repaired.push(row);
             }
             same_mtp_rows(name, &mtp_pages(&runtime, &lane), cold_pages, &repaired);
         }
