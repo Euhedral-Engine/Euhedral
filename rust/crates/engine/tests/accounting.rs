@@ -10,8 +10,10 @@
 
 use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::residency::accounting::{Consumer, MemoryAccount, PlanReservation};
-use euhedral_inference_engine::residency::footprint::first_sequence_bytes;
-use euhedral_inference_engine::residency::planner::{LocationBytes, PlanInputs, ResidencyPlan, plan_with};
+use euhedral_inference_engine::residency::footprint::{first_sequence_bytes, mtp_cache_bytes_of};
+use euhedral_inference_engine::residency::planner::{
+    DEFAULT_RUNTIME_RESERVE_BYTES, LocationBytes, PlanInputs, ResidencyPlan, plan_with,
+};
 use euhedral_inference_engine::workspace::{Workspace, input_records_for};
 use euhedral_inference_settings::{Auto, ByteSize, KvFormat};
 
@@ -170,13 +172,7 @@ fn take_startup_claims(plan: &ResidencyPlan, reservation: &mut PlanReservation) 
     let in_reserve = Workspace::allocation_bytes(&config, plan.rows, &regions, records) - plan.scratch_bytes;
     let mut claims = Vec::new();
     let mut take = |consumer, bytes| {
-        let claim = if consumer == Consumer::RuntimeReserve {
-            // The reserve is never the reason a startup is refused.
-            reservation.claim_reserve(bytes).map(|(claim, _over)| claim)
-        } else {
-            reservation.claim(consumer, bytes)
-        };
-        claims.push(claim.map_err(|error| error.to_string())?);
+        claims.push(reservation.claim(consumer, bytes).map_err(|error| error.to_string())?);
         Ok::<(), String>(())
     };
     take(Consumer::Weights, plan.arena_bytes)?;
@@ -185,7 +181,10 @@ fn take_startup_claims(plan: &ResidencyPlan, reservation: &mut PlanReservation) 
     for index in 0..plan.sequences {
         take(Consumer::Cache, plan.kv_device_bytes)?;
         if index == 0 {
-            take(Consumer::RuntimeReserve, first_sequence_bytes(plan, &config))?;
+            take(
+                Consumer::RuntimeReserve,
+                first_sequence_bytes(plan, &config) + mtp_cache_bytes_of(plan, &config),
+            )?;
         } else {
             take(Consumer::ExtraSequences, plan.extra_sequence_bytes)?;
         }
@@ -233,6 +232,31 @@ fn the_reserve_claim_that_does_not_fit_names_the_setting() {
         .unwrap_err()
         .to_string();
     assert!(refused.contains("memory.runtime-reserve"), "{refused}");
+}
+
+#[test]
+fn a_reserve_overrun_is_refused_not_warned_about() {
+    // A context whose MTP cache and a chunk whose workspace take more than the default reserve.
+    let (config, table) = (config(), rco_table());
+    let mut grown = settings(262_144);
+    grown.context.kv_cache_format = Auto::Value(KvFormat::Bf16);
+    grown.context.kv_cache_on_gpu_tokens = 262_144;
+    grown.batching.prefill_chunk_tokens = 2048;
+    let plan = plan_with(&config, &table, &grown, inputs(1)).unwrap();
+    assert!(plan.runtime_reserve_bytes > DEFAULT_RUNTIME_RESERVE_BYTES);
+    let (_account, mut reservation) = admit(&plan);
+    take_startup_claims(&plan, &mut reservation).unwrap();
+    // The planned reserve is spent to the byte: what the plan did not count has nothing to take.
+    assert_eq!(reservation.left(Consumer::RuntimeReserve), 0);
+    let refused = reservation.claim(Consumer::RuntimeReserve, 1).unwrap_err().to_string();
+    assert!(refused.contains("memory.runtime-reserve"), "{refused}");
+
+    // An allocation larger than planned is refused: the MTP cache of one more sequence.
+    let (_account, mut reservation) = admit(&plan);
+    let mtp = mtp_cache_bytes_of(&plan, &config);
+    let others = plan.runtime_reserve_bytes - mtp;
+    drop(reservation.claim(Consumer::RuntimeReserve, others).unwrap());
+    assert!(reservation.claim(Consumer::RuntimeReserve, mtp + 1).is_err());
 }
 
 #[test]

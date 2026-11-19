@@ -120,27 +120,44 @@ pub fn extra_sequence_bytes(
     let hidden = config.hidden_size as u64;
     total += seed_rows * hidden * 2 + hidden * 2 + DRAFT_TOKENS_BYTES;
     // The MTP layer is one full-attention layer's cache.
-    total += pages_for(context_tokens) * page_bytes(config, format);
+    total += mtp_cache_bytes(config, format, context_tokens);
     total
 }
 
+/// The device bytes of the MTP layer's cache for `context_tokens`: one full-attention layer's pages. The drafting
+/// sequence allocates them as its context grows, up to this.
+pub fn mtp_cache_bytes(config: &ModelConfig, format: KvFormat, context_tokens: u64) -> u64 {
+    pages_for(context_tokens) * page_bytes(config, format)
+}
+
+/// What the first sequence needs beyond its attention KV when it is allocated: [`extra_sequence_bytes`] without the
+/// MTP layer's cache ([`mtp_cache_bytes`]). The runtime reserve pays for it.
+pub fn first_state_bytes(
+    config: &ModelConfig,
+    format: KvFormat,
+    verified_rows: u64,
+    drafts: bool,
+    seed_rows: u64,
+) -> u64 {
+    // The cache is the one term that depends on the context: with none, extra_sequence_bytes has none of it.
+    extra_sequence_bytes(config, format, 0, verified_rows, drafts, seed_rows)
+}
+
 /// The device bytes the first sequence's state takes beyond its cache when it is allocated: what
-/// `ResidencyPlan::extra_sequence_bytes` is for each one beyond it, without the MTP layer's cache, whose pages are
-/// allocated as the context grows. The runtime reserve pays for it.
+/// `ResidencyPlan::extra_sequence_bytes` is for each one beyond it, without the MTP layer's cache
+/// ([`mtp_cache_bytes_of`]). The runtime reserve pays for it.
 pub fn first_sequence_bytes(plan: &ResidencyPlan, config: &ModelConfig) -> u64 {
     let drafts = plan.draft_depth > 0;
     let verified_rows = if drafts { 1 + plan.draft_depth as u64 } else { 0 };
-    let total = extra_sequence_bytes(
-        config,
-        plan.kv_format,
-        plan.max_context_tokens as u64,
-        verified_rows,
-        drafts,
-        plan.rows.rows,
-    );
-    if drafts {
-        total - pages_for(plan.max_context_tokens as u64) * page_bytes(config, plan.kv_format)
+    first_state_bytes(config, plan.kv_format, verified_rows, drafts, plan.rows.rows)
+}
+
+/// The MTP layer's cache of the plan's first sequence at `max_context_tokens`: 0 without a drafter. The runtime
+/// reserve pays for it.
+pub fn mtp_cache_bytes_of(plan: &ResidencyPlan, config: &ModelConfig) -> u64 {
+    if plan.draft_depth > 0 {
+        mtp_cache_bytes(config, plan.kv_format, plan.max_context_tokens as u64)
     } else {
-        total
+        0
     }
 }
