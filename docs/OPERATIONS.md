@@ -42,6 +42,7 @@ See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 | `memory.host-weights-limit` | the host limit's pinnable part | Pinned host memory for host-backed weights and the disk window. |
 | `memory.gpu-limit` | the free device memory | Device memory the residency plan may use, at most what is free. |
 | `memory.gpu-reserve` | 700MiB | Device memory a Flash-Next plan leaves free for other programs on the GPU. The dense Qwen3.8 plan does not use it: its budget is the free memory, at most `memory.gpu-limit`. |
+| `memory.runtime-headroom` | 320MiB | Device memory the Rust engine's plan keeps above what the workspace, the decode scratch, the first sequence's state and the MTP cache need, for what the driver takes after the plan is admitted: the code and local memory of each kernel family, loaded at its first launch. Counted where that demand raises `memory.runtime-reserve` above its value; below it the reserve's own slack pays. Read by the Rust engine; the Java engine checks the value. |
 | `memory.runtime-reserve` | 1280MiB | Device memory the dense Qwen3.8 plan keeps beside the weights and the cache for the first sequence's GDN state, the execution workspaces, the shared scratch and the kernel modules loaded after the model. A floor: the plan raises the reserve to what the workspace, the decode scratch, the first sequence's state and the MTP cache need at the given settings (a larger `batching.prefill-chunk-tokens` or a longer context), and logs the raise. Read by the Rust engine; the Java engine checks the value and uses 1280MiB. |
 | `memory.pinned-buffer-pool` | 1/256 of the machine's memory, at least 64 MiB | Released pinned staging buffers kept for reuse. |
 | `memory.weight-streaming.*` | 8, 1, 4, 2 | Flash-Next expert streaming: `concurrent-reads` (records read from the artifact at once), `read-split` (parts one record read is split into), `copy-streams` (CUDA streams copying experts to the GPU), `gpu-streams` (device lanes a step spreads over). |
@@ -123,6 +124,27 @@ The port opens only after the engine has loaded, so a server that answers is rea
 `GET /health` answers `200 {"status":"up","engine":"ready","model":"..."}`, and `503` with `"engine":"closed"` once the
 engine has closed. The image's Docker health check calls it.
 
+## Container images
+
+The root `Dockerfile` builds the Java server's image. `rust/Dockerfile` builds the Rust server's, in the same
+distroless `cc` base with the same default settings file (`/etc/euhedral/config.yaml`, also `EUHEDRAL_CONFIG`), the NVIDIA
+environment, the `nonroot` user and the same health check timing. Build it from the repository root; the build compiles
+the native library with the pinned toolchains, so it needs network access and takes a while:
+
+```bash
+docker build -f rust/Dockerfile -t euhedral-rust .
+docker run --rm --gpus all -p 1738:1738 -v /path/to/model.edrl:/models/model.edrl:ro \
+    -e EUHEDRAL_MODEL_NAME=qwen --stop-timeout 45 euhedral-rust
+```
+
+The image holds the linux-x64 server bundle (`cargo xtask bundle --product linux-x64`, see `rust/README.md`) under
+`/opt/euhedral`: `bin/euhedral-server` is the entry point and finds `lib/` beside it. Settings are given as for the
+Java image: `--config <mounted file>`, or variables (`docker run -e`, `--env-file`). The distroless base has no shell
+or curl, so the health check is `bin/euhedral-health-probe`, which asks `GET /health` of `127.0.0.1` on
+`EUHEDRAL_SERVER_PORT`, else `PORT`, else 1738, allows two seconds each to connect, to send the request and to read the answer, and exits 1 unless the answer is `200`. A
+server that listens on another port through a settings file needs the same port in one of those variables for the
+check to follow it.
+
 ## Shutting down
 
 On `SIGTERM` or `SIGINT` the server stops accepting connections and waits up to
@@ -203,8 +225,14 @@ Absent when the cache is off ([PREFIX_CACHE.md](PREFIX_CACHE.md)).
 | `euhedral_engine_device_free_bytes` | gauge | Free device memory the driver reports |
 | `euhedral_engine_host_backed_weight_bytes` | gauge | Weights held in pinned host memory and streamed in |
 
-The JVM's and the process's metrics (`jvm_*`, `process_*`, `process_uptime_seconds`), Tomcat's and HTTP server
-request timings (`http_server_requests_seconds`) come from Micrometer.
+The process's metrics (`process_uptime_seconds`, `process_start_time_seconds`, `process_cpu_time_ns_total`,
+`process_cpu_usage`, `process_files_open_files`, `process_files_max_files`) come from the operating system; a value the
+platform cannot report is left out rather than written as zero. On Windows the file limit has no series. The time of
+every request (`http_server_requests_seconds`, with `_count`, `_sum` and `_max`) is labelled by route template (`uri`,
+for example `/v1/models/{model}`), method, status and outcome; every path that is no route is `uri="/**"`. A request is
+timed from the moment the router has it (its head and body already read) to the last byte handed to the connection; a
+stream cut after its head is timed to the moment it was cut, as a `200`. The JVM's metrics (`jvm_*`) and
+`http_server_requests_active_seconds` belong to the Java server: the Rust server has none.
 
 ### Examples
 

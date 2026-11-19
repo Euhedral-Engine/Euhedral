@@ -27,6 +27,44 @@ pub struct Header {
 }
 
 impl Header {
+    /// The header of an artifact whose metadata is `metadata_size` bytes: the metadata follows the header and the
+    /// table follows the metadata. `tensor_data_offset` is where the table ends, which no payload precedes.
+    pub fn new(metadata_size: u64, tensor_count: u32, tensor_data_offset: u64) -> Result<Header, EdrlError> {
+        let metadata_offset = HEADER_BYTES as u64;
+        let tensor_table_offset = checked_end(metadata_offset, metadata_size, "metadata")?;
+        if metadata_size > MAX_METADATA_BYTES {
+            return Err(EdrlError::invalid("metadata is too large"));
+        }
+        if tensor_count > MAX_COUNT {
+            return Err(EdrlError::invalid("tensor count is outside the supported range"));
+        }
+        if tensor_data_offset < tensor_table_offset || i64::try_from(tensor_data_offset).is_err() {
+            return Err(EdrlError::invalid("tensor data offset is outside the file"));
+        }
+        Ok(Header {
+            version: COMPACT_VERSION,
+            metadata_offset,
+            metadata_size,
+            tensor_table_offset,
+            tensor_count,
+            tensor_data_offset,
+        })
+    }
+
+    /// The 48 bytes of the header: [`Header::parse`] reads them back.
+    pub fn encode(&self) -> [u8; HEADER_BYTES] {
+        let mut out = [0; HEADER_BYTES];
+        out[0..4].copy_from_slice(&MAGIC.to_be_bytes());
+        out[4..8].copy_from_slice(&self.version.to_be_bytes());
+        out[8..16].copy_from_slice(&self.metadata_offset.to_be_bytes());
+        out[16..24].copy_from_slice(&self.metadata_size.to_be_bytes());
+        out[24..32].copy_from_slice(&self.tensor_table_offset.to_be_bytes());
+        out[32..36].copy_from_slice(&self.tensor_count.to_be_bytes());
+        // Bytes 36..40 are the reserved field, zero.
+        out[40..48].copy_from_slice(&self.tensor_data_offset.to_be_bytes());
+        out
+    }
+
     /// Parses and validates everything the header alone decides. Whether its regions fit the file is
     /// [`Header::check_extent`].
     pub fn parse(bytes: &[u8; HEADER_BYTES]) -> Result<Header, EdrlError> {

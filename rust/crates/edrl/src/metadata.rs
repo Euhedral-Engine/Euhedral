@@ -5,13 +5,20 @@ use crate::reader::Reader;
 /// The most draft tokens per step an artifact may record (`MtpDecoder.MAX_DRAFTS`).
 pub const MAX_DRAFT_DEPTH: u8 = 16;
 
-const MAX_STRING_BYTES: usize = 1 << 20;
+pub(crate) const MAX_STRING_BYTES: usize = 1 << 20;
 
 /// The kind of a decoder layer; the ordinal is what the artifact stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerType {
-    FullAttention,
-    GatedDeltaNet,
+    FullAttention = 0,
+    GatedDeltaNet = 1,
+}
+
+impl LayerType {
+    /// The ordinal the artifact stores.
+    pub fn ordinal(self) -> i32 {
+        self as i32
+    }
 }
 
 /// The model configuration an artifact stores (`Qwen38Config`), in the order the metadata encodes it. Every count

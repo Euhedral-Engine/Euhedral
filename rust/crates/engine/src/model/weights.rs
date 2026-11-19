@@ -127,6 +127,8 @@ pub struct Weights {
     arena: DeviceBuffer,
     /// The pinned host arena the host-held tensors are read from, when the plan holds any.
     host: Option<Arc<HostWeightsArena>>,
+    /// The device slots the staged weights are copied into, when the plan stages any.
+    staging: Option<DeviceBuffer>,
     /// The arenas' bytes in the engine's memory account, released when the arenas are freed.
     claims: Vec<Claim>,
 }
@@ -142,8 +144,21 @@ impl Weights {
             tensors,
             arena: device,
             host,
+            staging: None,
             claims: Vec::new(),
         }
+    }
+
+    /// The weights, with the device `ring` the staged weights are copied into: it lives as long as the weights, which
+    /// the kernels that read its slots are over before they are dropped.
+    pub fn with_staging(mut self, ring: DeviceBuffer) -> Self {
+        self.staging = Some(ring);
+        self
+    }
+
+    /// The address of the first staging slot, when the plan stages weights.
+    pub fn staging_base(&self) -> Option<DevicePtr> {
+        self.staging.as_ref().map(DeviceBuffer::ptr)
     }
 
     /// The weights, with `claim` for the bytes of an arena: it is held until the arenas are freed.

@@ -1260,9 +1260,18 @@ impl Owner {
         let position = u64::from(hit.position());
         let reset = mem::take(&mut self.used);
         let drafting = self.drafts();
+        // The draft's last row of the checkpoint was paired with the token the stored prompt had at the position: with
+        // the same token here it is the row a cold run computes, and is restored with the others.
+        let whole = drafting
+            && hit.paired().is_some()
+            && self
+                .run
+                .as_ref()
+                .and_then(|run| run.prompt.get(position as usize).copied())
+                == hit.paired();
         let mut retained = KvRetained::default();
         let (_, reserved) = core
-            .lane_table
+            .lane_table()
             .submit_ops(core.owner_lane(), false, |lane| {
                 if reset {
                     self.sequence.reset(lane).map_err(why("resetting the sequence"))?;
@@ -1275,9 +1284,9 @@ impl Owner {
                 // The rows are part of the sequence from here: the copy's job is ordered before everything that reads them.
                 cache.commit(position).map_err(why("the cache's frontier"))?;
                 if drafting {
-                    // The draft's cache holds the rows below the checkpoint's last position: the pair of that row's
-                    // hidden row and the token after it belongs to whichever prompt resumes here.
-                    let rows = position - 1;
+                    // The draft's cache holds the rows below the checkpoint's last position, and the last too when the
+                    // prompt has the token the checkpoint paired it with: otherwise that row is recomputed.
+                    let rows = if whole { position } else { position - 1 };
                     let mtp = self.sequence.mtp_kv.as_mut().ok_or("the sequence has no MTP cache")?;
                     mtp.reserve(lane, &core.pool, 0, rows, &mut retained)
                         .map_err(why("reserving the restored draft rows"))?;
@@ -1291,7 +1300,7 @@ impl Owner {
             .sequence
             .refs(KvSource::Base)
             .map_err(why("the sequence's references"))?
-            .ordered_after(reserved, &core.lanes);
+            .ordered_after(reserved, core.lanes());
         if drafting {
             // The draft cache's reservation is claimed too; the references above hold its view.
             self.sequence
@@ -1324,8 +1333,9 @@ impl Owner {
         if let Mode::Speculative { state, .. } = &mut run.mode
             && drafting
         {
-            // The draft pairs the hidden row it was restored with and the token at the position, before the chunks do.
-            state.resumed_at(position as u32);
+            // Unless the last row came whole, the draft pairs the hidden row it was restored with and the token at the
+            // position, before the chunks do.
+            state.resumed_at(position as u32, whole);
         }
         Ok(())
     }
@@ -1565,7 +1575,7 @@ impl Owner {
         let frame = prepare_frame(self.id.0, step, constraint, move |prepared| {
             address.post(Message::Prepared(prepared))
         });
-        self.shared.core.completions.at(Instant::now(), frame);
+        self.shared.core.completions().at(Instant::now(), frame);
     }
 
     /// Takes in the preparation of the constraint's next mask. A row that retired meanwhile is selected from now; a
@@ -1619,7 +1629,7 @@ impl Owner {
         if core.released.is_empty() {
             return;
         }
-        let freed = core.lane_table.submit_ops(core.owner_lane(), false, |ops| {
+        let freed = core.lane_table().submit_ops(core.owner_lane(), false, |ops| {
             let mut first_error = None;
             core.released.drain(|buffer| {
                 if let Err(error) = ops.free_async(buffer) {
@@ -1636,7 +1646,7 @@ impl Owner {
 
     /// Lets go of the quanta whose owner-lane work has run.
     fn reap(&mut self) {
-        let lanes = &self.shared.core.lanes;
+        let lanes = self.shared.core.lanes();
         self.parked.retain(|parked| !lanes.reached(parked.marker));
     }
 
@@ -1652,7 +1662,7 @@ impl Owner {
     /// Keeps `quantum` and `retained` until the lane has reached `marker`, as `park` does for a quantum.
     fn keep(&mut self, marker: Marker, quantum: Option<Kept>, retained: KvRetained) {
         let core = &self.shared.core;
-        if core.lanes.reached(marker) {
+        if core.lanes().reached(marker) {
             return;
         }
         self.parked.push(Parked {
@@ -1661,7 +1671,7 @@ impl Owner {
             _retained: retained,
         });
         let address = Arc::clone(&self.shared.address);
-        core.completions.after_marker(
+        core.completions().after_marker(
             marker,
             step(Kind::Reaped, self.id.0, move || address.post(Message::Reaped)),
         );
@@ -1933,7 +1943,7 @@ impl Owner {
                 LeasedRow::new(Arc::clone(&lease), row),
                 move |sampled| address.post(Message::Sampled(sampled)),
             );
-            shared.core.completions.at(Instant::now(), frame);
+            shared.core.completions().at(Instant::now(), frame);
         }
     }
 
@@ -1948,7 +1958,7 @@ impl Owner {
         let total = if wants_hidden { bytes + hidden_bytes } else { bytes };
         let mut loan = core.pool.acquire(total).map_err(why("the pinned row for the logits"))?;
         let (_, marker) = core
-            .lane_table
+            .lane_table()
             .submit_ops(core.owner_lane(), false, |kernels| {
                 // SAFETY: the loan is held by the message that follows the copy, which is offered only once the lane
                 // has reached the marker; nothing reads or writes the bytes before.
@@ -1977,7 +1987,7 @@ impl Owner {
         let frame = step_frame(self.id.0, move || {
             address.post(Message::Logits(LogitsCopied { step, loan }))
         });
-        core.completions.after_marker(marker, frame);
+        core.completions().after_marker(marker, frame);
         Ok(())
     }
 
@@ -2169,7 +2179,7 @@ impl Owner {
         let mut retained = mem::take(&mut run.carried);
         run.carried_marker = None;
         let (_, reserved) = core
-            .lane_table
+            .lane_table()
             .submit_ops(core.owner_lane(), false, |lane| {
                 if run.admitted == 0 && self.used {
                     self.sequence.reset(lane).map_err(why("resetting the sequence"))?;
@@ -2193,7 +2203,7 @@ impl Owner {
             .sequence
             .refs(source)
             .map_err(why("the sequence's references"))?
-            .ordered_after(reserved, &core.lanes)
+            .ordered_after(reserved, core.lanes())
             .with_replay_rows(replay);
         let taken = take.then(|| refs.clone());
         let mode = SubmitMode {
@@ -2212,7 +2222,7 @@ impl Owner {
             refs,
             mode,
             Arc::clone(&shared.config),
-            core.lane_table.clone(),
+            core.lane_table().clone(),
         )
         .map_err(why("the quantum"))?
         .with_input_record(shared.order.record(self.id, record));
@@ -2238,7 +2248,7 @@ impl Owner {
         let offered = role == Role::Verify;
         if !offered {
             let (_, prepared) = core
-                .lane_table
+                .lane_table()
                 .submit_ops(core.owner_lane(), false, |kernels| {
                     quantum.prepare(&core.pool, kernels).map_err(why("the input record"))
                 })
@@ -2247,8 +2257,9 @@ impl Owner {
         }
 
         let selection = quantum.selection().cloned();
-        // The restore's flag goes to the first chunk. On a restore of a drafting request the first quantum is the one-row
-        // catch-up that precedes the chunk: it shares the flag (clones it) and the chunk takes it, so a failed copy stops both.
+        // The restore's flag goes to the first chunk. On a restore of a drafting request that has to re-pair the
+        // checkpoint's last row, the first quantum is the one-row catch-up that precedes the chunk: it shares the flag
+        // (clones it) and the chunk takes it, so a failed copy stops both.
         let kill = if kind == QuantumKind::Draft {
             run.first_kill.clone()
         } else {

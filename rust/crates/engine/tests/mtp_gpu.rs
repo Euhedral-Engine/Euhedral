@@ -69,14 +69,18 @@ fn machine() -> Option<Machine> {
 }
 
 fn start(machine: &Machine, max_tokens: u32) -> (Closer, Arc<EngineRuntime>) {
+    // These tests compare the state a run leaves, so each run must be cold: a prefix cache hit would restore the prompt.
+    start_with_cache(machine, max_tokens, ByteSize(0))
+}
+
+fn start_with_cache(machine: &Machine, max_tokens: u32, cache: ByteSize) -> (Closer, Arc<EngineRuntime>) {
     let mut settings = Settings::with_model(ModelSettings {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
     });
     settings.context.max_tokens = max_tokens;
     settings.kernels.graphs.captures_per_view = 8;
-    // These tests compare the state a run leaves, so each run must be cold: a prefix cache hit would restore the prompt.
-    settings.prefix_cache.size = ByteSize(0);
+    settings.prefix_cache.size = cache;
     let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
     let runtime = ready
         .wait(WAIT)
@@ -376,7 +380,7 @@ fn mtp_kv_and_gdn_state_equal_greedy_after_run() {
     let Some(machine) = machine() else { return };
     let tokenizer = tokenizer(&machine.artifact);
     let prompt = chat_prompts(&tokenizer, 2000).swap_remove(0);
-    let (owner, runtime) = start(&machine, 4096);
+    let (owner, runtime) = start_with_cache(&machine, 4096, ByteSize::gib(2));
     let depth = runtime.plan().draft_depth as u64;
     // The request ends on a page boundary of the cache, so that every generated row is in a whole page and compared.
     let ends = (prompt.len() as u64).div_ceil(PAGE) * PAGE;
@@ -425,7 +429,13 @@ fn mtp_kv_and_gdn_state_equal_greedy_after_run() {
     assert!(!got.mtp_pages.is_empty(), "the MTP cache has whole pages to compare");
 
     // A second speculative run gives the same MTP rows: they are a function of the committed tokens.
+    // The prefix cache is on: this run restores the checkpoints the run before stored, so the rows the restore brings
+    // back (the last of each checkpoint among them) must be the cold run's, bit for bit.
     let again = generate(&runtime, &prompt, wanted, &[], Speculation::Artifact);
+    assert!(
+        again.outcome.cached_prompt_tokens > 0,
+        "the second run restores a checkpoint"
+    );
     assert_eq!(again.tokens, speculative.tokens);
     let second = snapshot(&runtime, &lane);
     assert!(second.mtp_pages == got.mtp_pages, "the MTP cache is the same again");

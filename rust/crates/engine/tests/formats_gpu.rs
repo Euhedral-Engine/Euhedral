@@ -187,6 +187,37 @@ fn linear_bitwise_matches_reference_oracle() {
     }
 }
 
+/// A prefill above the skinny route's 64 rows launches the tile kernel with three tensor maps; run again, its maps come
+/// from the thread's cache: the same bytes out, none encoded.
+#[cfg(debug_assertions)]
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_repeated_tile_prefill_encodes_no_tensor_map() {
+    use euhedral_inference_cuda::launch::load::tensor_map_counts;
+    let Some(rig) = rig() else { return };
+    if !rig.library.nvfp4_native_available() {
+        println!("skipped: no native NVFP4 route");
+        return;
+    }
+    let Some(mut artifact) = Artifact::open() else { return };
+    let (_weights, weight) = artifact.plain(&rig.library, "mtp/layer/attention/output");
+    let (n, k, rows) = (5120usize, 6144usize, 128usize);
+    let x = upload(&rig.library, &activations(&mut Random::new(11), rows, k));
+    let production = Nvfp4Linear::new(&rig.library);
+    let run = || values(&rig.linear(&production, &weight, &x, 0, k, n, rows, PLAIN));
+    let first = run();
+    let (asked, encoded) = tensor_map_counts();
+    let second = run();
+    let (asked_again, encoded_again) = tensor_map_counts();
+    assert!(
+        asked_again > asked,
+        "the prefill launched a kernel that takes tensor maps"
+    );
+    assert_eq!(encoded_again, encoded, "the second run encoded no map");
+    assert_eq!(first, second, "the same bytes out");
+    assert!(encoded > 0, "the first run encoded its maps");
+}
+
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn row_twins_equal_single_rows() {

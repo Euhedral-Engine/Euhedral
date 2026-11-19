@@ -11,11 +11,14 @@
 //! handle resolved here launches in the context the native library's buffers live in.
 //!
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{read, read_dir, read_to_string};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{Builder, scope};
 use std::time::{Duration, Instant};
 
@@ -25,7 +28,7 @@ use thiserror::Error;
 
 use crate::CudaLibrary;
 use crate::launch::Dispatch;
-use crate::launch::catalog::{KERNELS, KernelId, Module, ids};
+use crate::launch::catalog::{KERNELS, KernelId, Module, TensorMapPlan, ids};
 
 /// The stack of the thread that compiles a module, in bytes unless the caller sets another: the native loader's own
 /// (256 MiB), because NVRTC recurses deeply on the largest modules. The engine is to pass `kernels.compile.stack` when it loads its kernels through
@@ -106,16 +109,101 @@ pub struct ModuleTiming {
     pub elapsed: Duration,
 }
 
+/// The most distinct tensor maps a thread keeps, derived from what a table can be asked for: two weight maps (codes and
+/// scales) for each of up to 1024 NVFP4 linears a model holds, and one activation map for each of up to 4096 shapes
+/// (row counts and scratch addresses). A slot holds the 128-byte map at the 64-byte alignment `TensorMap` has (256
+/// bytes) and its key (about 130 bytes), so a thread keeps at most about 2.3 MiB.
+const TENSOR_MAP_CACHE_LIMIT: usize = 2 * 1024 + 4096;
+
+thread_local! {
+    /// The maps this thread has encoded, by table and plan. Only the thread itself touches them: no lock, and a thread
+    /// that has seen a map before never encodes it again.
+    static ENCODED: RefCell<HashMap<(u64, TensorMapPlan), TensorMap>> = RefCell::new(HashMap::new());
+}
+
+/// Counters of the maps launches asked for and the maps encoded, by every table in the process. They exist only where
+/// they are read: tests and debug builds.
+#[cfg(any(test, debug_assertions))]
+mod counts {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(super) static REQUESTED: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static ENCODED: AtomicUsize = AtomicUsize::new(0);
+
+    /// How many tensor maps launches have asked for and how many of those were encoded (the rest came from a thread's
+    /// cache), over the process's life.
+    pub fn tensor_map_counts() -> (usize, usize) {
+        (REQUESTED.load(Ordering::Relaxed), ENCODED.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+pub use counts::tensor_map_counts;
+
+/// Tables made so far, to give each its own identity in the threads' caches.
+static TABLES: AtomicU64 = AtomicU64::new(0);
+
+/// Encoded tensor maps by their plan, kept by each calling thread.
+///
+/// A map's bytes are a function of its description alone (the driver encodes the address without reading it), so a
+/// plan that comes again to the same thread has the same bytes and is not encoded again. The key is the whole plan: a
+/// different address, extent, stride, box or swizzle is a different entry.
+#[derive(Debug)]
+pub(crate) struct TensorMapCache {
+    table: u64,
+}
+
+impl Default for TensorMapCache {
+    fn default() -> Self {
+        Self {
+            table: TABLES.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+impl TensorMapCache {
+    /// The map for `plan`: the thread's cached one, or the one `encode` makes (which is then kept).
+    pub(crate) fn get_or_encode(
+        &self,
+        plan: &TensorMapPlan,
+        encode: impl FnOnce(&TensorMapPlan) -> Result<TensorMap, GpuError>,
+    ) -> Result<TensorMap, GpuError> {
+        #[cfg(any(test, debug_assertions))]
+        counts::REQUESTED.fetch_add(1, Ordering::Relaxed);
+        let key = (self.table, *plan);
+        if let Some(map) = ENCODED.with_borrow(|encoded| encoded.get(&key).copied()) {
+            return Ok(map);
+        }
+        let map = encode(plan)?;
+        #[cfg(any(test, debug_assertions))]
+        counts::ENCODED.fetch_add(1, Ordering::Relaxed);
+        ENCODED.with_borrow_mut(|encoded| {
+            if encoded.len() >= TENSOR_MAP_CACHE_LIMIT {
+                // A fresh map, so the memory the full one held is released.
+                *encoded = HashMap::new();
+            }
+            encoded.insert(key, map);
+        });
+        Ok(map)
+    }
+}
+
 /// The resolved kernels, indexed like the catalog ([`KernelId::index`]).
 #[derive(Debug)]
 pub struct KernelTable {
     slots: Vec<Slot>,
     timings: Vec<ModuleTiming>,
     architecture_target: bool,
+    maps: TensorMapCache,
     dispatch: Dispatch,
 }
 
 impl KernelTable {
+    /// The table's cache of encoded tensor maps.
+    pub(crate) fn tensor_maps(&self) -> &TensorMapCache {
+        &self.maps
+    }
+
     /// The launch choices the planners work with.
     pub fn dispatch(&self) -> &Dispatch {
         &self.dispatch
@@ -135,6 +223,7 @@ impl KernelTable {
                 .collect(),
             timings: Vec::new(),
             architecture_target,
+            maps: TensorMapCache::default(),
             dispatch: Dispatch::measured(70),
         }
     }
@@ -434,6 +523,7 @@ pub fn load(gpu: &Arc<CudaGpu>, sources: &KernelSources) -> Result<KernelTable, 
         slots,
         timings,
         architecture_target,
+        maps: TensorMapCache::default(),
         dispatch: sources.dispatch,
     })
 }
@@ -675,6 +765,7 @@ mod tests {
                 .collect(),
             timings: Vec::new(),
             architecture_target: false,
+            maps: TensorMapCache::default(),
             dispatch: Dispatch::measured(70),
         };
         assert_eq!(table.iter().count(), KERNELS.len());
