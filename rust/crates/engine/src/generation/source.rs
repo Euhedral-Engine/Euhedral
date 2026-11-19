@@ -1260,6 +1260,15 @@ impl Owner {
         let position = u64::from(hit.position());
         let reset = mem::take(&mut self.used);
         let drafting = self.drafts();
+        // The draft's last row of the checkpoint was paired with the token the stored prompt had at the position: with
+        // the same token here it is the row a cold run computes, and is restored with the others.
+        let whole = drafting
+            && hit.paired().is_some()
+            && self
+                .run
+                .as_ref()
+                .and_then(|run| run.prompt.get(position as usize).copied())
+                == hit.paired();
         let mut retained = KvRetained::default();
         let (_, reserved) = core
             .lane_table
@@ -1275,9 +1284,9 @@ impl Owner {
                 // The rows are part of the sequence from here: the copy's job is ordered before everything that reads them.
                 cache.commit(position).map_err(why("the cache's frontier"))?;
                 if drafting {
-                    // The draft's cache holds the rows below the checkpoint's last position: the pair of that row's
-                    // hidden row and the token after it belongs to whichever prompt resumes here.
-                    let rows = position - 1;
+                    // The draft's cache holds the rows below the checkpoint's last position, and the last too when the
+                    // prompt has the token the checkpoint paired it with: otherwise that row is recomputed.
+                    let rows = if whole { position } else { position - 1 };
                     let mtp = self.sequence.mtp_kv.as_mut().ok_or("the sequence has no MTP cache")?;
                     mtp.reserve(lane, &core.pool, 0, rows, &mut retained)
                         .map_err(why("reserving the restored draft rows"))?;
@@ -1324,8 +1333,9 @@ impl Owner {
         if let Mode::Speculative { state, .. } = &mut run.mode
             && drafting
         {
-            // The draft pairs the hidden row it was restored with and the token at the position, before the chunks do.
-            state.resumed_at(position as u32);
+            // Unless the last row came whole, the draft pairs the hidden row it was restored with and the token at the
+            // position, before the chunks do.
+            state.resumed_at(position as u32, whole);
         }
         Ok(())
     }
@@ -2247,8 +2257,9 @@ impl Owner {
         }
 
         let selection = quantum.selection().cloned();
-        // The restore's flag goes to the first chunk. On a restore of a drafting request the first quantum is the one-row
-        // catch-up that precedes the chunk: it shares the flag (clones it) and the chunk takes it, so a failed copy stops both.
+        // The restore's flag goes to the first chunk. On a restore of a drafting request that has to re-pair the
+        // checkpoint's last row, the first quantum is the one-row catch-up that precedes the chunk: it shares the flag
+        // (clones it) and the chunk takes it, so a failed copy stops both.
         let kill = if kind == QuantumKind::Draft {
             run.first_kill.clone()
         } else {

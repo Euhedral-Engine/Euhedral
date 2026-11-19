@@ -8,10 +8,10 @@
 //! - for a node that holds speculative state, that state, laid end to end the same way as the GDN state.
 //!
 //! The MTP state is the base hidden row of the node's last position, then the MTP cache's pages. The MTP cache of a
-//! checkpoint at `position` holds rows `[0, position - 1)`: row `position - 1` pairs the hidden row of that position
-//! with the token at `position`, which belongs to whichever prompt resumes here, so a restore recomputes it from the
-//! stored hidden row. Its pages run from the page of row `start - 1` (which a restore overwrites from the later node,
-//! as that row is the parent's last) to `ceil((position - 1) / 256)`.
+//! checkpoint at `position` holds rows `[0, position)`: row `position - 1` pairs the hidden row of that position - 1
+//! with the token at `position` (the node's `paired` token). A prompt with that same token at `position` restores the
+//! row whole; any other recomputes it from the stored hidden row. Its pages run from the page of row `start - 1`
+//! (which a restore overwrites from the later node, as that row is the parent's last) to `ceil(position / 256)`.
 
 use std::slice;
 
@@ -131,7 +131,7 @@ impl CheckpointLayout {
     }
 
     fn mtp_end_page(position: u32) -> usize {
-        pages(position - 1)
+        pages(position)
     }
 
     fn speculative_bytes(&self, kind: Speculation, start: u32, position: u32) -> u64 {
