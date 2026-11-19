@@ -364,7 +364,7 @@ impl Quantum {
             token_from: self.token_from.as_ref().map(|selection| selection.generation()),
             row_exact: self.mode.row_exact,
             programmatic: self.mode.pdl,
-            split_geometry: split_geometry(start, rows, group),
+            split_geometry: split_geometry(start, rows, group, &self.lanes.kernels().dispatch().fused_verify_from),
             reserved_host_pages: keyed_host_pages(source, host_pages(KvSource::Base), host_pages(KvSource::Mtp)),
             replay_rows: capture_key::trimmed(self.segment().refs.replay_layers()),
             buffer_generations: self.buffer_generations(),

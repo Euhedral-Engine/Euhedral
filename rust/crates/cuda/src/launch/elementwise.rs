@@ -14,6 +14,10 @@ const RESIDUAL_ADD: KernelId = kernel!("euhedral_residual_add_bf16");
 const SWIGLU: KernelId = kernel!("euhedral_swiglu_bf16");
 const RESIDUAL_RMS_NORM: KernelId = kernel!("euhedral_residual_rms_norm_bf16");
 const RESIDUAL_RMS_NORM_ROW: KernelId = kernel!("euhedral_residual_rms_norm_row_bf16");
+/// Slices of the output pass of a one-row norm: the default of `kernels.rms-norm-decode-slices`, the value chosen with the
+/// sliced kernel and used on every card.
+pub const DEFAULT_RMS_NORM_DECODE_SLICES: u32 = 40;
+
 const RMS_NORM: KernelId = kernel!("euhedral_rms_norm_bf16");
 const ARGMAX: KernelId = kernel!("euhedral_argmax_bf16");
 const ARGMAX_LOGPROB: KernelId = kernel!("euhedral_argmax_logprob_bf16");
@@ -219,18 +223,33 @@ pub struct RmsNormShape {
 
 /// `euhedral_cuda_rms_norm_bf16`, `rms_norm_bf16.c`: the weight is used as it is (offset 0).
 pub fn plan_rms_norm(shape: &RmsNormShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
-    plan_rms_norm_with_offset(shape, 0.0, sink)
+    plan_rms_norm_sliced(shape, DEFAULT_RMS_NORM_DECODE_SLICES, sink)
+}
+
+/// [`plan_rms_norm`] with `slices`, the grid-y of a one-row norm (`kernels.rms-norm-decode-slices`).
+pub fn plan_rms_norm_sliced(shape: &RmsNormShape, slices: u32, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
+    plan_rms_norm_with_offset(shape, 0.0, slices, sink)
 }
 
 /// `euhedral_cuda_rms_norm_unit_offset_bf16`, `rms_norm_bf16.c`: the weight plus one (offset 1).
 pub fn plan_rms_norm_unit_offset(shape: &RmsNormShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
-    plan_rms_norm_with_offset(shape, 1.0, sink)
+    plan_rms_norm_unit_offset_sliced(shape, DEFAULT_RMS_NORM_DECODE_SLICES, sink)
+}
+
+/// [`plan_rms_norm_unit_offset`] with `slices`, the grid-y of a one-row norm (`kernels.rms-norm-decode-slices`).
+pub fn plan_rms_norm_unit_offset_sliced(
+    shape: &RmsNormShape,
+    slices: u32,
+    sink: &mut impl FnMut(Launch),
+) -> Result<(), PlanError> {
+    plan_rms_norm_with_offset(shape, 1.0, slices, sink)
 }
 
 /// `rms_norm_bf16_with_offset`, `rms_norm_bf16.c`: one launch.
 fn plan_rms_norm_with_offset(
     shape: &RmsNormShape,
     weight_offset: f32,
+    slices: u32,
     sink: &mut impl FnMut(Launch),
 ) -> Result<(), PlanError> {
     let s = shape;
@@ -252,8 +271,8 @@ fn plan_rms_norm_with_offset(
         .u32(s.width)
         .f32(s.epsilon)
         .f32(weight_offset);
-    // rms_norm_bf16_with_offset in rms_norm_bf16.c: a single row (decode) spreads its output pass over 40 slices.
-    let slices = if s.rows == 1 { 40 } else { 1 };
+    // rms_norm_bf16_with_offset in rms_norm_bf16.c: a single row (decode) spreads its output pass over `slices`.
+    let slices = if s.rows == 1 { slices } else { 1 };
     sink(Launch::new(RMS_NORM, [s.rows, slices, 1], [128, 1, 1], 0, args));
     Ok(())
 }
@@ -743,6 +762,16 @@ mod tests {
             rows,
             width: 128,
             epsilon: 1e-6,
+        }
+    }
+
+    #[test]
+    fn a_configured_slice_count_sets_the_grid_of_a_one_row_norm_only() {
+        for (rows, grid) in [(1, [1, 7, 1]), (2, [2, 1, 1])] {
+            let (plain, _) = collect(|sink| plan_rms_norm_sliced(&rms(rows), 7, &mut |l| sink(l)));
+            let (unit, _) = collect(|sink| plan_rms_norm_unit_offset_sliced(&rms(rows), 7, &mut |l| sink(l)));
+            assert_eq!(plain[0].grid, grid);
+            assert_eq!(unit[0].grid, grid);
         }
     }
 

@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::model::{Auto, CpuList, HostLayerCompute, KvFormat, MIN_TENSOR_CORE_ROWS, ModelSettings, Settings};
+use crate::model::{
+    Auto, CpuList, FusedVerifyFrom, HostLayerCompute, KvFormat, MIN_TENSOR_CORE_ROWS, ModelSettings, Settings,
+};
 use crate::retired;
 use crate::sizes::{ByteSize, parse_duration};
 
@@ -20,6 +22,8 @@ const PREFIX: &str = "EUHEDRAL_";
 
 /// The largest count a key accepts: the same bound the Java engine puts on its `int` settings, so one file serves both.
 const COUNT_MAX: i64 = i32::MAX as i64;
+/// The most slices of a one-row RMS norm: they become a launch grid's y extent, which the device limits to 65535.
+const MAX_RMS_NORM_SLICES: i64 = 65535;
 
 /// One problem with the settings, naming the key and, when a variable supplied the value, the variable.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -536,6 +540,9 @@ fn leaves() -> Vec<Leaf> {
         optional("memory.runtime-reserve", |s, t| {
             assign!(s.memory.runtime_reserve, auto_or(t, |t| size(t, 0)))
         }),
+        optional("memory.runtime-headroom", |s, t| {
+            assign!(s.memory.runtime_headroom, auto_or(t, |t| size(t, 0)))
+        }),
         optional("memory.pinned-buffer-pool", |s, t| {
             assign!(s.memory.pinned_buffer_pool, auto_or(t, |t| size(t, 0)))
         }),
@@ -572,6 +579,15 @@ fn leaves() -> Vec<Leaf> {
         }),
         optional("host.native-cache", |s, t| {
             assign!(s.host.native_cache, auto_or(t, |t| Ok(PathBuf::from(t))))
+        }),
+        optional("kernels.rms-norm-decode-slices", |s, t| {
+            assign!(
+                s.kernels.rms_norm_decode_slices,
+                auto_or(t, |t| int(t, 1, MAX_RMS_NORM_SLICES))
+            )
+        }),
+        optional("kernels.fused-verify-from", |s, t| {
+            assign!(s.kernels.fused_verify_from, auto_or(t, FusedVerifyFrom::parse))
         }),
         fixed("kernels.trellis.tensor-core-max-tokens", |s, t| {
             assign!(

@@ -75,6 +75,24 @@ planned launch the family files produce. Two files turn a plan into work on a Ru
 The device tests `kernels_gpu` (ignored by default) check that every catalog kernel resolves with parameters a
 plan can pass and print the module compile and load times.
 
+## Server bundle
+
+`cargo xtask bundle --product linux-x64` (or `windows-x64`, on Windows) builds `euhedral-server` in release and
+assembles a runnable directory from it and the native product the Gradle build leaves in `build/native/<product>`
+(run `gradle nativeVerify` first; `--native <dir>` and `--out <dir>` override the product and output directories). The
+result is `build/bundle/euhedral-server-<product>/` and an archive of it (`.tar.gz` on Linux, `.zip` on Windows):
+
+```text
+bin/euhedral-server
+lib/                  the CUDA library, CUDA runtime, NVRTC and llguidance
+share/euhedral_cuda/  the kernel sources
+cuda/include/         the CUDA headers
+files.sha256          the manifest of the kernel sources
+```
+
+Unpack it anywhere and run `bin/euhedral-server --config <file>`: with no `host.native-cache` set, the server finds
+`lib/` beside `bin/`. CI builds and uploads the linux-x64 archive next to the server jar.
+
 ## Benchmark
 
 `euhedral-bench` (crate `euhedral-inference-bench`) measures the Rust engine with the Java benchmark's configuration
@@ -112,7 +130,7 @@ exits 1 when the mean KL reaches 1e-2, when more than 2% of the steps flip top-1
 median peak 32-step hidden error reaches 12%, or when the median late/early hidden error is above 1.5.
 
 `tools/rust_gate.py` runs the Java and the Rust benchmark alternately, one process each per fork, each through the system
-launcher (`system-run --gpu exclusive --cpu exclusive`: exclusive GPU and CPU grant, memory cap, with `timeout` for the
+launcher (`system-run --system`: whole-machine exclusive grant on every resource, memory cap, with `timeout` for the
 time limit inside the grant), with the prefix cache off, and prints a per-row table of the output hashes of the two
 engines and the absolute medians of each. It is a timing run, so it takes the card exclusively.
 

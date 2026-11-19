@@ -12,7 +12,7 @@
 //! the artifact file. A plan that does not fit even then is refused with the bytes it needed and the bytes there
 //! were, naming the memory that is short.
 
-use euhedral_inference_cuda::launch::nvfp4::nvfp4_native_scratch_bytes;
+use euhedral_inference_cuda::launch::nvfp4::{SKINNY_MAX_ROWS, nvfp4_native_scratch_bytes, skinny_target_ctas};
 use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFormat, WeightLayout};
 use euhedral_inference_settings::{Auto, BatchingSettings, KvFormat, Settings};
 
@@ -37,6 +37,32 @@ use crate::workspace::{self, WorkspaceRows};
 /// outside the weights and the cache that one running sequence needs on the device: its GDN state, the execution
 /// workspaces, the shared scratch and the kernel modules the first launches compile.
 pub const DEFAULT_RUNTIME_RESERVE_BYTES: u64 = 1280 << 20;
+
+/// The multiprocessor count of the device the headroom was measured on.
+pub const HEADROOM_MEASURED_MULTIPROCESSORS: u32 = 70;
+
+/// What `memory.runtime-headroom: auto` means on a device of [`HEADROOM_MEASURED_MULTIPROCESSORS`] multiprocessors,
+/// and the least it means on any device: the device bytes kept above the demand that raises the runtime reserve, for
+/// what the driver takes after admission. Measured on 70 multiprocessors with drafting on, BF16 KV, 8192 tokens and
+/// the reserve at its tightest: 246 MiB lost beyond the engine's allocations after admission (118 MiB by the time the
+/// model was ready, and 128 MiB at the first prefill, the code and local memory of the trellis, attention and Gated
+/// DeltaNet kernels); this is that figure with about 30% over. The local memory grows with the multiprocessors, so a
+/// wider device scales it ([`auto_runtime_headroom`]).
+pub const DEFAULT_RUNTIME_HEADROOM_BYTES: u64 = 320 << 20;
+
+/// The headroom `auto` resolves to: [`DEFAULT_RUNTIME_HEADROOM_BYTES`] scaled by the device's multiprocessors over
+/// [`HEADROOM_MEASURED_MULTIPROCESSORS`] and rounded up, never less than the default. A count that is unknown (the
+/// plan made without a device) gets the default.
+pub fn auto_runtime_headroom(multiprocessors: Option<u32>) -> u64 {
+    let Some(count) = multiprocessors else {
+        return DEFAULT_RUNTIME_HEADROOM_BYTES;
+    };
+    let scaled = (u128::from(DEFAULT_RUNTIME_HEADROOM_BYTES) * u128::from(count))
+        .div_ceil(u128::from(HEADROOM_MEASURED_MULTIPROCESSORS));
+    u64::try_from(scaled)
+        .unwrap_or(u64::MAX)
+        .max(DEFAULT_RUNTIME_HEADROOM_BYTES)
+}
 
 /// Device allocations start on this many bytes, like the driver's.
 pub const ARENA_ALIGNMENT: u64 = 256;
@@ -136,8 +162,9 @@ pub struct ResidencyPlan {
     pub decode_scratch_bytes: u64,
     /// The device bytes the runtime reserves beyond the weights, the cache and the scratch (`memory.runtime-reserve`):
     /// the execution workspace, the decode scratch, the first sequence's state, the MTP layer's cache at the longest
-    /// context and what the kernel modules take. At least what the settings make the first four of these need,
-    /// whatever the setting says.
+    /// context and what the kernel modules take. At least what the settings make the first four of these need, and
+    /// `memory.runtime-headroom` above them for the kernels, whatever the setting says: the startup's claims take the
+    /// first four, so the headroom is left.
     pub runtime_reserve_bytes: u64,
     /// The device bytes the plan reserves in all: the weights, every sequence's cache, the runtime's reserve, the
     /// scratch and the state of the sequences beyond the first.
@@ -378,8 +405,12 @@ pub fn plan_closest(
     );
     let thresholds = trellis_thresholds(settings, inputs.multiprocessors);
     let widest = inputs.multiprocessors.is_none();
-    let scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::Plan)
-        .max(nvfp4_native_scratch(&device, chunk));
+    let scratch_bytes =
+        trellis_scratch(table, &profile, chunk, thresholds, widest, Route::Plan).max(nvfp4_native_scratch(
+            &device,
+            chunk,
+            inputs.multiprocessors.map_or(u64::MAX, skinny_target_ctas),
+        ));
     let decode_scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::TensorCore);
 
     let available = inputs
@@ -408,15 +439,25 @@ pub fn plan_closest(
     } else {
         0
     };
+    // The kernels the driver loads after admission (their code and local memory, at each one's first launch) are paid
+    // from what the claims leave. A reserve raised to the claims alone would leave them nothing, so the raised reserve
+    // keeps the headroom above them.
+    let headroom = settings
+        .memory
+        .runtime_headroom
+        .value()
+        .map_or_else(|| auto_runtime_headroom(inputs.multiprocessors), |size| size.bytes());
     let reserve_demand = workspace_bytes
         .saturating_add(decode_scratch_bytes)
         .saturating_add(first_state)
-        .saturating_add(mtp_cache);
+        .saturating_add(mtp_cache)
+        .saturating_add(headroom);
     let runtime_reserve = reserve_setting.max(reserve_demand);
     if reserve_demand > reserve_setting {
         log::info!(
             "the runtime reserve is raised from {reserve_setting} to {reserve_demand} bytes: the workspace, the decode \
-             scratch, the first sequence's state and the MTP cache need that much at these settings"
+             scratch, the first sequence's state and the MTP cache need that much at these settings, and {headroom} \
+             bytes are kept above them for the kernels loaded after admission"
         );
     }
     let extra = if sequences > 1 {
@@ -859,14 +900,25 @@ fn trellis_scratch(
     largest
 }
 
-/// The largest scratch the NVFP4 native route needs for any NVFP4 object of `placements` at `rows` rows: the one
-/// the workspace's first scratch region is sized by, when it is larger than the trellis routes'.
-fn nvfp4_native_scratch(placements: &[Placement], rows: u64) -> u64 {
+/// The largest scratch the NVFP4 native route needs for any NVFP4 object of `placements` in a launch of up to `rows`
+/// rows: the one the workspace's first scratch region is sized by, when it is larger than the trellis routes'. Beyond
+/// 64 rows the tile route's scratch is smaller than the skinny route's at 64, so the answer is the larger of the two
+/// (as `Nvfp4Linear::scratch_bytes` has it). `target_ctas` is the skinny kernels' grid on the device, the most any
+/// device splits to where it is not known.
+fn nvfp4_native_scratch(placements: &[Placement], rows: u64, target_ctas: u64) -> u64 {
+    let skinny_rows = rows.min(u64::from(SKINNY_MAX_ROWS));
     placements
         .iter()
         .filter(|placement| placement.format == WeightFormat::Nvfp4)
         .filter_map(|placement| match placement.shape.as_slice() {
-            [out, input] => Some(nvfp4_native_scratch_bytes(rows, *input, *out)),
+            [out, input] => Some(
+                nvfp4_native_scratch_bytes(rows, *input, *out, target_ctas).max(nvfp4_native_scratch_bytes(
+                    skinny_rows,
+                    *input,
+                    *out,
+                    target_ctas,
+                )),
+            ),
             _ => None,
         })
         .max()
@@ -1043,17 +1095,28 @@ mod tests {
     #[test]
     fn the_native_scratch_is_the_largest_of_the_nvfp4_objects_and_nothing_else_decides_it() {
         let objects = [nvfp4(&[4096, 1024]), nvfp4(&[1024, 17_408]), nvfp4(&[8, 8, 8])];
-        let scratch = nvfp4_native_scratch(&objects, 512);
+        let target = skinny_target_ctas(70);
+        let scratch = nvfp4_native_scratch(&objects, 512, target);
         assert_eq!(
             scratch,
-            nvfp4_native_scratch_bytes(512, 1024, 4096).max(nvfp4_native_scratch_bytes(512, 17_408, 1024))
+            nvfp4_native_scratch_bytes(512, 1024, 4096, target)
+                .max(nvfp4_native_scratch_bytes(512, 17_408, 1024, target))
         );
         assert!(scratch > 0);
-        assert!(nvfp4_native_scratch(&objects, 2048) > scratch);
+        assert!(nvfp4_native_scratch(&objects, 2048, target) > scratch);
+        // Past 64 rows the skinny route's partials at 64 rows are larger than the tile route's scratch: a chunk of 65
+        // rows is sized by them, as is the linear's own answer.
+        let wide = [nvfp4(&[5120, 17_408])];
+        let skinny = nvfp4_native_scratch_bytes(64, 17_408, 5120, target);
+        assert!(skinny > nvfp4_native_scratch_bytes(65, 17_408, 5120, target));
+        assert_eq!(nvfp4_native_scratch(&wide, 65, target), skinny);
+        assert_eq!(nvfp4_native_scratch(&wide, 64, target), skinny);
+        // A device that is not known is sized for the widest split.
+        assert!(nvfp4_native_scratch(&objects, 8, u64::MAX) >= nvfp4_native_scratch(&objects, 8, target));
         let mut other = nvfp4(&[4096, 1024]);
         other.format = WeightFormat::Trellis;
-        assert_eq!(nvfp4_native_scratch(&[other], 512), 0);
-        assert_eq!(nvfp4_native_scratch(&[], 512), 0);
+        assert_eq!(nvfp4_native_scratch(&[other], 512, 140), 0);
+        assert_eq!(nvfp4_native_scratch(&[], 512, 140), 0);
     }
 
     /// The decision before the memory planner made it: device bytes against the budget, the spill when the host

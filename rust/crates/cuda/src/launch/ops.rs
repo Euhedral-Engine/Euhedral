@@ -20,13 +20,13 @@ use euhedral_graph::Marker;
 
 use crate::error::{CudaError, check};
 use crate::launch::attention::{
-    AppendShape, CacheFormat, CausalShape, RopeShape, plan_causal, plan_kv_append, plan_qk_norm_rope,
+    AppendShape, CacheFormat, CausalShape, RopeShape, plan_causal_with, plan_kv_append, plan_qk_norm_rope,
 };
 use crate::launch::catalog::{Launch, linear_table, lookup};
 use crate::launch::elementwise::{
     ArgmaxShape, ResidualAddShape, ResidualRmsNormShape, RmsNormShape, SelectedTokenShape, SwigluShape,
     check_zero_device_memory, plan_argmax, plan_argmax_logprob, plan_residual_add, plan_residual_rms_norm,
-    plan_rms_norm_unit_offset, plan_selected_token, plan_swiglu,
+    plan_rms_norm_unit_offset_sliced, plan_selected_token, plan_swiglu,
 };
 use crate::launch::embedding::{EmbedShape, plan_embed_q3, plan_embed_q3_p2e2};
 use crate::launch::gdn::{
@@ -232,8 +232,9 @@ where
 
     fn causal(&mut self, call: &'static str, format: CacheFormat, shape: CausalShape) -> Result<(), CudaError> {
         let modes = self.modes;
+        let fused_from = self.table.dispatch().fused_verify_from;
         self.planned(call, |sink| {
-            plan_causal(format, &shape, modes, &mut |launch| sink(launch))
+            plan_causal_with(format, &shape, modes, &fused_from, &mut |launch| sink(launch))
         })
     }
 }
@@ -436,8 +437,14 @@ where
             out_features,
             weights_byte_size: weights_bytes,
         };
-        let plan = plan_native(&operands, scratch, scratch_bytes, self.modes.exact_numerics)
-            .map_err(|error| refused(CALL, error))?;
+        let plan = plan_native(
+            &operands,
+            scratch,
+            scratch_bytes,
+            self.table.dispatch().skinny_target_ctas(),
+            self.modes.exact_numerics,
+        )
+        .map_err(|error| refused(CALL, error))?;
         self.enqueue_all(plan.launches())
     }
 
@@ -761,8 +768,9 @@ where
             width,
             epsilon,
         };
+        let slices = self.table.dispatch().rms_norm_decode_slices;
         self.planned("euhedral_cuda_rms_norm_unit_offset_bf16", |sink| {
-            plan_rms_norm_unit_offset(&shape, &mut |launch| sink(launch))
+            plan_rms_norm_unit_offset_sliced(&shape, slices, &mut |launch| sink(launch))
         })
     }
 

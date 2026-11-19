@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core.gpu;
 
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.artifact.format.TrellisSettings;
+import io.euhedral_execution.inference.core.settings.KernelSettings;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -9,6 +10,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
+import java.util.List;
 import java.util.Objects;
 
 /// GPU operations for Qwen stages. Production launches are ordered by a quantum-owned [GpuStream];
@@ -46,6 +48,12 @@ public abstract class ExecutionGpu implements GpuMemory {
     /// Frees released pinned host buffers the pool had no room for. Synchronizes the device: only on a thread that
     /// may wait for it, never on a lattice worker.
     public void trimPinnedPool() {}
+
+    /// The fewest keys at which the fused verifier kernel serves each of 0 to 8 verified rows on this GPU
+    /// (`kernels.fused-verify-from`): the table its launches use, which a captured graph's key must follow.
+    public List<Long> fusedVerifyFrom() {
+        return KernelSettings.DEFAULT_FUSED_VERIFY_FROM;
+    }
 
     /// Whether exact numerics (the scalar oracles) are selected.
     public boolean exactNumerics() {

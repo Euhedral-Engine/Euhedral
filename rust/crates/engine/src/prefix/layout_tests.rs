@@ -320,20 +320,20 @@ fn a_nodes_copies_cover_each_byte_of_its_slots_once_without_overlap() {
     }
 }
 
-// --- MTP state: the MTP cache's rows [0, position - 1) and the base hidden row of position - 1.
+// --- MTP state: the MTP cache's rows [0, position) and the base hidden row of position - 1.
 
 #[test]
-fn mtp_state_adds_the_seed_row_and_only_the_mtp_pages_below_position_minus_one() {
+fn mtp_state_adds_the_seed_row_and_the_mtp_pages_up_to_the_position() {
     let config = compact();
     let layout = CheckpointLayout::new(&config, FORMAT).unwrap();
     let mtp = Speculation::Mtp;
-    // Rows [0, 767) fill 3 pages and the seed row: both in one slot of four pages.
+    // Rows [0, 768) fill 3 pages and the seed row: both in one slot of four pages.
     assert_eq!(layout.speculative_slots(mtp, 0, 768), 1);
-    // A span from 512 starts one MTP page early (the page of row 511): pages 1, 2 and 3 for rows below 1023.
+    // A span from 512 starts one MTP page early (the page of row 511): pages 1, 2 and 3 for rows below 1024.
     assert_eq!(layout.speculative_slots(mtp, 512, 1024), 1);
-    // Rows [0, 2047) fill 8 pages, and the seed row displaces the last page into a third slot.
+    // Rows [0, 2048) fill 8 pages, and the seed row displaces the last page into a third slot.
     assert_eq!(layout.speculative_slots(mtp, 0, 2048), 3);
-    // Rows [0, 1023) fill four pages: the seed row takes room from the fourth.
+    // Rows [0, 1024) fill four pages: the seed row takes room from the fourth.
     assert_eq!(layout.speculative_slots(mtp, 0, 1024), 2);
     assert_eq!(layout.slots(0, 768, Some(mtp)), 4 + 1);
 }

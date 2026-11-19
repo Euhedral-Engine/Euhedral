@@ -30,9 +30,11 @@ pub const SKINNY_MAX_ROWS: u32 = 64;
 /// Output columns of a block of the skinny kernels (`SKINNY_COLUMNS`, `nvfp4_linear.c`).
 const SKINNY_COLUMNS: u64 = 64;
 
-/// The blocks the native library splits a skinny launch over K to reach: two per streaming multiprocessor, a machine
-/// measurement (`SKINNY_TARGET_CTAS`, `nvfp4_linear.c`), ported as it is.
-const SKINNY_TARGET_CTAS: u64 = 140;
+/// The blocks the native library splits a skinny launch over K to reach, on a device of `sm_count` streaming
+/// multiprocessors: two per multiprocessor (`skinny_target_ctas`, `nvfp4_linear.c`).
+pub const fn skinny_target_ctas(sm_count: u32) -> u64 {
+    2 * sm_count as u64
+}
 
 /// Dynamic shared bytes of a tile kernel (`NATIVE_SHARED_BYTES`, `nvfp4_linear.c`).
 pub const NATIVE_SHARED_BYTES: u32 = 85040;
@@ -218,11 +220,11 @@ pub fn skinny_route(rows: u64, in_features: u64) -> bool {
 }
 
 /// K splits of the skinny kernel: enough blocks to keep every streaming multiprocessor reading weights
-/// (`skinny_splits`, `nvfp4_linear.c`).
-pub fn skinny_splits(in_features: u64, out_features: u64) -> u64 {
+/// (`skinny_splits`, `nvfp4_linear.c`); `target_ctas` is [`skinny_target_ctas`].
+pub fn skinny_splits(in_features: u64, out_features: u64, target_ctas: u64) -> u64 {
     let tiles = out_features.div_ceil(SKINNY_COLUMNS);
     let k_tiles = in_features / 256;
-    let splits = SKINNY_TARGET_CTAS.div_ceil(tiles).min(k_tiles / 2);
+    let splits = target_ctas.div_ceil(tiles).min(k_tiles / 2);
     splits.max(1)
 }
 
@@ -244,11 +246,12 @@ fn activation_bytes(rows: u64, in_features: u64) -> u64 {
 }
 
 /// The scratch one native linear needs (`euhedral_cuda_nvfp4_native_scratch_bytes`, `nvfp4_linear.c`): the
-/// activations, then, for a skinny launch split over K, FP32 partials.
-pub fn nvfp4_native_scratch_bytes(rows: u64, in_features: u64, out_features: u64) -> u64 {
+/// activations, then, for a skinny launch split over K, FP32 partials. `target_ctas` is [`skinny_target_ctas`].
+pub fn nvfp4_native_scratch_bytes(rows: u64, in_features: u64, out_features: u64, target_ctas: u64) -> u64 {
     let mut bytes = activation_bytes(rows, in_features);
-    if skinny_route(rows, in_features) && skinny_splits(in_features, out_features) > 1 {
-        bytes = align256(bytes) + 4 * skinny_splits(in_features, out_features) * rows * out_features;
+    let splits = skinny_splits(in_features, out_features, target_ctas);
+    if skinny_route(rows, in_features) && splits > 1 {
+        bytes = align256(bytes) + 4 * splits * rows * out_features;
     }
     bytes
 }
@@ -354,7 +357,14 @@ fn reference_launch(rows: u32, in_features: u32, out_features: u32, layout: Nvfp
 }
 
 /// The native launches (`launch_native`, `nvfp4_linear.c`) once the checks have passed.
-fn native_launches(rows: u32, in_features: u32, out_features: u32, layout: Nvfp4Layout, at: &Pointers) -> Nvfp4Plan {
+fn native_launches(
+    rows: u32,
+    in_features: u32,
+    out_features: u32,
+    layout: Nvfp4Layout,
+    target_ctas: u64,
+    at: &Pointers,
+) -> Nvfp4Plan {
     let (rows64, inputs, outputs) = (u64::from(rows), u64::from(in_features), u64::from(out_features));
     let scratch = at.scratch;
     let quantize = Launch::new(
@@ -378,7 +388,7 @@ fn native_launches(rows: u32, in_features: u32, out_features: u32, layout: Nvfp4
         } else {
             2
         };
-        let splits = skinny_splits(inputs, outputs);
+        let splits = skinny_splits(inputs, outputs, target_ctas);
         let partials = if splits > 1 {
             scratch.get() + align256(activation_bytes(rows64, inputs))
         } else {
@@ -525,12 +535,14 @@ pub fn plan_linear(operands: &Nvfp4Operands, exact_numerics: bool) -> Result<Nvf
 /// The launches of `euhedral_cuda_linear_nvfp4_native_bf16` (`nvfp4_linear.c`): the quantization of the
 /// activations into `scratch`, then the skinny kernel (and its finish when split over K) or the tile kernel.
 ///
-/// `scratch_byte_size` is the scratch's size. Where the C entry point declines, the refusal is
+/// `scratch_byte_size` is the scratch's size, and `target_ctas` the blocks a skinny launch splits over K to reach
+/// ([`skinny_target_ctas`] of the device). Where the C entry point declines, the refusal is
 /// [`PlanError::RouteUnavailable`] and the caller runs [`plan_linear`] instead.
 pub fn plan_native(
     operands: &Nvfp4Operands,
     scratch: DevicePtr,
     scratch_byte_size: u64,
+    target_ctas: u64,
     exact_numerics: bool,
 ) -> Result<Nvfp4Plan, PlanError> {
     let Nvfp4Operands {
@@ -555,7 +567,7 @@ pub fn plan_native(
         return Err(PlanError::RouteUnavailable);
     }
     let needed = if skinny {
-        nvfp4_native_scratch_bytes(rows64, inputs, outputs)
+        nvfp4_native_scratch_bytes(rows64, inputs, outputs, target_ctas)
     } else {
         activation_bytes(rows64, inputs)
     };
@@ -571,13 +583,20 @@ pub fn plan_native(
         output,
         scratch,
     };
-    Ok(native_launches(rows, in_features, out_features, layout, &at))
+    Ok(native_launches(
+        rows,
+        in_features,
+        out_features,
+        layout,
+        target_ctas,
+        &at,
+    ))
 }
 
 impl Nvfp4Route {
     /// The launches of the route as lines of the shape recorder's format, without arguments: the library queues them
     /// itself, so the geometry is what it computes for the shape.
-    pub fn lines(self, rows: u32, in_features: u32, out_features: u32, sd4: bool) -> Vec<String> {
+    pub fn lines(self, rows: u32, in_features: u32, out_features: u32, sd4: bool, target_ctas: u64) -> Vec<String> {
         let layout = if sd4 { Nvfp4Layout::Sd4 } else { Nvfp4Layout::Plain };
         let at = Pointers {
             input: DevicePtr::NULL,
@@ -593,7 +612,7 @@ impl Nvfp4Route {
                 Nvfp4Plan::single(decode_launch(groups * 8, in_features, out_features, layout, &at))
             }
             Nvfp4Route::Reference => Nvfp4Plan::single(reference_launch(rows, in_features, out_features, layout, &at)),
-            Nvfp4Route::Native { .. } => native_launches(rows, in_features, out_features, layout, &at),
+            Nvfp4Route::Native { .. } => native_launches(rows, in_features, out_features, layout, target_ctas, &at),
         };
         plan.launches()
             .iter()

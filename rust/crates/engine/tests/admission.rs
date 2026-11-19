@@ -9,6 +9,7 @@
 
 use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::residency::planner::{PlanInputs, plan_with, sequences_for};
+use euhedral_inference_engine::runtime::{LaneSizing, lane_sizing, resolve_sequences, stage_ring_for};
 use euhedral_inference_settings::{Auto, ByteSize};
 
 mod common;
@@ -160,4 +161,38 @@ fn the_prefix_cache_keeps_its_size_when_the_host_budget_is_unknown() {
     settings.prefix_cache.size = ByteSize::gib(1);
     let plan = plan_with(&config, &table, &settings, inputs(64 * GIB, None)).unwrap();
     assert_eq!(plan.prefix_cache_bytes, GIB);
+}
+
+#[test]
+fn the_lanes_open_with_a_ring_for_the_count_resolved_and_the_plan_takes_the_smaller_of_the_two() {
+    let (table, config) = (rco_table(), config());
+    let mut settings = settings(4096);
+    settings.batching.max_sequences = 0;
+    let first = resolve_sequences(&config, &table, &settings, inputs(64 * GIB, Some(u64::MAX))).unwrap();
+    assert!(first > 1, "the plan has room for more than one sequence: {first}");
+    let ring = stage_ring_for(first);
+    assert!(ring > stage_ring_for(1), "the ring grows with the count: {ring}");
+    // The lanes' events took memory: the count resolved again is lower, and the plan takes it; the ring stays.
+    let fewer = lane_sizing::<()>(0, first, || Ok(first - 1)).unwrap();
+    assert_eq!(
+        fewer,
+        LaneSizing {
+            sequences: first - 1,
+            ring
+        }
+    );
+    // A count resolved again that is higher is not taken: the ring serves the first.
+    let more = lane_sizing::<()>(0, first, || Ok(first + 5)).unwrap();
+    assert_eq!(more, LaneSizing { sequences: first, ring });
+    // A stated count is held as stated, and is not resolved again.
+    let stated = lane_sizing::<()>(3, 3, || Err(())).unwrap();
+    assert_eq!(
+        stated,
+        LaneSizing {
+            sequences: 3,
+            ring: stage_ring_for(3)
+        }
+    );
+    // A count that cannot be resolved again fails the startup.
+    assert_eq!(lane_sizing(0, first, || Err("no room")), Err("no room"));
 }

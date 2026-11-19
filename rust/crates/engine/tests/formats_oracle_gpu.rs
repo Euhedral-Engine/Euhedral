@@ -45,7 +45,7 @@ fn nvfp4_follows_the_switch(rig: &Rig) {
     let production = Nvfp4Linear::new(&rig.library);
     // The scalar reference computes each output element on its own, so its rows do not depend on how many run: above
     // 32 rows a device without the native route reaches it without the switch.
-    let portable = Nvfp4Linear::with_native_route(false);
+    let portable = Nvfp4Linear::with_native_route(false, 70);
     let reference = values(&rig.linear(&portable, &weight, &x, 0, k, n, 64, PLAIN));
     let ordinary: Vec<Vec<f32>> = [1usize, 8, 20, 40]
         .iter()

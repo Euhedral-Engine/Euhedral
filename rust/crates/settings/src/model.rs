@@ -261,6 +261,11 @@ pub struct MemorySettings {
     /// Device memory the dense model's plan keeps beside the weights and the cache for the first sequence's state, the
     /// workspaces and the kernel modules; `auto` is 1280 MiB.
     pub runtime_reserve: Auto<ByteSize>,
+    /// Device memory the plan keeps above what the workspace, the decode scratch, the first sequence's state and the
+    /// MTP cache need, for what the driver takes after the plan is admitted: the code and the local memory of the
+    /// kernels, loaded when each is first launched. Counted only where the demand raises the reserve; below that the
+    /// reserve's own slack pays for it. `auto` is 320 MiB.
+    pub runtime_headroom: Auto<ByteSize>,
     /// Released pinned buffers kept for reuse.
     pub pinned_buffer_pool: Auto<ByteSize>,
     /// Streaming of weights from disk.
@@ -280,6 +285,7 @@ impl Default for MemorySettings {
             gpu_limit: Auto::Auto,
             gpu_reserve: ByteSize::mib(700),
             runtime_reserve: Auto::Auto,
+            runtime_headroom: Auto::Auto,
             pinned_buffer_pool: Auto::Auto,
             weight_streaming: WeightStreamingSettings::default(),
             host_layers: HostLayersSettings::default(),
@@ -399,12 +405,58 @@ impl Default for HostSettings {
 /// Kernel thresholds (`kernels`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KernelSettings {
+    /// Slices of the output pass of a one-row RMS norm (a decode step); `auto` is 40 on every card, the value chosen with the
+    /// sliced kernel; 1 to 65535.
+    pub rms_norm_decode_slices: Auto<u32>,
+    /// The fewest keys at which the fused verifier kernel serves each count of verified rows; `auto` is the table
+    /// measured on an RTX 5070 Ti.
+    pub fused_verify_from: Auto<FusedVerifyFrom>,
     /// The trellis kernels.
     pub trellis: TrellisKernelSettings,
     /// The CUDA graphs of captured quanta.
     pub graphs: GraphKernelSettings,
     /// The runtime compilation of kernel sources.
     pub compile: CompileKernelSettings,
+}
+
+/// How many verified-row counts [`FusedVerifyFrom`] covers: 0 to 8.
+pub const FUSED_VERIFY_ROWS: usize = 9;
+
+/// The fewest keys at which the fused verifier kernel beats its row twins, by verified rows 0 to 8
+/// (`kernels.fused-verify-from`); [`u32::MAX`] is never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FusedVerifyFrom(pub [u32; FUSED_VERIFY_ROWS]);
+
+impl FusedVerifyFrom {
+    /// Parses nine comma-separated key counts, each a whole number from 1 or `never`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut keys = [u32::MAX; FUSED_VERIFY_ROWS];
+        let mut count = 0;
+        for part in text.split(',') {
+            let part = part.trim();
+            let value = if part.eq_ignore_ascii_case("never") {
+                u32::MAX
+            } else {
+                part.parse::<u32>()
+                    .ok()
+                    .filter(|&value| value >= 1)
+                    .ok_or_else(|| format!("each entry must be a whole number from 1 or never: {text}"))?
+            };
+            if count == FUSED_VERIFY_ROWS {
+                return Err(format!(
+                    "must list {FUSED_VERIFY_ROWS} entries, for 0 to 8 verified rows: {text}"
+                ));
+            }
+            keys[count] = value;
+            count += 1;
+        }
+        if count != FUSED_VERIFY_ROWS {
+            return Err(format!(
+                "must list {FUSED_VERIFY_ROWS} entries, for 0 to 8 verified rows: {text}"
+            ));
+        }
+        Ok(Self(keys))
+    }
 }
 
 /// The runtime compilation of kernel sources (`kernels.compile`).

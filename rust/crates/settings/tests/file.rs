@@ -117,7 +117,7 @@ fn file_must_be_a_mapping_and_must_exist() {
 #[test]
 fn values_parse() {
     let settings = load(&format!(
-        "{MODEL}context:\n  kv-cache-format: bf16\nmemory:\n  gpu-limit: 1GiB\n  host-limit: 0\n  runtime-reserve: 900MiB\nhost:\n  cpus: 2-5,8\n  idle-release: 0\n  max-batch-size: 2\n\
+        "{MODEL}context:\n  kv-cache-format: bf16\nmemory:\n  gpu-limit: 1GiB\n  host-limit: 0\n  runtime-reserve: 900MiB\n  runtime-headroom: 256MiB\nhost:\n  cpus: 2-5,8\n  idle-release: 0\n  max-batch-size: 2\n\
          server:\n  requests:\n    timeout: 90s\n    max-body-size: 2MiB\n"
     ))
     .unwrap();
@@ -125,6 +125,7 @@ fn values_parse() {
     assert_eq!(settings.memory.gpu_limit, Auto::Value(ByteSize::gib(1)));
     assert_eq!(settings.memory.host_limit, Auto::Value(ByteSize(0)));
     assert_eq!(settings.memory.runtime_reserve, Auto::Value(ByteSize::mib(900)));
+    assert_eq!(settings.memory.runtime_headroom, Auto::Value(ByteSize::mib(256)));
     assert_eq!(
         settings.host.cpus.value().unwrap().ids().collect::<Vec<_>>(),
         [2, 3, 4, 5, 8]
@@ -300,4 +301,42 @@ fn disk_window_slots_parse_and_refuse_zero() {
     let stated = load(&format!("{MODEL}memory:\n  disk-window-slots: 6\n")).unwrap();
     assert_eq!(stated.memory.disk_window_slots, Auto::Value(6));
     assert!(problems(&format!("{MODEL}memory:\n  disk-window-slots: 0\n"))[0].contains("memory.disk-window-slots"));
+}
+
+#[test]
+fn the_dispatch_kernel_settings_default_to_auto_and_parse() {
+    use euhedral_inference_settings::{Auto, FusedVerifyFrom};
+    let defaults = load(MODEL).unwrap().kernels;
+    assert_eq!(defaults.rms_norm_decode_slices, Auto::Auto);
+    assert_eq!(defaults.fused_verify_from, Auto::Auto);
+    let set = load(&format!(
+        "{MODEL}kernels:\n  rms-norm-decode-slices: 16\n  fused-verify-from: never,never,1,2,3,4,5,6,7\n"
+    ))
+    .unwrap()
+    .kernels;
+    assert_eq!(set.rms_norm_decode_slices, Auto::Value(16));
+    assert_eq!(
+        set.fused_verify_from,
+        Auto::Value(FusedVerifyFrom([u32::MAX, u32::MAX, 1, 2, 3, 4, 5, 6, 7]))
+    );
+    assert!(problems(&format!("{MODEL}kernels:\n  rms-norm-decode-slices: 0\n"))[0].contains("rms-norm-decode-slices"));
+    // The slices are a grid extent, which the device limits to 65535.
+    assert!(
+        problems(&format!("{MODEL}kernels:\n  rms-norm-decode-slices: 65536\n"))[0].contains("rms-norm-decode-slices")
+    );
+    let widest = load(&format!("{MODEL}kernels:\n  rms-norm-decode-slices: 65535\n"))
+        .unwrap()
+        .kernels;
+    assert_eq!(widest.rms_norm_decode_slices, Auto::Value(65535));
+    for bad in [
+        "1,2,3",
+        "1,2,3,4,5,6,7,8,9,10",
+        "never,never,0,1,2,3,4,5,6",
+        "a,b,c,d,e,f,g,h,i",
+    ] {
+        assert!(
+            problems(&format!("{MODEL}kernels:\n  fused-verify-from: \"{bad}\"\n"))[0].contains("fused-verify-from"),
+            "{bad}"
+        );
+    }
 }
