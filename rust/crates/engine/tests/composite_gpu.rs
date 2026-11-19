@@ -92,7 +92,7 @@ fn generate(machine: &Machine, composite: Composite) -> Vec<u32> {
     runtime
         .generate(GenerationRequest {
             prompt: PROMPT.to_vec(),
-            max_tokens: 32,
+            max_tokens: 64,
             stop_tokens: Vec::new(),
             speculation: Speculation::Off,
             sampling: SamplingConfig::greedy(0),
@@ -122,8 +122,8 @@ fn index(artifact: &Path) -> (Header, Vec<u8>, Vec<TensorEntry>) {
     (header, metadata, table.entries().to_vec())
 }
 
-/// Two trellis projections of different layers: the objects a composite takes.
-fn two_projections(entries: &[TensorEntry]) -> [String; 2] {
+/// A trellis projection from each of the first `count` layers that have one: the objects a composite takes.
+fn projections(entries: &[TensorEntry], count: usize) -> Vec<String> {
     let layer = |name: &str| name.split('/').nth(2).map(str::to_string);
     let mut chosen: Vec<String> = Vec::new();
     for entry in entries {
@@ -135,18 +135,22 @@ fn two_projections(entries: &[TensorEntry]) -> [String; 2] {
         {
             chosen.push(name.to_string());
         }
-        if chosen.len() == 2 {
+        if chosen.len() == count {
             break;
         }
     }
-    let [first, second] = <[String; 2]>::try_from(chosen).expect("the artifact has trellis projections in two layers");
-    [first, second]
+    assert_eq!(
+        chosen.len(),
+        count,
+        "the artifact has trellis projections in {count} layers"
+    );
+    chosen
 }
 
 /// Writes an artifact at `path` that holds `objects` and their companions, with the payloads of `base`, in the
-/// reverse of the base's order and at other offsets, so only a read from this file finds them. With `corrupt`, a block
-/// inside the first object's payload is zeros.
-fn write_source(base: &Path, path: &Path, objects: &[String; 2], corrupt: bool) {
+/// reverse of the base's order and at other offsets, so only a read from this file finds them. With `corrupt`, the payload
+/// of each object's payload is zeros.
+fn write_source(base: &Path, path: &Path, objects: &[String], corrupt: bool) {
     let (header, metadata, entries) = index(base);
     let mut specs = Vec::new();
     let mut from = Vec::new();
@@ -180,10 +184,8 @@ fn write_source(base: &Path, path: &Path, objects: &[String; 2], corrupt: bool) 
         let mut payload = vec![0u8; usize::try_from(original.bytes()).unwrap()];
         source.seek(SeekFrom::Start(original.offset())).unwrap();
         source.read_exact(&mut payload).unwrap();
-        if corrupt && placed.name() == specs[0].name {
-            let middle = payload.len() / 2;
-            let end = middle + 4096.min(payload.len() - middle);
-            payload[middle..end].fill(0);
+        if corrupt && objects.iter().any(|object| object == placed.name()) {
+            payload.fill(0);
         }
         out.write_all(&payload).unwrap();
         at = placed.offset() + original.bytes();
@@ -198,7 +200,7 @@ fn write_source(base: &Path, path: &Path, objects: &[String; 2], corrupt: bool) 
 fn a_composite_reads_each_object_from_its_own_file_and_generates_the_bases_tokens() {
     let Some(machine) = machine() else { return };
     let (_, _, entries) = index(&machine.artifact);
-    let objects = two_projections(&entries);
+    let objects = projections(&entries, 8);
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("composite-weights");
     fs::create_dir_all(&scratch).unwrap();
     let source = scratch.join("source.edrl");
@@ -207,11 +209,11 @@ fn a_composite_reads_each_object_from_its_own_file_and_generates_the_bases_token
     // The source holds the payloads at other offsets than the base: a read of the base's file at the source's offset
     // finds other bytes, and the tokens differ.
     let expected = generate(&machine, Composite::default());
-    assert_eq!(expected.len(), 32);
+    assert_eq!(expected.len(), 64);
     let composite = Composite {
         replacements: vec![Replacement {
             source: source.clone(),
-            objects: objects.to_vec(),
+            objects: objects.clone(),
         }],
         draft_depth: None,
     };
@@ -219,14 +221,14 @@ fn a_composite_reads_each_object_from_its_own_file_and_generates_the_bases_token
     fs::remove_file(&source).unwrap();
     assert_eq!(tokens, expected);
 
-    // The same source with a block of one payload zeroed: the engine reads the source's payload, so its tokens differ.
+    // The same source with each object's payload zeroed: the engine reads the source's payload, so its tokens differ.
     // Without this, a composite that were ignored would pass the comparison above.
     let damaged = scratch.join("damaged.edrl");
     write_source(&machine.artifact, &damaged, &objects, true);
     let composite = Composite {
         replacements: vec![Replacement {
             source: damaged.clone(),
-            objects: objects.to_vec(),
+            objects: objects.clone(),
         }],
         draft_depth: None,
     };
@@ -243,7 +245,7 @@ fn a_source_that_cannot_be_opened_stops_the_start_naming_it() {
     let composite = Composite {
         replacements: vec![Replacement {
             source: PathBuf::from("no-such-source.edrl"),
-            objects: two_projections(&entries).into_iter().take(1).collect(),
+            objects: projections(&entries, 1),
         }],
         draft_depth: None,
     };
