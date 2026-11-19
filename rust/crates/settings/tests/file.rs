@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use euhedral_inference_settings::{
     Auto, ByteSize, CpuList, HostLayerCompute, KvFormat, ModelSettings, Settings, SettingsErrors, load_file,
+    load_for_tool,
 };
 
 const MODEL: &str = "model:\n  artifact: /m/a.edrl\n  name: q\n";
@@ -235,6 +236,14 @@ fn limits_and_formats() {
         ByteSize::mib(4)
     );
     assert_eq!(load(MODEL).unwrap().prefix_cache.copy_piece_bytes, ByteSize::mib(16));
+    assert!(problems(&format!("{MODEL}host:\n  copy-chunk-bytes: 0\n"))[0].contains("host.copy-chunk-bytes"));
+    assert_eq!(
+        load(&format!("{MODEL}host:\n  copy-chunk-bytes: 4MiB\n"))
+            .unwrap()
+            .host
+            .copy_chunk_bytes,
+        ByteSize::mib(4)
+    );
     assert!(problems(&format!("{MODEL}kernels:\n  trellis:\n    tensor-core-max-tokens: 7\n"))[0].contains("8 to"));
     assert!(problems(&format!("{MODEL}context:\n  kv-cache-format: fp8\n"))[0].contains("nvfp4, bf16 or auto"));
     assert_eq!(
@@ -339,4 +348,14 @@ fn the_dispatch_kernel_settings_default_to_auto_and_parse() {
             "{bad}"
         );
     }
+}
+
+#[test]
+fn a_tool_that_serves_no_model_loads_without_the_model_keys() {
+    assert!(
+        load("host:\n  copy-chunk-bytes: 1MiB\n").is_err(),
+        "a server needs its model"
+    );
+    let settings = load_for_tool(&[], &no_env).unwrap();
+    assert_eq!(settings.host.copy_chunk_bytes, ByteSize::mib(16));
 }

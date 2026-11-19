@@ -17,6 +17,7 @@
 //! - [`recipe`]: the storage format of each quantized object of an artifact.
 //! - [`resume`]: the file a long run overwrites in place and resumes from, and [`durable`], the durability barrier,
 //!   truncation and removal it is built on.
+//! - [`package_tokenizer`]: gives an artifact a checkpoint's tokenizer, in place or as a copy.
 
 pub mod assemble;
 pub mod checkpoint;
@@ -27,8 +28,11 @@ pub mod kld;
 pub mod mixed;
 pub mod npy;
 pub mod npz;
+pub mod package_error;
+pub mod package_tokenizer;
 pub mod recipe;
 pub mod resume;
 pub mod rows;
 pub mod step;
+pub mod tokenizer_files;
 pub mod trellis;
