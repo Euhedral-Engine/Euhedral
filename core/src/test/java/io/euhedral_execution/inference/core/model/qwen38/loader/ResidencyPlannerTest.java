@@ -261,6 +261,25 @@ class ResidencyPlannerTest {
     }
 
     @Test
+    void aHostThatIsShortOnlyOnceThePagesTakeTheirShareIsRefusedForTheHost() {
+        long free = WEIGHTS + ResidencyPlanner.RESERVE_BYTES + deviceShare(1) - 200 * MIB;
+        var roomy = spillPlan(free, Long.MAX_VALUE, 1);
+        assertTrue(roomy.fits());
+        assertTrue(roomy.kvHostBytes() > 0 && roomy.hostArenaBytes() + roomy.windowBytes() > 0);
+        assertEquals(roomy.hostArenaBytes() + roomy.windowBytes() + roomy.kvHostBytes(), roomy.hostNeededBytes());
+        assertFalse(roomy.refusedForHost(Long.MAX_VALUE));
+        // One byte short of the weights' need and the pages together, though the weights alone fit the budget.
+        long host = roomy.hostNeededBytes() - 1;
+        assertTrue(roomy.hostArenaBytes() + roomy.windowBytes() <= host);
+        var short_ = spillPlan(free, host, 1);
+        assertFalse(short_.fits());
+        assertTrue(short_.refusedForHost(host), "more host memory is what would help");
+        var exact = spillPlan(free, roomy.hostNeededBytes(), 1);
+        assertTrue(exact.fits());
+        assertFalse(exact.refusedForHost(roomy.hostNeededBytes()));
+    }
+
+    @Test
     void aHostBudgetThatCannotHoldThePagesKeepsTheCacheOnTheDevice() {
         long free = WEIGHTS + ResidencyPlanner.RESERVE_BYTES + deviceShare(1) + MIB;
         var plan = spillPlan(free, 64 * MIB, 1);

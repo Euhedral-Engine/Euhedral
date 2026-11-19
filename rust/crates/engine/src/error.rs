@@ -26,36 +26,6 @@ fn or_fewer_sequences(sequences: usize) -> &'static str {
     }
 }
 
-/// What a device refusal adds when the host is short too: the pinned bytes the plan holds there, and the budget.
-fn host_figures(host: &HostFigures) -> String {
-    if host.needed() <= host.budget {
-        return String::new();
-    }
-    format!(
-        "; the host is short too: the weights outside the GPU need {} bytes of pinned host memory (host arena and \
-         disk window) and the cache pages on the host {} bytes, against a host budget of {} bytes",
-        host.weights, host.cache_pages, host.budget
-    )
-}
-
-/// The pinned host bytes a refused plan needs, beside what the host allows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostFigures {
-    /// The host arena and the disk window of the weights that left the device.
-    pub weights: u64,
-    /// The cache pages put on the host.
-    pub cache_pages: u64,
-    /// The host budget the plan was made with.
-    pub budget: u64,
-}
-
-impl HostFigures {
-    /// All the pinned host bytes the plan needs.
-    pub fn needed(&self) -> u64 {
-        self.weights + self.cache_pages
-    }
-}
-
 /// Why a residency plan could not be made.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PlanError {
@@ -74,11 +44,10 @@ pub enum PlanError {
         "{} of {context_tokens} tokens does not fit in the {} MiB free on this GPU, even with the weights in host \
          memory (the plan needs {weights_needed} bytes of weights and {state_needed} bytes of state on the device, \
          and {available} bytes are available: {free} free, limited by memory.gpu-limit); set a smaller max \
-         context.max-tokens{}{}",
+         context.max-tokens{}",
         what_does_not_fit(*.sequences),
         available / (1 << 20),
-        or_fewer_sequences(*.sequences),
-        host_figures(host)
+        or_fewer_sequences(*.sequences)
     )]
     DeviceTooSmallWithOffload {
         /// The device bytes of the weights that stay and of the staging ring, at the offload that came closest.
@@ -89,19 +58,25 @@ pub enum PlanError {
         free: u64,
         sequences: usize,
         context_tokens: u64,
-        /// The host the plan used, for the message when the host is short too.
-        host: HostFigures,
     },
 
-    /// The weights the device cannot hold need more pinned host memory than the host budget allows.
+    /// The weights the device cannot hold and the cache pages moved to the host need more pinned host memory than the
+    /// host budget allows. `needed` counts the host arena, the disk window and the cache pages on the host, of which
+    /// `cache_pages` are the cache pages.
     #[error(
-        "the weights the GPU cannot hold need {} MiB of host memory (the token embedding, the LM head, the \
-         host-backed weights and the disk window), more than the {} MiB host budget; set memory.host-weights-limit \
-         or memory.host-limit higher, or a smaller context.max-tokens or fewer sequences (batching.max-sequences)",
+        "the weights the GPU cannot hold and the attention cache pages moved to the host need {} MiB of host memory \
+         ({} MiB of it the cache pages; the rest the token embedding, the LM head, the host-backed weights and the \
+         disk window), more than the {} MiB host budget; set memory.host-weights-limit or memory.host-limit higher, or a smaller \
+         context.max-tokens or fewer sequences (batching.max-sequences)",
         needed / (1 << 20),
+        cache_pages / (1 << 20),
         budget / (1 << 20)
     )]
-    HostTooSmall { needed: u64, budget: u64 },
+    HostTooSmall {
+        needed: u64,
+        cache_pages: u64,
+        budget: u64,
+    },
 
     /// The plan puts weights outside the device, and this build cannot run weights held in host memory or in the file.
     #[error(

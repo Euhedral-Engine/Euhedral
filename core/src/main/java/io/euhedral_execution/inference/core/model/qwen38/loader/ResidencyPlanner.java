@@ -69,6 +69,18 @@ public final class ResidencyPlanner {
         public Plan(Set<String> hostBacked, long deviceBytes, boolean fits) {
             this(hostBacked, Set.of(), deviceBytes, 0L, 0L, fits);
         }
+
+        /// The pinned host bytes the plan needs: the host arena, the disk window and the cache pages on the host.
+        public long hostNeededBytes() {
+            return hostArenaBytes + windowBytes + kvHostBytes;
+        }
+
+        /// Whether the plan is refused for want of host memory: it does not fit and the host budget `hostBudget`
+        /// holds less than the arena, the window and the cache pages together. Otherwise a refused plan is
+        /// short on the device.
+        public boolean refusedForHost(long hostBudget) {
+            return !fits && hostNeededBytes() > hostBudget;
+        }
     }
 
     /// No attention cache page leaves the device: the planners' callers outside the engine.

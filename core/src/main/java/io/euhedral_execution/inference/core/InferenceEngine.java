@@ -657,10 +657,10 @@ public final class InferenceEngine implements AutoCloseable {
                     kvDeviceMinimumTokens,
                     tuning.batching().prefillChunkTokens(),
                     gpu.trellisSettings());
-            if (!plan.fits() && plan.hostArenaBytes() + plan.windowBytes() > host)
-                throw new IOException("the weights the GPU cannot hold need "
-                        + ((plan.hostArenaBytes() + plan.windowBytes()) >> 20) + " MiB of host memory (the token "
-                        + "embedding, the LM head, the host-backed weights and the disk window), more than the "
+            if (plan.refusedForHost(host))
+                throw new IOException("the weights the GPU cannot hold and the attention cache pages moved to the host"
+                        + " need " + (plan.hostNeededBytes() >> 20) + " MiB of host memory (the token "
+                        + "embedding, the LM head, the host-backed weights, the disk window and the cache pages), more than the "
                         + (host >> 20)
                         + " MiB host budget; set memory.host-weights-limit or memory.host-limit higher, or a smaller max"
                         + " context");
