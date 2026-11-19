@@ -55,7 +55,7 @@ use crate::stages::sampling::SelectedRows;
 use crate::stages::{LaneTable, QuantumError, QuantumKind, StageLaunch, fatal};
 use crate::state::SequenceId;
 use crate::workspace::BufferSlot;
-use whole::{Launches, Site, run_cached};
+use whole::{Launches, Site, run_held};
 
 /// What a quantum that runs as a graph body carries: its key, what the run holds for the device, and how it ran.
 #[derive(Debug)]
@@ -449,7 +449,6 @@ impl Stage<Quantum> for Whole {
                 .chain(busy.flat_map(|launch| launch.waits(quantum))),
             Some(id),
         );
-        let mut hold = GraphHold::new();
         let mut launches = QuantumLaunches {
             quantum,
             launches: &self.launches,
@@ -459,12 +458,8 @@ impl Stage<Quantum> for Whole {
             lane: &**lane,
             waits: &waits,
         };
-        let made = run_cached(&site, &self.cache, capture.key, &mut launches, &mut hold);
-        // A run that did not start keeps nothing; one that failed may have queued work that reads what it kept.
-        if !matches!(made, Err(StageError::Retry)) {
-            let _ = capture.hold.set(hold);
-        }
-        let (ran, marker) = made?;
+        // The hold is stored even when the body fails or panics: queued work may still read what it kept.
+        let (ran, marker) = run_held(&site, &self.cache, capture.key, &mut launches, &capture.hold)?;
         let _ = capture.ran.set(ran);
         Ok(Submitted::marker(marker))
     }
