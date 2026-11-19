@@ -9,6 +9,7 @@ version = "0.1.0"
 [dependencies]
 crc32fast.workspace = true
 euhedral-core.workspace = true
+euhedral-data-structures.workspace = true
 euhedral-gpu = { workspace = true, features = ["cuda"] }
 euhedral-graph.workspace = true
 euhedral-hashing.workspace = true
@@ -21,9 +22,7 @@ serde_json = { workspace = true }
 thiserror.workspace = true
 
 [dev-dependencies]
-euhedral-data-structures.workspace = true
 euhedral-gpu = { workspace = true, features = ["fake"] }
-euhedral-graph.workspace = true
 tempfile.workspace = true
 test-support = { path = "../test-support" }
 
