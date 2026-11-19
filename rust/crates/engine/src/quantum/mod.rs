@@ -60,7 +60,7 @@ use crate::stages::{LaneTable, QuantumError, QuantumKind, StageLaunch, fatal};
 use crate::state::SequenceId;
 use crate::workspace::BufferSlot;
 #[cfg(feature = "test-oracles")]
-use body_fault::{BodyFault, BodyFaults, HoldEvent, Planned, Sighting};
+use body_fault::{BodyFault, BodyFaults, Defect, HoldEvent, Planned, RunSnapshot, Sighting};
 use whole::{Launches, Site, run_held};
 
 /// What a quantum that runs as a graph body carries: its key, what the run holds for the device, and how it ran.
@@ -504,15 +504,18 @@ impl Stage<Quantum> for Whole {
         #[cfg(feature = "test-oracles")]
         let met = self.faults.meet(capture.key, self.cache.contains(&capture.key));
         #[cfg(feature = "test-oracles")]
-        let in_body = met
-            .planned
-            .clone()
-            .filter(|planned| planned.sighting != Sighting::Replay);
+        let newly_seen = met.newly_seen;
+        #[cfg(feature = "test-oracles")]
+        let mut planned = met.planned;
+        #[cfg(feature = "test-oracles")]
+        let aimed = planned.as_ref().map(|planned| (planned.fault, planned.sighting));
+        #[cfg(feature = "test-oracles")]
+        let before = aimed.map(|_| self.cache.stats());
         let mut launches = QuantumLaunches {
             quantum,
             launches: &self.launches,
             #[cfg(feature = "test-oracles")]
-            fault: in_body,
+            fault: planned.clone().filter(|planned| planned.sighting != Sighting::Replay),
         };
         let site = Site {
             gpu: &*self.gpu,
@@ -527,28 +530,43 @@ impl Stage<Quantum> for Whole {
             let made = catch_unwind(AssertUnwindSafe(|| {
                 run_held(&site, &self.cache, capture.key, &mut launches, &capture.hold)
             }));
+            let unfired = launches.fault.is_some();
+            // The test's value is held by the hold alone when the hook logs: nothing of the hook's keeps it.
+            drop(launches);
+            drop(planned.take());
             let mut replay_fault = None;
             if capture.hold.get().is_none() {
                 // Nothing ran (a busy lane): the cache did not see the key, and the fault stays armed.
-                if met.newly_seen {
+                if newly_seen {
                     self.faults.unsee(capture.key);
                 }
-                if let Some(planned) = &met.planned {
-                    self.faults.rearm(planned);
+                if let Some((fault, sighting)) = aimed {
+                    self.faults.rearm(fault, sighting);
                 }
-            } else if let Some(planned) = &met.planned {
+            } else if let Some((fault, sighting)) = aimed {
                 match &made {
                     // A replay that ran: the fault follows it, after its work was queued.
-                    Ok(Ok((Ran::Replayed, _))) if planned.sighting == Sighting::Replay => {
-                        replay_fault = Some(planned.fault);
+                    Ok(Ok((Ran::Replayed, _))) if sighting == Sighting::Replay => {
+                        replay_fault = Some(fault);
                     }
                     // Another run than the one the fault is for (no free instance: a direct run): put it back.
-                    Ok(_) if planned.sighting == Sighting::Replay => self.faults.rearm(planned),
+                    Ok(_) if sighting == Sighting::Replay => self.faults.rearm(fault, sighting),
                     // Only a body that ran is followed: the log is of this quantum's hold.
                     _ => {}
                 }
-                if planned.sighting != Sighting::Replay || replay_fault.is_some() {
+                if unfired {
+                    self.faults.defect(Defect::FaultUnfired);
+                }
+                if sighting != Sighting::Replay || replay_fault.is_some() {
                     let _ = capture.probe.set(Arc::clone(&self.faults));
+                    if let Some(before) = before {
+                        self.faults.snapshot(RunSnapshot {
+                            before,
+                            after: self.cache.stats(),
+                            graphs: self.cache.len(),
+                            contained: self.cache.contains(&capture.key),
+                        });
+                    }
                     self.faults.log(HoldEvent::Stored);
                 }
             }

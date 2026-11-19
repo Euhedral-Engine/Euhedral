@@ -164,23 +164,29 @@ fn graphs(runtime: &EngineRuntime) -> (GraphStats, usize) {
 struct Case {
     fault: BodyFault,
     sighting: Sighting,
-    /// Whether the body keeps a test-owned buffer in the hold of its run. A direct run's hold carries it to the quantum's
-    /// drop; a recording that failed made no graph, so its buffer goes with the recording; a replay runs no body.
+    /// Whether the body keeps a test-owned buffer in the hold of its run. The hold carries it to the quantum's drop,
+    /// from a direct run and from a recording that failed (RustEE hands the kept values to the hold on an error and
+    /// on a panic); a replay runs no body, so it keeps none.
     keeps: bool,
 }
 
 /// Arms `case`, runs a generation that fails, and checks the hold, the pages, the cache and the next request.
 ///
+/// What "fails on the old code" means here: the two panics in the body (first sighting and recording pass) fail on the
+/// code that dropped the hold at the unwind, before it was stored in the quantum; every test fails on a release of the
+/// hold ahead of the quantum's retirement; the replay tests fail on a replay failure that drops the cache entry.
+///
 /// Mutants of the release order each of these assertions fails on:
-/// - the hold is dropped at the unwind of a refusal or a panic, before it is stored in the quantum: the count of the
-///   kept buffer at the first event is 1 (a first sighting), or the first event is not `Stored` (the others);
+/// - the hold is dropped at the unwind of a panic in the body, before it is stored in the quantum: the count of the
+///   kept buffer at `Stored` is 1 (first sighting and recording pass), or the quantum has no `Stored` event;
 /// - the quantum is dropped, with its hold, before it retired: `Released` comes before `Retired`, and for a direct run
 ///   the count at `Retired` is 1;
 /// - the hold is released when the quantum's request ends, ahead of the quantum's retirement: the same two;
 /// - the quantum is never dropped (its hold never released): fewer than three events, and the buffer's count never
 ///   returns to 1;
 /// - the failed quantum is not retired, so its pages stay: the next request does not get them back, or hangs;
-/// - a failed replay drops the recording of its key: the graph count falls to 0 and the next request records again.
+/// - a failed replay drops the recording of its key: the cache no longer holds it right after the run, or the next
+///   request records it again (the records counter rises after the run).
 fn fails_and_recovers(case: Case) {
     let Case { fault, sighting, keeps } = case;
     let Some(machine) = machine() else { return };
@@ -206,7 +212,7 @@ fn fails_and_recovers(case: Case) {
         "{fault:?} at {sighting:?}: the hold of the failed quantum"
     );
     let held = runtime.body_held_counts_for_tests().remove(0);
-    if keeps && sighting == Sighting::First {
+    if keeps {
         // The hold is not empty: the buffer of the test is alive in it at every event, until the quantum dropped.
         assert!(
             held.iter().all(|count| *count > 1),
@@ -225,6 +231,15 @@ fn fails_and_recovers(case: Case) {
             "{fault:?} at {sighting:?}: the buffer is freed with the quantum's hold"
         );
     }
+    assert_eq!(
+        runtime.hook_defects_for_tests().remove(0),
+        [],
+        "{fault:?} at {sighting:?}: the hook did what the test says"
+    );
+    let run = runtime
+        .run_snapshots_for_tests()
+        .remove(0)
+        .expect("the faulted quantum's run was followed");
     let pages = assert_free(&runtime);
     assert!(
         pages > 0,
@@ -233,20 +248,31 @@ fn fails_and_recovers(case: Case) {
     let failed_graphs = graphs(&runtime);
     match sighting {
         Sighting::Recording => {
-            // The failed recording made no graph and marked nothing unrecordable: the key stays at its second
-            // sighting, so a quantum that follows records it (a graph exists only if one did).
+            // The failed recording made no graph and marked nothing: across that one run no record, no failed record and
+            // no unrecordable key were counted, and the cache did not hold the key after it.
             assert_eq!(
-                (failed_graphs.0.unrecordable_keys, failed_graphs.1 as u64),
-                (0, failed_graphs.0.records),
-                "{fault:?} at {sighting:?}: the failed recording left no graph and no mark, {:?}",
-                failed_graphs.0
+                (run.after.records, run.after.failed_records, run.after.unrecordable_keys),
+                (
+                    run.before.records,
+                    run.before.failed_records,
+                    run.before.unrecordable_keys
+                ),
+                "{fault:?} at {sighting:?}: the failed recording counted nothing, {run:?}"
+            );
+            assert!(
+                !run.contained,
+                "{fault:?} at {sighting:?}: the cache holds nothing of the failed recording, {run:?}"
             );
         }
         Sighting::Replay => {
             // The failure came after the replay queued its work, so the cache gave the instance back: its recording stays.
             assert!(
-                failed_graphs.1 >= 1,
-                "{fault:?} at {sighting:?}: the graph the failed replay ran is still cached"
+                run.contained && run.graphs >= 1,
+                "{fault:?} at {sighting:?}: the graph the failed replay ran is still cached right after, {run:?}"
+            );
+            assert_eq!(
+                failed_graphs.0.records, run.after.records,
+                "{fault:?} at {sighting:?}: nothing recorded the key again after the failed replay"
             );
             assert!(
                 failed_graphs.0.replays >= 1,
@@ -273,7 +299,7 @@ fn fails_and_recovers(case: Case) {
         Sighting::Replay => {
             // The cache serves the next request from the recording it kept: it recorded nothing again and replayed more.
             assert_eq!(
-                served.0.records, failed_graphs.0.records,
+                served.0.records, run.after.records,
                 "{fault:?} at {sighting:?}: the cached graph served the next request, nothing was recorded again"
             );
             assert!(

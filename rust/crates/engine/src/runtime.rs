@@ -38,7 +38,7 @@ use crate::pass_assembler::PassStatistics;
 use crate::plan::Plan;
 use crate::prefix::PrefixCacheStats;
 #[cfg(feature = "test-oracles")]
-use crate::quantum::body_fault::{BodyFault, HoldEvent, Sighting};
+use crate::quantum::body_fault::{BodyFault, Defect, HoldEvent, RunSnapshot, Sighting};
 use crate::residency::accounting::{Consumer, MemoryAccount, PlanReservation};
 use crate::residency::planner::{LocationBytes, PlanInputs, ResidencyPlan, pass_rows_limit, sequences_for};
 use crate::stages::LaneTable;
@@ -892,13 +892,6 @@ impl EngineRuntime {
         self.generations.quantum_admitted(Arc::new(hook));
     }
 
-    /// A test hook: the next graph body of the first sequence that runs for a key the cache has not seen ends as `fault` after its first launch
-    /// that has work. At most one body is affected.
-    #[cfg(feature = "test-oracles")]
-    pub fn fail_next_body_for_tests(&self, fault: BodyFault) {
-        self.generations.fail_body(fault, Sighting::First, None);
-    }
-
     /// A test hook: the next quantum of the first sequence whose key is at `sighting` ends as `fault`, after its work
     /// was queued: a first sighting (a direct run) and a second (the recording pass) in the middle of the body, a later
     /// one (a replay) after the replay was queued. A body keeps `token` alive in its run's hold; a replay runs none.
@@ -913,6 +906,18 @@ impl EngineRuntime {
     #[cfg(feature = "test-oracles")]
     pub fn body_held_counts_for_tests(&self) -> Vec<Vec<usize>> {
         self.generations.body_held_counts()
+    }
+
+    /// A test hook: the graph cache around the run of the quantum a fault was applied to, by sequence.
+    #[cfg(feature = "test-oracles")]
+    pub fn run_snapshots_for_tests(&self) -> Vec<Option<RunSnapshot>> {
+        self.generations.run_snapshots()
+    }
+
+    /// A test hook: faults of the hook itself (see [`Defect`]), by sequence. A test expects none.
+    #[cfg(feature = "test-oracles")]
+    pub fn hook_defects_for_tests(&self) -> Vec<Vec<Defect>> {
+        self.generations.hook_defects()
     }
 
     /// A test hook: what each sequence's graph cache counted, and how many graphs it holds.

@@ -43,7 +43,7 @@ use crate::prefix::{
     CacheSpec, Copier, POSITION_GRANULE, PrefixCacheHandle, PrefixCacheStats, open_prefix_cache_claimed,
 };
 #[cfg(feature = "test-oracles")]
-use crate::quantum::body_fault::{BodyFault, HoldEvent, Sighting};
+use crate::quantum::body_fault::{BodyFault, Defect, HoldEvent, RunSnapshot, Sighting};
 use crate::quantum::{Executor, Preparer};
 use crate::residency::offload::StagingGeometry;
 use crate::residency::planner::ResidencyPlan;
@@ -761,6 +761,24 @@ impl Generations {
         self.generations
             .iter()
             .map(|generation| generation.shared.executor.body_faults().held_counts())
+            .collect()
+    }
+
+    /// The test hook: the graph cache around the faulted quantum's run, by sequence.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn run_snapshots(&self) -> Vec<Option<RunSnapshot>> {
+        self.generations
+            .iter()
+            .map(|generation| generation.shared.executor.body_faults().run_snapshot())
+            .collect()
+    }
+
+    /// The test hook: faults of the hook itself, by sequence.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn hook_defects(&self) -> Vec<Vec<Defect>> {
+        self.generations
+            .iter()
+            .map(|generation| generation.shared.executor.body_faults().defects())
             .collect()
     }
 

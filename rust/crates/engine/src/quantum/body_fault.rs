@@ -3,6 +3,8 @@
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
+use euhedral_gpu::GraphStats;
+
 /// How the armed body ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyFault {
@@ -22,6 +24,27 @@ pub enum Sighting {
     /// A later one, with a recording in the cache: the quantum is a replay, which runs no body. The fault applies after
     /// the replay queued its work.
     Replay,
+}
+
+/// A fault of the hook itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Defect {
+    /// More keys than the hook can tell apart: later keys read as first sightings.
+    KeyTableFull = 1,
+    /// A body that ran ended without the armed fault firing (a recording that did not happen, a probe pass that
+    /// was not the one the hook skipped).
+    FaultUnfired = 2,
+}
+
+/// The graph cache just before and just after the run of the faulted quantum.
+#[derive(Clone, Debug)]
+pub struct RunSnapshot {
+    pub before: GraphStats,
+    pub after: GraphStats,
+    /// Graphs the cache held after the run.
+    pub graphs: usize,
+    /// Whether the cache held a recording of the quantum's key after the run.
+    pub contained: bool,
 }
 
 /// What the armed fault is applied to, taken for one quantum.
@@ -68,14 +91,11 @@ pub struct BodyFaults {
     token: OnceLock<Weak<()>>,
     /// The keys the hook has seen run, by a nonzero hash of each (0 is an empty place).
     seen: [AtomicU64; 32],
+    defects: AtomicU8,
+    run: OnceLock<RunSnapshot>,
 }
 
 impl BodyFaults {
-    /// The next graph body that runs for a key the cache has not seen ends as `fault`.
-    pub fn arm(&self, fault: BodyFault) {
-        self.arm_at(fault, Sighting::First, None);
-    }
-
     /// The next quantum whose key is at `sighting` ends as `fault`. A body that runs keeps `token` alive in its hold
     /// (the count of its strong handles at each event is logged); a replay runs no body, so it keeps none.
     pub fn arm_at(&self, fault: BodyFault, sighting: Sighting, token: Option<&Arc<()>>) {
@@ -87,9 +107,33 @@ impl BodyFaults {
     }
 
     /// Puts the fault back after a quantum that nothing ran for.
-    pub(crate) fn rearm(&self, planned: &Planned) {
-        self.sighting.store(planned.sighting as u8, Ordering::Release);
-        self.armed.store(planned.fault as u8 + 1, Ordering::Release);
+    pub(crate) fn rearm(&self, fault: BodyFault, sighting: Sighting) {
+        self.sighting.store(sighting as u8, Ordering::Release);
+        self.armed.store(fault as u8 + 1, Ordering::Release);
+    }
+
+    /// Notes a fault of the hook itself, which a test reads with [`defects`](Self::defects).
+    pub(crate) fn defect(&self, defect: Defect) {
+        self.defects.fetch_or(defect as u8, Ordering::AcqRel);
+    }
+
+    /// What went wrong in the hook itself: a test that sees any is not testing what it says.
+    pub fn defects(&self) -> Vec<Defect> {
+        let bits = self.defects.load(Ordering::Acquire);
+        [Defect::KeyTableFull, Defect::FaultUnfired]
+            .into_iter()
+            .filter(|defect| bits & *defect as u8 != 0)
+            .collect()
+    }
+
+    /// Records the graph cache around the faulted quantum's run.
+    pub(crate) fn snapshot(&self, snapshot: RunSnapshot) {
+        let _ = self.run.set(snapshot);
+    }
+
+    /// The graph cache around the run of the faulted quantum, once it ran.
+    pub fn run_snapshot(&self) -> Option<RunSnapshot> {
+        self.run.get().cloned()
     }
 
     /// The quantum with `key` asks the hook what sighting it is (`contained`: the cache holds a recording of it) and
@@ -100,13 +144,14 @@ impl BodyFaults {
         let sighting = if contained {
             Sighting::Replay
         } else if newly_seen {
-            for place in &self.seen {
-                if place
+            let placed = self.seen.iter().any(|place| {
+                place
                     .compare_exchange(0, mark, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
-                {
-                    break;
-                }
+            });
+            if !placed {
+                // Every later key would read as a first sighting.
+                self.defect(Defect::KeyTableFull);
             }
             Sighting::First
         } else {
