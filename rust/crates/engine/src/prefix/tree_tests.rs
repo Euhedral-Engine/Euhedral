@@ -471,3 +471,15 @@ fn dropping_the_tree_returns_every_slot() {
     drop(tree);
     assert_eq!(arena.leased(), 0);
 }
+
+#[test]
+fn a_node_keeps_the_token_that_follows_its_position() {
+    let mut tree = tree(64);
+    let stored = tokens(0, 4096);
+    let root = tree.root();
+    let a = add(&mut tree, root, &stored, 2048);
+    assert_eq!(tree.node(a).paired(), Some(stored[2048]));
+    // A prompt that ends at the node's position has no token to pair.
+    let b = add(&mut tree, a, &stored, 4096);
+    assert_eq!(tree.node(b).paired(), None);
+}

@@ -107,6 +107,7 @@ pub enum OpenError {
 pub struct Hit {
     matched: Option<Match>,
     position: u32,
+    paired: Option<u32>,
     leaf: NodeId,
     address: Arc<Address<PrefixCache>>,
 }
@@ -115,6 +116,12 @@ impl Hit {
     /// The tokens the hit restores: the prompt resumes from here.
     pub fn position(&self) -> u32 {
         self.position
+    }
+
+    /// The token the deepest node's last draft row was paired with: the stored prompt's token at the hit's position.
+    /// A prompt with the same token there restores the row whole.
+    pub fn paired(&self) -> Option<u32> {
+        self.paired
     }
 
     /// The deepest matched node: the parent of the next capture.
@@ -323,11 +330,13 @@ impl PrefixCache {
         let matched = self.tree.lookup(prompt, kind)?;
         let leaf = matched.leaf();
         let position = self.tree.get(leaf).map_or(0, |node| node.position());
+        let paired = self.tree.get(leaf).and_then(|node| node.paired());
         count(&self.shared.hits, 1);
         count(&self.shared.restored_tokens, u64::from(position));
         Some(Hit {
             matched: Some(matched),
             position,
+            paired,
             leaf,
             address: Arc::clone(&self.address),
         })

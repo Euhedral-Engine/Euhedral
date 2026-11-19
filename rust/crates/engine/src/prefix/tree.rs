@@ -49,6 +49,9 @@ pub struct PrefixNode {
     start: u32,
     position: u32,
     tokens: Vec<u32>,
+    /// The token at `position` of the prompt that stored the node, when it had one: the token the speculative state's
+    /// last row was paired with.
+    paired: Option<u32>,
     speculation: Option<Speculation>,
     slots: Vec<SlotLease>,
     children: Vec<NodeId>,
@@ -73,6 +76,12 @@ impl PrefixNode {
     /// The tokens at positions `[start, position)`.
     pub fn tokens(&self) -> &[u32] {
         &self.tokens
+    }
+
+    /// The token the node's last speculative row was paired with: the prompt's token at `position` when the node was
+    /// stored. A restore into a prompt with the same token there can use that row as it is.
+    pub fn paired(&self) -> Option<u32> {
+        self.paired
     }
 
     /// The kind of speculative state the node holds beside the base state. It is usable only with an unbroken chain of
@@ -139,6 +148,7 @@ impl PrefixTree {
             start: 0,
             position: 0,
             tokens: Vec::new(),
+            paired: None,
             speculation: None,
             slots: Vec::new(),
             children: Vec::new(),
@@ -322,6 +332,7 @@ impl PrefixTree {
             start,
             position,
             tokens: tokens[start as usize..position as usize].to_vec(),
+            paired: tokens.get(position as usize).copied(),
             speculation,
             slots: leased,
             children: Vec::new(),

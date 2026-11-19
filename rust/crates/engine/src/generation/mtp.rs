@@ -168,8 +168,15 @@ impl Speculating {
 
     /// The prompt resumes from a checkpoint at `position`, whose draft cache holds the rows below `position - 1` and
     /// whose seed row holds the base hidden row of `position - 1`. The row `position - 1` pairs that hidden row with the
-    /// token at `position`, which the checkpoint does not know: it is re-paired first, in a catch-up of one row.
-    pub(super) fn resumed_at(&mut self, position: u32) {
+    /// token at `position`. When the checkpoint paired it with the prompt's token (`whole`) the cache holds that row
+    /// too and the chunks go on from `position`; otherwise it is re-paired first, in a catch-up of one row.
+    pub(super) fn resumed_at(&mut self, position: u32, whole: bool) {
+        if whole {
+            self.mtp_position = u64::from(position);
+            self.prompt_catch_up = None;
+            self.resuming = false;
+            return;
+        }
         self.mtp_position = u64::from(position) - 1;
         self.prompt_catch_up = Some(1);
         self.resuming = true;
