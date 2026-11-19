@@ -15,7 +15,6 @@ use crate::tokenizer_section::{FOOTER_BYTES, MAGIC, MAX_BODY_BYTES, TOKENIZER_EN
 /// cache.
 pub const PAYLOAD_ALIGNMENT: u64 = 4096;
 
-
 /// One object to place: everything the table stores about it except where it goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectSpec {

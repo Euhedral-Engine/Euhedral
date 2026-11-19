@@ -6,8 +6,8 @@
 //! (multiplier 0x5DEECE66D, addend 0xB), so the same seed gives the same artifact on every platform.
 
 use crate::error::EdrlError;
-use crate::header::HEADER_BYTES;
 use crate::format::{TensorDataType, WeightFormat, WeightLayout, direct_size, grouped_size};
+use crate::header::HEADER_BYTES;
 use crate::metadata::ModelMetadata;
 use crate::writer::{ArtifactPlan, ObjectSpec, TokenizerTexts, encode_metadata, encode_tokenizer_section};
 
