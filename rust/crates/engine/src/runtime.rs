@@ -37,6 +37,8 @@ use crate::model::{ArtifactProfile, ModelConfig, Speculation, Weights};
 use crate::pass_assembler::PassStatistics;
 use crate::plan::Plan;
 use crate::prefix::PrefixCacheStats;
+#[cfg(feature = "test-oracles")]
+use crate::quantum::body_fault::{BodyFault, HoldEvent};
 use crate::residency::accounting::{MemoryAccount, PlanReservation};
 use crate::residency::planner::{LocationBytes, PlanInputs, ResidencyPlan, pass_rows_limit, sequences_for};
 use crate::stages::LaneTable;
@@ -783,6 +785,19 @@ impl EngineRuntime {
     #[cfg(feature = "test-oracles")]
     pub fn on_quantum_admitted_for_tests(&self, hook: impl Fn(u64) + Send + Sync + 'static) {
         self.generations.quantum_admitted(Arc::new(hook));
+    }
+
+    /// A test hook: the next graph body of the first sequence that runs for a key the cache has not seen ends as `fault` after its first launch
+    /// that has work. At most one body is affected.
+    #[cfg(feature = "test-oracles")]
+    pub fn fail_next_body_for_tests(&self, fault: BodyFault) {
+        self.generations.fail_body(fault);
+    }
+
+    /// A test hook: the events of the hold of the quantum a fault was applied to, one list for each sequence.
+    #[cfg(feature = "test-oracles")]
+    pub fn body_events_for_tests(&self) -> Vec<Vec<HoldEvent>> {
+        self.generations.body_events()
     }
 
     /// A test hook: the engine records no graphs from now on, so every quantum runs stage by stage. `false` while a
