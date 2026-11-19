@@ -59,9 +59,9 @@ native-package:
   rules:
     - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $INTEGRATION_BRANCH
       changes:
-        paths: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", ".gitlab-ci.yml"]
+        paths: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", "rust/**/*", ".gitlab-ci.yml"]
         compare_to: refs/heads/main
-    - changes: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", ".gitlab-ci.yml"]
+    - changes: ["api/**/*", "core/**/*", "benchmark/**/*", "gradle/**/*", "settings.gradle.kts", "gradle.properties", "native/**/*", "native.gradle.kts", "build.gradle.kts", "mise.toml", "rust/**/*", ".gitlab-ci.yml"]
   variables:
     ZIG_GLOBAL_CACHE_DIR: $CI_PROJECT_DIR/native/.zig-global-cache
   script:

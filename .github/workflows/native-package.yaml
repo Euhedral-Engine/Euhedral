@@ -15,6 +15,7 @@ on:
       - "build.gradle.kts"
       - "api/build.gradle.kts"
       - "mise.toml"
+      - "rust/**"
       - ".github/workflows/native-package.yaml"
   pull_request:
     paths:
@@ -29,6 +30,7 @@ on:
       - "build.gradle.kts"
       - "api/build.gradle.kts"
       - "mise.toml"
+      - "rust/**"
       - ".github/workflows/native-package.yaml"
   workflow_dispatch:
 
@@ -72,17 +74,6 @@ jobs:
           python-version: "3.12"
       - name: Build both CUDA products and package Spring Boot
         run: mise exec -- gradle nativeVerify :api:bootJar build
-      - name: Bundle the Rust server (linux-x64)
-        if: runner.os == 'Linux'
-        working-directory: rust
-        run: mise exec -- cargo xtask bundle --product linux-x64
-      - uses: actions/upload-artifact@v7.0.1
-        if: runner.os == 'Linux'
-        with:
-          name: rust-server-linux-x64
-          if-no-files-found: error
-          retention-days: 2
-          path: build/bundle/euhedral-server-linux-x64.tar.gz
       - uses: actions/upload-artifact@v7.0.1
         if: failure()
         with:
@@ -99,3 +90,14 @@ jobs:
           if-no-files-found: error
           retention-days: 2
           path: api/build/libs/euhedral-inference-*.jar
+      - name: Bundle the Rust server (linux-x64)
+        if: runner.os == 'Linux'
+        working-directory: rust
+        run: mise exec -- cargo xtask bundle --product linux-x64
+      - uses: actions/upload-artifact@v7.0.1
+        if: runner.os == 'Linux'
+        with:
+          name: rust-server-linux-x64
+          if-no-files-found: error
+          retention-days: 2
+          path: build/bundle/euhedral-server-linux-x64.tar.gz

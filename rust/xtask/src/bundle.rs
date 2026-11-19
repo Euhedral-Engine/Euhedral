@@ -9,7 +9,7 @@ use std::env;
 use std::fs;
 use std::io::Error;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
@@ -17,6 +17,9 @@ use std::os::unix::fs::symlink;
 use crate::repository_root;
 
 /// The native product trees that go into a bundle, relative to the product directory.
+/// The manifest of the installed sources, at the root of the native product.
+const MANIFEST: &str = "files.sha256";
+
 const TREES: [&str; 3] = ["lib", "share/euhedral_cuda", "cuda/include"];
 
 /// A platform a bundle exists for.
@@ -49,8 +52,25 @@ impl Product {
         }
     }
 
+    /// Whether this process runs on the product's operating system and architecture.
     fn is_host(self) -> bool {
-        cfg!(windows) == (self == Self::WindowsX64)
+        cfg!(target_arch = "x86_64") && cfg!(windows) == (self == Self::WindowsX64)
+    }
+
+    /// Fails unless this process runs on the product's platform: the server is built here, not cross-built.
+    fn require_host(self) -> Result<(), String> {
+        if self.is_host() {
+            Ok(())
+        } else {
+            Err(format!("the {} bundle is built on its own platform", self.id()))
+        }
+    }
+
+    fn library(self) -> &'static str {
+        match self {
+            Self::LinuxX64 => "lib/libeuhedral_cuda.so",
+            Self::WindowsX64 => "lib/euhedral_cuda.dll",
+        }
     }
 }
 
@@ -68,40 +88,72 @@ pub fn run(arguments: &[&str]) -> Result<(), String> {
         }
     }
     let product = product.ok_or("--product <linux-x64|windows-x64> is required")?;
-    if !product.is_host() {
-        return Err(format!("the {} bundle is built on its own platform", product.id()));
-    }
+    product.require_host()?;
     let root = repository_root();
     let native = native.unwrap_or_else(|| root.join("build/native").join(product.id()));
     let out = out.unwrap_or_else(|| root.join("build/bundle"));
-    let executable = build_server(&root, product)?;
+    let executable = build_server(&root)?;
     let directory = out.join(format!("euhedral-server-{}", product.id()));
-    assemble(&directory, &executable, &native, product.executable())?;
+    assemble(&directory, &executable, &native, product)?;
     let archive = archive(&directory, product)?;
     println!("bundle {}", directory.display());
     println!("archive {}", archive.display());
     Ok(())
 }
 
-/// Builds the server in release; returns the executable.
-fn build_server(root: &Path, product: Product) -> Result<PathBuf, String> {
-    let status = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+/// Builds the server in release; returns the executable the compiler reports.
+fn build_server(root: &Path) -> Result<PathBuf, String> {
+    let output = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .current_dir(root.join("rust"))
-        .args(["build", "--release", "--bin", "euhedral-server"])
-        .status()
+        .args([
+            "build",
+            "--release",
+            "--bin",
+            "euhedral-server",
+            "--message-format=json-render-diagnostics",
+        ])
+        .stderr(Stdio::inherit())
+        .output()
         .map_err(|error| format!("cannot run cargo: {error}"))?;
-    if !status.success() {
-        return Err(format!("building the server failed: {status}"));
+    if !output.status.success() {
+        return Err(format!("building the server failed: {}", output.status));
     }
-    let target = env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("rust/target"), PathBuf::from);
-    Ok(target.join("release").join(product.executable()))
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains(r#""reason":"compiler-artifact""#) && line.contains(r#""name":"euhedral-server""#))
+        .filter_map(executable_of)
+        .next_back()
+        .ok_or_else(|| "cargo did not report the server executable".to_string())
+}
+
+/// The `executable` field of a cargo JSON message line, unescaped.
+fn executable_of(line: &str) -> Option<PathBuf> {
+    let key = r#""executable":""#;
+    let rest = &line[line.find(key)? + key.len()..];
+    let mut path = String::new();
+    let mut characters = rest.chars();
+    loop {
+        match characters.next()? {
+            '"' => return Some(PathBuf::from(path)),
+            '\\' => path.push(characters.next()?),
+            other => path.push(other),
+        }
+    }
 }
 
 /// Writes `directory` from the server `executable` and the native product at `native`. An existing `directory` is
 /// replaced.
-fn assemble(directory: &Path, executable: &Path, native: &Path, name: &str) -> Result<(), String> {
+fn assemble(directory: &Path, executable: &Path, native: &Path, product: Product) -> Result<(), String> {
     if !executable.is_file() {
         return Err(format!("the server is not at {}", executable.display()));
+    }
+    for file in [product.library(), MANIFEST] {
+        if !native.join(file).is_file() {
+            return Err(format!(
+                "{} is missing {file}: build the native product first (`gradle nativeVerify`)",
+                native.display()
+            ));
+        }
     }
     for tree in TREES {
         if !native.join(tree).is_dir() {
@@ -116,10 +168,13 @@ fn assemble(directory: &Path, executable: &Path, native: &Path, name: &str) -> R
     }
     let bin = directory.join("bin");
     fs::create_dir_all(&bin).map_err(|error| io_error("create", &bin, &error))?;
-    fs::copy(executable, bin.join(name)).map_err(|error| io_error("copy", executable, &error))?;
+    fs::copy(executable, bin.join(product.executable())).map_err(|error| io_error("copy", executable, &error))?;
     for tree in TREES {
         copy_tree(&native.join(tree), &directory.join(tree))?;
     }
+    // The kernel sources' manifest, which the library reads from the root of the installed tree.
+    fs::copy(native.join(MANIFEST), directory.join(MANIFEST))
+        .map_err(|error| io_error("copy", &native.join(MANIFEST), &error))?;
     Ok(())
 }
 
@@ -209,6 +264,7 @@ mod tests {
             ("lib/libnvrtc-builtins.so.13.1", "nvrtc"),
             ("share/euhedral_cuda/kernel.cu", "kernel"),
             ("cuda/include/cuda.h", "header"),
+            ("files.sha256", "digests"),
         ] {
             let path = native.join(file);
             fs::create_dir_all(path.parent().expect("parent")).expect("dir");
@@ -224,13 +280,14 @@ mod tests {
         let server = root.join("server");
         fs::write(&server, "binary").expect("server");
         let bundle = root.join("out/bundle");
-        assemble(&bundle, &server, &native, "euhedral-server").expect("assemble");
+        assemble(&bundle, &server, &native, Product::LinuxX64).expect("assemble");
         for file in [
             "bin/euhedral-server",
             "lib/libeuhedral_cuda.so",
             "lib/libnvrtc-builtins.so.13.1",
             "share/euhedral_cuda/kernel.cu",
             "cuda/include/cuda.h",
+            "files.sha256",
         ] {
             assert!(bundle.join(file).is_file(), "{file}");
         }
@@ -244,9 +301,25 @@ mod tests {
         fs::remove_dir_all(native.join("cuda")).expect("remove");
         let server = root.join("server");
         fs::write(&server, "binary").expect("server");
-        let error = assemble(&root.join("bundle"), &server, &native, "euhedral-server").expect_err("refused");
+        let error = assemble(&root.join("bundle"), &server, &native, Product::LinuxX64).expect_err("refused");
         assert!(error.contains("cuda/include"), "{error}");
         drop(fs::remove_dir_all(root));
+    }
+
+    #[test]
+    fn the_other_platforms_product_is_refused() {
+        let other = if cfg!(windows) {
+            Product::LinuxX64
+        } else {
+            Product::WindowsX64
+        };
+        assert!(other.require_host().is_err());
+    }
+
+    #[test]
+    fn the_executable_is_read_from_the_compiler_message() {
+        let line = r#"{"reason":"compiler-artifact","target":{"name":"euhedral-server"},"executable":"C:\\t\"x\"/s"}"#;
+        assert_eq!(executable_of(line), Some(PathBuf::from(r#"C:\t"x"/s"#)));
     }
 
     #[test]

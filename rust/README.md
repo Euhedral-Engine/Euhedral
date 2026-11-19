@@ -87,6 +87,7 @@ bin/euhedral-server
 lib/                  the CUDA library, CUDA runtime, NVRTC and llguidance
 share/euhedral_cuda/  the kernel sources
 cuda/include/         the CUDA headers
+files.sha256          the manifest of the kernel sources
 ```
 
 Unpack it anywhere and run `bin/euhedral-server --config <file>`: with no `host.native-cache` set, the server finds
