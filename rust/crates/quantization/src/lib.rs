@@ -6,6 +6,13 @@
 //! - [`npy`] and [`npz`]: the NumPy array and archive formats the calibration state and the fixtures use. Both work
 //!   on bytes the caller supplies or takes; neither opens a file.
 
+//! - [`package_tokenizer`]: gives an artifact a checkpoint's tokenizer, in place or as a copy.
+//! - [`blocking_file`]: the file operations `AsyncIo` lacks, run as host-lake frames.
+
+pub mod blocking_file;
 pub mod java_random;
 pub mod npy;
 pub mod npz;
+pub mod package_error;
+pub mod package_tokenizer;
+pub mod tokenizer_files;
