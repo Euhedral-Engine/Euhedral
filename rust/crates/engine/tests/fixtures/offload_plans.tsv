@@ -1,7 +1,7 @@
 # Java offload plans for the RCO artifact's tensor table; see the header lines below.
 # command: OFFLOAD_GOLDEN_TABLE=<rco_table.tsv> OFFLOAD_GOLDEN_OUT=<this file> OFFLOAD_GOLDEN_COMMIT=<hash> mise exec -- gradle :core:test --tests '*OffloadGoldenDump*'
 # kv_device_min_tokens is an input column: 65536 (the default) on the first grid, 8192 on the KV-spill rows (32768 context, 1 and 2 sequences); then large deficits (8, 10, 12 GiB + 5 MiB) for the device refusal, then host budgets around the weights-plus-cache-pages need
-# commit: c3fee2208a0d with the refusal-kind change in ResidencyPlanner.Plan and InferenceEngine (the previous file, offload_plans.v1.tsv, was made at 86f5401bad45)
+# commit: c3fee2207d4a with the refusal-kind change in ResidencyPlanner.Plan and InferenceEngine (the previous file, offload_plans.v1.tsv, was made at 86f5401bad45)
 # table: rust/crates/engine/tests/fixtures/rco_table.tsv (1745 tensors of qwen3_8_27b_nvfp4_trellis_rco.edrl, names, shapes and formats, no payload); profile TRELLIS/MTP, draft depth 4, 64 layers (every 4th full attention)
 # resident weights deviceNeed (sum of uploaded objects, from the planner) = 12012811100
 # defaults: kvFormat NVFP4; kvDeviceMinimumTokens 65536 (so no KV page spills at 4096 or 32768 tokens); workspace rows 512; TrellisSettings.defaults(); RESERVE_BYTES 1342177280; step 64 MiB; DiskWindow.SLOTS 8; WeightStaging.SLOTS 4; auto cap 102 (prefill chunk rows / (1 + draft length), no max-tokens-per-pass)

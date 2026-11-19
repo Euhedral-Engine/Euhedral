@@ -72,11 +72,7 @@ pub enum PlanError {
         cache_pages / (1 << 20),
         budget / (1 << 20)
     )]
-    HostTooSmall {
-        needed: u64,
-        cache_pages: u64,
-        budget: u64,
-    },
+    HostTooSmall { needed: u64, cache_pages: u64, budget: u64 },
 
     /// The plan puts weights outside the device, and this build cannot run weights held in host memory or in the file.
     #[error(
