@@ -15,7 +15,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, UNIX_EPOCH};
 
-use euhedral_inference_bench::config::{ConfigError, Options, Scenario, ScenarioKind, SpeculationMode};
+use euhedral_inference_bench::config::{ConfigError, Options, Scenario, ScenarioKind};
 use euhedral_inference_bench::cpus::CpuSelection;
 use euhedral_inference_bench::prompt::PromptCorpus;
 use euhedral_inference_bench::run::generation;

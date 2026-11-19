@@ -365,7 +365,7 @@ mod tests {
         assert!(resolve(&host, "5-6", &[], &[]).unwrap_err().contains("processor 6"));
         assert_eq!(resolve(&host, "2-5", &[], &[]).unwrap(), "2-5");
         // Known CPUs and cores outside the mask may be excluded; ones the host does not have may not.
-        assert_eq!(resolve(&host, "all", &[0, 7], &[3]).unwrap(), "2-3");
+        assert_eq!(resolve(&host, "all", &[0, 7], &[2]).unwrap(), "2-3");
         assert_eq!(resolve(&host, "all", &[], &[0]).unwrap(), "2-5");
         assert!(resolve(&host, "all", &[8], &[]).is_err());
         assert!(resolve(&host, "all", &[], &[4]).is_err());
