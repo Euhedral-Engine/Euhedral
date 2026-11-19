@@ -787,7 +787,7 @@ impl EngineRuntime {
         self.generations.quantum_admitted(Arc::new(hook));
     }
 
-    /// A test hook: the next graph body that runs for a key the cache has not seen ends as `fault` after its first launch
+    /// A test hook: the next graph body of the first sequence that runs for a key the cache has not seen ends as `fault` after its first launch
     /// that has work. At most one body is affected.
     #[cfg(feature = "test-oracles")]
     pub fn fail_next_body_for_tests(&self, fault: BodyFault) {

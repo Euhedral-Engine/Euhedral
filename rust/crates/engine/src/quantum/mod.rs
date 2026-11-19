@@ -27,6 +27,7 @@ pub mod whole;
 
 use smallvec::SmallVec;
 use std::fmt;
+#[cfg(feature = "test-oracles")]
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -500,25 +501,27 @@ impl Stage<Quantum> for Whole {
             waits: &waits,
         };
         // The hold is stored even when the body fails or panics: queued work may still read what it kept.
+        #[cfg(not(feature = "test-oracles"))]
+        let (ran, marker) = run_held(&site, &self.cache, capture.key, &mut launches, &capture.hold)?;
         #[cfg(feature = "test-oracles")]
-        if fault.is_some() {
-            let _ = capture.probe.set(Arc::clone(&self.faults));
-        }
-        let made = catch_unwind(AssertUnwindSafe(|| {
-            run_held(&site, &self.cache, capture.key, &mut launches, &capture.hold)
-        }));
-        #[cfg(feature = "test-oracles")]
-        if let (Some(fault), Some(probe)) = (fault, capture.probe.get()) {
-            if capture.hold.get().is_some() {
-                probe.log(HoldEvent::Stored);
-            } else {
-                // Nothing ran (a busy lane): the fault stays armed for the next body.
-                probe.arm(fault);
+        let (ran, marker) = {
+            let made = catch_unwind(AssertUnwindSafe(|| {
+                run_held(&site, &self.cache, capture.key, &mut launches, &capture.hold)
+            }));
+            if let Some(fault) = fault {
+                if capture.hold.get().is_some() {
+                    // Only a body that ran is followed: the log is of this quantum's hold.
+                    let _ = capture.probe.set(Arc::clone(&self.faults));
+                    self.faults.log(HoldEvent::Stored);
+                } else {
+                    // Nothing ran (a busy lane): the fault stays armed for the next body.
+                    self.faults.arm(fault);
+                }
             }
-        }
-        let (ran, marker) = match made {
-            Ok(made) => made?,
-            Err(panic) => resume_unwind(panic),
+            match made {
+                Ok(made) => made?,
+                Err(panic) => resume_unwind(panic),
+            }
         };
         let _ = capture.ran.set(ran);
         Ok(Submitted::marker(marker))

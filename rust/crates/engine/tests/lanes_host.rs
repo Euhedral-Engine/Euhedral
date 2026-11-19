@@ -835,6 +835,11 @@ fn a_panicking_graph_body_leaves_its_hold_in_the_store() {
     assert!(!hold.is_empty(), "the stored hold keeps what the run kept");
     assert_eq!(Arc::strong_count(&kept), 3, "the value the body kept is alive");
     gpu.run_until_idle();
+    assert_eq!(
+        Arc::strong_count(&kept),
+        3,
+        "the queued work ran and the hold still keeps the value"
+    );
     drop(store);
     assert_eq!(Arc::strong_count(&kept), 2, "the quantum's drop releases it");
     drop(launches);

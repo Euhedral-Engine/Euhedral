@@ -745,10 +745,10 @@ impl Generations {
         }
     }
 
-    /// The test hook: the next graph body of each sequence that runs for a new key ends as `fault`.
+    /// The test hook: the next graph body of the first sequence that runs for a new key ends as `fault`.
     #[cfg(feature = "test-oracles")]
     pub(crate) fn fail_body(&self, fault: BodyFault) {
-        for generation in &self.generations {
+        if let Some(generation) = self.generations.first() {
             generation.shared.executor.body_faults().arm(fault);
         }
     }
