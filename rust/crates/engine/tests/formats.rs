@@ -37,7 +37,7 @@ mod formats {
         Launch, LinearKernel, LinearMode, Nvfp4Linear, Nvfp4Route, ROW_EXACT_KERNELS, ScratchRegion, Table,
         TrellisLinear, TrellisOperands, TrellisShape, nvfp4_native_scratch_bytes,
     };
-    use euhedral_inference_engine::model::{TrellisParts, WeightRef};
+    use euhedral_inference_engine::model::{Residence, TrellisParts, WeightRef};
     use euhedral_inference_engine::residency::scratch::splits;
     use euhedral_inference_settings::{Auto, TrellisKernelSettings};
 
@@ -480,6 +480,7 @@ mod formats {
             layout,
             ptr: address(0x1000),
             bytes: 1 << 20,
+            residence: Residence::Device,
             trellis: None,
         }
     }
@@ -675,6 +676,7 @@ mod formats {
             layout: WeightLayout::TrellisTile16V1,
             ptr: address(WORDS),
             bytes: 1088 * 320 * 56 * 2,
+            residence: Residence::Device,
             trellis: Some(TrellisParts {
                 suh: address(SUH),
                 svh: address(SVH),

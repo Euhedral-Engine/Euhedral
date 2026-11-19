@@ -32,12 +32,14 @@ mod typed;
 
 use std::collections::HashMap;
 
-use euhedral_inference_cuda::DeviceBuffer;
+use euhedral_inference_cuda::{DeviceBuffer, HostWeightsArena};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use euhedral_inference_engine::formats::{
     LinearFormat, LinearKernel, LinearMode, Nvfp4Linear, Q3Embedding, ROW_EXACT_KERNELS, ShapeRecorder, TrellisLinear,
     nvfp4_native_scratch_bytes,
 };
+use euhedral_inference_engine::model::{Residence, WeightRef};
+use euhedral_inference_engine::residency::offload::{MAPPED_HEAD_MAX_ROWS, OUTPUT_HEAD};
 use euhedral_inference_settings::TrellisKernelSettings;
 use linear_gpu::{
     Artifact, Random, Rig, Trellis, activations, assert_close, bf16, bf16_value, relative_rms, rig, synthetic_trellis,
@@ -492,4 +494,57 @@ fn real_trellis_objects_agree_with_the_scalar_reference() {
         println!("{name}: 64 rows relative rms {error:.4}");
         assert!(error < 0.06, "{name}: {error}");
     }
+}
+
+/// The NVFP4 output head computes the same logits from a copy the kernels read in place over the bus as from the copy
+/// on the device, at every row count the plan lets a mapped head run: one to eight rows (the decode kernels), the rows
+/// of a verification in groups, and the batched-pass bound ([`MAPPED_HEAD_MAX_ROWS`]). The comparison is bit for bit.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_mapped_head_computes_the_device_heads_logits() {
+    let Some(rig) = rig() else { return };
+    let Some(mut artifact) = Artifact::open() else { return };
+    let entry = artifact.table().get(OUTPUT_HEAD).unwrap();
+    assert_eq!(entry.format(), WeightFormat::Nvfp4, "the head is NVFP4");
+    let (n, k) = (entry.shape()[0] as usize, entry.shape()[1] as usize);
+    let payload = artifact.bytes(OUTPUT_HEAD);
+    let (_device_copy, device) = artifact.plain(&rig.library, OUTPUT_HEAD);
+
+    // The mapped copy: the same bytes in a pinned host arena, addressed through the device.
+    let mut arena = HostWeightsArena::alloc(&rig.library, payload.len()).unwrap();
+    arena.as_mut_slice().copy_from_slice(&payload);
+    drop(payload);
+    // SAFETY: the arena outlives every launch below, and nothing writes it after the copy above.
+    let ptr = unsafe { arena.device_address() }.unwrap();
+    let mapped = WeightRef {
+        ptr,
+        residence: Residence::Mapped,
+        ..device.clone()
+    };
+    assert_ne!(mapped.ptr, device.ptr);
+
+    let mut random = Random::new(0x4EAD);
+    let x = upload(
+        &rig.library,
+        &activations(&mut random, MAPPED_HEAD_MAX_ROWS as usize, k),
+    );
+    let format = Nvfp4Linear::new(&rig.library);
+    let mut compared = 0;
+    for (rows, mode) in (1..=8usize).flat_map(|rows| [(rows, PLAIN), (rows, VERIFY)]).chain(
+        [9usize, 12, 16, 20, 32]
+            .into_iter()
+            .flat_map(|rows| [(rows, PLAIN), (rows, VERIFY)]),
+    ) {
+        let on_device = rig.linear(&format, &device, &x, 0, k, n, rows, mode);
+        let in_place = rig.linear(&format, &mapped, &x, 0, k, n, rows, mode);
+        assert_eq!(on_device.len(), rows * n);
+        assert!(
+            on_device == in_place,
+            "rows {rows}, row-exact {}: the logits differ",
+            mode.row_exact
+        );
+        compared += 1;
+    }
+    println!("{compared} launches of the {n} x {k} head, mapped and on the device, bit-identical");
+    drop(arena);
 }

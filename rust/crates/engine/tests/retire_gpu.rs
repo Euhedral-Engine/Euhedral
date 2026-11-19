@@ -49,7 +49,7 @@ use euhedral_inference_cuda::{CudaError, CudaLibrary, DevicePtr, KernelOps, Lane
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::kernels::kernel_sources;
 use euhedral_inference_engine::lattice_config;
-use euhedral_inference_engine::model::{LayerIndex, LayerKind, ModelConfig, Role, WeightRef, object_key};
+use euhedral_inference_engine::model::{LayerIndex, LayerKind, ModelConfig, Residence, Role, WeightRef, object_key};
 use euhedral_inference_engine::plan::{Formats, Plan, WeightLookup};
 use euhedral_inference_engine::quantum::Executor;
 use euhedral_inference_engine::residency::planner::plan as residency_plan;
@@ -816,6 +816,7 @@ fn plan_without_weights(config: &Arc<ModelConfig>) -> Arc<Plan> {
                         layout: placement.layout,
                         ptr: DevicePtr::NULL,
                         bytes: placement.bytes,
+                        residence: Residence::Device,
                         trellis: None,
                     },
                 ))
