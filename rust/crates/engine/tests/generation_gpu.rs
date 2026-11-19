@@ -19,7 +19,14 @@
 //! `teacher-forced-rco.bin` holds the logits row of each of 192 teacher-forced steps after a 1100-token prefix of the
 //! benchmark corpus document, one-row decode (`tools/compare_teacher_forced.py` reads it).
 //!
-//! The artifact comes from `euhedral.qwen.rco-artifact` and the library from `euhedral.cuda.library`.
+//! The Q3 artifacts' references are made the same way, with `-Peuhedral.greedy.report=$GOLDENS/greedy-q3.txt` and
+//! `$GOLDENS/greedy-q3-compressed.txt` and the artifact of `euhedral.qwen.q3-artifact` and
+//! `euhedral.qwen.q3-compressed-artifact` as `-Peuhedral.greedy.artifact`; `q3_greedy_tokens_match_java` and
+//! `compressed_q3_greedy_tokens_match_java` check them (their prompts are shorter than 64 tokens).
+//!
+//! The artifact comes from `euhedral.qwen.rco-artifact` and the library from `euhedral.cuda.library`. Where the
+//! property is not set, `EUHEDRAL_TEST_CUDA_LIBRARY` names the library, `EUHEDRAL_NVRTC` a libnvrtc and
+//! `LD_LIBRARY_PATH` its directory; a test that finds none of them skips and still reports `ok`.
 
 #![allow(
     clippy::unwrap_used,
