@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use euhedral_graph::Stage;
 use euhedral_inference_cuda::{DevicePtr, HostWeightsArena};
-use euhedral_inference_edrl::WeightFormat;
+use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 
 use super::PlanBuildError;
 use super::buffers::Access;
@@ -62,18 +62,44 @@ impl WeightLookup for Weights {
 pub struct Formats {
     trellis: Arc<dyn LinearFormat>,
     nvfp4: Arc<dyn LinearFormat>,
+    grouped: Option<Arc<dyn LinearFormat>>,
 }
 
 impl Formats {
     /// The trellis format for trellis weights and the NVFP4 format for NVFP4 weights.
     pub fn new(trellis: Arc<dyn LinearFormat>, nvfp4: Arc<dyn LinearFormat>) -> Self {
-        Self { trellis, nvfp4 }
+        Self {
+            trellis,
+            nvfp4,
+            grouped: None,
+        }
+    }
+
+    /// The same formats, with `grouped` for the Q3, Q4 and Q5 weights (and the P2E2 compressed Q3).
+    pub fn with_grouped(mut self, grouped: Arc<dyn LinearFormat>) -> Self {
+        self.grouped = Some(grouped);
+        self
     }
 
     fn of(&self, weight: &WeightRef) -> Result<Arc<dyn LinearFormat>, PlanBuildError> {
         match weight.format {
             WeightFormat::Trellis => Ok(Arc::clone(&self.trellis)),
             WeightFormat::Nvfp4 => Ok(Arc::clone(&self.nvfp4)),
+            WeightFormat::Q3G64Fp16
+                if matches!(
+                    weight.layout,
+                    WeightLayout::RowSplitK128V1 | WeightLayout::RowSplitP2e2V1
+                ) =>
+            {
+                self.grouped
+                    .as_ref()
+                    .map(Arc::clone)
+                    .ok_or_else(|| PlanBuildError::Format {
+                        name: weight.name.clone(),
+                        format: weight.format,
+                        layout: weight.layout,
+                    })
+            }
             format => Err(PlanBuildError::Format {
                 name: weight.name.clone(),
                 format,

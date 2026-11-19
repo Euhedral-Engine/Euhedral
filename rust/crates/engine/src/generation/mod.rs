@@ -34,7 +34,7 @@ use euhedral_inference_cuda::CudaLibrary;
 use euhedral_memory::Claim;
 
 use crate::error::EngineError;
-use crate::formats::{Nvfp4Linear, TrellisLinear};
+use crate::formats::{Nvfp4Linear, Q3Linear, TrellisLinear};
 use crate::frames::{Kind, step};
 use crate::model::{LayerIndex, ModelConfig, Role, Weights};
 use crate::pass_assembler::PassStatistics;
@@ -213,7 +213,8 @@ impl Generation {
                 library.device().sm_count,
             )),
             Arc::new(Nvfp4Linear::new(library)),
-        );
+        )
+        .with_grouped(Arc::new(Q3Linear::new(library)));
         let plan = Plan::build(config, weights, residency, &formats, None, None)
             .map_err(|error| EngineError::Runtime(format!("the execution plan: {error}")))?;
         if plan.fan_out_width() > core.compute_lanes() {

@@ -1,11 +1,13 @@
 //! The linear formats: how one weight multiplies a block of rows.
 //!
 //! [`LinearFormat`] is the contract the stages consume. [`TrellisLinear`] and [`Nvfp4Linear`] implement it with the
-//! kernel choice, grid and K split of the Java formats, and [`Q3Embedding`] looks up token rows of a Q3 table.
+//! kernel choice, grid and K split of the Java formats, [`Q3Linear`] runs the grouped Q3, Q4 and Q5 tensors and the
+//! P2E2 compressed Q3, and [`Q3Embedding`] looks up token rows of a Q3 table.
 //! [`ShapeRecorder`] lists the launches a format queued, for the tests that compare them with Java's.
 
 mod embedding;
 mod nvfp4;
+mod q3;
 pub mod shapes;
 mod trellis;
 
@@ -15,6 +17,7 @@ use crate::model::WeightRef;
 
 pub use embedding::Q3Embedding;
 pub use nvfp4::{Nvfp4Linear, Nvfp4Route, nvfp4_native_scratch_bytes};
+pub use q3::Q3Linear;
 pub use shapes::{KernelArguments, Launch, LinearKernel, ShapeRecorder, Table};
 pub use trellis::{ROW_EXACT_KERNELS, TrellisLinear, TrellisOperands, TrellisShape};
 

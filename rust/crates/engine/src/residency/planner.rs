@@ -13,6 +13,7 @@
 //! were, naming the memory that is short.
 
 use euhedral_inference_cuda::launch::nvfp4::{SKINNY_MAX_ROWS, nvfp4_native_scratch_bytes, skinny_target_ctas};
+use euhedral_inference_cuda::launch::q3::linear_scratch_bytes;
 use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFormat, WeightLayout};
 use euhedral_inference_settings::{Auto, BatchingSettings, KvFormat, Settings};
 
@@ -378,11 +379,18 @@ pub fn plan_closest(
     );
     let thresholds = trellis_thresholds(settings, inputs.multiprocessors);
     let widest = inputs.multiprocessors.is_none();
-    let scratch_bytes =
-        trellis_scratch(table, &profile, chunk, thresholds, widest, Route::Plan).max(nvfp4_native_scratch(
+    let scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::Plan)
+        .max(nvfp4_native_scratch(
             &device,
             chunk,
             inputs.multiprocessors.map_or(u64::MAX, skinny_target_ctas),
+        ))
+        .max(grouped_scratch(
+            &device,
+            config.num_hidden_layers,
+            chunk,
+            rows.logits_rows,
+            inputs.multiprocessors,
         ));
     let decode_scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::TensorCore);
 
@@ -883,6 +891,48 @@ fn nvfp4_native_scratch(placements: &[Placement], rows: u64, target_ctas: u64) -
                 )),
             ),
             _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The largest scratch any Q3, Q4 or Q5 object of `placements` takes in a launch of up to `rows` rows (the heads, of
+/// up to `logits_rows`): the FP8 route's activations, behind the expansion of a P2E2 tensor. The embedding table is
+/// looked up, not multiplied. The FP8 route is counted on every device, and where the device is not known
+/// (`multiprocessors` is `None`) with the most K splits any device makes.
+fn grouped_scratch(
+    placements: &[Placement],
+    layers: usize,
+    rows: u64,
+    logits_rows: u64,
+    multiprocessors: Option<u32>,
+) -> u64 {
+    placements
+        .iter()
+        .filter(|placement| {
+            matches!(
+                placement.format,
+                WeightFormat::Q3G64Fp16 | WeightFormat::Q4G64Fp16 | WeightFormat::Q5G64Fp16
+            )
+        })
+        .filter_map(|placement| {
+            let role = placement.key(layers).map(|(_, role)| role);
+            let rows = match role {
+                Some(Role::Embedding) => return None,
+                Some(Role::LmHead | Role::DraftHead) => logits_rows,
+                _ => rows,
+            };
+            let [out, input] = placement.shape.as_slice() else {
+                return None;
+            };
+            linear_scratch_bytes(
+                placement.layout == WeightLayout::RowSplitP2e2V1,
+                u32::try_from(rows).unwrap_or(u32::MAX),
+                u32::try_from(*input).ok()?,
+                u32::try_from(*out).ok()?,
+                true,
+                multiprocessors,
+            )
         })
         .max()
         .unwrap_or(0)
