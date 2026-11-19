@@ -14,11 +14,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use checkpoint_support::{Spec, World, safetensors, write};
 use euhedral_inference_quantization::checkpoint::CheckpointError;
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
 use euhedral_inference_quantization::checkpoint::writer::{SafetensorsWriter, Source};
 use serde_json::Value;
+use checkpoint_support::{Spec, World, safetensors, write};
 
 fn finish(world: &World, writer: SafetensorsWriter) -> Result<(), CheckpointError> {
     world.call(|done| writer.finish(&world.io, &world.host, done))

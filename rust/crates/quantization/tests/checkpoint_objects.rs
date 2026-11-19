@@ -13,11 +13,11 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
-use checkpoint_support::{Spec, bf16, drive, safetensors, write};
 use euhedral_inference_quantization::checkpoint::CheckpointError;
 use euhedral_inference_quantization::checkpoint::objects::{Config, MTP_OBJECTS, ObjectSource, Piece, Qwen38Objects};
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
 use euhedral_io::AsyncIo;
+use checkpoint_support::{Spec, bf16, drive, safetensors, write};
 
 const CONFIG: &str = r#"{"text_config": {
     "num_hidden_layers": 2, "layer_types": ["linear_attention", "full_attention"],
