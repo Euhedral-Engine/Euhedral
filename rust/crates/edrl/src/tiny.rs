@@ -2,10 +2,11 @@
 //! that each source fills with its own bytes, and, for a source with companions, `.suh`, `.svh` and `.segments`
 //! after each projection. Projections are stored as 64 x 64 Q3 objects, a quantized format.
 //!
-//! Every byte is a function of the seeds: the payloads come from the generator `java.util.Random` defines, so the
-//! same seed gives the same artifact on every platform and the files match the ones the Java test helper writes.
+//! Every byte is a function of the seeds: the payloads come from a 48-bit linear congruential generator
+//! (multiplier 0x5DEECE66D, addend 0xB), so the same seed gives the same artifact on every platform.
 
 use crate::error::EdrlError;
+use crate::header::HEADER_BYTES;
 use crate::format::{TensorDataType, WeightFormat, WeightLayout, direct_size, grouped_size};
 use crate::metadata::ModelMetadata;
 use crate::writer::{ArtifactPlan, ObjectSpec, TokenizerTexts, encode_metadata, encode_tokenizer_section};
@@ -69,7 +70,7 @@ impl TinyArtifact<'_> {
         let content_end = to_len(plan.content_end())?;
         let mut file = vec![0; content_end];
         let header = plan.header();
-        file[..crate::HEADER_BYTES].copy_from_slice(&header.encode());
+        file[..HEADER_BYTES].copy_from_slice(&header.encode());
         let metadata_at = to_len(header.metadata_offset())?;
         file[metadata_at..metadata_at + metadata.len()].copy_from_slice(&metadata);
         let table_at = to_len(header.tensor_table_offset())?;
@@ -98,7 +99,7 @@ impl TinyArtifact<'_> {
             TensorDataType::Fp32,
             WeightFormat::Fp32,
             8,
-            shared + 1,
+            shared.wrapping_add(1),
         )?;
         objects.quantized("text/token_embedding", self.seed, false)?;
         for name in PROJECTIONS {
@@ -111,7 +112,7 @@ impl TinyArtifact<'_> {
             TensorDataType::Bf16,
             WeightFormat::Bf16,
             32,
-            shared + 2,
+            shared.wrapping_add(2),
         )?;
         objects.quantized("text/output_head", self.seed, false)?;
         objects.raw(
@@ -119,7 +120,7 @@ impl TinyArtifact<'_> {
             TensorDataType::Int32,
             WeightFormat::I32,
             16,
-            shared + 3,
+            shared.wrapping_add(3),
         )?;
         objects.raw(
             "mtp/layer/input_norm",
@@ -175,7 +176,7 @@ impl Objects {
     fn quantized(&mut self, name: &str, seed: i64, companions: bool) -> Result<(), EdrlError> {
         let shape = vec![64, 64];
         let bytes = grouped_size(&shape, TensorDataType::Bf16, WeightFormat::Q3G64Fp16).map_err(refused(name))?;
-        let seed = seed.wrapping_add(i64::from(java_hash(name)));
+        let seed = seed.wrapping_add(i64::from(text_hash(name)));
         self.add(
             name,
             shape,
@@ -186,7 +187,7 @@ impl Objects {
             ),
             bytes,
             seed,
-        );
+        )?;
         if !companions || name == "text/token_embedding" || name == "text/output_head" {
             return Ok(());
         }
@@ -223,8 +224,7 @@ impl Objects {
     ) -> Result<(), EdrlError> {
         let shape = vec![elements];
         let bytes = direct_size(&shape, dtype, format).map_err(refused(name))?;
-        self.add(name, shape, (dtype, format, WeightLayout::ContiguousLeV1), bytes, seed);
-        Ok(())
+        self.add(name, shape, (dtype, format, WeightLayout::ContiguousLeV1), bytes, seed)
     }
 
     fn add(
@@ -234,9 +234,9 @@ impl Objects {
         (dtype, format, layout): (TensorDataType, WeightFormat, WeightLayout),
         bytes: u64,
         seed: i64,
-    ) {
-        let mut payload = vec![0; usize::try_from(bytes).unwrap_or(0)];
-        JavaRandom::new(seed).fill(&mut payload);
+    ) -> Result<(), EdrlError> {
+        let mut payload = vec![0; to_len(bytes)?];
+        Lcg::new(seed).fill(&mut payload);
         self.specs.push(ObjectSpec {
             name: name.to_owned(),
             shape,
@@ -246,6 +246,7 @@ impl Objects {
             bytes,
         });
         self.payloads.push(payload);
+        Ok(())
     }
 }
 
@@ -260,18 +261,19 @@ fn to_len(value: u64) -> Result<usize, EdrlError> {
     usize::try_from(value).map_err(|_| EdrlError::invalid("a tiny artifact does not fit memory"))
 }
 
-/// `String.hashCode()` of the text: 31-based over its UTF-16 code units, wrapping in 32 bits.
-fn java_hash(text: &str) -> i32 {
+/// A 31-based hash over the text's UTF-16 code units, wrapping in 32 bits.
+fn text_hash(text: &str) -> i32 {
     text.encode_utf16()
         .fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(i32::from(unit)))
 }
 
-/// The 48-bit linear congruential generator `java.util.Random` defines.
-struct JavaRandom {
+/// A 48-bit linear congruential generator; its draws and the byte filling are fixed, because the golden files
+/// pin them.
+struct Lcg {
     state: u64,
 }
 
-impl JavaRandom {
+impl Lcg {
     const MULTIPLIER: u64 = 0x5_DEEC_E66D;
     const ADDEND: u64 = 0xB;
     const MASK: u64 = (1 << 48) - 1;
@@ -282,13 +284,13 @@ impl JavaRandom {
         }
     }
 
-    /// The next 32 bits, as `Random.nextInt()`.
+    /// The next 32 bits.
     fn next_int(&mut self) -> i32 {
         self.state = self.state.wrapping_mul(Self::MULTIPLIER).wrapping_add(Self::ADDEND) & Self::MASK;
         (self.state >> 16) as u32 as i32
     }
 
-    /// `Random.nextBytes`: each draw fills up to four bytes, low byte first.
+    /// Each draw fills up to four bytes, low byte first.
     fn fill(&mut self, bytes: &mut [u8]) {
         for chunk in bytes.chunks_mut(4) {
             let mut word = self.next_int();
@@ -302,20 +304,20 @@ impl JavaRandom {
 
 #[cfg(test)]
 mod tests {
-    use super::{JavaRandom, java_hash};
+    use super::{Lcg, text_hash};
 
     #[test]
-    fn java_random_matches_the_documented_sequence() {
+    fn lcg_matches_the_documented_sequence() {
         // `new Random(42).nextInt()` is -1170105035 and the next is 234785527.
-        let mut random = JavaRandom::new(42);
+        let mut random = Lcg::new(42);
         assert_eq!(random.next_int(), -1_170_105_035);
         assert_eq!(random.next_int(), 234_785_527);
     }
 
     #[test]
-    fn string_hash_is_the_documented_one() {
-        assert_eq!(java_hash(""), 0);
-        assert_eq!(java_hash("a"), 97);
-        assert_eq!(java_hash("hello"), 99_162_322);
+    fn string_hash_is_the_expected_one() {
+        assert_eq!(text_hash(""), 0);
+        assert_eq!(text_hash("a"), 97);
+        assert_eq!(text_hash("hello"), 99_162_322);
     }
 }

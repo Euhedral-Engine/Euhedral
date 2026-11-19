@@ -6,13 +6,13 @@ use crate::error::EdrlError;
 /// The source element type of a tensor (`TensorDataType`); the ordinal is what the table stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TensorDataType {
-    Bf16,
-    Fp16,
-    Fp32,
-    Fp8E4m3,
-    Uint8,
-    Int8,
-    Int32,
+    Bf16 = 0,
+    Fp16 = 1,
+    Fp32 = 2,
+    Fp8E4m3 = 3,
+    Uint8 = 4,
+    Int8 = 5,
+    Int32 = 6,
 }
 
 impl TensorDataType {
@@ -38,15 +38,15 @@ impl TensorDataType {
 /// How a payload's values are stored (`WeightFormat`); the ordinal is what the table stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WeightFormat {
-    Bf16,
-    Fp16,
-    Fp32,
-    I32,
-    Q3G64Fp16,
-    Q4G64Fp16,
-    Q5G64Fp16,
-    Nvfp4,
-    Trellis,
+    Bf16 = 0,
+    Fp16 = 1,
+    Fp32 = 2,
+    I32 = 3,
+    Q3G64Fp16 = 4,
+    Q4G64Fp16 = 5,
+    Q5G64Fp16 = 6,
+    Nvfp4 = 7,
+    Trellis = 8,
 }
 
 impl WeightFormat {
@@ -74,12 +74,12 @@ impl WeightFormat {
 /// The persistent byte layout of a payload (`WeightLayout`); the ordinal is what the table stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WeightLayout {
-    ContiguousLeV1,
-    RowSplitK128V1,
-    RowSplitP2e2V1,
-    RowSplitK128Sd4V1,
-    RowInterleavedNvfp4V1,
-    TrellisTile16V1,
+    ContiguousLeV1 = 0,
+    RowSplitK128V1 = 1,
+    RowSplitP2e2V1 = 2,
+    RowSplitK128Sd4V1 = 3,
+    RowInterleavedNvfp4V1 = 4,
+    TrellisTile16V1 = 5,
 }
 
 impl WeightLayout {
@@ -367,5 +367,26 @@ impl TrellisCompanions {
             Some(last) => Err(EdrlError::invalid(format!("last segment end {last} is not n={n}"))),
             None => Err(EdrlError::invalid("segment count 0 is outside 1..8")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TensorDataType, WeightFormat, WeightLayout};
+
+    #[test]
+    fn every_ordinal_reads_back_as_its_variant() {
+        for ordinal in 0..7 {
+            assert_eq!(TensorDataType::from_ordinal(ordinal).unwrap().ordinal(), ordinal);
+        }
+        for ordinal in 0..9 {
+            assert_eq!(WeightFormat::from_ordinal(ordinal).unwrap().ordinal(), ordinal);
+        }
+        for ordinal in 0..6 {
+            assert_eq!(WeightLayout::from_ordinal(ordinal).unwrap().ordinal(), ordinal);
+        }
+        assert!(TensorDataType::from_ordinal(7).is_err());
+        assert!(WeightFormat::from_ordinal(9).is_err());
+        assert!(WeightLayout::from_ordinal(6).is_err());
     }
 }

@@ -130,9 +130,14 @@ fn tiny_artifacts_read_back_as_written() {
             assert_eq!(entry.offset() % 256, 0, "{} is aligned", entry.name());
         }
         // Everything between the table and the first payload, and between payloads, is zero.
-        let data_offset = parsed.header.data_offset() as usize;
-        let first = parsed.table.entries()[0].offset() as usize;
-        assert!(file[data_offset..first].iter().all(|byte| *byte == 0));
+        // Every byte between the table and the content's end that no payload covers is zero.
+        let mut covered = vec![false; parsed.content_end as usize];
+        for entry in parsed.table.entries() {
+            covered[entry.offset() as usize..(entry.offset() + entry.bytes()) as usize].fill(true);
+        }
+        for at in parsed.header.data_offset() as usize..parsed.content_end as usize {
+            assert!(covered[at] || file[at] == 0, "byte {at} of the gap is not zero");
+        }
         assert!(parsed.table.get(PROJECTIONS[0]).is_some());
         assert_eq!(parsed.table.get("text/layers/0/mlp/gate_up.suh").is_some(), companions);
     }
@@ -222,7 +227,7 @@ fn the_table_refuses_what_the_parser_refuses() {
         encode_table(&[entry("", 4, 0, 16)]),
         Err(EdrlError::Invalid { .. })
     ));
-    // Touching payloads and an empty payload inside another are fine.
+    // Touching payloads are fine.
     assert!(encode_table(&[entry("a", 4, 0, 16), entry("b", 4, 16, 16)]).is_ok());
 }
 
@@ -275,4 +280,41 @@ fn the_tokenizer_footer_describes_the_body() {
     let parsed = TokenizerSection::parse(body.to_vec(), &footer).unwrap();
     assert_eq!(parsed.text("tokenizer.json"), Some("é"));
     assert_eq!(parsed.text("tokenizer_config.json"), Some(""));
+}
+
+#[test]
+fn oversized_names_ranks_strings_and_headers_are_refused() {
+    let long_name = "n".repeat((1 << 20) + 1);
+    assert!(matches!(
+        encode_table(&[entry(&long_name, 4, 0, 16)]),
+        Err(EdrlError::Invalid { .. })
+    ));
+    let deep = TensorEntry::new(
+        "deep",
+        vec![1; 65],
+        TensorDataType::Fp32,
+        WeightFormat::Fp32,
+        WeightLayout::ContiguousLeV1,
+        0,
+        4,
+    );
+    assert!(matches!(encode_table(&[deep]), Err(EdrlError::Invalid { .. })));
+
+    let mut metadata = parse(FIXTURE).metadata;
+    metadata.hidden_activation = "s".repeat((1 << 20) + 1);
+    assert!(encode_metadata(&metadata).is_err());
+}
+
+#[test]
+fn the_header_refuses_what_the_parser_refuses() {
+    let table_end = HEADER_BYTES as u64 + 10 + 100;
+    assert!(Header::new(10, 1, table_end).is_ok());
+    assert!(Header::new(8 << 20, 1, (8 << 20) + 1000).is_ok());
+    assert!(Header::new((8 << 20) + 1, 1, (8 << 20) + 1000).is_err());
+    assert!(Header::new(10, 1_000_001, table_end).is_err());
+    assert!(Header::new(10, 1, HEADER_BYTES as u64 + 9).is_err());
+    assert!(Header::new(10, 1, u64::MAX).is_err());
+    assert!(Header::new(u64::MAX, 1, u64::MAX).is_err());
+    let header = Header::new(10, 1, table_end).unwrap();
+    assert_eq!(Header::parse(&header.encode()).unwrap(), header);
 }

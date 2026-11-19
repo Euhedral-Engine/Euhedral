@@ -7,17 +7,14 @@ use std::collections::HashSet;
 use crate::error::EdrlError;
 use crate::format::{TensorDataType, WeightFormat, WeightLayout, accepts_byte_size};
 use crate::header::{HEADER_BYTES, Header, MAX_COUNT, MAX_METADATA_BYTES};
-use crate::metadata::{MAX_DRAFT_DEPTH, ModelMetadata};
+use crate::metadata::{MAX_DRAFT_DEPTH, MAX_STRING_BYTES, ModelMetadata};
 use crate::table::{MAX_NAME_BYTES, MAX_RANK, TensorEntry, validate_non_overlapping};
-use crate::tokenizer_section::{FOOTER_BYTES, TOKENIZER_ENTRIES};
+use crate::tokenizer_section::{FOOTER_BYTES, MAGIC, MAX_BODY_BYTES, TOKENIZER_ENTRIES, VERSION};
 
 /// The alignment of each payload in a written artifact: a block multiple, so a payload can be read past the page
 /// cache.
 pub const PAYLOAD_ALIGNMENT: u64 = 4096;
 
-const MAX_STRING_BYTES: usize = 1 << 20;
-const TOKENIZER_VERSION: u32 = 1;
-const TOKENIZER_MAGIC: &[u8; 8] = b"EDRLTOKN";
 
 /// One object to place: everything the table stores about it except where it goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,7 +245,7 @@ pub fn encode_metadata(metadata: &ModelMetadata) -> Result<Vec<u8>, EdrlError> {
     out.extend_from_slice(m.hidden_activation.as_bytes());
     put_i32(&mut out, length(m.layer_types.len())?);
     for layer in &m.layer_types {
-        put_i32(&mut out, *layer as i32);
+        put_i32(&mut out, layer.ordinal());
     }
     for value in [
         m.num_experts,
@@ -298,14 +295,14 @@ pub fn encode_tokenizer_section(texts: &TokenizerTexts<'_>) -> Result<Vec<u8>, E
         }
     }
     let body_length = out.len() as u64;
-    if body_length > 1 << 30 {
+    if body_length > MAX_BODY_BYTES {
         return Err(EdrlError::invalid("the tokenizer section is too large"));
     }
     let crc = crc32fast::hash(&out);
     put_i64(&mut out, signed(body_length)?);
     out.extend_from_slice(&crc.to_be_bytes());
-    out.extend_from_slice(&TOKENIZER_VERSION.to_be_bytes());
-    out.extend_from_slice(TOKENIZER_MAGIC);
+    out.extend_from_slice(&VERSION.to_be_bytes());
+    out.extend_from_slice(MAGIC);
     debug_assert_eq!(out.len() as u64, body_length + FOOTER_BYTES as u64);
     Ok(out)
 }
