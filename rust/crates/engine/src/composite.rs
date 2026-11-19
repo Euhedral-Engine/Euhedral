@@ -9,10 +9,8 @@ use std::path::PathBuf;
 use euhedral_inference_edrl::{TensorEntry, TensorTable, WeightFormat};
 
 use crate::error::{EngineError, PlanError};
-use crate::model::{companion_name, is_companion, trellis_logical};
-
-/// The companions that travel with an object.
-const COMPANIONS: [&str; 3] = [".suh", ".svh", ".segments"];
+use crate::model::{TRELLIS_COMPANIONS, companion_name, is_companion, trellis_logical};
+use crate::residency::planner::{Placement, Tier};
 
 /// The objects the choosable projections are named under.
 const CHOOSABLE_PREFIX: &str = "text/layers/";
@@ -31,14 +29,27 @@ pub struct Replacement {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Composite {
     pub replacements: Vec<Replacement>,
+    /// The MTP draft depth of the composite. A base that is one quantization becomes a mixed model when it takes an
+    /// object of another, and a mixed model must store its depth, so the composite gives it. `None` keeps the base's.
+    pub draft_depth: Option<u8>,
 }
 
 impl Composite {
     /// Whether the model loads from the base alone.
     pub fn is_empty(&self) -> bool {
+        self.draft_depth.is_none() && !self.has_objects()
+    }
+
+    /// Whether any object comes from a source.
+    pub(crate) fn has_objects(&self) -> bool {
         self.replacements
             .iter()
-            .all(|replacement| replacement.objects.is_empty())
+            .any(|replacement| !replacement.objects.is_empty())
+    }
+
+    /// The draft depth the model runs with, given the one its base stores.
+    pub(crate) fn depth(&self, stored: Option<u8>) -> Option<u8> {
+        self.draft_depth.or(stored)
     }
 }
 
@@ -59,8 +70,29 @@ fn invalid(why: String) -> EngineError {
 fn features(entry: &TensorEntry) -> Option<(u64, u64)> {
     match (entry.format(), entry.shape()) {
         (WeightFormat::Trellis, shape) => trellis_logical(shape),
-        (WeightFormat::Nvfp4, [rows, k]) => Some((*rows, *k)),
+        (
+            WeightFormat::Nvfp4 | WeightFormat::Q3G64Fp16 | WeightFormat::Q4G64Fp16 | WeightFormat::Q5G64Fp16,
+            [rows, k],
+        ) => Some((*rows, *k)),
         _ => None,
+    }
+}
+
+/// Refuses a plan that holds an object a replacement supplies on the disk tier, which reads the base's file only.
+pub(crate) fn refuse_replaced_on_disk(
+    placements: &[Placement],
+    source_of: &HashMap<String, usize>,
+) -> Result<(), EngineError> {
+    match placements
+        .iter()
+        .find(|placement| placement.tier == Tier::Disk && source_of.contains_key(&placement.name))
+    {
+        Some(placement) => Err(invalid(format!(
+            "'{}' comes from another artifact and the plan leaves it in the artifact file, which is read from the \
+             base alone",
+            placement.name
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -105,7 +137,7 @@ pub(crate) fn compose(
     }
     let replaced: HashSet<String> = chosen
         .keys()
-        .flat_map(|name| COMPANIONS.map(|suffix| companion_name(name, suffix)))
+        .flat_map(|name| TRELLIS_COMPANIONS.map(|suffix| companion_name(name, suffix)))
         .collect();
     let mut entries = Vec::with_capacity(base.len());
     let mut source_of = HashMap::new();
@@ -114,7 +146,7 @@ pub(crate) fn compose(
         if let Some(&index) = chosen.get(name) {
             let table = &sources[index];
             let taken = iter::once(name.to_string())
-                .chain(COMPANIONS.map(|suffix| companion_name(name, suffix)))
+                .chain(TRELLIS_COMPANIONS.map(|suffix| companion_name(name, suffix)))
                 .filter_map(|wanted| table.get(&wanted));
             for taken in taken {
                 source_of.insert(taken.name().to_string(), index + 1);
@@ -133,6 +165,7 @@ mod tests {
     use euhedral_inference_edrl::{TensorDataType, WeightLayout};
 
     use super::*;
+    use crate::residency::planner::PlacementSource;
 
     const OBJECT: &str = "text/layers/0/mlp/down";
     const OTHER: &str = "text/layers/1/mlp/down";
@@ -200,6 +233,7 @@ mod tests {
                 source: PathBuf::from("source.edrl"),
                 objects: objects.iter().map(ToString::to_string).collect(),
             }],
+            draft_depth: None,
         }
     }
 
@@ -275,6 +309,7 @@ mod tests {
                     objects: vec![OTHER.to_string()],
                 },
             ],
+            draft_depth: None,
         };
         let composed = compose(
             &base,
@@ -344,9 +379,73 @@ mod tests {
     }
 
     #[test]
-    fn a_composite_without_objects_is_empty() {
+    fn a_composite_without_objects_or_a_depth_is_empty() {
         assert!(Composite::default().is_empty());
         assert!(take(&[]).is_empty());
         assert!(!take(&[OBJECT]).is_empty());
+        let depth_only = Composite {
+            draft_depth: Some(3),
+            ..take(&[])
+        };
+        assert!(!depth_only.is_empty());
+        assert!(!depth_only.has_objects());
+    }
+
+    #[test]
+    fn the_composites_depth_replaces_the_bases_and_none_keeps_it() {
+        let mut composite = take(&[OBJECT]);
+        assert_eq!(composite.depth(Some(2)), Some(2));
+        assert_eq!(composite.depth(None), None);
+        composite.draft_depth = Some(4);
+        assert_eq!(composite.depth(Some(2)), Some(4));
+        assert_eq!(composite.depth(None), Some(4));
+    }
+
+    #[test]
+    fn the_group_quantized_formats_are_compared_by_their_stored_features() {
+        let group = |name: &str, shape: Vec<u64>| {
+            TensorEntry::new(
+                name,
+                shape,
+                TensorDataType::Uint8,
+                WeightFormat::Q4G64Fp16,
+                WeightLayout::ContiguousLeV1,
+                0,
+                0,
+            )
+        };
+        let base = table([group(OBJECT, vec![64, 128])]);
+        assert!(compose(&base, &take(&[OBJECT]), &[table([group(OBJECT, vec![64, 128])])]).is_ok());
+        assert!(refusal(&base, &take(&[OBJECT]), table([group(OBJECT, vec![64, 256])])).contains(OBJECT));
+    }
+
+    fn placed(name: &str, tier: Tier) -> Placement {
+        Placement {
+            name: name.to_string(),
+            source: PlacementSource::Object,
+            shape: vec![64],
+            dtype: TensorDataType::Bf16,
+            format: WeightFormat::Bf16,
+            layout: WeightLayout::ContiguousLeV1,
+            file_offset: 0,
+            bytes: 128,
+            offset: 0,
+            tier,
+        }
+    }
+
+    #[test]
+    fn a_replaced_object_on_the_disk_tier_is_refused_by_name_and_other_objects_are_not() {
+        let source_of = HashMap::from([(OBJECT.to_string(), 1)]);
+        let plan = [
+            placed(OTHER, Tier::Disk),
+            placed("text/final_norm", Tier::Device),
+            placed(OBJECT, Tier::Host { offset: 0 }),
+        ];
+        assert!(refuse_replaced_on_disk(&plan, &source_of).is_ok());
+        let plan = [placed(OTHER, Tier::Disk), placed(OBJECT, Tier::Disk)];
+        let refused = refuse_replaced_on_disk(&plan, &source_of).unwrap_err().to_string();
+        assert!(refused.contains(OBJECT) && !refused.contains(OTHER), "{refused}");
+        assert!(refuse_replaced_on_disk(&plan, &HashMap::new()).is_ok());
     }
 }

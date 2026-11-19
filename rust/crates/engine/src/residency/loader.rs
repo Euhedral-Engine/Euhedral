@@ -63,6 +63,11 @@ pub enum Target {
     Host { arena_offset: u64 },
 }
 
+/// The file a placement is read from: the one `file_of` names, or the first (the base) when it names none.
+fn file_index(file_of: &[usize], placement: usize) -> usize {
+    file_of.get(placement).copied().unwrap_or(0)
+}
+
 /// One read: `len` bytes at `file_offset` of the artifact go to `target`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Piece {
@@ -350,8 +355,7 @@ impl Shared {
 
     /// The file `piece` is read from.
     fn file(&self, piece: &Piece) -> &Arc<OwnedFile> {
-        let index = self.file_of.get(piece.placement).copied().unwrap_or(0);
-        &self.files[index]
+        &self.files[file_index(&self.file_of, piece.placement)]
     }
 }
 
@@ -676,6 +680,15 @@ mod tests {
     use euhedral_graph::{LanePool, QueueId};
 
     use super::*;
+
+    #[test]
+    fn a_placement_is_read_from_the_file_it_names_and_from_the_base_when_it_names_none() {
+        let file_of = [0, 2, 1];
+        assert_eq!(file_index(&file_of, 1), 2);
+        assert_eq!(file_index(&file_of, 2), 1);
+        assert_eq!(file_index(&file_of, 3), 0);
+        assert_eq!(file_index(&[], 5), 0);
+    }
 
     /// A lane whose ring holds `slots` markers: it refuses a submission while that many are in flight.
     #[derive(Debug)]

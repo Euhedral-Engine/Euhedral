@@ -35,7 +35,7 @@ use euhedral_inference_settings::Settings;
 use euhedral_io::{IoBuf, IoDone, OpenSpec, OwnedFile};
 use euhedral_memory::Claim;
 
-use crate::composite::{Composed, Composite, compose};
+use crate::composite::{Composed, Composite, compose, refuse_replaced_on_disk};
 use crate::error::{EngineError, PlanError};
 use crate::frames::{Kind, step};
 use crate::generation::Generations;
@@ -299,7 +299,7 @@ struct Indexed {
 /// Step 1: opens the artifact, then the source of each replacement of the composite, one after the other.
 fn open(startup: Startup) {
     let path = startup.core.settings.model.artifact.clone();
-    open_index(startup, path, |startup, base| sources(startup, base, Vec::new()));
+    open_index(startup, path, true, |startup, base| sources(startup, base, Vec::new()));
 }
 
 /// Opens the next source of the composite, or goes on to parse when each is open.
@@ -308,19 +308,25 @@ fn sources(startup: Startup, base: Indexed, mut opened: Vec<Indexed>) {
         return startup.then(host, move |startup| parse(startup, base, opened));
     };
     let path = replacement.source.clone();
-    open_index(startup, path, move |startup, part| {
+    open_index(startup, path, false, move |startup, part| {
         opened.push(part);
         sources(startup, base, opened);
     });
 }
 
-/// Opens `path`, reads its header and footer, then the metadata and the table they locate; `next` gets them.
-fn open_index(startup: Startup, path: PathBuf, next: impl FnOnce(Startup, Indexed) + Send + 'static) {
+/// Opens `path`, reads its header and footer, then the metadata (only when `with_metadata`: a replacement's is never
+/// used) and the table they locate; `next` gets them.
+fn open_index(
+    startup: Startup,
+    path: PathBuf,
+    with_metadata: bool,
+    next: impl FnOnce(Startup, Indexed) + Send + 'static,
+) {
     let core = Arc::clone(&startup.core);
     let named = path.clone();
     let then = Box::new(move |opened: io::Result<OwnedFile>| -> Box<dyn Frame> {
         step(Kind::Startup, 0, move || match opened {
-            Ok(file) => indexed(startup, path, file, next),
+            Ok(file) => indexed(startup, path, file, with_metadata, next),
             Err(error) => {
                 let what = format!("opening the artifact {}", path.display());
                 startup.fail(EngineError::io(what, error));
@@ -345,7 +351,13 @@ fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
 }
 
 /// Reads the header and the footer, then the metadata and the table they locate.
-fn indexed(startup: Startup, path: PathBuf, file: OwnedFile, next: impl FnOnce(Startup, Indexed) + Send + 'static) {
+fn indexed(
+    startup: Startup,
+    path: PathBuf,
+    file: OwnedFile,
+    with_metadata: bool,
+    next: impl FnOnce(Startup, Indexed) + Send + 'static,
+) {
     let (length, file) = file_len(file);
     let length = match length {
         Ok(length) => length,
@@ -403,41 +415,52 @@ fn indexed(startup: Startup, path: PathBuf, file: OwnedFile, next: impl FnOnce(S
                         Ok(parsed) => parsed,
                         Err(error) => return startup.fail(error),
                     };
-                    let handle = Arc::clone(&file);
-                    let named = path.clone();
+                    let index = Indexed {
+                        path,
+                        file,
+                        header,
+                        end,
+                        metadata: Vec::new(),
+                        table: Vec::new(),
+                    };
+                    if !with_metadata {
+                        return read_table(startup, index, table_range, next);
+                    }
+                    let handle = Arc::clone(&index.file);
+                    let named = index.path.clone();
                     read_range(
                         startup,
-                        &file,
+                        &handle,
                         &named,
                         metadata_range,
                         "metadata",
                         move |startup, metadata| {
-                            let file = Arc::clone(&handle);
-                            let named = path.clone();
-                            read_range(
-                                startup,
-                                &handle,
-                                &named,
-                                table_range,
-                                "tensor table",
-                                move |startup, table| {
-                                    next(
-                                        startup,
-                                        Indexed {
-                                            path,
-                                            file,
-                                            header,
-                                            end,
-                                            metadata,
-                                            table,
-                                        },
-                                    );
-                                },
-                            );
+                            read_table(startup, Indexed { metadata, ..index }, table_range, next);
                         },
                     );
                 },
             );
+        },
+    );
+}
+
+/// Reads the tensor table of `index`, then hands it on.
+fn read_table(
+    startup: Startup,
+    index: Indexed,
+    range: Range<u64>,
+    next: impl FnOnce(Startup, Indexed) + Send + 'static,
+) {
+    let handle = Arc::clone(&index.file);
+    let named = index.path.clone();
+    read_range(
+        startup,
+        &handle,
+        &named,
+        range,
+        "tensor table",
+        move |startup, table| {
+            next(startup, Indexed { table, ..index });
         },
     );
 }
@@ -450,7 +473,7 @@ fn parse(startup: Startup, base: Indexed, parts: Vec<Indexed>) {
         let mut table = TensorTable::parse(&base.table, &base.header, base.end)
             .map_err(|error| EngineError::artifact(&path, error))?;
         let mut source_of = HashMap::new();
-        if !startup.composite.is_empty() {
+        if startup.composite.has_objects() {
             let tables = parts
                 .iter()
                 .map(|part| {
@@ -460,7 +483,8 @@ fn parse(startup: Startup, base: Indexed, parts: Vec<Indexed>) {
                 .collect::<Result<Vec<_>, _>>()?;
             Composed { table, source_of } = compose(&table, &startup.composite, &tables)?;
         }
-        let config = ModelConfig::from(&metadata);
+        let mut config = ModelConfig::from(&metadata);
+        config.draft_depth = startup.composite.depth(config.draft_depth);
         config.check_supported()?;
         validate_inventory(&config, &table)?;
         Ok::<_, EngineError>((table, config, source_of))
@@ -687,6 +711,7 @@ fn plan_residency(
     )
     .map_err(EngineError::from)
     .and_then(|plan| refuse_offload(&plan.offload).map(|()| plan).map_err(EngineError::from))
+    .and_then(|plan| refuse_replaced_on_disk(&plan.device, &artifact.source_of).map(|()| plan))
     // The plan is admitted by the account: its allocations take their claims from the reservation.
     .and_then(|plan| {
         let reservation = core.account.admit(&plan)?;

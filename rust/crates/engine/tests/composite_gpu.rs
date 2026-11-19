@@ -1,5 +1,5 @@
-//! A model loaded from a composite: its projections taken from another artifact file, each payload read from the file
-//! its entry belongs to. The artifact comes from `euhedral.qwen.rco-artifact`, the library from `euhedral.cuda.library`.
+//! A model loaded from a composite: projections taken from another artifact file, each payload read from the file its
+//! entry belongs to. The artifact comes from `euhedral.qwen.rco-artifact`, the library from `euhedral.cuda.library`.
 
 #![allow(
     clippy::unwrap_used,
@@ -14,19 +14,21 @@
 
 mod common;
 
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::Closer;
-use euhedral_inference_edrl::WeightFormat;
+use euhedral_inference_edrl::{
+    ArtifactPlan, HEADER_BYTES, Header, ObjectSpec, PAYLOAD_ALIGNMENT, TensorEntry, WeightFormat,
+};
 use euhedral_inference_engine::generation::{
     GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
-use euhedral_inference_engine::model::is_companion;
+use euhedral_inference_engine::model::{TRELLIS_COMPANIONS, is_companion};
 use euhedral_inference_engine::sampling::SamplingConfig;
 use euhedral_inference_engine::{Composite, EngineRuntime, Handoff, Replacement};
 use euhedral_inference_settings::{ModelSettings, Settings};
@@ -34,21 +36,18 @@ use euhedral_inference_settings::{ModelSettings, Settings};
 /// The longest a device test waits for one hand-off; past it the test fails.
 const WAIT: Duration = Duration::from_secs(20 * 60);
 
+/// A prompt of ids every vocabulary of the model holds.
+const PROMPT: [u32; 6] = [785, 6722, 315, 9625, 374, 264];
+
 struct Machine {
     artifact: PathBuf,
     library: PathBuf,
-    goldens: PathBuf,
 }
 
 fn machine() -> Option<Machine> {
     let library = PathBuf::from(test_support::require_property("euhedral.cuda.library")?);
     let artifact = PathBuf::from(test_support::require_property("euhedral.qwen.rco-artifact")?);
-    let goldens = PathBuf::from(test_support::require_property("euhedral.rust.goldens")?);
-    (artifact.is_file() && goldens.is_dir()).then_some(Machine {
-        artifact,
-        library,
-        goldens,
-    })
+    artifact.is_file().then_some(Machine { artifact, library })
 }
 
 fn settings(artifact: &Path) -> Settings {
@@ -80,67 +79,8 @@ impl GenerationListener for Collector {
     }
 }
 
-/// The greedy golden: the prompt and the tokens that follow it.
-fn greedy_golden(machine: &Machine) -> (Vec<u32>, Vec<u32>) {
-    let text = fs::read_to_string(machine.goldens.join("greedy-rco.txt")).unwrap();
-    let ids = |line: &str, tag: &str| -> Vec<u32> {
-        line.strip_prefix(tag)
-            .unwrap()
-            .split_whitespace()
-            .map(|id| id.parse().unwrap())
-            .collect()
-    };
-    let mut lines = text.lines();
-    (
-        ids(lines.next().unwrap(), "prompt "),
-        ids(lines.next().unwrap(), "generated "),
-    )
-}
-
-#[cfg(unix)]
-use std::os::unix::fs::symlink;
-
-#[cfg(unix)]
-fn link(target: &Path, at: &Path) -> io::Result<()> {
-    symlink(target, at)
-}
-
-#[cfg(not(unix))]
-fn link(_target: &Path, _at: &Path) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
-}
-
-/// Every quantized projection of the layers: the objects a composite can take.
-fn choosable(artifact: &Path) -> Vec<String> {
-    let (_, table) = common::open_artifact(artifact);
-    table
-        .entries()
-        .iter()
-        .filter(|entry| entry.name().starts_with("text/layers/") && !is_companion(entry.name()))
-        .filter(|entry| matches!(entry.format(), WeightFormat::Nvfp4 | WeightFormat::Trellis))
-        .map(|entry| entry.name().to_string())
-        .collect()
-}
-
-#[test]
-#[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
-fn a_composite_of_the_artifact_with_itself_generates_the_artifacts_tokens() {
-    let Some(machine) = machine() else { return };
-    let (prompt, golden) = greedy_golden(&machine);
-    let objects = choosable(&machine.artifact);
-    assert!(!objects.is_empty());
-
-    // The source is another path to the same bytes, so every projection is read through the source's file.
-    let scratch = tempfile::tempdir().unwrap();
-    let source = scratch.path().join("source.edrl");
-    if link(&machine.artifact, &source).is_err() {
-        println!("skipped: this platform makes no link to the artifact");
-        return;
-    }
-    let composite = Composite {
-        replacements: vec![Replacement { source, objects }],
-    };
-
+/// The greedy tokens the engine over `artifact` (and `composite`) generates after the prompt.
+fn generate(machine: &Machine, composite: Composite) -> Vec<u32> {
     let (owner, ready) =
         EngineRuntime::start_composite(&settings(&machine.artifact), &machine.library, None, composite);
     let runtime = ready
@@ -151,8 +91,8 @@ fn a_composite_of_the_artifact_with_itself_generates_the_artifacts_tokens() {
     let done = Handoff::new();
     runtime
         .generate(GenerationRequest {
-            prompt,
-            max_tokens: 128,
+            prompt: PROMPT.to_vec(),
+            max_tokens: 32,
             stop_tokens: Vec::new(),
             speculation: Speculation::Off,
             sampling: SamplingConfig::greedy(0),
@@ -164,19 +104,127 @@ fn a_composite_of_the_artifact_with_itself_generates_the_artifacts_tokens() {
         })
         .expect("the request is admitted");
     let tokens = done.wait(WAIT).expect("the generation reports");
-    assert_eq!(tokens, golden);
     closer.shutdown(runtime).expect("the engine stops");
+    tokens
+}
+
+/// The index of the artifact: its header, the metadata bytes and its table.
+fn index(artifact: &Path) -> (Header, Vec<u8>, Vec<TensorEntry>) {
+    let (_, table) = common::open_artifact(artifact);
+    let mut file = File::open(artifact).unwrap();
+    let mut header = [0u8; HEADER_BYTES];
+    file.read_exact(&mut header).unwrap();
+    let header = Header::parse(&header).unwrap();
+    let range = header.metadata_range();
+    let mut metadata = vec![0u8; usize::try_from(range.end - range.start).unwrap()];
+    file.seek(SeekFrom::Start(range.start)).unwrap();
+    file.read_exact(&mut metadata).unwrap();
+    (header, metadata, table.entries().to_vec())
+}
+
+/// Two trellis projections of different layers: the objects a composite takes.
+fn two_projections(entries: &[TensorEntry]) -> [String; 2] {
+    let layer = |name: &str| name.split('/').nth(2).map(str::to_string);
+    let mut chosen: Vec<String> = Vec::new();
+    for entry in entries {
+        let name = entry.name();
+        if name.starts_with("text/layers/")
+            && !is_companion(name)
+            && entry.format() == WeightFormat::Trellis
+            && chosen.iter().all(|taken| layer(taken) != layer(name))
+        {
+            chosen.push(name.to_string());
+        }
+        if chosen.len() == 2 {
+            break;
+        }
+    }
+    let [first, second] = <[String; 2]>::try_from(chosen).expect("the artifact has trellis projections in two layers");
+    [first, second]
+}
+
+/// Writes an artifact at `path` that holds `objects` and their companions, with the payloads of `base`, in the
+/// reverse of the base's order and at other offsets, so only a read from this file finds them.
+fn write_source(base: &Path, path: &Path, objects: &[String; 2]) {
+    let (header, metadata, entries) = index(base);
+    let mut specs = Vec::new();
+    let mut from = Vec::new();
+    for object in objects.iter().rev() {
+        let names = [object.clone()]
+            .into_iter()
+            .chain(TRELLIS_COMPANIONS.map(|suffix| format!("{object}{suffix}")));
+        for name in names {
+            let entry = entries.iter().find(|entry| entry.name() == name).unwrap();
+            specs.push(ObjectSpec {
+                name,
+                shape: entry.shape().to_vec(),
+                dtype: entry.dtype(),
+                format: entry.format(),
+                layout: entry.layout(),
+                bytes: entry.bytes(),
+            });
+            from.push(entry.clone());
+        }
+    }
+    let plan = ArtifactPlan::new(header.metadata_size(), &specs, PAYLOAD_ALIGNMENT).unwrap();
+    let mut out = File::create(path).unwrap();
+    out.write_all(&plan.header().encode()).unwrap();
+    out.write_all(&metadata).unwrap();
+    out.write_all(&plan.table().unwrap()).unwrap();
+    let mut source = File::open(base).unwrap();
+    let mut at = out.stream_position().unwrap();
+    for (placed, original) in plan.entries().iter().zip(&from) {
+        out.write_all(&vec![0u8; usize::try_from(placed.offset() - at).unwrap()])
+            .unwrap();
+        let mut payload = vec![0u8; usize::try_from(original.bytes()).unwrap()];
+        source.seek(SeekFrom::Start(original.offset())).unwrap();
+        source.read_exact(&mut payload).unwrap();
+        out.write_all(&payload).unwrap();
+        at = placed.offset() + original.bytes();
+    }
+    out.write_all(&vec![0u8; usize::try_from(PAYLOAD_ALIGNMENT).unwrap()])
+        .unwrap();
+    out.flush().unwrap();
 }
 
 #[test]
-#[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_composite_reads_each_object_from_its_own_file_and_generates_the_bases_tokens() {
+    let Some(machine) = machine() else { return };
+    let (_, _, entries) = index(&machine.artifact);
+    let objects = two_projections(&entries);
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("composite-weights");
+    fs::create_dir_all(&scratch).unwrap();
+    let source = scratch.join("source.edrl");
+    write_source(&machine.artifact, &source, &objects);
+
+    // The source holds the payloads at other offsets than the base: a read of the base's file at the source's offset
+    // finds other bytes, and the tokens differ.
+    let expected = generate(&machine, Composite::default());
+    assert_eq!(expected.len(), 32);
+    let composite = Composite {
+        replacements: vec![Replacement {
+            source: source.clone(),
+            objects: objects.to_vec(),
+        }],
+        draft_depth: None,
+    };
+    let tokens = generate(&machine, composite);
+    fs::remove_file(&source).unwrap();
+    assert_eq!(tokens, expected);
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_source_that_cannot_be_opened_stops_the_start_naming_it() {
     let Some(machine) = machine() else { return };
+    let (_, _, entries) = index(&machine.artifact);
     let composite = Composite {
         replacements: vec![Replacement {
             source: PathBuf::from("no-such-source.edrl"),
-            objects: choosable(&machine.artifact).into_iter().take(1).collect(),
+            objects: two_projections(&entries).into_iter().take(1).collect(),
         }],
+        draft_depth: None,
     };
     let (owner, ready) =
         EngineRuntime::start_composite(&settings(&machine.artifact), &machine.library, None, composite);

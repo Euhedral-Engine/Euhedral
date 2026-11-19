@@ -747,7 +747,14 @@ impl EngineRuntime {
         let composite = if composite.is_empty() {
             Composite::default()
         } else {
-            composite
+            Composite {
+                replacements: composite
+                    .replacements
+                    .into_iter()
+                    .filter(|replacement| !replacement.objects.is_empty())
+                    .collect(),
+                ..composite
+            }
         };
         let ready = Handoff::new();
         match build(settings, library, close_timeout) {
