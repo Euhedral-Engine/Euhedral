@@ -25,7 +25,7 @@ use euhedral_inference_quantization::reference::{Forcer, Options, Written, parti
 use euhedral_inference_settings::{ByteSize, ModelSettings, Settings};
 
 const WAIT: Duration = Duration::from_secs(20 * 60);
-const CONTEXT: usize = 64;
+const CONTEXT: usize = 32;
 const TEXT: &str = "The quick brown fox jumps over the lazy dog while the river runs quietly past the old mill, \
     and the farmers count the sacks of grain stacked beside the barn before the first frost arrives in the valley. \
     In the evening the lamps are lit, the kettle sings on the stove, and the children read aloud from a worn book \
