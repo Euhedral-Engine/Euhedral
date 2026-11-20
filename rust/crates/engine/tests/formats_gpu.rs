@@ -33,9 +33,9 @@ mod typed;
 use std::collections::HashMap;
 
 use euhedral_inference_cuda::launch::nvfp4::skinny_target_ctas;
-use euhedral_inference_cuda::launch::q3::{P2E2_EXPAND_LIMIT, q3_byte_size};
+use euhedral_inference_cuda::launch::q3::P2E2_EXPAND_LIMIT;
 use euhedral_inference_cuda::{DeviceBuffer, HostWeightsArena};
-use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
+use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use euhedral_inference_engine::formats::{
     LinearFormat, LinearKernel, LinearMode, Nvfp4Linear, Q3Embedding, Q3Linear, ROW_EXACT_KERNELS, ShapeRecorder,
     TrellisLinear, nvfp4_native_scratch_bytes,
@@ -44,7 +44,7 @@ use euhedral_inference_engine::model::{Residence, WeightRef};
 use euhedral_inference_engine::residency::offload::{MAPPED_HEAD_MAX_ROWS, OUTPUT_HEAD};
 use euhedral_inference_settings::TrellisKernelSettings;
 use linear_gpu::{
-    Artifact, Random, Rig, Trellis, activations, assert_close, bf16, bf16_value, empty, fp16, relative_rms, rig,
+    Artifact, Random, Rig, Trellis, activations, assert_close, bf16, bf16_value, compressed_head, relative_rms, rig,
     synthetic_trellis, upload, values,
 };
 
@@ -590,59 +590,18 @@ fn a_mapped_head_computes_the_device_heads_logits() {
 fn a_compressed_tensor_run_in_chunks_equals_its_whole_expansion() {
     let Some(rig) = rig() else { return };
     let (out, k) = (70_016usize, 5120usize);
-    let expanded = q3_byte_size(out as u32, k as u32);
-    assert!(expanded > P2E2_EXPAND_LIMIT, "{expanded} bytes must need chunks");
-    // A valid stream of the geometry (`q3_p2e2_geometry.h`): codes of -1, 0 and +1 (no BIG symbol, so no payload
-    // units and every row's base is 0), FP16 scales, and the zero padding words behind the empty payload.
-    let align = |value: usize| value.next_multiple_of(256);
-    let base = align(out * k / 4);
-    let scales = align(base + 4 * out);
-    let payload = align(scales + out * k / 32);
-    let bytes = (payload + 4 * 80) as u64;
     let mut random = Random::new(29);
-    let mut words = vec![0u8; bytes as usize];
-    for word in words[..out * k / 4].as_chunks_mut::<4>().0 {
-        let symbols = random.next_u64() as u32;
-        let big = symbols & (symbols >> 1) & 0x5555_5555;
-        *word = (symbols & !(big | (big << 1))).to_le_bytes();
-    }
-    for scale in words[scales..scales + out * k / 32].as_chunks_mut::<2>().0 {
-        *scale = fp16(0.01 + 0.02 * random.uniform()).to_le_bytes();
-    }
-    let compressed = upload(&rig.library, &words);
-    let whole = empty(&rig.library, expanded as usize);
-    rig.run(|ops| {
-        ops.q3_p2e2_expand(
-            compressed.ptr(),
-            bytes,
-            out as u32,
-            k as u32,
-            0,
-            out as u32,
-            whole.ptr(),
-            expanded,
-        )
-    });
-    let weight = |name: &str, layout, ptr, bytes| WeightRef {
-        name: name.to_string(),
-        shape: vec![out as u64, k as u64],
-        dtype: TensorDataType::Bf16,
-        format: WeightFormat::Q3G64Fp16,
-        layout,
-        ptr,
-        bytes,
-        residence: Residence::Device,
-        trellis: None,
-    };
-    let chunked = weight("head", WeightLayout::RowSplitP2e2V1, compressed.ptr(), bytes);
-    let plain = weight("head-expanded", WeightLayout::RowSplitK128V1, whole.ptr(), expanded);
+    let head = compressed_head(&rig, &mut random, out, k);
+    let expanded = head.expanded;
+    assert!(expanded > P2E2_EXPAND_LIMIT, "{expanded} bytes must need chunks");
+    let (chunked, plain) = (&head.compressed, &head.expanded_weight);
     let format = Q3Linear::new(&rig.library);
     for rows in [9usize, 40] {
         let x = upload(&rig.library, &activations(&mut random, rows, k));
-        let wanted = rig.linear(&format, &plain, &x, 0, k, out, rows, PLAIN);
-        let actual = rig.linear(&format, &chunked, &x, 0, k, out, rows, PLAIN);
+        let wanted = rig.linear(&format, plain, &x, 0, k, out, rows, PLAIN);
+        let actual = rig.linear(&format, chunked, &x, 0, k, out, rows, PLAIN);
         assert!(
-            format.scratch_bytes(&chunked, rows, PLAIN) < expanded as usize,
+            format.scratch_bytes(chunked, rows, PLAIN) < expanded as usize,
             "{rows} rows: the chunks are bounded"
         );
         assert!(

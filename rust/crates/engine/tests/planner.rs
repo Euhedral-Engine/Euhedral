@@ -54,6 +54,7 @@ fn inputs(device_free: u64) -> PlanInputs {
     PlanInputs {
         device_free,
         multiprocessors: Some(70),
+        exact_numerics: false,
         host_pinned_bytes: Some(u64::MAX),
         sequences: 1,
     }
@@ -629,6 +630,7 @@ fn a_plan_of_one_sequence_is_the_plan_that_knew_none() {
     let one = plan_with(&config, &table, &settings(131_072), with_sequences(16 * GIB, 1)).unwrap();
     let unaware = PlanInputs {
         multiprocessors: None,
+        exact_numerics: false,
         ..with_sequences(16 * GIB, 1)
     };
     assert_eq!(

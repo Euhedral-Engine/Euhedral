@@ -13,7 +13,7 @@
 //! were, naming the memory that is short.
 
 use euhedral_inference_cuda::launch::nvfp4::{SKINNY_MAX_ROWS, nvfp4_native_scratch_bytes, skinny_target_ctas};
-use euhedral_inference_cuda::launch::q3::linear_scratch_bytes;
+use euhedral_inference_cuda::launch::q3::linear_scratch_bytes_upto;
 use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFormat, WeightLayout};
 use euhedral_inference_settings::{Auto, BatchingSettings, KvFormat, Settings};
 
@@ -282,6 +282,8 @@ pub struct PlanInputs {
     /// The device's streaming multiprocessors; sizes the trellis K split's partials when
     /// `kernels.trellis.target-blocks` is `auto`. `None`: the widest split the shapes allow.
     pub multiprocessors: Option<u32>,
+    /// Whether the library runs the exact kernels, which expand a compressed tensor the fused decode reads in place.
+    pub exact_numerics: bool,
     /// Pinned host bytes the cache pages may take. `None`: not known, and no spill is allowed (the prefix cache still
     /// keeps its stated size).
     pub host_pinned_bytes: Option<u64>,
@@ -312,6 +314,7 @@ pub fn plan(
         PlanInputs {
             device_free,
             multiprocessors: None,
+            exact_numerics: false,
             host_pinned_bytes,
             sequences: 1,
         },
@@ -418,6 +421,7 @@ pub fn plan_closest(
             chunk,
             rows.logits_rows,
             inputs.multiprocessors,
+            inputs.exact_numerics,
         ));
     let decode_scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::TensorCore);
 
@@ -939,14 +943,15 @@ fn nvfp4_native_scratch(placements: &[Placement], rows: u64, target_ctas: u64) -
 /// (`multiprocessors` is `None`) with the most K splits any device makes.
 ///
 /// A P2E2 tensor too large to expand whole (`P2E2_EXPAND_LIMIT`) is run in chunks of output rows, which the scratch
-/// holds one at a time. The library's numerics are not known here, so a tensor is sized for both: the exact kernels
-/// expand a tensor the fused decode reads in place.
+/// holds one at a time; a chunk grows as the rows shrink, so every tensor is sized at the most of 1 to its rows. The
+/// exact kernels expand a tensor the fused decode reads in place, so `exact_numerics` is the library's.
 fn grouped_scratch(
     placements: &[Placement],
     layers: usize,
     rows: u64,
     logits_rows: u64,
     multiprocessors: Option<u32>,
+    exact_numerics: bool,
 ) -> u64 {
     let mut largest = 0;
     for placement in placements.iter().filter(|placement| {
@@ -967,18 +972,15 @@ fn grouped_scratch(
             continue;
         };
         let p2e2 = placement.layout == WeightLayout::RowSplitP2e2V1;
-        let needed = [false, true].map(|exact_numerics| {
-            linear_scratch_bytes(
-                p2e2,
-                u32::try_from(rows).unwrap_or(u32::MAX),
-                input,
-                out,
-                true,
-                multiprocessors,
-                exact_numerics,
-            )
-        });
-        largest = largest.max(needed[0]).max(needed[1]);
+        largest = largest.max(linear_scratch_bytes_upto(
+            p2e2,
+            u32::try_from(rows).unwrap_or(u32::MAX),
+            input,
+            out,
+            true,
+            multiprocessors,
+            exact_numerics,
+        ));
     }
     largest
 }
@@ -1133,7 +1135,7 @@ pub mod nvfp4 {
 mod tests {
     use std::slice;
 
-    use euhedral_inference_cuda::launch::q3::{P2E2_EXPAND_LIMIT, q3_byte_size};
+    use euhedral_inference_cuda::launch::q3::{P2E2_EXPAND_LIMIT, linear_scratch_bytes, q3_byte_size};
 
     use super::*;
 
@@ -1161,11 +1163,12 @@ mod tests {
         }
     }
 
-    /// A compressed head just over the expansion limit is run in chunks, and its scratch is sized for them whatever the
-    /// numerics and the rows (the exact kernels expand it even at the rows its fused decode reads it in place); the
-    /// largest head that fits is sized for its whole expansion.
+    /// A compressed head over the expansion limit is run in chunks that grow as the rows shrink, so the plan covers
+    /// the scratch of a launch of any row count up to the head's rows, not only of the most rows; the largest head
+    /// that fits is sized for its whole expansion. The fused decode reads a head of few rows in place, so only the
+    /// exact kernels give it scratch there.
     #[test]
-    fn a_compressed_head_over_the_expansion_limit_is_sized_for_its_chunks_at_every_row_count() {
+    fn a_compressed_head_over_the_expansion_limit_is_planned_for_every_launch_up_to_its_rows() {
         let width = 5120u32;
         let mut fits = 1024u32;
         while q3_byte_size(fits + 16, width) <= P2E2_EXPAND_LIMIT {
@@ -1174,18 +1177,29 @@ mod tests {
         let largest = p2e2("text/draft_head", &[fits.into(), width.into()]);
         let over = p2e2("text/draft_head", &[u64::from(fits) + 16, width.into()]);
         let whole = q3_byte_size(fits, width);
-        for logits_rows in [1, 8, 9] {
-            let sized = grouped_scratch(slice::from_ref(&largest), 64, 8, logits_rows, Some(70));
-            assert!(
-                sized >= whole,
-                "{logits_rows} rows: {sized} for a head of {whole} bytes"
-            );
-            let chunked = grouped_scratch(slice::from_ref(&over), 64, 8, logits_rows, Some(70));
-            assert!(chunked > 0, "{logits_rows} rows: a head over the limit takes scratch");
-            assert!(
-                chunked <= whole.next_multiple_of(256) + (64 << 20),
-                "{logits_rows} rows: {chunked} is bounded"
-            );
+        let needed =
+            |out: u32, launch: u32, exact| linear_scratch_bytes(true, launch, width, out, true, Some(70), exact);
+        for exact in [false, true] {
+            for logits_rows in [1, 8, 9, 17, 18, 24, 64, 512] {
+                let planned = grouped_scratch(slice::from_ref(&largest), 64, 8, logits_rows, Some(70), exact);
+                assert!(
+                    exact || logits_rows > 8 || planned == 0,
+                    "{logits_rows} rows: no scratch for a decode"
+                );
+                assert!(
+                    !exact || planned >= whole,
+                    "{logits_rows} rows: {planned} for a head of {whole} bytes"
+                );
+                let chunked = grouped_scratch(slice::from_ref(&over), 64, 8, logits_rows, Some(70), exact);
+                for launch in 1..=logits_rows as u32 {
+                    let wanted = needed(fits + 16, launch, exact);
+                    assert!(
+                        chunked >= wanted,
+                        "{logits_rows} rows, a launch of {launch}, exact {exact}: planned {chunked}, needed {wanted}"
+                    );
+                }
+                assert!(exact || logits_rows <= 8 || chunked > 0);
+            }
         }
     }
 

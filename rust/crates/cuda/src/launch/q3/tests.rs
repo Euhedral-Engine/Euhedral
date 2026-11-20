@@ -210,7 +210,8 @@ fn the_scratch_of_a_linear() {
     );
 }
 
-/// The chunks of a head tile its rows in whole kilorows, and a chunk with its output fits the expansion limit.
+/// The chunks of a head tile its rows in whole kilorows, and a chunk with its output fits the expansion limit; a
+/// chunk is never one of the widths the FFN and mixer kernels are specialised for.
 #[test]
 fn the_chunks_of_a_large_head_fit_the_expansion_limit_and_avoid_the_specialised_widths() {
     for rows in [1, 8, 9, 64, 512] {
@@ -218,8 +219,13 @@ fn the_chunks_of_a_large_head_fit_the_expansion_limit_and_avoid_the_specialised_
         assert_eq!(chunk % 1024, 0);
         let (_, activations) = p2e2_chunk_offsets(rows, 5120, chunk);
         assert!(activations <= P2E2_EXPAND_LIMIT + 512, "{rows}");
-        assert_ne!(chunk, 5120);
-        assert_ne!(chunk, 34816);
+    }
+    // Widths of K whose unguarded chunk of one row is 5120 and 34816.
+    for input in [57_344, 9344] {
+        let per_unit = q3_byte_size(1024, input) + 1024 * 2;
+        let unguarded = (P2E2_EXPAND_LIMIT / per_unit) * 1024;
+        assert!(unguarded == 5120 || unguarded == 34816, "{input}: {unguarded}");
+        assert_eq!(u64::from(p2e2_chunk_rows(1, input)), unguarded - 1024);
     }
 }
 

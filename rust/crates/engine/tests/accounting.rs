@@ -27,6 +27,7 @@ fn inputs(sequences: usize) -> PlanInputs {
     PlanInputs {
         device_free: 64 * GIB,
         multiprocessors: Some(70),
+        exact_numerics: false,
         host_pinned_bytes: Some(u64::MAX),
         sequences,
     }

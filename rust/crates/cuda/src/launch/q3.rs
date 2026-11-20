@@ -608,6 +608,33 @@ pub fn linear_scratch_bytes(
     activation_offset + reserve
 }
 
+/// The most scratch any launch of 1 to `rows` rows takes ([`linear_scratch_bytes`]). A chunked tensor's chunk grows as
+/// the rows shrink, so a launch of fewer rows can take more than one of `rows`.
+pub fn linear_scratch_bytes_upto(
+    p2e2: bool,
+    rows: u32,
+    in_features: u32,
+    out_features: u32,
+    mx_available: bool,
+    sm_count: Option<u32>,
+    exact_numerics: bool,
+) -> u64 {
+    (1..=rows.max(1))
+        .map(|launch| {
+            linear_scratch_bytes(
+                p2e2,
+                launch,
+                in_features,
+                out_features,
+                mx_available,
+                sm_count,
+                exact_numerics,
+            )
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// The offsets of the planes of a Q4 or Q5 tensor that the FP8 kernel takes: the fifth-bit plane's and the scales'
 /// (`run`, `q3_mx.c`). A Q3 tensor has its codes first.
 fn mx_offsets(bits: Bits, weight_rows: u32, width: u32) -> (u64, u64) {
