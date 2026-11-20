@@ -16,6 +16,7 @@
     reason = "no-wait, blocking I/O and waiting calls: a test reads the device and waits on hand-offs"
 )]
 
+use std::iter;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -82,12 +83,18 @@ struct Recording {
 }
 
 struct Recorder {
+    /// Cancels the generation once its prompt has prefilled, when set.
+    cancel_after_prefill: Option<CancelHandle>,
     tokens: Vec<u32>,
     done: Option<Arc<Handoff<Recording>>>,
 }
 
 impl GenerationListener for Recorder {
-    fn prefill_done(&mut self, _at: Instant) {}
+    fn prefill_done(&mut self, _at: Instant) {
+        if let Some(cancel) = &self.cancel_after_prefill {
+            cancel.cancel();
+        }
+    }
 
     fn token(&mut self, id: u32, _at: Instant) {
         self.tokens.push(id);
@@ -155,6 +162,7 @@ fn request(
         sampling,
         constraint: None,
         listener: Box::new(Recorder {
+            cancel_after_prefill: None,
             tokens: Vec::new(),
             done: Some(Arc::clone(done)),
         }),
@@ -262,9 +270,21 @@ fn hidden_rows_are_the_seed_rows_the_catch_up_reads() {
     // A request that drafts runs its verification on the row of the token it has, and the seed rows then hold that
     // row's post-final-norm hidden state, which the next catch-up reads. The hidden request decodes the same row.
     let ids = prompt(40);
-    // A request that drafts and generates nothing ends after its prompt chunk, whose rows the catch-up reads.
-    let prefilled = plain(&runtime, &ids, 0, Speculation::Artifact, greedy());
-    assert_eq!(prefilled.outcome.reason, FinishReason::Length);
+    // A request that drafts and is cancelled once its prompt has prefilled leaves the chunk's rows in the seed buffer,
+    // which its catch-up would read.
+    let cancel = CancelHandle::default();
+    let done = Handoff::new();
+    let mut cancelled = request(&ids, 8, Speculation::Artifact, greedy(), &done);
+    cancelled.listener = Box::new(Recorder {
+        cancel_after_prefill: Some(cancel.clone()),
+        tokens: Vec::new(),
+        done: Some(Arc::clone(&done)),
+    });
+    runtime
+        .generate_cancellable(cancelled, cancel)
+        .expect("the request is admitted");
+    let prefilled = done.wait(WAIT).expect("the generation reports");
+    assert_eq!(prefilled.outcome.reason, FinishReason::Cancelled);
     let chunk_hidden_bytes = runtime.config().hidden_size * 2;
     let chunk_reads = seed_rows(&runtime, 40, chunk_hidden_bytes);
     let speculative = plain(&runtime, &ids, 2, Speculation::Artifact, greedy());
@@ -389,7 +409,7 @@ fn a_slow_sink_holds_the_request_back_and_hears_every_row_in_order() {
     let (recording, heard) = hidden_slowly(&runtime, &ids, 12, greedy(), Duration::from_millis(150));
     assert_eq!(recording.outcome.reason, FinishReason::Length);
     let positions: Vec<u64> = heard.iter().map(|call| call.first_position).collect();
-    let expected: Vec<u64> = std::iter::once(0).chain(20..31).collect();
+    let expected: Vec<u64> = iter::once(0).chain(20..31).collect();
     assert_eq!(positions, expected, "every quantum's rows, once, in order");
     owner.shutdown(runtime).unwrap();
 }
