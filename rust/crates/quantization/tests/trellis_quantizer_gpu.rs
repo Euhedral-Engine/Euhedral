@@ -117,7 +117,10 @@ fn a_zeroed_leading_block_is_damped_and_quantized() {
     let out = rig
         .quantize(&request(&w, Some(&h), N as u32, K as u32, 512, 3.0))
         .unwrap();
-    assert_eq!(out.cholesky_retries, 0, "the initial damping alone makes it positive definite");
+    assert_eq!(
+        out.cholesky_retries, 0,
+        "the initial damping alone makes it positive definite"
+    );
     assert_eq!(out.refit_failures, 0);
     assert!(all_finite(&out.suh) && all_finite(&out.svh));
     assert!(relative_error(&rig, &out.decoded, &weight) < 0.4);
@@ -236,9 +239,7 @@ fn hessian_error(rig: &Rig, decoded: &euhedral_inference_cuda::DeviceBuffer, wei
     let (mut error, mut energy) = (0f64, 0f64);
     for r in 0..N {
         let w: Vec<f64> = (0..K).map(|j| f64::from(bf16(weight[r * K + j]))).collect();
-        let e: Vec<f64> = (0..K)
-            .map(|j| f64::from(bf16(decoded[r * K + j])) - w[j])
-            .collect();
+        let e: Vec<f64> = (0..K).map(|j| f64::from(bf16(decoded[r * K + j])) - w[j]).collect();
         error += quadratic(&e);
         energy += quadratic(&w);
     }
@@ -264,8 +265,15 @@ fn the_error_in_the_hessian_metric_is_what_the_quantizer_reports_and_beats_the_p
     let measured = hessian_error(&rig, &calibrated.decoded, &weight, &values);
     let plain_measured = hessian_error(&rig, &plain.decoded, &weight, &values);
     let relative = (measured - calibrated.proxy_error).abs() / calibrated.proxy_error;
-    assert!(relative < 0.05, "measured {measured}, reported {}", calibrated.proxy_error);
-    assert!(measured < 0.4 * plain_measured, "{measured} against plain {plain_measured}");
+    assert!(
+        relative < 0.05,
+        "measured {measured}, reported {}",
+        calibrated.proxy_error
+    );
+    assert!(
+        measured < 0.4 * plain_measured,
+        "{measured} against plain {plain_measured}"
+    );
     // this input gives 0.0040 with the scale search and the refit; without the refit it gives 0.0045 and with the
     // global scale fixed at one 0.0052
     assert!(measured < 0.0043, "{measured}");
