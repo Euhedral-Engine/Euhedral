@@ -2,6 +2,7 @@
 # for the main pushes that forge-mirror sends). One workflow, so `rollover promote` finds one run per commit
 # (require_run = ["ci.yaml"]).
 #
+# The runner labels are listed below with the jobs that use them.
 # Runs for a pull request that touches a path below, for a push to main or to an integration branch (rust/next*), and by hand.
 # A push to any other branch starts nothing: the runner is shared, and the branch's pull request runs the same jobs.
 # On an integration branch the jobs run whenever anything since main touched their paths, so a later push that touches none
