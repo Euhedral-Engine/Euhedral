@@ -268,6 +268,6 @@ fn the_error_in_the_hessian_metric_is_what_the_quantizer_reports_and_beats_the_p
         calibrated.proxy_error, calibrated.cholesky_retries, calibrated.global_scale
     );
     let relative = (measured - calibrated.proxy_error).abs() / calibrated.proxy_error;
-    assert!(relative < 0.1, "measured {measured}, reported {}", calibrated.proxy_error);
-    assert!(measured < 0.8 * plain_measured, "{measured} against plain {plain_measured}");
+    assert!(relative < 0.05, "measured {measured}, reported {}", calibrated.proxy_error);
+    assert!(measured < 0.4 * plain_measured, "{measured} against plain {plain_measured}");
 }
