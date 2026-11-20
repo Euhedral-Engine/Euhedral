@@ -1,4 +1,4 @@
-# Gitea Actions twin of .gitlab-ci.yml (Linux only; Windows, ARM and the Intel SDE step stay on GitHub, which runs them
+# CI for Linux (Windows, ARM and the Intel SDE step stay on GitHub, which runs them
 # for the main pushes that forge-mirror sends). One workflow, so `rollover promote` finds one run per commit
 # (require_run = ["ci.yaml"]).
 #
@@ -81,7 +81,7 @@ jobs:
           set -euo pipefail
           zero=0000000000000000000000000000000000000000
 
-          # The path groups of the GitLab twin's rules. mise.toml and rust/** are in both, as there.
+          # The path groups of each job. mise.toml and rust/** are in both groups.
           rust_paths=(
             ':(glob)rust/**' ':(glob)native/include/**' ':(glob)mise.toml' ':(glob).gitea/workflows/ci.yaml'
           )
