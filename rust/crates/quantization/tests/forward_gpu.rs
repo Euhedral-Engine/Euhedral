@@ -92,7 +92,7 @@ fn gathered_rows_are_the_table_rows_the_ids_name_in_order() {
     let mut rig = rig();
     let (entries, width) = (10usize, 24usize);
     let table: Vec<u16> = (0..entries * width)
-        .map(|i| to_bf16((i / width * 100 + i % width) as f32))
+        .map(|i| to_bf16((i / width * 10 + i % width) as f32))
         .collect();
     let ids = [3i32, 0, 9, 3, 7];
     let table_device = rig.upload(&bytes_of(&table));
@@ -105,11 +105,7 @@ fn gathered_rows_are_the_table_rows_the_ids_name_in_order() {
         for column in 0..width {
             let at = 2 * (row * width + column);
             let value = bf16_to_f32(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
-            assert_eq!(
-                value,
-                (*id as usize * 100 + column) as f32,
-                "row {row}, column {column}"
-            );
+            assert_eq!(value, (*id as usize * 10 + column) as f32, "row {row}, column {column}");
         }
     }
     rig.finish();
@@ -151,7 +147,7 @@ struct Run {
 
 /// Runs `layer` over two sequences of 256 rows twice on `forward` from `model.input`, each run's hidden states and
 /// observations returned.
-fn forward_twice(rig: &mut Rig, model: &Model, staged: &StagedLayer, index_label: &str) -> [Run; 2] {
+fn forward_twice(rig: &mut Rig, model: &Model, staged: &StagedLayer) -> [Run; 2] {
     let (sequences, length) = (2u32, 256u32);
     let rows = sequences * length;
     let hidden = rig.upload(&model.input);
@@ -166,8 +162,8 @@ fn forward_twice(rig: &mut Rig, model: &Model, staged: &StagedLayer, index_label
     drop(retained);
     let hidden_ptr = hidden.ptr();
     let mut runs = Vec::new();
-    for pass in 0..2 {
-        hidden.copy_from_host(0, &model.input).unwrap();
+    for _ in 0..2 {
+        rig.overwrite(&hidden, &model.input);
         let mut observed = Vec::new();
         rig.run(|context| {
             let mut observer = |seen: &Observation<'_>, _: &mut LaneContext<'_, _>| {
@@ -178,7 +174,6 @@ fn forward_twice(rig: &mut Rig, model: &Model, staged: &StagedLayer, index_label
         });
         forward.retire();
         let bytes = rig.download(&hidden, model.input.len());
-        println!("{index_label} pass {pass}: observed {observed:?}");
         runs.push(Run {
             hidden: bytes,
             observed,
@@ -206,7 +201,7 @@ fn a_rerun_is_identical_and_the_observer_sees_each_object_once_in_order() {
     let model = model();
     for index in [0usize, 3] {
         let layer = staged(&model, Target::Layer(index));
-        let [first, second] = forward_twice(&mut rig, &model, &layer, &format!("layer {index}"));
+        let [first, second] = forward_twice(&mut rig, &model, &layer);
         assert_eq!(first.hidden, second.hidden, "layer {index}: a rerun differs");
         assert_ne!(
             first.hidden, model.input,
