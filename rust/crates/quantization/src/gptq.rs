@@ -25,15 +25,15 @@ use euhedral_inference_cuda::math::{Fill, LaneHandles, MathMode, Matrix, Operati
 use euhedral_inference_cuda::{CudaError, DevicePtr};
 use thiserror::Error;
 
+use crate::chain::{self, ChainError, Next, Parts, Unsettled};
 use crate::gptq::format::{
     BLOCK, E2M1_MAX, Format, FormatError, Nvfp4Search, SEARCH_BELOW, column_order, damped_diagonal, dead_columns,
     group_of_places, positions,
 };
-use crate::chain::{self, ChainError, Next, Parts, Unsettled};
-use crate::memory::{Claims, Device, LaneMemory, Memory, MemoryError, Staged, StepBytes, pinned_bytes, reclaim};
 use crate::gptq::sd4::{CODES, ENTRIES};
 use crate::gptq::state::{QuantState, StateError};
 use crate::kernels::{Compiled, Module, ModuleError, Modules};
+use crate::memory::{Claims, Device, LaneMemory, Memory, MemoryError, Staged, StepBytes, pinned_bytes, reclaim};
 
 /// Why a step could not be started or did not finish.
 #[derive(Debug, Error)]

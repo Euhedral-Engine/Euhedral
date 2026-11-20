@@ -18,7 +18,6 @@ use euhedral_core::generics::LatticeSource;
 use euhedral_gpu::cuda::{CudaGpu, CudaModule};
 use euhedral_gpu::{Gpu, StreamOptions};
 use euhedral_graph::{Completions, LanePool};
-use euhedral_memory::{LocationId, LocationKind, LocationSpec, OwnerId, OwnerSpec, Planner, Priority, Scope};
 use euhedral_inference_cuda::math::MathLibraries;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, PinnedPool};
 use euhedral_inference_quantization::kernels::{ModuleOptions, Modules};
@@ -26,6 +25,7 @@ use euhedral_inference_quantization::memory::{Claims, Device, LaneMemory, StepBy
 use euhedral_inference_quantization::trellis::{
     Finished, QuantizeError, Quantized, Refused, Request, TrellisLane, TrellisSettings,
 };
+use euhedral_memory::{LocationId, LocationKind, LocationSpec, OwnerId, OwnerSpec, Planner, Priority, Scope};
 
 pub struct Rig {
     pub library: Arc<CudaLibrary>,
@@ -73,7 +73,8 @@ pub fn rig(settings: TrellisSettings) -> Rig {
     let handles = handles.unwrap().expect("the math handles");
     let pinned = PinnedPool::new(&library, 256 << 20);
     let memory = LaneMemory::new(Arc::clone(&library), Arc::clone(&pinned));
-    let lane = TrellisLane::new(stream, handles, kernels, memory, Arc::clone(&completions), settings).expect("the lane");
+    let lane =
+        TrellisLane::new(stream, handles, kernels, memory, Arc::clone(&completions), settings).expect("the lane");
     let planner = Planner::new([
         LocationSpec {
             kind: LocationKind::Device { ordinal: 0 },
@@ -236,7 +237,11 @@ impl Rig {
 
     pub fn download(&self, buffer: &Device, bytes: usize) -> Vec<u8> {
         let mut host = vec![0u8; bytes];
-        buffer.buffer().expect("a live buffer").copy_to_host(0, &mut host).expect("download");
+        buffer
+            .buffer()
+            .expect("a live buffer")
+            .copy_to_host(0, &mut host)
+            .expect("download");
         host
     }
 }

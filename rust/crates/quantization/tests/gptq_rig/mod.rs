@@ -20,12 +20,12 @@ use euhedral_graph::{Completions, LanePool};
 use euhedral_inference_cuda::math::MathLibraries;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, PinnedPool};
 use euhedral_inference_quantization::gptq::format::Format;
-use euhedral_inference_quantization::memory::{Claims, LaneMemory, StepBytes};
 use euhedral_inference_quantization::gptq::{
     DeviceRange, Factor, Finished, GptqError, GptqKernels, GptqLane, GptqSettings, Refused, TensorScales,
 };
 use euhedral_inference_quantization::gptq::{RoundRequest, state::QuantState};
 use euhedral_inference_quantization::kernels::{ModuleOptions, Modules};
+use euhedral_inference_quantization::memory::{Claims, LaneMemory, StepBytes};
 use euhedral_memory::{LocationId, LocationKind, LocationSpec, OwnerId, OwnerSpec, Planner, Priority, Scope};
 
 pub struct Rig {

@@ -80,6 +80,33 @@ pub struct Claims {
     pub pinned: Option<Claim>,
 }
 
+impl Claims {
+    /// Refuses claims that do not hold `needed`, before the step allocates anything: a step that would be refused
+    /// part-way leaves nothing behind.
+    pub fn cover(&self, needed: StepBytes) -> Result<(), MemoryError> {
+        for (kind, claim, bytes) in [
+            ("device", &self.device, needed.device),
+            ("pinned", &self.pinned, needed.pinned),
+        ] {
+            match claim {
+                None => {
+                    return Err(MemoryError::Refused(format!(
+                        "the step was given no {kind} claim for the {bytes} bytes it allocates"
+                    )));
+                }
+                Some(claim) if claim.bytes() < bytes => {
+                    return Err(MemoryError::Refused(format!(
+                        "the {kind} claim has {} bytes, fewer than the {bytes} the step allocates",
+                        claim.bytes()
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 struct Held {
     buffer: DeviceBuffer,
     claim: Option<Claim>,
@@ -339,7 +366,10 @@ pub struct Staged {
 }
 
 impl Staged {
-    pub fn new<Q: LaneStream<Raw = *mut c_void>>(memory: &mut Memory<'_, Q>, bytes: usize) -> Result<Staged, MemoryError> {
+    pub fn new<Q: LaneStream<Raw = *mut c_void>>(
+        memory: &mut Memory<'_, Q>,
+        bytes: usize,
+    ) -> Result<Staged, MemoryError> {
         Ok(Staged {
             host: memory.pinned(bytes)?,
             device: memory.device(bytes)?,

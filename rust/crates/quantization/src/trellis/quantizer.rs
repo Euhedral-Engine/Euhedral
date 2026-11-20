@@ -355,7 +355,13 @@ impl TrellisLane {
         let shape = Shape::new(n, k, rate, self.parts.settings)?;
         let hessian = hessian.filter(|_| count > 0);
         let sizes = Sizes::of(&shape, hessian.is_some());
-        let workspace_floats = if hessian.is_some() { self.workspace_floats(k)? } else { 1 };
+        let workspace_floats = if hessian.is_some() {
+            self.workspace_floats(k)?
+        } else {
+            1
+        };
+
+        claims.cover(sizes.step_bytes(workspace_floats))?;
 
         let mut random = SplittableRandom::new(seed);
         let su_values = signs(&mut random, k as usize);
