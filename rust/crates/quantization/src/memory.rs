@@ -80,9 +80,49 @@ pub struct Claims {
     pub pinned: Option<Claim>,
 }
 
+/// A range of device memory a step reads or writes, with its size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceRange {
+    addr: u64,
+    bytes: u64,
+}
+
+impl DeviceRange {
+    /// `bytes` of device memory at `addr`.
+    ///
+    /// # Safety
+    /// The range must be live device memory of at least `bytes` bytes, which nothing writes (when the step reads it)
+    /// or reads (when the step writes it) and which is not freed until the step's work has run: its `done` call, or,
+    /// when the step failed with the lane's `unsettled` count not 0, until that count is back
+    /// to 0 or the lane's next step is confirmed.
+    pub unsafe fn new(addr: u64, bytes: u64) -> DeviceRange {
+        DeviceRange { addr, bytes }
+    }
+
+    pub fn addr(&self) -> u64 {
+        self.addr
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// The address, when the range holds at least `needed` bytes.
+    pub fn holding(&self, what: &str, needed: u64) -> Result<u64, MemoryError> {
+        if self.addr == 0 || self.bytes < needed {
+            return Err(MemoryError::Refused(format!(
+                "the {what} needs {needed} device bytes and the range holds {}",
+                self.bytes
+            )));
+        }
+        Ok(self.addr)
+    }
+}
+
 impl Claims {
-    /// Refuses claims that do not hold `needed`, before the step allocates anything: a step that would be refused
-    /// part-way leaves nothing behind.
+    /// Refuses a missing claim, or one smaller than `needed`, before the step allocates anything. A claim that
+    /// passes can still be refused part-way when the planner has meanwhile shrunk it (an elastic claim) or its owner
+    /// has gone; the step then gives back what it took.
     pub fn cover(&self, needed: StepBytes) -> Result<(), MemoryError> {
         for (kind, claim, bytes) in [
             ("device", &self.device, needed.device),
@@ -287,7 +327,7 @@ impl<Q> Debug for Memory<'_, Q> {
 }
 
 impl<'a, Q: LaneStream<Raw = *mut c_void>> Memory<'a, Q> {
-    pub fn new(
+    pub(crate) fn new(
         queue: &'a Q,
         library: &'a Arc<CudaLibrary>,
         released: &'a Arc<Released>,
@@ -366,7 +406,7 @@ pub struct Staged {
 }
 
 impl Staged {
-    pub fn new<Q: LaneStream<Raw = *mut c_void>>(
+    pub(crate) fn new<Q: LaneStream<Raw = *mut c_void>>(
         memory: &mut Memory<'_, Q>,
         bytes: usize,
     ) -> Result<Staged, MemoryError> {
@@ -450,7 +490,7 @@ impl Staged {
     }
 
     /// Enqueues the copy of the host bytes to the device. The host bytes must stay as they are until it retires.
-    pub fn upload<Q: LaneEnqueue>(&self, queue: &mut Q) -> Result<(), GpuError> {
+    pub(crate) fn upload<Q: LaneEnqueue>(&self, queue: &mut Q) -> Result<(), GpuError> {
         // SAFETY: both ranges are live buffers of `len` bytes owned by this value, which the chain keeps until the
         // retirement is confirmed; nothing writes the host side meanwhile.
         unsafe { queue.copy_to_device(self.device.addr(), self.host.as_ptr(), self.host.len()) }?;
@@ -458,7 +498,7 @@ impl Staged {
     }
 
     /// Enqueues the copy of the device bytes to the host buffer, which is read after the retirement.
-    pub fn download<Q: LaneEnqueue>(&mut self, queue: &mut Q) -> Result<(), GpuError> {
+    pub(crate) fn download<Q: LaneEnqueue>(&mut self, queue: &mut Q) -> Result<(), GpuError> {
         let bytes = self.host.len();
         // SAFETY: as `upload`; nothing reads the host side before the retirement.
         unsafe { queue.copy_to_host(self.host.as_mut_ptr(), self.device.addr(), bytes) }?;

@@ -42,7 +42,9 @@ use super::{
 use crate::chain::{self, ChainError, Finished, Next, Parts, Stage, Unsettled, start};
 use crate::java_random::SplittableRandom;
 use crate::kernels::{Module, ModuleError, Modules};
-use crate::memory::{Claims, Device, LaneMemory, Memory, MemoryError, Staged, StepBytes, pinned_bytes, reclaim};
+use crate::memory::{
+    Claims, Device, DeviceRange, LaneMemory, Memory, MemoryError, Staged, StepBytes, pinned_bytes, reclaim,
+};
 
 /// The sizes the quantizer is tuned by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,8 +109,10 @@ impl ChainError for QuantizeError {
 /// What to quantize.
 #[derive(Clone, Copy, Debug)]
 pub struct Request {
-    /// The BF16 `nn.Linear` weight `[n, k]` on the device.
-    pub weight: u64,
+    /// The BF16 `nn.Linear` weight `[n, k]` on the device: at least `2 n k` bytes. The range stays in use until the
+    /// chain's `done` call or, when the chain failed with the lane's `unsettled` count not 0, until that count is
+    /// back to 0 or the lane's next step is confirmed.
+    pub weight: DeviceRange,
     /// Output features, a positive multiple of 128.
     pub n: u32,
     /// Input features, a positive multiple of 128.
@@ -116,7 +120,8 @@ pub struct Request {
     /// The FP32 Hessian `[k, k]` on the device, symmetric, normalised by `count` and undamped; it is left as it is. The
     /// weight is quantized without one when this is `None`, when `count` is zero, or when the mean diagonal is not
     /// finite or is below 1e-20.
-    pub hessian: Option<u64>,
+    /// At least `4 k²` bytes, in use for as long as the weight.
+    pub hessian: Option<DeviceRange>,
     /// The number of calibration rows the Hessian was summed over.
     pub count: u64,
     /// The rate: 2 to 6, or 2.5 or 3.5.
@@ -310,8 +315,8 @@ impl TrellisLane {
     }
 
     /// Quantizes the weight of `request`. `done` is called, from the frame that ends the chain, with the lane back, the
-    /// memory the chain used (to drop off the lattice) and the result. The request's weight and Hessian stay live and
-    /// unchanged until then.
+    /// memory the chain used (to drop off the lattice) and the result. The request's ranges stay in use as
+    /// [`Request`] says.
     pub fn quantize(
         mut self,
         request: &Request,
@@ -346,14 +351,13 @@ impl TrellisLane {
             seed,
             apply_out_scales,
         } = *request;
-        if weight == 0 || hessian == Some(0) {
-            return Err(QuantizeError::Request(
-                "the weight and the Hessian are device addresses".into(),
-            ));
-        }
+        let weight = weight.holding("weight", 2 * u64::from(n) * u64::from(k))?;
+        let hessian = hessian
+            .filter(|_| count > 0)
+            .map(|range| range.holding("Hessian", 4 * u64::from(k) * u64::from(k)))
+            .transpose()?;
         let rate = Rate::new(bits)?;
         let shape = Shape::new(n, k, rate, self.parts.settings)?;
-        let hessian = hessian.filter(|_| count > 0);
         let sizes = Sizes::of(&shape, hessian.is_some());
         let workspace_floats = if hessian.is_some() {
             self.workspace_floats(k)?

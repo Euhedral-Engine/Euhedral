@@ -193,44 +193,7 @@ pub use crate::chain::Scratch;
 /// count is back to 0 or the lane's next step has been confirmed.
 pub type Finished<T> = chain::Finished<GptqLane, T, GptqError>;
 
-/// A range of device memory a step reads or writes, with its size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeviceRange {
-    addr: u64,
-    bytes: u64,
-}
-
-impl DeviceRange {
-    /// `bytes` of device memory at `addr`.
-    ///
-    /// # Safety
-    /// The range must be live device memory of at least `bytes` bytes, which nothing writes (when the step reads it)
-    /// or reads (when the step writes it) and which is not freed until the step's work has run: its `done` call, or,
-    /// when the step failed with the lane's [`unsettled`](GptqLane::unsettled) count not 0, until that count is back
-    /// to 0 or the lane's next step is confirmed.
-    pub unsafe fn new(addr: u64, bytes: u64) -> DeviceRange {
-        DeviceRange { addr, bytes }
-    }
-
-    pub fn addr(&self) -> u64 {
-        self.addr
-    }
-
-    pub fn bytes(&self) -> u64 {
-        self.bytes
-    }
-
-    /// The address, when the range holds at least `needed` bytes.
-    fn holding(&self, what: &str, needed: u64) -> Result<u64, GptqError> {
-        if self.addr == 0 || self.bytes < needed {
-            return Err(GptqError::Request(format!(
-                "the {what} needs {needed} device bytes and the range holds {}",
-                self.bytes
-            )));
-        }
-        Ok(self.addr)
-    }
-}
+pub use crate::memory::DeviceRange;
 
 impl GptqLane {
     /// A lane from its stream, its handles (cuBLAS products run in full FP32, as the rounding needs), the memory it

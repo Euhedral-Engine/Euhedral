@@ -251,9 +251,11 @@ fn hessian_error(rig: &Rig, decoded: &Device, weight: &[u16], h: &[f32]) -> f64 
 }
 
 /// Under a correlated Hessian the error in its metric, measured on the host from the decoded weight, matches the
-/// quantizer's own proxy error and is clearly below what the plain path gives on the same weight. A mutant that drops
-/// the feedback of the rounding errors (a strip error launched over one row), skips the scale refit or fixes the global
-/// scale at one leaves the error above the bound.
+/// quantizer's own proxy error and is clearly below what the plain path gives on the same weight. The assert against
+/// 0.4 times the plain path's error catches a mutant that drops the feedback of the rounding errors (a strip error
+/// launched over one row); the absolute bound catches one that fixes the global scale at one. A mutant that skips the
+/// scale refit is caught by the `proxy_error > 0` assert of the calibrated test, not here: the bound lies between what
+/// the full path gives and what it gives without the refit, and no mutant kill is claimed for it.
 #[test]
 #[ignore = "needs the graphics card"]
 fn the_error_in_the_hessian_metric_is_what_the_quantizer_reports_and_beats_the_plain_path() {
@@ -278,8 +280,8 @@ fn the_error_in_the_hessian_metric_is_what_the_quantizer_reports_and_beats_the_p
         measured < 0.4 * plain_measured,
         "{measured} against plain {plain_measured}"
     );
-    // this input gives 0.0040 with the scale search and the refit; without the refit it gives 0.0045 and with the
-    // global scale fixed at one 0.0052
+    // this input gives 0.0040 with the scale search and the refit, 0.0045 without the refit and 0.0052 with the
+    // global scale fixed at one
     assert!(measured < 0.0043, "{measured}");
 }
 
@@ -295,10 +297,13 @@ fn a_quantization_takes_the_bytes_it_charges_and_gives_them_back() {
     let out = rig
         .quantize(&request(&w, Some(&h), N as u32, K as u32, 512, 3.0))
         .unwrap();
-    // The decoded weight is the only buffer that outlives the step; its claim is still held.
-    let held = rig.free();
-    assert!(held.0 < capacity, "the result's device bytes are no longer charged");
-    assert_eq!(held.1, capacity, "staging stayed charged after the step");
+    // The decoded weight is the only buffer that outlives the step: exactly its bytes are still charged, and no
+    // staging.
+    assert_eq!(
+        rig.free(),
+        (capacity - 2 * (N * K) as u64, capacity),
+        "what the step left charged is not the decoded weight alone"
+    );
     drop(out);
     rig.settle();
     assert_eq!(rig.free(), (capacity, capacity));
@@ -329,19 +334,34 @@ fn a_step_refused_for_a_short_claim_allocates_nothing() {
             "{short:?}: the pool allocated for a refused step"
         );
     }
+    // No claims at all is refused too.
+    let refused = rig.quantize_with(&asked, Claims::default());
+    assert!(matches!(&refused, Err(QuantizeError::Request(text)) if text.contains("claim")));
+    assert_eq!(rig.pinned.allocated_bytes(), 0);
     rig.short = (0, 0);
     rig.quantize(&asked).unwrap();
 }
 
-/// A step given no claims is refused before it does anything.
+/// A range smaller than the matrix it holds is refused before anything is allocated or launched: a wrong `k` would make
+/// the kernels read past it. A mutant that skips the check lets the step run.
 #[test]
 #[ignore = "needs the graphics card"]
-fn a_step_given_no_claims_is_refused() {
+fn a_weight_or_hessian_range_smaller_than_the_matrix_is_refused() {
     let mut rig = rig(TrellisSettings::default());
-    let w = rig.upload_halves(&weights(9));
-    let refused = rig.quantize_with(&request(&w, None, N as u32, K as u32, 0, 3.0), Claims::default());
-    assert!(matches!(&refused, Err(QuantizeError::Request(text)) if text.contains("claim")));
+    let capacity = rig.capacity();
+    let w = rig.upload_halves(&weights(15));
+    let h = rig.upload_floats(&hessian(K, 512, 16));
+    // The weight and Hessian are right for a `k` of 128; the request says 256.
+    for (n, k) in [(N as u32, 2 * K as u32), (2 * N as u32, K as u32)] {
+        let refused = rig.quantize_with(&request(&w, Some(&h), n, k, 512, 3.0), Claims::default());
+        assert!(
+            matches!(&refused, Err(QuantizeError::Request(text)) if text.contains("device bytes")),
+            "n {n}, k {k}: {:?}",
+            refused.map(|_| ())
+        );
+    }
     assert_eq!(rig.pinned.allocated_bytes(), 0);
+    assert_eq!(rig.free(), (capacity, capacity));
 }
 
 /// A chain that cannot arm its retirement keeps its buffers parked until a later retirement is confirmed, because

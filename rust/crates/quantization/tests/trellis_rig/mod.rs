@@ -16,12 +16,12 @@ use std::time::{Duration, Instant};
 
 use euhedral_core::generics::LatticeSource;
 use euhedral_gpu::cuda::{CudaGpu, CudaModule};
-use euhedral_gpu::{Gpu, StreamOptions};
+use euhedral_gpu::{Gpu, Stream, StreamOptions};
 use euhedral_graph::{Completions, LanePool};
 use euhedral_inference_cuda::math::MathLibraries;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, PinnedPool};
 use euhedral_inference_quantization::kernels::{ModuleOptions, Modules};
-use euhedral_inference_quantization::memory::{Claims, Device, LaneMemory, StepBytes};
+use euhedral_inference_quantization::memory::{Claims, Device, DeviceRange, LaneMemory, StepBytes};
 use euhedral_inference_quantization::trellis::{
     Finished, QuantizeError, Quantized, Refused, Request, TrellisLane, TrellisSettings,
 };
@@ -65,7 +65,7 @@ pub fn rig(settings: TrellisSettings) -> Rig {
     let mut stream = streams.remove(0);
     let completions = Completions::new(&pool);
     let mut handles = None;
-    euhedral_gpu::Stream::submit(&mut stream, |_| {
+    Stream::submit(&mut stream, |_| {
         handles = Some(math.lane_handles());
         Ok(())
     })
@@ -315,6 +315,12 @@ pub fn hessian(k: usize, rows: usize, seed: u64) -> Vec<f32> {
 }
 
 /// A request over the buffers.
+/// The buffer as a range the quantizer may use.
+pub fn range_of(buffer: &DeviceBuffer) -> DeviceRange {
+    // SAFETY: the buffer is live for the test's whole run and nothing else touches it while a step runs.
+    unsafe { DeviceRange::new(buffer.addr(), buffer.bytes() as u64) }
+}
+
 pub fn request(
     weight: &DeviceBuffer,
     hessian: Option<&DeviceBuffer>,
@@ -324,10 +330,10 @@ pub fn request(
     bits: f64,
 ) -> Request {
     Request {
-        weight: weight.addr(),
+        weight: range_of(weight),
         n,
         k,
-        hessian: hessian.map(DeviceBuffer::addr),
+        hessian: hessian.map(range_of),
         count,
         bits,
         seed: 0,
