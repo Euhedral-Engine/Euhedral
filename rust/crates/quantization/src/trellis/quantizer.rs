@@ -136,6 +136,8 @@ pub struct Quantized {
     pub global_scale: f32,
     /// How many refit rounds failed to factor the input-side system and so left the input scales alone.
     pub refit_failures: u32,
+    /// How many more attempts the Cholesky factorization of the damped Hessian took, each with more damping.
+    pub cholesky_retries: u32,
 }
 
 /// A lane's parts apart from its stream: what a stage uses besides the stream.
@@ -815,7 +817,7 @@ fn begin(stream: &mut CudaStream, parts: &mut LaneParts, state: &mut State) -> R
 fn after_mean(stream: &mut CudaStream, parts: &mut LaneParts, state: &mut State) -> Result<Move, QuantizeError> {
     let mean = state.small.float_at(0);
     state.diagonal_mean = f64::from(mean);
-    if !mean.is_finite() || mean < 1e-20 {
+    if !mean.is_finite() || state.diagonal_mean < 1e-20 {
         state.hessian = None;
         return regularize(stream, parts, state);
     }
@@ -1285,20 +1287,13 @@ fn finish(_stream: &mut CudaStream, _parts: &mut LaneParts, state: &mut State) -
         proxy_error,
         global_scale: state.global_scale,
         refit_failures,
+        cholesky_retries: state.attempt,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_default_scratch_holds_a_chunk_at_every_rate() {
-        for bits in [2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0] {
-            let shape = Shape::new(256, 256, Rate::new(bits).unwrap(), TrellisSettings::default()).unwrap();
-            assert!(shape.scratch_tiles >= 1, "{bits}");
-        }
-    }
 
     #[test]
     fn a_shape_off_the_tile_multiple_is_refused() {

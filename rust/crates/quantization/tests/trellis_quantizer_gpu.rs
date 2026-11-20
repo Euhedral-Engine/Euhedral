@@ -9,7 +9,7 @@
 
 mod trellis_rig;
 
-use euhedral_inference_quantization::trellis::{CHOLESKY_RETRIES, QuantizeError, TrellisSettings};
+use euhedral_inference_quantization::trellis::{CHOLESKY_RETRIES, QuantizeError, Rate, TrellisSettings};
 use trellis_rig::{Rig, bf16, f16, gaussians, halves, hessian, request, rig, to_bf16};
 
 const N: usize = 128;
@@ -96,8 +96,9 @@ fn a_zero_hessian_falls_back_to_the_plain_path() {
     assert!(relative_error(&rig, &out.decoded, &weight) < 0.35);
 }
 
-/// A Hessian whose leading rows and columns are zero (inputs that never fired) is still factored, after damping.
-/// A mutant that damps only when the factorization fails would fail on the first attempt and run the whole cap.
+/// A Hessian whose leading rows and columns are zero (inputs that never fired) is singular. The damping applied before
+/// the first attempt makes it factor at once; a mutant without that damping needs a retry (one retry's extra damping
+/// would also rescue it, so the result alone could not tell).
 #[test]
 #[ignore = "needs the graphics card"]
 fn a_zeroed_leading_block_is_damped_and_quantized() {
@@ -116,14 +117,15 @@ fn a_zeroed_leading_block_is_damped_and_quantized() {
     let out = rig
         .quantize(&request(&w, Some(&h), N as u32, K as u32, 512, 3.0))
         .unwrap();
+    assert_eq!(out.cholesky_retries, 0, "the initial damping alone makes it positive definite");
     assert_eq!(out.refit_failures, 0);
     assert!(all_finite(&out.suh) && all_finite(&out.svh));
     assert!(relative_error(&rig, &out.decoded, &weight) < 0.4);
 }
 
-/// A mildly indefinite Hessian fails the first factorization and succeeds with more damping; a hopeless one gives up
-/// after the cap and names it. A mutant that never retries fails the first; one that retries forever hangs the second
-/// (the pump's deadline fails it).
+/// A mildly indefinite Hessian fails the first factorization and succeeds after retries with more damping; a hopeless
+/// one gives up after the cap and names it. A mutant that never retries, or that restores the matrix wrongly between
+/// retries, fails the first; one that retries forever hangs the second (the pump's deadline fails it).
 #[test]
 #[ignore = "needs the graphics card"]
 fn an_indefinite_hessian_retries_with_more_damping_then_gives_up() {
@@ -135,7 +137,9 @@ fn an_indefinite_hessian_retries_with_more_damping_then_gives_up() {
         (0..K).map(|i| f64::from(h[i * K + i])).sum::<f64>() / K as f64
     };
     let mut mild = hessian(K, 512, 9);
-    mild[5 * K + 5] -= (0.6 * mean) as f32;
+    // after the initial damping its smallest eigenvalue is about -0.16 (the mean diagonal is 1); three retries make
+    // it positive definite
+    mild[5 * K + 5] -= mean as f32;
     let h = rig.upload_floats(&mild);
     let out = rig
         .quantize(&request(&w, Some(&h), N as u32, K as u32, 512, 3.0))
@@ -164,7 +168,12 @@ fn an_indefinite_hessian_retries_with_more_damping_then_gives_up() {
 fn the_seed_picks_the_signs_and_the_scratch_size_changes_nothing() {
     let weight = weights(10);
     let values = hessian(K, 512, 11);
-    let run = |scratch: u64, seed: u64| {
+    let run = |tiles: u64, seed: u64| {
+        let scratch = if tiles == 0 {
+            TrellisSettings::default().viterbi_scratch_bytes
+        } else {
+            Rate::new(2.5).unwrap().scratch_bytes(tiles)
+        };
         let mut rig = rig(TrellisSettings {
             viterbi_scratch_bytes: scratch,
         });
@@ -174,12 +183,91 @@ fn the_seed_picks_the_signs_and_the_scratch_size_changes_nothing() {
         r.seed = seed;
         rig.quantize(&r).unwrap()
     };
-    let big = run(256 << 20, 0);
-    // room for one tile at a time
-    let small = run(9 << 20, 0);
-    assert_eq!(big.trellis, small.trellis);
-    assert_eq!(big.suh, small.suh);
-    assert_eq!(big.svh, small.svh);
-    let other = run(256 << 20, 1);
-    assert_ne!(big.suh, other.suh);
+    let whole = run(0, 0);
+    assert!(whole.trellis.iter().any(|word| *word != 0));
+    for tiles in 1..=3 {
+        let chunked = run(tiles, 0);
+        assert_eq!(whole.trellis, chunked.trellis, "{tiles} tiles");
+        assert_eq!(whole.suh, chunked.suh, "{tiles} tiles");
+        assert_eq!(whole.svh, chunked.svh, "{tiles} tiles");
+    }
+    let other = run(0, 1);
+    assert_ne!(whole.suh, other.suh);
+}
+
+/// `X^T X / rows` over rows whose features share a component within each group of eight and differ in scale: a
+/// Hessian the rounding errors can be steered by.
+fn correlated_hessian(rows: usize, seed: u64) -> Vec<f32> {
+    let noise = gaussians(rows * K, seed);
+    let shared = gaussians(rows * (K / 8), seed + 1000);
+    let scale = |j: usize| 0.3 * 1.03f32.powi(j as i32);
+    let mut x = vec![0f32; rows * K];
+    for r in 0..rows {
+        for j in 0..K {
+            x[r * K + j] = scale(j) * (0.5 * noise[r * K + j] + 0.85 * shared[r * (K / 8) + j / 8]);
+        }
+    }
+    let mut h = vec![0f32; K * K];
+    for r in 0..rows {
+        let row = &x[r * K..(r + 1) * K];
+        for i in 0..K {
+            for j in 0..K {
+                h[i * K + j] += row[i] * row[j] / rows as f32;
+            }
+        }
+    }
+    h
+}
+
+/// `tr(E H Eᵀ) / tr(W H Wᵀ)` for the error `E = decoded - weight`, in double precision on the host.
+fn hessian_error(rig: &Rig, decoded: &euhedral_inference_cuda::DeviceBuffer, weight: &[u16], h: &[f32]) -> f64 {
+    let decoded = halves(&rig.download(decoded, N * K * 2));
+    let quadratic = |row: &[f64]| {
+        let mut sum = 0f64;
+        for i in 0..K {
+            let mut inner = 0f64;
+            for j in 0..K {
+                inner += f64::from(h[i * K + j]) * row[j];
+            }
+            sum += row[i] * inner;
+        }
+        sum
+    };
+    let (mut error, mut energy) = (0f64, 0f64);
+    for r in 0..N {
+        let w: Vec<f64> = (0..K).map(|j| f64::from(bf16(weight[r * K + j]))).collect();
+        let e: Vec<f64> = (0..K)
+            .map(|j| f64::from(bf16(decoded[r * K + j])) - w[j])
+            .collect();
+        error += quadratic(&e);
+        energy += quadratic(&w);
+    }
+    error / energy
+}
+
+/// Under a correlated Hessian the error in its metric, measured on the host from the decoded weight, matches the
+/// quantizer's own proxy error and is clearly below what the plain path gives on the same weight. A mutant that drops
+/// the feedback of the rounding errors (a strip error launched over one row), skips the scale refit or fixes the global
+/// scale at one leaves the error above the bound.
+#[test]
+#[ignore = "needs the graphics card"]
+fn the_error_in_the_hessian_metric_is_what_the_quantizer_reports_and_beats_the_plain_path() {
+    let mut rig = rig(TrellisSettings::default());
+    let weight = weights(12);
+    let values = correlated_hessian(512, 13);
+    let w = rig.upload_halves(&weight);
+    let h = rig.upload_floats(&values);
+    let calibrated = rig
+        .quantize(&request(&w, Some(&h), N as u32, K as u32, 512, 3.0))
+        .unwrap();
+    let plain = rig.quantize(&request(&w, None, N as u32, K as u32, 0, 3.0)).unwrap();
+    let measured = hessian_error(&rig, &calibrated.decoded, &weight, &values);
+    let plain_measured = hessian_error(&rig, &plain.decoded, &weight, &values);
+    println!(
+        "measured {measured} proxy {} plain {plain_measured} retries {} scale {}",
+        calibrated.proxy_error, calibrated.cholesky_retries, calibrated.global_scale
+    );
+    let relative = (measured - calibrated.proxy_error).abs() / calibrated.proxy_error;
+    assert!(relative < 0.1, "measured {measured}, reported {}", calibrated.proxy_error);
+    assert!(measured < 0.8 * plain_measured, "{measured} against plain {plain_measured}");
 }

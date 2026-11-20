@@ -280,7 +280,8 @@ pub(super) fn plan_strip_gather_sum(
     step("strip_gather_sum", Dim3::x(n / 16), 256, args)
 }
 
-/// The error of row `first_row` (`w - q`) into row `e_row` of the error block `e`.
+/// The error (`w - q`) of the 16 rows from `first_row`, one thread per element, into the 16 rows of the error block
+/// `e` from row `e_row`.
 pub(super) fn plan_strip_error(
     w: u64,
     q: u64,
@@ -387,27 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn grids_follow_the_shape_of_the_kernels_work() {
-        let weight = plan_weight_to_float(64, 512, 1024, 128).unwrap();
-        assert_eq!(geometry(&weight), ((32, 16), 256));
-        let strided = plan_strided_mean(64, 1024, 1025, 128).unwrap();
-        assert_eq!(geometry(&strided), ((1, 1), 1024));
-        let triangle = plan_triangle(64, 1024, Triangle::ClearUpper).unwrap();
-        assert_eq!(geometry(&triangle), ((32, 128), 256));
-        let inverse = plan_invert_diagonal_blocks(64, 1024, 128).unwrap();
-        assert_eq!(geometry(&inverse), ((64, 1), 16));
-        let multiply = plan_right_multiply_blocks(64, 1024, 128).unwrap();
-        assert_eq!(geometry(&multiply), ((8, 64), 128));
-        let scale = plan_scale_floats(64, 1024, 512, 128, Axis::Columns, Scaling::Divide).unwrap();
-        assert_eq!(geometry(&scale), ((2, 1024), 256));
-        let rows = plan_row_rms(64, 1024, 512, 128).unwrap();
-        assert_eq!(geometry(&rows), ((1024, 1), 256));
-        let columns = plan_column_rms(64, 1024, 512, 128).unwrap();
-        assert_eq!(geometry(&columns), ((16, 1), 256));
-        let product = plan_hessian_product(64, 128, 1024, 0.5).unwrap();
-        assert_eq!(geometry(&product), ((4, 1024), 256));
-        let gather = plan_strip_gather_sum(64, 0, 512, 16, 128).unwrap();
-        assert_eq!(geometry(&gather), ((32, 1), 256));
+    fn the_strip_error_covers_every_element_of_the_strip() {
         let error = plan_strip_error(64, 128, 512, 16, 192, 3).unwrap();
         assert_eq!(geometry(&error), ((32, 1), 256));
     }

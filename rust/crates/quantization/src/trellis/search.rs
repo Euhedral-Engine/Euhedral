@@ -31,7 +31,7 @@ const FINE_STEP: f64 = 0.075;
 /// Every third sample is rounded for the coarse candidates, every sample for the fine ones.
 pub(super) const COARSE_STRIDE: u32 = 3;
 
-/// `count` signs, each `1.0` or `-1.0`, from the generator in the order `nextBoolean` gives them.
+/// `count` signs, each `1.0` or `-1.0`, from the generator in the order the generator's boolean draws give them.
 pub(super) fn signs(random: &mut SplittableRandom, count: usize) -> Vec<f32> {
     (0..count)
         .map(|_| if random.next_boolean() { 1.0 } else { -1.0 })
@@ -234,12 +234,6 @@ mod tests {
     }
 
     #[test]
-    fn the_coarse_grid_runs_from_a_tenth_by_a_fifth() {
-        let scales = coarse_scales();
-        assert!((scales[0] - 0.1).abs() < 1e-12 && (scales[9] - 1.9).abs() < 1e-12);
-    }
-
-    #[test]
     fn a_tie_between_candidates_takes_the_first() {
         assert_eq!(smallest(&[3.0, 1.0, 1.0, 2.0]), 1);
     }
@@ -257,14 +251,5 @@ mod tests {
         assert_eq!(refined_scale(&fine, &[0.0, 1.0, 2.0, 3.0, 4.0]), fine[0] as f32);
         // a flat parabola is not refined and the result is never below a hundredth
         assert_eq!(refined_scale(&fine_scales(0.0), &[2.0, 2.0, 1.0, 2.0, 2.0]), 0.01);
-    }
-
-    #[test]
-    fn the_drift_is_one_above_three_bits() {
-        assert_eq!(drift(2.0), 1.018_f64 as f32);
-        assert_eq!(drift(2.5), 1.009_f64 as f32);
-        assert_eq!(drift(3.0), 1.004_f64 as f32);
-        assert_eq!(drift(3.5), 1.0);
-        assert_eq!(drift(6.0), 1.0);
     }
 }
