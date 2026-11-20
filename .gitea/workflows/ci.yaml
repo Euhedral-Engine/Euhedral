@@ -40,10 +40,10 @@ permissions:
   contents: read
 
 # The event is part of the group, so a manual run on the integration branch never cancels the push run that
-# `rollover promote` requires for that commit. A push to main never cancels an earlier one: each main run diffs against
-# the previous push, so a cancelled run's changes would go untested.
+# `rollover promote` requires for that commit. Each push to main has its own group (its sha), so no main run is
+# cancelled or replaced by a newer one: each main run diffs against the previous push.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 defaults:
