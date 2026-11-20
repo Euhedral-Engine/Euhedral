@@ -12,6 +12,7 @@ mod trellis_rig;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use euhedral_inference_quantization::memory::{Claims, Device};
 use euhedral_inference_quantization::trellis::{CHOLESKY_RETRIES, QuantizeError, Rate, TrellisSettings};
 use trellis_rig::{Rig, bf16, f16, gaussians, halves, hessian, request, rig, to_bf16};
 
@@ -23,7 +24,7 @@ fn weights(seed: u64) -> Vec<u16> {
 }
 
 /// The root-mean-square of `decoded - weight` over the root-mean-square of the weight.
-fn relative_error(rig: &Rig, decoded: &euhedral_inference_quantization::memory::Device, weight: &[u16]) -> f64 {
+fn relative_error(rig: &Rig, decoded: &Device, weight: &[u16]) -> f64 {
     let decoded = halves(&rig.download(decoded, N * K * 2));
     let (mut error, mut energy) = (0f64, 0f64);
     for (d, w) in decoded.iter().zip(weight) {
@@ -226,12 +227,7 @@ fn correlated_hessian(rows: usize, seed: u64) -> Vec<f32> {
 }
 
 /// `tr(E H Eᵀ) / tr(W H Wᵀ)` for the error `E = decoded - weight`, in double precision on the host.
-fn hessian_error(
-    rig: &Rig,
-    decoded: &euhedral_inference_quantization::memory::Device,
-    weight: &[u16],
-    h: &[f32],
-) -> f64 {
+fn hessian_error(rig: &Rig, decoded: &Device, weight: &[u16], h: &[f32]) -> f64 {
     let decoded = halves(&rig.download(decoded, N * K * 2));
     let quadratic = |row: &[f64]| {
         let mut sum = 0f64;
@@ -343,10 +339,7 @@ fn a_step_refused_for_a_short_claim_allocates_nothing() {
 fn a_step_given_no_claims_is_refused() {
     let mut rig = rig(TrellisSettings::default());
     let w = rig.upload_halves(&weights(9));
-    let refused = rig.quantize_with(
-        &request(&w, None, N as u32, K as u32, 0, 3.0),
-        euhedral_inference_quantization::memory::Claims::default(),
-    );
+    let refused = rig.quantize_with(&request(&w, None, N as u32, K as u32, 0, 3.0), Claims::default());
     assert!(matches!(&refused, Err(QuantizeError::Request(text)) if text.contains("claim")));
     assert_eq!(rig.pinned.allocated_bytes(), 0);
 }
