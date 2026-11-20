@@ -100,8 +100,8 @@ fn open(directory: &Path) -> (Arc<AsyncIo>, Qwen38Objects) {
     (io, objects)
 }
 
-fn staged(io: &Arc<AsyncIo>, objects: &Qwen38Objects, target: Target) -> Result<StagedLayer, CheckpointError> {
-    drive(io, |done| stage(objects, target, done))
+fn staged(io: &Arc<AsyncIo>, objects: &Qwen38Objects, target: Target) -> Result<StagedLayer<Vec<u8>>, CheckpointError> {
+    drive(io, |done| stage(objects, target, |bytes| Ok(vec![0u8; bytes]), done))
 }
 
 fn floats(bytes: &[u8]) -> Vec<f32> {
@@ -149,10 +149,10 @@ fn a_gdn_layer_is_staged_with_its_tensors_as_the_kernels_take_them() {
     }
 
     // A_log and dt_bias are FP32 for the control kernel.
-    assert_eq!(floats(layer.bytes(&Part::ALog).unwrap()), [5.0, 6.0]);
-    assert_eq!(floats(layer.bytes(&Part::DtBias).unwrap()), [7.0, 8.0]);
+    assert_eq!(floats(&layer.bytes(&Part::ALog).unwrap()), [5.0, 6.0]);
+    assert_eq!(floats(&layer.bytes(&Part::DtBias).unwrap()), [7.0, 8.0]);
     // The convolution is [taps, channels]: element (tap, channel) is the checkpoint's (channel, tap).
-    let convolution = bf16_values(layer.bytes(&Part::Convolution).unwrap());
+    let convolution = bf16_values(&layer.bytes(&Part::Convolution).unwrap());
     assert_eq!(convolution.len(), CHANNELS * TAPS);
     for channel in 0..CHANNELS {
         for tap in 0..TAPS {
@@ -165,16 +165,16 @@ fn a_gdn_layer_is_staged_with_its_tensors_as_the_kernels_take_them() {
     }
     // The norms and projections are the tensors themselves.
     assert_eq!(
-        bf16_values(layer.bytes(&Part::InputNorm).unwrap()),
+        bf16_values(&layer.bytes(&Part::InputNorm).unwrap()),
         [1.0, 2.0, 3.0, 4.0]
     );
     assert_eq!(
-        bf16_values(layer.bytes(&Part::PostNorm).unwrap()),
+        bf16_values(&layer.bytes(&Part::PostNorm).unwrap()),
         [11.0, 12.0, 13.0, 14.0]
     );
-    assert_eq!(bf16_values(layer.bytes(&Part::GdnNorm).unwrap()), [60.0, 61.0]);
-    assert_eq!(bf16_values(layer.bytes(&Part::AProjection).unwrap())[0], 500.0);
-    assert_eq!(bf16_values(layer.bytes(&Part::BProjection).unwrap())[0], 510.0);
+    assert_eq!(bf16_values(&layer.bytes(&Part::GdnNorm).unwrap()), [60.0, 61.0]);
+    assert_eq!(bf16_values(&layer.bytes(&Part::AProjection).unwrap())[0], 500.0);
+    assert_eq!(bf16_values(&layer.bytes(&Part::BProjection).unwrap())[0], 510.0);
     assert!(layer.bytes(&Part::QueryNorm).is_none());
 }
 
@@ -184,13 +184,13 @@ fn an_attention_layer_and_the_mtp_block_carry_the_query_and_key_norms() {
     let (io, objects) = open(directory.path());
     let layer = staged(&io, &objects, Target::Layer(1)).unwrap();
     assert_eq!((layer.prefix(), layer.attention()), ("text/layers/1/", true));
-    assert_eq!(bf16_values(layer.bytes(&Part::QueryNorm).unwrap()), [92.0, 93.0]);
-    assert_eq!(bf16_values(layer.bytes(&Part::KeyNorm).unwrap()), [102.0, 103.0]);
+    assert_eq!(bf16_values(&layer.bytes(&Part::QueryNorm).unwrap()), [92.0, 93.0]);
+    assert_eq!(bf16_values(&layer.bytes(&Part::KeyNorm).unwrap()), [102.0, 103.0]);
     assert!(layer.bytes(&Part::Convolution).is_none() && layer.bytes(&Part::ALog).is_none());
 
     let mtp = staged(&io, &objects, Target::Mtp).unwrap();
     assert_eq!((mtp.prefix(), mtp.attention()), ("mtp/layer/", true));
-    assert_eq!(bf16_values(mtp.bytes(&Part::QueryNorm).unwrap()), [93.0, 94.0]);
+    assert_eq!(bf16_values(&mtp.bytes(&Part::QueryNorm).unwrap()), [93.0, 94.0]);
     let fused = mtp
         .bytes(&Part::Object("mtp/layer/attention/query_key_gate_value".to_owned()))
         .expect("the MTP block's fused object");

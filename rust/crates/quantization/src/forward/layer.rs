@@ -72,6 +72,10 @@ pub struct LayerForward {
 impl LayerForward {
     /// A layer for up to `max_rows` rows (all sequences together), with its workspace allocated on `lane`. `pool` is
     /// where the KV cache's table uploads stage their bytes.
+    ///
+    /// The workspace and the slots are ordered only on the lane that queued them: work on another lane must wait for
+    /// this lane's work to retire first, and [`release`](Self::release) takes the same lane. On `Err` what was
+    /// allocated is freed in stream order.
     pub fn new(
         lane: &mut dyn LaneOps,
         library: &Arc<CudaLibrary>,
@@ -88,24 +92,51 @@ impl LayerForward {
             .vz_width
             .max(shape.attention_q + shape.attention_kv)
             .max(shape.convolution_width);
-        let mut alloc = |bytes: u64| -> Result<DeviceBuffer, ForwardError> {
-            let bytes =
-                usize::try_from(bytes).map_err(|_| ForwardError::Invalid("a workspace too large".to_owned()))?;
-            Ok(lane.alloc_async(bytes)?)
-        };
-        let normalized = alloc(BF16_BYTES * rows * u64::from(shape.hidden))?;
-        let first = alloc(BF16_BYTES * rows * u64::from(widest))?;
-        let second = alloc(BF16_BYTES * rows * u64::from(widest))?;
-        let mixed =
-            alloc(BF16_BYTES * rows * u64::from(shape.convolution_width.max(shape.attention_q + shape.attention_kv)))?;
-        let context = alloc(BF16_BYTES * rows * u64::from(shape.gdn_value_width.max(shape.attention_q)))?;
-        let gate_up = alloc(BF16_BYTES * rows * 2 * u64::from(shape.intermediate))?;
-        let swiglu = alloc(BF16_BYTES * rows * u64::from(shape.intermediate))?;
-        let delta = alloc(BF16_BYTES * rows * u64::from(shape.hidden))?;
-        let alpha = alloc(FP32_BYTES * rows * u64::from(shape.value_heads))?;
-        let beta = alloc(FP32_BYTES * rows * u64::from(shape.value_heads))?;
-        let position = alloc(8)?;
-        lane.zero_device_memory(position.ptr(), 8)?;
+        let hidden_bytes = BF16_BYTES * rows * u64::from(shape.hidden);
+        let wide_bytes = BF16_BYTES * rows * u64::from(widest);
+        let sizes = [
+            hidden_bytes,
+            wide_bytes,
+            wide_bytes,
+            BF16_BYTES * rows * u64::from(shape.convolution_width.max(shape.attention_q + shape.attention_kv)),
+            BF16_BYTES * rows * u64::from(shape.gdn_value_width.max(shape.attention_q)),
+            BF16_BYTES * rows * 2 * u64::from(shape.intermediate),
+            BF16_BYTES * rows * u64::from(shape.intermediate),
+            hidden_bytes,
+            FP32_BYTES * rows * u64::from(shape.value_heads),
+            FP32_BYTES * rows * u64::from(shape.value_heads),
+            8,
+        ];
+        let mut made = Vec::with_capacity(sizes.len());
+        let outcome = (|| -> Result<(), ForwardError> {
+            for bytes in sizes {
+                let bytes =
+                    usize::try_from(bytes).map_err(|_| ForwardError::Invalid("a workspace too large".to_owned()))?;
+                made.push(lane.alloc_async(bytes)?);
+            }
+            if let Some(position) = made.last() {
+                lane.zero_device_memory(position.ptr(), 8)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            free_all(lane, made);
+            return Err(error);
+        }
+        let [
+            normalized,
+            first,
+            second,
+            mixed,
+            context,
+            gate_up,
+            swiglu,
+            delta,
+            alpha,
+            beta,
+            position,
+        ] = <[DeviceBuffer; 11]>::try_from(made)
+            .map_err(|_| ForwardError::Invalid("the workspace is 11 buffers".to_owned()))?;
         Ok(LayerForward {
             shape,
             epsilon: config.eps as f32,
@@ -132,6 +163,13 @@ impl LayerForward {
     /// The widths this layer runs with.
     pub fn shape(&self) -> &Shape {
         &self.shape
+    }
+
+    /// Where [`head`](Self::head) leaves the mixer's two projections of the normalized rows: attention's query_key and
+    /// gate_value, or GDN's query_key and value_z. BF16 `[rows, width]` on the device, valid once the lane has run the
+    /// head and until the next work that uses the workspace.
+    pub fn projections(&self) -> (DevicePtr, DevicePtr) {
+        (self.first.ptr(), self.second.ptr())
     }
 
     /// The rows the workspace holds.
@@ -174,8 +212,14 @@ impl LayerForward {
             u64::from(shape.value_heads) * u64::from(shape.key_dim) * u64::from(shape.value_dim) * FP32_BYTES;
         while self.slots.len() < sequences as usize {
             let convolution = lane.alloc_async(to_usize(convolution_bytes)?)?;
-            let recurrent = lane.alloc_async(to_usize(recurrent_bytes)?)?;
-            let cache = KvCache::new(
+            let recurrent = match lane.alloc_async(to_usize(recurrent_bytes)?) {
+                Ok(recurrent) => recurrent,
+                Err(error) => {
+                    free_all(lane, vec![convolution]);
+                    return Err(error.into());
+                }
+            };
+            let made = KvCache::new(
                 &self.library,
                 &self.released,
                 1,
@@ -183,7 +227,20 @@ impl LayerForward {
                 KvFormat::Nvfp4,
                 u64::from(self.max_rows),
                 0,
-            )?;
+            )
+            .map_err(ForwardError::from)
+            .and_then(|cache| {
+                // The first reservation would otherwise allocate the pinned memory its table upload stages from.
+                cache.prime_staging(&self.pool, 1)?;
+                Ok(cache)
+            });
+            let cache = match made {
+                Ok(cache) => cache,
+                Err(error) => {
+                    free_all(lane, vec![convolution, recurrent]);
+                    return Err(error);
+                }
+            };
             self.slots.push(Slot {
                 convolution,
                 recurrent,
@@ -492,7 +549,8 @@ impl LayerForward {
         }
     }
 
-    /// Frees the workspace and the slots in stream order on `lane`.
+    /// Frees the workspace and the slots in stream order on `lane`, every buffer even when one refuses (the first
+    /// refusal is the error). The frees are ordered only against `lane`'s work.
     pub fn release(self, lane: &mut dyn LaneOps) -> Result<(), ForwardError> {
         let LayerForward {
             normalized,
@@ -510,6 +568,12 @@ impl LayerForward {
             released,
             ..
         } = self;
+        let mut first_failure = None;
+        let mut free = |buffer: DeviceBuffer| {
+            if let Err(error) = lane.free_async(buffer) {
+                first_failure.get_or_insert(error);
+            }
+        };
         for slot in slots {
             let Slot {
                 convolution,
@@ -520,24 +584,16 @@ impl LayerForward {
             // The cache hands its pages and tables to `released` when it is dropped.
             drop(cache);
             drop(retained);
-            lane.free_async(convolution)?;
-            lane.free_async(recurrent)?;
+            free(convolution);
+            free(recurrent);
         }
-        let mut failure = None;
-        released.drain(|buffer| {
-            if let Err(error) = lane.free_async(buffer) {
-                failure.get_or_insert(error);
-            }
-        });
-        if let Some(error) = failure {
-            return Err(error.into());
-        }
+        released.drain(&mut free);
         for buffer in [
             normalized, first, second, mixed, context, gate_up, swiglu, delta, alpha, beta, position,
         ] {
-            lane.free_async(buffer)?;
+            free(buffer);
         }
-        Ok(())
+        first_failure.map_or(Ok(()), |error| Err(error.into()))
     }
 
     fn check_rows(&self, rows: u32) -> Result<(), ForwardError> {
@@ -604,5 +660,12 @@ impl Debug for LayerForward {
             .field("shape", &self.shape)
             .field("sequences", &self.slots.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// Frees `buffers` in stream order on `lane` after a failure; a refusal adds nothing the caller can act on.
+fn free_all(lane: &mut dyn LaneOps, buffers: Vec<DeviceBuffer>) {
+    for buffer in buffers {
+        let _ = lane.free_async(buffer);
     }
 }

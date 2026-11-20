@@ -26,10 +26,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use checkpoint_support::drive;
+use euhedral_inference_cuda::KernelOps;
 use euhedral_inference_quantization::checkpoint::objects::Qwen38Objects;
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
 use euhedral_inference_quantization::forward::{
-    LaneContext, LayerForward, LayerWeights, Observation, StagedLayer, Target, stage,
+    LaneContext, LayerForward, LayerWeights, Observation, Part, StagedLayer, Target, stage,
 };
 use euhedral_io::AsyncIo;
 use forward_support::{Rig, bf16_to_f32, gaussians, npy_payload, rig};
@@ -145,25 +146,23 @@ struct Run {
     observed: Vec<(String, u32, u32)>,
 }
 
-/// Runs `layer` over two sequences of 256 rows twice on `forward` from `model.input`, each run's hidden states and
-/// observations returned.
-fn forward_twice(rig: &mut Rig, model: &Model, staged: &StagedLayer) -> [Run; 2] {
+/// Runs `layer` over two sequences of 256 rows once per input in `inputs` on one `LayerForward`, each run's hidden
+/// states and observations returned.
+fn forward_runs(rig: &mut Rig, model: &Model, staged: &StagedLayer, inputs: &[&[u8]]) -> Vec<Run> {
     let (sequences, length) = (2u32, 256u32);
     let rows = sequences * length;
     let hidden = rig.upload(&model.input);
     let (library, pool) = (Arc::clone(&rig.library), Arc::clone(&rig.pool));
     let config = &model.objects.config;
-    let mut retained = Vec::new();
     let (mut forward, weights) = rig.run(|context| {
         let forward = LayerForward::new(context.ops(), &library, &pool, config, rows)?;
-        let weights = LayerWeights::upload(context.ops(), &pool, staged, UPLOAD_CHUNK, &mut retained)?;
+        let weights = LayerWeights::upload(context.ops(), staged, UPLOAD_CHUNK)?;
         Ok((forward, weights))
     });
-    drop(retained);
     let hidden_ptr = hidden.ptr();
     let mut runs = Vec::new();
-    for _ in 0..2 {
-        rig.overwrite(&hidden, &model.input);
+    for input in inputs {
+        rig.overwrite(&hidden, input);
         let mut observed = Vec::new();
         rig.run(|context| {
             let mut observer = |seen: &Observation<'_>, _: &mut LaneContext<'_, _>| {
@@ -183,12 +182,21 @@ fn forward_twice(rig: &mut Rig, model: &Model, staged: &StagedLayer) -> [Run; 2]
         weights.release(context.ops())?;
         forward.release(context.ops())
     });
-    let [first, second]: [Run; 2] = runs.try_into().ok().unwrap();
-    [first, second]
+    runs
 }
 
-fn staged(model: &Model, target: Target) -> StagedLayer {
-    drive(&model.io, |done| stage(&model.objects, target, done)).unwrap()
+fn forward_twice(rig: &mut Rig, model: &Model, staged: &StagedLayer) -> [Run; 2] {
+    let runs = forward_runs(rig, model, staged, &[&model.input, &model.input]);
+    runs.try_into().ok().unwrap()
+}
+
+/// `target` read into pinned memory from the rig's pool.
+fn staged(rig: &Rig, model: &Model, target: Target) -> StagedLayer {
+    let pool = Arc::clone(&rig.pool);
+    drive(&model.io, |done| {
+        stage(&model.objects, target, |bytes| pool.acquire(bytes), done)
+    })
+    .unwrap()
 }
 
 /// A second run over the same input gives the same hidden states bit for bit: the GDN state and the attention cache
@@ -200,7 +208,7 @@ fn a_rerun_is_identical_and_the_observer_sees_each_object_once_in_order() {
     let mut rig = rig();
     let model = model();
     for index in [0usize, 3] {
-        let layer = staged(&model, Target::Layer(index));
+        let layer = staged(&rig, &model, Target::Layer(index));
         let [first, second] = forward_twice(&mut rig, &model, &layer);
         assert_eq!(first.hidden, second.hidden, "layer {index}: a rerun differs");
         assert_ne!(
@@ -215,5 +223,148 @@ fn a_rerun_is_identical_and_the_observer_sees_each_object_once_in_order() {
         );
         assert_eq!(first.observed, second.observed);
     }
+    rig.finish();
+}
+
+/// Uploading with a chunk that divides none of the parts puts every part on the device exactly as it was staged: the
+/// chunks of a part land at their own offsets, and the pieces of a multi-piece object follow one another.
+#[test]
+#[ignore = "needs a GPU, the bundled NVRTC, the math libraries and the checkpoint"]
+fn an_upload_in_odd_chunks_puts_each_part_on_the_device_as_staged() {
+    let mut rig = rig();
+    let model = model();
+    let pool = Arc::clone(&rig.pool);
+    for index in [0usize, 3] {
+        let layer = staged(&rig, &model, Target::Layer(index));
+        let weights = rig.run(|context| LayerWeights::upload(context.ops(), &layer, 1_000_003));
+        let mut loans = Vec::new();
+        for (part, bytes) in layer.parts() {
+            loans.push((part, pool.acquire(bytes).unwrap(), weights.ptr(part).unwrap()));
+        }
+        rig.run(|context| {
+            for (_, loan, source) in &mut loans {
+                let bytes = loan.len();
+                // SAFETY: the loans outlive the run, which returns once the lane has retired the copies.
+                unsafe {
+                    context
+                        .ops()
+                        .copy_device_to_readback(loan.buffer_mut(), 0, *source, bytes)
+                }?;
+            }
+            Ok(())
+        });
+        for (part, loan, _) in &loans {
+            assert!(
+                loan.buffer().as_slice()[..loan.len()] == layer.bytes(part).unwrap()[..],
+                "layer {index}: {part:?} differs after the upload"
+            );
+        }
+        rig.run(|context| weights.release(context.ops()));
+    }
+    rig.finish();
+}
+
+/// A sequence's result does not depend on where it sits among the others: the sequences A, B and then B, A give the
+/// same rows with their places swapped.
+#[test]
+#[ignore = "needs a GPU, the bundled NVRTC, the math libraries and the checkpoint"]
+fn a_sequence_gives_the_same_rows_wherever_it_sits() {
+    let mut rig = rig();
+    let model = model();
+    let half = model.input.len() / 2;
+    let swapped = [&model.input[half..], &model.input[..half]].concat();
+    assert_ne!(
+        model.input[..half],
+        model.input[half..],
+        "the two sequences must differ"
+    );
+    for index in [0usize, 3] {
+        let layer = staged(&rig, &model, Target::Layer(index));
+        let [straight, crossed]: [Run; 2] = forward_runs(&mut rig, &model, &layer, &[&model.input, &swapped])
+            .try_into()
+            .ok()
+            .unwrap();
+        assert!(
+            straight.hidden[..half] == crossed.hidden[half..] && straight.hidden[half..] == crossed.hidden[..half],
+            "layer {index}: a sequence's rows depend on its place"
+        );
+        assert!(
+            straight.hidden[..half] != straight.hidden[half..],
+            "layer {index}: the sequences came out equal"
+        );
+    }
+    rig.finish();
+}
+
+/// The MTP block's one fused query_key_gate_value object is two projections: the first half of its rows, then the
+/// second. After the head, the projections are the normalized rows times each half, taken from the object's own
+/// shape.
+#[test]
+#[ignore = "needs a GPU, the bundled NVRTC, the math libraries and the checkpoint"]
+fn the_fused_mtp_object_is_two_projections_one_after_the_other() {
+    let mut rig = rig();
+    let model = model();
+    let layer = staged(&rig, &model, Target::Mtp);
+    let (library, pool) = (Arc::clone(&rig.library), Arc::clone(&rig.pool));
+    let config = &model.objects.config;
+    let rows = 8u32;
+    let hidden = rig.upload(&model.input[..rows as usize * config.hidden as usize * 2]);
+    let (mut forward, weights) = rig.run(|context| {
+        let forward = LayerForward::new(context.ops(), &library, &pool, config, rows)?;
+        let weights = LayerWeights::upload(context.ops(), &layer, UPLOAD_CHUNK)?;
+        Ok((forward, weights))
+    });
+    let name = "mtp/layer/attention/query_key_gate_value";
+    let (fused_rows, columns) = weights.shapes().iter().find(|(held, _)| held == name).unwrap().1;
+    let (width, k) = ((fused_rows / 2) as u32, columns as u32);
+    let first_half = weights.object(name).unwrap();
+    let second_half = first_half.offset(fused_rows / 2 * columns * 2);
+    let bytes = rows as usize * width as usize * 2;
+    let scratch = rig.upload(&vec![0u8; 3 * bytes + rows as usize * k as usize * 2]);
+    let (normalized, want_first, want_second) = (
+        scratch.ptr().offset(3 * bytes as u64),
+        scratch.ptr(),
+        scratch.ptr().offset(bytes as u64),
+    );
+    let (got_first, got_second) = forward.projections();
+    let (got_first_loan, got_second_loan) = (pool.acquire(bytes).unwrap(), pool.acquire(bytes).unwrap());
+    let (want_first_loan, want_second_loan) = (pool.acquire(bytes).unwrap(), pool.acquire(bytes).unwrap());
+    let mut loans = [got_first_loan, got_second_loan, want_first_loan, want_second_loan];
+    let hidden_ptr = hidden.ptr();
+    rig.run(|context| {
+        forward.head(context, &weights, hidden_ptr, rows, None)?;
+        let norm = weights.ptr(&Part::InputNorm).unwrap();
+        context
+            .ops()
+            .rms_norm_unit_offset_bf16(hidden_ptr, norm, normalized, rows, k, config.eps as f32)?;
+        context.linear(normalized, first_half, want_first, rows, k, width)?;
+        context.linear(normalized, second_half, want_second, rows, k, width)?;
+        let sources = [got_first, got_second, want_first, want_second];
+        for (loan, source) in loans.iter_mut().zip(sources) {
+            // SAFETY: the loans outlive the run, which returns once the lane has retired the copies.
+            unsafe {
+                context
+                    .ops()
+                    .copy_device_to_readback(loan.buffer_mut(), 0, source, bytes)
+            }?;
+        }
+        Ok(())
+    });
+    assert!(
+        loans[0].buffer().as_slice()[..bytes] == loans[2].buffer().as_slice()[..bytes],
+        "the first projection is not the first half"
+    );
+    assert!(
+        loans[1].buffer().as_slice()[..bytes] == loans[3].buffer().as_slice()[..bytes],
+        "the second projection is not the second half"
+    );
+    assert!(
+        loans[2].buffer().as_slice()[..bytes] != loans[3].buffer().as_slice()[..bytes],
+        "the halves came out equal"
+    );
+    rig.run(|context| {
+        weights.release(context.ops())?;
+        forward.release(context.ops())
+    });
     rig.finish();
 }

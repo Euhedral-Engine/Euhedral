@@ -26,7 +26,7 @@ use crate::checkpoint::objects::Config;
 
 pub use layer::{LayerForward, Observation, Observer};
 pub use math::{ForwardKernels, LaneContext, plan_gather_rows, plan_mirror_upper};
-pub use weights::{LayerWeights, Part, StagedLayer, Target, stage, transpose_convolution, widen_bf16};
+pub use weights::{HostMemory, LayerWeights, Part, StagedLayer, Target, stage, transpose_convolution, widen_bf16};
 
 /// Why a forward pass or the loading of a layer failed.
 #[derive(Debug, Error)]

@@ -1,10 +1,11 @@
 //! A layer's weights: read from the checkpoint into host memory ([`stage`]), then copied to the device on a lane
 //! ([`LayerWeights::upload`]).
 
-use std::mem::{replace, take};
+use std::mem::replace;
 use std::sync::Arc;
 
-use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, LaneOps, PinnedPool, PooledPinned};
+use euhedral_inference_cuda::{CudaError, DeviceBuffer, DevicePtr, LaneOps, PooledPinned};
+use euhedral_io::IoMemory;
 
 use super::ForwardError;
 use crate::checkpoint::objects::{MTP_OBJECTS, Qwen38Objects};
@@ -45,22 +46,66 @@ pub enum Part {
     Object(String),
 }
 
+/// Host memory the checkpoint reads into: the first [`len`](IoMemory::len) bytes are the region.
+pub trait HostMemory: IoMemory {
+    /// The region.
+    fn bytes(&self) -> &[u8];
+
+    /// The region, writable.
+    fn bytes_mut(&mut self) -> &mut [u8];
+
+    /// Makes the region `len` bytes, at most what the memory was made with.
+    fn set_len(&mut self, len: usize) -> Result<(), ForwardError>;
+}
+
+impl HostMemory for Vec<u8> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        self
+    }
+
+    fn set_len(&mut self, len: usize) -> Result<(), ForwardError> {
+        self.resize(len, 0);
+        Ok(())
+    }
+}
+
+impl HostMemory for PooledPinned {
+    fn bytes(&self) -> &[u8] {
+        &self.buffer().as_slice()[..self.len()]
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        let len = self.len();
+        &mut self.buffer_mut().as_mut_slice()[..len]
+    }
+
+    fn set_len(&mut self, len: usize) -> Result<(), ForwardError> {
+        Ok(PooledPinned::set_len(self, len)?)
+    }
+}
+
 #[derive(Debug)]
-struct Entry {
+struct Entry<M> {
     part: Part,
-    bytes: Vec<u8>,
+    pieces: Vec<M>,
+    bytes: usize,
     shape: Option<(u64, u64)>,
 }
 
-/// A layer read into host memory, not yet on the device.
+/// A layer read into host memory, not yet on the device. With pinned memory ([`StagedLayer<PooledPinned>`]) the
+/// upload copies from the memory the checkpoint was read into.
 #[derive(Debug)]
-pub struct StagedLayer {
+pub struct StagedLayer<M = PooledPinned> {
     prefix: String,
     attention: bool,
-    entries: Vec<Entry>,
+    entries: Vec<Entry<M>>,
 }
 
-impl StagedLayer {
+impl<M: HostMemory> StagedLayer<M> {
     /// The object names' common prefix (`text/layers/N/`, or `mtp/layer/`).
     pub fn prefix(&self) -> &str {
         &self.prefix
@@ -71,17 +116,20 @@ impl StagedLayer {
         self.attention
     }
 
-    /// The bytes of `part` as they are uploaded.
-    pub fn bytes(&self, part: &Part) -> Option<&[u8]> {
-        self.entries
-            .iter()
-            .find(|entry| &entry.part == part)
-            .map(|entry| entry.bytes.as_slice())
+    /// A copy of the bytes of `part` as they are uploaded.
+    pub fn bytes(&self, part: &Part) -> Option<Vec<u8>> {
+        self.entries.iter().find(|entry| &entry.part == part).map(|entry| {
+            entry
+                .pieces
+                .iter()
+                .flat_map(|piece| piece.bytes().iter().copied())
+                .collect()
+        })
     }
 
-    /// Every part with its bytes, in upload order.
-    pub fn parts(&self) -> impl Iterator<Item = (&Part, &[u8])> {
-        self.entries.iter().map(|entry| (&entry.part, entry.bytes.as_slice()))
+    /// Every part with its size in bytes, in upload order.
+    pub fn parts(&self) -> impl Iterator<Item = (&Part, usize)> {
+        self.entries.iter().map(|entry| (&entry.part, entry.bytes))
     }
 }
 
@@ -95,7 +143,6 @@ enum Post {
 
 struct Plan {
     part: Part,
-    first: usize,
     count: usize,
     post: Post,
     shape: Option<(u64, u64)>,
@@ -129,11 +176,47 @@ pub fn transpose_convolution(bytes: &[u8], channels: usize, taps: usize) -> Resu
     Ok(out)
 }
 
-/// Reads `target` from `objects` into host memory with one set of reads; `then` gets the layer from the frame that
-/// ends the last read. `Err` started nothing.
-pub fn stage(objects: &Qwen38Objects, target: Target, then: Done<StagedLayer>) -> Result<(), CheckpointError> {
+/// Widens the BF16 vector `memory` holds to FP32 in the same memory, which was made for twice the bytes.
+fn widen_in_place<M: HostMemory>(memory: &mut M) -> Result<(), ForwardError> {
+    let raw = memory.len();
+    if !raw.is_multiple_of(2) {
+        return Err(ForwardError::Invalid(format!("{raw} bytes are not BF16 values")));
+    }
+    memory.set_len(raw * 2)?;
+    let bytes = memory.bytes_mut();
+    // From the back: each value's four bytes end at or after where its two began, so a value not yet widened is
+    // never overwritten.
+    for index in (0..raw / 2).rev() {
+        let value = u32::from(u16::from_le_bytes([bytes[2 * index], bytes[2 * index + 1]])) << 16;
+        bytes[4 * index..4 * index + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Transposes the convolution `memory` holds in the same memory.
+fn transpose_in_place<M: HostMemory>(memory: &mut M, channels: usize, taps: usize) -> Result<(), ForwardError> {
+    let transposed = transpose_convolution(memory.bytes(), channels, taps)?;
+    memory.bytes_mut().copy_from_slice(&transposed);
+    Ok(())
+}
+
+/// Reads `target` from `objects` into host memory with one set of reads, the memory from `alloc` (pinned memory from
+/// a pool, made here and not later, when the lanes run); `then` gets the layer from the frame that ends the last
+/// read. `Err` started nothing.
+///
+/// A quantized object that spans several pieces of the checkpoint keeps them apart, each read into memory of its own.
+pub fn stage<M: HostMemory>(
+    objects: &Qwen38Objects,
+    target: Target,
+    mut alloc: impl FnMut(usize) -> Result<M, CudaError>,
+    then: Done<StagedLayer<M>>,
+) -> Result<(), CheckpointError> {
     let store = objects.store();
-    let mut ranges: Vec<ReadRange<Vec<u8>>> = Vec::new();
+    let mut memory = |bytes: usize| {
+        alloc(bytes)
+            .map_err(|error| CheckpointError::Invalid(format!("no memory for {bytes} bytes to read into: {error}")))
+    };
+    let mut ranges: Vec<ReadRange<M>> = Vec::new();
     let mut plans: Vec<Plan> = Vec::new();
     let (prefix, attention, names, tensors, gdn_prefix) = match target {
         Target::Layer(index) => {
@@ -166,18 +249,16 @@ pub fn stage(objects: &Qwen38Objects, target: Target, then: Done<StagedLayer>) -
         let source = objects.object(&name)?;
         let too_large = || CheckpointError::Invalid(format!("{name}: the object is too large"));
         let row_bytes = source.columns.checked_mul(2).ok_or_else(too_large)?;
-        let first = ranges.len();
         for piece in &source.pieces {
             let bytes = piece.rows.checked_mul(row_bytes).ok_or_else(too_large)?;
             ranges.push(ReadRange {
                 tensor: piece.tensor.clone(),
                 skip: piece.first_row.checked_mul(row_bytes).ok_or_else(too_large)?,
-                memory: vec![0u8; usize::try_from(bytes).map_err(|_| too_large())?],
+                memory: memory(usize::try_from(bytes).map_err(|_| too_large())?)?,
             });
         }
         plans.push(Plan {
             part: Part::Object(name),
-            first,
             count: source.pieces.len(),
             post: Post::Plain,
             shape: Some((source.rows, source.columns)),
@@ -186,9 +267,13 @@ pub fn stage(objects: &Qwen38Objects, target: Target, then: Done<StagedLayer>) -
     let mut tensor = |part: Part, name: String, post: Post| -> Result<(), CheckpointError> {
         let bytes = usize::try_from(store.tensor(&name)?.bytes)
             .map_err(|_| CheckpointError::Invalid(format!("{name}: the tensor is too large")))?;
+        // A widened vector is read into the front of memory made for the result.
+        let mut destination = memory(if matches!(post, Post::Floats) { bytes * 2 } else { bytes })?;
+        destination
+            .set_len(bytes)
+            .map_err(|error| CheckpointError::Invalid(error.to_string()))?;
         plans.push(Plan {
             part,
-            first: ranges.len(),
             count: 1,
             post,
             shape: None,
@@ -196,7 +281,7 @@ pub fn stage(objects: &Qwen38Objects, target: Target, then: Done<StagedLayer>) -
         ranges.push(ReadRange {
             tensor: name,
             skip: 0,
-            memory: vec![0u8; bytes],
+            memory: destination,
         });
         Ok(())
     };
@@ -247,24 +332,24 @@ pub fn stage(objects: &Qwen38Objects, target: Target, then: Done<StagedLayer>) -
     store.read_ranges(
         ranges,
         Arc::new(move |result| {
-            let assembled = result.and_then(|mut memories| {
+            let assembled = result.and_then(|memories| {
+                let mut memories = memories.into_iter();
                 let mut entries = Vec::with_capacity(plans.len());
                 for plan in &plans {
-                    let pieces = &mut memories[plan.first..plan.first + plan.count];
-                    let joined = if let [only] = pieces {
-                        take(only)
-                    } else {
-                        pieces.iter().flat_map(|piece| piece.iter().copied()).collect()
-                    };
-                    let bytes = match plan.post {
-                        Post::Plain => joined,
-                        Post::Floats => widen_bf16(&joined),
-                        Post::Convolution { channels, taps } => transpose_convolution(&joined, channels, taps)
-                            .map_err(|error| CheckpointError::Invalid(error.to_string()))?,
-                    };
+                    let mut pieces: Vec<M> = memories.by_ref().take(plan.count).collect();
+                    let invalid = |error: ForwardError| CheckpointError::Invalid(error.to_string());
+                    match (plan.post, pieces.as_mut_slice()) {
+                        (Post::Plain, _) => {}
+                        (Post::Floats, [only]) => widen_in_place(only).map_err(invalid)?,
+                        (Post::Convolution { channels, taps }, [only]) => {
+                            transpose_in_place(only, channels, taps).map_err(invalid)?;
+                        }
+                        _ => return Err(CheckpointError::Invalid("a converted tensor is one piece".to_owned())),
+                    }
                     entries.push(Entry {
                         part: plan.part.clone(),
-                        bytes,
+                        bytes: pieces.iter().map(|piece| piece.len()).sum(),
+                        pieces,
                         shape: plan.shape,
                     });
                 }
@@ -289,15 +374,17 @@ pub struct LayerWeights {
 }
 
 impl LayerWeights {
-    /// Allocates the layer's buffers in stream order on `lane` and queues their uploads, `chunk_bytes` at a time
-    /// through pinned memory from `pool`. The pinned chunks go to `retained`: keep them until the lane has retired
-    /// the work, then drop them. On `Err` the buffers already made are freed in stream order.
+    /// Allocates the layer's buffers in stream order on `lane` and queues their uploads from `staged`'s pinned memory,
+    /// `chunk_bytes` at a time, each piece of an object at its place in the object. Nothing is copied on the host and
+    /// no pinned memory is made here.
+    ///
+    /// The allocations and the uploads are ordered only on `lane`: work on another lane must wait for this lane's
+    /// work to retire first. Keep `staged` until the lane has retired the copies. On `Err` the buffers already made
+    /// are freed in stream order.
     pub fn upload(
         lane: &mut dyn LaneOps,
-        pool: &Arc<PinnedPool>,
         staged: &StagedLayer,
         chunk_bytes: usize,
-        retained: &mut Vec<PooledPinned>,
     ) -> Result<LayerWeights, ForwardError> {
         if chunk_bytes == 0 {
             return Err(ForwardError::Invalid("an upload chunk of 0 bytes".to_owned()));
@@ -310,23 +397,25 @@ impl LayerWeights {
         };
         let outcome = (|| {
             for entry in &staged.entries {
-                let buffer = lane.alloc_async(entry.bytes.len().max(1))?;
+                let buffer = lane.alloc_async(entry.bytes.max(1))?;
                 let destination = buffer.ptr();
                 weights.buffers.push((entry.part.clone(), buffer));
                 if let (Part::Object(name), Some(shape)) = (&entry.part, entry.shape) {
                     weights.shapes.push((name.clone(), shape));
                 }
                 let mut offset = 0;
-                for chunk in entry.bytes.chunks(chunk_bytes) {
-                    let mut pinned = pool.acquire(chunk.len())?;
-                    pinned.buffer_mut().as_mut_slice()[..chunk.len()].copy_from_slice(chunk);
-                    // SAFETY: the pinned chunk is kept in `retained`, unmodified, until the caller has seen the lane
-                    // retire this copy.
-                    unsafe {
-                        lane.copy_upload_to_device(destination.offset(offset as u64), pinned.buffer(), 0, chunk.len())
-                    }?;
-                    retained.push(pinned);
-                    offset += chunk.len();
+                for piece in &entry.pieces {
+                    let mut start = 0;
+                    while start < piece.len() {
+                        let bytes = chunk_bytes.min(piece.len() - start);
+                        // SAFETY: the piece is in `staged`, unmodified, and the caller keeps `staged` until the lane
+                        // has retired this copy.
+                        unsafe {
+                            lane.copy_upload_to_device(destination.offset(offset as u64), piece.buffer(), start, bytes)
+                        }?;
+                        start += bytes;
+                        offset += bytes;
+                    }
                 }
             }
             Ok::<(), ForwardError>(())
@@ -372,31 +461,46 @@ impl LayerWeights {
         &self.shapes
     }
 
-    /// Replaces object `name` with `decoded` (BF16, the same size), which this layer then owns; the old buffer is
-    /// freed in stream order on `lane`.
+    /// Replaces object `name` with `decoded` (BF16, the same size, allocated in stream order), which this layer then
+    /// owns; the old buffer is freed in stream order on `lane`, which orders it only against that lane's work.
+    ///
+    /// A replacement that is refused is freed in stream order too when it can be.
     pub fn replace(&mut self, lane: &mut dyn LaneOps, name: &str, decoded: DeviceBuffer) -> Result<(), ForwardError> {
-        let slot = self
+        let refusal = match self
             .buffers
             .iter_mut()
             .find(|(held, _)| matches!(held, Part::Object(object) if object == name))
-            .ok_or_else(|| ForwardError::Invalid(format!("the layer has no object {name}")))?;
-        if slot.1.bytes() != decoded.bytes() {
-            return Err(ForwardError::Invalid(format!(
+        {
+            None => ForwardError::Invalid(format!("the layer has no object {name}")),
+            Some(_) if !decoded.is_stream_ordered() => ForwardError::Invalid(format!(
+                "the replacement of {name} was not allocated in stream order, so the layer could not free it"
+            )),
+            Some(slot) if slot.1.bytes() != decoded.bytes() => ForwardError::Invalid(format!(
                 "{name} holds {} bytes, its replacement {}",
                 slot.1.bytes(),
                 decoded.bytes()
-            )));
+            )),
+            Some(slot) => {
+                let old = replace(&mut slot.1, decoded);
+                lane.free_async(old)?;
+                return Ok(());
+            }
+        };
+        if decoded.is_stream_ordered() {
+            lane.free_async(decoded)?;
         }
-        let old = replace(&mut slot.1, decoded);
-        lane.free_async(old)?;
-        Ok(())
+        Err(refusal)
     }
 
-    /// Frees every buffer in stream order on `lane`.
+    /// Frees every buffer in stream order on `lane`, all of them even when one refuses; the first refusal is the
+    /// error. The frees are ordered only against `lane`'s work.
     pub fn release(mut self, lane: &mut dyn LaneOps) -> Result<(), ForwardError> {
+        let mut first = None;
         for (_, buffer) in self.buffers.drain(..) {
-            lane.free_async(buffer)?;
+            if let Err(error) = lane.free_async(buffer) {
+                first.get_or_insert(error);
+            }
         }
-        Ok(())
+        first.map_or(Ok(()), |error| Err(error.into()))
     }
 }

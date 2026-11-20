@@ -1134,7 +1134,7 @@ where
     /// through `self`.
     ///
     /// # Safety
-    /// As [`LaneEnqueue::launch`]: `args` match the kernel's parameters, and every address the kernel touches is valid
+    /// As [`LaneEnqueue::launch`]: every address the kernel touches is valid
     /// for that access until the work retires.
     pub unsafe fn launch_kernel(
         &mut self,
@@ -1142,7 +1142,22 @@ where
         geometry: GpuLaunch,
         args: &Args,
     ) -> Result<(), CudaError> {
-        // SAFETY: the caller's contract.
+        let driver = kernel.parameter_sizes().ok_or_else(|| {
+            CudaError::Argument("launch_kernel: the driver does not report the kernel's parameter sizes".into())
+        })?;
+        let same =
+            args.len() == driver.len() && args.sizes().zip(driver).all(|(size, &driver)| size == driver as usize);
+        if !same {
+            return Err(CudaError::Argument(format!(
+                "launch_kernel: the arguments' sizes {:?} are not the kernel's parameter sizes {driver:?}",
+                args.sizes().collect::<Vec<_>>()
+            )));
+        }
+        let geometry = GpuLaunch {
+            programmatic: geometry.programmatic && self.pdl,
+            ..geometry
+        };
+        // SAFETY: the caller's contract; the arguments were checked against the kernel's parameter sizes above.
         unsafe { self.queue.launch(kernel, geometry, args) }.map_err(|error| lane_error("launch_kernel", &error))
     }
 
