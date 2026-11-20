@@ -13,16 +13,19 @@ euhedral-data-structures.workspace = true
 euhedral-gpu = { workspace = true, features = ["cuda"] }
 euhedral-graph.workspace = true
 euhedral-hashing.workspace = true
+euhedral-inference-api-protocol = { path = "../api-protocol" }
 euhedral-inference-cuda = { path = "../cuda" }
 euhedral-inference-edrl = { path = "../edrl" }
 euhedral-inference-engine = { path = "../engine" }
 euhedral-inference-settings = { path = "../settings" }
 euhedral-inference-tokenizer = { path = "../tokenizer" }
 euhedral-io.workspace = true
+same-file.workspace = true
 serde_json = { workspace = true }
 thiserror.workspace = true
 
 [dev-dependencies]
+euhedral-inference-edrl = { path = "../edrl", features = ["test-util"] }
 euhedral-gpu = { workspace = true, features = ["fake"] }
 tempfile.workspace = true
 test-support = { path = "../test-support" }
