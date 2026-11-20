@@ -21,6 +21,7 @@
 mod chain;
 pub mod checkpoint;
 pub mod durable;
+pub mod gptq;
 pub mod java_random;
 pub mod kernels;
 pub mod kld;
