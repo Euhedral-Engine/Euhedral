@@ -379,9 +379,14 @@ impl LayerWeights {
     /// no pinned memory is made here.
     ///
     /// The allocations and the uploads are ordered only on `lane`: work on another lane must wait for this lane's
-    /// work to retire first. Keep `staged` until the lane has retired the copies. On `Err` the buffers already made
-    /// are freed in stream order.
-    pub fn upload(
+    /// work to retire first. On `Err` the buffers already made are freed in stream order.
+    ///
+    /// # Safety
+    ///
+    /// The queued copies read `staged`'s pinned buffers asynchronously. `staged` must stay alive, and its buffers
+    /// must not return to the pool or be written, until `lane` has retired every copy this call queued. That holds
+    /// on `Err` too: copies queued before the failure are still in flight.
+    pub unsafe fn upload(
         lane: &mut dyn LaneOps,
         staged: &StagedLayer,
         chunk_bytes: usize,
@@ -408,8 +413,8 @@ impl LayerWeights {
                     let mut start = 0;
                     while start < piece.len() {
                         let bytes = chunk_bytes.min(piece.len() - start);
-                        // SAFETY: the piece is in `staged`, unmodified, and the caller keeps `staged` until the lane
-                        // has retired this copy.
+                        // SAFETY: the piece is in `staged`, unmodified, and the caller of `upload` keeps `staged`
+                        // until the lane has retired this copy.
                         unsafe {
                             lane.copy_upload_to_device(destination.offset(offset as u64), piece.buffer(), start, bytes)
                         }?;

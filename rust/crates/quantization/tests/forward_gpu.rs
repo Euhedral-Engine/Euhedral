@@ -156,7 +156,9 @@ fn forward_runs(rig: &mut Rig, model: &Model, staged: &StagedLayer, inputs: &[&[
     let config = &model.objects.config;
     let (mut forward, weights) = rig.run(|context| {
         let forward = LayerForward::new(context.ops(), &library, &pool, config, rows)?;
-        let weights = LayerWeights::upload(context.ops(), staged, UPLOAD_CHUNK)?;
+        // SAFETY: `staged` is borrowed for the whole of `forward_runs`, and `rig.run` waits for the lane to retire
+        // the copies before it returns.
+        let weights = unsafe { LayerWeights::upload(context.ops(), staged, UPLOAD_CHUNK) }?;
         Ok((forward, weights))
     });
     let hidden_ptr = hidden.ptr();
@@ -236,7 +238,8 @@ fn an_upload_in_odd_chunks_puts_each_part_on_the_device_as_staged() {
     let pool = Arc::clone(&rig.pool);
     for index in [0usize, 3] {
         let layer = staged(&rig, &model, Target::Layer(index));
-        let weights = rig.run(|context| LayerWeights::upload(context.ops(), &layer, 1_000_003));
+        // SAFETY: `layer` outlives the call, and `rig.run` waits for the lane to retire the copies.
+        let weights = rig.run(|context| unsafe { LayerWeights::upload(context.ops(), &layer, 1_000_003) });
         let mut loans = Vec::new();
         for (part, bytes) in layer.parts() {
             loans.push((part, pool.acquire(bytes).unwrap(), weights.ptr(part).unwrap()));
@@ -311,7 +314,8 @@ fn the_fused_mtp_object_is_two_projections_one_after_the_other() {
     let hidden = rig.upload(&model.input[..rows as usize * config.hidden as usize * 2]);
     let (mut forward, weights) = rig.run(|context| {
         let forward = LayerForward::new(context.ops(), &library, &pool, config, rows)?;
-        let weights = LayerWeights::upload(context.ops(), &layer, UPLOAD_CHUNK)?;
+        // SAFETY: `layer` outlives the call, and `rig.run` waits for the lane to retire the copies.
+        let weights = unsafe { LayerWeights::upload(context.ops(), &layer, UPLOAD_CHUNK) }?;
         Ok((forward, weights))
     });
     let name = "mtp/layer/attention/query_key_gate_value";

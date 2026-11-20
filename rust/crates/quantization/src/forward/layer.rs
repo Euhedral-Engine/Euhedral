@@ -135,8 +135,13 @@ impl LayerForward {
             alpha,
             beta,
             position,
-        ] = <[DeviceBuffer; 11]>::try_from(made)
-            .map_err(|_| ForwardError::Invalid("the workspace is 11 buffers".to_owned()))?;
+        ] = match <[DeviceBuffer; 11]>::try_from(made) {
+            Ok(buffers) => buffers,
+            Err(made) => {
+                free_all(lane, made);
+                return Err(ForwardError::Invalid("the workspace is 11 buffers".to_owned()));
+            }
+        };
         Ok(LayerForward {
             shape,
             epsilon: config.eps as f32,
@@ -168,6 +173,8 @@ impl LayerForward {
     /// Where [`head`](Self::head) leaves the mixer's two projections of the normalized rows: attention's query_key and
     /// gate_value, or GDN's query_key and value_z. BF16 `[rows, width]` on the device, valid once the lane has run the
     /// head and until the next work that uses the workspace.
+    // Exists for device tests only.
+    #[doc(hidden)]
     pub fn projections(&self) -> (DevicePtr, DevicePtr) {
         (self.first.ptr(), self.second.ptr())
     }
@@ -180,6 +187,9 @@ impl LayerForward {
     /// Runs `layer` over `sequences` sequences of `length` tokens whose hidden states are `hidden` (BF16 device
     /// rows), every step on `context`'s lane: [`head`](Self::head), then [`sequence`](Self::sequence) for each
     /// sequence, then [`tail`](Self::tail). Call [`retire`](Self::retire) once the lane has retired the work.
+    ///
+    /// The first call allocates pinned memory and waits for it when the pool is cold (see
+    /// [`prepare_slots`](Self::prepare_slots)).
     pub fn forward<Q>(
         &mut self,
         context: &mut LaneContext<'_, Q>,
@@ -204,6 +214,10 @@ impl LayerForward {
     }
 
     /// Makes the GDN states and attention caches of `sequences` slots.
+    ///
+    /// The first call that makes a slot allocates the pinned staging its cache's table uploads read, and waits for
+    /// it if the pool is cold: the number of slots is known only here, so it cannot be primed in
+    /// [`new`](Self::new). Call it before the lane's work starts, or accept that wait on the first `forward`.
     pub fn prepare_slots(&mut self, lane: &mut dyn LaneOps, sequences: u32) -> Result<(), ForwardError> {
         let shape = self.shape;
         let channels = u64::from(shape.convolution_width);
