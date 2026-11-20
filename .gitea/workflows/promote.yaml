@@ -32,8 +32,7 @@ permissions:
 env:
   # The rollover release to run, and the sha256 of its asset rollover-x86_64-unknown-linux-musl.
   ROLLOVER_TAG: v1.0.0
-  # PLACEHOLDER until the v1.0.0 release is cut: replace with the digest of that asset (a line of its SHA256SUMS).
-  # The step refuses to run while this is not 64 hex digits.
+  # The digest of that asset, from the release's SHA256SUMS. The step refuses to run when this is not 64 hex digits.
   ROLLOVER_SHA256: "6b16d4cb9c989b1ed99e75cf410a8bfe15419bddd23a3bbda01970b2260f008c"
 
 concurrency:
