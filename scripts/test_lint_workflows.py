@@ -42,6 +42,21 @@ class LintWorkflowsTest(unittest.TestCase):
         self.assertEqual(len(problems("      ARBITER_ARGS: ${{ vars.ARGS }}\n")), 1)
         self.assertEqual(len(problems('      ARBITER_ARGS: "--mem 8"\n')), 1)
 
+    def test_forms_that_hide_the_value_fail(self):
+        for text in (
+            '      ARBITER_ARGS: "--mem 64G"  # note\n',
+            '      env: {ARBITER_ARGS: "--mem 64G", ARBITER_EST: "60"}\n',
+            "      ARBITER_ARGS: >-\n        --mem 64G\n",
+            "      ARBITER_ARGS: |\n        --mem 64G\n",
+            '      ARBITER_ARGS: "--mem 1G" "--mem 64G"\n',
+            "      ARBITER_ARGS:\n",
+        ):
+            self.assertGreaterEqual(len(problems(text)), 1, text)
+
+    def test_a_comment_after_a_readable_value_is_fine(self):
+        self.assertEqual(problems('      ARBITER_ARGS: "--mem 8G"  # note\n'), [])
+        self.assertEqual(problems("      ARBITER_ARGS: --mem 8G # note\n"), [])
+
     def test_system_run_lines_are_read_too(self):
         self.assertEqual(len(problems("          system-run --mem 64G --est 60 -- true\n")), 1)
         self.assertEqual(problems("          system-run --mem 1G --est 300 -- ./x --mem 99G\n"), [])

@@ -78,6 +78,22 @@ def check_args(args):
         i += 1
 
 
+def plain_scalar(value):
+    """The text of a one-line plain or fully quoted scalar; anything else cannot be checked and is refused."""
+    if value[:1] in "\"'":
+        match = re.fullmatch(r"(['\"])(.*)\1\s*(?:#.*)?", value)
+        if not match:
+            raise ValueError("ARBITER_ARGS is not one fully quoted value")
+        value = match.group(2)
+    else:
+        value = re.sub(r"\s+#.*$", "", value)
+        if not value or value[0] in ">|{[&*!%@`" or re.search(r"[{}]|,\s*\w+\s*:", value):
+            raise ValueError("ARBITER_ARGS is not a one-line plain or quoted value")
+    if "${{" in value:
+        raise ValueError("ARBITER_ARGS is an expression, which cannot be checked")
+    return value
+
+
 def requests(line):
     """The argument strings a workflow line gives the arbiter."""
     code = line.strip()
@@ -85,13 +101,7 @@ def requests(line):
         return
     match = re.search(r"\bARBITER_ARGS\b\s*[:=]\s*(.*)$", code)
     if match:
-        value = match.group(1).strip()
-        value = re.sub(r"\s+#.*$", "", value) if value[:1] not in "\"'" else value
-        if value[:1] in "\"'" and value.endswith(value[0]) and len(value) > 1:
-            value = value[1:-1]
-        if "${{" in value:
-            raise ValueError("ARBITER_ARGS is an expression, which cannot be checked")
-        yield value
+        yield plain_scalar(match.group(1).strip())
     match = re.search(r"\bsystem-run\b(.*?)(?:\s--(?:\s|$)|$)", code)
     if match and "ARBITER_ARGS" not in code:
         yield match.group(1)

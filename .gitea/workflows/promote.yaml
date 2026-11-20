@@ -62,6 +62,7 @@ jobs:
           [ -n "$FORGE_URL" ] || { echo "::error::vars.FORGE_URL is not set"; exit 1; }
 
           secrets="${FORGE_CI_SECRETS:-$HOME/.config/forge/ci-secrets/euhedral}"
+          mkdir -p "$GITHUB_WORKSPACE"
           work=$(mktemp -d -p "$GITHUB_WORKSPACE" rollover.XXXXXX)
           trap 'rm -rf "$work"' EXIT
           umask 077

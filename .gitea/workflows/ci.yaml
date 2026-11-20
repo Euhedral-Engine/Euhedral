@@ -11,7 +11,8 @@
 # seccomp off). No docker job sets timeout-minutes: the arbiter's hold limit (ARBITER_EST + 60 s from the grant) is its limit.
 # No job asks for more than --mem 32G, and none uses a cpu form (scripts/lint-workflows.py checks both).
 #
-# The artifact action major is the one to prove on the rehearsal instance, and it needs Node in the image.
+# The artifact action's major version (v4 here) is not yet proven against Gitea's artifact store, and the action needs Node
+# in the image.
 name: ci
 
 on:
@@ -36,8 +37,10 @@ on:
 permissions:
   contents: read
 
+# The event is part of the group, so a manual run on the integration branch never cancels the push run that
+# `rollover promote` requires for that commit.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 defaults:
