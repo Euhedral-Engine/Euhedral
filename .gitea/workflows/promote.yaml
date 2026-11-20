@@ -34,7 +34,7 @@ env:
   ROLLOVER_TAG: v1.0.0
   # PLACEHOLDER until the v1.0.0 release is cut: replace with the digest of that asset (a line of its SHA256SUMS).
   # The step refuses to run while this is not 64 hex digits.
-  ROLLOVER_SHA256: "PLACEHOLDER-fill-with-the-sha256-of-rollover-x86_64-unknown-linux-musl-v1.0.0"
+  ROLLOVER_SHA256: "6b16d4cb9c989b1ed99e75cf410a8bfe15419bddd23a3bbda01970b2260f008c"
 
 concurrency:
   group: euhedral-integration
@@ -47,7 +47,6 @@ jobs:
     if: github.ref_name == vars.INTEGRATION_BRANCH
     timeout-minutes: 20
     env:
-      CI_JOB_TIMEOUT: "1200" # timeout-minutes x 60; keep the two together
       FORGE_URL: ${{ vars.FORGE_URL }}
     steps:
       - name: Download rollover and check its sha256
@@ -83,6 +82,8 @@ jobs:
             401 | 403 | 404)
               echo "the job token was refused ($code); trying the promote bot's token"
               [ -r "$secrets/promote.token" ] || { echo "::error::no promote.token to fall back to"; exit 1; }
+              perm=$(stat -Lc '%a' "$secrets/promote.token")
+              case "$perm" in [0-7]00) ;; *) echo "::error::promote.token is readable by others (mode $perm); it must be 0600 or 0400"; exit 1 ;; esac
               code=$(fetch "$(tr -d '\r\n' < "$secrets/promote.token")") ||
                 { echo "::error::the download of rollover $ROLLOVER_TAG failed"; exit 1; }
               [ "$code" = 200 ] || { echo "::error::the promote bot's token was refused too ($code)"; exit 1; }
@@ -102,7 +103,7 @@ jobs:
         run: |
           set -euo pipefail
           secrets="${FORGE_CI_SECRETS:-$HOME/.config/forge/ci-secrets/euhedral}"
-          args=(promote --production --token-file "$secrets/promote.token")
+          args=(promote --production --token-file "$secrets/promote.token" --lock-wait 15m)
           if [ -n "$NEXT_BRANCH" ]; then args+=(--next "$NEXT_BRANCH"); fi
           if [ "${DRY_RUN:-1}" != 0 ]; then args+=(--dry-run); fi
           # Host jobs are not arbiter-gated, so this step asks for its own lease. The repository, the commit, the
