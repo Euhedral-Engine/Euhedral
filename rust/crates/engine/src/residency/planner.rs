@@ -13,7 +13,7 @@
 //! were, naming the memory that is short.
 
 use euhedral_inference_cuda::launch::nvfp4::{SKINNY_MAX_ROWS, nvfp4_native_scratch_bytes, skinny_target_ctas};
-use euhedral_inference_cuda::launch::q3::{P2E2_EXPAND_LIMIT, linear_scratch_bytes, q3_byte_size};
+use euhedral_inference_cuda::launch::q3::linear_scratch_bytes;
 use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFormat, WeightLayout};
 use euhedral_inference_settings::{Auto, BatchingSettings, KvFormat, Settings};
 
@@ -418,7 +418,7 @@ pub fn plan_closest(
             chunk,
             rows.logits_rows,
             inputs.multiprocessors,
-        )?);
+        ));
     let decode_scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::TensorCore);
 
     let available = inputs
@@ -938,16 +938,16 @@ fn nvfp4_native_scratch(placements: &[Placement], rows: u64, target_ctas: u64) -
 /// looked up, not multiplied. The FP8 route is counted on every device, and where the device is not known
 /// (`multiprocessors` is `None`) with the most K splits any device makes.
 ///
-/// A P2E2 tensor that a launch of this many rows must expand, and that is larger than the scratch takes whole
-/// ([`P2E2_EXPAND_LIMIT`]), is refused by name: its run in chunks of output rows is not ported, and the launch would
-/// fail at its first use.
+/// A P2E2 tensor too large to expand whole (`P2E2_EXPAND_LIMIT`) is run in chunks of output rows, which the scratch
+/// holds one at a time. The library's numerics are not known here, so a tensor is sized for both: the exact kernels
+/// expand a tensor the fused decode reads in place.
 fn grouped_scratch(
     placements: &[Placement],
     layers: usize,
     rows: u64,
     logits_rows: u64,
     multiprocessors: Option<u32>,
-) -> Result<u64, PlanError> {
+) -> u64 {
     let mut largest = 0;
     for placement in placements.iter().filter(|placement| {
         matches!(
@@ -967,30 +967,20 @@ fn grouped_scratch(
             continue;
         };
         let p2e2 = placement.layout == WeightLayout::RowSplitP2e2V1;
-        // The production numerics: the exact kernels expand a tensor the fused decode reads in place, which a tensor
-        // of this size cannot do whole (and every other P2E2 tensor is sized below at the prefill chunk's rows).
-        let needed = linear_scratch_bytes(
-            p2e2,
-            u32::try_from(rows).unwrap_or(u32::MAX),
-            input,
-            out,
-            true,
-            multiprocessors,
-            false,
-        );
-        match needed {
-            Some(bytes) => largest = largest.max(bytes),
-            None => {
-                return Err(PlanError::Unsupported(format!(
-                    "{} is a compressed Q3 tensor of {} bytes expanded, more than the {P2E2_EXPAND_LIMIT} bytes a launch \
-                     of {rows} rows can expand into the scratch",
-                    placement.name,
-                    q3_byte_size(out, input),
-                )));
-            }
-        }
+        let needed = [false, true].map(|exact_numerics| {
+            linear_scratch_bytes(
+                p2e2,
+                u32::try_from(rows).unwrap_or(u32::MAX),
+                input,
+                out,
+                true,
+                multiprocessors,
+                exact_numerics,
+            )
+        });
+        largest = largest.max(needed[0]).max(needed[1]);
     }
-    Ok(largest)
+    largest
 }
 
 fn align(value: u64) -> u64 {
@@ -1143,6 +1133,8 @@ pub mod nvfp4 {
 mod tests {
     use std::slice;
 
+    use euhedral_inference_cuda::launch::q3::{P2E2_EXPAND_LIMIT, q3_byte_size};
+
     use super::*;
 
     fn nvfp4(shape: &[u64]) -> Placement {
@@ -1169,16 +1161,32 @@ mod tests {
         }
     }
 
-    /// A compressed tensor too large to expand whole is refused by name, with the limit, wherever a launch of its rows
-    /// must expand it; at the rows its fused decode reads it in place it is sized, not refused.
+    /// A compressed head just over the expansion limit is run in chunks, and its scratch is sized for them whatever the
+    /// numerics and the rows (the exact kernels expand it even at the rows its fused decode reads it in place); the
+    /// largest head that fits is sized for its whole expansion.
     #[test]
-    fn a_compressed_tensor_above_the_expansion_limit_is_refused_by_name_where_it_must_be_expanded() {
-        let head = p2e2("text/draft_head", &[262_144, 5120]);
-        let error = grouped_scratch(slice::from_ref(&head), 64, 8, 9, Some(70)).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("text/draft_head"), "{message}");
-        assert!(message.contains(&P2E2_EXPAND_LIMIT.to_string()), "{message}");
-        assert!(grouped_scratch(slice::from_ref(&head), 64, 8, 8, Some(70)).is_ok());
+    fn a_compressed_head_over_the_expansion_limit_is_sized_for_its_chunks_at_every_row_count() {
+        let width = 5120u32;
+        let mut fits = 1024u32;
+        while q3_byte_size(fits + 16, width) <= P2E2_EXPAND_LIMIT {
+            fits += 16;
+        }
+        let largest = p2e2("text/draft_head", &[fits.into(), width.into()]);
+        let over = p2e2("text/draft_head", &[u64::from(fits) + 16, width.into()]);
+        let whole = q3_byte_size(fits, width);
+        for logits_rows in [1, 8, 9] {
+            let sized = grouped_scratch(slice::from_ref(&largest), 64, 8, logits_rows, Some(70));
+            assert!(
+                sized >= whole,
+                "{logits_rows} rows: {sized} for a head of {whole} bytes"
+            );
+            let chunked = grouped_scratch(slice::from_ref(&over), 64, 8, logits_rows, Some(70));
+            assert!(chunked > 0, "{logits_rows} rows: a head over the limit takes scratch");
+            assert!(
+                chunked <= whole.next_multiple_of(256) + (64 << 20),
+                "{logits_rows} rows: {chunked} is bounded"
+            );
+        }
     }
 
     /// An artifact with no trellis objects has the native route's scratch as its first region: the largest of its

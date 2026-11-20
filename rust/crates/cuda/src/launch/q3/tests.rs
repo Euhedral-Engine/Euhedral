@@ -175,45 +175,52 @@ fn the_largest_scratch_up_to_a_row_count_is_no_smaller_than_any_launch_of_fewer_
 fn the_scratch_of_a_linear() {
     let upto = |p2e2, rows, mx| linear_scratch_bytes(p2e2, rows, 5120, 5120, mx, Some(70), false);
     // Up to 8 rows take no scratch, whatever the layout.
-    assert_eq!(upto(false, 8, true), Some(0));
-    assert_eq!(upto(true, 8, true), Some(0));
+    assert_eq!(upto(false, 8, true), 0);
+    assert_eq!(upto(true, 8, true), 0);
     // A plain tensor takes the FP8 route's scratch where it runs, and none where it does not or the shape is not tiled.
-    assert_eq!(
-        upto(false, 512, true),
-        Some(mx_scratch_bytes_upto(512, 5120, 5120, Some(70)))
-    );
-    assert_eq!(upto(false, 512, false), Some(0));
-    assert_eq!(
-        linear_scratch_bytes(false, 512, 5120, 5000, true, Some(70), false),
-        Some(0)
-    );
+    assert_eq!(upto(false, 512, true), mx_scratch_bytes_upto(512, 5120, 5120, Some(70)));
+    assert_eq!(upto(false, 512, false), 0);
+    assert_eq!(linear_scratch_bytes(false, 512, 5120, 5000, true, Some(70), false), 0);
     // A P2E2 tensor takes its expansion, 256-aligned, with the FP8 scratch behind it.
     let expanded = q3_byte_size(5120, 5120);
-    assert_eq!(upto(true, 512, false), Some(expanded));
+    assert_eq!(upto(true, 512, false), expanded);
     assert_eq!(
         upto(true, 512, true),
-        Some(expanded + mx_scratch_bytes_upto(512, 5120, 5120, Some(70)))
+        expanded + mx_scratch_bytes_upto(512, 5120, 5120, Some(70))
     );
     // Where the fused decode does not run, a P2E2 tensor of few rows is expanded as well: under exact numerics, and
     // for a shape the decode kernels do not take.
     assert_eq!(
         linear_scratch_bytes(true, 8, 5120, 5120, true, Some(70), true),
-        Some(expanded)
+        expanded
     );
     assert_eq!(
         linear_scratch_bytes(true, 1, 5120, 5120, false, Some(70), true),
-        Some(expanded)
+        expanded
     );
+    assert_eq!(linear_scratch_bytes(false, 8, 5120, 5120, true, Some(70), true), 0);
+    assert!(linear_scratch_bytes(true, 8, 5120, 5000, true, Some(70), false) > 0);
+    // One too large to expand whole is run in chunks: the scratch holds one chunk's expansion, its output and its
+    // activations, so it is far below the whole expansion and does not grow with the head.
+    let chunked = linear_scratch_bytes(true, 512, 5120, 248_320, true, Some(70), false);
+    assert!(chunked > 0 && chunked < q3_byte_size(248_320, 5120));
     assert_eq!(
-        linear_scratch_bytes(false, 8, 5120, 5120, true, Some(70), true),
-        Some(0)
+        linear_scratch_bytes(true, 8, 5120, 496_640, false, Some(70), true),
+        linear_scratch_bytes(true, 8, 5120, 248_320, false, Some(70), true)
     );
-    assert!(linear_scratch_bytes(true, 8, 5120, 5000, true, Some(70), false) > Some(0));
-    // One too large to expand whole is run in chunks and is not sized here.
-    assert_eq!(
-        linear_scratch_bytes(true, 512, 5120, 248_320, true, Some(70), false),
-        None
-    );
+}
+
+/// The chunks of a head tile its rows in whole kilorows, and a chunk with its output fits the expansion limit.
+#[test]
+fn the_chunks_of_a_large_head_fit_the_expansion_limit_and_avoid_the_specialised_widths() {
+    for rows in [1, 8, 9, 64, 512] {
+        let chunk = p2e2_chunk_rows(rows, 5120);
+        assert_eq!(chunk % 1024, 0);
+        let (_, activations) = p2e2_chunk_offsets(rows, 5120, chunk);
+        assert!(activations <= P2E2_EXPAND_LIMIT + 512, "{rows}");
+        assert_ne!(chunk, 5120);
+        assert_ne!(chunk, 34816);
+    }
 }
 
 fn mx(rows: u32, scratch: u64, scratch_bytes: u64) -> Result<Q3Plan, PlanError> {
@@ -333,7 +340,7 @@ fn the_paired_gate_up_never_splits_and_needs_only_the_activations() {
 fn a_linear_of_the_scratch_covers_its_paired_gate_up() {
     for sm_count in [Some(70), Some(170), None] {
         for rows in [64, 129, 512, 1000] {
-            let linear = linear_scratch_bytes(false, rows, 5120, 34816, true, sm_count, false).unwrap();
+            let linear = linear_scratch_bytes(false, rows, 5120, 34816, true, sm_count, false);
             assert!(
                 mx_scratch_bytes_upto(rows, 5120, 0, sm_count) <= linear,
                 "{rows} {sm_count:?}"
