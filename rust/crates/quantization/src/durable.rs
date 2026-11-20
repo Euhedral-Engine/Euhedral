@@ -6,6 +6,9 @@
 //! This is a departure from the rule that library code does no blocking I/O. It is confined to this module, and ends
 //! when `AsyncIo` gains the three operations: only the bodies of [`sync`], [`truncate`] and [`remove`] change.
 //!
+//! [`clash`] is a host-lake step of the same kind (dup, fstat and open calls that compare file identities). It has no
+//! `AsyncIo` counterpart to wait for: it needs none, and stays as it is.
+//!
 //! The caller must hold an admitted unit of `host` until the completion has run: a lake takes frames only while a
 //! unit is admitted. A completion that cannot be offered (the lake closed meanwhile) is dropped without running, and
 //! what it owns is dropped with it.
@@ -132,7 +135,8 @@ pub fn clash(
         }
         match Handle::from_path(&path) {
             Ok(named) => Ok(known.contains(&named).then_some(Clash::Path)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            // A name that does not exist, or that cannot be read, is never a source: every source was opened for reading.
+            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied) => Ok(None),
             Err(error) => Err(error),
         }
     };

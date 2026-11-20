@@ -467,3 +467,37 @@ fn a_stale_temporary_file_is_replaced() {
     assert_eq!(fs::read(&out).unwrap(), fs::read(&reference).unwrap());
     fixture.world.finish();
 }
+
+#[cfg(unix)]
+#[test]
+fn an_output_name_that_cannot_be_compared_ends_the_run_and_leaves_the_temporary_file() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new();
+    let sources = fixture.open(&fixture.two()).unwrap();
+    let composite = view(&sources, &allocation(&[]), None).unwrap();
+    let out = fixture.dir.path().join("loop.edrl");
+    symlink(&out, &out).unwrap();
+    let error = fixture.write(&composite, &out, 1 << 20).unwrap_err().to_string();
+    assert!(error.contains("cannot compare"), "{error}");
+    assert!(fixture.dir.path().join("loop.edrl.part").exists());
+    assert_eq!(fs::read_link(&out).unwrap(), out);
+    fixture.world.finish();
+}
+
+#[test]
+fn a_copy_buffer_that_does_not_fit_is_refused() {
+    let fixture = Fixture::new();
+    let allocation = fixture.dir.path().join("allocation.json");
+    fs::write(&allocation, "{\"objects\":{}}").unwrap();
+    let request = Request {
+        allocation,
+        sources: fixture.two(),
+        base: BASE,
+        out: fixture.dir.path().join("mixed.edrl"),
+        draft_depth: None,
+        copy_buffer_mib: Some(u64::MAX),
+    };
+    let error = call(|done| run(&fixture.world.io, &fixture.world.host, request, 100, done)).unwrap_err();
+    assert!(error.to_string().contains("copy buffer"), "{error}");
+    fixture.world.finish();
+}
