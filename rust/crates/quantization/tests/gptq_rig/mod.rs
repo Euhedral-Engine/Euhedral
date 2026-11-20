@@ -183,23 +183,23 @@ impl Rig {
 
     /// Arms a retirement on the lane's stream that nobody collects, so the next chain cannot arm its own and fails.
     pub fn block_arming(&mut self) {
-        self.lane_mut()
-            .stream_mut()
-            .arm_retirement()
-            .expect("a retirement arms");
+        self.lane_mut().block_arming().expect("a retirement arms");
     }
 
     /// Collects the retirement [`block_arming`](Self::block_arming) armed, when the stream has run up to it.
     pub fn unblock_arming(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(60);
-        let stream = self.lane_mut().stream_mut();
-        let ticket = loop {
-            if let Some(ticket) = stream.poll_retired() {
-                break ticket;
-            }
+        while !self.lane_mut().unblock_arming() {
             assert!(Instant::now() < deadline, "the retirement did not arrive in a minute");
-        };
-        assert!(stream.confirm_retired(ticket).is_none());
+        }
+    }
+
+    /// Takes the lane apart as a shutdown does, calling `probe` just before it waits for the stream.
+    pub fn shutdown(&mut self, probe: Box<dyn Fn() + Send>) -> Result<u64, GptqError> {
+        let mut lane = self.lane.take().expect("the lane is idle");
+        lane.set_shutdown_probe(probe);
+        let (_stream, _handles, reclaimed) = lane.into_parts();
+        reclaimed
     }
 
     /// Failed chains whose state the lane still holds.

@@ -167,6 +167,8 @@ pub struct LaneParts {
     /// The state of chains whose retirement could not be armed, with work possibly still queued on the stream: kept
     /// until a later retirement is confirmed.
     unsettled: Unsettled,
+    #[cfg(feature = "test-hooks")]
+    shutdown_probe: Option<Box<dyn Fn() + Send>>,
 }
 
 /// State parked until the lane's stream has run the work queued before it.
@@ -231,6 +233,10 @@ impl Debug for Scratch {
 }
 
 /// What a chain hands to its `done` call, from the frame that ended it.
+///
+/// After a failed chain whose retirement could not be armed, `result` is an `Err` while the chain's kernels may still
+/// read the caller's [`DeviceRange`]s and write its `decoded_out`: they stay in use until the lane's
+/// [`unsettled`](GptqLane::unsettled) count is back to 0 or the lane's next step has been confirmed.
 #[derive(Debug)]
 pub struct Finished<T> {
     pub lane: GptqLane,
@@ -250,7 +256,9 @@ impl DeviceRange {
     ///
     /// # Safety
     /// The range must be live device memory of at least `bytes` bytes, which nothing writes (when the step reads it)
-    /// or reads (when the step writes it) and which is not freed until the step's `done` call.
+    /// or reads (when the step writes it) and which is not freed until the step's work has run: its `done` call, or,
+    /// when the step failed with the lane's [`unsettled`](GptqLane::unsettled) count not 0, until that count is back
+    /// to 0 or the lane's next step is confirmed.
     pub unsafe fn new(addr: u64, bytes: u64) -> DeviceRange {
         DeviceRange { addr, bytes }
     }
@@ -296,6 +304,8 @@ impl GptqLane {
                 completions,
                 settings,
                 unsettled: Unsettled::default(),
+                #[cfg(feature = "test-hooks")]
+                shutdown_probe: None,
             },
         })
     }
@@ -303,15 +313,44 @@ impl GptqLane {
     /// Takes the lane apart for shutdown: the stream and the handles are destroyed by their owner. The device buffers
     /// given up are freed in stream order first, and the error of that, if any, comes back with the parts. A [`Factor`]
     /// must not outlive its lane: when it is dropped after this, its memory is freed with the plain `cudaFree`.
+    ///
+    /// State parked by a failed chain is released only after the stream has run its queued work. This is a shutdown
+    /// call, so it waits for the stream here; no frame calls it.
     pub fn into_parts(mut self) -> (CudaStream, LaneHandles, Result<u64, GptqError>) {
+        if self.parts.unsettled.len() > 0 {
+            #[cfg(feature = "test-hooks")]
+            if let Some(probe) = &self.parts.shutdown_probe {
+                probe();
+            }
+            Stream::quiesce(&mut self.stream);
+            self.parts.unsettled.release();
+        }
         let reclaimed = self.reclaim();
         (self.stream, self.parts.handles, reclaimed)
     }
 
-    /// The lane's stream, for work the owner enqueues on it besides the chains. A chain that ends with work still queued
-    /// keeps its state until the stream's next confirmed retirement: see [`unsettled`](Self::unsettled).
-    pub fn stream_mut(&mut self) -> &mut CudaStream {
-        &mut self.stream
+    /// Arms a retirement on the stream that nobody collects, so the next chain's own cannot be armed and fails after it
+    /// enqueued its work. For tests of that path.
+    #[cfg(feature = "test-hooks")]
+    pub fn block_arming(&mut self) -> Result<(), GpuError> {
+        self.stream.arm_retirement()
+    }
+
+    /// Collects the retirement [`block_arming`](Self::block_arming) armed, once the stream has run up to it. Returns
+    /// false when it has not arrived yet.
+    #[cfg(feature = "test-hooks")]
+    pub fn unblock_arming(&mut self) -> bool {
+        match self.stream.poll_retired() {
+            Some(ticket) => self.stream.confirm_retired(ticket).is_none(),
+            None => false,
+        }
+    }
+
+    /// Sets a call made by [`into_parts`](Self::into_parts) just before it waits for the stream, when a failed chain's
+    /// state is parked.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_shutdown_probe(&mut self, probe: Box<dyn Fn() + Send>) {
+        self.parts.shutdown_probe = Some(probe);
     }
 
     /// How many failed chains' states the lane still holds because work of theirs may be queued on the stream.

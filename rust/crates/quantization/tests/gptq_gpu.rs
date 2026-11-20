@@ -5,9 +5,9 @@
 //! `euhedral.quantization.cuda-libraries`; a missing setting fails the test. The kernels' NVRTC and its builtins
 //! library must be reachable (`EUHEDRAL_NVRTC`, `LD_LIBRARY_PATH`).
 //!
-//! The tests round the Hessian and the weight of the frozen calibration fixture and
-//! check what must hold of any GPTQ rounding: dead columns, act-order equivariance, the error under H against
-//! nearest-code rounding, the code range, the decoded output, the identity table and the SD4 table over chunks.
+//! The tests round the Hessian and the weight of the frozen calibration fixture and check what must hold of any GPTQ
+//! rounding: dead columns, act-order equivariance, the error under H against nearest-code rounding, the code range,
+//! the decoded output, the identity table and the SD4 table over chunks.
 #![cfg(target_os = "linux")]
 #![allow(
     clippy::unwrap_used,
@@ -22,6 +22,8 @@ mod gptq_rig;
 use std::array::from_fn;
 use std::fs::read;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use euhedral_inference_cuda::DeviceBuffer;
 use euhedral_inference_quantization::gptq::format::Format;
@@ -628,4 +630,55 @@ fn a_chain_that_cannot_arm_keeps_its_staging_until_a_retirement_is_confirmed() {
     rig.factor(&hessian, p.k, p.damp, false).unwrap();
     assert_eq!(rig.unsettled(), 0);
     assert!(rig.pinned.held_bytes() > 0, "the staging came back to the pool");
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
+fn a_step_refused_for_a_short_pinned_claim_allocates_no_pinned_memory() {
+    let p = problem();
+    let mut rig = rig(GptqSettings::default());
+    let hessian = rig.upload(&floats(&p.h));
+    // No pinned bytes at all: the first staging buffer is refused, so the pool must not have allocated for it.
+    rig.short = (0, u64::MAX);
+    let refused = rig.factor(&hessian, p.k, p.damp, false);
+    assert!(matches!(refused, Err(GptqError::Request(text)) if text.contains("claim")));
+    assert_eq!(
+        rig.pinned.allocated_bytes(),
+        0,
+        "the pool allocated before the claim was charged"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the math libraries and the bundled NVRTC"]
+fn shutdown_waits_for_the_stream_before_it_releases_a_failed_chains_staging() {
+    let p = problem();
+    let mut rig = rig(GptqSettings::default());
+    let hessian = rig.upload(&floats(&p.h));
+    rig.block_arming();
+    let failed = rig.factor(&hessian, p.k, p.damp, false);
+    assert!(matches!(failed, Err(GptqError::Gpu(_))), "{failed:?}");
+    assert_eq!(rig.unsettled(), 1);
+    // The probe runs just before the lane waits for its stream: the staging must still be parked then.
+    let pool = Arc::clone(&rig.pinned);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let probe = Box::new(move || {
+        assert_eq!(
+            pool.held_bytes(),
+            0,
+            "the staging went back to the pool before the stream was quiesced"
+        );
+        seen.fetch_add(1, Ordering::SeqCst);
+    });
+    rig.shutdown(probe).expect("reclaim");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "shutdown did not wait for the stream before releasing"
+    );
+    assert!(
+        rig.pinned.held_bytes() > 0,
+        "the staging came back to the pool after the wait"
+    );
 }

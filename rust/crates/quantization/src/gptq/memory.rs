@@ -251,9 +251,12 @@ impl<'a, Q: LaneStream<Raw = *mut c_void>> Memory<'a, Q> {
     /// `bytes` of pooled page-locked memory.
     pub fn pinned(&mut self, bytes: usize) -> Result<Host, GptqError> {
         let bytes = bytes.max(1);
+        // The pool hands out its size class: that is what the buffer takes of the pinned memory. Charge it before the
+        // pool can allocate, so a refused step allocates nothing.
+        let class = PinnedPool::class_bytes(bytes)
+            .ok_or_else(|| GptqError::Request(format!("{bytes} bytes is too large for a pinned buffer")))?;
+        let claim = charge(&mut self.claims.pinned, class, "pinned")?;
         let pooled = self.pool.acquire(bytes)?;
-        // The pool hands out its size class: that is what the buffer takes of the pinned memory.
-        let claim = charge(&mut self.claims.pinned, pooled.capacity(), "pinned")?;
         Ok(Host {
             pooled,
             bytes,

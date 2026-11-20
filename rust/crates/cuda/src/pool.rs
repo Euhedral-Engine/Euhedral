@@ -152,9 +152,7 @@ impl PinnedPool {
 
     /// A buffer of at least `bytes`: a released one of its size class, or a new allocation.
     pub fn acquire(self: &Arc<Self>, bytes: usize) -> Result<PooledPinned, CudaError> {
-        let capacity = bytes
-            .max(MIN_CLASS_BYTES)
-            .checked_next_power_of_two()
+        let capacity = Self::class_bytes(bytes)
             .ok_or_else(|| CudaError::Argument(format!("{bytes} bytes is too large for a pinned buffer")))?;
         let class = capacity.trailing_zeros() as usize;
         let mut fresh = false;

@@ -522,6 +522,7 @@ dependencies = [
  "euhedral-gpu",
  "euhedral-graph",
  "euhedral-inference-cuda",
+ "euhedral-inference-quantization",
  "euhedral-memory",
  "serde_json",
  "test-support",
