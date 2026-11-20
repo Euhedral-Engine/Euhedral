@@ -263,11 +263,10 @@ fn the_error_in_the_hessian_metric_is_what_the_quantizer_reports_and_beats_the_p
     let plain = rig.quantize(&request(&w, None, N as u32, K as u32, 0, 3.0)).unwrap();
     let measured = hessian_error(&rig, &calibrated.decoded, &weight, &values);
     let plain_measured = hessian_error(&rig, &plain.decoded, &weight, &values);
-    println!(
-        "measured {measured} proxy {} plain {plain_measured} retries {} scale {}",
-        calibrated.proxy_error, calibrated.cholesky_retries, calibrated.global_scale
-    );
     let relative = (measured - calibrated.proxy_error).abs() / calibrated.proxy_error;
     assert!(relative < 0.05, "measured {measured}, reported {}", calibrated.proxy_error);
     assert!(measured < 0.4 * plain_measured, "{measured} against plain {plain_measured}");
+    // this input gives 0.0040 with the scale search and the refit; without the refit it gives 0.0045 and with the
+    // global scale fixed at one 0.0052
+    assert!(measured < 0.0043, "{measured}");
 }
