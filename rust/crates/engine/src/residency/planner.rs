@@ -13,6 +13,7 @@
 //! were, naming the memory that is short.
 
 use euhedral_inference_cuda::launch::nvfp4::{SKINNY_MAX_ROWS, nvfp4_native_scratch_bytes, skinny_target_ctas};
+use euhedral_inference_cuda::launch::q3::{P2E2_EXPAND_LIMIT, linear_scratch_bytes, q3_byte_size};
 use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFormat, WeightLayout};
 use euhedral_inference_settings::{Auto, BatchingSettings, KvFormat, Settings};
 
@@ -405,12 +406,19 @@ pub fn plan_closest(
     );
     let thresholds = trellis_thresholds(settings, inputs.multiprocessors);
     let widest = inputs.multiprocessors.is_none();
-    let scratch_bytes =
-        trellis_scratch(table, &profile, chunk, thresholds, widest, Route::Plan).max(nvfp4_native_scratch(
+    let scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::Plan)
+        .max(nvfp4_native_scratch(
             &device,
             chunk,
             inputs.multiprocessors.map_or(u64::MAX, skinny_target_ctas),
-        ));
+        ))
+        .max(grouped_scratch(
+            &device,
+            config.num_hidden_layers,
+            chunk,
+            rows.logits_rows,
+            inputs.multiprocessors,
+        )?);
     let decode_scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::TensorCore);
 
     let available = inputs
@@ -692,8 +700,8 @@ pub(crate) const CAPACITY_CAP: u64 = u64::MAX / 4;
 
 /// The two memory spaces of a plan: pinned host memory first, so a refusal at the host is reported before one at the
 /// device. When both are short the result relies on `Planner::admit` reporting the lowest location index, which
-/// RustEE does not promise; the unit test `the_memory_planner_decides_as_the_hand_written_fit_did` (host and device
-/// both short in its sweep) guards it.
+/// RustEE does not promise; the unit test `a_refusal_reports_the_split_layout_only_when_the_host_holds_its_pages`
+/// (host and device both short) guards it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Location {
     Host,
@@ -925,6 +933,66 @@ fn nvfp4_native_scratch(placements: &[Placement], rows: u64, target_ctas: u64) -
         .unwrap_or(0)
 }
 
+/// The largest scratch any Q3, Q4 or Q5 object of `placements` takes in a launch of up to `rows` rows (the heads, of
+/// up to `logits_rows`): the FP8 route's activations, behind the expansion of a P2E2 tensor. The embedding table is
+/// looked up, not multiplied. The FP8 route is counted on every device, and where the device is not known
+/// (`multiprocessors` is `None`) with the most K splits any device makes.
+///
+/// A P2E2 tensor that a launch of this many rows must expand, and that is larger than the scratch takes whole
+/// ([`P2E2_EXPAND_LIMIT`]), is refused by name: its run in chunks of output rows is not ported, and the launch would
+/// fail at its first use.
+fn grouped_scratch(
+    placements: &[Placement],
+    layers: usize,
+    rows: u64,
+    logits_rows: u64,
+    multiprocessors: Option<u32>,
+) -> Result<u64, PlanError> {
+    let mut largest = 0;
+    for placement in placements.iter().filter(|placement| {
+        matches!(
+            placement.format,
+            WeightFormat::Q3G64Fp16 | WeightFormat::Q4G64Fp16 | WeightFormat::Q5G64Fp16
+        )
+    }) {
+        let rows = match placement.key(layers).map(|(_, role)| role) {
+            Some(Role::Embedding) => continue,
+            Some(Role::LmHead | Role::DraftHead) => logits_rows,
+            _ => rows,
+        };
+        let [out, input] = placement.shape.as_slice() else {
+            continue;
+        };
+        let (Ok(out), Ok(input)) = (u32::try_from(*out), u32::try_from(*input)) else {
+            continue;
+        };
+        let p2e2 = placement.layout == WeightLayout::RowSplitP2e2V1;
+        // The production numerics: the exact kernels expand a tensor the fused decode reads in place, which a tensor
+        // of this size cannot do whole (and every other P2E2 tensor is sized below at the prefill chunk's rows).
+        let needed = linear_scratch_bytes(
+            p2e2,
+            u32::try_from(rows).unwrap_or(u32::MAX),
+            input,
+            out,
+            true,
+            multiprocessors,
+            false,
+        );
+        match needed {
+            Some(bytes) => largest = largest.max(bytes),
+            None => {
+                return Err(PlanError::Unsupported(format!(
+                    "{} is a compressed Q3 tensor of {} bytes expanded, more than the {P2E2_EXPAND_LIMIT} bytes a launch \
+                     of {rows} rows can expand into the scratch",
+                    placement.name,
+                    q3_byte_size(out, input),
+                )));
+            }
+        }
+    }
+    Ok(largest)
+}
+
 fn align(value: u64) -> u64 {
     value.div_ceil(ARENA_ALIGNMENT) * ARENA_ALIGNMENT
 }
@@ -1073,6 +1141,8 @@ pub mod nvfp4 {
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use super::*;
 
     fn nvfp4(shape: &[u64]) -> Placement {
@@ -1088,6 +1158,27 @@ mod tests {
             offset: 0,
             tier: Tier::Device,
         }
+    }
+
+    fn p2e2(name: &str, shape: &[u64]) -> Placement {
+        Placement {
+            name: name.to_string(),
+            format: WeightFormat::Q3G64Fp16,
+            layout: WeightLayout::RowSplitP2e2V1,
+            ..nvfp4(shape)
+        }
+    }
+
+    /// A compressed tensor too large to expand whole is refused by name, with the limit, wherever a launch of its rows
+    /// must expand it; at the rows its fused decode reads it in place it is sized, not refused.
+    #[test]
+    fn a_compressed_tensor_above_the_expansion_limit_is_refused_by_name_where_it_must_be_expanded() {
+        let head = p2e2("text/draft_head", &[262_144, 5120]);
+        let error = grouped_scratch(slice::from_ref(&head), 64, 8, 9, Some(70)).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("text/draft_head"), "{message}");
+        assert!(message.contains(&P2E2_EXPAND_LIMIT.to_string()), "{message}");
+        assert!(grouped_scratch(slice::from_ref(&head), 64, 8, 8, Some(70)).is_ok());
     }
 
     /// An artifact with no trellis objects has the native route's scratch as its first region: the largest of its
@@ -1119,34 +1210,9 @@ mod tests {
         assert_eq!(nvfp4_native_scratch(&[], 512, 140), 0);
     }
 
-    /// The decision before the memory planner made it: device bytes against the budget, the spill when the host
-    /// holds it.
-    fn before(budgets: Budgets, whole: Layout, split: Option<Layout>) -> Result<(Layout, bool), Layout> {
-        let mut layout = whole;
-        let mut spills = false;
-        if layout.device_bytes() > budgets.device
-            && let Some(split) = split.filter(|split| split.cache_host <= budgets.host)
-        {
-            layout = split;
-            spills = true;
-        }
-        if layout.device_bytes() > budgets.device {
-            return Err(layout);
-        }
-        Ok((layout, spills))
-    }
-
-    fn same(a: &Result<(Layout, bool), Layout>, b: &Result<(Layout, bool), Layout>) -> bool {
-        let key = |l: &Layout| (l.weights, l.runtime_reserve, l.scratch, l.cache_device, l.cache_host);
-        match (a, b) {
-            (Ok((x, s)), Ok((y, t))) => key(x) == key(y) && s == t,
-            (Err(x), Err(y)) => key(x) == key(y),
-            _ => false,
-        }
-    }
-
-    #[test]
-    fn the_memory_planner_decides_as_the_hand_written_fit_did() {
+    /// A model of 1550 device bytes with the whole cache on the device, and the same with a part of the cache
+    /// (250 bytes of the device's 400) moved to 300 bytes of pinned host pages.
+    fn layouts() -> (Layout, Layout) {
         let whole = Layout {
             weights: 1000,
             runtime_reserve: 100,
@@ -1164,56 +1230,99 @@ mod tests {
             cache_host: 300,
             ..whole
         };
-        let hosts = [0, 299, 300, 301, 5000, u64::MAX];
-        let mut cases = 0;
-        for with_split in [None, Some(split)] {
-            for host in hosts {
-                for device in (0..=1700).step_by(1).chain([u64::MAX]) {
-                    let budgets = Budgets { device, host };
-                    let (new, old) = (decide(budgets, whole, with_split), before(budgets, whole, with_split));
-                    assert!(
-                        same(&new, &old),
-                        "device {device}, host {host}, split {}",
-                        with_split.is_some()
-                    );
-                    cases += 1;
-                }
+        (whole, split)
+    }
+
+    #[test]
+    fn the_whole_layout_is_chosen_whenever_the_device_holds_it() {
+        let (whole, split) = layouts();
+        assert_eq!(whole.device_bytes(), 1550);
+        assert_eq!(split.device_bytes(), 1300);
+        for host in [0, 300, u64::MAX] {
+            for with_split in [None, Some(split)] {
+                let budgets = Budgets { device: 1550, host };
+                let Ok((layout, spills)) = decide(budgets, whole, with_split) else {
+                    panic!("the device holds the whole layout at host {host}");
+                };
+                assert!(!spills && layout.cache_host == 0 && layout.cache_device == 400);
             }
         }
-        assert!(cases > 10_000);
+    }
+
+    #[test]
+    fn the_cache_spills_when_the_device_is_short_and_the_host_holds_the_pages() {
+        let (whole, split) = layouts();
+        for (device, host) in [(1549, 300), (1300, 300), (1300, u64::MAX), (u64::MAX - 1, u64::MAX)] {
+            let Ok((layout, spilled)) = decide(Budgets { device, host }, whole, Some(split)) else {
+                panic!("device {device}, host {host} holds the split layout");
+            };
+            let short = device < 1550;
+            assert_eq!(spilled, short, "device {device}, host {host}");
+            assert_eq!(layout.cache_host, if short { 300 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn a_refusal_reports_the_split_layout_only_when_the_host_holds_its_pages() {
+        let (whole, split) = layouts();
+        // The device is short of the split, the host holds its pages: the split's numbers are reported.
+        let Err(reported) = decide(
+            Budgets {
+                device: 1299,
+                host: 300,
+            },
+            whole,
+            Some(split),
+        ) else {
+            panic!("1299 device bytes cannot hold the split layout");
+        };
+        assert_eq!((reported.cache_device, reported.cache_host), (150, 300));
+        // The host is short of the pages by a byte: the whole layout's numbers are reported, whatever the device.
+        for device in [0, 1300, 1549] {
+            let Err(reported) = decide(Budgets { device, host: 299 }, whole, Some(split)) else {
+                panic!("299 host bytes cannot hold the pages");
+            };
+            assert_eq!(
+                (reported.cache_device, reported.cache_host),
+                (400, 0),
+                "device {device}"
+            );
+        }
+        // With no split the whole layout is refused one byte short of it.
+        let Err(reported) = decide(
+            Budgets {
+                device: 1549,
+                host: u64::MAX,
+            },
+            whole,
+            None,
+        ) else {
+            panic!("1549 device bytes cannot hold 1550");
+        };
+        assert_eq!(reported.cache_device, 400);
     }
 
     #[test]
     fn a_need_above_the_cap_is_judged_against_the_budget_itself() {
-        let whole = Layout {
-            weights: 1000,
-            runtime_reserve: u64::MAX / 4 + 1,
-            scratch: 50,
-            cache_device: 400,
-            cache_host: 0,
-            sequences: 1,
-            extra_sequence_bytes: 0,
-            staging_ring: 0,
-            host_weights: 0,
-            disk_window: 0,
-        };
-        for device in [u64::MAX, whole.device_bytes(), whole.device_bytes() - 1] {
-            let budgets = Budgets { device, host: u64::MAX };
+        let (mut whole, _) = layouts();
+        whole.runtime_reserve = u64::MAX / 4 + 1;
+        let need = whole.device_bytes();
+        for device in [u64::MAX, need] {
             assert!(
-                same(&decide(budgets, whole, None), &before(budgets, whole, None)),
+                decide(Budgets { device, host: u64::MAX }, whole, None).is_ok(),
                 "device {device}"
             );
         }
         assert!(
             decide(
                 Budgets {
-                    device: u64::MAX,
+                    device: need - 1,
                     host: u64::MAX
                 },
                 whole,
                 None
             )
-            .is_ok()
+            .is_err()
         );
     }
 

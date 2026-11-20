@@ -5,8 +5,12 @@
 //! wired yet says so and exits with [`EXIT_NOT_AVAILABLE`]; three commands are not part of this tool at all
 //! ([`Availability::Dropped`]).
 
+mod package;
+
 /// The process exit code of a run that finished.
 pub const EXIT_OK: u8 = 0;
+/// The command was valid and its work failed.
+pub const EXIT_RUN_FAILED: u8 = 1;
 /// The command or its flags are not valid.
 pub const EXIT_USAGE: u8 = 2;
 /// The command is known but not wired in this build.
@@ -96,7 +100,7 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "package-tokenizer",
-        availability: Availability::Pending,
+        availability: Availability::Wired,
         usage: "--artifact ARTIFACT --tokenizer CHECKPOINT [--out ARTIFACT]",
     },
 ];
@@ -138,9 +142,12 @@ pub fn run(args: &[String]) -> Outcome {
         };
     };
     match command.availability {
-        Availability::Wired => Outcome {
-            code: EXIT_OK,
-            message: String::new(),
+        Availability::Wired => match command.name {
+            "package-tokenizer" => package::run(&args[1..]),
+            _ => Outcome {
+                code: EXIT_NOT_AVAILABLE,
+                message: format!("the command '{name}' has no work behind it\n"),
+            },
         },
         Availability::Pending => Outcome {
             code: EXIT_NOT_AVAILABLE,
@@ -155,6 +162,8 @@ pub fn run(args: &[String]) -> Outcome {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     fn run_words(words: &[&str]) -> Outcome {
@@ -162,11 +171,11 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_has_thirteen_distinct_commands() {
+    fn the_commands_have_distinct_names() {
         let mut names: Vec<&str> = COMMANDS.iter().map(|command| command.name).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), COMMANDS.len());
     }
 
     #[test]
@@ -184,6 +193,19 @@ mod tests {
         let outcome = run_words(&["calibrate", "--model", "x"]);
         assert_eq!(outcome.code, EXIT_NOT_AVAILABLE);
         assert!(outcome.message.contains("not available"));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
+    fn the_flags_of_package_tokenizer_are_checked_before_anything_runs() {
+        let words = |words: &[&str]| words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+        let parsed = package::parse(&words(&["--artifact", "a", "--tokenizer=c", "--out", "o"])).unwrap();
+        assert_eq!(parsed.out.as_deref(), Some(Path::new("o")));
+        assert!(package::parse(&words(&["--artifact", "a"])).is_err());
+        assert!(package::parse(&words(&["--artifact", "a", "--artifact", "b", "--tokenizer", "c"])).is_err());
+        assert!(package::parse(&words(&["--artifact", "a", "--tokenizer", "c", "--bogus"])).is_err());
+        assert!(package::parse(&words(&["--artifact"])).is_err());
+        assert_eq!(run_words(&["package-tokenizer"]).code, EXIT_USAGE);
     }
 
     #[test]

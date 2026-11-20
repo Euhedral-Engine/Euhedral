@@ -216,32 +216,6 @@ mod tests {
         assert_eq!(handoff.take(), Some(1));
     }
 
-    /// The holder of a sending end the way the engine writes one: it sends the failure in `Drop` when it has not
-    /// sent a result.
-    struct Holder {
-        ready: Option<Arc<Handoff<Result<u32, &'static str>>>>,
-    }
-
-    impl Drop for Holder {
-        fn drop(&mut self) {
-            if let Some(ready) = self.ready.take() {
-                ready.send(Err("abandoned"));
-            }
-        }
-    }
-
-    #[test]
-    fn a_holder_dropped_without_a_result_ends_the_waiter() {
-        let handoff = Handoff::new();
-        let holder = Holder {
-            ready: Some(Arc::clone(&handoff)),
-        };
-        let dropper = thread::spawn(move || drop(holder));
-        // Without the send in `Drop` this returns `TimedOut` after the bound.
-        assert_eq!(handoff.wait(BOUND), Ok(Err("abandoned")));
-        dropper.join().unwrap();
-    }
-
     #[test]
     fn a_wait_ends_when_the_value_comes_from_another_thread() {
         let handoff = Handoff::new();

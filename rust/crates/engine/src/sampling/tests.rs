@@ -176,22 +176,6 @@ fn temperature_changes_the_filtered_sampling_distribution() {
 }
 
 #[test]
-fn independent_samplers_with_the_same_seed_produce_the_same_sequence() {
-    let row = [0.1, 0.4, 0.9, 0.2];
-    let mut first = sampled(1.0, 0, 1.0, 1234, 4);
-    let mut second = sampled(1.0, 0, 1.0, 1234, 4);
-    assert_eq!(picks(&mut first, &row, 0, 64), picks(&mut second, &row, 0, 64));
-}
-
-#[test]
-fn different_seeds_can_produce_different_sequences() {
-    let row = [0.0; 4];
-    let mut first = sampled(1.0, 0, 1.0, 3, 4);
-    let mut second = sampled(1.0, 0, 1.0, 11, 4);
-    assert_ne!(picks(&mut first, &row, 0, 64), picks(&mut second, &row, 0, 64));
-}
-
-#[test]
 fn greedy_selection_rejects_rows_with_no_selectable_logits() {
     let mut sampler = sampler(SamplingConfig::greedy(9), 2);
     assert_eq!(

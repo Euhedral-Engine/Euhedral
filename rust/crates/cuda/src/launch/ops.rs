@@ -35,6 +35,10 @@ use crate::launch::gdn::{
 };
 use crate::launch::load::KernelTable;
 use crate::launch::nvfp4::{Nvfp4Operands, plan_linear, plan_native};
+use crate::launch::q3::{
+    Bits, Q3Operands, plan_linear_q3, plan_linear_q45, plan_mx, plan_mx_gate_up_swiglu, plan_p2e2_decode,
+    plan_p2e2_expand,
+};
 use crate::launch::queue::{EnqueueError, enqueue_overlapping};
 use crate::launch::table::{Geometry, plan_linear_launch, plan_qwen4_launch};
 use crate::launch::{Modes, PlanError};
@@ -443,6 +447,180 @@ where
             scratch_bytes,
             self.table.dispatch().skinny_target_ctas(),
             self.modes.exact_numerics,
+        )
+        .map_err(|error| refused(CALL, error))?;
+        self.enqueue_all(plan.launches())
+    }
+
+    fn linear_q3_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+    ) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_linear_q3_bf16";
+        let operands = Q3Operands {
+            input,
+            weights,
+            output,
+            rows,
+            in_features,
+            out_features,
+            weights_byte_size: weights_bytes,
+        };
+        let plan = plan_linear_q3(&operands, self.modes.exact_numerics).map_err(|error| refused(CALL, error))?;
+        self.enqueue_all(plan.launches())
+    }
+
+    fn linear_quantized_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+        bits: u32,
+    ) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_linear_quantized_bf16";
+        let operands = Q3Operands {
+            input,
+            weights,
+            output,
+            rows,
+            in_features,
+            out_features,
+            weights_byte_size: weights_bytes,
+        };
+        let bits = Bits::from_number(bits)
+            .filter(|bits| *bits != Bits::Q3)
+            .ok_or_else(|| refused(CALL, PlanError::FormatMismatch))?;
+        let plan = plan_linear_q45(bits, &operands, self.modes.exact_numerics).map_err(|error| refused(CALL, error))?;
+        self.enqueue_all(plan.launches())
+    }
+
+    fn linear_q3_p2e2_decode_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+    ) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_linear_q3_p2e2_decode_bf16";
+        let operands = Q3Operands {
+            input,
+            weights,
+            output,
+            rows,
+            in_features,
+            out_features,
+            weights_byte_size: weights_bytes,
+        };
+        let plan = plan_p2e2_decode(&operands, self.modes.exact_numerics).map_err(|error| refused(CALL, error))?;
+        self.enqueue_all(plan.launches())
+    }
+
+    fn q3_p2e2_expand(
+        &mut self,
+        weights: DevicePtr,
+        weights_bytes: u64,
+        rows: u32,
+        in_features: u32,
+        first_row: u32,
+        row_count: u32,
+        destination: DevicePtr,
+        destination_bytes: u64,
+    ) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_q3_p2e2_expand";
+        let plan = plan_p2e2_expand(
+            weights,
+            weights_bytes,
+            rows,
+            in_features,
+            first_row,
+            row_count,
+            destination,
+            destination_bytes,
+        )
+        .map_err(|error| refused(CALL, error))?;
+        self.enqueue_all(plan.launches())
+    }
+
+    fn linear_q3_mx_bf16(
+        &mut self,
+        bits: u32,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        scratch: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+        scratch_bytes: u64,
+        split_rows: u32,
+    ) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_linear_q3_mx_bf16";
+        let operands = Q3Operands {
+            input,
+            weights,
+            output,
+            rows,
+            in_features,
+            out_features,
+            weights_byte_size: weights_bytes,
+        };
+        let bits = Bits::from_number(bits).ok_or_else(|| refused(CALL, PlanError::InvalidArgument))?;
+        let plan = plan_mx(
+            bits,
+            &operands,
+            scratch,
+            scratch_bytes,
+            self.table.dispatch().sm_count,
+            split_rows,
+            self.modes.exact_numerics,
+            self.modes.row_exact,
+        )
+        .map_err(|error| refused(CALL, error))?;
+        self.enqueue_all(plan.launches())
+    }
+
+    fn q3_mx_gate_up_swiglu_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        scratch: DevicePtr,
+        rows: u32,
+        width: u32,
+        outputs: u32,
+        weights_bytes: u64,
+        scratch_bytes: u64,
+    ) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_q3_mx_gate_up_swiglu_bf16";
+        let operands = Q3Operands {
+            input,
+            weights,
+            output,
+            rows,
+            in_features: width,
+            out_features: outputs,
+            weights_byte_size: weights_bytes,
+        };
+        let plan = plan_mx_gate_up_swiglu(
+            &operands,
+            scratch,
+            scratch_bytes,
+            self.modes.exact_numerics,
+            self.modes.row_exact,
         )
         .map_err(|error| refused(CALL, error))?;
         self.enqueue_all(plan.launches())

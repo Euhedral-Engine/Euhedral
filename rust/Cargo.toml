@@ -25,12 +25,13 @@ libloading = "0.8"
 llguidance = { version = "=1.9.1", default-features = false, features = ["lark", "referencing", "ahash"] }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 serde_yaml_ng = "0.10"
 smallvec = "1.16"
 signal-hook = "0.4"
 socket2 = "0.6"
 sha2 = "0.10"
+same-file = "1.0.6"
 tempfile = "3.27"
 thiserror = "2"
 toktrie = "=1.9.1"

@@ -139,6 +139,26 @@ class PdlWaitTest(unittest.TestCase):
         source = 'extern "C" __global__ void k(float* out) { out[0] = 1.0f; }'
         self.assertIn("k: registered", "\n".join(check(source, catalog=self.catalog("k"))))
 
+    NESTED = r'''
+#define INNER(B, M)                                                       \
+extern "C" __global__ void euhedral_q##B##_rows##M(float* out) {          \
+    %s                                                                    \
+    out[0] = 1.0f;                                                        \
+}
+#define OUTER(B)                                                          \
+    INNER(B, 2) INNER(B, 3)
+OUTER(4)
+OUTER(5)
+'''
+
+    def test_a_two_level_two_parameter_macro_names_its_kernels(self):
+        names = [f"euhedral_q{b}_rows{m}" for b in (4, 5) for m in (2, 3)]
+        waits = self.NESTED % "euhedral_pdl_begin();"
+        self.assertEqual([], check(waits, catalog=self.catalog(*names)))
+        problems = "\n".join(check(self.NESTED % "", catalog=self.catalog(*names)))
+        for name in names:
+            self.assertIn(name, problems)
+
     def test_a_missing_catalog_and_a_miscounted_one_fail(self):
         source = kernel("")
         with self.assertRaises(FileNotFoundError):
