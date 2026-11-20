@@ -5,38 +5,32 @@
 //! retirement of that work, delivered by the lane's [`Completions`], runs the next stage, which reads what came back.
 //! Nothing waits on the device inside a frame. The lane's stream and cuBLAS and cuSOLVER handles travel with the
 //! chain from one frame to the next and come back with the result in [`Finished`], together with the scratch memory.
-//! Nothing in a frame frees device memory with a call that waits: see [`memory`].
+//! Nothing in a frame frees device memory with a call that waits: see [`memory`](crate::memory).
 //!
-//! - [`memory`]: stream-ordered device buffers, pooled pinned staging and the claims that account for them.
 //! - [`format`]: the formats, the NVFP4 search's reach, the column order and the damped diagonal.
 //! - [`sd4`]: the SD4 table of an NVFP4 object, chosen from the costs the device summed.
 //! - [`state`]: one object's rounding and the `.npz` it is stored in.
 
 pub mod format;
-pub mod memory;
 pub mod sd4;
 pub mod state;
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::Arc;
 
-use euhedral_core::frames::Frame;
 use euhedral_gpu::cuda::{CudaKernel, CudaModule, CudaStream};
-use euhedral_gpu::{
-    Args, Dim3, GpuError, LaneEnqueue, LaneStream, Launch, OnceFrame, RetireError, RetireTicket, Stream,
-    retire_into_with,
-};
+use euhedral_gpu::{Args, Dim3, GpuError, LaneEnqueue, LaneStream, Launch, Stream};
 use euhedral_graph::Completions;
 use euhedral_inference_cuda::math::{Fill, LaneHandles, MathMode, Matrix, Operation, Product, check_info};
-use euhedral_inference_cuda::{CudaError, CudaLibrary, DevicePtr, PinnedPool};
+use euhedral_inference_cuda::{CudaError, DevicePtr};
 use thiserror::Error;
 
 use crate::gptq::format::{
     BLOCK, E2M1_MAX, Format, FormatError, Nvfp4Search, SEARCH_BELOW, column_order, damped_diagonal, dead_columns,
     group_of_places, positions,
 };
-use crate::gptq::memory::{Claims, Device, Host, Memory, Released, StepBytes, pinned_bytes, reclaim};
+use crate::chain::{self, ChainError, Next, Parts, Unsettled};
+use crate::memory::{Claims, Device, LaneMemory, Memory, MemoryError, Staged, StepBytes, pinned_bytes, reclaim};
 use crate::gptq::sd4::{CODES, ENTRIES};
 use crate::gptq::state::{QuantState, StateError};
 use crate::kernels::{Compiled, Module, ModuleError, Modules};
@@ -63,6 +57,21 @@ pub enum GptqError {
     ForeignFactor,
     #[error("the kernel {0} is not in the module")]
     Kernel(&'static str),
+}
+
+impl From<MemoryError> for GptqError {
+    fn from(error: MemoryError) -> Self {
+        match error {
+            MemoryError::Cuda(error) => GptqError::Cuda(error),
+            MemoryError::Refused(text) => GptqError::Request(text),
+        }
+    }
+}
+
+impl ChainError for GptqError {
+    fn broken(message: &str) -> Self {
+        GptqError::Request(message.to_owned())
+    }
 }
 
 /// The sizes and reach GPTQ is tuned by.
@@ -130,33 +139,6 @@ impl GptqKernels {
     }
 }
 
-/// The memory a lane works with: the C library its stream-ordered allocator belongs to, the queue where dropped device
-/// buffers wait to be freed in stream order, and the pool the pinned staging comes from (its limit is the pinned
-/// buffer pool setting). The queue belongs to the one lane it is made for: a buffer is freed on the stream it was
-/// allocated on, so two lanes never share one.
-#[derive(Debug)]
-pub struct LaneMemory {
-    library: Arc<CudaLibrary>,
-    released: Arc<Released>,
-    pinned: Arc<PinnedPool>,
-}
-
-impl LaneMemory {
-    /// The memory of a new lane, with a queue of its own.
-    pub fn new(library: Arc<CudaLibrary>, pinned: Arc<PinnedPool>) -> LaneMemory {
-        LaneMemory {
-            library,
-            released: Arc::new(Released::new()),
-            pinned,
-        }
-    }
-
-    /// The device buffers given up and not yet freed.
-    pub fn waiting(&self) -> u64 {
-        self.released.waiting()
-    }
-}
-
 /// Everything of a lane except its stream: what a stage uses besides the stream.
 pub struct LaneParts {
     handles: LaneHandles,
@@ -171,29 +153,13 @@ pub struct LaneParts {
     shutdown_probe: Option<Box<dyn Fn() + Send>>,
 }
 
-/// State parked until the lane's stream has run the work queued before it.
-///
-/// A chain that fails to arm its retirement ends at once, but the copies and launches it enqueued are still on the
-/// stream and write into its pinned staging. That staging must not go back to the shared pool where another lane could
-/// take it: it waits here, and the lane's next confirmed retirement (which the stream's order puts behind that work)
-/// releases it.
-#[derive(Default)]
-struct Unsettled {
-    held: Vec<Box<dyn Any + Send>>,
-}
-
-impl Unsettled {
-    fn park(&mut self, state: Box<dyn Any + Send>) {
-        self.held.push(state);
+impl Parts for LaneParts {
+    fn completions(&self) -> &Arc<Completions> {
+        &self.completions
     }
 
-    /// Releases what is parked: the stream has retired everything enqueued before now.
-    fn release(&mut self) {
-        self.held.clear();
-    }
-
-    fn len(&self) -> usize {
-        self.held.len()
+    fn unsettled(&mut self) -> &mut Unsettled {
+        &mut self.unsettled
     }
 }
 
@@ -218,31 +184,14 @@ pub struct Refused {
     pub error: GptqError,
 }
 
-/// Memory a chain used. Dropping it gives its device buffers to the lane's [`Released`] queue (freed in stream order by
-/// the next step on a lane, or by [`GptqLane::reclaim`]) and its pinned staging to the pool: nothing waits for the
-/// device. A chain that failed to arm its retirement hands back an empty scratch: its state stays with the lane until a
-/// later retirement confirms the stream has run the work still queued for it.
-pub struct Scratch {
-    _state: Box<dyn Any + Send>,
-}
+/// Memory a chain used: see [`chain::Scratch`].
+pub use crate::chain::Scratch;
 
-impl Debug for Scratch {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
-        formatter.debug_struct("Scratch").finish_non_exhaustive()
-    }
-}
-
-/// What a chain hands to its `done` call, from the frame that ended it.
-///
-/// After a failed chain whose retirement could not be armed, `result` is an `Err` while the chain's kernels may still
-/// read the caller's [`DeviceRange`]s and write its `decoded_out`: they stay in use until the lane's
-/// [`unsettled`](GptqLane::unsettled) count is back to 0 or the lane's next step has been confirmed.
-#[derive(Debug)]
-pub struct Finished<T> {
-    pub lane: GptqLane,
-    pub scratch: Scratch,
-    pub result: Result<T, GptqError>,
-}
+/// What a chain hands to its `done` call, from the frame that ended it: see [`chain::Finished`]. After a failed chain
+/// whose retirement could not be armed, `result` is an `Err` while the chain's kernels may still read the caller's
+/// [`DeviceRange`]s and write its `decoded_out`: they stay in use until the lane's [`unsettled`](GptqLane::unsettled)
+/// count is back to 0 or the lane's next step has been confirmed.
+pub type Finished<T> = chain::Finished<GptqLane, T, GptqError>;
 
 /// A range of device memory a step reads or writes, with its size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,14 +266,14 @@ impl GptqLane {
     /// State parked by a failed chain is released only after the stream has run its queued work. This is a shutdown
     /// call, so it waits for the stream here; no frame calls it.
     pub fn into_parts(mut self) -> (CudaStream, LaneHandles, Result<u64, GptqError>) {
-        if self.parts.unsettled.len() > 0 {
+        #[cfg(feature = "test-hooks")]
+        let probe = self.parts.shutdown_probe.take();
+        self.parts.unsettled.settle(&mut self.stream, || {
             #[cfg(feature = "test-hooks")]
-            if let Some(probe) = &self.parts.shutdown_probe {
+            if let Some(probe) = &probe {
                 probe();
             }
-            Stream::quiesce(&mut self.stream);
-            self.parts.unsettled.release();
-        }
+        });
         let reclaimed = self.reclaim();
         (self.stream, self.parts.handles, reclaimed)
     }
@@ -333,17 +282,14 @@ impl GptqLane {
     /// enqueued its work. For tests of that path.
     #[cfg(feature = "test-hooks")]
     pub fn block_arming(&mut self) -> Result<(), GpuError> {
-        self.stream.arm_retirement()
+        chain::block_arming(&mut self.stream)
     }
 
     /// Collects the retirement [`block_arming`](Self::block_arming) armed, once the stream has run up to it. Returns
     /// false when it has not arrived yet.
     #[cfg(feature = "test-hooks")]
     pub fn unblock_arming(&mut self) -> bool {
-        match self.stream.poll_retired() {
-            Some(ticket) => self.stream.confirm_retired(ticket).is_none(),
-            None => false,
-        }
+        chain::unblock_arming(&mut self.stream)
     }
 
     /// Sets a call made by [`into_parts`](Self::into_parts) just before it waits for the stream, when a failed chain's
@@ -413,205 +359,31 @@ pub struct TensorScales {
 
 type Enq<'a> = <CudaStream as Stream>::Enqueue<'a>;
 type Done<T> = Box<dyn FnOnce(Finished<T>) + Send>;
-type Stage<S, T> = Box<dyn FnOnce(&mut CudaStream, &mut LaneParts, &mut S) -> Result<Step<S, T>, GptqError> + Send>;
-
-/// What a stage ends with.
-enum Step<S, T> {
-    /// It submitted work ending in a readback: run the next stage when that retires.
-    Wait(Stage<S, T>),
-    /// The result is complete.
-    Done(T),
-}
-
-struct Link<S, T> {
-    parts: LaneParts,
-    state: S,
-    done: Done<T>,
-    /// A stage failed with work possibly in flight: the chain waits for the retirement, then ends with this.
-    failure: Option<GptqError>,
-}
+type Stage<S, T> = chain::Stage<LaneParts, S, T, GptqError>;
+type Step<S, T> = Next<LaneParts, S, T, GptqError>;
 
 /// Runs the first stage here, then each next one in the frame the lane's completions emit.
 fn start<S: Send + 'static, T: Send + 'static>(lane: GptqLane, state: S, done: Done<T>, first: Stage<S, T>) {
     let GptqLane { stream, parts } = lane;
-    advance(
+    chain::start(
         stream,
-        Link {
-            parts,
-            state,
-            done,
-            failure: None,
-        },
+        parts,
+        state,
+        |stream, parts| GptqLane { stream, parts },
+        done,
         first,
     );
 }
 
-fn advance<S: Send + 'static, T: Send + 'static>(mut stream: CudaStream, mut link: Link<S, T>, stage: Stage<S, T>) {
-    match stage(&mut stream, &mut link.parts, &mut link.state) {
-        Ok(Step::Wait(next)) => arm(stream, link, Some(next)),
-        Ok(Step::Done(value)) => finish(stream, link, Ok(value)),
-        Err(error) => {
-            link.failure = Some(error);
-            arm(stream, link, None);
-        }
-    }
-}
-
-fn arm<S: Send + 'static, T: Send + 'static>(stream: CudaStream, link: Link<S, T>, next: Option<Stage<S, T>>) {
-    let completions = Arc::clone(&link.parts.completions);
-    let id = u64::from(stream.lane().0);
-    let armed = retire_into_with(
-        stream,
-        (link, next),
-        &completions,
-        move |stream, (link, next), ticket| {
-            let frame: Box<dyn Frame> = Box::new(OnceFrame::new(id, move || resume(stream, link, next, ticket)));
-            frame
-        },
-    );
-    if let Err(RetireError {
-        stream,
-        state: (mut link, _),
-        error,
-    }) = armed
-    {
-        // Work may still be queued behind this failure: the state stays with the lane until a retirement is confirmed.
-        let cause = link.failure.take().unwrap_or(GptqError::Gpu(error));
-        let Link {
-            mut parts, state, done, ..
-        } = link;
-        parts.unsettled.park(Box::new(state));
-        done(Finished {
-            lane: GptqLane { stream, parts },
-            scratch: Scratch { _state: Box::new(()) },
-            result: Err(cause),
-        });
-    }
-}
-
-fn resume<S: Send + 'static, T: Send + 'static>(
-    mut stream: CudaStream,
-    mut link: Link<S, T>,
-    next: Option<Stage<S, T>>,
-    ticket: RetireTicket,
-) {
-    let confirmed = stream.confirm_retired(ticket);
-    // The stream has run everything enqueued before this retirement, what an earlier failed arm left included.
-    link.parts.unsettled.release();
-    if let Some(failure) = link.failure.take() {
-        return finish(stream, link, Err(failure));
-    }
-    if let Some(error) = confirmed {
-        return finish(stream, link, Err(GptqError::Gpu(error)));
-    }
-    match next {
-        Some(stage) => advance(stream, link, stage),
-        None => finish(
-            stream,
-            link,
-            Err(GptqError::Request("a chain resumed with no stage".into())),
-        ),
-    }
-}
-
-fn finish<S: Send + 'static, T: Send + 'static>(stream: CudaStream, link: Link<S, T>, result: Result<T, GptqError>) {
-    let Link { parts, state, done, .. } = link;
-    done(Finished {
-        lane: GptqLane { stream, parts },
-        scratch: Scratch {
-            _state: Box::new(state),
-        },
-        result,
-    });
-}
-
-/// Runs `body` as one submission, keeping its own error type.
+/// Runs `body` as one submission, keeping this module's error type.
 fn submit<R>(
     stream: &mut CudaStream,
     body: impl for<'a> FnOnce(&mut Enq<'a>) -> Result<R, GptqError>,
 ) -> Result<R, GptqError> {
-    let mut failure = None;
-    let outcome = stream.submit(|queue| match body(queue) {
-        Ok(value) => Ok(Some(value)),
-        Err(error) => {
-            failure = Some(error);
-            Ok(None)
-        }
-    });
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    outcome?.ok_or_else(|| GptqError::Request("a submission produced nothing".into()))
+    chain::submit(stream, body)
 }
 
 // ---- memory and launches -------------------------------------------------------------------------------------
-
-/// The allocations of a step's preparation, made on the lane's stream.
-type Mem<'a, 'q> = Memory<'a, Enq<'q>>;
-
-/// A device buffer with a page-locked twin of the same size: what goes up, or what comes back.
-struct Staged {
-    host: Host,
-    device: Device,
-}
-
-impl Staged {
-    fn new(memory: &mut Mem<'_, '_>, bytes: usize) -> Result<Staged, GptqError> {
-        Ok(Staged {
-            host: memory.pinned(bytes)?,
-            device: memory.device(bytes)?,
-        })
-    }
-
-    fn of_u32(memory: &mut Mem<'_, '_>, values: &[u32]) -> Result<Staged, GptqError> {
-        let mut staged = Staged::new(memory, values.len() * 4)?;
-        staged.fill_u32(values);
-        Ok(staged)
-    }
-
-    fn of_f32(memory: &mut Mem<'_, '_>, values: &[f32]) -> Result<Staged, GptqError> {
-        let mut staged = Staged::new(memory, values.len() * 4)?;
-        staged.fill_f32(values);
-        Ok(staged)
-    }
-
-    fn addr(&self) -> u64 {
-        self.device.addr()
-    }
-
-    fn fill_u32(&mut self, values: &[u32]) {
-        for (slot, value) in self.host.as_mut_slice().as_chunks_mut::<4>().0.iter_mut().zip(values) {
-            *slot = value.to_le_bytes();
-        }
-    }
-
-    fn fill_f32(&mut self, values: &[f32]) {
-        for (slot, value) in self.host.as_mut_slice().as_chunks_mut::<4>().0.iter_mut().zip(values) {
-            *slot = value.to_le_bytes();
-        }
-    }
-
-    fn read_f32(&self) -> Vec<f32> {
-        let (words, _) = self.host.as_slice().as_chunks::<4>();
-        words.iter().map(|word| f32::from_le_bytes(*word)).collect()
-    }
-
-    /// Enqueues the copy of the host bytes to the device. The host bytes must stay as they are until it retires.
-    fn upload<Q: LaneEnqueue>(&self, queue: &mut Q) -> Result<(), GptqError> {
-        // SAFETY: both ranges are live buffers of `len` bytes owned by this value, which the chain keeps until the
-        // retirement is confirmed; nothing writes the host side meanwhile.
-        unsafe { queue.copy_to_device(self.device.addr(), self.host.as_ptr(), self.host.len()) }?;
-        Ok(())
-    }
-
-    /// Enqueues the copy of the device bytes to the host buffer, which is read after the retirement.
-    fn download<Q: LaneEnqueue>(&mut self, queue: &mut Q) -> Result<(), GptqError> {
-        let bytes = self.host.len();
-        // SAFETY: as `upload`; nothing reads the host side before the retirement.
-        unsafe { queue.copy_to_host(self.host.as_mut_ptr(), self.device.addr(), bytes) }?;
-        Ok(())
-    }
-}
 
 /// The grid of `count` items at `threads` per block, at least one block.
 fn grid(count: u64, threads: u64) -> Result<u32, GptqError> {
@@ -782,7 +554,7 @@ fn factor_read_diagonal(
         .arg(state.diagonal.addr());
     submit(stream, |queue| {
         launch_linear(queue, &kernels.read_diagonal, state.k as u64, &args)?;
-        state.diagonal.download(queue)
+        Ok(state.diagonal.download(queue)?)
     })?;
     Ok(Step::Wait(Box::new(factor_decompose)))
 }
@@ -835,7 +607,7 @@ fn factor_decompose(
             // sizes the calls take, kept in the chain's state until the retirement is confirmed.
             unsafe { handles.cholesky(&raw, inverse, fill, n, upper, workspace, floats, word) }?;
         }
-        state.info.download(queue)
+        Ok(state.info.download(queue)?)
     })?;
     Ok(Step::Wait(Box::new(factor_check)))
 }
@@ -1009,7 +781,7 @@ fn scales_amax(
     submit(stream, |queue| {
         zero(queue, state.amax.addr(), 4)?;
         launch(queue, &kernels.amax_bf16, 1024, 256, 0, &args)?;
-        state.amax.download(queue)
+        Ok(state.amax.download(queue)?)
     })?;
     Ok(Step::Wait(Box::new(scales_global)))
 }
@@ -1076,7 +848,7 @@ fn scales_global(
         }
         scratch.costs.download(queue)?;
         scratch.energy.download(queue)?;
-        scratch.counts.download(queue)
+        Ok(scratch.counts.download(queue)?)
     })?;
     Ok(Step::Wait(Box::new(scales_table)))
 }
@@ -1485,7 +1257,7 @@ fn round_all(
             launch_linear(queue, &kernels.float_to_bf16, (n * k) as u64, &args)?;
         }
         state.codes.download(queue)?;
-        state.scales.download(queue)
+        Ok(state.scales.download(queue)?)
     })?;
     Ok(Step::Wait(Box::new(round_collect)))
 }

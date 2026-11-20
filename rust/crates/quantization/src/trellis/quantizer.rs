@@ -9,19 +9,18 @@
 //! on the host depends on what they compute until the end.
 //!
 //! Device memory beyond the caller's weight and Hessian is allocated when the quantization starts and handed back,
-//! with the lane, in [`Finished`] (freeing it waits for the device, so the caller does it off the lattice).
-//! [`working_bytes`] gives its size.
+//! with the lane, in [`Finished`]: it is stream-ordered on the lane and charged to the claims the caller took, from
+//! [`TrellisLane::quantize_bytes`], so no frame waits for the device to free it.
 
-use std::array::from_fn;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::mem::take;
 use std::sync::Arc;
 
 use euhedral_gpu::cuda::{CudaModule, CudaStream};
-use euhedral_gpu::{GpuError, LaneEnqueue, LaneStream, Stream};
+use euhedral_gpu::{GpuError, LaneStream, Stream};
 use euhedral_graph::Completions;
 use euhedral_inference_cuda::math::{Fill, LaneHandles, MathMode, Matrix, Operation, Product};
-use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, DevicePtr, PinnedBuffer};
+use euhedral_inference_cuda::{CudaError, DevicePtr};
 use thiserror::Error;
 
 use super::launch::{
@@ -40,9 +39,10 @@ use super::{
     plan_from_tiles, plan_hadamard_columns, plan_hadamard_rows, plan_pack, plan_reconstruct, plan_sum_products,
     plan_tile_mean_square, plan_viterbi,
 };
-use crate::chain::{ChainError, Finished, Next, Parts, Stage, start};
+use crate::chain::{self, ChainError, Finished, Next, Parts, Stage, Unsettled, start};
 use crate::java_random::SplittableRandom;
 use crate::kernels::{Module, ModuleError, Modules};
+use crate::memory::{Claims, Device, LaneMemory, Memory, MemoryError, Staged, StepBytes, pinned_bytes, reclaim};
 
 /// The sizes the quantizer is tuned by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +89,15 @@ pub enum QuantizeError {
     Broken(String),
 }
 
+impl From<MemoryError> for QuantizeError {
+    fn from(error: MemoryError) -> Self {
+        match error {
+            MemoryError::Cuda(error) => QuantizeError::Cuda(error),
+            MemoryError::Refused(text) => QuantizeError::Request(text),
+        }
+    }
+}
+
 impl ChainError for QuantizeError {
     fn broken(message: &str) -> Self {
         QuantizeError::Broken(message.to_owned())
@@ -127,8 +136,9 @@ pub struct Quantized {
     pub suh: Vec<u16>,
     /// The fp16 bits of the output-side scales, `[n]`.
     pub svh: Vec<u16>,
-    /// The BF16 `[n, k]` weight the tensors reconstruct to, on the device, owned by the caller.
-    pub decoded: DeviceBuffer,
+    /// The BF16 `[n, k]` weight the tensors reconstruct to, on the device, owned by the caller. Dropping it gives it
+    /// to the lane's queue, which frees it in stream order.
+    pub decoded: Device,
     /// `tr(E H Eᵀ) / tr(W H Wᵀ)`, the error in the Hessian metric (the mean squared error of the rotated weight when
     /// there was no Hessian).
     pub proxy_error: f64,
@@ -144,9 +154,14 @@ pub struct Quantized {
 pub struct LaneParts {
     handles: LaneHandles,
     kernels: Arc<TrellisKernels<CudaModule>>,
-    library: Arc<CudaLibrary>,
+    memory: LaneMemory,
     completions: Arc<Completions>,
     settings: TrellisSettings,
+    /// The state of chains whose retirement could not be armed, with work possibly still queued on the stream: kept
+    /// until a later retirement is confirmed.
+    unsettled: Unsettled,
+    #[cfg(feature = "test-hooks")]
+    shutdown_probe: Option<Box<dyn Fn() + Send>>,
 }
 
 impl Debug for LaneParts {
@@ -158,6 +173,10 @@ impl Debug for LaneParts {
 impl Parts for LaneParts {
     fn completions(&self) -> &Arc<Completions> {
         &self.completions
+    }
+
+    fn unsettled(&mut self) -> &mut Unsettled {
+        &mut self.unsettled
     }
 }
 
@@ -187,13 +206,13 @@ impl TrellisLane {
         Ok(Arc::new(TrellisKernels::new(&compiled)?))
     }
 
-    /// A lane from its stream, its handles (cuBLAS products run in full FP32) and the completions that deliver its
-    /// retirements.
+    /// A lane from its stream, its handles (cuBLAS products run in full FP32), the memory it works with and the
+    /// completions that deliver its retirements.
     pub fn new(
         stream: CudaStream,
         mut handles: LaneHandles,
         kernels: Arc<TrellisKernels<CudaModule>>,
-        library: Arc<CudaLibrary>,
+        memory: LaneMemory,
         completions: Arc<Completions>,
         settings: TrellisSettings,
     ) -> Result<TrellisLane, QuantizeError> {
@@ -203,16 +222,91 @@ impl TrellisLane {
             parts: LaneParts {
                 handles,
                 kernels,
-                library,
+                memory,
                 completions,
                 settings,
+                unsettled: Unsettled::default(),
+                #[cfg(feature = "test-hooks")]
+                shutdown_probe: None,
             },
         })
     }
 
-    /// Takes the lane apart for shutdown: the stream and the handles are destroyed by their owner.
-    pub fn into_parts(self) -> (CudaStream, LaneHandles) {
-        (self.stream, self.parts.handles)
+    /// Takes the lane apart for shutdown: the stream and the handles are destroyed by their owner. The device buffers
+    /// given up are freed in stream order first, and the error of that, if any, comes back with the parts. A
+    /// [`Quantized::decoded`] must not outlive its lane: when it is dropped after this, its memory is freed with the
+    /// plain `cudaFree`.
+    ///
+    /// State parked by a failed chain is released only after the stream has run its queued work. This is a shutdown
+    /// call, so it waits for the stream here; no frame calls it.
+    pub fn into_parts(mut self) -> (CudaStream, LaneHandles, Result<u64, QuantizeError>) {
+        #[cfg(feature = "test-hooks")]
+        let probe = self.parts.shutdown_probe.take();
+        self.parts.unsettled.settle(&mut self.stream, || {
+            #[cfg(feature = "test-hooks")]
+            if let Some(probe) = &probe {
+                probe();
+            }
+        });
+        let reclaimed = self.reclaim();
+        (self.stream, self.parts.handles, reclaimed)
+    }
+
+    /// Arms a retirement on the stream that nobody collects, so the next chain's own cannot be armed and fails after it
+    /// enqueued its work. For tests of that path.
+    #[cfg(feature = "test-hooks")]
+    pub fn block_arming(&mut self) -> Result<(), GpuError> {
+        chain::block_arming(&mut self.stream)
+    }
+
+    /// Collects the retirement [`block_arming`](Self::block_arming) armed, once the stream has run up to it. Returns
+    /// false when it has not arrived yet.
+    #[cfg(feature = "test-hooks")]
+    pub fn unblock_arming(&mut self) -> bool {
+        chain::unblock_arming(&mut self.stream)
+    }
+
+    /// Sets a call made by [`into_parts`](Self::into_parts) just before it waits for the stream, when a failed chain's
+    /// state is parked.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_shutdown_probe(&mut self, probe: Box<dyn Fn() + Send>) {
+        self.parts.shutdown_probe = Some(probe);
+    }
+
+    /// How many failed chains' states the lane still holds because work of theirs may be queued on the stream.
+    pub fn unsettled(&self) -> usize {
+        self.parts.unsettled.len()
+    }
+
+    /// Frees, in stream order on this lane, the device buffers given up since the last call, and returns how many. A
+    /// step does it before it allocates; call it after the last step to free what that left.
+    pub fn reclaim(&mut self) -> Result<u64, QuantizeError> {
+        let memory = &self.parts.memory;
+        submit(&mut self.stream, |queue| {
+            Ok(reclaim(&memory.released, &memory.library, queue)?)
+        })
+    }
+
+    /// The memory [`quantize`](Self::quantize) takes for a weight of `n` outputs by `k` inputs at `bits`, to be claimed
+    /// before it, with a Hessian when `calibrated`. It asks cuSOLVER for the workspace the factorizations need, which
+    /// enqueues nothing.
+    pub fn quantize_bytes(&mut self, n: u32, k: u32, bits: f64, calibrated: bool) -> Result<StepBytes, QuantizeError> {
+        let rate = Rate::new(bits)?;
+        let shape = Shape::new(n, k, rate, self.parts.settings)?;
+        let floats = if calibrated { self.workspace_floats(k)? } else { 1 };
+        Ok(Sizes::of(&shape, calibrated).step_bytes(floats))
+    }
+
+    /// The floats of workspace the factorizations of a `k` by `k` matrix ask for.
+    fn workspace_floats(&mut self, k: u32) -> Result<i32, QuantizeError> {
+        let n = i32::try_from(k).map_err(|_| QuantizeError::Request(format!("{k} does not fit a 32-bit count")))?;
+        let handles = &mut self.parts.handles;
+        let floats = submit(&mut self.stream, |queue| {
+            let raw = queue.raw_stream().ok_or(QuantizeError::NoStream)?;
+            // SAFETY: the stream is the lane's own; the size query reads no memory, so no matrix is given.
+            Ok(unsafe { handles.solver_workspace(&raw, false, Fill::Upper, n, DevicePtr::NULL) }?)
+        })?;
+        Ok(floats.max(1))
     }
 
     /// Quantizes the weight of `request`. `done` is called, from the frame that ends the chain, with the lane back, the
@@ -221,9 +315,10 @@ impl TrellisLane {
     pub fn quantize(
         mut self,
         request: &Request,
+        claims: Claims,
         done: impl FnOnce(Finished<TrellisLane, Quantized, QuantizeError>) + Send + 'static,
     ) -> Result<(), Box<Refused>> {
-        match self.prepare(request) {
+        match self.prepare(request, claims) {
             Ok(state) => {
                 let TrellisLane { stream, parts } = self;
                 start(
@@ -240,7 +335,7 @@ impl TrellisLane {
         }
     }
 
-    fn prepare(&mut self, request: &Request) -> Result<State, QuantizeError> {
+    fn prepare(&mut self, request: &Request, claims: Claims) -> Result<State, QuantizeError> {
         let Request {
             weight,
             n,
@@ -260,89 +355,64 @@ impl TrellisLane {
         let shape = Shape::new(n, k, rate, self.parts.settings)?;
         let hessian = hessian.filter(|_| count > 0);
         let sizes = Sizes::of(&shape, hessian.is_some());
-        let library = Arc::clone(&self.parts.library);
+        let workspace_floats = if hessian.is_some() { self.workspace_floats(k)? } else { 1 };
 
         let mut random = SplittableRandom::new(seed);
-        let su_signs = Staged::of_f32(&library, &signs(&mut random, k as usize))?;
-        let sv_signs = Staged::of_f32(&library, &signs(&mut random, n as usize))?;
-
-        let factor = device(&library, sizes.factor)?;
-        // One query serves the block factorization and the refit's system, which have the same size.
-        let workspace_floats = if hessian.is_some() {
-            let handles = &mut self.parts.handles;
-            let ptr = factor.ptr();
-            submit(&mut self.stream, |queue| {
-                let raw = queue.raw_stream().ok_or(QuantizeError::NoStream)?;
-                // SAFETY: the stream is the lane's own; the matrix is a live k by k allocation, not read.
-                Ok(unsafe { handles.solver_workspace(&raw, false, Fill::Upper, shape.k as i32, ptr) }?)
-            })?
-            .max(1)
-        } else {
-            1
-        };
-        Ok(State {
-            rate,
-            shape,
-            weight,
-            hessian,
-            apply_out_scales,
-            bits,
-            diagonal_mean: 0.0,
-            attempt: 0,
-            fine: [0.0; FINE],
-            global_scale: 1.0,
-            workspace_floats,
-            su_signs,
-            sv_signs,
-            small: Staged::new(&library, 64)?,
-            original: device(&library, sizes.matrix)?,
-            w: device(&library, sizes.matrix)?,
-            decoded: device(&library, sizes.matrix)?,
-            cache: device(&library, sizes.matrix)?,
-            hw: device(&library, sizes.hw)?,
-            encoded: device(&library, sizes.encoded)?,
-            words: Staged::new(&library, sizes.words)?,
-            su: device(&library, sizes.su)?,
-            sv: device(&library, sizes.sv)?,
-            suh: Staged::new(&library, sizes.suh)?,
-            svh: Staged::new(&library, sizes.svh)?,
-            rms: device(&library, sizes.rms)?,
-            divisor: device(&library, sizes.divisor)?,
-            energy: Staged::new(&library, sizes.energy)?,
-            tile_k: Staged::new(&library, sizes.samples_index)?,
-            tile_n: Staged::new(&library, sizes.samples_index)?,
-            sampled: device(&library, sizes.sampled)?,
-            candidate_scales: Staged::new(&library, sizes.candidates)?,
-            candidate_errors: Staged::new(&library, sizes.candidates)?,
-            scaled: device(&library, sizes.candidate_values)?,
-            quantized: device(&library, sizes.candidate_values)?,
-            indices: device(&library, sizes.candidate_indices)?,
-            viterbi: device(&library, sizes.viterbi)?,
-            strip: device(&library, sizes.strip)?,
-            rounded: device(&library, sizes.strip)?,
-            error: device(&library, sizes.error)?,
-            diagonal: device(&library, sizes.diagonal)?,
-            inverse: device(&library, sizes.inverse)?,
-            workspace: device(&library, 4 * u64::from(workspace_floats.unsigned_abs()))?,
-            rebuilt: Some(device(&library, sizes.rebuilt)?),
-            factor,
+        let su_values = signs(&mut random, k as usize);
+        let sv_values = signs(&mut random, n as usize);
+        let memory = &self.parts.memory;
+        submit(&mut self.stream, |queue| {
+            reclaim(&memory.released, &memory.library, queue)?;
+            let mut memory = Memory::new(queue, &memory.library, &memory.released, &memory.pinned, claims);
+            let memory = &mut memory;
+            Ok(State {
+                rate,
+                shape,
+                weight,
+                hessian,
+                apply_out_scales,
+                bits,
+                diagonal_mean: 0.0,
+                attempt: 0,
+                fine: [0.0; FINE],
+                global_scale: 1.0,
+                workspace_floats,
+                su_signs: Staged::of_f32(memory, &su_values)?,
+                sv_signs: Staged::of_f32(memory, &sv_values)?,
+                small: staged(memory, 64)?,
+                original: device(memory, sizes.matrix)?,
+                w: device(memory, sizes.matrix)?,
+                decoded: device(memory, sizes.matrix)?,
+                cache: device(memory, sizes.matrix)?,
+                encoded: device(memory, sizes.encoded)?,
+                words: staged(memory, sizes.words)?,
+                su: device(memory, sizes.su)?,
+                sv: device(memory, sizes.sv)?,
+                suh: staged(memory, sizes.suh)?,
+                svh: staged(memory, sizes.svh)?,
+                rms: device(memory, sizes.rms)?,
+                divisor: device(memory, sizes.divisor)?,
+                energy: staged(memory, sizes.energy)?,
+                tile_k: staged(memory, sizes.samples_index)?,
+                tile_n: staged(memory, sizes.samples_index)?,
+                sampled: device(memory, sizes.sampled)?,
+                candidate_scales: staged(memory, sizes.candidates)?,
+                candidate_errors: staged(memory, sizes.candidates)?,
+                scaled: device(memory, sizes.candidate_values)?,
+                quantized: device(memory, sizes.candidate_values)?,
+                indices: device(memory, sizes.candidate_indices)?,
+                viterbi: device(memory, sizes.viterbi)?,
+                strip: device(memory, sizes.strip)?,
+                rounded: device(memory, sizes.strip)?,
+                error: device(memory, sizes.error)?,
+                diagonal: device(memory, sizes.diagonal)?,
+                inverse: device(memory, sizes.inverse)?,
+                workspace: device(memory, 4 * u64::from(workspace_floats.unsigned_abs()))?,
+                rebuilt: Some(device(memory, sizes.rebuilt)?),
+                factor: device(memory, sizes.factor)?,
+            })
         })
     }
-}
-
-/// The bytes of device memory a quantization of `n` outputs by `k` inputs at `bits` holds, beyond the caller's weight
-/// and Hessian and the cuSOLVER workspace (a few megabytes the library names), under `settings`; `calibrated` says
-/// whether there is a Hessian.
-pub fn working_bytes(
-    n: u32,
-    k: u32,
-    bits: f64,
-    calibrated: bool,
-    settings: TrellisSettings,
-) -> Result<u64, QuantizeError> {
-    let rate = Rate::new(bits)?;
-    let shape = Shape::new(n, k, rate, settings)?;
-    Ok(Sizes::of(&shape, calibrated).total())
 }
 
 /// What a shape fixes: the sampled tiles, the candidate rounds and how the Viterbi scratch is cut.
@@ -395,7 +465,6 @@ struct Sizes {
     /// A float matrix `[k, n]`.
     matrix: u64,
     factor: u64,
-    hw: u64,
     encoded: u64,
     words: u64,
     su: u64,
@@ -416,7 +485,8 @@ struct Sizes {
     diagonal: u64,
     inverse: u64,
     rebuilt: u64,
-    signs: u64,
+    su_signs: u64,
+    sv_signs: u64,
 }
 
 impl Sizes {
@@ -427,7 +497,6 @@ impl Sizes {
         Sizes {
             matrix: 4 * shape.kn(),
             factor: when(4 * k * k),
-            hw: when(4 * shape.kn()),
             encoded: 2 * shape.kn(),
             words: 2 * (shape.tiles() * shape.rate.words_per_tile()) as u64,
             su: 4 * k,
@@ -448,38 +517,69 @@ impl Sizes {
             diagonal: when(4 * k),
             inverse: when(4 * 256 * (k / 16)),
             rebuilt: 2 * shape.kn(),
-            signs: 4 * (k + n),
+            su_signs: 4 * k,
+            sv_signs: 4 * n,
         }
     }
 
-    fn total(&self) -> u64 {
-        // the original, the rotated weight, the decoded one and the feedback cache are four matrices; the staged
-        // buffers are counted once on the device; the rounded strip is a second strip
-        4 * self.matrix
-            + self.factor
-            + self.hw
-            + self.encoded
-            + self.words
-            + self.su
-            + self.sv
-            + self.suh
-            + self.svh
-            + self.rms
-            + self.divisor
-            + self.energy
-            + 2 * self.samples_index
-            + self.sampled
-            + 2 * self.candidates
-            + 2 * self.candidate_values
-            + self.candidate_indices
-            + self.viterbi
-            + 2 * self.strip
-            + self.error
-            + self.diagonal
-            + self.inverse
-            + self.rebuilt
-            + self.signs
-            + 64
+    /// The device buffers, each a plain allocation, and the staged ones (a pinned buffer with a device twin), as the
+    /// quantizer allocates them.
+    fn buffers(&self) -> (Vec<u64>, Vec<u64>) {
+        let plain = vec![
+            self.matrix,
+            self.matrix,
+            self.matrix,
+            self.matrix,
+            self.encoded,
+            self.su,
+            self.sv,
+            self.rms,
+            self.divisor,
+            self.sampled,
+            self.candidate_values,
+            self.candidate_values,
+            self.candidate_indices,
+            self.viterbi,
+            self.strip,
+            self.strip,
+            self.error,
+            self.diagonal,
+            self.inverse,
+            self.rebuilt,
+            self.factor,
+        ];
+        let staged = vec![
+            64,
+            self.words,
+            self.suh,
+            self.svh,
+            self.energy,
+            self.samples_index,
+            self.samples_index,
+            self.candidates,
+            self.candidates,
+            self.su_signs,
+            self.sv_signs,
+        ];
+        (plain, staged)
+    }
+
+    /// What a quantization charges: every device allocation (a zero size takes one byte), the cuSOLVER workspace of
+    /// `workspace_floats`, and the pinned twin of each staged buffer at its pool size class.
+    fn step_bytes(&self, workspace_floats: i32) -> StepBytes {
+        let (plain, staged) = self.buffers();
+        let workspace = 4 * u64::from(workspace_floats.unsigned_abs());
+        let device = plain
+            .iter()
+            .chain(&staged)
+            .copied()
+            .chain([workspace])
+            .map(|bytes| bytes.max(1))
+            .fold(0, u64::saturating_add);
+        StepBytes {
+            device,
+            pinned: pinned_bytes(staged),
+        }
     }
 }
 
@@ -489,108 +589,23 @@ fn bytes_of(bytes: u64) -> Result<usize, QuantizeError> {
     usize::try_from(bytes.max(1)).map_err(|_| QuantizeError::Request(format!("{bytes} bytes do not fit the host")))
 }
 
-fn device(library: &Arc<CudaLibrary>, bytes: u64) -> Result<DeviceBuffer, QuantizeError> {
-    Ok(DeviceBuffer::alloc(library, bytes_of(bytes)?)?)
+/// The allocations of a quantization's preparation, made on the lane's stream.
+type Mem<'a, 'q> = Memory<'a, Enq<'q>>;
+
+fn device(memory: &mut Mem<'_, '_>, bytes: u64) -> Result<Device, QuantizeError> {
+    Ok(memory.device(bytes_of(bytes)?)?)
 }
 
-/// A device buffer with a page-locked twin of the same size: what goes up, or what comes back.
-struct Staged {
-    host: PinnedBuffer,
-    device: DeviceBuffer,
+fn staged(memory: &mut Mem<'_, '_>, bytes: u64) -> Result<Staged, QuantizeError> {
+    Ok(Staged::new(memory, bytes_of(bytes)?)?)
 }
 
-impl Staged {
-    fn new(library: &Arc<CudaLibrary>, bytes: u64) -> Result<Staged, QuantizeError> {
-        let bytes = bytes_of(bytes)?;
-        Ok(Staged {
-            host: PinnedBuffer::alloc(library, bytes)?,
-            device: DeviceBuffer::alloc(library, bytes)?,
-        })
-    }
-
-    fn of_f32(library: &Arc<CudaLibrary>, values: &[f32]) -> Result<Staged, QuantizeError> {
-        let mut staged = Staged::new(library, 4 * values.len() as u64)?;
-        staged.fill_f32(values);
-        Ok(staged)
-    }
-
-    fn addr(&self) -> u64 {
-        self.device.addr()
-    }
-
-    fn fill_f32(&mut self, values: &[f32]) {
-        for (slot, value) in self.host.as_mut_slice().as_chunks_mut::<4>().0.iter_mut().zip(values) {
-            *slot = value.to_le_bytes();
-        }
-    }
-
-    fn fill_i32(&mut self, values: &[i32]) {
-        for (slot, value) in self.host.as_mut_slice().as_chunks_mut::<4>().0.iter_mut().zip(values) {
-            *slot = value.to_le_bytes();
-        }
-    }
-
-    fn floats(&self, count: usize) -> Vec<f32> {
-        let (words, _) = self.host.as_slice().as_chunks::<4>();
-        words.iter().take(count).map(|word| f32::from_le_bytes(*word)).collect()
-    }
-
-    fn halves(&self) -> Vec<u16> {
-        let (words, _) = self.host.as_slice().as_chunks::<2>();
-        words.iter().map(|word| u16::from_le_bytes(*word)).collect()
-    }
-
-    fn bytes<const N: usize>(&self, offset: usize) -> [u8; N] {
-        let host = self.host.as_slice();
-        from_fn(|i| host.get(offset + i).copied().unwrap_or(0))
-    }
-
-    fn float_at(&self, offset: usize) -> f32 {
-        f32::from_le_bytes(self.bytes(offset))
-    }
-
-    fn int_at(&self, offset: usize) -> i32 {
-        i32::from_le_bytes(self.bytes(offset))
-    }
-
-    fn double_at(&self, offset: usize) -> f64 {
-        f64::from_le_bytes(self.bytes(offset))
-    }
-
-    /// Enqueues the copy of the host bytes to the device. The host bytes must stay as they are until it retires.
-    fn upload(&self, queue: &mut Enq<'_>) -> Result<(), QuantizeError> {
-        // SAFETY: both ranges are live buffers of `len` bytes owned by this value, which the chain keeps until the
-        // retirement is confirmed; nothing writes the host side meanwhile.
-        unsafe { queue.copy_to_device(self.device.addr(), self.host.as_ptr(), self.host.len()) }?;
-        Ok(())
-    }
-
-    /// Enqueues the copy of the device bytes to the host buffer, which is read after the retirement.
-    fn download(&mut self, queue: &mut Enq<'_>) -> Result<(), QuantizeError> {
-        let bytes = self.host.len();
-        // SAFETY: as `upload`; nothing reads the host side before the retirement.
-        unsafe { queue.copy_to_host(self.host.as_mut_ptr(), self.device.addr(), bytes) }?;
-        Ok(())
-    }
-}
-
-/// Runs `body` as one submission, keeping its own error type.
+/// Runs `body` as one submission, keeping this module's error type.
 fn submit<R>(
     stream: &mut CudaStream,
     body: impl for<'a> FnOnce(&mut Enq<'a>) -> Result<R, QuantizeError>,
 ) -> Result<R, QuantizeError> {
-    let mut failure = None;
-    let outcome = stream.submit(|queue| match body(queue) {
-        Ok(value) => Ok(Some(value)),
-        Err(error) => {
-            failure = Some(error);
-            Ok(None)
-        }
-    });
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    outcome?.ok_or_else(|| QuantizeError::Request("a submission produced nothing".into()))
+    chain::submit(stream, body)
 }
 
 /// Planned launches waiting to go onto the queue in order, so the library calls between them keep their place.
@@ -644,40 +659,39 @@ struct State {
     sv_signs: Staged,
     /// Floats 0 (mean), ints at bytes 8 and 12 (statuses), doubles at 16, 24, 32, an int at 48 (refit failures).
     small: Staged,
-    original: DeviceBuffer,
+    original: Device,
     /// The rotated and scaled weight.
-    w: DeviceBuffer,
-    decoded: DeviceBuffer,
+    w: Device,
+    decoded: Device,
     /// The feedback of the rounding errors; the refit's product, and the error of the uncalibrated path.
-    cache: DeviceBuffer,
-    hw: DeviceBuffer,
-    encoded: DeviceBuffer,
+    cache: Device,
+    encoded: Device,
     words: Staged,
-    su: DeviceBuffer,
-    sv: DeviceBuffer,
+    su: Device,
+    sv: Device,
     suh: Staged,
     svh: Staged,
-    rms: DeviceBuffer,
-    divisor: DeviceBuffer,
+    rms: Device,
+    divisor: Device,
     energy: Staged,
     tile_k: Staged,
     tile_n: Staged,
-    sampled: DeviceBuffer,
+    sampled: Device,
     candidate_scales: Staged,
     candidate_errors: Staged,
-    scaled: DeviceBuffer,
-    quantized: DeviceBuffer,
-    indices: DeviceBuffer,
-    viterbi: DeviceBuffer,
-    strip: DeviceBuffer,
-    rounded: DeviceBuffer,
-    error: DeviceBuffer,
-    diagonal: DeviceBuffer,
-    inverse: DeviceBuffer,
-    workspace: DeviceBuffer,
-    rebuilt: Option<DeviceBuffer>,
+    scaled: Device,
+    quantized: Device,
+    indices: Device,
+    viterbi: Device,
+    strip: Device,
+    rounded: Device,
+    error: Device,
+    diagonal: Device,
+    inverse: Device,
+    workspace: Device,
+    rebuilt: Option<Device>,
     /// The block factor of the Hessian; the refit's system afterwards.
-    factor: DeviceBuffer,
+    factor: Device,
 }
 
 impl State {
@@ -801,7 +815,7 @@ fn begin(stream: &mut CudaStream, parts: &mut LaneParts, state: &mut State) -> R
         if let Some(hessian) = hessian {
             work.add(plan_strided_mean(hessian, k, u64::from(k) + 1, state.small.addr()))?;
             work.flush(queue)?;
-            state.small.download(queue)
+            Ok(state.small.download(queue)?)
         } else {
             work.flush(queue)
         }
@@ -841,7 +855,7 @@ fn after_mean(stream: &mut CudaStream, parts: &mut LaneParts, state: &mut State)
         work.add(plan_triangle(h, k, Triangle::LowerToUpper))?;
         work.add(plan_diagonal_io(h, k, diagonal, true))?;
         factor_attempt(&mut work, handles, queue, state, h)?;
-        state.small.download(queue)
+        Ok(state.small.download(queue)?)
     })?;
     Ok(wait(after_factor))
 }
@@ -869,7 +883,7 @@ fn after_factor(stream: &mut CudaStream, parts: &mut LaneParts, state: &mut Stat
             work.add(plan_add_diagonal(h, k, state.small.addr(), (2.0 * SIGMA_REG) as f32))?;
             work.add(plan_diagonal_io(h, k, diagonal, true))?;
             factor_attempt(&mut work, handles, queue, state, h)?;
-            state.small.download(queue)
+            Ok(state.small.download(queue)?)
         })?;
         return Ok(wait(after_factor));
     }
@@ -921,7 +935,7 @@ fn regularize(stream: &mut CudaStream, parts: &mut LaneParts, state: &mut State)
         work.all(plan_hadamard_rows(w, k, n))?;
         work.all(plan_tile_mean_square(w, k, n, state.energy.addr()))?;
         work.flush(queue)?;
-        state.energy.download(queue)
+        Ok(state.energy.download(queue)?)
     })?;
     Ok(wait(after_energy))
 }
@@ -1002,7 +1016,7 @@ fn round(
         state.candidate_errors.addr(),
     ))?;
     work.flush(queue)?;
-    state.candidate_errors.download(queue)
+    Ok(state.candidate_errors.download(queue)?)
 }
 
 fn after_coarse(stream: &mut CudaStream, parts: &mut LaneParts, state: &mut State) -> Result<Move, QuantizeError> {
@@ -1169,7 +1183,7 @@ fn after_fine(stream: &mut CudaStream, parts: &mut LaneParts, state: &mut State)
         state.words.download(queue)?;
         state.suh.download(queue)?;
         state.svh.download(queue)?;
-        state.small.download(queue)
+        Ok(state.small.download(queue)?)
     })?;
     Ok(wait(finish))
 }
@@ -1193,7 +1207,8 @@ fn refit(
     let (original, q, hw, feedback, system) = (
         state.original.addr(),
         state.decoded.addr(),
-        state.hw.addr(),
+        // the rotated weight is dead once the strips are rounded: the refit's product reuses its memory
+        state.w.addr(),
         state.cache.addr(),
         state.factor.addr(),
     );
@@ -1323,13 +1338,5 @@ mod tests {
         let shape = Shape::new(256, 256, rate, small).unwrap();
         assert_eq!(shape.scratch_tiles, 3);
         assert_eq!(Sizes::of(&shape, true).viterbi, rate.scratch_bytes(3));
-    }
-
-    #[test]
-    fn working_bytes_grow_with_the_hessian() {
-        let settings = TrellisSettings::default();
-        let with = working_bytes(256, 256, 3.0, true, settings).unwrap();
-        let without = working_bytes(256, 256, 3.0, false, settings).unwrap();
-        assert!(with > without);
     }
 }

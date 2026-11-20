@@ -20,9 +20,9 @@ use euhedral_graph::{Completions, LanePool};
 use euhedral_inference_cuda::math::MathLibraries;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, PinnedPool};
 use euhedral_inference_quantization::gptq::format::Format;
-use euhedral_inference_quantization::gptq::memory::{Claims, StepBytes};
+use euhedral_inference_quantization::memory::{Claims, LaneMemory, StepBytes};
 use euhedral_inference_quantization::gptq::{
-    DeviceRange, Factor, Finished, GptqError, GptqKernels, GptqLane, GptqSettings, LaneMemory, Refused, TensorScales,
+    DeviceRange, Factor, Finished, GptqError, GptqKernels, GptqLane, GptqSettings, Refused, TensorScales,
 };
 use euhedral_inference_quantization::gptq::{RoundRequest, state::QuantState};
 use euhedral_inference_quantization::kernels::{ModuleOptions, Modules};

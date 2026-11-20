@@ -8,6 +8,8 @@
 //!   chains them on a lane: scales, LDLQ through the Viterbi encode and the refit.
 //! - [`npy`] and [`npz`]: the NumPy array and archive formats the calibration state and the fixtures use. Both work
 //!   on bytes the caller supplies or takes; neither opens a file.
+//! - [`memory`]: stream-ordered device buffers, pooled pinned staging and the claims that account for them, which
+//!   the GPTQ rounding and the trellis quantizer share.
 //! - [`kld`]: the reference logits file the scorer and the reference writer share, opened and read through `AsyncIo`.
 //! - [`rows`]: the work on the logits rows of one teacher-forced run, as frames of the `host` lake.
 //! - [`mixed`]: the mixed allocation search's data: options, allocations, priors, the cost table, the knapsack, the
@@ -25,6 +27,7 @@ pub mod gptq;
 pub mod java_random;
 pub mod kernels;
 pub mod kld;
+pub mod memory;
 pub mod mixed;
 pub mod npy;
 pub mod npz;

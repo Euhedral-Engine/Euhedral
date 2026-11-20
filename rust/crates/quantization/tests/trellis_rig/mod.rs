@@ -18,9 +18,11 @@ use euhedral_core::generics::LatticeSource;
 use euhedral_gpu::cuda::{CudaGpu, CudaModule};
 use euhedral_gpu::{Gpu, StreamOptions};
 use euhedral_graph::{Completions, LanePool};
+use euhedral_memory::{LocationId, LocationKind, LocationSpec, OwnerId, OwnerSpec, Planner, Priority, Scope};
 use euhedral_inference_cuda::math::MathLibraries;
-use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer};
+use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, PinnedPool};
 use euhedral_inference_quantization::kernels::{ModuleOptions, Modules};
+use euhedral_inference_quantization::memory::{Claims, Device, LaneMemory, StepBytes};
 use euhedral_inference_quantization::trellis::{
     Finished, QuantizeError, Quantized, Refused, Request, TrellisLane, TrellisSettings,
 };
@@ -28,11 +30,22 @@ use euhedral_inference_quantization::trellis::{
 pub struct Rig {
     pub library: Arc<CudaLibrary>,
     pub completions: Arc<Completions>,
+    /// The pool the lane's pinned staging comes from.
+    pub pinned: Arc<PinnedPool>,
     lane: Option<TrellisLane>,
+    planner: Arc<Planner>,
+    owner: OwnerId,
+    /// Bytes the next claims are short by, device and pinned: a step must refuse a claim too small for it.
+    pub short: (u64, u64),
     // The device and the lane pool stay open for the lane.
     _gpu: Arc<CudaGpu>,
     _pool: Arc<LanePool>,
 }
+
+/// Bytes each planner location holds: more than any test asks for.
+const CAPACITY: u64 = 8 << 30;
+const DEVICE: LocationId = LocationId(0);
+const PINNED: LocationId = LocationId(1);
 
 /// The rig, or a panic naming the missing setting: a device test that skips is no check.
 pub fn rig(settings: TrellisSettings) -> Rig {
@@ -58,19 +71,30 @@ pub fn rig(settings: TrellisSettings) -> Rig {
     })
     .expect("the handles are made on the lane");
     let handles = handles.unwrap().expect("the math handles");
-    let lane = TrellisLane::new(
-        stream,
-        handles,
-        kernels,
-        Arc::clone(&library),
-        Arc::clone(&completions),
-        settings,
-    )
-    .expect("the lane");
+    let pinned = PinnedPool::new(&library, 256 << 20);
+    let memory = LaneMemory::new(Arc::clone(&library), Arc::clone(&pinned));
+    let lane = TrellisLane::new(stream, handles, kernels, memory, Arc::clone(&completions), settings).expect("the lane");
+    let planner = Planner::new([
+        LocationSpec {
+            kind: LocationKind::Device { ordinal: 0 },
+            capacity: CAPACITY,
+            reserve: 0,
+        },
+        LocationSpec {
+            kind: LocationKind::HostPinned,
+            capacity: CAPACITY,
+            reserve: 0,
+        },
+    ]);
+    let owner = planner.open_owner(OwnerSpec::new("trellis-test", Priority(0), Scope::Process));
     Rig {
         library,
         completions,
+        pinned,
         lane: Some(lane),
+        planner,
+        owner,
+        short: (0, 0),
         _gpu: gpu,
         _pool: pool,
     }
@@ -79,12 +103,25 @@ pub fn rig(settings: TrellisSettings) -> Rig {
 type Slot = Arc<Mutex<Option<Finished<TrellisLane, Quantized, QuantizeError>>>>;
 
 impl Rig {
-    /// Quantizes and pumps the lane's completions until the chain finishes (two minutes at most).
+    /// Quantizes with claims of exactly the bytes the lane says it takes, and pumps the lane's completions until the
+    /// chain finishes (two minutes at most).
     pub fn quantize(&mut self, request: &Request) -> Result<Quantized, QuantizeError> {
+        let bytes = self.lane_mut().quantize_bytes(
+            request.n,
+            request.k,
+            request.bits,
+            request.hessian.is_some() && request.count > 0,
+        )?;
+        let claims = self.claims(bytes);
+        self.quantize_with(request, claims)
+    }
+
+    /// Quantizes with the claims given.
+    pub fn quantize_with(&mut self, request: &Request, claims: Claims) -> Result<Quantized, QuantizeError> {
         let slot: Slot = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&slot);
         let lane = self.lane.take().expect("the lane is idle");
-        let begun = lane.quantize(request, move |finished| {
+        let begun = lane.quantize(request, claims, move |finished| {
             *sink.lock().unwrap() = Some(finished);
         });
         if let Err(refused) = begun {
@@ -108,10 +145,77 @@ impl Rig {
             }
             assert!(Instant::now() < deadline, "the chain did not finish in two minutes");
         };
-        let Finished { lane, scratch, result } = finished;
+        let Finished {
+            mut lane,
+            scratch,
+            result,
+        } = finished;
+        drop(scratch);
+        lane.reclaim().expect("the buffers are freed in stream order");
         self.lane = Some(lane);
-        scratch.release();
         result
+    }
+
+    /// Claims of the bytes given, less what `short` takes off.
+    pub fn claims(&self, bytes: StepBytes) -> Claims {
+        let take = |location, bytes| {
+            self.planner
+                .claim(self.owner, location, bytes, "test")
+                .expect("the planner has the bytes")
+        };
+        Claims {
+            device: Some(take(DEVICE, bytes.device.saturating_sub(self.short.0))),
+            pinned: Some(take(PINNED, bytes.pinned.saturating_sub(self.short.1))),
+        }
+    }
+
+    /// The bytes the planner has not handed out, device and pinned.
+    pub fn free(&self) -> (u64, u64) {
+        (self.planner.free(DEVICE), self.planner.free(PINNED))
+    }
+
+    pub fn capacity(&self) -> u64 {
+        CAPACITY
+    }
+
+    /// Frees the buffers given up, in stream order.
+    pub fn settle(&mut self) {
+        self.lane_mut().reclaim().expect("reclaim");
+    }
+
+    /// The bytes the lane says a quantization takes.
+    pub fn bytes(&mut self, n: u32, k: u32, bits: f64, calibrated: bool) -> StepBytes {
+        self.lane_mut().quantize_bytes(n, k, bits, calibrated).expect("bytes")
+    }
+
+    /// Arms a retirement on the lane's stream that nobody collects, so the next chain cannot arm its own and fails.
+    pub fn block_arming(&mut self) {
+        self.lane_mut().block_arming().expect("a retirement arms");
+    }
+
+    /// Collects the retirement [`block_arming`](Self::block_arming) armed, when the stream has run up to it.
+    pub fn unblock_arming(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !self.lane_mut().unblock_arming() {
+            assert!(Instant::now() < deadline, "the retirement did not arrive in a minute");
+        }
+    }
+
+    /// Takes the lane apart as a shutdown does, calling `probe` just before it waits for the stream.
+    pub fn shutdown(&mut self, probe: Box<dyn Fn() + Send>) -> Result<u64, QuantizeError> {
+        let mut lane = self.lane.take().expect("the lane is idle");
+        lane.set_shutdown_probe(probe);
+        let (_stream, _handles, reclaimed) = lane.into_parts();
+        reclaimed
+    }
+
+    /// Failed chains whose state the lane still holds.
+    pub fn unsettled(&mut self) -> usize {
+        self.lane_mut().unsettled()
+    }
+
+    fn lane_mut(&mut self) -> &mut TrellisLane {
+        self.lane.as_mut().expect("the lane is idle")
     }
 
     pub fn upload(&self, bytes: &[u8]) -> DeviceBuffer {
@@ -130,9 +234,9 @@ impl Rig {
         self.upload(&bytes)
     }
 
-    pub fn download(&self, buffer: &DeviceBuffer, bytes: usize) -> Vec<u8> {
+    pub fn download(&self, buffer: &Device, bytes: usize) -> Vec<u8> {
         let mut host = vec![0u8; bytes];
-        buffer.copy_to_host(0, &mut host).expect("download");
+        buffer.buffer().expect("a live buffer").copy_to_host(0, &mut host).expect("download");
         host
     }
 }

@@ -24,7 +24,7 @@ pub use plan::{
     plan_viterbi,
 };
 pub use quantizer::{
-    LaneParts, QuantizeError, Quantized, Refused, Request, TrellisLane, TrellisSettings, working_bytes,
+    LaneParts, QuantizeError, Quantized, Refused, Request, TrellisLane, TrellisSettings,
 };
 pub use rate::{Rate, TENSOR_CORE_ORDER, TILE_WEIGHTS};
 pub use run::TrellisKernels;

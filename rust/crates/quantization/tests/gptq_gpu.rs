@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use euhedral_inference_cuda::DeviceBuffer;
 use euhedral_inference_quantization::gptq::format::Format;
-use euhedral_inference_quantization::gptq::memory::Claims;
+use euhedral_inference_quantization::memory::Claims;
 use euhedral_inference_quantization::gptq::state::QuantState;
 use euhedral_inference_quantization::gptq::{GptqError, GptqSettings, RoundRequest, TensorScales};
 use euhedral_inference_quantization::npy::Npy;

@@ -2,8 +2,14 @@
 //! work, delivered by the lane's [`Completions`], runs the next stage as a frame. Nothing waits on the device.
 //!
 //! The stream, the state the stages share and the lane's own parts travel with the chain from frame to frame. When
-//! the chain ends, by a result or by a failure, [`Finished`] hands the lane back with the state, which the caller drops
-//! off the lattice (freeing device and pinned memory waits for the device).
+//! the chain ends, by a result or by a failure, [`Finished`] hands the lane back with the state. Dropping the state
+//! gives its device buffers to the lane's queue (freed in stream order by the lane's next step) and its pinned staging
+//! to the pool: nothing waits for the device.
+//!
+//! A chain that cannot arm its retirement ends at once, but the copies and launches it enqueued are still on the
+//! stream and write into its pinned staging. That staging must not go back to the shared pool where another lane could
+//! take it: the state is parked in the lane's [`Unsettled`], and the lane's next confirmed retirement (which the
+//! stream's order puts behind that work) releases it. At shutdown the lane waits for the stream first.
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
@@ -18,6 +24,8 @@ use euhedral_graph::Completions;
 pub(crate) trait Parts: Send + 'static {
     /// The completions that deliver the lane's retirements.
     fn completions(&self) -> &Arc<Completions>;
+    /// The states of chains that could not arm their retirement.
+    fn unsettled(&mut self) -> &mut Unsettled;
 }
 
 /// An error the chain can raise itself: the device refusing a submission, or a stage that has nowhere to go.
@@ -26,17 +34,52 @@ pub(crate) trait ChainError: From<GpuError> + Send + 'static {
     fn broken(message: &str) -> Self;
 }
 
-/// State a chain used, handed back to the caller to drop off the lattice: freeing it waits for the device.
-pub struct Scratch(Box<dyn Any + Send>);
+/// State parked until the lane's stream has run the work queued before it.
+#[derive(Default)]
+pub(crate) struct Unsettled {
+    held: Vec<Box<dyn Any + Send>>,
+}
+
+impl Unsettled {
+    fn park(&mut self, state: Box<dyn Any + Send>) {
+        self.held.push(state);
+    }
+
+    /// Releases what is parked: the stream has retired everything enqueued before now.
+    fn release(&mut self) {
+        self.held.clear();
+    }
+
+    /// How many failed chains' states are parked.
+    pub(crate) fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// For a shutdown: calls `before_wait` if anything is parked, waits for the stream, then releases it. A frame never
+    /// calls this.
+    pub(crate) fn settle(&mut self, stream: &mut CudaStream, before_wait: impl FnOnce()) {
+        if self.held.is_empty() {
+            return;
+        }
+        before_wait();
+        Stream::quiesce(stream);
+        self.release();
+    }
+}
+
+/// Memory a chain used. Dropping it gives its device buffers to the lane's queue (freed in stream order by the next
+/// step on the lane, or by the lane's `reclaim`) and its pinned staging to the pool: nothing waits for the device. A
+/// chain that failed to arm its retirement hands back an empty scratch: its state stays with the lane until a later
+/// retirement confirms the stream has run the work still queued for it.
+pub struct Scratch {
+    _state: Box<dyn Any + Send>,
+}
 
 impl Scratch {
     pub(crate) fn new(state: impl Any + Send) -> Scratch {
-        Scratch(Box::new(state))
-    }
-
-    /// Frees the memory, waiting for the device: call it off the lattice.
-    pub fn release(self) {
-        drop(self.0);
+        Scratch {
+            _state: Box::new(state),
+        }
     }
 }
 
@@ -47,6 +90,10 @@ impl Debug for Scratch {
 }
 
 /// What a chain hands to its `done` call, from the frame that ended it.
+///
+/// After a failed chain whose retirement could not be armed, `result` is an `Err` while the chain's kernels may still
+/// read the caller's device memory and write what the caller gave them: it stays in use until the lane's unsettled count
+/// is back to 0 or the lane's next step has been confirmed.
 #[derive(Debug)]
 pub struct Finished<L, T, E> {
     /// The lane, free again.
@@ -148,15 +195,26 @@ where
         },
     );
     if let Err(RetireError {
-        mut stream,
+        stream,
         state: (mut link, _),
         error,
     }) = armed
     {
-        // Work may still be in flight against the state: let it end before the state goes back.
-        stream.quiesce();
+        // Work may still be queued behind this failure: the state stays with the lane until a retirement is confirmed.
         let cause = link.failure.take().unwrap_or_else(|| E::from(error));
-        finish(stream, link, Err(cause));
+        let Link {
+            mut parts,
+            state,
+            done,
+            rebuild,
+            ..
+        } = link;
+        parts.unsettled().park(Box::new(state));
+        done(Finished {
+            lane: rebuild(stream, parts),
+            scratch: Scratch::new(()),
+            result: Err(cause),
+        });
     }
 }
 
@@ -173,6 +231,8 @@ fn resume<L, P, S, T, E>(
     E: ChainError,
 {
     let confirmed = stream.confirm_retired(ticket);
+    // The stream has run everything enqueued before this retirement, what an earlier failed arm left included.
+    link.parts.unsettled().release();
     if let Some(failure) = link.failure.take() {
         return finish(stream, link, Err(failure));
     }
@@ -205,4 +265,40 @@ where
         scratch: Scratch::new(state),
         result,
     });
+}
+
+/// Runs `body` as one submission, keeping its own error type.
+pub(crate) fn submit<R, E: ChainError>(
+    stream: &mut CudaStream,
+    body: impl for<'a> FnOnce(&mut <CudaStream as Stream>::Enqueue<'a>) -> Result<R, E>,
+) -> Result<R, E> {
+    let mut failure = None;
+    let outcome = stream.submit(|queue| match body(queue) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            failure = Some(error);
+            Ok(None)
+        }
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    outcome?.ok_or_else(|| E::broken("a submission produced nothing"))
+}
+
+/// Arms a retirement on the stream that nobody collects, so the next chain's own cannot be armed and fails after it
+/// enqueued its work. For tests of that path.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn block_arming(stream: &mut CudaStream) -> Result<(), GpuError> {
+    stream.arm_retirement()
+}
+
+/// Collects the retirement [`block_arming`] armed, once the stream has run up to it. Returns false when it has not
+/// arrived yet.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn unblock_arming(stream: &mut CudaStream) -> bool {
+    match stream.poll_retired() {
+        Some(ticket) => stream.confirm_retired(ticket).is_none(),
+        None => false,
+    }
 }

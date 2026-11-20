@@ -20,7 +20,7 @@ fn weights(seed: u64) -> Vec<u16> {
 }
 
 /// The root-mean-square of `decoded - weight` over the root-mean-square of the weight.
-fn relative_error(rig: &Rig, decoded: &euhedral_inference_cuda::DeviceBuffer, weight: &[u16]) -> f64 {
+fn relative_error(rig: &Rig, decoded: &euhedral_inference_quantization::memory::Device, weight: &[u16]) -> f64 {
     let decoded = halves(&rig.download(decoded, N * K * 2));
     let (mut error, mut energy) = (0f64, 0f64);
     for (d, w) in decoded.iter().zip(weight) {
@@ -223,7 +223,7 @@ fn correlated_hessian(rows: usize, seed: u64) -> Vec<f32> {
 }
 
 /// `tr(E H Eᵀ) / tr(W H Wᵀ)` for the error `E = decoded - weight`, in double precision on the host.
-fn hessian_error(rig: &Rig, decoded: &euhedral_inference_cuda::DeviceBuffer, weight: &[u16], h: &[f32]) -> f64 {
+fn hessian_error(rig: &Rig, decoded: &euhedral_inference_quantization::memory::Device, weight: &[u16], h: &[f32]) -> f64 {
     let decoded = halves(&rig.download(decoded, N * K * 2));
     let quadratic = |row: &[f64]| {
         let mut sum = 0f64;

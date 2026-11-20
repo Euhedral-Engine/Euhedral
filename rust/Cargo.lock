@@ -527,6 +527,7 @@ dependencies = [
  "euhedral-inference-cuda",
  "euhedral-inference-edrl",
  "euhedral-inference-engine",
+ "euhedral-inference-quantization",
  "euhedral-inference-settings",
  "euhedral-inference-tokenizer",
  "euhedral-io",
