@@ -30,6 +30,8 @@ on:
       - "build.gradle.kts"
       - "mise.toml"
       - ".gitea/workflows/**"
+      - "scripts/lint-workflows.py"
+      - "scripts/test_lint_workflows.py"
   push:
     branches: [main, "rust/next*"]
   workflow_dispatch:
@@ -38,10 +40,11 @@ permissions:
   contents: read
 
 # The event is part of the group, so a manual run on the integration branch never cancels the push run that
-# `rollover promote` requires for that commit.
+# `rollover promote` requires for that commit. A push to main never cancels an earlier one: each main run diffs against
+# the previous push, so a cancelled run's changes would go untested.
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 defaults:
   run:
@@ -61,6 +64,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Test the workflow lint
+        run: python3 -m unittest scripts/test_lint_workflows.py
       - name: Lint the memory asked by the workflows
         run: python3 scripts/lint-workflows.py .gitea/workflows
       - name: Decide which groups changed

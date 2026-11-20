@@ -5,7 +5,7 @@
 #
 # It runs on the host runner, which runs only push and workflow_dispatch on a protected integration branch (the runner's
 # host-guard enforces that; the `if` below is a convenience). The token is the promote bot's host file, never an Actions
-# secret. No checkout is needed: rollover clones the repository itself and reads .gitea/rollover.toml from the promoted commit.
+# secret; this job is the one reader of promote.token (the rollover step, and the download only when the job token is refused). No checkout is needed: rollover clones the repository itself and reads .gitea/rollover.toml from the promoted commit.
 #
 # Inputs (strings):
 #   next_branch  optional: the new branch's name (default: the old number plus one)
@@ -65,26 +65,33 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE"
           work=$(mktemp -d -p "$GITHUB_WORKSPACE" rollover.XXXXXX)
           trap 'rm -rf "$work"' EXIT
-          umask 077
           url="$FORGE_URL/euhedral/rollover/releases/download/$ROLLOVER_TAG/rollover-x86_64-unknown-linux-musl"
           bin="$work/rollover"
 
-          # A header file keeps the token out of every command line. The job token goes first; if it cannot read the
-          # release (or the answer is not the pinned file), the promote bot's token does. The hash decides either way.
+          # The header reaches curl on its standard input, so the token is in no file and no command line (printf is a
+          # builtin). -L follows a redirect on the same host; curl drops the header for another host. Prints the HTTP status.
           fetch() {
-            printf 'Authorization: token %s\n' "$1" > "$work/header"
             rm -f "$bin"
-            curl -fsS --max-time 120 --retry 2 -H "@$work/header" -o "$bin" "$url" || return 1
-            echo "$ROLLOVER_SHA256  $bin" | sha256sum --check --status
+            printf 'Authorization: token %s\n' "$1" |
+              curl -sS -L --max-time 120 --retry 2 -H @- -o "$bin" -w '%{http_code}' "$url"
           }
-          if fetch "$JOB_TOKEN"; then
-            echo "downloaded rollover $ROLLOVER_TAG with the job token"
-          elif [ -r "$secrets/promote.token" ] && fetch "$(tr -d '\r\n' < "$secrets/promote.token")"; then
-            echo "downloaded rollover $ROLLOVER_TAG with the promote bot's token"
-          else
-            echo "::error::could not download rollover $ROLLOVER_TAG with a matching sha256"
-            exit 1
-          fi
+          # The job token goes first. Only a refusal (401, 403, 404) sends us to the promote bot's token; any other answer,
+          # and a file that is not the pinned one, is a hard failure.
+          code=$(fetch "$JOB_TOKEN") || { echo "::error::the download of rollover $ROLLOVER_TAG failed"; exit 1; }
+          case "$code" in
+            200) echo "downloaded rollover $ROLLOVER_TAG with the job token" ;;
+            401 | 403 | 404)
+              echo "the job token was refused ($code); trying the promote bot's token"
+              [ -r "$secrets/promote.token" ] || { echo "::error::no promote.token to fall back to"; exit 1; }
+              code=$(fetch "$(tr -d '\r\n' < "$secrets/promote.token")") ||
+                { echo "::error::the download of rollover $ROLLOVER_TAG failed"; exit 1; }
+              [ "$code" = 200 ] || { echo "::error::the promote bot's token was refused too ($code)"; exit 1; }
+              echo "downloaded rollover $ROLLOVER_TAG with the promote bot's token"
+              ;;
+            *) echo "::error::downloading rollover $ROLLOVER_TAG answered $code"; exit 1 ;;
+          esac
+          echo "$ROLLOVER_SHA256  $bin" | sha256sum --check --status ||
+            { echo "::error::rollover $ROLLOVER_TAG does not match ROLLOVER_SHA256"; exit 1; }
           chmod 0755 "$bin"
           mkdir -p "$GITHUB_WORKSPACE/.bin"
           mv "$bin" "$GITHUB_WORKSPACE/.bin/rollover"
@@ -100,4 +107,4 @@ jobs:
           if [ "${DRY_RUN:-1}" != 0 ]; then args+=(--dry-run); fi
           # Host jobs are not arbiter-gated, so this step asks for its own lease. The repository, the commit, the
           # branch and the API address come from the job's GITHUB_* variables and FORGE_URL.
-          system-run --mem 1G --est 300 -- "$GITHUB_WORKSPACE/.bin/rollover" "${args[@]}"
+          system-run --mem 1G --est 1200 -- "$GITHUB_WORKSPACE/.bin/rollover" "${args[@]}"
