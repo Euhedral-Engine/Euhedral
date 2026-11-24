@@ -20,6 +20,10 @@ test:system --cache_test_results=no
 build:ci --keep_going
 test:ci --keep_going
 test:ci --test_output=errors
+# The CI job leases 8 threads from the arbiter while Bazel sees every core of the host (32 test actions at once). The
+# server and API tests start worker pools and bound stops and connects in seconds; beside 30 other tests and other jobs a
+# stop took 40 s and failed them. Cargo runs one test binary at a time; this keeps four.
+test:ci --local_test_jobs=4
 common:ci --color=no
 
 try-import %workspace%/user.bazelrc
