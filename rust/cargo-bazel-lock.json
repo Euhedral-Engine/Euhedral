@@ -1,5 +1,5 @@
 {
-  "checksum": "641e572eab5484684814d92fb73c904452e5411efbf35f3f405ae248d41f8d92",
+  "checksum": "4c9e03f0ba7493b3b4c033fb8459b44288d71c755ab0153178f57d62f9b2f076",
   "conditions": {
     "aarch64-linux-android": [],
     "cfg(all(any(target_os = \"linux\", target_os = \"android\"), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))": [],
@@ -1746,7 +1746,7 @@
       "repository": {
         "Git": {
           "commitish": {
-            "Rev": "d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+            "Rev": "880a70a03d94685c74b194efe29d829f1a157495"
           },
           "remote": "https://github.com/Euhedral-Engine/RustEE.git",
           "strip_prefix": "euhedral-core"
@@ -1786,7 +1786,7 @@
       "repository": {
         "Git": {
           "commitish": {
-            "Rev": "d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+            "Rev": "880a70a03d94685c74b194efe29d829f1a157495"
           },
           "remote": "https://github.com/Euhedral-Engine/RustEE.git",
           "strip_prefix": "euhedral-data-structures"
@@ -1855,7 +1855,7 @@
       "repository": {
         "Git": {
           "commitish": {
-            "Rev": "d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+            "Rev": "880a70a03d94685c74b194efe29d829f1a157495"
           },
           "remote": "https://github.com/Euhedral-Engine/RustEE.git",
           "strip_prefix": "euhedral-gpu"
@@ -1917,7 +1917,7 @@
       "repository": {
         "Git": {
           "commitish": {
-            "Rev": "d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+            "Rev": "880a70a03d94685c74b194efe29d829f1a157495"
           },
           "remote": "https://github.com/Euhedral-Engine/RustEE.git",
           "strip_prefix": "euhedral-graph"
@@ -1972,7 +1972,7 @@
       "repository": {
         "Git": {
           "commitish": {
-            "Rev": "d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+            "Rev": "880a70a03d94685c74b194efe29d829f1a157495"
           },
           "remote": "https://github.com/Euhedral-Engine/RustEE.git",
           "strip_prefix": "euhedral-hardware-utils"
@@ -2001,7 +2001,7 @@
       "repository": {
         "Git": {
           "commitish": {
-            "Rev": "d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+            "Rev": "880a70a03d94685c74b194efe29d829f1a157495"
           },
           "remote": "https://github.com/Euhedral-Engine/RustEE.git",
           "strip_prefix": "euhedral-hashing"
@@ -2639,7 +2639,7 @@
       "repository": {
         "Git": {
           "commitish": {
-            "Rev": "d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+            "Rev": "880a70a03d94685c74b194efe29d829f1a157495"
           },
           "remote": "https://github.com/Euhedral-Engine/RustEE.git",
           "strip_prefix": "euhedral-io"
@@ -2701,7 +2701,7 @@
       "repository": {
         "Git": {
           "commitish": {
-            "Rev": "d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+            "Rev": "880a70a03d94685c74b194efe29d829f1a157495"
           },
           "remote": "https://github.com/Euhedral-Engine/RustEE.git",
           "strip_prefix": "euhedral-memory"
@@ -2748,7 +2748,7 @@
       "repository": {
         "Git": {
           "commitish": {
-            "Rev": "d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+            "Rev": "880a70a03d94685c74b194efe29d829f1a157495"
           },
           "remote": "https://github.com/Euhedral-Engine/RustEE.git",
           "strip_prefix": "euhedral-net"
