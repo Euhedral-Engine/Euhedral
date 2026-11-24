@@ -19,7 +19,7 @@ pub enum Applies {
 /// One dependency edge of a package.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Dep {
-    /// The Bazel label: `//rust/crates/x:y` for a member, `@crates//:name` for anything else.
+    /// The Bazel label: `//rust/crates/x:y` for a member, `@euhedral_rustee//...` for a RustEE crate, `@euhedral_crates//:name` for anything else.
     pub label: String,
     pub applies: Applies,
     pub dev: bool,
@@ -62,6 +62,30 @@ impl Package {
     pub fn lib_name(&self) -> String {
         self.name.replace('-', "_")
     }
+}
+
+/// The RustEE crates this workspace takes from the module `euhedral_rustee`.
+const RUSTEE_CRATES: &[&str] = &[
+    "euhedral-core",
+    "euhedral-data-structures",
+    "euhedral-gpu",
+    "euhedral-graph",
+    "euhedral-hardware-utils",
+    "euhedral-hashing",
+    "euhedral-io",
+    "euhedral-memory",
+    "euhedral-net",
+];
+
+/// The target of a RustEE crate. One feature world, the one `cargo test --workspace` builds: RustEE names it `cuda_testing`
+/// (cuda, fake and test-hooks on gpu), and the targets of that world agree on which copy of each crate they use.
+fn rustee_label(crate_name: &str) -> Option<String> {
+    RUSTEE_CRATES.contains(&crate_name).then(|| {
+        format!(
+            "@euhedral_rustee//{crate_name}:{}_cuda_testing",
+            crate_name.replace('-', "_")
+        )
+    })
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -184,8 +208,14 @@ pub fn load(metadata: &str, root: &Path) -> Result<Workspace, String> {
                     .and_then(|dir| dir.strip_prefix(&format!("{root_text}/")))
                     .ok_or_else(|| format!("{dep_name}: manifest outside the workspace"))?;
                 format!("//{owner_dir}:{}", dep_name.replace('-', "_"))
+            } else if let Some(label) = rustee_label(dep_name) {
+                label
+            } else if dep_name.starts_with("euhedral-") {
+                return Err(format!(
+                    "{name}: {dep_name} is a RustEE crate with no known Bazel target (see rustee_label)"
+                ));
             } else {
-                format!("@crates//:{dep_name}")
+                format!("@euhedral_crates//:{dep_name}")
             };
             deps.push(Dep { label, applies, dev });
         }

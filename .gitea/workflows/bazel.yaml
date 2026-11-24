@@ -49,7 +49,8 @@ jobs:
       GH_APP_INSTALLATION_ID: ${{ secrets.GH_APP_INSTALLATION_ID }}
       GH_APP_PRIVATE_KEY_B64: ${{ secrets.GH_APP_PRIVATE_KEY_B64 }}
 
-  # The one check to require: a skipped gate (a caller's `if:`) is a failure here, not a pass.
+  # The one check to require: a skipped gate (a caller's `if:`) is a failure here, not a pass. The Windows workflow runs only
+  # for a pull request, so on a push or a manual run its result is `skipped`, and only then is that accepted.
   gate-ok:
     needs: [gate, windows]
     if: always()
@@ -60,5 +61,13 @@ jobs:
         shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
         env:
           PATH: /usr/bin:/bin
-          RESULTS: ${{ needs.gate.result }} ${{ needs.windows.result }}
-        run: test "$RESULTS" = "success success"
+          EVENT: ${{ github.event_name }}
+          GATE: ${{ needs.gate.result }}
+          WINDOWS: ${{ needs.windows.result }}
+        run: |
+          test "$GATE" = success
+          if test "$EVENT" = pull_request; then
+            test "$WINDOWS" = success
+          else
+            test "$WINDOWS" = success -o "$WINDOWS" = skipped
+          fi

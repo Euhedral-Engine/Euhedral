@@ -1,17 +1,30 @@
 # Euhedral's Bazel build of the Rust workspace in rust/ (Java and Zig stay on Gradle). Versions are the table in forge's
 # build/module/MODULE.bazel (forge build/CONTRACTS.md C4); forge's check-repo.sh checks the bazel_dep versions below.
 module(
-    name = "euhedral",
+    name = "euhedral_euhedral",
     version = "0.0.0",
 )
 
 # The euhedral_build module (the shared platforms and tags) is a copy of forge's build/module, loaded through a local path
 # until the private registry (C5) is reachable from every runner; bazel/ is in .bazelignore, so its files are not packages
-# of this module.
-bazel_dep(name = "euhedral_build", version = "0.1.0")
+# of this module. It is a dev dependency (used only for the Windows platform label of this repository's own CI), so a module
+# that takes this one ignores it and its path override.
+bazel_dep(name = "euhedral_build", version = "0.1.0", dev_dependency = True)
 local_path_override(
     module_name = "euhedral_build",
     path = "bazel/euhedral_build",
+)
+
+# RustEE is a Bazel module, so that a module taking this one and RustEE gets one copy of euhedral-core. Its commit is
+# the `rev` of the RustEE dependencies in rust/Cargo.toml: bazel-gen's layout test fails when they differ. A module that
+# takes this one pins RustEE itself (an override of a non-root module is ignored). The crate_universe below still resolves
+# the RustEE crates of Cargo.lock, but nothing refers to them: the targets use @euhedral_rustee.
+bazel_dep(name = "euhedral_rustee", version = "0.0.0")
+git_override(
+    module_name = "euhedral_rustee",
+    remote = "https://github.com/Euhedral-Engine/RustEE.git",
+    # Placeholder until the shared pin moves: the head of RustEE's crate-lock branch, not Cargo's rev.
+    commit = "a1ef132d663684458a53ea43361919de815da489",
 )
 
 bazel_dep(name = "platforms", version = "1.1.0")
@@ -31,24 +44,26 @@ use_repo(rust, "rust_toolchains")
 
 rust_host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
 rust_host_tools.host_tools(
-    name = "rust_host_tools_pinned",
+    name = "euhedral_host_tools",
     version = "1.99.1",
 )
-use_repo(rust_host_tools, "rust_host_tools_pinned")
+use_repo(rust_host_tools, "euhedral_host_tools")
 
 register_toolchains("@rust_toolchains//:all")
 
 # crate_universe reads the workspace's Cargo.toml and Cargo.lock (the RustEE crates are git dependencies pinned there);
-# Cargo owns the lock, Bazel never rewrites it.
+# Cargo owns Cargo.lock; cargo-bazel-lock.json is crate_universe's own lock, shipped so that a module taking this one needs
+# no resolution. Regenerate it after Cargo.lock or a manifest changes: `CARGO_BAZEL_REPIN=1 bazel build //rust/...`.
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
-    name = "crates",
+    name = "euhedral_crates",
     cargo_lockfile = "//rust:Cargo.lock",
-    host_tools = "@rust_host_tools_pinned",
+    lockfile = "//rust:cargo-bazel-lock.json",
+    host_tools = "@euhedral_host_tools",
     manifests = ["//rust:Cargo.toml"],
     supported_platform_triples = [
         "x86_64-unknown-linux-gnu",
         "x86_64-pc-windows-msvc",
     ],
 )
-use_repo(crate, "crates")
+use_repo(crate, "euhedral_crates")

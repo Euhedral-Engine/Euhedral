@@ -4,6 +4,7 @@
 exports_files([
     "BUILD.bazel",
     "Cargo.lock",
+    "cargo-bazel-lock.json",
     "Cargo.toml",
     "rust-toolchain.toml",
 ])

@@ -211,6 +211,7 @@ pub fn files(workspace: &Workspace) -> Result<BTreeMap<String, String>, String> 
         "//:mise.toml".to_owned(),
         "//rust:BUILD.bazel".to_owned(),
         "//rust:Cargo.lock".to_owned(),
+        "//rust:cargo-bazel-lock.json".to_owned(),
         "//rust:Cargo.toml".to_owned(),
         "//rust:rust-toolchain.toml".to_owned(),
     ];
@@ -232,7 +233,7 @@ pub fn files(workspace: &Workspace) -> Result<BTreeMap<String, String>, String> 
 
 fn rust_file() -> String {
     format!(
-        "{GENERATED}\n# The files crate_universe reads, and the ones the layout test checks.\nexports_files([\n    \"BUILD.bazel\",\n    \"Cargo.lock\",\n    \"Cargo.toml\",\n    \"rust-toolchain.toml\",\n])\n"
+        "{GENERATED}\n# The files crate_universe reads, and the ones the layout test checks.\nexports_files([\n    \"BUILD.bazel\",\n    \"Cargo.lock\",\n    \"cargo-bazel-lock.json\",\n    \"Cargo.toml\",\n    \"rust-toolchain.toml\",\n])\n"
     )
 }
 
@@ -432,7 +433,7 @@ fn package_file(workspace: &Workspace, package: &Package, layout_data: &[String]
             )
             .set("rustc_env", runtime_env(extra));
         if layout {
-            // The test reads the real source tree through a data file's symlink, which needs Linux.
+            // The test reads the real source tree through a data file's symlink (and is empty on Windows).
             rule.set(
                 "env",
                 Value::Map(vec![(
@@ -440,7 +441,6 @@ fn package_file(workspace: &Workspace, package: &Package, layout_data: &[String]
                     "$(rlocationpath @rules_rust//cargo:current_cargo_toolchain)".to_owned(),
                 )]),
             );
-            rule.list("target_compatible_with", vec!["@platforms//os:linux".to_owned()]);
             // The gate's `stale-build: tested` input looks for this tag.
             rule.list("tags", vec!["stale-build".to_owned()]);
         }

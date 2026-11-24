@@ -14,7 +14,7 @@ rust_binary(
     crate_root = "src/main.rs",
     data = ["@rules_rust//cargo:current_cargo_toolchain"],
     deps = [
-        "@crates//:serde_json",
+        "@euhedral_crates//:serde_json",
     ],
     edition = "2024",
     env = {
@@ -99,12 +99,13 @@ rust_test(
         "//rust:BUILD.bazel",
         "//rust:Cargo.lock",
         "//rust:Cargo.toml",
+        "//rust:cargo-bazel-lock.json",
         "//rust:rust-toolchain.toml",
         ":BUILD.bazel",
         "@rules_rust//cargo:current_cargo_toolchain",
     ],
     deps = [
-        "@crates//:serde_json",
+        "@euhedral_crates//:serde_json",
     ],
     edition = "2024",
     env = {
@@ -123,6 +124,5 @@ rust_test(
         allow_empty = True,
     ),
     tags = ["stale-build"],
-    target_compatible_with = ["@platforms//os:linux"],
     version = "0.1.0",
 )

@@ -22,7 +22,7 @@ rust_library(
     crate_name = "euhedral_inference_settings",
     crate_root = "src/lib.rs",
     deps = [
-        "@crates//:serde_yaml_ng",
+        "@euhedral_crates//:serde_yaml_ng",
     ],
     edition = "2024",
     srcs = glob(
@@ -39,7 +39,7 @@ rust_test(
     name = "unit_test",
     crate = ":euhedral_inference_settings",
     deps = [
-        "@crates//:tempfile",
+        "@euhedral_crates//:tempfile",
     ],
     edition = "2024",
     version = "0.1.0",
@@ -50,7 +50,7 @@ rust_doc_test(
     name = "doc_test",
     crate = ":euhedral_inference_settings",
     deps = [
-        "@crates//:tempfile",
+        "@euhedral_crates//:tempfile",
     ],
 )
 
@@ -80,8 +80,8 @@ rust_test(
     ),
     deps = [
         ":euhedral_inference_settings",
-        "@crates//:serde_yaml_ng",
-        "@crates//:tempfile",
+        "@euhedral_crates//:serde_yaml_ng",
+        "@euhedral_crates//:tempfile",
     ],
     edition = "2024",
     rustc_env = {
@@ -126,8 +126,8 @@ rust_test(
     ],
     deps = [
         ":euhedral_inference_settings",
-        "@crates//:serde_yaml_ng",
-        "@crates//:tempfile",
+        "@euhedral_crates//:serde_yaml_ng",
+        "@euhedral_crates//:tempfile",
     ],
     edition = "2024",
     rustc_env = {
@@ -170,8 +170,8 @@ rust_test(
     ),
     deps = [
         ":euhedral_inference_settings",
-        "@crates//:serde_yaml_ng",
-        "@crates//:tempfile",
+        "@euhedral_crates//:serde_yaml_ng",
+        "@euhedral_crates//:tempfile",
     ],
     edition = "2024",
     rustc_env = {

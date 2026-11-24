@@ -14,7 +14,7 @@ mod model;
 mod render;
 mod scan;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -61,6 +61,8 @@ fn run(diff: bool) -> Result<bool, String> {
         }
     }
     let mut problems = pins(&root)?;
+    problems.extend(crate_lock(&root)?);
+    problems.extend(rustee_rev(&root)?);
     problems.extend(stray_build_files(&root, &workspace, &files)?);
     if diff {
         for path in &stale {
@@ -70,7 +72,9 @@ fn run(diff: bool) -> Result<bool, String> {
             report(problem);
         }
         if !stale.is_empty() || !problems.is_empty() {
-            report("regenerate with `bazel run //:gazelle` and commit the BUILD files");
+            report(
+                "regenerate the BUILD files with `bazel run //:gazelle` (or `cargo run -p bazel-gen`), fix what is named above, and commit",
+            );
             return Ok(false);
         }
     }
@@ -181,4 +185,67 @@ fn walk(dir: &Path) -> Result<Vec<PathBuf>, String> {
         }
     }
     Ok(found)
+}
+
+/// crate_universe does not notice a Cargo.lock that moved on: its own lock (`rust/cargo-bazel-lock.json`) must list exactly
+/// the packages of Cargo.lock, by name and version.
+fn crate_lock(root: &Path) -> Result<Vec<String>, String> {
+    let read = |path: &str| fs::read_to_string(root.join(path)).map_err(|error| format!("read {path}: {error}"));
+    let mut cargo: BTreeSet<String> = BTreeSet::new();
+    let mut name = String::new();
+    for line in read("rust/Cargo.lock")?.lines() {
+        if let Some(value) = line.strip_prefix("name = \"") {
+            name = value.trim_end_matches('"').to_owned();
+        } else if let Some(value) = line.strip_prefix("version = \"") {
+            cargo.insert(format!("{name} {}", value.trim_end_matches('"')));
+        }
+    }
+    let lock: serde_json::Value =
+        serde_json::from_str(&read("rust/cargo-bazel-lock.json")?).map_err(|error| error.to_string())?;
+    let bazel: BTreeSet<String> = lock
+        .get("crates")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("rust/cargo-bazel-lock.json has no crates")?
+        .keys()
+        .cloned()
+        .collect();
+    let mut problems = Vec::new();
+    for missing in cargo.difference(&bazel) {
+        problems.push(format!(
+            "rust/cargo-bazel-lock.json lacks {missing}, which rust/Cargo.lock has"
+        ));
+    }
+    for extra in bazel.difference(&cargo) {
+        problems.push(format!(
+            "rust/cargo-bazel-lock.json has {extra}, which rust/Cargo.lock does not"
+        ));
+    }
+    if !problems.is_empty() {
+        problems
+            .push("repin: CARGO_BAZEL_REPIN=1 bazel build //rust/... and commit rust/cargo-bazel-lock.json".to_owned());
+    }
+    Ok(problems)
+}
+
+/// Cargo and Bazel must build the same RustEE: the commit of the `git_override` of `euhedral_rustee` in MODULE.bazel is the
+/// `rev` of the RustEE dependencies in rust/Cargo.toml.
+fn rustee_rev(root: &Path) -> Result<Vec<String>, String> {
+    let read = |path: &str| fs::read_to_string(root.join(path)).map_err(|error| format!("read {path}: {error}"));
+    let quoted_after = |text: &str, key: &str| -> BTreeSet<String> {
+        text.lines()
+            .filter_map(|line| {
+                let rest = line.split(key).nth(1)?;
+                Some(rest.split('"').nth(1)?.to_owned())
+            })
+            .collect()
+    };
+    let cargo = quoted_after(&read("rust/Cargo.toml")?, "rev = ");
+    let module = read("MODULE.bazel")?;
+    let bazel = quoted_after(&module, "commit = ");
+    if cargo.len() == 1 && cargo == bazel {
+        return Ok(Vec::new());
+    }
+    Ok(vec![format!(
+        "RustEE rev: rust/Cargo.toml says {cargo:?} but the git_override in MODULE.bazel says {bazel:?}; they must be one commit"
+    )])
 }
