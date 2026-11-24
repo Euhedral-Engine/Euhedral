@@ -71,9 +71,15 @@ fn spawn(arguments: &[&str]) -> Server {
 /// A server whose standard output is `stdout`.
 fn spawn_with(arguments: &[&str], stdout: Stdio) -> Server {
     let _forks = FORKS.lock().expect("the lock");
-    let child = Command::new(SERVER)
-        .args(arguments)
-        .env_clear()
+    let mut command = Command::new(SERVER);
+    command.args(arguments).env_clear();
+    // Winsock cannot start without the system root, so a cleared
+    // environment on Windows still carries it.
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SYSTEMROOT") {
+        command.env("SYSTEMROOT", root);
+    }
+    let child = command
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(Stdio::piped())
