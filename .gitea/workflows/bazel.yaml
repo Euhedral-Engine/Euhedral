@@ -33,14 +33,17 @@ concurrency:
 
 jobs:
   gate:
-    uses: euhedral/ci/.gitea/workflows/bazel-gate.yml@refs/tags/v5
+    uses: euhedral/ci/.gitea/workflows/bazel-gate.yml@refs/tags/v6
     with:
       stale-build: gazelle
       bazel-mem: 16
       bazel-est: 1200
+    secrets:
+      # Also read by the repo check's pin alignment (C5).
+      forge-read-token: ${{ secrets.FORGE_READ_TOKEN }}
 
   windows:
-    uses: euhedral/ci/.gitea/workflows/bazel-windows.yml@refs/tags/v5
+    uses: euhedral/ci/.gitea/workflows/bazel-windows.yml@refs/tags/v6
     with:
       repo: Euhedral-Engine/Euhedral
       permissions: contents:write,actions:write,workflows:write
