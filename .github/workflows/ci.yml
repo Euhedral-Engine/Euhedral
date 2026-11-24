@@ -1,0 +1,34 @@
+# The GitHub side of the Windows Bazel gate: the workflow the proxy dispatches from the Gitea pull request (the inputs only_os
+# and proxy_id are the proxy's). It runs the Linux gate's test command on the Windows platform; the repository's own .bazelrc
+# defines `--config=ci`.
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      only_os:
+        type: choice
+        options: [all, ubuntu-latest, windows-2025]
+        default: all
+      base_ref:
+        type: string
+        default: ""
+      proxy_id:
+        type: string
+        default: ""
+run-name: ${{ inputs.proxy_id && format('ci [{0}]', inputs.proxy_id) || github.ref_name }}
+permissions:
+  contents: read
+jobs:
+  bazel-windows:
+    if: inputs.only_os == 'windows-2025'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bazel test on the Windows platform
+        env:
+          MSYS_NO_PATHCONV: "1" # Git Bash would rewrite the // in the labels as a path
+        run: bazel test //... --config=ci --platforms=@euhedral_build//platforms:windows_x86_64
