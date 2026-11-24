@@ -1,0 +1,6 @@
+*.bazel text eol=lf
+*.bzl text eol=lf
+MODULE.bazel.lock text eol=lf
+.bazelrc text eol=lf
+.bazelversion text eol=lf
+.bazelignore text eol=lf

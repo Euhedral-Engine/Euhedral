@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/api-protocol", "crates/api-server", "crates/bench", "crates/cuda", "crates/edrl", "crates/engine", "crates/host-gemv", "crates/quantization", "crates/quantize", "crates/server", "crates/settings", "crates/test-support", "crates/tokenizer", "xtask"]
+members = ["crates/api-protocol", "crates/api-server", "crates/bench", "crates/cuda", "crates/edrl", "crates/engine", "crates/host-gemv", "crates/quantization", "crates/quantize", "crates/server", "crates/settings", "crates/test-support", "crates/tokenizer", "tools/bazel-gen", "xtask"]
 resolver = "3"
 
 [workspace.package]
