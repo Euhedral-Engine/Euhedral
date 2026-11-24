@@ -7,6 +7,8 @@ common --lockfile_mode=error
 
 # Windows has no symlinks without developer mode; tests and tools find their data through runfiles directories.
 common:windows --enable_runfiles
+# Winsock cannot start in a child that has no system root; Bazel passes tests only a minimal environment.
+test:windows --test_env=SYSTEMROOT
 
 # C7
 test --test_tag_filters=-gpu,-exclusive
