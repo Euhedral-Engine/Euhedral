@@ -4,3 +4,5 @@ MODULE.bazel.lock text eol=lf
 .bazelrc text eol=lf
 .bazelversion text eol=lf
 .bazelignore text eol=lf
+Cargo.toml text eol=lf
+Cargo.lock text eol=lf

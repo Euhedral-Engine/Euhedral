@@ -441,6 +441,8 @@ fn package_file(workspace: &Workspace, package: &Package, layout_data: &[String]
                 )]),
             );
             rule.list("target_compatible_with", vec!["@platforms//os:linux".to_owned()]);
+            // The gate's `stale-build: tested` input looks for this tag.
+            rule.list("tags", vec!["stale-build".to_owned()]);
         }
         let labels = if data.is_empty() {
             String::new()

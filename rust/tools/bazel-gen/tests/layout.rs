@@ -1,6 +1,8 @@
 //! The BUILD files match the Cargo manifests: a changed dependency or feature list without regenerated BUILD files
 //! fails here, under `bazel test` and under `cargo test` alike.
 
+#![cfg(unix)] // The BUILD files are checked on Linux; Windows checks out the same files.
+
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;

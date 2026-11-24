@@ -122,6 +122,7 @@ rust_test(
         ],
         allow_empty = True,
     ),
+    tags = ["stale-build"],
     target_compatible_with = ["@platforms//os:linux"],
     version = "0.1.0",
 )
