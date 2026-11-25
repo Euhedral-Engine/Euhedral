@@ -244,6 +244,45 @@ struct State {
     /// The tests waiting for the card, oldest first, with the key of the engine each one wants (none: an empty card).
     waiting: Vec<(u64, Option<String>)>,
     tickets: u64,
+    /// The tests inside the card now, by thread name, for the message of a hang.
+    holders: Vec<String>,
+    /// Counts every change of who holds the card: a wait that sees none for [`HANG_GUARD`] is a hang.
+    epoch: u64,
+}
+
+/// How long a test waits for the card with no test taking or leaving it, before it fails naming who holds it. The
+/// longest test holds it a few minutes.
+const HANG_GUARD: Duration = Duration::from_secs(15 * 60);
+
+fn thread_name() -> String {
+    thread::current().name().unwrap_or("?").to_owned()
+}
+
+/// Waits for a change of the card; fails, naming the holders, when none comes within [`HANG_GUARD`].
+fn wait_for_change<'a>(mut state: MutexGuard<'a, State>, wanted: &str) -> MutexGuard<'a, State> {
+    let seen = state.epoch;
+    let (guard, timeout) = CHANGED
+        .wait_timeout(state, HANG_GUARD)
+        .unwrap_or_else(PoisonError::into_inner);
+    state = guard;
+    if timeout.timed_out() && state.epoch == seen {
+        let message = format!(
+            "test {} waited {} s for {wanted}, and no test took or left the card in that time; held by {:?}, exclusive: {}, \
+             engine kept: {:?}, last to keep it: {}",
+            thread_name(),
+            HANG_GUARD.as_secs(),
+            state.holders,
+            state.exclusive,
+            state
+                .engine
+                .as_ref()
+                .map(|(key, _)| key.chars().take(60).collect::<String>()),
+            state.last,
+        );
+        drop(state);
+        panic!("{message}");
+    }
+    state
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -253,6 +292,8 @@ static STATE: Mutex<State> = Mutex::new(State {
     exclusive: false,
     waiting: Vec::new(),
     tickets: 0,
+    holders: Vec::new(),
+    epoch: 0,
 });
 static CHANGED: Condvar = Condvar::new();
 static LOADS: AtomicUsize = AtomicUsize::new(0);
@@ -315,10 +356,12 @@ fn acquire_exclusive(wanted: Option<&str>) -> Card {
                 break;
             }
         }
-        state = CHANGED.wait(state).unwrap_or_else(PoisonError::into_inner);
+        state = wait_for_change(state, wanted.unwrap_or("an empty card"));
     }
     state.waiting.retain(|(waiting, _)| *waiting != ticket);
     state.exclusive = true;
+    state.holders.push(thread_name());
+    state.epoch += 1;
     Card {
         held: state.engine.take(),
         before: state.last.clone(),
@@ -379,9 +422,12 @@ impl Drop for Card {
             state = lock();
         } else {
             state.engine = held;
-            state.last = thread::current().name().unwrap_or("?").to_owned();
+            state.last = thread_name();
         }
         state.exclusive = false;
+        let name = thread_name();
+        state.holders.retain(|holder| *holder != name);
+        state.epoch += 1;
         drop(state);
         CHANGED.notify_all();
     }
@@ -396,7 +442,7 @@ pub fn light() -> Light {
     let mut state = lock();
     loop {
         if state.exclusive {
-            state = CHANGED.wait(state).unwrap_or_else(PoisonError::into_inner);
+            state = wait_for_change(state, "the card, for a test without an engine");
         } else if let Some(held) = state.engine.take() {
             let before = state.last.clone();
             retire(held, &before);
@@ -405,12 +451,21 @@ pub fn light() -> Light {
         }
     }
     state.light += 1;
+    state.holders.push(thread_name());
+    state.epoch += 1;
     Light(())
 }
 
 impl Drop for Light {
     fn drop(&mut self) {
-        lock().light -= 1;
+        let mut state = lock();
+        state.light -= 1;
+        let name = thread_name();
+        if let Some(at) = state.holders.iter().position(|holder| *holder == name) {
+            state.holders.remove(at);
+        }
+        state.epoch += 1;
+        drop(state);
         CHANGED.notify_all();
     }
 }

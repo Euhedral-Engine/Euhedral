@@ -223,8 +223,8 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
-      # The peak of a full engine run on the card is 22.1 GB (one engine at a time), and the host peak 9 GB.
-      ARBITER_ARGS: "--gpu shared:22.5 --mem 24G"
+      # A full engine run peaks at 22.1 GB on the card (one engine at a time) and reached 24 GB of host memory.
+      ARBITER_ARGS: "--gpu shared:22.5 --mem 32G"
       ARBITER_EST: "1500"
       APT_OPTS: "-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true"
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}

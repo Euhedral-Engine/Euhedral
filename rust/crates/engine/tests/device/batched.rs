@@ -34,7 +34,7 @@ use std::mem;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use euhedral_core::control_plane::ControlPlaneLattice;
@@ -199,17 +199,20 @@ fn load_model(artifact: &mut Artifact, library: &Arc<CudaLibrary>) -> Model {
     }
 }
 
-/// The reduced model, loaded once for the tests of this binary: its weights are read-only, so every test's world
-/// reads the same buffers (each test still owns its library, lanes, lattice and workspace). It is never freed.
-fn shared_model() -> Option<&'static Model> {
-    static SHARED: OnceLock<Option<Model>> = OnceLock::new();
-    SHARED
-        .get_or_init(|| {
-            let library = library()?;
-            let mut artifact = Artifact::open()?;
-            Some(load_model(&mut artifact, &library))
-        })
-        .as_ref()
+/// The reduced model, loaded for the tests running now: its weights are read-only, so the worlds that exist together
+/// read the same buffers (each test still owns its library, lanes, lattice and workspace). The last world to end frees
+/// them, so the engines of the other tests find the card empty.
+fn shared_model() -> Option<Arc<Model>> {
+    static SHARED: Mutex<Weak<Model>> = Mutex::new(Weak::new());
+    let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(model) = shared.upgrade() {
+        return Some(model);
+    }
+    let library = library()?;
+    let mut artifact = Artifact::open()?;
+    let model = Arc::new(load_model(&mut artifact, &library));
+    *shared = Arc::downgrade(&model);
+    Some(model)
 }
 
 /// A lattice, the lanes and the plan: what a test's quanta run on.
@@ -229,6 +232,8 @@ struct World {
     lattice: Arc<ControlPlaneLattice>,
     lake: Arc<Lake>,
     unit: Option<UnitGuard>,
+    /// The weights the plan addresses: the last world to end frees them.
+    _model: Arc<Model>,
 }
 
 impl World {
@@ -292,6 +297,7 @@ impl World {
         let workspace = Arc::new(Workspace::allocate(&library, &config, rows, &regions).unwrap());
         let unit = lake.admit().unwrap();
         Some(World {
+            _model: model,
             pinned: PinnedPool::new(&library, 64 << 20),
             released: Arc::new(ReleasedBuffers::new()),
             library,

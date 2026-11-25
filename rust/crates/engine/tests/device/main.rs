@@ -6,6 +6,10 @@
     clippy::disallowed_methods,
     reason = "no-wait, waiting calls: a test synchronizes a lane to read results"
 )]
+#![allow(
+    clippy::disallowed_types,
+    reason = "the reduced model of the rig tests is shared under a lock of the test harness, no engine state"
+)]
 
 #[path = "../common/mod.rs"]
 mod common;
