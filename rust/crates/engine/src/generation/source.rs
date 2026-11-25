@@ -473,6 +473,21 @@ impl Mode {
     }
 }
 
+/// Why a request that asks for its hidden states is refused: it speculates (its drafts' rows are not the rows of the
+/// tokens it commits), or the artifact has no draft layer whose state the rows come from.
+fn hidden_refusal(hidden: bool, speculation: &Speculation, drafts: bool) -> Option<AdmissionError> {
+    if !hidden {
+        return None;
+    }
+    if !matches!(speculation, Speculation::Off) {
+        return Some(AdmissionError::HiddenWithSpeculation);
+    }
+    if !drafts {
+        return Some(AdmissionError::HiddenUnavailable);
+    }
+    None
+}
+
 /// `count` samplers of `config` for rows of `vocabulary` logits, all made when the request begins.
 fn samplers(config: SamplingConfig, vocabulary: usize, count: usize) -> Result<Vec<TokenSampler>, SamplingError> {
     (0..count).map(|_| TokenSampler::new(config, vocabulary)).collect()
@@ -897,15 +912,8 @@ impl Owner {
             Ok(units) => units,
             Err(error) => return Err(Rejected::new(error, Audience::Greedy(listener))),
         };
-        if hidden.is_some() {
-            if !matches!(speculation, Speculation::Off) {
-                let error = AdmissionError::HiddenWithSpeculation;
-                return Err(Rejected::new(error, Audience::Greedy(listener)));
-            }
-            if self.shared.drafts.is_none() {
-                let error = AdmissionError::HiddenUnavailable;
-                return Err(Rejected::new(error, Audience::Greedy(listener)));
-            }
+        if let Some(error) = hidden_refusal(hidden.is_some(), &speculation, self.shared.drafts.is_some()) {
+            return Err(Rejected::new(error, Audience::Greedy(listener)));
         }
         let mode = match speculation {
             // The host selects the tokens: its drafts, if it speculates, stay greedy.
@@ -2636,6 +2644,20 @@ mod routing_tests {
             hash(step_frame(2, || {})),
             hash(step_frame(2, || {})),
             "one sequence keeps its chain"
+        );
+    }
+
+    #[test]
+    fn hidden_states_are_refused_with_speculation_or_without_a_draft_layer() {
+        assert_eq!(hidden_refusal(false, &Speculation::Artifact, false), None);
+        assert_eq!(hidden_refusal(true, &Speculation::Off, true), None);
+        assert_eq!(
+            hidden_refusal(true, &Speculation::Artifact, true),
+            Some(AdmissionError::HiddenWithSpeculation)
+        );
+        assert_eq!(
+            hidden_refusal(true, &Speculation::Off, false),
+            Some(AdmissionError::HiddenUnavailable)
         );
     }
 }
