@@ -5,11 +5,15 @@ module(
     version = "0.0.0",
 )
 
-# The euhedral_build module (the shared platforms and tags) is a copy of forge's build/module, loaded through a local path
-# until the private registry (C5) is reachable from every runner; bazel/ is in .bazelignore, so its files are not packages
-# of this module. It is a dev dependency (used only for the Windows platform label of this repository's own CI), so a module
-# that takes this one ignores it and its path override.
-bazel_dep(name = "euhedral_build", version = "0.1.0", dev_dependency = True)
+# The euhedral_build module (the shared platforms and tags) is the published version of forge's build/module (forge
+# build/CONTRACTS.md C5). The Windows leg of CI runs on GitHub and cannot reach the private registry, so the root also
+# takes a byte-identical copy of that version's archive from bazel/ (a root-only override: a module that takes this one
+# ignores it). The container job `registry-copy` of .gitea/workflows/bazel.yaml fails when the copy differs from the
+# archive in /registry. To move to a newer version: change the version here, replace bazel/euhedral_build with the new
+# archive's contents (`tar -xzf <registry>/modules/euhedral_build/<version>/source.tar.gz -C bazel`) and run
+# `bazel mod deps --lockfile_mode=update`. bazel/ is in .bazelignore, so its files are not packages of this module. It is
+# a dev dependency (used only for the Windows platform label of this repository's own CI).
+bazel_dep(name = "euhedral_build", version = "0.0.0-20261125015307", dev_dependency = True)
 local_path_override(
     module_name = "euhedral_build",
     path = "bazel/euhedral_build",
