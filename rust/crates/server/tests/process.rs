@@ -283,6 +283,30 @@ fn a_stop_by_signal_interrupts_a_running_request_and_refuses_the_queued_one() {
     assert!(running.contains("interrupted by server shutdown"), "{running}");
 }
 
+/// RustEE logs through its own `log` dependency: the record only arrives when the whole build links one copy of the crate,
+/// the one the server installed its logger on.
+#[cfg(unix)]
+#[test]
+fn the_log_carries_the_records_of_the_runtime_beside_the_servers() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let (mut server, _) = serving_on(directory.path(), "hello", &[], Stdio::piped());
+    signal(&server, "TERM");
+    assert_eq!(exit_code(&mut server, PATIENCE), 143);
+    let mut log = String::new();
+    server
+        .0
+        .stdout
+        .take()
+        .expect("a piped stdout")
+        .read_to_string(&mut log)
+        .expect("the log");
+    assert!(log.contains("Started in"), "the server's own record is missing: {log}");
+    assert!(
+        log.contains("startup complete"),
+        "the runtime's record is missing: {log}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_stop_by_signal_still_ends_in_order_when_the_standard_output_is_closed() {

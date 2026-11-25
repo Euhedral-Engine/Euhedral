@@ -66,3 +66,8 @@ crate.from_cargo(
     ],
 )
 use_repo(crate, "euhedral_crates")
+
+# RustEE's build files name their third-party crates as @crates//:X. Pointing that hub at this one makes the whole build link one
+# copy of each crate (one `log`, so RustEE's records reach the server's logger). The hub exposes only direct dependencies of a
+# workspace member: crates/hub-deps lists the ones RustEE names that nothing else here depends on directly.
+override_repo(crate, crates = "euhedral_crates")

@@ -82,6 +82,8 @@ rust_test(
         "//rust/crates/engine:Cargo.toml",
         "//rust/crates/host-gemv:BUILD.bazel",
         "//rust/crates/host-gemv:Cargo.toml",
+        "//rust/crates/hub-deps:BUILD.bazel",
+        "//rust/crates/hub-deps:Cargo.toml",
         "//rust/crates/quantization:BUILD.bazel",
         "//rust/crates/quantization:Cargo.toml",
         "//rust/crates/quantize:BUILD.bazel",
