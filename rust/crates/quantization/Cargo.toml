@@ -6,6 +6,11 @@ publish.workspace = true
 rust-version.workspace = true
 version = "0.1.0"
 
+[features]
+# `test-hooks`: calls on a lane that tests use to reach paths a healthy driver does not take (a failed arming of a
+# retirement). Not for production code.
+test-hooks = []
+
 [dependencies]
 crc32fast.workspace = true
 euhedral-core.workspace = true
@@ -20,6 +25,7 @@ euhedral-inference-engine = { path = "../engine" }
 euhedral-inference-settings = { path = "../settings" }
 euhedral-inference-tokenizer = { path = "../tokenizer" }
 euhedral-io.workspace = true
+euhedral-memory.workspace = true
 same-file.workspace = true
 serde_json = { workspace = true }
 sha2.workspace = true
@@ -27,6 +33,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 euhedral-inference-edrl = { path = "../edrl", features = ["test-util"] }
+euhedral-inference-quantization = { path = ".", features = ["test-hooks"] }
 euhedral-gpu = { workspace = true, features = ["fake"] }
 tempfile.workspace = true
 test-support = { path = "../test-support" }
