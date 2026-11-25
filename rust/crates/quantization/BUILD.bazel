@@ -1398,6 +1398,7 @@ rust_test(
         "@euhedral_crates//:crc32fast",
         "@euhedral_crates//:same-file",
         "@euhedral_crates//:serde_json",
+        "@euhedral_crates//:sha2",
         "@euhedral_crates//:tempfile",
         "@euhedral_crates//:thiserror",
         "@euhedral_rustee//euhedral-core:euhedral_core_cuda_testing",
