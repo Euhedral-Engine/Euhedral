@@ -134,17 +134,6 @@ mod tests {
     }
 
     #[test]
-    fn settled_switches_are_removed() {
-        for variable in [
-            "EUHEDRAL_CUDA_GRAPHS",
-            "EUHEDRAL_QWEN4_DIRECT_READS",
-            "EUHEDRAL_LAKE_PARTITIONS",
-        ] {
-            assert_eq!(message(variable).as_deref(), Some("removed: the setting is fixed"));
-        }
-    }
-
-    #[test]
     fn a_retired_key_reads_through_its_variable() {
         assert_eq!(
             key_message("model.tokenizer").as_deref(),

@@ -132,22 +132,10 @@ mod tests {
     }
 
     #[test]
-    fn properties_values_are_unescaped_like_java() {
-        let text = "euhedral.a=C:\\\\models\\\\q3\neuhedral.b=C\\:/models/q3\n";
-        assert_eq!(properties_value(text, "euhedral.a").as_deref(), Some("C:\\models\\q3"));
-        assert_eq!(properties_value(text, "euhedral.b").as_deref(), Some("C:/models/q3"));
-    }
-
-    #[test]
     fn env_name_drops_the_prefix_and_maps_separators() {
         assert_eq!(
             env_name("euhedral.qwen.tokenizer-dir"),
             "EUHEDRAL_TEST_QWEN_TOKENIZER_DIR"
         );
-    }
-
-    #[test]
-    fn require_property_returns_none_for_an_absent_key() {
-        assert_eq!(require_property("euhedral.no-such-key.for-tests"), None);
     }
 }

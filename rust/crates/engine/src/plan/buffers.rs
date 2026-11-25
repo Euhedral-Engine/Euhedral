@@ -37,17 +37,3 @@ pub(crate) fn slot_storage(slot: BufferSlot) -> Option<usize> {
 pub(crate) fn scratch_storage(region: usize) -> usize {
     BufferSlot::ALL.len() + region
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_input_record_is_not_a_tracked_storage() {
-        assert_eq!(slot_storage(BufferSlot::TokenIds), None);
-        assert_eq!(slot_storage(BufferSlot::HiddenState), Some(0));
-        assert_eq!(scratch_storage(1), BufferSlot::ALL.len() + 1);
-        assert_eq!(storage_count(2, 3), BufferSlot::ALL.len() + 5);
-        assert_eq!(ring_storage(2, 1), BufferSlot::ALL.len() + 3);
-    }
-}

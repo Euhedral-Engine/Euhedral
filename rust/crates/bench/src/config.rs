@@ -8,18 +8,21 @@
 //! A file that asks for something this engine does not do is refused with the reason, never run with the request
 //! dropped, because the two engines' rows would then measure different work:
 //! - `prefixCacheBytes` above 0: the engine always prefills the whole prompt;
-//! - `cpus` other than `all`, or any `excludeCpus` / `excludeCores`: the engine uses every processor and never restricts
-//!   its workers;
+//!
+//! `cpus` and `excludeCpus` / `excludeCores` select the processors the engine's workers may use; they are resolved
+//! against the host's topology (see [`crate::cpus`]) and passed as `host.cpus`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use euhedral_inference_engine::sampling::{SamplingConfig, SamplingError};
+use euhedral_inference_quantization::rows::RowsError;
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::cpus::{CpuSelection, CpuTopology, ResolvedCpus};
 use crate::prompt::PromptCorpus;
 use crate::prompt::words::DEFAULT_SEED;
 use crate::result::civil;
@@ -37,6 +40,12 @@ pub const PREFIX_TAIL_TOKENS: usize = 16;
 pub enum ConfigError {
     #[error("{0}")]
     Invalid(String),
+}
+
+impl From<RowsError> for ConfigError {
+    fn from(error: RowsError) -> Self {
+        ConfigError::Invalid(error.to_string())
+    }
 }
 
 fn invalid<T>(message: impl Into<String>) -> Result<T, ConfigError> {
@@ -271,6 +280,10 @@ pub struct Options {
     pub speculation: SpeculationMode,
     /// A settings file (`euhedral.yaml`) the engine's tuning is read from; the fields above choose the model and context.
     pub engine_config: Option<PathBuf>,
+    /// The worker CPUs the run selects (`cpus`), before the exclusions; see [`Options::worker_cpus`].
+    pub cpus: CpuSelection,
+    pub exclude_cpus: Vec<u32>,
+    pub exclude_cores: Vec<u32>,
 }
 
 #[derive(Deserialize)]
@@ -367,25 +380,19 @@ impl Options {
                  on at the size of the engine settings",
             );
         }
-        let cpus = raw.cpus.as_deref().map_or("all", str::trim);
-        if cpus.is_empty() {
+        let cpus_text = raw.cpus.as_deref().map_or("all", str::trim);
+        if cpus_text.is_empty() {
             return invalid("cpus must not be blank");
         }
-        if cpus != "all" {
-            return invalid(format!(
-                "cpus must be \"all\" (got \"{cpus}\"): the Rust engine uses every processor and never restricts its workers"
-            ));
-        }
-        for (name, ids) in [("excludeCpus", &raw.exclude_cpus), ("excludeCores", &raw.exclude_cores)] {
-            if ids.iter().flatten().any(|id| *id < 0) {
-                return invalid(format!("{name} must not be negative"));
-            }
-            if ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
-                return invalid(format!(
-                    "{name} must be empty: the Rust engine uses every processor and never restricts its workers"
-                ));
-            }
-        }
+        let cpus = CpuSelection::parse(cpus_text)?;
+        let ids = |name: &str, ids: &Option<Vec<i64>>| -> Result<Vec<u32>, ConfigError> {
+            ids.iter()
+                .flatten()
+                .map(|id| u32::try_from(*id).or_else(|_| invalid(format!("{name} must not be negative"))))
+                .collect()
+        };
+        let exclude_cpus = ids("excludeCpus", &raw.exclude_cpus)?;
+        let exclude_cores = ids("excludeCores", &raw.exclude_cores)?;
         let scenarios = match &raw.scenarios {
             None => Scenario::default_suite(),
             Some(specs) => specs
@@ -458,7 +465,16 @@ impl Options {
             prompt_corpus,
             speculation,
             engine_config: raw.engine_config,
+            cpus,
+            exclude_cpus,
+            exclude_cores,
         })
+    }
+
+    /// The worker CPUs the run asks for on `topology`: the selection less the exclusions (all the available CPUs for
+    /// `all`). Rejects an empty result and a CPU the process may not use.
+    pub fn worker_cpus(&self, topology: &CpuTopology) -> Result<ResolvedCpus, ConfigError> {
+        topology.resolve(&self.cpus, &self.exclude_cpus, &self.exclude_cores)
     }
 
     /// Whether the run needs the engine's prefix cache: it has prefix scenarios (and then only those). The cache is

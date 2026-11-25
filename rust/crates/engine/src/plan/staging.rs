@@ -141,6 +141,7 @@ pub(super) fn staged(
                 input,
                 output,
                 rows,
+                swiglu,
             } = &node.make
             else {
                 unreachable!("a staged use is a linear");
@@ -156,6 +157,7 @@ pub(super) fn staged(
                     input: *input,
                     output: *output,
                     rows: *rows,
+                    swiglu: *swiglu,
                 }),
             }
         } else {

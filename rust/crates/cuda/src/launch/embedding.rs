@@ -87,12 +87,12 @@ const P2E2_SLICE: u32 = 1024;
 /// `EUHEDRAL_Q3_P2E2_PAD_WORDS`, `q3_p2e2_geometry.h`.
 const P2E2_PAD_WORDS: u64 = 80;
 
-const fn align256(value: u64) -> u64 {
+pub(crate) const fn align256(value: u64) -> u64 {
     (value + 255) & !255u64
 }
 
 /// `euhedral_q3_p2e2_geometry`, `q3_p2e2_geometry.h`: a byte size is valid between an empty and a full payload.
-fn p2e2_geometry(rows: u32, in_features: u32, byte_size: u64) -> Result<(), PlanError> {
+pub(crate) fn p2e2_geometry(rows: u32, in_features: u32, byte_size: u64) -> Result<(), PlanError> {
     if rows == 0 || in_features == 0 {
         return Err(PlanError::InvalidArgument);
     }

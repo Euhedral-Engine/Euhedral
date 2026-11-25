@@ -8,7 +8,8 @@
 
 mod common;
 
-use common::{config, rco_table, settings};
+use common::{config, q3_table, rco_table, settings};
+use euhedral_inference_edrl::WeightLayout;
 use euhedral_inference_engine::residency::loader::{Check, Piece, Ring, Target, check_piece, pieces};
 use euhedral_inference_engine::residency::offload::{EMBEDDING, HOST_ALIGNMENT, OUTPUT_HEAD};
 use euhedral_inference_engine::residency::planner::{PlanInputs, ResidencyPlan, Tier, nvfp4, plan, plan_with};
@@ -338,4 +339,30 @@ fn an_all_device_plans_pieces_are_all_device_pieces_at_the_arena_offsets() {
         let placement = &plan.device[piece.placement];
         assert!(piece.arena_offset() >= placement.offset);
     }
+}
+
+#[test]
+fn the_pieces_of_a_p2e2_tensor_carry_its_check_from_their_offset_in_it() {
+    let plan = plan(&config(), &q3_table(true), &settings(8192), 16 * GIB).unwrap();
+    let all = pieces(&plan, 4 * MIB);
+    let mut checked = 0;
+    for (index, placement) in plan.device.iter().enumerate() {
+        let mine: Vec<&Piece> = all.iter().filter(|piece| piece.placement == index).collect();
+        for piece in mine {
+            match piece.check {
+                Check::P2e2 { from, rows, k, bytes } => {
+                    checked += 1;
+                    assert_eq!(from, piece.file_offset - placement.file_offset, "{}", placement.name);
+                    assert_eq!(bytes, placement.bytes, "{}", placement.name);
+                    assert_eq!([rows, k].as_slice(), placement.shape.as_slice(), "{}", placement.name);
+                }
+                other => assert!(
+                    !matches!(placement.layout, WeightLayout::RowSplitP2e2V1),
+                    "{}: {other:?}",
+                    placement.name
+                ),
+            }
+        }
+    }
+    assert!(checked > 100, "{checked} pieces are checked");
 }

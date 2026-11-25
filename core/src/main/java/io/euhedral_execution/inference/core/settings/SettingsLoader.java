@@ -364,6 +364,9 @@ public final class SettingsLoader {
         // Read by the Rust engine, which sizes its lattice's batches with it; this engine checks the value and does not
         // use it.
         m.put("host.max-batch-size", optional(integer(1, Integer.MAX_VALUE)));
+        // Read by the Rust quantization tools, which copy a file in pieces of this size; this engine checks the value
+        // and does not use it.
+        m.put("host.copy-chunk-bytes", fixed(size(1)));
 
         m.put("kernels.rms-norm-decode-slices", optional(integer(1, KernelSettings.MAX_RMS_NORM_DECODE_SLICES)));
         m.put("kernels.fused-verify-from", optional(SettingsLoader::fusedVerifyFrom));

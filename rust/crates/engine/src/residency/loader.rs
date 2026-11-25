@@ -38,6 +38,7 @@ use euhedral_io::{IoDoneOwned, OwnedFile};
 
 use crate::error::EngineError;
 use crate::frames::{Kind, step};
+use crate::residency::p2e2::{P2e2Geometry, P2e2Validation};
 use crate::residency::planner::{Placement, PlacementSource, ResidencyPlan, Tier, nvfp4};
 use crate::runtime::{Core, raw_file};
 use crate::stages::SubmitError;
@@ -52,6 +53,10 @@ pub enum Check {
     /// An NVFP4 trailer: for an SD4 layout the 16-entry scale table (no NaN), then the global scale, a finite
     /// non-negative little-endian FP32.
     Nvfp4Trailer { sd4: bool },
+    /// A piece of a P2E2 tensor of `rows` rows of `k` codes in `bytes` bytes, starting `from` bytes into it. The
+    /// tensor's check needs all its pieces (see [`P2e2Validation`]): the pieces' scans are put together as they land
+    /// and the last one's verdict is the tensor's.
+    P2e2 { from: u64, rows: u64, k: u64, bytes: u64 },
 }
 
 /// Where a piece's bytes go.
@@ -107,6 +112,12 @@ pub fn pieces(plan: &ResidencyPlan, piece_bytes: u64) -> Vec<Piece> {
                 let len = (copy.len - done).min(piece_bytes);
                 let check = match copy.check {
                     Check::Nvfp4Scales { from } => Check::Nvfp4Scales { from: from + done },
+                    Check::P2e2 { from, rows, k, bytes } => Check::P2e2 {
+                        from: from + done,
+                        rows,
+                        k,
+                        bytes,
+                    },
                     other => other,
                 };
                 out.push(Piece {
@@ -218,18 +229,39 @@ fn copies(placement: &Placement) -> Vec<Copy> {
 }
 
 fn whole(placement: &Placement) -> Vec<Copy> {
+    let check = match (
+        placement.format,
+        placement.layout,
+        placement.shape.as_slice(),
+        &placement.source,
+    ) {
+        (WeightFormat::Q3G64Fp16, WeightLayout::RowSplitP2e2V1, [rows, k], PlacementSource::Object) => Check::P2e2 {
+            from: 0,
+            rows: *rows,
+            k: *k,
+            bytes: placement.bytes,
+        },
+        _ => Check::None,
+    };
     vec![Copy {
         file_offset: placement.file_offset,
         arena_offset: 0,
         len: placement.bytes,
-        check: Check::None,
+        check,
     }]
 }
 
-/// Applies `check` to a piece's bytes.
+/// Applies `check` to a piece's bytes. What needs the tensor's other pieces is left to the load's
+/// [`P2e2Validation`] of the tensor: here a P2E2 piece is only read as words of a tensor of its shape.
 pub fn check_piece(check: Check, bytes: &[u8]) -> Result<(), String> {
     match check {
         Check::None => Ok(()),
+        Check::P2e2 {
+            from,
+            rows,
+            k,
+            bytes: size,
+        } => P2e2Geometry::new(rows, k, size)?.scan(from, bytes).map(drop),
         Check::Nvfp4Scales { from } => match bytes.iter().position(|byte| byte & 0x7f == 0x7f) {
             Some(at) => Err(format!("NVFP4 block scale at byte {} is NaN", from + at as u64)),
             None => Ok(()),
@@ -333,12 +365,36 @@ struct Shared {
     pinned_at_start: u64,
     arena: Option<DeviceBuffer>,
     done: Option<Done>,
+    /// The P2E2 tensors being checked, by placement: built before the first piece is read, so that no piece waits for
+    /// another to make it.
+    p2e2: Box<[Option<P2e2Validation>]>,
 }
 
 impl Shared {
     fn fail(&self, error: EngineError) {
         self.failed.store(true, Ordering::Release);
         let _ = self.error.set(error);
+    }
+
+    /// Checks a piece's bytes: its own, and for a P2E2 tensor the tensor's once the piece is the last to land.
+    fn verify(&self, piece: Piece, bytes: &[u8]) -> Result<(), String> {
+        let Check::P2e2 {
+            from,
+            rows,
+            k,
+            bytes: size,
+        } = piece.check
+        else {
+            return check_piece(piece.check, bytes);
+        };
+        let geometry = P2e2Geometry::new(rows, k, size)?;
+        let scan = geometry.scan(from, bytes)?;
+        let validation = self
+            .p2e2
+            .get(piece.placement)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| format!("no P2E2 check was made ready for placement {}", piece.placement))?;
+        validation.absorb(scan)
     }
 
     fn has_failed(&self) -> bool {
@@ -369,6 +425,22 @@ impl Drop for Shared {
     }
 }
 
+/// The checks of the P2E2 tensors among `pieces`, by placement, each made once before any piece is read. A tensor
+/// whose shape and size do not fit has none: its pieces are refused for that when they are read.
+pub(crate) fn p2e2_validations(pieces: &[Piece]) -> Box<[Option<P2e2Validation>]> {
+    let placements = pieces.iter().map(|piece| piece.placement + 1).max().unwrap_or(0);
+    let mut validations: Vec<Option<P2e2Validation>> = (0..placements).map(|_| None).collect();
+    for piece in pieces {
+        if let Check::P2e2 { rows, k, bytes, .. } = piece.check
+            && validations[piece.placement].is_none()
+            && let Ok(geometry) = P2e2Geometry::new(rows, k, bytes)
+        {
+            validations[piece.placement] = Some(P2e2Validation::new(geometry));
+        }
+    }
+    validations.into()
+}
+
 /// Acquires the ring before the upload starts: two loans of the ring's piece size for each chain. This is the only
 /// pinned allocation of the upload; once it runs, no chain asks the pool for memory. The waiting allocation is the
 /// startup's.
@@ -396,6 +468,7 @@ pub(crate) fn start(
     loans: Vec<PooledPinned>,
     done: impl FnOnce(LoadOutcome) + Send + Sync + 'static,
 ) {
+    let p2e2 = p2e2_validations(&pieces);
     let shared = Arc::new(Shared {
         core: Arc::clone(core),
         file,
@@ -412,6 +485,7 @@ pub(crate) fn start(
         arena: Some(arena),
         done: Some(Box::new(done)),
         pieces: pieces.into(),
+        p2e2,
     });
     let mut loans = loans.into_iter();
     for chain in 0..chains {
@@ -512,7 +586,7 @@ fn in_place_done(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPi
     }
     let host = Arc::clone(&shared.core);
     let frame = step(Kind::UploadCheck, chain, move || {
-        match check_piece(piece.check, range.as_slice()) {
+        match shared.verify(piece, range.as_slice()) {
             Ok(()) => finish(shared, loan),
             Err(reason) => {
                 let name = shared.names[piece.placement].clone();
@@ -567,7 +641,7 @@ fn read_done(shared: Arc<Shared>, chain: usize, index: usize, done: IoDoneOwned<
     let host = Arc::clone(&shared.core);
     let frame = step(Kind::UploadCheck, chain, move || {
         let bytes = &loan.buffer().as_slice()[..piece.len];
-        match check_piece(piece.check, bytes) {
+        match shared.verify(piece, bytes) {
             Ok(()) => copy(shared, chain, index, loan),
             Err(reason) => {
                 let name = shared.names[piece.placement].clone();
@@ -820,5 +894,48 @@ mod tests {
         });
         assert_eq!(offered.load(Ordering::Acquire), 1, "offered once");
         assert_eq!(completions.pending(), 0);
+    }
+
+    fn piece(placement: usize, from: u64, check: impl Fn(u64) -> Check) -> Piece {
+        Piece {
+            file_offset: from,
+            len: 4096,
+            target: Target::Device { arena_offset: from },
+            check: check(from),
+            placement,
+        }
+    }
+
+    #[test]
+    fn the_checks_of_the_p2e2_tensors_exist_before_any_piece_is_read() {
+        let bytes = (1024..)
+            .step_by(4)
+            .find(|bytes| P2e2Geometry::new(2, 1024, *bytes).is_ok())
+            .unwrap();
+        let compressed = |from| Check::P2e2 {
+            from,
+            rows: 2,
+            k: 1024,
+            bytes,
+        };
+        let pieces = [
+            piece(0, 0, |_| Check::None),
+            piece(1, 0, compressed),
+            piece(1, 4096, compressed),
+            piece(1, 8192, compressed),
+            // A tensor whose size does not fit its shape has no check: its pieces are refused when they are read.
+            piece(2, 0, |from| Check::P2e2 {
+                from,
+                rows: 2,
+                k: 1024,
+                bytes: 7,
+            }),
+        ];
+        let validations = p2e2_validations(&pieces);
+        assert_eq!(validations.len(), 3);
+        assert!(validations[0].is_none());
+        assert!(validations[1].is_some());
+        assert!(validations[2].is_none());
+        assert!(p2e2_validations(&[]).is_empty());
     }
 }
