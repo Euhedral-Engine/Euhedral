@@ -186,6 +186,30 @@ impl Safetensors {
         )
     }
 
+    /// Opens the safetensors files `names` of `directory` as one checkpoint, with no index: each file's header is
+    /// read, and `then` gets the checkpoint. A tensor that two files hold belongs to the later one. `Err` started
+    /// nothing.
+    pub fn open_files(
+        io: &Arc<AsyncIo>,
+        directory: &Path,
+        names: Vec<String>,
+        then: Done<Safetensors>,
+    ) -> Result<(), CheckpointError> {
+        if names.is_empty() {
+            return Err(CheckpointError::Invalid("no files to open".to_owned()));
+        }
+        Opening {
+            io: Arc::clone(io),
+            directory: directory.to_path_buf(),
+            queue: names.into(),
+            shards: Vec::new(),
+            tensors: HashMap::new(),
+            then,
+        }
+        .advance();
+        Ok(())
+    }
+
     /// The `AsyncIo` that opened the shards, which every read goes through.
     pub fn io(&self) -> &Arc<AsyncIo> {
         &self.io
