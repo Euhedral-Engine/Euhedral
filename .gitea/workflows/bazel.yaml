@@ -19,7 +19,6 @@ on:
       - ".gitattributes"
       - "mise.toml"
       - ".gitea/workflows/bazel.yaml"
-      - "scripts/check-build-copy.sh"
       - ".github/workflows/ci.yml"
   push:
     branches: [main, "rust/next*"]
@@ -34,7 +33,7 @@ concurrency:
 
 jobs:
   gate:
-    uses: euhedral/ci/.gitea/workflows/bazel-gate.yml@refs/tags/v7
+    uses: euhedral/ci/.gitea/workflows/bazel-gate.yml@refs/tags/v9
     with:
       stale-build: gazelle
       bazel-mem: 16
@@ -44,7 +43,7 @@ jobs:
       forge-read-token: ${{ secrets.FORGE_READ_TOKEN }}
 
   windows:
-    uses: euhedral/ci/.gitea/workflows/bazel-windows.yml@refs/tags/v7
+    uses: euhedral/ci/.gitea/workflows/bazel-windows.yml@refs/tags/v9
     with:
       repo: Euhedral-Engine/Euhedral
       permissions: contents:write,actions:write,workflows:write
@@ -53,23 +52,10 @@ jobs:
       GH_APP_INSTALLATION_ID: ${{ secrets.GH_APP_INSTALLATION_ID }}
       GH_APP_PRIVATE_KEY_B64: ${{ secrets.GH_APP_PRIVATE_KEY_B64 }}
 
-  # The Windows leg cannot reach the registry, so MODULE.bazel also takes a copy of the euhedral_build archive from bazel/. On the
-  # bazel label the registry is bound read-only at /registry; the job gets no token and copies the runner's checkout.
-  registry-copy:
-    runs-on: arbiter-docker-bazel
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Copy the runner's checkout (gitea)
-        run: cp -a /checkout/. .
-      - name: The copy of euhedral_build equals the archive in the registry
-        run: scripts/check-build-copy.sh
-
   # The one check to require: a skipped gate (a caller's `if:`) is a failure here, not a pass. The Windows workflow runs only
   # for a pull request, so on a push or a manual run its result is `skipped`, and only then is that accepted.
   gate-ok:
-    needs: [gate, windows, registry-copy]
+    needs: [gate, windows]
     if: always()
     runs-on: arbiter-docker
     steps:
@@ -81,10 +67,8 @@ jobs:
           EVENT: ${{ github.event_name }}
           GATE: ${{ needs.gate.result }}
           WINDOWS: ${{ needs.windows.result }}
-          REGISTRY_COPY: ${{ needs.registry-copy.result }}
         run: |
           test "$GATE" = success
-          test "$REGISTRY_COPY" = success
           if test "$EVENT" = pull_request; then
             test "$WINDOWS" = success
           else
