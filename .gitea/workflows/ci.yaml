@@ -157,7 +157,7 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     runs-on: arbiter-docker-unconfined
     env:
-      ARBITER_ARGS: "--mem 32G"
+      ARBITER_ARGS: "--mem 12G"
       ARBITER_EST: "1800"
       # apt waits forever on a stalled mirror; bound each request and retry it.
       APT_OPTS: "-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true"
@@ -217,7 +217,7 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     runs-on: arbiter-docker-unconfined
     env:
-      ARBITER_ARGS: "--mem 32G"
+      ARBITER_ARGS: "--mem 12G"
       ARBITER_EST: "1800"
       APT_OPTS: "-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true"
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
