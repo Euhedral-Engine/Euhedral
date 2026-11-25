@@ -56,9 +56,9 @@ use crate::workspace::{input_records, input_records_for};
 pub use acceptance::{Accepted, accept, accept_tokens};
 pub use constraint::{ConstraintError, ReasoningConstraint, TokenConstraint};
 pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
-pub use hidden::HiddenSink;
 #[cfg(feature = "test-oracles")]
 use euhedral_gpu::GraphStats;
+pub use hidden::HiddenSink;
 pub use listener::GenerationListener;
 pub(crate) use mailbox::OPERATION_BOUND;
 pub use mailbox::Spawn;
