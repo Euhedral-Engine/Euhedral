@@ -8,9 +8,12 @@
 //!
 //! Tiles are 16x16 weights in tensor-core element order ([`TENSOR_CORE_ORDER`]); every address is a device address.
 
+mod launch;
 mod plan;
+mod quantizer;
 mod rate;
 mod run;
+mod search;
 
 use euhedral_gpu::GpuError;
 use thiserror::Error;
@@ -20,8 +23,12 @@ pub use plan::{
     plan_hadamard_rows, plan_pack, plan_reconstruct, plan_sum_products, plan_tile_mean_square, plan_to_tiles,
     plan_viterbi,
 };
+pub use quantizer::{LaneParts, QuantizeError, Quantized, Refused, Request, TrellisLane, TrellisSettings};
 pub use rate::{Rate, TENSOR_CORE_ORDER, TILE_WEIGHTS};
 pub use run::TrellisKernels;
+pub use search::{CHOLESKY_RETRIES, SIGMA_REG};
+
+pub use crate::chain::{Finished, Scratch};
 
 pub use crate::kernels::{Step, StepError};
 

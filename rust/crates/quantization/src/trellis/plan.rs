@@ -26,7 +26,7 @@ pub(super) fn rate_kernel(kind: &str, rate: Rate) -> Result<&'static str, Trelli
         .ok_or(TrellisError::NoKernel(name))
 }
 
-fn step(kernel: &str, grid: Dim3, block: u32, args: Args) -> Result<Step, TrellisError> {
+pub(super) fn step(kernel: &str, grid: Dim3, block: u32, args: Args) -> Result<Step, TrellisError> {
     let launch = Launch {
         grid,
         block: Dim3::x(block),
@@ -36,7 +36,7 @@ fn step(kernel: &str, grid: Dim3, block: u32, args: Args) -> Result<Step, Trelli
     Step::new(Module::Trellis, kernel, launch, args).ok_or_else(|| TrellisError::NoKernel(kernel.to_owned()))
 }
 
-fn address(name: &'static str, value: u64) -> Result<u64, TrellisError> {
+pub(super) fn address(name: &'static str, value: u64) -> Result<u64, TrellisError> {
     if value == 0 {
         Err(TrellisError::NullAddress(name))
     } else {
@@ -45,7 +45,7 @@ fn address(name: &'static str, value: u64) -> Result<u64, TrellisError> {
 }
 
 /// `value` as the kernel's signed 32-bit parameter.
-fn int(name: &'static str, value: u32) -> Result<i32, TrellisError> {
+pub(super) fn int(name: &'static str, value: u32) -> Result<i32, TrellisError> {
     i32::try_from(value).map_err(|_| TrellisError::TooLarge {
         name,
         value: u64::from(value),
@@ -53,12 +53,12 @@ fn int(name: &'static str, value: u32) -> Result<i32, TrellisError> {
 }
 
 /// `value` as the kernel's signed 64-bit parameter.
-fn long(name: &'static str, value: u64) -> Result<i64, TrellisError> {
+pub(super) fn long(name: &'static str, value: u64) -> Result<i64, TrellisError> {
     i64::try_from(value).map_err(|_| TrellisError::TooLarge { name, value })
 }
 
 /// `value`, when it is a positive multiple of `unit`.
-fn multiple(name: &'static str, value: u32, unit: u32) -> Result<u32, TrellisError> {
+pub(super) fn multiple(name: &'static str, value: u32, unit: u32) -> Result<u32, TrellisError> {
     if value == 0 || !value.is_multiple_of(unit) {
         return Err(TrellisError::NotMultiple {
             name,
@@ -73,7 +73,7 @@ fn multiple(name: &'static str, value: u32, unit: u32) -> Result<u32, TrellisErr
 const MOST_GRID_ROWS: u32 = 65535;
 
 /// `blocks`, when a grid can be that tall.
-fn grid_rows(name: &'static str, blocks: u32) -> Result<u32, TrellisError> {
+pub(super) fn grid_rows(name: &'static str, blocks: u32) -> Result<u32, TrellisError> {
     if blocks > MOST_GRID_ROWS {
         return Err(TrellisError::GridTooTall {
             name,
@@ -85,7 +85,7 @@ fn grid_rows(name: &'static str, blocks: u32) -> Result<u32, TrellisError> {
 }
 
 /// Blocks of an elementwise launch over `count` values, 256 threads each.
-fn elementwise(count: u64) -> u32 {
+pub(super) fn elementwise(count: u64) -> u32 {
     count.div_ceil(256).clamp(1, MOST_ELEMENTWISE_BLOCKS) as u32
 }
 
