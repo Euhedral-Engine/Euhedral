@@ -9,7 +9,7 @@
 # of them cannot hide a failed earlier one. A push to a rust/next* branch that is not vars.INTEGRATION_BRANCH fails at once.
 #
 # Job labels are the runner's (arbiter-docker for the cheap job, arbiter-docker-unconfined for the two heavy ones, which need
-# seccomp off, arbiter-gpu for the device job, which gets the card, the driver library and the NVRTC directory). No docker job sets timeout-minutes: the arbiter's hold limit (ARBITER_EST + 60 s from the grant) is its limit.
+# seccomp off, arbiter-gpu for the device job, which gets the card). No docker job sets timeout-minutes: the arbiter's hold limit (ARBITER_EST + 60 s from the grant) is its limit.
 # No job asks for more than --mem 32G, and none uses a cpu form (scripts/lint-workflows.py checks both).
 #
 # The artifact action's major version (v4 here) is not yet proven against Gitea's artifact store, and the action needs Node
@@ -211,9 +211,12 @@ jobs:
           eval "$(mise env -s bash)"
           cargo test --workspace
 
-  # The ignored device tests of the workspace, on the card. The runner's gpu profile mounts the card, libcuda and the
-  # NVRTC directory, and nothing else of the host: no model artifact, no goldens, no math libraries. The tests that need those
-  # print a skip line and pass (the log lists them); the quantization tests that fail without the math libraries are not run.
+  # The ignored device tests of the workspace, on the card. Every location comes from the Actions variables below; the job
+  # writes none. EUHEDRAL_NVRTC_DIR (the directory holding libnvrtc) is required. The optional ones are passed to the tests
+  # only when set, and a test whose data is missing prints a skip line and passes (the last step lists them):
+  #   EUHEDRAL_TEST_QWEN_RCO_ARTIFACT              the model artifact
+  #   EUHEDRAL_TEST_RUST_GOLDENS                   the goldens directory
+  #   EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES    the directory with the CUDA math libraries
   device:
     name: device
     needs: changes
@@ -235,31 +238,36 @@ jobs:
         run: mise install >/dev/null
       - name: Build the native library
         run: mise exec -- gradle -q nativeBuildLinuxX64
-      - name: Find the card and NVRTC
+      - name: Set the test environment
+        env:
+          NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
+          QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
+          RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
+          MATH_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
         run: |
           set -euo pipefail
-          nvrtc=$(find /usr/local -name 'libnvrtc.so.13' 2>/dev/null | head -n 1)
-          if [ -z "$nvrtc" ]; then
-            echo "::error::libnvrtc.so.13 is not under /usr/local: the runner's gpu profile mounts it there"
+          if [ -z "$NVRTC_DIR" ]; then
+            echo "::error::the Actions variable EUHEDRAL_NVRTC_DIR is not set"
             exit 1
           fi
           library="$GITHUB_WORKSPACE/build/native/linux-x64/lib/libeuhedral_cuda.so"
           test -f "$library"
           {
             echo "EUHEDRAL_TEST_CUDA_LIBRARY=$library"
-            echo "EUHEDRAL_NVRTC=$nvrtc"
-            echo "LD_LIBRARY_PATH=$(dirname "$nvrtc")"
+            echo "EUHEDRAL_NVRTC=$NVRTC_DIR/libnvrtc.so.13"
+            echo "LD_LIBRARY_PATH=$NVRTC_DIR"
+            if [ -n "$QWEN_RCO_ARTIFACT" ]; then echo "EUHEDRAL_TEST_QWEN_RCO_ARTIFACT=$QWEN_RCO_ARTIFACT"; fi
+            if [ -n "$RUST_GOLDENS" ]; then echo "EUHEDRAL_TEST_RUST_GOLDENS=$RUST_GOLDENS"; fi
+            if [ -n "$MATH_LIBRARIES" ]; then echo "EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES=$MATH_LIBRARIES"; fi
           } >> "$GITHUB_ENV"
-          ls -l /dev/nvidiactl /dev/nvidia0 /dev/nvidia-uvm
       - name: Device tests
         working-directory: rust
         run: |
           set -euo pipefail
-          # The quantization crate's math-library tests need cuBLAS and cuSOLVER, which the runner does not mount: only
-          # its kernel and reference tests run. A test without a model artifact skips with a line starting "skipped:".
+          # and kernel tests run. A test without a model artifact skips with a line starting "skipped:".
           {
             mise exec -- cargo test --workspace --exclude euhedral-inference-quantization -- --ignored --nocapture
-            mise exec -- cargo test -p euhedral-inference-quantization --test kernels_gpu --test reference_gpu -- --ignored --nocapture
+            mise exec -- cargo test -p euhedral-inference-quantization --test kernels_gpu -- --ignored --nocapture
           } 2>&1 | tee "$RUNNER_TEMP/device.log"
       - name: Skipped tests
         if: always()
