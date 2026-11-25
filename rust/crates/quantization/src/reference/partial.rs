@@ -194,7 +194,7 @@ impl Partial {
         );
     }
 
-    /// The size says whether the file is new (empty), a stopped run's (the whole size) or another's.
+    /// The size says whether the file is new (empty), a stopped run's (the whole size), a finished run's cut before its rename (no count) or another's.
     fn sized(opening: &Arc<Opening>, file: ResumeFile) {
         let (next, held) = (Arc::clone(opening), file.clone());
         on_file(
@@ -202,7 +202,7 @@ impl Partial {
                 Ok(size) => Self::inspect(&next, held, size),
                 Err(error) => next.end(Err(error)),
             }),
-            move |then| file.size(then),
+            move |then| file.len(then),
         );
     }
 
@@ -211,7 +211,9 @@ impl Partial {
         if size == 0 {
             Self::start(opening, file);
         } else if size == whole {
-            Self::compare(opening, file);
+            Self::compare(opening, file, false);
+        } else if size == whole - COUNT_BYTES as u64 {
+            Self::compare(opening, file, true);
         } else {
             opening.end(Err(ReferenceError::Mismatch(opening.out.display().to_string())));
         }
@@ -253,12 +255,17 @@ impl Partial {
         );
     }
 
-    /// A file of the right size: it must start with this run's header and tokens.
-    fn compare(opening: &Arc<Opening>, file: ResumeFile) {
+    /// A file of the right size: it must start with this run's header and tokens. A file without its count is one
+    /// whose sealing cut the count off and stopped before the rename: every chunk is complete.
+    fn compare(opening: &Arc<Opening>, file: ResumeFile, cut: bool) {
         let (next, held) = (Arc::clone(opening), file.clone());
         let length = opening.head.len();
         on_file(
             Box::new(move |found| match found {
+                Ok(found) if found == next.head && cut => {
+                    let chunks = next.layout.chunks();
+                    next.ready(held, chunks);
+                }
                 Ok(found) if found == next.head => Self::count(&next, held),
                 Ok(_) => next.end(Err(ReferenceError::Mismatch(next.out.display().to_string()))),
                 Err(error) => next.end(Err(error)),

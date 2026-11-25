@@ -246,20 +246,6 @@ impl ResumeFile {
             .on_host(durable::sync_and_close, &Slot::new(Box::new(barrier)))
     }
 
-    /// The length of the file in bytes.
-    pub fn size(&self, then: Then<u64>) -> Result<(), ResumeError> {
-        let (io, file) = (Arc::clone(&self.inner.io), raw(&self.inner.file));
-        let slot = Slot::new(then);
-        slot.submit(self.clone(), move |watch| {
-            let measured = move |len: io::Result<u64>| {
-                let (slot, held) = watch.take();
-                drop(held);
-                slot.finish(len.map_err(ResumeError::Io))
-            };
-            Ok(io.file_len(file, Box::new(measured))?)
-        })
-    }
-
     /// Writes `bytes` at `offset`; `then` is told the offset after them.
     pub fn write(&self, offset: u64, bytes: Vec<u8>, then: Then<u64>) -> Result<(), ResumeError> {
         self.clone().write_slot(offset, bytes, &Slot::new(then))

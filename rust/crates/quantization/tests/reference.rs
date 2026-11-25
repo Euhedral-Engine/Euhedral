@@ -356,3 +356,20 @@ fn stopping_before_the_end_at_the_last_chunk_still_finishes() {
     assert_eq!(fs::read(&out).unwrap(), expected(&tokens()));
     world.finish();
 }
+
+/// A run killed after the seal cut the count off and before the rename leaves a complete file without its count. The
+/// next run renames it and forces nothing, where a size check that only knows the whole size discards the work.
+#[test]
+fn a_file_sealed_but_not_renamed_is_renamed_without_forcing() {
+    let directory = tempfile::tempdir().unwrap();
+    let out = out_path(directory.path());
+    fs::write(partial_path(&out), expected(&tokens())).unwrap();
+    let world = World::start();
+    let fake = Fake::new();
+    let written = world.run(&fake, &out, tokens(), Options::default()).unwrap();
+    assert!(written.finished);
+    assert_eq!(fake.calls(), 0);
+    assert_eq!(fs::read(&out).unwrap(), expected(&tokens()));
+    assert!(!partial_path(&out).exists());
+    world.finish();
+}
