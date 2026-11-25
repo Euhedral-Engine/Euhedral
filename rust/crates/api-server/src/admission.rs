@@ -41,6 +41,7 @@ use euhedral_graph::Completions;
 use euhedral_inference_api_protocol::ApiError;
 
 use crate::backend::Backend;
+use crate::clock::{Clock, Timers};
 use crate::frames::once_or_refused;
 use crate::limits::Limits;
 
@@ -205,19 +206,21 @@ struct Rules {
 }
 
 impl Owner {
-    fn turn(&mut self, rules: Rules, max_active: usize, effects: &mut Vec<Effect>) {
+    fn turn(&mut self, rules: Rules, clock: &dyn Clock, max_active: usize, effects: &mut Vec<Effect>) {
         while let Some(command) = self.inbox.poll() {
             match command {
-                Command::Offer { id, entry, arrived } => self.offer(rules, max_active, id, entry, arrived, effects),
+                Command::Offer { id, entry, arrived } => {
+                    self.offer(rules, clock, max_active, id, entry, arrived, effects)
+                }
                 Command::Release(id) => self.running.retain(|running| running.id != id),
                 Command::Cancel(id) => self.cancel(id, effects),
-                Command::Stop(continuation) => self.stop(rules, continuation, effects),
+                Command::Stop(continuation) => self.stop(rules, clock, continuation, effects),
                 Command::Sweep => self.armed = None,
             }
         }
-        let now = Instant::now();
+        let now = clock.now();
         self.expire(rules, now, effects);
-        self.promote(max_active, effects);
+        self.promote(clock, max_active, effects);
         self.finish_stop(now, effects);
         self.arm(rules, effects);
     }
@@ -225,6 +228,7 @@ impl Owner {
     fn offer(
         &mut self,
         rules: Rules,
+        clock: &dyn Clock,
         max_active: usize,
         id: u64,
         entry: Arc<dyn Entry>,
@@ -235,7 +239,7 @@ impl Owner {
             return effects.push(Effect::Refuse(entry, ApiError::shutting_down()));
         }
         if self.running.len() < max_active && self.waiting.is_empty() {
-            return self.run(id, entry, arrived, effects);
+            return self.run(clock, id, entry, arrived, effects);
         }
         if self.waiting.len() < rules.max_queued {
             self.waiting.push_back(Queued { id, entry, arrived });
@@ -244,15 +248,11 @@ impl Owner {
         }
     }
 
-    fn run(&mut self, id: u64, entry: Arc<dyn Entry>, arrived: Instant, effects: &mut Vec<Effect>) {
+    fn run(&mut self, clock: &dyn Clock, id: u64, entry: Arc<dyn Entry>, arrived: Instant, effects: &mut Vec<Effect>) {
         self.running.push(Running {
             id,
             entry: entry.clone(),
-            arrived: if entry.limit_from_start() {
-                Instant::now()
-            } else {
-                arrived
-            },
+            arrived: if entry.limit_from_start() { clock.now() } else { arrived },
             interrupted: false,
             abandoned: false,
         });
@@ -273,7 +273,7 @@ impl Owner {
         }
     }
 
-    fn stop(&mut self, rules: Rules, continuation: Continuation, effects: &mut Vec<Effect>) {
+    fn stop(&mut self, rules: Rules, clock: &dyn Clock, continuation: Continuation, effects: &mut Vec<Effect>) {
         if let Some(stopping) = &mut self.stopping {
             if stopping.done {
                 effects.push(Effect::Stopped(vec![continuation]));
@@ -283,7 +283,7 @@ impl Owner {
             return;
         }
         self.stopping = Some(Stopping {
-            deadline: Instant::now().checked_add(rules.shutdown_limit),
+            deadline: clock.now().checked_add(rules.shutdown_limit),
             done: false,
             continuations: vec![continuation],
         });
@@ -321,7 +321,7 @@ impl Owner {
     }
 
     /// Starts waiting entries, in order, while slots are free.
-    fn promote(&mut self, max_active: usize, effects: &mut Vec<Effect>) {
+    fn promote(&mut self, clock: &dyn Clock, max_active: usize, effects: &mut Vec<Effect>) {
         if self.stopping.is_some() {
             return;
         }
@@ -329,7 +329,7 @@ impl Owner {
             let Some(queued) = self.waiting.pop_front() else {
                 return;
             };
-            self.run(queued.id, queued.entry, queued.arrived, effects);
+            self.run(clock, queued.id, queued.entry, queued.arrived, effects);
         }
     }
 
@@ -394,7 +394,7 @@ struct Shared {
     /// Weak: a frame queued in the sink holds this state, so a strong reference would be a cycle if the sink is
     /// detached with frames queued.
     sink: Weak<QueueIngestSink>,
-    timers: Arc<Completions>,
+    clock: Arc<dyn Clock>,
     inbox: Producer<Command, Multi>,
     owner: ClaimCell<Owner>,
     /// A command was posted that no turn has taken yet.
@@ -446,7 +446,12 @@ impl Shared {
             };
             self.pending.swap(false, Ordering::SeqCst);
             let mut effects = Vec::new();
-            claim.turn(self.rules, self.backend.max_active_generations().max(1), &mut effects);
+            claim.turn(
+                self.rules,
+                self.clock.as_ref(),
+                self.backend.max_active_generations().max(1),
+                &mut effects,
+            );
             self.active.store(claim.running.len(), Ordering::Release);
             self.waiting.store(claim.waiting.len(), Ordering::Release);
             // The claim goes back before `pending` is loaded and before anyone is told.
@@ -494,7 +499,7 @@ impl Shared {
             }),
             Effect::Arm(deadline) => {
                 let me = self.me.clone();
-                self.timers.at(
+                self.clock.at(
                     deadline,
                     once_or_refused(move |ran| {
                         if ran && let Some(shared) = me.upgrade() {
@@ -516,7 +521,7 @@ impl Drop for Shared {
                 owner.waiting.push_back(Queued {
                     id: 0,
                     entry,
-                    arrived: Instant::now(),
+                    arrived: self.clock.now(),
                 });
             }
         }
@@ -549,6 +554,16 @@ impl Admission {
         sink: Arc<QueueIngestSink>,
         timers: Arc<Completions>,
     ) -> Admission {
+        Admission::with_clock(backend, limits, sink, Arc::new(Timers::new(timers)))
+    }
+
+    /// As [`new`](Admission::new), on `clock`: the moments admission reads and the timers it arms are the clock's.
+    pub fn with_clock(
+        backend: Arc<dyn Backend>,
+        limits: &Limits,
+        sink: Arc<QueueIngestSink>,
+        clock: Arc<dyn Clock>,
+    ) -> Admission {
         let queue = MpscQueue::<Command>::new(COMMANDS_PER_CHUNK);
         let inbox = queue.producer();
         let owner = Owner {
@@ -567,7 +582,7 @@ impl Admission {
                 shutdown_limit: limits.shutdown_limit,
             },
             sink: Arc::downgrade(&sink),
-            timers,
+            clock,
             inbox,
             owner: ClaimCell::new(owner),
             pending: AtomicBool::new(false),
@@ -582,7 +597,7 @@ impl Admission {
     /// Offers `entry`: it starts when a slot is free (first come, first served), or is refused with the error that
     /// says why. Returns at once; the request limit counts from this call.
     pub fn offer(&self, entry: Arc<dyn Entry>) -> Handle {
-        self.offer_at(entry, Instant::now())
+        self.offer_at(entry, self.shared.clock.now())
     }
 
     /// Offers `entry` as [`offer`](Admission::offer) does, for a request that arrived at `arrived`: the request limit
