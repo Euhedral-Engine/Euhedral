@@ -11,7 +11,7 @@ mod common;
 use common::{Fixture, Raw, assert_json, headers, small_limits, text};
 use euhedral_core::generics::LatticeSource;
 use euhedral_inference_api_server::scripted::ScriptedBackend;
-use euhedral_inference_api_server::{ApiConfig, Limits, RequestDefaults, once, start};
+use euhedral_inference_api_server::{ApiConfig, RequestDefaults, once, start};
 use euhedral_io::AsyncIo;
 use euhedral_net::Method;
 use std::sync::mpsc::channel;
