@@ -28,6 +28,7 @@ use euhedral_inference_edrl::TensorTable;
 use euhedral_inference_settings::{Auto, BatchingSettings, Settings};
 use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
+use crate::composite::Composite;
 use crate::error::{EngineError, PlanError};
 use crate::generation::{AdmissionError, CancelHandle, GenerationRequest, Generations, LogitsSink};
 use crate::generation::{GREEDY_DEPTH, OPERATION_BOUND};
@@ -40,7 +41,9 @@ use crate::prefix::PrefixCacheStats;
 #[cfg(feature = "test-oracles")]
 use crate::quantum::body_fault::{BodyFault, Defect, HoldEvent, RunSnapshot, Sighting};
 use crate::residency::accounting::{Consumer, MemoryAccount, PlanReservation};
-use crate::residency::planner::{LocationBytes, PlanInputs, ResidencyPlan, pass_rows_limit, sequences_for};
+use crate::residency::planner::{
+    LocationBytes, PlanInputs, ResidencyPlan, forced_rows_of, pass_rows_limit, sequences_for,
+};
 use crate::stages::LaneTable;
 use crate::startup;
 use crate::state::SequenceState;
@@ -117,11 +120,12 @@ pub fn resolve_sequences(
         return Ok(1);
     }
     let rows = pass_rows_limit(&settings.batching);
-    let verified = 1 + if profile.speculation == Speculation::Mtp {
+    let drafted = 1 + if profile.speculation == Speculation::Mtp {
         profile.speculative_depth()?
     } else {
         0
     };
+    let verified = drafted.max(forced_rows_of(&settings.batching));
     let cap = (rows / verified).max(1);
     let chosen = sequences_for(config, table, settings, inputs, cap)?;
     log::info!(
@@ -734,11 +738,35 @@ impl EngineRuntime {
         library: &Path,
         close_timeout: Option<Duration>,
     ) -> (RuntimeOwner, ReadyHandoff) {
+        Self::start_composite(settings, library, close_timeout, Composite::default())
+    }
+
+    /// [`start_with`](EngineRuntime::start_with) over weights some of whose objects come from other artifacts:
+    /// `composite` names them, and the model loads from the composite table, each payload read from its own file. An
+    /// empty `composite` starts the model of `model.artifact` alone, as `start_with` does.
+    pub fn start_composite(
+        settings: &Settings,
+        library: &Path,
+        close_timeout: Option<Duration>,
+        composite: Composite,
+    ) -> (RuntimeOwner, ReadyHandoff) {
+        let composite = if composite.is_empty() {
+            Composite::default()
+        } else {
+            Composite {
+                replacements: composite
+                    .replacements
+                    .into_iter()
+                    .filter(|replacement| !replacement.objects.is_empty())
+                    .collect(),
+                ..composite
+            }
+        };
         let ready = Handoff::new();
         match build(settings, library, close_timeout) {
             Ok(core) => {
                 let owner = RuntimeOwner::over(Arc::clone(&core.teardown));
-                startup::run(core, Arc::clone(&ready));
+                startup::run(core, Arc::clone(&ready), composite);
                 (owner, ready)
             }
             Err(error) => {
@@ -953,7 +981,35 @@ impl EngineRuntime {
         forced: Vec<u32>,
         sink: Box<dyn LogitsSink>,
     ) -> Result<(), AdmissionError> {
-        self.generations.teacher_forced(prefix, forced, sink)
+        self.generations.teacher_forced(prefix, forced, 1, sink)
+    }
+
+    /// [`EngineRuntime::teacher_forced`] that feeds up to `rows` forced tokens in one pass, as a verification does, and
+    /// hands the sink the same rows in the same order. The sequences are sized to verify at most `1 + draft depth` rows
+    /// (more with `batching.forced-rows`); concurrent runs share their passes. `rows` of 0 or 1 is the one-row path. A
+    /// sink that wants the hidden state needs one row.
+    pub fn teacher_forced_rows(
+        &self,
+        prefix: Vec<u32>,
+        forced: Vec<u32>,
+        rows: usize,
+        sink: Box<dyn LogitsSink>,
+    ) -> Result<(), AdmissionError> {
+        let rows = rows.max(1);
+        if rows > 1 {
+            if sink.wants_hidden() {
+                return Err(AdmissionError::Engine(
+                    "a teacher-forced run that takes the hidden state decodes one row at a time".to_string(),
+                ));
+            }
+            let sized = self.plan().verified_rows() as usize;
+            if rows > sized {
+                return Err(AdmissionError::Engine(format!(
+                    "the sequences verify at most {sized} rows: {rows} were asked (batching.forced-rows sizes them)"
+                )));
+            }
+        }
+        self.generations.teacher_forced(prefix, forced, rows, sink)
     }
 
     /// What stops the engine, which also keeps the result of the leak check of the memory account once the engine is

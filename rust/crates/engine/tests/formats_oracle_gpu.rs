@@ -18,8 +18,8 @@ mod linear_gpu;
 #[path = "common/typed.rs"]
 mod typed;
 
-use euhedral_inference_engine::formats::{LinearMode, Nvfp4Linear, TrellisLinear};
-use linear_gpu::{Artifact, Random, Rig, activations, rig, synthetic_trellis, upload, values};
+use euhedral_inference_engine::formats::{LinearFormat, LinearMode, Nvfp4Linear, Q3Linear, TrellisLinear};
+use linear_gpu::{Artifact, Random, Rig, activations, compressed_head, rig, synthetic_trellis, upload, values};
 
 const PLAIN: LinearMode = LinearMode {
     row_exact: false,
@@ -34,6 +34,35 @@ fn exact_numerics_run_every_launch_on_the_scalar_reference() {
     let Some(rig) = rig() else { return };
     nvfp4_follows_the_switch(&rig);
     trellis_follows_the_switch(&rig);
+    a_compressed_head_in_chunks_follows_the_switch(&rig);
+}
+
+/// A compressed tensor too large to expand whole is expanded even at 1 to 8 rows under the switch (its fused decode
+/// declines), in chunks, and equals its whole expansion run the same way.
+fn a_compressed_head_in_chunks_follows_the_switch(rig: &Rig) {
+    let (out, k) = (70_016usize, 5120usize);
+    let mut random = Random::new(31);
+    let head = compressed_head(rig, &mut random, out, k);
+    assert!(!rig.library.exact_numerics_for_tests(true), "the switch starts off");
+    let format = Q3Linear::new(&rig.library);
+    for rows in [1usize, 8] {
+        let x = upload(&rig.library, &activations(&mut random, rows, k));
+        let wanted = rig.linear(&format, &head.expanded_weight, &x, 0, k, out, rows, PLAIN);
+        let actual = rig.linear(&format, &head.compressed, &x, 0, k, out, rows, PLAIN);
+        assert!(
+            format.scratch_bytes(&head.compressed, rows, PLAIN) > 0,
+            "{rows} rows: the exact kernels expand it"
+        );
+        assert!(
+            wanted.iter().any(|bits| *bits != wanted[0]),
+            "{rows} rows: the outputs vary"
+        );
+        assert!(
+            wanted == actual,
+            "{rows} rows: the chunks differ from the whole expansion"
+        );
+    }
+    assert!(rig.library.exact_numerics_for_tests(false), "and reports it was on");
 }
 
 fn nvfp4_follows_the_switch(rig: &Rig) {

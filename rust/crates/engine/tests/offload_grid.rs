@@ -81,6 +81,7 @@ impl Setup {
         PlanInputs {
             device_free,
             multiprocessors: Some(70),
+            exact_numerics: false,
             host_pinned_bytes: Some(host),
             sequences,
         }

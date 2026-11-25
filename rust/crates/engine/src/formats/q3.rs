@@ -19,7 +19,8 @@
 #[cfg(test)]
 use euhedral_inference_cuda::launch::q3::q3_decode_shape;
 use euhedral_inference_cuda::launch::q3::{
-    Bits, DECODE_MAX_ROWS, MX_MIN_ROWS, P2E2_EXPAND_LIMIT, linear_scratch_bytes, mx_scratch_bytes, q3_byte_size,
+    Bits, DECODE_MAX_ROWS, MX_MIN_ROWS, P2E2_EXPAND_LIMIT, linear_scratch_bytes, mx_scratch_bytes, p2e2_chunk_offsets,
+    p2e2_chunk_rows, q3_byte_size,
 };
 use euhedral_inference_cuda::sys::EUHEDRAL_CUDA_ROUTE_UNAVAILABLE;
 use euhedral_inference_cuda::{CudaError, CudaLibrary, DevicePtr, KernelOps};
@@ -68,9 +69,10 @@ impl Q3Linear {
 
     /// The bytes of FP8 activations a launch of `rows` rows over `shape` takes where the FP8 route runs it: none where it
     /// does not (too few rows, no device support, a verification, a width it has no kernel for).
+    /// `split_rows` names the whole tensor's weight rows for a run in output-row chunks (0 for a tensor run whole).
     /// `tiled_outputs`: whether the outputs must be whole tiles too (a P2E2 tensor reads its expansion, which has
     /// none of this to say about the compressed one).
-    fn mx_reserve(&self, rows: u32, shape: Shape, row_exact: bool, tiled_outputs: bool) -> u64 {
+    fn mx_reserve(&self, rows: u32, shape: Shape, row_exact: bool, tiled_outputs: bool, split_rows: u32) -> u64 {
         let Shape { out, input } = shape;
         if rows >= MX_MIN_ROWS
             && self.mx_available
@@ -78,7 +80,7 @@ impl Q3Linear {
             && input.is_multiple_of(128)
             && (!tiled_outputs || out.is_multiple_of(128))
         {
-            mx_scratch_bytes(rows, input, out, self.sm_count, 0)
+            mx_scratch_bytes(rows, input, out, self.sm_count, split_rows)
         } else {
             0
         }
@@ -89,12 +91,12 @@ impl Q3Linear {
     #[cfg(test)]
     fn demand(&self, p2e2: bool, shape: Shape, rows: u32, row_exact: bool) -> u64 {
         if !p2e2 {
-            return self.mx_reserve(rows, shape, row_exact, true);
+            return self.mx_reserve(rows, shape, row_exact, true, 0);
         }
         if rows <= DECODE_MAX_ROWS && !self.exact_numerics && q3_decode_shape(shape.input, shape.out) {
             return 0;
         }
-        q3_byte_size(shape.out, shape.input).next_multiple_of(256) + self.mx_reserve(rows, shape, row_exact, false)
+        q3_byte_size(shape.out, shape.input).next_multiple_of(256) + self.mx_reserve(rows, shape, row_exact, false, 0)
     }
 
     /// Expands the P2E2 tensor `weight` into `scratch`, with room behind it for `reserve` bytes of activations, and
@@ -109,12 +111,6 @@ impl Q3Linear {
     ) -> Result<(u64, ScratchRegion), CudaError> {
         let Shape { out, input } = shape;
         let expanded = q3_byte_size(out, input);
-        if expanded > P2E2_EXPAND_LIMIT {
-            return Err(CudaError::Argument(format!(
-                "{} expands to {expanded} bytes, more than the {P2E2_EXPAND_LIMIT} the scratch takes whole",
-                weight.name
-            )));
-        }
         let offset = expanded.next_multiple_of(256);
         if (scratch.bytes as u64) < offset + reserve {
             return Err(CudaError::Argument(format!(
@@ -134,6 +130,79 @@ impl Q3Linear {
         ))
     }
 
+    /// Runs a P2E2 tensor too large to expand whole in chunks of output rows: each chunk is expanded into the scratch,
+    /// run there, and its outputs copied into place. A Q3 linear computes an output from its own weight row alone, and
+    /// the FP8 route's split of K follows the whole tensor, so the outputs equal those of the whole tensor.
+    #[allow(clippy::too_many_arguments, reason = "one launch's operands")]
+    fn run_p2e2_in_chunks(
+        &self,
+        kernels: &mut dyn KernelOps,
+        weight: &WeightRef,
+        shape: Shape,
+        x: DevicePtr,
+        y: DevicePtr,
+        rows: u32,
+        scratch: ScratchRegion,
+        row_exact: bool,
+    ) -> Result<(), CudaError> {
+        let Shape { out, input } = shape;
+        let chunk = p2e2_chunk_rows(rows, input, out, Some(self.sm_count));
+        let mut first = 0;
+        while first < out {
+            let count = chunk.min(out - first);
+            let part = Shape { out: count, input };
+            let expanded = q3_byte_size(count, input);
+            let (output_offset, activation_offset) = p2e2_chunk_offsets(rows, input, count);
+            let reserve = self.mx_reserve(rows, part, row_exact, false, out);
+            if (scratch.bytes as u64) < activation_offset + reserve {
+                return Err(CudaError::Argument(format!(
+                    "a launch of {rows} rows over {}, too large to expand whole ({P2E2_EXPAND_LIMIT} bytes), needs {} bytes of scratch for a chunk of {count} rows and has {}",
+                    weight.name,
+                    activation_offset + reserve,
+                    scratch.bytes
+                )));
+            }
+            kernels.q3_p2e2_expand(
+                weight.ptr,
+                weight.bytes,
+                out,
+                input,
+                first,
+                count,
+                scratch.ptr,
+                expanded,
+            )?;
+            let result = scratch.ptr.offset(output_offset);
+            self.run_row_split(
+                kernels,
+                Bits::Q3,
+                part,
+                x,
+                scratch.ptr,
+                expanded,
+                result,
+                rows,
+                ScratchRegion {
+                    ptr: scratch.ptr.offset(activation_offset),
+                    bytes: reserve as usize,
+                },
+                row_exact,
+                out,
+            )?;
+            let value_bytes = 2;
+            kernels.copy_device_to_device_2d(
+                y.offset(u64::from(first) * value_bytes),
+                u64::from(out) * value_bytes,
+                result,
+                u64::from(count) * value_bytes,
+                u64::from(count) * value_bytes,
+                u64::from(rows),
+            )?;
+            first += count;
+        }
+        Ok(())
+    }
+
     /// Runs a row-split tensor of `bits` at `weights`: the FP8 route where it runs and `activations` holds its scratch,
     /// else the decode kernels.
     #[allow(clippy::too_many_arguments, reason = "one launch's operands")]
@@ -149,9 +218,10 @@ impl Q3Linear {
         rows: u32,
         activations: ScratchRegion,
         row_exact: bool,
+        split_rows: u32,
     ) -> Result<(), CudaError> {
         let Shape { out, input } = shape;
-        let needed = self.mx_reserve(rows, shape, row_exact, true);
+        let needed = self.mx_reserve(rows, shape, row_exact, true, split_rows);
         if needed > 0 {
             if (activations.bytes as u64) < needed {
                 return Err(CudaError::Argument(format!(
@@ -171,7 +241,7 @@ impl Q3Linear {
                 out,
                 weights_bytes,
                 activations.bytes as u64,
-                0,
+                split_rows,
             );
             match mx {
                 // The FP8 route declines under exact numerics and for alignments it has no kernel for.
@@ -221,6 +291,7 @@ impl LinearFormat for Q3Linear {
                 rows,
                 scratch,
                 row_exact,
+                0,
             );
         }
         let Shape { out, input } = shape;
@@ -236,7 +307,10 @@ impl LinearFormat for Q3Linear {
         }
         // Every other launch expands the tensor into the scratch and runs the row-split route on the expansion, with
         // the activations of the FP8 route behind it.
-        let reserve = self.mx_reserve(rows, shape, row_exact, false);
+        if q3_byte_size(out, input) > P2E2_EXPAND_LIMIT {
+            return self.run_p2e2_in_chunks(kernels, weight, shape, x, y, rows, scratch, row_exact);
+        }
+        let reserve = self.mx_reserve(rows, shape, row_exact, false, 0);
         let (expanded, activations) = Self::expand(kernels, weight, shape, rows, scratch, reserve)?;
         self.run_row_split(
             kernels,
@@ -249,6 +323,7 @@ impl LinearFormat for Q3Linear {
             rows,
             activations,
             row_exact,
+            0,
         )
     }
 
@@ -324,7 +399,6 @@ impl LinearFormat for Q3Linear {
         let Ok(rows) = u32::try_from(rows) else {
             return usize::MAX;
         };
-        // A tensor too large to expand whole is refused at submission (and at plan build), which needs no scratch.
         let bytes = linear_scratch_bytes(
             p2e2,
             rows,
@@ -333,8 +407,7 @@ impl LinearFormat for Q3Linear {
             self.mx_available,
             Some(self.sm_count),
             self.exact_numerics,
-        )
-        .unwrap_or(0);
+        );
         usize::try_from(bytes).unwrap_or(usize::MAX)
     }
 }

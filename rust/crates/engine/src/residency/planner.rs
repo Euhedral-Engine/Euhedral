@@ -13,7 +13,7 @@
 //! were, naming the memory that is short.
 
 use euhedral_inference_cuda::launch::nvfp4::{SKINNY_MAX_ROWS, nvfp4_native_scratch_bytes, skinny_target_ctas};
-use euhedral_inference_cuda::launch::q3::{P2E2_EXPAND_LIMIT, linear_scratch_bytes, q3_byte_size};
+use euhedral_inference_cuda::launch::q3::linear_scratch_bytes_upto;
 use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFormat, WeightLayout};
 use euhedral_inference_settings::{Auto, BatchingSettings, KvFormat, Settings};
 
@@ -180,6 +180,9 @@ pub struct ResidencyPlan {
     pub profile: ArtifactProfile,
     /// Drafts per verification (0 without a drafter).
     pub draft_depth: usize,
+    /// Rows of one step of a teacher-forced run that takes several rows at a time, which every sequence is sized to
+    /// verify (`batching.forced-rows`); 0 when the settings ask for none.
+    pub forced_rows: usize,
     /// The longest context of one sequence.
     pub max_context_tokens: usize,
     /// Pinned host bytes the prefix cache's arena may take: what `prefix-cache.size` asks, when the memory planner
@@ -219,7 +222,27 @@ pub fn pass_bounds(batching: &BatchingSettings, sequences: usize, verified: u64)
     (rows, parts)
 }
 
+/// The rows of a forced step the settings size the sequences for: 0 unless they ask for more than one.
+pub fn forced_rows_of(batching: &BatchingSettings) -> usize {
+    if batching.forced_rows >= 2 {
+        batching.forced_rows as usize
+    } else {
+        0
+    }
+}
+
 impl ResidencyPlan {
+    /// The rows a sequence's verification holds at most: one more than the drafts, or the rows of a forced step when
+    /// those are more; 0 when the sequence neither drafts nor forces several rows (it keeps no verification state).
+    pub fn verified_rows(&self) -> u64 {
+        let drafted = if self.draft_depth > 0 {
+            1 + self.draft_depth as u64
+        } else {
+            0
+        };
+        drafted.max(self.forced_rows as u64)
+    }
+
     /// The bytes the plan asks of each location: what `plan_with` had the memory planner admit.
     pub fn location_bytes(&self) -> LocationBytes {
         LocationBytes {
@@ -282,6 +305,8 @@ pub struct PlanInputs {
     /// The device's streaming multiprocessors; sizes the trellis K split's partials when
     /// `kernels.trellis.target-blocks` is `auto`. `None`: the widest split the shapes allow.
     pub multiprocessors: Option<u32>,
+    /// Whether the library runs the exact kernels, which expand a compressed tensor the fused decode reads in place.
+    pub exact_numerics: bool,
     /// Pinned host bytes the cache pages may take. `None`: not known, and no spill is allowed (the prefix cache still
     /// keeps its stated size).
     pub host_pinned_bytes: Option<u64>,
@@ -312,6 +337,7 @@ pub fn plan(
         PlanInputs {
             device_free,
             multiprocessors: None,
+            exact_numerics: false,
             host_pinned_bytes,
             sequences: 1,
         },
@@ -383,14 +409,22 @@ pub fn plan_closest(
 
     let (mut device, arena_all, _) = place(table, &profile)?;
 
-    let verified = (1 + (draft_depth as u64).min(MAX_VERIFIED)).max(DRAFT_LOGITS_ROWS);
+    let forced_rows = forced_rows_of(&settings.batching);
+    if forced_rows as u64 > chunk {
+        return Err(PlanError::Setting(format!(
+            "batching.forced-rows ({forced_rows}) is more than the {chunk} rows of batching.prefill-chunk-tokens"
+        )));
+    }
+    let verified = (1 + (draft_depth as u64).min(MAX_VERIFIED))
+        .max(DRAFT_LOGITS_ROWS)
+        .max(forced_rows as u64);
     // A pass of several sequences' verifications scores every row of every member: its logits rows are the pass's.
     let (pass_rows, pass_parts) = pass_bounds(
         &settings.batching,
         inputs.sequences,
-        1 + (draft_depth as u64).min(MAX_VERIFIED),
+        (1 + (draft_depth as u64).min(MAX_VERIFIED)).max(forced_rows as u64),
     );
-    let pass_logits = if draft_depth > 0 && pass_parts > 1 {
+    let pass_logits = if (draft_depth > 0 || forced_rows > 0) && pass_parts > 1 {
         pass_rows as u64
     } else {
         0
@@ -418,7 +452,8 @@ pub fn plan_closest(
             chunk,
             rows.logits_rows,
             inputs.multiprocessors,
-        )?);
+            inputs.exact_numerics,
+        ));
     let decode_scratch_bytes = trellis_scratch(table, &profile, chunk, thresholds, widest, Route::TensorCore);
 
     let available = inputs
@@ -437,7 +472,7 @@ pub fn plan_closest(
     let page = footprint::page_bytes(config, kv_format);
     let region = host_pages * page;
     let spilled = (region * config.attention_layers() as u64).saturating_mul(sequences);
-    let verified_rows = if draft_depth > 0 { 1 + draft_depth as u64 } else { 0 };
+    let verified_rows = (if draft_depth > 0 { 1 + draft_depth as u64 } else { 0 }).max(forced_rows as u64);
     // The runtime reserve pays for what the settings make grow: the workspace's slots (with the rows of a pass), the
     // decode scratch, the first sequence's state and the MTP layer's cache at the longest context. When they are
     // more than the setting, the reserve is what they need: admission counts it and the account refuses less.
@@ -512,7 +547,7 @@ pub fn plan_closest(
              ({staging_slots}): the window is read one staging ring ahead, whole rings at a time"
         )));
     }
-    let head_rows = sequences.saturating_mul(1 + draft_depth as u64);
+    let head_rows = sequences.saturating_mul((1 + draft_depth as u64).max(forced_rows as u64));
     let (layout, spills, offload, reach) = match decide(budgets, whole, split) {
         Ok((layout, spills)) => (layout, spills, Offload::default(), None),
         Err(_) => {
@@ -587,6 +622,7 @@ pub fn plan_closest(
             rows,
             profile,
             draft_depth,
+            forced_rows,
             max_context_tokens: max_tokens as usize,
             prefix_cache_bytes,
             host_budget_bytes: inputs.host_pinned_bytes,
@@ -938,16 +974,17 @@ fn nvfp4_native_scratch(placements: &[Placement], rows: u64, target_ctas: u64) -
 /// looked up, not multiplied. The FP8 route is counted on every device, and where the device is not known
 /// (`multiprocessors` is `None`) with the most K splits any device makes.
 ///
-/// A P2E2 tensor that a launch of this many rows must expand, and that is larger than the scratch takes whole
-/// ([`P2E2_EXPAND_LIMIT`]), is refused by name: its run in chunks of output rows is not ported, and the launch would
-/// fail at its first use.
+/// A P2E2 tensor too large to expand whole (`P2E2_EXPAND_LIMIT`) is run in chunks of output rows, which the scratch
+/// holds one at a time; a chunk grows as the rows shrink, so every tensor is sized at the most of 1 to its rows. The
+/// exact kernels expand a tensor the fused decode reads in place, so `exact_numerics` is the library's.
 fn grouped_scratch(
     placements: &[Placement],
     layers: usize,
     rows: u64,
     logits_rows: u64,
     multiprocessors: Option<u32>,
-) -> Result<u64, PlanError> {
+    exact_numerics: bool,
+) -> u64 {
     let mut largest = 0;
     for placement in placements.iter().filter(|placement| {
         matches!(
@@ -967,30 +1004,17 @@ fn grouped_scratch(
             continue;
         };
         let p2e2 = placement.layout == WeightLayout::RowSplitP2e2V1;
-        // The production numerics: the exact kernels expand a tensor the fused decode reads in place, which a tensor
-        // of this size cannot do whole (and every other P2E2 tensor is sized below at the prefill chunk's rows).
-        let needed = linear_scratch_bytes(
+        largest = largest.max(linear_scratch_bytes_upto(
             p2e2,
             u32::try_from(rows).unwrap_or(u32::MAX),
             input,
             out,
             true,
             multiprocessors,
-            false,
-        );
-        match needed {
-            Some(bytes) => largest = largest.max(bytes),
-            None => {
-                return Err(PlanError::Unsupported(format!(
-                    "{} is a compressed Q3 tensor of {} bytes expanded, more than the {P2E2_EXPAND_LIMIT} bytes a launch \
-                     of {rows} rows can expand into the scratch",
-                    placement.name,
-                    q3_byte_size(out, input),
-                )));
-            }
-        }
+            exact_numerics,
+        ));
     }
-    Ok(largest)
+    largest
 }
 
 fn align(value: u64) -> u64 {
@@ -1143,7 +1167,24 @@ pub mod nvfp4 {
 mod tests {
     use std::slice;
 
+    use euhedral_inference_cuda::launch::q3::{P2E2_EXPAND_LIMIT, linear_scratch_bytes, q3_byte_size};
+
     use super::*;
+
+    /// The rows of a forced step size nothing unless they ask for more than one, and a pass holds as many of them as
+    /// the settings allow.
+    #[test]
+    fn forced_rows_size_the_passes_only_when_they_are_several() {
+        let mut batching = BatchingSettings::default();
+        assert_eq!(forced_rows_of(&batching), 0, "the default asks for nothing");
+        batching.forced_rows = 1;
+        assert_eq!(forced_rows_of(&batching), 0, "one row is the decode path");
+        batching.forced_rows = 8;
+        assert_eq!(forced_rows_of(&batching), 8);
+        let (rows, parts) = pass_bounds(&batching, 4, 8);
+        assert_eq!(parts, 4);
+        assert_eq!(rows, 32.min(pass_rows_limit(&batching)));
+    }
 
     fn nvfp4(shape: &[u64]) -> Placement {
         Placement {
@@ -1169,16 +1210,44 @@ mod tests {
         }
     }
 
-    /// A compressed tensor too large to expand whole is refused by name, with the limit, wherever a launch of its rows
-    /// must expand it; at the rows its fused decode reads it in place it is sized, not refused.
+    /// A compressed head over the expansion limit is run in chunks that grow as the rows shrink, so the plan covers
+    /// the scratch of a launch of any row count up to the head's rows, not only of the most rows; the largest head
+    /// that fits is sized for its whole expansion. The fused decode reads a head of few rows in place, so only the
+    /// exact kernels give it scratch there.
     #[test]
-    fn a_compressed_tensor_above_the_expansion_limit_is_refused_by_name_where_it_must_be_expanded() {
-        let head = p2e2("text/draft_head", &[262_144, 5120]);
-        let error = grouped_scratch(slice::from_ref(&head), 64, 8, 9, Some(70)).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("text/draft_head"), "{message}");
-        assert!(message.contains(&P2E2_EXPAND_LIMIT.to_string()), "{message}");
-        assert!(grouped_scratch(slice::from_ref(&head), 64, 8, 8, Some(70)).is_ok());
+    fn a_compressed_head_over_the_expansion_limit_is_planned_for_every_launch_up_to_its_rows() {
+        let width = 5120u32;
+        let mut fits = 1024u32;
+        while q3_byte_size(fits + 16, width) <= P2E2_EXPAND_LIMIT {
+            fits += 16;
+        }
+        let largest = p2e2("text/draft_head", &[fits.into(), width.into()]);
+        let over = p2e2("text/draft_head", &[u64::from(fits) + 16, width.into()]);
+        let whole = q3_byte_size(fits, width);
+        let needed =
+            |out: u32, launch: u32, exact| linear_scratch_bytes(true, launch, width, out, true, Some(70), exact);
+        for exact in [false, true] {
+            for logits_rows in [1, 8, 9, 17, 18, 24, 64, 512] {
+                let planned = grouped_scratch(slice::from_ref(&largest), 64, 8, logits_rows, Some(70), exact);
+                assert!(
+                    exact || logits_rows > 8 || planned == 0,
+                    "{logits_rows} rows: no scratch for a decode"
+                );
+                assert!(
+                    !exact || planned >= whole,
+                    "{logits_rows} rows: {planned} for a head of {whole} bytes"
+                );
+                let chunked = grouped_scratch(slice::from_ref(&over), 64, 8, logits_rows, Some(70), exact);
+                for launch in 1..=logits_rows as u32 {
+                    let wanted = needed(fits + 16, launch, exact);
+                    assert!(
+                        chunked >= wanted,
+                        "{logits_rows} rows, a launch of {launch}, exact {exact}: planned {chunked}, needed {wanted}"
+                    );
+                }
+                assert!(exact || logits_rows <= 8 || chunked > 0);
+            }
+        }
     }
 
     /// An artifact with no trellis objects has the native route's scratch as its first region: the largest of its
