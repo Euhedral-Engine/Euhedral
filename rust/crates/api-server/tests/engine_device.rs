@@ -242,6 +242,7 @@ fn a_greedy_chat_completion_matches_the_engine_and_a_cancel_frees_the_sequence()
         backend,
         defaults: RequestDefaults::default(),
         io: None,
+        clock: None,
         created_at: CREATED,
     };
     let server = start_server(host.lattice(), config).expect("a started server");

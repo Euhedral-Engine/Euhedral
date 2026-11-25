@@ -15,87 +15,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{sleep, spawn, yield_now};
 use std::time::{Duration, Instant};
 
-use common::{Fixture, PATIENCE, lattice, small_limits};
+use common::{Fixture, ManualClock, PATIENCE, lattice, small_limits};
 use euhedral_core::control_plane::ControlPlaneLattice;
-use euhedral_core::frames::Frame;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_inference_api_protocol::ApiError;
 use euhedral_inference_api_server::scripted::{Script, ScriptedBackend};
 use euhedral_inference_api_server::{
-    Admission, Backend, BackendError, Clock, EncodedPrompt, Entry, Generation, GenerationConfig, GenerationResult,
-    Handle, Interruption, Limits, OutputSpec, Slot, TextListener, once,
+    Admission, Backend, BackendError, EncodedPrompt, Entry, Generation, GenerationConfig, GenerationResult, Handle,
+    Interruption, Limits, OutputSpec, Slot, TextListener, once,
 };
-
-/// The time admission sees, which only the test moves: the moments are a base plus what was [advanced](Self::advance),
-/// and a timer fires, as a frame into the lattice, when the test moves the clock to its deadline or past it.
-struct ManualClock {
-    base: Instant,
-    sink: Arc<QueueIngestSink>,
-    state: Mutex<ClockState>,
-}
-
-struct ClockState {
-    moved: Duration,
-    timers: Vec<(Instant, Box<dyn Frame>)>,
-}
-
-impl ManualClock {
-    fn new(sink: Arc<QueueIngestSink>) -> Arc<ManualClock> {
-        Arc::new(ManualClock {
-            base: Instant::now(),
-            sink,
-            state: Mutex::new(ClockState {
-                moved: Duration::ZERO,
-                timers: Vec::new(),
-            }),
-        })
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, ClockState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Moves the clock on by `by` and emits the timers that are due.
-    fn advance(&self, by: Duration) {
-        let due = {
-            let mut state = self.lock();
-            state.moved += by;
-            let now = self.base + state.moved;
-            let (due, later): (Vec<_>, Vec<_>) = state.timers.drain(..).partition(|(deadline, _)| *deadline <= now);
-            state.timers = later;
-            due
-        };
-        for (_, frame) in due {
-            drop(self.sink.offer(frame));
-        }
-    }
-
-    /// The earliest deadline of a timer that has not fired.
-    fn next_deadline(&self) -> Option<Instant> {
-        self.lock().timers.iter().map(|(deadline, _)| *deadline).min()
-    }
-
-    /// The moment `after` from the start of the clock.
-    fn at_offset(&self, after: Duration) -> Instant {
-        self.base + after
-    }
-}
-
-impl Clock for ManualClock {
-    fn now(&self) -> Instant {
-        self.base + self.lock().moved
-    }
-
-    fn at(&self, deadline: Instant, frame: Box<dyn Frame>) {
-        let mut state = self.lock();
-        if deadline <= self.base + state.moved {
-            drop(state);
-            drop(self.sink.offer(frame));
-        } else {
-            state.timers.push((deadline, frame));
-        }
-    }
-}
 
 /// The ways a test gives a limit time to pass.
 const LIMIT: Duration = Duration::from_millis(150);
@@ -201,7 +129,8 @@ impl Rig {
         backend.set_max_active(max_active);
         let sink = Arc::new(QueueIngestSink::new());
         lattice.add_upstream(sink.delegate()).expect("the sink is attached");
-        let clock = ManualClock::new(sink.clone());
+        let clock = ManualClock::new();
+        clock.attach(&lattice);
         let admission = Admission::with_clock(backend.clone(), &limits, sink.clone(), clock.clone());
         let (sender, events) = channel();
         Rig {
@@ -278,6 +207,7 @@ impl Rig {
     /// Closes the lattice, which carries out every frame published before, and asserts that no event was left over:
     /// what the test did not expect to happen, did not.
     fn finish(self) {
+        self.clock.complete();
         self.sink.complete_gracefully();
         self.backend.release();
         self.lattice.close();

@@ -210,7 +210,7 @@ impl Owner {
         while let Some(command) = self.inbox.poll() {
             match command {
                 Command::Offer { id, entry, arrived } => {
-                    self.offer(rules, clock, max_active, id, entry, arrived, effects)
+                    self.offer(rules, clock, max_active, Queued { id, entry, arrived }, effects)
                 }
                 Command::Release(id) => self.running.retain(|running| running.id != id),
                 Command::Cancel(id) => self.cancel(id, effects),
@@ -230,9 +230,7 @@ impl Owner {
         rules: Rules,
         clock: &dyn Clock,
         max_active: usize,
-        id: u64,
-        entry: Arc<dyn Entry>,
-        arrived: Instant,
+        Queued { id, entry, arrived }: Queued,
         effects: &mut Vec<Effect>,
     ) {
         if self.stopping.is_some() {
@@ -592,6 +590,11 @@ impl Admission {
             me: me.clone(),
         });
         Admission { shared }
+    }
+
+    /// The moment now, on the clock admission reads: the arrival of a request is told in it.
+    pub fn now(&self) -> Instant {
+        self.shared.clock.now()
     }
 
     /// Offers `entry`: it starts when a slot is free (first come, first served), or is refused with the error that

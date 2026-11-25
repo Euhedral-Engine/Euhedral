@@ -24,6 +24,9 @@ const RESPONSES: &str = "/v1/responses";
 const BIG: &str = r#","max_tokens":100000000"#;
 const JSON: Option<&str> = Some("application/json");
 
+/// The limit a test makes pass by moving its clock.
+const LIMIT: Duration = Duration::from_millis(500);
+
 fn limits() -> Limits {
     let mut limits = common::small_limits();
     limits.max_body_bytes = 1 << 20;
@@ -620,16 +623,20 @@ fn disconnect_while_queued_leaves_the_queue_and_the_next_request_runs() {
 #[test]
 fn time_limit_while_generating_is_a_503() {
     let mut limits = limits();
-    limits.request_limit = Duration::from_millis(1500);
-    let fx = Fixture::with(limits, Some(2));
+    limits.request_limit = LIMIT;
+    let (fx, clock) = Fixture::timed(limits);
     endless(&fx);
-    let response = chat(&fx, BIG);
-    assert_eq!(response.status, 503, "{}", text(&response));
-    let body = norm(text(&response));
-    assert!(body.contains(r#""code":"timeout""#), "{body}");
+    let mut raw = Raw::connect(fx.addr);
+    raw.send(&raw_post(CHAT, &chat_body(BIG)));
+    until("generating", || generating(&fx));
+    // The limit passes while the generation runs, however long the machine took to start it.
+    clock.advance(LIMIT);
+    let seen = raw.read_until(r#""code":"timeout""#);
+    assert!(seen.starts_with("HTTP/1.1 503"), "{seen}");
     until("cancelled", || {
         fx.backend.generations().first().is_some_and(|g| g.is_cancelled())
     });
+    drop(raw);
     assert_closed_once(&fx);
     fx.finish();
 }
@@ -637,21 +644,24 @@ fn time_limit_while_generating_is_a_503() {
 #[test]
 fn time_limit_while_queued_is_a_503() {
     let mut limits = limits();
-    // Only the queue limit is short: the request limit must not fire first on a loaded machine.
-    limits.request_limit = Duration::from_secs(15);
-    limits.queue_limit = Some(Duration::from_millis(300));
-    let fx = Fixture::with(limits, Some(2));
+    // Only the queue limit is short: the request limit is far off.
+    limits.request_limit = Duration::from_secs(3600);
+    limits.queue_limit = Some(LIMIT);
+    let (fx, clock) = Fixture::timed(limits);
     fx.backend.set_max_active(1);
     endless(&fx);
-    let first = Raw::connect(fx.addr);
-    let mut first = first;
+    let mut first = Raw::connect(fx.addr);
     first.send(&raw_post(CHAT, &chat_body(BIG)));
     until("generating", || generating(&fx));
-    let response = chat(&fx, BIG);
-    assert_eq!(response.status, 503, "{}", text(&response));
-    assert!(text(&response).contains(r#""code":"timeout""#), "{}", text(&response));
+    let mut second = Raw::connect(fx.addr);
+    second.send(&raw_post(CHAT, &chat_body(BIG)));
+    until("queued", || fx.server.admission().counts().waiting == 1);
+    clock.advance(LIMIT);
+    let seen = second.read_until(r#""code":"timeout""#);
+    assert!(seen.starts_with("HTTP/1.1 503"), "{seen}");
     assert_eq!(fx.backend.generations().len(), 1);
     drop(first);
+    drop(second);
     assert_closed_once(&fx);
     fx.finish();
 }

@@ -67,6 +67,7 @@ impl Served {
             backend: host.backend(),
             defaults: RequestDefaults::default(),
             io: None,
+            clock: None,
             created_at: CREATED,
         };
         let server = start_server(host.lattice(), config).expect("a started server");

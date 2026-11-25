@@ -18,8 +18,7 @@
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::thread::sleep;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 mod common;
@@ -66,8 +65,6 @@ fn start() -> Option<(Closer, Arc<EngineRuntime>)> {
 struct Recording {
     tokens: Vec<u32>,
     quanta: Vec<QuantumKind>,
-    /// When each decode quantum entered the engine.
-    decodes: Vec<Instant>,
     outcome: GenerationOutcome,
 }
 
@@ -76,6 +73,28 @@ struct Recorder {
     quanta: Vec<QuantumKind>,
     decodes: Vec<Instant>,
     done: Option<Arc<Handoff<Recording>>>,
+    /// Opened once this many decode quanta were reported.
+    opens: Option<(Arc<Gate>, usize)>,
+}
+
+/// A door a slow preparation waits at until the test's listener has seen the decode beside it retire.
+struct Gate {
+    door: Arc<Handoff<()>>,
+}
+
+impl Gate {
+    fn new() -> Arc<Gate> {
+        Arc::new(Gate { door: Handoff::new() })
+    }
+
+    fn open(&self) {
+        self.door.send(());
+    }
+
+    /// Waits for the gate to open; `false` if it did not within the time a hung engine is given.
+    fn wait(&self) -> bool {
+        self.door.wait(GENERATION_WAIT).is_ok()
+    }
 }
 
 impl GenerationListener for Recorder {
@@ -89,6 +108,11 @@ impl GenerationListener for Recorder {
         self.quanta.push(event.kind);
         if event.kind == QuantumKind::Decode {
             self.decodes.push(event.admitted);
+            if let Some((gate, count)) = &self.opens
+                && self.decodes.len() == *count
+            {
+                gate.open();
+            }
         }
     }
 
@@ -97,14 +121,10 @@ impl GenerationListener for Recorder {
         done.send(Recording {
             tokens: mem::take(&mut self.tokens),
             quanta: mem::take(&mut self.quanta),
-            decodes: mem::take(&mut self.decodes),
             outcome,
         });
     }
 }
-
-/// How long a slow preparation takes: long enough for the decode that runs beside it to retire first.
-const SLOW: Duration = Duration::from_millis(300);
 
 /// What a fake constraint does at its `fail_at`th step.
 #[derive(Clone, Copy, PartialEq)]
@@ -112,9 +132,12 @@ enum Fault {
     None,
     AcceptErrors,
     PrepareErrors,
-    PrepareSleepsThenPanics,
-    /// The preparation at `fail_at` takes a while and succeeds; the time it ended is kept.
-    PrepareSleeps,
+    /// The preparation at `fail_at` waits for the decode beside it to retire, so that the row of the decode after it
+    /// waits for the mask, and then panics.
+    PrepareWaitsThenPanics,
+    /// The preparation at `fail_at` waits for the decode beside it to retire and succeeds: the row of the decode
+    /// after it waits for the mask.
+    PrepareWaits,
 }
 
 /// A constraint that allows one token a step, the next of `cycle`.
@@ -125,9 +148,8 @@ struct Cycle {
     fail_at: usize,
     accepted: Arc<AtomicUsize>,
     prepared: Arc<AtomicUsize>,
-    /// Nanoseconds from `base` to the end of the slow preparation.
-    ended: Arc<AtomicU64>,
-    base: Instant,
+    /// Opened when `fail_at` decodes were reported, which the preparation at `fail_at` waits for.
+    gate: Arc<Gate>,
 }
 
 impl Cycle {
@@ -141,8 +163,7 @@ impl Cycle {
             fail_at,
             accepted: Arc::clone(&accepted),
             prepared: Arc::clone(&prepared),
-            ended: Arc::new(AtomicU64::new(0)),
-            base: Instant::now(),
+            gate: Gate::new(),
         };
         (constraint, accepted, prepared)
     }
@@ -160,15 +181,15 @@ impl TokenConstraint for Cycle {
         if self.step == self.fail_at {
             match self.fault {
                 Fault::PrepareErrors => return Err(ConstraintError::new("no mask")),
-                Fault::PrepareSleepsThenPanics => {
-                    // Long enough for the decode that follows to retire first: its row waits for this mask.
-                    sleep(SLOW);
+                Fault::PrepareWaitsThenPanics => {
+                    // The decode that follows retires first: its row waits for this mask.
+                    assert!(self.gate.wait(), "the decode never retired while the mask was prepared");
                     panic!("a constraint that cannot prepare");
                 }
-                Fault::PrepareSleeps => {
-                    sleep(SLOW);
-                    let nanos = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    self.ended.store(nanos, Ordering::SeqCst);
+                Fault::PrepareWaits if !self.gate.wait() => {
+                    return Err(ConstraintError::new(
+                        "the decode never retired while the mask was prepared",
+                    ));
                 }
                 _ => {}
             }
@@ -197,6 +218,27 @@ fn run(
     speculation: Speculation,
     constraint: Option<Box<dyn TokenConstraint>>,
 ) -> Recording {
+    run_opening(
+        runtime,
+        max_tokens,
+        stop_tokens,
+        sampling,
+        speculation,
+        constraint,
+        None,
+    )
+}
+
+/// As [`run`], with the gate `opens` opened once its count of decode quanta were reported.
+fn run_opening(
+    runtime: &EngineRuntime,
+    max_tokens: u32,
+    stop_tokens: Vec<u32>,
+    sampling: SamplingConfig,
+    speculation: Speculation,
+    constraint: Option<Box<dyn TokenConstraint>>,
+    opens: Option<(Arc<Gate>, usize)>,
+) -> Recording {
     let done = Handoff::new();
     runtime
         .generate(GenerationRequest {
@@ -211,6 +253,7 @@ fn run(
                 quanta: Vec::new(),
                 decodes: Vec::new(),
                 done: Some(Arc::clone(&done)),
+                opens,
             }),
         })
         .expect("the request is admitted");
@@ -285,17 +328,19 @@ fn a_constraint_that_fails_ends_the_request_once_with_an_error_and_frees_the_seq
         ("prepare", Fault::PrepareErrors),
         (
             "a panic in prepare while the next row waits",
-            Fault::PrepareSleepsThenPanics,
+            Fault::PrepareWaitsThenPanics,
         ),
     ] {
         let (constraint, _, _) = Cycle::new(&cycle, fault, 3);
-        let recording = run(
+        let gate = Arc::clone(&constraint.gate);
+        let recording = run_opening(
             &runtime,
             40,
             Vec::new(),
             SamplingConfig::greedy(0),
             Speculation::Off,
             Some(Box::new(constraint)),
+            Some((gate, 3)),
         );
         assert!(
             matches!(recording.outcome.reason, FinishReason::Failed(_)),
@@ -332,30 +377,24 @@ fn the_next_mask_is_prepared_while_the_next_decode_runs_and_a_row_that_retires_f
     let Some((owner, runtime)) = start() else { return };
     let cycle = [4000, 120, 9000, 77];
     let slow_at = 5;
-    let (constraint, _, _) = Cycle::new(&cycle, Fault::PrepareSleeps, slow_at);
-    let ended = Arc::clone(&constraint.ended);
-    let base = constraint.base;
-    let recording = run(
+    let (constraint, _, _) = Cycle::new(&cycle, Fault::PrepareWaits, slow_at);
+    let gate = Arc::clone(&constraint.gate);
+    // The mask for step `slow_at` is prepared after token `slow_at - 1`, while the decode that feeds that token runs:
+    // the preparation waits until that decode retired, and a row that retires first waits for the mask.
+    let recording = run_opening(
         &runtime,
         12,
         Vec::new(),
         SamplingConfig::greedy(0),
         Speculation::Off,
         Some(Box::new(constraint)),
+        Some((gate, slow_at)),
     );
     assert_eq!(recording.outcome.reason, FinishReason::Length);
     let expected: Vec<u32> = (0..12).map(|index| cycle[index % cycle.len()]).collect();
     assert_eq!(
         recording.tokens, expected,
         "a row that waited for its mask selects the same tokens"
-    );
-    // The mask for step `slow_at` is prepared after token `slow_at - 1`, while the decode that feeds that token runs.
-    let ended = Duration::from_nanos(ended.load(Ordering::SeqCst));
-    assert!(ended > Duration::ZERO, "the slow preparation ran");
-    let admitted = recording.decodes[slow_at - 1].duration_since(base);
-    assert!(
-        admitted < ended,
-        "the decode ({admitted:?}) was admitted before the mask was ready ({ended:?})"
     );
     assert!(sequence_free(&runtime));
     owner.shutdown(runtime).unwrap();

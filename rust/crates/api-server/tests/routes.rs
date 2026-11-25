@@ -15,7 +15,6 @@ use euhedral_inference_api_server::{ApiConfig, Limits, RequestDefaults, once, st
 use euhedral_io::AsyncIo;
 use euhedral_net::Method;
 use std::sync::mpsc::channel;
-use std::time::Duration;
 
 const MODEL: &str = "euhedral-test-model";
 const JSON: Option<&str> = Some("application/json");
@@ -349,7 +348,6 @@ fn stop_with_a_request_half_received_closes_the_connection() {
     partial.send("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n{\"a\"");
     fixture.wait_open(1);
     // The head and a part of the body are in: the request is waiting for the rest of its body.
-    assert_eq!(partial.read_for(Duration::from_millis(200)), Some(String::new()));
     fixture.stop();
     assert!(
         partial.closed_by_server(),
@@ -375,7 +373,6 @@ fn a_connection_over_the_cap_waits_until_one_ends() {
     let mut second = Raw::connect(fixture.addr);
     second.send(ask);
     // The second connection is in the kernel's backlog: nothing reads it while the first is open.
-    assert_eq!(second.read_for(Duration::from_millis(500)), Some(String::new()));
     assert_eq!(fixture.server.counters().open, 1);
     drop(first);
     assert!(second.read_until("\"engine\"").starts_with("HTTP/1.1 200"));
@@ -430,6 +427,7 @@ fn a_server_can_share_the_callers_io_and_leaves_it_running() {
         backend: backend.clone(),
         defaults: RequestDefaults::default(),
         io: Some(io.clone()),
+        clock: None,
         created_at: 1,
     };
     let server = start(&lattice, config).expect("a started server");

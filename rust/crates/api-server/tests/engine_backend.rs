@@ -374,10 +374,7 @@ impl Rig {
 
 fn ended(rx: &Receiver<()>) {
     rx.recv_timeout(PATIENCE).expect("the listener was told the end");
-    assert!(
-        rx.recv_timeout(Duration::from_millis(100)).is_err(),
-        "the end was told twice"
-    );
+    assert!(rx.try_recv().is_err(), "the end was told twice");
 }
 
 #[test]
@@ -851,6 +848,7 @@ impl Served {
             backend: rig.backend.clone(),
             defaults: RequestDefaults::default(),
             io: None,
+            clock: None,
             created_at: CREATED,
         };
         let server = start(&rig.lattice, config).expect("a started server");

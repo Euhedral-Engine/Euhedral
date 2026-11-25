@@ -263,6 +263,7 @@ pub fn serve(
         created_at: now_seconds(),
         defaults: defaults(settings),
         io: None,
+        clock: None,
     };
     let patience = windows.drain.saturating_add(windows.shutdown);
     let timeout = settings.server.shutdown_timeout;

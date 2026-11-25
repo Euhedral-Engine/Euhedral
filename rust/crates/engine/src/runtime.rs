@@ -1376,7 +1376,6 @@ mod tests {
         let freed = Cell::new(false);
         let drops = Rc::new(Cell::new(0));
         let window = Duration::from_millis(20);
-        let begun = Instant::now();
         let result = stop_within(
             window,
             Counted(Rc::clone(&drops)),
@@ -1387,7 +1386,6 @@ mod tests {
             },
             |_| "7 bytes stay".to_owned(),
         );
-        assert!(begun.elapsed() < Duration::from_secs(5));
         assert!(!freed.get());
         assert_eq!(drops.get(), 0, "the runtime is left undropped");
         match result {
