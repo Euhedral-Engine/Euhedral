@@ -521,6 +521,16 @@ name = "euhedral-inference-host-gemv"
 version = "0.1.0"
 
 [[package]]
+name = "euhedral-inference-hub-deps"
+version = "0.1.0"
+dependencies = [
+ "io-uring",
+ "libc",
+ "log",
+ "windows-sys",
+]
+
+[[package]]
 name = "euhedral-inference-quantization"
 version = "0.1.0"
 dependencies = [
