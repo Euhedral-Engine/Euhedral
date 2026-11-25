@@ -145,10 +145,10 @@ pub fn cgroup_headroom(memory_max: &str, memory_current: &str, memory_stat: Opti
     Some(limit.saturating_sub(current.saturating_sub(reclaimable)))
 }
 
-/// The page cache a cgroup can give back under pressure, from the text of `memory.stat`: `file` less `shmem`
-/// (tmpfs and shared memory sit in `file` but only swap can free them), `file_dirty` and `file_writeback` (not
-/// droppable until written), never below zero. The active and inactive lists both count: a file read many times is on
-/// the active list and is reclaimed all the same. `None` when `file` is missing.
+/// The page cache a cgroup can give back under pressure, from the text of `memory.stat`: the pages on the active and
+/// inactive file lists less `file_dirty` and `file_writeback` (not droppable until written), never below zero. These
+/// are the lists the kernel builds `MemAvailable` from; they leave out shared memory, mlocked and other unevictable
+/// pages, which `file` includes. `None` when any of the four keys is missing or unparsable.
 pub fn reclaimable_file_bytes(memory_stat: &str) -> Option<u64> {
     let field = |key: &str| -> Option<u64> {
         memory_stat
@@ -157,12 +157,9 @@ pub fn reclaimable_file_bytes(memory_stat: &str) -> Option<u64> {
             .find(|(name, _)| *name == key)
             .and_then(|(_, value)| value.trim().parse().ok())
     };
-    let file = field("file")?;
-    let pinned = ["shmem", "file_dirty", "file_writeback"]
-        .iter()
-        .map(|key| field(key).unwrap_or(0))
-        .fold(0u64, u64::saturating_add);
-    Some(file.saturating_sub(pinned))
+    let listed = field("active_file")?.saturating_add(field("inactive_file")?);
+    let pinned = field("file_dirty")?.saturating_add(field("file_writeback")?);
+    Some(listed.saturating_sub(pinned))
 }
 
 /// The memory the machine and the process's cgroups can spare now: the lesser of `MemAvailable` and the least cgroup
@@ -268,55 +265,79 @@ mod tests {
         assert_eq!(available_bytes(None, None), None);
     }
 
-    fn stat(file: u64, shmem: u64, dirty: u64, writeback: u64) -> String {
+    /// A `memory.stat` whose file lists hold `active + inactive`; `unevictable` file pages (shared memory, mlocked) are
+    /// counted in `file` and `shmem` but sit on neither list.
+    fn stat(active: u64, inactive: u64, dirty: u64, writeback: u64, unevictable: u64) -> String {
+        let file = active + inactive + unevictable;
         format!(
-            "anon 1000\nfile {file}\nkernel 5\nshmem {shmem}\nfile_mapped 7\nfile_dirty {dirty}\nfile_writeback {writeback}\ninactive_file 1\nactive_file 2\n"
+            "anon 1000\nfile {file}\nkernel 5\nshmem {unevictable}\nfile_mapped 7\nfile_dirty {dirty}\nfile_writeback {writeback}\ninactive_file {inactive}\nactive_file {active}\nunevictable {unevictable}\n"
         )
     }
 
     #[test]
     fn page_cache_counts_as_headroom() {
-        // 32 GiB cap, 30 GiB current of which 28 GiB is clean cache: 30 GiB of headroom.
-        let text = stat(28 * GIB, 0, 0, 0);
+        // 32 GiB cap, 30 GiB current of which 28 GiB is clean cache (active and inactive): 30 GiB of headroom.
+        let text = stat(20 * GIB, 8 * GIB, 0, 0, 0);
         assert_eq!(
             cgroup_headroom(&(32 * GIB).to_string(), &(30 * GIB).to_string(), Some(&text)),
             Some(30 * GIB)
         );
-        // Mutant: ignoring memory.stat leaves 2 GiB.
+        // Mutant: ignoring memory.stat leaves 2 GiB; reading only the inactive list gives 10 GiB.
     }
 
     #[test]
-    fn shared_memory_dirty_and_writeback_pages_are_not_headroom() {
-        let text = stat(20 * GIB, 8 * GIB, 3 * GIB, GIB);
-        // 20 - 8 - 3 - 1 = 8 GiB reclaimable.
+    fn unevictable_dirty_and_writeback_pages_are_not_headroom() {
+        // Unevictable file pages (shared memory, mlocked) are in `file` but on neither list.
+        let text = stat(6 * GIB, 6 * GIB, 3 * GIB, GIB, 8 * GIB);
         assert_eq!(reclaimable_file_bytes(&text), Some(8 * GIB));
-        // Mutant: counting only `file` would give 20 GiB; dropping any one subtraction gives 9, 11 or 16 GiB.
-        let only_shmem = stat(10 * GIB, 4 * GIB, 0, 0);
-        assert_eq!(reclaimable_file_bytes(&only_shmem), Some(6 * GIB));
-        let only_dirty = stat(10 * GIB, 0, 4 * GIB, 0);
-        assert_eq!(reclaimable_file_bytes(&only_dirty), Some(6 * GIB));
-        let only_writeback = stat(10 * GIB, 0, 0, 4 * GIB);
-        assert_eq!(reclaimable_file_bytes(&only_writeback), Some(6 * GIB));
+        assert_eq!(
+            reclaimable_file_bytes(&stat(5 * GIB, 5 * GIB, 0, 0, 4 * GIB)),
+            Some(10 * GIB)
+        );
+        assert_eq!(
+            reclaimable_file_bytes(&stat(5 * GIB, 5 * GIB, 4 * GIB, 0, 0)),
+            Some(6 * GIB)
+        );
+        assert_eq!(
+            reclaimable_file_bytes(&stat(5 * GIB, 5 * GIB, 0, 4 * GIB, 0)),
+            Some(6 * GIB)
+        );
     }
 
     #[test]
     fn file_pages_beyond_current_clamp_headroom_at_the_limit() {
-        // A stale or racy `file` above `memory.current` must not make headroom exceed the limit.
-        let text = stat(50 * GIB, 0, 0, 0);
-        assert_eq!(cgroup_headroom("100", "40", Some(&stat(500, 0, 0, 0))), Some(100));
+        // A stale or racy list size above `memory.current` must not make headroom exceed the limit.
+        assert_eq!(cgroup_headroom("100", "40", Some(&stat(500, 0, 0, 0, 0))), Some(100));
         assert_eq!(
-            cgroup_headroom(&(32 * GIB).to_string(), &(10 * GIB).to_string(), Some(&text)),
+            cgroup_headroom(
+                &(32 * GIB).to_string(),
+                &(10 * GIB).to_string(),
+                Some(&stat(50 * GIB, 0, 0, 0, 0))
+            ),
             Some(32 * GIB)
         );
-        // Pinned pages beyond `file` clamp the reclaimable figure at zero.
-        assert_eq!(reclaimable_file_bytes(&stat(GIB, 2 * GIB, 0, 0)), Some(0));
+        // Pinned pages beyond the lists clamp the reclaimable figure at zero.
+        assert_eq!(reclaimable_file_bytes(&stat(GIB, 0, 2 * GIB, 0, 0)), Some(0));
     }
 
     #[test]
     fn a_missing_or_unusable_memory_stat_counts_everything_as_used() {
         assert_eq!(cgroup_headroom("1000", "900", None), Some(100));
         assert_eq!(cgroup_headroom("1000", "900", Some("anon 5\n")), Some(100));
-        assert_eq!(cgroup_headroom("1000", "900", Some("file notanumber\n")), Some(100));
+        assert_eq!(
+            cgroup_headroom("1000", "900", Some("active_file notanumber\n")),
+            Some(100)
+        );
         assert_eq!(reclaimable_file_bytes(""), None);
+        // Each key is required: one missing key must not fail open.
+        for key in ["active_file", "inactive_file", "file_dirty", "file_writeback"] {
+            let text: String = stat(500, 0, 0, 0, 0)
+                .lines()
+                .filter(|line| !line.starts_with(key))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            assert_eq!(reclaimable_file_bytes(&text), None, "without {key}");
+            assert_eq!(cgroup_headroom("1000", "900", Some(&text)), Some(100), "without {key}");
+        }
     }
 }
