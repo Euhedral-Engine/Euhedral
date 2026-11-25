@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-use common::Closer;
+use common::{Card, Closer};
 use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, HiddenSink,
     QuantumEvent, Speculation,
@@ -54,6 +54,11 @@ fn machine() -> Option<Machine> {
         return None;
     }
     Some(Machine { artifact, library })
+}
+
+/// The engine every test of this binary runs on, one at a time.
+fn shared_engine(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
+    common::shared(|| start(machine))
 }
 
 fn start(machine: &Machine) -> (Closer, Arc<EngineRuntime>) {
@@ -308,7 +313,7 @@ fn hidden_bytes_of(delivered: &[Delivered]) -> usize {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn hidden_rows_are_the_seed_rows_the_catch_up_reads() {
     let Some(machine) = machine() else { return };
-    let (owner, runtime) = start(&machine);
+    let (_card, runtime) = shared_engine(&machine);
 
     // A request that drafts runs its verification on the row of the token it has, and the seed rows then hold that
     // row's post-final-norm hidden state, which the next catch-up reads. The hidden request decodes the same row.
@@ -351,14 +356,13 @@ fn hidden_rows_are_the_seed_rows_the_catch_up_reads() {
     );
     assert!(heard[1].logits.is_some() && heard[0].logits.is_some());
     println!("the row of {hidden_bytes} bytes equals the seed row");
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn hidden_rows_cover_every_row_with_logits_where_a_token_is_selected() {
     let Some(machine) = machine() else { return };
-    let (owner, runtime) = start(&machine);
+    let (_card, runtime) = shared_engine(&machine);
 
     // Three chunks (64, 64, 22) and five decode rows.
     let ids = prompt(150);
@@ -400,14 +404,13 @@ fn hidden_rows_cover_every_row_with_logits_where_a_token_is_selected() {
         seed_rows(&runtime, 1, row_bytes),
         "the last decode row is the seed row"
     );
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn sampled_tokens_are_the_same_with_the_sink_on_and_off() {
     let Some(machine) = machine() else { return };
-    let (owner, runtime) = start(&machine);
+    let (_card, runtime) = shared_engine(&machine);
 
     let ids = prompt(100);
     for (name, sampling) in [("sampled", sampled()), ("greedy", greedy())] {
@@ -419,14 +422,13 @@ fn sampled_tokens_are_the_same_with_the_sink_on_and_off() {
         assert_eq!(rows, 100 + 23, "{name}: a row for every prompt token and every decode");
         println!("{name}: {} tokens equal", on.tokens.len());
     }
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_request_that_speculates_is_refused() {
     let Some(machine) = machine() else { return };
-    let (owner, runtime) = start(&machine);
+    let (_card, runtime) = shared_engine(&machine);
 
     let done = Handoff::new();
     let refused = runtime.generate_hidden(
@@ -439,14 +441,13 @@ fn a_request_that_speculates_is_refused() {
         CancelHandle::default(),
     );
     assert_eq!(refused.unwrap_err(), AdmissionError::HiddenWithSpeculation);
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_held_sink_holds_the_request_back_and_hears_every_row_in_order() {
     let Some(machine) = machine() else { return };
-    let (owner, runtime) = start(&machine);
+    let (_card, runtime) = shared_engine(&machine);
 
     // The sink's first call waits at a gate that opens when the third quantum retires: by then one quantum's rows are
     // in the sink and two wait, the most the owner may keep (the engine asserts it, and fails the request otherwise).
@@ -457,5 +458,4 @@ fn a_held_sink_holds_the_request_back_and_hears_every_row_in_order() {
     let positions: Vec<u64> = heard.iter().map(|call| call.first_position).collect();
     let expected: Vec<u64> = iter::once(0).chain(20..31).collect();
     assert_eq!(positions, expected, "every quantum's rows, once, in order");
-    owner.shutdown(runtime).unwrap();
 }

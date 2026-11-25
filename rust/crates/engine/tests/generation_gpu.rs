@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
 mod common;
 
-use common::Closer;
+use common::{Card, Closer};
 use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, LogitsSink,
     QuantumEvent, Speculation, Verification,
@@ -99,6 +99,11 @@ fn settings(artifact: &Path, max_tokens: u32) -> Settings {
 }
 
 /// Starts the engine and waits for the latch, as `main` does.
+/// The engine the tests that need no other configuration run on, one at a time.
+fn shared_engine(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
+    common::shared(|| start(machine, 4096))
+}
+
 fn start(machine: &Machine, max_tokens: u32) -> (Closer, Arc<EngineRuntime>) {
     let (owner, ready) = EngineRuntime::start(&settings(&machine.artifact, max_tokens), &machine.library);
     let runtime = ready
@@ -358,6 +363,10 @@ fn submit_with(
 fn start_with_sequences(machine: &Machine, sequences: u32) -> (Closer, Arc<EngineRuntime>) {
     let mut settings = settings(&machine.artifact, 4096);
     settings.batching.max_sequences = sequences;
+    if sequences == 0 {
+        // An automatic count takes every byte the card has free, more than the share a device job is given.
+        common::limit_gpu(&mut settings, AUTOMATIC_DEVICE_BUDGET);
+    }
     let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
     let runtime = ready
         .wait(WAIT)
@@ -365,6 +374,9 @@ fn start_with_sequences(machine: &Machine, sequences: u32) -> (Closer, Arc<Engin
         .expect("the engine starts");
     (Closer::new(owner, &runtime), runtime)
 }
+
+/// The device budget of an engine whose sequence count is automatic: the count is what fits in it.
+const AUTOMATIC_DEVICE_BUDGET: u64 = 22 << 30;
 
 fn micros(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e6
@@ -391,7 +403,7 @@ fn greedy_tokens_match_java_for_short_prompt() {
     assert_eq!(reference.generated.len(), 128);
     assert!(!reference.stopped_by_eos);
     let eos = tokenizer(&machine.artifact).eos_ids().to_vec();
-    let (owner, runtime) = start(&machine, 4096);
+    let (_card, runtime) = shared_engine(&machine);
 
     // Twice on one engine: the second request resets the sequence and replays the graphs the first recorded.
     for round in 0..2 {
@@ -439,7 +451,6 @@ fn greedy_tokens_match_java_for_short_prompt() {
             decodes.iter().filter(|event| event.recorded).count(),
         );
     }
-    owner.shutdown(runtime).unwrap();
 }
 
 /// The greedy tokens of the short prompt with projections staged through the ring: the Java engine's, and the same on a
@@ -448,6 +459,7 @@ fn greedy_tokens_match_java_for_short_prompt() {
 #[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
 fn greedy_tokens_match_java_for_short_prompt_when_staged() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let reference = greedy_reference(&machine);
     assert_eq!(reference.generated.len(), 128);
     let eos = tokenizer(&machine.artifact).eos_ids().to_vec();
@@ -485,7 +497,7 @@ fn greedy_tokens_match_java_for_short_prompt_when_staged() {
 fn a_stop_token_ends_the_generation_and_leaves_no_overshoot_in_the_sequence() {
     let Some(machine) = machine() else { return };
     let reference = greedy_reference(&machine);
-    let (owner, runtime) = start(&machine, 4096);
+    let (_card, runtime) = shared_engine(&machine);
     let prompt_rows = reference.prompt.len() as u64;
 
     // The token the Java engine selected sixth ends the generation when it is a stop token: the quantum that already
@@ -543,13 +555,13 @@ fn a_stop_token_ends_the_generation_and_leaves_no_overshoot_in_the_sequence() {
         nothing(vec![1; 5000]),
         Err(AdmissionError::PromptTooLong { capacity: 4096, .. })
     ));
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
 fn context_end_stops_cleanly() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let reference = greedy_reference(&machine);
     let context = 600u32;
     let (owner, runtime) = start(&machine, context);
@@ -620,6 +632,7 @@ fn repository_root() -> PathBuf {
 #[ignore = "needs a GPU, the native library, the RCO artifact, the Java references and python3 with numpy"]
 fn teacher_forced_logits_bitwise_equal_java_report() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     teacher_forced_against_java(&machine, None, 4096, false);
 }
 
@@ -629,6 +642,7 @@ fn teacher_forced_logits_bitwise_equal_java_report() {
 #[ignore = "needs a GPU, the native library, the RCO artifact, the Java references and python3 with numpy"]
 fn teacher_forced_logits_bitwise_equal_java_report_with_a_mapped_embedding() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let limit = common::limit_below_need(&machine.library, &settings(&machine.artifact, 4096), 256 << 20);
     teacher_forced_against_java(&machine, Some(limit), 4096, false);
 }
@@ -643,6 +657,7 @@ const STAGED_SHORT: u64 = 1 << 30;
 #[ignore = "needs a GPU, the native library, the RCO artifact, the Java references and python3 with numpy"]
 fn teacher_forced_logits_bitwise_equal_java_report_when_staged() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let limit = common::limit_to_stage(&machine.library, &settings(&machine.artifact, 2048), STAGED_SHORT);
     teacher_forced_against_java(&machine, Some(limit), 2048, true);
 }
@@ -762,6 +777,7 @@ fn teacher_forced_against_java(machine: &Machine, gpu_limit: Option<u64>, max_to
 #[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
 fn a_panic_in_the_owner_ends_the_request_with_a_failure_and_the_engine_serves_the_next() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let reference = greedy_reference(&machine);
     let (owner, runtime) = start(&machine, 4096);
 
@@ -796,7 +812,7 @@ fn sampled_requests_select_on_the_host_and_agree_with_greedy_at_top_k_one() {
     let Some(machine) = machine() else { return };
     let reference = greedy_reference(&machine);
     let tokens = 32;
-    let (owner, runtime) = start(&machine, 4096);
+    let (_card, runtime) = shared_engine(&machine);
     let expected = &reference.generated[..tokens as usize];
 
     // Temperature 0 is greedy: the device selects, no row is copied.
@@ -827,7 +843,6 @@ fn sampled_requests_select_on_the_host_and_agree_with_greedy_at_top_k_one() {
         .inspect_sequence(|sequence| sequence.row_readbacks.leased())
         .expect("the generation gave the sequence back");
     assert_eq!(leased, 0, "no row left leased");
-    owner.shutdown(runtime).unwrap();
 }
 
 /// Collects the logits rows of a teacher-forced run.
@@ -872,6 +887,7 @@ fn forced_rows(runtime: &EngineRuntime, prompt: &[u32], forced: &[u32]) -> Vec<V
 #[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
 fn sampled_tokens_are_drawn_at_the_position_they_follow() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let reference = greedy_reference(&machine);
     let config = SamplingConfig::new(50.0, 40, 1.0, 77, false).unwrap();
     let tokens = 24;
@@ -920,7 +936,7 @@ fn a_sampled_first_token_can_be_the_stop_token_or_the_whole_budget() {
     let Some(machine) = machine() else { return };
     let reference = greedy_reference(&machine);
     let config = SamplingConfig::new(50.0, 40, 1.0, 5, false).unwrap();
-    let (owner, runtime) = start(&machine, 4096);
+    let (_card, runtime) = shared_engine(&machine);
     let full = generate_sampled(&runtime, &reference.prompt, 8, &[], config);
     assert_eq!(full.tokens.len(), 8);
     let first = full.tokens[0];
@@ -946,13 +962,13 @@ fn a_sampled_first_token_can_be_the_stop_token_or_the_whole_budget() {
         assert_eq!(stopped.outcome.reason, FinishReason::Stop);
         assert_eq!(stopped.tokens, full.tokens[..4]);
     }
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library, the RCO artifact and the Java references"]
 fn two_sequences_start_hold_a_spare_generate_the_same_tokens_and_shut_down_clean() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let prompt = greedy_reference(&machine).prompt;
     let eos = tokenizer(&machine.artifact).eos_ids().to_vec();
 
@@ -1080,6 +1096,7 @@ fn together_some(
 fn sampled_tokens_do_not_depend_on_speculation_or_on_the_sequences_sharing_a_pass() {
     const NEW_TOKENS: u32 = 64;
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let tokenizer = tokenizer(&machine.artifact);
     let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
         .iter()
@@ -1168,6 +1185,7 @@ fn speculative_decode_rates_of_one_and_of_four_requests() {
     const PROMPT_TOKENS: usize = 512;
     const NEW_TOKENS: u32 = 512;
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let tokenizer = tokenizer(&machine.artifact);
     // Four different prompts of 512 tokens, from the texts the concurrent test uses.
     let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
@@ -1242,6 +1260,7 @@ fn speculative_decode_rates_of_one_and_of_four_requests() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn the_lanes_of_one_sequence_hold_one_sequence() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let began = Instant::now();
     let (owner, runtime) = start_with_sequences(&machine, 1);
     let (ring, lane_bytes) = runtime.lane_rings_for_tests();
@@ -1260,6 +1279,7 @@ fn the_lanes_of_one_sequence_hold_one_sequence() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn automatic_sequences_run_concurrently_and_match_alone() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let tokenizer = tokenizer(&machine.artifact);
     let began = Instant::now();
     let (owner, runtime) = start_with_sequences(&machine, 0);
@@ -1324,6 +1344,7 @@ fn automatic_sequences_run_concurrently_and_match_alone() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn concurrent_sequences_match_alone() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let tokenizer = tokenizer(&machine.artifact);
     let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
         .iter()
@@ -1504,6 +1525,7 @@ fn concurrent_sequences_match_alone() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn concurrent_sequences_match_alone_when_staged() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let tokenizer = tokenizer(&machine.artifact);
     let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
         .iter()
@@ -1651,6 +1673,7 @@ impl LogitsSink for WantsHidden {
 /// and the two sequences share passes.
 fn forced_rows_equal_the_one_row_path(forced_rows: u32, rows_of: impl Fn(usize) -> usize) {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let mut engine = settings(&machine.artifact, 4096);
     engine.batching.max_sequences = 2;
     engine.batching.forced_rows = forced_rows;

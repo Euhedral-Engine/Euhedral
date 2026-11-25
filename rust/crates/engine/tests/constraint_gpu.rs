@@ -18,12 +18,13 @@
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 mod common;
 
-use common::Closer;
+use common::{Card, Closer};
 use euhedral_inference_engine::generation::{
     ConstraintError, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
     TokenConstraint,
@@ -42,24 +43,27 @@ const GENERATION_WAIT: Duration = Duration::from_secs(60);
 /// The prompt: any ids inside the vocabulary will do.
 const PROMPT: [u32; 6] = [3000, 1500, 2200, 800, 4100, 1200];
 
-fn start() -> Option<(Closer, Arc<EngineRuntime>)> {
+/// The engine every test of this binary runs on, one at a time; `None` without the card's settings.
+fn start() -> Option<(Card, Arc<EngineRuntime>)> {
     let library = PathBuf::from(test_support::require_property("euhedral.cuda.library")?);
     let artifact = PathBuf::from(test_support::require_property("euhedral.qwen.rco-artifact")?);
     if !artifact.is_file() {
         return None;
     }
-    let mut settings = Settings::with_model(ModelSettings {
-        artifact,
-        name: "test".to_string(),
-    });
-    settings.context.max_tokens = 256;
-    settings.kernels.graphs.captures_per_view = 8;
-    let (owner, ready) = EngineRuntime::start(&settings, &library);
-    let runtime = ready
-        .wait(WAIT)
-        .expect("the engine reports")
-        .expect("the engine starts");
-    Some((Closer::new(owner, &runtime), runtime))
+    Some(common::shared(|| {
+        let mut settings = Settings::with_model(ModelSettings {
+            artifact,
+            name: "test".to_string(),
+        });
+        settings.context.max_tokens = 256;
+        settings.kernels.graphs.captures_per_view = 8;
+        let (owner, ready) = EngineRuntime::start(&settings, &library);
+        let runtime = ready
+            .wait(WAIT)
+            .expect("the engine reports")
+            .expect("the engine starts");
+        (Closer::new(owner, &runtime), runtime)
+    }))
 }
 
 struct Recording {
@@ -79,21 +83,31 @@ struct Recorder {
 
 /// A door a slow preparation waits at until the test's listener has seen the decode beside it retire.
 struct Gate {
-    door: Arc<Handoff<()>>,
+    door: AtomicBool,
 }
 
 impl Gate {
     fn new() -> Arc<Gate> {
-        Arc::new(Gate { door: Handoff::new() })
+        Arc::new(Gate {
+            door: AtomicBool::new(false),
+        })
     }
 
     fn open(&self) {
-        self.door.send(());
+        self.door.store(true, Ordering::Release);
     }
 
-    /// Waits for the gate to open; `false` if it did not within the time a hung engine is given.
+    /// Waits for the gate to open; `false` if it did not within the time a hung engine is given. The waiter is a
+    /// worker of the engine's lattice, which `Handoff::wait` refuses, so it yields on the flag.
     fn wait(&self) -> bool {
-        self.door.wait(GENERATION_WAIT).is_ok()
+        let start = Instant::now();
+        while !self.door.load(Ordering::Acquire) {
+            if start.elapsed() > GENERATION_WAIT {
+                return false;
+            }
+            thread::yield_now();
+        }
+        true
     }
 }
 
@@ -272,7 +286,7 @@ fn sequence_free(runtime: &EngineRuntime) -> bool {
 #[test]
 #[ignore = "loads the artifact on the device"]
 fn a_constraint_that_allows_one_token_a_step_decides_every_token_and_the_request_never_speculates() {
-    let Some((owner, runtime)) = start() else { return };
+    let Some((_card, runtime)) = start() else { return };
     let cycle = [4000, 120, 9000, 77];
     let sampled = SamplingConfig::new(1.0, 20, 0.95, 5, false).unwrap();
     for (what, sampling) in [("greedy", SamplingConfig::greedy(0)), ("sampled", sampled)] {
@@ -315,13 +329,12 @@ fn a_constraint_that_allows_one_token_a_step_decides_every_token_and_the_request
     );
     assert_eq!(free.outcome.reason, FinishReason::Length);
     assert_eq!(free.tokens.len(), 24);
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "loads the artifact on the device"]
 fn a_constraint_that_fails_ends_the_request_once_with_an_error_and_frees_the_sequence() {
-    let Some((owner, runtime)) = start() else { return };
+    let Some((_card, runtime)) = start() else { return };
     let cycle = [4000, 120];
     for (what, fault) in [
         ("accept", Fault::AcceptErrors),
@@ -368,13 +381,12 @@ fn a_constraint_that_fails_ends_the_request_once_with_an_error_and_frees_the_seq
             "{what}: the next request runs"
         );
     }
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "loads the artifact on the device"]
 fn the_next_mask_is_prepared_while_the_next_decode_runs_and_a_row_that_retires_first_waits_for_it() {
-    let Some((owner, runtime)) = start() else { return };
+    let Some((_card, runtime)) = start() else { return };
     let cycle = [4000, 120, 9000, 77];
     let slow_at = 5;
     let (constraint, _, _) = Cycle::new(&cycle, Fault::PrepareWaits, slow_at);
@@ -397,13 +409,12 @@ fn the_next_mask_is_prepared_while_the_next_decode_runs_and_a_row_that_retires_f
         "a row that waited for its mask selects the same tokens"
     );
     assert!(sequence_free(&runtime));
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "loads the artifact on the device"]
 fn a_constrained_request_ends_at_a_stop_token_it_chose_and_at_a_budget_of_one() {
-    let Some((owner, runtime)) = start() else { return };
+    let Some((_card, runtime)) = start() else { return };
     let cycle = [4000, 120, 9000, 77];
     let (constraint, accepted, _) = Cycle::new(&cycle, Fault::None, usize::MAX);
     let stopped = run(
@@ -436,5 +447,4 @@ fn a_constrained_request_ends_at_a_stop_token_it_chose_and_at_a_budget_of_one() 
     assert_eq!(single.tokens, vec![4000]);
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
     assert!(sequence_free(&runtime), "one token: every lease is back");
-    owner.shutdown(runtime).unwrap();
 }

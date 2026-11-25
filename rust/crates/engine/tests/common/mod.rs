@@ -2,6 +2,11 @@
 
 #![allow(dead_code, reason = "each test file uses some of these helpers")]
 #![allow(
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    reason = "the tests of one binary take turns on the card: a lock of the test harness, no engine state"
+)]
+#![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "a test helper: a failed unwrap is the failure"
@@ -10,7 +15,8 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread;
 use std::time::Duration;
 
 use euhedral_inference_cuda::CudaLibrary;
@@ -174,6 +180,11 @@ impl Closer {
         }
     }
 
+    /// A handle to the engine.
+    pub fn runtime(&self) -> Arc<EngineRuntime> {
+        Arc::clone(self.runtime.as_ref().expect("the engine is not shut down yet"))
+    }
+
     /// Shuts the engine down: the test's `runtime` is the last handle.
     pub fn shutdown(mut self, runtime: Arc<EngineRuntime>) -> Result<(), EngineError> {
         drop(self.runtime.take());
@@ -198,6 +209,58 @@ impl Drop for Closer {
         // Reached with the engine still up only when the test unwound.
         if let (Some(owner), Some(runtime)) = (self.owner.take(), self.runtime.take()) {
             let _ = owner.shutdown(runtime);
+        }
+    }
+}
+
+/// The engine one test binary shares among its tests, while no test needs an engine of its own.
+static SHARED: Mutex<Option<Closer>> = Mutex::new(None);
+
+/// The card, held by one test at a time. Every engine of the model fills the card, so two engines never exist side by
+/// side: a test takes the card, then either borrows the binary's shared engine ([`shared`]) or starts one of its own
+/// and shuts it down.
+pub struct Card {
+    slot: MutexGuard<'static, Option<Closer>>,
+}
+
+fn lock() -> MutexGuard<'static, Option<Closer>> {
+    // A test that failed holding the card leaves it usable: the next one starts from what is left.
+    SHARED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Takes the card for a test that starts its own engine (another configuration, a shutdown, a fault, a restart).
+/// Waits for the test that holds it, then shuts the shared engine down, which must end clean: the leak check of a
+/// shared engine is made here, where it ends.
+pub fn card() -> Card {
+    let mut slot = lock();
+    if let Some(closer) = slot.take() {
+        let runtime = closer.runtime();
+        closer.shutdown(runtime).expect("the shared engine shuts down clean");
+    }
+    Card { slot }
+}
+
+/// Takes the card for a test that runs on the binary's shared engine, started by `start` for the first of them. The
+/// test runs one at a time against it: a request starts each sequence from nothing, and the tests read the first
+/// sequence and expect it idle, so tests do not interleave on one engine. The test keeps no handle past its end.
+pub fn shared(start: impl FnOnce() -> (Closer, Arc<EngineRuntime>)) -> (Card, Arc<EngineRuntime>) {
+    let mut slot = lock();
+    let runtime = match slot.as_ref() {
+        Some(closer) => closer.runtime(),
+        None => {
+            let (closer, runtime) = start();
+            *slot = Some(closer);
+            runtime
+        }
+    };
+    (Card { slot }, runtime)
+}
+
+impl Drop for Card {
+    fn drop(&mut self) {
+        // A test that failed may have left the shared engine in a state the next test would trip on.
+        if thread::panicking() {
+            drop(self.slot.take());
         }
     }
 }

@@ -327,6 +327,7 @@ fn cancel_all_ways(
 /// inside a step, with captured graphs and without; after each, full generations equal one no cancel preceded.
 fn cancels_and_recovers(speculation: Speculation) {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let (owner, runtime) = start(&machine);
     let short = prompt(40);
     let long = prompt(LONG_PROMPT);
@@ -381,6 +382,7 @@ fn a_cancel_ends_a_speculative_generation_and_frees_the_sequence() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_cancel_ends_a_sampled_generation_and_frees_the_sequence() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let (owner, runtime) = start(&machine);
     let short = prompt(40);
     let sampling = SamplingConfig::new(1.0, 40, 1.0, 3, false).unwrap();
@@ -464,6 +466,7 @@ impl GenerationListener for Watcher {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn closing_the_engine_mid_decode_cancels_the_generation_and_frees_the_sequence() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let (owner, runtime) = start(&machine);
 
     // A request that would run for thousands of tokens: only the close ends it.
@@ -508,6 +511,7 @@ fn closing_the_engine_mid_decode_cancels_the_generation_and_frees_the_sequence()
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn cancel_one_of_two_staged_sequences() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let mut settings = Settings::with_model(ModelSettings {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
