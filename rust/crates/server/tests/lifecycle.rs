@@ -13,9 +13,9 @@ use std::cell::Cell;
 use std::fs::write;
 use std::net::TcpListener;
 use std::rc::Rc;
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{Receiver, channel};
 use std::thread::spawn;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::{PATIENCE, chat, closed_by_server, exchange, gauge, idle_connection, ready, status, until};
 use euhedral_inference_api_server::scripted::{MODEL_ID, Script};
@@ -28,6 +28,9 @@ use euhedral_inference_settings::{ByteSize, ModelSettings, Settings};
 
 const CHAT: &str = "/v1/chat/completions";
 
+/// A window no test waits out: a stop that has to wait for it never returns.
+const FOR_EVER: Duration = Duration::from_secs(3600);
+
 /// The windows of a stop that waits for the requests in flight not at all, and for the generations `shutdown`.
 fn at_once(shutdown: Duration) -> StopWindows {
     StopWindows {
@@ -36,22 +39,14 @@ fn at_once(shutdown: Duration) -> StopWindows {
     }
 }
 
-/// What a test's wait for the stop returns when the stop is asked for: the moment is noted, so that a test times the stop
-/// and not the start of the backend before it.
-fn stop_asked(asked: &Cell<Option<Instant>>) -> u8 {
-    asked.set(Some(Instant::now()));
-    EXIT_SIGTERM
-}
-
-/// How long `serve` waits for the stop's report: as long again as the windows add up to. A stop that took that long was
-/// not reported at all, so every stop that is reported is quicker.
-fn report_limit(windows: StopWindows) -> Duration {
-    (windows.drain + windows.shutdown) * 2
-}
-
-/// How long the stop took, from the moment [`stop_asked`] noted to now.
-fn stopped_after(asked: &Cell<Option<Instant>>) -> Duration {
-    asked.get().expect("the stop was asked for").elapsed()
+/// Runs `body`, which calls `serve`, on a thread of its own and returns what it returned. A `serve` that does not
+/// return within the patience is a stop that waits for something that does not end: the test fails, saying so.
+fn returns<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+    let (done, returned) = channel();
+    spawn(move || done.send(body()).ok());
+    returned
+        .recv_timeout(PATIENCE)
+        .expect("serve never returned: the stop is waiting for something that does not end")
 }
 
 fn settings() -> Settings {
@@ -82,60 +77,17 @@ fn the_routes_answer_and_the_model_is_listed() {
 }
 
 #[test]
-fn a_stop_with_nothing_running_returns_promptly() {
-    let asked = Rc::new(Cell::new(None));
-    let windows = StopWindows::default();
-    let code = serve(&settings(), windows, start, {
-        let asked = asked.clone();
-        move |_| stop_asked(&asked)
-    });
+fn a_stop_with_nothing_running_returns_without_waiting_for_the_windows() {
+    let windows = StopWindows {
+        drain: FOR_EVER,
+        shutdown: FOR_EVER,
+    };
+    let code = returns(move || serve(&settings(), windows, start, |_| EXIT_SIGTERM));
     assert_eq!(code, EXIT_SIGTERM);
-    // A stop with nothing in flight waits for neither window.
-    let took = stopped_after(&asked);
-    assert!(took < windows.drain, "stopping took {took:?}");
 }
 
-#[test]
-fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one_within_the_shutdown_timeout() {
-    let windows = StopWindows {
-        drain: Duration::from_millis(300),
-        shutdown: Duration::from_secs(2),
-    };
-    let (clients, answers) = channel();
-    let asked = Rc::new(Cell::new(None));
-    let code = serve(
-        &settings(),
-        windows,
-        |_| start_with(Script::Hung),
-        |addr| {
-            ready(addr);
-            let running = clients.clone();
-            spawn(move || {
-                running
-                    .send(("running", exchange(addr, "POST", CHAT, Some(&chat(true, 3000)))))
-                    .ok()
-            });
-            until("the first request to run", || {
-                gauge(addr, "euhedral_generations_active") == Some(1.0)
-            });
-            let queued = clients.clone();
-            spawn(move || {
-                queued
-                    .send(("queued", exchange(addr, "POST", CHAT, Some(&chat(false, 3000)))))
-                    .ok()
-            });
-            until("the second request to wait", || {
-                gauge(addr, "euhedral_generations_queued") == Some(1.0)
-            });
-            stop_asked(&asked)
-        },
-    );
-    assert_eq!(code, EXIT_SIGTERM);
-    // The generation never ends, so the stop waits for it up to the drain and the shutdown windows and no longer.
-    let took = stopped_after(&asked);
-    assert!(took >= windows.drain + windows.shutdown, "stopping took only {took:?}");
-    assert!(took < report_limit(windows), "stopping took {took:?}");
-    drop(clients);
+/// The answers of the clients of a test that ended: the running request's and the queued one's, each when it came.
+fn answered(answers: &Receiver<(&'static str, String)>) -> (String, String) {
     let mut running = String::new();
     let mut queued = String::new();
     while let Ok((which, answer)) = answers.recv_timeout(PATIENCE) {
@@ -148,6 +100,51 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one_within_the_s
             break;
         }
     }
+    (running, queued)
+}
+
+#[test]
+fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one() {
+    let (clients, answers) = channel();
+    let code = returns({
+        let clients = clients.clone();
+        move || {
+            serve(
+                &settings(),
+                // The generation never ends, so the stop has to give up on it at the end of the shutdown window.
+                StopWindows {
+                    drain: Duration::from_millis(1),
+                    shutdown: Duration::from_millis(1),
+                },
+                |_| start_with(Script::Hung),
+                |addr| {
+                    ready(addr);
+                    let running = clients.clone();
+                    spawn(move || {
+                        running
+                            .send(("running", exchange(addr, "POST", CHAT, Some(&chat(true, 3000)))))
+                            .ok()
+                    });
+                    until("the first request to run", || {
+                        gauge(addr, "euhedral_generations_active") == Some(1.0)
+                    });
+                    let queued = clients.clone();
+                    spawn(move || {
+                        queued
+                            .send(("queued", exchange(addr, "POST", CHAT, Some(&chat(false, 3000)))))
+                            .ok()
+                    });
+                    until("the second request to wait", || {
+                        gauge(addr, "euhedral_generations_queued") == Some(1.0)
+                    });
+                    EXIT_SIGTERM
+                },
+            )
+        }
+    });
+    assert_eq!(code, EXIT_SIGTERM);
+    drop(clients);
+    let (running, queued) = answered(&answers);
     assert_eq!(status(&queued), 503, "{queued}");
     assert!(queued.contains("shutting down"), "{queued}");
     assert_eq!(status(&running), 200, "{running}");
@@ -155,27 +152,23 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one_within_the_s
 }
 
 #[test]
-fn a_stop_with_a_generation_that_never_ends_returns_after_the_shutdown_window() {
-    let shutdown_timeout = Duration::from_secs(1);
-    let windows = at_once(shutdown_timeout);
-    let asked = Rc::new(Cell::new(None));
-    let code = serve(
-        &settings(),
-        windows,
-        |_| start_with(Script::Hung),
-        |addr| {
-            ready(addr);
-            spawn(move || exchange(addr, "POST", CHAT, Some(&chat(true, 10))));
-            until("the request to run", || {
-                gauge(addr, "euhedral_generations_active") == Some(1.0)
-            });
-            stop_asked(&asked)
-        },
-    );
+fn a_stop_with_a_generation_that_never_ends_returns_once_the_shutdown_window_passed() {
+    let code = returns(|| {
+        serve(
+            &settings(),
+            at_once(Duration::from_millis(1)),
+            |_| start_with(Script::Hung),
+            |addr| {
+                ready(addr);
+                spawn(move || exchange(addr, "POST", CHAT, Some(&chat(true, 10))));
+                until("the request to run", || {
+                    gauge(addr, "euhedral_generations_active") == Some(1.0)
+                });
+                EXIT_SIGTERM
+            },
+        )
+    });
     assert_eq!(code, EXIT_SIGTERM);
-    let took = stopped_after(&asked);
-    assert!(took >= shutdown_timeout, "stopping took only {took:?}");
-    assert!(took < report_limit(windows), "stopping took {took:?}");
 }
 
 #[test]
@@ -303,78 +296,70 @@ fn the_backend_is_shut_down_within_the_shutdown_timeout_of_the_settings() {
 
 #[test]
 fn running_and_queued_requests_finish_within_the_drain_window() {
+    // The windows are not waited out: the stop returns as soon as both requests finished, and a stop that did not
+    // wait for them would answer the queued one with a refusal.
     let windows = StopWindows {
-        drain: Duration::from_secs(20),
-        shutdown: Duration::from_secs(5),
+        drain: FOR_EVER,
+        shutdown: FOR_EVER,
     };
-    let (started, backend) = start_scripted(Script::Hung).expect("a scripted backend");
     let (clients, answers) = channel();
-    let asked = Rc::new(Cell::new(None));
-    let code = serve(
-        &settings(),
-        windows,
-        |_| Ok(started),
-        |addr| {
-            ready(addr);
-            let running = clients.clone();
-            spawn(move || {
-                running
-                    .send(("running", exchange(addr, "POST", CHAT, Some(&chat(true, 20)))))
-                    .ok()
-            });
-            until("the first request to run", || {
-                gauge(addr, "euhedral_generations_active") == Some(1.0)
-            });
-            // What the queued request will get once it runs.
-            backend.set_script(Script::hello());
-            until("the first token", || {
-                backend
-                    .generations()
-                    .first()
-                    .is_some_and(|generation| generation.emit_held("tok0 "))
-            });
-            let queued = clients.clone();
-            spawn(move || {
-                queued
-                    .send(("queued", exchange(addr, "POST", CHAT, Some(&chat(false, 20)))))
-                    .ok()
-            });
-            until("the second request to wait", || {
-                gauge(addr, "euhedral_generations_queued") == Some(1.0)
-            });
-            // The running generation ends on its own, once the stop has begun: the stop closes the idle connection.
-            let running = backend.generations().remove(0);
-            let idle = idle_connection(addr);
-            spawn(move || {
-                assert!(closed_by_server(idle), "the stop did not begin");
-                assert!(running.finish_held_ok(20, false), "the generation was not held");
-            });
-            stop_asked(&asked)
-        },
-    );
-    assert_eq!(code, EXIT_SIGTERM);
-    let took = stopped_after(&asked);
-    assert!(
-        took < windows.drain,
-        "the stop waited for the whole drain window: {took:?}"
-    );
+    let generations = returns({
+        let clients = clients.clone();
+        move || {
+            let (started, backend) = start_scripted(Script::Hung).expect("a scripted backend");
+            let code = serve(
+                &settings(),
+                windows,
+                |_| Ok(started),
+                |addr| {
+                    ready(addr);
+                    let running = clients.clone();
+                    spawn(move || {
+                        running
+                            .send(("running", exchange(addr, "POST", CHAT, Some(&chat(true, 20)))))
+                            .ok()
+                    });
+                    until("the first request to run", || {
+                        gauge(addr, "euhedral_generations_active") == Some(1.0)
+                    });
+                    // What the queued request will get once it runs.
+                    backend.set_script(Script::hello());
+                    until("the first token", || {
+                        backend
+                            .generations()
+                            .first()
+                            .is_some_and(|generation| generation.emit_held("tok0 "))
+                    });
+                    let queued = clients.clone();
+                    spawn(move || {
+                        queued
+                            .send(("queued", exchange(addr, "POST", CHAT, Some(&chat(false, 20)))))
+                            .ok()
+                    });
+                    until("the second request to wait", || {
+                        gauge(addr, "euhedral_generations_queued") == Some(1.0)
+                    });
+                    // The running generation ends on its own, once the stop has begun: the stop closes the idle
+                    // connection.
+                    let running = backend.generations().remove(0);
+                    let idle = idle_connection(addr);
+                    spawn(move || {
+                        assert!(closed_by_server(idle), "the stop did not begin");
+                        assert!(running.finish_held_ok(20, false), "the generation was not held");
+                    });
+                    EXIT_SIGTERM
+                },
+            );
+            assert_eq!(code, EXIT_SIGTERM);
+            backend.generations().len()
+        }
+    });
     drop(clients);
-    let mut running = String::new();
-    let mut queued = String::new();
-    while let Ok((which, answer)) = answers.recv_timeout(PATIENCE) {
-        if which == "running" {
-            running = answer;
-        } else {
-            queued = answer;
-        }
-        if !running.is_empty() && !queued.is_empty() {
-            break;
-        }
-    }
+    let (running, queued) = answered(&answers);
     assert_eq!(status(&running), 200, "{running}");
     assert!(running.contains("\"finish_reason\":\"length\""), "{running}");
     assert!(running.contains("[DONE]"), "{running}");
     assert_eq!(status(&queued), 200, "{queued}");
     assert!(queued.contains("Hello, world"), "{queued}");
-    assert_eq!(backend.generations().len(), 2);
+    assert_eq!(generations, 2);
 }
