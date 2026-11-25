@@ -309,6 +309,152 @@ rust_test(
 )
 
 rust_test(
+    name = "exl3_linears_test",
+    compile_data = glob(
+        [
+            "tests/**",
+            "src/**",
+            "Cargo.toml",
+            "README.md",
+        ],
+        exclude = ["tests/**/*.rs", "src/**/*.rs"],
+        allow_empty = True,
+    ) + [
+        "//:native/src/trellis/codebook.cuh",
+        "//:quantization/src/main/resources/cuda/drafter.cu",
+        "//:quantization/src/main/resources/cuda/gptq.cu",
+        "//:quantization/src/main/resources/cuda/mtp.cu",
+        "//:quantization/src/main/resources/cuda/rows.cu",
+        "//:quantization/src/main/resources/cuda/score.cu",
+        "//:quantization/src/main/resources/cuda/train.cu",
+        "//:quantization/src/main/resources/cuda/trellis.cu",
+        "//rust/crates/api-protocol:tests/data/qwen-chat-template.jinja",
+        "//rust/crates/engine:tests/fixtures/rco_table.tsv",
+    ],
+    crate_features = ["test-hooks"],
+    crate_name = "exl3_linears",
+    crate_root = "tests/exl3_linears.rs",
+    data = glob(
+        [
+            "tests/**",
+            "src/**",
+            "Cargo.toml",
+            "README.md",
+        ],
+        exclude = ["tests/**/*.rs", "src/**/*.rs"],
+        allow_empty = True,
+    ),
+    deps = [
+        ":euhedral_inference_quantization",
+        "//rust/crates/api-protocol:euhedral_inference_api_protocol",
+        "//rust/crates/cuda:euhedral_inference_cuda",
+        "//rust/crates/edrl:euhedral_inference_edrl",
+        "//rust/crates/engine:euhedral_inference_engine",
+        "//rust/crates/settings:euhedral_inference_settings",
+        "//rust/crates/test-support:test_support",
+        "//rust/crates/tokenizer:euhedral_inference_tokenizer",
+        "@euhedral_crates//:crc32fast",
+        "@euhedral_crates//:same-file",
+        "@euhedral_crates//:serde_json",
+        "@euhedral_crates//:tempfile",
+        "@euhedral_crates//:thiserror",
+        "@euhedral_rustee//euhedral-core:euhedral_core_cuda_testing",
+        "@euhedral_rustee//euhedral-data-structures:euhedral_data_structures_cuda_testing",
+        "@euhedral_rustee//euhedral-gpu:euhedral_gpu_cuda_testing",
+        "@euhedral_rustee//euhedral-graph:euhedral_graph_cuda_testing",
+        "@euhedral_rustee//euhedral-hashing:euhedral_hashing_cuda_testing",
+        "@euhedral_rustee//euhedral-io:euhedral_io_cuda_testing",
+        "@euhedral_rustee//euhedral-memory:euhedral_memory_cuda_testing",
+    ],
+    edition = "2024",
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "rust/crates/quantization",
+        "CARGO_TARGET_TMPDIR": "unused-under-bazel",
+    },
+    srcs = glob(
+        [
+            "tests/exl3_linears.rs",
+            "tests/*/**/*.rs",
+        ],
+        allow_empty = True,
+    ),
+    version = "0.1.0",
+)
+
+rust_test(
+    name = "exl3_writer_test",
+    compile_data = glob(
+        [
+            "tests/**",
+            "src/**",
+            "Cargo.toml",
+            "README.md",
+        ],
+        exclude = ["tests/**/*.rs", "src/**/*.rs"],
+        allow_empty = True,
+    ) + [
+        "//:native/src/trellis/codebook.cuh",
+        "//:quantization/src/main/resources/cuda/drafter.cu",
+        "//:quantization/src/main/resources/cuda/gptq.cu",
+        "//:quantization/src/main/resources/cuda/mtp.cu",
+        "//:quantization/src/main/resources/cuda/rows.cu",
+        "//:quantization/src/main/resources/cuda/score.cu",
+        "//:quantization/src/main/resources/cuda/train.cu",
+        "//:quantization/src/main/resources/cuda/trellis.cu",
+        "//rust/crates/api-protocol:tests/data/qwen-chat-template.jinja",
+        "//rust/crates/engine:tests/fixtures/rco_table.tsv",
+    ],
+    crate_features = ["test-hooks"],
+    crate_name = "exl3_writer",
+    crate_root = "tests/exl3_writer.rs",
+    data = glob(
+        [
+            "tests/**",
+            "src/**",
+            "Cargo.toml",
+            "README.md",
+        ],
+        exclude = ["tests/**/*.rs", "src/**/*.rs"],
+        allow_empty = True,
+    ),
+    deps = [
+        ":euhedral_inference_quantization",
+        "//rust/crates/api-protocol:euhedral_inference_api_protocol",
+        "//rust/crates/cuda:euhedral_inference_cuda",
+        "//rust/crates/edrl:euhedral_inference_edrl",
+        "//rust/crates/engine:euhedral_inference_engine",
+        "//rust/crates/settings:euhedral_inference_settings",
+        "//rust/crates/test-support:test_support",
+        "//rust/crates/tokenizer:euhedral_inference_tokenizer",
+        "@euhedral_crates//:crc32fast",
+        "@euhedral_crates//:same-file",
+        "@euhedral_crates//:serde_json",
+        "@euhedral_crates//:tempfile",
+        "@euhedral_crates//:thiserror",
+        "@euhedral_rustee//euhedral-core:euhedral_core_cuda_testing",
+        "@euhedral_rustee//euhedral-data-structures:euhedral_data_structures_cuda_testing",
+        "@euhedral_rustee//euhedral-gpu:euhedral_gpu_cuda_testing",
+        "@euhedral_rustee//euhedral-graph:euhedral_graph_cuda_testing",
+        "@euhedral_rustee//euhedral-hashing:euhedral_hashing_cuda_testing",
+        "@euhedral_rustee//euhedral-io:euhedral_io_cuda_testing",
+        "@euhedral_rustee//euhedral-memory:euhedral_memory_cuda_testing",
+    ],
+    edition = "2024",
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "rust/crates/quantization",
+        "CARGO_TARGET_TMPDIR": "unused-under-bazel",
+    },
+    srcs = glob(
+        [
+            "tests/exl3_writer.rs",
+            "tests/*/**/*.rs",
+        ],
+        allow_empty = True,
+    ),
+    version = "0.1.0",
+)
+
+rust_test(
     name = "gptq_gpu_test",
     compile_data = glob(
         [

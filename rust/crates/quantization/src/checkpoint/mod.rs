@@ -21,6 +21,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub use io::Done;
+pub(crate) use io::read_file;
 
 /// Why a checkpoint could not be read or written.
 #[derive(Debug, Error)]
