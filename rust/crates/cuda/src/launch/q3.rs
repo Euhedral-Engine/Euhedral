@@ -500,6 +500,18 @@ fn mx_scratch_for_splits(rows: u32, width: u32, weight_rows: u32, splits: u32) -
 /// last row, where its planes and partials are largest. 0 below [`MX_MIN_ROWS`]. Where the device is not known
 /// (`sm_count` is `None`) the answer is the most any device takes: the split of K is at most 4 and divides the groups.
 pub fn mx_scratch_bytes_upto(rows: u32, width: u32, weight_rows: u32, sm_count: Option<u32>) -> u64 {
+    mx_scratch_bytes_upto_split(rows, width, weight_rows, sm_count, 0)
+}
+
+/// [`mx_scratch_bytes_upto`] for a run in output-row chunks of `weight_rows` rows, whose split of K follows the whole
+/// tensor's `split_rows` weight rows (0 for a tensor run whole).
+pub fn mx_scratch_bytes_upto_split(
+    rows: u32,
+    width: u32,
+    weight_rows: u32,
+    sm_count: Option<u32>,
+    split_rows: u32,
+) -> u64 {
     if rows < MX_MIN_ROWS {
         return 0;
     }
@@ -507,7 +519,7 @@ pub fn mx_scratch_bytes_upto(rows: u32, width: u32, weight_rows: u32, sm_count: 
     let mut top = 128.min(rows);
     loop {
         largest = largest.max(match sm_count {
-            Some(sm_count) => mx_scratch_bytes(top, width, weight_rows, sm_count, 0),
+            Some(sm_count) => mx_scratch_bytes(top, width, weight_rows, sm_count, split_rows),
             None => {
                 let groups = width / 64;
                 let splits = if groups.is_multiple_of(4) {
@@ -531,13 +543,62 @@ pub fn mx_scratch_bytes_upto(rows: u32, width: u32, weight_rows: u32, sm_count: 
 /// chunks of output rows.
 pub const P2E2_EXPAND_LIMIT: u64 = 128 << 20;
 
+/// Output rows of a chunk of a P2E2 linear of `out_features` by `in_features` too large to expand whole, for a launch of
+/// `rows` rows: the largest multiple of 1024 whose whole scratch ([`p2e2_chunk_scratch`]: the expansion, the output,
+/// the activations of the FP8 route and its split-K partials, which grow with the device's `sm_count`) fits
+/// [`P2E2_EXPAND_LIMIT`], and no width the FFN or mixer kernels are specialised for (5120 and 34816), so every chunk
+/// takes the generic kernels and each output equals the whole tensor's. One kilorow is the least, whatever it takes.
+/// The FP8 route's scratch is always counted, whether or not the device runs it, so the plan and every launch choose
+/// the same chunk (a chunk's size never changes an output) and a launch without the route takes less than planned.
+pub fn p2e2_chunk_rows(rows: u32, in_features: u32, out_features: u32, sm_count: Option<u32>) -> u32 {
+    let most = (P2E2_EXPAND_LIMIT / q3_byte_size(1024, in_features).max(1))
+        .max(1)
+        .min(u64::from(u32::MAX / 2) / 1024);
+    let mut units = most;
+    while units > 1 {
+        let chunk = u32::try_from(units * 1024).unwrap_or(1024);
+        let guarded = chunk == 5120 || chunk == 34816;
+        if !guarded && p2e2_chunk_scratch(rows, in_features, out_features, chunk, true, sm_count) <= P2E2_EXPAND_LIMIT {
+            break;
+        }
+        units -= 1;
+    }
+    u32::try_from(units * 1024).unwrap_or(1024)
+}
+
+/// The scratch a chunk of `chunk` output rows of a P2E2 tensor of `out_features` takes for a launch of up to `rows`
+/// rows: the chunk's expansion, its output and its activations ([`p2e2_chunk_offsets`]), then the FP8 route's scratch.
+pub fn p2e2_chunk_scratch(
+    rows: u32,
+    in_features: u32,
+    out_features: u32,
+    chunk: u32,
+    mx_available: bool,
+    sm_count: Option<u32>,
+) -> u64 {
+    let (_, activation_offset) = p2e2_chunk_offsets(rows, in_features, chunk);
+    let reserve = if mx_available && in_features.is_multiple_of(128) {
+        mx_scratch_bytes_upto_split(rows, in_features, chunk, sm_count, out_features)
+    } else {
+        0
+    };
+    activation_offset + reserve
+}
+
+/// Where a chunk of `count` output rows keeps its output and its activations in the scratch, behind the chunk's
+/// expansion at offset 0: `(output offset, activations offset)`.
+pub fn p2e2_chunk_offsets(rows: u32, in_features: u32, count: u32) -> (u64, u64) {
+    let output = align256(q3_byte_size(count, in_features));
+    (output, align256(output + u64::from(rows) * u64::from(count) * 2))
+}
+
 /// The scratch a Q3, Q4 or Q5 linear of up to `rows` rows over a tensor of `out_features` by `in_features` takes,
 /// where `mx_available` says the device runs the FP8 route, `sm_count` is its multiprocessor count and
 /// `exact_numerics` says the library runs the exact kernels (`scratchBytes` of the grouped formats). A plain tensor
 /// takes the FP8 route's scratch when it runs; a P2E2 tensor is expanded first wherever its fused decode does not run
 /// (more than 8 rows, a shape it does not take, exact numerics), so it takes the expansion, 256-aligned, and the FP8
-/// scratch behind it. A P2E2 tensor too large to expand whole is run in chunks, which this does not size: its answer
-/// is `None`.
+/// scratch behind it. A P2E2 tensor too large to expand whole is run in chunks of output rows: the scratch holds one
+/// chunk's expansion, its output and its activations.
 pub fn linear_scratch_bytes(
     p2e2: bool,
     rows: u32,
@@ -546,10 +607,10 @@ pub fn linear_scratch_bytes(
     mx_available: bool,
     sm_count: Option<u32>,
     exact_numerics: bool,
-) -> Option<u64> {
+) -> u64 {
     let decodes = rows < MX_MIN_ROWS && !exact_numerics && q3_decode_shape(in_features, out_features);
     if (!p2e2 && rows < MX_MIN_ROWS) || (p2e2 && decodes) {
-        return Some(0);
+        return 0;
     }
     let activations = |tiled_outputs: bool| {
         if mx_available && in_features.is_multiple_of(128) && (!tiled_outputs || out_features.is_multiple_of(128)) {
@@ -559,10 +620,41 @@ pub fn linear_scratch_bytes(
         }
     };
     if !p2e2 {
-        return Some(activations(true));
+        return activations(true);
     }
     let expanded = q3_byte_size(out_features, in_features);
-    (expanded <= P2E2_EXPAND_LIMIT).then(|| align256(expanded) + activations(false))
+    if expanded <= P2E2_EXPAND_LIMIT {
+        return align256(expanded) + activations(false);
+    }
+    let chunk = p2e2_chunk_rows(rows, in_features, out_features, sm_count).min(out_features);
+    p2e2_chunk_scratch(rows, in_features, out_features, chunk, mx_available, sm_count)
+}
+
+/// The most scratch any launch of 1 to `rows` rows takes ([`linear_scratch_bytes`]). A chunked tensor's chunk grows as
+/// the rows shrink, so a launch of fewer rows can take more than one of `rows`.
+pub fn linear_scratch_bytes_upto(
+    p2e2: bool,
+    rows: u32,
+    in_features: u32,
+    out_features: u32,
+    mx_available: bool,
+    sm_count: Option<u32>,
+    exact_numerics: bool,
+) -> u64 {
+    (1..=rows.max(1))
+        .map(|launch| {
+            linear_scratch_bytes(
+                p2e2,
+                launch,
+                in_features,
+                out_features,
+                mx_available,
+                sm_count,
+                exact_numerics,
+            )
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The offsets of the planes of a Q4 or Q5 tensor that the FP8 kernel takes: the fifth-bit plane's and the scales'

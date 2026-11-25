@@ -22,6 +22,7 @@ fn inputs(device_free: u64, host_pinned_bytes: Option<u64>) -> PlanInputs {
     PlanInputs {
         device_free,
         multiprocessors: Some(70),
+        exact_numerics: false,
         host_pinned_bytes,
         sequences: 1,
     }

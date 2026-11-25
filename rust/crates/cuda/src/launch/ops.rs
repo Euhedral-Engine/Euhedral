@@ -15,7 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use euhedral_gpu::cuda::CudaKernel;
-use euhedral_gpu::{GpuError, LaneEnqueue, LaneStream};
+use euhedral_gpu::{Args, GpuError, LaneEnqueue, LaneStream, Launch as GpuLaunch, RawStream};
 use euhedral_graph::Marker;
 
 use crate::error::{CudaError, check};
@@ -1185,6 +1185,54 @@ pub struct FreeFailure {
     /// The buffer, still allocated, when it was not freed and not dropped.
     pub buffer: Option<DeviceBuffer>,
     pub error: CudaError,
+}
+
+impl<Q> RusteeOps<'_, Q>
+where
+    Q: LaneEnqueue<Kernel = CudaKernel> + LaneStream<Raw = *mut c_void>,
+{
+    /// Launches `kernel`, a kernel that is not in the catalog (another module's), in order with the operations queued
+    /// through `self`.
+    ///
+    /// # Safety
+    /// As [`LaneEnqueue::launch`]: every address the kernel touches is valid
+    /// for that access until the work retires.
+    pub unsafe fn launch_kernel(
+        &mut self,
+        kernel: &CudaKernel,
+        geometry: GpuLaunch,
+        args: &Args,
+    ) -> Result<(), CudaError> {
+        let driver = kernel.parameter_sizes().ok_or_else(|| {
+            CudaError::Argument("launch_kernel: the driver does not report the kernel's parameter sizes".into())
+        })?;
+        let same =
+            args.len() == driver.len() && args.sizes().zip(driver).all(|(size, &driver)| size == driver as usize);
+        if !same {
+            return Err(CudaError::Argument(format!(
+                "launch_kernel: the arguments' sizes {:?} are not the kernel's parameter sizes {driver:?}",
+                args.sizes().collect::<Vec<_>>()
+            )));
+        }
+        let geometry = GpuLaunch {
+            programmatic: geometry.programmatic && self.pdl,
+            ..geometry
+        };
+        // SAFETY: the caller's contract; the arguments were checked against the kernel's parameter sizes above.
+        unsafe { self.queue.launch(kernel, geometry, args) }.map_err(|error| lane_error("launch_kernel", &error))
+    }
+
+    /// Runs `call` with the stream the lane lends, for a library call that takes the stream itself (cuBLAS through
+    /// [`LaneHandles`](crate::math::LaneHandles)). The lent stream is the one every operation of this submission goes
+    /// to, so the call is ordered with everything enqueued before it and after it; the contract of
+    /// [`LaneStream::raw_stream`] applies to what `call` does with it.
+    pub fn with_raw_stream<R>(&self, call: impl FnOnce(&RawStream<'_, *mut c_void>) -> R) -> Result<R, CudaError> {
+        let stream = self
+            .queue
+            .raw_stream()
+            .ok_or_else(|| CudaError::Argument("the lane lent no stream".to_string()))?;
+        Ok(call(&stream))
+    }
 }
 
 /// The calling thread's stream selection, cleared when dropped.

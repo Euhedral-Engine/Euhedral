@@ -448,16 +448,15 @@ impl Writing {
     fn finish(self, file: OwnedFile) {
         let shared = durable::share(file);
         let host = Arc::clone(&self.host);
-        let held = Arc::clone(&shared);
         let cell = Handoff::new();
         cell.send(self);
         let waiting = Arc::clone(&cell);
-        let started = durable::sync(
+        // The call gives up its reference before the completion runs, so the file is closed before it is renamed (a
+        // file that is open cannot be renamed on Windows).
+        let started = durable::sync_and_close(
             &host,
-            &shared,
+            shared,
             Box::new(move |synced| {
-                // The file is closed before it is renamed: a file that is open cannot be renamed on Windows.
-                drop(held);
                 let Some(writing) = waiting.take() else {
                     return idle();
                 };
@@ -471,7 +470,6 @@ impl Writing {
                 idle()
             }),
         );
-        drop(shared);
         if started.is_err()
             && let Some(writing) = cell.take()
         {

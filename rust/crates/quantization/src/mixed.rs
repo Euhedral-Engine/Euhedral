@@ -10,8 +10,8 @@
 //!
 //! [`SearchState`] is the search's resume file: the candidates it measured and how far it got.
 //!
-//! The objects a search chooses over come from the source artifacts, which a later module owns. What the search needs
-//! of them is the narrow [`Sources`] trait.
+//! The objects a search chooses over come from the source artifacts, which [`assemble`](crate::assemble) opens. What
+//! the search needs of them is the narrow [`Sources`] trait.
 
 mod allocation;
 mod cost_table;
