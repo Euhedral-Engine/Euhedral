@@ -1,0 +1,110 @@
+# The release step, played by hand (workflow_dispatch) on the integration branch. `rollover promote` checks everything first
+# and changes nothing when a check fails: it needs a successful push run of ci.yaml on the promoted commit, moves main to it,
+# starts the next integration branch there (protected, the open pull requests moved to it, INTEGRATION_BRANCH set to it) and
+# deletes the old branch on Gitea and, over ssh with the host user's key, on GitHub. It never deploys.
+#
+# It runs on the host runner, which runs only push and workflow_dispatch on a protected integration branch (the runner's
+# host-guard enforces that; the `if` below is a convenience). The token is the promote bot's host file, never an Actions
+# secret; this job is the one reader of promote.token (the rollover step, and the download only when the job token is refused). No checkout is needed: rollover clones the repository itself and reads .gitea/rollover.toml from the promoted commit.
+#
+# Inputs (strings):
+#   next_branch  optional: the new branch's name (default: the old number plus one)
+#   dry_run      "1" (the default) prints the plan and changes nothing; "0" promotes
+#
+# The rollover release is pinned here: the tag and the sha256 of its linux binary, changed by a reviewed pull request.
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      next_branch:
+        description: "Name of the next integration branch (empty: the old number plus one)"
+        required: false
+        default: ""
+      dry_run:
+        description: 'Print the plan and change nothing ("1"); "0" promotes'
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+env:
+  # The rollover release to run, and the sha256 of its asset rollover-x86_64-unknown-linux-musl.
+  ROLLOVER_TAG: v1.0.0
+  # The digest of that asset, from the release's SHA256SUMS. The step refuses to run when this is not 64 hex digits.
+  ROLLOVER_SHA256: "6b16d4cb9c989b1ed99e75cf410a8bfe15419bddd23a3bbda01970b2260f008c"
+
+concurrency:
+  group: euhedral-integration
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: promote
+    runs-on: arbiter-host
+    if: github.ref_name == vars.INTEGRATION_BRANCH
+    timeout-minutes: 20
+    env:
+      FORGE_URL: ${{ vars.FORGE_URL }}
+    steps:
+      - name: Download rollover and check its sha256
+        env:
+          JOB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$ROLLOVER_SHA256" in
+            *[!0-9a-f]* | "") echo "::error::ROLLOVER_SHA256 in promote.yaml is not filled in"; exit 1 ;;
+          esac
+          [ "${#ROLLOVER_SHA256}" -eq 64 ] || { echo "::error::ROLLOVER_SHA256 in promote.yaml is not 64 hex digits"; exit 1; }
+          [ -n "$FORGE_URL" ] || { echo "::error::vars.FORGE_URL is not set"; exit 1; }
+
+          secrets="${FORGE_CI_SECRETS:-$HOME/.config/forge/ci-secrets/euhedral}"
+          mkdir -p "$GITHUB_WORKSPACE"
+          work=$(mktemp -d -p "$GITHUB_WORKSPACE" rollover.XXXXXX)
+          trap 'rm -rf "$work"' EXIT
+          url="$FORGE_URL/euhedral/rollover/releases/download/$ROLLOVER_TAG/rollover-x86_64-unknown-linux-musl"
+          bin="$work/rollover"
+
+          # The header reaches curl on its standard input, so the token is in no file and no command line (printf is a
+          # builtin). No redirect is followed (--max-redirs 0); a redirect, such as one to the login page, counts as a refusal. Prints the HTTP status.
+          fetch() {
+            rm -f "$bin"
+            printf 'Authorization: token %s\n' "$1" |
+              curl -sS --max-redirs 0 --max-time 120 --retry 2 -H @- -o "$bin" -w '%{http_code}' "$url"
+          }
+          # The job token goes first. Only a refusal (401, 403, 404, or a redirect) sends us to the promote bot's token; any other answer,
+          # and a file that is not the pinned one, is a hard failure.
+          code=$(fetch "$JOB_TOKEN") || { echo "::error::the download of rollover $ROLLOVER_TAG failed"; exit 1; }
+          case "$code" in
+            200) echo "downloaded rollover $ROLLOVER_TAG with the job token" ;;
+            401 | 403 | 404 | 301 | 302 | 303 | 307 | 308)
+              echo "the job token was refused ($code); trying the promote bot's token"
+              [ -r "$secrets/promote.token" ] || { echo "::error::no promote.token to fall back to"; exit 1; }
+              perm=$(stat -Lc '%a' "$secrets/promote.token")
+              case "$perm" in [0-7]00) ;; *) echo "::error::promote.token is readable by others (mode $perm); it must be 0600 or 0400"; exit 1 ;; esac
+              code=$(fetch "$(tr -d '\r\n' < "$secrets/promote.token")") ||
+                { echo "::error::the download of rollover $ROLLOVER_TAG failed"; exit 1; }
+              [ "$code" = 200 ] || { echo "::error::the promote bot's token was refused too ($code)"; exit 1; }
+              echo "downloaded rollover $ROLLOVER_TAG with the promote bot's token"
+              ;;
+            *) echo "::error::downloading rollover $ROLLOVER_TAG answered $code"; exit 1 ;;
+          esac
+          echo "$ROLLOVER_SHA256  $bin" | sha256sum --check --status ||
+            { echo "::error::rollover $ROLLOVER_TAG does not match ROLLOVER_SHA256"; exit 1; }
+          chmod 0755 "$bin"
+          mkdir -p "$GITHUB_WORKSPACE/.bin"
+          mv "$bin" "$GITHUB_WORKSPACE/.bin/rollover"
+      - name: Promote
+        env:
+          NEXT_BRANCH: ${{ github.event.inputs.next_branch }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          secrets="${FORGE_CI_SECRETS:-$HOME/.config/forge/ci-secrets/euhedral}"
+          args=(promote --production --token-file "$secrets/promote.token" --lock-wait 15m)
+          if [ -n "$NEXT_BRANCH" ]; then args+=(--next "$NEXT_BRANCH"); fi
+          if [ "${DRY_RUN:-1}" != 0 ]; then args+=(--dry-run); fi
+          # Host jobs are not arbiter-gated, so this step asks for its own lease. The repository, the commit, the
+          # branch and the API address come from the job's GITHUB_* variables and FORGE_URL.
+          system-run --mem 1G --est 1200 -- "$GITHUB_WORKSPACE/.bin/rollover" "${args[@]}"

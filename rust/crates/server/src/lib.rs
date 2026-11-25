@@ -208,6 +208,10 @@ fn listen(port: u16) -> io::Result<TcpListener> {
         socket.listen(1024)?;
         Ok(socket.into())
     };
+    // Windows lets a dual-stack socket take a port another program holds on IPv4 only, so the IPv4 side is tried first
+    // (and released at once): the start fails with the same address-in-use error as elsewhere.
+    #[cfg(windows)]
+    drop(bind(Domain::IPV4, IpAddr::V4(Ipv4Addr::UNSPECIFIED))?);
     match bind(Domain::IPV6, IpAddr::V6(Ipv6Addr::UNSPECIFIED)) {
         Err(error) if error.kind() != io::ErrorKind::AddrInUse => {
             log::info!("listening on IPv6 is not possible ({error}): IPv4 only");
