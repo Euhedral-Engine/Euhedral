@@ -241,6 +241,7 @@ pub fn limit_below_need(library: &Path, settings: &Settings, below: u64) -> u64 
     let inputs = PlanInputs {
         device_free: 64 << 30,
         multiprocessors: Some(loaded.device().sm_count),
+        exact_numerics: false,
         host_pinned_bytes: Some(u64::MAX),
         sequences: 1,
     };
@@ -285,6 +286,7 @@ pub fn limit_to_stage(library: &Path, settings: &Settings, staged: u64) -> u64 {
     let inputs = PlanInputs {
         device_free: 64 << 30,
         multiprocessors: Some(loaded.device().sm_count),
+        exact_numerics: false,
         host_pinned_bytes: Some(u64::MAX),
         sequences: settings.batching.max_sequences as usize,
     };

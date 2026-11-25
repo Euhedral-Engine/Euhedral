@@ -81,6 +81,7 @@ impl<C: Composites> Feasibility for PlannerFeasibility<C> {
         let inputs = PlanInputs {
             device_free: u64::try_from(self.free_bytes).unwrap_or(0),
             multiprocessors: None,
+            exact_numerics: false,
             host_pinned_bytes: Some(u64::MAX),
             sequences: 1,
         };

@@ -675,6 +675,7 @@ fn device_inputs(core: &Core) -> Result<PlanInputs, EngineError> {
     Ok(PlanInputs {
         device_free,
         multiprocessors: Some(core.library.device().sm_count),
+        exact_numerics: core.library.exact_numerics(),
         host_pinned_bytes: core.host_pinned_bytes,
         sequences: 1,
     })
