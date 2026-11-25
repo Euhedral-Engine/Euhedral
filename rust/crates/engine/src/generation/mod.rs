@@ -10,6 +10,7 @@
 mod acceptance;
 mod constraint;
 mod draft_length;
+mod hidden;
 mod listener;
 mod mailbox;
 mod mtp;
@@ -57,6 +58,7 @@ pub use constraint::{ConstraintError, ReasoningConstraint, TokenConstraint};
 pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
 #[cfg(feature = "test-oracles")]
 use euhedral_gpu::GraphStats;
+pub use hidden::HiddenSink;
 pub use listener::GenerationListener;
 pub(crate) use mailbox::OPERATION_BOUND;
 pub use mailbox::Spawn;
@@ -400,6 +402,21 @@ impl Generation {
         })
     }
 
+    /// Starts `request` on this sequence, which hands every row's hidden state to `sink`.
+    fn generate_hidden(
+        &self,
+        request: GenerationRequest,
+        sink: Box<dyn HiddenSink>,
+        cancel: CancelHandle,
+        lease: Lease,
+    ) -> Result<(), AdmissionError> {
+        let core = Arc::clone(&self.shared.core);
+        self.start(move |owner| match owner {
+            Some(owner) => owner.begin_with(admit(&core), request, cancel, lease, Some(sink)),
+            None => Err(closed(Audience::Greedy(request.listener))),
+        })
+    }
+
     /// Starts a teacher-forced run on this sequence.
     fn teacher_forced(
         &self,
@@ -687,6 +704,17 @@ impl Generations {
     pub(crate) fn generate(&self, request: GenerationRequest, cancel: CancelHandle) -> Result<(), AdmissionError> {
         let (generation, lease) = self.take()?;
         generation.generate(request, cancel, lease)
+    }
+
+    /// Starts `request` on an idle sequence, which hands the hidden state of every row it runs to `sink`.
+    pub(crate) fn generate_hidden(
+        &self,
+        request: GenerationRequest,
+        sink: Box<dyn HiddenSink>,
+        cancel: CancelHandle,
+    ) -> Result<(), AdmissionError> {
+        let (generation, lease) = self.take()?;
+        generation.generate_hidden(request, sink, cancel, lease)
     }
 
     /// What the engine's shared passes did.

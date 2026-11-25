@@ -53,6 +53,7 @@ use euhedral_gpu::Ran;
 use euhedral_graph::{Marker, QuantumOutcome};
 use euhedral_inference_cuda::{DevicePtr, PooledPinned, SubmitMode};
 
+use super::hidden::{Hidden, HiddenRows, HiddenSink, delivery_frame};
 use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
 use super::mtp::{Joining, Speculating, Verifying};
@@ -96,6 +97,10 @@ const ALTERNATING_RECORDS: u64 = 2;
 pub(crate) enum Message {
     /// A quantum retired.
     Retired(Box<Retired>),
+    /// The hidden rows of a quantum reached pinned memory.
+    HiddenCopied(Box<HiddenRows>),
+    /// The sink of a hidden request is free again: a delivery to it ended.
+    HiddenDelivered(Box<dyn HiddenSink>),
     /// The logits row of a teacher-forced step reached pinned memory.
     Logits(LogitsCopied),
     /// The host selected the token of a sampled request (or could not).
@@ -145,6 +150,8 @@ impl fmt::Debug for Message {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Message::Retired(_) => formatter.write_str("Message::Retired"),
+            Message::HiddenCopied(rows) => write!(formatter, "Message::HiddenCopied(position {})", rows.first_position),
+            Message::HiddenDelivered(_) => formatter.write_str("Message::HiddenDelivered"),
             Message::Logits(copied) => write!(formatter, "Message::Logits(step {})", copied.step),
             Message::Sampled(sampled) => write!(formatter, "Message::Sampled(step {})", sampled.step),
             Message::Prepared(prepared) => write!(formatter, "Message::Prepared(step {})", prepared.step),
@@ -466,6 +473,21 @@ impl Mode {
     }
 }
 
+/// Why a request that asks for its hidden states is refused: it speculates (its drafts' rows are not the rows of the
+/// tokens it commits), or the artifact has no draft layer whose state the rows come from.
+fn hidden_refusal(hidden: bool, speculation: &Speculation, drafts: bool) -> Option<AdmissionError> {
+    if !hidden {
+        return None;
+    }
+    if !matches!(speculation, Speculation::Off) {
+        return Some(AdmissionError::HiddenWithSpeculation);
+    }
+    if !drafts {
+        return Some(AdmissionError::HiddenUnavailable);
+    }
+    None
+}
+
 /// `count` samplers of `config` for rows of `vocabulary` logits, all made when the request begins.
 fn samplers(config: SamplingConfig, vocabulary: usize, count: usize) -> Result<Vec<TokenSampler>, SamplingError> {
     (0..count).map(|_| TokenSampler::new(config, vocabulary)).collect()
@@ -562,6 +584,8 @@ pub(super) struct Run {
     cancel: CancelHandle,
     /// A teacher-forced step's logits row is being copied.
     pub(super) waiting_logits: bool,
+    /// The sink the request hands every row's hidden state to; `None` for a request that does not.
+    pub(super) hidden: Option<Hidden>,
     /// Turns of the owner that panicked during this request.
     pub(super) panics: u32,
     pub(super) began: Instant,
@@ -861,6 +885,20 @@ impl Owner {
         cancel: CancelHandle,
         lease: Lease,
     ) -> Result<(), Rejected> {
+        self.begin_with(units, request, cancel, lease, None)
+    }
+
+    /// Starts a request, which hands the hidden state of every row it runs to `hidden` when there is a sink. Such a
+    /// request has the host select its tokens (as a sampled one), runs one quantum at a time, does not speculate and
+    /// does not use the prefix cache, whose restored rows would have no hidden state to hand out.
+    pub(crate) fn begin_with(
+        &mut self,
+        units: Result<Units, AdmissionError>,
+        request: GenerationRequest,
+        cancel: CancelHandle,
+        lease: Lease,
+        hidden: Option<Box<dyn HiddenSink>>,
+    ) -> Result<(), Rejected> {
         let GenerationRequest {
             prompt,
             max_tokens,
@@ -874,9 +912,12 @@ impl Owner {
             Ok(units) => units,
             Err(error) => return Err(Rejected::new(error, Audience::Greedy(listener))),
         };
+        if let Some(error) = hidden_refusal(hidden.is_some(), &speculation, self.shared.drafts.is_some()) {
+            return Err(Rejected::new(error, Audience::Greedy(listener)));
+        }
         let mode = match speculation {
             // The host selects the tokens: its drafts, if it speculates, stay greedy.
-            _ if !sampling.is_greedy() || constraint.is_some() => {
+            _ if hidden.is_some() || !sampling.is_greedy() || constraint.is_some() => {
                 if self.sequence.row_readbacks.is_exhausted() {
                     // Refused before the prompt prefills: the last chunk would find no row to copy its logits to.
                     let error = AdmissionError::Engine("the sequence has no row readback to sample from".to_string());
@@ -944,6 +985,9 @@ impl Owner {
             }
         };
         self.start_run(units, lease, mode, prompt, max_tokens as usize, stop_tokens, cancel)?;
+        if let Some(run) = self.run.as_mut() {
+            run.hidden = hidden.map(Hidden::new);
+        }
         self.look_up_prompt();
         // The first mask is prepared while the prompt prefills.
         self.prepare_constraint();
@@ -959,6 +1003,9 @@ impl Owner {
             return;
         };
         let Some(run) = self.run.as_mut() else { return };
+        if run.hidden.is_some() {
+            return;
+        }
         let kind = match &run.mode {
             Mode::Greedy { .. } | Mode::Sampled { .. } => None,
             Mode::Speculative { state, .. } => state.drafting().then_some(CheckpointKind::Mtp),
@@ -1091,6 +1138,7 @@ impl Owner {
             stopping: None,
             cancel,
             waiting_logits: false,
+            hidden: None,
             panics: 0,
             began: Instant::now(),
             capacity,
@@ -1117,7 +1165,9 @@ impl Owner {
     fn admissible(&self) -> Option<Step> {
         let run = self.run.as_ref()?;
         // The tokens the host is selecting decide the next step.
-        if run.waiting_logits || run.selecting() || run.in_flight.len() >= run.depth {
+        // A hidden request's next quantum overwrites the rows being copied, and waits for a sink that is far behind.
+        let copying = run.hidden.as_ref().is_some_and(Hidden::full);
+        if run.waiting_logits || copying || run.selecting() || run.in_flight.len() >= run.depth {
             return None;
         }
         // The prefix cache first: the lookup's answer, the restore's job, or a capture of the state the next chunk would
@@ -1239,6 +1289,8 @@ impl Owner {
                 }
             }
             Message::Logits(copied) => self.deliver_row(copied),
+            Message::HiddenCopied(rows) => self.hidden_copied(*rows),
+            Message::HiddenDelivered(sink) => self.hidden_delivered(sink),
             Message::Sampled(sampled) => self.deliver_sample(sampled),
             Message::Prepared(prepared) => self.deliver_prepared(prepared),
             // The turn's `reap` is what the message is for.
@@ -1828,6 +1880,13 @@ impl Owner {
                 listener.prefill_done(now);
             }
         }
+        if run.hidden.is_some()
+            && matches!(flying.role, Role::Prefill { .. } | Role::Decode)
+            && let Err(why) = self.copy_hidden(flying, retired)
+        {
+            return self.fail(why);
+        }
+        let Some(run) = self.run.as_mut() else { return };
         match flying.role {
             Role::Settle => return,
             Role::PromptCatchUp => return,
@@ -2015,6 +2074,101 @@ impl Owner {
         Ok(())
     }
 
+    /// Queues the copy of the rows a retired quantum seeded, and of its logits row when it selected, to pinned memory on
+    /// the owner's lane. The next quantum is admitted once the lane has reached the copy ([`Owner::hidden_copied`]).
+    fn copy_hidden(&mut self, flying: &Flying, retired: &Retired) -> Result<(), String> {
+        let Kept::Whole(_) = &retired.kept else {
+            return Err("a hidden request's quantum is not part of a pass".to_string());
+        };
+        let seeds = self
+            .sequence
+            .device
+            .scratch
+            .draft()
+            .ok_or_else(|| "the sequence has no draft buffers to hold the hidden rows".to_string())?
+            .seed_rows
+            .ptr();
+        let core = &self.shared.core;
+        let hidden_bytes = flying.rows * self.shared.config.hidden_size * 2;
+        let logits_bytes = if flying.row.is_some() {
+            self.shared.config.vocab_size * 2
+        } else {
+            0
+        };
+        let mut loan = core
+            .pool
+            .acquire(hidden_bytes + logits_bytes)
+            .map_err(why("the pinned rows for the hidden state"))?;
+        if logits_bytes > 0 {
+            // The logits row is the one the quantum copied in-stream to its row readback, which only this request's
+            // quantum wrote: the workspace's logits are shared by every sequence and may be another's by now.
+            let row = flying
+                .row
+                .as_ref()
+                .and_then(|lease| lease.readback().row(0))
+                .ok_or_else(|| "a hidden request's quantum retired with no logits row in its readback".to_string())?;
+            if row.len() != logits_bytes {
+                return Err("the logits row's readback has the wrong size".to_string());
+            }
+            loan.buffer_mut().as_mut_slice()[hidden_bytes..hidden_bytes + logits_bytes].copy_from_slice(row);
+        }
+        // One device copy is queued, so a failure to queue it leaves nothing pending on the loan.
+        let (_, marker) = core
+            .lane_table()
+            .submit_ops(core.owner_lane(), false, |kernels| {
+                // SAFETY: the loan is held by the message that follows the copy, which is offered only once the lane has
+                // reached the marker, and the next quantum, which overwrites the sources, is admitted after that message.
+                unsafe { kernels.copy_device_to_readback(loan.buffer_mut(), 0, seeds, hidden_bytes) }
+                    .map_err(why("queueing the hidden rows' copy"))
+            })
+            .map_err(why("the hidden rows' copy"))?;
+        let rows = HiddenRows {
+            first_position: flying.start,
+            rows: flying.rows,
+            hidden_bytes,
+            logits_bytes,
+            loan,
+        };
+        if let Some(hidden) = self.run.as_mut().and_then(|run| run.hidden.as_mut()) {
+            hidden.copying = true;
+        }
+        let address = Arc::clone(&self.shared.address);
+        let frame = step_frame(self.id.0, move || address.post(Message::HiddenCopied(Box::new(rows))));
+        core.completions().after_marker(marker, frame);
+        Ok(())
+    }
+
+    /// The rows of a quantum reached pinned memory: they go to the sink, as a frame, when it is free.
+    fn hidden_copied(&mut self, rows: HiddenRows) {
+        if let Some(hidden) = self.run.as_mut().and_then(|run| run.hidden.as_mut()) {
+            hidden.arrived(rows);
+        }
+        self.deliver_hidden();
+    }
+
+    /// A delivery ended: the sink is back, and the rows that waited for it go.
+    fn hidden_delivered(&mut self, sink: Box<dyn HiddenSink>) {
+        if let Some(hidden) = self.run.as_mut().and_then(|run| run.hidden.as_mut()) {
+            hidden.returned(sink);
+        }
+        self.deliver_hidden();
+    }
+
+    /// Publishes the frame that hands the oldest waiting rows to the sink, when the sink is free.
+    fn deliver_hidden(&mut self) {
+        let Some((sink, rows)) = self
+            .run
+            .as_mut()
+            .and_then(|run| run.hidden.as_mut())
+            .and_then(Hidden::next_delivery)
+        else {
+            return;
+        };
+        let address = Arc::clone(&self.shared.address);
+        let frame = delivery_frame(self.id.0, address, sink, rows);
+        self.shared.core.completions().at(Instant::now(), frame);
+    }
+
     /// Admits quanta while the request has steps and room for them.
     fn admit_ready(&mut self) {
         let chunk = self.shared.chunk;
@@ -2048,6 +2202,7 @@ impl Owner {
         let start = run.position;
         let speculative = matches!(run.mode, Mode::Speculative { .. });
         let drafting = matches!(&run.mode, Mode::Speculative { state, .. } if state.drafting());
+        let hidden = run.hidden.is_some();
         // A chunk that ends at a checkpoint has nothing chained behind it: it retires, and the state it leaves is captured
         // before the next chunk starts (see `PromptCheckpoints`).
         let end = run.offset + next_rows(next);
@@ -2123,7 +2278,7 @@ impl Owner {
                     Some(previous) => quantum.token_from(previous)?,
                     None => quantum.with_tokens(tokens)?,
                 };
-                if drafting && matches!(next, Step::Prefill { .. }) {
+                if hidden || (drafting && matches!(next, Step::Prefill { .. })) {
                     quantum.seeding_draft()
                 } else {
                     Ok(quantum)
@@ -2353,7 +2508,9 @@ impl Owner {
             return;
         }
         let ended = run.stopping.is_some() || run.next_step(chunk).is_none();
-        if !run.in_flight.is_empty() || run.waiting_logits || run.selecting() || run.preparing() || !ended {
+        let delivering = run.hidden.as_ref().is_some_and(Hidden::busy);
+        if !run.in_flight.is_empty() || run.waiting_logits || delivering || run.selecting() || run.preparing() || !ended
+        {
             return;
         }
         // A restore's reservation that no chunk took (the request ended first) has its table upload queued on the owner's
@@ -2488,6 +2645,20 @@ mod routing_tests {
             hash(step_frame(2, || {})),
             hash(step_frame(2, || {})),
             "one sequence keeps its chain"
+        );
+    }
+
+    #[test]
+    fn hidden_states_are_refused_with_speculation_or_without_a_draft_layer() {
+        assert_eq!(hidden_refusal(false, &Speculation::Artifact, false), None);
+        assert_eq!(hidden_refusal(true, &Speculation::Off, true), None);
+        assert_eq!(
+            hidden_refusal(true, &Speculation::Artifact, true),
+            Some(AdmissionError::HiddenWithSpeculation)
+        );
+        assert_eq!(
+            hidden_refusal(true, &Speculation::Off, false),
+            Some(AdmissionError::HiddenUnavailable)
         );
     }
 }
