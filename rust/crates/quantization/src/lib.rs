@@ -4,11 +4,14 @@
 //! - [`java_random`]: seeded generators in the style of `java.util.Random` and `java.util.SplittableRandom`. A
 //!   consumer that needs the exact sequence of a seed adds its own test of it.
 //! - [`kernels`]: the quantization kernels as NVRTC modules, their kernel names and the loader that compiles them.
-//! - [`trellis`]: the trellis kernels: rates, launch planners and the enqueue of their steps.
+//! - [`trellis`]: the trellis kernels (rates, launch planners and the enqueue of their steps) and the quantizer that
+//!   chains them on a lane: scales, LDLQ through the Viterbi encode and the refit.
 //! - [`npy`] and [`npz`]: the NumPy array and archive formats the calibration state and the fixtures use. Both work
 //!   on bytes the caller supplies or takes; neither opens a file.
 //! - [`forward`]: one decoder layer in BF16 on the engine's kernels, with the weights loaded for it and an observer of
 //!   each quantized linear's input.
+//! - [`memory`]: stream-ordered device buffers, pooled pinned staging and the claims that account for them, which
+//!   the GPTQ rounding and the trellis quantizer share.
 //! - [`kld`]: the reference logits file the scorer and the reference writer share, opened and read through `AsyncIo`.
 //! - [`rows`]: the work on the logits rows of one teacher-forced run, as frames of the `host` lake.
 //! - [`mixed`]: the mixed allocation search's data: options, allocations, priors, the cost table, the knapsack, the
@@ -20,13 +23,16 @@
 //!   truncation and removal it is built on.
 //! - [`package_tokenizer`]: gives an artifact a checkpoint's tokenizer, in place or as a copy.
 
+mod chain;
 pub mod checkpoint;
 pub mod durable;
 pub mod exl3;
 pub mod forward;
+pub mod gptq;
 pub mod java_random;
 pub mod kernels;
 pub mod kld;
+pub mod memory;
 pub mod mixed;
 pub mod npy;
 pub mod npz;
