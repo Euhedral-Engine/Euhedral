@@ -11,7 +11,7 @@ use euhedral_inference_quantization::kld::Reference;
 use euhedral_inference_quantization::reference::{Forcer, Options, tokenize, write};
 use euhedral_inference_settings::{ByteSize, ModelSettings, Settings, load_file, process_env};
 
-use crate::{EXIT_RUN_FAILED, EXIT_OK, EXIT_USAGE, Outcome};
+use crate::{EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, Outcome};
 
 /// The context of a chunk when `--context` is not given.
 const DEFAULT_CONTEXT: usize = 2560;
