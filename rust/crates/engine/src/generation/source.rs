@@ -2077,7 +2077,7 @@ impl Owner {
     /// Queues the copy of the rows a retired quantum seeded, and of its logits row when it selected, to pinned memory on
     /// the owner's lane. The next quantum is admitted once the lane has reached the copy ([`Owner::hidden_copied`]).
     fn copy_hidden(&mut self, flying: &Flying, retired: &Retired) -> Result<(), String> {
-        let Kept::Whole(quantum) = &retired.kept else {
+        let Kept::Whole(_) = &retired.kept else {
             return Err("a hidden request's quantum is not part of a pass".to_string());
         };
         let seeds = self
@@ -2090,7 +2090,7 @@ impl Owner {
             .ptr();
         let core = &self.shared.core;
         let hidden_bytes = flying.rows * self.shared.config.hidden_size * 2;
-        let logits_bytes = if flying.selection.is_some() || flying.row.is_some() {
+        let logits_bytes = if flying.row.is_some() {
             self.shared.config.vocab_size * 2
         } else {
             0
@@ -2099,26 +2099,27 @@ impl Owner {
             .pool
             .acquire(hidden_bytes + logits_bytes)
             .map_err(why("the pinned rows for the hidden state"))?;
+        if logits_bytes > 0 {
+            // The logits row is the one the quantum copied in-stream to its row readback, which only this request's
+            // quantum wrote: the workspace's logits are shared by every sequence and may be another's by now.
+            let row = flying
+                .row
+                .as_ref()
+                .and_then(|lease| lease.readback().row(0))
+                .ok_or_else(|| "a hidden request's quantum retired with no logits row in its readback".to_string())?;
+            if row.len() != logits_bytes {
+                return Err("the logits row's readback has the wrong size".to_string());
+            }
+            loan.buffer_mut().as_mut_slice()[hidden_bytes..hidden_bytes + logits_bytes].copy_from_slice(row);
+        }
+        // One device copy is queued, so a failure to queue it leaves nothing pending on the loan.
         let (_, marker) = core
             .lane_table()
             .submit_ops(core.owner_lane(), false, |kernels| {
                 // SAFETY: the loan is held by the message that follows the copy, which is offered only once the lane has
                 // reached the marker, and the next quantum, which overwrites the sources, is admitted after that message.
                 unsafe { kernels.copy_device_to_readback(loan.buffer_mut(), 0, seeds, hidden_bytes) }
-                    .map_err(why("queueing the hidden rows' copy"))?;
-                if logits_bytes > 0 {
-                    // SAFETY: as above; the logits row follows the hidden rows in the loan.
-                    unsafe {
-                        kernels.copy_device_to_readback(
-                            loan.buffer_mut(),
-                            hidden_bytes,
-                            quantum.slot(BufferSlot::Logits),
-                            logits_bytes,
-                        )
-                    }
-                    .map_err(why("queueing the logits row's copy"))?;
-                }
-                Ok::<(), String>(())
+                    .map_err(why("queueing the hidden rows' copy"))
             })
             .map_err(why("the hidden rows' copy"))?;
         let rows = HiddenRows {

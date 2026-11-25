@@ -70,7 +70,7 @@ impl Hidden {
     pub(super) fn arrived(&mut self, rows: HiddenRows) {
         self.copying = false;
         self.queue.push_back(rows);
-        debug_assert!(
+        assert!(
             self.queue.len() <= MAX_QUEUED,
             "{} rows wait for the sink, past the {MAX_QUEUED} the owner allows",
             self.queue.len()

@@ -20,6 +20,7 @@ use std::iter;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -82,9 +83,31 @@ struct Recording {
     outcome: GenerationOutcome,
 }
 
+/// A door the test holds shut: the sink waits at it until a listener opens it.
+#[derive(Default)]
+struct Gate(AtomicBool);
+
+impl Gate {
+    fn open(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Waits on the calling thread (a worker of the engine's lattice, which `Handoff::wait` refuses) until it opens.
+    fn pass(&self) {
+        let start = Instant::now();
+        while !self.0.load(Ordering::Acquire) {
+            assert!(start.elapsed() < WAIT, "the gate was never opened");
+            thread::yield_now();
+        }
+    }
+}
+
 struct Recorder {
     /// Cancels the generation once its prompt has prefilled, when set.
     cancel_after_prefill: Option<CancelHandle>,
+    /// Opens the gate once this many quanta have retired, when set.
+    open_after_quanta: Option<(usize, Arc<Gate>)>,
+    quanta: usize,
     tokens: Vec<u32>,
     done: Option<Arc<Handoff<Recording>>>,
 }
@@ -100,7 +123,14 @@ impl GenerationListener for Recorder {
         self.tokens.push(id);
     }
 
-    fn quantum(&mut self, _event: QuantumEvent) {}
+    fn quantum(&mut self, _event: QuantumEvent) {
+        self.quanta += 1;
+        if let Some((count, gate)) = &self.open_after_quanta
+            && self.quanta == *count
+        {
+            gate.open();
+        }
+    }
 
     fn finished(&mut self, outcome: GenerationOutcome) {
         let done = self.done.take().expect("a generation finishes once");
@@ -121,15 +151,17 @@ struct Delivered {
 
 /// Keeps what it hears, and hands it over when the engine lets go of it at the generation's end.
 struct Collector {
-    pause: Duration,
+    /// The first call waits at this gate: a sink that holds the first rows it was given while the engine goes on.
+    hold: Option<Arc<Gate>>,
     heard: Vec<Delivered>,
     done: Option<Arc<Handoff<Vec<Delivered>>>>,
 }
 
 impl HiddenSink for Collector {
     fn rows(&mut self, first_position: u64, rows: usize, hidden: &[u8], logits: Option<&[u8]>) {
-        // A sink that is slow holds the rows it was given while the engine goes on.
-        thread::sleep(self.pause);
+        if let Some(gate) = self.hold.take() {
+            gate.pass();
+        }
         self.heard.push(Delivered {
             first_position,
             rows,
@@ -163,6 +195,8 @@ fn request(
         constraint: None,
         listener: Box::new(Recorder {
             cancel_after_prefill: None,
+            open_after_quanta: None,
+            quanta: 0,
             tokens: Vec::new(),
             done: Some(Arc::clone(done)),
         }),
@@ -199,24 +233,33 @@ fn hidden(
     max_tokens: u32,
     sampling: SamplingConfig,
 ) -> (Recording, Vec<Delivered>) {
-    hidden_slowly(runtime, prompt, max_tokens, sampling, Duration::ZERO)
+    hidden_held(runtime, prompt, max_tokens, sampling, None)
 }
 
-/// As [`hidden`], with a sink that takes `pause` for every call.
-fn hidden_slowly(
+/// As [`hidden`], with a sink whose first call waits at `hold` (the listener opens it, when it has a count).
+fn hidden_held(
     runtime: &EngineRuntime,
     prompt: &[u32],
     max_tokens: u32,
     sampling: SamplingConfig,
-    pause: Duration,
+    hold: Option<(usize, Arc<Gate>)>,
 ) -> (Recording, Vec<Delivered>) {
     let done = Handoff::new();
     let heard = Handoff::new();
+    let mut generation = request(prompt, max_tokens, Speculation::Off, sampling, &done);
+    let gate = hold.as_ref().map(|(_, gate)| Arc::clone(gate));
+    generation.listener = Box::new(Recorder {
+        cancel_after_prefill: None,
+        open_after_quanta: hold,
+        quanta: 0,
+        tokens: Vec::new(),
+        done: Some(Arc::clone(&done)),
+    });
     runtime
         .generate_hidden(
-            request(prompt, max_tokens, Speculation::Off, sampling, &done),
+            generation,
             Collector {
-                pause,
+                hold: gate,
                 heard: Vec::new(),
                 done: Some(Arc::clone(&heard)),
             },
@@ -277,6 +320,8 @@ fn hidden_rows_are_the_seed_rows_the_catch_up_reads() {
     let mut cancelled = request(&ids, 8, Speculation::Artifact, greedy(), &done);
     cancelled.listener = Box::new(Recorder {
         cancel_after_prefill: Some(cancel.clone()),
+        open_after_quanta: None,
+        quanta: 0,
         tokens: Vec::new(),
         done: Some(Arc::clone(&done)),
     });
@@ -387,7 +432,7 @@ fn a_request_that_speculates_is_refused() {
     let refused = runtime.generate_hidden(
         request(&prompt(8), 4, Speculation::Artifact, greedy(), &done),
         Collector {
-            pause: Duration::ZERO,
+            hold: None,
             heard: Vec::new(),
             done: None,
         },
@@ -399,14 +444,15 @@ fn a_request_that_speculates_is_refused() {
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
-fn a_slow_sink_holds_the_request_back_and_hears_every_row_in_order() {
+fn a_held_sink_holds_the_request_back_and_hears_every_row_in_order() {
     let Some(machine) = machine() else { return };
     let (owner, runtime) = start(&machine);
 
-    // Each call takes far longer than a quantum: the owner may keep at most two quanta's rows waiting (a debug assertion
-    // of the engine fails the request otherwise).
+    // The sink's first call waits at a gate that opens when the third quantum retires: by then one quantum's rows are
+    // in the sink and two wait, the most the owner may keep (the engine asserts it, and fails the request otherwise).
     let ids = prompt(20);
-    let (recording, heard) = hidden_slowly(&runtime, &ids, 12, greedy(), Duration::from_millis(150));
+    let gate = Arc::new(Gate::default());
+    let (recording, heard) = hidden_held(&runtime, &ids, 12, greedy(), Some((3, gate)));
     assert_eq!(recording.outcome.reason, FinishReason::Length);
     let positions: Vec<u64> = heard.iter().map(|call| call.first_position).collect();
     let expected: Vec<u64> = iter::once(0).chain(20..31).collect();
