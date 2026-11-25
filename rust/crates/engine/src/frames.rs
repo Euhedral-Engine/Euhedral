@@ -38,6 +38,8 @@ pub(crate) enum Kind {
     Copy,
     /// The completions of the reads of the disk window, one chain per slot.
     DiskRead,
+    /// The delivery of a hidden-rows request's rows to its sink.
+    Hidden,
 }
 
 /// The id hash of a frame of `kind` on chain `chain`: distinct per kind and chain, mixed so that the chains spread

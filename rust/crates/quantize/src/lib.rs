@@ -6,6 +6,7 @@
 //! ([`Availability::Dropped`]).
 
 mod package;
+mod reference;
 
 /// The process exit code of a run that finished.
 pub const EXIT_OK: u8 = 0;
@@ -95,8 +96,8 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "reference",
-        availability: Availability::Pending,
-        usage: "--artifact ARTIFACT --tokenizer CHECKPOINT --text FILE --out OUT.kld",
+        availability: Availability::Wired,
+        usage: "--artifact ARTIFACT [--tokenizer ARTIFACT] --text FILE --out OUT.kld [--context N] [--chunks N] [--parse-special] [--config YAML] [--cuda-library FILE]",
     },
     Command {
         name: "package-tokenizer",
@@ -144,6 +145,7 @@ pub fn run(args: &[String]) -> Outcome {
     match command.availability {
         Availability::Wired => match command.name {
             "package-tokenizer" => package::run(&args[1..]),
+            "reference" => reference::run(&args[1..]),
             _ => Outcome {
                 code: EXIT_NOT_AVAILABLE,
                 message: format!("the command '{name}' has no work behind it\n"),
