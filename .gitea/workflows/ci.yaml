@@ -264,7 +264,8 @@ jobs:
         working-directory: rust
         run: |
           set -euo pipefail
-          # and kernel tests run. A test without a model artifact skips with a line starting "skipped:".
+          # The quantization crate's other device tests fail, not skip, without their settings: only its kernel tests run.
+          # A test without a model artifact skips with a line starting "skipped:".
           {
             mise exec -- cargo test --workspace --exclude euhedral-inference-quantization -- --ignored --nocapture
             mise exec -- cargo test -p euhedral-inference-quantization --test kernels_gpu -- --ignored --nocapture
