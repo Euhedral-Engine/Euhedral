@@ -16,11 +16,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use euhedral_gpu::fake::{FakeGpu, FakeModule};
-use euhedral_gpu::{Args, Dim3, GpuError, Lane, StreamOptions, open_shared_lanes};
+use euhedral_gpu::{Args, Dim3, Lane, StreamOptions, open_shared_lanes};
 use euhedral_graph::LaneId;
 
 use super::*;
 use crate::kernels::{Compiled, Module, ModuleOptions, compile};
+use crate::training::plan_zero;
 
 fn rate(bits: f64) -> Rate {
     Rate::new(bits).unwrap()
@@ -91,23 +92,23 @@ fn the_tensor_core_order_visits_every_element_of_a_tile_once() {
 fn dims(steps: &[Step]) -> Vec<(u32, u32, u32)> {
     steps
         .iter()
-        .map(|step| (step.launch.grid.x, step.launch.grid.y, step.launch.block.x))
+        .map(|step| (step.launch().grid.x, step.launch().grid.y, step.launch().block.x))
         .collect()
 }
 
 #[test]
 fn viterbi_chunks_by_the_scratch_and_advances_each_pointer_by_the_chunk() {
     let steps = plan_viterbi(rate(4.0), 0x1000_0000, 100, 0x2000_0000, 0x3000_0000, 0x4000_0000, 16).unwrap();
-    let sizes: Vec<u32> = steps.iter().map(|step| step.launch.grid.x).collect();
+    let sizes: Vec<u32> = steps.iter().map(|step| step.launch().grid.x).collect();
     assert_eq!(sizes, [16, 16, 16, 16, 16, 16, 4]);
     for (index, step) in steps.iter().enumerate() {
         let first = 16 * index as u64 * 256;
-        assert_eq!(step.kernel, "viterbi_k4");
-        assert_eq!(step.args.read::<u64>(0), Some(0x1000_0000 + 4 * first));
-        assert_eq!(step.args.read::<i32>(1), Some(step.launch.grid.x as i32));
-        assert_eq!(step.args.read::<u64>(2), Some(0x2000_0000 + 2 * first));
-        assert_eq!(step.args.read::<u64>(3), Some(0x3000_0000 + 4 * first));
-        assert_eq!(step.args.read::<u64>(4), Some(0x4000_0000));
+        assert_eq!(step.kernel(), "viterbi_k4");
+        assert_eq!(step.args().read::<u64>(0), Some(0x1000_0000 + 4 * first));
+        assert_eq!(step.args().read::<i32>(1), Some(step.launch().grid.x as i32));
+        assert_eq!(step.args().read::<u64>(2), Some(0x2000_0000 + 2 * first));
+        assert_eq!(step.args().read::<u64>(3), Some(0x3000_0000 + 4 * first));
+        assert_eq!(step.args().read::<u64>(4), Some(0x4000_0000));
     }
 }
 
@@ -115,7 +116,11 @@ fn viterbi_chunks_by_the_scratch_and_advances_each_pointer_by_the_chunk() {
 fn viterbi_takes_the_block_and_shared_memory_of_its_rate() {
     let at = |bits: f64| {
         let steps = plan_viterbi(rate(bits), 8, 1, 8, 8, 8, 1).unwrap();
-        (steps[0].kernel, steps[0].launch.block.x, steps[0].launch.shared_bytes)
+        (
+            steps[0].kernel(),
+            steps[0].launch().block.x,
+            steps[0].launch().shared_bytes,
+        )
     };
     assert_eq!(at(2.0), ("viterbi_k2", 1024, 2 * 16384 * 2 + 512 + 64 + 128));
     assert_eq!(at(4.0), ("viterbi_k4", 1024, 2 * 4096 * 2 + 512 + 64 + 128));
@@ -137,9 +142,9 @@ fn viterbi_refuses_what_it_cannot_run() {
 fn the_half_step_rates_pack_a_block_of_tiles_per_launch() {
     assert_eq!(dims(&plan_pack(rate(3.0), 8, 300, 8).unwrap()), [(300, 1, 128)]);
     assert_eq!(dims(&plan_pack(rate(3.5), 8, 300, 8).unwrap()), [(3, 1, 128)]);
-    assert_eq!(plan_pack(rate(3.5), 8, 300, 8).unwrap()[0].kernel, "pack_frac_k3");
+    assert_eq!(plan_pack(rate(3.5), 8, 300, 8).unwrap()[0].kernel(), "pack_frac_k3");
     assert_eq!(dims(&plan_decode(rate(2.5), 8, 300, 8).unwrap()), [(300, 1, 256)]);
-    assert_eq!(plan_decode(rate(2.5), 8, 300, 8).unwrap()[0].kernel, "decode_frac_k2");
+    assert_eq!(plan_decode(rate(2.5), 8, 300, 8).unwrap()[0].kernel(), "decode_frac_k2");
 }
 
 #[test]
@@ -164,11 +169,11 @@ fn a_strip_is_sixteen_rows_inside_the_matrix_in_either_direction() {
     let forward = plan_to_tiles(8, 48, 64, 16, 16).unwrap();
     let back = plan_from_tiles(16, 48, 64, 16, 8).unwrap();
     assert_eq!(dims(&forward), [(4, 1, 256)]);
-    assert_eq!(forward[0].args.read::<i32>(4), Some(0));
-    assert_eq!(back[0].args.read::<i32>(4), Some(1));
-    assert_eq!(forward[0].args.read::<u64>(0), Some(8));
-    assert_eq!(back[0].args.read::<u64>(0), Some(8));
-    assert_eq!(back[0].args.read::<u64>(3), Some(16));
+    assert_eq!(forward[0].args().read::<i32>(4), Some(0));
+    assert_eq!(back[0].args().read::<i32>(4), Some(1));
+    assert_eq!(forward[0].args().read::<u64>(0), Some(8));
+    assert_eq!(back[0].args().read::<u64>(0), Some(8));
+    assert_eq!(back[0].args().read::<u64>(3), Some(16));
     assert!(plan_to_tiles(8, 48, 64, 32, 16).is_ok());
     assert!(matches!(
         plan_to_tiles(8, 48, 64, 33, 16),
@@ -193,7 +198,7 @@ fn a_reconstruction_decodes_rotates_scales_and_transposes_in_that_order() {
         scratch: 0x50,
     };
     let steps = plan_reconstruct(rate(3.0), &operands).unwrap();
-    let names: Vec<&str> = steps.iter().map(|step| step.kernel).collect();
+    let names: Vec<&str> = steps.iter().map(|step| step.kernel()).collect();
     assert_eq!(
         names,
         [
@@ -205,14 +210,19 @@ fn a_reconstruction_decodes_rotates_scales_and_transposes_in_that_order() {
             "transpose_to_bf16"
         ]
     );
-    assert_eq!(steps[0].launch.grid, Dim3::x(16 * 32));
-    assert_eq!(steps[2].args.read::<u64>(1), Some(0x20));
-    assert_eq!(steps[4].args.read::<u64>(1), Some(0x30));
-    assert_eq!(steps[5].args.read::<u64>(3), Some(0x40));
-    assert!(steps.iter().skip(1).all(|step| step.args.read::<u64>(0) == Some(0x50)));
+    assert_eq!(steps[0].launch().grid, Dim3::x(16 * 32));
+    assert_eq!(steps[2].args().read::<u64>(1), Some(0x20));
+    assert_eq!(steps[4].args().read::<u64>(1), Some(0x30));
+    assert_eq!(steps[5].args().read::<u64>(3), Some(0x40));
+    assert!(
+        steps
+            .iter()
+            .skip(1)
+            .all(|step| step.args().read::<u64>(0) == Some(0x50))
+    );
     assert_eq!(dims(&steps[5..]), [(16, 8, 256)]);
     let half = plan_reconstruct(rate(3.5), &operands).unwrap();
-    assert_eq!(half[0].kernel, "reconstruct_frac_k3");
+    assert_eq!(half[0].kernel(), "reconstruct_frac_k3");
     let ragged = Reconstruction {
         k: 128,
         n: 100,
@@ -226,12 +236,12 @@ fn a_reconstruction_decodes_rotates_scales_and_transposes_in_that_order() {
 
 #[test]
 fn the_reduction_helpers_size_their_launches_by_the_count() {
-    let sum = |count| plan_sum_products(8, 16, count, 24).unwrap()[0].launch.grid.x;
+    let sum = |count| plan_sum_products(8, 16, count, 24).unwrap()[0].launch().grid.x;
     assert_eq!(sum(0), 1);
     assert_eq!(sum(256), 1);
     assert_eq!(sum(257), 2);
     assert_eq!(sum(1 << 40), 1024);
-    let fill = |count| plan_fill_floats(8, count, 0.0).unwrap()[0].launch.grid.x;
+    let fill = |count| plan_fill_floats(8, count, 0.0).unwrap()[0].launch().grid.x;
     assert_eq!(fill(1 << 40), 1 << 20);
     assert_eq!(dims(&plan_tile_mean_square(8, 64, 128, 16).unwrap()), [(8, 4, 256)]);
     assert!(plan_tile_mean_square(8, 60, 128, 16).is_err());
@@ -272,18 +282,17 @@ fn rig() -> Rig {
     Rig { gpu, launched }
 }
 
-fn run(rig: &Rig, kernels: &TrellisKernels<FakeModule>, steps: &[Step]) -> Result<(), GpuError> {
+fn run(rig: &Rig, kernels: &TrellisKernels<FakeModule>, steps: &[Step]) -> Result<(), TrellisError> {
     let lanes = open_shared_lanes(&rig.gpu, &[("test", StreamOptions::default())]).unwrap();
     let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
+    let mut refused = None;
     lane.submit(|queue| {
         // SAFETY: the fake kernels read no memory.
-        unsafe { kernels.enqueue(queue, steps) }.map_err(|error| match error {
-            TrellisError::Gpu(gpu) => gpu,
-            other => GpuError::Invalid(other.to_string()),
-        })
+        refused = unsafe { kernels.enqueue(queue, steps) }.err();
+        Ok(())
     })?;
     while rig.gpu.step() {}
-    Ok(())
+    refused.map_or(Ok(()), Err)
 }
 
 fn trellis_kernels(rig: &Rig) -> (Arc<Compiled<FakeModule>>, TrellisKernels<FakeModule>) {
@@ -323,17 +332,16 @@ fn planned_steps_reach_the_lane_in_order_and_with_their_arguments() {
 }
 
 #[test]
-fn a_step_for_a_kernel_the_table_lacks_is_refused() {
+fn a_step_of_another_module_is_refused() {
     let rig = rig();
     let (_compiled, kernels) = trellis_kernels(&rig);
-    // A good step first: the lookup of every step comes before the first launch, so nothing reaches the lane.
+    // A good step first: the check of every step comes before the first launch, so nothing reaches the lane.
     let mut steps = plan_pack(rate(2.0), 8, 5, 16).unwrap();
-    steps.push(Step {
-        kernel: "no_such_kernel",
-        launch: Launch::linear(1, 32),
-        args: Args::new(),
-    });
-    assert!(run(&rig, &kernels, &steps).is_err());
+    steps.extend(plan_zero(8, 4).unwrap());
+    assert!(matches!(
+        run(&rig, &kernels, &steps),
+        Err(TrellisError::Step(StepError::WrongModule { .. }))
+    ));
     assert!(rig.launched.lock().unwrap().is_empty());
 }
 

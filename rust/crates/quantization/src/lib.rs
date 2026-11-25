@@ -4,6 +4,8 @@
 //! - [`java_random`]: seeded generators in the style of `java.util.Random` and `java.util.SplittableRandom`. A
 //!   consumer that needs the exact sequence of a seed adds its own test of it.
 //! - [`kernels`]: the quantization kernels as NVRTC modules, their kernel names and the loader that compiles them.
+//! - [`training`]: the drafter's training operations: launch planners for the kernels and the FP32 products, and
+//!   their enqueue on a lane.
 //! - [`trellis`]: the trellis kernels (rates, launch planners and the enqueue of their steps) and the quantizer that
 //!   chains them on a lane: scales, LDLQ through the Viterbi encode and the refit.
 //! - [`npy`] and [`npz`]: the NumPy array and archive formats the calibration state and the fixtures use. Both work
@@ -46,4 +48,5 @@ pub mod resume;
 pub mod rows;
 pub mod step;
 pub mod tokenizer_files;
+pub mod training;
 pub mod trellis;

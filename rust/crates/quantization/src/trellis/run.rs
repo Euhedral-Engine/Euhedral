@@ -8,7 +8,7 @@ use euhedral_gpu::{Gpu, KernelOptions, LaneEnqueue, Module as GpuModule};
 use super::plan::rate_kernel;
 use super::rate::Rate;
 use super::{Step, TrellisError};
-use crate::kernels::Compiled;
+use crate::kernels::{Compiled, Module, enqueue_steps};
 
 /// The rates the kernels support.
 const RATES: [f64; 7] = [2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0];
@@ -62,19 +62,8 @@ impl<M: GpuModule> TrellisKernels<M> {
     where
         E: LaneEnqueue<Kernel = <M::Gpu as Gpu>::Kernel>,
     {
-        let resolved = steps
-            .iter()
-            .map(|step| {
-                self.kernels
-                    .get(step.kernel)
-                    .ok_or_else(|| TrellisError::NoKernel(step.kernel.to_owned()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for (step, kernel) in steps.iter().zip(resolved) {
-            // SAFETY: the caller vouches for the addresses; only the planners build a step, with the arguments in
-            // the kernel's parameter order.
-            unsafe { lane.launch(kernel, step.launch, &step.args) }?;
-        }
+        // SAFETY: the caller vouches for the addresses.
+        unsafe { enqueue_steps(Module::Trellis, &self.kernels, lane, steps) }?;
         Ok(())
     }
 }

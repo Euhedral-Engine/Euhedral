@@ -15,31 +15,25 @@ const MOST_ELEMENTWISE_BLOCKS: u64 = 1 << 20;
 /// The most blocks of a reduction launch: each block adds into one double, so more blocks only add contention.
 const MOST_REDUCTION_BLOCKS: u64 = 1024;
 
-pub(super) fn kernel_name(name: &str) -> Result<&'static str, TrellisError> {
+pub(super) fn rate_kernel(kind: &str, rate: Rate) -> Result<&'static str, TrellisError> {
+    let frac = if rate.is_half_step() { "_frac" } else { "" };
+    let name = format!("{kind}{frac}_k{}", rate.lower());
     Module::Trellis
         .kernels()
         .iter()
         .copied()
         .find(|listed| *listed == name)
-        .ok_or_else(|| TrellisError::NoKernel(name.to_owned()))
-}
-
-pub(super) fn rate_kernel(kind: &str, rate: Rate) -> Result<&'static str, TrellisError> {
-    let frac = if rate.is_half_step() { "_frac" } else { "" };
-    kernel_name(&format!("{kind}{frac}_k{}", rate.lower()))
+        .ok_or(TrellisError::NoKernel(name))
 }
 
 pub(super) fn step(kernel: &str, grid: Dim3, block: u32, args: Args) -> Result<Step, TrellisError> {
-    Ok(Step {
-        kernel: kernel_name(kernel)?,
-        launch: Launch {
-            grid,
-            block: Dim3::x(block),
-            shared_bytes: 0,
-            programmatic: false,
-        },
-        args,
-    })
+    let launch = Launch {
+        grid,
+        block: Dim3::x(block),
+        shared_bytes: 0,
+        programmatic: false,
+    };
+    Step::new(Module::Trellis, kernel, launch, args).ok_or_else(|| TrellisError::NoKernel(kernel.to_owned()))
 }
 
 pub(super) fn address(name: &'static str, value: u64) -> Result<u64, TrellisError> {
@@ -129,9 +123,9 @@ pub fn plan_viterbi(
             .device(indices + STATE_BYTES * offset)
             .device(decoded + FLOAT_BYTES * offset)
             .device(scratch);
-        let mut planned = step(kernel, Dim3::x(n), rate.viterbi_threads(), args)?;
-        planned.launch.shared_bytes = rate.viterbi_shared_bytes();
-        steps.push(planned);
+        steps.push(
+            step(kernel, Dim3::x(n), rate.viterbi_threads(), args)?.with_shared_bytes(rate.viterbi_shared_bytes()),
+        );
         start += n;
     }
     Ok(steps)
