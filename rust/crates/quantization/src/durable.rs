@@ -6,6 +6,9 @@
 //! This is a departure from the rule that library code does no blocking I/O. It is confined to this module, and ends
 //! when `AsyncIo` gains the three operations: only the bodies of [`sync`], [`truncate`] and [`remove`] change.
 //!
+//! [`clash`] is a host-lake step of the same kind (dup, fstat and open calls that compare file identities). It has no
+//! `AsyncIo` counterpart to wait for: it needs none, and stays as it is.
+//!
 //! The caller must hold an admitted unit of `host` until the completion has run: a lake takes frames only while a
 //! unit is admitted. A completion that cannot be offered (the lake closed meanwhile) is dropped without running, and
 //! what it owns is dropped with it.
@@ -17,6 +20,7 @@ use std::sync::Arc;
 
 use euhedral_graph::Lake;
 use euhedral_io::{Continuation, OwnedFile};
+use same_file::Handle;
 use thiserror::Error;
 
 use crate::step::{Kind, step};
@@ -40,10 +44,10 @@ pub fn share(file: OwnedFile) -> SharedFile {
 }
 
 /// Runs `work` as a frame of `host`, then offers the frame `then` makes of its result to `host`.
-fn on_host(
+fn on_host<T: Send + 'static>(
     host: &Arc<Lake>,
-    work: impl FnOnce() -> io::Result<()> + Send + 'static,
-    then: Done,
+    work: impl FnOnce() -> io::Result<T> + Send + 'static,
+    then: Continuation<io::Result<T>>,
 ) -> Result<(), LakeClosed> {
     let next = Arc::clone(host);
     let frame = step(Kind::Durable, move || {
@@ -97,6 +101,44 @@ pub fn remove(host: &Arc<Lake>, path: &Path, then: Done) -> Result<(), LakeClose
     let work = move || match fs::remove_file(&path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         other => other,
+    };
+    on_host(host, work, then)
+}
+
+/// Which of two names a file is another name of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Clash {
+    /// The file that was open.
+    Open,
+    /// The path.
+    Path,
+}
+
+/// Finds whether `open`, or the file at `path` (if there is one), is the same file as any of `sources`, by identity
+/// (device and index, volume and index), not by name. `open` is checked first: if it clashes, the answer is
+/// [`Clash::Open`].
+pub fn clash(
+    host: &Arc<Lake>,
+    open: SharedFile,
+    path: &Path,
+    sources: Vec<Arc<OwnedFile>>,
+    then: Continuation<io::Result<Option<Clash>>>,
+) -> Result<(), LakeClosed> {
+    let path: PathBuf = path.to_owned();
+    let work = move || {
+        let mut known = Vec::with_capacity(sources.len());
+        for source in &sources {
+            known.push(Handle::from_file(File::from(source.try_clone()?))?);
+        }
+        if known.contains(&Handle::from_file(open.try_clone()?)?) {
+            return Ok(Some(Clash::Open));
+        }
+        match Handle::from_path(&path) {
+            Ok(named) => Ok(known.contains(&named).then_some(Clash::Path)),
+            // A name that does not exist, or that cannot be read, is never a source: every source was opened for reading.
+            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied) => Ok(None),
+            Err(error) => Err(error),
+        }
     };
     on_host(host, work, then)
 }

@@ -33,18 +33,19 @@ mod typed;
 use std::collections::HashMap;
 
 use euhedral_inference_cuda::launch::nvfp4::skinny_target_ctas;
+use euhedral_inference_cuda::launch::q3::P2E2_EXPAND_LIMIT;
 use euhedral_inference_cuda::{DeviceBuffer, HostWeightsArena};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use euhedral_inference_engine::formats::{
-    LinearFormat, LinearKernel, LinearMode, Nvfp4Linear, Q3Embedding, ROW_EXACT_KERNELS, ShapeRecorder, TrellisLinear,
-    nvfp4_native_scratch_bytes,
+    LinearFormat, LinearKernel, LinearMode, Nvfp4Linear, Q3Embedding, Q3Linear, ROW_EXACT_KERNELS, ShapeRecorder,
+    TrellisLinear, nvfp4_native_scratch_bytes,
 };
 use euhedral_inference_engine::model::{Residence, WeightRef};
 use euhedral_inference_engine::residency::offload::{MAPPED_HEAD_MAX_ROWS, OUTPUT_HEAD};
 use euhedral_inference_settings::TrellisKernelSettings;
 use linear_gpu::{
-    Artifact, Random, Rig, Trellis, activations, assert_close, bf16, bf16_value, relative_rms, rig, synthetic_trellis,
-    upload, values,
+    Artifact, Random, Rig, Trellis, activations, assert_close, bf16, bf16_value, compressed_head, relative_rms, rig,
+    synthetic_trellis, upload, values,
 };
 
 /// The target blocks the fixture was recorded with.
@@ -579,4 +580,41 @@ fn a_mapped_head_computes_the_device_heads_logits() {
     }
     println!("{compared} launches of the {n} x {k} head, mapped and on the device, bit-identical");
     drop(arena);
+}
+
+/// A compressed Q3 tensor too large to expand whole is run in chunks of output rows, and every output equals the one
+/// of the same tensor expanded whole and run as a plain Q3 tensor (the FP8 route's split of K follows the whole
+/// tensor, the last chunk is short, and each chunk lands at its own columns).
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn a_compressed_tensor_run_in_chunks_equals_its_whole_expansion() {
+    let Some(rig) = rig() else { return };
+    let (out, k) = (70_016usize, 5120usize);
+    let mut random = Random::new(29);
+    let head = compressed_head(&rig, &mut random, out, k);
+    let expanded = head.expanded;
+    assert!(expanded > P2E2_EXPAND_LIMIT, "{expanded} bytes must need chunks");
+    let (chunked, plain) = (&head.compressed, &head.expanded_weight);
+    let format = Q3Linear::new(&rig.library);
+    for rows in [9usize, 40] {
+        let x = upload(&rig.library, &activations(&mut random, rows, k));
+        let wanted = rig.linear(&format, plain, &x, 0, k, out, rows, PLAIN);
+        let actual = rig.linear(&format, chunked, &x, 0, k, out, rows, PLAIN);
+        let scratch = format.scratch_bytes(chunked, rows, PLAIN);
+        assert!(
+            scratch < expanded as usize && scratch as u64 <= P2E2_EXPAND_LIMIT,
+            "{rows} rows: the chunks are bounded: {scratch} bytes of scratch, {expanded} expanded, limit {P2E2_EXPAND_LIMIT}"
+        );
+        assert!(
+            wanted.iter().any(|bits| *bits != wanted[0]),
+            "{rows} rows: the outputs vary"
+        );
+        let different = wanted.iter().zip(&actual).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            different,
+            0,
+            "{rows} rows: {different} of {} outputs differ",
+            wanted.len()
+        );
+    }
 }

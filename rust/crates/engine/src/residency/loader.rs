@@ -68,6 +68,11 @@ pub enum Target {
     Host { arena_offset: u64 },
 }
 
+/// The file a placement is read from: the one `file_of` names, or the first (the base) when it names none.
+fn file_index(file_of: &[usize], placement: usize) -> usize {
+    file_of.get(placement).copied().unwrap_or(0)
+}
+
 /// One read: `len` bytes at `file_offset` of the artifact go to `target`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Piece {
@@ -351,7 +356,10 @@ type Done = Box<dyn FnOnce(LoadOutcome) + Send + Sync>;
 /// What the chains share. Its last owner reports the outcome when it drops.
 struct Shared {
     core: Arc<Core>,
-    file: Arc<OwnedFile>,
+    /// The files the pieces are read from.
+    files: Arc<[Arc<OwnedFile>]>,
+    /// The file of each placement, an index into `files`; empty when every piece reads from the first.
+    file_of: Arc<[usize]>,
     pieces: Arc<[Piece]>,
     names: Arc<[String]>,
     chains: usize,
@@ -399,6 +407,11 @@ impl Shared {
 
     fn has_failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
+    }
+
+    /// The file `piece` is read from.
+    fn file(&self, piece: &Piece) -> &Arc<OwnedFile> {
+        &self.files[file_index(&self.file_of, piece.placement)]
     }
 }
 
@@ -459,7 +472,8 @@ pub(crate) fn acquire_loans(core: &Core, ring: &Ring) -> Result<Vec<PooledPinned
 )]
 pub(crate) fn start(
     core: &Arc<Core>,
-    file: Arc<OwnedFile>,
+    files: Arc<[Arc<OwnedFile>]>,
+    file_of: Arc<[usize]>,
     names: Arc<[String]>,
     pieces: Vec<Piece>,
     chains: usize,
@@ -471,7 +485,8 @@ pub(crate) fn start(
     let p2e2 = p2e2_validations(&pieces);
     let shared = Arc::new(Shared {
         core: Arc::clone(core),
-        file,
+        files,
+        file_of,
         names,
         base: arena.ptr(),
         host,
@@ -521,7 +536,7 @@ fn issue(shared: Arc<Shared>, chain: usize, index: usize, mut loan: PooledPinned
     if let Err(error) = loan.set_len(piece.len) {
         return shared.fail(EngineError::Cuda(error));
     }
-    let raw = raw_file(&shared.file);
+    let raw = raw_file(shared.file(&piece));
     let next = Arc::clone(&shared);
     let then = Box::new(move |done: IoDoneOwned<PooledPinned>| -> Box<dyn Frame> {
         step(Kind::UploadRead, chain, move || read_done(next, chain, index, done))
@@ -548,7 +563,7 @@ fn issue_in_place(shared: Arc<Shared>, chain: usize, index: usize, arena_offset:
             shared.names[piece.placement]
         )));
     };
-    let raw = raw_file(&shared.file);
+    let raw = raw_file(shared.file(&piece));
     let next = Arc::clone(&shared);
     let then = Box::new(move |done: IoDoneOwned<ArenaRange>| -> Box<dyn Frame> {
         step(Kind::UploadRead, chain, move || {
@@ -739,6 +754,15 @@ mod tests {
     use euhedral_graph::{LanePool, QueueId};
 
     use super::*;
+
+    #[test]
+    fn a_placement_is_read_from_the_file_it_names_and_from_the_base_when_it_names_none() {
+        let file_of = [0, 2, 1];
+        assert_eq!(file_index(&file_of, 1), 2);
+        assert_eq!(file_index(&file_of, 2), 1);
+        assert_eq!(file_index(&file_of, 3), 0);
+        assert_eq!(file_index(&[], 5), 0);
+    }
 
     /// A lane whose ring holds `slots` markers: it refuses a submission while that many are in flight.
     #[derive(Debug)]

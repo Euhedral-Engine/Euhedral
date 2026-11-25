@@ -10,7 +10,7 @@
 //! called once, from a frame of the lattice that drives the `AsyncIo`, and must not wait: it hands the result on (to a
 //! lake, a hand-off) and returns. A function that returns `Err` started nothing and never calls its callback.
 
-mod io;
+pub(crate) mod io;
 pub mod objects;
 pub mod safetensors;
 pub mod writer;
@@ -21,6 +21,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub use io::Done;
+pub(crate) use io::read_file;
 
 /// Why a checkpoint could not be read or written.
 #[derive(Debug, Error)]

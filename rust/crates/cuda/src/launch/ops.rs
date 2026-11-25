@@ -15,7 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use euhedral_gpu::cuda::CudaKernel;
-use euhedral_gpu::{GpuError, LaneEnqueue, LaneStream};
+use euhedral_gpu::{Args, GpuError, LaneEnqueue, LaneStream, Launch as GpuLaunch, RawStream};
 use euhedral_graph::Marker;
 
 use crate::error::{CudaError, check};
@@ -1103,26 +1103,135 @@ where
     /// the selection after. The lent stream is private to the submission and the operations enqueued after the lend go
     /// to it too, so the call is ordered with everything enqueued before it and after it.
     pub fn on_lent_stream<R>(&self, call: impl FnOnce(&Arc<CudaLibrary>) -> R) -> Result<R, CudaError> {
-        let Some((library, _)) = self.lane else {
-            return Err(CudaError::Argument(
-                "the operations were made without a lane's library: use `on_lane`".to_string(),
-            ));
+        with_lent_stream(self.lane_library()?, &*self.queue, call)
+    }
+
+    fn lane_library(&self) -> Result<&Arc<CudaLibrary>, CudaError> {
+        self.lane.map(|(library, _)| library).ok_or_else(|| {
+            CudaError::Argument("the operations were made without a lane's library: use `on_lane`".to_string())
+        })
+    }
+}
+
+/// Runs `call` with the C library's stream selected for the calling thread to the stream `queue` lends, and clears the
+/// selection after.
+fn with_lent_stream<Q, R>(
+    library: &Arc<CudaLibrary>,
+    queue: &Q,
+    call: impl FnOnce(&Arc<CudaLibrary>) -> R,
+) -> Result<R, CudaError>
+where
+    Q: LaneStream<Raw = *mut c_void>,
+{
+    let stream = queue
+        .raw_stream()
+        .ok_or_else(|| CudaError::Argument("the lane lent no stream".to_string()))?
+        .as_raw();
+    // SAFETY: the stream is live for this submission; the selection is cleared before the lent stream can end.
+    let status = unsafe {
+        library
+            .api()
+            .euhedral_cuda_stream_select(stream.expose_provenance() as u64)
+    };
+    check("euhedral_cuda_stream_select", status)?;
+    // The selection is cleared when the call returns or panics.
+    let _selection = SelectedStream(library);
+    Ok(call(library))
+}
+
+impl DeviceBuffer {
+    /// Allocates `bytes` in stream order on the stream `queue` lends: the allocation is ordered with the work already
+    /// enqueued on it and with what is enqueued after. Free it with [`DeviceBuffer::free_on_lane`]; a plain drop
+    /// waits for the device.
+    pub fn alloc_on_lane<Q>(library: &Arc<CudaLibrary>, queue: &Q, bytes: usize) -> Result<DeviceBuffer, CudaError>
+    where
+        Q: LaneStream<Raw = *mut c_void>,
+    {
+        with_lent_stream(library, queue, |library| {
+            DeviceBuffer::alloc_on_selected(library, bytes)
+        })?
+    }
+
+    /// Frees a stream-ordered buffer in stream order on the stream `queue` lends, so the free waits for the work
+    /// already enqueued there and never waits for the device. A buffer that was not allocated stream-ordered is
+    /// refused (and dropped, with the plain free). When the stream cannot be selected the buffer comes back in the
+    /// error, still allocated: dropping it would be the plain free, so the caller parks it and tries again.
+    pub fn free_on_lane<Q>(self, library: &Arc<CudaLibrary>, queue: &Q) -> Result<(), FreeFailure>
+    where
+        Q: LaneStream<Raw = *mut c_void>,
+    {
+        if !self.is_stream_ordered() {
+            return Err(FreeFailure {
+                buffer: None,
+                error: CudaError::Argument(
+                    "a buffer from DeviceBuffer::alloc is freed with cudaFree, which waits for the device; allocate \
+                     with alloc_async to free it in stream order"
+                        .to_string(),
+                ),
+            });
+        }
+        let mut slot = Some(self);
+        match with_lent_stream(library, queue, |_| slot.take().map(DeviceBuffer::free_on_selected)) {
+            Ok(Some(freed)) => freed.map_err(|error| FreeFailure { buffer: None, error }),
+            Ok(None) => Ok(()),
+            Err(error) => Err(FreeFailure { buffer: slot, error }),
+        }
+    }
+}
+
+/// A free in stream order that did not happen.
+#[derive(Debug)]
+pub struct FreeFailure {
+    /// The buffer, still allocated, when it was not freed and not dropped.
+    pub buffer: Option<DeviceBuffer>,
+    pub error: CudaError,
+}
+
+impl<Q> RusteeOps<'_, Q>
+where
+    Q: LaneEnqueue<Kernel = CudaKernel> + LaneStream<Raw = *mut c_void>,
+{
+    /// Launches `kernel`, a kernel that is not in the catalog (another module's), in order with the operations queued
+    /// through `self`.
+    ///
+    /// # Safety
+    /// As [`LaneEnqueue::launch`]: every address the kernel touches is valid
+    /// for that access until the work retires.
+    pub unsafe fn launch_kernel(
+        &mut self,
+        kernel: &CudaKernel,
+        geometry: GpuLaunch,
+        args: &Args,
+    ) -> Result<(), CudaError> {
+        let driver = kernel.parameter_sizes().ok_or_else(|| {
+            CudaError::Argument("launch_kernel: the driver does not report the kernel's parameter sizes".into())
+        })?;
+        let same =
+            args.len() == driver.len() && args.sizes().zip(driver).all(|(size, &driver)| size == driver as usize);
+        if !same {
+            return Err(CudaError::Argument(format!(
+                "launch_kernel: the arguments' sizes {:?} are not the kernel's parameter sizes {driver:?}",
+                args.sizes().collect::<Vec<_>>()
+            )));
+        }
+        let geometry = GpuLaunch {
+            programmatic: geometry.programmatic && self.pdl,
+            ..geometry
         };
+        // SAFETY: the caller's contract; the arguments were checked against the kernel's parameter sizes above.
+        unsafe { self.queue.launch(kernel, geometry, args) }.map_err(|error| lane_error("launch_kernel", &error))
+    }
+
+    /// Runs `call` with the stream the lane lends, for a library call that takes the stream itself (cuBLAS through
+    /// [`LaneHandles`](crate::math::LaneHandles)). The lent stream is the one every operation of this submission goes
+    /// to, so the call is ordered with everything enqueued before it and after it; the contract of
+    /// [`LaneStream::raw_stream`] applies to what `call` does with it.
+    pub fn with_raw_stream<R>(&self, call: impl FnOnce(&RawStream<'_, *mut c_void>) -> R) -> Result<R, CudaError> {
         let stream = self
             .queue
             .raw_stream()
-            .ok_or_else(|| CudaError::Argument("the lane lent no stream".to_string()))?
-            .as_raw();
-        // SAFETY: the stream is live for this submission; the selection is cleared before the lent stream can end.
-        let status = unsafe {
-            library
-                .api()
-                .euhedral_cuda_stream_select(stream.expose_provenance() as u64)
-        };
-        check("euhedral_cuda_stream_select", status)?;
-        // The selection is cleared when the call returns or panics.
-        let _selection = SelectedStream(library);
-        Ok(call(library))
+            .ok_or_else(|| CudaError::Argument("the lane lent no stream".to_string()))?;
+        Ok(call(&stream))
     }
 }
 
@@ -1147,18 +1256,14 @@ where
     }
 
     fn alloc_async(&mut self, bytes: usize) -> Result<DeviceBuffer, CudaError> {
-        self.on_lent_stream(|library| DeviceBuffer::alloc_on_selected(library, bytes))?
+        let library = self.lane_library()?;
+        DeviceBuffer::alloc_on_lane(library, &*self.queue, bytes)
     }
 
     fn free_async(&mut self, buffer: DeviceBuffer) -> Result<(), CudaError> {
-        if !buffer.is_stream_ordered() {
-            // Dropped here: the plain free, which waits for the device. Freeing it with `cudaFreeAsync` would be wrong.
-            return Err(CudaError::Argument(
-                "a buffer from DeviceBuffer::alloc is freed with cudaFree, which waits for the device; allocate with \
-                 alloc_async to free it in stream order"
-                    .to_string(),
-            ));
-        }
-        self.on_lent_stream(|_| buffer.free_on_selected())?
+        let library = self.lane_library()?;
+        buffer
+            .free_on_lane(library, &*self.queue)
+            .map_err(|failure| failure.error)
     }
 }

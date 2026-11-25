@@ -285,3 +285,51 @@ fn an_element_count_that_does_not_fit_is_none() {
     assert_eq!(store.tensor("t").unwrap().elements(), None);
     assert_eq!(store.tensor("s").unwrap().elements(), Some(15));
 }
+
+// Mutants caught: a tensor of two files that belongs to the earlier one; a name list that is read in another order or
+// not at all; an empty list that starts nothing yet returns Ok.
+#[test]
+fn open_files_gives_a_tensor_of_two_files_to_the_later_one() {
+    let io = AsyncIo::open().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let file = |value: u8| {
+        safetensors(&[
+            Spec {
+                name: "shared",
+                dtype: "U8",
+                shape: vec![1],
+                bytes: vec![value],
+            },
+            Spec {
+                name: if value == 1 { "only-first" } else { "only-second" },
+                dtype: "U8",
+                shape: vec![1],
+                bytes: vec![value],
+            },
+        ])
+    };
+    write(&directory.path().join("first.safetensors"), &file(1));
+    write(&directory.path().join("second.safetensors"), &file(2));
+    let names = |names: [&str; 2]| names.map(str::to_owned).to_vec();
+    for (order, winner) in [
+        (["first.safetensors", "second.safetensors"], 2),
+        (["second.safetensors", "first.safetensors"], 1),
+    ] {
+        let store = Arc::new(
+            drive(&io, |done| {
+                Safetensors::open_files(&io, directory.path(), names(order), done)
+            })
+            .unwrap(),
+        );
+        assert_eq!(read(&io, &store, "shared", 0, 1).unwrap(), vec![winner], "{order:?}");
+        assert_eq!(store.shard_of(store.tensor("shared").unwrap()), order[1]);
+        assert!(store.contains("only-first") && store.contains("only-second"));
+    }
+    let none = Safetensors::open_files(
+        &io,
+        directory.path(),
+        Vec::new(),
+        Arc::new(|_| panic!("nothing was started")),
+    );
+    assert!(matches!(none, Err(CheckpointError::Invalid(_))));
+}
