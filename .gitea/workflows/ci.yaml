@@ -267,7 +267,7 @@ jobs:
           # The quantization crate's other device tests fail, not skip, without their settings: only its kernel tests run.
           # A test without a model artifact skips with a line starting "skipped:".
           {
-            mise exec -- cargo test --workspace --exclude euhedral-inference-quantization -- --ignored --nocapture
+            mise exec -- cargo test --workspace --exclude euhedral-inference-quantization --no-fail-fast -- --ignored --nocapture
             mise exec -- cargo test -p euhedral-inference-quantization --test kernels_gpu -- --ignored --nocapture
           } 2>&1 | tee "$RUNNER_TEMP/device.log"
       - name: Skipped tests
