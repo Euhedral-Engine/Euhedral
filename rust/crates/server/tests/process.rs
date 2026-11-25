@@ -88,6 +88,7 @@ fn spawn_with(arguments: &[&str], stdout: Stdio) -> Server {
     Server(child)
 }
 
+// Timing-based on purpose: a real process exits on its own clock and no counter of ours sees it; `limit` is a hang guard.
 /// The exit code of the child, waiting at most `limit`.
 fn exit_code(server: &mut Server, limit: Duration) -> i32 {
     let deadline = Instant::now() + limit;

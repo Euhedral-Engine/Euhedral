@@ -1150,7 +1150,9 @@ mod tests {
 
     #[test]
     fn a_stop_waits_for_an_outcome_that_another_thread_is_telling() {
-        let (mailbox, address) = threaded(Probe::new);
+        // The poster's thread takes the turn and blocks in the listener; every hand-off to a worker waits for the
+        // test, which runs it where it stands, so the stop's turn is over when this thread has run it.
+        let (mailbox, address, mut handoffs) = queued(Probe::new);
         let (entered, release, told) = (Handoff::new(), Handoff::new(), Handoff::new());
         mailbox
             .with(|probe| {
@@ -1168,14 +1170,15 @@ mod tests {
         let poster = Arc::clone(&mailbox);
         thread::spawn(move || poster.post(1));
         entered.wait(BOUND).expect("the listener is being told");
-        let stopper = Arc::clone(&mailbox);
-        let stopped = Handoff::new();
-        let answer = Arc::clone(&stopped);
-        thread::spawn(move || answer.send(stopper.stop(BOUND)));
-        // Whether the stop is already waiting when the listener is released is the scheduler's: either way it returns
-        // only once the listener's call has ended.
+        let idle = mailbox.stopping().expect("a thread outside the owner");
+        run_frames(&mut handoffs);
+        // The owner took the stop while the listener's call is still running: the stop waits for that call.
+        assert!(
+            !idle.is_set(),
+            "the stop was told the owner idle while a listener was still in `finished`"
+        );
         release.send(());
-        assert_eq!(stopped.wait(BOUND), Ok(true));
+        assert_eq!(idle.wait(BOUND), Ok(()), "the stop was never told the owner idle");
         assert!(told.is_set(), "the listener's call had not ended");
     }
 

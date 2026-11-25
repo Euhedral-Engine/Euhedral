@@ -381,6 +381,7 @@ fn a_greedy_chat_completion_matches_the_engine_and_a_cancel_frees_the_sequence()
     let produced = counted_tokens(server.local_addr()) - counted - again_ids.len() as u64;
     println!("the cancelled request produced {produced} of {BUDGET} tokens");
     assert!(
+        // Timing-based on purpose: a cancel races a real device that decodes on its own clock, so only a share of the budget can be asserted.
         produced < BUDGET / 2,
         "the cancel took effect: {produced} of {BUDGET} tokens were produced"
     );

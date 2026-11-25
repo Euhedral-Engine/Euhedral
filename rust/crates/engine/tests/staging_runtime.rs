@@ -13,12 +13,13 @@
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
+use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_gpu::fake::{FakeGpu, FakeKernel, FakeModule, FakeQueue};
 use euhedral_gpu::{Args, CompileOptions, LaneEnqueue, Launch, Module};
@@ -448,7 +449,82 @@ impl Stage<Q, FakeQueue> for Unit {
     }
 }
 
+/// What the rig handed to the lake and what came back: every frame is counted in and counted out when it finishes.
+#[derive(Default)]
+struct Traffic {
+    offered: AtomicUsize,
+    finished: AtomicUsize,
+}
+
+impl Traffic {
+    /// Whether every frame handed to the lake has finished.
+    fn balanced(&self) -> bool {
+        self.finished.load(Ordering::SeqCst) == self.offered.load(Ordering::SeqCst)
+    }
+}
+
+/// A frame that counts its own end and is otherwise the frame it wraps.
+struct Counted {
+    inner: Box<dyn Frame>,
+    traffic: Arc<Traffic>,
+}
+
+impl Frame for Counted {
+    fn header(&self) -> &FrameHeader {
+        self.inner.header()
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        self.inner.header_mut()
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        self.inner.execute()
+    }
+
+    fn is_alive(&self) -> bool {
+        self.inner.is_alive()
+    }
+
+    fn kill(&self) {
+        self.inner.kill();
+    }
+
+    fn do_finally(self: Box<Self>) {
+        let Counted { inner, traffic } = *self;
+        inner.do_finally();
+        traffic.finished.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn do_finally_with_error(self: Box<Self>, error: FrameError) {
+        let Counted { inner, traffic } = *self;
+        inner.do_finally_with_error(error);
+        traffic.finished.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The lake, counting what is offered to it.
+struct Counting {
+    lake: Arc<Lake>,
+    traffic: Arc<Traffic>,
+}
+
+impl FrameSink for Counting {
+    fn offer(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
+        self.traffic.offered.fetch_add(1, Ordering::SeqCst);
+        let counted = Box::new(Counted {
+            inner: frame,
+            traffic: Arc::clone(&self.traffic),
+        });
+        self.lake.offer(counted).inspect_err(|_| {
+            // Refused: the frame goes back to its owner, who does not run it.
+            self.traffic.offered.fetch_sub(1, Ordering::SeqCst);
+        })
+    }
+}
+
 struct Rig {
+    traffic: Arc<Traffic>,
     gpu: Arc<FakeGpu>,
     graph: Arc<StageGraph<Q, FakeQueue>>,
     lattice: Arc<ControlPlaneLattice>,
@@ -511,12 +587,16 @@ fn rig(view: View) -> Rig {
         })
         .collect();
     let retired: Arc<Mutex<Vec<(u32, QuantumOutcome)>>> = Arc::default();
+    let traffic = Arc::new(Traffic::default());
     let record = Arc::clone(&retired);
     let graph = StageGraph::new(
         plan.spec_homed(view, 0, compute).unwrap().unwrap(),
         stages,
         GraphRuntime {
-            stages: Arc::clone(&lake) as Arc<dyn FrameSink>,
+            stages: Arc::new(Counting {
+                lake: Arc::clone(&lake),
+                traffic: Arc::clone(&traffic),
+            }),
             completions: Arc::clone(&completions),
             lanes: Arc::clone(&lanes.typed),
             retries: Arc::default(),
@@ -526,6 +606,7 @@ fn rig(view: View) -> Rig {
     )
     .unwrap();
     Rig {
+        traffic,
         gpu,
         graph,
         lattice,
@@ -561,15 +642,23 @@ impl Rig {
         offered(&self.plan, self.view)
     }
 
-    /// Runs the device until nothing more is submitted for a while (the lattice runs the frames and the completions).
+    /// Runs the device until everything the rig handed to the lake has finished and no completion is in flight: what
+    /// can run has run. Bounded: a frame that never finishes fails the test, naming what is left.
     fn settle(&self) {
-        let (mut quiet, mut seen) = (0, usize::MAX);
-        while quiet < 40 {
-            self.gpu.run_until_idle();
-            thread::sleep(Duration::from_millis(1));
-            let now = lock(&self.log).len() + lock(&self.retired).len();
-            quiet = if now == seen { quiet + 1 } else { 0 };
-            seen = now;
+        let deadline = Instant::now() + BOUND;
+        loop {
+            let ran = self.gpu.run_until_idle();
+            if ran == 0 && self.completions.pending() == 0 && self.traffic.balanced() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the frames never finished: {} offered, {} finished, {} completions pending",
+                self.traffic.offered.load(Ordering::SeqCst),
+                self.traffic.finished.load(Ordering::SeqCst),
+                self.completions.pending()
+            );
+            thread::yield_now();
         }
     }
 

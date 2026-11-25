@@ -374,6 +374,8 @@ fn a_connection_over_the_cap_waits_until_one_ends() {
     let mut second = Raw::connect(fixture.addr);
     second.send(ask);
     // The second connection is in the kernel's backlog: nothing reads it while the first is open.
+    // Not provable by a counter: a refused connection waits in the kernel's backlog and moves none, so an `open` of 1
+    // here may also mean the transport has not yet accepted the second; the answer after `drop(first)` is the proof.
     assert_eq!(fixture.server.counters().open, 1);
     drop(first);
     assert!(second.read_until("\"engine\"").starts_with("HTTP/1.1 200"));

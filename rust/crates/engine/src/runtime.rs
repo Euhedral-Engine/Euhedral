@@ -1375,6 +1375,7 @@ mod tests {
     fn a_close_that_spends_the_window_skips_the_free_drops_nothing_and_says_what_is_left() {
         let freed = Cell::new(false);
         let drops = Rc::new(Cell::new(0));
+        // Timing-based on purpose: the window is wall time and the closer must really overrun it (the sleep is longer).
         let window = Duration::from_millis(20);
         let result = stop_within(
             window,
