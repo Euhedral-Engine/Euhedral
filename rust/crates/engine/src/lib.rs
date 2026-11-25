@@ -1,6 +1,7 @@
 //! The Qwen3.8 engine on RustEE: the runtime, the residency planner, the weight loader, the workspace and the
 //! sequence state.
 
+pub mod composite;
 pub mod error;
 pub mod formats;
 mod frames;
@@ -22,6 +23,7 @@ pub mod summary;
 mod warmup;
 pub mod workspace;
 
+pub use composite::{Composite, Replacement};
 pub use handoff::{Handoff, TimedOut};
 pub use runtime::{
     EngineRuntime, ReadyHandoff, RuntimeOwner, StartupReport, Teardown, fragment_config, lattice_config,

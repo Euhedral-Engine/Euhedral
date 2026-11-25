@@ -275,7 +275,7 @@ impl ArtifactProfile {
             Speculation::Mtp => match (self.draft_depth, self.quantization) {
                 (Some(depth), _) => Ok(usize::from(depth)),
                 (None, Quantization::Mixed) => Err(PlanError::Inventory(
-                    "a mixed artifact stores no MTP draft depth".to_string(),
+                    "a mixed artifact stores no MTP draft depth (a composite can supply one)".to_string(),
                 )),
                 (None, Quantization::Q3) => Ok(2),
                 (None, _) => Ok(4),
