@@ -10,18 +10,19 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::str::from_utf8;
-use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use euhedral_core::config::{FragmentConfig, LatticeConfig};
 use euhedral_core::control_plane::ControlPlaneLattice;
+use euhedral_core::frames::Frame;
 use euhedral_core::impls::{BaseCloneableObject, DefaultExecutor};
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_hardware_utils::affinity;
 use euhedral_inference_api_server::scripted::ScriptedBackend;
-use euhedral_inference_api_server::{ApiConfig, ApiServer, EngineReport, Limits, RequestDefaults, once, start};
+use euhedral_inference_api_server::{ApiConfig, ApiServer, Clock, EngineReport, Limits, RequestDefaults, once, start};
 use euhedral_io::AsyncIo;
 use euhedral_net::{ClientConfig, Method, NetError, Request, Response, request};
 
@@ -42,6 +43,89 @@ pub fn lattice(cpus: Option<usize>) -> Arc<ControlPlaneLattice> {
     let lattice = ControlPlaneLattice::new(config).expect("a lattice");
     lattice.start().expect("a started lattice");
     lattice
+}
+
+/// The time admission sees, which only the test moves: the moments are a base plus what was [advanced](Self::advance),
+/// and a timer fires, as a frame into the lattice, when the test moves the clock to its deadline or past it.
+pub struct ManualClock {
+    base: Instant,
+    sink: Arc<QueueIngestSink>,
+    state: Mutex<ClockState>,
+}
+
+struct ClockState {
+    moved: Duration,
+    timers: Vec<(Instant, Box<dyn Frame>)>,
+}
+
+impl ManualClock {
+    pub fn new() -> Arc<ManualClock> {
+        Arc::new(ManualClock {
+            base: Instant::now(),
+            sink: Arc::new(QueueIngestSink::new()),
+            state: Mutex::new(ClockState {
+                moved: Duration::ZERO,
+                timers: Vec::new(),
+            }),
+        })
+    }
+
+    /// Attaches the clock's timers to `lattice`, which emits them when they fire.
+    pub fn attach(&self, lattice: &ControlPlaneLattice) {
+        lattice
+            .add_upstream(self.sink.delegate())
+            .expect("the timers are attached");
+    }
+
+    /// Completes the clock's timers: call it before the lattice closes.
+    pub fn complete(&self) {
+        self.sink.complete_gracefully();
+    }
+
+    fn lock(&self) -> MutexGuard<'_, ClockState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Moves the clock on by `by` and emits the timers that are due.
+    pub fn advance(&self, by: Duration) {
+        let due = {
+            let mut state = self.lock();
+            state.moved += by;
+            let now = self.base + state.moved;
+            let (due, later): (Vec<_>, Vec<_>) = state.timers.drain(..).partition(|(deadline, _)| *deadline <= now);
+            state.timers = later;
+            due
+        };
+        for (_, frame) in due {
+            drop(self.sink.offer(frame));
+        }
+    }
+
+    /// The earliest deadline of a timer that has not fired.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.lock().timers.iter().map(|(deadline, _)| *deadline).min()
+    }
+
+    /// The moment `after` from the start of the clock.
+    pub fn at_offset(&self, after: Duration) -> Instant {
+        self.base + after
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> Instant {
+        self.base + self.lock().moved
+    }
+
+    fn at(&self, deadline: Instant, frame: Box<dyn Frame>) {
+        let mut state = self.lock();
+        if deadline <= self.base + state.moved {
+            drop(state);
+            drop(self.sink.offer(frame));
+        } else {
+            state.timers.push((deadline, frame));
+        }
+    }
 }
 
 /// Limits small enough to cross in a test.
@@ -66,6 +150,7 @@ pub struct Fixture {
     pub addr: SocketAddr,
     io: Arc<AsyncIo>,
     sink: Arc<QueueIngestSink>,
+    clock: Option<Arc<ManualClock>>,
 }
 
 impl Fixture {
@@ -79,6 +164,17 @@ impl Fixture {
 
     /// A server whose backend reports `report` for the metrics.
     pub fn reporting(limits: Limits, cpus: Option<usize>, report: EngineReport) -> Fixture {
+        Fixture::build(limits, cpus, report, None)
+    }
+
+    /// A server on a clock the test moves: its limits pass when [`ManualClock::advance`] reaches them.
+    pub fn timed(limits: Limits) -> (Fixture, Arc<ManualClock>) {
+        let clock = ManualClock::new();
+        let fixture = Fixture::build(limits, Some(2), EngineReport::default(), Some(clock.clone()));
+        (fixture, clock)
+    }
+
+    fn build(limits: Limits, cpus: Option<usize>, report: EngineReport, clock: Option<Arc<ManualClock>>) -> Fixture {
         let lattice = lattice(cpus);
         let backend = ScriptedBackend::on(&lattice);
         backend.set_engine_report(report);
@@ -88,10 +184,14 @@ impl Fixture {
             backend: backend.clone(),
             defaults: RequestDefaults::default(),
             io: None,
+            clock: clock.clone().map(|clock| clock as Arc<dyn Clock>),
             created_at: CREATED,
         };
         let server = start(&lattice, config).expect("a started server");
         let io = AsyncIo::open().expect("an AsyncIo");
+        if let Some(clock) = &clock {
+            clock.attach(&lattice);
+        }
         let sink = Arc::new(QueueIngestSink::new());
         lattice.add_upstream(io.clone()).expect("io attached");
         lattice.add_upstream(sink.delegate()).expect("sink attached");
@@ -103,6 +203,7 @@ impl Fixture {
             addr,
             io,
             sink,
+            clock,
         }
     }
 
@@ -160,6 +261,9 @@ impl Fixture {
         let counters = self.server.counters();
         assert_eq!(counters.open, 0, "a connection is still counted");
         self.server.release();
+        if let Some(clock) = &self.clock {
+            clock.complete();
+        }
         self.backend.release();
         self.sink.complete_gracefully();
         self.lattice.close();
@@ -280,13 +384,21 @@ impl Raw {
 
     /// Whether the server closes the connection within the patience of a test.
     pub fn closed_by_server(&mut self) -> bool {
+        self.read_to_close().is_some()
+    }
+
+    /// Everything the server sends until it closes the connection, or `None` if it does not within the patience of a
+    /// test.
+    pub fn read_to_close(&mut self) -> Option<String> {
+        let mut seen = String::new();
         let end = Instant::now() + PATIENCE;
         while Instant::now() < end {
-            if self.read_for(Duration::from_millis(200)).is_none() {
-                return true;
+            match self.read_for(Duration::from_millis(200)) {
+                Some(more) => seen.push_str(&more),
+                None => return Some(seen),
             }
         }
-        false
+        None
     }
 }
 

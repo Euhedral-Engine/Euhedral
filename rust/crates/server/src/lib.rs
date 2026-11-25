@@ -242,6 +242,18 @@ pub fn serve(
     start_backend: impl FnOnce(&Settings) -> Result<Started, StartError>,
     wait_for_stop: impl FnOnce(SocketAddr) -> u8,
 ) -> u8 {
+    serve_waiting(settings, windows, None, start_backend, wait_for_stop)
+}
+
+/// As [`serve`], with how long the stop waits for the server's report that it stopped: `None` is the two windows plus
+/// a margin for admission's own timer to report first. A test that must not race that margin gives a long time.
+pub fn serve_waiting(
+    settings: &Settings,
+    windows: StopWindows,
+    report_wait: Option<Duration>,
+    start_backend: impl FnOnce(&Settings) -> Result<Started, StartError>,
+    wait_for_stop: impl FnOnce(SocketAddr) -> u8,
+) -> u8 {
     let started = match start_backend(settings) {
         Ok(started) => started,
         Err(error) => {
@@ -263,6 +275,7 @@ pub fn serve(
         created_at: now_seconds(),
         defaults: defaults(settings),
         io: None,
+        clock: None,
     };
     let patience = windows.drain.saturating_add(windows.shutdown);
     let timeout = settings.server.shutdown_timeout;
@@ -290,7 +303,8 @@ pub fn serve(
     }));
     // Admission waits for the generations up to the shutdown limit and then tells them to give up; the margin lets its
     // own timer report before this wait gives up first.
-    match reported.recv_timeout(patience.saturating_add(patience.max(Duration::from_secs(1)))) {
+    let wait = report_wait.unwrap_or_else(|| patience.saturating_add(patience.max(Duration::from_secs(1))));
+    match reported.recv_timeout(wait) {
         Ok(()) => server.release(),
         Err(_) => log::error!("the server did not report that it stopped; closing the backend anyway"),
     }

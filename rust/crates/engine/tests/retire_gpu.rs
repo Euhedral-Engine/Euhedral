@@ -776,6 +776,7 @@ fn a_failed_submission_on_another_lane_retires_only_after_its_kernel_ended() {
     retirements.assert_outcome(0, FAILED, "the stage on the other lane failed");
     let elapsed = begun.elapsed();
     assert!(
+        // Timing-based on purpose: the claim is that a stage retires only after a kernel that spins for SPIN_NS; the kernel's run time is the signal.
         elapsed >= Duration::from_nanos(SPIN_NS) * 3 / 4,
         "the quantum retired after {elapsed:?}, while the kernel it queued runs for {SPIN_NS} ns"
     );
