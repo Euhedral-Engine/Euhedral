@@ -45,8 +45,10 @@ import org.junit.jupiter.api.Timeout;
 @ModelGroup.OwnJvm // loads the artifact named by euhedral.greedy.artifact, not one of the shared ones
 class GreedyReferenceCudaIntegrationTest {
 
-    /// The user turn of the chat prompt unless `euhedral.greedy.user` names another (a longer one, to prefill more rows).
-    static final String USER = "Explain, in a few short paragraphs, how a language model produces text one token at a time.";
+    /// The user turn of the chat prompt unless `euhedral.greedy.user` names another (a longer one, to prefill more
+    /// rows).
+    static final String USER =
+            "Explain, in a few short paragraphs, how a language model produces text one token at a time.";
 
     /// The chat prompt: one user turn, then the assistant's turn open.
     static String prompt() {

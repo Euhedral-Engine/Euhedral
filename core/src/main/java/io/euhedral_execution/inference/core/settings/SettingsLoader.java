@@ -329,6 +329,8 @@ public final class SettingsLoader {
         m.put("batching.max-sequences-per-pass", optional(integer(1, Integer.MAX_VALUE)));
         m.put("batching.max-tokens-per-pass", optional(integer(1, Integer.MAX_VALUE)));
         m.put("batching.prefill-chunk-tokens", fixed(integer(1, Integer.MAX_VALUE)));
+        // Read only by the Rust engine; accepted so the shared example file loads here.
+        m.put("batching.forced-rows", fixed(integer(0, Integer.MAX_VALUE)));
 
         m.put("memory.host-limit", optional(size(0)));
         m.put("memory.host-weights-limit", optional(size(1)));
