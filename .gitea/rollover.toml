@@ -1,0 +1,17 @@
+# Settings of `rollover promote` for this repository, read from the promoted commit. Flags override them.
+# The token file and the Gitea address are not here: promote.yaml passes the first, and FORGE_URL gives the second.
+
+# Integration branches are named rust/next-<n>; the next one is the current number plus one.
+branch_pattern = "rust/next-{n}"
+
+# Who may push and who may merge on a protected integration branch (exact-name rules only):
+# push = [promote_bot, admin_user], merge = [merge_user, admin_user].
+promote_bot = "promote-euhedral"
+admin_user = "forge-admin"
+merge_user = "agents"
+
+# The commit being promoted needs a successful push run of this workflow on its integration branch.
+require_run = ["ci.yaml"]
+
+# The GitHub repository the old integration branch is deleted from, over ssh. Only a --production run may use it.
+mirror_url = "git@github.com:Euhedral-Engine/Euhedral.git"
