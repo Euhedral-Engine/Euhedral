@@ -548,15 +548,9 @@ pub const P2E2_EXPAND_LIMIT: u64 = 128 << 20;
 /// the activations of the FP8 route and its split-K partials, which grow with the device's `sm_count`) fits
 /// [`P2E2_EXPAND_LIMIT`], and no width the FFN or mixer kernels are specialised for (5120 and 34816), so every chunk
 /// takes the generic kernels and each output equals the whole tensor's. One kilorow is the least, whatever it takes.
-/// The plan assumes the FP8 route runs wherever the device has it (`mx_available`), so a launch that declines it takes
-/// less.
-pub fn p2e2_chunk_rows(
-    rows: u32,
-    in_features: u32,
-    out_features: u32,
-    mx_available: bool,
-    sm_count: Option<u32>,
-) -> u32 {
+/// The FP8 route's scratch is always counted, whether or not the device runs it, so the plan and every launch choose
+/// the same chunk (a chunk's size never changes an output) and a launch without the route takes less than planned.
+pub fn p2e2_chunk_rows(rows: u32, in_features: u32, out_features: u32, sm_count: Option<u32>) -> u32 {
     let most = (P2E2_EXPAND_LIMIT / q3_byte_size(1024, in_features).max(1))
         .max(1)
         .min(u64::from(u32::MAX / 2) / 1024);
@@ -564,9 +558,7 @@ pub fn p2e2_chunk_rows(
     while units > 1 {
         let chunk = u32::try_from(units * 1024).unwrap_or(1024);
         let guarded = chunk == 5120 || chunk == 34816;
-        if !guarded
-            && p2e2_chunk_scratch(rows, in_features, out_features, chunk, mx_available, sm_count) <= P2E2_EXPAND_LIMIT
-        {
+        if !guarded && p2e2_chunk_scratch(rows, in_features, out_features, chunk, true, sm_count) <= P2E2_EXPAND_LIMIT {
             break;
         }
         units -= 1;
@@ -634,7 +626,7 @@ pub fn linear_scratch_bytes(
     if expanded <= P2E2_EXPAND_LIMIT {
         return align256(expanded) + activations(false);
     }
-    let chunk = p2e2_chunk_rows(rows, in_features, out_features, mx_available, sm_count).min(out_features);
+    let chunk = p2e2_chunk_rows(rows, in_features, out_features, sm_count).min(out_features);
     p2e2_chunk_scratch(rows, in_features, out_features, chunk, mx_available, sm_count)
 }
 

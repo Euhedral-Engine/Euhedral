@@ -218,24 +218,37 @@ fn the_scratch_of_a_chunked_head_fits_the_expansion_limit_on_every_device_and_av
     let (out, input) = (70_016, 5120);
     for sm_count in [Some(1), Some(70), Some(170), Some(256), Some(1024), None] {
         for rows in [1, 8, 9, 40, 64, 129, 512] {
-            let chunk = p2e2_chunk_rows(rows, input, out, true, sm_count);
+            let chunk = p2e2_chunk_rows(rows, input, out, sm_count);
             assert_eq!(chunk % 1024, 0);
             let scratch = linear_scratch_bytes(true, rows, input, out, true, sm_count, false);
             assert!(
                 scratch <= P2E2_EXPAND_LIMIT,
                 "{sm_count:?} SMs, {rows} rows: {scratch} bytes in chunks of {chunk}"
             );
+            // A device without the FP8 route runs the same chunks and needs no more than the plan, which counts it.
+            let without = linear_scratch_bytes(true, rows, input, out, false, sm_count, false);
+            assert_eq!(p2e2_chunk_rows(rows, input, out, sm_count), chunk);
+            assert!(
+                without <= scratch,
+                "{sm_count:?} SMs, {rows} rows: {without} without FP8, {scratch} with"
+            );
         }
+    }
+    // The plan counts the FP8 route and a device without it chunks alike, so its launch never needs more than planned.
+    for rows in 1..=64 {
+        let planned = linear_scratch_bytes(true, rows, 5120, 248_320, true, Some(70), false);
+        let launched = linear_scratch_bytes(true, rows, 5120, 248_320, false, Some(70), false);
+        assert!(
+            launched <= planned,
+            "{rows} rows: {launched} bytes launched, {planned} planned"
+        );
     }
     // Widths of K whose unguarded chunk of one row is 5120 and 34816.
     for input in [57_344, 9344] {
         let per_unit = q3_byte_size(1024, input) + 1024 * 2;
         let unguarded = (P2E2_EXPAND_LIMIT / per_unit) * 1024;
         assert!(unguarded == 5120 || unguarded == 34816, "{input}: {unguarded}");
-        assert_eq!(
-            u64::from(p2e2_chunk_rows(1, input, 1 << 20, false, None)),
-            unguarded - 1024
-        );
+        assert_eq!(u64::from(p2e2_chunk_rows(1, input, 1 << 20, None)), unguarded - 1024);
     }
 }
 

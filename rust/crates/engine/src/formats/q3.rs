@@ -146,7 +146,7 @@ impl Q3Linear {
         row_exact: bool,
     ) -> Result<(), CudaError> {
         let Shape { out, input } = shape;
-        let chunk = p2e2_chunk_rows(rows, input, out, self.mx_available, Some(self.sm_count));
+        let chunk = p2e2_chunk_rows(rows, input, out, Some(self.sm_count));
         let mut first = 0;
         while first < out {
             let count = chunk.min(out - first);
@@ -156,7 +156,7 @@ impl Q3Linear {
             let reserve = self.mx_reserve(rows, part, row_exact, false, out);
             if (scratch.bytes as u64) < activation_offset + reserve {
                 return Err(CudaError::Argument(format!(
-                    "a launch of {rows} rows over {} needs {} bytes of scratch for a chunk of {count} rows and has {}",
+                    "a launch of {rows} rows over {}, too large to expand whole ({P2E2_EXPAND_LIMIT} bytes), needs {} bytes of scratch for a chunk of {count} rows and has {}",
                     weight.name,
                     activation_offset + reserve,
                     scratch.bytes
