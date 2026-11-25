@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
@@ -133,6 +134,10 @@ fn what_is_recorded_survives_a_stop_and_comes_back_without_duplicates() {
         held_out: 0.07,
     };
     let state = call(|then| state.set_progress(progress, then)).unwrap();
+    // The same allocation offered again in the same run.
+    let (state, added) = add(state, measured(nvfp4(), 0.5, 1));
+    assert!(!added, "no duplicate within a run");
+    assert_eq!(state.measured().len(), 2);
     drop(state);
 
     let state = world.open(&path, "fingerprint", 99, 5).unwrap();
@@ -276,11 +281,7 @@ fn doubles_come_back_bit_for_bit() {
     ];
     let mut state = world.open(&path, "fingerprint", -5, 7).unwrap();
     for (round, value) in values.iter().enumerate() {
-        let mut candidate = measured(
-            allocation(QuantOption::Nvfp4, QuantOption::ALL[round % 5]),
-            *value,
-            round as u32,
-        );
+        let mut candidate = measured(Allocation::default(), *value, round as u32);
         candidate.allocation = Allocation::new(BTreeMap::from([(format!("object {round}"), QuantOption::Nvfp4)]));
         candidate.kl_se = *value;
         candidate.prefill = *value;
@@ -319,6 +320,12 @@ fn a_new_state_has_no_progress() {
     assert_eq!((progress.round, progress.stale), (0, 0));
     assert!(progress.explore.is_nan() && progress.held_out.is_nan());
     assert!(state.measured().is_empty());
+    drop(state);
+    let state = world.open(&directory.path().join("search.resume"), "f", 2, 2).unwrap();
+    let progress = state.progress();
+    assert_eq!((progress.round, progress.stale), (0, 0));
+    assert!(progress.explore.is_nan() && progress.held_out.is_nan());
+    assert_eq!(state.seed(), 1);
     world.finish();
 }
 
@@ -337,10 +344,7 @@ fn a_header_that_covers_more_than_the_records_is_refused() {
     file_call(|then| file.set_header(&header, then)).unwrap();
     drop(file);
     let failure = world.open(&path, "f", 1, 1).unwrap_err();
-    assert!(
-        matches!(failure, SearchError::Damaged(_) | SearchError::Resume(_)),
-        "{failure}"
-    );
+    assert!(matches!(failure, SearchError::Damaged(_)), "{failure}");
 
     let file = open_file(&world, &path);
     header.set("end", (end - 2).to_string());
@@ -372,5 +376,111 @@ fn the_header_does_not_grow_with_the_candidates() {
     assert!(fs::metadata(&path).unwrap().len() > HEADER + 300 * 50);
     drop(file);
     assert_eq!(world.open(&path, "f", 1, 1).unwrap().measured().len(), 300);
+    world.finish();
+}
+
+/// The import of a path that does not exist is an error and creates nothing; a file that is only readable imports.
+#[test]
+fn reading_a_missing_path_creates_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("mistyped.resume");
+    let world = World::start();
+    let failure = world.read(&missing).unwrap_err();
+    match failure {
+        SearchError::Resume(ResumeError::Io(error)) => assert_eq!(error.kind(), ErrorKind::NotFound),
+        other => panic!("{other}"),
+    }
+    assert!(!missing.exists());
+
+    let path = directory.path().join("search.resume");
+    let (state, _) = add(world.open(&path, "f", 1, 1).unwrap(), measured(nvfp4(), 0.1, 0));
+    drop(state);
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&path, permissions).unwrap();
+    assert_eq!(world.read(&path).unwrap().len(), 1);
+    world.finish();
+}
+
+/// A path mistyped onto a small file that is not a state is refused and the file is untouched; an empty file is a new
+/// state.
+#[test]
+fn a_short_file_that_is_not_a_state_is_not_overwritten() {
+    let directory = tempfile::tempdir().unwrap();
+    let small = directory.path().join("notes.txt");
+    fs::write(&small, b"keep me").unwrap();
+    let empty = directory.path().join("empty.resume");
+    fs::write(&empty, b"").unwrap();
+    let world = World::start();
+    let failure = world.open(&small, "f", 1, 1).unwrap_err();
+    assert!(matches!(failure, SearchError::NotSearchState { .. }), "{failure}");
+    assert_eq!(fs::read(&small).unwrap(), b"keep me");
+    let state = world.open(&empty, "f", 1, 1).unwrap();
+    assert!(state.measured().is_empty());
+    world.finish();
+}
+
+/// The names in a record on disk are fixed: a record written as literal text reads back, so a renamed key fails.
+#[test]
+fn a_record_in_the_documented_text_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("search.resume");
+    let world = World::start();
+    drop(world.open(&path, "f", 1, 1).unwrap());
+    let text = br#"{"objects":{"text/layers/0/mlp/down":"trellis-3.5"},"kl":0.25,"klSe":0.5,"bytes":99,"prefill":1.5,"decode":2.5,"fits":false,"round":7,"origin":"explore:move"}"#;
+    let mut record = (text.len() as u32).to_le_bytes().to_vec();
+    record.extend_from_slice(text);
+    let file = open_file(&world, &path);
+    let end = file_call(|then| file.write(HEADER, record, then)).unwrap();
+    let mut header = file_call(|then| file.header(then)).unwrap();
+    header.set("count", "1");
+    header.set("end", end.to_string());
+    file_call(|then| file.set_header(&header, then)).unwrap();
+    drop(file);
+
+    let read = world.read(&path).unwrap();
+    let expected = Measured {
+        allocation: Allocation::new(BTreeMap::from([(
+            "text/layers/0/mlp/down".to_string(),
+            QuantOption::Trellis3_5,
+        )])),
+        kl: 0.25,
+        kl_se: 0.5,
+        bytes: 99,
+        prefill: 1.5,
+        decode: 2.5,
+        fits: false,
+        round: 7,
+        origin: "explore:move".to_string(),
+    };
+    assert_eq!(read, vec![expected]);
+    world.finish();
+}
+
+/// What a stop during the first header write can leave, a file of zeros no longer than a header, is a new state; the
+/// same zeros under bytes past the header are some other file and are kept.
+#[test]
+fn a_torn_first_header_is_a_new_state_and_a_big_file_of_zeros_is_not() {
+    let directory = tempfile::tempdir().unwrap();
+    let torn = directory.path().join("torn.resume");
+    fs::write(&torn, vec![0u8; 1000]).unwrap();
+    let full = directory.path().join("full.resume");
+    fs::write(&full, vec![0u8; HEADER as usize]).unwrap();
+    let mut data = vec![0u8; HEADER as usize + 10];
+    data[HEADER as usize + 3] = 7;
+    let big = directory.path().join("big.resume");
+    fs::write(&big, &data).unwrap();
+    let marked = directory.path().join("marked.resume");
+    fs::write(&marked, b"\0\0not zero").unwrap();
+    let world = World::start();
+    for path in [&torn, &full] {
+        assert!(world.open(path, "f", 1, 1).unwrap().measured().is_empty());
+    }
+    for path in [&big, &marked] {
+        let failure = world.open(path, "f", 1, 1).unwrap_err();
+        assert!(matches!(failure, SearchError::NotSearchState { .. }), "{failure}");
+    }
+    assert_eq!(fs::read(&big).unwrap(), data);
+    assert_eq!(fs::read(&marked).unwrap(), b"\0\0not zero");
     world.finish();
 }
