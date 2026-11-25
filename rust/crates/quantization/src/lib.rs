@@ -14,6 +14,8 @@
 //! - [`rows`]: the work on the logits rows of one teacher-forced run, as frames of the `host` lake.
 //! - [`mixed`]: the mixed allocation search's data: options, allocations, priors, the cost table, the knapsack, the
 //!   Pareto front and the residency check.
+//! - [`assemble`]: the source artifacts of a mixed artifact, opened and checked, and the artifact an allocation makes of
+//!   them, written through `AsyncIo`.
 //! - [`checkpoint`]: the safetensors reader and writer and the fused objects of a Qwen 3.8 checkpoint, on `AsyncIo`.
 //! - [`recipe`]: the storage format of each quantized object of an artifact.
 //! - [`exl3`]: the bit allocation of the trellis quantizer and the writer of its EXL3 checkpoint.
@@ -21,6 +23,7 @@
 //!   truncation and removal it is built on.
 //! - [`package_tokenizer`]: gives an artifact a checkpoint's tokenizer, in place or as a copy.
 
+pub mod assemble;
 mod chain;
 pub mod checkpoint;
 pub mod durable;

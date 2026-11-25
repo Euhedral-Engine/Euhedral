@@ -47,6 +47,8 @@ pub struct TinyArtifact<'a> {
     pub shared_seed: i64,
     /// A projection left out (the empty string leaves none out).
     pub omitted: &'a str,
+    /// A projection stored with 128 input features instead of 64 (the empty string widens none).
+    pub widened: &'a str,
 }
 
 impl TinyArtifact<'_> {
@@ -57,6 +59,7 @@ impl TinyArtifact<'_> {
             companions,
             shared_seed: SHARED_SEED,
             omitted: "",
+            widened: "",
         }
     }
 
@@ -101,10 +104,11 @@ impl TinyArtifact<'_> {
             8,
             shared.wrapping_add(1),
         )?;
-        objects.quantized("text/token_embedding", self.seed, false)?;
+        objects.quantized("text/token_embedding", 64, self.seed, false)?;
         for name in PROJECTIONS {
             if name != self.omitted {
-                objects.quantized(name, self.seed, self.companions)?;
+                let features = if name == self.widened { 128 } else { 64 };
+                objects.quantized(name, features, self.seed, self.companions)?;
             }
         }
         objects.raw(
@@ -114,7 +118,7 @@ impl TinyArtifact<'_> {
             32,
             shared.wrapping_add(2),
         )?;
-        objects.quantized("text/output_head", self.seed, false)?;
+        objects.quantized("text/output_head", 64, self.seed, false)?;
         objects.raw(
             "text/draft_head_token_ids",
             TensorDataType::Int32,
@@ -129,7 +133,7 @@ impl TinyArtifact<'_> {
             32,
             self.seed,
         )?;
-        objects.quantized(DRAFTER_PROJECTION, self.seed, self.companions)?;
+        objects.quantized(DRAFTER_PROJECTION, 64, self.seed, self.companions)?;
         Ok((objects.specs, objects.payloads))
     }
 }
@@ -173,8 +177,8 @@ struct Objects {
 }
 
 impl Objects {
-    fn quantized(&mut self, name: &str, seed: i64, companions: bool) -> Result<(), EdrlError> {
-        let shape = vec![64, 64];
+    fn quantized(&mut self, name: &str, features: u64, seed: i64, companions: bool) -> Result<(), EdrlError> {
+        let shape = vec![64, features];
         let bytes = grouped_size(&shape, TensorDataType::Bf16, WeightFormat::Q3G64Fp16).map_err(refused(name))?;
         let seed = seed.wrapping_add(i64::from(text_hash(name)));
         self.add(

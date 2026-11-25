@@ -551,6 +551,7 @@ dependencies = [
  "euhedral-memory",
  "same-file",
  "serde_json",
+ "sha2",
  "tempfile",
  "test-support",
  "thiserror",
