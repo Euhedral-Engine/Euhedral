@@ -44,6 +44,7 @@ pub mod npz;
 pub mod package_error;
 pub mod package_tokenizer;
 pub mod recipe;
+pub mod reference;
 pub mod resume;
 pub mod rows;
 pub mod step;
