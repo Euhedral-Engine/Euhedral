@@ -15,7 +15,7 @@ mod rate;
 mod run;
 mod search;
 
-use euhedral_gpu::{Args, GpuError, Launch};
+use euhedral_gpu::GpuError;
 use thiserror::Error;
 
 pub use plan::{
@@ -30,31 +30,7 @@ pub use search::{CHOLESKY_RETRIES, SIGMA_REG};
 
 pub use crate::chain::{Finished, Scratch};
 
-/// One kernel launch: the kernel's name in the trellis module, its geometry and its arguments. Only the planners
-/// build one, so its arguments always match the kernel's parameter list.
-#[derive(Clone, Debug)]
-pub struct Step {
-    kernel: &'static str,
-    launch: Launch,
-    args: Args,
-}
-
-impl Step {
-    /// The kernel's symbol name.
-    pub fn kernel(&self) -> &'static str {
-        self.kernel
-    }
-
-    /// The grid, block and dynamic shared memory.
-    pub fn launch(&self) -> &Launch {
-        &self.launch
-    }
-
-    /// The arguments, in the kernel's parameter order.
-    pub fn args(&self) -> &Args {
-        &self.args
-    }
-}
+pub use crate::kernels::{Step, StepError};
 
 /// Why a launch cannot be planned or run.
 #[derive(Debug, Error)]
@@ -86,6 +62,9 @@ pub enum TrellisError {
     /// The module has no kernel of this name.
     #[error("the trellis module has no kernel {0}")]
     NoKernel(String),
+    /// A step could not be enqueued.
+    #[error(transparent)]
+    Step(#[from] StepError),
     /// The device or the driver failed.
     #[error("device failure: {0}")]
     Gpu(#[from] GpuError),
