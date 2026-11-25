@@ -1,6 +1,6 @@
 //! Captured quanta on a GPU: the plan's stage graphs run on a lattice, with and without CUDA graphs. The tests are
 //! `#[ignore]`d and run locally in a memory-capped scope:
-//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test capture_gpu -- --ignored`.
+//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored capture::`.
 //!
 //! The model is the first four layers of the RCO artifact (three GDN layers and one full-attention layer), its MTP
 //! layer, heads and embedding, loaded object by object from the artifact named by `euhedral.qwen.rco-artifact`; the
@@ -20,14 +20,12 @@
 )]
 #![allow(clippy::print_stdout, reason = "a test reports what it measured")]
 
-#[path = "common/linear_gpu.rs"]
-mod linear_gpu;
-#[path = "common/typed.rs"]
-mod typed;
+use crate::linear_gpu;
+use crate::typed;
 
 use typed::Typed;
 
-mod common;
+use crate::common;
 
 use common::Card;
 
@@ -773,6 +771,7 @@ fn compare(world: &World, before: impl Fn(&mut Run), steps: &[Step]) -> (Run, Ru
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn replay_equals_stage_by_stage() {
+    let _light = common::light();
     let Some(world) = World::open() else { return };
     assert!(
         world.plan.fan_out_width() >= 2,
@@ -831,6 +830,7 @@ fn replay_equals_stage_by_stage() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn replay_equals_stage_by_stage_for_a_verification_twin_the_fused_verifier_and_deep_decode() {
+    let _light = common::light();
     let Some(world) = World::open() else { return };
     let mut steps = vec![Step::Decode; 5];
     for rows in [3usize, 5] {
@@ -867,6 +867,7 @@ fn trace(world: &World, pdl: bool, steps: &[Step]) -> (Vec<Outcome>, Vec<Vec<u8>
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn decode_with_programmatic_launch_equals_without_bit_for_bit() {
+    let _light = common::light();
     const RUNS: usize = 20;
     let Some(world) = World::open() else { return };
     let steps = scenario();
@@ -907,6 +908,7 @@ fn decode_with_programmatic_launch_equals_without_bit_for_bit() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_key_runs_direct_once_is_recorded_once_and_is_then_replayed() {
+    let _light = common::light();
     let Some(world) = World::open() else { return };
     let mut run = Run::new(&world, 8);
     run.step(&world, Step::Prefill(16));
@@ -948,6 +950,7 @@ fn a_key_runs_direct_once_is_recorded_once_and_is_then_replayed() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact; run alone"]
 fn a_recorded_graph_holds_device_memory_that_is_measured() {
+    let _light = common::light();
     const GEOMETRIES: u64 = 20;
     let Some(world) = World::open() else { return };
     let free = || world.library.free_bytes().unwrap() as i64;
@@ -1148,6 +1151,7 @@ impl Light {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn page_boundary_quantum_not_captured() {
+    let _light = common::light();
     let Some(light) = light() else { return };
     let mut sequence = light.sequence(1024, 1);
     let mut keys = Vec::new();
@@ -1179,6 +1183,7 @@ fn page_boundary_quantum_not_captured() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn the_capture_key_of_a_quantum_changes_every_48_positions_below_2048_and_is_constant_from_there() {
+    let _light = common::light();
     let Some(light) = light() else { return };
     let mut sequence = light.sequence(4096, 1);
     // One reservation of the first 4000 rows, then quanta over them, one reservation each (as the owner makes).
@@ -1218,6 +1223,7 @@ fn the_capture_key_of_a_quantum_changes_every_48_positions_below_2048_and_is_con
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn the_row_exact_mode_is_part_of_the_capture_key() {
+    let _light = common::light();
     let Some(light) = light() else { return };
     let mut sequence = light.sequence(1024, 1);
     let first = light.quantum(&mut sequence, QuantumKind::Decode, 1, 0, false);
@@ -1241,6 +1247,7 @@ fn the_row_exact_mode_is_part_of_the_capture_key() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_selection_is_held_by_its_quantum_until_the_quantum_is_dropped() {
+    let _light = common::light();
     let Some(light) = light() else { return };
     let pool = SelectionPool::new(&light.library, 2, 8).unwrap();
     let first = pool.acquire().unwrap();
@@ -1260,6 +1267,7 @@ fn a_selection_is_held_by_its_quantum_until_the_quantum_is_dropped() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_reservation_marker_is_kept_until_reached_and_then_dropped() {
+    let _light = common::light();
     let Some(light) = light() else { return };
     let mut sequence = light.sequence(1024, 1);
     let mut retained = KvRetained::default();
@@ -1291,6 +1299,7 @@ fn a_reservation_marker_is_kept_until_reached_and_then_dropped() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_cache_reserved_twice_or_not_at_all_for_a_quantum_is_refused_its_references() {
+    let _light = common::light();
     let Some(light) = light() else { return };
     let mut sequence = light.sequence(1024, 1);
     assert_eq!(
@@ -1324,6 +1333,7 @@ fn a_cache_reserved_twice_or_not_at_all_for_a_quantum_is_refused_its_references(
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_sequence_closes_only_when_no_quantum_is_in_flight() {
+    let _light = common::light();
     let Some(light) = light() else { return };
     let mut sequence = light.sequence(1024, 1);
     let mut retained = KvRetained::default();
@@ -1345,6 +1355,7 @@ fn a_sequence_closes_only_when_no_quantum_is_in_flight() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn growing_a_cache_after_a_view_was_taken_costs_one_handle_copy_per_page() {
+    let _light = common::light();
     const ROUNDS: usize = 6;
     let Some(light) = light() else { return };
     // 16 attention layers and 131072 tokens: 512 pages a layer.
@@ -1403,6 +1414,7 @@ fn growing_a_cache_after_a_view_was_taken_costs_one_handle_copy_per_page() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn the_capture_key_of_each_kind_of_quantum_is_pinned() {
+    let _light = common::light();
     let Some(light) = light() else { return };
     let mut sequence = light.sequence_with(1024, 1, true);
     let vocabulary = light.config.vocab_size;

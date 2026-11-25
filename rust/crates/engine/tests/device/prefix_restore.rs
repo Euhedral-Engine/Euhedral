@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-mod common;
+use crate::common;
 
 use common::Closer;
 use euhedral_inference_engine::generation::{
@@ -66,14 +66,14 @@ fn settings(artifact: &Path, sequences: u32, cache: ByteSize) -> Settings {
     settings
 }
 
+/// The engine without a prefix cache, from the cache of engines: it holds nothing a test could find, so tests share it.
+fn cold(machine: &Machine) -> (common::Card, Arc<EngineRuntime>) {
+    common::engine(&settings(&machine.artifact, 1, ByteSize(0)), &machine.library)
+}
+
 /// Starts the engine with `sequences` sequences and a prefix cache of `cache` bytes (0: off).
 fn start(machine: &Machine, sequences: u32, cache: ByteSize) -> (Closer, Arc<EngineRuntime>) {
-    let (owner, ready) = EngineRuntime::start(&settings(&machine.artifact, sequences, cache), &machine.library);
-    let runtime = ready
-        .wait(WAIT)
-        .expect("the engine reports")
-        .expect("the engine starts");
-    (Closer::new(owner, &runtime), runtime)
+    common::start_engine(&settings(&machine.artifact, sequences, cache), &machine.library)
 }
 
 /// A prompt of `LENGTH` tokens whose first `shared` tokens are those of every prompt of `seed` 0 and whose others
@@ -200,9 +200,8 @@ fn cases() -> Vec<(&'static str, Vec<u32>, SamplingConfig, usize)> {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_restored_prefix_gives_the_tokens_of_a_cold_run() {
     let Some(machine) = machine() else { return };
-    let _card = common::card();
     // The cold references: the cache is off.
-    let (owner, runtime) = start(&machine, 1, ByteSize(0));
+    let (card, runtime) = cold(&machine);
     let cold: Vec<Recording> = cases()
         .iter()
         .map(|(_, prompt, sampling, _)| generate(&runtime, prompt, *sampling))
@@ -212,7 +211,9 @@ fn a_restored_prefix_gives_the_tokens_of_a_cold_run() {
         assert_eq!(recording.outcome.cached_prompt_tokens, 0, "no cache restores nothing");
         assert_eq!(recording.tokens.len(), GENERATED as usize);
     }
-    owner.shutdown(runtime).expect("the engine shuts down clean");
+    drop(runtime);
+    drop(card);
+    let _card = common::card();
 
     let (owner, runtime) = start(&machine, 1, ByteSize::gib(2));
     for ((name, prompt, sampling, restored), cold) in cases().iter().zip(&cold) {

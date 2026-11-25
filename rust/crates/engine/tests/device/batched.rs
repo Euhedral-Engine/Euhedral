@@ -21,14 +21,12 @@
 )]
 #![allow(clippy::print_stdout, reason = "a test reports what it measured")]
 
-#[path = "common/linear_gpu.rs"]
-mod linear_gpu;
-#[path = "common/typed.rs"]
-mod typed;
+use crate::linear_gpu;
+use crate::typed;
 
 use typed::Typed;
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -1066,6 +1064,7 @@ fn rounds_equal(world: &World, rounds: &[[usize; 3]], commits: Option<&[[usize; 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn batched_verification_equals_each_sequence_verified_alone() {
+    let _light = common::light();
     let Some(world) = World::open() else { return };
     // 24 rows run on the wide verify view; 16 on it as well; 6 on the decode view.
     rounds_equal(&world, &[[8, 8, 8], [5, 8, 3], [1, 2, 3]], None);
@@ -1075,6 +1074,7 @@ fn batched_verification_equals_each_sequence_verified_alone() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn batched_segments_commit_only_their_accepted_rows() {
+    let _light = common::light();
     let Some(world) = World::open() else { return };
     // The rows of each round and the rows each sequence commits; a partial acceptance is replayed by the next round.
     rounds_equal(
@@ -1088,6 +1088,7 @@ fn batched_segments_commit_only_their_accepted_rows() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn batched_segments_resolve_their_own_greedy_acceptance() {
+    let _light = common::light();
     let Some(world) = World::open() else { return };
     let mut alone: Vec<Run> = PREFIXES.iter().map(|prefix| prefilled(&world, *prefix)).collect();
     let mut batched: Vec<Run> = PREFIXES.iter().map(|prefix| prefilled(&world, *prefix)).collect();
@@ -1167,6 +1168,7 @@ fn batched_segments_resolve_their_own_greedy_acceptance() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_cancelled_member_stops_only_its_own_commit() {
+    let _light = common::light();
     let Some(world) = World::open() else { return };
     let mut alone: Vec<Run> = PREFIXES.iter().map(|prefix| prefilled(&world, *prefix)).collect();
     let mut batched: Vec<Run> = PREFIXES.iter().map(|prefix| prefilled(&world, *prefix)).collect();
@@ -1225,6 +1227,7 @@ fn a_cancelled_member_stops_only_its_own_commit() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_one_row_decode_beside_the_row_of_a_batch() {
+    let _light = common::light();
     let Some(world) = World::open() else { return };
     let mut decoded = prefilled(&world, 300);
     let mut verified = prefilled(&world, 300);
@@ -1261,6 +1264,7 @@ fn a_one_row_decode_beside_the_row_of_a_batch() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_batch_refuses_what_is_for_one_sequence_and_one_sequence_under_two_ids() {
+    let _light = common::light();
     let Some(world) = World::open() else { return };
     let mode = SubmitMode {
         pdl: false,
@@ -1321,6 +1325,7 @@ fn a_batch_refuses_what_is_for_one_sequence_and_one_sequence_under_two_ids() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn each_member_of_a_batch_holds_its_own_count_in_flight() {
+    let _light = common::light();
     let Some(world) = World::open() else { return };
     let mode = SubmitMode {
         pdl: false,

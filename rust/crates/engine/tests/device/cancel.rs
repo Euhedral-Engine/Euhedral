@@ -1,6 +1,6 @@
 //! Cancelling a generation on a GPU. The tests are `#[ignore]`d and run locally, one at a time (each loads the 12 GB
 //! artifact), through the system arbiter:
-//! `system-run --gpu shared:16 --mem 24G --est 300 --who <name> -- cargo test -p euhedral-inference-engine --test cancel_gpu -- --ignored --test-threads=1`.
+//! `system-run --gpu shared:16 --mem 24G --est 300 --who <name> -- cargo test -p euhedral-inference-engine --test device -- --ignored cancel::`.
 //!
 //! A generation is cancelled at a point its listener sees (a token, a prompt chunk's quantum) or from the test's thread.
 //! Each time the generation must end through its listener once, as `Cancelled`, with the tokens it had reported (a prefix
@@ -24,9 +24,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-mod common;
+use crate::common;
 
-use common::Closer;
+use common::Card;
 use euhedral_inference_engine::generation::{
     CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
     Verification,
@@ -60,7 +60,7 @@ fn machine() -> Option<Machine> {
     Some(Machine { artifact, library })
 }
 
-fn start(machine: &Machine) -> (Closer, Arc<EngineRuntime>) {
+fn settings(machine: &Machine) -> Settings {
     let mut settings = Settings::with_model(ModelSettings {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
@@ -69,14 +69,14 @@ fn start(machine: &Machine) -> (Closer, Arc<EngineRuntime>) {
     settings.kernels.graphs.captures_per_view = 8;
     // The long prompt takes many chunks of this size, whatever the default is.
     settings.batching.prefill_chunk_tokens = PREFILL_CHUNK as u32;
-    // A cached prefix would skip the chunks the mid-prefill cancel counts; cancels around a restore are `prefix_restore_gpu`'s.
+    // A cached prefix would skip the chunks the mid-prefill cancel counts; cancels around a restore are `prefix_restore`'s.
     settings.prefix_cache.size = ByteSize(0);
-    let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
-    let runtime = ready
-        .wait(WAIT)
-        .expect("the engine reports")
-        .expect("the engine starts");
-    (Closer::new(owner, &runtime), runtime)
+    settings
+}
+
+/// The engine of these tests: the one a test before left running, when it has these settings.
+fn start(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
+    common::engine(&settings(machine), &machine.library)
 }
 
 /// A prompt of `length` token ids inside any vocabulary.
@@ -327,8 +327,7 @@ fn cancel_all_ways(
 /// inside a step, with captured graphs and without; after each, full generations equal one no cancel preceded.
 fn cancels_and_recovers(speculation: Speculation) {
     let Some(machine) = machine() else { return };
-    let _card = common::card();
-    let (owner, runtime) = start(&machine);
+    let (_card, runtime) = start(&machine);
     let short = prompt(40);
     let long = prompt(LONG_PROMPT);
 
@@ -363,7 +362,6 @@ fn cancels_and_recovers(speculation: Speculation) {
     // The same without captured graphs.
     assert!(runtime.disable_graphs_for_tests(), "no request runs");
     cancel_all_ways(&runtime, speculation, &short, &long, &references);
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
@@ -382,8 +380,7 @@ fn a_cancel_ends_a_speculative_generation_and_frees_the_sequence() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_cancel_ends_a_sampled_generation_and_frees_the_sequence() {
     let Some(machine) = machine() else { return };
-    let _card = common::card();
-    let (owner, runtime) = start(&machine);
+    let (_card, runtime) = start(&machine);
     let short = prompt(40);
     let sampling = SamplingConfig::new(1.0, 40, 1.0, 3, false).unwrap();
     let uncut = run_sampling(
@@ -430,7 +427,6 @@ fn a_cancel_ends_a_sampled_generation_and_frees_the_sequence() {
         sampling,
     );
     assert_eq!(again.tokens, uncut.tokens);
-    owner.shutdown(runtime).unwrap();
 }
 
 /// Tells the test thread once the generation reported `after` tokens, and when it ended.
@@ -467,7 +463,7 @@ impl GenerationListener for Watcher {
 fn closing_the_engine_mid_decode_cancels_the_generation_and_frees_the_sequence() {
     let Some(machine) = machine() else { return };
     let _card = common::card();
-    let (owner, runtime) = start(&machine);
+    let (owner, runtime) = common::start_engine(&settings(&machine), &machine.library);
 
     // A request that would run for thousands of tokens: only the close ends it.
     let (reported, done) = (Handoff::new(), Handoff::new());
@@ -499,7 +495,7 @@ fn closing_the_engine_mid_decode_cancels_the_generation_and_frees_the_sequence()
 
     // The sequence's memory went with the rest: a second engine loads and generates in the same process (the card's
     // free memory is not compared, because the card is shared).
-    let (owner, runtime) = start(&machine);
+    let (owner, runtime) = common::start_engine(&settings(&machine), &machine.library);
     let again = run_with(&runtime, &prompt(40), Speculation::Off, Trigger::Never);
     assert_eq!(again.outcome.reason, FinishReason::Length);
     owner.shutdown(runtime).unwrap();
@@ -511,7 +507,6 @@ fn closing_the_engine_mid_decode_cancels_the_generation_and_frees_the_sequence()
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn cancel_one_of_two_staged_sequences() {
     let Some(machine) = machine() else { return };
-    let _card = common::card();
     let mut settings = Settings::with_model(ModelSettings {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
@@ -522,15 +517,9 @@ fn cancel_one_of_two_staged_sequences() {
     settings.prefix_cache.size = ByteSize(0);
     let limit = common::limit_to_stage(&machine.library, &settings, 1 << 30);
     common::limit_gpu(&mut settings, limit);
-    let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
-    let runtime = ready
-        .wait(WAIT)
-        .expect("the engine reports")
-        .expect("the engine starts");
-    let (owner, runtime) = (Closer::new(owner, &runtime), runtime);
+    let (_card, runtime) = common::engine(&settings, &machine.library);
     assert_eq!(runtime.sequences(), 2, "the engine holds two sequences");
     if !common::staged_through_a_ring(&runtime, limit) {
-        owner.shutdown(runtime).unwrap();
         return;
     }
     let bound = Duration::from_secs(10 * 60);
@@ -589,5 +578,4 @@ fn cancel_one_of_two_staged_sequences() {
     );
     assert_eq!(a.wait(bound).expect("reports").tokens, first_alone.tokens);
     assert_eq!(b.wait(bound).expect("reports").tokens, second_alone.tokens);
-    owner.shutdown(runtime).unwrap();
 }

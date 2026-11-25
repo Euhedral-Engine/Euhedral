@@ -1,7 +1,7 @@
 //! Constrained requests on a GPU: the host selects the best allowed token at each step, the request never speculates,
 //! and a constraint that fails ends the request with an error and leaves the sequence free. The tests are `#[ignore]`d
 //! and run locally (each loads the 12 GB artifact), through the system arbiter:
-//! `system-run --gpu shared:14 --mem 24G --est 600 --who <name> -- cargo test -p euhedral-inference-engine --test constraint_gpu -- --ignored --test-threads=1`.
+//! `system-run --gpu shared:14 --mem 24G --est 600 --who <name> -- cargo test -p euhedral-inference-engine --test device -- --ignored constraint::`.
 //!
 //! The artifact comes from `euhedral.qwen.rco-artifact` and the library from `euhedral.cuda.library`.
 
@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod common;
+use crate::common;
 
-use common::{Card, Closer};
+use common::Card;
 use euhedral_inference_engine::generation::{
     ConstraintError, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
     TokenConstraint,
@@ -33,9 +33,6 @@ use euhedral_inference_engine::sampling::{SamplingConfig, TokenFilter};
 use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff};
 use euhedral_inference_settings::{ModelSettings, Settings};
-
-/// The longest a device test waits for the engine to start; past it the test fails.
-const WAIT: Duration = Duration::from_secs(20 * 60);
 
 /// The longest a test waits for a generation of a few tokens: a request that hangs fails the test inside the grant.
 const GENERATION_WAIT: Duration = Duration::from_secs(60);
@@ -50,20 +47,13 @@ fn start() -> Option<(Card, Arc<EngineRuntime>)> {
     if !artifact.is_file() {
         return None;
     }
-    Some(common::shared(|| {
-        let mut settings = Settings::with_model(ModelSettings {
-            artifact,
-            name: "test".to_string(),
-        });
-        settings.context.max_tokens = 256;
-        settings.kernels.graphs.captures_per_view = 8;
-        let (owner, ready) = EngineRuntime::start(&settings, &library);
-        let runtime = ready
-            .wait(WAIT)
-            .expect("the engine reports")
-            .expect("the engine starts");
-        (Closer::new(owner, &runtime), runtime)
-    }))
+    let mut settings = Settings::with_model(ModelSettings {
+        artifact,
+        name: "test".to_string(),
+    });
+    settings.context.max_tokens = 256;
+    settings.kernels.graphs.captures_per_view = 8;
+    Some(common::engine(&settings, &library))
 }
 
 struct Recording {

@@ -1,6 +1,6 @@
 //! Quanta that end before their stages do, on a GPU: a quantum that is killed or fails part-way must still retire.
 //! The tests are `#[ignore]`d and run locally in a memory-capped scope:
-//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test retire_gpu -- --ignored`.
+//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored retire::`.
 //!
 //! The shapes are synthetic: stages that queue nothing but their markers, on lanes of their own, in graphs the test
 //! builds, and the plan's own graphs over weights with no memory behind them (a quantum that is killed never launches
@@ -19,9 +19,8 @@
     reason = "no-wait, waiting calls: the test thread waits for retirements against a deadline and synchronizes lanes"
 )]
 
-mod common;
-#[path = "common/typed.rs"]
-mod typed;
+use crate::common;
+use crate::typed;
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -371,6 +370,7 @@ fn not_killed() -> Arc<AtomicBool> {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_quantum_killed_after_its_first_stage_retires() {
+    let _light = common::light();
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let kill = not_killed();
@@ -395,6 +395,7 @@ fn a_quantum_killed_after_its_first_stage_retires() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_quantum_killed_with_markers_on_two_lanes_retires() {
+    let _light = common::light();
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let kill = not_killed();
@@ -420,6 +421,7 @@ fn a_quantum_killed_with_markers_on_two_lanes_retires() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_quantum_killed_before_its_first_stage_retires() {
+    let _light = common::light();
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let (graph, ran) = chain(&world, vec![link(0, Act::Nothing), link(0, Act::Nothing)], &retirements);
@@ -434,6 +436,7 @@ fn a_quantum_killed_before_its_first_stage_retires() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_quantum_whose_middle_stage_fails_retires() {
+    let _light = common::light();
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let (graph, ran) = chain(
@@ -456,6 +459,7 @@ fn a_quantum_whose_middle_stage_fails_retires() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_quantum_whose_last_stage_fails_retires() {
+    let _light = common::light();
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     // No stage is left to be abandoned: the quantum retires behind the markers of the stages that ran.
@@ -480,6 +484,7 @@ fn a_quantum_whose_last_stage_fails_retires() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_quantum_whose_last_stage_panics_retires() {
+    let _light = common::light();
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let (graph, _ran) = chain(
@@ -497,6 +502,7 @@ fn a_quantum_whose_last_stage_panics_retires() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_quantum_that_runs_to_its_end_retires_completed() {
+    let _light = common::light();
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let (graph, ran) = chain(
@@ -520,6 +526,7 @@ fn a_quantum_that_runs_to_its_end_retires_completed() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_killed_quantum_is_followed_by_quanta_on_the_same_sequence() {
+    let _light = common::light();
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let shape = |kill: Act| {
@@ -564,6 +571,7 @@ fn a_killed_quantum_is_followed_by_quanta_on_the_same_sequence() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn quanta_that_complete_are_killed_and_fail_on_shared_lanes_all_retire() {
+    let _light = common::light();
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let mut sequence = world.sequence(1024);
@@ -666,6 +674,7 @@ impl Stage<Quantum> for Watch {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_stage_that_fails_through_its_own_submission_keeps_its_marker_for_the_abandonment() {
+    let _light = common::light();
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let ran: Arc<Vec<AtomicUsize>> = Arc::new(vec![AtomicUsize::new(0)]);
@@ -722,6 +731,7 @@ fn a_stage_that_fails_through_its_own_submission_keeps_its_marker_for_the_abando
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_failed_submission_on_another_lane_retires_only_after_its_kernel_ended() {
+    let _light = common::light();
     let Some(world) = World::open(3) else { return };
     let retirements = Retirements::new();
     let settings = Settings::with_model(ModelSettings::default());

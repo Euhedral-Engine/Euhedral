@@ -11,11 +11,13 @@
     clippy::expect_used,
     reason = "a test helper: a failed unwrap is the failure"
 )]
+#![allow(clippy::print_stdout, reason = "the log counts the engine loads")]
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -207,61 +209,209 @@ impl Closer {
 impl Drop for Closer {
     fn drop(&mut self) {
         // Reached with the engine still up only when the test unwound.
-        if let (Some(owner), Some(runtime)) = (self.owner.take(), self.runtime.take()) {
-            let _ = owner.shutdown(runtime);
+        if let (Some(owner), Some(runtime)) = (self.owner.take(), self.runtime.take())
+            && let Err(error) = owner.shutdown(runtime)
+        {
+            mark_unfreed(&error.to_string());
         }
     }
 }
 
-/// The engine one test binary shares among its tests, while no test needs an engine of its own.
-static SHARED: Mutex<Option<Closer>> = Mutex::new(None);
+/// Set when an engine's device memory could not be freed (another handle to it was alive): the card is then full, and no
+/// test loads a second model on top of it.
+static UNFREED: Mutex<Option<String>> = Mutex::new(None);
 
-/// The card, held by one test at a time. Every engine of the model fills the card, so two engines never exist side by
-/// side: a test takes the card, then either borrows the binary's shared engine ([`shared`]) or starts one of its own
-/// and shuts it down.
-pub struct Card {
-    slot: MutexGuard<'static, Option<Closer>>,
+fn mark_unfreed(why: &str) {
+    let name = thread::current().name().unwrap_or("?").to_owned();
+    *UNFREED.lock().unwrap_or_else(PoisonError::into_inner) = Some(format!("found by {name}, {why}"));
 }
 
-fn lock() -> MutexGuard<'static, Option<Closer>> {
-    // A test that failed holding the card leaves it usable: the next one starts from what is left.
-    SHARED.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Takes the card for a test that starts its own engine (another configuration, a shutdown, a fault, a restart).
-/// Waits for the test that holds it, then shuts the shared engine down, which must end clean: the leak check of a
-/// shared engine is made here, where it ends.
-pub fn card() -> Card {
-    let mut slot = lock();
-    if let Some(closer) = slot.take() {
-        let runtime = closer.runtime();
-        closer.shutdown(runtime).expect("the shared engine shuts down clean");
+/// Fails the test that would load a model on a card an earlier engine still fills.
+fn require_free_card() {
+    if let Some(why) = UNFREED.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        panic!("an engine of an earlier test still holds the card, so no model is loaded on top of it ({why})");
     }
-    Card { slot }
 }
 
-/// Takes the card for a test that runs on the binary's shared engine, started by `start` for the first of them. The
-/// test runs one at a time against it: a request starts each sequence from nothing, and the tests read the first
-/// sequence and expect it idle, so tests do not interleave on one engine. The test keeps no handle past its end.
-pub fn shared(start: impl FnOnce() -> (Closer, Arc<EngineRuntime>)) -> (Card, Arc<EngineRuntime>) {
-    let mut slot = lock();
-    let runtime = match slot.as_ref() {
-        Some(closer) => closer.runtime(),
+/// What the card holds between tests: the engine the last test left running, under the key of the settings it started
+/// with, and how many tests use the card without an engine.
+struct State {
+    engine: Option<(String, Closer)>,
+    /// The test that held the card last, for the failure of a shutdown it left unclean.
+    last: String,
+    light: usize,
+    exclusive: bool,
+    /// The tests waiting for the card, oldest first, with the key of the engine each one wants (none: an empty card).
+    waiting: Vec<(u64, Option<String>)>,
+    tickets: u64,
+}
+
+static STATE: Mutex<State> = Mutex::new(State {
+    engine: None,
+    last: String::new(),
+    light: 0,
+    exclusive: false,
+    waiting: Vec::new(),
+    tickets: 0,
+});
+static CHANGED: Condvar = Condvar::new();
+static LOADS: AtomicUsize = AtomicUsize::new(0);
+
+/// The longest an engine start waits for its latch.
+const START_WAIT: Duration = Duration::from_secs(20 * 60);
+
+fn lock() -> MutexGuard<'static, State> {
+    // A test that failed holding the card leaves it usable: the next one starts from what is left.
+    STATE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Counts one model load in the log: a test that starts an engine itself, to see how the start ends, calls this.
+pub fn note_load() {
+    require_free_card();
+    let loads = LOADS.fetch_add(1, Ordering::Relaxed) + 1;
+    println!("ENGINE LOAD {loads}");
+}
+
+/// Starts an engine and waits for its latch, as `main` does, and counts the start: every engine of the device tests
+/// is started here, so the count in the log (`ENGINE LOAD n`) is the number of model loads of the run.
+pub fn start_engine(settings: &Settings, library: &Path) -> (Closer, Arc<EngineRuntime>) {
+    require_free_card();
+    let (owner, ready) = EngineRuntime::start(settings, library);
+    let runtime = ready
+        .wait(START_WAIT)
+        .expect("the engine reports")
+        .expect("the engine starts");
+    note_load();
+    (Closer::new(owner, &runtime), runtime)
+}
+
+/// The card, held by one test at a time unless the tests need no engine. Every engine of the model fills the card, so
+/// two engines never exist side by side: a test takes the card, then either runs on the engine the tests before it left
+/// running ([`engine`]), or starts one of its own after `card()` and shuts it down.
+pub struct Card {
+    held: Option<(String, Closer)>,
+    /// The test that held the engine before.
+    before: String,
+}
+
+/// Waits for the card, alone. When the card is free the next test is the oldest one that wants the engine already
+/// running, so that tests with the same settings follow each other whatever the order they arrived in; with none, the
+/// oldest.
+fn acquire_exclusive(wanted: Option<&str>) -> Card {
+    let mut state = lock();
+    let ticket = state.tickets;
+    state.tickets += 1;
+    state.waiting.push((ticket, wanted.map(str::to_owned)));
+    loop {
+        if !state.exclusive && state.light == 0 {
+            let running = state.engine.as_ref().map(|(key, _)| key.as_str());
+            let next = state
+                .waiting
+                .iter()
+                .find(|(_, key)| running.is_some() && key.as_deref() == running)
+                .or_else(|| state.waiting.first())
+                .map(|(next, _)| *next);
+            if next == Some(ticket) {
+                break;
+            }
+        }
+        state = CHANGED.wait(state).unwrap_or_else(PoisonError::into_inner);
+    }
+    state.waiting.retain(|(waiting, _)| *waiting != ticket);
+    state.exclusive = true;
+    Card {
+        held: state.engine.take(),
+        before: state.last.clone(),
+    }
+}
+
+/// Shuts the engine of `held` down, which must end clean: the leak check of a shared engine is made here, where it ends.
+fn retire((_, closer): (String, Closer), before: &str) {
+    let runtime = closer.runtime();
+    closer.shutdown(runtime).unwrap_or_else(|error| {
+        mark_unfreed(&format!("the engine the test {before} left: {error}"));
+        panic!("the engine the test {before} left shuts down clean: {error}")
+    });
+}
+
+/// Takes the card for a test that starts its own engine (a shutdown, a fault, a failed start), or that needs the card
+/// empty. Waits for the tests that hold it, then shuts the cached engine down.
+pub fn card() -> Card {
+    let mut card = acquire_exclusive(None);
+    if let Some(held) = card.held.take() {
+        retire(held, &card.before);
+    }
+    card
+}
+
+/// Takes the card for a test that runs on an engine started with `settings`: the one the tests before it left running
+/// when their settings are these, else a new one, after the old one is shut down. The test runs alone against it: a
+/// request starts each sequence from nothing, and the tests read the first sequence and expect it idle, so tests do not
+/// interleave on one engine. The test keeps no handle past its end, and leaves the engine as a request leaves it.
+pub fn engine(settings: &Settings, library: &Path) -> (Card, Arc<EngineRuntime>) {
+    let key = format!("{settings:?} {}", library.display());
+    let mut card = acquire_exclusive(Some(&key));
+    if card.held.as_ref().is_some_and(|(held, _)| *held != key) {
+        {
+            let held = card.held.take().expect("checked");
+            retire(held, &card.before);
+        }
+    }
+    let runtime = match card.held.as_ref() {
+        Some((_, closer)) => closer.runtime(),
         None => {
-            let (closer, runtime) = start();
-            *slot = Some(closer);
+            let (closer, runtime) = start_engine(settings, library);
+            card.held = Some((key, closer));
             runtime
         }
     };
-    (Card { slot }, runtime)
+    (card, runtime)
 }
 
 impl Drop for Card {
     fn drop(&mut self) {
-        // A test that failed may have left the shared engine in a state the next test would trip on.
+        let mut state = lock();
+        // A test that failed may have left the engine in a state the next test would trip on: it is shut down, not kept.
+        let held = self.held.take();
         if thread::panicking() {
-            drop(self.slot.take());
+            drop(state);
+            drop(held);
+            state = lock();
+        } else {
+            state.engine = held;
+            state.last = thread::current().name().unwrap_or("?").to_owned();
         }
+        state.exclusive = false;
+        drop(state);
+        CHANGED.notify_all();
+    }
+}
+
+/// A test that uses the card without an engine, beside others that do the same.
+pub struct Light(());
+
+/// Takes the card for a test of kernels alone: it waits for the test that holds an engine and shuts the cached one
+/// down, then runs beside the other tests of this kind.
+pub fn light() -> Light {
+    let mut state = lock();
+    loop {
+        if state.exclusive {
+            state = CHANGED.wait(state).unwrap_or_else(PoisonError::into_inner);
+        } else if let Some(held) = state.engine.take() {
+            let before = state.last.clone();
+            retire(held, &before);
+        } else {
+            break;
+        }
+    }
+    state.light += 1;
+    Light(())
+}
+
+impl Drop for Light {
+    fn drop(&mut self) {
+        lock().light -= 1;
+        CHANGED.notify_all();
     }
 }
 

@@ -223,8 +223,9 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
-      ARBITER_ARGS: "--gpu shared:24 --mem 32G"
-      ARBITER_EST: "1800"
+      # The peak of a full engine run on the card is 22.1 GB (one engine at a time), and the host peak 9 GB.
+      ARBITER_ARGS: "--gpu shared:22.5 --mem 24G"
+      ARBITER_EST: "1500"
       APT_OPTS: "-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true"
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/native/.zig-global-cache
@@ -260,16 +261,40 @@ jobs:
             if [ -n "$RUST_GOLDENS" ]; then echo "EUHEDRAL_TEST_RUST_GOLDENS=$RUST_GOLDENS"; fi
             if [ -n "$MATH_LIBRARIES" ]; then echo "EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES=$MATH_LIBRARIES"; fi
           } >> "$GITHUB_ENV"
-      - name: Device tests
+      # The device profile is the release profile with debug assertions and overflow checks on: the tests run at the speed
+      # of the product and still trip on what the debug build would. One build serves the three groups below.
+      - name: Build the device tests
         working-directory: rust
         run: |
           set -euo pipefail
-          # The quantization crate's other device tests fail, not skip, without their settings: only its kernel tests run.
-          # A test without a model artifact skips with a line starting "skipped:".
+          mise exec -- cargo test --profile device --workspace --exclude euhedral-inference-quantization --no-run
+          mise exec -- cargo test --profile device -p euhedral-inference-quantization --test kernels_gpu --no-run
+      # The groups stop at the first failure: no step runs on after a test failed. A test without a model artifact skips
+      # with a line starting "skipped:". The quantization crate's other device tests fail, not skip, without their
+      # settings: only its kernel tests run.
+      - name: Device tests, kernels
+        working-directory: rust
+        run: |
+          set -euo pipefail
           {
-            mise exec -- cargo test --workspace --exclude euhedral-inference-quantization --no-fail-fast -- --ignored --nocapture
-            mise exec -- cargo test -p euhedral-inference-quantization --test kernels_gpu -- --ignored --nocapture
+            mise exec -- cargo test --profile device -p euhedral-inference-cuda -- --ignored --nocapture
+            mise exec -- cargo test --profile device -p euhedral-inference-quantization --test kernels_gpu -- --ignored --nocapture
           } 2>&1 | tee "$RUNNER_TEMP/device.log"
+      - name: Device tests, servers and benchmarks
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          mise exec -- cargo test --profile device --workspace --exclude euhedral-inference-quantization \
+            --exclude euhedral-inference-cuda --exclude euhedral-inference-engine -- --ignored --nocapture \
+            2>&1 | tee -a "$RUNNER_TEMP/device.log"
+      # One test binary holds one engine at a time and reuses it for the tests with the same settings; the log counts the
+      # model loads ("ENGINE LOAD n").
+      - name: Device tests, engine
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          mise exec -- cargo test --profile device -p euhedral-inference-engine -- --ignored --nocapture \
+            2>&1 | tee -a "$RUNNER_TEMP/device.log"
       - name: Skipped tests
         if: always()
         run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true

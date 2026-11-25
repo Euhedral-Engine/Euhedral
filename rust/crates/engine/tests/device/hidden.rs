@@ -1,7 +1,7 @@
 //! Hidden rows on a GPU: a generation hands the post-final-norm hidden state of every row it runs to a sink, with the
 //! logits of the rows that select. The tests are `#[ignore]`d and run locally, one at a time (each loads the 12 GB
 //! artifact), through the system arbiter:
-//! `system-run --gpu shared:14 --mem 24G --est 300 --who <name> -- cargo test -p euhedral-inference-engine --test hidden_gpu -- --ignored --test-threads=1`.
+//! `system-run --gpu shared:14 --mem 24G --est 300 --who <name> -- cargo test -p euhedral-inference-engine --test device -- --ignored hidden::`.
 //!
 //! The artifact comes from `euhedral.qwen.rco-artifact` and the library from `euhedral.cuda.library`.
 
@@ -24,9 +24,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod common;
+use crate::common;
 
-use common::{Card, Closer};
+use common::Card;
 use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, HiddenSink,
     QuantumEvent, Speculation,
@@ -58,10 +58,10 @@ fn machine() -> Option<Machine> {
 
 /// The engine every test of this binary runs on, one at a time.
 fn shared_engine(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
-    common::shared(|| start(machine))
+    start(machine)
 }
 
-fn start(machine: &Machine) -> (Closer, Arc<EngineRuntime>) {
+fn start(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
     let mut settings = Settings::with_model(ModelSettings {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
@@ -69,12 +69,7 @@ fn start(machine: &Machine) -> (Closer, Arc<EngineRuntime>) {
     settings.context.max_tokens = 512;
     settings.kernels.graphs.captures_per_view = 8;
     settings.batching.prefill_chunk_tokens = CHUNK;
-    let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
-    let runtime = ready
-        .wait(WAIT)
-        .expect("the engine reports")
-        .expect("the engine starts");
-    (Closer::new(owner, &runtime), runtime)
+    common::engine(&settings, &machine.library)
 }
 
 /// A prompt of `length` ordinary token ids.

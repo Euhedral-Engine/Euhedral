@@ -1,5 +1,5 @@
 //! The layer operation stages on a GPU. The tests are `#[ignore]`d and run locally in a memory-capped scope:
-//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test stages_gpu -- --ignored`.
+//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored stages::`.
 //!
 //! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, or
 //! `gradle.properties`); a test skips with a message when it is absent. Each test builds its own library, lane and
@@ -20,10 +20,9 @@
     reason = "a test reports the error it measured against its reference"
 )]
 
-#[path = "common/linear_gpu.rs"]
-mod linear_gpu;
-#[path = "common/typed.rs"]
-mod typed;
+use crate::common;
+use crate::linear_gpu;
+use crate::typed;
 
 use std::cell::RefCell;
 use std::fmt::Display;
@@ -446,6 +445,7 @@ fn assert_close(what: &str, actual: &[f32], expected: &[f32], relative: f32, abs
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn norms_and_elementwise_match_the_host_reference() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
@@ -618,6 +618,7 @@ fn stub_weight() -> WeightRef {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn the_linear_stage_hands_its_format_the_geometry_the_mode_and_the_scratch() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
@@ -815,6 +816,7 @@ impl<'r> GdnRig<'r> {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn gdn_replay_restores_committed_rows() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
@@ -901,6 +903,7 @@ fn gdn_replay_restores_committed_rows() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn gdn_project_control_and_gated_norm_match_the_host_reference() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
@@ -1136,6 +1139,7 @@ fn check_row_twins(format: KvFormat, start: u64, m: usize) {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn attention_row_twins_equal_single_rows() {
+    let _light = common::light();
     for format in [KvFormat::Nvfp4, KvFormat::Bf16] {
         // Below 2048 keys, the per-head kernel; above, the three-warp one; and a step that crosses 2048.
         check_row_twins(format, 1000, 5);
@@ -1230,6 +1234,7 @@ fn append_then_decode(rig: &Rig, format: KvFormat, n: u64) -> ReadBack {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn kv_append_then_decode_reads_back() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let n = 300u64;
 
@@ -1282,6 +1287,7 @@ fn kv_append_then_decode_reads_back() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn qk_norm_rope_rows_equal_single_rows() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
@@ -1358,6 +1364,7 @@ fn host_argmax(row: &[f32]) -> Option<u32> {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn argmax_lowest_id_tie_break() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
@@ -1458,6 +1465,7 @@ fn argmax_lowest_id_tie_break() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn mtp_stem_concatenates_e_h() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
@@ -1668,6 +1676,7 @@ fn rounded(values: &[f32]) -> Vec<f32> {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn gdn_convolution_matches_the_host_reference_and_carries_the_tail() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
@@ -1743,6 +1752,7 @@ fn gdn_convolution_matches_the_host_reference_and_carries_the_tail() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn gdn_recurrence_matches_the_host_reference() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
@@ -1824,6 +1834,7 @@ fn gdn_recurrence_matches_the_host_reference() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn qk_norm_rope_matches_the_host_reference() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
@@ -1895,6 +1906,7 @@ fn qk_norm_rope_matches_the_host_reference() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_quantum_runs_row_exact_if_and_only_if_it_verifies() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
@@ -1928,6 +1940,7 @@ fn a_quantum_runs_row_exact_if_and_only_if_it_verifies() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let Some(mut artifact) = linear_gpu::Artifact::open() else {
         return;
@@ -2001,6 +2014,7 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn every_stage_launches_eagerly_on_a_lane_and_the_selection_is_made() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 1, KvFormat::Nvfp4, 256);
@@ -2209,6 +2223,7 @@ fn boxed<L: Launch + 'static>(stage: L) -> Box<dyn LaunchOnly> {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let mut cache = KvCache::new(&rig.library, &rig.released, 1, 1024, KvFormat::Bf16, 4096, 0).unwrap();
     let plane = cache.plane_page_bytes();
@@ -2279,6 +2294,7 @@ fn a_view_keeps_the_page_table_it_read_alive_after_the_cache_grew_a_new_one() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn the_cache_stages_wait_for_the_reservation_that_allocated_the_pages() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let workspace = rig.workspace(&config, 8, 8, &[]);
@@ -2323,6 +2339,7 @@ fn the_cache_stages_wait_for_the_reservation_that_allocated_the_pages() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn launching_a_stage_on_an_idle_quantum_queues_nothing_and_does_not_underflow() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     let config = config(vec![LayerType::GatedDeltaNet, LayerType::FullAttention]);
     let (sequence, _retained) = rig.sequence(&config, 0, KvFormat::Nvfp4, 0);
