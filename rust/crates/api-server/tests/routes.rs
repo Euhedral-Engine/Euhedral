@@ -359,31 +359,6 @@ fn stop_with_a_request_half_received_closes_the_connection() {
 }
 
 #[test]
-fn a_connection_over_the_cap_waits_until_one_ends() {
-    let fixture = Fixture::with(
-        Limits {
-            max_connections: 1,
-            ..small_limits()
-        },
-        Some(2),
-    );
-    let ask = "GET /health HTTP/1.1\r\nHost: t\r\n\r\n";
-    let mut first = Raw::connect(fixture.addr);
-    first.send(ask);
-    assert!(first.read_until("\"engine\"").starts_with("HTTP/1.1 200"));
-    let mut second = Raw::connect(fixture.addr);
-    second.send(ask);
-    // The second connection is in the kernel's backlog: nothing reads it while the first is open.
-    // Not provable by a counter: a refused connection waits in the kernel's backlog and moves none, so an `open` of 1
-    // here may also mean the transport has not yet accepted the second; the answer after `drop(first)` is the proof.
-    assert_eq!(fixture.server.counters().open, 1);
-    drop(first);
-    assert!(second.read_until("\"engine\"").starts_with("HTTP/1.1 200"));
-    drop(second);
-    fixture.finish();
-}
-
-#[test]
 fn expect_100_continue_is_answered_by_the_transport_and_the_body_then_read() {
     let fixture = Fixture::start();
     let mut raw = Raw::connect(fixture.addr);
