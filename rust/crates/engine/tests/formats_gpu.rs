@@ -600,9 +600,10 @@ fn a_compressed_tensor_run_in_chunks_equals_its_whole_expansion() {
         let x = upload(&rig.library, &activations(&mut random, rows, k));
         let wanted = rig.linear(&format, plain, &x, 0, k, out, rows, PLAIN);
         let actual = rig.linear(&format, chunked, &x, 0, k, out, rows, PLAIN);
+        let scratch = format.scratch_bytes(chunked, rows, PLAIN);
         assert!(
-            format.scratch_bytes(chunked, rows, PLAIN) < expanded as usize,
-            "{rows} rows: the chunks are bounded"
+            scratch < expanded as usize && scratch as u64 <= P2E2_EXPAND_LIMIT,
+            "{rows} rows: the chunks are bounded: {scratch} bytes of scratch, {expanded} expanded, limit {P2E2_EXPAND_LIMIT}"
         );
         assert!(
             wanted.iter().any(|bits| *bits != wanted[0]),

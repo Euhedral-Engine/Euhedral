@@ -146,7 +146,7 @@ impl Q3Linear {
         row_exact: bool,
     ) -> Result<(), CudaError> {
         let Shape { out, input } = shape;
-        let chunk = p2e2_chunk_rows(rows, input);
+        let chunk = p2e2_chunk_rows(rows, input, out, self.mx_available, Some(self.sm_count));
         let mut first = 0;
         while first < out {
             let count = chunk.min(out - first);

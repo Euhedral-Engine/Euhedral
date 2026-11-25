@@ -210,22 +210,32 @@ fn the_scratch_of_a_linear() {
     );
 }
 
-/// The chunks of a head tile its rows in whole kilorows, and a chunk with its output fits the expansion limit; a
-/// chunk is never one of the widths the FFN and mixer kernels are specialised for.
+/// The chunks of a head tile its rows in whole kilorows, and a launch's whole scratch (a chunk's expansion, output,
+/// activations and split-K partials) fits the expansion limit on every device, however many multiprocessors it has
+/// (the partials grow with them); a chunk is never one of the widths the FFN and mixer kernels are specialised for.
 #[test]
-fn the_chunks_of_a_large_head_fit_the_expansion_limit_and_avoid_the_specialised_widths() {
-    for rows in [1, 8, 9, 64, 512] {
-        let chunk = p2e2_chunk_rows(rows, 5120);
-        assert_eq!(chunk % 1024, 0);
-        let (_, activations) = p2e2_chunk_offsets(rows, 5120, chunk);
-        assert!(activations <= P2E2_EXPAND_LIMIT + 512, "{rows}");
+fn the_scratch_of_a_chunked_head_fits_the_expansion_limit_on_every_device_and_avoids_the_specialised_widths() {
+    let (out, input) = (70_016, 5120);
+    for sm_count in [Some(1), Some(70), Some(170), Some(256), Some(1024), None] {
+        for rows in [1, 8, 9, 40, 64, 129, 512] {
+            let chunk = p2e2_chunk_rows(rows, input, out, true, sm_count);
+            assert_eq!(chunk % 1024, 0);
+            let scratch = linear_scratch_bytes(true, rows, input, out, true, sm_count, false);
+            assert!(
+                scratch <= P2E2_EXPAND_LIMIT,
+                "{sm_count:?} SMs, {rows} rows: {scratch} bytes in chunks of {chunk}"
+            );
+        }
     }
     // Widths of K whose unguarded chunk of one row is 5120 and 34816.
     for input in [57_344, 9344] {
         let per_unit = q3_byte_size(1024, input) + 1024 * 2;
         let unguarded = (P2E2_EXPAND_LIMIT / per_unit) * 1024;
         assert!(unguarded == 5120 || unguarded == 34816, "{input}: {unguarded}");
-        assert_eq!(u64::from(p2e2_chunk_rows(1, input)), unguarded - 1024);
+        assert_eq!(
+            u64::from(p2e2_chunk_rows(1, input, 1 << 20, false, None)),
+            unguarded - 1024
+        );
     }
 }
 
