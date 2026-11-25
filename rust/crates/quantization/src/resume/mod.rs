@@ -114,14 +114,41 @@ impl ResumeFile {
     /// Opens the file at `path`, creating it empty if it is missing. `host` runs the durability calls and must take
     /// frames: the file holds an admitted unit of it until the last handle closes.
     pub fn open(io: &Arc<AsyncIo>, host: &Arc<Lake>, path: &Path, then: Then<ResumeFile>) -> Result<(), ResumeError> {
-        let unit = host.admit().map_err(|_| ResumeError::LakeClosed)?;
-        let (io_held, host_held, path_held) = (Arc::clone(io), Arc::clone(host), path.to_owned());
         let spec = OpenSpec {
             read: true,
             write: true,
             create: Create::IfMissing,
             unix_mode: 0o644,
         };
+        ResumeFile::open_with(io, host, path, spec, then)
+    }
+
+    /// Opens the file at `path` for reading only. A missing file is an I/O error of kind `NotFound` and nothing is
+    /// created; a file the caller may not write opens. The calls that write, sync, truncate or remove then fail.
+    pub fn open_read_only(
+        io: &Arc<AsyncIo>,
+        host: &Arc<Lake>,
+        path: &Path,
+        then: Then<ResumeFile>,
+    ) -> Result<(), ResumeError> {
+        let spec = OpenSpec {
+            read: true,
+            write: false,
+            create: Create::Never,
+            unix_mode: 0o644,
+        };
+        ResumeFile::open_with(io, host, path, spec, then)
+    }
+
+    fn open_with(
+        io: &Arc<AsyncIo>,
+        host: &Arc<Lake>,
+        path: &Path,
+        spec: OpenSpec,
+        then: Then<ResumeFile>,
+    ) -> Result<(), ResumeError> {
+        let unit = host.admit().map_err(|_| ResumeError::LakeClosed)?;
+        let (io_held, host_held, path_held) = (Arc::clone(io), Arc::clone(host), path.to_owned());
         let opened = move |opened: io::Result<OwnedFile>| {
             then(opened.map_err(ResumeError::Io).map(|file| ResumeFile {
                 inner: Arc::new(Inner {
@@ -134,6 +161,25 @@ impl ResumeFile {
             }))
         };
         Ok(io.open_path(path, spec, Box::new(opened))?)
+    }
+
+    /// The length of the file in bytes.
+    pub fn len(&self, then: Then<u64>) -> Result<(), ResumeError> {
+        let (io, file) = (Arc::clone(&self.inner.io), raw(&self.inner.file));
+        let slot = Slot::new(then);
+        slot.submit(self.clone(), move |watch| {
+            let measured = move |len: io::Result<u64>| {
+                let (slot, held) = watch.take();
+                drop(held);
+                slot.finish(len.map_err(ResumeError::Io))
+            };
+            Ok(io.file_len(file, Box::new(measured))?)
+        })
+    }
+
+    /// Ends a call that has nothing to wait for: `then` runs on the host lake, and the file is not touched.
+    pub fn settled(&self, then: Then<()>) -> Result<(), ResumeError> {
+        self.clone().resolve(Ok(()), &Slot::new(then))
     }
 
     /// The header on disk: empty for a new file, and for one that is shorter than a header.
