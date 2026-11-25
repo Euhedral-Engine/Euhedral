@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 euhedral-core.workspace = true
 euhedral-graph.workspace = true
+euhedral-hardware-utils.workspace = true
 euhedral-hashing.workspace = true
 euhedral-io.workspace = true
 euhedral-inference-edrl = { path = "../edrl" }

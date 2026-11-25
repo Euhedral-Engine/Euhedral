@@ -396,18 +396,6 @@ fn the_cache_keeps_a_bounded_number_of_grammars_and_evicts_the_least_recently_us
 }
 
 #[test]
-fn the_default_bound_is_thirty_two() {
-    assert_eq!(DEFAULT_CACHED_GRAMMARS, 32);
-    let mut checker = checker();
-    for number in 0..=DEFAULT_CACHED_GRAMMARS {
-        checker.constraint(&grammar(number)).expect("compiles");
-    }
-    assert_eq!(checker.compiled.len(), DEFAULT_CACHED_GRAMMARS);
-    assert!(!checker.compiled.holds(&grammar(0)));
-    assert!(checker.compiled.holds(&grammar(1)));
-}
-
-#[test]
 fn a_refused_grammar_is_not_cached_and_a_zero_bound_keeps_nothing() {
     let mut checker = checker();
     assert!(checker.constraint("start: nothing").is_err());

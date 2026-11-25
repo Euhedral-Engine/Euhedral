@@ -71,9 +71,15 @@ fn spawn(arguments: &[&str]) -> Server {
 /// A server whose standard output is `stdout`.
 fn spawn_with(arguments: &[&str], stdout: Stdio) -> Server {
     let _forks = FORKS.lock().expect("the lock");
-    let child = Command::new(SERVER)
-        .args(arguments)
-        .env_clear()
+    let mut command = Command::new(SERVER);
+    command.args(arguments).env_clear();
+    // Winsock cannot start without the system root, so a cleared
+    // environment on Windows still carries it.
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SYSTEMROOT") {
+        command.env("SYSTEMROOT", root);
+    }
+    let child = command
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(Stdio::piped())
@@ -275,6 +281,30 @@ fn a_stop_by_signal_interrupts_a_running_request_and_refuses_the_queued_one() {
     assert!(queued.contains("shutting down"), "{queued}");
     let running = running.join().expect("a client");
     assert!(running.contains("interrupted by server shutdown"), "{running}");
+}
+
+/// RustEE logs through its own `log` dependency: the record only arrives when the whole build links one copy of the crate,
+/// the one the server installed its logger on.
+#[cfg(unix)]
+#[test]
+fn the_log_carries_the_records_of_the_runtime_beside_the_servers() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let (mut server, _) = serving_on(directory.path(), "hello", &[], Stdio::piped());
+    signal(&server, "TERM");
+    assert_eq!(exit_code(&mut server, PATIENCE), 143);
+    let mut log = String::new();
+    server
+        .0
+        .stdout
+        .take()
+        .expect("a piped stdout")
+        .read_to_string(&mut log)
+        .expect("the log");
+    assert!(log.contains("Started in"), "the server's own record is missing: {log}");
+    assert!(
+        log.contains("startup complete"),
+        "the runtime's record is missing: {log}"
+    );
 }
 
 #[cfg(unix)]

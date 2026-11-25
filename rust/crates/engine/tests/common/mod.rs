@@ -41,7 +41,25 @@ pub fn put_u64(out: &mut Vec<u8>, value: u64) {
 
 /// The RCO artifact's table, rebuilt in the container's binary form with synthetic offsets, and parsed.
 pub fn rco_table_without(skip: impl Fn(&str) -> bool) -> TensorTable {
-    let rows: Vec<Vec<&str>> = fixture()
+    table_of(fixture(), skip)
+}
+
+/// The table of a Q3 artifact (`compressed`: its P2E2 form), rebuilt the same way.
+pub fn q3_table(compressed: bool) -> TensorTable {
+    table_of(
+        if compressed {
+            include_str!("../fixtures/q3_compressed_table.tsv")
+        } else {
+            include_str!("../fixtures/q3_table.tsv")
+        },
+        |_| false,
+    )
+}
+
+/// A tensor table listed in a fixture's rows (`name`, `shape`, ordinals of dtype, format and layout, bytes), rebuilt in
+/// the container's binary form with synthetic offsets, and parsed.
+pub fn table_of(fixture: &str, skip: impl Fn(&str) -> bool) -> TensorTable {
+    let rows: Vec<Vec<&str>> = fixture
         .lines()
         .filter(|line| !line.starts_with('#'))
         .map(|line| line.split('\t').collect::<Vec<_>>())
@@ -223,6 +241,7 @@ pub fn limit_below_need(library: &Path, settings: &Settings, below: u64) -> u64 
     let inputs = PlanInputs {
         device_free: 64 << 30,
         multiprocessors: Some(loaded.device().sm_count),
+        exact_numerics: false,
         host_pinned_bytes: Some(u64::MAX),
         sequences: 1,
     };
@@ -267,6 +286,7 @@ pub fn limit_to_stage(library: &Path, settings: &Settings, staged: u64) -> u64 {
     let inputs = PlanInputs {
         device_free: 64 << 30,
         multiprocessors: Some(loaded.device().sm_count),
+        exact_numerics: false,
         host_pinned_bytes: Some(u64::MAX),
         sequences: settings.batching.max_sequences as usize,
     };

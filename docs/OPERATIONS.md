@@ -34,6 +34,7 @@ See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 | `context.kv-cache-on-gpu-tokens` | 65536 | Tokens of each sequence's attention cache that stay in device memory. When the weights and every sequence's whole cache do not fit, the pages past this many tokens move to pinned host memory before any weight leaves the GPU, and each attention layer copies them in before it reads them ([ATTENTION_DECODE.md](kernels/ATTENTION_DECODE.md#cache-pages-in-host-memory)). Raise it to keep more of the cache on the GPU at the price of weights in host memory; lower it to fit longer contexts or more sequences. |
 | `batching.max-tokens-per-pass` | the prefill chunk | The most rows one shared decode or verification pass holds; lower it to bound a pass. It also caps the sequence count `batching.max-sequences: 0` chooses. |
 | `batching.max-sequences-per-pass` | unlimited (1 with DFlash2) | The most sequences one shared pass serves; with DFlash2 a pass serves one. |
+| `batching.forced-rows` | 0 | The rows one step of a teacher-forced run takes at a time (scoring a context against a reference). Every sequence is sized to verify that many rows, so a larger value costs device memory; 0 or 1 sizes nothing for it and forces one row a step. Only the Rust engine reads it. |
 | `batching.prefill-chunk-tokens` | 512 | The rows the workspace holds per pass, the longest prefill chunk it runs. |
 | `memory.host-limit` | automatic | Host memory the engine may use (pinned weights, the expert tier): by default what the machine can spare (90% of the available memory, never closer than 4 GiB to exhaustion, or as `memory.host-margin` says; no runtime reserve is subtracted). |
 | `memory.host-margin` | the larger of 4 GiB and 10% of the available memory | Host memory kept for the system when the host budget is derived from what the machine can spare; `0` keeps none. It also covers the runtime's own use of host memory: the Rust engine subtracts no separate runtime reserve. Where the engine cannot learn the available memory (Windows today), nothing spills to the host unless `memory.host-limit` or `memory.host-weights-limit` is set, and a plan that needs host memory is refused naming them; the prefix cache keeps its `prefix-cache.size`. Read by the Rust engine; the Java engine checks the value and ignores it. |
@@ -48,6 +49,7 @@ See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 | `memory.weight-streaming.*` | 8, 1, 4, 2 | Flash-Next expert streaming: `concurrent-reads` (records read from the artifact at once), `read-split` (parts one record read is split into), `copy-streams` (CUDA streams copying experts to the GPU), `gpu-streams` (device lanes a step spreads over). |
 | `host.task-parallelism` | 8 | Ingest sinks of each pool of ready host work: more spread the contention of the workers that publish and take frames. |
 | `host.max-batch-size` | auto | Most frames a lattice worker takes from its cache at once (auto is the runtime's default). `1` or `2` makes the workers poll their caches one frame at a time, so other workers can steal what waits behind a heavy frame. Read by the Rust engine; the Java engine checks the value and ignores it. |
+| `host.copy-chunk-bytes` | 16MiB | The most bytes one read and write of a file copy moves; the quantization tools copy an artifact's content in pieces this size (`package-tokenizer --out`). Read by the Rust quantization tools; the Java engine checks the value and ignores it. An in-place `package-tokenizer` cuts the artifact back to its content before it writes the tokenizer section: a run that fails after the cut leaves the artifact without a section, and running the command again writes it. |
 | `host.idle-release` | 1s | Idle time before the workers stop polling an idle pool of work; `0` never releases them. |
 | `kernels.graphs.captures-per-view` | 0 | CUDA graphs a sequence keeps for each of decode, verification and draft, counted together (the cache holds this many times the number of views and releases the graph used least recently, of any view, when it is full); The default `0` captures nothing and every quantum runs stage by stage; a positive value turns captures on (8 is a usual choice). Read by the Rust engine; the Java engine checks the value and ignores it. |
 | `kernels.compile.stack` | 256MiB | Stack of the thread that compiles a kernel module at load; the compiler recurses deeply on the largest modules. Applies when the Rust engine loads its kernels through RustEE, which it does not do yet; the Java engine checks the value and ignores it. |
@@ -107,15 +109,18 @@ chain of Spring beans around them: worker CPUs this process may not run on, a co
 or than the GPU can hold with every weight in host memory, a GPU that is missing or not a Blackwell, a CUDA runtime
 the native library cannot load. A port in use is reported by Spring Boot, after the weights have loaded.
 
-A successful start logs the context and how it fits (RTX 5070 Ti, `qwen3_8_27b_q3`, the default context):
+A successful start logs the context and how it fits, the prefix cache, and the time from the process's start to the open
+port (the Rust server, RTX 5070 Ti, `qwen3_8_27b_nvfp4_trellis_rco`, the default context; the first start also compiles
+the kernels, which is most of the time):
 
 ```text
-Context 32768 tokens: 13854 MiB of the 15100 MiB free on the GPU, 0 MiB of weights in host memory
-Prefix cache: 4096 MiB pinned, a checkpoint every 2048 tokens
-Started EuhedralInferenceApplication in 7.761 seconds (process running for 7.951)
+Context 32768 tokens x 1 sequence: 13465 MiB of the 15083 MiB available on the GPU, 0 MiB of weights in host memory
+Prefix cache: 4095 MiB pinned, a checkpoint every 2048 tokens
+Listening on port 1738, serving model qwen3_8_27b_nvfp4_trellis_rco
+Started in 128.440 seconds
 ```
 
-With `qwen3_8_27b_nvfp4` and a context of 131072 the same card keeps 3485 MiB of weights in host memory.
+"Available" is the device's free memory, at most `memory.gpu-limit`. A cache that is off logs `Prefix cache: off`.
 
 The port opens only after the engine has loaded, so a server that answers is ready.
 

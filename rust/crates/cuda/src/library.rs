@@ -122,6 +122,12 @@ impl CudaLibrary {
         unsafe { self.api.euhedral_cuda_nvfp4_native_available() != 0 }
     }
 
+    /// Whether the FP8 prefill route of the Q3, Q4 and Q5 linears runs on this device.
+    pub fn q3_mx_available(&self) -> bool {
+        // SAFETY: the call takes no arguments.
+        unsafe { self.api.euhedral_cuda_q3_mx_available() != 0 }
+    }
+
     /// Scratch bytes one native NVFP4 linear needs.
     pub fn nvfp4_native_scratch_bytes(&self, rows: u32, in_features: u32, out_features: u32) -> u64 {
         // SAFETY: the call takes plain integers.

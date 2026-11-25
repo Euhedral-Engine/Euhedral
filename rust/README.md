@@ -29,7 +29,7 @@ The rules are enforced by the compiler toolchain, not by review. Each is checked
 | Libraries do not print | `print_stdout`, `print_stderr` lints |
 | No `dbg!`, `todo!`, `unwrap()` or `expect()` in library code (tests may unwrap and expect) | `dbg_macro`, `todo`, `unwrap_used`, `expect_used` lints; `allow-unwrap-in-tests`, `allow-expect-in-tests` |
 | Every `unsafe` block states why it is sound | `undocumented_unsafe_blocks` lint |
-| Dependencies point one way (settings, edrl, host-gemv, test-support: none; tokenizer: edrl; cuda: none; engine: all of them; quantization: the leaves and the engine; quantize: quantization, settings, engine and cuda; bench: engine, the leaves and quantization) | layer check |
+| Dependencies point one way (settings, edrl, host-gemv, test-support: none; tokenizer: edrl; cuda: none; engine: all of them; quantization: the leaves, the engine and the API protocol; quantize: quantization, settings, engine and cuda; bench: engine, the leaves and quantization) | layer check |
 | Configuration is parsed in one place: only the settings crate depends on `serde_yaml_ng` | layer check |
 | Only the engine, bench, quantization, quantize and cuda depend on `euhedral-core` or `euhedral-graph`; cuda depends on nothing of ours and externally only on `euhedral-gpu`, `euhedral-graph`, `libloading` and `thiserror` | layer check |
 | No crate depends on `level-zero*`, `opencl3`, `ocl` (hardware agnosticism) or `core_affinity` (worker CPUs are never pinned) | layer check |
@@ -98,8 +98,8 @@ image's health check, into the distroless image; see `docs/OPERATIONS.md`.
 
 ## Quantization
 
-`euhedral-inference-quantization` (`crates/quantization`) is the library behind the quantization tools: Java's `Random`
-and `SplittableRandom` drawn exactly as Java draws them (`java_random`), and the `.npy` and `.npz` formats (`npy`,
+`euhedral-inference-quantization` (`crates/quantization`) is the library behind the quantization tools: seeded `Random` and
+`SplittableRandom` generators in the style of Java's (`java_random`), and the `.npy` and `.npz` formats (`npy`,
 `npz`). `euhedral-inference-quantize` (`crates/quantize`) is the command line, a binary called `quantization` that
 dispatches the commands of the Java tool. A command whose work is not wired yet exits with code 3; `train-blocks`,
 `train-model` and `rotate` are not part of this tool.

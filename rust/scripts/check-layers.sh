@@ -38,6 +38,8 @@ QUANTIZE = "euhedral-inference-quantize"
 SERVER = "euhedral-inference-server"
 TEST_SUPPORT = "test-support"
 XTASK = "xtask"
+BAZEL_GEN = "bazel-gen"
+HUB_DEPS = "euhedral-inference-hub-deps"
 
 # Which dependencies count: normal and build dependencies, in every target section. Dev-dependencies are ignored by
 # every rule below, so a test may use any crate (test-support is a dev-dependency only, which this makes a rule).
@@ -53,14 +55,16 @@ ALLOWED = {
     CUDA: set(),
     API_SERVER: {API_PROTOCOL, ENGINE, SETTINGS, TOKENIZER},
     ENGINE: {SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER},
-    QUANTIZATION: {SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER, ENGINE},
+    QUANTIZATION: {SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER, ENGINE, API_PROTOCOL},
     QUANTIZE: {QUANTIZATION, SETTINGS, ENGINE, CUDA},
     BENCH: {ENGINE, SETTINGS, EDRL, CUDA, HOST_GEMV, TOKENIZER, QUANTIZATION},
     SERVER: {API_SERVER, SETTINGS},
     XTASK: set(),
+    BAZEL_GEN: set(),
+    HUB_DEPS: set(),
 }
 # Binaries: their main thread may block, so they do not carry the no-wait clippy.toml. Every other crate does.
-BINARIES = {BENCH, QUANTIZE, SERVER, XTASK}
+BINARIES = {BENCH, QUANTIZE, SERVER, XTASK, BAZEL_GEN}
 # Crates that no crate may depend on except as a dev-dependency.
 DEV_ONLY = {TEST_SUPPORT}
 

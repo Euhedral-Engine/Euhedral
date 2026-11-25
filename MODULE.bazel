@@ -1,0 +1,79 @@
+# Euhedral's Bazel build of the Rust workspace in rust/ (Java and Zig stay on Gradle). Versions are the table in forge's
+# build/module/MODULE.bazel (forge build/CONTRACTS.md C4); forge's check-repo.sh checks the bazel_dep versions below.
+module(
+    name = "euhedral_euhedral",
+    version = "0.0.0",
+)
+
+# The euhedral_build module (the shared platforms and tags) is the published version of forge's build/module (forge
+# build/CONTRACTS.md C5). The Windows leg of CI runs on GitHub and cannot reach the private registry, so the root also
+# takes a byte-identical copy of that version's archive from bazel/ (a root-only override: a module that takes this one
+# ignores it). Forge's repo check (C13, run by the shared gate) fails when the copy differs from that version's
+# published archive. To move to a newer version: change the version here, replace bazel/euhedral_build with the new
+# archive's contents (`tar -xzf <registry>/modules/euhedral_build/<version>/source.tar.gz -C bazel`) and run
+# `bazel mod deps --lockfile_mode=update`. bazel/ is in .bazelignore, so its files are not packages of this module. It is
+# a dev dependency (used only for the Windows platform label of this repository's own CI).
+bazel_dep(name = "euhedral_build", version = "0.0.0-20261125015307", dev_dependency = True)
+local_path_override(
+    module_name = "euhedral_build",
+    path = "bazel/euhedral_build",
+)
+
+# RustEE is a Bazel module, so that a module taking this one and RustEE gets one copy of euhedral-core. Its commit is
+# the `rev` of the RustEE dependencies in rust/Cargo.toml: bazel-gen's layout test fails when they differ. The version
+# is the one forge's registry holds, built from that commit, so a module that takes this one needs no override of its
+# own. The Windows leg of CI runs on GitHub and cannot reach the registry, so the root takes the same source from the
+# commit (a root-only override: a module that takes this one ignores it). The crate_universe below still resolves
+# the RustEE crates of Cargo.lock, but nothing refers to them: the targets use @euhedral_rustee.
+bazel_dep(name = "euhedral_rustee", version = "0.0.0-20261125020612+2d11a4aff406")
+git_override(
+    module_name = "euhedral_rustee",
+    remote = "https://github.com/Euhedral-Engine/RustEE.git",
+    commit = "2d11a4aff406d7aa326f735b97da888d35f29d5f",
+)
+
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+bazel_dep(name = "rules_rust", version = "0.75.0")
+
+# The toolchain is rust/rust-toolchain.toml's version (and mise.toml's). rules_rust takes only a literal, so the version is
+# written twice; the generator's check (`bazel run //:gazelle -- -mode=diff`) fails when either differs from the toolchain
+# file. host_tools is the cargo that crate_universe splices with: rules_rust declares its own at its own version, which
+# moves when rules_rust is bumped, so this one has another name and from_cargo is pointed at it.
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.99.1"],
+)
+use_repo(rust, "rust_toolchains")
+
+rust_host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
+rust_host_tools.host_tools(
+    name = "euhedral_host_tools",
+    version = "1.99.1",
+)
+use_repo(rust_host_tools, "euhedral_host_tools")
+
+register_toolchains("@rust_toolchains//:all")
+
+# crate_universe reads the workspace's Cargo.toml and Cargo.lock (the RustEE crates are git dependencies pinned there);
+# Cargo owns Cargo.lock; cargo-bazel-lock.json is crate_universe's own lock, shipped so that a module taking this one needs
+# no resolution. Regenerate it after Cargo.lock or a manifest changes: `CARGO_BAZEL_REPIN=1 bazel build //rust/...`.
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "euhedral_crates",
+    cargo_lockfile = "//rust:Cargo.lock",
+    lockfile = "//rust:cargo-bazel-lock.json",
+    host_tools = "@euhedral_host_tools",
+    manifests = ["//rust:Cargo.toml"],
+    supported_platform_triples = [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+    ],
+)
+use_repo(crate, "euhedral_crates")
+
+# RustEE's build files name their third-party crates as @crates//:X. Pointing that hub at this one makes the whole build link one
+# copy of each crate (one `log`, so RustEE's records reach the server's logger). The hub exposes only direct dependencies of a
+# workspace member: crates/hub-deps lists the ones RustEE names that nothing else here depends on directly.
+override_repo(crate, crates = "euhedral_crates")

@@ -336,6 +336,8 @@ pub(super) enum Step {
     /// A speculative step of `drafts` drafts: the catch-up (which makes the first), the recursive drafts and the
     /// verification of the current token and the drafts.
     Speculate { drafts: usize },
+    /// A verification of `rows` forced rows of a teacher-forced run, which hands every row's logits to its sink.
+    Forced { rows: usize },
     /// The decode that feeds the last token of a speculative request (a test hook).
     #[cfg_attr(
         not(feature = "test-oracles"),
@@ -419,6 +421,9 @@ pub(super) enum Mode {
     Forced {
         forced: Vec<u32>,
         sink: Box<dyn LogitsSink>,
+        /// Rows of one step after the prompt: 1 decodes a row at a time, more verifies that many rows at once
+        /// (`teacher_forced.rs`).
+        rows: usize,
     },
 }
 
@@ -486,7 +491,7 @@ pub(super) enum Role {
     CatchUp,
     /// A recursive draft of a step.
     Draft,
-    /// The verification of a step.
+    /// The verification of a step, or of several forced rows.
     Verify,
     /// The decode that feeds the last token of a speculative request.
     Settle,
@@ -602,6 +607,15 @@ impl Run {
                 last: self.offset + rows == self.prompt.len(),
             });
         }
+        if let Mode::Forced { rows, forced, .. } = &self.mode
+            && *rows > 1
+        {
+            // The rows still to be fed: the last forced token is only predicted.
+            let left = forced.len().saturating_sub(1 + self.decodes);
+            let room = self.capacity.saturating_sub(self.position) as usize;
+            let rows = left.min(*rows).min(room);
+            return (rows > 0).then_some(Step::Forced { rows });
+        }
         // Decode `k` takes token `k` and selects token `k + 1`: it is wanted while a token after it is.
         if self.wanted > 0 && self.decodes + 1 < self.wanted && self.position < self.capacity {
             Some(Step::Decode)
@@ -618,7 +632,7 @@ impl Run {
                 usize::from(last && self.wanted > 0 && !self.copies_rows(Role::Prefill { last }))
             }
             Step::Decode => usize::from(!self.copies_rows(Role::Decode)),
-            Step::PromptCatchUp { .. } | Step::Settle => 0,
+            Step::PromptCatchUp { .. } | Step::Settle | Step::Forced { .. } => 0,
             // The drafts are always selected on the device; the verification only when the host does not.
             Step::Speculate { drafts } => drafts + usize::from(!self.copies_rows(Role::Verify)),
         }
@@ -633,7 +647,8 @@ impl Run {
             Mode::Speculative { state, .. } => {
                 state.samples() && matches!(role, Role::Prefill { .. } | Role::Decode | Role::Verify)
             }
-            Mode::Greedy { .. } | Mode::Forced { .. } => false,
+            Mode::Forced { rows, .. } => *rows > 1 && role == Role::Verify,
+            Mode::Greedy { .. } => false,
         }
     }
 
@@ -1001,6 +1016,7 @@ impl Owner {
         units: Result<Units, AdmissionError>,
         prefix: Vec<u32>,
         forced: Vec<u32>,
+        step_rows: usize,
         sink: Box<dyn LogitsSink>,
         lease: Lease,
     ) -> Result<(), Rejected> {
@@ -1008,6 +1024,9 @@ impl Owner {
             Ok(units) => units,
             Err(error) => return Err(Rejected::new(error, Audience::Forced(sink))),
         };
+        if let Some(error) = self.forced_rows_refusal(step_rows, sink.as_ref()) {
+            return Err(Rejected::new(error, Audience::Forced(sink)));
+        }
         let vocabulary = self.shared.config.vocab_size;
         if let Some((index, id)) = forced.iter().enumerate().find(|(_, id)| **id as usize >= vocabulary) {
             let error = AdmissionError::TokenOutsideVocabulary {
@@ -1033,7 +1052,11 @@ impl Owner {
         self.start_run(
             units,
             lease,
-            Mode::Forced { forced, sink },
+            Mode::Forced {
+                forced,
+                sink,
+                rows: step_rows,
+            },
             prefix,
             wanted,
             Vec::new(),
@@ -1510,7 +1533,7 @@ impl Owner {
     fn deliver_row(&mut self, copied: LogitsCopied) {
         let Some(run) = self.run.as_mut() else { return };
         let vocabulary = self.shared.config.vocab_size;
-        if let Mode::Forced { forced, sink } = &mut run.mode {
+        if let Mode::Forced { forced, sink, .. } = &mut run.mode {
             let all = copied.loan.buffer().as_slice();
             let bytes = &all[..vocabulary * 2];
             if let Some(next) = forced.get(copied.step) {
@@ -1744,7 +1767,7 @@ impl Owner {
     }
 
     /// Ends the request with a failure.
-    fn fail(&mut self, why: String) {
+    pub(super) fn fail(&mut self, why: String) {
         if let Some(run) = self.run.as_mut() {
             run.stop(FinishReason::Failed(why));
         }
@@ -1860,6 +1883,7 @@ impl Owner {
             Role::Settle => return,
             Role::PromptCatchUp => return,
             Role::CatchUp | Role::Draft => return self.drafted(flying),
+            Role::Verify if matches!(run.mode, Mode::Forced { .. }) => return self.forced_rows_retired(flying),
             Role::Verify if run.copies_rows(Role::Verify) => return self.sample(flying),
             Role::Verify => return self.verified(flying),
             Role::Prefill { .. } | Role::Decode => {}
@@ -2159,6 +2183,7 @@ impl Owner {
             Step::PromptCatchUp { rows } => self.admit_prompt_catch_up(rows),
             Step::Speculate { drafts } => self.admit_speculation(drafts),
             Step::Settle => self.admit_settle(),
+            Step::Forced { rows } => self.admit_forced_rows(rows),
         }
     }
 

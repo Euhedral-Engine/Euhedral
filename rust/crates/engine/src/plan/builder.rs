@@ -8,11 +8,12 @@
 //! are trellis, so no view fuses a gate/up projection with its SwiGLU (a format that offered it would).
 
 use std::fmt;
+use std::iter::once;
 use std::sync::Arc;
 
 use euhedral_graph::Stage;
 use euhedral_inference_cuda::{DevicePtr, HostWeightsArena};
-use euhedral_inference_edrl::WeightFormat;
+use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 
 use super::PlanBuildError;
 use super::buffers::Access;
@@ -62,18 +63,43 @@ impl WeightLookup for Weights {
 pub struct Formats {
     trellis: Arc<dyn LinearFormat>,
     nvfp4: Arc<dyn LinearFormat>,
+    grouped: Option<Arc<dyn LinearFormat>>,
 }
 
 impl Formats {
     /// The trellis format for trellis weights and the NVFP4 format for NVFP4 weights.
     pub fn new(trellis: Arc<dyn LinearFormat>, nvfp4: Arc<dyn LinearFormat>) -> Self {
-        Self { trellis, nvfp4 }
+        Self {
+            trellis,
+            nvfp4,
+            grouped: None,
+        }
+    }
+
+    /// The same formats, with `grouped` for the Q3, Q4 and Q5 weights (and the P2E2 compressed Q3).
+    pub fn with_grouped(mut self, grouped: Arc<dyn LinearFormat>) -> Self {
+        self.grouped = Some(grouped);
+        self
     }
 
     fn of(&self, weight: &WeightRef) -> Result<Arc<dyn LinearFormat>, PlanBuildError> {
         match weight.format {
             WeightFormat::Trellis => Ok(Arc::clone(&self.trellis)),
             WeightFormat::Nvfp4 => Ok(Arc::clone(&self.nvfp4)),
+            // Only a Q3 tensor is stored compressed: a Q4 or Q5 one in the P2E2 layout is refused, here, by name.
+            WeightFormat::Q3G64Fp16 | WeightFormat::Q4G64Fp16 | WeightFormat::Q5G64Fp16
+                if weight.layout == WeightLayout::RowSplitK128V1
+                    || (weight.format == WeightFormat::Q3G64Fp16 && weight.layout == WeightLayout::RowSplitP2e2V1) =>
+            {
+                self.grouped
+                    .as_ref()
+                    .map(Arc::clone)
+                    .ok_or_else(|| PlanBuildError::Format {
+                        name: weight.name.clone(),
+                        format: weight.format,
+                        layout: weight.layout,
+                    })
+            }
             format => Err(PlanBuildError::Format {
                 name: weight.name.clone(),
                 format,
@@ -98,6 +124,8 @@ pub enum StageKind {
     ResidualAdd,
     GdnProjectControl,
     Linear,
+    /// The gate/up projection and the SwiGLU that follows it, which a format may run as one launch.
+    GateUpSwiglu,
     GdnConvolution,
     GdnRecurrence,
     GdnGatedRmsNorm,
@@ -123,6 +151,7 @@ impl StageKind {
             StageKind::ResidualAdd => "residual-add",
             StageKind::GdnProjectControl => "gdn-project-control",
             StageKind::Linear => "linear",
+            StageKind::GateUpSwiglu => "gate-up-swiglu",
             StageKind::GdnConvolution => "gdn-convolution",
             StageKind::GdnRecurrence => "gdn-recurrence",
             StageKind::GdnGatedRmsNorm => "gdn-gated-rms-norm",
@@ -172,6 +201,9 @@ pub(crate) enum Make {
         input: BufferSlot,
         output: BufferSlot,
         rows: LinearRows,
+        /// The slot the SwiGLU of `output` goes to, when the linear is a gate/up projection that carries it: its
+        /// format may run both as one launch (`ExecutionPlan`'s fused gate/up node).
+        swiglu: Option<BufferSlot>,
     },
     GdnConvolution {
         layer: usize,
@@ -229,6 +261,7 @@ impl Make {
             Make::ResidualRmsNorm { .. } => StageKind::ResidualRmsNorm,
             Make::ResidualAdd { .. } => StageKind::ResidualAdd,
             Make::GdnProjectControl { .. } => StageKind::GdnProjectControl,
+            Make::Linear { swiglu: Some(_), .. } => StageKind::GateUpSwiglu,
             Make::Linear { .. } => StageKind::Linear,
             Make::GdnConvolution { .. } => StageKind::GdnConvolution,
             Make::GdnRecurrence { .. } => StageKind::GdnRecurrence,
@@ -292,7 +325,9 @@ impl Make {
                 output,
             } => (vec![*residual, *delta], vec![*output]),
             Make::GdnProjectControl { .. } => (vec![InputNormalized], vec![GdnAlpha, GdnBeta]),
-            Make::Linear { input, output, .. } => (vec![*input], vec![*output]),
+            Make::Linear {
+                input, output, swiglu, ..
+            } => (vec![*input], once(*output).chain(*swiglu).collect()),
             Make::GdnConvolution { .. } => (vec![QkProjected, ValueZProjected], vec![GdnConvolved]),
             Make::GdnRecurrence { .. } => (vec![GdnConvolved, GdnAlpha, GdnBeta], vec![GdnRecurrent]),
             Make::GdnGatedRmsNorm { .. } => (vec![GdnRecurrent, ValueZProjected], vec![GdnNormalized]),
@@ -325,7 +360,8 @@ impl Make {
     }
 
     /// The scratch region the stage takes in `variant`, if it declares a scratch use (`Shape.scratchUse` and
-    /// `Shape.scratchRegion`): a trellis linear always, any other quantized linear in the multi-row views; the
+    /// `Shape.scratchRegion`): a trellis linear always, and a P2E2 linear (which expands its tensor wherever its fused
+    /// decode does not run, as it does under exact numerics), any other quantized linear in the multi-row views; the
     /// value/z projection of a decode-type view has a region of its own, which it takes beside the query/key
     /// projection.
     pub(crate) fn scratch_region(&self, variant: Variant) -> Option<usize> {
@@ -335,7 +371,7 @@ impl Make {
                 _ => None,
             };
         };
-        if weight.format == WeightFormat::Trellis {
+        if weight.format == WeightFormat::Trellis || weight.layout == WeightLayout::RowSplitP2e2V1 {
             Some(usize::from(variant.decode_type() && *output == ValueZProjected))
         } else {
             variant.multi_row().then_some(0)
@@ -386,9 +422,14 @@ impl Make {
                 input,
                 output,
                 rows,
+                swiglu,
             } => {
                 let format = formats.of(&weight)?;
-                entry(self.kind(), Linear::new(format, weight, input, output, rows, region))
+                let mut linear = Linear::new(format, weight, input, output, rows, region);
+                if let Some(slot) = swiglu {
+                    linear = linear.with_swiglu(slot);
+                }
+                entry(self.kind(), linear)
             }
             Make::GdnConvolution { layer, weights } => entry(
                 self.kind(),
@@ -534,9 +575,33 @@ impl<W: WeightLookup + ?Sized> Nodes<'_, W> {
                 input,
                 output,
                 rows: LinearRows::All,
+                swiglu: None,
             },
             deps,
         ))
+    }
+
+    /// The gate/up projection of `layer` with the SwiGLU after it: one node whose stage runs the pair as one launch
+    /// where the weight's format has one (`ExecutionPlan`'s fusion of a Q3 gate/up and its SwiGLU), and the two
+    /// launches where it has none. Any other weight keeps its linear and its SwiGLU as two nodes.
+    fn gate_up_swiglu(&mut self, layer: LayerIndex, deps: &[usize]) -> Result<usize, PlanBuildError> {
+        let weight = self.weight(layer, Role::GateUp)?;
+        let fused = weight.format == WeightFormat::Q3G64Fp16;
+        let gate_up = self.push(
+            Make::Linear {
+                weight,
+                input: PostMixerNormalized,
+                output: GateUp,
+                rows: LinearRows::All,
+                swiglu: fused.then_some(SwigluSlot),
+            },
+            deps,
+        );
+        Ok(if fused {
+            gate_up
+        } else {
+            self.push(Make::Swiglu, &[gate_up])
+        })
     }
 
     fn norm_weight(&self, layer: LayerIndex, kind: NormKind) -> Result<WeightRef, PlanBuildError> {
@@ -569,6 +634,7 @@ fn head<W: WeightLookup + ?Sized>(
             input: FinalNormalized,
             output: Logits,
             rows: LinearRows::Logits,
+            swiglu: None,
         },
         &[norm],
     );
@@ -673,8 +739,7 @@ pub(crate) fn base_nodes<W: WeightLookup + ?Sized>(
             },
             &[previous, mixer_out],
         );
-        let gate_up = nodes.linear(layer, Role::GateUp, PostMixerNormalized, GateUp, &[mixer])?;
-        let swiglu = nodes.push(Make::Swiglu, &[gate_up]);
+        let swiglu = nodes.gate_up_swiglu(layer, &[mixer])?;
         let down = nodes.linear(layer, Role::Down, SwigluSlot, FfnDelta, &[swiglu])?;
         if index + 1 < layers {
             // The layer's residual add and the next layer's input norm, in one launch.

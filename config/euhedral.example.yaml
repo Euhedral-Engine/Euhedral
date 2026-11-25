@@ -50,6 +50,7 @@ batching:
   max-sequences-per-pass: auto                # optional, default auto: sequences in one shared decode or verification pass (auto = no bound)
   max-tokens-per-pass: auto                   # optional, default auto: rows in one shared pass (auto = prefill-chunk-tokens)
   prefill-chunk-tokens: 512                   # optional, default 512: rows of the longest prefill chunk
+  forced-rows: 0                              # optional, default 0, Rust engine only: rows of one step of a teacher-forced run that takes several rows at a time (0 or 1: one row a step)
 
 memory:
   host-limit: auto                            # optional, default auto: host memory the engine may use (0: no RAM tier)
@@ -78,6 +79,7 @@ host:
   idle-release: 1s                            # optional, default 1s: idle time before workers are released; 0 never releases them
   max-batch-size: auto                        # optional, default auto: most frames a lattice worker takes from its cache at once (auto = the runtime's default); 1 or 2 makes workers poll one frame at a time, so other workers can steal what waits behind a heavy frame
   native-cache: auto                          # optional, default auto: where the jar unpacks its native files (auto = the user's cache directory)
+  copy-chunk-bytes: 16MiB                     # optional, default 16MiB: the most bytes one read and write of a file copy moves (the quantization tools copy an artifact in pieces this size)
 
 kernels:
   rms-norm-decode-slices: auto                # optional, default auto: slices of the output pass of a one-row RMS norm, a decode step (auto = 40 on every card, the value chosen with the sliced kernel; 1 to 65535, the output is the same for any count)

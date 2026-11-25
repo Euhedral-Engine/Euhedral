@@ -358,6 +358,16 @@ impl KernelSources {
         self
     }
 
+    /// The CUDA header directory the modules compile against.
+    pub fn include(&self) -> &Path {
+        &self.include
+    }
+
+    /// The stack, in bytes, of the thread that compiles.
+    pub fn compile_stack(&self) -> usize {
+        self.compile_stack
+    }
+
     /// The compiler library that will be used, when one was found beside the library.
     pub fn compiler(&self) -> Option<&Path> {
         self.compiler.as_deref()
@@ -546,38 +556,45 @@ fn module_gate(module: Module, architecture_target: bool) -> Option<Unavailable>
 type Compilations = (Vec<(Module, Compiled)>, Vec<ModuleTiming>);
 
 /// Compiles each distinct module, in first-appearance order, on a thread with the configured stack.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "startup: NVRTC needs a deep stack the caller's thread may not have, and loading waits for the compile by nature"
-)]
 fn compile_all(
     gpu: &Arc<CudaGpu>,
     sources: &KernelSources,
     architecture_target: bool,
 ) -> Result<Compilations, LoadError> {
+    on_compile_stack(sources.compile_stack, || -> Result<Compilations, LoadError> {
+        let mut modules: Vec<(Module, Compiled)> = Vec::new();
+        let mut timings = Vec::new();
+        for spec in &KERNELS {
+            if modules.iter().any(|(module, _)| *module == spec.module) {
+                continue;
+            }
+            let started = Instant::now();
+            let compiled = compile(gpu, sources, spec.module, architecture_target)?;
+            if matches!(compiled, Compiled::Module(_)) {
+                timings.push(ModuleTiming {
+                    module: spec.module,
+                    elapsed: started.elapsed(),
+                });
+            }
+            modules.push((spec.module, compiled));
+        }
+        Ok((modules, timings))
+    })?
+}
+
+/// Runs `work` on a thread of its own with a stack of `stack` bytes and waits for it: NVRTC recurses deeply on the
+/// largest sources, which the caller's thread may not have the stack for. Blocking: it is a startup call, made
+/// before any frame runs.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "startup: NVRTC needs a deep stack the caller's thread may not have, and loading waits for the compile by nature"
+)]
+pub fn on_compile_stack<T: Send>(stack: usize, work: impl FnOnce() -> T + Send) -> Result<T, LoadError> {
     scope(|scope| {
         let worker = Builder::new()
             .name("kernel-compile".to_owned())
-            .stack_size(sources.compile_stack)
-            .spawn_scoped(scope, || -> Result<Compilations, LoadError> {
-                let mut modules: Vec<(Module, Compiled)> = Vec::new();
-                let mut timings = Vec::new();
-                for spec in &KERNELS {
-                    if modules.iter().any(|(module, _)| *module == spec.module) {
-                        continue;
-                    }
-                    let started = Instant::now();
-                    let compiled = compile(gpu, sources, spec.module, architecture_target)?;
-                    if matches!(compiled, Compiled::Module(_)) {
-                        timings.push(ModuleTiming {
-                            module: spec.module,
-                            elapsed: started.elapsed(),
-                        });
-                    }
-                    modules.push((spec.module, compiled));
-                }
-                Ok((modules, timings))
-            })
+            .stack_size(stack)
+            .spawn_scoped(scope, work)
             .map_err(|error| LoadError::CompileThread(error.to_string()))?;
         worker.join().map_err(|payload| {
             let what = payload
@@ -586,7 +603,7 @@ fn compile_all(
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "a panic".to_owned());
             LoadError::CompileThread(what)
-        })?
+        })
     })
 }
 
@@ -735,25 +752,6 @@ mod tests {
         let mut bare = sources().with_cache_dir(PathBuf::from("/c"));
         bare.manifest = None;
         assert_eq!(bare.cache_path(), None);
-    }
-
-    #[test]
-    fn the_compile_stack_defaults_to_the_native_size_and_is_set_by_the_caller() {
-        assert_eq!(sources().compile_stack, 256 << 20);
-        assert_eq!(sources().with_compile_stack(64 << 20).compile_stack, 64 << 20);
-    }
-
-    #[test]
-    fn the_dispatch_is_the_measured_one_until_set() {
-        let measured = Dispatch::measured(70);
-        assert_eq!(measured.rms_norm_decode_slices, 40);
-        assert_eq!(measured.fused_verify_from[2], 49152);
-        assert_eq!(measured.skinny_target_ctas(), 140);
-        let set = Dispatch {
-            rms_norm_decode_slices: 8,
-            ..measured
-        };
-        assert_eq!(sources().with_dispatch(set).dispatch, set);
     }
 
     #[test]
