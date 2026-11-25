@@ -16,7 +16,7 @@ use euhedral_graph::{Lake, UnitGuard};
 use euhedral_inference_engine::Handoff;
 use euhedral_io::{AsyncIo, Create, IoBuf, IoDone, OpenSpec, OwnedFile};
 
-use super::io::{raw_file, submit_error};
+use super::io::{Next, file_length, open_read, raw_file, read_exact, submit_error};
 use super::{CheckpointError, Done};
 use crate::durable;
 use crate::step::{Kind, idle, step};
@@ -46,6 +46,8 @@ pub type Source = Arc<dyn Fn(u64, Vec<u8>, Done<Vec<u8>>) -> Result<(), Checkpoi
 
 struct Entry {
     name: String,
+    /// What error messages call the data: `tensor <name>`, or the file.
+    label: String,
     dtype: String,
     shape: Vec<u64>,
     bytes: u64,
@@ -102,22 +104,7 @@ impl SafetensorsWriter {
     /// Adds a tensor held in `data` (little-endian, row-major).
     pub fn add(&mut self, name: &str, dtype: &str, shape: &[u64], data: Vec<u8>) -> Result<(), CheckpointError> {
         let bytes = data.len() as u64;
-        self.add_source(
-            name,
-            dtype,
-            shape,
-            bytes,
-            Arc::new(move |offset, mut chunk, done| {
-                let range = usize::try_from(offset)
-                    .ok()
-                    .and_then(|from| Some(from..from.checked_add(chunk.len())?))
-                    .and_then(|range| data.get(range))
-                    .ok_or_else(|| CheckpointError::Invalid("a chunk beyond the tensor".to_owned()))?;
-                chunk.copy_from_slice(range);
-                done(Ok(chunk));
-                Ok(())
-            }),
-        )
+        self.add_source(name, dtype, shape, bytes, bytes_source(data))
     }
 
     /// Adds a tensor of `bytes` bytes that `source` produces on demand.
@@ -151,6 +138,7 @@ impl SafetensorsWriter {
         }
         self.entries.push(Entry {
             name: name.to_owned(),
+            label: format!("tensor {name}"),
             dtype: dtype.to_owned(),
             shape: shape.to_vec(),
             bytes,
@@ -194,6 +182,21 @@ impl SafetensorsWriter {
     /// If `host` closes before the data is made durable, or before a failed file can be removed, the error says that
     /// the `.part` file was left. `Err` started nothing.
     pub fn finish(self, io: &Arc<AsyncIo>, host: &Arc<Lake>, then: Done<()>) -> Result<(), CheckpointError> {
+        let json = self.header();
+        let mut head = Vec::with_capacity(8 + json.len());
+        head.extend_from_slice(&(json.len() as u64).to_le_bytes());
+        head.extend_from_slice(&json);
+        self.finish_with(head, io, host, then)
+    }
+
+    /// The write chain: `head` first, then the tensors' data.
+    fn finish_with(
+        self,
+        head: Vec<u8>,
+        io: &Arc<AsyncIo>,
+        host: &Arc<Lake>,
+        then: Done<()>,
+    ) -> Result<(), CheckpointError> {
         let unit = host.admit().map_err(|_| CheckpointError::LakeClosed)?;
         let mut part: OsString = self.file.clone().into_os_string();
         part.push(".part");
@@ -201,10 +204,6 @@ impl SafetensorsWriter {
         let name = self.file_name();
         let largest = self.entries.iter().map(|entry| entry.bytes).max().unwrap_or(0);
         let buffer = usize::try_from(largest).map_or(self.buffer_bytes, |largest| largest.min(self.buffer_bytes));
-        let json = self.header();
-        let mut head = Vec::with_capacity(8 + json.len());
-        head.extend_from_slice(&(json.len() as u64).to_le_bytes());
-        head.extend_from_slice(&json);
         let spec = OpenSpec {
             read: false,
             write: true,
@@ -294,6 +293,11 @@ impl Writing {
     /// Writes the header, then the data.
     fn begin(self, file: OwnedFile, head: Vec<u8>) {
         let filled = head.len();
+        if filled == 0 {
+            // An empty file has nothing to write first.
+            Step { file, writing: self }.next();
+            return;
+        }
         Step { file, writing: self }.submit(head, filled, false);
     }
 
@@ -370,7 +374,8 @@ impl Step {
                         }
                         Err(error) => {
                             drop(file);
-                            writing.fail(CheckpointError::io("cannot write the safetensors file", error));
+                            let context = format!("cannot write {}", writing.part.display());
+                            writing.fail(CheckpointError::io(context, error));
                         }
                     }
                 })
@@ -380,7 +385,8 @@ impl Step {
             && let Some(Step { file, writing }) = started.take()
         {
             drop(file);
-            writing.fail(submit_error("the safetensors file", error));
+            let context = writing.part.display().to_string();
+            writing.fail(submit_error(&context, error));
         }
     }
 
@@ -398,7 +404,7 @@ impl Step {
         let entry = &writing.entries[writing.entry];
         let n = (writing.buffer_bytes as u64).min(entry.bytes - writing.at) as usize;
         let source = Arc::clone(&entry.source);
-        let name = entry.name.clone();
+        let name = entry.label.clone();
         let named = name.clone();
         let at = writing.at;
         let mut buffer = take(&mut writing.buffer);
@@ -424,7 +430,7 @@ impl Step {
                 }
                 Err(error) => {
                     drop(file);
-                    writing.fail(CheckpointError::Invalid(format!("cannot read tensor {name}: {error}")));
+                    writing.fail(CheckpointError::Invalid(format!("cannot read {name}: {error}")));
                 }
             }
         });
@@ -432,7 +438,7 @@ impl Step {
             && let Some(Step { file, writing }) = cell.take()
         {
             drop(file);
-            writing.fail(CheckpointError::Invalid(format!("cannot read tensor {named}: {error}")));
+            writing.fail(CheckpointError::Invalid(format!("cannot read {named}: {error}")));
         }
     }
 }
@@ -508,7 +514,143 @@ impl Writing {
         if let Err(error) = renamed
             && let Some(writing) = cell.take()
         {
-            writing.fail(submit_error("the safetensors file", error));
+            let context = writing.part.display().to_string();
+            writing.fail(submit_error(&context, error));
         }
     }
+}
+
+/// A [`Source`] over bytes held in memory.
+pub fn bytes_source(data: Vec<u8>) -> Source {
+    Arc::new(move |offset, mut chunk, done| {
+        let range = usize::try_from(offset)
+            .ok()
+            .and_then(|from| Some(from..from.checked_add(chunk.len())?))
+            .and_then(|range| data.get(range))
+            .ok_or_else(|| CheckpointError::Invalid("a chunk beyond the data".to_owned()))?;
+        chunk.copy_from_slice(range);
+        done(Ok(chunk));
+        Ok(())
+    })
+}
+
+/// Writes the `size` bytes that `source` produces as the whole of `file`: as `<file>.part`, made durable and renamed
+/// once complete, with nothing left behind on failure, and with no more than `buffer_bytes` (a positive multiple of 8)
+/// in memory at a time. `then` and the host lake are as for [`SafetensorsWriter::finish`]. `Err` started nothing.
+pub fn write_file(
+    file: &Path,
+    size: u64,
+    source: Source,
+    buffer_bytes: usize,
+    io: &Arc<AsyncIo>,
+    host: &Arc<Lake>,
+    then: Done<()>,
+) -> Result<(), CheckpointError> {
+    let target = Target {
+        file,
+        label: file.display().to_string(),
+        size,
+    };
+    write_target(target, source, buffer_bytes, io, host, then)
+}
+
+/// The file a write makes, the name its read errors give for where the bytes come from, and its size.
+struct Target<'a> {
+    file: &'a Path,
+    label: String,
+    size: u64,
+}
+
+fn write_target(
+    target: Target<'_>,
+    source: Source,
+    buffer_bytes: usize,
+    io: &Arc<AsyncIo>,
+    host: &Arc<Lake>,
+    then: Done<()>,
+) -> Result<(), CheckpointError> {
+    let mut writer = SafetensorsWriter::with_buffer(target.file, buffer_bytes)?;
+    writer.entries.push(Entry {
+        name: target.file.display().to_string(),
+        label: target.label,
+        dtype: String::new(),
+        shape: Vec::new(),
+        bytes: target.size,
+        source,
+    });
+    writer.finish_with(Vec::new(), io, host, then)
+}
+
+/// Copies `from` to `to` the way [`write_file`] writes a file, a buffer at a time, so a file of any size can be
+/// copied. `Err` started nothing.
+pub(crate) fn copy_file(
+    from: &Path,
+    to: &Path,
+    buffer_bytes: usize,
+    io: &Arc<AsyncIo>,
+    host: &Arc<Lake>,
+    then: Done<()>,
+) -> Result<(), CheckpointError> {
+    let (io_next, host, to, label) = (
+        Arc::clone(io),
+        Arc::clone(host),
+        to.to_path_buf(),
+        from.display().to_string(),
+    );
+    let handed = Handoff::new();
+    handed.send(then);
+    let waiting = Arc::clone(&handed);
+    let opened = open_read(
+        io,
+        from,
+        Box::new(move |opened| {
+            let Some(then) = waiting.take() else { return };
+            let file = match opened {
+                Ok(file) => Arc::new(file),
+                Err(error) => return then(Err(error)),
+            };
+            let sizing = Arc::clone(&file);
+            let cell = Handoff::new();
+            cell.send((then, io_next.clone()));
+            let ready = Arc::clone(&cell);
+            let sized = file_length(
+                &io_next,
+                sizing,
+                label.clone(),
+                Box::new(move |length| {
+                    let Some((then, io)) = ready.take() else { return };
+                    let size = match length {
+                        Ok(size) => size,
+                        Err(error) => return then(Err(error)),
+                    };
+                    let reader = Arc::clone(&io);
+                    let context = label.clone();
+                    let source: Source = Arc::new(move |offset, chunk, done| {
+                        let next: Next<Vec<u8>> = Box::new(move |bytes| done(bytes));
+                        read_exact(&reader, Arc::clone(&file), offset, chunk.len(), context.clone(), next)
+                    });
+                    let report = Arc::clone(&then);
+                    let target = Target {
+                        file: &to,
+                        label: label.clone(),
+                        size,
+                    };
+                    if let Err(error) = write_target(target, source, buffer_bytes, &io, &host, then) {
+                        report(Err(error));
+                    }
+                }),
+            );
+            if let Err(error) = sized
+                && let Some((then, _)) = cell.take()
+            {
+                then(Err(error));
+            }
+        }),
+    );
+    if let Err(error) = opened {
+        // Nothing started: the continuation was dropped with the refusal.
+        drop(handed.take());
+        return Err(error);
+    }
+    Ok(())
 }
