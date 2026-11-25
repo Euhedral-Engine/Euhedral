@@ -1,5 +1,5 @@
 //! The sequence state and the workspace on a GPU. The tests are `#[ignore]`d and run locally in a memory-capped scope:
-//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test state_gpu -- --ignored`.
+//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored state::`.
 //!
 //! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, or
 //! `gradle.properties`); a test skips with a message when it is absent.
@@ -14,8 +14,7 @@
     reason = "no-wait, waiting calls: a test synchronizes a lane and copies synchronously to check results"
 )]
 
-#[path = "common/typed.rs"]
-mod typed;
+use crate::typed;
 
 use std::fmt::Display;
 use std::path::PathBuf;
@@ -35,7 +34,7 @@ use euhedral_inference_engine::workspace::{BufferSlot, Workspace, WorkspaceError
 use euhedral_inference_settings::KvFormat;
 use typed::Typed;
 
-mod common;
+use crate::common;
 
 fn library() -> Option<Arc<CudaLibrary>> {
     let path = test_support::require_property("euhedral.cuda.library")?;
@@ -105,6 +104,7 @@ fn words(bytes: &[u8]) -> Vec<u64> {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_reservation_allocates_pages_and_a_table_that_names_them() {
+    let _light = common::light();
     let Some(library) = library() else { return };
     let lane = lane(&library);
     let pool = PinnedPool::new(&library, 64 << 20);
@@ -210,6 +210,7 @@ fn a_reservation_allocates_pages_and_a_table_that_names_them() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_buffer_that_is_not_stream_ordered_is_refused_by_the_stream_ordered_free() {
+    let _light = common::light();
     let Some(library) = library() else { return };
     let lane = lane(&library);
     let plain = DeviceBuffer::alloc(&library, 4096).unwrap();
@@ -222,6 +223,7 @@ fn a_buffer_that_is_not_stream_ordered_is_refused_by_the_stream_ordered_free() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn host_pages_are_read_and_written_through_the_device_region() {
+    let _light = common::light();
     let Some(library) = library() else { return };
     let lane = lane(&library);
     let pool = PinnedPool::new(&library, 64 << 20);
@@ -279,6 +281,7 @@ fn host_pages_are_read_and_written_through_the_device_region() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn gdn_state_is_zeroed_and_as_large_as_the_planner_says() {
+    let _light = common::light();
     let Some(library) = library() else { return };
     let lane = lane(&library);
     let config = config();
@@ -313,6 +316,7 @@ fn gdn_state_is_zeroed_and_as_large_as_the_planner_says() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn the_extra_state_of_a_sequence_is_what_its_buffers_hold() {
+    let _light = common::light();
     let Some(library) = library() else { return };
     let lane = lane(&library);
     let config = common::config();
@@ -347,6 +351,7 @@ fn the_extra_state_of_a_sequence_is_what_its_buffers_hold() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn the_workspace_holds_one_buffer_per_slot_and_refuses_a_larger_quantum() {
+    let _light = common::light();
     let Some(library) = library() else { return };
     let config = config();
     let rows = WorkspaceRows {
@@ -385,6 +390,7 @@ fn the_workspace_holds_one_buffer_per_slot_and_refuses_a_larger_quantum() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn primed_staging_means_a_reservation_allocates_nothing() {
+    let _light = common::light();
     let Some(library) = library() else { return };
     let lane = lane(&library);
     let pool = PinnedPool::new(&library, 64 << 20);

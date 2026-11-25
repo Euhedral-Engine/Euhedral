@@ -20,15 +20,14 @@
     reason = "no-wait, blocking I/O and waiting calls: a test waits on hand-offs and the device"
 )]
 
-#[path = "common/typed.rs"]
-mod typed;
+use crate::typed;
 
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-mod common;
+use crate::common;
 
 use common::Closer;
 use euhedral_inference_engine::generation::{
@@ -78,14 +77,14 @@ fn settings(artifact: &Path, cache: ByteSize) -> Settings {
     settings
 }
 
+/// The engine without a prefix cache, from the cache of engines: it holds nothing a test could find, so tests share it.
+fn cold(machine: &Machine) -> (common::Card, Arc<EngineRuntime>) {
+    common::engine(&settings(&machine.artifact, ByteSize(0)), &machine.library)
+}
+
 /// Starts the engine with a prefix cache of `cache` bytes (0: off).
 fn start(machine: &Machine, cache: ByteSize) -> (Closer, Arc<EngineRuntime>) {
-    let (owner, ready) = EngineRuntime::start(&settings(&machine.artifact, cache), &machine.library);
-    let runtime = ready
-        .wait(WAIT)
-        .expect("the engine reports")
-        .expect("the engine starts");
-    (Closer::new(owner, &runtime), runtime)
+    common::start_engine(&settings(&machine.artifact, cache), &machine.library)
 }
 
 /// A prompt of `LENGTH` tokens whose first `shared` tokens are those of every prompt of `seed` 0 and whose others
@@ -390,7 +389,7 @@ fn cases() -> Vec<(&'static str, Vec<u32>, SamplingConfig, usize, bool)> {
 fn a_speculative_restore_gives_the_tokens_and_the_drafts_of_a_cold_run() {
     let Some(machine) = machine() else { return };
     // The cold references: the cache is off.
-    let (owner, runtime) = start(&machine, ByteSize(0));
+    let (card, runtime) = cold(&machine);
     let lane = Arc::new(Typed::plain(runtime.library(), 1, 4));
     let cold: Vec<(Recording, MtpPages)> = cases()
         .iter()
@@ -403,7 +402,9 @@ fn a_speculative_restore_gives_the_tokens_and_the_drafts_of_a_cold_run() {
         assert_eq!(recording.outcome.cached_prompt_tokens, 0, "no cache restores nothing");
     }
     drop(lane);
-    owner.shutdown(runtime).expect("the engine shuts down clean");
+    drop(runtime);
+    drop(card);
+    let _card = common::card();
 
     let (owner, runtime) = start(&machine, ByteSize::gib(2));
     let lane = Arc::new(Typed::plain(runtime.library(), 1, 4));
@@ -456,10 +457,12 @@ fn a_speculative_restore_gives_the_tokens_and_the_drafts_of_a_cold_run() {
 fn a_plain_request_restores_the_checkpoints_of_a_speculative_one_but_not_the_reverse() {
     let Some(machine) = machine() else { return };
     let shared = prompt(0, LENGTH);
-    let (owner, runtime) = start(&machine, ByteSize(0));
+    let (card, runtime) = cold(&machine);
     let cold_plain = generate(&runtime, &shared, Speculation::Off, SamplingConfig::greedy(0));
     let cold_speculative = generate(&runtime, &shared, Speculation::Artifact, SamplingConfig::greedy(0));
-    owner.shutdown(runtime).expect("the engine shuts down clean");
+    drop(runtime);
+    drop(card);
+    let _card = common::card();
 
     // A speculative request captures checkpoints that hold the draft's state: a plain one restores them and needs none.
     let (owner, runtime) = start(&machine, ByteSize::gib(2));

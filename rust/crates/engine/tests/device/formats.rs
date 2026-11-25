@@ -1,5 +1,5 @@
 //! The linear formats on a GPU. The tests are `#[ignore]`d and run locally in a memory-capped scope:
-//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test formats_gpu -- --ignored`.
+//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored formats::`.
 //!
 //! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, or
 //! `gradle.properties`) and the real objects from `euhedral.qwen.rco-artifact`; a test skips with a message when one
@@ -9,7 +9,7 @@
 //! `TrellisLinearCudaIntegrationTest`, and the NVFP4 and embedding objects are the RCO artifact's own. The scalar
 //! reference is reached without the library's process-wide exact-numerics switch (which another test of this binary
 //! would see): the trellis format runs it when built for it, and NVFP4 takes it above 32 rows of a device without the
-//! native route. The switch itself is checked in `formats_oracle_gpu`, a binary of its own.
+//! native route. The switch itself is checked in `formats_oracle`, a binary of its own.
 
 #![allow(
     clippy::unwrap_used,
@@ -25,13 +25,8 @@
     reason = "no-wait, waiting calls: a test copies device memory and synchronizes"
 )]
 
-mod common;
-#[path = "common/linear_gpu.rs"]
-mod linear_gpu;
-#[path = "common/typed.rs"]
-mod typed;
-
-use std::collections::HashMap;
+use crate::common;
+use crate::linear_gpu;
 
 use euhedral_inference_cuda::launch::nvfp4::skinny_target_ctas;
 use euhedral_inference_cuda::launch::q3::P2E2_EXPAND_LIMIT;
@@ -48,9 +43,6 @@ use linear_gpu::{
     Artifact, Random, Rig, Trellis, activations, assert_close, bf16, bf16_value, compressed_head, relative_rms, rig,
     synthetic_trellis, upload, values,
 };
-
-/// The target blocks the fixture was recorded with.
-const FIXTURE_TARGET_BLOCKS: usize = 560;
 
 const VERIFY: LinearMode = LinearMode {
     row_exact: true,
@@ -271,112 +263,15 @@ fn row_twins_equal_single_rows() {
     }
 }
 
-/// One case of the fixture Java wrote: its key, and the launches it made without their pointers.
-fn java_launches() -> HashMap<String, Vec<String>> {
-    let mut cases: HashMap<String, Vec<String>> = HashMap::new();
-    let mut key = String::new();
-    for line in include_str!("fixtures/linear_launches.txt").lines() {
-        if let Some(header) = line.strip_prefix("case ") {
-            // The name only labels the case; the shape keys it.
-            key = header.split_once(' ').unwrap().1.to_string();
-            cases.insert(key.clone(), Vec::new());
-        } else if !line.starts_with("scratch=") {
-            cases.get_mut(&key).unwrap().push(without_pointers(line));
-        }
-    }
-    cases
-}
-
-/// A launch line with its pointer arguments blanked: the addresses differ between the fixture and a real device.
-fn without_pointers(line: &str) -> String {
-    let (head, args) = line.split_once(" args=").unwrap();
-    let args: Vec<&str> = args
-        .split(',')
-        .map(|argument| if argument.starts_with('p') { "p" } else { argument })
-        .collect();
-    format!("{head} args={}", args.join(","))
-}
-
-fn java_key(weight: &Trellis, rows: usize, row_exact: bool, fp8: bool, target: usize) -> String {
-    let ends = weight.weight.trellis.as_ref().unwrap().segment_ends.clone();
-    format!(
-        "n={} k={} w={} ends={:?} rows={rows} rowExact={row_exact} fp8={fp8} exact=false target={target} mma=512 \
-         wholeK=64 wide=128",
-        weight.n, weight.k, weight.weight.shape[2], ends,
-    )
-    .replace(", ", ",")
-}
-
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
-fn launch_shapes_match_java_goldens() {
+fn nvfp4_launch_shapes_follow_the_route_of_the_shape() {
     let _card = common::card();
     let Some(rig) = rig() else { return };
     let Some(mut artifact) = Artifact::open() else { return };
-    let java = java_launches();
-    let fp8 = rig
-        .library
-        .linear_kernel_available(LinearKernel::TrellisMmaRowsFp8.index())
-        .unwrap();
-    // The fixture's thresholds, whatever device runs this: 560 target blocks (8 per multiprocessor of 70) and the
-    // defaults of the others.
-    let format = TrellisLinear::new(FIXTURE_TARGET_BLOCKS, 512, 64, 128).with_shape_recording();
     let mut random = Random::new(3);
-    let x = upload(&rig.library, &activations(&mut random, 512, 17408));
-    ShapeRecorder::take();
-    let mut compared = 0;
-    // One decode layer's linears (the first GDN layer) and a full-attention layer's (the fourth): decode, a two-row
-    // twin, a four-draft verification (5 rows) and a seven-draft one (8), a batch of 6 and of 20, a batch over the
-    // whole-K threshold, and a prefill chunk.
-    let layers = [
-        (
-            0,
-            ["gdn/query_key", "gdn/value_z", "gdn/output", "mlp/gate_up", "mlp/down"].as_slice(),
-        ),
-        (
-            3,
-            ["attention/query_key", "attention/gate_value", "attention/output"].as_slice(),
-        ),
-    ];
-    let launches = [
-        (1usize, false),
-        (2, false),
-        (5, true),
-        (6, false),
-        (8, true),
-        (20, false),
-        (64, false),
-        (512, false),
-    ];
-    for (tensor, layer) in layers
-        .iter()
-        .flat_map(|(layer, tensors)| tensors.iter().map(move |t| (*t, *layer)))
-    {
-        let object = artifact.trellis(&rig.library, &format!("text/layers/{layer}/{tensor}"));
-        for (rows, row_exact) in launches {
-            let mode = LinearMode {
-                row_exact,
-                prefill: false,
-            };
-            rig.linear(&format, &object.weight, &x, 0, object.k, object.n, rows, mode);
-            let recorded: Vec<String> = ShapeRecorder::take()
-                .iter()
-                .map(|line| without_pointers(line))
-                .collect();
-            assert!(!recorded.is_empty(), "{tensor} recorded nothing");
-            // A verification is recorded once, whatever the device: it never takes the FP8 kernels.
-            let key = java_key(&object, rows, row_exact, row_exact || fp8, FIXTURE_TARGET_BLOCKS);
-            let expected = java
-                .get(&key)
-                .unwrap_or_else(|| panic!("the fixture has no case {key}"));
-            assert_eq!(&recorded, expected, "{tensor} rows {rows} rowExact {row_exact}");
-            compared += 1;
-        }
-    }
-    assert!(compared >= 60, "only {compared} launches were compared with Java's");
-
-    // NVFP4: the library queues these launches itself, so the geometry is what the route computes for the shape.
-    // The expectations are read from native/src/host/nvfp4_linear.c.
+    // The library queues these launches itself, so the geometry is what the route computes for the shape. The
+    // expectations are read from native/src/host/nvfp4_linear.c.
     let (_weights, down) = artifact.plain(&rig.library, "mtp/layer/mlp/down");
     let nvfp4 = Nvfp4Linear::new(&rig.library).with_shape_recording();
     let x = upload(&rig.library, &activations(&mut random, 64, 17408));

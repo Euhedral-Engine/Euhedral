@@ -1,6 +1,6 @@
 //! MTP speculative decoding on a GPU: the tokens it commits are the ones greedy decode selects. The tests are
 //! `#[ignore]`d and run locally, one at a time (each loads the 12 GB artifact), through the GPU runner:
-//! `/mnt/Samsung_980_1TB/euhedral-dev/bin/gpu-run -m 24G -t 30m -- cargo test -p euhedral-inference-engine --test mtp_gpu -- --ignored --test-threads=1`.
+//! `/mnt/Samsung_980_1TB/euhedral-dev/bin/gpu-run -m 24G -t 30m -- cargo test -p euhedral-inference-engine --test device -- --ignored mtp::`.
 //!
 //! The reference is the engine's own greedy decode (`Speculation::Off`), whose tokens equal the Java engine's
 //! (`generation_gpu`). The prompts are the chat corpus of the benchmark crate. The artifact comes from
@@ -20,8 +20,7 @@
     reason = "no-wait, blocking I/O and waiting calls: a test reads files and waits on hand-offs and the device"
 )]
 
-#[path = "common/typed.rs"]
-mod typed;
+use crate::typed;
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -31,12 +30,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::common;
 use euhedral_inference_bench::prompt::PromptCorpus;
 use euhedral_inference_bench::prompt::words::DEFAULT_SEED;
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
-mod common;
 
-use common::{Card, Closer};
+use common::Card;
 use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
@@ -70,15 +69,15 @@ fn machine() -> Option<Machine> {
 
 /// The engine the tests that need no other configuration run on, one at a time.
 fn shared_engine(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
-    common::shared(|| start(machine, 4096))
+    start(machine, 4096)
 }
 
-fn start(machine: &Machine, max_tokens: u32) -> (Closer, Arc<EngineRuntime>) {
+fn start(machine: &Machine, max_tokens: u32) -> (Card, Arc<EngineRuntime>) {
     // These tests compare the state a run leaves, so each run must be cold: a prefix cache hit would restore the prompt.
     start_with_cache(machine, max_tokens, ByteSize(0))
 }
 
-fn start_with_cache(machine: &Machine, max_tokens: u32, cache: ByteSize) -> (Closer, Arc<EngineRuntime>) {
+fn settings(machine: &Machine, max_tokens: u32, cache: ByteSize) -> Settings {
     let mut settings = Settings::with_model(ModelSettings {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
@@ -86,12 +85,11 @@ fn start_with_cache(machine: &Machine, max_tokens: u32, cache: ByteSize) -> (Clo
     settings.context.max_tokens = max_tokens;
     settings.kernels.graphs.captures_per_view = 8;
     settings.prefix_cache.size = cache;
-    let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
-    let runtime = ready
-        .wait(WAIT)
-        .expect("the engine reports")
-        .expect("the engine starts");
-    (Closer::new(owner, &runtime), runtime)
+    settings
+}
+
+fn start_with_cache(machine: &Machine, max_tokens: u32, cache: ByteSize) -> (Card, Arc<EngineRuntime>) {
+    common::engine(&settings(machine, max_tokens, cache), &machine.library)
 }
 
 fn read_range(file: &mut File, range: Range<u64>) -> Vec<u8> {
@@ -382,10 +380,9 @@ fn mtp_output_equals_greedy() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn mtp_kv_and_gdn_state_equal_greedy_after_run() {
     let Some(machine) = machine() else { return };
-    let _card = common::card();
     let tokenizer = tokenizer(&machine.artifact);
     let prompt = chat_prompts(&tokenizer, 2000).swap_remove(0);
-    let (owner, runtime) = start_with_cache(&machine, 4096, ByteSize::gib(2));
+    let (_card, runtime) = start_with_cache(&machine, 4096, ByteSize::gib(2));
     let depth = runtime.plan().draft_depth as u64;
     // The request ends on a page boundary of the cache, so that every generated row is in a whole page and compared.
     let ends = (prompt.len() as u64).div_ceil(PAGE) * PAGE;
@@ -445,7 +442,6 @@ fn mtp_kv_and_gdn_state_equal_greedy_after_run() {
     let second = snapshot(&runtime, &lane);
     assert!(second.mtp_pages == got.mtp_pages, "the MTP cache is the same again");
     drop(lane);
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
@@ -501,11 +497,10 @@ fn mtp_eos_inside_accepted_drafts() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn mtp_stops_at_context_capacity() {
     let Some(machine) = machine() else { return };
-    let _card = common::card();
     let tokenizer = tokenizer(&machine.artifact);
     let base = chat_prompts(&tokenizer, 128).swap_remove(0);
     let context = 600u32;
-    let (owner, runtime) = start(&machine, context);
+    let (_card, runtime) = start(&machine, context);
     let capacity = u64::from(context);
     assert_eq!(runtime.plan().max_context_tokens as u64, capacity);
 
@@ -533,7 +528,6 @@ fn mtp_stops_at_context_capacity() {
         assert_eq!(speculative.tokens, greedy.tokens, "budget {wanted}");
         assert_eq!(speculative.outcome.reason, FinishReason::Length);
     }
-    owner.shutdown(runtime).unwrap();
 }
 
 /// A run of one engine on the long prompt.
@@ -545,8 +539,9 @@ struct LongRun {
 }
 
 fn long_run(machine: &Machine, prompt: &[u32], graphs: bool) -> LongRun {
+    // The engine is the test's own: graphs are switched off on it for good, and the first round records them.
     let _card = common::card();
-    let (owner, runtime) = start(machine, 4096);
+    let (owner, runtime) = common::start_engine(&settings(machine, 4096, ByteSize(0)), &machine.library);
     let depth = runtime.plan().draft_depth;
     if !graphs {
         assert!(runtime.disable_graphs_for_tests());

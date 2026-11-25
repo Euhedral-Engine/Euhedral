@@ -1,5 +1,5 @@
 //! The startup on a GPU, with the RCO artifact. The tests are `#[ignore]`d and run locally in a memory-capped scope:
-//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test loader_gpu -- --ignored`.
+//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored loader::`.
 //!
 //! The artifact comes from the `euhedral.qwen.rco-artifact` property and the library from `euhedral.cuda.library`
 //! (`EUHEDRAL_TEST_QWEN_RCO_ARTIFACT` and `EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, or `gradle.properties`); a
@@ -20,10 +20,9 @@
     reason = "no-wait, blocking I/O and waiting calls: a test reads files, copies device memory and waits on the hand-off"
 )]
 
-#[path = "common/typed.rs"]
-mod typed;
+use crate::typed;
 
-mod common;
+use crate::common;
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -73,6 +72,7 @@ fn settings(artifact: &Path, max_tokens: u32) -> Settings {
 
 /// Starts the engine and waits for the hand-off, as `main` does.
 fn start(settings: &Settings, library: &Path) -> (Result<Arc<EngineRuntime>, EngineError>, RuntimeOwner) {
+    common::note_load();
     let (guard, ready) = EngineRuntime::start(settings, library);
     (ready.wait(WAIT).expect("the engine reports"), guard)
 }

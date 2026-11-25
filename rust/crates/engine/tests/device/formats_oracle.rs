@@ -1,7 +1,7 @@
 //! The library's process-wide exact-numerics switch (`exact_numerics_for_tests`) on the linear formats. It is a binary of
 //! its own because the switch is seen by every launch of the process: a test beside it would run on the reference.
 //! The tests are `#[ignore]`d and run locally in a memory-capped scope:
-//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test formats_oracle_gpu -- --ignored`.
+//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored formats_oracle::`.
 
 #![allow(
     clippy::unwrap_used,
@@ -13,10 +13,8 @@
     reason = "no-wait, waiting calls: a test copies device memory and synchronizes"
 )]
 
-#[path = "common/linear_gpu.rs"]
-mod linear_gpu;
-#[path = "common/typed.rs"]
-mod typed;
+use crate::common;
+use crate::linear_gpu;
 
 use euhedral_inference_engine::formats::{LinearFormat, LinearMode, Nvfp4Linear, Q3Linear, TrellisLinear};
 use linear_gpu::{Artifact, Random, Rig, activations, compressed_head, rig, synthetic_trellis, upload, values};
@@ -31,6 +29,7 @@ const PLAIN: LinearMode = LinearMode {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn exact_numerics_run_every_launch_on_the_scalar_reference() {
+    let _light = common::light();
     let Some(rig) = rig() else { return };
     nvfp4_follows_the_switch(&rig);
     trellis_follows_the_switch(&rig);

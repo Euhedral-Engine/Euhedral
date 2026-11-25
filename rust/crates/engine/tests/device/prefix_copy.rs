@@ -17,9 +17,8 @@
     reason = "the test thread waits for the cache's answers against a deadline and runs the cache's owner on a thread"
 )]
 
-mod common;
-#[path = "common/typed.rs"]
-mod typed;
+use crate::common;
+use crate::typed;
 
 use std::fmt::Display;
 use std::num::NonZeroUsize;
@@ -272,6 +271,7 @@ impl Sequence {
 #[test]
 #[ignore = "needs a GPU"]
 fn two_sequences_capture_and_restore_their_own_bytes_at_once() {
+    let _light = common::light();
     let Some(world) = World::open() else {
         eprintln!("skipped: no CUDA library");
         return;
