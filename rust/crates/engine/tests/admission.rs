@@ -28,6 +28,22 @@ fn inputs(device_free: u64, host_pinned_bytes: Option<u64>) -> PlanInputs {
     }
 }
 
+/// Rows of a forced step beyond a prefill chunk are refused by name; up to the chunk they size the verification.
+#[test]
+fn forced_rows_up_to_the_chunk_size_the_verification_and_more_are_refused() {
+    let (config, table) = (config(), rco_table());
+    let mut settings = settings(131_072);
+    let chunk = settings.batching.prefill_chunk_tokens;
+    settings.batching.forced_rows = chunk + 1;
+    match plan_with(&config, &table, &settings, inputs(64 * GIB, Some(u64::MAX))) {
+        Err(PlanError::Setting(text)) => assert!(text.contains("batching.forced-rows"), "{text}"),
+        other => panic!("rows beyond the chunk were not refused: {other:?}"),
+    }
+    settings.batching.forced_rows = chunk;
+    let plan = plan_with(&config, &table, &settings, inputs(64 * GIB, Some(u64::MAX))).unwrap();
+    assert_eq!(plan.verified_rows(), u64::from(chunk));
+}
+
 #[test]
 fn the_location_bytes_are_the_plans_device_bytes_and_host_pages() {
     let (table, config) = (rco_table(), config());

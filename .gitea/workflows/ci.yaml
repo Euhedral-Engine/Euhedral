@@ -1,0 +1,256 @@
+# CI for Linux (Windows, ARM and the Intel SDE step stay on GitHub, which runs them
+# for the main pushes that forge-mirror sends). One workflow, so `rollover promote` finds one run per commit
+# (require_run = ["ci.yaml"]).
+#
+# The runner labels are listed below with the jobs that use them.
+# Runs for a pull request that touches a path below, for a push to main or to an integration branch (rust/next*), and by hand.
+# A push to any other branch starts nothing: the runner is shared, and the branch's pull request runs the same jobs.
+# On an integration branch the jobs run whenever anything since main touched their paths, so a later push that touches none
+# of them cannot hide a failed earlier one. A push to a rust/next* branch that is not vars.INTEGRATION_BRANCH fails at once.
+#
+# Job labels are the runner's (arbiter-docker for the cheap job, arbiter-docker-unconfined for the two heavy ones, which need
+# seccomp off). No docker job sets timeout-minutes: the arbiter's hold limit (ARBITER_EST + 60 s from the grant) is its limit.
+# No job asks for more than --mem 32G, and none uses a cpu form (scripts/lint-workflows.py checks both).
+#
+# The artifact action's major version (v4 here) is not yet proven against Gitea's artifact store, and the action needs Node
+# in the image.
+name: ci
+
+on:
+  pull_request:
+    paths:
+      - "rust/**"
+      - "native/**"
+      - "api/**"
+      - "core/**"
+      - "benchmark/**"
+      - "gradle/**"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - "native.gradle.kts"
+      - "build.gradle.kts"
+      - "mise.toml"
+      - ".gitea/workflows/**"
+      - "scripts/lint-workflows.py"
+      - "scripts/test_lint_workflows.py"
+  push:
+    branches: [main, "rust/next*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The event is part of the group, so a manual run on the integration branch never cancels the push run that
+# `rollover promote` requires for that commit. Each push to main has its own group (its sha), so no main run is
+# cancelled or replaced by a newer one: each main run diffs against the previous push.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  changes:
+    name: changes
+    runs-on: arbiter-docker
+    env:
+      ARBITER_ARGS: "--mem 1G"
+      ARBITER_EST: "60"
+    outputs:
+      rust: ${{ steps.diff.outputs.rust }}
+      native: ${{ steps.diff.outputs.native }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Test the workflow lint
+        run: python3 -m unittest scripts/test_lint_workflows.py
+      - name: Lint the memory asked by the workflows
+        run: python3 scripts/lint-workflows.py .gitea/workflows
+      - name: Decide which groups changed
+        id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          INTEGRATION_BRANCH: ${{ vars.INTEGRATION_BRANCH }}
+        run: |
+          set -euo pipefail
+          zero=0000000000000000000000000000000000000000
+
+          # The path groups of each job. mise.toml and rust/** are in both groups.
+          rust_paths=(
+            ':(glob)rust/**' ':(glob)native/include/**' ':(glob)mise.toml' ':(glob).gitea/workflows/ci.yaml'
+          )
+          native_paths=(
+            ':(glob)api/**' ':(glob)core/**' ':(glob)benchmark/**' ':(glob)gradle/**' ':(glob)settings.gradle.kts'
+            ':(glob)gradle.properties' ':(glob)native/**' ':(glob)native.gradle.kts' ':(glob)build.gradle.kts'
+            ':(glob)mise.toml' ':(glob)rust/**' ':(glob).gitea/workflows/ci.yaml'
+          )
+
+          # Guard: an integration branch other than the current one runs nothing heavy.
+          if [ "$EVENT" = push ]; then
+            case "$REF_NAME" in
+              rust/next*)
+                if [ -z "$INTEGRATION_BRANCH" ]; then
+                  echo "::error::INTEGRATION_BRANCH is empty, so $REF_NAME is not the integration branch (rollover promote sets it)"
+                  exit 1
+                fi
+                if [ "$INTEGRATION_BRANCH" != "$REF_NAME" ]; then
+                  echo "::error::$REF_NAME is not the integration branch ($INTEGRATION_BRANCH is; rollover promote sets it)"
+                  exit 1
+                fi
+                ;;
+            esac
+          fi
+
+          # Base: what the groups are compared with.
+          #   pull request       the merge base with the target branch
+          #   integration branch the merge base with main, so a later push cannot hide an earlier failure
+          #   main               the previous push; everything when it is unknown (new branch, forced push)
+          #   dispatch           everything
+          all=false
+          range=
+          case "$EVENT" in
+            pull_request)
+              range="origin/${BASE_REF#refs/heads/}...HEAD"
+              ;;
+            push)
+              if [ "$REF_NAME" = main ]; then
+                if [ -z "$BEFORE" ] || [ "$BEFORE" = "$zero" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+                  all=true
+                else
+                  range="$BEFORE..HEAD"
+                fi
+              else
+                range="origin/main...HEAD"
+              fi
+              ;;
+            *)
+              all=true
+              ;;
+          esac
+
+          # git diff --quiet: 0 means no difference, 1 a difference; anything else is an error and fails the job.
+          changed() {
+            local rc=0
+            if [ "$all" = true ]; then echo true; return; fi
+            git diff --quiet "$range" -- "$@" || rc=$?
+            case "$rc" in
+              0) echo false ;;
+              1) echo true ;;
+              *) echo "::error::git diff $range failed ($rc)" >&2; return 1 ;;
+            esac
+          }
+          rust=$(changed "${rust_paths[@]}")
+          native=$(changed "${native_paths[@]}")
+          echo "event=$EVENT ref=$REF_NAME all=$all range=${range:-none} rust=$rust native=$native"
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "native=$native" >> "$GITHUB_OUTPUT"
+
+  rust:
+    name: rust
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: arbiter-docker-unconfined
+    env:
+      ARBITER_ARGS: "--mem 32G"
+      ARBITER_EST: "1800"
+      # apt waits forever on a stalled mirror; bound each request and retry it.
+      APT_OPTS: "-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true"
+      # local/ci-base trusts only its own build directory.
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the Rust toolchain
+        run: mise install rust >/dev/null
+      - name: Install bindgen
+        run: |
+          eval "$(mise env -s bash)"
+          # shellcheck disable=SC2086 # APT_OPTS is a list of options
+          apt-get $APT_OPTS update -qq && apt-get $APT_OPTS install -y -qq --no-install-recommends libclang-dev >/dev/null
+          cargo install bindgen-cli --version 0.72.1 --locked
+      - name: Check the CUDA bindings are current
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          cargo xtask bindings --check
+      - name: Layers
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          scripts/check-layers.sh --self-test
+      - name: Check formatting
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          cargo fmt --all --check
+      - name: Lint
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          cargo clippy --workspace --all-targets -- -D warnings
+      # A build of the server alone, which does not turn on the engine's test-only features that the workspace build does.
+      - name: Check the server crates alone
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          cargo check -p euhedral-inference-server -p euhedral-inference-api-server -p euhedral-inference-bench
+      - name: Check the aarch64 kernels
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          rustup target add aarch64-unknown-linux-gnu
+          cargo check --target aarch64-unknown-linux-gnu -p euhedral-inference-host-gemv
+      - name: Test
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          cargo test --workspace
+
+  native-package:
+    name: native-package
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
+    runs-on: arbiter-docker-unconfined
+    env:
+      ARBITER_ARGS: "--mem 32G"
+      ARBITER_EST: "1800"
+      APT_OPTS: "-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true"
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/native/.zig-global-cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        run: |
+          # shellcheck disable=SC2086 # APT_OPTS is a list of options
+          apt-get $APT_OPTS update -qq && apt-get $APT_OPTS install -y -qq llvm xz-utils python3-pip gcc libc6-dev >/dev/null
+      - name: Install the toolchains
+        run: mise install >/dev/null
+      - name: Build both CUDA products and package Spring Boot
+        run: mise exec -- gradle nativeVerify :api:bootJar build
+      # Host-only native tests (no card): the programmatic-launch wait rule over the kernel sources and the registry.
+      - name: Native host tests
+        working-directory: native/tests
+        run: python3 -m unittest test_pdl_wait test_pdl_registry
+      # The Rust server bundle for linux-x64, from the native product just built.
+      - name: Bundle the Rust server (linux-x64)
+        working-directory: rust
+        run: mise exec -- cargo xtask bundle --product linux-x64
+      - name: Upload the test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit
+          path: api/build/test-results/test/*.xml
+          retention-days: 2
+      - name: Upload the server bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-server-linux-x64
+          path: build/bundle/euhedral-server-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 2
