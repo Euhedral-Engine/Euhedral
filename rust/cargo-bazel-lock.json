@@ -1,5 +1,5 @@
 {
-  "checksum": "e016a1a91fe741f04ac1098f20646911a9ca63a7873ca4642833ca0ad14626e4",
+  "checksum": "927e32a72b122d44bfebb377e310e6150b686a366081b73be0afcda469ebf002",
   "conditions": {
     "aarch64-linux-android": [],
     "cfg(all(any(target_os = \"linux\", target_os = \"android\"), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))": [],
@@ -2409,6 +2409,9 @@
     },
     "euhedral-inference-quantization 0.1.0": {
       "common_attrs": {
+        "crate_features": [
+          "test-hooks"
+        ],
         "deps": [
           {
             "id": "crc32fast 1.5.3",
@@ -2439,12 +2442,20 @@
             "target": "euhedral_io"
           },
           {
+            "id": "euhedral-memory 0.1.0",
+            "target": "euhedral_memory"
+          },
+          {
             "id": "same-file 1.0.6",
             "target": "same_file"
           },
           {
             "id": "serde_json 1.0.154",
             "target": "serde_json"
+          },
+          {
+            "id": "sha2 0.10.9",
+            "target": "sha2"
           },
           {
             "id": "thiserror 2.0.21",
