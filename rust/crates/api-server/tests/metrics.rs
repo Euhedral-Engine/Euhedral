@@ -391,9 +391,12 @@ fn a_stream_cut_after_its_head_is_timed_once() {
         assert!(Instant::now() < end, "{scrape}");
         sleep(Duration::from_millis(5));
     }
-    // Still once on a later scrape.
-    assert!(text(&fixture.get("/metrics")).contains(&counted));
-    fixture.finish();
+    // The stop returns once every connection has ended: nothing is left that could count the request again.
+    fixture.stop();
+    let mut last = fixture.server.metrics().render("m", 1, &EngineReport::default(), 0);
+    last.push_str(&fixture.server.metrics().render_platform(0));
+    assert!(last.contains(&counted), "{last}");
+    fixture.finish_after_stop();
 }
 
 #[test]

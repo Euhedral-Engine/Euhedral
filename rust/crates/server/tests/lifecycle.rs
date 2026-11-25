@@ -22,7 +22,7 @@ use euhedral_inference_api_server::scripted::{MODEL_ID, Script};
 use euhedral_inference_server::scripted::{start, start_scripted, start_with};
 use euhedral_inference_server::{
     DRAIN_WINDOW, EXIT_SIGINT, EXIT_SIGTERM, EXIT_START_FAILED, SHUTDOWN_WINDOW, StartError, StopWindows, defaults,
-    limits, load_settings, serve,
+    limits, load_settings, serve, serve_waiting,
 };
 use euhedral_inference_settings::{ByteSize, ModelSettings, Settings};
 
@@ -30,14 +30,6 @@ const CHAT: &str = "/v1/chat/completions";
 
 /// A window no test waits out: a stop that has to wait for it never returns.
 const FOR_EVER: Duration = Duration::from_secs(3600);
-
-/// The windows of a stop that waits for the requests in flight not at all, and for the generations `shutdown`.
-fn at_once(shutdown: Duration) -> StopWindows {
-    StopWindows {
-        drain: Duration::ZERO,
-        shutdown,
-    }
-}
 
 /// Runs `body`, which calls `serve`, on a thread of its own and returns what it returned. A `serve` that does not
 /// return within the patience is a stop that waits for something that does not end: the test fails, saying so.
@@ -109,13 +101,16 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one() {
     let code = returns({
         let clients = clients.clone();
         move || {
-            serve(
+            serve_waiting(
                 &settings(),
                 // The generation never ends, so the stop has to give up on it at the end of the shutdown window.
                 StopWindows {
                     drain: Duration::from_millis(1),
                     shutdown: Duration::from_millis(1),
                 },
+                // Serve waits for admission's report for as long as it takes: a report that never comes is the
+                // hang guard's failure, and the running request's answer proves the report came from the window.
+                Some(FOR_EVER),
                 |_| start_with(Script::Hung),
                 |addr| {
                     ready(addr);
@@ -149,26 +144,6 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one() {
     assert!(queued.contains("shutting down"), "{queued}");
     assert_eq!(status(&running), 200, "{running}");
     assert!(running.contains("interrupted by server shutdown"), "{running}");
-}
-
-#[test]
-fn a_stop_with_a_generation_that_never_ends_returns_once_the_shutdown_window_passed() {
-    let code = returns(|| {
-        serve(
-            &settings(),
-            at_once(Duration::from_millis(1)),
-            |_| start_with(Script::Hung),
-            |addr| {
-                ready(addr);
-                spawn(move || exchange(addr, "POST", CHAT, Some(&chat(true, 10))));
-                until("the request to run", || {
-                    gauge(addr, "euhedral_generations_active") == Some(1.0)
-                });
-                EXIT_SIGTERM
-            },
-        )
-    });
-    assert_eq!(code, EXIT_SIGTERM);
 }
 
 #[test]

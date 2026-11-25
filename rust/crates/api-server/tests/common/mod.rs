@@ -384,13 +384,21 @@ impl Raw {
 
     /// Whether the server closes the connection within the patience of a test.
     pub fn closed_by_server(&mut self) -> bool {
+        self.read_to_close().is_some()
+    }
+
+    /// Everything the server sends until it closes the connection, or `None` if it does not within the patience of a
+    /// test.
+    pub fn read_to_close(&mut self) -> Option<String> {
+        let mut seen = String::new();
         let end = Instant::now() + PATIENCE;
         while Instant::now() < end {
-            if self.read_for(Duration::from_millis(200)).is_none() {
-                return true;
+            match self.read_for(Duration::from_millis(200)) {
+                Some(more) => seen.push_str(&more),
+                None => return Some(seen),
             }
         }
-        false
+        None
     }
 }
 

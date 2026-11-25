@@ -349,9 +349,10 @@ fn stop_with_a_request_half_received_closes_the_connection() {
     fixture.wait_open(1);
     // The head and a part of the body are in: the request is waiting for the rest of its body.
     fixture.stop();
-    assert!(
-        partial.closed_by_server(),
-        "the half-received request kept its connection"
+    assert_eq!(
+        partial.read_to_close().as_deref(),
+        Some(""),
+        "the half-received request kept its connection or was answered"
     );
     assert_eq!(fixture.server.counters().open, 0);
     fixture.finish_after_stop();

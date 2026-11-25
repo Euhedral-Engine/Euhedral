@@ -327,6 +327,8 @@ struct Rig {
     lattice: Arc<ControlPlaneLattice>,
     engine: Arc<FakeEngine>,
     backend: Arc<EngineBackend>,
+    /// What each run's listener heard: once the lattice is closed, nothing more can come to it.
+    runs: Mutex<Vec<Arc<Mutex<Heard>>>>,
 }
 
 impl Rig {
@@ -342,6 +344,7 @@ impl Rig {
             lattice,
             engine,
             backend,
+            runs: Mutex::default(),
         }
     }
 
@@ -354,6 +357,7 @@ impl Rig {
     /// Runs one generation of the prompt `abc` to the listener's end, returning what it heard and how often it ended.
     fn run(&self, generation: &Arc<dyn Generation>) -> (Arc<Mutex<Heard>>, Receiver<()>) {
         let heard = Arc::new(Mutex::new(Heard::default()));
+        locked(&self.runs).push(heard.clone());
         let (tx, rx) = channel();
         generation.generate(
             EncodedPrompt {
@@ -366,15 +370,18 @@ impl Rig {
         (heard, rx)
     }
 
+    /// Closes the backend and the lattice, then checks that every listener was told its end once and no more.
     fn finish(self) {
         self.backend.close();
         self.lattice.close();
+        for heard in locked(&self.runs).iter() {
+            assert_eq!(locked(heard).results.len(), 1, "the end was not told exactly once");
+        }
     }
 }
 
 fn ended(rx: &Receiver<()>) {
     rx.recv_timeout(PATIENCE).expect("the listener was told the end");
-    assert!(rx.try_recv().is_err(), "the end was told twice");
 }
 
 #[test]

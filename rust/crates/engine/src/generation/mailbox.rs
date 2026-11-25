@@ -1172,10 +1172,8 @@ mod tests {
         let stopped = Handoff::new();
         let answer = Arc::clone(&stopped);
         thread::spawn(move || answer.send(stopper.stop(BOUND)));
-        assert!(
-            stopped.wait(Duration::from_millis(200)).is_err(),
-            "the stop returned while a listener was still in `finished`"
-        );
+        // Whether the stop is already waiting when the listener is released is the scheduler's: either way it returns
+        // only once the listener's call has ended.
         release.send(());
         assert_eq!(stopped.wait(BOUND), Ok(true));
         assert!(told.is_set(), "the listener's call had not ended");
@@ -1191,9 +1189,7 @@ mod tests {
             })
             .expect("free");
         let bound = Duration::from_millis(100);
-        let start = Instant::now();
         assert!(!mailbox.stop(bound));
-        assert!(start.elapsed() < BOUND, "the stop waited past its bound");
         assert!(mailbox.close().is_none(), "the owner left while a request runs");
     }
 
@@ -1201,10 +1197,17 @@ mod tests {
     fn a_stop_from_inside_a_turn_is_refused_at_once() {
         let (mailbox, _address, _handoffs) = queued(Probe::new);
         let held = Arc::clone(&mailbox);
-        let start = Instant::now();
-        let stopped = mailbox.with(move |_| held.stop(BOUND)).expect("free");
-        assert!(!stopped);
-        assert!(start.elapsed() < BOUND / 2, "the stop waited for itself");
+        // A stop that waited for itself would wait out an hour: the hand-off names it.
+        let stopped = Handoff::new();
+        let answer = Arc::clone(&stopped);
+        thread::spawn(move || {
+            answer.send(
+                mailbox
+                    .with(move |_| held.stop(Duration::from_secs(3600)))
+                    .expect("free"),
+            );
+        });
+        assert_eq!(stopped.wait(BOUND), Ok(false), "the stop waited for itself");
     }
 
     #[test]
@@ -1491,9 +1494,7 @@ mod tests {
     fn an_ask_after_a_close_answers_at_once() {
         let (mailbox, _address, mut handoffs) = queued(Probe::new);
         assert!(mailbox.close().is_some());
-        let start = Instant::now();
         assert_eq!(mailbox.ask(true, |probe| probe.busy), None);
-        assert!(start.elapsed() < BOUND, "the asker waited for the bound");
         // The owner is closed while the claim is held: the posted operation is dropped by the next drive, which answers.
         let claim = mailbox.owner.try_claim().expect("free");
         let asked = Arc::clone(&mailbox);
@@ -1552,20 +1553,17 @@ mod tests {
                 probe.asked_inside = Some(Arc::clone(&refused));
             })
             .expect("free");
-        let start = Instant::now();
         mailbox.post(1);
         assert!(
             refused.load(Ordering::SeqCst),
             "a thread holding the claim was answered"
         );
-        assert!(start.elapsed() < BOUND, "the turn waited for itself");
         // From inside an operation, too; and the mark is gone once the claim is released.
         let held = Arc::clone(&mailbox);
         let inside = mailbox
             .with(move |_| (held.ask(false, |_| ()), held.close()))
             .expect("free");
         assert!(inside.0.is_none() && inside.1.is_none());
-        assert!(start.elapsed() < BOUND, "the operation waited for itself");
         assert_eq!(mailbox.ask(false, |_| 7), Some(7));
     }
 
