@@ -699,3 +699,31 @@ fn a_hostile_tensor_count_is_a_truncated_table() {
     assert!(matches!(parse(&file), Err(EdrlError::Truncated { .. })));
     assert_eq!(parsed.header.tensor_count(), 11);
 }
+
+fn entry_at(name: &str, offset: u64) -> TensorEntry {
+    TensorEntry::new(
+        name,
+        vec![4],
+        TensorDataType::Bf16,
+        WeightFormat::Bf16,
+        WeightLayout::ContiguousLeV1,
+        offset,
+        8,
+    )
+}
+
+#[test]
+fn a_table_of_entries_keeps_their_order_and_lets_payloads_of_different_files_share_offsets() {
+    let table = TensorTable::from_entries(vec![entry_at("b", 4096), entry_at("a", 4096)]).unwrap();
+    let names: Vec<&str> = table.entries().iter().map(TensorEntry::name).collect();
+    assert_eq!(names, ["b", "a"]);
+    assert_eq!(table.get("a").unwrap().offset(), table.get("b").unwrap().offset());
+}
+
+#[test]
+fn a_table_of_entries_refuses_a_name_twice() {
+    assert!(matches!(
+        TensorTable::from_entries(vec![entry_at("a", 0), entry_at("a", 64)]),
+        Err(EdrlError::DuplicateName { name }) if name == "a"
+    ));
+}
