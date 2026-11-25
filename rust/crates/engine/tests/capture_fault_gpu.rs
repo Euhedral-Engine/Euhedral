@@ -190,6 +190,7 @@ struct Case {
 fn fails_and_recovers(case: Case) {
     let Case { fault, sighting, keeps } = case;
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let (closer, runtime) = start(&machine);
     let buffer = Arc::new(());
     let before = graphs(&runtime);

@@ -36,7 +36,7 @@ use euhedral_inference_bench::prompt::words::DEFAULT_SEED;
 use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
 mod common;
 
-use common::Closer;
+use common::{Card, Closer};
 use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
@@ -66,6 +66,11 @@ fn machine() -> Option<Machine> {
         return None;
     }
     Some(Machine { artifact, library })
+}
+
+/// The engine the tests that need no other configuration run on, one at a time.
+fn shared_engine(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
+    common::shared(|| start(machine, 4096))
 }
 
 fn start(machine: &Machine, max_tokens: u32) -> (Closer, Arc<EngineRuntime>) {
@@ -316,7 +321,7 @@ fn mtp_output_equals_greedy() {
     let Some(machine) = machine() else { return };
     let tokenizer = tokenizer(&machine.artifact);
     let eos = tokenizer.eos_ids().to_vec();
-    let (owner, runtime) = start(&machine, 4096);
+    let (_card, runtime) = shared_engine(&machine);
     let depth = runtime.plan().draft_depth;
     assert!(depth > 0, "the artifact drafts");
     // Each quantum of a step reads its own input record, and the record index wraps over the records the workspace holds.
@@ -371,13 +376,13 @@ fn mtp_output_equals_greedy() {
         "accepted drafts per verification over all prompts: {total:?}, mean {:.3}",
         mean_accepted(&total)
     );
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn mtp_kv_and_gdn_state_equal_greedy_after_run() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let tokenizer = tokenizer(&machine.artifact);
     let prompt = chat_prompts(&tokenizer, 2000).swap_remove(0);
     let (owner, runtime) = start_with_cache(&machine, 4096, ByteSize::gib(2));
@@ -449,7 +454,7 @@ fn mtp_eos_inside_accepted_drafts() {
     let Some(machine) = machine() else { return };
     let tokenizer = tokenizer(&machine.artifact);
     let prompt = chat_prompts(&tokenizer, 128).swap_remove(0);
-    let (owner, runtime) = start(&machine, 4096);
+    let (_card, runtime) = shared_engine(&machine);
     let depth = runtime.plan().draft_depth;
     let reference = generate(&runtime, &prompt, 128, &[], Speculation::Artifact);
     assert_eq!(reference.tokens.len(), 128);
@@ -490,13 +495,13 @@ fn mtp_eos_inside_accepted_drafts() {
     // The engine serves the next request from a reset sequence.
     let again = generate(&runtime, &prompt, 128, &[], Speculation::Artifact);
     assert_eq!(again.tokens, reference.tokens);
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn mtp_stops_at_context_capacity() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let tokenizer = tokenizer(&machine.artifact);
     let base = chat_prompts(&tokenizer, 128).swap_remove(0);
     let context = 600u32;
@@ -540,6 +545,7 @@ struct LongRun {
 }
 
 fn long_run(machine: &Machine, prompt: &[u32], graphs: bool) -> LongRun {
+    let _card = common::card();
     let (owner, runtime) = start(machine, 4096);
     let depth = runtime.plan().draft_depth;
     if !graphs {

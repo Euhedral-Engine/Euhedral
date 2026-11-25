@@ -200,6 +200,7 @@ fn cases() -> Vec<(&'static str, Vec<u32>, SamplingConfig, usize)> {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_restored_prefix_gives_the_tokens_of_a_cold_run() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     // The cold references: the cache is off.
     let (owner, runtime) = start(&machine, 1, ByteSize(0));
     let cold: Vec<Recording> = cases()
@@ -234,6 +235,7 @@ fn a_restored_prefix_gives_the_tokens_of_a_cold_run() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_request_on_one_sequence_restores_what_another_captured() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let (owner, runtime) = start(&machine, 2, ByteSize::gib(2));
     let shared = prompt(0, LENGTH);
     let first = generate(&runtime, &shared, SamplingConfig::greedy(0));
@@ -272,6 +274,7 @@ fn a_request_on_one_sequence_restores_what_another_captured() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_request_cancelled_while_its_restore_runs_leaves_the_sequence_clean() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let (owner, runtime) = start(&machine, 1, ByteSize::gib(2));
     let shared = prompt(0, LENGTH);
     let first = generate(&runtime, &shared, SamplingConfig::greedy(0));
@@ -330,6 +333,7 @@ enum Point {
 /// upload reads pinned staging) is cancelled at `point`: the sequence the next request gets back is clean.
 fn cancel_on_a_fresh_sequence(point: Point) {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let (owner, runtime) = start(&machine, 2, ByteSize::gib(2));
     let shared = prompt(0, LENGTH);
     let first = generate(&runtime, &shared, SamplingConfig::greedy(0));
@@ -414,6 +418,7 @@ fn a_request_cancelled_with_its_first_chunk_behind_the_restore_leaves_a_fresh_se
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn closing_the_engine_while_a_capture_runs_ends_within_its_bound() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let (owner, runtime) = start(&machine, 1, ByteSize::gib(2));
     let started = Handoff::new();
     let once = Arc::new(AtomicBool::new(false));

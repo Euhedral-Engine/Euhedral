@@ -29,6 +29,8 @@ use typed::Typed;
 
 mod common;
 
+use common::Card;
+
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Display;
 use std::mem;
@@ -225,10 +227,14 @@ struct World {
     lattice: Arc<ControlPlaneLattice>,
     lake: Arc<Lake>,
     unit: Option<UnitGuard>,
+    /// The card, held until the world is gone: a capture in one thread fails when another thread of the process
+    /// allocates or synchronizes meanwhile, so the tests of this binary take turns.
+    _card: Card,
 }
 
 impl World {
     fn open() -> Option<World> {
+        let card = common::card();
         let model = shared_model()?;
         let library = library()?;
         let config = reduced_config();
@@ -297,6 +303,7 @@ impl World {
             lattice,
             lake,
             unit: Some(unit),
+            _card: card,
         })
     }
 
@@ -996,9 +1003,12 @@ struct Light {
     released: Arc<ReleasedBuffers>,
     config: Arc<ModelConfig>,
     workspace: Arc<Workspace>,
+    /// The card, held until the world is gone (see [`World`]).
+    _card: Card,
 }
 
 fn light() -> Option<Light> {
+    let card = common::card();
     let library = library()?;
     let config = reduced_config();
     let typed = Typed::plain(&library, 1, 1024);
@@ -1023,6 +1033,7 @@ fn light() -> Option<Light> {
         typed,
         config,
         workspace,
+        _card: card,
     })
 }
 

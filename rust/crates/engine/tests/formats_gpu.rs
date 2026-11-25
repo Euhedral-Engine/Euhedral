@@ -25,6 +25,7 @@
     reason = "no-wait, waiting calls: a test copies device memory and synchronizes"
 )]
 
+mod common;
 #[path = "common/linear_gpu.rs"]
 mod linear_gpu;
 #[path = "common/typed.rs"]
@@ -74,6 +75,7 @@ fn run(
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn linear_bitwise_matches_reference_oracle() {
+    let _card = common::card();
     let Some(rig) = rig() else { return };
     let mut random = Random::new(7);
     // Mirrors Java's `everyRouteAgreesWithTheScalarReference`: the routes sum in other orders than the scalar
@@ -194,6 +196,7 @@ fn linear_bitwise_matches_reference_oracle() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_repeated_tile_prefill_encodes_no_tensor_map() {
+    let _card = common::card();
     use euhedral_inference_cuda::launch::load::tensor_map_counts;
     let Some(rig) = rig() else { return };
     if !rig.library.nvfp4_native_available() {
@@ -222,6 +225,7 @@ fn a_repeated_tile_prefill_encodes_no_tensor_map() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn row_twins_equal_single_rows() {
+    let _card = common::card();
     let Some(rig) = rig() else { return };
     let mut random = Random::new(11);
     // A trellis object of a decode layer's size: 18 K splits at the default 8 blocks per multiprocessor of 70.
@@ -306,6 +310,7 @@ fn java_key(weight: &Trellis, rows: usize, row_exact: bool, fp8: bool, target: u
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn launch_shapes_match_java_goldens() {
+    let _card = common::card();
     let Some(rig) = rig() else { return };
     let Some(mut artifact) = Artifact::open() else { return };
     let java = java_launches();
@@ -392,12 +397,17 @@ fn launch_shapes_match_java_goldens() {
         ["euhedral_nvfp4_decode_groups3_w4 grid=160,1,1 block=128,1,1 smem=0"]
     );
     if rig.library.nvfp4_native_available() {
+        // The K split aims at two blocks per multiprocessor of the device over the 80 column tiles of the 5120 rows
+        // (`skinny_splits`), at most half the 68 K tiles of 256.
+        let splits = skinny_target_ctas(rig.library.device().sm_count)
+            .div_ceil(80)
+            .clamp(1, 34);
         assert_eq!(
             record(12, PLAIN),
             [
-                "euhedral_nvfp4n_quantize_rows grid=12,1,1 block=128,1,1 smem=0",
-                "euhedral_nvfp4n_skinny_16 grid=80,2,1 block=128,1,1 smem=61440",
-                "euhedral_nvfp4n_skinny_finish grid=240,1,1 block=256,1,1 smem=0",
+                "euhedral_nvfp4n_quantize_rows grid=12,1,1 block=128,1,1 smem=0".to_string(),
+                format!("euhedral_nvfp4n_skinny_16 grid=80,{splits},1 block=128,1,1 smem=61440"),
+                "euhedral_nvfp4n_skinny_finish grid=240,1,1 block=256,1,1 smem=0".to_string(),
             ]
         );
     }
@@ -406,6 +416,7 @@ fn launch_shapes_match_java_goldens() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn kernel_tables_and_scratch_match_the_native_library() {
+    let _card = common::card();
     let Some(rig) = rig() else { return };
     assert_eq!(rig.library.linear_kernel_count(), LinearKernel::ALL.len());
     for kernel in LinearKernel::ALL {
@@ -437,6 +448,7 @@ fn kernel_tables_and_scratch_match_the_native_library() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn q3_embedding_looks_up_token_rows() {
+    let _card = common::card();
     let Some(rig) = rig() else { return };
     let Some(mut artifact) = Artifact::open() else { return };
     let (_table, weight) = artifact.plain(&rig.library, "text/token_embedding");
@@ -490,6 +502,7 @@ fn q3_embedding_looks_up_token_rows() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn real_trellis_objects_agree_with_the_scalar_reference() {
+    let _card = common::card();
     let Some(rig) = rig() else { return };
     let Some(mut artifact) = Artifact::open() else { return };
     let sm_count = rig.library.device().sm_count;
@@ -535,6 +548,7 @@ fn real_trellis_objects_agree_with_the_scalar_reference() {
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_mapped_head_computes_the_device_heads_logits() {
+    let _card = common::card();
     let Some(rig) = rig() else { return };
     let Some(mut artifact) = Artifact::open() else { return };
     let entry = artifact.table().get(OUTPUT_HEAD).unwrap();
@@ -588,6 +602,7 @@ fn a_mapped_head_computes_the_device_heads_logits() {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_compressed_tensor_run_in_chunks_equals_its_whole_expansion() {
+    let _card = common::card();
     let Some(rig) = rig() else { return };
     let (out, k) = (70_016usize, 5120usize);
     let mut random = Random::new(29);
