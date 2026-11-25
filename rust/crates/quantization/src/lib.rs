@@ -8,6 +8,8 @@
 //!   chains them on a lane: scales, LDLQ through the Viterbi encode and the refit.
 //! - [`npy`] and [`npz`]: the NumPy array and archive formats the calibration state and the fixtures use. Both work
 //!   on bytes the caller supplies or takes; neither opens a file.
+//! - [`forward`]: one decoder layer in BF16 on the engine's kernels, with the weights loaded for it and an observer of
+//!   each quantized linear's input.
 //! - [`memory`]: stream-ordered device buffers, pooled pinned staging and the claims that account for them, which
 //!   the GPTQ rounding and the trellis quantizer share.
 //! - [`kld`]: the reference logits file the scorer and the reference writer share, opened and read through `AsyncIo`.
@@ -28,6 +30,7 @@ mod chain;
 pub mod checkpoint;
 pub mod durable;
 pub mod exl3;
+pub mod forward;
 pub mod gptq;
 pub mod java_random;
 pub mod kernels;
