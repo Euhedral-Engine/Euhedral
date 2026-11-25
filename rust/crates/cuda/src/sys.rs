@@ -67,6 +67,7 @@ pub struct EuhedralCuda {
         in_features: u32,
         out_features: u32,
     ) -> u64,
+    pub euhedral_cuda_q3_mx_available: unsafe extern "C" fn() -> ::std::os::raw::c_int,
     pub euhedral_cuda_synchronize: unsafe extern "C" fn() -> ::std::os::raw::c_int,
     pub euhedral_cuda_stream_select: unsafe extern "C" fn(
         stream: u64,
@@ -148,6 +149,9 @@ impl EuhedralCuda {
         let euhedral_cuda_nvfp4_native_scratch_bytes = __library
             .get(b"euhedral_cuda_nvfp4_native_scratch_bytes\0")
             .map(|sym| *sym)?;
+        let euhedral_cuda_q3_mx_available = __library
+            .get(b"euhedral_cuda_q3_mx_available\0")
+            .map(|sym| *sym)?;
         let euhedral_cuda_synchronize = __library
             .get(b"euhedral_cuda_synchronize\0")
             .map(|sym| *sym)?;
@@ -189,6 +193,7 @@ impl EuhedralCuda {
             euhedral_cuda_select_exact_numerics,
             euhedral_cuda_nvfp4_native_available,
             euhedral_cuda_nvfp4_native_scratch_bytes,
+            euhedral_cuda_q3_mx_available,
             euhedral_cuda_synchronize,
             euhedral_cuda_stream_select,
             euhedral_cuda_stream_clear,
@@ -311,6 +316,9 @@ impl EuhedralCuda {
         out_features: u32,
     ) -> u64 {
         (self.euhedral_cuda_nvfp4_native_scratch_bytes)(rows, in_features, out_features)
+    }
+    pub unsafe fn euhedral_cuda_q3_mx_available(&self) -> ::std::os::raw::c_int {
+        (self.euhedral_cuda_q3_mx_available)()
     }
     pub unsafe fn euhedral_cuda_synchronize(&self) -> ::std::os::raw::c_int {
         (self.euhedral_cuda_synchronize)()

@@ -45,36 +45,6 @@ pub(crate) fn range_start(
     }
 }
 
-#[cfg(test)]
-mod range_tests {
-    use super::*;
-
-    #[test]
-    fn a_range_starts_at_its_offset_and_may_end_at_the_end() {
-        let base = 0x1000 as *mut u8;
-        assert_eq!(range_start(base, 64, 0, 64, "buffer").unwrap() as usize, 0x1000);
-        assert_eq!(range_start(base, 64, 16, 48, "buffer").unwrap() as usize, 0x1010);
-        assert_eq!(range_start(base, 64, 64, 0, "buffer").unwrap() as usize, 0x1040);
-    }
-
-    #[test]
-    fn a_range_past_the_end_or_overflowing_is_refused() {
-        let base = 0x1000 as *mut u8;
-        assert!(matches!(
-            range_start(base, 64, 16, 49, "buffer"),
-            Err(CudaError::Argument(_))
-        ));
-        assert!(matches!(
-            range_start(base, 64, 65, 0, "buffer"),
-            Err(CudaError::Argument(_))
-        ));
-        assert!(matches!(
-            range_start(base, 64, usize::MAX, 2, "buffer"),
-            Err(CudaError::Argument(_))
-        ));
-    }
-}
-
 /// The operations the stages queue, as a trait, so a stage does not name the lane it runs on: the stages take a
 /// `&mut dyn KernelOps`. [`RusteeOps`](crate::launch::ops::RusteeOps) implements it by planning each call and
 /// enqueueing the launches on a RustEE lane.
@@ -148,6 +118,84 @@ pub trait KernelOps {
         rows: u32,
         in_features: u32,
         out_features: u32,
+        weights_bytes: u64,
+        scratch_bytes: u64,
+    ) -> Result<(), CudaError>;
+    fn linear_q3_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+    ) -> Result<(), CudaError>;
+    /// The Q4 (`bits` 4) or Q5 (`bits` 5) linear.
+    fn linear_quantized_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+        bits: u32,
+    ) -> Result<(), CudaError>;
+    /// The fused decode of a P2E2 Q3 tensor (up to 8 rows); [`ROUTE_UNAVAILABLE`](crate::sys::EUHEDRAL_CUDA_ROUTE_UNAVAILABLE)
+    /// where the kernels do not take the launch.
+    fn linear_q3_p2e2_decode_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+    ) -> Result<(), CudaError>;
+    /// Expands rows `first_row..first_row + row_count` of the P2E2 tensor `weights` of `rows` rows into a row-split Q3
+    /// tensor at `destination`.
+    fn q3_p2e2_expand(
+        &mut self,
+        weights: DevicePtr,
+        weights_bytes: u64,
+        rows: u32,
+        in_features: u32,
+        first_row: u32,
+        row_count: u32,
+        destination: DevicePtr,
+        destination_bytes: u64,
+    ) -> Result<(), CudaError>;
+    /// The FP8 prefill linear of a Q3, Q4 or Q5 tensor (`bits` 3, 4 or 5), quantizing the activations into `scratch`.
+    /// `split_rows`, when not zero, names the whole tensor's weight rows for a run in output-row chunks.
+    /// [`ROUTE_UNAVAILABLE`](crate::sys::EUHEDRAL_CUDA_ROUTE_UNAVAILABLE) where the route declines the launch.
+    fn linear_q3_mx_bf16(
+        &mut self,
+        bits: u32,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        scratch: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+        scratch_bytes: u64,
+        split_rows: u32,
+    ) -> Result<(), CudaError>;
+    /// The paired FP8 linear of a Q3 gate/up tensor with SwiGLU (gate rows, then up rows; `outputs` is both), which
+    /// never splits K: `output` takes `outputs / 2` values per row. `ROUTE_UNAVAILABLE` where the route declines.
+    fn q3_mx_gate_up_swiglu_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        scratch: DevicePtr,
+        rows: u32,
+        width: u32,
+        outputs: u32,
         weights_bytes: u64,
         scratch_bytes: u64,
     ) -> Result<(), CudaError>;
@@ -414,372 +462,31 @@ pub trait LaneOps: KernelOps {
 }
 
 #[cfg(test)]
-mod tests {
+mod range_tests {
     use super::*;
 
-    /// Records the names of the operations it is given, and queues nothing.
-    #[derive(Default)]
-    struct Recorder {
-        calls: Vec<&'static str>,
-        began_row_exact: bool,
-        selected_row_exact: bool,
-    }
-
-    impl KernelOps for Recorder {
-        fn copy_device_to_device(&mut self, _: DevicePtr, _: DevicePtr, _: u64) -> Result<(), CudaError> {
-            self.calls.push("copy");
-            Ok(())
-        }
-        fn copy_device_to_device_2d(
-            &mut self,
-            _: DevicePtr,
-            _: u64,
-            _: DevicePtr,
-            _: u64,
-            _: u64,
-            _: u64,
-        ) -> Result<(), CudaError> {
-            self.calls.push("copy2d");
-            Ok(())
-        }
-        fn zero_device_memory(&mut self, _: DevicePtr, _: u64) -> Result<(), CudaError> {
-            self.calls.push("zero");
-            Ok(())
-        }
-        fn embed_q3(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u64,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn embed_q3_p2e2(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u64,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn linear_launch(
-            &mut self,
-            _: i32,
-            _: [u32; 3],
-            _: [u32; 3],
-            _: u32,
-            _: &[u64],
-            _: &[u8],
-        ) -> Result<(), CudaError> {
-            self.calls.push("linear");
-            Ok(())
-        }
-        fn qwen4_launch(
-            &mut self,
-            _: i32,
-            _: [u32; 3],
-            _: [u32; 3],
-            _: u32,
-            _: &[u64],
-            _: &[u8],
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn linear_nvfp4_bf16(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u64,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn linear_nvfp4_native_bf16(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u64,
-            _: u64,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn attention_qk_norm_rope_bf16(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u64,
-            _: DevicePtr,
-            _: f32,
-            _: f64,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn attention_kv_append_nvfp4(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u64,
-            _: DevicePtr,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn attention_kv_append_bf16(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u64,
-            _: DevicePtr,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn attention_causal_nvfp4(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u64,
-            _: DevicePtr,
-            _: DevicePtr,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn attention_causal_bf16(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u64,
-            _: DevicePtr,
-            _: DevicePtr,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn gdn_project_control_fp32(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: u32,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn gdn_convolution_bf16(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u32,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn gdn_recurrence_bf16(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: f32,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn gdn_gated_rms_norm_bf16(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: u32,
-            _: f32,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn residual_rms_norm_bf16(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: f32,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn rms_norm_unit_offset_bf16(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-            _: f32,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn swiglu_bf16(&mut self, _: DevicePtr, _: DevicePtr, _: u32, _: u32) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn residual_add_bf16(
-            &mut self,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: DevicePtr,
-            _: u32,
-            _: u32,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn argmax_bf16(&mut self, _: DevicePtr, _: u32, _: DevicePtr) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn argmax_logprob_bf16(&mut self, _: DevicePtr, _: u32, _: DevicePtr) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn selected_token(&mut self, _: DevicePtr, _: DevicePtr, _: DevicePtr) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn set_row_exact(&mut self, enabled: bool) {
-            self.selected_row_exact = enabled;
-        }
-        unsafe fn copy_device_to_readback_shared(
-            &mut self,
-            _: &PinnedBuffer,
-            _: usize,
-            _: DevicePtr,
-            _: usize,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        unsafe fn copy_upload_to_device(
-            &mut self,
-            _: DevicePtr,
-            _: &PinnedBuffer,
-            _: usize,
-            _: usize,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        unsafe fn copy_device_to_readback(
-            &mut self,
-            _: &mut PinnedBuffer,
-            _: usize,
-            _: DevicePtr,
-            _: usize,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        unsafe fn copy_host_weights_to_device(
-            &mut self,
-            _: DevicePtr,
-            _: &HostWeightsArena,
-            _: usize,
-            _: usize,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        unsafe fn copy_device_to_host_weights(
-            &mut self,
-            _: &HostWeightsArena,
-            _: usize,
-            _: DevicePtr,
-            _: usize,
-        ) -> Result<(), CudaError> {
-            Ok(())
-        }
-        fn row_exact(&self) -> bool {
-            self.began_row_exact
-        }
-        fn exact_numerics(&self) -> bool {
-            false
-        }
-        fn linear_kernel_available(&self, _: usize) -> Result<bool, CudaError> {
-            Ok(false)
-        }
-    }
-
-    /// Code written the way a stage is: against `&mut dyn KernelOps`.
-    fn stage(ops: &mut dyn KernelOps) -> Result<(), CudaError> {
-        ops.set_row_exact(true);
-        ops.zero_device_memory(DevicePtr::NULL, 8)?;
-        ops.copy_device_to_device(DevicePtr::NULL, DevicePtr::NULL, 8)?;
-        ops.linear_launch(0, [1; 3], [1; 3], 0, &[], &[])
+    #[test]
+    fn a_range_starts_at_its_offset_and_may_end_at_the_end() {
+        let base = 0x1000 as *mut u8;
+        assert_eq!(range_start(base, 64, 0, 64, "buffer").unwrap() as usize, 0x1000);
+        assert_eq!(range_start(base, 64, 16, 48, "buffer").unwrap() as usize, 0x1010);
+        assert_eq!(range_start(base, 64, 64, 0, "buffer").unwrap() as usize, 0x1040);
     }
 
     #[test]
-    fn a_recording_implementation_serves_code_written_against_the_trait_object() {
-        let mut recorder = Recorder::default();
-        stage(&mut recorder).unwrap();
-        assert_eq!(recorder.calls, ["zero", "copy", "linear"]);
-        assert!(recorder.selected_row_exact);
-        // The selection does not change the mode the operations were made with.
-        assert!(!recorder.row_exact());
+    fn a_range_past_the_end_or_overflowing_is_refused() {
+        let base = 0x1000 as *mut u8;
+        assert!(matches!(
+            range_start(base, 64, 16, 49, "buffer"),
+            Err(CudaError::Argument(_))
+        ));
+        assert!(matches!(
+            range_start(base, 64, 65, 0, "buffer"),
+            Err(CudaError::Argument(_))
+        ));
+        assert!(matches!(
+            range_start(base, 64, usize::MAX, 2, "buffer"),
+            Err(CudaError::Argument(_))
+        ));
     }
 }

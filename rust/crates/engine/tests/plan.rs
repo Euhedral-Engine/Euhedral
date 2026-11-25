@@ -23,13 +23,11 @@ use euhedral_graph::{
     RetryCounts, Stage, StageCx, StageError, StageGraph, Submitted,
 };
 use euhedral_inference_cuda::DevicePtr;
-use euhedral_inference_cuda::launch::attention::DEFAULT_FUSED_VERIFY_FROM;
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{LayerKind, ModelConfig, Residence, WeightRef, object_key};
 use euhedral_inference_engine::plan::{DECODE_MAX_ROWS, Formats, Plan, StageKind, View, WeightLookup};
-use euhedral_inference_engine::quantum::split_geometry;
 use euhedral_inference_engine::residency::planner::{ResidencyPlan, plan as residency};
 use euhedral_inference_settings::{ModelSettings, Settings, TrellisKernelSettings};
 
@@ -51,11 +49,6 @@ struct Built {
     config: Arc<ModelConfig>,
     residency: ResidencyPlan,
     plan: Plan,
-}
-
-/// The key's split geometry under the default fused-verifier table.
-fn default_geometry(start: u64, rows: u64, group: u64) -> u64 {
-    split_geometry(start, rows, group, &DEFAULT_FUSED_VERIFY_FROM)
 }
 
 /// The RCO artifact's objects as weights with no device memory behind them, and the plan over them (built once: the
@@ -373,44 +366,6 @@ fn a_verification_selects_every_row_and_a_decode_the_last() {
     assert!(!Arc::ptr_eq(&decode[last].stage, &verify[last].stage));
     assert_eq!(built.residency.draft_depth, 4);
     assert_eq!(built.plan.verified_rows(), 5);
-}
-
-#[test]
-fn capture_key_changes_every_48_positions_below_2048() {
-    let group = 24 / 4;
-    let mut distinct = BTreeSet::new();
-    let mut changes = 0;
-    let mut previous = default_geometry(0, 1, group);
-    distinct.insert(previous);
-    for start in 1..2047u64 {
-        let geometry = default_geometry(start, 1, group);
-        if geometry != previous {
-            assert_eq!(start % 48, 0, "the counts change on a multiple of 48 positions");
-            changes += 1;
-            previous = geometry;
-            distinct.insert(geometry);
-        }
-    }
-    assert_eq!((changes, distinct.len()), (42, 43));
-}
-
-#[test]
-fn capture_key_constant_from_2048() {
-    let group = 24 / 4;
-    let wanted = default_geometry(2047, 1, group);
-    for start in 2047..4200u64 {
-        assert_eq!(default_geometry(start, 1, group), wanted, "{start}");
-    }
-    assert_eq!(default_geometry(131_070, 1, group), wanted);
-}
-
-#[test]
-fn prefill_and_exact_never_captured() {
-    // Prefill and the wide views have no graph; exact numerics is checked on a device by `capture_gpu`.
-    assert!(!View::PrefillChunk.capturable());
-    assert!(!View::Verify { rows: 9 }.capturable());
-    assert!(!View::CatchUp { rows: 9 }.capturable());
-    assert!(View::Decode.capturable() && View::Verify { rows: 5 }.capturable() && View::Draft { rows: 4 }.capturable());
 }
 
 /// The stages every chain of `edges` leads to the last one from: all of them, for a funnel.

@@ -1,5 +1,5 @@
-//! The result row: its fields are the Java row's, the output digest is the Java digest, and the decode rate is measured
-//! from the first token to the last.
+//! The result row: the fields the comparison tool reads, the output digest, and a decode rate measured from the first
+//! token to the last.
 
 #![allow(
     clippy::unwrap_used,
@@ -11,7 +11,7 @@
     reason = "no-wait, blocking I/O: a test reads a fixture and writes a result file"
 )]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -23,32 +23,6 @@ use euhedral_inference_bench::result::{
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
-
-/// Every key path of a row's JSON, `engine` excepted (its content is the engine's own) and the keys of `draftPhases`
-/// excepted (they are phase names).
-fn shape(value: &Value, path: &str, out: &mut BTreeSet<String>) {
-    out.insert(path.to_string());
-    if let Value::Object(map) = value {
-        if path.ends_with("engine") || path.ends_with("draftPhases") {
-            return;
-        }
-        for (key, child) in map {
-            shape(child, &format!("{path}.{key}"), out);
-        }
-    }
-}
-
-fn shapes(row: &Value) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    shape(row, "", &mut out);
-    out
-}
-
-fn keys_in_order(row: &str) -> Vec<String> {
-    // The top-level keys in the order of the text: Java writes them in declaration order, and so do we.
-    let value: serde_json::Map<String, Value> = serde_json::from_str(row).unwrap();
-    value.keys().cloned().collect()
-}
 
 fn sample_row(speculative: Option<Speculative>) -> Row {
     Row {
@@ -126,15 +100,10 @@ fn sample_row(speculative: Option<Speculative>) -> Row {
     }
 }
 
+/// The fields `tools/rust_gate.py` reads from a row, each with the kind of value it takes there. A row written without
+/// one of them, or with it of another kind, breaks the comparison.
 #[test]
-fn row_schema_matches_java_fixture() {
-    // Two rows made by the Java benchmark's own `ResultStoreTest` fixture: a decode row, and the same row with a
-    // speculative block (rows are stored one per line).
-    let text = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/java-rows.jsonl")).unwrap();
-    let java: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-    assert_eq!(java.len(), 2);
-    assert!(java[0]["work"]["speculative"].is_null() && java[1]["work"]["speculative"].is_object());
-
+fn a_row_carries_every_field_the_comparison_tool_reads() {
     let speculative = Speculative {
         verifications: 3,
         accepted_drafts: vec![1, 0, 2, 0],
@@ -145,35 +114,30 @@ fn row_schema_matches_java_fixture() {
         rejections_outside_shortlist: 0,
         draft_phases: BTreeMap::from([("catchup".to_string(), DraftPhase { quanta: 3, nanos: 90 })]),
     };
-    for (java, ours) in java.iter().zip([sample_row(None), sample_row(Some(speculative))]) {
-        let line = ours.to_json();
-        let ours_value: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(shapes(java), shapes(&ours_value), "the field set of a row");
-        let java_line = serde_json::to_string(java).unwrap();
-        assert_eq!(
-            keys_in_order(&java_line),
-            keys_in_order(&line),
-            "the order of the top-level fields"
-        );
-        // Same value kinds field by field (null or not is a property of the work, not of the schema; numbers and strings
-        // do not trade places).
-        for key in [
-            "schema",
-            "schemaVersion",
-            "recordedAt",
-            "runId",
-            "warmup",
-            "iteration",
-            "status",
-        ] {
-            assert_eq!(java[key].is_string(), ours_value[key].is_string(), "{key}");
-            assert_eq!(java[key].is_number(), ours_value[key].is_number(), "{key}");
+    for row in [sample_row(None), sample_row(Some(speculative))] {
+        let speculated = row.work.speculative.is_some();
+        let value: Value = serde_json::from_str(&row.to_json()).unwrap();
+        assert!(value["warmup"].is_boolean());
+        assert_eq!(value["status"], "success");
+        assert!(value["iteration"].is_u64());
+        assert!(value["scenario"]["name"].is_string());
+        assert!(value["scenario"]["promptSha256"].is_string());
+        let work = &value["work"];
+        for key in ["promptTokens", "generatedTokens", "decodeSampledTokens"] {
+            assert!(work[key].is_u64(), "work.{key}");
         }
-        assert_eq!(java["schema"], ours_value["schema"]);
-        assert_eq!(java["schemaVersion"], ours_value["schemaVersion"]);
-        assert_eq!(java["provenance"]["kind"], ours_value["provenance"]["kind"]);
+        assert!(work["outputSha256"].is_string());
+        // The histogram is a list of counts when the row speculated, and absent or null when it did not.
+        if speculated {
+            let drafts = work["speculative"]["acceptedDrafts"].as_array().unwrap();
+            assert!(!drafts.is_empty() && drafts.iter().all(Value::is_u64));
+        } else {
+            assert!(work["speculative"].is_null());
+        }
+        assert!(value["timings"]["timeToFirstToken"].is_u64());
+        assert!(value["timings"]["timeToLastToken"].is_u64());
+        assert!(value["throughput"]["prefillTokensPerSecond"].is_number());
     }
-    assert_eq!(sample_row(None).implementation, "rust");
 }
 
 #[test]

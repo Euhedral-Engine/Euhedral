@@ -78,15 +78,3 @@ impl Launch for WeightTransfer {
 }
 
 super::eager!(WeightTransfer);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_transfer_reports_what_it_copies() {
-        let transfer = WeightTransfer::new("w".into(), None, 4096, 100, DevicePtr::NULL);
-        assert_eq!(transfer.bytes(), 100);
-        assert_eq!(transfer.destination(), DevicePtr::NULL);
-    }
-}

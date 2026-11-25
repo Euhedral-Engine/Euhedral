@@ -39,15 +39,20 @@ use crate::pass_assembler::PassStatistics;
 use crate::plan::Plan;
 use crate::prefix::PrefixCacheStats;
 #[cfg(feature = "test-oracles")]
-use crate::quantum::body_fault::{BodyFault, HoldEvent};
+use crate::quantum::body_fault::{BodyFault, Defect, HoldEvent, RunSnapshot, Sighting};
 use crate::residency::accounting::{Consumer, MemoryAccount, PlanReservation};
-use crate::residency::planner::{LocationBytes, PlanInputs, ResidencyPlan, pass_rows_limit, sequences_for};
+use crate::residency::planner::{
+    LocationBytes, PlanInputs, ResidencyPlan, forced_rows_of, pass_rows_limit, sequences_for,
+};
 use crate::stages::LaneTable;
 use crate::startup;
 use crate::state::SequenceState;
 use crate::state::released::ReleasedBuffers;
+use crate::summary;
 use crate::warmup::Warmed;
 use crate::workspace::Workspace;
+#[cfg(feature = "test-oracles")]
+use euhedral_gpu::GraphStats;
 
 /// The markers a transfer lane's ring holds: a chain has two copies in flight, and the next waits for the completion of
 /// one of them, so the ring has room beyond them.
@@ -115,11 +120,12 @@ pub fn resolve_sequences(
         return Ok(1);
     }
     let rows = pass_rows_limit(&settings.batching);
-    let verified = 1 + if profile.speculation == Speculation::Mtp {
+    let drafted = 1 + if profile.speculation == Speculation::Mtp {
         profile.speculative_depth()?
     } else {
         0
     };
+    let verified = drafted.max(forced_rows_of(&settings.batching));
     let cap = (rows / verified).max(1);
     let chosen = sequences_for(config, table, settings, inputs, cap)?;
     log::info!(
@@ -781,6 +787,10 @@ impl EngineRuntime {
         reservation: PlanReservation,
         report: StartupReport,
     ) -> EngineRuntime {
+        let cache = generations.prefix_cache_stats().map(|stats| stats.capacity_bytes);
+        for line in summary::lines(&summary::Facts::of(&plan, &core.settings, cache)) {
+            log::info!("{line}");
+        }
         EngineRuntime {
             core,
             plan,
@@ -915,11 +925,38 @@ impl EngineRuntime {
         self.generations.quantum_admitted(Arc::new(hook));
     }
 
-    /// A test hook: the next graph body of the first sequence that runs for a key the cache has not seen ends as `fault` after its first launch
-    /// that has work. At most one body is affected.
+    /// A test hook: the next quantum of the first sequence whose key is at `sighting` ends as `fault`, after its work
+    /// was queued: a first sighting (a direct run) and a second (the recording pass) in the middle of the body, a later
+    /// one (a replay) after the replay was queued. A body keeps `token` alive in its run's hold; a replay runs none.
+    /// At most one quantum is affected.
     #[cfg(feature = "test-oracles")]
-    pub fn fail_next_body_for_tests(&self, fault: BodyFault) {
-        self.generations.fail_body(fault);
+    pub fn fail_next_quantum_for_tests(&self, fault: BodyFault, sighting: Sighting, token: Option<&Arc<()>>) {
+        self.generations.fail_body(fault, sighting, token);
+    }
+
+    /// A test hook: the strong handles of the armed token at each event of
+    /// [`body_events_for_tests`](Self::body_events_for_tests), one list for each sequence.
+    #[cfg(feature = "test-oracles")]
+    pub fn body_held_counts_for_tests(&self) -> Vec<Vec<usize>> {
+        self.generations.body_held_counts()
+    }
+
+    /// A test hook: the graph cache around the run of the quantum a fault was applied to, by sequence.
+    #[cfg(feature = "test-oracles")]
+    pub fn run_snapshots_for_tests(&self) -> Vec<Option<RunSnapshot>> {
+        self.generations.run_snapshots()
+    }
+
+    /// A test hook: faults of the hook itself (see [`Defect`]), by sequence. A test expects none.
+    #[cfg(feature = "test-oracles")]
+    pub fn hook_defects_for_tests(&self) -> Vec<Vec<Defect>> {
+        self.generations.hook_defects()
+    }
+
+    /// A test hook: what each sequence's graph cache counted, and how many graphs it holds.
+    #[cfg(feature = "test-oracles")]
+    pub fn graph_counts_for_tests(&self) -> Vec<(GraphStats, usize)> {
+        self.generations.graph_counts()
     }
 
     /// A test hook: the events of the hold of the quantum a fault was applied to, one list for each sequence.
@@ -944,7 +981,35 @@ impl EngineRuntime {
         forced: Vec<u32>,
         sink: Box<dyn LogitsSink>,
     ) -> Result<(), AdmissionError> {
-        self.generations.teacher_forced(prefix, forced, sink)
+        self.generations.teacher_forced(prefix, forced, 1, sink)
+    }
+
+    /// [`EngineRuntime::teacher_forced`] that feeds up to `rows` forced tokens in one pass, as a verification does, and
+    /// hands the sink the same rows in the same order. The sequences are sized to verify at most `1 + draft depth` rows
+    /// (more with `batching.forced-rows`); concurrent runs share their passes. `rows` of 0 or 1 is the one-row path. A
+    /// sink that wants the hidden state needs one row.
+    pub fn teacher_forced_rows(
+        &self,
+        prefix: Vec<u32>,
+        forced: Vec<u32>,
+        rows: usize,
+        sink: Box<dyn LogitsSink>,
+    ) -> Result<(), AdmissionError> {
+        let rows = rows.max(1);
+        if rows > 1 {
+            if sink.wants_hidden() {
+                return Err(AdmissionError::Engine(
+                    "a teacher-forced run that takes the hidden state decodes one row at a time".to_string(),
+                ));
+            }
+            let sized = self.plan().verified_rows() as usize;
+            if rows > sized {
+                return Err(AdmissionError::Engine(format!(
+                    "the sequences verify at most {sized} rows: {rows} were asked (batching.forced-rows sizes them)"
+                )));
+            }
+        }
+        self.generations.teacher_forced(prefix, forced, rows, sink)
     }
 
     /// What stops the engine, which also keeps the result of the leak check of the memory account once the engine is

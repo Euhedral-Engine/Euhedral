@@ -338,6 +338,10 @@ fn open_index(
 
 /// The length of `file`, and the file back.
 #[cfg(unix)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: one fstat at startup, before any frame runs"
+)]
 fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
     let file = File::from(file);
     (file.metadata().map(|metadata| metadata.len()), OwnedFile::from(file))
@@ -345,6 +349,10 @@ fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
 
 /// The length of `file`, and the file back.
 #[cfg(windows)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: one fstat at startup, before any frame runs"
+)]
 fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
     let file = File::from(file);
     (file.metadata().map(|metadata| metadata.len()), OwnedFile::from(file))

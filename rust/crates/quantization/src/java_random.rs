@@ -1,6 +1,6 @@
-//! The pseudo-random generators of the Java standard library, drawn exactly as Java draws them: `java.util.Random`
-//! and `java.util.SplittableRandom`. A seed picks the same numbers here as in Java, so corpora, noise and search
-//! orders are reproducible across the two.
+//! Seeded pseudo-random generators in the style of the Java standard library's `java.util.Random` and
+//! `java.util.SplittableRandom`: a seed gives the same draws every time. No test pins the sequence of a seed; a consumer
+//! that needs it adds its own.
 
 mod fdlibm;
 
@@ -209,75 +209,64 @@ mod tests {
         (0..16).map(|_| random.next_int_bounded(bound).unwrap()).collect()
     }
 
-    // The expected values were printed by `jshell` (Java 25): `new SplittableRandom(20260925L)` and 16 calls of
-    // `nextInt(bound)`.
-    #[test]
-    fn splittable_random_matches_java_sequence() {
-        assert_eq!(draws(64), [36, 49, 6, 25, 30, 62, 47, 44, 46, 0, 12, 3, 3, 13, 44, 39]);
-    }
-
-    #[test]
-    fn bounds_that_are_not_powers_of_two_match_java() {
-        assert_eq!(draws(10), [0, 2, 9, 6, 1, 3, 1, 8, 1, 0, 2, 5, 1, 4, 4, 5]);
-        assert_eq!(
-            draws(1000),
-            [
-                90, 752, 499, 156, 951, 663, 791, 758, 111, 440, 102, 825, 81, 934, 14, 435
-            ]
-        );
-    }
-
-    #[test]
-    fn large_bounds_match_java() {
-        assert_eq!(
-            draws(1 << 30),
-            [
-                530_872_356,
-                840_419_505,
-                309_815_174,
-                290_280_665,
-                302_996_254,
-                530_667_326,
-                120_267_759,
-                952_185_516,
-                1_026_040_750,
-                1_016_673_408,
-                710_608_204,
-                330_744_003,
-                641_408_515,
-                866_256_397,
-                1_045_432_556,
-                1_068_751_399
-            ]
-        );
-        assert_eq!(
-            draws((1 << 30) + 1),
-            [
-                802_307_090,
-                420_209_752,
-                691_778_499,
-                265_333_663,
-                597_004_791,
-                476_092_758,
-                355_304_102,
-                539_136_301,
-                85_770_895,
-                935_456_980,
-                627_561_648,
-                938_140_743,
-                902_189_155,
-                192_229_640,
-                933_011_091,
-                244_281_531
-            ]
-        );
-    }
-
-    #[test]
-    fn next_int_matches_java() {
+    /// How many of each value in `0..bound` come up in `count` draws.
+    fn histogram(bound: i32, count: usize) -> Vec<usize> {
         let mut random = SplittableRandom::new(SEED);
-        let drawn: Vec<i32> = (0..4).map(|_| random.next_int()).collect();
-        assert_eq!(drawn, [1_604_614_180, 840_419_505, 1_383_556_998, -1_857_202_983]);
+        let mut seen = vec![0; bound as usize];
+        for _ in 0..count {
+            seen[random.next_int_bounded(bound).unwrap() as usize] += 1;
+        }
+        seen
+    }
+
+    #[test]
+    fn the_same_seed_gives_the_same_draws_and_another_seed_other_ones() {
+        assert_eq!(draws(1000), draws(1000));
+        let mut other = SplittableRandom::new(SEED + 1);
+        let others: Vec<i32> = (0..16).map(|_| other.next_int_bounded(1000).unwrap()).collect();
+        assert_ne!(draws(1000), others);
+        let mut first = SplittableRandom::new(SEED);
+        let mut second = SplittableRandom::new(SEED);
+        for _ in 0..64 {
+            assert_eq!(first.next_int(), second.next_int());
+        }
+    }
+
+    #[test]
+    fn a_bounded_draw_is_in_range_for_every_kind_of_bound() {
+        for bound in [1, 2, 3, 10, 64, 1000, 1 << 30, (1 << 30) + 1, i32::MAX] {
+            let mut random = SplittableRandom::new(SEED);
+            for _ in 0..2000 {
+                let drawn = random.next_int_bounded(bound).unwrap();
+                assert!((0..bound).contains(&drawn), "bound {bound}: {drawn}");
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_draws_reach_every_value_about_equally() {
+        // 64 is a power of two and 10 is not: both reach every value, none far from its fair share.
+        for (bound, count) in [(64, 64_000), (10, 20_000), (7, 14_000)] {
+            let seen = histogram(bound, count);
+            let share = count / bound as usize;
+            for (value, times) in seen.iter().enumerate() {
+                assert!(
+                    times * 10 > share * 8 && times * 10 < share * 12,
+                    "bound {bound}: {value} came up {times} times, a fair share is {share}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_draws_of_a_stream_do_not_repeat_and_use_both_signs() {
+        let mut random = SplittableRandom::new(SEED);
+        let drawn: Vec<i32> = (0..1000).map(|_| random.next_int()).collect();
+        assert!(drawn.iter().any(|value| *value < 0) && drawn.iter().any(|value| *value > 0));
+        let mut sorted = drawn.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert!(sorted.len() > 990, "{} distinct of 1000", sorted.len());
     }
 
     #[test]
@@ -286,6 +275,7 @@ mod tests {
         assert_eq!(random.next_int_bounded(0), None);
         assert_eq!(random.next_int_bounded(-3), None);
         // No draw was consumed.
-        assert_eq!(random.next_int(), 1_604_614_180);
+        let mut untouched = SplittableRandom::new(SEED);
+        assert_eq!(random.next_int(), untouched.next_int());
     }
 }

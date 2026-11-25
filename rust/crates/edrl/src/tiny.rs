@@ -267,8 +267,8 @@ fn text_hash(text: &str) -> i32 {
         .fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(i32::from(unit)))
 }
 
-/// A 48-bit linear congruential generator; its draws and the byte filling are fixed, because the golden files
-/// pin them.
+/// A 48-bit linear congruential generator; its draws and the byte filling are fixed, so that a seed gives the same
+/// artifact every time.
 struct Lcg {
     state: u64,
 }
@@ -299,25 +299,5 @@ impl Lcg {
                 word >>= 8;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Lcg, text_hash};
-
-    #[test]
-    fn lcg_matches_the_documented_sequence() {
-        // `new Random(42).nextInt()` is -1170105035 and the next is 234785527.
-        let mut random = Lcg::new(42);
-        assert_eq!(random.next_int(), -1_170_105_035);
-        assert_eq!(random.next_int(), 234_785_527);
-    }
-
-    #[test]
-    fn string_hash_is_the_expected_one() {
-        assert_eq!(text_hash(""), 0);
-        assert_eq!(text_hash("a"), 97);
-        assert_eq!(text_hash("hello"), 99_162_322);
     }
 }

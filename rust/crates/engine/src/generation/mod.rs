@@ -31,10 +31,11 @@ use euhedral_core::generics::FrameSink;
 use euhedral_data_structures::queues::MpscQueue;
 use euhedral_graph::{DEFAULT_RETRY_BACKSTOP, GraphRuntime, RetryCounts};
 use euhedral_inference_cuda::{CudaLibrary, DevicePtr};
+use euhedral_inference_edrl::WeightFormat;
 use euhedral_memory::Claim;
 
 use crate::error::EngineError;
-use crate::formats::{Nvfp4Linear, TrellisLinear};
+use crate::formats::{Nvfp4Linear, Q3Linear, TrellisLinear};
 use crate::frames::{Kind, step};
 use crate::model::{LayerIndex, ModelConfig, Role, Weights};
 use crate::pass_assembler::PassStatistics;
@@ -43,7 +44,7 @@ use crate::prefix::{
     CacheSpec, Copier, POSITION_GRANULE, PrefixCacheHandle, PrefixCacheStats, open_prefix_cache_claimed,
 };
 #[cfg(feature = "test-oracles")]
-use crate::quantum::body_fault::{BodyFault, HoldEvent};
+use crate::quantum::body_fault::{BodyFault, Defect, HoldEvent, RunSnapshot, Sighting};
 use crate::quantum::{Executor, Preparer};
 use crate::residency::offload::StagingGeometry;
 use crate::residency::planner::ResidencyPlan;
@@ -54,6 +55,8 @@ use crate::workspace::{input_records, input_records_for};
 pub use acceptance::{Accepted, accept, accept_tokens};
 pub use constraint::{ConstraintError, ReasoningConstraint, TokenConstraint};
 pub use draft_length::{DraftLength, DraftLengthError, MAX_DRAFTS, MAX_VERIFIED};
+#[cfg(feature = "test-oracles")]
+use euhedral_gpu::GraphStats;
 pub use listener::GenerationListener;
 pub(crate) use mailbox::OPERATION_BOUND;
 pub use mailbox::Spawn;
@@ -284,13 +287,23 @@ impl Generation {
         copies: Option<(SequenceId, Arc<Order<Executor>>)>,
     ) -> Result<Executor, EngineError> {
         let library: &Arc<CudaLibrary> = &core.library;
-        let formats = Formats::new(
+        let mut formats = Formats::new(
             Arc::new(TrellisLinear::from_settings(
                 &core.settings.kernels.trellis,
                 library.device().sm_count,
             )),
             Arc::new(Nvfp4Linear::new(library)),
         );
+        // The grouped format asks the device for its FP8 route, which compiles a module: only an artifact that has
+        // grouped tensors pays for it.
+        if residency.device.iter().any(|placement| {
+            matches!(
+                placement.format,
+                WeightFormat::Q3G64Fp16 | WeightFormat::Q4G64Fp16 | WeightFormat::Q5G64Fp16
+            )
+        }) {
+            formats = formats.with_grouped(Arc::new(Q3Linear::new(library)));
+        }
         // The staging ring and the lane its transfers run on, when the plan holds weights that are staged.
         let ring = staging_ring(
             residency.offload.staging,
@@ -392,12 +405,13 @@ impl Generation {
         &self,
         prefix: Vec<u32>,
         forced: Vec<u32>,
+        rows: usize,
         sink: Box<dyn LogitsSink>,
         lease: Lease,
     ) -> Result<(), AdmissionError> {
         let core = Arc::clone(&self.shared.core);
         self.start(move |owner| match owner {
-            Some(owner) => owner.begin_forced(admit(&core), prefix, forced, sink, lease),
+            Some(owner) => owner.begin_forced(admit(&core), prefix, forced, rows, sink, lease),
             None => Err(closed(Audience::Forced(sink))),
         })
     }
@@ -690,10 +704,11 @@ impl Generations {
         &self,
         prefix: Vec<u32>,
         forced: Vec<u32>,
+        rows: usize,
         sink: Box<dyn LogitsSink>,
     ) -> Result<(), AdmissionError> {
         let (generation, lease) = self.take()?;
-        generation.teacher_forced(prefix, forced, sink, lease)
+        generation.teacher_forced(prefix, forced, rows, sink, lease)
     }
 
     /// The test hook: the owner of the sequence the next request takes panics at the end of the turn in which that
@@ -747,10 +762,49 @@ impl Generations {
 
     /// The test hook: the next graph body of the first sequence that runs for a new key ends as `fault`.
     #[cfg(feature = "test-oracles")]
-    pub(crate) fn fail_body(&self, fault: BodyFault) {
+    pub(crate) fn fail_body(&self, fault: BodyFault, sighting: Sighting, token: Option<&Arc<()>>) {
         if let Some(generation) = self.generations.first() {
-            generation.shared.executor.body_faults().arm(fault);
+            generation.shared.executor.body_faults().arm_at(fault, sighting, token);
         }
+    }
+
+    /// The test hook: the strong handles of the test's value at each event of the faulted quantum's hold, by sequence.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn body_held_counts(&self) -> Vec<Vec<usize>> {
+        self.generations
+            .iter()
+            .map(|generation| generation.shared.executor.body_faults().held_counts())
+            .collect()
+    }
+
+    /// The test hook: the graph cache around the faulted quantum's run, by sequence.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn run_snapshots(&self) -> Vec<Option<RunSnapshot>> {
+        self.generations
+            .iter()
+            .map(|generation| generation.shared.executor.body_faults().run_snapshot())
+            .collect()
+    }
+
+    /// The test hook: faults of the hook itself, by sequence.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn hook_defects(&self) -> Vec<Vec<Defect>> {
+        self.generations
+            .iter()
+            .map(|generation| generation.shared.executor.body_faults().defects())
+            .collect()
+    }
+
+    /// The test hook: what each sequence's graph cache counted, and how many graphs it holds.
+    #[cfg(feature = "test-oracles")]
+    pub(crate) fn graph_counts(&self) -> Vec<(GraphStats, usize)> {
+        self.generations
+            .iter()
+            .map(|generation| {
+                let executor = &generation.shared.executor;
+                (executor.graph_stats(), executor.graphs().0)
+            })
+            .collect()
     }
 
     /// The test hook: what became of the hold of the quantum a fault was applied to, by sequence.
