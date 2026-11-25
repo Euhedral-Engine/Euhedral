@@ -36,6 +36,24 @@ fn at_once(shutdown: Duration) -> StopWindows {
     }
 }
 
+/// What a test's wait for the stop returns when the stop is asked for: the moment is noted, so that a test times the stop
+/// and not the start of the backend before it.
+fn stop_asked(asked: &Cell<Option<Instant>>) -> u8 {
+    asked.set(Some(Instant::now()));
+    EXIT_SIGTERM
+}
+
+/// How long `serve` waits for the stop's report: as long again as the windows add up to. A stop that took that long was
+/// not reported at all, so every stop that is reported is quicker.
+fn report_limit(windows: StopWindows) -> Duration {
+    (windows.drain + windows.shutdown) * 2
+}
+
+/// How long the stop took, from the moment [`stop_asked`] noted to now.
+fn stopped_after(asked: &Cell<Option<Instant>>) -> Duration {
+    asked.get().expect("the stop was asked for").elapsed()
+}
+
 fn settings() -> Settings {
     let mut settings = Settings::with_model(ModelSettings {
         artifact: "/m.edrl".into(),
@@ -65,19 +83,15 @@ fn the_routes_answer_and_the_model_is_listed() {
 
 #[test]
 fn a_stop_with_nothing_running_returns_promptly() {
-    // Far shorter than the windows: a stop with nothing in flight waits for neither. The clock starts at the signal,
-    // so the time the lattice takes to come up on a busy machine does not count.
-    let windows = StopWindows {
-        drain: Duration::from_secs(5),
-        shutdown: Duration::from_secs(5),
-    };
-    let signalled = Cell::new(None);
-    let code = serve(&settings(), windows, start, |_| {
-        signalled.set(Some(Instant::now()));
-        EXIT_SIGTERM
+    let asked = Rc::new(Cell::new(None));
+    let windows = StopWindows::default();
+    let code = serve(&settings(), windows, start, {
+        let asked = asked.clone();
+        move |_| stop_asked(&asked)
     });
-    let took = signalled.get().expect("the signal").elapsed();
     assert_eq!(code, EXIT_SIGTERM);
+    // A stop with nothing in flight waits for neither window.
+    let took = stopped_after(&asked);
     assert!(took < windows.drain, "stopping took {took:?}");
 }
 
@@ -88,7 +102,7 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one_within_the_s
         shutdown: Duration::from_secs(2),
     };
     let (clients, answers) = channel();
-    let signalled = Cell::new(None);
+    let asked = Rc::new(Cell::new(None));
     let code = serve(
         &settings(),
         windows,
@@ -113,18 +127,14 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one_within_the_s
             until("the second request to wait", || {
                 gauge(addr, "euhedral_generations_queued") == Some(1.0)
             });
-            signalled.set(Some(Instant::now()));
-            EXIT_SIGTERM
+            stop_asked(&asked)
         },
     );
     assert_eq!(code, EXIT_SIGTERM);
-    // The generation never ends, so the stop waits for it up to the drain and the shutdown windows. It reports itself
-    // done by then; `serve` itself gives up on the report after as long again, so a stop that took that long was
-    // not reported at all.
-    let took = signalled.get().expect("the signal").elapsed();
-    let patience = windows.drain + windows.shutdown;
-    assert!(took >= patience, "stopping took only {took:?}");
-    assert!(took < patience * 2, "stopping took {took:?}");
+    // The generation never ends, so the stop waits for it up to the drain and the shutdown windows and no longer.
+    let took = stopped_after(&asked);
+    assert!(took >= windows.drain + windows.shutdown, "stopping took only {took:?}");
+    assert!(took < report_limit(windows), "stopping took {took:?}");
     drop(clients);
     let mut running = String::new();
     let mut queued = String::new();
@@ -147,10 +157,11 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one_within_the_s
 #[test]
 fn a_stop_with_a_generation_that_never_ends_returns_after_the_shutdown_window() {
     let shutdown_timeout = Duration::from_secs(1);
-    let signalled = Cell::new(None);
+    let windows = at_once(shutdown_timeout);
+    let asked = Rc::new(Cell::new(None));
     let code = serve(
         &settings(),
-        at_once(shutdown_timeout),
+        windows,
         |_| start_with(Script::Hung),
         |addr| {
             ready(addr);
@@ -158,15 +169,13 @@ fn a_stop_with_a_generation_that_never_ends_returns_after_the_shutdown_window() 
             until("the request to run", || {
                 gauge(addr, "euhedral_generations_active") == Some(1.0)
             });
-            signalled.set(Some(Instant::now()));
-            EXIT_SIGTERM
+            stop_asked(&asked)
         },
     );
     assert_eq!(code, EXIT_SIGTERM);
-    // Measured from the signal. `serve` gives up on the report after as long again as the windows add up to.
-    let took = signalled.get().expect("the signal").elapsed();
+    let took = stopped_after(&asked);
     assert!(took >= shutdown_timeout, "stopping took only {took:?}");
-    assert!(took < shutdown_timeout * 2, "stopping took {took:?}");
+    assert!(took < report_limit(windows), "stopping took {took:?}");
 }
 
 #[test]
@@ -300,7 +309,7 @@ fn running_and_queued_requests_finish_within_the_drain_window() {
     };
     let (started, backend) = start_scripted(Script::Hung).expect("a scripted backend");
     let (clients, answers) = channel();
-    let begun = Instant::now();
+    let asked = Rc::new(Cell::new(None));
     let code = serve(
         &settings(),
         windows,
@@ -340,13 +349,14 @@ fn running_and_queued_requests_finish_within_the_drain_window() {
                 assert!(closed_by_server(idle), "the stop did not begin");
                 assert!(running.finish_held_ok(20, false), "the generation was not held");
             });
-            EXIT_SIGTERM
+            stop_asked(&asked)
         },
     );
     assert_eq!(code, EXIT_SIGTERM);
+    let took = stopped_after(&asked);
     assert!(
-        begun.elapsed() < windows.drain,
-        "the stop waited for the whole drain window"
+        took < windows.drain,
+        "the stop waited for the whole drain window: {took:?}"
     );
     drop(clients);
     let mut running = String::new();

@@ -33,3 +33,5 @@ __pycache__/
 
 # Rust
 rust/target/
+/user.bazelrc
+/bazel-*

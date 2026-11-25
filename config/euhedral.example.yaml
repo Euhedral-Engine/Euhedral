@@ -50,6 +50,7 @@ batching:
   max-sequences-per-pass: auto                # optional, default auto: sequences in one shared decode or verification pass (auto = no bound)
   max-tokens-per-pass: auto                   # optional, default auto: rows in one shared pass (auto = prefill-chunk-tokens)
   prefill-chunk-tokens: 512                   # optional, default 512: rows of the longest prefill chunk
+  forced-rows: 0                              # optional, default 0, Rust engine only: rows of one step of a teacher-forced run that takes several rows at a time (0 or 1: one row a step)
 
 memory:
   host-limit: auto                            # optional, default auto: host memory the engine may use (0: no RAM tier)

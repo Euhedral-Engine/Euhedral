@@ -125,6 +125,20 @@ impl TensorTable {
         Ok(TensorTable { entries, index })
     }
 
+    /// A table of `entries` in the order given, whose payloads may lie in different files: only the names are checked
+    /// (unique). Offsets are not compared across entries, because two files' payloads overlap by position.
+    pub fn from_entries(entries: Vec<TensorEntry>) -> Result<TensorTable, EdrlError> {
+        let mut index = HashMap::with_capacity(entries.len());
+        for (position, entry) in entries.iter().enumerate() {
+            if index.insert(entry.name.clone(), position).is_some() {
+                return Err(EdrlError::DuplicateName {
+                    name: entry.name.clone(),
+                });
+            }
+        }
+        Ok(TensorTable { entries, index })
+    }
+
     /// The entries, in file order.
     pub fn entries(&self) -> &[TensorEntry] {
         &self.entries

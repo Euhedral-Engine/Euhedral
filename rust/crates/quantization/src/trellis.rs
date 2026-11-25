@@ -8,9 +8,12 @@
 //!
 //! Tiles are 16x16 weights in tensor-core element order ([`TENSOR_CORE_ORDER`]); every address is a device address.
 
+mod launch;
 mod plan;
+mod quantizer;
 mod rate;
 mod run;
+mod search;
 
 use euhedral_gpu::{Args, GpuError, Launch};
 use thiserror::Error;
@@ -20,8 +23,12 @@ pub use plan::{
     plan_hadamard_rows, plan_pack, plan_reconstruct, plan_sum_products, plan_tile_mean_square, plan_to_tiles,
     plan_viterbi,
 };
+pub use quantizer::{LaneParts, QuantizeError, Quantized, Refused, Request, TrellisLane, TrellisSettings};
 pub use rate::{Rate, TENSOR_CORE_ORDER, TILE_WEIGHTS};
 pub use run::TrellisKernels;
+pub use search::{CHOLESKY_RETRIES, SIGMA_REG};
+
+pub use crate::chain::{Finished, Scratch};
 
 /// One kernel launch: the kernel's name in the trellis module, its geometry and its arguments. Only the planners
 /// build one, so its arguments always match the kernel's parameter list.

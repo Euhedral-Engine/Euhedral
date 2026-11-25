@@ -231,6 +231,7 @@ fn embedding_offloaded() -> ResidencyPlan {
     let inputs = |device_free| PlanInputs {
         device_free,
         multiprocessors: Some(70),
+        exact_numerics: false,
         host_pinned_bytes: Some(u64::MAX),
         sequences: 1,
     };
