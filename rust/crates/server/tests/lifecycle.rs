@@ -11,13 +11,13 @@ mod common;
 
 use std::cell::Cell;
 use std::fs::write;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::rc::Rc;
 use std::sync::mpsc::channel;
 use std::thread::spawn;
 use std::time::{Duration, Instant};
 
-use common::{PATIENCE, chat, exchange, gauge, reach, ready, status, until};
+use common::{PATIENCE, chat, closed_by_server, exchange, gauge, idle_connection, ready, status, until};
 use euhedral_inference_api_server::scripted::{MODEL_ID, Script};
 use euhedral_inference_server::scripted::{start, start_scripted, start_with};
 use euhedral_inference_server::{
@@ -41,6 +41,12 @@ fn at_once(shutdown: Duration) -> StopWindows {
 fn stop_asked(asked: &Cell<Option<Instant>>) -> u8 {
     asked.set(Some(Instant::now()));
     EXIT_SIGTERM
+}
+
+/// How long `serve` waits for the stop's report: as long again as the windows add up to. A stop that took that long was
+/// not reported at all, so every stop that is reported is quicker.
+fn report_limit(windows: StopWindows) -> Duration {
+    (windows.drain + windows.shutdown) * 2
 }
 
 /// How long the stop took, from the moment [`stop_asked`] noted to now.
@@ -78,13 +84,15 @@ fn the_routes_answer_and_the_model_is_listed() {
 #[test]
 fn a_stop_with_nothing_running_returns_promptly() {
     let asked = Rc::new(Cell::new(None));
-    let code = serve(&settings(), StopWindows::default(), start, {
+    let windows = StopWindows::default();
+    let code = serve(&settings(), windows, start, {
         let asked = asked.clone();
         move |_| stop_asked(&asked)
     });
     assert_eq!(code, EXIT_SIGTERM);
+    // A stop with nothing in flight waits for neither window.
     let took = stopped_after(&asked);
-    assert!(took < Duration::from_secs(10), "stopping took {took:?}");
+    assert!(took < windows.drain, "stopping took {took:?}");
 }
 
 #[test]
@@ -126,10 +134,7 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one_within_the_s
     // The generation never ends, so the stop waits for it up to the drain and the shutdown windows and no longer.
     let took = stopped_after(&asked);
     assert!(took >= windows.drain + windows.shutdown, "stopping took only {took:?}");
-    assert!(
-        took < windows.drain + windows.shutdown + Duration::from_secs(10),
-        "stopping took {took:?}"
-    );
+    assert!(took < report_limit(windows), "stopping took {took:?}");
     drop(clients);
     let mut running = String::new();
     let mut queued = String::new();
@@ -152,10 +157,11 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one_within_the_s
 #[test]
 fn a_stop_with_a_generation_that_never_ends_returns_after_the_shutdown_window() {
     let shutdown_timeout = Duration::from_secs(1);
+    let windows = at_once(shutdown_timeout);
     let asked = Rc::new(Cell::new(None));
     let code = serve(
         &settings(),
-        at_once(shutdown_timeout),
+        windows,
         |_| start_with(Script::Hung),
         |addr| {
             ready(addr);
@@ -169,7 +175,7 @@ fn a_stop_with_a_generation_that_never_ends_returns_after_the_shutdown_window() 
     assert_eq!(code, EXIT_SIGTERM);
     let took = stopped_after(&asked);
     assert!(took >= shutdown_timeout, "stopping took only {took:?}");
-    assert!(took < PATIENCE, "stopping took {took:?}");
+    assert!(took < report_limit(windows), "stopping took {took:?}");
 }
 
 #[test]
@@ -303,7 +309,7 @@ fn running_and_queued_requests_finish_within_the_drain_window() {
     };
     let (started, backend) = start_scripted(Script::Hung).expect("a scripted backend");
     let (clients, answers) = channel();
-    let begun = Instant::now();
+    let asked = Rc::new(Cell::new(None));
     let code = serve(
         &settings(),
         windows,
@@ -336,21 +342,21 @@ fn running_and_queued_requests_finish_within_the_drain_window() {
             until("the second request to wait", || {
                 gauge(addr, "euhedral_generations_queued") == Some(1.0)
             });
-            // The running generation ends on its own, once the stop has begun and no longer accepts.
+            // The running generation ends on its own, once the stop has begun: the stop closes the idle connection.
             let running = backend.generations().remove(0);
+            let idle = idle_connection(addr);
             spawn(move || {
-                until("the server to stop accepting", || {
-                    TcpStream::connect_timeout(&reach(addr), Duration::from_millis(200)).is_err()
-                });
+                assert!(closed_by_server(idle), "the stop did not begin");
                 assert!(running.finish_held_ok(20, false), "the generation was not held");
             });
-            EXIT_SIGTERM
+            stop_asked(&asked)
         },
     );
     assert_eq!(code, EXIT_SIGTERM);
+    let took = stopped_after(&asked);
     assert!(
-        begun.elapsed() < windows.drain,
-        "the stop waited for the whole drain window"
+        took < windows.drain,
+        "the stop waited for the whole drain window: {took:?}"
     );
     drop(clients);
     let mut running = String::new();

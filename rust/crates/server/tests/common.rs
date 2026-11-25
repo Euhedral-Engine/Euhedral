@@ -92,6 +92,46 @@ pub fn try_exchange(addr: SocketAddr, method: &str, target: &str, body: Option<&
     Ok(String::from_utf8_lossy(&text).into_owned())
 }
 
+/// A connection that asked for `/health`, was answered and was left open: the server has accepted it and holds it idle.
+pub fn idle_connection(addr: SocketAddr) -> TcpStream {
+    let mut stream = TcpStream::connect_timeout(&reach(addr), PATIENCE).expect("a connection");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("a read timeout");
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: t\r\n\r\n")
+        .expect("a request");
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let deadline = Instant::now() + PATIENCE;
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        assert!(Instant::now() < deadline, "no answer on the idle connection");
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("the server closed the connection before it answered"),
+            Ok(count) => head.extend_from_slice(&chunk[..count]),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) => panic!("reading: {error}"),
+        }
+    }
+    stream
+}
+
+/// Waits until the server closes `stream`, for at most the patience. The server closes an idle connection when it
+/// stops, so this is the sign that a stop has begun.
+pub fn closed_by_server(mut stream: TcpStream) -> bool {
+    let mut chunk = [0_u8; 4096];
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline {
+        match stream.read(&mut chunk) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
 pub fn status(answer: &str) -> u16 {
     answer
         .split(' ')
