@@ -223,8 +223,8 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
-      ARBITER_ARGS: "--gpu shared:16 --mem 24G"
-      ARBITER_EST: "3300"
+      ARBITER_ARGS: "--gpu shared:28 --mem 32G"
+      ARBITER_EST: "2400"
       APT_OPTS: "-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true"
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/native/.zig-global-cache
@@ -267,8 +267,8 @@ jobs:
           # The quantization crate's other device tests fail, not skip, without their settings: only its kernel tests run.
           # A test without a model artifact skips with a line starting "skipped:".
           {
-            mise exec -- cargo test --workspace --exclude euhedral-inference-quantization --no-fail-fast -- --ignored --nocapture --test-threads=1
-            mise exec -- cargo test -p euhedral-inference-quantization --test kernels_gpu -- --ignored --nocapture --test-threads=1
+            mise exec -- cargo test --workspace --exclude euhedral-inference-quantization --no-fail-fast -- --ignored --nocapture
+            mise exec -- cargo test -p euhedral-inference-quantization --test kernels_gpu -- --ignored --nocapture
           } 2>&1 | tee "$RUNNER_TEMP/device.log"
       - name: Skipped tests
         if: always()
