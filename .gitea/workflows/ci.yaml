@@ -223,8 +223,8 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
-      ARBITER_ARGS: "--gpu shared:28 --mem 32G"
-      ARBITER_EST: "2400"
+      ARBITER_ARGS: "--gpu shared:24 --mem 32G"
+      ARBITER_EST: "1800"
       APT_OPTS: "-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true"
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/native/.zig-global-cache
