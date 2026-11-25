@@ -15,12 +15,14 @@
 //!   Pareto front and the residency check.
 //! - [`checkpoint`]: the safetensors reader and writer and the fused objects of a Qwen 3.8 checkpoint, on `AsyncIo`.
 //! - [`recipe`]: the storage format of each quantized object of an artifact.
+//! - [`exl3`]: the bit allocation of the trellis quantizer and the writer of its EXL3 checkpoint.
 //! - [`resume`]: the file a long run overwrites in place and resumes from, and [`durable`], the durability barrier,
 //!   truncation and removal it is built on.
 //! - [`package_tokenizer`]: gives an artifact a checkpoint's tokenizer, in place or as a copy.
 
 pub mod checkpoint;
 pub mod durable;
+pub mod exl3;
 pub mod forward;
 pub mod java_random;
 pub mod kernels;

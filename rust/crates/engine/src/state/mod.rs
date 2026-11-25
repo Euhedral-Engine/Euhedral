@@ -178,7 +178,7 @@ impl SequenceState {
         kernels: &mut dyn KernelOps,
     ) -> Result<SequenceState, EngineError> {
         let drafts = plan.draft_depth > 0;
-        let verified_rows = if drafts { 1 + plan.draft_depth as u64 } else { 0 };
+        let verified_rows = plan.verified_rows();
         let kv = KvCache::new(
             library,
             released,
@@ -207,7 +207,11 @@ impl SequenceState {
         };
         let gdn = GdnStates::allocate(library, config, verified_rows, kernels)?;
         // A drafting sequence's catch-up runs up to the decode row twins' rows on the same scratch.
-        let decode_rows = if drafts { verified_rows.max(DRAFT_TWIN_ROWS) } else { 1 };
+        let decode_rows = if drafts {
+            verified_rows.max(DRAFT_TWIN_ROWS)
+        } else {
+            verified_rows.max(1)
+        };
         let scratch = AttentionScratch::allocate(
             library,
             config,

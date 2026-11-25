@@ -36,6 +36,18 @@ fn at_once(shutdown: Duration) -> StopWindows {
     }
 }
 
+/// What a test's wait for the stop returns when the stop is asked for: the moment is noted, so that a test times the stop
+/// and not the start of the backend before it.
+fn stop_asked(asked: &Cell<Option<Instant>>) -> u8 {
+    asked.set(Some(Instant::now()));
+    EXIT_SIGTERM
+}
+
+/// How long the stop took, from the moment [`stop_asked`] noted to now.
+fn stopped_after(asked: &Cell<Option<Instant>>) -> Duration {
+    asked.get().expect("the stop was asked for").elapsed()
+}
+
 fn settings() -> Settings {
     let mut settings = Settings::with_model(ModelSettings {
         artifact: "/m.edrl".into(),
@@ -65,14 +77,14 @@ fn the_routes_answer_and_the_model_is_listed() {
 
 #[test]
 fn a_stop_with_nothing_running_returns_promptly() {
-    let started = Instant::now();
-    let code = serve(&settings(), StopWindows::default(), start, |_| EXIT_SIGTERM);
+    let asked = Rc::new(Cell::new(None));
+    let code = serve(&settings(), StopWindows::default(), start, {
+        let asked = asked.clone();
+        move |_| stop_asked(&asked)
+    });
     assert_eq!(code, EXIT_SIGTERM);
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "stopping took {:?}",
-        started.elapsed()
-    );
+    let took = stopped_after(&asked);
+    assert!(took < Duration::from_secs(10), "stopping took {took:?}");
 }
 
 #[test]
@@ -82,7 +94,7 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one_within_the_s
         shutdown: Duration::from_secs(2),
     };
     let (clients, answers) = channel();
-    let started = Instant::now();
+    let asked = Rc::new(Cell::new(None));
     let code = serve(
         &settings(),
         windows,
@@ -107,12 +119,12 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one_within_the_s
             until("the second request to wait", || {
                 gauge(addr, "euhedral_generations_queued") == Some(1.0)
             });
-            EXIT_SIGTERM
+            stop_asked(&asked)
         },
     );
     assert_eq!(code, EXIT_SIGTERM);
     // The generation never ends, so the stop waits for it up to the drain and the shutdown windows and no longer.
-    let took = started.elapsed();
+    let took = stopped_after(&asked);
     assert!(took >= windows.drain + windows.shutdown, "stopping took only {took:?}");
     assert!(
         took < windows.drain + windows.shutdown + Duration::from_secs(10),
@@ -140,7 +152,7 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one_within_the_s
 #[test]
 fn a_stop_with_a_generation_that_never_ends_returns_after_the_shutdown_window() {
     let shutdown_timeout = Duration::from_secs(1);
-    let started = Instant::now();
+    let asked = Rc::new(Cell::new(None));
     let code = serve(
         &settings(),
         at_once(shutdown_timeout),
@@ -151,11 +163,11 @@ fn a_stop_with_a_generation_that_never_ends_returns_after_the_shutdown_window() 
             until("the request to run", || {
                 gauge(addr, "euhedral_generations_active") == Some(1.0)
             });
-            EXIT_SIGTERM
+            stop_asked(&asked)
         },
     );
     assert_eq!(code, EXIT_SIGTERM);
-    let took = started.elapsed();
+    let took = stopped_after(&asked);
     assert!(took >= shutdown_timeout, "stopping took only {took:?}");
     assert!(took < PATIENCE, "stopping took {took:?}");
 }

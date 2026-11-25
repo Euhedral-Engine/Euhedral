@@ -38,6 +38,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
+name = "bazel-gen"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -340,7 +347,7 @@ checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 [[package]]
 name = "euhedral-core"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93#d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-data-structures",
  "euhedral-hardware-utils",
@@ -351,7 +358,7 @@ dependencies = [
 [[package]]
 name = "euhedral-data-structures"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93#d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "loom",
 ]
@@ -359,7 +366,7 @@ dependencies = [
 [[package]]
 name = "euhedral-gpu"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93#d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -373,7 +380,7 @@ dependencies = [
 [[package]]
 name = "euhedral-graph"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93#d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -385,7 +392,7 @@ dependencies = [
 [[package]]
 name = "euhedral-hardware-utils"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93#d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-data-structures",
  "libc",
@@ -396,7 +403,7 @@ dependencies = [
 [[package]]
 name = "euhedral-hashing"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93#d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 
 [[package]]
 name = "euhedral-inference-api-protocol"
@@ -514,6 +521,16 @@ name = "euhedral-inference-host-gemv"
 version = "0.1.0"
 
 [[package]]
+name = "euhedral-inference-hub-deps"
+version = "0.1.0"
+dependencies = [
+ "io-uring",
+ "libc",
+ "log",
+ "windows-sys",
+]
+
+[[package]]
 name = "euhedral-inference-quantization"
 version = "0.1.0"
 dependencies = [
@@ -591,7 +608,7 @@ dependencies = [
 [[package]]
 name = "euhedral-io"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93#d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -603,7 +620,7 @@ dependencies = [
 [[package]]
 name = "euhedral-memory"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93#d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -616,7 +633,7 @@ dependencies = [
 [[package]]
 name = "euhedral-net"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93#d5bf309b7ea4ce3dc503a01d59c7b584d4cc5e93"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",

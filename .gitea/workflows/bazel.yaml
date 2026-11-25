@@ -1,0 +1,76 @@
+# The Bazel gate of the Rust workspace, beside the Cargo jobs of ci.yaml: `bazel test //... --config=ci` on Linux, the BUILD
+# files' staleness check, forge's repo check, and the same test on the Windows platform (GitHub runs that one, dispatched
+# by the proxy). The reusable workflows are pinned by the protected tag, by its full ref.
+#
+# `gate-ok` is the one check to require: a skipped gate is a failure there, not a pass.
+name: bazel
+
+on:
+  pull_request:
+    paths:
+      - "rust/**"
+      - "MODULE.bazel"
+      - "MODULE.bazel.lock"
+      - ".bazelrc"
+      - ".bazelversion"
+      - ".bazelignore"
+      - "BUILD.bazel"
+      - "bazel/**"
+      - ".gitattributes"
+      - "mise.toml"
+      - ".gitea/workflows/bazel.yaml"
+      - ".github/workflows/ci.yml"
+  push:
+    branches: [main, "rust/next*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bazel-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  gate:
+    uses: euhedral/ci/.gitea/workflows/bazel-gate.yml@refs/tags/v10
+    with:
+      stale-build: gazelle
+      bazel-mem: 16
+      bazel-est: 1200
+    secrets:
+      # Also read by the repo check's pin alignment (C5).
+      forge-read-token: ${{ secrets.FORGE_READ_TOKEN }}
+
+  windows:
+    uses: euhedral/ci/.gitea/workflows/bazel-windows.yml@refs/tags/v10
+    with:
+      repo: Euhedral-Engine/Euhedral
+      permissions: contents:write,actions:write,workflows:write
+    secrets:
+      GH_APP_ID: ${{ secrets.GH_APP_ID }}
+      GH_APP_INSTALLATION_ID: ${{ secrets.GH_APP_INSTALLATION_ID }}
+      GH_APP_PRIVATE_KEY_B64: ${{ secrets.GH_APP_PRIVATE_KEY_B64 }}
+
+  # The one check to require: a skipped gate (a caller's `if:`) is a failure here, not a pass. The Windows workflow runs only
+  # for a pull request, so on a push or a manual run its result is `skipped`, and only then is that accepted.
+  gate-ok:
+    needs: [gate, windows]
+    if: always()
+    runs-on: arbiter-docker
+    steps:
+      # The image's PATH starts with directories an earlier job can write: a planted `bash` could pass this step.
+      - name: The gate ran and passed
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
+        env:
+          PATH: /usr/bin:/bin
+          EVENT: ${{ github.event_name }}
+          GATE: ${{ needs.gate.result }}
+          WINDOWS: ${{ needs.windows.result }}
+        run: |
+          test "$GATE" = success
+          if test "$EVENT" = pull_request; then
+            test "$WINDOWS" = success
+          else
+            test "$WINDOWS" = success -o "$WINDOWS" = skipped
+          fi
