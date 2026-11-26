@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 use euhedral_io::{AsyncIo, IoDoneOwned, IoMemory, OwnedFile};
 use serde_json::Value;
 
-use super::io::{self, Done, Next, file_length, open_read, raw_file, read_exact, read_file};
+use super::io::{self, Closing, Done, Next, file_length, open_read, raw_file, read_exact, read_file};
 use super::writer::Source;
 use super::{CheckpointError, report};
 use crate::step::{Kind, idle, step};
@@ -314,7 +314,7 @@ impl Safetensors {
             slots: (0..count).map(|_| Slot(OnceLock::new())).collect(),
             lengths: ranges.iter().map(|range| range.memory.len()).collect(),
             names: ranges.iter().map(|range| range.tensor.clone()).collect(),
-            then,
+            then: Closing::new(then),
         });
         for (index, (range, (shard, offset))) in ranges.into_iter().zip(places).enumerate() {
             let token = Arc::clone(&gather);
@@ -333,7 +333,13 @@ impl Safetensors {
             );
             match submitted {
                 Ok(()) => {}
-                Err(error) if index == 0 => return Err(io::submit_error(&range.tensor, error)),
+                Err(error) if index == 0 => {
+                    // Nothing started: the refusal is the caller's, and the continuation is not called.
+                    if let Some(gather) = Arc::into_inner(gather) {
+                        drop(gather.then.release());
+                    }
+                    return Err(io::submit_error(&range.tensor, error));
+                }
                 Err(error) => {
                     // The reads already submitted still end. The ones that were not are failed here, and the last
                     // reference to the gather delivers.
@@ -374,7 +380,7 @@ struct Gather<B> {
     slots: Vec<Slot<Outcome<B>>>,
     lengths: Vec<usize>,
     names: Vec<String>,
-    then: Done<Vec<B>>,
+    then: Closing<Vec<B>>,
 }
 
 /// Records one outcome and gives up the reference; the gather comes back to whoever held the last.
@@ -409,7 +415,7 @@ impl<B> Gather<B> {
                 }
             }
         }
-        then(match failure {
+        then.end(match failure {
             Some(error) => Err(error),
             None => Ok(memories),
         });
@@ -441,7 +447,7 @@ impl Opening {
         let path = self.directory.join(&name);
         let io = Arc::clone(&self.io);
         let failed = Arc::clone(&self.then);
-        let next: Next<OwnedFile> = Box::new(move |opened| match opened {
+        let next = Next::<OwnedFile>::new(move |opened| match opened {
             Ok(file) => self.sized_file(name, Arc::new(file)),
             Err(error) => (self.then)(Err(error)),
         });
@@ -456,7 +462,7 @@ impl Opening {
         let failed = Arc::clone(&self.then);
         let again = Arc::clone(&file);
         let context = name.clone();
-        let next: Next<u64> = Box::new(move |length| match length {
+        let next = Next::<u64>::new(move |length| match length {
             Ok(length) => self.opened(name, file, length),
             Err(error) => (self.then)(Err(error)),
         });
@@ -470,7 +476,7 @@ impl Opening {
         let io = Arc::clone(&self.io);
         let failed = Arc::clone(&self.then);
         let again = Arc::clone(&file);
-        let next: Next<Vec<u8>> = Box::new(move |prefix| match prefix {
+        let next = Next::<Vec<u8>>::new(move |prefix| match prefix {
             Ok(prefix) => self.sized(name, file, file_len, &prefix),
             Err(error) => (self.then)(Err(error)),
         });
@@ -500,7 +506,7 @@ impl Opening {
         let failed = Arc::clone(&self.then);
         let again = Arc::clone(&file);
         let context = format!("the header of {name}");
-        let next: Next<Vec<u8>> = Box::new(move |header| match header {
+        let next = Next::<Vec<u8>>::new(move |header| match header {
             Ok(header) => self.parsed(name, file, file_len, &header),
             Err(error) => (self.then)(Err(error)),
         });

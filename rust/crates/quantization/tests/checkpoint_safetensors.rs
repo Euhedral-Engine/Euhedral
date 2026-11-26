@@ -13,7 +13,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use checkpoint_support::{Spec, drive, safetensors, write};
+use checkpoint_support::{Spec, drive, every_step_dropped_unrun, safetensors, write};
 use euhedral_inference_quantization::checkpoint::CheckpointError;
 use euhedral_inference_quantization::checkpoint::safetensors::{ReadRange, Safetensors};
 use euhedral_io::AsyncIo;
@@ -332,4 +332,35 @@ fn open_files_gives_a_tensor_of_two_files_to_the_later_one() {
         Arc::new(|_| panic!("nothing was started")),
     );
     assert!(matches!(none, Err(CheckpointError::Invalid(_))));
+}
+
+// Mutants caught: a step discarded unrun that drops the continuation with it (the caller waits for ever), in the
+// open, length, prefix and header reads of an opening, and in the reads of a tensor; a call that ends twice.
+#[test]
+fn a_read_step_discarded_unrun_ends_the_call_once_with_the_closing_error() {
+    let directory = tempfile::tempdir().unwrap();
+    write(&directory.path().join("model.safetensors"), &single());
+    let opening = every_step_dropped_unrun(|io, done| Safetensors::open(io, directory.path(), done));
+    assert!(
+        opening >= 5,
+        "index, open, length, prefix and header are steps: only {opening}"
+    );
+
+    let whole = every_step_dropped_unrun(|io, done| {
+        Safetensors::open_files(io, directory.path(), vec!["model.safetensors".to_owned()], done)
+    });
+    assert!(whole >= 4);
+}
+
+// Mutant caught: a ranged read whose last holder is dropped unrun and takes the continuation with it.
+#[test]
+fn a_tensor_read_discarded_unrun_ends_the_call_once_with_the_closing_error() {
+    let directory = tempfile::tempdir().unwrap();
+    write(&directory.path().join("model.safetensors"), &single());
+    let steps = every_step_dropped_unrun(|io, done| {
+        // The store reads through the `AsyncIo` that opened it: open it on the driven one, before the read is started.
+        let opened = drive(io, |opened| Safetensors::open(io, directory.path(), opened))?;
+        Arc::new(opened).read("a", 0, vec![0u8; 12], done)
+    });
+    assert!(steps >= 1, "a read is a step: only {steps}");
 }

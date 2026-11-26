@@ -23,7 +23,7 @@ use euhedral_graph::{Lake, UnitGuard};
 use euhedral_inference_engine::Handoff;
 use euhedral_io::{AsyncIo, Create, IoBuf, IoDone, OpenSpec, OwnedFile};
 
-use super::io::{Next, file_length, open_read, raw_file, read_exact, submit_error};
+use super::io::{Closing, Next, file_length, open_read, raw_file, read_exact, submit_error};
 use super::{CheckpointError, Done};
 use crate::durable;
 use crate::step::{Kind, idle, step};
@@ -302,39 +302,7 @@ struct Writing {
     /// Where the next write goes in the file.
     offset: u64,
     buffer: Vec<u8>,
-    then: Closing,
-}
-
-/// The continuation of a write while the chain holds it. A chain dropped without ending (a step that was accepted and
-/// discarded unrun) ends the write with [`CheckpointError::LakeClosed`]; [`Closing::release`] takes the continuation
-/// back for the step that ends the write itself, or for the call that returns `Err` and calls nothing.
-struct Closing(Option<Done<()>>);
-
-impl Closing {
-    fn new(then: Done<()>) -> Self {
-        Self(Some(then))
-    }
-
-    /// The continuation, and the guard is spent: dropping it says nothing.
-    fn release(mut self) -> Option<Done<()>> {
-        self.0.take()
-    }
-
-    /// Ends the write with `result`.
-    fn end(self, result: Result<(), CheckpointError>) {
-        if let Some(then) = self.release() {
-            then(result);
-        }
-    }
-}
-
-impl Drop for Closing {
-    // This runs the caller's continuation inside a drop, on the thread of the lake or engine that discards the step.
-    fn drop(&mut self) {
-        if let Some(then) = self.0.take() {
-            then(Err(CheckpointError::LakeClosed));
-        }
-    }
+    then: Closing<()>,
 }
 
 /// An open `.part` file and the chain's state.
@@ -677,7 +645,7 @@ pub(crate) fn copy_file(
     let opened = open_read(
         io,
         from,
-        Box::new(move |opened| {
+        Next::new(move |opened| {
             let Some(closing) = waiting.take() else { return };
             let file = match opened {
                 Ok(file) => Arc::new(file),
@@ -691,7 +659,7 @@ pub(crate) fn copy_file(
                 &io_next,
                 sizing,
                 label.clone(),
-                Box::new(move |length| {
+                Next::new(move |length| {
                     let Some((closing, io)) = ready.take() else { return };
                     let size = match length {
                         Ok(size) => size,
@@ -701,7 +669,7 @@ pub(crate) fn copy_file(
                     let reader = Arc::clone(&io);
                     let context = label.clone();
                     let source: Source = Arc::new(move |offset, chunk, done| {
-                        let next: Next<Vec<u8>> = Box::new(move |bytes| done(bytes));
+                        let next = Next::<Vec<u8>>::new(move |bytes| done(bytes));
                         read_exact(&reader, Arc::clone(&file), offset, chunk.len(), context.clone(), next)
                     });
                     let report = Arc::clone(&then);

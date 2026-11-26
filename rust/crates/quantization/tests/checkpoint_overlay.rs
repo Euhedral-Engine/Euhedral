@@ -9,12 +9,13 @@
 
 mod checkpoint_support;
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use checkpoint_support::{Spec, World, bf16, drive, safetensors, write};
+use checkpoint_support::{Spec, World, bf16, drive, every_step_dropped_unrun, safetensors, write};
 use euhedral_inference_quantization::checkpoint::CheckpointError;
 use euhedral_inference_quantization::checkpoint::overlay;
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
@@ -182,5 +183,24 @@ fn an_overlay_of_an_overlay_keeps_the_first_rounds_replacements_and_replaces_the
         [0.5, 1.5],
         "the first overlay is untouched"
     );
+    world.finish();
+}
+
+// Mutants caught: a step discarded unrun that drops the overlay's continuation with it (the caller waits for ever), at
+// the index read, the link on the host lake, or the writes of the shard and the index; a call that ends twice.
+#[test]
+fn an_overlay_step_discarded_unrun_ends_the_call_once_with_the_closing_error() {
+    let world = World::start();
+    let directory = tempfile::tempdir().unwrap();
+    let from = directory.path().join("source");
+    source(&from);
+    let run = Cell::new(0);
+    let steps = every_step_dropped_unrun(|io, done| {
+        run.set(run.get() + 1);
+        let to = directory.path().join(format!("target{}", run.get()));
+        let tensors = BTreeMap::from([("a.weight".to_owned(), vec![9.0f32])]);
+        overlay::write(io, &world.host, &from, &to, tensors, done)
+    });
+    assert!(steps >= 6, "index, shard and index writes are steps: only {steps}");
     world.finish();
 }
