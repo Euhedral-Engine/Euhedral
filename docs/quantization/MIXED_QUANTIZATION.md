@@ -121,13 +121,16 @@ residency planner decides). Each round:
 3. gives part of the batch (`explore`) to feasible proposals the ensemble members disagree on most, and to single
    moves of the front's points;
 4. assembles each proposal as a composite view, checks it with the residency planner and scores it in the engine
-   against the search reference (row-exact verification, several candidates on the device at once over one cache of
-   their shared weights).
+   against the search reference (row-exact verification). The Rust search scores one candidate at a time, each in its
+   own engine, and refuses `--max-concurrent` above 1 until scoring several at once is ported; a candidate the
+   planner refuses is not scored.
 
 Every measurement goes into one resume file; a stopped search resumes from it, and `--import-state` starts a search
 from another's measurements, refitted to its own budget and context. Held-out error is the mean absolute log ratio of
 the ensemble's predicted KL to the KL measured for the round's proposals, before they are fitted (0.06: predictions
-about 6% off).
+about 6% off). A round is derived from the measurements of earlier rounds only, so a resumed search proposes what an
+unbroken one would. The state key covers the references, the cost table and the sources; the priors, the batch and the
+other tuning may change on a resume.
 
 | Context | Rounds | Measured | Front | Held-out error, last round | Lowest search KL on the front |
 |---|---|---|---|---|---|

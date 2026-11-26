@@ -26,6 +26,7 @@ pub mod pareto;
 mod pretty;
 mod priors;
 pub mod rco;
+pub mod search;
 mod search_state;
 mod seeds;
 mod space;
