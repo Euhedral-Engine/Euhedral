@@ -10,8 +10,8 @@
 //! the `stages` lake for the first turn to run on a worker.
 //!
 //! What arrives is a [`Message`] in the owner's inbox: a quantum that retired (the executor's retirement callback posts
-//! it), the copy of a logits row to pinned memory (a teacher-forced run), and the running of the work a parked quantum
-//! waited for on the owner's lane. Nothing waits for them.
+//! it), the host's selection of a sampled row, and the running of the work a parked quantum waited for on the owner's
+//! lane. Nothing waits for them.
 //!
 //! **The chain.** A greedy request keeps two quanta in flight. The one admitted behind another runs behind it on the
 //! device (the graph's external edge waits for its sink), and takes its token id from the selection the earlier one
@@ -647,9 +647,9 @@ impl Run {
         matches!(&self.mode, Mode::Forced { sink, .. } if sink.wants_hidden())
     }
 
-    /// Whether the logits rows of a quantum of `role` go to the host, which selects the tokens: every quantum of a
-    /// sampled request that does not speculate, and the prompt's and the verifications' of one that does. Its drafts
-    /// stay greedy and on the device.
+    /// Whether the logits rows of a quantum of `role` go to the host: it selects the tokens of every quantum of a
+    /// sampled request that does not speculate, and of the prompt's and the verifications' of one that does (its drafts
+    /// stay greedy and on the device); a teacher-forced run's sink reads the rows of the quanta that score.
     pub(super) fn copies_rows(&self, role: Role) -> bool {
         match &self.mode {
             Mode::Sampled { .. } => true,

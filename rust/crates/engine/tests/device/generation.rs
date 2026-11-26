@@ -1534,3 +1534,114 @@ fn multi_row_teacher_forcing_matches_the_one_row_path_alone_and_batched() {
 fn eight_forced_rows_sized_by_the_setting_equal_the_one_row_path_alone_and_batched() {
     forced_rows_equal_the_one_row_path(8, |depth| (1 + depth).max(8));
 }
+
+/// The hidden rows and the logits rows of a forced run that takes the hidden state.
+type HiddenDelivery = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+/// A forced run whose sink takes the hidden state: the hidden row and the logits row of every step.
+struct HiddenRows {
+    hidden: Vec<Vec<u8>>,
+    rows: Vec<Vec<u8>>,
+    done: Option<Arc<Handoff<HiddenDelivery>>>,
+}
+
+impl LogitsSink for HiddenRows {
+    fn wants_hidden(&self) -> bool {
+        true
+    }
+
+    fn hidden(&mut self, step: usize, hidden: &[u8]) {
+        assert_eq!(
+            step,
+            self.hidden.len(),
+            "the hidden rows arrive in order, before their logits row"
+        );
+        self.hidden.push(hidden.to_vec());
+    }
+
+    fn row(&mut self, step: usize, _forced: u32, logits: &[u8]) {
+        assert_eq!(step, self.rows.len(), "the rows arrive in order");
+        assert_eq!(
+            self.hidden.len(),
+            step + 1,
+            "the hidden row came just before its logits row"
+        );
+        self.rows.push(logits.to_vec());
+    }
+
+    fn finished(&mut self, _outcome: GenerationOutcome) {
+        let done = self.done.take().expect("a run finishes once");
+        done.send((mem::take(&mut self.hidden), mem::take(&mut self.rows)));
+    }
+}
+
+/// The hidden rows and logits rows of a forced one-row run that takes the hidden state.
+fn forced_hidden(runtime: &EngineRuntime, prefix: &[u32], forced: &[u32]) -> Arc<Handoff<HiddenDelivery>> {
+    let done = Handoff::new();
+    runtime
+        .teacher_forced_rows(
+            prefix.to_vec(),
+            forced.to_vec(),
+            1,
+            Box::new(HiddenRows {
+                hidden: Vec::new(),
+                rows: Vec::new(),
+                done: Some(Arc::clone(&done)),
+            }),
+        )
+        .expect("the run is admitted");
+    done
+}
+
+/// A forced step's hidden row and logits row are the same when the run is alone and when another request shares the
+/// engine, and its logits rows are those of a run that does not take the hidden state: the quantum copies both rows
+/// before the workspace goes to the next sequence.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn forced_hidden_rows_are_the_same_alone_and_beside_another_request() {
+    let Some(machine) = machine() else { return };
+    let mut engine = settings(&machine.artifact, 4096);
+    engine.batching.max_sequences = 2;
+    let (_card, runtime) = common::engine(&engine, &machine.library);
+    let tokenizer = tokenizer(&machine.artifact);
+    let document =
+        fs::read_to_string(repository_root().join("rust/resources/bench/chat-corpus-v1-document.md")).unwrap();
+    let document = tokenizer.encode(&document).unwrap();
+    let (prefix, steps) = (96, 24);
+    let first = &document[..prefix];
+    let forced = &document[prefix..prefix + steps];
+
+    let (alone_hidden, alone_rows) = forced_hidden(&runtime, first, forced).wait(WAIT).unwrap();
+    assert_eq!(alone_hidden.len(), steps);
+    assert!(
+        alone_hidden.windows(2).all(|pair| pair[0] != pair[1]),
+        "each step has its own hidden row"
+    );
+    let (plain, _) = run_forced(&runtime, first, forced, 1).unwrap().wait(WAIT).unwrap();
+    assert!(
+        alone_rows == plain,
+        "the logits rows differ when the hidden state is taken"
+    );
+
+    let other = &document[prefix + steps..prefix + steps + prefix];
+    let greedy = submit(
+        &runtime,
+        other,
+        48,
+        &[],
+        Speculation::Off,
+        SamplingConfig::greedy(0),
+        None,
+    )
+    .unwrap();
+    let (beside_hidden, beside_rows) = forced_hidden(&runtime, first, forced).wait(WAIT).unwrap();
+    greedy.wait(WAIT).unwrap();
+    assert!(
+        beside_hidden == alone_hidden,
+        "the hidden rows differ beside another request"
+    );
+    assert!(
+        beside_rows == alone_rows,
+        "the logits rows differ beside another request"
+    );
+}

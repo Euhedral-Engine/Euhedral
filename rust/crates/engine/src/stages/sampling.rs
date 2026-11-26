@@ -1,6 +1,6 @@
 //! Selection (`generation/HostLogits`, `native/src/sampling/argmax.cuh`). A greedy quantum selects on the device: an
 //! argmax key per logits row, the copy of the keys into pinned memory, and the pass of a drafted token to the next
-//! quantum of its step; no logits row is copied to the host. A quantum of a sampling request ([`CopyRows`]) copies its
+//! quantum of its step; no logits row is copied to the host. A quantum of a sampling or teacher-forced request ([`CopyRows`]) copies its
 //! logits row to pinned memory instead, inside its graph, and the host selects from the row.
 //!
 //! A key is 64 bits whose low word is `0xFFFFFFFF` minus the selected token id, so that among equal maxima the
@@ -328,7 +328,7 @@ impl Launch for SelectedToken {
     }
 }
 
-/// Pinned memory the logits rows of a sampled quantum are copied to, and the allocation identity its graph is keyed
+/// Pinned memory the logits rows of a quantum that the host reads (sampled or teacher-forced) are copied to, and the allocation identity its graph is keyed
 /// on. The host reads the rows only after the quantum that wrote them has retired.
 #[derive(Debug)]
 pub struct RowReadback {
@@ -336,8 +336,8 @@ pub struct RowReadback {
     /// Bytes of one row: the model's vocabulary at two bytes an entry.
     row_bytes: usize,
     capacity: usize,
-    /// Bytes after the rows that hold the last row's final hidden state: 0 for a readback of a sampling request, the
-    /// hidden row's size for one a teacher-forced run that takes the hidden state leases.
+    /// Bytes after the rows that hold the last row's final hidden state: 0 for a plain readback, the hidden
+    /// row's size for one a teacher-forced run that takes the hidden state leases.
     hidden_bytes: usize,
     /// Whether a quantum in flight, or the frame that selects from its rows, holds the readback
     /// ([`RowReadbackPool::acquire`]).
@@ -407,7 +407,7 @@ impl RowReadback {
     }
 }
 
-/// The row readbacks of one sequence: a sampled quantum leases one from its admission until the host has selected from
+/// The row readbacks of one sequence: a quantum whose rows the host reads leases one from its admission until the host has selected from
 /// its row, which is later than the quantum's retirement, so the lease belongs to the owner and then to the frame that
 /// selects, not to the quantum.
 #[derive(Debug, Default)]
@@ -456,38 +456,48 @@ impl RowReadbackPool {
         vocabulary: usize,
         hidden_size: usize,
     ) -> Result<RowReadbackPool, CudaError> {
+        if vocabulary == 0 || hidden_size == 0 {
+            return Err(CudaError::Argument(format!(
+                "a readback that holds the hidden state needs a vocabulary and a hidden size, not {vocabulary} and {hidden_size}"
+            )));
+        }
         self.hidden = (0..count)
             .map(|_| RowReadback::with_hidden(library, 1, vocabulary, hidden_size).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(self)
     }
 
-    /// A pool with no readback: a sequence that cannot serve sampled requests.
+    /// A pool with no readback: a sequence that cannot serve requests whose rows the host reads.
     pub fn none() -> RowReadbackPool {
         RowReadbackPool::default()
     }
 
+    /// The readbacks of the pool, those that hold the hidden state too.
     pub fn len(&self) -> usize {
-        self.readbacks.len()
+        self.readbacks.len() + self.hidden.len()
     }
 
-    /// The rows each readback of the pool holds; 0 for a pool with none.
+    /// The rows each readback of the pool holds, the hidden ones aside (they hold one); 0 for a pool with none.
     pub fn rows(&self) -> usize {
         self.readbacks.first().map_or(0, |readback| readback.capacity())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.readbacks.is_empty()
+        self.readbacks.is_empty() && self.hidden.is_empty()
     }
 
-    /// Whether no readback is free to lease: the pool has none, or every one is held.
+    /// Whether no readback without a hidden tail is free to lease: the pool has none, or every one is held.
     pub fn is_exhausted(&self) -> bool {
-        self.leased() >= self.len()
+        RowReadbackPool::held(&self.readbacks) >= self.readbacks.len()
     }
 
-    /// Readbacks leased now.
+    /// Readbacks leased now, the hidden ones too.
     pub fn leased(&self) -> usize {
-        self.readbacks
+        RowReadbackPool::held(&self.readbacks) + RowReadbackPool::held(&self.hidden)
+    }
+
+    fn held(readbacks: &[Arc<RowReadback>]) -> usize {
+        readbacks
             .iter()
             .filter(|readback| readback.held.load(Ordering::Acquire))
             .count()
@@ -495,7 +505,7 @@ impl RowReadbackPool {
 
     /// Whether no readback that holds the hidden state is free to lease.
     pub fn hidden_is_exhausted(&self) -> bool {
-        self.hidden.iter().all(|readback| readback.held.load(Ordering::Acquire))
+        RowReadbackPool::held(&self.hidden) >= self.hidden.len()
     }
 
     /// Leases a readback no one holds, or refuses. Called by the sequence's owner, one admission at a time.
@@ -542,8 +552,8 @@ impl Drop for RowReadbackLease {
     }
 }
 
-/// Copies the quantum's logits rows to the pinned [`RowReadback`] the quantum was given, for a host that selects
-/// (sampling). Idle for a quantum with no readback, which is every greedy quantum: the stage is in the graph's list
+/// Copies the quantum's logits rows to the pinned [`RowReadback`] the quantum was given, for a host that reads them
+/// (sampling, teacher forcing). Idle for a quantum with no readback, which is every greedy quantum: the stage is in the graph's list
 /// and queues nothing.
 #[derive(Clone, Debug)]
 pub struct CopyRows {
@@ -613,32 +623,24 @@ impl Launch for CopyRows {
                 }
                 .map_err(fatal)?;
             }
-            if readback.hidden_bytes > 0 {
-                if !single {
-                    return Err(fatal(
-                        "a readback that holds the hidden state is a quantum of one sequence's own",
-                    ));
-                }
-                if self.rows == SelectedRows::Each {
-                    return Err(fatal("the hidden state is copied for a quantum's last row only"));
-                }
-                let hidden_bytes = quantum.config.hidden_size * 2;
-                if hidden_bytes != readback.hidden_bytes {
-                    return Err(fatal(format!(
-                        "a readback of {} hidden bytes does not fit the hidden rows of {hidden_bytes}",
-                        readback.hidden_bytes
-                    )));
-                }
+            let copy = hidden_copy(
+                readback.hidden_bytes,
+                readback.capacity * row_bytes,
+                quantum.config.hidden_size * 2,
+                quantum.rows,
+                single,
+                self.rows,
+            )
+            .map_err(fatal)?;
+            if let Some(copy) = copy {
                 // SAFETY: as above; the hidden row follows the logits rows in the readback, and the quantum's own
                 // stages wrote the slot before this launch, so it is this quantum's row and not another's.
                 unsafe {
                     kernels.copy_device_to_readback_shared(
                         readback.pinned(),
-                        readback.capacity * row_bytes,
-                        quantum
-                            .slot(self.hidden)
-                            .offset((quantum.rows.max(1).saturating_sub(1) * hidden_bytes) as u64),
-                        hidden_bytes,
+                        copy.destination,
+                        quantum.slot(self.hidden).offset(copy.source as u64),
+                        copy.bytes,
                     )
                 }
                 .map_err(fatal)?;
@@ -646,6 +648,50 @@ impl Launch for CopyRows {
         }
         Ok(())
     }
+}
+
+/// The copy of a quantum's last final-hidden row into the tail of a readback.
+#[derive(Debug, PartialEq, Eq)]
+struct HiddenCopy {
+    /// Byte offset in the readback: after its logits rows.
+    destination: usize,
+    /// Byte offset in the hidden slot: the start of the quantum's last row.
+    source: usize,
+    bytes: usize,
+}
+
+/// The hidden-row copy of a quantum of `quantum_rows` rows, or `None` for a readback with no hidden tail
+/// (`tail_bytes` 0). `logits_bytes` is the readback's logits rows, `hidden_bytes` one hidden row as the model has it,
+/// `single` whether the quantum is one sequence's own and `selected` which logits rows it copies. Refuses what cannot
+/// be honoured: a tail that does not fit the model's hidden row, a batch, or a quantum that copies every row (the
+/// hidden state is the last row's only).
+fn hidden_copy(
+    tail_bytes: usize,
+    logits_bytes: usize,
+    hidden_bytes: usize,
+    quantum_rows: usize,
+    single: bool,
+    selected: SelectedRows,
+) -> Result<Option<HiddenCopy>, String> {
+    if tail_bytes == 0 {
+        return Ok(None);
+    }
+    if !single {
+        return Err("a readback that holds the hidden state is a quantum of one sequence's own".to_string());
+    }
+    if selected == SelectedRows::Each {
+        return Err("the hidden state is copied for a quantum's last row only".to_string());
+    }
+    if tail_bytes != hidden_bytes {
+        return Err(format!(
+            "a readback of {tail_bytes} hidden bytes does not fit the hidden rows of {hidden_bytes}"
+        ));
+    }
+    Ok(Some(HiddenCopy {
+        destination: logits_bytes,
+        source: quantum_rows.max(1).saturating_sub(1) * hidden_bytes,
+        bytes: hidden_bytes,
+    }))
 }
 
 eager!(Argmax, SelectedToken, CopyRows);
@@ -669,6 +715,35 @@ mod tests {
             pool.is_exhausted(),
             "a request that samples is refused before it prefills"
         );
+    }
+
+    #[test]
+    fn a_plain_readback_copies_no_hidden_row() {
+        assert_eq!(hidden_copy(0, 800, 16, 3, true, SelectedRows::Last), Ok(None));
+        assert_eq!(hidden_copy(0, 800, 16, 3, false, SelectedRows::Each), Ok(None));
+    }
+
+    #[test]
+    fn a_hidden_readback_takes_the_last_row_after_the_logits() {
+        let copy = |rows| hidden_copy(16, 800, 16, rows, true, SelectedRows::Last);
+        let at = |source| {
+            Ok(Some(HiddenCopy {
+                destination: 800,
+                source,
+                bytes: 16,
+            }))
+        };
+        assert_eq!(copy(1), at(0));
+        assert_eq!(copy(5), at(64));
+        assert_eq!(copy(0), at(0));
+    }
+
+    #[test]
+    fn a_hidden_readback_refuses_a_batch_every_row_and_a_wrong_size() {
+        assert!(hidden_copy(16, 800, 16, 4, false, SelectedRows::Last).is_err());
+        assert!(hidden_copy(16, 800, 16, 4, true, SelectedRows::Each).is_err());
+        let error = hidden_copy(16, 800, 32, 4, true, SelectedRows::Last).unwrap_err();
+        assert!(error.contains("16") && error.contains("32"), "{error}");
     }
 
     #[test]

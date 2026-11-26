@@ -39,27 +39,14 @@ impl Owner {
     /// Why a run of `rows` rows per step cannot start on this sequence, if it cannot.
     pub(super) fn forced_rows_refusal(&self, rows: usize, sink: &dyn LogitsSink) -> Option<AdmissionError> {
         let readbacks = &self.sequence.row_readbacks;
-        if rows <= 1 {
-            // The step's row and its hidden row are copied by the quantum, to a readback it leases.
-            let exhausted = if sink.wants_hidden() {
-                readbacks.hidden_is_exhausted()
-            } else {
-                readbacks.is_exhausted()
-            };
-            return exhausted
-                .then(|| AdmissionError::Engine("the sequence has no row readback to copy the rows to".to_string()));
-        }
-        if sink.wants_hidden() {
-            return Some(AdmissionError::Engine(
-                "a teacher-forced run that takes the hidden state decodes one row at a time".to_string(),
-            ));
-        }
-        let held = readbacks.rows();
-        (rows > held).then(|| {
-            AdmissionError::Engine(format!(
-                "the sequences verify at most {held} rows: {rows} were asked (batching.forced-rows sizes them)"
-            ))
-        })
+        forced_refusal(
+            rows,
+            sink.wants_hidden(),
+            !readbacks.is_exhausted(),
+            !readbacks.hidden_is_exhausted(),
+            readbacks.rows(),
+        )
+        .map(AdmissionError::Engine)
     }
 
     /// Admits the verification of the next `rows` forced tokens: their logits rows go to the sink in order, and the
@@ -141,5 +128,47 @@ impl Owner {
         if run.generated >= run.wanted {
             run.stop(FinishReason::Length);
         }
+    }
+}
+
+/// Why a teacher-forced run of `rows` rows per step cannot start, given whether a plain readback and one that holds the
+/// hidden state are free to lease and how many rows the plain ones hold. A one-row step and its hidden row are copied
+/// by the quantum to a readback it leases, so a sequence with none free refuses at admission, not mid-run.
+fn forced_refusal(rows: usize, wants_hidden: bool, plain_free: bool, hidden_free: bool, held: usize) -> Option<String> {
+    if rows <= 1 {
+        let free = if wants_hidden { hidden_free } else { plain_free };
+        return (!free).then(|| "the sequence has no row readback to copy the rows to".to_string());
+    }
+    if wants_hidden {
+        return Some("a teacher-forced run that takes the hidden state decodes one row at a time".to_string());
+    }
+    (rows > held).then(|| {
+        format!("the sequences verify at most {held} rows: {rows} were asked (batching.forced-rows sizes them)")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_one_row_run_needs_the_readback_its_sink_takes() {
+        assert_eq!(forced_refusal(1, false, true, false, 4), None);
+        assert_eq!(forced_refusal(1, true, false, true, 4), None);
+        assert!(forced_refusal(1, false, false, true, 4).is_some());
+        assert!(forced_refusal(1, true, true, false, 4).is_some());
+        assert!(
+            forced_refusal(0, false, false, false, 0).is_some(),
+            "a sequence with none"
+        );
+    }
+
+    #[test]
+    fn a_multi_row_run_is_refused_with_the_hidden_state_or_past_the_rows_held() {
+        assert_eq!(forced_refusal(4, false, true, true, 4), None);
+        assert!(forced_refusal(4, true, true, true, 4).unwrap().contains("hidden state"));
+        let wide = forced_refusal(5, false, true, true, 4).unwrap();
+        assert!(wide.contains('4') && wide.contains('5'), "{wide}");
+        assert!(forced_refusal(2, false, false, false, 0).is_some());
     }
 }
