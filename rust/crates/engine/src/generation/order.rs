@@ -69,6 +69,9 @@ pub(crate) trait Launch: Send + Sync + 'static {
     /// The job's own number, distinct for every job.
     fn serial(job: &Self::Job) -> u64;
 
+    /// `kill`, a flag passed to `start`, was set: what waits for something of its own can give up.
+    fn killed(&self, _kill: &Arc<AtomicBool>) {}
+
     /// The number of the job `started` started.
     fn serial_of(started: &Self::Started) -> u64;
 
@@ -132,6 +135,10 @@ impl Launch for Executor {
 
     fn serial_of(started: &Started) -> u64 {
         started.serial
+    }
+
+    fn killed(&self, kill: &Arc<AtomicBool>) {
+        Executor::killed(self, kill);
     }
 
     fn start(&self, job: Job, kill: Arc<AtomicBool>, after: &[&Started]) -> Result<Started, StartError> {
@@ -282,18 +289,21 @@ impl Counters {
 
 /// A pass in flight: its members and the flag each is cancelled by, and the flag that stops the whole job when it is
 /// one job of several members.
-struct Flight {
+struct Flight<L: Launch> {
     members: Vec<(SequenceId, Arc<AtomicBool>)>,
     kill: Option<Arc<AtomicBool>>,
+    /// Told when `kill` is set, so work that waits on the flag can give up.
+    launcher: Arc<L>,
 }
 
-impl Flight {
+impl<L: Launch> Flight<L> {
     /// Stops the job once every member is cancelled, never for one.
     fn reevaluate(&self) {
         if let Some(kill) = &self.kill
             && self.members.iter().all(|(_, cancel)| cancel.load(Ordering::Acquire))
+            && !kill.swap(true, Ordering::AcqRel)
         {
-            kill.store(true, Ordering::Release);
+            self.launcher.killed(kill);
         }
     }
 }
@@ -351,7 +361,7 @@ pub(crate) struct WorkspaceOwner<L: Launch> {
     /// The verifications offered for a pass, and the rule that forms passes of them.
     assembler: PassAssembler<Offer<L>>,
     /// The passes in flight, by the number of the job each started.
-    flights: Vec<(u64, Flight)>,
+    flights: Vec<(u64, Flight<L>)>,
     counters: Arc<Counters>,
 }
 
@@ -557,6 +567,7 @@ impl<L: Launch> WorkspaceOwner<L> {
                 let flight = Flight {
                     members,
                     kill: Some(kill),
+                    launcher,
                 };
                 flight.reevaluate();
                 self.flights.push((serial, flight));
@@ -685,6 +696,7 @@ impl<L: Launch> WorkspaceOwner<L> {
                         Flight {
                             members: vec![(sequence, cancel)],
                             kill: None,
+                            launcher: Arc::clone(&launcher),
                         },
                     ));
                 }
@@ -1093,6 +1105,8 @@ mod tests {
         passes: Mutex<Vec<(Vec<u64>, Vec<u64>)>>,
         /// The kill flag of each pass that started as one job.
         kills: Mutex<Vec<Arc<AtomicBool>>>,
+        /// The flags the launcher was told were set, in order.
+        killed: Mutex<Vec<Arc<AtomicBool>>>,
         /// Whether the launcher refuses to run passes as one job.
         unbatchable: AtomicBool,
         /// Whether asking the launcher if a pass can be one job panics.
@@ -1127,6 +1141,10 @@ mod tests {
 
         fn serial_of(started: &Pin) -> u64 {
             started.serial
+        }
+
+        fn killed(&self, kill: &Arc<AtomicBool>) {
+            self.killed.lock().unwrap().push(Arc::clone(kill));
         }
 
         fn start(&self, job: u64, _kill: Arc<AtomicBool>, after: &[&Pin]) -> Result<Pin, StartError> {
@@ -1692,9 +1710,15 @@ mod tests {
             !batch_kill.load(Ordering::Acquire),
             "one cancelled member does not stop the others"
         );
+        assert!(fake.killed.lock().unwrap().is_empty(), "nothing was told of a kill");
         b.store(true, Ordering::Release);
         owner.leave(B);
         assert!(batch_kill.load(Ordering::Acquire), "all cancelled: the job stops");
+        // The launcher hears of it, so what waits on the flag can give up; once, however often the pass is re-evaluated.
+        owner.leave(B);
+        let killed = fake.killed.lock().unwrap();
+        assert_eq!(killed.len(), 1);
+        assert!(Arc::ptr_eq(&killed[0], &batch_kill));
     }
 
     #[test]

@@ -262,7 +262,7 @@ impl Generation {
     /// A frame that drives an owner's mailbox from a thread that must not run its turn, or after a frame's turns are
     /// used: unordered (a random routing hash), so that it may run on any worker, and so that no two owners' frames
     /// share a chain in the lake.
-    fn spawner(core: &Arc<Core>) -> Spawn {
+    pub(crate) fn spawner(core: &Arc<Core>) -> Spawn {
         let stages = Arc::clone(&core.stages);
         let seeds = AtomicU64::new(0);
         Box::new(move |work| {
@@ -313,13 +313,14 @@ impl Generation {
             weights.host_arena().is_some(),
         )
         .map_err(EngineError::Runtime)?;
-        let plan = Plan::build(
+        let plan = Plan::build_tiered(
             config,
             weights,
             residency,
             &formats,
             ring.as_ref(),
             ring.as_ref().map(|_| core.staging_lane_id()),
+            weights.disk_tier(),
         )
         .map_err(|error| EngineError::Runtime(format!("the execution plan: {error}")))?;
         if plan.fan_out_width() > core.compute_lanes() {

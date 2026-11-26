@@ -278,6 +278,9 @@ pub struct MemorySettings {
     pub staging_slots: Auto<u32>,
     /// Pinned window slots the artifact is read into for weights that stay on disk; `auto` is twice `staging_slots`.
     pub disk_window_slots: Auto<u32>,
+    /// The most bytes one piece of a read of the artifact moves, for weights that stay on disk; `auto` reads each slot
+    /// whole. A multiple of 4 KiB, at most what the I/O ring allows (the engine checks that bound).
+    pub disk_read_piece: Auto<ByteSize>,
     /// Device memory the engine may use; `auto` is what is free.
     pub gpu_limit: Auto<ByteSize>,
     /// Device memory left for other programs.
@@ -306,6 +309,7 @@ impl Default for MemorySettings {
             host_margin: Auto::Auto,
             staging_slots: Auto::Auto,
             disk_window_slots: Auto::Auto,
+            disk_read_piece: Auto::Auto,
             gpu_limit: Auto::Auto,
             gpu_reserve: ByteSize::mib(700),
             runtime_reserve: Auto::Auto,

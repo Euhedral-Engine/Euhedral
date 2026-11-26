@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::ptr::copy_nonoverlapping;
 use std::slice::from_raw_parts;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -161,7 +161,7 @@ struct Rig {
     reader: DiskReader,
     port: Arc<FakePort>,
     window: Arc<DiskWindow>,
-    harness: StageHarness,
+    harness: Arc<StageHarness>,
     stage: Copy,
     failures: Arc<Mutex<Vec<String>>>,
 }
@@ -180,7 +180,7 @@ impl Rig {
             reader,
             port,
             window,
-            harness: StageHarness::new(lanes),
+            harness: Arc::new(StageHarness::new(lanes)),
             failures: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -398,6 +398,43 @@ fn abandon_drops_the_failed_quantums_uses() {
 }
 
 #[test]
+fn a_kill_flag_set_abandons_the_quanta_watching_it_and_no_others() {
+    let rig = Rig::new(1);
+    let (flag, other) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
+    rig.reader.watch(1, Arc::clone(&flag));
+    rig.enqueue(2, vec![use_of("b", BLOCK, 100, 0)]);
+    rig.reader.watch(2, Arc::clone(&other));
+    // The read of quantum 1 is in flight; the flag is set and the reader told: quantum 2 reads once it arrives.
+    flag.store(true, Ordering::Release);
+    rig.reader.killed(&flag);
+    rig.port.finish(0);
+    assert_eq!(
+        rig.port.started().len(),
+        2,
+        "the slot went on to the quantum that is not killed"
+    );
+    assert_eq!(rig.port.started()[1].offset, BLOCK);
+    rig.port.finish(0);
+    assert!(rig.claim(0, 2));
+    // Telling again changes nothing.
+    rig.reader.killed(&flag);
+    assert_eq!(rig.port.started().len(), 2);
+}
+
+#[test]
+fn a_quantum_watched_with_its_flag_already_set_is_abandoned_at_once() {
+    let rig = Rig::new(1);
+    rig.enqueue(1, vec![use_of("a", 0, 100, 0), use_of("b", BLOCK, 100, 0)]);
+    rig.enqueue(2, vec![use_of("c", 2 * BLOCK, 100, 0)]);
+    rig.reader.watch(1, Arc::new(AtomicBool::new(true)));
+    // The read in flight is dropped when it arrives, and the quantum's second use is never read.
+    rig.port.finish(0);
+    assert_eq!(rig.port.started().len(), 2);
+    assert_eq!(rig.port.started()[1].offset, 2 * BLOCK);
+}
+
+#[test]
 fn a_read_nobody_claimed_of_an_abandoned_quantum_is_dropped() {
     let rig = Rig::new(1);
     rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
@@ -423,7 +460,7 @@ fn a_quantum_abandoned_before_its_registration_reads_nothing() {
 }
 
 #[test]
-fn a_failed_read_fails_its_quantum_and_still_releases_the_gate() {
+fn a_failed_read_fails_its_quantum_and_the_gate_of_its_waiting_copy() {
     let rig = Rig::new(1);
     rig.enqueue(1, vec![use_of("weights", 0, 100, 0)]);
     assert!(!rig.claim(0, 1));
@@ -434,17 +471,78 @@ fn a_failed_read_fails_its_quantum_and_still_releases_the_gate() {
         failures[0].contains("weights") && failures[0].contains("no disk"),
         "{failures:?}"
     );
-    assert_eq!(rig.events(), [GateEvent::Released]);
+    assert!(matches!(
+        rig.events().as_slice(),
+        [GateEvent::Failed(StageError::Fatal(why))] if why.contains("no disk")
+    ));
 }
 
 #[test]
-fn a_short_read_is_a_failed_read() {
+fn a_short_read_is_a_failed_read_and_its_copy_is_failed_not_handed_the_slot() {
     let rig = Rig::new(1);
     rig.enqueue(1, vec![use_of("weights", 0, 100, 0)]);
     rig.port.finish_with(0, Ok(40));
     assert_eq!(lock(&rig.failures).len(), 1);
-    // The copy still gets the slot: its quantum cannot commit.
-    assert!(rig.claim(0, 1));
+    // No copy was waiting: the failure stays with the slot, and the copy that comes is failed with it.
+    assert!(!rig.claim(0, 1));
+    assert!(
+        matches!(rig.events().as_slice(), [GateEvent::Failed(StageError::Fatal(why))] if why.contains("40 of 100")),
+        "{:?}",
+        rig.events()
+    );
+}
+
+#[test]
+fn a_failed_slot_goes_back_once_the_failed_copy_frees_it() {
+    let rig = Rig::new(1);
+    rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
+    rig.enqueue(2, vec![use_of("b", 0, 100, 0)]);
+    rig.port.finish_with(0, Err(io::Error::other("no disk")));
+    assert!(!rig.claim(0, 1));
+    // The copy owns the slot until its quantum ends; the next quantum reads only after.
+    assert!(rig.port.pending().is_empty());
+    rig.reader.slot_freed(0, 1);
+    assert_eq!(rig.port.pending().len(), 1);
+}
+
+#[test]
+fn a_claim_between_the_owners_release_and_the_failure_is_never_ready() {
+    let rig = Rig::new(1);
+    let (reader, harness) = (rig.reader.clone(), Arc::clone(&rig.harness));
+    let seen: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    // The fail handle runs where a racing claim would: after the owner's claim is released, before the failure is told.
+    let fail: FailHandle = Arc::new(move |_why| {
+        let passed = harness.pass_gate(&Copy(reader.clone()), &(0, 1));
+        lock(&record).push(passed.open);
+    });
+    rig.reader
+        .enqueue(1, vec![use_of("weights", 0, 100, 0)], fail)
+        .expect("accepted");
+    rig.port.finish_with(0, Err(io::Error::other("no disk")));
+    assert_eq!(*lock(&seen), [false], "the copy of a failed read was handed the slot");
+    assert!(matches!(
+        rig.events().as_slice(),
+        [GateEvent::Failed(StageError::Fatal(_))]
+    ));
+}
+
+#[test]
+fn a_claim_the_owner_decides_later_on_a_failed_read_fails_its_gate() {
+    let rig = Rig::new(1);
+    rig.enqueue(1, vec![use_of("weights", 0, 100, 0)]);
+    rig.port.finish_with(0, Err(io::Error::other("no disk")));
+    // The claim finds the owner busy and leaves its gate to it.
+    {
+        let rig_ref = &rig;
+        rig.reader.mailbox.with(move |_| {
+            assert!(!rig_ref.claim(0, 1));
+        });
+    }
+    assert!(matches!(
+        rig.events().as_slice(),
+        [GateEvent::Failed(StageError::Fatal(why))] if why.contains("no disk")
+    ));
 }
 
 #[test]
@@ -752,7 +850,12 @@ fn read_through_the_ring(file: ArtifactFile) -> (Vec<u8>, Vec<u8>, bool) {
     let file = Arc::new(file);
     let direct = file.has_direct();
     let window = DiskWindow::on_heap(geometry(2));
-    let port = Arc::new(FilePort::new(Arc::clone(&io), file, window));
+    let port = Arc::new(FilePort::new(
+        Arc::clone(&io),
+        file,
+        window,
+        DiskReadPiece::from_setting(Auto::Auto).unwrap(),
+    ));
     let reader = DiskReader::new(Arc::clone(&port) as Arc<dyn ReadPort>, geometry(2), inline());
     let failures = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&failures);
@@ -813,4 +916,33 @@ fn a_direct_open_that_fails_leaves_every_read_buffered() {
 fn a_missing_artifact_is_an_error() {
     let missing = Path::new("/nonexistent-disk-reader-test/artifact.bin");
     assert!(ArtifactFile::open(missing).is_err());
+}
+
+#[test]
+fn an_unset_read_piece_is_the_most_the_ring_allows() {
+    let piece = DiskReadPiece::from_setting(Auto::Auto).expect("auto is valid");
+    assert_eq!(piece.bytes(), MAX_PIECE);
+}
+
+#[test]
+fn a_stated_read_piece_of_whole_blocks_is_kept() {
+    let piece = DiskReadPiece::from_setting(Auto::Value(ByteSize::mib(8))).expect("8 MiB is whole blocks");
+    assert_eq!(piece.bytes(), 8 << 20);
+    let limit = DiskReadPiece::from_setting(Auto::Value(ByteSize(MAX_PIECE as u64))).expect("the limit");
+    assert_eq!(limit.bytes(), MAX_PIECE);
+}
+
+#[test]
+fn a_read_piece_that_is_zero_unaligned_or_over_the_limit_is_refused_naming_the_value() {
+    for bytes in [0, 1, BLOCK + 1, MAX_PIECE as u64 + BLOCK] {
+        let refusal = DiskReadPiece::from_setting(Auto::Value(ByteSize(bytes))).expect_err("refused");
+        assert!(refusal.contains(&format!("is {bytes} bytes")), "{refusal}");
+        assert!(refusal.contains(&MAX_PIECE.to_string()), "{refusal}");
+    }
+}
+
+#[test]
+fn a_read_piece_is_the_option_every_read_of_the_port_carries() {
+    let piece = DiskReadPiece::from_setting(Auto::Value(ByteSize(BLOCK))).expect("a block");
+    assert_eq!(piece.options().piece, Some(BLOCK as usize));
 }

@@ -1310,25 +1310,202 @@ fn concurrent_sequences_match_alone() {
     }
 }
 
+/// The bytes of the host arena a disk-tier test leaves in the artifact file: about 0.6 GiB.
+const ON_DISK: u64 = 600 << 20;
+
+/// The settings that leave about [`ON_DISK`] bytes in the artifact file, and the device limit they were made with.
+fn disk_settings(machine: &Machine, sequences: u32) -> (Settings, u64) {
+    let mut engine = settings(&machine.artifact, 4096);
+    engine.batching.max_sequences = sequences;
+    let limit = common::limit_to_stage(&machine.library, &engine, STAGED_SHORT);
+    common::limit_gpu(&mut engine, limit);
+    let host = common::limit_to_disk(&machine.library, &engine, limit, ON_DISK);
+    common::limit_host_weights(&mut engine, host);
+    (engine, limit)
+}
+
+/// The prompt and the tokens a resident engine selects after it: what a run with weights in the file must also give.
+fn resident_reference(machine: &Machine) -> Greedy {
+    let (_card, runtime) = shared_engine(machine);
+    greedy_reference(machine, &runtime)
+}
+
+/// The logits rows of 64 teacher-forced steps with part of the weights read from the artifact file through the window
+/// are those of the resident engine, byte for byte: what is read from disk is what the host would have held.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn disk_backed_weights_compute_what_host_backed_ones_do() {
+    let Some(machine) = machine() else { return };
+    let reference = resident_reference(&machine);
+    let forced = &reference.generated[..64];
+    let resident = {
+        let (_card, runtime) = shared_engine(&machine);
+        forced_rows(&runtime, &reference.prompt, forced)
+    };
+    let (engine, limit) = disk_settings(&machine, 1);
+    let (_card, runtime) = common::engine(&engine, &machine.library);
+    if !common::read_through_the_window(&runtime, limit) {
+        return;
+    }
+    let from_disk = forced_rows(&runtime, &reference.prompt, forced);
+    assert_eq!(from_disk.len(), resident.len());
+    for (step, (disk, host)) in from_disk.iter().zip(&resident).enumerate() {
+        assert!(
+            disk == host,
+            "step {step}: the logits read through the window differ from the resident ones"
+        );
+    }
+}
+
+/// The engine closes with a request admitted and its reads in flight: the shutdown ends within its bound, frees nothing
+/// under a read and leaves no handle to the runtime.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn closing_with_reads_in_flight_frees_after_them_only() {
+    let Some(machine) = machine() else { return };
+    let reference = resident_reference(&machine);
+    let (engine, limit) = disk_settings(&machine, 1);
+    let _card = common::card();
+    let (closer, runtime) = common::start_engine(&engine, &machine.library);
+    if !common::read_through_the_window(&runtime, limit) {
+        closer.shutdown(runtime).unwrap();
+        return;
+    }
+    let done = submit(
+        &runtime,
+        &reference.prompt,
+        512,
+        &[],
+        Speculation::Off,
+        SamplingConfig::greedy(0),
+        None,
+    )
+    .expect("the request is admitted");
+    closer
+        .shutdown_within(runtime, Duration::from_secs(120))
+        .expect("the engine closes within its bound");
+    drop(done);
+}
+
+/// Two loads in a row, each generating the tokens of the reference and each closing with no memory left claimed: the
+/// window and the reader of one load are gone before the next begins (the second start's allocation and the leak check
+/// of the shutdown fail otherwise).
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn every_load_generates_within_its_bound() {
+    let Some(machine) = machine() else { return };
+    let reference = resident_reference(&machine);
+    let (engine, limit) = disk_settings(&machine, 1);
+    let _card = common::card();
+    for cycle in 0..2 {
+        let (closer, runtime) = common::start_engine(&engine, &machine.library);
+        if !common::read_through_the_window(&runtime, limit) {
+            closer.shutdown(runtime).unwrap();
+            return;
+        }
+        let recording = generate(&runtime, &reference.prompt, 128, &[]);
+        assert_eq!(recording.outcome.reason, FinishReason::Length, "cycle {cycle}");
+        assert_eq!(recording.tokens, reference.generated, "cycle {cycle}");
+        closer
+            .shutdown_within(runtime, Duration::from_secs(120))
+            .unwrap_or_else(|error| panic!("cycle {cycle}: the engine closes clean within its bound: {error}"));
+    }
+}
+
+/// A request cancelled while the reader has reads for its quanta ends, and the next request on the same engine
+/// generates the reference tokens: the cancelled quanta gave their slots back. A slot never given back hangs the
+/// next request, which the bounded waits report.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn cancel_during_a_disk_read_ends_cleanly() {
+    let Some(machine) = machine() else { return };
+    let reference = resident_reference(&machine);
+    let (engine, limit) = disk_settings(&machine, 1);
+    let (_card, runtime) = common::engine(&engine, &machine.library);
+    if !common::read_through_the_window(&runtime, limit) {
+        return;
+    }
+    for after in [1, 5] {
+        let cancelled = submit(
+            &runtime,
+            &reference.prompt,
+            512,
+            &[],
+            Speculation::Off,
+            SamplingConfig::greedy(0),
+            Some(after),
+        )
+        .expect("the request is admitted")
+        .wait(Duration::from_secs(5 * 60))
+        .expect("the cancelled request never reported: a read or a held slot of a cancelled quantum was never freed");
+        assert_eq!(
+            cancelled.outcome.reason,
+            FinishReason::Cancelled,
+            "after {after} tokens"
+        );
+        assert!(cancelled.tokens.len() < 512);
+        let again = submit(
+            &runtime,
+            &reference.prompt,
+            128,
+            &[],
+            Speculation::Off,
+            SamplingConfig::greedy(0),
+            None,
+        )
+        .expect("the next request is admitted")
+        .wait(Duration::from_secs(5 * 60))
+        .expect("the next request never reported: the cancelled one left a slot held");
+        assert_eq!(again.tokens, reference.generated, "after a cancel at {after} tokens");
+    }
+}
+
 /// Two sequences with their draft layer on, projections staged through the one ring: each request's tokens are what
 /// they are alone. The waits are bounded.
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn concurrent_sequences_match_alone_when_staged() {
     let Some(machine) = machine() else { return };
+    concurrent_through(&machine, 2, false);
+}
+
+/// Sequences started together on the disk tier, with their draft layer on, each request's tokens are what they are
+/// alone: the reads of the quanta of several sequences are registered in the order the quanta start, and one slot of
+/// the window is never the copy of two quanta at once.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn sessions_started_together_on_the_disk_tier_match_running_alone() {
+    let Some(machine) = machine() else { return };
+    for count in [2, 4] {
+        concurrent_through(&machine, count, true);
+    }
+}
+
+/// `count` sequences generate alone and then together (the draft layer on when the artifact has one) under a forced
+/// plan: staged through the ring, or, with `disk`, with part of the weights left in the artifact file.
+fn concurrent_through(machine: &Machine, count: usize, disk: bool) {
     let tokenizer = tokenizer(&machine.artifact);
     let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
         .iter()
-        .take(2)
+        .take(count)
         .map(|text| tokenizer.encode_with_model_special_tokens(text).unwrap())
         .collect();
     let mut engine = settings(&machine.artifact, 2048);
-    engine.batching.max_sequences = 2;
+    engine.batching.max_sequences = count as u32;
     let limit = common::limit_to_stage(&machine.library, &engine, STAGED_SHORT);
     common::limit_gpu(&mut engine, limit);
+    if disk {
+        let host = common::limit_to_disk(&machine.library, &engine, limit, ON_DISK);
+        common::limit_host_weights(&mut engine, host);
+    }
     let (_card, runtime) = common::engine(&engine, &machine.library);
-    assert_eq!(runtime.sequences(), 2, "the engine holds two sequences");
-    if !common::staged_through_a_ring(&runtime, limit) {
+    assert_eq!(runtime.sequences(), count, "the engine holds {count} sequences");
+    let forced = if disk {
+        common::read_through_the_window(&runtime, limit)
+    } else {
+        common::staged_through_a_ring(&runtime, limit)
+    };
+    if !forced {
         return;
     }
     let wait = Duration::from_secs(10 * 60);

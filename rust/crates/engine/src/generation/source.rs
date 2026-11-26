@@ -692,9 +692,9 @@ impl Run {
     pub(super) fn stop(&mut self, reason: FinishReason) {
         if self.stopping.is_none() {
             self.stopping = Some(reason);
-            for flying in &self.in_flight {
-                flying.kill.store(true, Ordering::Release);
-            }
+            kill_all(self.in_flight.iter().map(|flying| &flying.kill), |kill| {
+                self.shared.executor.killed(kill);
+            });
             if let Some(checkpoints) = self.checkpoints.as_mut() {
                 checkpoints.stop();
             }
@@ -2507,6 +2507,15 @@ enum PassesChoice {
     Leave,
 }
 
+/// Sets each kill flag and tells `killed` of it, also of a flag already set (a failed restore may have set it first, and
+/// what waits on the flag must hear of every kill, not only of the one that set it).
+fn kill_all<'a>(flags: impl Iterator<Item = &'a Arc<AtomicBool>>, killed: impl Fn(&Arc<AtomicBool>)) {
+    for flag in flags {
+        flag.store(true, Ordering::Release);
+        killed(flag);
+    }
+}
+
 /// Whether a request leaves the shared passes: only a hidden request (`sink_behind` is its sink's state, `None` for
 /// any other request) whose sink is behind or that has no next step (`ended`), and only with nothing in flight, since
 /// a step still pending would be withdrawn.
@@ -2629,6 +2638,26 @@ mod passes_choice_tests {
         for ended in [false, true] {
             assert_eq!(passes_choice(None, ended, 0), PassesChoice::Offer);
         }
+    }
+}
+
+#[cfg(test)]
+mod kill_tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    #[test]
+    fn every_flag_is_set_and_told_also_one_that_was_set_already() {
+        let (fresh, early) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(true)));
+        let told = RefCell::new(Vec::new());
+        kill_all([&fresh, &early].into_iter(), |flag| {
+            told.borrow_mut().push(Arc::clone(flag))
+        });
+        assert!(fresh.load(Ordering::Acquire) && early.load(Ordering::Acquire));
+        let told = told.into_inner();
+        assert_eq!(told.len(), 2);
+        assert!(Arc::ptr_eq(&told[0], &fresh) && Arc::ptr_eq(&told[1], &early));
     }
 }
 

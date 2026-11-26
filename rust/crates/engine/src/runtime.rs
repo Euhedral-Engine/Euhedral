@@ -10,7 +10,7 @@ use std::fmt;
 use std::mem::{self, ManuallyDrop};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -41,8 +41,9 @@ use crate::prefix::PrefixCacheStats;
 #[cfg(feature = "test-oracles")]
 use crate::quantum::body_fault::{BodyFault, Defect, HoldEvent, RunSnapshot, Sighting};
 use crate::residency::accounting::{Consumer, MemoryAccount, PlanReservation};
+use crate::residency::disk::DiskReader;
 use crate::residency::planner::{
-    LocationBytes, PlanInputs, ResidencyPlan, forced_rows_of, pass_rows_limit, sequences_for,
+    LocationBytes, PlanInputs, ResidencyPlan, TierSummary, forced_rows_of, pass_rows_limit, sequences_for,
 };
 use crate::stages::LaneTable;
 use crate::startup;
@@ -387,10 +388,14 @@ pub struct StartupReport {
     pub piece_bytes: u64,
     /// Objects on the device (the halves of a split projection counted for two).
     pub objects: usize,
+    /// What each tier holds: the objects and bytes on the device, in pinned host memory and in the artifact file.
+    pub tiers: TierSummary,
     /// Payload bytes of the objects held in pinned host memory (the host arena's contents).
     pub host_backed_bytes: u64,
     /// Payload bytes of the objects the plan leaves in the artifact file, read through the disk window.
     pub disk_backed_bytes: u64,
+    /// Pinned host bytes of the disk window the objects left in the file are read through; 0 without any.
+    pub window_bytes: u64,
     /// Device bytes of the staging ring the staged weights are copied into; 0 when nothing is staged.
     pub staging_bytes: u64,
     /// The objects among them that kernels read in place over the bus (the embedding and the output head).
@@ -426,6 +431,11 @@ pub struct Teardown {
     leaked_bytes: AtomicU64,
     /// How long `shutdown` waits for a running request to end after its cancel: the lattice's close timeout.
     pub(crate) cancel_bound: Duration,
+    /// The disk reader, until the close takes it: reads are stopped first, while the lattice still runs the frames that
+    /// end them.
+    disk: Handoff<DiskReader>,
+    /// The reader did not end its reads in time: nothing it reads into may be freed.
+    disk_stuck: AtomicBool,
 }
 
 impl Teardown {
@@ -446,7 +456,19 @@ impl Teardown {
             device_bytes: AtomicU64::new(0),
             leaked_bytes: AtomicU64::new(NOT_CHECKED),
             cancel_bound,
+            disk: Handoff::empty(),
+            disk_stuck: AtomicBool::new(false),
         })
+    }
+
+    /// Whether a read of the disk window was still in flight when the close gave up on it.
+    pub(crate) fn disk_stuck(&self) -> bool {
+        self.disk_stuck.load(Ordering::Acquire)
+    }
+
+    /// The engine reads from disk: `close` stops `reader` before the lattice stops.
+    pub(crate) fn hold_disk(&self, reader: DiskReader) {
+        self.disk.send(reader);
     }
 
     /// The bytes the memory account's leak check found still claimed when the engine was shut down and its memory
@@ -460,6 +482,15 @@ impl Teardown {
 
     /// Closes the lakes, then the lattice. Idempotent. Waits for the workers: never from a worker.
     pub fn close(&self) {
+        // The quanta of the engine have ended by now (the owner stopped the request first), and the reads still in
+        // flight end on the lattice's frames: the reader is closed before the lattice is, and its window is freed only
+        // with the weights, after both.
+        if let Some(reader) = self.disk.take()
+            && reader.close().wait(self.cancel_bound).is_err()
+        {
+            self.disk_stuck.store(true, Ordering::Release);
+            log::error!("the disk reader did not end its reads within {:?}", self.cancel_bound);
+        }
         for lake in &self.lakes {
             lake.complete_gracefully();
         }
@@ -508,9 +539,11 @@ impl RuntimeOwner {
             .as_ref()
             .map_or(OPERATION_BOUND, |teardown| teardown.cancel_bound);
         // The running request ends on the lattice's workers, so before the lattice closes.
-        let stopped = runtime.generations.stop(bound);
+        let mut stopped = runtime.generations.stop(bound);
         if let Some(teardown) = &teardown {
             teardown.close();
+            // A read that did not end would write into the window after it is freed.
+            stopped &= !teardown.disk_stuck();
         }
         if !stopped {
             // A quantum may still be in flight: nothing it uses is freed. The runtime is forgotten, not dropped, because
@@ -616,6 +649,9 @@ impl RuntimeOwner {
                 stopped.set(runtime.generations.stop(bound));
                 if let Some(teardown) = teardown {
                     teardown.close();
+                    if teardown.disk_stuck() {
+                        stopped.set(false);
+                    }
                 }
             },
             |(runtime, teardown)| {
@@ -1311,12 +1347,23 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "the fake port's reads are shared between the test and the closures the reader is given"
+)]
 mod tests {
     use std::cell::Cell;
+    use std::io;
     use std::rc::Rc;
+    use std::sync::Mutex;
     use std::thread;
 
+    use euhedral_inference_settings::ModelSettings;
+
     use super::*;
+    use crate::residency::disk::{DiskUse, ReadDone, ReadPort, ReadSpec};
+    use crate::residency::offload::WindowGeometry;
 
     #[test]
     fn the_stage_ring_holds_the_quanta_in_flight_in_a_power_of_two() {
@@ -1356,6 +1403,82 @@ mod tests {
         settings.max_sequences = 5;
         settings.max_tokens_per_pass = Auto::Value(4);
         assert!(check_stated_sequences(&settings).is_err());
+    }
+
+    /// A port whose reads end when the test says.
+    #[derive(Default)]
+    struct Reads(Mutex<Vec<ReadDone>>);
+
+    impl ReadPort for Arc<Reads> {
+        fn start(&self, _spec: ReadSpec, done: ReadDone) -> io::Result<()> {
+            self.0.lock().unwrap().push(done);
+            Ok(())
+        }
+        fn has_direct(&self) -> bool {
+            false
+        }
+        fn file_len(&self) -> u64 {
+            u64::MAX
+        }
+    }
+
+    fn teardown_with_disk(bound: Duration) -> (Arc<Teardown>, DiskReader, Arc<Reads>) {
+        let geometry = WindowGeometry {
+            slots: 1,
+            slot_bytes: 4096,
+        };
+        let reads = Arc::new(Reads::default());
+        let reader = DiskReader::new(
+            Arc::new(Arc::clone(&reads)),
+            geometry,
+            Box::new(|work| {
+                work();
+                true
+            }),
+        );
+        let settings = Settings::with_model(ModelSettings::default());
+        let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
+        let teardown = Teardown::with_cancel_bound(lattice, Vec::new(), bound);
+        teardown.hold_disk(reader.clone());
+        (teardown, reader, reads)
+    }
+
+    fn read_of_one_use(reader: &DiskReader) -> Arc<Mutex<Vec<String>>> {
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let told = Arc::clone(&failures);
+        let use_ = DiskUse {
+            name: "w".to_string(),
+            file_offset: 0,
+            bytes: 100,
+            slot: 0,
+        };
+        reader
+            .enqueue(1, vec![use_], Arc::new(move |why| told.lock().unwrap().push(why)))
+            .expect("accepted");
+        failures
+    }
+
+    #[test]
+    fn closing_the_teardown_closes_the_disk_reader_once() {
+        let (teardown, reader, reads) = teardown_with_disk(Duration::from_secs(10));
+        teardown.close();
+        assert!(!teardown.disk_stuck(), "no read was in flight");
+        // A closed reader reads nothing more: a use posted to it is failed, and no read starts.
+        let failures = read_of_one_use(&reader);
+        assert_eq!(failures.lock().unwrap().len(), 1);
+        assert!(reads.0.lock().unwrap().is_empty());
+        // The reader was taken: a second close has none to close and is harmless.
+        teardown.close();
+        assert!(!teardown.disk_stuck());
+    }
+
+    #[test]
+    fn a_read_still_in_flight_when_the_close_gives_up_marks_the_disk_stuck() {
+        let (teardown, reader, reads) = teardown_with_disk(Duration::from_millis(1));
+        let _failures = read_of_one_use(&reader);
+        assert_eq!(reads.0.lock().unwrap().len(), 1);
+        teardown.close();
+        assert!(teardown.disk_stuck(), "the window may still be written to");
     }
 
     /// A stand-in for the runtime that counts its drops.

@@ -228,24 +228,142 @@ fn crate_lock(root: &Path) -> Result<Vec<String>, String> {
 }
 
 /// Cargo and Bazel must build the same RustEE: the commit of the `git_override` of `euhedral_rustee` in MODULE.bazel is the
-/// `rev` of the RustEE dependencies in rust/Cargo.toml.
+/// `rev` of the RustEE dependencies in rust/Cargo.toml, and the version of its `bazel_dep` was published from that commit.
 fn rustee_rev(root: &Path) -> Result<Vec<String>, String> {
     let read = |path: &str| fs::read_to_string(root.join(path)).map_err(|error| format!("read {path}: {error}"));
-    let quoted_after = |text: &str, key: &str| -> BTreeSet<String> {
-        text.lines()
-            .filter_map(|line| {
-                let rest = line.split(key).nth(1)?;
-                Some(rest.split('"').nth(1)?.to_owned())
-            })
-            .collect()
-    };
-    let cargo = quoted_after(&read("rust/Cargo.toml")?, "rev = ");
-    let module = read("MODULE.bazel")?;
-    let bazel = quoted_after(&module, "commit = ");
-    if cargo.len() == 1 && cargo == bazel {
-        return Ok(Vec::new());
+    Ok(rustee_problems(&read("rust/Cargo.toml")?, &read("MODULE.bazel")?))
+}
+
+/// The problems of RustEE's pin, given the text of rust/Cargo.toml and of MODULE.bazel.
+fn rustee_problems(cargo: &str, module: &str) -> Vec<String> {
+    let cargo_revs = quoted_after(cargo, "rev = ");
+    let commits = quoted_after(module, "commit = ");
+    let mut problems = Vec::new();
+    if cargo_revs.len() != 1 || cargo_revs != commits {
+        problems.push(format!(
+            "RustEE rev: rust/Cargo.toml says {cargo_revs:?} but the git_override in MODULE.bazel says {commits:?}; they must be one commit"
+        ));
     }
-    Ok(vec![format!(
-        "RustEE rev: rust/Cargo.toml says {cargo:?} but the git_override in MODULE.bazel says {bazel:?}; they must be one commit"
-    )])
+    problems.extend(version_problems(module, &commits));
+    problems
+}
+
+/// The quoted value after each `key` on a line of `text`.
+fn quoted_after(text: &str, key: &str) -> BTreeSet<String> {
+    text.lines()
+        .filter_map(|line| {
+            let rest = line.split(key).nth(1)?;
+            Some(rest.split('"').nth(1)?.to_owned())
+        })
+        .collect()
+}
+
+/// The version of the `bazel_dep` named `euhedral_rustee`, read from its own line only.
+fn rustee_version(module: &str) -> Option<&str> {
+    module
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("bazel_dep(") && line.contains("name = \"euhedral_rustee\""))
+        .and_then(|line| line.split("version = \"").nth(1)?.split('"').next())
+}
+
+/// The registry version of RustEE is `0.0.0-<UTC time>+<commit>` (forge build/CONTRACTS.md C5). Its stamp, the hex after
+/// the `+`, must be a prefix of the commit of the `git_override`, so the version and the override name one RustEE commit.
+fn version_problems(module: &str, commits: &BTreeSet<String>) -> Vec<String> {
+    let Some(version) = rustee_version(module) else {
+        return vec![
+            "MODULE.bazel has no bazel_dep(name = \"euhedral_rustee\", version = \"...\") on one line".to_owned(),
+        ];
+    };
+    let [commit] = commits.iter().map(String::as_str).collect::<Vec<_>>()[..] else {
+        return vec![format!(
+            "MODULE.bazel must have one git_override commit for euhedral_rustee, found {}",
+            commits.len()
+        )];
+    };
+    let publish = format!(
+        "publish RustEE at {commit} with forge's build-publish workflow (repo RustEE, commit {commit}) and set the bazel_dep to the version it publishes"
+    );
+    let stamp = version
+        .split_once('+')
+        .map(|(_, stamp)| stamp)
+        .filter(|stamp| !stamp.is_empty() && stamp.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    match stamp {
+        None => vec![format!(
+            "RustEE version {version} in MODULE.bazel has no +<commit> stamp; {publish}"
+        )],
+        Some(stamp) if commit.starts_with(stamp) => Vec::new(),
+        Some(stamp) => vec![format!(
+            "RustEE version {version} in MODULE.bazel was published from commit {stamp}, but the git_override commit is {commit}; {publish}"
+        )],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COMMIT: &str = "c10b3c34ba5c5cd7f7f070111d83071a61a29f75";
+    const OTHER_COMMIT: &str = "2d11a4aff4064a2b8c1e9f0d3b7a5c6e8f9012ab";
+    const VERSION: &str = "0.0.0-20261126223154+c10b3c34ba5c";
+
+    fn cargo(rev: &str) -> String {
+        format!(
+            "[dependencies]\neuhedral-core = {{ git = \"https://github.com/Euhedral-Engine/RustEE.git\", rev = \"{rev}\" }}\n"
+        )
+    }
+
+    fn module(version: &str, commit: &str) -> String {
+        format!(
+            "bazel_dep(name = \"euhedral_rustee\", version = \"{version}\")\ngit_override(\n    module_name = \"euhedral_rustee\",\n    remote = \"https://github.com/Euhedral-Engine/RustEE.git\",\n    commit = \"{commit}\",\n)\n"
+        )
+    }
+
+    #[test]
+    fn version_stamped_from_the_override_commit_passes() {
+        assert!(rustee_problems(&cargo(COMMIT), &module(VERSION, COMMIT)).is_empty());
+    }
+
+    #[test]
+    fn version_stamped_from_another_commit_names_version_stamp_and_commit() {
+        let version = "0.0.0-20261126000000+2d11a4aff406";
+        let problems = rustee_problems(&cargo(COMMIT), &module(version, COMMIT));
+        let [problem] = &problems[..] else {
+            panic!("expected one problem, got {problems:?}");
+        };
+        assert!(problem.contains(version), "{problem}");
+        assert!(problem.contains("2d11a4aff406"), "{problem}");
+        assert!(problem.contains(COMMIT), "{problem}");
+    }
+
+    #[test]
+    fn version_without_a_stamp_fails_naming_version_and_commit() {
+        let problems = rustee_problems(&cargo(COMMIT), &module("0.0.0-20261126223154", COMMIT));
+        let [problem] = &problems[..] else {
+            panic!("expected one problem, got {problems:?}");
+        };
+        assert!(problem.contains("0.0.0-20261126223154"), "{problem}");
+        assert!(problem.contains(COMMIT), "{problem}");
+    }
+
+    #[test]
+    fn missing_euhedral_rustee_bazel_dep_fails_even_when_another_dep_has_a_matching_stamp() {
+        let module = format!(
+            "bazel_dep(name = \"other\", version = \"0.0.0-1+c10b3c34ba5c\")\ngit_override(\n    module_name = \"euhedral_rustee\",\n    commit = \"{COMMIT}\",\n)\n"
+        );
+        let problems = rustee_problems(&cargo(COMMIT), &module);
+        let [problem] = &problems[..] else {
+            panic!("expected one problem, got {problems:?}");
+        };
+        assert!(problem.contains("euhedral_rustee"), "{problem}");
+    }
+
+    #[test]
+    fn commit_that_differs_from_cargo_rev_still_fails() {
+        let problems = rustee_problems(&cargo(OTHER_COMMIT), &module(VERSION, COMMIT));
+        assert!(
+            problems.iter().any(|problem| problem.contains("rust/Cargo.toml says")),
+            "{problems:?}"
+        );
+    }
 }

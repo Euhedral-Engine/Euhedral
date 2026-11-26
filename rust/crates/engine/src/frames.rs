@@ -38,6 +38,8 @@ pub(crate) enum Kind {
     Copy,
     /// The completions of the reads of the disk window, one chain per slot.
     DiskRead,
+    /// The completions of the copies out of the disk window, one chain per slot.
+    DiskCopy,
     /// The delivery of a hidden-rows request's rows to its sink.
     Hidden,
 }

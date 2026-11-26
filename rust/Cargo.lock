@@ -347,7 +347,7 @@ checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 [[package]]
 name = "euhedral-core"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=c10b3c34ba5c5cd7f7f070111d83071a61a29f75#c10b3c34ba5c5cd7f7f070111d83071a61a29f75"
 dependencies = [
  "euhedral-data-structures",
  "euhedral-hardware-utils",
@@ -358,7 +358,7 @@ dependencies = [
 [[package]]
 name = "euhedral-data-structures"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=c10b3c34ba5c5cd7f7f070111d83071a61a29f75#c10b3c34ba5c5cd7f7f070111d83071a61a29f75"
 dependencies = [
  "loom",
 ]
@@ -366,7 +366,7 @@ dependencies = [
 [[package]]
 name = "euhedral-gpu"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=c10b3c34ba5c5cd7f7f070111d83071a61a29f75#c10b3c34ba5c5cd7f7f070111d83071a61a29f75"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -380,7 +380,7 @@ dependencies = [
 [[package]]
 name = "euhedral-graph"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=c10b3c34ba5c5cd7f7f070111d83071a61a29f75#c10b3c34ba5c5cd7f7f070111d83071a61a29f75"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -392,7 +392,7 @@ dependencies = [
 [[package]]
 name = "euhedral-hardware-utils"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=c10b3c34ba5c5cd7f7f070111d83071a61a29f75#c10b3c34ba5c5cd7f7f070111d83071a61a29f75"
 dependencies = [
  "euhedral-data-structures",
  "libc",
@@ -403,7 +403,7 @@ dependencies = [
 [[package]]
 name = "euhedral-hashing"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=c10b3c34ba5c5cd7f7f070111d83071a61a29f75#c10b3c34ba5c5cd7f7f070111d83071a61a29f75"
 
 [[package]]
 name = "euhedral-inference-api-protocol"
@@ -615,7 +615,7 @@ dependencies = [
 [[package]]
 name = "euhedral-io"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=c10b3c34ba5c5cd7f7f070111d83071a61a29f75#c10b3c34ba5c5cd7f7f070111d83071a61a29f75"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -627,7 +627,7 @@ dependencies = [
 [[package]]
 name = "euhedral-memory"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=c10b3c34ba5c5cd7f7f070111d83071a61a29f75#c10b3c34ba5c5cd7f7f070111d83071a61a29f75"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -640,7 +640,7 @@ dependencies = [
 [[package]]
 name = "euhedral-net"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=c10b3c34ba5c5cd7f7f070111d83071a61a29f75#c10b3c34ba5c5cd7f7f070111d83071a61a29f75"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",

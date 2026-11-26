@@ -13,7 +13,7 @@ use euhedral_inference_engine::residency::offload::{
     EMBEDDING, FAMILIES, HOST_ALIGNMENT, OUTPUT_HEAD, mapped, select, stageable,
 };
 use euhedral_inference_engine::residency::planner::{
-    ARENA_ALIGNMENT, PlanInputs, ResidencyPlan, Tier, plan_closest, plan_with, sequences_for,
+    ARENA_ALIGNMENT, PlanInputs, ResidencyPlan, Tier, TierSummary, plan_closest, plan_with, sequences_for,
 };
 use euhedral_inference_settings::{Auto, ByteSize, Settings};
 
@@ -212,6 +212,48 @@ fn a_disk_window_that_is_not_a_whole_multiple_of_the_staging_slots_is_refused() 
     assert!(
         text.contains("memory.disk-window-slots") && text.contains("memory.staging-slots"),
         "{text}"
+    );
+}
+
+#[test]
+fn the_tier_summary_counts_what_each_tier_holds_and_states_it_in_one_line() {
+    let (config, table, settings) = (config(), rco_table(), settings(4096));
+    let need = resident(4096).device_bytes;
+    let plan = plan_with(&config, &table, &settings, inputs(need - 3 * GIB, Some(GIB))).unwrap();
+    let summary = TierSummary::of(&plan);
+    assert_eq!(summary.host_objects, plan.offload.host.len());
+    assert_eq!(summary.disk_objects, plan.offload.disk.len());
+    assert!(summary.disk_objects > 0, "the plan reaches the file");
+    assert_eq!(summary.device_objects, plan.on_device().count());
+    assert_eq!(
+        summary.device_objects + summary.host_objects + summary.disk_objects,
+        plan.device.len()
+    );
+    assert_eq!(summary.host_bytes + summary.disk_bytes, plan.offloaded_bytes());
+    assert_eq!(summary.device_bytes, plan.weights_bytes);
+    assert_eq!(summary.window_bytes, plan.offload.window_bytes());
+    let resident = TierSummary::of(&self::resident(4096));
+    assert_eq!(
+        (resident.host_objects, resident.disk_objects, resident.window_bytes),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn the_tier_summary_line_names_each_tier_its_objects_and_bytes_and_the_window() {
+    let summary = TierSummary {
+        device_objects: 1641,
+        device_bytes: 10_238_669_664,
+        host_objects: 49,
+        host_bytes: 938_557_440,
+        disk_objects: 56,
+        disk_bytes: 835_584_000,
+        window_bytes: 125_861_888,
+    };
+    assert_eq!(
+        summary.to_string(),
+        "weights: device 1641 objects 10238669664 bytes, host 49 objects 938557440 bytes, disk 56 objects 835584000 \
+         bytes (window 125861888 bytes)"
     );
 }
 

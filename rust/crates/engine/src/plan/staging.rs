@@ -8,6 +8,11 @@
 //! the quantum before; and the stage that reads the weight follows the transfer, which it also lists as a dependency.
 //!
 //! The first transfers are listed after the view's first stage, which stays the root a quantum enters through.
+//!
+//! A weight held on disk is staged the same way; its transfer copies from the disk window, not the host arena. The
+//! window has a whole multiple of the ring's slots, and the `k`th disk use of staging slot `s` in a view reads window
+//! slot `s + slots * (k mod (window / slots))`: the read of one use of a slot runs while the copy of the last one is
+//! not done, and slots of the window are shared by no two staging slots.
 
 use std::sync::Arc;
 
@@ -16,6 +21,8 @@ use euhedral_inference_cuda::{DevicePtr, HostWeightsArena};
 use super::PlanBuildError;
 use super::builder::{Make, Node};
 use crate::model::{Residence, WeightRef};
+use crate::residency::disk::DiskUse;
+use crate::stages::transfer::DiskTier;
 
 /// The device slots every staged weight is copied into before it is read: `slots` slots of `slot_bytes` bytes each,
 /// one after the other from `base`. A slot starts on an address the weights' formats may read from (the ring's
@@ -35,9 +42,9 @@ impl StagingRing {
     }
 }
 
-/// Whether the weight is in host memory, to be copied to a slot before it is read.
+/// Whether the weight is in host memory or on disk, to be copied to a slot before it is read.
 fn is_held(weight: &WeightRef) -> bool {
-    matches!(weight.residence, Residence::Host { .. })
+    matches!(weight.residence, Residence::Host { .. } | Residence::Disk { .. })
 }
 
 /// The first weight a view reads that is held off the device (in host memory to be staged, or on disk), in name order.
@@ -56,14 +63,15 @@ pub(super) fn staged(
     nodes: &[Node],
     arena: Option<&Arc<HostWeightsArena>>,
     ring: &StagingRing,
+    disk: Option<&Arc<DiskTier>>,
 ) -> Result<Option<Vec<Node>>, PlanBuildError> {
     // The node of each use, in order.
     let mut uses: Vec<usize> = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
         let weights = node.make.weights();
         for weight in &weights {
-            if matches!(weight.residence, Residence::Disk { .. }) {
-                return Err(PlanBuildError::OnDisk {
+            if matches!(weight.residence, Residence::Disk { .. }) && disk.is_none() {
+                return Err(PlanBuildError::NoDiskWindow {
                     name: weight.name.clone(),
                 });
             }
@@ -97,12 +105,24 @@ pub(super) fn staged(
     if uses.is_empty() {
         return Ok(None);
     }
+    if let Some(tier) = disk {
+        let window = tier.geometry().slots;
+        if window < ring.slots || !window.is_multiple_of(ring.slots) {
+            return Err(PlanBuildError::WindowSlots {
+                window,
+                staging: ring.slots,
+            });
+        }
+    }
     let total = uses.len();
     let mut result: Vec<Node> = Vec::with_capacity(nodes.len() + total);
     let mut remap: Vec<usize> = Vec::with_capacity(nodes.len());
     let mut transfer_of: Vec<usize> = vec![0; total];
     let mut next_use = 0;
-    let emit = |result: &mut Vec<Node>, use_index: usize| -> Result<usize, PlanBuildError> {
+    // How many disk uses each staging slot has had, and the view's disk uses so far.
+    let mut disk_uses_of: Vec<usize> = vec![0; ring.slots];
+    let mut disk_use = 0;
+    let mut emit = |result: &mut Vec<Node>, use_index: usize| -> Result<usize, PlanBuildError> {
         let Make::Linear { weight, .. } = &nodes[uses[use_index]].make else {
             unreachable!("a staged use is a linear");
         };
@@ -113,13 +133,9 @@ pub(super) fn staged(
                 slot_bytes: ring.slot_bytes,
             });
         }
-        let Residence::Host { offset } = weight.residence else {
-            unreachable!("a staged use is held in host memory");
-        };
         let slot = use_index % ring.slots;
-        let id = result.len();
-        result.push(Node {
-            make: Make::Transfer {
+        let make = match weight.residence {
+            Residence::Host { offset } => Make::Transfer {
                 name: weight.name.clone(),
                 source: arena.cloned(),
                 offset,
@@ -127,8 +143,41 @@ pub(super) fn staged(
                 slot,
                 destination: ring.slot(slot),
             },
-            deps: Vec::new(),
-        });
+            Residence::Disk { file_offset } => {
+                let Some(tier) = disk else {
+                    return Err(PlanBuildError::NoDiskWindow {
+                        name: weight.name.clone(),
+                    });
+                };
+                let window = tier.geometry();
+                let window_slot = slot + ring.slots * (disk_uses_of[slot] % (window.slots / ring.slots));
+                let use_ = DiskUse {
+                    name: weight.name.clone(),
+                    file_offset,
+                    bytes: weight.bytes,
+                    slot: window_slot,
+                };
+                if use_.bytes == 0 || use_.read_bytes() > window.slot_bytes {
+                    return Err(PlanBuildError::ReadTooLarge {
+                        name: weight.name.clone(),
+                        bytes: use_.read_bytes(),
+                        slot_bytes: window.slot_bytes,
+                    });
+                }
+                disk_uses_of[slot] += 1;
+                disk_use += 1;
+                Make::DiskTransfer {
+                    tier: Arc::clone(tier),
+                    use_,
+                    use_index: disk_use - 1,
+                    slot,
+                    destination: ring.slot(slot),
+                }
+            }
+            _ => unreachable!("a staged use is held in host memory or on disk"),
+        };
+        let id = result.len();
+        result.push(Node { make, deps: Vec::new() });
         Ok(id)
     };
     for (index, node) in nodes.iter().enumerate() {
@@ -184,12 +233,16 @@ pub(super) fn staged(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io;
 
     use super::super::buffers::Access;
     use super::super::builder::{WeightLookup, base_nodes};
     use super::super::hazards::with_hazards;
     use super::*;
     use crate::model::{LayerIndex, LayerKind, ModelConfig, Residence, Role, object_key};
+    use crate::residency::disk::{DiskReader, ReadDone, ReadPort, ReadSpec};
+    use crate::residency::offload::WindowGeometry;
+    use euhedral_graph::Completions;
     use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
 
     const LAYERS: usize = 8;
@@ -341,7 +394,9 @@ mod tests {
     }
 
     fn staged_of(suffixes: &[&str], slots: usize) -> Vec<Node> {
-        staged(&base_of(suffixes, &[]), None, &ring(slots)).unwrap().unwrap()
+        staged(&base_of(suffixes, &[]), None, &ring(slots), None)
+            .unwrap()
+            .unwrap()
     }
 
     /// The ids of the transfers and of the staged readers, in list order.
@@ -361,7 +416,7 @@ mod tests {
     #[test]
     fn an_empty_selection_stages_nothing() {
         // Objects read in place over the bus are not staged either.
-        assert!(staged(&base(), None, &ring(3)).unwrap().is_none());
+        assert!(staged(&base(), None, &ring(3), None).unwrap().is_none());
         assert_eq!(first_held(&base()), None);
     }
 
@@ -482,7 +537,7 @@ mod tests {
 
     #[test]
     fn a_ring_with_no_slot_is_refused_naming_the_weight() {
-        let error = staged(&base_of(&["/mlp/down"], &[]), None, &ring(0)).unwrap_err();
+        let error = staged(&base_of(&["/mlp/down"], &[]), None, &ring(0), None).unwrap_err();
         assert!(matches!(error, PlanBuildError::NoSlots { .. }), "{error}");
         assert_eq!(
             error.to_string(),
@@ -494,7 +549,7 @@ mod tests {
     fn a_weight_larger_than_a_slot_is_refused() {
         let mut tight = ring(3);
         tight.slot_bytes = BYTES - 1;
-        let error = staged(&base_of(&["/mlp/down"], &[]), None, &tight).unwrap_err();
+        let error = staged(&base_of(&["/mlp/down"], &[]), None, &tight, None).unwrap_err();
         assert!(
             matches!(error, PlanBuildError::WeightTooLarge { bytes: BYTES, .. }),
             "{error}"
@@ -503,7 +558,7 @@ mod tests {
 
     #[test]
     fn a_host_weight_no_projection_reads_is_refused() {
-        let error = staged(&base_of(&["/gdn/a_projection"], &[]), None, &ring(3)).unwrap_err();
+        let error = staged(&base_of(&["/gdn/a_projection"], &[]), None, &ring(3), None).unwrap_err();
         assert!(matches!(error, PlanBuildError::NotStageable { .. }), "{error}");
         assert_eq!(
             error.to_string(),
@@ -515,11 +570,99 @@ mod tests {
     fn a_disk_weight_is_refused() {
         let nodes = base_of(&[], &["layers/0/mlp/down"]);
         assert_eq!(first_held(&nodes).as_deref(), Some("text/layers/0/mlp/down"));
-        let error = staged(&nodes, None, &ring(3)).unwrap_err();
-        assert!(matches!(error, PlanBuildError::OnDisk { .. }), "{error}");
+        let error = staged(&nodes, None, &ring(3), None).unwrap_err();
+        assert!(matches!(error, PlanBuildError::NoDiskWindow { .. }), "{error}");
         assert_eq!(
             error.to_string(),
-            "text/layers/0/mlp/down is held on disk, which no plan stages yet"
+            "text/layers/0/mlp/down is held on disk and the plan was given no disk window"
         );
+    }
+
+    struct NoPort;
+
+    impl ReadPort for NoPort {
+        fn start(&self, _spec: ReadSpec, _done: ReadDone) -> io::Result<()> {
+            Err(io::Error::other("a plan test reads nothing"))
+        }
+        fn has_direct(&self) -> bool {
+            false
+        }
+        fn file_len(&self) -> u64 {
+            u64::MAX
+        }
+    }
+
+    /// A tier of `slots` window slots of `slot_bytes` that registers and reads nothing.
+    fn tier(slots: usize, slot_bytes: u64) -> Arc<DiskTier> {
+        let geometry = WindowGeometry { slots, slot_bytes };
+        let reader = DiskReader::new(Arc::new(NoPort), geometry, Box::new(|_| false));
+        DiskTier::detached(reader, geometry, Completions::without_lanes())
+    }
+
+    fn disk_nodes(tier: &Arc<DiskTier>, ring_slots: usize) -> Result<Vec<Node>, PlanBuildError> {
+        staged(&base_of(&[], &["/mlp/down"]), None, &ring(ring_slots), Some(tier)).map(Option::unwrap)
+    }
+
+    #[test]
+    fn disk_uses_transfer_through_the_window_in_plan_order() {
+        let (slots, window) = (3, 6);
+        let tier = tier(window, 4096);
+        let nodes = disk_nodes(&tier, slots).unwrap();
+        let mut seen = vec![0usize; slots];
+        let mut count = 0;
+        for node in &nodes {
+            let Make::DiskTransfer {
+                use_,
+                use_index,
+                slot,
+                destination,
+                ..
+            } = &node.make
+            else {
+                continue;
+            };
+            assert_eq!(*use_index, count, "the uses are numbered in plan order");
+            assert_eq!(*slot, count % slots);
+            assert_eq!(*destination, ring(slots).slot(*slot));
+            // The k-th use of a staging slot reads the window slot s + S * (k mod W/S).
+            let expected = *slot + slots * (seen[*slot] % (window / slots));
+            assert_eq!(use_.slot, expected, "use {count}");
+            assert_eq!(use_.bytes, BYTES);
+            seen[*slot] += 1;
+            count += 1;
+        }
+        assert_eq!(count, LAYERS, "a disk use for each FFN down");
+        assert!(seen.iter().any(|&uses| uses > window / slots), "the rotation wraps");
+    }
+
+    #[test]
+    fn a_disk_backed_plan_needs_a_window() {
+        let error = staged(&base_of(&[], &["/mlp/down"]), None, &ring(3), None).unwrap_err();
+        assert!(matches!(error, PlanBuildError::NoDiskWindow { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_window_that_is_not_a_whole_multiple_of_the_ring_is_refused() {
+        for window in [2, 4, 7] {
+            let error = disk_nodes(&tier(window, 4096), 3).unwrap_err();
+            assert!(
+                matches!(error, PlanBuildError::WindowSlots { window: w, staging: 3 } if w == window),
+                "{window}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_larger_than_a_window_slot_is_refused() {
+        let error = disk_nodes(&tier(6, 2048), 3).unwrap_err();
+        assert!(matches!(error, PlanBuildError::ReadTooLarge { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_disk_object_larger_than_a_ring_slot_is_refused() {
+        let mut tight = ring(3);
+        tight.slot_bytes = BYTES - 1;
+        let error = staged(&base_of(&[], &["/mlp/down"]), None, &tight, Some(&tier(6, 4096))).unwrap_err();
+        assert!(matches!(error, PlanBuildError::WeightTooLarge { .. }), "{error}");
     }
 }

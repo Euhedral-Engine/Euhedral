@@ -7,6 +7,8 @@ use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, HostWeightsArena};
 use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
 use euhedral_memory::Claim;
 
+use crate::stages::transfer::DiskTier;
+
 /// A layer of the model. The decoder layers count from 0; the MTP layer follows them (index 64 in the 64-layer
 /// model, as its KV cache does); the tensors that belong to no layer (embedding, heads, final norm, the MTP stem)
 /// take [`LayerIndex::GLOBAL`].
@@ -127,6 +129,9 @@ pub struct Weights {
     arena: DeviceBuffer,
     /// The pinned host arena the host-held tensors are read from, when the plan holds any.
     host: Option<Arc<HostWeightsArena>>,
+    /// The window the disk-held tensors are read through, with the reader that fills it; it goes after the quanta that
+    /// copy from it, with the weights.
+    disk: Option<Arc<DiskTier>>,
     /// The device slots the staged weights are copied into, when the plan stages any.
     staging: Option<DeviceBuffer>,
     /// The arenas' bytes in the engine's memory account, released when the arenas are freed.
@@ -144,6 +149,7 @@ impl Weights {
             tensors,
             arena: device,
             host,
+            disk: None,
             staging: None,
             claims: Vec::new(),
         }
@@ -154,6 +160,17 @@ impl Weights {
     pub fn with_staging(mut self, ring: DeviceBuffer) -> Self {
         self.staging = Some(ring);
         self
+    }
+
+    /// The weights, with the `disk` tier the tensors the plan leaves in the artifact file are read through.
+    pub fn with_disk(mut self, disk: Arc<DiskTier>) -> Self {
+        self.disk = Some(disk);
+        self
+    }
+
+    /// The disk tier, when the plan leaves weights in the artifact file.
+    pub fn disk_tier(&self) -> Option<&Arc<DiskTier>> {
+        self.disk.as_ref()
     }
 
     /// The address of the first staging slot, when the plan stages weights.

@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use euhedral_core::frames::Frame;
 use euhedral_graph::Lake;
-use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, HostWeightsArena, PooledPinned};
+use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, HostWeightsArena, PinnedBuffer, PooledPinned};
 use euhedral_inference_edrl::{
     HEADER_BYTES, Header, Metadata, ReadPlan, Region, TensorTable, TokenizerFooter, TrellisCompanions, WeightFormat,
     WeightLayout, content_end,
@@ -38,7 +38,7 @@ use euhedral_memory::Claim;
 use crate::composite::{Composed, Composite, compose, composed_depth, refuse_replaced_on_disk};
 use crate::error::{EngineError, PlanError};
 use crate::frames::{Kind, step};
-use crate::generation::Generations;
+use crate::generation::{Generation, Generations};
 use crate::handoff::Handoff;
 use crate::model::{
     LayerIndex, MTP_ATTENTION_PACK, ModelConfig, Residence, Role, TrellisParts, WeightRef, Weights, companion_name,
@@ -46,12 +46,14 @@ use crate::model::{
 };
 use crate::residency::accounting::{Consumer, PlanReservation};
 use crate::residency::budget::{self, HostBudget};
+use crate::residency::disk::{ArtifactFile, DiskReadPiece, DiskReader, DiskWindow, FilePort};
 use crate::residency::footprint;
 use crate::residency::loader::{self, LoadOutcome, Ring};
-use crate::residency::offload::{self, Offload};
-use crate::residency::planner::{LocationBytes, Placement, PlanInputs, ResidencyPlan, Tier, plan_with};
+use crate::residency::offload::{self, Offload, WindowGeometry};
+use crate::residency::planner::{LocationBytes, Placement, PlanInputs, ResidencyPlan, Tier, TierSummary, plan_with};
 use crate::runtime::{Core, EngineRuntime, ReadyHandoff, StartupReport, Units, free_arrival, raw_file};
 use crate::runtime::{lane_sizing, resolve_sequences};
+use crate::stages::transfer::DiskTier;
 use crate::state::SequenceState;
 use crate::warmup;
 use crate::workspace::{Workspace, input_records_for};
@@ -249,6 +251,10 @@ pub(crate) fn run(core: Arc<Core>, ready: ReadyHandoff, composite: Composite) {
     };
     startup.then(control, open);
 }
+
+/// What the plan holds outside the device memory besides the pinned host arena: the device ring staged weights are
+/// copied into, and the disk tier whose window the artifact's objects are read into.
+type Staged = (Option<(DeviceBuffer, Claim)>, Option<(Arc<DiskTier>, Claim)>);
 
 /// What the steps after the index need of the artifact.
 struct Artifact {
@@ -757,11 +763,13 @@ fn plan_residency(
 
 /// Refuses a plan that holds weights this build cannot run from where they are. Objects in pinned host memory are
 /// loaded into the host arena and run: the embedding and the head read in place, the others staged through the device
-/// ring the plan carries. Objects read from the artifact file would be left unloaded, and so would staged ones in a
-/// plan with no ring. The refusal names the pinned host bytes the plan needs.
+/// ring the plan carries. Objects read from the artifact file go through the disk window into the same ring; a plan
+/// with no ring or no window leaves them unloaded, and so are staged ones in a plan with no ring. The refusal names the pinned host bytes the plan needs.
 fn refuse_offload(offload: &Offload) -> Result<(), PlanError> {
     let staged = offload.host.iter().any(|name| !offload::mapped(name));
-    let in_reach = offload.disk.is_empty() && (!staged || (offload.staging.is_some() && offload.host_arena_bytes > 0));
+    let host_in_reach = !staged || (offload.staging.is_some() && offload.host_arena_bytes > 0);
+    let disk_in_reach = offload.disk.is_empty() || (offload.staging.is_some() && offload.window.is_some());
+    let in_reach = host_in_reach && disk_in_reach;
     if in_reach {
         return Ok(());
     }
@@ -812,6 +820,12 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
                 })?;
                 Some((Arc::new(HostWeightsArena::alloc(&core.library, usize_bytes)?), claim))
             }
+        };
+        // The window the artifact's objects are read into when the plan leaves some in the file, and the reader that fills
+        // it: allocated before any read, like the host arena.
+        let disk = match plan.offload.window {
+            Some(geometry) => Some(disk_tier(&core, reservation, geometry)?),
+            None => None,
         };
         // Every pinned allocation of the startup happens here: the ring of the upload, and the staging the cache's
         // page tables will take. Once the chains run, the pool allocates nothing.
@@ -864,7 +878,7 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
             ring,
             arena,
             host,
-            staging,
+            (staging, disk),
             weights_claim,
             loans,
             workspace,
@@ -897,6 +911,31 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
     }
 }
 
+/// The window of `geometry` in pinned host memory, claimed before it is allocated, and the reader of the artifact that
+/// fills it. The reader is also given to the teardown, which stops it before the lattice stops.
+fn disk_tier(
+    core: &Arc<Core>,
+    reservation: &mut PlanReservation,
+    geometry: WindowGeometry,
+) -> Result<(Arc<DiskTier>, Claim), EngineError> {
+    let path = &core.settings.model.artifact;
+    let bytes = geometry.bytes();
+    let claim = reservation.claim(Consumer::DiskWindow, bytes)?;
+    let size = usize::try_from(bytes)
+        .map_err(|_| EngineError::Runtime(format!("the disk window of {bytes} bytes does not fit memory")))?;
+    let buffer = Arc::new(PinnedBuffer::alloc(&core.library, size)?);
+    let window = DiskWindow::new(Arc::clone(&buffer), geometry)
+        .map_err(|error| EngineError::Runtime(format!("the disk window: {error}")))?;
+    let file =
+        ArtifactFile::open(path).map_err(|error| EngineError::io(format!("opening {}", path.display()), error))?;
+    let piece = DiskReadPiece::from_setting(core.settings.memory.disk_read_piece).map_err(EngineError::Runtime)?;
+    let port = FilePort::new(Arc::clone(&core.io), Arc::new(file), window, piece);
+    let reader = DiskReader::new(Arc::new(port), geometry, Generation::spawner(core));
+    core.teardown.hold_disk(reader.clone());
+    let tier = DiskTier::new(reader, buffer, geometry, Arc::clone(core.completions()));
+    Ok((tier, claim))
+}
+
 /// Step 5: uploads the weights.
 #[allow(
     clippy::too_many_arguments,
@@ -910,7 +949,7 @@ fn load(
     ring: Ring,
     arena: DeviceBuffer,
     pinned: Option<(Arc<HostWeightsArena>, Claim)>,
-    staging: Option<(DeviceBuffer, Claim)>,
+    staging: Staged,
     weights_claim: Claim,
     loans: Vec<PooledPinned>,
     workspace: Workspace,
@@ -968,7 +1007,7 @@ fn assemble(
     ends: HashMap<String, Arc<[u32]>>,
     ring: Ring,
     claims: (Claim, Option<Claim>),
-    staging: Option<(DeviceBuffer, Claim)>,
+    staging: Staged,
     workspace: Workspace,
     sequences: Vec<SequenceState>,
     outcome: LoadOutcome,
@@ -998,8 +1037,10 @@ fn assemble(
         }
     };
     let objects = plan.on_device().count();
+    let tiers = TierSummary::of(&plan);
     let host_backed_bytes = host_backed_bytes(&plan);
     let disk_backed_bytes = disk_backed_bytes(&plan);
+    let window_bytes = plan.offload.window_bytes();
     let staging_bytes = plan.offload.staging_bytes();
     let staging_geometry = plan.offload.staging;
     let mapped_objects = mapped_objects(&plan);
@@ -1008,8 +1049,12 @@ fn assemble(
     if let Some(claim) = host_claim {
         weights = weights.with_claim(claim);
     }
+    let (staging, disk) = staging;
     if let Some((buffer, claim)) = staging {
         weights = weights.with_staging(buffer).with_claim(claim);
+    }
+    if let Some((tier, claim)) = disk {
+        weights = weights.with_disk(tier).with_claim(claim);
     }
     let admitted = startup
         .reservation
@@ -1051,6 +1096,9 @@ fn assemble(
                     mapped_objects.join(", ")
                 );
             }
+            if disk_backed_bytes > 0 {
+                log::info!("weights read from the artifact file: {disk_backed_bytes} bytes through a {window_bytes} byte window");
+            }
             if let Some(ring) = staging_geometry {
                 log::info!(
                     "staging ring: {} slots of {} bytes on the device, {staging_bytes} bytes",
@@ -1066,8 +1114,10 @@ fn assemble(
                 chains: ring.depth,
                 piece_bytes: ring.piece_bytes,
                 objects,
+                tiers,
                 host_backed_bytes,
                 disk_backed_bytes,
+                window_bytes,
                 staging_bytes,
                 mapped_objects,
                 allocated_bytes: allocated,
@@ -1378,7 +1428,7 @@ mod tests {
     use euhedral_inference_settings::ModelSettings;
 
     use super::*;
-    use crate::residency::offload::StagingGeometry;
+    use crate::residency::offload::{StagingGeometry, WindowGeometry};
 
     #[test]
     fn the_transfer_lane_cap_follows_the_librarys_lane_limit() {
@@ -1391,7 +1441,6 @@ mod tests {
 
     #[test]
     fn a_plan_with_weights_outside_the_device_is_refused_naming_the_host_bytes() {
-        use crate::residency::offload::WindowGeometry;
         assert_eq!(refuse_offload(&Offload::default()), Ok(()));
         let offload = Offload {
             host: vec!["text/token_embedding".to_string()],
@@ -1441,6 +1490,29 @@ mod tests {
         let mut with_disk = host(&["text/token_embedding"]);
         with_disk.disk = vec!["text/layers/0/mlp/down".to_string()];
         assert!(refuse_offload(&with_disk).is_err());
+        // Disk objects are in reach once the plan carries the ring and the window that read them.
+        with_disk.staging = Some(StagingGeometry {
+            slots: 4,
+            slot_bytes: 4096,
+        });
+        assert!(
+            refuse_offload(&with_disk).is_err(),
+            "a ring alone does not read the file"
+        );
+        with_disk.window = Some(WindowGeometry {
+            slots: 8,
+            slot_bytes: 8192,
+        });
+        assert_eq!(refuse_offload(&with_disk), Ok(()));
+        let bare = Offload {
+            disk: vec!["text/layers/0/mlp/down".to_string()],
+            window: with_disk.window,
+            ..Offload::default()
+        };
+        assert!(
+            refuse_offload(&bare).is_err(),
+            "a window without a ring has nowhere to copy to"
+        );
     }
 
     #[test]
