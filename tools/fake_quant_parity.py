@@ -135,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     pattern = re.compile(args.objects)
     # What names this export: an export into a directory of another key is refused.
     key = export_key(args.model.resolve(), args.artifact.resolve(), args.quantization, args.compressed,
-                     args.imatrix.resolve() if args.imatrix is not None else None, args.objects)
+                     args.imatrix.resolve() if args.imatrix is not None else None)
     if args.export is not None:
         args.export.mkdir(parents=True, exist_ok=True)
     formats = {ordinal: name for name, ordinal in FORMAT_ORDINAL.items()}

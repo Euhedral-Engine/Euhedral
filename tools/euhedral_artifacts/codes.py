@@ -151,7 +151,8 @@ def _plain(name) -> bool:
 
 def export_key(*parts) -> str:
     """The key of an export: what names the run whose objects it holds (the source model, the artifact, the recipe,
-    the selection), joined as calibrate joins its key."""
+    the importance matrix), joined as calibrate joins its key. The objects chosen are not part of it: passes over other
+    objects of the same run add to one export."""
     return "|".join(str(part) for part in parts)
 
 
