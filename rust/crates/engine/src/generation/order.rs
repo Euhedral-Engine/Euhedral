@@ -1105,6 +1105,8 @@ mod tests {
         passes: Mutex<Vec<(Vec<u64>, Vec<u64>)>>,
         /// The kill flag of each pass that started as one job.
         kills: Mutex<Vec<Arc<AtomicBool>>>,
+        /// The flags the launcher was told were set, in order.
+        killed: Mutex<Vec<Arc<AtomicBool>>>,
         /// Whether the launcher refuses to run passes as one job.
         unbatchable: AtomicBool,
         /// Whether asking the launcher if a pass can be one job panics.
@@ -1139,6 +1141,10 @@ mod tests {
 
         fn serial_of(started: &Pin) -> u64 {
             started.serial
+        }
+
+        fn killed(&self, kill: &Arc<AtomicBool>) {
+            self.killed.lock().unwrap().push(Arc::clone(kill));
         }
 
         fn start(&self, job: u64, _kill: Arc<AtomicBool>, after: &[&Pin]) -> Result<Pin, StartError> {
@@ -1704,9 +1710,15 @@ mod tests {
             !batch_kill.load(Ordering::Acquire),
             "one cancelled member does not stop the others"
         );
+        assert!(fake.killed.lock().unwrap().is_empty(), "nothing was told of a kill");
         b.store(true, Ordering::Release);
         owner.leave(B);
         assert!(batch_kill.load(Ordering::Acquire), "all cancelled: the job stops");
+        // The launcher hears of it, so what waits on the flag can give up; once, however often the pass is re-evaluated.
+        owner.leave(B);
+        let killed = fake.killed.lock().unwrap();
+        assert_eq!(killed.len(), 1);
+        assert!(Arc::ptr_eq(&killed[0], &batch_kill));
     }
 
     #[test]

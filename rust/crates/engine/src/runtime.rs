@@ -1348,9 +1348,15 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
 mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
+    use std::io;
+    use std::sync::Mutex;
     use std::thread;
 
+    use euhedral_inference_settings::ModelSettings;
+
     use super::*;
+    use crate::residency::disk::{DiskUse, ReadDone, ReadPort, ReadSpec};
+    use crate::residency::offload::WindowGeometry;
 
     #[test]
     fn the_stage_ring_holds_the_quanta_in_flight_in_a_power_of_two() {
@@ -1390,6 +1396,97 @@ mod tests {
         settings.max_sequences = 5;
         settings.max_tokens_per_pass = Auto::Value(4);
         assert!(check_stated_sequences(&settings).is_err());
+    }
+
+    /// A port whose reads end when the test says.
+    #[derive(Default)]
+    struct Reads(Mutex<Vec<ReadDone>>);
+
+    impl ReadPort for Arc<Reads> {
+        fn start(&self, _spec: ReadSpec, done: ReadDone) -> io::Result<()> {
+            self.0.lock().unwrap().push(done);
+            Ok(())
+        }
+        fn has_direct(&self) -> bool {
+            false
+        }
+        fn file_len(&self) -> u64 {
+            u64::MAX
+        }
+    }
+
+    fn teardown_with_disk(bound: Duration) -> (Arc<Teardown>, DiskReader, Arc<Reads>) {
+        let geometry = WindowGeometry {
+            slots: 1,
+            slot_bytes: 4096,
+        };
+        let reads = Arc::new(Reads::default());
+        let reader = DiskReader::new(
+            Arc::new(Arc::clone(&reads)),
+            geometry,
+            Box::new(|work| {
+                work();
+                true
+            }),
+        );
+        let settings = Settings::with_model(ModelSettings::default());
+        let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
+        let teardown = Teardown::with_cancel_bound(lattice, Vec::new(), bound);
+        teardown.hold_disk(reader.clone());
+        (teardown, reader, reads)
+    }
+
+    fn read_of_one_use(reader: &DiskReader) -> Arc<Mutex<Vec<String>>> {
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let told = Arc::clone(&failures);
+        let use_ = DiskUse {
+            name: "w".to_string(),
+            file_offset: 0,
+            bytes: 100,
+            slot: 0,
+        };
+        reader
+            .enqueue(1, vec![use_], Arc::new(move |why| told.lock().unwrap().push(why)))
+            .expect("accepted");
+        failures
+    }
+
+    #[test]
+    fn closing_the_teardown_closes_the_disk_reader_once() {
+        let (teardown, reader, reads) = teardown_with_disk(Duration::from_secs(10));
+        teardown.close();
+        assert!(!teardown.disk_stuck(), "no read was in flight");
+        // A closed reader reads nothing more: a use posted to it is failed, and no read starts.
+        let failures = read_of_one_use(&reader);
+        assert_eq!(failures.lock().unwrap().len(), 1);
+        assert!(reads.0.lock().unwrap().is_empty());
+        // The reader was taken: a second close has none to close and is harmless.
+        teardown.close();
+        assert!(!teardown.disk_stuck());
+    }
+
+    #[test]
+    fn a_read_still_in_flight_when_the_close_gives_up_marks_the_disk_stuck() {
+        let (teardown, reader, reads) = teardown_with_disk(Duration::from_millis(1));
+        let _failures = read_of_one_use(&reader);
+        assert_eq!(reads.0.lock().unwrap().len(), 1);
+        teardown.close();
+        assert!(teardown.disk_stuck(), "the window may still be written to");
+    }
+
+    #[test]
+    fn a_read_that_ends_before_the_bound_leaves_the_disk_free_to_release() {
+        let (teardown, reader, reads) = teardown_with_disk(Duration::from_secs(10));
+        let _failures = read_of_one_use(&reader);
+        // The read ends as the reader closes, as a lattice frame would end it.
+        let end = reads.0.lock().unwrap().remove(0);
+        let closing = thread::spawn({
+            let teardown = Arc::clone(&teardown);
+            move || teardown.close()
+        });
+        end(Ok(100));
+        closing.join().expect("the close ends");
+        assert!(!teardown.disk_stuck());
     }
 
     /// A stand-in for the runtime that counts its drops.
