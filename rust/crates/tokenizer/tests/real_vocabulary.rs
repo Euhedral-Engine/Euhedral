@@ -1,6 +1,6 @@
 //! The tokenizer's behaviour on the real vocabulary of an artifact: text round-trips, every control token encodes to
 //! its own single id, encoding is repeatable and a split character is held back. Needs `euhedral.qwen.rco-artifact`
-//! (in `~/.gradle/gradle.properties`, or `EUHEDRAL_TEST_QWEN_RCO_ARTIFACT`); reads only the header, the footer and the
+//! (in `~/.config/euhedral/test.properties` or `~/.gradle/gradle.properties`, or `EUHEDRAL_TEST_QWEN_RCO_ARTIFACT`); reads only the header, the footer and the
 //! tokenizer body, never a payload.
 //!
 //! ```text

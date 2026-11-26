@@ -5,7 +5,7 @@
 //! The shapes are synthetic: stages that queue nothing but their markers, on lanes of their own, in graphs the test
 //! builds, and the plan's own graphs over weights with no memory behind them (a quantum that is killed never launches
 //! them). No artifact is loaded. The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY`
-//! in the environment, or `gradle.properties`); a test skips with a message when it is absent. Every wait for a quantum
+//! in the environment, in `~/.config/euhedral/test.properties`, or `gradle.properties`); a test skips with a message when it is absent. Every wait for a quantum
 //! to retire has a deadline, so a quantum that never retires fails its test and does not hang the suite.
 
 #![allow(clippy::print_stderr, reason = "a test reports what it skipped")]

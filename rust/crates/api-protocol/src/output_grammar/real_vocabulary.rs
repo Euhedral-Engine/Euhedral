@@ -1,5 +1,5 @@
 //! The grammar matcher over the real Qwen vocabulary: the checkpoint tokenizer's token bytes and end tokens, a
-//! logits row as wide as the model's. Needs `euhedral.qwen.tokenizer-dir` (in `~/.gradle/gradle.properties`, or
+//! logits row as wide as the model's. Needs `euhedral.qwen.tokenizer-dir` (in `~/.config/euhedral/test.properties` or `~/.gradle/gradle.properties`, or
 //! `EUHEDRAL_TEST_QWEN_TOKENIZER_DIR`); each test is skipped, with a line `--nocapture` shows, without it.
 
 #![allow(
