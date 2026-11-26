@@ -10,9 +10,6 @@ use euhedral_hashing::hasher_api;
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_quantization::mixed::search::{Fan, SearchFailure};
 
-/// The longest a wave of host tasks takes: a bound on the wait, not a rate.
-const LONGEST_WAVE: Duration = Duration::from_secs(24 * 60 * 60);
-
 /// Why a task has no answer: its frame was dropped before it ran, or its closure ended without sending (it panicked).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Lost;
@@ -76,18 +73,31 @@ impl fmt::Debug for Task {
 }
 
 /// Runs the tasks of the search on the host lake, `sinks` at a time, and joins them in the order they were given.
-/// The calling thread, outside the lattice, waits for each wave.
+/// The calling thread, outside the lattice, waits for each wave, at most `longest_wave` for a task.
 pub(super) struct LakeFan {
     host: Arc<Lake>,
     sinks: usize,
+    longest_wave: Duration,
 }
 
 impl LakeFan {
-    pub(super) fn new(host: Arc<Lake>, sinks: usize) -> LakeFan {
-        LakeFan {
-            host,
-            sinks: sinks.max(1),
+    /// Refuses no sinks and no time to wait: either would fail every wave.
+    pub(super) fn new(host: Arc<Lake>, sinks: usize, longest_wave: Duration) -> Result<LakeFan, SearchFailure> {
+        if sinks == 0 {
+            return Err(SearchFailure::Host(
+                "a host fan needs at least one sink, not 0".to_owned(),
+            ));
         }
+        if longest_wave.is_zero() {
+            return Err(SearchFailure::Host(
+                "a host fan needs a wave bound above 0 seconds, not 0".to_owned(),
+            ));
+        }
+        Ok(LakeFan {
+            host,
+            sinks,
+            longest_wave,
+        })
     }
 }
 
@@ -119,7 +129,7 @@ impl Fan for LakeFan {
             }
             for done in wave {
                 let answer = done
-                    .wait(LONGEST_WAVE)
+                    .wait(self.longest_wave)
                     .map_err(|_| lost("a host task did not come back in time"))?
                     .map_err(|Lost| lost("a host task panicked or was dropped before it ran"))?;
                 answers.push(answer);
@@ -131,7 +141,9 @@ impl Fan for LakeFan {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::thread;
 
     use euhedral_inference_settings::load_for_tool;
 
@@ -142,47 +154,122 @@ mod tests {
         Rig::start(&load_for_tool(&[], &|_| None).unwrap()).unwrap()
     }
 
+    /// The deadline for a step that must happen; a run that reaches it is hung, and its failure says which step.
+    const HANG: Duration = Duration::from_secs(30);
+    /// The wave bound of the test that must hear of a lost task at once: far under `HANG`.
+    const SHORT_WAVE: Duration = Duration::from_secs(5);
+
     type Job<T> = Box<dyn FnOnce() -> T + Send>;
 
     #[test]
     fn answers_come_back_in_the_order_the_tasks_were_given() {
         let rig = rig();
-        let fan = LakeFan::new(Arc::clone(&rig.host), 3);
+        let fan = LakeFan::new(Arc::clone(&rig.host), 3, HANG).unwrap();
         let tasks: Vec<Job<usize>> = (0..10usize).map(|i| Box::new(move || i * i) as Job<usize>).collect();
         assert_eq!(fan.map(tasks).unwrap(), (0..10usize).map(|i| i * i).collect::<Vec<_>>());
         assert_eq!(fan.map(Vec::<Job<usize>>::new()).unwrap(), Vec::<usize>::new());
         rig.stop();
     }
 
+    /// A gate the tasks wait at until the test opens it; the deadline is only for a hang, with a message that says
+    /// what never happened.
+    struct Gate {
+        state: Mutex<(usize, bool)>,
+        changed: Condvar,
+    }
+
+    impl Gate {
+        fn new() -> Arc<Gate> {
+            Arc::new(Gate {
+                state: Mutex::new((0, false)),
+                changed: Condvar::new(),
+            })
+        }
+
+        /// A task arrives and waits for the gate to open.
+        fn arrive_and_wait(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 += 1;
+            self.changed.notify_all();
+            let (state, timeout) = self.changed.wait_timeout_while(state, HANG, |state| !state.1).unwrap();
+            assert!(!timeout.timed_out() && state.1, "the gate was never opened");
+        }
+
+        /// Waits until `count` tasks have arrived.
+        fn await_arrivals(&self, count: usize) {
+            let state = self.state.lock().unwrap();
+            let (state, timeout) = self
+                .changed
+                .wait_timeout_while(state, HANG, |state| state.0 < count)
+                .unwrap();
+            assert!(
+                !timeout.timed_out() && state.0 >= count,
+                "only {} of {count} tasks of the first wave started",
+                state.0
+            );
+        }
+
+        fn open(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.changed.notify_all();
+        }
+    }
+
     #[test]
-    fn no_more_than_the_sinks_are_in_flight_at_once() {
-        let rig = rig();
-        let (sinks, count) = (2, 9);
-        let fan = LakeFan::new(Arc::clone(&rig.host), sinks);
-        let finished = Arc::new(AtomicUsize::new(0));
-        let tasks: Vec<Job<usize>> = (0..count)
+    fn a_wave_is_not_offered_before_the_one_before_it_is_joined() {
+        let mut settings = load_for_tool(&[], &|_| None).unwrap();
+        // Workers enough that a task offered too early would start while the first wave still holds the gate.
+        settings.host.task_parallelism = 3;
+        let rig = Rig::start(&settings).unwrap();
+        let (sinks, count) = (1, 4);
+        let fan = Arc::new(LakeFan::new(Arc::clone(&rig.host), sinks, HANG).unwrap());
+        let gate = Gate::new();
+        let opened = Arc::new(AtomicBool::new(false));
+        let tasks: Vec<Job<bool>> = (0..count)
             .map(|index| {
-                let finished = Arc::clone(&finished);
+                let (gate, opened) = (Arc::clone(&gate), Arc::clone(&opened));
                 Box::new(move || {
-                    // Tasks of one wave start only after the whole wave before it was joined.
-                    let before = finished.load(Ordering::Acquire);
-                    finished.fetch_add(1, Ordering::AcqRel);
-                    assert!(
-                        before >= index / sinks * sinks,
-                        "task {index} started after only {before} finished"
-                    );
-                    before
-                }) as Job<usize>
+                    if index < sinks {
+                        gate.arrive_and_wait();
+                    }
+                    // Only the first wave runs before the gate opens.
+                    index < sinks || opened.load(Ordering::Acquire)
+                }) as Job<bool>
             })
             .collect();
-        assert_eq!(fan.map(tasks).unwrap().len(), count);
+        let running = {
+            let fan = Arc::clone(&fan);
+            thread::spawn(move || fan.map(tasks))
+        };
+        gate.await_arrivals(sinks);
+        opened.store(true, Ordering::Release);
+        gate.open();
+        let answers = running.join().unwrap().unwrap();
+        assert_eq!(
+            answers,
+            vec![true; count],
+            "a task outside the first wave started before the gate opened"
+        );
+        rig.stop();
+    }
+
+    #[test]
+    fn a_fan_without_sinks_or_without_time_is_refused() {
+        let rig = rig();
+        for (sinks, wave, named) in [(0, HANG, "sink"), (1, Duration::ZERO, "wave bound")] {
+            let refusal = LakeFan::new(Arc::clone(&rig.host), sinks, wave).err().unwrap();
+            assert!(
+                matches!(&refusal, SearchFailure::Host(why) if why.contains(named)),
+                "{refusal}"
+            );
+        }
         rig.stop();
     }
 
     #[test]
     fn a_panicking_task_fails_the_wave_at_once_naming_the_cause() {
         let rig = rig();
-        let fan = LakeFan::new(Arc::clone(&rig.host), 2);
+        let fan = LakeFan::new(Arc::clone(&rig.host), 2, SHORT_WAVE).unwrap();
         let tasks: Vec<Job<usize>> = vec![
             Box::new(|| 1usize),
             Box::new(|| panic!("a task's own panic")),
@@ -202,18 +289,10 @@ mod tests {
     fn a_task_dropped_before_it_ran_sends_its_loss() {
         let done = Handoff::<Result<usize, Lost>>::new();
         drop(Slot::new(&done));
-        assert_eq!(
-            done.wait(Duration::from_secs(10)).unwrap(),
-            Err(Lost),
-            "no loss was sent"
-        );
+        assert_eq!(done.wait(HANG).unwrap(), Err(Lost), "no loss was sent");
         let done = Handoff::<Result<usize, Lost>>::new();
         Slot::new(&done).send(5);
-        assert_eq!(
-            done.wait(Duration::from_secs(10)).unwrap(),
-            Ok(5),
-            "the answer was replaced by a loss"
-        );
+        assert_eq!(done.wait(HANG).unwrap(), Ok(5), "the answer was replaced by a loss");
     }
 
     #[test]
@@ -221,7 +300,8 @@ mod tests {
         let rig = rig();
         let host = Arc::clone(&rig.host);
         rig.stop();
-        let refusal = LakeFan::new(host, 2)
+        let refusal = LakeFan::new(host, 2, HANG)
+            .unwrap()
             .map(vec![Box::new(|| 1usize) as Job<usize>])
             .unwrap_err();
         assert!(matches!(refusal, SearchFailure::Host(_)), "{refusal}");

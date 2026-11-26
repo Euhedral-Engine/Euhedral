@@ -15,6 +15,7 @@ mod ledger;
 use std::fs::{create_dir_all, read_to_string};
 use std::path::Path;
 use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use euhedral_inference_cuda::CudaLibrary;
 use euhedral_inference_engine::model::ModelConfig;
@@ -271,7 +272,8 @@ fn searched_on(rig: &Rig, settings: &Settings, flags: &Flags, library: &Path, in
     let sinks = flags
         .host_sinks
         .unwrap_or_else(|| usize::try_from(settings.host.task_parallelism).unwrap_or(1));
-    let fan = LakeFan::new(Arc::clone(&rig.host), sinks);
+    let fan = LakeFan::new(Arc::clone(&rig.host), sinks, Duration::from_secs(flags.wave_secs))
+        .map_err(|error| error.to_string())?;
     let assembly = Resident(Arc::clone(&sources));
     let outcome = search
         .run(World {

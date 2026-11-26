@@ -98,7 +98,7 @@ pub const COMMANDS: [Command; 13] = [
     Command {
         name: "allocate",
         availability: Availability::Wired,
-        usage: "--source OPTION=ARTIFACT... --base OPTION --costs COSTS.json --priors PRIORS.json --reference R.kld... --state SEARCH.resume --out DIR [--context N] [--seed-file FILE] [--import-state FILE] [--free-mib N] [--workers N] [--host-mib N] [--score-rows N] [--score-batch N] [--batch N] [--explore X] [--patience N] [--random N] [--bands N] [--verify-rows N] [--host-sinks N] [--members N] [--ridge X] [--lambdas A,B,...] [--budget-fractions A,B,...] [--rco-steps N] [--rco-lr X] [--rco-samples N] [--rco-restarts N] [--knapsack-steps N] [--max-rounds N] [--seed N] [--max-concurrent 1] [--config YAML] [--cuda-library FILE]",
+        usage: "--source OPTION=ARTIFACT... --base OPTION --costs COSTS.json --priors PRIORS.json --reference R.kld... --state SEARCH.resume --out DIR [--context N] [--seed-file FILE] [--import-state FILE] [--free-mib N] [--workers N] [--host-mib N] [--score-rows N] [--score-batch N] [--batch N] [--explore X] [--patience N] [--random N] [--bands N] [--verify-rows N] [--host-sinks N] [--wave-secs N] [--members N] [--ridge X] [--lambdas A,B,...] [--budget-fractions A,B,...] [--rco-steps N] [--rco-lr X] [--rco-samples N] [--rco-restarts N] [--knapsack-steps N] [--max-rounds N] [--seed N] [--max-concurrent 1] [--config YAML] [--cuda-library FILE]",
     },
     Command {
         name: "reference",

@@ -173,6 +173,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs::{read_to_string, write};
 
+    use euhedral_core::generics::LatticeSource;
     use euhedral_inference_quantization::mixed::QuantOption;
     use euhedral_inference_settings::load_for_tool;
 
@@ -248,8 +249,13 @@ mod tests {
         let (rig, directory) = (rig(), tempfile::tempdir().unwrap());
         let mut ledger = open(&rig, directory.path(), "one").unwrap();
         ledger.add(measured("a", 0.5)).unwrap();
-        // The state a failed call to the file leaves.
-        ledger.state = None;
+        // With the asynchronous I/O ended, the next write to the file fails.
+        rig.io.complete();
+        let failed = ledger.add(measured("b", 0.1)).unwrap_err().to_string();
+        assert!(
+            !failed.contains("lost"),
+            "the failed write is reported as itself: {failed}"
+        );
         for refusal in [
             ledger.add(measured("b", 0.1)).map(drop),
             ledger.set_progress(Progress::default()),

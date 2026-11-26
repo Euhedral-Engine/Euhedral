@@ -17,6 +17,10 @@ use euhedral_inference_quantization::reference::DEFAULT_ROWS;
 const MOST_IN_FLIGHT: usize = 32;
 /// The most rows of a scored verification.
 const MOST_SCORE_ROWS: usize = 8;
+/// The default bound on one wave of host tasks, in seconds: a day.
+const DEFAULT_WAVE_SECS: u64 = 24 * 60 * 60;
+/// The most a wave may be given, in seconds: a year, so that the deadline stays a time the clock can hold.
+const MOST_WAVE_SECS: u64 = 366 * 24 * 60 * 60;
 /// The default target context in tokens.
 const DEFAULT_CONTEXT: u32 = 32_768;
 
@@ -49,6 +53,8 @@ pub(super) struct Flags {
     pub verify_rows: u32,
     /// The most host tasks of the search the lake holds at once; unset takes the lake's workers.
     pub host_sinks: Option<usize>,
+    /// The longest, in seconds, the search waits for one wave of host tasks before it gives the run up.
+    pub wave_secs: u64,
     pub members: usize,
     pub ridge: f64,
     pub lambdas: Vec<f64>,
@@ -129,6 +135,7 @@ pub(super) fn parse(args: &[String]) -> Result<Flags, String> {
         bands: DEFAULT_BANDS,
         verify_rows: 5,
         host_sinks: None,
+        wave_secs: DEFAULT_WAVE_SECS,
         members: 8,
         ridge: 1e-3,
         lambdas: vec![0.0, 0.002, 0.005, 0.01, 0.02],
@@ -177,6 +184,7 @@ pub(super) fn parse(args: &[String]) -> Result<Flags, String> {
             "--bands" => flags.bands = whole(flag, value, 1, MOST_BANDS)?,
             "--verify-rows" => flags.verify_rows = whole(flag, value, 2, VERIFY_MAX_ROWS)?,
             "--host-sinks" => flags.host_sinks = Some(whole(flag, value, 1, MOST_CANDIDATES)?),
+            "--wave-secs" => flags.wave_secs = whole(flag, value, 1, MOST_WAVE_SECS)?,
             "--members" => flags.members = whole(flag, value, 1, MOST_MEMBERS)?,
             "--ridge" => flags.ridge = real(flag, value, 0.0, f64::MAX)?,
             "--lambdas" => flags.lambdas = reals(flag, value, 0.0, f64::MAX)?,
@@ -269,7 +277,7 @@ mod tests {
         let flags = with(
             "--context 4096 --seed-file s.json --import-state o.resume --free-mib 20000 --workers 3 --host-mib 512 \
              --score-rows 4 --score-batch 2 --batch 5 --explore 0.5 --patience 2 --random 0 --bands 4 \
-             --verify-rows 3 --host-sinks 2 --members 4 --ridge 0.01 --lambdas 0,0.5 --budget-fractions 1 \
+             --verify-rows 3 --host-sinks 2 --wave-secs 90 --members 4 --ridge 0.01 --lambdas 0,0.5 --budget-fractions 1 \
              --rco-steps 10 --rco-lr 0.2 --rco-samples 3 --rco-restarts 2 --knapsack-steps 64 --max-rounds 9 \
              --seed -7 --max-concurrent 1 --reference r2.kld",
         )
@@ -283,8 +291,14 @@ mod tests {
             (4, 2, 5, 0)
         );
         assert_eq!(
-            (flags.verify_rows, flags.host_sinks, flags.members, flags.seed),
-            (3, Some(2), 4, -7)
+            (
+                flags.verify_rows,
+                flags.host_sinks,
+                flags.wave_secs,
+                flags.members,
+                flags.seed
+            ),
+            (3, Some(2), 90, 4, -7)
         );
         assert_eq!(flags.rco, rco::Settings::new(10, 0.2, 3, 2).unwrap());
         assert_eq!(flags.lambdas, [0.0, 0.5]);
@@ -324,6 +338,7 @@ mod tests {
             ("--workers 0", "--workers 0"),
             ("--host-mib 0", "--host-mib 0"),
             ("--host-sinks 0", "--host-sinks 0"),
+            ("--wave-secs 0", "--wave-secs 0"),
             ("--score-rows 9", "--score-rows 9 is not a whole number from 1 to 8"),
             ("--score-rows 0", "--score-rows 0"),
             ("--score-batch 33", "--score-batch 33"),
