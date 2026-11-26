@@ -275,10 +275,8 @@ jobs:
           apt-get $APT_OPTS update -qq && apt-get $APT_OPTS install -y -qq llvm xz-utils python3-pip gcc libc6-dev >/dev/null
       - name: Install the toolchains
         run: mise install >/dev/null
-      # No daemon: the docker jobs share one Gradle home and host networking, so a client would attach to the idle daemon of
-      # another job's container and build there.
       - name: Build the native library
-        run: mise exec -- gradle --no-daemon -q nativeBuildLinuxX64
+        run: mise exec -- gradle -q nativeBuildLinuxX64
       # The device profile is the release profile with debug assertions and overflow checks on: the tests run at the speed
       # of the product and still trip on what the debug build would. The quantization crate's other device tests fail,
       # not skip, without their settings: only its kernel tests are built for the groups.
@@ -318,8 +316,9 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
+      # The engine sizes its host memory from the container headroom, so a learned cap starves it: limit to the full ask.
       # Measured: 0.5 GB on the card, 0.5 GB of host memory, 114 s.
-      ARBITER_ARGS: "--gpu shared:1.5 --mem 2G"
+      ARBITER_ARGS: "--gpu shared:1.5 --mem 2G --no-learned-cap"
       ARBITER_EST: "240"
     steps:
       - uses: actions/checkout@v4
@@ -367,7 +366,7 @@ jobs:
     runs-on: arbiter-gpu
     env:
       # Measured: 12.7 GB on the card (one engine at a time), 5.4 GB of host memory, 74 s.
-      ARBITER_ARGS: "--gpu shared:13.5 --mem 8G"
+      ARBITER_ARGS: "--gpu shared:13.5 --mem 8G --no-learned-cap"
       ARBITER_EST: "240"
     steps:
       - uses: actions/checkout@v4
@@ -415,7 +414,7 @@ jobs:
     runs-on: arbiter-gpu
     env:
       # Measured: 5.4 GB on the card (a reduced model), 12.2 GB of host memory, 140 s.
-      ARBITER_ARGS: "--gpu shared:6 --mem 14G"
+      ARBITER_ARGS: "--gpu shared:6 --mem 14G --no-learned-cap"
       ARBITER_EST: "300"
     steps:
       - uses: actions/checkout@v4
@@ -463,7 +462,7 @@ jobs:
     runs-on: arbiter-gpu
     env:
       # Measured: 13.1 GB on the card (a 512 and an 8192 token engine), 2.6 GB of host memory, 57 to 141 s.
-      ARBITER_ARGS: "--gpu shared:14 --mem 6G"
+      ARBITER_ARGS: "--gpu shared:14 --mem 6G --no-learned-cap"
       ARBITER_EST: "300"
     steps:
       - uses: actions/checkout@v4
@@ -511,7 +510,7 @@ jobs:
     runs-on: arbiter-gpu
     env:
       # Measured: 22.1 GB on the card, 23.4 GB of host memory, 53 model loads, 582 s.
-      ARBITER_ARGS: "--gpu shared:22.5 --mem 28G"
+      ARBITER_ARGS: "--gpu shared:22.5 --mem 28G --no-learned-cap"
       ARBITER_EST: "700"
     steps:
       - uses: actions/checkout@v4
@@ -597,7 +596,7 @@ jobs:
       - name: Install the toolchains
         run: mise install >/dev/null
       - name: Build both CUDA products and package Spring Boot
-        run: mise exec -- gradle --no-daemon nativeVerify :api:bootJar build
+        run: mise exec -- gradle nativeVerify :api:bootJar build
       # Host-only native tests (no card): the programmatic-launch wait rule over the kernel sources and the registry.
       - name: Native host tests
         working-directory: native/tests
