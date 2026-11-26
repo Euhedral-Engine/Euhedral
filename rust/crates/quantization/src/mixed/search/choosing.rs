@@ -175,12 +175,12 @@ impl Search<'_> {
         let (n, k) = (self.space.objects().len(), self.space.options().len());
         let mut moves = Vec::with_capacity(MOVES_TRIED);
         for _ in 0..MOVES_TRIED {
-            let anchor = below(&mut choosing.random, choosing.anchors.len());
+            let anchor = below(&mut choosing.random, choosing.anchors.len())?;
             let mut choice = self.space.choice(&choosing.anchors[anchor].allocation)?;
-            let changes = 1 + below(&mut choosing.random, 2);
+            let changes = 1 + below(&mut choosing.random, 2)?;
             for _ in 0..changes {
-                let i = below(&mut choosing.random, n);
-                let other = below(&mut choosing.random, k - 1);
+                let i = below(&mut choosing.random, n)?;
+                let other = below(&mut choosing.random, k - 1)?;
                 choice[i] = if other >= choice[i] { other + 1 } else { other };
             }
             moves.push(choice);

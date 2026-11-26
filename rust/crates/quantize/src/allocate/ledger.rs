@@ -170,9 +170,97 @@ fn publish(out: &Path, files: &[(String, String)]) -> Result<(), String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs::{read_to_string, write};
 
+    use euhedral_inference_quantization::mixed::QuantOption;
+    use euhedral_inference_settings::load_for_tool;
+
     use super::*;
+    use crate::rig::Rig;
+
+    fn rig() -> Rig {
+        Rig::start(&load_for_tool(&[], &|_| None).unwrap()).unwrap()
+    }
+
+    fn measured(name: &str, kl: f64) -> Measured {
+        Measured {
+            allocation: Allocation::new(BTreeMap::from([(name.to_owned(), QuantOption::Nvfp4)])),
+            kl,
+            kl_se: 0.01,
+            bytes: 7,
+            prefill: 1.5,
+            decode: 2.5,
+            fits: true,
+            round: 0,
+            origin: "seed:pure".to_owned(),
+        }
+    }
+
+    fn open(rig: &Rig, directory: &Path, fingerprint: &str) -> Result<FileLedger, SearchFailure> {
+        FileLedger::open(
+            &rig.io,
+            &rig.host,
+            &directory.join("search.resume"),
+            fingerprint,
+            9,
+            1 << 30,
+            &directory.join("out"),
+        )
+    }
+
+    #[test]
+    fn what_a_ledger_adds_and_sets_is_there_when_the_file_is_opened_again() {
+        let (rig, directory) = (rig(), tempfile::tempdir().unwrap());
+        let mut ledger = open(&rig, directory.path(), "one").unwrap();
+        assert_eq!((ledger.seed(), ledger.free_bytes()), (9, Some(1 << 30)));
+        assert!(ledger.add(measured("a", 0.5)).unwrap());
+        assert!(
+            !ledger.add(measured("a", 0.9)).unwrap(),
+            "an allocation is recorded once"
+        );
+        assert!(ledger.add(measured("b", 0.25)).unwrap());
+        let progress = Progress {
+            round: 3,
+            explore: 0.4,
+            stale: 1,
+            held_out: 0.06,
+        };
+        ledger.set_progress(progress).unwrap();
+        assert!(ledger.contains(&measured("a", 0.0).allocation));
+        assert_eq!(ledger.progress(), progress);
+        drop(ledger);
+
+        let again = open(&rig, directory.path(), "one").unwrap();
+        let kls: Vec<f64> = again.measured().iter().map(|each| each.kl).collect();
+        assert_eq!(kls, [0.5, 0.25], "the first record of an allocation stands");
+        assert_eq!(again.progress(), progress);
+        assert!(again.contains(&measured("b", 0.0).allocation));
+        assert!(
+            open(&rig, directory.path(), "another").is_err(),
+            "a state of another search is refused"
+        );
+        rig.stop();
+    }
+
+    #[test]
+    fn a_ledger_that_lost_its_state_refuses_writes_and_still_reads() {
+        let (rig, directory) = (rig(), tempfile::tempdir().unwrap());
+        let mut ledger = open(&rig, directory.path(), "one").unwrap();
+        ledger.add(measured("a", 0.5)).unwrap();
+        // The state a failed call to the file leaves.
+        ledger.state = None;
+        for refusal in [
+            ledger.add(measured("b", 0.1)).map(drop),
+            ledger.set_progress(Progress::default()),
+        ] {
+            let message = refusal.unwrap_err().to_string();
+            assert!(message.contains("lost"), "{message}");
+        }
+        assert_eq!(ledger.measured().len(), 1, "what was recorded can still be read");
+        assert!(!ledger.contains(&measured("b", 0.0).allocation));
+        rig.stop();
+    }
 
     fn files(names: &[&str]) -> Vec<(String, String)> {
         names

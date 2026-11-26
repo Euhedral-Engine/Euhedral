@@ -301,6 +301,8 @@ fn log_summary(outcome: &Found, flags: &Flags) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
 mod tests {
+    use euhedral_inference_quantization::mixed::QuantOption;
+
     use super::*;
 
     fn flags(extra: &str) -> Flags {
@@ -319,8 +321,9 @@ mod tests {
             base,
             "another reference is another search"
         );
-        let other_costs = base.replace("c.json", "other.json");
-        assert_ne!(other_costs, base);
+        let mut moved = flags("");
+        moved.sources.insert(QuantOption::Nvfp4, "elsewhere.edrl".into());
+        assert_ne!(identity(&moved), base, "another source file is another search");
         assert_ne!(
             identity(&flags("--costs d.json")),
             base,

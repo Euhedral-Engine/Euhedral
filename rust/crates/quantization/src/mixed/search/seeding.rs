@@ -1,6 +1,7 @@
 //! The candidates measured first: each pure option, the seeds a file names and random feasible mixes.
 
 use super::super::allocation::Allocation;
+use super::super::error::MixedError;
 use super::super::feasibility::Feasibility;
 use super::Search;
 use super::candidate::Candidate;
@@ -12,10 +13,18 @@ const MIX_ATTEMPTS: usize = 100;
 /// Floor of the log of a draw of zero.
 const TINY: f64 = 1e-300;
 
-/// A draw below `bound` (at least 1).
-pub(super) fn below(random: &mut Random, bound: usize) -> usize {
-    let bound = i32::try_from(bound).unwrap_or(i32::MAX);
-    random.next_int_bounded(bound).map_or(0, |draw| draw as usize)
+/// A draw below `bound`; a bound that is not in `1..=i32::MAX` is refused, naming it.
+pub(super) fn below(random: &mut Random, bound: usize) -> Result<usize, MixedError> {
+    i32::try_from(bound)
+        .ok()
+        .and_then(|limit| random.next_int_bounded(limit))
+        .and_then(|draw| usize::try_from(draw).ok())
+        .ok_or_else(|| {
+            MixedError::Invalid(format!(
+                "a random draw below {bound}: the bound must be 1 to {}",
+                i32::MAX
+            ))
+        })
 }
 
 impl Search<'_> {
@@ -77,7 +86,7 @@ impl Search<'_> {
                     }
                     break;
                 }
-                let i = below(random, n);
+                let i = below(random, n)?;
                 choice[i] = self.space.cheapest(i);
                 draws += 1;
             }
@@ -87,5 +96,20 @@ impl Search<'_> {
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_draw_with_no_valid_bound_is_refused_naming_it() {
+        let mut random = Random::new(1);
+        for bound in [0, usize::MAX] {
+            let refusal = below(&mut random, bound).unwrap_err().to_string();
+            assert!(refusal.contains(&bound.to_string()), "{refusal}");
+        }
+        assert!(below(&mut random, 5).unwrap() < 5);
     }
 }

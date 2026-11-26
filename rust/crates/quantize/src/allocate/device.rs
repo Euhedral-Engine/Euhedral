@@ -38,26 +38,33 @@ pub(super) struct Device {
 }
 
 impl Device {
-    /// The objects the allocation takes from each source other than the base's.
-    fn composite(&self, allocation: &Allocation) -> Composite {
+    /// The objects the allocation takes from each source other than the base's. An object on an option with no source
+    /// is refused, naming both: it could not be loaded, and leaving it out would score another allocation.
+    fn composite(&self, allocation: &Allocation) -> Result<Composite, String> {
         let mut taken: BTreeMap<QuantOption, Vec<String>> = BTreeMap::new();
         for (object, option) in allocation.choices() {
             if *option != self.base {
                 taken.entry(*option).or_default().push(object.clone());
             }
         }
-        Composite {
-            replacements: taken
-                .into_iter()
-                .filter_map(|(option, objects)| {
-                    self.sources.get(&option).map(|source| Replacement {
-                        source: source.clone(),
-                        objects,
-                    })
-                })
-                .collect(),
-            draft_depth: self.draft_depth,
+        let mut replacements = Vec::with_capacity(taken.len());
+        for (option, objects) in taken {
+            let source = self.sources.get(&option).ok_or_else(|| {
+                format!(
+                    "{} is allocated to {}, which has no --source",
+                    objects.first().map_or("", String::as_str),
+                    option.key()
+                )
+            })?;
+            replacements.push(Replacement {
+                source: source.clone(),
+                objects,
+            });
         }
+        Ok(Composite {
+            replacements,
+            draft_depth: self.draft_depth,
+        })
     }
 
     /// Every chunk of every reference scored on the started engine, pooled.
@@ -124,7 +131,7 @@ impl Device {
 impl Scoring for Device {
     fn score(&mut self, allocation: &Allocation) -> Result<Score, SearchFailure> {
         let failed = |why: String| SearchFailure::Scoring(why);
-        let composite = self.composite(allocation);
+        let composite = self.composite(allocation).map_err(failed)?;
         let (owner, waiting) = EngineRuntime::start_composite(&self.settings, &self.library, None, composite);
         let runtime = match waiting.wait(LONGEST_RUN) {
             Ok(Ok(runtime)) => runtime,
@@ -136,5 +143,79 @@ impl Scoring for Device {
         let score = result.map_err(failed)?;
         shutdown.map_err(|error| failed(format!("the engine's shutdown: {error}")))?;
         Ok(score)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
+mod tests {
+    use euhedral_inference_settings::load_for_tool;
+
+    use super::*;
+
+    fn device(sources: &[(QuantOption, &str)]) -> Device {
+        Device {
+            settings: load_for_tool(&[], &|_| None).unwrap(),
+            library: PathBuf::from("library"),
+            base: QuantOption::Trellis3_0,
+            sources: sources
+                .iter()
+                .map(|(option, path)| (*option, PathBuf::from(path)))
+                .collect(),
+            references: Vec::new(),
+            batch: 1,
+            rows: 1,
+            draft_depth: Some(4),
+            chunks: 1,
+        }
+    }
+
+    fn allocation(choices: &[(&str, QuantOption)]) -> Allocation {
+        Allocation::new(
+            choices
+                .iter()
+                .map(|(object, option)| ((*object).to_owned(), *option))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_composite_replaces_only_what_leaves_the_base_each_from_its_own_source() {
+        let device = device(&[
+            (QuantOption::Trellis3_0, "base.edrl"),
+            (QuantOption::Nvfp4, "nvfp4.edrl"),
+        ]);
+        let composite = device
+            .composite(&allocation(&[
+                ("a", QuantOption::Nvfp4),
+                ("b", QuantOption::Trellis3_0),
+                ("c", QuantOption::Nvfp4),
+            ]))
+            .unwrap();
+        assert_eq!(composite.draft_depth, Some(4));
+        assert_eq!(
+            composite.replacements.len(),
+            1,
+            "the base's own objects are not replaced"
+        );
+        assert_eq!(composite.replacements[0].source, PathBuf::from("nvfp4.edrl"));
+        assert_eq!(composite.replacements[0].objects, ["a", "c"]);
+        let pure = device
+            .composite(&allocation(&[("a", QuantOption::Trellis3_0)]))
+            .unwrap();
+        assert!(pure.replacements.is_empty());
+    }
+
+    #[test]
+    fn an_object_on_an_option_without_a_source_is_refused_naming_both() {
+        let device = device(&[(QuantOption::Trellis3_0, "base.edrl")]);
+        let refusal = device
+            .composite(&allocation(&[("layer/3/down", QuantOption::Nvfp4)]))
+            .err()
+            .unwrap();
+        assert!(
+            refusal.contains("layer/3/down") && refusal.contains("nvfp4"),
+            "{refusal}"
+        );
     }
 }

@@ -12,6 +12,8 @@ use super::super::rco;
 use super::super::search_state::{Measured, Progress};
 use super::super::space::Sources;
 use super::super::space::tests::TinySources;
+use super::candidate::Candidate;
+use super::proposing::Proposals;
 use super::{Assembly, Inline, Ledger, Score, Scoring, Search, SearchFailure, Settings, World};
 
 const VERIFY_ROWS: u32 = 4;
@@ -271,26 +273,31 @@ fn a_resumed_search_scores_nothing_twice_and_reaches_the_front_of_an_unbroken_on
 }
 
 #[test]
-fn an_infeasible_candidate_is_not_scored() {
+fn an_infeasible_candidate_is_scored_and_recorded_but_stays_off_the_front() {
     let (sources, costs) = (TinySources::new(), costs());
     let search = Search::new(settings(), &sources, &options(), &priors(0.5), &costs).unwrap();
     let (mut ledger, mut scoring) = (Memory::default(), Fake::new());
-    run(&search, &mut ledger, &mut scoring, 2, Vec::new()).unwrap();
-    assert!(!scoring.scored.is_empty());
-    for allocation in &scoring.scored {
+    let outcome = run(&search, &mut ledger, &mut scoring, 2, Vec::new()).unwrap();
+    let cap = Cap { most_nvfp4: 2 };
+    let unfit: Vec<&Measured> = ledger.measured.iter().filter(|each| !each.fits).collect();
+    assert!(!unfit.is_empty(), "the pure NVFP4 seed does not fit a cap of 2");
+    for each in &unfit {
         assert!(
-            Cap { most_nvfp4: 2 }.check(allocation).unwrap().fits,
-            "scored {}",
-            allocation.render()
+            scoring.scored.contains(&each.allocation),
+            "an unfit candidate was scored"
         );
+        assert!(!cap.check(&each.allocation).unwrap().fits);
     }
-    assert!(ledger.measured.iter().all(|each| each.fits));
-    assert!(
-        ledger
-            .notes
-            .iter()
-            .any(|line| line.contains("does not fit the device, not scored"))
+    assert_eq!(
+        ledger.measured.len(),
+        scoring.scored.len(),
+        "everything scored was recorded"
     );
+    assert!(
+        outcome.front.iter().all(|each| each.fits),
+        "the front holds only what fits"
+    );
+    assert!(ledger.notes.iter().any(|line| line.contains("does not fit the device")));
 }
 
 #[test]
@@ -367,6 +374,47 @@ fn imported_candidates_are_recorded_unscored_before_the_seeds() {
     );
     assert!(first.fits, "fit is judged again for this search");
     assert!(!scoring.scored.contains(&first.allocation));
+}
+
+#[test]
+fn an_import_a_stop_cut_short_is_finished_on_resume() {
+    let (sources, costs) = (TinySources::new(), costs());
+    let search = Search::new(settings(), &sources, &options(), &priors(0.5), &costs).unwrap();
+    let objects = sources.projections();
+    let imported = |at: usize| Measured {
+        allocation: Allocation::new(BTreeMap::from([(objects[at].clone(), QuantOption::Nvfp4)])),
+        kl: 0.1 * (at + 1) as f64,
+        kl_se: 0.004,
+        bytes: 1,
+        prefill: 1.0,
+        decode: 1.0,
+        fits: true,
+        round: 0,
+        origin: "elsewhere".to_owned(),
+    };
+    let (first, second) = (imported(0), imported(1));
+    let (mut ledger, mut scoring) = (Memory::default(), Fake::new());
+    // The state a stop left: the first import recorded, the second not, no seed scored.
+    ledger.measured.push(Measured {
+        allocation: search.space.normalize(&first.allocation).unwrap(),
+        origin: "import:elsewhere".to_owned(),
+        ..first.clone()
+    });
+    run(&search, &mut ledger, &mut scoring, 4, vec![first, second.clone()]).unwrap();
+    let recorded = ledger
+        .measured
+        .iter()
+        .find(|each| each.origin == "import:elsewhere" && each.kl == second.kl);
+    assert!(recorded.is_some(), "the second import was recorded");
+    assert_eq!(
+        ledger
+            .measured
+            .iter()
+            .filter(|each| each.origin == "import:elsewhere")
+            .count(),
+        2,
+        "the first import was not recorded twice"
+    );
 }
 
 #[test]
@@ -468,4 +516,160 @@ fn scores_pool_over_chunks_and_a_malformed_chunk_has_none() {
     assert!(score.kl_se > 0.0);
     assert!(Score::of(&[]).is_none());
     assert!(Score::of(&[vec![1.0; 4]]).is_none());
+}
+
+/// The tiny sources and settings of a search whose only measurements are its two pure allocations.
+fn seeded() -> (TinySources, CostTable, Settings) {
+    (TinySources::new(), costs(), settings())
+}
+
+fn pure_data(search: &Search<'_>) -> Vec<Measured> {
+    let pure = search.space.pure();
+    assert_eq!(pure.len(), 2, "the two pure allocations");
+    pure.into_iter()
+        .map(|allocation| Measured {
+            kl: Fake::kl(&allocation),
+            kl_se: 0.001,
+            bytes: 1,
+            prefill: 1.0,
+            decode: 1.0,
+            fits: true,
+            round: 0,
+            origin: "seed:pure".to_owned(),
+            allocation,
+        })
+        .collect()
+}
+
+fn proposed(search: &Search<'_>, data: &[Measured], candidates: Vec<Candidate>) -> Proposals {
+    let ensemble = Arc::new(search.fit(&Inline, Arc::new(data.to_vec()), 1, 1).unwrap());
+    Proposals { ensemble, candidates }
+}
+
+/// A proposal that is the `choice` of options, from the sweep's `cell` (none: not from the sweep), as RCO valued it
+/// and the ensemble's members spread on it.
+fn proposal(search: &Search<'_>, choice: [usize; 4], cell: Option<usize>, value: f64, spread: f64) -> Candidate {
+    Candidate {
+        allocation: search.space.allocation(&choice),
+        origin: "rco".to_owned(),
+        predicted: 0.0,
+        spread,
+        value,
+        cell,
+    }
+}
+
+fn choose(search: &Search<'_>, data: &[Measured], proposals: &Proposals, share: f64, need: usize) -> Vec<Candidate> {
+    let feasibility = Cap { most_nvfp4: 4 };
+    search.choose(proposals, &feasibility, data, share, need, 1, 1).unwrap()
+}
+
+fn origins(chosen: &[Candidate]) -> Vec<&str> {
+    chosen.iter().map(|each| each.origin.as_str()).collect()
+}
+
+#[test]
+fn the_explore_share_of_a_batch_is_taken_from_the_spread_and_the_rest_from_the_sweep() {
+    let (sources, costs, settings) = seeded();
+    let search = Search::new(settings, &sources, &options(), &priors(0.5), &costs).unwrap();
+    let data = pure_data(&search);
+    let proposals = proposed(
+        &search,
+        &data,
+        vec![
+            proposal(&search, [0, 0, 0, 1], Some(0), 1.0, 0.1),
+            proposal(&search, [0, 0, 1, 0], Some(1), 2.0, 0.2),
+            proposal(&search, [0, 1, 0, 0], Some(2), 3.0, 0.3),
+            proposal(&search, [1, 0, 0, 0], Some(3), 4.0, 0.4),
+        ],
+    );
+    let kinds = |share: f64, need: usize| -> (usize, usize) {
+        let chosen = choose(&search, &data, &proposals, share, need);
+        assert_eq!(chosen.len(), need);
+        let exploiting = chosen.iter().filter(|each| each.origin.starts_with("exploit:")).count();
+        let exploring = chosen.iter().filter(|each| each.origin.starts_with("explore:")).count();
+        (exploiting, exploring)
+    };
+    assert_eq!(kinds(0.5, 4), (2, 2));
+    assert_eq!(kinds(0.0, 4), (4, 0));
+    assert_eq!(kinds(0.3, 3), (2, 1), "0.9 of a candidate rounds half up to one");
+    assert_eq!(kinds(1.0, 3), (0, 3));
+}
+
+#[test]
+fn the_sweeps_cells_give_their_best_in_turn() {
+    let (sources, costs, settings) = seeded();
+    let search = Search::new(settings, &sources, &options(), &priors(0.5), &costs).unwrap();
+    let data = pure_data(&search);
+    let (a, b, c) = ([0, 0, 0, 1], [0, 0, 1, 0], [0, 1, 0, 0]);
+    // Cell 0 holds the two best values; one pick from each cell comes before a second from any.
+    let proposals = proposed(
+        &search,
+        &data,
+        vec![
+            proposal(&search, b, Some(0), 2.0, 0.0),
+            proposal(&search, a, Some(0), 1.0, 0.0),
+            proposal(&search, c, Some(2), 5.0, 0.0),
+        ],
+    );
+    let chosen = choose(&search, &data, &proposals, 0.0, 3);
+    let order: Vec<_> = chosen.iter().map(|each| each.allocation.clone()).collect();
+    let expected: Vec<_> = [a, c, b].iter().map(|choice| search.space.allocation(choice)).collect();
+    assert_eq!(order, expected);
+}
+
+#[test]
+fn exploring_alternates_the_most_uncertain_proposal_with_a_move_and_never_repeats_or_remeasures() {
+    let (sources, costs, settings) = seeded();
+    let search = Search::new(settings, &sources, &options(), &priors(0.5), &costs).unwrap();
+    let data = pure_data(&search);
+    let measured = data[0].allocation.clone();
+    let proposals = proposed(
+        &search,
+        &data,
+        vec![
+            proposal(&search, [0, 0, 0, 1], None, 0.0, 0.1),
+            // The most uncertain is one already measured: it is passed over.
+            Candidate {
+                allocation: measured.clone(),
+                ..proposal(&search, [0, 0, 0, 0], None, 0.0, 0.9)
+            },
+            proposal(&search, [0, 0, 1, 0], None, 0.0, 0.5),
+        ],
+    );
+    let chosen = choose(&search, &data, &proposals, 1.0, 4);
+    assert_eq!(
+        origins(&chosen),
+        ["explore:rco", "explore:move", "explore:rco", "explore:move"]
+    );
+    assert_eq!(
+        chosen[0].allocation,
+        search.space.allocation(&[0, 0, 1, 0]),
+        "the larger spread first"
+    );
+    assert_eq!(chosen[2].allocation, search.space.allocation(&[0, 0, 0, 1]));
+    let mut distinct: Vec<_> = chosen.iter().map(|each| each.allocation.clone()).collect();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), chosen.len(), "no candidate twice");
+    assert!(
+        chosen
+            .iter()
+            .all(|each| !data.iter().any(|seen| seen.allocation == each.allocation))
+    );
+}
+
+#[test]
+fn a_batch_short_of_proposals_is_filled_with_moves_around_the_front() {
+    let (sources, costs, settings) = seeded();
+    let search = Search::new(settings, &sources, &options(), &priors(0.5), &costs).unwrap();
+    let data = pure_data(&search);
+    let proposals = proposed(&search, &data, Vec::new());
+    let chosen = choose(&search, &data, &proposals, 0.3, 3);
+    assert_eq!(chosen.len(), 3);
+    assert!(
+        chosen.iter().all(|each| each.origin == "explore:move"),
+        "{:?}",
+        origins(&chosen)
+    );
 }

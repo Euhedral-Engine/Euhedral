@@ -153,7 +153,8 @@ impl<'a> Search<'a> {
             world.ledger.set_progress(progress)?;
         }
         if progress.round == 0 {
-            if world.ledger.measured().is_empty() && !world.imported.is_empty() {
+            // Recorded ones are skipped by the ledger, so an import a stop cut short is finished here.
+            if !world.imported.is_empty() {
                 self.import(&mut world)?;
             }
             let seeds = self.seed_candidates(&*feasibility, budget, seed)?;
@@ -227,8 +228,9 @@ impl<'a> Search<'a> {
         })
     }
 
-    /// Scores the candidates of `batch` not measured yet, each recorded as soon as it is scored. One that does not fit
-    /// the device is left out.
+    /// Scores the candidates of `batch` not measured yet, each recorded as soon as it is scored. One the planner says
+    /// does not fit at the target context is scored and recorded too, with `fits` false: its score does not depend on
+    /// the context, and the ensemble learns from it, but it stays off the front.
     fn measure<F: Fan>(
         &self,
         world: &mut World<'_, F>,
@@ -245,14 +247,6 @@ impl<'a> Search<'a> {
         let total = todo.len();
         for (k, candidate) in todo.into_iter().enumerate() {
             let ready = self.prepare(world, candidate)?;
-            if !ready.fits {
-                world.ledger.note(&format!(
-                    "round {round}, {}/{total}: {} does not fit the device, not scored",
-                    k + 1,
-                    ready.candidate.origin
-                ));
-                continue;
-            }
             let predicted = ready.candidate.predicted;
             let score = world.scoring.score(&ready.candidate.allocation)?;
             let measured = Measured {
@@ -268,7 +262,7 @@ impl<'a> Search<'a> {
             };
             world.ledger.add(measured.clone())?;
             world.ledger.note(&format!(
-                "round {round}, {}/{total}: {} kl {:.5} +- {:.5}, {} MiB, prefill {:.2} us/token, verify {:.1} us, predicted {:.5}",
+                "round {round}, {}/{total}: {} kl {:.5} +- {:.5}, {} MiB, prefill {:.2} us/token, verify {:.1} us, predicted {:.5}{}",
                 k + 1,
                 measured.origin,
                 measured.kl,
@@ -276,7 +270,8 @@ impl<'a> Search<'a> {
                 measured.bytes >> 20,
                 measured.prefill,
                 measured.decode,
-                predicted
+                predicted,
+                if measured.fits { "" } else { ", does not fit the device" }
             ));
         }
         Ok(())

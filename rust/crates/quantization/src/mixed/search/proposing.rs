@@ -199,7 +199,13 @@ impl Search<'_> {
     }
 
     /// The ensemble fitted to `data` for `round`: each member's fit is a task of its own, joined in member order.
-    fn fit<F: Fan>(&self, fan: &F, data: Arc<Vec<Measured>>, seed: i64, round: u32) -> Result<Ensemble, SearchFailure> {
+    pub(super) fn fit<F: Fan>(
+        &self,
+        fan: &F,
+        data: Arc<Vec<Measured>>,
+        seed: i64,
+        round: u32,
+    ) -> Result<Ensemble, SearchFailure> {
         let fits = Ensemble::member_fits(
             data.len(),
             self.settings.members,
