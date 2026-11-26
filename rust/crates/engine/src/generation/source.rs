@@ -51,7 +51,7 @@ use euhedral_core::frames::Frame;
 use euhedral_data_structures::queues::{Consumer, Single};
 use euhedral_gpu::Ran;
 use euhedral_graph::{Marker, QuantumOutcome};
-use euhedral_inference_cuda::{DevicePtr, PooledPinned, SubmitMode};
+use euhedral_inference_cuda::{DevicePtr, SubmitMode};
 
 use super::hidden::{Hidden, HiddenRows, HiddenSink, delivery_frame};
 use super::listener::GenerationListener;
@@ -80,7 +80,7 @@ use crate::stages::{InputRecordRef, Outcome, Quantum, QuantumError, QuantumKind,
 use crate::state::FlightGuard;
 use crate::state::kv::KvRetained;
 use crate::state::{Flight, SequenceId, SequenceState};
-use crate::workspace::{BufferSlot, Workspace};
+use crate::workspace::Workspace;
 
 /// Decode quanta that start below this position overlap their launches with the quantum before them
 /// (`Quantum.OVERLAP_MAX_START_POSITION`).
@@ -101,8 +101,6 @@ pub(crate) enum Message {
     HiddenCopied(Box<HiddenRows>),
     /// The sink of a hidden request is free again: a delivery to it ended.
     HiddenDelivered(Box<dyn HiddenSink>),
-    /// The logits row of a teacher-forced step reached pinned memory.
-    Logits(LogitsCopied),
     /// The host selected the token of a sampled request (or could not).
     Sampled(Sampled),
     /// The host prepared the next mask of a constrained request (or could not).
@@ -152,7 +150,6 @@ impl fmt::Debug for Message {
             Message::Retired(_) => formatter.write_str("Message::Retired"),
             Message::HiddenCopied(rows) => write!(formatter, "Message::HiddenCopied(position {})", rows.first_position),
             Message::HiddenDelivered(_) => formatter.write_str("Message::HiddenDelivered"),
-            Message::Logits(copied) => write!(formatter, "Message::Logits(step {})", copied.step),
             Message::Sampled(sampled) => write!(formatter, "Message::Sampled(step {})", sampled.step),
             Message::Prepared(prepared) => write!(formatter, "Message::Prepared(step {})", prepared.step),
             Message::Reaped => formatter.write_str("Message::Reaped"),
@@ -267,12 +264,6 @@ pub(crate) struct StartFailed {
     /// The quantum's number ([`Flying::id`]).
     pub(crate) serial: u64,
     pub(crate) error: StartError,
-}
-
-/// The logits row of step `step` in pinned memory.
-pub(crate) struct LogitsCopied {
-    pub(crate) step: usize,
-    pub(crate) loan: PooledPinned,
 }
 
 /// The parts of the engine every request shares, made once at startup.
@@ -582,8 +573,6 @@ pub(super) struct Run {
     pub(super) stopping: Option<FinishReason>,
     /// Set from any thread to end the request at the next quantum boundary.
     cancel: CancelHandle,
-    /// A teacher-forced step's logits row is being copied.
-    pub(super) waiting_logits: bool,
     /// The sink the request hands every row's hidden state to; `None` for a request that does not.
     pub(super) hidden: Option<Hidden>,
     /// Turns of the owner that panicked during this request.
@@ -653,6 +642,11 @@ impl Run {
         }
     }
 
+    /// Whether the run is a teacher-forced one whose sink takes the final hidden state beside each row.
+    pub(super) fn wants_forced_hidden(&self) -> bool {
+        matches!(&self.mode, Mode::Forced { sink, .. } if sink.wants_hidden())
+    }
+
     /// Whether the logits rows of a quantum of `role` go to the host, which selects the tokens: every quantum of a
     /// sampled request that does not speculate, and the prompt's and the verifications' of one that does. Its drafts
     /// stay greedy and on the device.
@@ -662,7 +656,7 @@ impl Run {
             Mode::Speculative { state, .. } => {
                 state.samples() && matches!(role, Role::Prefill { .. } | Role::Decode | Role::Verify)
             }
-            Mode::Forced { rows, .. } => *rows > 1 && role == Role::Verify,
+            Mode::Forced { rows, .. } => forced_copies_rows(*rows, role),
             Mode::Greedy { .. } => false,
         }
     }
@@ -1137,7 +1131,6 @@ impl Owner {
             previous: None,
             stopping: None,
             cancel,
-            waiting_logits: false,
             hidden: None,
             panics: 0,
             began: Instant::now(),
@@ -1167,7 +1160,7 @@ impl Owner {
         // The tokens the host is selecting decide the next step.
         // A hidden request's next quantum overwrites the rows being copied, and waits for a sink that is far behind.
         let copying = run.hidden.as_ref().is_some_and(Hidden::full);
-        if run.waiting_logits || copying || run.selecting() || run.in_flight.len() >= run.depth {
+        if copying || run.selecting() || run.in_flight.len() >= run.depth {
             return None;
         }
         // The prefix cache first: the lookup's answer, the restore's job, or a capture of the state the next chunk would
@@ -1288,7 +1281,6 @@ impl Owner {
                     }
                 }
             }
-            Message::Logits(copied) => self.deliver_row(copied),
             Message::HiddenCopied(rows) => self.hidden_copied(*rows),
             Message::HiddenDelivered(sink) => self.hidden_delivered(sink),
             Message::Sampled(sampled) => self.deliver_sample(sampled),
@@ -1535,30 +1527,6 @@ impl Owner {
         };
         let Some(flying) = run.in_flight.remove(at) else { return };
         self.keep(flying.reserved, None, flying.retained);
-    }
-
-    /// Hands the logits row of a teacher-forced step to the sink.
-    fn deliver_row(&mut self, copied: LogitsCopied) {
-        let Some(run) = self.run.as_mut() else { return };
-        let vocabulary = self.shared.config.vocab_size;
-        if let Mode::Forced { forced, sink, .. } = &mut run.mode {
-            let all = copied.loan.buffer().as_slice();
-            let bytes = &all[..vocabulary * 2];
-            if let Some(next) = forced.get(copied.step) {
-                if sink.wants_hidden() {
-                    sink.hidden(
-                        copied.step,
-                        &all[vocabulary * 2..vocabulary * 2 + self.shared.config.hidden_size * 2],
-                    );
-                }
-                sink.row(copied.step, *next, bytes);
-            }
-        }
-        run.waiting_logits = false;
-        run.generated += 1;
-        if run.generated >= run.wanted {
-            run.stop(FinishReason::Length);
-        }
     }
 
     /// Takes in the host's selection of one row of a sampled quantum. An answer for a selection the request no longer
@@ -1907,20 +1875,11 @@ impl Owner {
             }
             return;
         }
+        if let Mode::Forced { .. } = run.mode {
+            return self.forced_step_retired(flying);
+        }
         if run.copies_rows(flying.role) {
             return self.sample(flying);
-        }
-        if let Mode::Forced { .. } = run.mode {
-            let step = run.generated;
-            run.waiting_logits = true;
-            let copied = match &retired.kept {
-                Kept::Whole(quantum) => self.copy_logits(step, quantum, flying.rows),
-                Kept::Part { .. } => Err("a teacher-forced step is not part of a pass".to_string()),
-            };
-            if let Err(why) = copied {
-                self.fail(why);
-            }
-            return;
         }
         let token = flying.selection.as_ref().and_then(|selection| selection.token(0));
         let Some(token) = token else {
@@ -2032,50 +1991,6 @@ impl Owner {
             );
             shared.core.completions().at(Instant::now(), frame);
         }
-    }
-
-    /// Queues the copy of the quantum's logits row to pinned memory, and of its last row's final hidden state when the
-    /// sink wants it, and the message that says they have run. `rows` is the quantum's row count.
-    fn copy_logits(&mut self, step: usize, quantum: &Quantum, rows: usize) -> Result<(), String> {
-        let core = &self.shared.core;
-        let bytes = self.shared.config.vocab_size * 2;
-        let hidden_bytes = self.shared.config.hidden_size * 2;
-        let wants_hidden =
-            matches!(self.run.as_ref().map(|run| &run.mode), Some(Mode::Forced { sink, .. }) if sink.wants_hidden());
-        let total = if wants_hidden { bytes + hidden_bytes } else { bytes };
-        let mut loan = core.pool.acquire(total).map_err(why("the pinned row for the logits"))?;
-        let (_, marker) = core
-            .lane_table()
-            .submit_ops(core.owner_lane(), false, |kernels| {
-                // SAFETY: the loan is held by the message that follows the copy, which is offered only once the lane
-                // has reached the marker; nothing reads or writes the bytes before.
-                unsafe {
-                    kernels.copy_device_to_readback(loan.buffer_mut(), 0, quantum.slot(BufferSlot::Logits), bytes)
-                }
-                .map_err(why("queueing the logits row's copy"))?;
-                if wants_hidden {
-                    // SAFETY: as above; the hidden row follows the logits row in the loan.
-                    unsafe {
-                        kernels.copy_device_to_readback(
-                            loan.buffer_mut(),
-                            bytes,
-                            quantum
-                                .slot(BufferSlot::FinalHiddenState)
-                                .offset(((rows.max(1) - 1) * hidden_bytes) as u64),
-                            hidden_bytes,
-                        )
-                    }
-                    .map_err(why("queueing the final hidden row's copy"))?;
-                }
-                Ok::<(), String>(())
-            })
-            .map_err(why("the logits row's copy"))?;
-        let address = Arc::clone(&self.shared.address);
-        let frame = step_frame(self.id.0, move || {
-            address.post(Message::Logits(LogitsCopied { step, loan }))
-        });
-        core.completions().after_marker(marker, frame);
-        Ok(())
     }
 
     /// Queues the copy of the rows a retired quantum seeded, and of its logits row when it selected, to pinned memory on
@@ -2431,7 +2346,13 @@ impl Owner {
         let mut row = None;
         if logits > 0 {
             if run.copies_rows(role) {
-                let lease = self.sequence.row_readbacks.acquire().map_err(why("the row readback"))?;
+                let readbacks = &self.sequence.row_readbacks;
+                let lease = if run.wants_forced_hidden() {
+                    readbacks.acquire_hidden()
+                } else {
+                    readbacks.acquire()
+                }
+                .map_err(why("the row readback"))?;
                 quantum = quantum.with_row_readback(Arc::clone(lease.readback()));
                 row = Some(lease);
             } else {
@@ -2527,8 +2448,7 @@ impl Owner {
         }
         let ended = run.stopping.is_some() || run.next_step(chunk).is_none();
         let delivering = run.hidden.as_ref().is_some_and(Hidden::busy);
-        if !run.in_flight.is_empty() || run.waiting_logits || delivering || run.selecting() || run.preparing() || !ended
-        {
+        if !run.in_flight.is_empty() || delivering || run.selecting() || run.preparing() || !ended {
             return;
         }
         // A restore's reservation that no chunk took (the request ended first) has its table upload queued on the owner's
@@ -2594,6 +2514,18 @@ fn passes_choice(sink_behind: Option<bool>, ended: bool, in_flight: usize) -> Pa
     match sink_behind {
         Some(behind) if (behind || ended) && in_flight == 0 => PassesChoice::Leave,
         _ => PassesChoice::Offer,
+    }
+}
+
+/// Whether a quantum of `role` in a teacher-forced run of `rows` rows a step copies its logits row to the run's readback.
+/// The workspace's logits belong to the next sequence's quantum once this one retires, so the row is copied by the
+/// quantum itself, never by a copy queued after its retirement.
+fn forced_copies_rows(rows: usize, role: Role) -> bool {
+    match role {
+        Role::Prefill { last } => last,
+        Role::Decode => true,
+        Role::Verify => rows > 1,
+        _ => false,
     }
 }
 
@@ -2703,6 +2635,22 @@ mod passes_choice_tests {
 #[cfg(test)]
 mod routing_tests {
     use super::*;
+
+    #[test]
+    fn a_forced_step_that_scores_copies_its_row_in_the_quantum() {
+        for rows in [1, 4] {
+            assert!(forced_copies_rows(rows, Role::Prefill { last: true }), "{rows} rows");
+            assert!(forced_copies_rows(rows, Role::Decode), "{rows} rows");
+        }
+        assert!(forced_copies_rows(4, Role::Verify));
+    }
+
+    #[test]
+    fn a_forced_quantum_that_scores_nothing_copies_nothing() {
+        assert!(!forced_copies_rows(1, Role::Prefill { last: false }));
+        assert!(!forced_copies_rows(1, Role::Settle));
+        assert!(!forced_copies_rows(1, Role::Verify));
+    }
 
     #[test]
     fn the_frames_of_two_sequences_are_never_on_one_chain() {

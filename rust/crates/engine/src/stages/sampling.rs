@@ -336,6 +336,9 @@ pub struct RowReadback {
     /// Bytes of one row: the model's vocabulary at two bytes an entry.
     row_bytes: usize,
     capacity: usize,
+    /// Bytes after the rows that hold the last row's final hidden state: 0 for a readback of a sampling request, the
+    /// hidden row's size for one a teacher-forced run that takes the hidden state leases.
+    hidden_bytes: usize,
     /// Whether a quantum in flight, or the frame that selects from its rows, holds the readback
     /// ([`RowReadbackPool::acquire`]).
     held: AtomicBool,
@@ -345,12 +348,25 @@ impl RowReadback {
     /// Pinned memory for up to `rows` rows (at least 1) of `vocabulary` BF16 entries. The allocation waits: startup
     /// only, and so is the drop.
     pub fn new(library: &Arc<CudaLibrary>, rows: usize, vocabulary: usize) -> Result<RowReadback, CudaError> {
+        RowReadback::with_hidden(library, rows, vocabulary, 0)
+    }
+
+    /// [`RowReadback::new`] that also holds `hidden_size` BF16 entries after the rows: the final hidden state of the
+    /// quantum's last row, copied by the quantum beside its logits ([`CopyRows`]).
+    pub fn with_hidden(
+        library: &Arc<CudaLibrary>,
+        rows: usize,
+        vocabulary: usize,
+        hidden_size: usize,
+    ) -> Result<RowReadback, CudaError> {
         let rows = rows.max(1);
         let row_bytes = vocabulary * 2;
+        let hidden_bytes = hidden_size * 2;
         Ok(RowReadback {
-            readback: PinnedBuffer::alloc(library, rows * row_bytes)?,
+            readback: PinnedBuffer::alloc(library, rows * row_bytes + hidden_bytes)?,
             row_bytes,
             capacity: rows,
+            hidden_bytes,
             held: AtomicBool::new(false),
         })
     }
@@ -370,6 +386,16 @@ impl RowReadback {
             .get(row * self.row_bytes..(row + 1) * self.row_bytes)
     }
 
+    /// The BF16 bytes of the last row's final hidden state, once the quantum that copied it has retired; `None` for a
+    /// readback that holds none.
+    pub fn hidden(&self) -> Option<&[u8]> {
+        if self.hidden_bytes == 0 {
+            return None;
+        }
+        let start = self.capacity * self.row_bytes;
+        self.readback.as_slice().get(start..start + self.hidden_bytes)
+    }
+
     /// The identity a graph that copies into the readback is keyed on: its address, which the launch bakes in, and
     /// which no other live readback shares.
     pub fn generation(&self) -> AllocationId {
@@ -387,6 +413,9 @@ impl RowReadback {
 #[derive(Debug, Default)]
 pub struct RowReadbackPool {
     readbacks: Vec<Arc<RowReadback>>,
+    /// Readbacks of one row that also hold the last row's final hidden state, for a teacher-forced run that takes it.
+    /// Their own allocations: a quantum that copies the hidden row is a different graph from one that does not.
+    hidden: Vec<Arc<RowReadback>>,
 }
 
 /// Every row readback of the pool is leased.
@@ -412,7 +441,25 @@ impl RowReadbackPool {
         let readbacks = (0..count)
             .map(|_| RowReadback::new(library, rows, vocabulary).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(RowReadbackPool { readbacks })
+        Ok(RowReadbackPool {
+            readbacks,
+            hidden: Vec::new(),
+        })
+    }
+
+    /// The pool with `count` more readbacks of one row of `vocabulary` entries and the final hidden state of
+    /// `hidden_size` entries ([`RowReadbackPool::acquire_hidden`]). The allocations wait: startup only.
+    pub fn with_hidden(
+        mut self,
+        library: &Arc<CudaLibrary>,
+        count: usize,
+        vocabulary: usize,
+        hidden_size: usize,
+    ) -> Result<RowReadbackPool, CudaError> {
+        self.hidden = (0..count)
+            .map(|_| RowReadback::with_hidden(library, 1, vocabulary, hidden_size).map(Arc::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self)
     }
 
     /// A pool with no readback: a sequence that cannot serve sampled requests.
@@ -446,9 +493,23 @@ impl RowReadbackPool {
             .count()
     }
 
+    /// Whether no readback that holds the hidden state is free to lease.
+    pub fn hidden_is_exhausted(&self) -> bool {
+        self.hidden.iter().all(|readback| readback.held.load(Ordering::Acquire))
+    }
+
     /// Leases a readback no one holds, or refuses. Called by the sequence's owner, one admission at a time.
     pub fn acquire(&self) -> Result<RowReadbackLease, ReadbacksBusy> {
-        for readback in &self.readbacks {
+        RowReadbackPool::lease(&self.readbacks)
+    }
+
+    /// [`RowReadbackPool::acquire`] for a readback that also holds the last row's final hidden state.
+    pub fn acquire_hidden(&self) -> Result<RowReadbackLease, ReadbacksBusy> {
+        RowReadbackPool::lease(&self.hidden)
+    }
+
+    fn lease(readbacks: &[Arc<RowReadback>]) -> Result<RowReadbackLease, ReadbacksBusy> {
+        for readback in readbacks {
             if readback
                 .held
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -487,12 +548,14 @@ impl Drop for RowReadbackLease {
 #[derive(Clone, Debug)]
 pub struct CopyRows {
     logits: BufferSlot,
+    /// The slot of the final hidden state, whose last row goes beside the logits to a readback that holds it.
+    hidden: BufferSlot,
     rows: SelectedRows,
 }
 
 impl CopyRows {
-    pub fn new(logits: BufferSlot, rows: SelectedRows) -> Self {
-        Self { logits, rows }
+    pub fn new(logits: BufferSlot, hidden: BufferSlot, rows: SelectedRows) -> Self {
+        Self { logits, hidden, rows }
     }
 }
 
@@ -546,6 +609,36 @@ impl Launch for CopyRows {
                         row * row_bytes,
                         logits.offset(((base + first + row) * row_bytes) as u64),
                         row_bytes,
+                    )
+                }
+                .map_err(fatal)?;
+            }
+            if readback.hidden_bytes > 0 {
+                if !single {
+                    return Err(fatal(
+                        "a readback that holds the hidden state is a quantum of one sequence's own",
+                    ));
+                }
+                if self.rows == SelectedRows::Each {
+                    return Err(fatal("the hidden state is copied for a quantum's last row only"));
+                }
+                let hidden_bytes = quantum.config.hidden_size * 2;
+                if hidden_bytes != readback.hidden_bytes {
+                    return Err(fatal(format!(
+                        "a readback of {} hidden bytes does not fit the hidden rows of {hidden_bytes}",
+                        readback.hidden_bytes
+                    )));
+                }
+                // SAFETY: as above; the hidden row follows the logits rows in the readback, and the quantum's own
+                // stages wrote the slot before this launch, so it is this quantum's row and not another's.
+                unsafe {
+                    kernels.copy_device_to_readback_shared(
+                        readback.pinned(),
+                        readback.capacity * row_bytes,
+                        quantum
+                            .slot(self.hidden)
+                            .offset((quantum.rows.max(1).saturating_sub(1) * hidden_bytes) as u64),
+                        hidden_bytes,
                     )
                 }
                 .map_err(fatal)?;
