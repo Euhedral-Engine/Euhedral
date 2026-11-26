@@ -65,7 +65,7 @@ fn kernels(work: &[Work]) -> Vec<&'static str> {
     work.iter()
         .flat_map(|piece| match piece {
             Work::Steps(steps) => steps.iter().map(Step::kernel).collect::<Vec<_>>(),
-            Work::Product(_) => vec!["gemm"],
+            Work::Product(_) | Work::Head(_) => vec!["gemm"],
         })
         .collect()
 }
@@ -569,18 +569,33 @@ fn arguments_match_the_parameter_lists_the_loaded_source_declares() {
             plan_cross_entropy(1, 4, 50, 2, 0.5, 3, 4, 5).unwrap(),
             vec![("vocabulary", Scalar::Int(50)), ("scale", Scalar::Float(0.5))],
         ),
+        (
+            plan_nvfp4_decode_bf16(1, 2, 3, 7, 48, 40, 4).unwrap(),
+            vec![
+                ("rows", Scalar::Long(7)),
+                ("kPad", Scalar::Int(48)),
+                ("k", Scalar::Int(40)),
+            ],
+        ),
+        (plan_float_to_bf16(1, 99, 2).unwrap(), vec![("count", Scalar::Long(99))]),
+        (
+            plan_q3_embedding_rows(1, 2, 5, 128, 4096, 3).unwrap(),
+            vec![
+                ("rows", Scalar::Int(5)),
+                ("width", Scalar::Int(128)),
+                ("scaleOffset", Scalar::Long(4096)),
+            ],
+        ),
     ];
     let mut seen = assert_arguments(&declared, &cases);
     seen.sort_unstable();
     seen.dedup();
-    // The kernels no planner here builds: the artifact's decode and the embedding gather belong to the draft head's
-    // input and output, which the drafter's layer does not use.
-    let mut unplanned: Vec<_> = Module::Drafter
+    // Every kernel of the module has a planner under test here.
+    let unplanned: Vec<_> = Module::Drafter
         .kernels()
         .iter()
         .copied()
         .filter(|name| !seen.contains(name))
         .collect();
-    unplanned.sort_unstable();
-    assert_eq!(unplanned, ["float_to_bf16", "nvfp4_decode_bf16", "q3_embedding_rows"]);
+    assert!(unplanned.is_empty(), "no case for {unplanned:?}");
 }
