@@ -295,3 +295,136 @@ fn linears_that_read_the_same_rows_share_one_matrix_and_add_once() {
         "the shared matrix holds the two batches once each"
     );
 }
+
+#[test]
+fn a_plan_stops_at_the_smaller_of_its_layers_and_its_stop_and_checkpoints_never_at_the_end() {
+    let mut plan = Plan::new(16);
+    assert_eq!(plan.stop(), 16, "no stop runs to the end");
+    assert!(!plan.stops_early());
+    plan.stop_after = 100;
+    assert_eq!(plan.stop(), 16, "a stop past the end is the end");
+    assert!(!plan.stops_early());
+    plan.stop_after = 16;
+    assert!(!plan.stops_early(), "a stop at the end is a full run");
+    plan.stop_after = 9;
+    assert!(plan.stops_early());
+    assert!(plan.checkpoint_due(8));
+    assert!(!plan.checkpoint_due(16), "the end is not checkpointed");
+    assert!(!plan.checkpoint_due(7));
+    assert!(
+        plan.checkpoint_due(0),
+        "nothing done is a multiple of every count, as Java's loop never asks it"
+    );
+    plan.checkpoint_every = 0;
+    assert!(!plan.checkpoint_due(8), "no interval checkpoints nothing");
+    assert!(!Plan::new(8).checkpoint_due(8));
+}
+
+#[test]
+fn no_shapes_have_no_round_order() {
+    assert!(round_order(&[]).is_empty());
+}
+
+/// Where a fake fails.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Point {
+    Begin,
+    Stage(usize),
+    Checkpoint,
+    Finish,
+}
+
+/// A fake that fails at one point and counts the layers it ran.
+struct Failing {
+    at: Point,
+    layers: AtomicUsize,
+}
+
+impl Failing {
+    fn run(at: Point, plan: Plan) -> (Result<(), CalibrateError>, usize) {
+        let fake = Arc::new(Failing {
+            at,
+            layers: AtomicUsize::new(0),
+        });
+        let (done, receiver) = result_sink();
+        drive(Arc::clone(&fake), plan, done);
+        let result = receiver.recv_timeout(HANG).expect("the calibration never ended");
+        (result, fake.layers.load(Ordering::Acquire))
+    }
+
+    fn fail(&self, at: Point, then: Then<()>, otherwise: impl FnOnce(Then<()>)) {
+        if self.at == at {
+            then(Err(CalibrateError::Failed("stopped".to_owned())));
+        } else {
+            otherwise(then);
+        }
+    }
+}
+
+impl Stages for Failing {
+    type Staged = usize;
+
+    fn begin(&self, _plan: &Plan, then: Then<usize>) {
+        if self.at == Point::Begin {
+            then(Err(CalibrateError::Failed("stopped".to_owned())));
+        } else {
+            then(Ok(0));
+        }
+    }
+
+    fn stage(&self, layer: usize, then: Then<usize>) {
+        if self.at == Point::Stage(layer) {
+            then(Err(CalibrateError::Failed("stopped".to_owned())));
+        } else {
+            then(Ok(layer));
+        }
+    }
+
+    fn layer(&self, _layer: usize, _staged: usize, then: Then<()>) {
+        self.layers.fetch_add(1, Ordering::AcqRel);
+        then(Ok(()));
+    }
+
+    fn checkpoint(&self, _done: usize, then: Then<()>) {
+        self.fail(Point::Checkpoint, then, |then| then(Ok(())));
+    }
+
+    fn finish(&self, then: Then<()>) {
+        self.fail(Point::Finish, then, |then| then(Ok(())));
+    }
+}
+
+#[test]
+fn a_failure_to_begin_runs_no_layer() {
+    let (result, layers) = Failing::run(Point::Begin, Plan::new(4));
+    assert!(result.is_err());
+    assert_eq!(layers, 0);
+}
+
+#[test]
+fn a_failure_to_read_the_next_layer_ends_the_run_after_the_layers_before_it() {
+    let (result, layers) = Failing::run(Point::Stage(2), Plan::new(4));
+    assert!(result.is_err());
+    assert!(layers <= 2, "the layer whose read failed never runs, ran {layers}");
+}
+
+#[test]
+fn a_failure_to_checkpoint_ends_the_run_before_the_next_layer() {
+    let (result, layers) = Failing::run(Point::Checkpoint, Plan::new(12));
+    assert!(result.is_err());
+    assert_eq!(layers, 8, "the layers up to the checkpoint ran and no more");
+}
+
+#[test]
+fn a_failure_of_the_heads_is_the_runs_result() {
+    let (result, layers) = Failing::run(Point::Finish, Plan::new(3));
+    assert!(result.is_err());
+    assert_eq!(layers, 3);
+}
+
+#[test]
+fn a_plan_of_no_layers_only_finishes() {
+    let fake = Fake::new(None, 0);
+    run(&fake, Plan::new(0)).unwrap();
+    assert_eq!(fake.events(), vec![Event::Finish]);
+}

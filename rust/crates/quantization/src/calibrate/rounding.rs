@@ -537,3 +537,40 @@ pub fn save(services: &Services, path: PathBuf, bytes: Vec<u8>, then: Saved) {
         drop(end(&finish, Err(CalibrateError::failed("open", error))));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(rows: u64, fill: u8) -> QuantState {
+        QuantState {
+            format_name: "nvfp4".to_owned(),
+            layout: "layout".to_owned(),
+            rows,
+            columns: 2,
+            codes: vec![fill; (rows * 2) as usize],
+            scales: vec![fill; rows as usize],
+            global_scale: 0.5,
+            table: None,
+        }
+    }
+
+    #[test]
+    fn no_slices_join_to_nothing() {
+        assert!(joined(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn one_slice_joins_to_itself() {
+        let one = joined(vec![state(3, 7)]).unwrap();
+        assert_eq!(one, state(3, 7));
+    }
+
+    #[test]
+    fn slices_join_in_order_with_their_rows_added() {
+        let all = joined(vec![state(2, 1), state(3, 2)]).unwrap();
+        assert_eq!((all.rows, all.global_scale), (5, 0.5), "the tensor scale is shared");
+        assert_eq!(all.codes, [1, 1, 1, 1, 2, 2, 2, 2, 2, 2]);
+        assert_eq!(all.scales, [1, 1, 2, 2, 2]);
+    }
+}
