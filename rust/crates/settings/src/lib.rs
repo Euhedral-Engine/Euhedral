@@ -28,8 +28,8 @@ pub use loader::{SettingsError, SettingsErrors, known_keys, variable_name};
 pub use model::{
     Auto, BatchingSettings, ContextSettings, CpuList, FUSED_VERIFY_ROWS, FusedVerifyFrom, GraphKernelSettings,
     HostLayerCompute, HostLayersSettings, HostSettings, KernelSettings, KvFormat, MIN_TENSOR_CORE_ROWS, MemorySettings,
-    ModelSettings, PrefixCacheSettings, RequestSettings, SamplingSettings, ServerSettings, Settings,
-    TrellisKernelSettings, WeightStreamingSettings,
+    ModelSettings, PrefixCacheSettings, RequestSettings, SamplingSettings, ServerSettings, Settings, SpeculationMode,
+    SpeculationSettings, TrellisKernelSettings, WeightStreamingSettings,
 };
 pub use retired::{key_message as retired_key_message, message as retired_message};
 pub use sizes::{ByteSize, parse_duration};

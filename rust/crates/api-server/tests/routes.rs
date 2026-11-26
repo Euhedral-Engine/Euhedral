@@ -417,7 +417,7 @@ fn a_server_can_share_the_callers_io_and_leaves_it_running() {
     server.stop(once(move || {
         tx.send(()).ok();
     }));
-    rx.recv_timeout(common::PATIENCE).expect("a stop report");
+    rx.recv_timeout(common::HANG_GUARD).expect("a stop report");
     server.release();
     backend.release();
     assert!(!io.is_complete(), "the caller's io was completed");

@@ -11,7 +11,7 @@ mod common;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use common::{Fixture, PATIENCE, Raw, assert_json, headers, small_limits, text};
+use common::{Fixture, HANG_GUARD, Raw, assert_json, headers, small_limits, text};
 use euhedral_inference_api_server::Limits;
 use euhedral_inference_api_server::metrics::{Api, ConstraintFailure, Outcome};
 use euhedral_inference_api_server::scripted::Script;
@@ -84,9 +84,13 @@ fn the_queue_gauges_show_the_slots_in_use_and_the_requests_waiting() {
     first.send(&request);
     let mut second = Raw::connect(fixture.addr);
     second.send(&request);
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     while fixture.server.admission().counts() != (Counts { active: 1, waiting: 1 }) {
-        assert!(Instant::now() < end, "{:?}", fixture.server.admission().counts());
+        assert!(
+            Instant::now() < end,
+            "never reached the expected slots: {:?}",
+            fixture.server.admission().counts()
+        );
         sleep(Duration::from_millis(5));
     }
     let answer = fixture.get("/metrics");
@@ -102,9 +106,13 @@ fn the_queue_gauges_show_the_slots_in_use_and_the_requests_waiting() {
     );
     drop(first);
     drop(second);
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     while fixture.server.admission().counts() != Counts::default() {
-        assert!(Instant::now() < end, "{:?}", fixture.server.admission().counts());
+        assert!(
+            Instant::now() < end,
+            "never reached the expected slots: {:?}",
+            fixture.server.admission().counts()
+        );
         sleep(Duration::from_millis(5));
     }
     fixture.finish();
@@ -322,13 +330,13 @@ fn a_streamed_reply_is_timed_when_its_last_byte_is_written() {
     raw.send(&request);
     raw.read_until("[DONE]");
     let timed = "http_server_requests_seconds_count{";
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     let scrape = loop {
         let scrape = text(&fixture.get("/metrics")).to_owned();
         if scrape.contains("uri=\"/v1/chat/completions\"") {
             break scrape;
         }
-        assert!(Instant::now() < end, "{scrape}");
+        assert!(Instant::now() < end, "the request was never counted: {scrape}");
         sleep(Duration::from_millis(5));
     };
     assert!(scrape.contains(timed), "{scrape}");
@@ -379,7 +387,7 @@ fn a_stream_cut_after_its_head_is_timed_once() {
     raw.send(&request);
     raw.read_until("tok0");
     drop(raw);
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     let counted = format!(
         "http_server_requests_seconds_count{{{APP},error=\"none\",exception=\"none\",method=\"POST\",outcome=\"SUCCESS\",status=\"200\",uri=\"/v1/chat/completions\"}} 1\n"
     );
@@ -388,7 +396,7 @@ fn a_stream_cut_after_its_head_is_timed_once() {
         if scrape.contains(&counted) {
             break;
         }
-        assert!(Instant::now() < end, "{scrape}");
+        assert!(Instant::now() < end, "the request was never counted: {scrape}");
         sleep(Duration::from_millis(5));
     }
     // The stop returns once every connection has ended: nothing is left that could count the request again.
