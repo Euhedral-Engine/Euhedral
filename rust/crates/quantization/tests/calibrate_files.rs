@@ -399,7 +399,14 @@ fn a_listed_name_may_be_inside_the_heads_directory_and_nowhere_deeper_or_outside
         Manifest::parse(&manifest.to_bytes().unwrap())
     };
     assert!(listing(&["heads/text__output_head.npz", "layer.safetensors"]).is_ok());
-    for refused in ["heads/deeper/x.npz", "other/x.npz", "heads/", "heads/..", "heads//x", "../heads/x.npz"] {
+    for refused in [
+        "heads/deeper/x.npz",
+        "other/x.npz",
+        "heads/",
+        "heads/..",
+        "heads//x",
+        "../heads/x.npz",
+    ] {
         assert!(listing(&[refused]).is_err(), "{refused} was accepted");
     }
 }
@@ -438,6 +445,8 @@ fn a_listed_heads_file_that_is_gone_refuses_the_resume() {
     let mut manifest = Manifest::new("A", 64);
     manifest.files = vec!["heads/gone.npz".to_owned()];
     fs::write(directory.path().join("calibration.json"), manifest.to_bytes().unwrap()).unwrap();
-    let why = inspect(directory.path(), "A", 64, &FIELDS, false).unwrap_err().to_string();
+    let why = inspect(directory.path(), "A", 64, &FIELDS, false)
+        .unwrap_err()
+        .to_string();
     assert!(why.contains("heads/gone.npz"), "{why}");
 }

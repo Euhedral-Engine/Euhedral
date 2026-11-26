@@ -127,7 +127,10 @@ pub fn plain(name: &str) -> bool {
 /// Whether `name` may be listed: a [`plain`] name, or a plain name inside [`HEADS_DIRECTORY`] (`heads/<name>`, with the
 /// slash on every platform). Nothing deeper and nothing outside the directory is ever read or removed.
 pub fn listable(name: &str) -> bool {
-    match name.strip_prefix(HEADS_DIRECTORY).and_then(|rest| rest.strip_prefix('/')) {
+    match name
+        .strip_prefix(HEADS_DIRECTORY)
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
         Some(inside) => plain(inside),
         None => plain(name),
     }

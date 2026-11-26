@@ -30,7 +30,8 @@ impl Allocation {
         target: f64,
         scratch_bytes: u64,
     ) -> Result<Allocation, CalibrateError> {
-        let allocated = allocate(linears, layers, target).map_err(|error| CalibrateError::Invalid(error.to_string()))?;
+        let allocated =
+            allocate(linears, layers, target).map_err(|error| CalibrateError::Invalid(error.to_string()))?;
         let mut rates = allocated;
         rates.sort_by(|left, right| left.0.cmp(&right.0));
         for (name, bits) in &rates {
