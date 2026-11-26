@@ -26,8 +26,9 @@ use euhedral_inference_api_server::{ApiConfig, ApiServer, Clock, EngineReport, L
 use euhedral_io::AsyncIo;
 use euhedral_net::{ClientConfig, Method, NetError, Request, Response, request};
 
-/// How long a test waits for anything before it fails.
-pub const PATIENCE: Duration = Duration::from_secs(20);
+/// The bound of a test that waits for something that never happens: a hang guard, not a speed limit. No test passes or
+/// fails on how fast the host ran it, so the bound is long enough that a loaded host never reaches it.
+pub const HANG_GUARD: Duration = Duration::from_secs(600);
 
 /// A lattice on at most `cpus` of the CPUs this process may use (`None`: the default worker count).
 pub fn lattice(cpus: Option<usize>) -> Arc<ControlPlaneLattice> {
@@ -38,8 +39,8 @@ pub fn lattice(cpus: Option<usize>) -> Arc<ControlPlaneLattice> {
     if let Some(count) = cpus {
         config.allowed_cpus = affinity::base_mask().iter().take(count).collect();
     }
-    config.shutdown_timeout = Duration::from_secs(5);
-    config.startup_timeout = Duration::from_secs(10);
+    config.shutdown_timeout = HANG_GUARD;
+    config.startup_timeout = HANG_GUARD;
     let lattice = ControlPlaneLattice::new(config).expect("a lattice");
     lattice.start().expect("a started lattice");
     lattice
@@ -211,7 +212,7 @@ impl Fixture {
     pub fn try_call(&self, request_to_send: &Request) -> Result<Response, NetError> {
         let (tx, rx): (Sender<Result<Response, NetError>>, _) = channel();
         let config = ClientConfig {
-            time_limit: Some(PATIENCE),
+            time_limit: Some(HANG_GUARD),
             ..ClientConfig::default()
         };
         request(
@@ -225,7 +226,7 @@ impl Fixture {
                 once(|| {})
             }),
         );
-        rx.recv_timeout(PATIENCE + Duration::from_secs(5))
+        rx.recv_timeout(HANG_GUARD + Duration::from_secs(5))
             .expect("the client reported")
     }
 
@@ -275,7 +276,7 @@ impl Fixture {
         self.server.stop(once(move || {
             tx.send(()).ok();
         }));
-        rx.recv_timeout(PATIENCE)
+        rx.recv_timeout(HANG_GUARD)
             .expect("the server did not report that it stopped");
     }
 }
@@ -333,7 +334,7 @@ pub fn utf8_text(held: &mut Vec<u8>, fresh: &[u8]) -> String {
 
 impl Raw {
     pub fn connect(addr: SocketAddr) -> Raw {
-        let stream = TcpStream::connect_timeout(&addr, PATIENCE).expect("a connection");
+        let stream = TcpStream::connect_timeout(&addr, HANG_GUARD).expect("a connection");
         Raw {
             stream,
             held: Vec::new(),
@@ -368,9 +369,9 @@ impl Raw {
         }
     }
 
-    /// Reads until `needle` has arrived, within the patience of a test.
+    /// Reads until `needle` has arrived, within the hang guard.
     pub fn read_until(&mut self, needle: &str) -> String {
-        let end = Instant::now() + PATIENCE;
+        let end = Instant::now() + HANG_GUARD;
         let mut seen = String::new();
         while !seen.contains(needle) {
             assert!(Instant::now() < end, "no {needle:?} in {seen:?}");
@@ -382,16 +383,15 @@ impl Raw {
         seen
     }
 
-    /// Whether the server closes the connection within the patience of a test.
+    /// Whether the server closes the connection within the hang guard.
     pub fn closed_by_server(&mut self) -> bool {
         self.read_to_close().is_some()
     }
 
-    /// Everything the server sends until it closes the connection, or `None` if it does not within the patience of a
-    /// test.
+    /// Everything the server sends until it closes the connection, or `None` if it does not within the hang guard.
     pub fn read_to_close(&mut self) -> Option<String> {
         let mut seen = String::new();
-        let end = Instant::now() + PATIENCE;
+        let end = Instant::now() + HANG_GUARD;
         while Instant::now() < end {
             match self.read_for(Duration::from_millis(200)) {
                 Some(more) => seen.push_str(&more),
@@ -403,11 +403,15 @@ impl Raw {
 }
 
 impl Fixture {
-    /// Waits, within the patience of a test, until the server counts `open` connections.
+    /// Waits, within the hang guard, until the server counts `open` connections.
     pub fn wait_open(&self, open: u64) {
-        let end = Instant::now() + PATIENCE;
+        let end = Instant::now() + HANG_GUARD;
         while self.server.counters().open != open {
-            assert!(Instant::now() < end, "{:?}", self.server.counters());
+            assert!(
+                Instant::now() < end,
+                "never {open} open connections: {:?}",
+                self.server.counters()
+            );
             sleep(Duration::from_millis(10));
         }
     }

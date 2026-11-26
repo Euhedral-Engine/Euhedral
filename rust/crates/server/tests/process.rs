@@ -10,25 +10,51 @@ mod common;
 
 use std::fs::{create_dir, write};
 use std::io::{BufRead, BufReader, Read};
+use std::mem::take;
 use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio, id};
+use std::process::{Child, ChildStdout, Command, Stdio, id};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::thread::{scope as scope_threads, sleep, spawn as spawn_thread};
 use std::time::{Duration, Instant};
 
-use common::{PATIENCE, chat, exchange, gauge, ready, status, try_exchange, until};
+use common::{HANG_GUARD, chat, exchange, gauge, status, try_exchange, until};
 
 const SERVER: &str = env!("CARGO_BIN_EXE_euhedral-server");
 
-/// A child that is killed when the test ends, whatever happened.
-struct Server(Child);
+/// A child that is killed when the test ends, whatever happened. `log` is the reader of its standard output once the
+/// test has asked for it, and `announced` what the test read from it up to the record that the server listens.
+struct Server {
+    child: Child,
+    log: Option<BufReader<ChildStdout>>,
+    announced: String,
+}
+
+impl Server {
+    /// Reads the server's log up to its own record that it listens: the port is open from then on. `false` when the
+    /// log ends first, that is when the process exited without announcing it.
+    fn await_listening(&mut self) -> bool {
+        let log = self.log.as_mut().expect("a piped stdout");
+        loop {
+            let mut line = String::new();
+            match log.read_line(&mut line) {
+                Ok(0) | Err(_) => return false,
+                Ok(_) => {
+                    self.announced.push_str(&line);
+                    if line.contains("Listening on port") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+}
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.0.kill().ok();
-        self.0.wait().ok();
+        self.child.kill().ok();
+        self.child.wait().ok();
     }
 }
 
@@ -64,6 +90,7 @@ fn config(directory: &Path, port: u16, extra: &str) -> PathBuf {
     file
 }
 
+/// A server that is not asked to serve: the tests read its exit code and its standard error.
 fn spawn(arguments: &[&str]) -> Server {
     spawn_with(arguments, Stdio::null())
 }
@@ -79,24 +106,30 @@ fn spawn_with(arguments: &[&str], stdout: Stdio) -> Server {
     if let Some(root) = std::env::var_os("SYSTEMROOT") {
         command.env("SYSTEMROOT", root);
     }
-    let child = command
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(Stdio::piped())
         .spawn()
         .expect("the server binary");
-    Server(child)
+    let log = child.stdout.take().map(BufReader::new);
+    Server {
+        child,
+        log,
+        announced: String::new(),
+    }
 }
 
-// Timing-based on purpose: a real process exits on its own clock and no counter of ours sees it; `limit` is a hang guard.
+// Polled on purpose: a real process exits on its own clock, `Child` offers no wait with a bound, and `limit` is only a
+// hang guard.
 /// The exit code of the child, waiting at most `limit`.
 fn exit_code(server: &mut Server, limit: Duration) -> i32 {
     let deadline = Instant::now() + limit;
     loop {
-        if let Some(status) = server.0.try_wait().expect("a status") {
+        if let Some(status) = server.child.try_wait().expect("a status") {
             return status.code().expect("an exit code");
         }
-        assert!(Instant::now() < deadline, "the process did not exit within {limit:?}");
+        assert!(Instant::now() < deadline, "the process never exited, in {limit:?}");
         sleep(Duration::from_millis(10));
     }
 }
@@ -104,7 +137,7 @@ fn exit_code(server: &mut Server, limit: Duration) -> i32 {
 fn stderr_of(server: &mut Server) -> String {
     let mut text = String::new();
     server
-        .0
+        .child
         .stderr
         .take()
         .expect("a piped stderr")
@@ -123,7 +156,7 @@ fn a_bad_file_exits_with_two_and_lists_every_problem_on_its_own_line() {
     )
     .expect("a file");
     let mut server = spawn(&["--config", file.to_str().expect("a path")]);
-    assert_eq!(exit_code(&mut server, PATIENCE), 2);
+    assert_eq!(exit_code(&mut server, HANG_GUARD), 2);
     let text = stderr_of(&mut server);
     assert_eq!(text.lines().count(), 3, "{text}");
     for key in ["server.port", "server.colour", "context.max-tokens"] {
@@ -134,7 +167,7 @@ fn a_bad_file_exits_with_two_and_lists_every_problem_on_its_own_line() {
 #[test]
 fn settings_that_name_no_model_exit_with_two() {
     let mut server = spawn(&[]);
-    assert_eq!(exit_code(&mut server, PATIENCE), 2);
+    assert_eq!(exit_code(&mut server, HANG_GUARD), 2);
     assert!(stderr_of(&mut server).contains("model.artifact"));
 }
 
@@ -143,7 +176,7 @@ fn a_backend_that_does_not_start_exits_with_one_and_says_why() {
     let directory = tempfile::tempdir().expect("a directory");
     let file = config(directory.path(), free_port(), "");
     let mut server = spawn(&["--config", file.to_str().expect("a path")]);
-    assert_eq!(exit_code(&mut server, PATIENCE), 1);
+    assert_eq!(exit_code(&mut server, HANG_GUARD), 1);
     let text = stderr_of(&mut server);
     assert!(text.contains("APPLICATION FAILED TO START"), "{text}");
     assert!(text.contains("Starting the engine failed"), "{text}");
@@ -156,7 +189,7 @@ fn a_missing_cuda_library_exits_with_one_and_gives_the_driver_message() {
     let extra = format!("host:\n  native-cache: {}\n", cache.display());
     let file = config(directory.path(), free_port(), &extra);
     let mut server = spawn(&["--config", file.to_str().expect("a path")]);
-    assert_eq!(exit_code(&mut server, PATIENCE), 1);
+    assert_eq!(exit_code(&mut server, HANG_GUARD), 1);
     let text = stderr_of(&mut server);
     assert!(
         text.contains("the NVIDIA driver is required, with an NVIDIA Blackwell GPU:"),
@@ -180,34 +213,33 @@ fn a_port_in_use_exits_with_one_and_names_the_port() {
     let directory = tempfile::tempdir().expect("a directory");
     let file = config(directory.path(), port, "");
     let mut server = spawn(&["--config", file.to_str().expect("a path"), "--scripted-backend"]);
-    assert_eq!(exit_code(&mut server, PATIENCE), 1);
+    assert_eq!(exit_code(&mut server, HANG_GUARD), 1);
     let text = stderr_of(&mut server);
     assert!(text.contains(&format!("Port {port} was already in use.")), "{text}");
 }
 
-/// Starts a scripted server and waits until it answers. `windows` are the hidden arguments that shorten the stop's
-/// windows.
+/// Starts a scripted server and waits until its log says that it listens. `windows` are the hidden arguments that
+/// shorten the stop's windows.
 fn serving(directory: &Path, script: &str, windows: &[&str]) -> (Server, SocketAddr) {
-    serving_on(directory, script, windows, Stdio::null())
-}
-
-fn serving_on(directory: &Path, script: &str, windows: &[&str], stdout: Stdio) -> (Server, SocketAddr) {
     let port = free_port();
     let file = config(directory, port, "");
     let backend = format!("--scripted-backend={script}");
     let mut arguments = vec!["--config", file.to_str().expect("a path"), &backend];
     arguments.extend_from_slice(windows);
-    let server = spawn_with(&arguments, stdout);
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    ready(addr);
-    (server, addr)
+    let mut server = spawn_with(&arguments, Stdio::piped());
+    assert!(
+        server.await_listening(),
+        "the server ended without announcing that it listens: {}",
+        server.announced
+    );
+    (server, SocketAddr::from(([127, 0, 0, 1], port)))
 }
 
 #[cfg(unix)]
 fn signal(server: &Server, name: &str) {
     let sent = Command::new("kill")
         .arg(format!("-{name}"))
-        .arg(server.0.id().to_string())
+        .arg(server.child.id().to_string())
         .status()
         .expect("kill");
     assert!(sent.success());
@@ -219,7 +251,7 @@ fn sigterm_stops_a_serving_process_with_143() {
     let directory = tempfile::tempdir().expect("a directory");
     let (mut server, _) = serving(directory.path(), "hello", &[]);
     signal(&server, "TERM");
-    assert_eq!(exit_code(&mut server, PATIENCE), 143);
+    assert_eq!(exit_code(&mut server, HANG_GUARD), 143);
 }
 
 #[cfg(unix)]
@@ -228,7 +260,7 @@ fn sigint_stops_a_serving_process_with_130() {
     let directory = tempfile::tempdir().expect("a directory");
     let (mut server, _) = serving(directory.path(), "hello", &[]);
     signal(&server, "INT");
-    assert_eq!(exit_code(&mut server, PATIENCE), 130);
+    assert_eq!(exit_code(&mut server, HANG_GUARD), 130);
 }
 
 #[cfg(unix)]
@@ -247,15 +279,13 @@ fn a_second_signal_ends_the_process_at_once_with_the_code_of_the_signal() {
     });
     signal(&server, "TERM");
     // The server stopped accepting: the first signal was taken, and the stop is waiting for the generation.
-    until("the listener to close", || {
-        TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err()
-    });
+    until("the listener to close", || TcpStream::connect(addr).is_err());
     assert!(
-        server.0.try_wait().expect("a status").is_none(),
+        server.child.try_wait().expect("a status").is_none(),
         "the stop ended by itself"
     );
     signal(&server, "INT");
-    assert_eq!(exit_code(&mut server, Duration::from_secs(10)), 130);
+    assert_eq!(exit_code(&mut server, HANG_GUARD), 130);
 }
 
 #[cfg(unix)]
@@ -276,7 +306,7 @@ fn a_stop_by_signal_interrupts_a_running_request_and_refuses_the_queued_one() {
         gauge(addr, "euhedral_generations_queued") == Some(1.0)
     });
     signal(&server, "TERM");
-    assert_eq!(exit_code(&mut server, PATIENCE), 143);
+    assert_eq!(exit_code(&mut server, HANG_GUARD), 143);
     let queued = queued.join().expect("a client");
     assert_eq!(status(&queued), 503, "{queued}");
     assert!(queued.contains("shutting down"), "{queued}");
@@ -290,13 +320,12 @@ fn a_stop_by_signal_interrupts_a_running_request_and_refuses_the_queued_one() {
 #[test]
 fn the_log_carries_the_records_of_the_runtime_beside_the_servers() {
     let directory = tempfile::tempdir().expect("a directory");
-    let (mut server, _) = serving_on(directory.path(), "hello", &[], Stdio::piped());
+    let (mut server, _) = serving(directory.path(), "hello", &[]);
     signal(&server, "TERM");
-    assert_eq!(exit_code(&mut server, PATIENCE), 143);
-    let mut log = String::new();
+    assert_eq!(exit_code(&mut server, HANG_GUARD), 143);
+    let mut log = take(&mut server.announced);
     server
-        .0
-        .stdout
+        .log
         .take()
         .expect("a piped stdout")
         .read_to_string(&mut log)
@@ -312,11 +341,11 @@ fn the_log_carries_the_records_of_the_runtime_beside_the_servers() {
 #[test]
 fn a_stop_by_signal_still_ends_in_order_when_the_standard_output_is_closed() {
     let directory = tempfile::tempdir().expect("a directory");
-    let (mut server, _) = serving_on(directory.path(), "hello", &[], Stdio::piped());
+    let (mut server, _) = serving(directory.path(), "hello", &[]);
     // The reader goes away: from now on every line of the log fails to be written.
-    drop(server.0.stdout.take());
+    drop(server.log.take());
     signal(&server, "TERM");
-    assert_eq!(exit_code(&mut server, PATIENCE), 143);
+    assert_eq!(exit_code(&mut server, HANG_GUARD), 143);
     let text = stderr_of(&mut server);
     assert!(!text.contains("panicked"), "{text}");
 }
@@ -349,22 +378,11 @@ fn first_exchange(directory: &Path, start: usize) -> Result<(), String> {
         Stdio::piped(),
     );
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    // Held until the end so that the server's log keeps a reader. The read ends at the record, or at the end of the
-    // stream when the process exits without it.
-    let mut log = BufReader::new(server.0.stdout.take().expect("a piped stdout"));
-    let mut line = String::new();
-    let listening = loop {
-        line.clear();
-        match log.read_line(&mut line) {
-            Ok(0) | Err(_) => break false,
-            Ok(_) if line.contains("Listening on port") => break true,
-            Ok(_) => {}
-        }
-    };
-    if !listening {
+    // The log stays with `server` until the end, so that the server's log keeps a reader.
+    if !server.await_listening() {
         return Err(format!(
             "port {port}: the server ended without announcing that it listens; the process {:?}",
-            server.0.wait().expect("a status")
+            server.child.wait().expect("a status")
         ));
     }
     let outcome = try_exchange(addr, "GET", "/health", None);
@@ -372,7 +390,7 @@ fn first_exchange(directory: &Path, start: usize) -> Result<(), String> {
         Ok(answer) if status(&answer) == 200 => Ok(()),
         other => Err(format!(
             "port {port}: {other:?}; the process {:?}",
-            server.0.try_wait().expect("a status")
+            server.child.try_wait().expect("a status")
         )),
     }
 }
