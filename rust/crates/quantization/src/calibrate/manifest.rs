@@ -26,6 +26,17 @@ const MOST_NAMED: usize = 5;
 /// Characters a listed name may not hold: the separators of every platform, and Windows' stream and drive mark.
 const NOT_IN_NAMES: [char; 4] = ['/', '\\', ':', '\0'];
 
+/// The parts of a run that are written after its layers, each sealed and listed on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// The MTP block: its input projection and its layer's linears.
+    Mtp,
+    /// The output head.
+    OutputHead,
+    /// The draft head; the heads are written once it is.
+    DraftHead,
+}
+
 /// How far a run of one key got.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -374,6 +385,49 @@ impl Ledger {
                 if !next.lists_resume_file() {
                     next.files.push(RESUME_FILE.to_owned());
                 }
+                Ok(next)
+            },
+            write,
+            then,
+        );
+    }
+
+    /// Lists the files of `part`, which are saved, and marks the part written, saving the manifest through `write` as
+    /// [`Ledger::record`] does: a part counts only once its files are listed on disk.
+    pub fn sealed<W>(self: &Arc<Self>, part: Part, files: Vec<String>, write: W, then: Then<()>)
+    where
+        W: FnOnce(Vec<u8>, Then<()>),
+    {
+        self.commit(
+            |held| {
+                let mut next = held.clone();
+                for name in files {
+                    if !next.files.contains(&name) {
+                        next.files.push(name);
+                    }
+                }
+                match part {
+                    Part::Mtp => next.mtp_done = true,
+                    Part::OutputHead => {}
+                    Part::DraftHead => next.heads_done = true,
+                }
+                Ok(next)
+            },
+            write,
+            then,
+        );
+    }
+
+    /// Unlists the resume file, saving the manifest through `write`: the caller removes the file only once this is
+    /// Ok, so the manifest never lists a file that is gone.
+    pub fn resume_file_dropped<W>(self: &Arc<Self>, write: W, then: Then<()>)
+    where
+        W: FnOnce(Vec<u8>, Then<()>),
+    {
+        self.commit(
+            |held| {
+                let mut next = held.clone();
+                next.files.retain(|name| name != RESUME_FILE);
                 Ok(next)
             },
             write,

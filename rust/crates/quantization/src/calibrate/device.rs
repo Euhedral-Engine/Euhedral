@@ -20,7 +20,8 @@ use std::iter::once;
 use std::mem::forget;
 use std::path::{Path, PathBuf};
 use std::slice;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use euhedral_gpu::cuda::{CudaGpu, CudaModule, CudaQueue};
 use euhedral_gpu::{Gpu, GpuError, Lane, Stream, StreamOptions, open_shared_lanes};
@@ -37,6 +38,7 @@ use euhedral_memory::{LocationId, LocationKind, LocationSpec, OwnerSpec, Planner
 use super::driver::{Once, Then, end, single};
 use super::embedding;
 use super::files::{Region, resume, save, write_checkpoint};
+use super::heads::run as run_heads;
 use super::hessians::HessianSet;
 use super::manifest::{Ledger, MANIFEST_FILE, Manifest, RESUME_FILE};
 use super::plan::{Plan, round_order};
@@ -55,6 +57,10 @@ use crate::memory::LaneMemory;
 use crate::recipe::Recipe;
 use crate::resume::ResumeFile;
 use crate::step::{Kind, idle, step};
+
+mod heads;
+
+use heads::{DeviceHeads, HeadState};
 
 /// The checkpoint tensor the tokens are looked up in.
 const EMBEDDING: &str = "model.language_model.embed_tokens.weight";
@@ -103,6 +109,11 @@ pub struct Settings {
     /// [`DEVICE_RESERVE`].
     pub device_reserve: Option<u64>,
     pub chunk_bytes: usize,
+    /// Whether a run of the whole model leaves out the MTP block: the draft head is then rounded under the output
+    /// head's Hessian.
+    pub skip_mtp: bool,
+    /// The vocabulary rows the draft head keeps, in the order it stores them: checked against the vocabulary.
+    pub draft_ids: Vec<i32>,
     /// The manifest the run starts from (a resumed directory's, or a new one): its key names the run in the resume
     /// file, and it is all the run resumes from.
     pub manifest: Manifest,
@@ -125,6 +136,8 @@ impl Settings {
             lane_pinned_bytes: LANE_PINNED_BYTES,
             device_reserve: None,
             chunk_bytes: UPLOAD_CHUNK_BYTES,
+            skip_mtp: false,
+            draft_ids: Vec::new(),
             manifest,
         }
     }
@@ -171,10 +184,14 @@ struct Inner {
     handles: Handoff<LaneHandles>,
     lanes: Handoff<Vec<GptqLane>>,
     services: Arc<Services>,
-    resume: OnceLock<ResumeFile>,
+    resume: Handoff<ResumeFile>,
     /// The manifest of the run, which each layer updates.
     ledger: Arc<Ledger>,
     hidden: usize,
+    /// Tokens of a sequence in the pass that runs: the run's, and the MTP layer's one fewer.
+    pass_length: AtomicUsize,
+    /// What the heads keep on the card between their calls.
+    heads: Handoff<HeadState>,
 }
 
 /// The calibration on the card; its calls are [`Stages`].
@@ -372,10 +389,13 @@ impl Calibration {
             handles: Handoff::empty(),
             lanes: Handoff::empty(),
             services,
-            resume: OnceLock::new(),
+            resume: Handoff::empty(),
             ledger,
             hidden,
+            pass_length: AtomicUsize::new(length),
+            heads: Handoff::empty(),
         });
+        inner.heads.send(HeadState::default());
         inner.handles.send(symmetric);
         inner.lanes.send(lanes);
         Ok((Calibration { inner }, vec![completions, gptq_completions]))
@@ -404,17 +424,21 @@ impl Inner {
             states: self.host_states(),
             batch_states: self.batch_states.ptr(),
             sequences: self.settings.sequences() as u32,
-            length: self.settings.length as u32,
+            length: self.pass_length.load(Ordering::Acquire) as u32,
             batch: self.settings.batch as u32,
             observer,
             write,
         }
     }
 
-    fn resume_file(&self) -> Result<&ResumeFile, CalibrateError> {
-        self.resume
-            .get()
-            .ok_or_else(|| CalibrateError::Failed("the resume file is not open".to_owned()))
+    /// A handle on the resume file.
+    fn resume_file(&self) -> Result<ResumeFile, CalibrateError> {
+        let file = self
+            .resume
+            .take()
+            .ok_or_else(|| CalibrateError::Failed("the resume file is not open".to_owned()))?;
+        self.resume.send(file.clone());
+        Ok(file)
     }
 }
 
@@ -480,23 +504,7 @@ impl Stages for Calibration {
     }
 
     fn stage(&self, layer: usize, then: Then<StagedLayer>) {
-        let cell = single(then);
-        let ready = Arc::clone(&cell);
-        let staging = Arc::clone(&self.inner.staging);
-        let started = stage(
-            &self.inner.objects,
-            Target::Layer(layer),
-            move |bytes| staging.acquire(bytes),
-            Arc::new(move |staged: Result<StagedLayer<PooledPinned>, CheckpointError>| {
-                end(
-                    &ready,
-                    staged.map_err(|error| CalibrateError::failed("reading the layer", error)),
-                );
-            }),
-        );
-        if let Err(error) = started {
-            end(&cell, Err(CalibrateError::failed("reading the layer", error)));
-        }
+        stage_target(&self.inner, Target::Layer(layer), then);
     }
 
     /// The layer, then the manifest with the layer counted: its files are all written by then.
@@ -505,27 +513,50 @@ impl Stages for Calibration {
         let recorded: Then<()> = Box::new(move |result| {
             Arc::clone(&inner.ledger).record(layer, result, save_manifest(&inner), then);
         });
-        upload(Arc::clone(&self.inner), layer, staged, single(recorded));
+        upload(Arc::clone(&self.inner), Target::Layer(layer), staged, single(recorded));
     }
 
     fn checkpoint(&self, done: usize, then: Then<()>) {
         checkpoint(&self.inner, done, then);
     }
 
-    /// The layers' files are complete, and the manifest says so; the output head, the draft head and the MTP block are
-    /// not rounded by this build, so the run does not end well: its output is not whole.
+    /// The heads over the states the layers left: see [`heads`].
     fn finish(&self, then: Then<()>) {
-        refuse_finish(then);
+        run_heads(
+            Arc::new(DeviceHeads::new(Arc::clone(&self.inner))),
+            self.inner.settings.skip_mtp,
+            then,
+        );
     }
 }
 
-/// What a run of the whole model ends with: an error, since this build does not round the output head, the draft head
-/// or the MTP block, and the manifest records the output as incomplete.
-pub fn refuse_finish(then: Then<()>) {
-    then(Err(CalibrateError::Failed(format!(
-        "every layer is rounded and written, but this build does not round the output head, the draft head or the MTP \
-         block; {MANIFEST_FILE} records the output as incomplete"
-    ))));
+/// Reads `target` from the checkpoint into pinned host memory.
+fn stage_target(inner: &Arc<Inner>, target: Target, then: Then<StagedLayer>) {
+    let cell = single(then);
+    let ready = Arc::clone(&cell);
+    let staging = Arc::clone(&inner.staging);
+    let started = stage(
+        &inner.objects,
+        target,
+        move |bytes| staging.acquire(bytes),
+        Arc::new(move |staged: Result<StagedLayer<PooledPinned>, CheckpointError>| {
+            end(
+                &ready,
+                staged.map_err(|error| CalibrateError::failed("reading the layer", error)),
+            );
+        }),
+    );
+    if let Err(error) = started {
+        end(&cell, Err(CalibrateError::failed("reading the layer", error)));
+    }
+}
+
+/// What `target` is called in a failure.
+fn describe(target: Target) -> String {
+    match target {
+        Target::Layer(layer) => format!("layer {layer}"),
+        Target::Mtp => "the MTP layer".to_owned(),
+    }
 }
 
 // ---- begin: resume or embed ----
@@ -543,7 +574,7 @@ fn begin(inner: Arc<Inner>, layers: usize, then: Once<usize>) {
             match opened {
                 Err(error) => end(&then, Err(CalibrateError::failed("the resume file", error))),
                 Ok(file) => {
-                    let _ = opening.resume.set(file.clone());
+                    opening.resume.send(file.clone());
                     resume_or_embed(opening, &file, layers, then);
                 }
             }
@@ -628,7 +659,7 @@ fn checkpoint(inner: &Arc<Inner>, done: usize, then: Then<()>) {
     let listed: Then<()> = Box::new(move |result| {
         Arc::clone(&listing.ledger).checkpointed(result, save_manifest(&listing), then);
     });
-    write_checkpoint(file, &manifest.key, inner.region(), STATES_CHUNK, done, listed);
+    write_checkpoint(&file, &manifest.key, inner.region(), STATES_CHUNK, done, listed);
 }
 
 /// The save of the manifest's bytes over its file, for the ledger.
@@ -656,7 +687,23 @@ fn after(inner: &Arc<Inner>, marker: Marker, work: impl FnOnce() + Send + 'stati
     inner.completions.after_marker(marker, step(Kind::Resolve, work));
 }
 
-fn upload(inner: Arc<Inner>, layer: usize, staged: StagedLayer, then: Once<()>) {
+/// The chain of one layer's calls for `target`, from its read to the end of its write pass; `then` gets its end. The
+/// manifest is the caller's to update.
+fn run_target(inner: &Arc<Inner>, target: Target, then: Then<()>) {
+    let cell = single(then);
+    let failed = Arc::clone(&cell);
+    let next = Arc::clone(inner);
+    stage_target(
+        inner,
+        target,
+        Box::new(move |staged| match staged {
+            Ok(staged) => upload(next, target, staged, cell),
+            Err(error) => end(&failed, Err(error)),
+        }),
+    );
+}
+
+fn upload(inner: Arc<Inner>, target: Target, staged: StagedLayer, then: Once<()>) {
     let submitted = inner.main.submit_marked(|queue| {
         let mut ops = RusteeOps::new(queue, &inner.table, Modes::default()).on_lane(&inner.library, inner.home);
         // SAFETY: `staged` is kept until the marker of this submission is reached, which is after the copies.
@@ -668,7 +715,10 @@ fn upload(inner: Arc<Inner>, layer: usize, staged: StagedLayer, then: Once<()>) 
             forget(staged);
             end(
                 &then,
-                Err(CalibrateError::failed(&format!("uploading layer {layer}"), error)),
+                Err(CalibrateError::failed(
+                    &format!("uploading {}", describe(target)),
+                    error,
+                )),
             );
         }
         Ok((weights, marker)) => {
