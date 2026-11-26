@@ -54,8 +54,7 @@ class TeacherForcedQualityCudaIntegrationTest {
         QwenTokenizer tokenizer = QwenTokenizer.load(TokenizerFiles.fromCheckpoint(
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"))));
         int[] document = tokenizer.encodeText(Files.readString(SpeculativeVerifyCudaIntegrationTest.repositoryRoot()
-                .resolve("benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/"
-                        + "chat-corpus-v1-document.md")));
+                .resolve("rust/resources/bench/chat-corpus-v1-document.md")));
         if (document.length < prefix + steps + 1) throw new IllegalStateException("document too short");
         var data = ArtifactReader.read(artifact);
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);

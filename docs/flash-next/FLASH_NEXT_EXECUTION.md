@@ -179,7 +179,7 @@ from several: the expert reads of one wave run on as many workers as the staging
 ## End-to-end agreement
 
 `GreedyAgreementCudaIntegrationTest` compares the engine's greedy continuation with the reference's, both reading the KV
-cache through the NVFP4 codec (`tools/flash_next_reference/cli.py greedy`, fixture `core/src/test/resources/qwen4/greedy-reference.json`).
+cache through the NVFP4 codec (`tools/flash_next_reference/cli.py greedy`, fixture `rust/resources/fixtures/qwen4/greedy-reference.json`).
 Teacher-forced (the engine fed the reference's tokens) and free-running (the engine fed its own), 72 of 72 positions agree, and the
 engine's tokenisation of every prompt matches the reference tokenizer's. A position where the reference's top two logits are within
 the BF16 noise of the comparison (1.0 logit) is not counted as a disagreement; none of the 72 needed it.

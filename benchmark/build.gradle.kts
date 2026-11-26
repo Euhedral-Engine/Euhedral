@@ -31,3 +31,11 @@ tasks.named<JavaExec>("run") {
     dependsOn(rootProject.tasks.named("nativeBuild${hostProductId.split("-").joinToString("") { it.replaceFirstChar(Char::uppercase) }}"))
     workingDir = rootProject.projectDir
 }
+
+// The prompt document the Rust bench also includes lives under rust/resources; it keeps its classpath path.
+tasks.named<ProcessResources>("processResources") {
+    from(rootProject.layout.projectDirectory.dir("rust/resources/bench")) {
+        include("chat-corpus-v1-document.md")
+        into("io/euhedral_execution/inference/benchmark/prompt")
+    }
+}

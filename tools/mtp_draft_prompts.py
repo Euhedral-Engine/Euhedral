@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from render_qwen_chat_template_golden import compile_template  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-CORPUS = "benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md"
+CORPUS = "rust/resources/bench/chat-corpus-v1-document.md"
 SPECULATIVE = "core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/speculative/"
 HOST_LOGITS = "core/src/main/java/io/euhedral_execution/inference/core/generation/HostLogits.java"
 

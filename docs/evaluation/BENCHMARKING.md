@@ -42,14 +42,14 @@ Change one variable at a time and keep the JSON for every run you compare.
    treating any timing as a baseline.
 
    ```bash
-   ./gradlew :benchmark:run --args="run benchmark/configs/baseline.json --validate-only"
+   ./gradlew :benchmark:run --args="run rust/resources/bench/configs/baseline.json --validate-only"
    ```
 
 5. **Baseline benchmark.** The default suite on all available processors with the default
    context capacity.
 
    ```bash
-   ./gradlew :benchmark:run --args="run benchmark/configs/baseline.json"
+   ./gradlew :benchmark:run --args="run rust/resources/bench/configs/baseline.json"
    ```
 
 6. **Retain the JSON.** Rows are appended to the configured `output` as they complete (JSONL), and a
@@ -64,10 +64,10 @@ Change one variable at a time and keep the JSON for every run you compare.
    ./gradlew :benchmark:installDist nativeBuild
    nsys profile --trace=cuda,nvtx,osrt -o benchmark-results/smoke \
      benchmark/build/install/euhedral-inference-benchmark/bin/euhedral-inference-benchmark \
-     run benchmark/configs/smoke.json
+     run rust/resources/bench/configs/smoke.json
    ncu --target-processes all -o benchmark-results/smoke-kernels \
      benchmark/build/install/euhedral-inference-benchmark/bin/euhedral-inference-benchmark \
-     run benchmark/configs/smoke.json
+     run rust/resources/bench/configs/smoke.json
    ```
 
    Profiled runs are slower; give each command a fresh result path and keep their JSON separate
@@ -77,7 +77,7 @@ Change one variable at a time and keep the JSON for every run you compare.
 8. **Change one variable**, for example the CPU selection:
 
    ```bash
-   ./gradlew :benchmark:run --args="run benchmark/configs/custom-cpus.json"
+   ./gradlew :benchmark:run --args="run rust/resources/bench/configs/custom-cpus.json"
    ```
 
 9. **Rerun and compare** against the retained baseline. Use the same scenarios, prompt seed,
@@ -143,7 +143,7 @@ the same config several times with an appending output:
 
 ```bash
 for fork in 1 2 3; do
-  ./gradlew :benchmark:run --args="run benchmark/configs/forks.json --fork-id $fork"
+  ./gradlew :benchmark:run --args="run rust/resources/bench/configs/forks.json --fork-id $fork"
 done
 ```
 
@@ -230,7 +230,7 @@ below is illustrative; its values are not a measurement.
 {
   "schema": "euhedral-inference.benchmark-result", "schemaVersion": 1,
   "implementation": "euhedral-inference",
-  "provenance": {"kind": "measured", "tool": "euhedral-inference-benchmark", "commandLine": "run benchmark/configs/baseline.json",
+  "provenance": {"kind": "measured", "tool": "euhedral-inference-benchmark", "commandLine": "run rust/resources/bench/configs/baseline.json",
                  "source": null, "sourceSha256": null, "note": null},
   "runId": "<uuid per JVM>",
   "fork": {"id": null, "source": "unspecified", "pid": 1234, "jvmStartedAt": "<instant>"},

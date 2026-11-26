@@ -117,7 +117,7 @@ Test settings are looked up in this order: `EUHEDRAL_TEST_<KEY>` in the environm
 ## Benchmark
 
 `euhedral-bench` (crate `euhedral-inference-bench`) measures the Rust engine with the Java benchmark's configuration
-files (`benchmark/configs`) and writes rows in its result schema (`euhedral-inference.benchmark-result` version 1,
+files (`rust/resources/bench/configs`) and writes rows in its result schema (`euhedral-inference.benchmark-result` version 1,
 `implementation` `rust`):
 
 ```text

@@ -37,7 +37,7 @@ use serde_json::Value;
 const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 
 fn fixture(name: &str) -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../quantization/src/test/resources/gptq-fixture");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../resources/fixtures/gptq-fixture");
     read(path.join(name)).unwrap_or_else(|error| panic!("{name}: {error}"))
 }
 

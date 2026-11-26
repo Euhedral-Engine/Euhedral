@@ -80,3 +80,10 @@ tasks.register<Test>("tokenizerReferenceTest") {
     }
     useJUnitPlatform()
 }
+// The Flash-Next greedy reference lives under rust/resources; it keeps its classpath path qwen4/.
+tasks.named<ProcessResources>("processTestResources") {
+    from(rootProject.layout.projectDirectory.dir("rust/resources/fixtures/qwen4")) {
+        include("greedy-reference.json")
+        into("qwen4")
+    }
+}
