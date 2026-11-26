@@ -30,9 +30,7 @@ use euhedral_inference_cuda::launch::Modes;
 use euhedral_inference_cuda::launch::load::{KernelSources, KernelTable, load};
 use euhedral_inference_cuda::launch::ops::RusteeOps;
 use euhedral_inference_cuda::math::{LaneHandles, MathLibraries};
-use euhedral_inference_cuda::{
-    CudaLibrary, DeviceBuffer, KernelOps, LaneOps, PinnedBuffer, PinnedPool, PinnedRange, PooledPinned,
-};
+use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, KernelOps, LaneOps, PinnedBuffer, PinnedPool, PooledPinned};
 use euhedral_inference_engine::Handoff;
 use euhedral_io::AsyncIo;
 use euhedral_memory::{LocationId, LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope};
@@ -66,7 +64,7 @@ mod staging;
 mod trellis;
 
 use super::head_state::HeadState;
-use heads::{DeviceHeads, OUTPUT_HEAD, head_groups};
+use heads::{Call, DeviceHeads, OUTPUT_HEAD, head_groups, read_tensors};
 use staging::HeadStaging;
 use trellis::{Opening, Trellis, TrellisDeviceHeads, round_layer};
 
@@ -330,7 +328,14 @@ impl Calibration {
                 .map_err(|error| CalibrateError::failed("the hidden states", error))?,
             bytes: states_bytes,
         };
-        let head_staging = HeadStaging::open(&library, &head_groups(&objects, settings.trellis.is_some()))?;
+        let head_staging = HeadStaging::open(
+            &library,
+            &head_groups(
+                settings.trellis.is_some(),
+                |call| call.names(&objects),
+                |name| objects.store().tensor(name).ok().map(|tensor| tensor.bytes as usize),
+            ),
+        )?;
         let batch_states = DeviceBuffer::alloc(&library, batch * length * hidden * BF16_BYTES)
             .map_err(|error| CalibrateError::failed("the batch states", error))?;
 
@@ -691,40 +696,26 @@ fn embed(inner: Arc<Inner>, then: Once<usize>) {
     }
     // The heads' own buffer, allocated at open: a pooled loan of this size would be rounded up to a power of two and
     // allocated in this frame.
-    let memory = match inner.head_staging.lease(&[tensor.bytes as usize]) {
-        Ok(memory) => memory,
+    let names = match Call::Embedding.names(&inner.objects) {
+        Ok(names) => names,
         Err(error) => return end(&then, Err(error)),
     };
-    let Some(range) = memory.range(0) else {
-        return end(
-            &then,
-            Err(CalibrateError::Failed(
-                "the embedding table has no part to be read into".to_owned(),
-            )),
-        );
-    };
-    let failed = Arc::clone(&then);
-    let started = store.read_tensor(
-        EMBEDDING,
-        range,
-        Arc::new(move |read: Result<PinnedRange, CheckpointError>| {
-            let outcome = read
-                .map_err(|error| CalibrateError::failed("the embedding table", error))
-                .and_then(|range| {
-                    drop(range);
-                    let table = memory
-                        .bytes(0)
-                        .ok_or_else(|| CalibrateError::Failed("the embedding table was not read".to_owned()))?;
-                    // SAFETY: the states are the run's own and nothing touches them before the run starts.
-                    let states = unsafe { slice::from_raw_parts_mut(inner.states.pointer(), inner.states.bytes) };
-                    embedding::copy_rows(&inner.settings.tokens, table, inner.row_bytes(), states)
-                });
+    let reading = Arc::clone(&inner);
+    read_tensors(
+        &reading,
+        names,
+        Box::new(move |read| {
+            let outcome = read.and_then(|memory| {
+                let table = memory
+                    .bytes(0)
+                    .ok_or_else(|| CalibrateError::Failed("the embedding table was not read".to_owned()))?;
+                // SAFETY: the states are the run's own and nothing touches them before the run starts.
+                let states = unsafe { slice::from_raw_parts_mut(inner.states.pointer(), inner.states.bytes) };
+                embedding::copy_rows(&inner.settings.tokens, table, inner.row_bytes(), states)
+            });
             end(&then, outcome.map(|()| 0));
         }),
     );
-    if let Err(error) = started {
-        end(&failed, Err(CalibrateError::failed("the embedding table", error)));
-    }
 }
 
 // ---- checkpoint ----

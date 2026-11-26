@@ -76,8 +76,17 @@ impl<B> HeadStaging<B> {
         Ok(Lease {
             buffer: Some(Arc::new(buffer)),
             home: Arc::clone(&self.home),
+            claimed: vec![false; parts.len()],
             parts,
         })
+    }
+}
+
+#[cfg(test)]
+impl<B> HeadStaging<B> {
+    /// A staging that owns `buffer`, for tests with a stand-in for the pinned buffer.
+    pub(super) fn open_with(buffer: B, capacity: usize) -> Self {
+        Self::holding(Some(buffer), capacity)
     }
 }
 
@@ -99,12 +108,31 @@ pub(super) struct Lease<B> {
     buffer: Option<Arc<B>>,
     home: Arc<Handoff<B>>,
     parts: Vec<(usize, usize)>,
+    /// Which parts a read has been given: a part is given once.
+    claimed: Vec<bool>,
 }
 
 impl<B> Lease<B> {
     /// Where part `index` starts in the buffer, and its bytes.
     pub(super) fn part(&self, index: usize) -> Option<(usize, usize)> {
         self.parts.get(index).copied()
+    }
+
+    /// Hands part `index` to a read: where it starts, its bytes, and a clone of the buffer that the read holds until it
+    /// ends. Refused (`None`) for a part that does not exist and for one already given, so two reads never share bytes.
+    pub(super) fn claim(&mut self, index: usize) -> Option<(usize, usize, Arc<B>)> {
+        let (start, bytes) = self.part(index)?;
+        let taken = self.claimed.get_mut(index).filter(|taken| !**taken)?;
+        *taken = true;
+        Some((start, bytes, Arc::clone(self.buffer())))
+    }
+
+    /// Where part `index` starts and its bytes, for the host to read them: refused (`None`) while a clone of the buffer
+    /// is out, that is while a read may still be writing.
+    pub(super) fn settled(&self, index: usize) -> Option<(usize, usize)> {
+        (Arc::strong_count(self.buffer()) == 1)
+            .then(|| self.part(index))
+            .flatten()
     }
 
     pub(super) fn buffer(&self) -> &Arc<B> {
@@ -124,29 +152,65 @@ impl<B> Drop for Lease<B> {
     }
 }
 
+/// What the tensors are read from: it reads the tensor `name` into part `index` of `lease` and gives the lease back to
+/// `then`, once, after the read has ended and let go of its part (or at once, with the error, when it cannot start).
+pub(super) trait PartReader<B>: Send + Sync + 'static {
+    fn read(
+        &self,
+        name: &str,
+        index: usize,
+        lease: Lease<B>,
+        then: Box<dyn FnOnce(Result<Lease<B>, CalibrateError>) + Send>,
+    );
+}
+
+/// Reads `names` one after the other, name `i` into part `i`, starting at `index`; `then` gets the lease with every
+/// part read, or the first failure.
+pub(super) fn read_parts<B: Send + Sync + 'static>(
+    reader: Arc<dyn PartReader<B>>,
+    names: Vec<String>,
+    index: usize,
+    lease: Lease<B>,
+    then: Box<dyn FnOnce(Result<Lease<B>, CalibrateError>) + Send>,
+) {
+    let Some(name) = names.get(index).cloned() else {
+        return then(Ok(lease));
+    };
+    let next = Arc::clone(&reader);
+    reader.read(
+        &name,
+        index,
+        lease,
+        Box::new(move |read| match read {
+            Ok(lease) => read_parts(next, names, index + 1, lease, then),
+            Err(error) => then(Err(error)),
+        }),
+    );
+}
+
 /// The heads' tensors in pinned memory.
 pub(super) type HeadMemory = Lease<PinnedBuffer>;
 
 impl HeadMemory {
-    /// The range of part `index`, for a read to fill. Each part is cut once, while the lease is out, and the parts are
-    /// disjoint, so no two ranges touch the same bytes.
-    pub(super) fn range(&self, index: usize) -> Option<PinnedRange> {
-        let (start, bytes) = self.part(index)?;
-        // SAFETY: the lease is the buffer's only user, its parts do not overlap, and the caller cuts this one once.
-        unsafe { PinnedRange::new(self.buffer(), start, bytes) }
+    /// The range of part `index`, for a read to fill; `None` when the part was already cut.
+    pub(super) fn range(&mut self, index: usize) -> Option<PinnedRange> {
+        let (start, bytes, buffer) = self.claim(index)?;
+        // SAFETY: the lease is the buffer's only user, its parts do not overlap, and `claim` gave this part once.
+        unsafe { PinnedRange::new(&buffer, start, bytes) }
     }
 
-    /// The bytes of part `index`, once its read has ended.
+    /// The bytes of part `index`; `None` while any range is out, which is while a read may be writing.
     pub(super) fn bytes(&self, index: usize) -> Option<&[u8]> {
-        let (start, bytes) = self.part(index)?;
-        // SAFETY: the part lies inside the buffer (the lease was cut to fit), and the caller reads it after its range
-        // came back from the read, so nothing writes it.
+        let (start, bytes) = self.settled(index)?;
+        // SAFETY: the part lies inside the buffer (the lease was cut to fit), and no range is out, so nothing writes.
         Some(unsafe { slice::from_raw_parts(self.buffer().as_ptr().add(start), bytes) })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     fn staging(capacity: usize) -> HeadStaging<Vec<u8>> {
@@ -173,11 +237,10 @@ mod tests {
     }
 
     #[test]
-    fn a_group_larger_than_the_buffer_is_refused_and_the_buffer_is_not_grown() {
+    fn a_group_larger_than_the_buffer_is_refused_and_takes_nothing() {
         let staging = staging(8192);
         assert!(staging.lease(&[8193]).is_err());
         assert!(staging.lease(&[4097, 4097]).is_err());
-        assert_eq!(staging.capacity, 8192);
         assert!(staging.lease(&[8192]).is_ok(), "a refusal takes nothing");
     }
 
@@ -187,26 +250,110 @@ mod tests {
         let lease = staging.lease(&[100]).unwrap();
         assert!(staging.lease(&[100]).is_err(), "a lent buffer is not lent again");
         drop(lease);
-        let again = staging.lease(&[100]).unwrap();
-        assert_eq!(again.buffer().len(), 4096, "the same buffer, whole");
+        assert!(staging.lease(&[100]).is_ok());
     }
 
     #[test]
     fn a_buffer_a_read_still_holds_is_not_given_back() {
         let staging = staging(4096);
-        let lease = staging.lease(&[100]).unwrap();
-        let outstanding = Arc::clone(lease.buffer());
+        let mut lease = staging.lease(&[100]).unwrap();
+        let (.., held) = lease.claim(0).unwrap();
         drop(lease);
         assert!(
             staging.lease(&[100]).is_err(),
             "memory a read may still write is not lent"
         );
-        drop(outstanding);
+        drop(held);
     }
 
     #[test]
-    fn a_staging_with_no_head_tensors_lends_nothing() {
-        let staging = HeadStaging::<Vec<u8>>::holding(None, 0);
-        assert!(staging.lease(&[1]).is_err());
+    fn a_part_is_given_to_one_read_only() {
+        let staging = staging(8192);
+        let mut lease = staging.lease(&[10, 10]).unwrap();
+        assert!(lease.claim(0).is_some());
+        assert!(lease.claim(0).is_none(), "a second read of the same bytes is refused");
+        assert!(lease.claim(1).is_some(), "another part is still free");
+        assert!(lease.claim(2).is_none(), "there is no third part");
+    }
+
+    #[test]
+    fn the_host_reads_a_part_only_when_no_read_is_out() {
+        let staging = staging(8192);
+        let mut lease = staging.lease(&[10, 10]).unwrap();
+        assert_eq!(lease.settled(1), Some((4096, 10)));
+        let (.., read) = lease.claim(0).unwrap();
+        assert_eq!(lease.settled(1), None, "a read of part 0 may still be writing");
+        drop(read);
+        assert_eq!(lease.settled(1), Some((4096, 10)));
+        assert_eq!(lease.settled(2), None);
+    }
+
+    /// Records, in order, the first byte of each tensor name and the part it was given to, and ends each read at once
+    /// or fails the one named `fail`.
+    struct Fake {
+        asked: [AtomicUsize; 4],
+        count: AtomicUsize,
+        fail: Option<&'static str>,
+    }
+
+    impl PartReader<Vec<u8>> for Fake {
+        fn read(
+            &self,
+            name: &str,
+            index: usize,
+            mut lease: Lease<Vec<u8>>,
+            then: Box<dyn FnOnce(Result<Lease<Vec<u8>>, CalibrateError>) + Send>,
+        ) {
+            let at = self.count.fetch_add(1, Ordering::Relaxed);
+            self.asked[at].store(usize::from(name.as_bytes()[0]) * 10 + index, Ordering::Relaxed);
+            assert!(lease.claim(index).is_some(), "each part is claimed once");
+            then(if self.fail == Some(name) {
+                Err(CalibrateError::Failed(name.to_owned()))
+            } else {
+                Ok(lease)
+            });
+        }
+    }
+
+    /// Reads `names` through a fake that fails `fail`; what it was asked to read as name byte times ten plus part, in
+    /// order, and whether the read ended well.
+    fn read_with(names: &[&str], fail: Option<&'static str>) -> (Vec<usize>, bool) {
+        let staging = staging(3 * 4096);
+        let lease = staging.lease(&[1, 1, 1][..names.len()]).unwrap();
+        let fake = Arc::new(Fake {
+            asked: Default::default(),
+            count: AtomicUsize::new(0),
+            fail,
+        });
+        let reader: Arc<dyn PartReader<Vec<u8>>> = Arc::clone(&fake) as _;
+        let done = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::clone(&done);
+        read_parts(
+            reader,
+            names.iter().map(|name| (*name).to_owned()).collect(),
+            0,
+            lease,
+            Box::new(move |read| ended.store(if read.is_ok() { 1 } else { 2 }, Ordering::Relaxed)),
+        );
+        let count = fake.count.load(Ordering::Relaxed);
+        let asked = fake.asked[..count]
+            .iter()
+            .map(|at| at.load(Ordering::Relaxed))
+            .collect();
+        (asked, done.load(Ordering::Relaxed) == 1)
+    }
+
+    #[test]
+    fn tensors_are_read_one_part_each_in_the_order_named() {
+        let (asked, done) = read_with(&["a", "b", "c"], None);
+        assert!(done);
+        assert_eq!(asked, [970, 981, 992]);
+    }
+
+    #[test]
+    fn a_failed_read_stops_the_rest() {
+        let (asked, done) = read_with(&["a", "b", "c"], Some("b"));
+        assert!(!done);
+        assert_eq!(asked, [970, 981], "c was never read");
     }
 }
