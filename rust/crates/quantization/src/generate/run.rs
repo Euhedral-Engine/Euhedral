@@ -176,7 +176,6 @@ impl Drop for State {
 
 /// The run. See the module documentation.
 struct Generation {
-    host: Arc<Lake>,
     options: Options,
     state: ClaimCell<State>,
     inbox: Producer<Record, Multi>,
@@ -205,7 +204,6 @@ pub fn start(
     };
     let queue = MpscQueue::<Record>::new(INBOX_CHUNK);
     let generation = Arc::new(Generation {
-        host: Arc::clone(host),
         state: ClaimCell::new(State {
             engine: Some(engine),
             writer: Some(writer),
