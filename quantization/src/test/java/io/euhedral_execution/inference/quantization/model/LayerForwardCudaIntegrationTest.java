@@ -18,11 +18,11 @@ import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
-/// Layers 0 (GDN) and 3 (attention) on the engine's kernels against the BF16 forward of a PyTorch reference of the
-/// calibration (tools/gptq, last at commit 9ff02525) on the same input (frozen fixture named by
-/// `euhedral.quantization.forward-fixture`; skips without it).
-/// Each layer's update of the hidden states is compared. The engine keeps attention's keys and values in its NVFP4
-/// cache, so layer 3 is held to the reference with the same cache codec, and its distance from plain BF16 is reported.
+/// Layer 0 (GDN) on the engine's kernels against the BF16 forward of a PyTorch reference of the calibration
+/// (tools/gptq, last at commit 9ff02525) on the same input (frozen fixture named by
+/// `euhedral.quantization.forward-fixture`; skips without it). The layer's update of the hidden states is compared, and
+/// the objects the forward observes are checked. The attention layer is not checked: the fixture's reference models the
+/// KV cache's old E2M1 grid.
 class LayerForwardCudaIntegrationTest {
 
     @Test
@@ -41,28 +41,18 @@ class LayerForwardCudaIntegrationTest {
             try (LayerForward forward = new LayerForward(device, objects.config, rows)) {
                 long states = device.gpu.allocate(2L * rows * hidden);
                 MemorySegment host = arena.allocate(2L * rows * hidden);
-                for (int index : new int[] {0, 3}) {
-                    MemorySegment.copy(raw(fixture.resolve("input.npy")), 0, host, 0, host.byteSize());
-                    device.gpu.copyHostToDevice(states, host, host.byteSize());
-                    List<String> observed = new ArrayList<>();
-                    try (LayerWeights layer = LayerWeights.layer(device.gpu, objects, index)) {
-                        forward.forward(
-                                layer, states, sequences, length, (name, at, count, columns) -> observed.add(name));
-                        device.synchronize();
-                    }
-                    device.gpu.copyDeviceToHost(host, states, host.byteSize());
-                    double plain =
-                            difference(host, input, bf16(fixture.resolve("layer" + index + ".npy")), rows * hidden);
-                    double relative = index == 0
-                            ? plain
-                            : difference(host, input, bf16(fixture.resolve("layer3-kv.npy")), rows * hidden);
-                    System.out.printf(
-                            "layer %d: relative difference of the update %.4f (from plain BF16 %.4f), observed %s%n",
-                            index, relative, plain, observed);
-                    assertEquals(objects.layerObjects(index), observed);
-                    // The engine's attention multiplies probabilities and values in FP16 (1.85% on this fixture).
-                    assertTrue(relative < (index == 0 ? 0.01 : 0.03), "layer " + index + ": " + relative);
+                MemorySegment.copy(raw(fixture.resolve("input.npy")), 0, host, 0, host.byteSize());
+                device.gpu.copyHostToDevice(states, host, host.byteSize());
+                List<String> observed = new ArrayList<>();
+                try (LayerWeights layer = LayerWeights.layer(device.gpu, objects, 0)) {
+                    forward.forward(layer, states, sequences, length, (name, at, count, columns) -> observed.add(name));
+                    device.synchronize();
                 }
+                device.gpu.copyDeviceToHost(host, states, host.byteSize());
+                double relative = difference(host, input, bf16(fixture.resolve("layer0.npy")), rows * hidden);
+                System.out.printf("layer 0: relative difference of the update %.4f, observed %s%n", relative, observed);
+                assertEquals(objects.layerObjects(0), observed);
+                assertTrue(relative < 0.01, "layer 0: " + relative);
                 device.gpu.free(states);
             }
         }
