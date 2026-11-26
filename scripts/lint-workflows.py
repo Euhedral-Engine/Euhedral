@@ -4,8 +4,8 @@
 Every `ARBITER_ARGS` value and every `system-run` / `gpu-run` command line in the given workflow files (or directories)
 is read, shell continuation lines joined. A request fails when it:
   - uses any `--` option but --mem --est --spec --res --gpu --disk --headset --threads --who --background --tool-timeout
-    (exact names, also as `--name=value`; the arbiter's argument parser accepts abbreviations such as `--me 64G`, so
-    those are refused), or any single-dash option;
+    --no-learned-cap (exact names, also as `--name=value`; the arbiter's argument parser accepts abbreviations such as
+    `--me 64G`, so those are refused), or any single-dash option;
   - asks for more than 32G through `--mem`, or through `mem=` in `--spec` / `--res`, or asks for no cap
     (0, none, off, unlimited, inf, infinity, max), or gives a size it cannot read (no unit, a variable);
   - has an item `system` (the whole machine) or anything containing `cpu` in `--spec` / `--res`;
@@ -31,6 +31,7 @@ NO_CAP = ("0", "none", "off", "unlimited", "inf", "infinity", "max")
 OPTIONS = {
     "--mem": True, "--est": True, "--spec": True, "--res": True, "--threads": True, "--who": True,
     "--tool-timeout": True, "--gpu": None, "--disk": None, "--headset": False, "--background": False,
+    "--no-learned-cap": False,
 }
 ARBITER_ARGS_REFERENCE = re.compile(r"^\$(?:ARBITER_ARGS|\{ARBITER_ARGS\})$")
 
