@@ -20,8 +20,8 @@ use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
@@ -229,6 +229,7 @@ struct Started {
 #[derive(Default)]
 struct Fake {
     started: Mutex<Vec<Started>>,
+    arrived: Condvar,
     flying: AtomicUsize,
     most_flying: AtomicUsize,
 }
@@ -243,11 +244,27 @@ impl Answerer for Fake {
         let flying = self.flying.fetch_add(1, Ordering::SeqCst) + 1;
         self.most_flying.fetch_max(flying, Ordering::SeqCst);
         self.started.lock().unwrap().push(Started { request, sink, cancel });
+        self.arrived.notify_all();
         Ok(())
     }
 }
 
 impl Fake {
+    /// The newest answer asked for, waiting until the run asks for one: a worker of the lattice may still be starting
+    /// it when the test thread gets here.
+    fn await_next(&self, what: &str) -> Started {
+        let mut started = self.started.lock().unwrap();
+        loop {
+            if let Some(next) = started.pop() {
+                self.flying.fetch_sub(1, Ordering::SeqCst);
+                return next;
+            }
+            let (guard, timeout) = self.arrived.wait_timeout(started, Duration::from_secs(60)).unwrap();
+            assert!(!timeout.timed_out(), "the run never asked the engine for {what}");
+            started = guard;
+        }
+    }
+
     fn take(&self) -> Option<Started> {
         let started = self.started.lock().unwrap().pop();
         if started.is_some() {
@@ -401,8 +418,8 @@ fn every_answer_reaches_the_corpus_whole_whatever_order_the_answers_end_in() {
         options(2),
     );
     // The newest answer ends first, so the answers end out of order; each end starts the next prompt.
-    let mut played = 0;
-    while let Some(started) = fake.take() {
+    for number in 1..=5 {
+        let started = fake.await_next(&format!("prompt {number} of 5"));
         let greedy = started.request.sampling.is_greedy();
         assert_eq!(started.request.max_tokens, MAX_TOKENS + 1);
         assert_eq!(started.request.stop_tokens, [STOP]);
@@ -414,9 +431,7 @@ fn every_answer_reaches_the_corpus_whole_whatever_order_the_answers_end_in() {
             .unwrap();
         assert_eq!(greedy, matches!(found.id.as_str(), "p0" | "p1"), "{}", found.id);
         play(started, None);
-        played += 1;
     }
-    assert_eq!(played, 5);
     assert_eq!(
         wait(&done).unwrap(),
         Summary {
@@ -479,16 +494,15 @@ fn a_failed_answer_cancels_the_others_and_ends_the_run_with_its_reason_and_nothi
         prompts,
         options(2),
     );
-    let failing = fake.take().unwrap();
-    let other = fake.take().unwrap();
+    let failing = fake.await_next("the first prompt");
+    let other = fake.await_next("the second prompt");
     assert!(fake.take().is_none());
     let other_cancel = other.cancel.clone();
     play(failing, Some(FinishReason::ContextFull));
     // The other answer is told to stop, and the third prompt never starts.
-    assert!(other_cancel.is_cancelled());
-    assert!(fake.take().is_none());
     play(other, Some(FinishReason::Cancelled));
     let error = wait(&done).unwrap_err();
+    assert!(other_cancel.is_cancelled(), "the other answer was not told to stop");
     assert!(
         matches!(error, GenerateError::Engine(_)) && error.to_string().contains("ContextFull"),
         "{error}"
@@ -512,7 +526,7 @@ fn rows_that_do_not_follow_on_end_the_run_as_inconsistent() {
         vec![prompt("p0", 0)],
         options(1),
     );
-    let mut started = fake.take().unwrap();
+    let mut started = fake.await_next("the prompt");
     started.sink.rows(3, 1, &row(&[0], 3), None);
     let mut listener = started.request.listener;
     listener.finished(GenerationOutcome {
