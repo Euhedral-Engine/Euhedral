@@ -20,7 +20,8 @@
 //! A run of the whole model checkpoints its last layer's states, rounds the heads and drops the resume file once the
 //! heads are listed; a head that fails leaves the checkpoint, and the next run starts at the heads.
 //!
-//! The rounding arm is the GPTQ one. A format whose rounding differs (trellis) plugs in at [`Stages::layer`].
+//! Two rounding arms share the driver: GPTQ, and trellis (each layer rounded through the trellis library, the heads with
+//! the trellis recipe, the checkpoint written as exllamav3). The trellis arm plugs in at [`Stages::layer`].
 
 pub mod allocation;
 pub mod device;

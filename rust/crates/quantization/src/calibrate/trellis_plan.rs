@@ -64,7 +64,7 @@ pub fn lanes_that_fit(
     (device, pinned): (u64, u64),
     most: usize,
 ) -> Option<usize> {
-    let by = |capacity: u64, peak: u64| if peak == 0 { u64::MAX } else { capacity / peak };
+    let by = |capacity: u64, peak: u64| capacity.checked_div(peak).unwrap_or(u64::MAX);
     let fit = by(device, peak_device).min(by(pinned, peak_pinned));
     let fit = usize::try_from(fit.min(most as u64)).unwrap_or(most);
     (fit >= 1).then_some(fit)

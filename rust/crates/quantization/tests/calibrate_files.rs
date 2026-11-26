@@ -450,3 +450,25 @@ fn a_listed_heads_file_that_is_gone_refuses_the_resume() {
         .to_string();
     assert!(why.contains("heads/gone.npz"), "{why}");
 }
+
+/// A trellis directory whose manifest is complete (the MTP block and the heads sealed, the heads in their directory) is
+/// finished: the run does nothing, and applying it, as the command does not, would change none of its files.
+#[test]
+fn a_complete_trellis_directory_is_finished_and_its_files_stay() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("heads")).unwrap();
+    fs::write(directory.path().join("heads/text__output_head.npz"), b"head").unwrap();
+    fs::write(directory.path().join("mtp.safetensors"), b"mtp").unwrap();
+    let mut manifest = Manifest::new("A", 2);
+    manifest.layers_done = 2;
+    manifest.mtp_done = true;
+    manifest.heads_done = true;
+    manifest.files = vec!["mtp.safetensors".to_owned(), "heads/text__output_head.npz".to_owned()];
+    fs::write(directory.path().join("calibration.json"), manifest.to_bytes().unwrap()).unwrap();
+    let before = fs::read(directory.path().join("calibration.json")).unwrap();
+    let prepared = inspect(directory.path(), "A", 2, &FIELDS, false).unwrap();
+    assert!(prepared.finished());
+    prepared.creating("heads").apply().unwrap();
+    assert_eq!(fs::read(directory.path().join("calibration.json")).unwrap(), before);
+    assert!(directory.path().join("heads/text__output_head.npz").exists());
+}

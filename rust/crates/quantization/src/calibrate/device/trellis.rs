@@ -12,6 +12,7 @@
 //! The lanes' width is fixed when the device opens, from the memory the largest step of the model takes.
 
 use std::collections::{HashMap, HashSet};
+use std::mem::forget;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -110,7 +111,7 @@ fn dimension(value: u64) -> Result<u32, CalibrateError> {
 fn steps_of(objects: &Qwen38Objects, run: &TrellisRun) -> Result<(Shapes, u64, usize), CalibrateError> {
     let mut shapes = Shapes::new();
     let (mut held, mut most) = (0, 1);
-    for index in 0..objects.config.layers as usize {
+    for index in 0..objects.config.layers {
         let mut numel = Vec::new();
         for linear in layer(objects, index).map_err(|error| CalibrateError::failed("the layer's linears", error))? {
             if !linear.quantized {
@@ -230,7 +231,7 @@ pub(super) fn open(opening: Opening<'_>, run: &TrellisRun) -> Result<(Trellis, A
     );
     let vision = objects.store().names().any(|name| name.starts_with("model.visual."));
     let closing = closing_files(vision, run.source_files.iter().map(String::as_str));
-    std::mem::forget(pool);
+    forget(pool);
     let trellis = Trellis {
         kernels,
         lanes: Handoff::empty(),
