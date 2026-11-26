@@ -18,18 +18,21 @@ use euhedral_gpu::{Lane, LaneEnqueue};
 use euhedral_inference_cuda::launch::Modes;
 use euhedral_inference_cuda::launch::ops::RusteeOps;
 use euhedral_inference_cuda::math::LaneHandles;
-use euhedral_inference_cuda::{DeviceBuffer, KernelOps, LaneOps, PooledPinned};
+use euhedral_inference_cuda::{DeviceBuffer, KernelOps, LaneOps, PinnedBuffer, PinnedRange};
 use euhedral_inference_engine::Handoff;
 
+use super::staging::{HeadMemory, PartReader, read_parts};
+use super::trellis::mtp_tensors;
 use super::{BF16_BYTES, EMBEDDING, FP32_BYTES, Inner, after, gpu_error, run_target, save_manifest};
 use crate::calibrate::CalibrateError;
-use crate::calibrate::driver::{Once, Then, end, single};
+use crate::calibrate::driver::{Then, end, single};
 use crate::calibrate::head_state::{HeadState, MtpBuffers, at_pass_length, drop_resume_file, release_failed};
 use crate::calibrate::heads::{DraftHessian, Heads};
 use crate::calibrate::manifest::Part;
 use crate::calibrate::rounding::{Ended, Linear, round_all};
 use crate::checkpoint::CheckpointError;
-use crate::checkpoint::objects::MTP_OBJECTS;
+use crate::checkpoint::objects::{MTP_OBJECTS, Qwen38Objects};
+use crate::checkpoint::safetensors::Safetensors;
 use crate::forward::{ForwardError, LaneContext, Target};
 use crate::gptq::state::QuantState;
 use crate::step::idle;
@@ -204,26 +207,32 @@ fn zeroed(context: &mut Context<'_, '_>, bytes: usize) -> Result<DeviceBuffer, F
     Ok(buffer)
 }
 
-/// Uploads `memory` to a new buffer on the lane, in copies of at most the run's chunk.
+/// Uploads part `index` of `memory` to a new buffer on the lane, in copies of at most the run's chunk.
 ///
 /// # Safety
 /// `memory` stays live, and unchanged, until the lane has retired the work queued up to this call.
-pub(super) unsafe fn upload_pinned(
+pub(super) unsafe fn upload_part(
     inner: &Inner,
     context: &mut Context<'_, '_>,
-    memory: &PooledPinned,
+    memory: &HeadMemory,
+    index: usize,
 ) -> Result<DeviceBuffer, ForwardError> {
-    let bytes = memory.len();
+    let Some((start, bytes)) = memory.part(index) else {
+        return Err(ForwardError::Invalid(format!("the head tensors have no part {index}")));
+    };
     let buffer = context.ops().alloc_async(bytes)?;
     let mut offset = 0;
     while offset < bytes {
         let chunk = inner.settings.chunk_bytes.min(bytes - offset);
         // SAFETY: the caller keeps `memory` as this function's contract says; the destination range lies in `buffer`,
-        // and `bytes` is at most the buffer the loan holds.
+        // and the part lies in the staging buffer.
         let queued = unsafe {
-            context
-                .ops()
-                .copy_upload_to_device(buffer.ptr().offset(offset as u64), memory.buffer(), offset, chunk)
+            context.ops().copy_upload_to_device(
+                buffer.ptr().offset(offset as u64),
+                memory.buffer(),
+                start + offset,
+                chunk,
+            )
         };
         if let Err(error) = queued {
             let _ = context.ops().free_async(buffer);
@@ -262,54 +271,169 @@ fn free_in_stream(inner: &Arc<Inner>, buffers: Vec<DeviceBuffer>) {
     }
 }
 
-/// Reads the tensors `names`, each whole, into the staging pool's pinned memory, in order.
-pub(super) fn read_tensors(inner: &Arc<Inner>, names: Vec<String>, then: Then<Vec<PooledPinned>>) {
-    let pending = names.into_iter().rev().collect();
-    read_next(Arc::clone(inner), pending, Vec::new(), single(then));
+/// The calls that read tensors into the heads' staging buffer. Each call takes the names of its tensors from
+/// [`Call::names`] and the staging buffer is sized from the same names ([`head_groups`]), so a call cannot ask for more
+/// than the buffer holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Call {
+    /// The embedding table, for the states of layer 0 and for nothing else.
+    Embedding,
+    /// The final norm, for the output head's Hessian.
+    FinalNorm,
+    /// The MTP block's stem, in a GPTQ run: its parts are [`StemPart`]s.
+    Stem,
+    /// The output head's weight.
+    OutputHead,
+    /// The eight linears of the MTP block, in a trellis run.
+    TrellisMtp,
 }
 
-fn read_next(inner: Arc<Inner>, mut pending: Vec<String>, read: Vec<PooledPinned>, then: Once<Vec<PooledPinned>>) {
-    let Some(name) = pending.pop() else {
-        return end(&then, Ok(read));
-    };
-    let store = Arc::clone(inner.objects.store());
-    let bytes = match store.tensor(&name) {
-        Ok(tensor) => tensor.bytes as usize,
-        Err(error) => return end(&then, Err(CalibrateError::failed(&name, error))),
-    };
-    let memory = match inner.staging.acquire(bytes) {
-        Ok(memory) => memory,
-        Err(error) => return end(&then, Err(CalibrateError::failed(&name, error))),
-    };
-    let rest = Arc::new(Handoff::empty());
-    rest.send((pending, read));
-    let (ended, failed, next) = (Arc::clone(&then), Arc::clone(&then), Arc::clone(&inner));
-    let label = name.clone();
-    let started = store.read_tensor(
-        &label,
-        memory,
-        Arc::new(move |result: Result<PooledPinned, CheckpointError>| {
-            let Some((pending, mut read)) = rest.take() else {
-                return;
-            };
-            match result {
-                Ok(memory) => {
-                    read.push(memory);
-                    read_next(Arc::clone(&next), pending, read, Arc::clone(&ended));
+impl Call {
+    const ALL: [Call; 5] = [
+        Call::Embedding,
+        Call::FinalNorm,
+        Call::Stem,
+        Call::OutputHead,
+        Call::TrellisMtp,
+    ];
+
+    /// Whether a run of this kind makes the call.
+    fn made_by(self, trellis: bool) -> bool {
+        match self {
+            Call::Embedding | Call::FinalNorm | Call::OutputHead => true,
+            Call::Stem => !trellis,
+            Call::TrellisMtp => trellis,
+        }
+    }
+
+    /// The names of the tensors the call reads, in the order of its parts.
+    pub(super) fn names(self, objects: &Qwen38Objects) -> Result<Vec<String>, CalibrateError> {
+        match self {
+            Call::Embedding => Ok(vec![EMBEDDING.to_owned()]),
+            Call::FinalNorm => Ok(vec![FINAL_NORM.to_owned()]),
+            Call::Stem => Ok(stem_names(&tensor_of(objects, INPUT_PROJECTION)?.0)),
+            Call::OutputHead => Ok(vec![tensor_of(objects, OUTPUT_HEAD)?.0]),
+            Call::TrellisMtp => Ok(mtp_tensors()),
+        }
+    }
+}
+
+/// The parts of the MTP block's stem, in the order [`Call::Stem`] reads them: a part's number is its index.
+#[derive(Clone, Copy)]
+enum StemPart {
+    Table,
+    EmbeddingNorm,
+    HiddenNorm,
+    MtpNorm,
+    Projection,
+}
+
+/// The stem's tensors, `projection` being the input projection's, in the order of [`StemPart`].
+fn stem_names(projection: &str) -> Vec<String> {
+    [EMBEDDING, EMBEDDING_NORM, HIDDEN_NORM, MTP_NORM, projection]
+        .map(str::to_owned)
+        .into()
+}
+
+/// The sizes of the tensors each call of a run reads together, for the staging buffer. A tensor the checkpoint lacks
+/// (`size` knows no such name) is left out, and its call fails when it reads.
+pub(super) fn head_groups(
+    trellis: bool,
+    names: impl Fn(Call) -> Result<Vec<String>, CalibrateError>,
+    size: impl Fn(&str) -> Option<usize>,
+) -> Vec<Vec<usize>> {
+    Call::ALL
+        .into_iter()
+        .filter(|call| call.made_by(trellis))
+        .map(|call| {
+            names(call)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|name| size(name))
+                .collect()
+        })
+        .collect()
+}
+
+/// The sizes of the tensors `names`, in order.
+fn sizes_of(inner: &Inner, names: &[String]) -> Result<Vec<usize>, CalibrateError> {
+    names
+        .iter()
+        .map(|name| {
+            let tensor = inner
+                .objects
+                .store()
+                .tensor(name)
+                .map_err(|error| CalibrateError::failed(name, error))?;
+            Ok(tensor.bytes as usize)
+        })
+        .collect()
+}
+
+/// Reads tensors from the checkpoint into ranges of the staging buffer.
+struct StoreReader {
+    store: Arc<Safetensors>,
+}
+
+impl PartReader<PinnedBuffer> for StoreReader {
+    fn read(
+        &self,
+        name: &str,
+        index: usize,
+        mut lease: HeadMemory,
+        then: Box<dyn FnOnce(Result<HeadMemory, CalibrateError>) + Send>,
+    ) {
+        let Some(range) = lease.range(index) else {
+            return then(Err(CalibrateError::Failed(format!(
+                "{name} has no part to be read into"
+            ))));
+        };
+        let rest = Arc::new(Handoff::empty());
+        rest.send((lease, then));
+        let (ended, label) = (Arc::clone(&rest), name.to_owned());
+        let started = self.store.read_tensor(
+            name,
+            range,
+            Arc::new(move |result: Result<PinnedRange, CheckpointError>| {
+                let Some((lease, then)) = ended.take() else {
+                    return;
+                };
+                match result {
+                    // The range is let go of before the lease goes on: the host reads the part only when none is out.
+                    Ok(range) => {
+                        drop(range);
+                        then(Ok(lease));
+                    }
+                    Err(error) => then(Err(CalibrateError::failed(&label, error))),
                 }
-                Err(error) => end(&ended, Err(CalibrateError::failed(&name, error))),
-            }
-        }),
-    );
-    if let Err(error) = started {
-        end(&failed, Err(CalibrateError::failed("reading a tensor", error)));
+            }),
+        );
+        if let Err(error) = started
+            && let Some((_, then)) = rest.take()
+        {
+            then(Err(CalibrateError::failed(name, error)));
+        }
+    }
+}
+
+/// Reads the tensors `names`, each whole, one after the other, into the parts of the heads' staging buffer.
+pub(super) fn read_tensors(inner: &Arc<Inner>, names: Vec<String>, then: Then<HeadMemory>) {
+    let cell = single(then);
+    let leased = sizes_of(inner, &names).and_then(|sizes| inner.head_staging.lease(&sizes));
+    match leased {
+        Ok(memory) => {
+            let reader = Arc::new(StoreReader {
+                store: Arc::clone(inner.objects.store()),
+            });
+            read_parts(reader, names, 0, memory, Box::new(move |read| end(&cell, read)));
+        }
+        Err(error) => end(&cell, Err(error)),
     }
 }
 
 /// The tensor of the single-piece object `name`.
-fn tensor_of(inner: &Inner, name: &str) -> Result<(String, u64, usize), CalibrateError> {
-    let source = inner
-        .objects
+fn tensor_of(objects: &Qwen38Objects, name: &str) -> Result<(String, u64, usize), CalibrateError> {
+    let source = objects
         .object(name)
         .map_err(|error| CalibrateError::failed(name, error))?;
     match source.pieces.as_slice() {
@@ -487,17 +611,21 @@ impl Stem<'_> {
 
 /// What the MTP call reads from the host: the tensors and the next tokens.
 struct MtpHost {
-    memory: Vec<PooledPinned>,
+    memory: HeadMemory,
     ids: Vec<i32>,
 }
 
 impl Heads for DeviceHeads {
     fn observe(&self, then: Then<()>) {
         let then = self.cleaned(then);
+        let names = match Call::FinalNorm.names(&self.inner.objects) {
+            Ok(names) => names,
+            Err(error) => return then(Err(error)),
+        };
         let next = Arc::clone(&self.inner);
         read_tensors(
             &self.inner,
-            vec![FINAL_NORM.to_owned()],
+            names,
             Box::new(move |read| match read {
                 Ok(read) => observe_states(next, read, then),
                 Err(error) => then(Err(error)),
@@ -508,15 +636,10 @@ impl Heads for DeviceHeads {
     fn mtp(&self, then: Then<Vec<String>>) {
         let then = self.cleaned(then);
         let inner = &self.inner;
-        let projection = match tensor_of(inner, INPUT_PROJECTION) {
-            Ok((tensor, ..)) => tensor,
+        let names = match Call::Stem.names(&inner.objects) {
+            Ok(names) => names,
             Err(error) => return then(Err(error)),
         };
-        let names = [EMBEDDING, EMBEDDING_NORM, HIDDEN_NORM, MTP_NORM]
-            .into_iter()
-            .map(str::to_owned)
-            .chain([projection])
-            .collect();
         let next = Arc::clone(inner);
         read_tensors(
             inner,
@@ -531,14 +654,18 @@ impl Heads for DeviceHeads {
     fn output_head(&self, then: Then<Vec<String>>) {
         let then = self.cleaned(then);
         let inner = &self.inner;
-        let (tensor, rows, columns) = match tensor_of(inner, OUTPUT_HEAD) {
+        let shape = tensor_of(&inner.objects, OUTPUT_HEAD).map(|(_, rows, columns)| (rows, columns));
+        let (names, (rows, columns)) = match Call::OutputHead
+            .names(&inner.objects)
+            .and_then(|names| Ok((names, shape?)))
+        {
             Ok(found) => found,
             Err(error) => return then(Err(error)),
         };
         let next = Arc::clone(inner);
         read_tensors(
             inner,
-            vec![tensor],
+            names,
             Box::new(move |read| match read {
                 Ok(memory) => round_output_head(next, memory, (rows, columns), then),
                 Err(error) => then(Err(error)),
@@ -587,7 +714,7 @@ fn remove_resume_file(inner: &Arc<Inner>, then: Then<()>) {
 }
 
 /// The Hessian of the final norm's output over every sequence, for the output head.
-fn observe_states(inner: Arc<Inner>, read: Vec<PooledPinned>, then: Then<()>) {
+fn observe_states(inner: Arc<Inner>, read: HeadMemory, then: Then<()>) {
     let (hidden, epsilon) = (inner.hidden, inner.objects.config.eps as f32);
     let length = inner.settings.length;
     let rows_of = |count: usize| (count * length) as u32;
@@ -604,7 +731,7 @@ fn observe_states(inner: Arc<Inner>, read: Vec<PooledPinned>, then: Then<()>) {
                     let mut context = lane(inner, queue, handles);
                     // Each buffer is the state's the moment it exists: a failure after it frees it in stream order.
                     // SAFETY: `read` is kept until the lane has retired this submission.
-                    state.norm = Some(unsafe { upload_pinned(inner, &mut context, &read[0]) }?);
+                    state.norm = Some(unsafe { upload_part(inner, &mut context, read, 0) }?);
                     state.normed = Some(context.ops().alloc_async(normed_bytes)?);
                     state.hessian = Some(zeroed(&mut context, FP32_BYTES * hidden * hidden)?);
                 }
@@ -640,7 +767,7 @@ fn observe_states(inner: Arc<Inner>, read: Vec<PooledPinned>, then: Then<()>) {
 }
 
 /// The MTP block, first step: the stem's Hessian over every sequence, the projection's decoded weight allocated.
-fn stem_states(inner: Arc<Inner>, memory: Vec<PooledPinned>, then: Then<Vec<String>>) {
+fn stem_states(inner: Arc<Inner>, memory: HeadMemory, then: Then<Vec<String>>) {
     let (hidden, length) = (inner.hidden, inner.settings.length);
     let Some(rows) = length.checked_sub(1).filter(|rows| *rows > 0) else {
         return then(Err(CalibrateError::Invalid(
@@ -664,11 +791,6 @@ fn stem_states(inner: Arc<Inner>, memory: Vec<PooledPinned>, then: Then<Vec<Stri
             let inner = &*working;
             let batch_rows = inner.settings.batch * rows;
             let row_bytes = inner.row_bytes();
-            let [table, embedding_norm, hidden_norm, mtp_norm, weight] = &host.memory[..] else {
-                return Err(ForwardError::Invalid(
-                    "the MTP block's tensors were not all read".to_owned(),
-                ));
-            };
             with_state(inner, |state| {
                 {
                     let mut context = lane(inner, queue, handles);
@@ -676,11 +798,36 @@ fn stem_states(inner: Arc<Inner>, memory: Vec<PooledPinned>, then: Then<Vec<Stri
                     // Each buffer is the state's the moment it exists: a failure after it frees it in stream order.
                     // SAFETY: the tensors are kept until the lane has retired this submission.
                     unsafe {
-                        mtp.table = Some(upload_pinned(inner, &mut context, table)?);
-                        mtp.embedding_norm = Some(upload_pinned(inner, &mut context, embedding_norm)?);
-                        mtp.hidden_norm = Some(upload_pinned(inner, &mut context, hidden_norm)?);
-                        state.mtp_norm = Some(upload_pinned(inner, &mut context, mtp_norm)?);
-                        mtp.weight = Some(upload_pinned(inner, &mut context, weight)?);
+                        mtp.table = Some(upload_part(
+                            inner,
+                            &mut context,
+                            &host.memory,
+                            StemPart::Table as usize,
+                        )?);
+                        mtp.embedding_norm = Some(upload_part(
+                            inner,
+                            &mut context,
+                            &host.memory,
+                            StemPart::EmbeddingNorm as usize,
+                        )?);
+                        mtp.hidden_norm = Some(upload_part(
+                            inner,
+                            &mut context,
+                            &host.memory,
+                            StemPart::HiddenNorm as usize,
+                        )?);
+                        state.mtp_norm = Some(upload_part(
+                            inner,
+                            &mut context,
+                            &host.memory,
+                            StemPart::MtpNorm as usize,
+                        )?);
+                        mtp.weight = Some(upload_part(
+                            inner,
+                            &mut context,
+                            &host.memory,
+                            StemPart::Projection as usize,
+                        )?);
                     }
                     mtp.decoded = Some(context.ops().alloc_async(BF16_BYTES * hidden * 2 * hidden)?);
                     mtp.ids = Some(context.ops().alloc_async(I32_BYTES * host.ids.len())?);
@@ -883,7 +1030,7 @@ fn mtp_files() -> Vec<String> {
 }
 
 /// The output head: its weight uploaded and kept for the draft head, rounded under the head Hessian.
-fn round_output_head(inner: Arc<Inner>, read: Vec<PooledPinned>, shape: (u64, usize), then: Then<Vec<String>>) {
+fn round_output_head(inner: Arc<Inner>, read: HeadMemory, shape: (u64, usize), then: Then<Vec<String>>) {
     let working = Arc::clone(&inner);
     on_main(
         &Arc::clone(&inner),
@@ -895,7 +1042,7 @@ fn round_output_head(inner: Arc<Inner>, read: Vec<PooledPinned>, shape: (u64, us
                 let hessian = held(&state.hessian, "output head Hessian")?.addr();
                 let mut context = lane(inner, queue, handles);
                 // SAFETY: `read` is kept until the lane has retired this submission.
-                let weight = unsafe { upload_pinned(inner, &mut context, &read[0]) }?;
+                let weight = unsafe { upload_part(inner, &mut context, read, 0) }?;
                 let weight = state.weight.insert(weight).addr();
                 let decoded = context.ops().alloc_async(BF16_BYTES * shape.0 as usize * shape.1)?;
                 Ok(((weight, hessian), decoded))
@@ -1020,4 +1167,96 @@ fn release_heads(inner: Arc<Inner>, decoded: DeviceBuffer, then: Then<Vec<String
         },
         move |freed| then(freed.map(|((), ())| vec![QuantState::file_name(DRAFT_HEAD)])),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::super::staging::{HeadStaging, capacity_of};
+    use super::*;
+
+    /// The names each call reads in a checkpoint with these tensors; the stem and the output head use their object's
+    /// tensor, `projection` and `head`.
+    fn names_of(call: Call) -> Result<Vec<String>, CalibrateError> {
+        match call {
+            Call::Embedding => Ok(vec![EMBEDDING.to_owned()]),
+            Call::FinalNorm => Ok(vec![FINAL_NORM.to_owned()]),
+            Call::Stem => Ok(stem_names("projection")),
+            Call::OutputHead => Ok(vec!["head".to_owned()]),
+            Call::TrellisMtp => Ok(mtp_tensors()),
+        }
+    }
+
+    fn sizes() -> HashMap<String, usize> {
+        let mut sizes = HashMap::from([
+            (EMBEDDING.to_owned(), 9000),
+            (FINAL_NORM.to_owned(), 10),
+            (EMBEDDING_NORM.to_owned(), 10),
+            (HIDDEN_NORM.to_owned(), 10),
+            (MTP_NORM.to_owned(), 10),
+            ("projection".to_owned(), 5000),
+            ("head".to_owned(), 9000),
+        ]);
+        sizes.extend(mtp_tensors().into_iter().map(|name| (name, 3000)));
+        sizes
+    }
+
+    #[test]
+    fn every_call_a_run_makes_fits_the_staging_buffer_sized_for_the_run() {
+        let sizes = sizes();
+        for trellis in [false, true] {
+            let groups = head_groups(trellis, names_of, |name| sizes.get(name).copied());
+            let capacity = capacity_of(&groups).unwrap();
+            let staging = HeadStaging::<Vec<u8>>::open_with(vec![0; capacity], capacity);
+            for call in Call::ALL.into_iter().filter(|call| call.made_by(trellis)) {
+                let wanted: Vec<usize> = names_of(call).unwrap().iter().map(|name| sizes[name]).collect();
+                assert!(
+                    staging.lease(&wanted).is_ok(),
+                    "{call:?} is refused by the buffer of a {} run",
+                    if trellis { "trellis" } else { "GPTQ" }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_run_is_sized_only_for_the_mtp_calls_it_makes() {
+        let sizes = sizes();
+        let gptq = head_groups(false, names_of, |name| sizes.get(name).copied());
+        let trellis = head_groups(true, names_of, |name| sizes.get(name).copied());
+        assert!(gptq.contains(&vec![9000, 10, 10, 10, 5000]), "the stem");
+        assert!(
+            !gptq.iter().any(|group| group.len() == 8),
+            "no trellis MTP in a GPTQ run"
+        );
+        assert!(trellis.iter().any(|group| group.len() == 8), "the trellis MTP");
+        assert!(
+            !trellis.contains(&vec![9000, 10, 10, 10, 5000]),
+            "no stem in a trellis run"
+        );
+    }
+
+    #[test]
+    fn the_stem_parts_are_numbered_in_the_order_its_names_come() {
+        let names = stem_names("projection");
+        for (part, name) in [
+            (StemPart::Table, EMBEDDING),
+            (StemPart::EmbeddingNorm, EMBEDDING_NORM),
+            (StemPart::HiddenNorm, HIDDEN_NORM),
+            (StemPart::MtpNorm, MTP_NORM),
+            (StemPart::Projection, "projection"),
+        ] {
+            assert_eq!(names[part as usize], name);
+        }
+    }
+
+    #[test]
+    fn a_tensor_the_checkpoint_lacks_is_left_out_of_the_sizing() {
+        let groups = head_groups(false, names_of, |name| (name != "head").then_some(7));
+        assert!(
+            groups.contains(&vec![]),
+            "the output head's group is empty, not an error"
+        );
+    }
 }

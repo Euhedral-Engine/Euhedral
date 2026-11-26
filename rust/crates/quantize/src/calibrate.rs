@@ -32,7 +32,7 @@ use euhedral_inference_quantization::calibrate::allocation::Allocation;
 use euhedral_inference_quantization::calibrate::device::{Calibration, Settings as RunSettings, TrellisRun};
 use euhedral_inference_quantization::calibrate::draft_ids::read_draft_ids;
 use euhedral_inference_quantization::calibrate::manifest::{HEADS_DIRECTORY, inspect};
-use euhedral_inference_quantization::calibrate::plan::{resume_key, values_digest};
+use euhedral_inference_quantization::calibrate::plan::{model_identity, resume_key, values_digest};
 use euhedral_inference_quantization::calibrate::{Plan, drive};
 use euhedral_inference_quantization::checkpoint::objects::Qwen38Objects;
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
@@ -56,7 +56,7 @@ const MOST_LANES: usize = 64;
 /// The most mebibytes a size flag takes: its bytes fit in 64 bits.
 const MOST_MIB: u64 = u64::MAX >> 20;
 /// The parts of the resume key, in order, for the refusal that names what differs.
-const KEY_FIELDS: [&str; 12] = [
+const KEY_FIELDS: [&str; 13] = [
     "the tokens file",
     "the sequences",
     "the sequence length",
@@ -69,9 +69,10 @@ const KEY_FIELDS: [&str; 12] = [
     "the tokens' contents",
     "--skip-mtp",
     "the draft ids",
+    "the model's files",
 ];
 /// The parts of a trellis run's resume key: a GPTQ run's, then the rate asked for and the allocation it gives.
-const TRELLIS_KEY_FIELDS: [&str; 14] = [
+const TRELLIS_KEY_FIELDS: [&str; 15] = [
     KEY_FIELDS[0],
     KEY_FIELDS[1],
     KEY_FIELDS[2],
@@ -84,6 +85,7 @@ const TRELLIS_KEY_FIELDS: [&str; 14] = [
     KEY_FIELDS[9],
     KEY_FIELDS[10],
     KEY_FIELDS[11],
+    KEY_FIELDS[12],
     "--bits",
     "the allocation",
 ];
@@ -517,7 +519,7 @@ fn run_key(
     recipe: &Recipe,
     search: &Nvfp4Search,
     (tokens, length): (&[i32], usize),
-    draft_ids: &[i32],
+    (draft_ids, model_files): (&[i32], &str),
     allocation: Option<&Allocation>,
 ) -> String {
     let tokens_path = fs::canonicalize(&flags.tokens).unwrap_or_else(|_| flags.tokens.clone());
@@ -535,6 +537,7 @@ fn run_key(
         values_digest(tokens),
         flags.skip_mtp.to_string(),
         values_digest(draft_ids),
+        model_files.to_owned(),
     ];
     if let (Some(trellis), Some(allocation)) = (&flags.trellis, allocation) {
         parts.push(trellis.bits.to_string());
@@ -633,12 +636,14 @@ fn calibrated(
         }
         None => None,
     };
+    let model_files =
+        model_identity(&flags.model).map_err(|error| format!("--model {}: {error}", flags.model.display()))?;
     let key = run_key(
         flags,
         &recipe,
         &search,
         (&tokens, length),
-        &draft_ids,
+        (&draft_ids, &model_files),
         allocation.as_ref(),
     );
     let fields: &[&str] = if allocation.is_some() {
@@ -906,7 +911,18 @@ mod tests {
         let given = flags(&with(extra)).unwrap();
         let recipe = Recipe::new(given.quantization, given.compressed, given.output_head.as_deref()).unwrap();
         let search = Nvfp4Search::new(given.nvfp4_above, given.nvfp4_scale_max).unwrap();
-        run_key(&given, &recipe, &search, (&[1, 2, 3, 4], 2), draft_ids, None)
+        run_key(&given, &recipe, &search, (&[1, 2, 3, 4], 2), (draft_ids, "files"), None)
+    }
+
+    #[test]
+    fn a_model_rewritten_at_the_same_path_is_another_run_naming_its_files() {
+        let given = flags(&with(&[])).unwrap();
+        let recipe = Recipe::new(given.quantization, given.compressed, given.output_head.as_deref()).unwrap();
+        let search = Nvfp4Search::new(given.nvfp4_above, given.nvfp4_scale_max).unwrap();
+        let key = |files: &str| run_key(&given, &recipe, &search, (&[1, 2, 3, 4], 2), (&[1, 2], files), None);
+        assert_eq!(key("a"), key("a"));
+        let fields = differences(&Manifest::new(&key("a"), 4), &Manifest::new(&key("b"), 4), &KEY_FIELDS);
+        assert_eq!(fields, vec!["the model's files"]);
     }
 
     #[test]
@@ -1038,8 +1054,15 @@ mod tests {
             })
             .collect();
         let allocation = Allocation::refuse(&linears, 4, target, 1 << 30).unwrap();
-        let plain = run_key(&given, &recipe, &search, (&[1, 2, 3, 4], 2), &[1, 2], None);
-        let trellis = run_key(&given, &recipe, &search, (&[1, 2, 3, 4], 2), &[1, 2], Some(&allocation));
+        let plain = run_key(&given, &recipe, &search, (&[1, 2, 3, 4], 2), (&[1, 2], "files"), None);
+        let trellis = run_key(
+            &given,
+            &recipe,
+            &search,
+            (&[1, 2, 3, 4], 2),
+            (&[1, 2], "files"),
+            Some(&allocation),
+        );
         (plain, trellis)
     }
 
