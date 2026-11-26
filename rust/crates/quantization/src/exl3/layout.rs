@@ -202,10 +202,25 @@ pub(super) fn bf16_to_half(name: &str, bytes: &mut [u8]) -> Result<(), Checkpoin
 /// `tensor_storage` lists.
 #[derive(Debug, Default)]
 pub(super) struct Ledger {
-    /// Tensor and file, in the order the files were written and, within a file, by name.
+    /// Tensor and file, in the order the files were recorded and, within a file, by name.
     weight_map: Vec<(String, String)>,
     modules: HashMap<String, HashMap<String, Stored>>,
     file_bytes: HashMap<String, u64>,
+}
+
+/// Where a file comes in the index: the layers by number, the MTP block, then the rest in the order they were
+/// recorded. It is the order of a run that wrote them in turn, so a run resumed from files an earlier run left (which it
+/// records in another order) has the same index.
+fn written_rank(file: &str) -> (u8, usize) {
+    let layer = file
+        .strip_prefix(&format!("{TEXT}layers."))
+        .and_then(|rest| rest.strip_suffix(".safetensors"))
+        .and_then(|number| number.parse().ok());
+    match (layer, file) {
+        (Some(number), _) => (0, number),
+        (None, "mtp.safetensors") => (1, 0),
+        _ => (2, 0),
+    }
 }
 
 impl Ledger {
@@ -263,8 +278,10 @@ impl Ledger {
     /// The `model.safetensors.index.json` document.
     pub fn index(&self) -> Value {
         let total: u64 = self.file_bytes.values().sum();
+        let mut entries: Vec<&(String, String)> = self.weight_map.iter().collect();
+        entries.sort_by_key(|(_, file)| written_rank(file));
         let mut map = Map::new();
-        for (tensor, file) in &self.weight_map {
+        for (tensor, file) in entries {
             map.insert(tensor.clone(), Value::String(file.clone()));
         }
         json!({"metadata": {"total_size": total}, "weight_map": map})
