@@ -288,6 +288,19 @@ jobs:
         with:
           name: device-tests
           path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
       # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
       - name: Device tests, kernels
         env:
@@ -319,6 +332,19 @@ jobs:
         with:
           name: device-tests
           path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
       # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
       - name: Device tests, servers and benchmarks
         env:
@@ -350,6 +376,19 @@ jobs:
         with:
           name: device-tests
           path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
       # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
       - name: Device tests, engine, reduced model
         env:
@@ -381,6 +420,19 @@ jobs:
         with:
           name: device-tests
           path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
       # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
       - name: Device tests, engine, short context
         env:
@@ -412,6 +464,19 @@ jobs:
         with:
           name: device-tests
           path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
       # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
       - name: Device tests, engine, long context
         env:
