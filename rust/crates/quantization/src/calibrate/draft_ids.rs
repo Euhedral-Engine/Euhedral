@@ -30,14 +30,18 @@ pub fn read_draft_ids(
         .iter()
         .map(|word| i32::from_le_bytes(*word))
         .collect();
+    check_draft_ids(&ids, vocabulary)?;
+    Ok(ids)
+}
+
+/// Whether `ids` can be the draft head's: at least one, each a row of an output head of `rows` rows. The refusal names
+/// the id that is wrong.
+pub fn check_draft_ids(ids: &[i32], rows: u64) -> Result<(), String> {
     if ids.is_empty() {
         return Err(format!("{NAME} is empty"));
     }
-    if let Some(id) = ids
-        .iter()
-        .find(|id| u64::try_from(**id).map_or(true, |id| id >= vocabulary))
-    {
-        return Err(format!("{NAME} holds {id}, outside the vocabulary of {vocabulary}"));
+    if let Some(id) = ids.iter().find(|id| u64::try_from(**id).map_or(true, |id| id >= rows)) {
+        return Err(format!("{NAME} holds {id}, outside the {rows} rows of the output head"));
     }
-    Ok(ids)
+    Ok(())
 }

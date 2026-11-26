@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_quantization::calibrate::manifest::{Ledger, Manifest, differences, inspect};
-use euhedral_inference_quantization::calibrate::plan::{resume_at, resume_header, resume_key, tokens_digest};
+use euhedral_inference_quantization::calibrate::plan::{resume_at, resume_header, resume_key, values_digest};
 use euhedral_inference_quantization::calibrate::schedule::{Schedule, Settled};
 use euhedral_inference_quantization::calibrate::{
     CalibrateError, HessianSet, Plan, Stages, Then, drive, embedding, round_order,
@@ -1230,7 +1230,58 @@ fn a_manifest_is_complete_only_when_every_layer_and_both_heads_and_the_mtp_block
 
 #[test]
 fn the_token_digest_follows_the_tokens_contents() {
-    assert_eq!(tokens_digest(&[1, 2, 3]), tokens_digest(&[1, 2, 3]));
-    assert_ne!(tokens_digest(&[1, 2, 3]), tokens_digest(&[1, 2, 4]));
-    assert_ne!(tokens_digest(&[1, 2]), tokens_digest(&[1, 2, 0]));
+    assert_eq!(values_digest(&[1, 2, 3]), values_digest(&[1, 2, 3]));
+    assert_ne!(values_digest(&[1, 2, 3]), values_digest(&[1, 2, 4]));
+    assert_ne!(values_digest(&[1, 2]), values_digest(&[1, 2, 0]));
+}
+
+#[test]
+fn a_directory_whose_own_manifest_is_complete_is_finished_and_inspecting_it_changes_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut done = Manifest::new("run", 4).after(4);
+    done.heads_done = true;
+    done.mtp_skipped = true;
+    fs::write(directory.path().join("calibration.json"), done.to_bytes().unwrap()).unwrap();
+    let before = names(directory.path());
+    let prepared = inspect(directory.path(), "run", 4, &FIELDS, false).unwrap();
+    assert!(prepared.finished());
+    assert_eq!(names(directory.path()), before);
+    assert_eq!(
+        Manifest::parse(&fs::read(directory.path().join("calibration.json")).unwrap()).unwrap(),
+        done
+    );
+    assert!(
+        !inspect(directory.path(), "run", 4, &FIELDS, true).unwrap().finished(),
+        "--fresh redoes it"
+    );
+    let mut unfinished = done.clone();
+    unfinished.heads_done = false;
+    fs::write(
+        directory.path().join("calibration.json"),
+        unfinished.to_bytes().unwrap(),
+    )
+    .unwrap();
+    assert!(!inspect(directory.path(), "run", 4, &FIELDS, false).unwrap().finished());
+    assert!(!inspect(directory.path(), "other", 4, &FIELDS, false).is_ok_and(|prepared| prepared.finished()));
+}
+
+#[test]
+fn a_new_directory_is_not_finished() {
+    let directory = tempfile::tempdir().unwrap();
+    assert!(!inspect(directory.path(), "run", 4, &FIELDS, false).unwrap().finished());
+}
+
+#[test]
+fn a_change_of_the_skip_or_the_draft_ids_is_a_difference_named_by_its_field() {
+    let fields = ["tokens", "--skip-mtp", "the draft ids"];
+    let run = |key: &str| Manifest::new(key, 4);
+    assert_eq!(
+        differences(&run("8|false|7"), &run("8|true|7"), &fields),
+        vec!["--skip-mtp"]
+    );
+    assert_eq!(
+        differences(&run("8|false|7"), &run("8|false|9"), &fields),
+        vec!["the draft ids"]
+    );
+    assert!(differences(&run("8|false|7"), &run("8|false|7"), &fields).is_empty());
 }

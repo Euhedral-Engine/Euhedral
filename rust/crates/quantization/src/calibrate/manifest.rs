@@ -31,6 +31,8 @@ const NOT_IN_NAMES: [char; 4] = ['/', '\\', ':', '\0'];
 pub enum Part {
     /// The MTP block: its input projection and its layer's linears.
     Mtp,
+    /// The MTP block, left out by `--skip-mtp`: it has no files, and the run is complete without it.
+    MtpSkipped,
     /// The output head.
     OutputHead,
     /// The draft head; the heads are written once it is.
@@ -50,6 +52,9 @@ pub struct Manifest {
     pub heads_done: bool,
     /// Whether the MTP block's objects are written.
     pub mtp_done: bool,
+    /// Whether the run left the MTP block out (`--skip-mtp`), so that it is complete without it.
+    #[serde(default)]
+    pub mtp_skipped: bool,
     /// The state files the run saved, each listed once its save sealed.
     pub files: Vec<String>,
 }
@@ -63,6 +68,7 @@ impl Manifest {
             layers_total,
             heads_done: false,
             mtp_done: false,
+            mtp_skipped: false,
             files: Vec::new(),
         }
     }
@@ -75,9 +81,10 @@ impl Manifest {
         }
     }
 
-    /// Whether every object of the model is written.
+    /// Whether every object the run was asked for is written: the layers and the heads, and the MTP block unless the
+    /// run left it out.
     pub fn is_complete(&self) -> bool {
-        self.layers_done == self.layers_total && self.heads_done && self.mtp_done
+        self.layers_done == self.layers_total && self.heads_done && (self.mtp_done || self.mtp_skipped)
     }
 
     /// The manifest as the file holds it.
@@ -151,6 +158,12 @@ impl Prepared {
     /// The manifest the run starts from: the directory's, or one of a run that has written nothing.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// Whether the directory holds this run's own manifest, and it is complete: there is nothing to do, and the run
+    /// leaves the directory as it is (`--fresh` makes a directory that does not hold it).
+    pub fn finished(&self) -> bool {
+        self.resumed && self.manifest.is_complete()
     }
 
     /// Makes the directory the run's: removes the files of the manifest `--fresh` replaces and writes the manifest of
@@ -408,6 +421,7 @@ impl Ledger {
                 }
                 match part {
                     Part::Mtp => next.mtp_done = true,
+                    Part::MtpSkipped => next.mtp_skipped = true,
                     Part::OutputHead => {}
                     Part::DraftHead => next.heads_done = true,
                 }

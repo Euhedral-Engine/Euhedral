@@ -1,7 +1,8 @@
 //! What a run of the whole model writes after its layers, in Java's order, over the final hidden states:
 //! 1. the Hessian of the final hidden states under the final norm (the output head's);
-//! 2. the MTP block, unless `--skip-mtp`: its input projection, then the states it makes (which replace the hidden
-//!    states), then the MTP layer, then the Hessian of the MTP output (the draft head's);
+//! 2. the MTP block: its input projection, then the states it makes (which replace the hidden states), then the MTP
+//!    layer, then the Hessian of the MTP output (the draft head's). `--skip-mtp` leaves it out, and the manifest
+//!    records that, so that the run is complete without it;
 //! 3. the output head;
 //! 4. the draft head, under the MTP output's Hessian, or the output head's when the MTP block is skipped.
 //!
@@ -64,12 +65,26 @@ pub fn run<H: Heads>(heads: Arc<H>, skip_mtp: bool, done: Then<()>) {
     observing.observe(Box::new(move |observed| {
         onward(observed, done, move |(), done| {
             if skip_mtp {
-                output_head(heads, DraftHessian::OutputHead, done);
+                skipped(heads, done);
             } else {
                 mtp(heads, done);
             }
         });
     }));
+}
+
+/// Records that the MTP block is left out, then goes on to the output head.
+fn skipped<H: Heads>(heads: Arc<H>, done: Then<()>) {
+    let sealing = Arc::clone(&heads);
+    sealing.seal(
+        Part::MtpSkipped,
+        Vec::new(),
+        Box::new(move |sealed| {
+            onward(sealed, done, move |(), done| {
+                output_head(heads, DraftHessian::OutputHead, done)
+            });
+        }),
+    );
 }
 
 fn mtp<H: Heads>(heads: Arc<H>, done: Then<()>) {

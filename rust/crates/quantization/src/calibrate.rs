@@ -14,7 +14,8 @@
 //!   the embedding table; the manifest of how far a run got, and the output directory of a run of another key cleared.
 //!
 //! - [`heads`]: what a run of the whole model writes after its layers (the MTP block, the output head, the draft head)
-//!   and the order they and the dropping of the resume file happen in.
+//!   and the order they and the dropping of the resume file happen in; [`head_state`]: what the heads keep on the card,
+//!   and the bookkeeping around a call that holds whatever the card does.
 //!
 //! A run of the whole model checkpoints its last layer's states, rounds the heads and drops the resume file once the
 //! heads are listed; a head that fails leaves the checkpoint, and the next run starts at the heads.
@@ -26,6 +27,7 @@ pub mod draft_ids;
 pub mod driver;
 pub mod embedding;
 pub mod files;
+pub mod head_state;
 pub mod heads;
 pub mod hessians;
 pub mod manifest;

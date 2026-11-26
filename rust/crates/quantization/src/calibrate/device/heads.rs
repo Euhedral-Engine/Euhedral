@@ -10,21 +10,21 @@
 //! Its input projection is rounded under the stem's Hessian, the projection makes the states the MTP layer runs over
 //! (compacted in the host states, a sequence `rows` long), and the layer is the layers' own chain with that length.
 
-use std::mem::forget;
+use std::mem::{forget, take};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use euhedral_gpu::cuda::CudaLaneEnqueue;
 use euhedral_gpu::{Lane, LaneEnqueue};
 use euhedral_inference_cuda::launch::Modes;
 use euhedral_inference_cuda::launch::ops::RusteeOps;
 use euhedral_inference_cuda::math::LaneHandles;
-use euhedral_inference_cuda::{DeviceBuffer, KernelOps, LaneOps, PinnedBuffer};
+use euhedral_inference_cuda::{DeviceBuffer, KernelOps, LaneOps, PooledPinned};
 use euhedral_inference_engine::Handoff;
 
 use super::{BF16_BYTES, EMBEDDING, FP32_BYTES, Inner, after, gpu_error, run_target, save_manifest};
 use crate::calibrate::CalibrateError;
 use crate::calibrate::driver::{Once, Then, end, single};
+use crate::calibrate::head_state::{HeadState, MtpBuffers, at_pass_length, drop_resume_file, release_failed};
 use crate::calibrate::heads::{DraftHessian, Heads};
 use crate::calibrate::manifest::Part;
 use crate::calibrate::rounding::{Ended, Linear, round_all};
@@ -41,42 +41,12 @@ const EMBEDDING_NORM: &str = "mtp.pre_fc_norm_embedding.weight";
 const HIDDEN_NORM: &str = "mtp.pre_fc_norm_hidden.weight";
 const MTP_NORM: &str = "mtp.norm.weight";
 const INPUT_PROJECTION: &str = "mtp/input_projection";
-const OUTPUT_HEAD: &str = "text/output_head";
+pub(super) const OUTPUT_HEAD: &str = "text/output_head";
 const DRAFT_HEAD: &str = "text/draft_head";
 const I32_BYTES: usize = 4;
 
 /// What the heads keep on the card between their calls.
-#[derive(Default)]
-pub struct HeadState {
-    /// The final norm's weight.
-    norm: Option<DeviceBuffer>,
-    /// A batch of states after the final norm, or after the MTP norm.
-    normed: Option<DeviceBuffer>,
-    /// The output head's Hessian.
-    hessian: Option<DeviceBuffer>,
-    /// The MTP norm's weight, until the draft head's Hessian is made.
-    mtp_norm: Option<DeviceBuffer>,
-    /// The draft head's Hessian, when the MTP block made one.
-    draft: Option<DeviceBuffer>,
-    /// The output head's weight, which the draft head's rows are taken from.
-    weight: Option<DeviceBuffer>,
-}
-
-impl HeadState {
-    fn every(&mut self) -> Vec<DeviceBuffer> {
-        [
-            self.norm.take(),
-            self.normed.take(),
-            self.hessian.take(),
-            self.mtp_norm.take(),
-            self.draft.take(),
-            self.weight.take(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
-    }
-}
+type State = HeadState<DeviceBuffer>;
 
 /// The device calls of the heads.
 pub struct DeviceHeads {
@@ -86,6 +56,18 @@ pub struct DeviceHeads {
 impl DeviceHeads {
     pub fn new(inner: Arc<Inner>) -> Self {
         Self { inner }
+    }
+
+    /// `then`, which on a failure is first preceded by the freeing of everything the heads hold on the card, in
+    /// stream order: a failed call leaves buffers in the state, and a plain drop of them would wait for the device.
+    fn cleaned<T: Send + 'static>(&self, then: Then<T>) -> Then<T> {
+        let inner = Arc::clone(&self.inner);
+        Box::new(move |result| {
+            if result.is_err() {
+                release_failed(&inner.heads, |buffers| free_in_stream(&inner, buffers));
+            }
+            then(result);
+        })
     }
 }
 
@@ -143,10 +125,7 @@ fn on_main<K, T>(
 }
 
 /// Runs `work` over the heads' state.
-fn with_state<R>(
-    inner: &Inner,
-    work: impl FnOnce(&mut HeadState) -> Result<R, ForwardError>,
-) -> Result<R, ForwardError> {
+fn with_state<R>(inner: &Inner, work: impl FnOnce(&mut State) -> Result<R, ForwardError>) -> Result<R, ForwardError> {
     let mut state = inner
         .heads
         .take()
@@ -213,7 +192,11 @@ fn walk(
 /// A new buffer of `bytes`, zeroed, on the lane.
 fn zeroed(context: &mut Context<'_, '_>, bytes: usize) -> Result<DeviceBuffer, ForwardError> {
     let buffer = context.ops().alloc_async(bytes)?;
-    context.ops().zero_device_memory(buffer.ptr(), bytes as u64)?;
+    if let Err(error) = context.ops().zero_device_memory(buffer.ptr(), bytes as u64) {
+        // Freed in stream order: a plain drop waits for the device.
+        let _ = context.ops().free_async(buffer);
+        return Err(error.into());
+    }
     Ok(buffer)
 }
 
@@ -224,19 +207,25 @@ fn zeroed(context: &mut Context<'_, '_>, bytes: usize) -> Result<DeviceBuffer, F
 unsafe fn upload_pinned(
     inner: &Inner,
     context: &mut Context<'_, '_>,
-    memory: &PinnedBuffer,
+    memory: &PooledPinned,
 ) -> Result<DeviceBuffer, ForwardError> {
-    let buffer = context.ops().alloc_async(memory.len())?;
+    let bytes = memory.len();
+    let buffer = context.ops().alloc_async(bytes)?;
     let mut offset = 0;
-    while offset < memory.len() {
-        let bytes = inner.settings.chunk_bytes.min(memory.len() - offset);
-        // SAFETY: the caller keeps `memory` as this function's contract says; the destination range lies in `buffer`.
-        unsafe {
+    while offset < bytes {
+        let chunk = inner.settings.chunk_bytes.min(bytes - offset);
+        // SAFETY: the caller keeps `memory` as this function's contract says; the destination range lies in `buffer`,
+        // and `bytes` is at most the buffer the loan holds.
+        let queued = unsafe {
             context
                 .ops()
-                .copy_upload_to_device(buffer.ptr().offset(offset as u64), memory, offset, bytes)?;
+                .copy_upload_to_device(buffer.ptr().offset(offset as u64), memory.buffer(), offset, chunk)
+        };
+        if let Err(error) = queued {
+            let _ = context.ops().free_async(buffer);
+            return Err(error.into());
         }
-        offset += bytes;
+        offset += chunk;
     }
     Ok(buffer)
 }
@@ -249,13 +238,30 @@ fn free(context: &mut Context<'_, '_>, buffers: impl IntoIterator<Item = DeviceB
     Ok(())
 }
 
-/// Reads the tensors `names`, each whole, into pinned memory, in order.
-fn read_tensors(inner: &Arc<Inner>, names: Vec<String>, then: Then<Vec<PinnedBuffer>>) {
+/// After a failure: frees `buffers` in stream order on the main lane, without waiting for it. When the lane takes no
+/// more work they are left allocated (the run is ending), never dropped, since a plain drop waits for the device.
+fn free_in_stream(inner: &Arc<Inner>, buffers: Vec<DeviceBuffer>) {
+    let held = Handoff::empty();
+    held.send(buffers);
+    let submitted = inner.main.submit_marked(|queue| {
+        let mut ops = RusteeOps::new(queue, &inner.table, Modes::default()).on_lane(&inner.library, inner.home);
+        for buffer in held.take().unwrap_or_default() {
+            ops.free_async(buffer).map_err(gpu_error)?;
+        }
+        Ok(())
+    });
+    if submitted.is_err() {
+        forget(held.take());
+    }
+}
+
+/// Reads the tensors `names`, each whole, into the staging pool's pinned memory, in order.
+fn read_tensors(inner: &Arc<Inner>, names: Vec<String>, then: Then<Vec<PooledPinned>>) {
     let pending = names.into_iter().rev().collect();
     read_next(Arc::clone(inner), pending, Vec::new(), single(then));
 }
 
-fn read_next(inner: Arc<Inner>, mut pending: Vec<String>, read: Vec<PinnedBuffer>, then: Once<Vec<PinnedBuffer>>) {
+fn read_next(inner: Arc<Inner>, mut pending: Vec<String>, read: Vec<PooledPinned>, then: Once<Vec<PooledPinned>>) {
     let Some(name) = pending.pop() else {
         return end(&then, Ok(read));
     };
@@ -264,7 +270,7 @@ fn read_next(inner: Arc<Inner>, mut pending: Vec<String>, read: Vec<PinnedBuffer
         Ok(tensor) => tensor.bytes as usize,
         Err(error) => return end(&then, Err(CalibrateError::failed(&name, error))),
     };
-    let memory = match PinnedBuffer::alloc(&inner.library, bytes) {
+    let memory = match inner.staging.acquire(bytes) {
         Ok(memory) => memory,
         Err(error) => return end(&then, Err(CalibrateError::failed(&name, error))),
     };
@@ -275,7 +281,7 @@ fn read_next(inner: Arc<Inner>, mut pending: Vec<String>, read: Vec<PinnedBuffer
     let started = store.read_tensor(
         &label,
         memory,
-        Arc::new(move |result: Result<PinnedBuffer, CheckpointError>| {
+        Arc::new(move |result: Result<PooledPinned, CheckpointError>| {
             let Some((pending, mut read)) = rest.take() else {
                 return;
             };
@@ -373,6 +379,28 @@ struct Stem<'a> {
     stem: &'a DeviceBuffer,
 }
 
+impl<'a> Stem<'a> {
+    /// The stem over what the state and the MTP block hold; each must be set.
+    fn of(
+        inner: &'a Inner,
+        (norm, normed): (&'a Option<DeviceBuffer>, &'a Option<DeviceBuffer>),
+        mtp: &'a MtpBuffers<DeviceBuffer>,
+    ) -> Result<Stem<'a>, ForwardError> {
+        Ok(Stem {
+            inner,
+            norm: held(norm, "final norm")?,
+            normed: held(normed, "normed states")?,
+            table: held(&mtp.table, "embedding table")?,
+            ids: held(&mtp.ids, "next tokens")?,
+            embedding_norm: held(&mtp.embedding_norm, "embedding norm")?,
+            hidden_norm: held(&mtp.hidden_norm, "hidden norm")?,
+            scratch: held(&mtp.scratch, "scratch rows")?,
+            scratch_normed: held(&mtp.scratch_normed, "normed scratch rows")?,
+            stem: held(&mtp.stem, "stem rows")?,
+        })
+    }
+}
+
 impl Stem<'_> {
     fn length(&self) -> usize {
         self.inner.settings.length
@@ -450,47 +478,15 @@ impl Stem<'_> {
     }
 }
 
-/// What the MTP block holds on the card while its projection is rounded and applied.
-struct Mtp {
-    table: DeviceBuffer,
-    embedding_norm: DeviceBuffer,
-    hidden_norm: DeviceBuffer,
-    /// The input projection's weight, then its decoded weight.
-    weight: DeviceBuffer,
-    decoded: Option<DeviceBuffer>,
-    ids: DeviceBuffer,
-    scratch: DeviceBuffer,
-    scratch_normed: DeviceBuffer,
-    stem: DeviceBuffer,
-    /// The stem's Hessian.
-    hessian: DeviceBuffer,
-}
-
-impl Mtp {
-    fn stem<'a>(&'a self, inner: &'a Inner, state: &'a HeadState) -> Result<Stem<'a>, ForwardError> {
-        Ok(Stem {
-            inner,
-            norm: held(&state.norm, "final norm")?,
-            normed: held(&state.normed, "normed states")?,
-            table: &self.table,
-            ids: &self.ids,
-            embedding_norm: &self.embedding_norm,
-            hidden_norm: &self.hidden_norm,
-            scratch: &self.scratch,
-            scratch_normed: &self.scratch_normed,
-            stem: &self.stem,
-        })
-    }
-}
-
 /// What the MTP call reads from the host: the tensors and the next tokens.
 struct MtpHost {
-    memory: Vec<PinnedBuffer>,
+    memory: Vec<PooledPinned>,
     ids: Vec<i32>,
 }
 
 impl Heads for DeviceHeads {
     fn observe(&self, then: Then<()>) {
+        let then = self.cleaned(then);
         let next = Arc::clone(&self.inner);
         read_tensors(
             &self.inner,
@@ -503,6 +499,7 @@ impl Heads for DeviceHeads {
     }
 
     fn mtp(&self, then: Then<Vec<String>>) {
+        let then = self.cleaned(then);
         let inner = &self.inner;
         let projection = match tensor_of(inner, INPUT_PROJECTION) {
             Ok((tensor, ..)) => tensor,
@@ -525,6 +522,7 @@ impl Heads for DeviceHeads {
     }
 
     fn output_head(&self, then: Then<Vec<String>>) {
+        let then = self.cleaned(then);
         let inner = &self.inner;
         let (tensor, rows, columns) = match tensor_of(inner, OUTPUT_HEAD) {
             Ok(found) => found,
@@ -542,20 +540,21 @@ impl Heads for DeviceHeads {
     }
 
     fn draft_head(&self, hessian: DraftHessian, then: Then<Vec<String>>) {
-        round_draft_head(Arc::clone(&self.inner), hessian, then);
+        round_draft_head(Arc::clone(&self.inner), hessian, self.cleaned(then));
     }
 
     fn seal(&self, part: Part, files: Vec<String>, then: Then<()>) {
-        Arc::clone(&self.inner.ledger).sealed(part, files, save_manifest(&self.inner), then);
+        Arc::clone(&self.inner.ledger).sealed(part, files, save_manifest(&self.inner), self.cleaned(then));
     }
 
     fn drop_checkpoint(&self, then: Then<()>) {
         let inner = Arc::clone(&self.inner);
-        let dropped: Then<()> = Box::new(move |unlisted| match unlisted {
-            Err(error) => then(Err(error)),
-            Ok(()) => remove_resume_file(&inner, then),
-        });
-        Arc::clone(&self.inner.ledger).resume_file_dropped(save_manifest(&self.inner), dropped);
+        drop_resume_file(
+            &self.inner.ledger,
+            save_manifest(&self.inner),
+            move |unlisted| remove_resume_file(&inner, unlisted),
+            then,
+        );
     }
 }
 
@@ -581,7 +580,7 @@ fn remove_resume_file(inner: &Arc<Inner>, then: Then<()>) {
 }
 
 /// The Hessian of the final norm's output over every sequence, for the output head.
-fn observe_states(inner: Arc<Inner>, read: Vec<PinnedBuffer>, then: Then<()>) {
+fn observe_states(inner: Arc<Inner>, read: Vec<PooledPinned>, then: Then<()>) {
     let (hidden, epsilon) = (inner.hidden, inner.objects.config.eps as f32);
     let length = inner.settings.length;
     let rows_of = |count: usize| (count * length) as u32;
@@ -594,14 +593,17 @@ fn observe_states(inner: Arc<Inner>, read: Vec<PinnedBuffer>, then: Then<()>) {
             let inner = &*working;
             with_state(inner, |state| {
                 let normed_bytes = inner.settings.batch * length * inner.row_bytes();
-                let (norm, normed, hessian) = {
+                {
                     let mut context = lane(inner, queue, handles);
+                    // Each buffer is the state's the moment it exists: a failure after it frees it in stream order.
                     // SAFETY: `read` is kept until the lane has retired this submission.
-                    let norm = unsafe { upload_pinned(inner, &mut context, &read[0]) }?;
-                    let normed = context.ops().alloc_async(normed_bytes)?;
-                    let hessian = zeroed(&mut context, FP32_BYTES * hidden * hidden)?;
-                    (norm, normed, hessian)
-                };
+                    state.norm = Some(unsafe { upload_pinned(inner, &mut context, &read[0]) }?);
+                    state.normed = Some(context.ops().alloc_async(normed_bytes)?);
+                    state.hessian = Some(zeroed(&mut context, FP32_BYTES * hidden * hidden)?);
+                }
+                let norm = held(&state.norm, "final norm")?.ptr();
+                let normed = held(&state.normed, "normed states")?.ptr();
+                let hessian = held(&state.hessian, "output head Hessian")?.ptr();
                 walk(
                     inner,
                     queue,
@@ -614,20 +616,16 @@ fn observe_states(inner: Arc<Inner>, read: Vec<PinnedBuffer>, then: Then<()>) {
                         let rows = rows_of(batch.count);
                         context.ops().rms_norm_unit_offset_bf16(
                             inner.batch_states.ptr(),
-                            norm.ptr(),
-                            normed.ptr(),
+                            norm,
+                            normed,
                             rows,
                             hidden as u32,
                             epsilon,
                         )?;
-                        context.accumulate_hessian(hessian.ptr(), normed.ptr(), rows, hidden as u32)
+                        context.accumulate_hessian(hessian, normed, rows, hidden as u32)
                     },
                 )?;
-                lane(inner, queue, handles).symmetrize(hessian.ptr(), hidden as u32)?;
-                state.norm = Some(norm);
-                state.normed = Some(normed);
-                state.hessian = Some(hessian);
-                Ok(())
+                lane(inner, queue, handles).symmetrize(hessian, hidden as u32)
             })
         },
         move |made| then(made.map(|((), read)| drop(read))),
@@ -635,7 +633,7 @@ fn observe_states(inner: Arc<Inner>, read: Vec<PinnedBuffer>, then: Then<()>) {
 }
 
 /// The MTP block, first step: the stem's Hessian over every sequence, the projection's decoded weight allocated.
-fn stem_states(inner: Arc<Inner>, memory: Vec<PinnedBuffer>, then: Then<Vec<String>>) {
+fn stem_states(inner: Arc<Inner>, memory: Vec<PooledPinned>, then: Then<Vec<String>>) {
     let (hidden, length) = (inner.hidden, inner.settings.length);
     let Some(rows) = length.checked_sub(1).filter(|rows| *rows > 0) else {
         return then(Err(CalibrateError::Invalid(
@@ -665,38 +663,32 @@ fn stem_states(inner: Arc<Inner>, memory: Vec<PinnedBuffer>, then: Then<Vec<Stri
                 ));
             };
             with_state(inner, |state| {
-                let mtp = {
+                {
                     let mut context = lane(inner, queue, handles);
+                    let mtp = &mut state.mtp;
+                    // Each buffer is the state's the moment it exists: a failure after it frees it in stream order.
                     // SAFETY: the tensors are kept until the lane has retired this submission.
-                    let (table, embedding_norm, hidden_norm, mtp_norm, weight) = unsafe {
-                        (
-                            upload_pinned(inner, &mut context, table)?,
-                            upload_pinned(inner, &mut context, embedding_norm)?,
-                            upload_pinned(inner, &mut context, hidden_norm)?,
-                            upload_pinned(inner, &mut context, mtp_norm)?,
-                            upload_pinned(inner, &mut context, weight)?,
-                        )
-                    };
-                    state.mtp_norm = Some(mtp_norm);
-                    let ids = context.ops().alloc_async(I32_BYTES * host.ids.len())?;
-                    Mtp {
-                        table,
-                        embedding_norm,
-                        hidden_norm,
-                        weight,
-                        decoded: Some(context.ops().alloc_async(BF16_BYTES * hidden * 2 * hidden)?),
-                        ids,
-                        scratch: context.ops().alloc_async(batch_rows * row_bytes)?,
-                        scratch_normed: context.ops().alloc_async(batch_rows * row_bytes)?,
-                        stem: context.ops().alloc_async(2 * batch_rows * row_bytes)?,
-                        hessian: zeroed(&mut context, FP32_BYTES * 4 * hidden * hidden)?,
+                    unsafe {
+                        mtp.table = Some(upload_pinned(inner, &mut context, table)?);
+                        mtp.embedding_norm = Some(upload_pinned(inner, &mut context, embedding_norm)?);
+                        mtp.hidden_norm = Some(upload_pinned(inner, &mut context, hidden_norm)?);
+                        state.mtp_norm = Some(upload_pinned(inner, &mut context, mtp_norm)?);
+                        mtp.weight = Some(upload_pinned(inner, &mut context, weight)?);
                     }
-                };
+                    mtp.decoded = Some(context.ops().alloc_async(BF16_BYTES * hidden * 2 * hidden)?);
+                    mtp.ids = Some(context.ops().alloc_async(I32_BYTES * host.ids.len())?);
+                    mtp.scratch = Some(context.ops().alloc_async(batch_rows * row_bytes)?);
+                    mtp.scratch_normed = Some(context.ops().alloc_async(batch_rows * row_bytes)?);
+                    mtp.stem = Some(context.ops().alloc_async(2 * batch_rows * row_bytes)?);
+                    mtp.hessian = Some(zeroed(&mut context, FP32_BYTES * 4 * hidden * hidden)?);
+                }
+                let ids = held(&state.mtp.ids, "next tokens")?.addr();
                 // SAFETY: the ids are kept until the lane has retired this submission.
                 unsafe {
-                    queue.copy_to_device(mtp.ids.addr(), host.ids.as_ptr().cast(), I32_BYTES * host.ids.len())?;
+                    queue.copy_to_device(ids, host.ids.as_ptr().cast(), I32_BYTES * host.ids.len())?;
                 }
-                let stem = mtp.stem(inner, state)?;
+                let stem = Stem::of(inner, (&state.norm, &state.normed), &state.mtp)?;
+                let (stem_rows, hessian) = (stem.stem.ptr(), held(&state.mtp.hessian, "stem Hessian")?.ptr());
                 walk(
                     inner,
                     queue,
@@ -707,39 +699,41 @@ fn stem_states(inner: Arc<Inner>, memory: Vec<PinnedBuffer>, then: Then<Vec<Stri
                     },
                     |context, batch| {
                         stem.build(context, batch)?;
-                        context.accumulate_hessian(
-                            mtp.hessian.ptr(),
-                            mtp.stem.ptr(),
-                            (batch.count * rows) as u32,
-                            2 * hidden as u32,
-                        )
+                        context.accumulate_hessian(hessian, stem_rows, (batch.count * rows) as u32, 2 * hidden as u32)
                     },
                 )?;
-                lane(inner, queue, handles).symmetrize(mtp.hessian.ptr(), 2 * hidden as u32)?;
-                Ok(mtp)
+                lane(inner, queue, handles).symmetrize(hessian, 2 * hidden as u32)
             })
         },
         move |made| match made {
             Err(error) => then(Err(error)),
-            Ok((mtp, host)) => {
+            Ok(((), host)) => {
                 drop(host);
-                round_projection(inner, mtp, then);
+                round_projection(inner, then);
             }
         },
     );
 }
 
 /// The MTP block, second step: the input projection rounded under the stem's Hessian.
-fn round_projection(inner: Arc<Inner>, mut mtp: Mtp, then: Then<Vec<String>>) {
-    let Some(decoded) = mtp.decoded.take() else {
-        return then(Err(CalibrateError::Failed(
-            "the projection has no decoded weight".to_owned(),
-        )));
-    };
+fn round_projection(inner: Arc<Inner>, then: Then<Vec<String>>) {
     let hidden = inner.hidden;
-    let addresses = (mtp.weight.addr(), mtp.hessian.addr());
+    let taken = with_state(&inner, |state| {
+        let weight = held(&state.mtp.weight, "projection weight")?.addr();
+        let hessian = held(&state.mtp.hessian, "stem Hessian")?.addr();
+        let decoded = state
+            .mtp
+            .decoded
+            .take()
+            .ok_or_else(|| ForwardError::Invalid("the projection has no decoded weight".to_owned()))?;
+        Ok(((weight, hessian), decoded))
+    });
+    let (addresses, decoded) = match taken {
+        Ok(taken) => taken,
+        Err(error) => return then(Err(CalibrateError::failed("the MTP block's projection", error))),
+    };
     let next = Arc::clone(&inner);
-    // SAFETY: the weight and the Hessian are in `mtp`, which the continuation holds until the rounding has ended.
+    // SAFETY: the weight and the Hessian are in the heads' state, which holds them until the rounding has ended.
     unsafe {
         round_one(
             &inner,
@@ -749,8 +743,14 @@ fn round_projection(inner: Arc<Inner>, mut mtp: Mtp, then: Then<Vec<String>>) {
             decoded,
             Box::new(move |rounded| match rounded {
                 Ok(decoded) => {
-                    mtp.decoded = Some(decoded);
-                    project_states(next, mtp, then);
+                    let kept = with_state(&next, |state| {
+                        state.mtp.decoded = Some(decoded);
+                        Ok(())
+                    });
+                    match kept {
+                        Ok(()) => project_states(next, then),
+                        Err(error) => then(Err(CalibrateError::failed("the MTP block's projection", error))),
+                    }
                 }
                 Err(error) => then(Err(error)),
             }),
@@ -759,21 +759,20 @@ fn round_projection(inner: Arc<Inner>, mut mtp: Mtp, then: Then<Vec<String>>) {
 }
 
 /// The MTP block, third step: the rounded projection of every stem replaces the states, `rows` per sequence.
-fn project_states(inner: Arc<Inner>, mtp: Mtp, then: Then<Vec<String>>) {
+fn project_states(inner: Arc<Inner>, then: Then<Vec<String>>) {
     let (hidden, length) = (inner.hidden, inner.settings.length);
     let rows = length - 1;
     let working = Arc::clone(&inner);
     on_main(
         &Arc::clone(&inner),
         "the MTP block's projection",
-        mtp,
-        move |queue, handles, mtp| {
+        (),
+        move |queue, handles, ()| {
             let inner = &*working;
             with_state(inner, |state| {
-                let Some(decoded) = mtp.decoded.as_ref() else {
-                    return Err(ForwardError::Invalid("the projection has no decoded weight".to_owned()));
-                };
-                let stem = mtp.stem(inner, state)?;
+                let decoded = held(&state.mtp.decoded, "decoded projection")?.ptr();
+                let stem = Stem::of(inner, (&state.norm, &state.normed), &state.mtp)?;
+                let stem_rows = stem.stem.ptr();
                 let layout = Layout {
                     rows: length,
                     write: Some(rows),
@@ -781,8 +780,8 @@ fn project_states(inner: Arc<Inner>, mtp: Mtp, then: Then<Vec<String>>) {
                 walk(inner, queue, handles, layout, |context, batch| {
                     stem.build(context, batch)?;
                     context.linear(
-                        mtp.stem.ptr(),
-                        decoded.ptr(),
+                        stem_rows,
+                        decoded,
                         inner.batch_states.ptr(),
                         (batch.count * rows) as u32,
                         2 * hidden as u32,
@@ -793,45 +792,25 @@ fn project_states(inner: Arc<Inner>, mtp: Mtp, then: Then<Vec<String>>) {
         },
         move |made| match made {
             Err(error) => then(Err(error)),
-            Ok(((), mtp)) => release_projection(inner, mtp, then),
+            Ok(((), ())) => release_projection(inner, then),
         },
     );
 }
 
 /// Frees what only the projection needed, then runs the MTP layer over the states it made.
-fn release_projection(inner: Arc<Inner>, mtp: Mtp, then: Then<Vec<String>>) {
-    let Mtp {
-        table,
-        embedding_norm,
-        hidden_norm,
-        weight,
-        decoded,
-        ids,
-        scratch,
-        scratch_normed,
-        stem,
-        hessian,
-    } = mtp;
-    let buffers = [
-        table,
-        embedding_norm,
-        hidden_norm,
-        weight,
-        ids,
-        scratch,
-        scratch_normed,
-        stem,
-        hessian,
-    ]
-    .into_iter()
-    .chain(decoded)
-    .collect::<Vec<_>>();
+fn release_projection(inner: Arc<Inner>, then: Then<Vec<String>>) {
     let next = Arc::clone(&inner);
+    let working = Arc::clone(&inner);
     on_main(
         &Arc::clone(&inner),
         "freeing the MTP block's projection",
         (),
-        |queue, handles, ()| free(&mut lane(&inner, queue, handles), buffers),
+        move |queue, handles, ()| {
+            with_state(&working, |state| {
+                let buffers = take(&mut state.mtp).every();
+                free(&mut lane(&working, queue, handles), buffers)
+            })
+        },
         move |freed| match freed {
             Ok(((), ())) => run_mtp_layer(next, then),
             Err(error) => then(Err(error)),
@@ -842,17 +821,14 @@ fn release_projection(inner: Arc<Inner>, mtp: Mtp, then: Then<Vec<String>>) {
 /// The MTP block, fourth step: the layer rounded and run over the projection's states, with `rows` per sequence.
 fn run_mtp_layer(inner: Arc<Inner>, then: Then<Vec<String>>) {
     let length = inner.settings.length;
-    inner.pass_length.store(length - 1, Ordering::Release);
-    let next = Arc::clone(&inner);
-    run_target(
-        &inner,
-        Target::Mtp,
-        Box::new(move |ran| {
-            next.pass_length.store(length, Ordering::Release);
-            match ran {
-                Ok(()) => draft_states(next, then),
-                Err(error) => then(Err(error)),
-            }
+    let (running, next) = (Arc::clone(&inner), Arc::clone(&inner));
+    at_pass_length(
+        &inner.pass_length,
+        length - 1,
+        move |ran| run_target(&running, Target::Mtp, ran),
+        Box::new(move |ran| match ran {
+            Ok(()) => draft_states(next, then),
+            Err(error) => then(Err(error)),
         }),
     );
 }
@@ -869,29 +845,25 @@ fn draft_states(inner: Arc<Inner>, then: Then<Vec<String>>) {
         move |queue, handles, ()| {
             let inner = &*working;
             with_state(inner, |state| {
-                let normed = held(&state.normed, "normed states")?;
-                let mtp_norm = state
-                    .mtp_norm
-                    .take()
-                    .ok_or_else(|| ForwardError::Invalid("the heads have no MTP norm".to_owned()))?;
-                let hessian = zeroed(&mut lane(inner, queue, handles), FP32_BYTES * hidden * hidden)?;
+                let normed = held(&state.normed, "normed states")?.ptr();
+                let mtp_norm = held(&state.mtp_norm, "MTP norm")?.ptr();
+                state.draft = Some(zeroed(&mut lane(inner, queue, handles), FP32_BYTES * hidden * hidden)?);
+                let hessian = held(&state.draft, "draft head Hessian")?.ptr();
                 walk(inner, queue, handles, Layout { rows, write: None }, |context, batch| {
                     let count = (batch.count * rows) as u32;
                     context.ops().rms_norm_unit_offset_bf16(
                         inner.batch_states.ptr(),
-                        mtp_norm.ptr(),
-                        normed.ptr(),
+                        mtp_norm,
+                        normed,
                         count,
                         hidden as u32,
                         epsilon,
                     )?;
-                    context.accumulate_hessian(hessian.ptr(), normed.ptr(), count, hidden as u32)
+                    context.accumulate_hessian(hessian, normed, count, hidden as u32)
                 })?;
                 let mut context = lane(inner, queue, handles);
-                context.symmetrize(hessian.ptr(), hidden as u32)?;
-                free(&mut context, [mtp_norm])?;
-                state.draft = Some(hessian);
-                Ok(())
+                context.symmetrize(hessian, hidden as u32)?;
+                free(&mut context, state.mtp_norm.take())
             })
         },
         move |made| then(made.map(|((), ())| mtp_files())),
@@ -904,7 +876,7 @@ fn mtp_files() -> Vec<String> {
 }
 
 /// The output head: its weight uploaded and kept for the draft head, rounded under the head Hessian.
-fn round_output_head(inner: Arc<Inner>, read: Vec<PinnedBuffer>, shape: (u64, usize), then: Then<Vec<String>>) {
+fn round_output_head(inner: Arc<Inner>, read: Vec<PooledPinned>, shape: (u64, usize), then: Then<Vec<String>>) {
     let working = Arc::clone(&inner);
     on_main(
         &Arc::clone(&inner),
@@ -913,14 +885,13 @@ fn round_output_head(inner: Arc<Inner>, read: Vec<PinnedBuffer>, shape: (u64, us
         move |queue, handles, read| {
             let inner = &*working;
             with_state(inner, |state| {
+                let hessian = held(&state.hessian, "output head Hessian")?.addr();
                 let mut context = lane(inner, queue, handles);
                 // SAFETY: `read` is kept until the lane has retired this submission.
                 let weight = unsafe { upload_pinned(inner, &mut context, &read[0]) }?;
+                let weight = state.weight.insert(weight).addr();
                 let decoded = context.ops().alloc_async(BF16_BYTES * shape.0 as usize * shape.1)?;
-                let hessian = held(&state.hessian, "output head Hessian")?.addr();
-                let addresses = (weight.addr(), hessian);
-                state.weight = Some(weight);
-                Ok((addresses, decoded))
+                Ok(((weight, hessian), decoded))
             })
         },
         move |made| match made {
@@ -973,40 +944,41 @@ fn round_draft_head(inner: Arc<Inner>, hessian: DraftHessian, then: Then<Vec<Str
         move |queue, handles, ids| {
             let inner = &*working;
             with_state(inner, |state| {
-                let source = held(&state.weight, "output head weight")?;
-                let (ids_buffer, weight, decoded) = {
+                let source = held(&state.weight, "output head weight")?.ptr();
+                let under = match hessian {
+                    DraftHessian::Mtp => held(&state.draft, "draft head Hessian")?,
+                    DraftHessian::OutputHead => held(&state.hessian, "output head Hessian")?,
+                }
+                .addr();
+                {
                     let mut context = lane(inner, queue, handles);
-                    (
-                        context.ops().alloc_async(I32_BYTES * ids.len())?,
-                        context.ops().alloc_async(BF16_BYTES * rows * hidden)?,
-                        context.ops().alloc_async(BF16_BYTES * rows * hidden)?,
-                    )
+                    state.gathered.push(context.ops().alloc_async(I32_BYTES * ids.len())?);
+                    state
+                        .gathered
+                        .push(context.ops().alloc_async(BF16_BYTES * rows * hidden)?);
+                }
+                let [ids_buffer, weight] = &state.gathered[..] else {
+                    return Err(ForwardError::Invalid(
+                        "the draft head's buffers are not both made".to_owned(),
+                    ));
                 };
                 // SAFETY: the ids are kept until the lane has retired this submission.
                 unsafe {
                     queue.copy_to_device(ids_buffer.addr(), ids.as_ptr().cast(), I32_BYTES * ids.len())?;
                 }
-                lane(inner, queue, handles).gather_rows(
-                    source.ptr(),
-                    ids_buffer.ptr(),
-                    rows as u32,
-                    hidden as u32,
-                    weight.ptr(),
-                )?;
-                let under = match hessian {
-                    DraftHessian::Mtp => held(&state.draft, "draft head Hessian")?,
-                    DraftHessian::OutputHead => held(&state.hessian, "output head Hessian")?,
-                };
-                Ok((weight.addr(), under.addr(), ids_buffer, weight, decoded))
+                let mut context = lane(inner, queue, handles);
+                context.gather_rows(source, ids_buffer.ptr(), rows as u32, hidden as u32, weight.ptr())?;
+                let decoded = context.ops().alloc_async(BF16_BYTES * rows * hidden)?;
+                Ok(((weight.addr(), under), decoded))
             })
         },
         move |made| match made {
             Err(error) => then(Err(error)),
-            Ok(((weight_address, hessian_address, ids_buffer, weight, decoded), ids)) => {
+            Ok((((weight_address, hessian_address), decoded), ids)) => {
                 drop(ids);
                 let next = Arc::clone(&inner);
-                // SAFETY: the gathered weight is held by the continuation, and the Hessian by the heads' state, until
-                // the rounding has ended.
+                // SAFETY: the gathered weight and the Hessian are in the heads' state, which holds them until the
+                // rounding has ended.
                 unsafe {
                     round_one(
                         &inner,
@@ -1015,7 +987,7 @@ fn round_draft_head(inner: Arc<Inner>, hessian: DraftHessian, then: Then<Vec<Str
                         (weight_address, hessian_address),
                         decoded,
                         Box::new(move |rounded| match rounded {
-                            Ok(decoded) => release_heads(next, vec![ids_buffer, weight, decoded], then),
+                            Ok(decoded) => release_heads(next, decoded, then),
                             Err(error) => then(Err(error)),
                         }),
                     );
@@ -1025,8 +997,8 @@ fn round_draft_head(inner: Arc<Inner>, hessian: DraftHessian, then: Then<Vec<Str
     );
 }
 
-/// Frees the draft head's buffers and every buffer the heads kept, then gives the draft head's file.
-fn release_heads(inner: Arc<Inner>, mut buffers: Vec<DeviceBuffer>, then: Then<Vec<String>>) {
+/// Frees the draft head's decoded weight and every buffer the heads kept, then gives the draft head's file.
+fn release_heads(inner: Arc<Inner>, decoded: DeviceBuffer, then: Then<Vec<String>>) {
     let working = Arc::clone(&inner);
     on_main(
         &Arc::clone(&inner),
@@ -1034,7 +1006,8 @@ fn release_heads(inner: Arc<Inner>, mut buffers: Vec<DeviceBuffer>, then: Then<V
         (),
         move |queue, handles, ()| {
             with_state(&working, |state| {
-                buffers.extend(state.every());
+                let mut buffers = state.every();
+                buffers.push(decoded);
                 free(&mut lane(&working, queue, handles), buffers)
             })
         },

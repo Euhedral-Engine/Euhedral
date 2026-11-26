@@ -35,6 +35,7 @@ use euhedral_inference_engine::Handoff;
 use euhedral_io::AsyncIo;
 use euhedral_memory::{LocationId, LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope};
 
+use super::draft_ids::check_draft_ids;
 use super::driver::{Once, Then, end, single};
 use super::embedding;
 use super::files::{Region, resume, save, write_checkpoint};
@@ -60,7 +61,8 @@ use crate::step::{Kind, idle, step};
 
 mod heads;
 
-use heads::{DeviceHeads, HeadState};
+use super::head_state::HeadState;
+use heads::{DeviceHeads, OUTPUT_HEAD};
 
 /// The checkpoint tensor the tokens are looked up in.
 const EMBEDDING: &str = "model.language_model.embed_tokens.weight";
@@ -112,7 +114,8 @@ pub struct Settings {
     /// Whether a run of the whole model leaves out the MTP block: the draft head is then rounded under the output
     /// head's Hessian.
     pub skip_mtp: bool,
-    /// The vocabulary rows the draft head keeps, in the order it stores them: checked against the vocabulary.
+    /// The output head's rows the draft head keeps, in the order it stores them: [`Calibration::open`] checks them
+    /// against the output head's rows, and a run needs at least one.
     pub draft_ids: Vec<i32>,
     /// The manifest the run starts from (a resumed directory's, or a new one): its key names the run in the resume
     /// file, and it is all the run resumes from.
@@ -189,9 +192,9 @@ struct Inner {
     ledger: Arc<Ledger>,
     hidden: usize,
     /// Tokens of a sequence in the pass that runs: the run's, and the MTP layer's one fewer.
-    pass_length: AtomicUsize,
+    pass_length: Arc<AtomicUsize>,
     /// What the heads keep on the card between their calls.
-    heads: Handoff<HeadState>,
+    heads: Handoff<HeadState<DeviceBuffer>>,
 }
 
 /// The calibration on the card; its calls are [`Stages`].
@@ -221,6 +224,11 @@ impl Calibration {
         io: Arc<AsyncIo>,
         host: Arc<Lake>,
     ) -> Result<(Calibration, Vec<Arc<Completions>>), CalibrateError> {
+        let head_rows = objects
+            .object(OUTPUT_HEAD)
+            .map_err(|error| CalibrateError::failed(OUTPUT_HEAD, error))?
+            .rows;
+        check_draft_ids(&settings.draft_ids, head_rows).map_err(CalibrateError::Invalid)?;
         let library = CudaLibrary::load(library).map_err(|error| CalibrateError::failed("the CUDA library", error))?;
         let math =
             MathLibraries::load(math_directory).map_err(|error| CalibrateError::failed("the math libraries", error))?;
@@ -392,7 +400,7 @@ impl Calibration {
             resume: Handoff::empty(),
             ledger,
             hidden,
-            pass_length: AtomicUsize::new(length),
+            pass_length: Arc::new(AtomicUsize::new(length)),
             heads: Handoff::empty(),
         });
         inner.heads.send(HeadState::default());
@@ -618,7 +626,9 @@ fn embed(inner: Arc<Inner>, then: Once<usize>) {
     if let Err(error) = checked {
         return end(&then, Err(error));
     }
-    let memory = match PinnedBuffer::alloc(&inner.library, tensor.bytes as usize) {
+    // The staging pool's memory, which a drop returns to the pool: a plain pinned buffer is freed with a wait for the
+    // device, in the frame that ends the read.
+    let memory = match inner.staging.acquire(tensor.bytes as usize) {
         Ok(memory) => memory,
         Err(error) => return end(&then, Err(CalibrateError::failed("the embedding table", error))),
     };
@@ -626,12 +636,12 @@ fn embed(inner: Arc<Inner>, then: Once<usize>) {
     let started = store.read_tensor(
         EMBEDDING,
         memory,
-        Arc::new(move |read: Result<PinnedBuffer, CheckpointError>| {
+        Arc::new(move |read: Result<PooledPinned, CheckpointError>| {
             let outcome = read
                 .map_err(|error| CalibrateError::failed("the embedding table", error))
                 .and_then(|memory| {
                     // SAFETY: the table was read whole into the buffer, which nothing else touches.
-                    let table = unsafe { slice::from_raw_parts(memory.as_ptr(), tensor.bytes as usize) };
+                    let table = unsafe { slice::from_raw_parts(memory.buffer().as_ptr(), tensor.bytes as usize) };
                     // SAFETY: the states are the run's own and nothing touches them before the run starts.
                     let states = unsafe { slice::from_raw_parts_mut(inner.states.pointer(), inner.states.bytes) };
                     embedding::copy_rows(&inner.settings.tokens, table, inner.row_bytes(), states)
