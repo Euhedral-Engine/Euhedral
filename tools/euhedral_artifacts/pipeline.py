@@ -136,7 +136,7 @@ def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path |
     config = read_json(model / "config.json")
     check_checkpoint(config)
     if codes_from is not None and recipe.quantization != "trellis":
-        require_complete_codes(codes_from)
+        require_complete_codes(codes_from, config.get("text_config", {}).get("num_hidden_layers"))
     selected = shortlist(model, ranking_path) if ranking_path is not None else draft_token_ids(draft_ids_from)
     importance = ImportanceMatrix(imatrix) if imatrix is not None else None
     trellis = None

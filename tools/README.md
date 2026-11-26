@@ -90,10 +90,12 @@ FP32 tensor scale of an NVFP4 object. It must match the object's format, layout 
 the manifest records DIR and how many objects it supplied.
 
 DIR must hold `calibration.json`, and the converter refuses a directory without it. `quantization calibrate` writes it
-with the layers done of the model's, and whether the heads and the MTP block are written; the conversion needs all of
-them. `fake_quant.py`'s export (`codes.export_state`, used by `fake_quant_parity.py --export`) writes
-`{"producer": "fake_quant", "objects": [...], "complete": true}`, listing the objects it saved, and the rest are
-rounded as usual. A hand-made directory needs that file written the same way.
+with the file names it saved, the layers done of the model's, and whether the heads and the MTP block are written; the
+conversion needs all of them, the model's layer count to match, every listed file present and no state file unlisted.
+`fake_quant.py`'s export (`codes.export_state` per object, then `codes.finish_export`; `fake_quant_parity.py --export`
+does both) writes `{"producer": "fake_quant", "objects": [...], "complete": ...}`, with `complete` true only once the
+export is finished, and refuses a directory that holds calibrate's manifest. The objects it lists are taken from it and
+the rest are rounded as usual. A hand-made directory needs that file written the same way.
 
 `euhedral_artifacts/fake_quant.py` holds the same rounding as PyTorch modules for training: built from an object's
 weights with the converter's own scale selection, a module's codes and scales are the converter's byte for byte, its

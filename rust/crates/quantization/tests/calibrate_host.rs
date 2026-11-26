@@ -7,6 +7,7 @@
     reason = "a test: the fake records in a mutex and a failed unwrap is the failure"
 )]
 
+use std::fmt::Debug;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use euhedral_inference_engine::Handoff;
-use euhedral_inference_quantization::calibrate::manifest::{Manifest, prepare};
+use euhedral_inference_quantization::calibrate::device::refuse_finish;
+use euhedral_inference_quantization::calibrate::manifest::{Ledger, Manifest, differences, inspect};
 use euhedral_inference_quantization::calibrate::plan::{resume_at, resume_header, resume_key, tokens_digest};
 use euhedral_inference_quantization::calibrate::schedule::{Schedule, Settled};
 use euhedral_inference_quantization::calibrate::{
@@ -753,6 +755,8 @@ fn each_token_gets_its_own_row_in_its_own_position() {
 
 // ---- the manifest and the output directory ----
 
+const FIELDS: [&str; 2] = ["the tokens", "the batch"];
+
 fn touch(directory: &Path, names: &[&str]) {
     for name in names {
         fs::write(directory.join(name), name.as_bytes()).unwrap();
@@ -768,67 +772,243 @@ fn names(directory: &Path) -> Vec<String> {
     names
 }
 
-#[test]
-fn a_directory_of_another_key_keeps_only_the_new_runs_files() {
+/// A directory that holds the manifest of a run of `key` that listed `files` (which exist) and some neighbours.
+fn run_directory(key: &str, files: &[&str], neighbours: &[&str]) -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
-    let old = prepare(directory.path(), "old", 64).unwrap();
-    assert_eq!(old, Manifest::new("old", 64));
-    touch(
-        directory.path(),
-        &[
-            "a.npz",
-            "text.layers.40.mlp.npz",
-            "hidden.bin",
-            "b.npz.tmp",
-            "notes.txt",
-        ],
-    );
-    let fresh = prepare(directory.path(), "new", 64).unwrap();
-    assert_eq!(fresh, Manifest::new("new", 64));
-    assert_eq!(
-        names(directory.path()),
-        vec!["calibration.json".to_owned(), "notes.txt".to_owned()],
-        "the old run's states, resume file and torn writes are gone; a file no run writes stays"
-    );
-    let written = Manifest::parse(&fs::read(directory.path().join("calibration.json")).unwrap()).unwrap();
-    assert_eq!(written, fresh);
+    let mut manifest = Manifest::new(key, 64).after(2);
+    manifest.files = files.iter().map(|name| (*name).to_owned()).collect();
+    fs::write(directory.path().join("calibration.json"), manifest.to_bytes().unwrap()).unwrap();
+    touch(directory.path(), files);
+    touch(directory.path(), neighbours);
+    directory
+}
+
+fn refusal(result: Result<impl Debug, CalibrateError>) -> String {
+    result.unwrap_err().to_string()
 }
 
 #[test]
-fn a_directory_of_the_same_key_keeps_its_files_and_progress() {
+fn an_empty_or_missing_directory_starts_a_run_that_lists_nothing() {
     let directory = tempfile::tempdir().unwrap();
-    prepare(directory.path(), "run", 64).unwrap();
-    let progress = Manifest::new("run", 64).after(9);
-    fs::write(directory.path().join("calibration.json"), progress.to_bytes().unwrap()).unwrap();
-    touch(directory.path(), &["a.npz", "hidden.bin"]);
-    assert_eq!(prepare(directory.path(), "run", 64).unwrap(), progress);
+    let prepared = inspect(directory.path(), "run", 64, &FIELDS, false).unwrap();
+    assert_eq!(prepared.manifest(), &Manifest::new("run", 64));
+    assert!(names(directory.path()).is_empty(), "inspecting writes nothing");
+    let missing = directory.path().join("new");
+    let prepared = inspect(&missing, "run", 64, &FIELDS, false).unwrap();
+    assert!(!missing.exists(), "inspecting creates nothing");
+    prepared.apply().unwrap();
+    let written = Manifest::parse(&fs::read(missing.join("calibration.json")).unwrap()).unwrap();
+    assert_eq!(written, Manifest::new("run", 64));
+    assert_eq!(
+        names(&missing),
+        vec!["calibration.json"],
+        "the manifest is renamed into place, no temporary left"
+    );
+}
+
+#[test]
+fn the_directory_of_the_same_key_resumes_and_keeps_every_file() {
+    let directory = run_directory("run", &["a.npz", "b.npz"], &["hidden.bin", "c.npz.tmp", "notes.txt"]);
+    let before = names(directory.path());
+    let prepared = inspect(directory.path(), "run", 64, &FIELDS, false).unwrap();
+    assert_eq!(prepared.manifest().layers_done, 2);
+    assert_eq!(prepared.manifest().files, vec!["a.npz", "b.npz"]);
+    prepared.apply().unwrap();
+    assert_eq!(names(directory.path()), before);
+}
+
+#[test]
+fn a_directory_with_files_and_no_manifest_is_refused_naming_them_and_nothing_is_removed() {
+    let directory = tempfile::tempdir().unwrap();
+    touch(directory.path(), &["mine.npz", "text.layers.0.mlp.npz", "hidden.bin"]);
+    for fresh in [false, true] {
+        let why = refusal(inspect(directory.path(), "run", 64, &FIELDS, fresh));
+        assert!(why.contains("mine.npz") && why.contains("calibration.json"), "{why}");
+        assert_eq!(names(directory.path()).len(), 3, "nothing was removed");
+    }
+}
+
+#[test]
+fn a_manifest_that_is_not_a_calibrations_is_refused_and_nothing_is_removed() {
+    let directory = tempfile::tempdir().unwrap();
+    touch(directory.path(), &["a.npz"]);
+    for manifest in [
+        &b"{ torn"[..],
+        br#"{"producer":"fake_quant","objects":["a"],"complete":true}"#,
+    ] {
+        fs::write(directory.path().join("calibration.json"), manifest).unwrap();
+        for fresh in [false, true] {
+            let why = refusal(inspect(directory.path(), "run", 64, &FIELDS, fresh));
+            assert!(why.contains("not a calibration's manifest"), "{why}");
+        }
+        assert_eq!(names(directory.path()), vec!["a.npz", "calibration.json"]);
+        assert_eq!(fs::read(directory.path().join("calibration.json")).unwrap(), manifest);
+    }
+}
+
+#[test]
+fn listed_files_that_are_missing_refuse_the_run_naming_them() {
+    let directory = run_directory("run", &["a.npz", "b.npz"], &[]);
+    fs::remove_file(directory.path().join("b.npz")).unwrap();
+    let why = refusal(inspect(directory.path(), "run", 64, &FIELDS, false));
+    assert!(why.contains("b.npz") && !why.contains("a.npz"), "{why}");
+}
+
+#[test]
+fn another_key_is_refused_naming_the_fields_that_differ_and_nothing_is_removed() {
+    let directory = run_directory("tokens|8", &["a.npz"], &["hidden.bin"]);
+    let why = refusal(inspect(directory.path(), "tokens|4", 64, &FIELDS, false));
+    assert!(why.contains("the batch") && !why.contains("the tokens,"), "{why}");
+    assert!(why.contains("--fresh"), "{why}");
+    let why = refusal(inspect(directory.path(), "tokens|8", 40, &FIELDS, false));
+    assert!(why.contains("the model's layers"), "{why}");
     assert_eq!(names(directory.path()), vec!["a.npz", "calibration.json", "hidden.bin"]);
 }
 
 #[test]
-fn files_without_a_readable_manifest_or_of_a_model_of_other_depth_are_not_kept() {
-    let directory = tempfile::tempdir().unwrap();
-    touch(directory.path(), &["a.npz", "hidden.bin"]);
-    prepare(directory.path(), "run", 64).unwrap();
-    assert_eq!(
-        names(directory.path()),
-        vec!["calibration.json"],
-        "no manifest: unknown files"
+fn fresh_removes_only_the_files_the_old_manifest_lists_and_a_foreign_file_survives() {
+    let directory = run_directory(
+        "tokens|8",
+        &["a.npz", "b.npz"],
+        &["notes.txt", "hidden.bin", "stray.npz"],
     );
-    touch(directory.path(), &["a.npz"]);
-    fs::write(directory.path().join("calibration.json"), b"{ torn").unwrap();
-    prepare(directory.path(), "run", 64).unwrap();
+    let prepared = inspect(directory.path(), "tokens|4", 64, &FIELDS, true).unwrap();
     assert_eq!(
-        names(directory.path()),
-        vec!["calibration.json"],
-        "an unreadable manifest"
+        names(directory.path()).len(),
+        6,
+        "inspecting removes nothing, even with --fresh"
     );
-    touch(directory.path(), &["a.npz"]);
-    prepare(directory.path(), "run", 40).unwrap();
+    let manifest = prepared.apply().unwrap();
+    assert_eq!(manifest, Manifest::new("tokens|4", 64));
     assert_eq!(
         names(directory.path()),
-        vec!["calibration.json"],
-        "the same key over another model"
+        vec!["calibration.json", "hidden.bin", "notes.txt", "stray.npz"],
+        "the listed files are gone; the others stay"
+    );
+    let written = Manifest::parse(&fs::read(directory.path().join("calibration.json")).unwrap()).unwrap();
+    assert_eq!(written.key, "tokens|4");
+}
+
+#[test]
+fn a_prepared_directory_that_is_dropped_because_the_open_failed_changes_nothing() {
+    let directory = run_directory("tokens|8", &["a.npz"], &[]);
+    let before = names(directory.path());
+    let manifest = fs::read(directory.path().join("calibration.json")).unwrap();
+    drop(inspect(directory.path(), "tokens|4", 64, &FIELDS, true).unwrap());
+    assert_eq!(names(directory.path()), before);
+    assert_eq!(fs::read(directory.path().join("calibration.json")).unwrap(), manifest);
+}
+
+// ---- the ledger: a layer is counted only when its files and its manifest are saved ----
+
+/// What a fake manifest save did: the bytes it was asked to write, and whether it succeeds.
+struct FakeWrite {
+    written: Arc<Mutex<Vec<Manifest>>>,
+    succeed: bool,
+}
+
+impl FakeWrite {
+    fn call(&self) -> impl FnOnce(Vec<u8>, Then<()>) + use<> {
+        let (written, succeed) = (Arc::clone(&self.written), self.succeed);
+        move |bytes, then| {
+            written.lock().unwrap().push(Manifest::parse(&bytes).unwrap());
+            then(if succeed {
+                Ok(())
+            } else {
+                Err(CalibrateError::Failed("save failed".to_owned()))
+            });
+        }
+    }
+}
+
+fn recorded(
+    ledger: &Arc<Ledger>,
+    done: usize,
+    result: Result<(), CalibrateError>,
+    write: &FakeWrite,
+) -> Result<(), CalibrateError> {
+    let (sender, receiver) = channel();
+    ledger.record(
+        done,
+        result,
+        write.call(),
+        Box::new(move |result| sender.send(result).unwrap()),
+    );
+    receiver.recv_timeout(HANG).expect("the record never ended")
+}
+
+#[test]
+fn a_layer_is_counted_with_its_listed_files_after_its_manifest_is_saved() {
+    let ledger = Arc::new(Ledger::new(Manifest::new("run", 4)));
+    let write = FakeWrite {
+        written: Arc::default(),
+        succeed: true,
+    };
+    ledger.list(["a.npz".to_owned(), "b.npz".to_owned()]);
+    ledger.list(["b.npz".to_owned()]);
+    recorded(&ledger, 1, Ok(()), &write).unwrap();
+    let saved = write.written.lock().unwrap().clone();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(
+        (saved[0].layers_done, saved[0].files.clone()),
+        (1, vec!["a.npz".to_owned(), "b.npz".to_owned()])
+    );
+    assert_eq!(ledger.manifest().unwrap(), saved[0]);
+}
+
+#[test]
+fn a_failed_layer_records_nothing() {
+    let ledger = Arc::new(Ledger::new(Manifest::new("run", 4)));
+    let write = FakeWrite {
+        written: Arc::default(),
+        succeed: true,
+    };
+    let error = recorded(
+        &ledger,
+        1,
+        Err(CalibrateError::Failed("layer failed".to_owned())),
+        &write,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("layer failed"));
+    assert!(write.written.lock().unwrap().is_empty(), "no manifest was written");
+    assert_eq!(ledger.manifest().unwrap().layers_done, 0);
+}
+
+#[test]
+fn a_failed_manifest_save_does_not_count_the_layer_and_a_later_one_can() {
+    let ledger = Arc::new(Ledger::new(Manifest::new("run", 4)));
+    let failing = FakeWrite {
+        written: Arc::default(),
+        succeed: false,
+    };
+    let error = recorded(&ledger, 1, Ok(()), &failing).unwrap_err();
+    assert!(error.to_string().contains("save failed"));
+    assert_eq!(ledger.manifest().unwrap().layers_done, 0, "the layer is not counted");
+    let working = FakeWrite {
+        written: Arc::default(),
+        succeed: true,
+    };
+    recorded(&ledger, 1, Ok(()), &working).unwrap();
+    assert_eq!(ledger.manifest().unwrap().layers_done, 1);
+}
+
+#[test]
+fn the_fields_that_differ_are_named_and_a_key_of_another_shape_is_named_whole() {
+    let (old, new) = (Manifest::new("t|8", 4), Manifest::new("t|4", 4));
+    assert_eq!(differences(&old, &new, &FIELDS), vec!["the batch"]);
+    assert_eq!(differences(&old, &Manifest::new("t|8|x", 4), &FIELDS), vec!["the key"]);
+    assert!(differences(&old, &old, &FIELDS).is_empty());
+}
+
+#[test]
+fn a_run_of_the_whole_model_ends_with_an_error_naming_the_heads_and_the_mtp_block() {
+    let (sender, receiver) = channel();
+    refuse_finish(Box::new(move |result| sender.send(result).unwrap()));
+    let why = receiver.recv_timeout(HANG).unwrap().unwrap_err().to_string();
+    assert!(
+        why.contains("output head") && why.contains("MTP") && why.contains("incomplete"),
+        "{why}"
     );
 }
 

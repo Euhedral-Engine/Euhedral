@@ -38,7 +38,7 @@ use super::driver::{Once, Then, end, single};
 use super::embedding;
 use super::files::{Region, read_states, save, write_checkpoint};
 use super::hessians::HessianSet;
-use super::manifest::{MANIFEST_FILE, Manifest, RESUME_FILE};
+use super::manifest::{Ledger, MANIFEST_FILE, Manifest, RESUME_FILE};
 use super::plan::{Plan, resume_at, round_order};
 use super::rounding::{Ended, HEAD_ROWS, Linear, RoundSettings, Services, round_all};
 use super::{CalibrateError, Stages};
@@ -48,6 +48,7 @@ use crate::forward::pipeline::device::{ForwardPipeline, HostStates, Parts, Pipel
 use crate::forward::{ForwardError, ForwardKernels, LaneContext, LayerForward, Observation};
 use crate::forward::{LayerWeights, StagedLayer, Target, stage};
 use crate::gptq::format::Nvfp4Search;
+use crate::gptq::state::QuantState;
 use crate::gptq::{GptqKernels, GptqLane, GptqSettings};
 use crate::kernels::{Module, ModuleOptions, Modules};
 use crate::memory::LaneMemory;
@@ -104,6 +105,8 @@ pub struct Settings {
     /// [`DEVICE_RESERVE`].
     pub device_reserve: Option<u64>,
     pub chunk_bytes: usize,
+    /// The manifest the run starts from (a resumed directory's); none starts one that lists nothing.
+    pub manifest: Option<Manifest>,
 }
 
 impl Settings {
@@ -124,6 +127,7 @@ impl Settings {
             lane_pinned_bytes: LANE_PINNED_BYTES,
             device_reserve: None,
             chunk_bytes: UPLOAD_CHUNK_BYTES,
+            manifest: None,
         }
     }
 
@@ -170,8 +174,8 @@ struct Inner {
     lanes: Handoff<Vec<GptqLane>>,
     services: Arc<Services>,
     resume: OnceLock<ResumeFile>,
-    /// The manifest of a run that has written nothing.
-    manifest: Manifest,
+    /// The manifest of the run, which each layer updates.
+    ledger: Arc<Ledger>,
     hidden: usize,
 }
 
@@ -224,7 +228,12 @@ impl Calibration {
             ForwardKernels::new(&gptq, &rows).map_err(|error| CalibrateError::failed("the forward kernels", error))?,
         );
         let config = &objects.config;
-        let manifest = Manifest::new(&settings.key, config.layers);
+        let ledger = Arc::new(Ledger::new(
+            settings
+                .manifest
+                .clone()
+                .unwrap_or_else(|| Manifest::new(&settings.key, config.layers)),
+        ));
         let (hidden, length, batch) = (config.hidden as usize, settings.length, settings.batch);
         let max_rows = u32::try_from(batch * length)
             .map_err(|_| CalibrateError::Invalid(format!("{batch} sequences of {length} tokens are too many rows")))?;
@@ -371,7 +380,7 @@ impl Calibration {
             lanes: Handoff::empty(),
             services,
             resume: OnceLock::new(),
-            manifest,
+            ledger,
             hidden,
         });
         inner.handles.send(symmetric);
@@ -500,9 +509,26 @@ impl Stages for Calibration {
     /// The layer, then the manifest with the layer counted: its files are all written by then.
     fn layer(&self, layer: usize, staged: StagedLayer, then: Then<()>) {
         let inner = Arc::clone(&self.inner);
-        let recorded: Then<()> = Box::new(move |result| match result {
-            Ok(()) => record(&inner, layer + 1, then),
-            Err(error) => then(Err(error)),
+        let recorded: Then<()> = Box::new(move |result| {
+            let (io, host) = (Arc::clone(&inner.services.io), Arc::clone(&inner.services.host));
+            let path = inner.settings.out.join(MANIFEST_FILE);
+            Arc::clone(&inner.ledger).record(
+                layer + 1,
+                result,
+                move |bytes, saved| {
+                    save(
+                        &io,
+                        &host,
+                        path,
+                        bytes,
+                        Box::new(move |result| {
+                            saved(result);
+                            idle()
+                        }),
+                    );
+                },
+                then,
+            );
         });
         upload(Arc::clone(&self.inner), layer, staged, single(recorded));
     }
@@ -514,29 +540,17 @@ impl Stages for Calibration {
     /// The layers' files are complete, and the manifest says so; the output head, the draft head and the MTP block are
     /// not rounded by this build, so the run does not end well: its output is not whole.
     fn finish(&self, then: Then<()>) {
-        then(Err(CalibrateError::Failed(format!(
-            "every layer is rounded and written, but this build does not round the output head, the draft head or the \
-             MTP block; {MANIFEST_FILE} records the output as incomplete"
-        ))));
+        refuse_finish(then);
     }
 }
 
-/// Writes the manifest of a run that has rounded `done` layers.
-fn record(inner: &Arc<Inner>, done: usize, then: Then<()>) {
-    let bytes = match inner.manifest.after(done).to_bytes() {
-        Ok(bytes) => bytes,
-        Err(error) => return then(Err(error)),
-    };
-    save(
-        &inner.services.io,
-        &inner.services.host,
-        inner.settings.out.join(MANIFEST_FILE),
-        bytes,
-        Box::new(move |saved| {
-            then(saved);
-            idle()
-        }),
-    );
+/// What a run of the whole model ends with: an error, since this build does not round the output head, the draft head
+/// or the MTP block, and the manifest records the output as incomplete.
+pub fn refuse_finish(then: Then<()>) {
+    then(Err(CalibrateError::Failed(format!(
+        "every layer is rounded and written, but this build does not round the output head, the draft head or the MTP \
+         block; {MANIFEST_FILE} records the output as incomplete"
+    ))));
 }
 
 // ---- begin: resume or embed ----
@@ -805,6 +819,9 @@ fn round(
 fn swap(inner: Arc<Inner>, mut weights: LayerWeights, set: HessianSet<DeviceBuffer>, ended: Ended, then: Once<()>) {
     let Ended { lanes, linears } = ended;
     inner.lanes.send(lanes);
+    inner
+        .ledger
+        .list(linears.iter().map(|linear| QuantState::file_name(&linear.name)));
     let submitted = inner.main.submit_marked(|queue| {
         let mut ops = RusteeOps::new(queue, &inner.table, Modes::default()).on_lane(&inner.library, inner.home);
         for linear in linears {

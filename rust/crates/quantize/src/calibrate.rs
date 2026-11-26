@@ -1,9 +1,12 @@
 //! The `calibrate` command for GPTQ: the BF16 checkpoint run layer by layer over calibration tokens, each layer's
 //! linears rounded from the Hessians of their inputs and written to the output directory, with `calibration.json`
-//! recording how far the run got. The trellis arm is not part of this build. Nor is the rounding of the output head,
-//! the draft head and the MTP block: a run of fewer layers than the model's stops after them and exits 0, keeping its
-//! resume file; a run of every layer writes them all but the heads and the MTP block, then exits with an error naming
-//! that gap, and its manifest stays incomplete, so the converter refuses its output. The resume file is not removed.
+//! listing the files saved and how far the run got. The output directory must be empty or hold the same run's manifest
+//! (the run resumes); another run's manifest is refused unless `--fresh`, which removes only the files it lists; any
+//! other content is refused, and nothing is removed or written before the checkpoint and the device have opened. The
+//! trellis arm is not part of this build. Nor is the rounding of the output head, the draft head and the MTP block: a
+//! run of fewer layers than the model's stops after them and exits 0, keeping its resume file; a run of every layer
+//! writes them all but the heads and the MTP block, then exits with an error naming that gap, and its manifest stays
+//! incomplete, so the converter refuses its output. The resume file is not removed.
 
 use std::env::consts;
 use std::ffi::OsString;
@@ -12,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
 use euhedral_inference_quantization::calibrate::device::{Calibration, Settings as RunSettings};
-use euhedral_inference_quantization::calibrate::manifest::prepare;
+use euhedral_inference_quantization::calibrate::manifest::inspect;
 use euhedral_inference_quantization::calibrate::plan::{resume_key, tokens_digest};
 use euhedral_inference_quantization::calibrate::{Plan, drive};
 use euhedral_inference_quantization::checkpoint::objects::Qwen38Objects;
@@ -31,13 +34,30 @@ const DEFAULT_BATCH: usize = 8;
 const DEFAULT_LAYERS: usize = 64;
 /// The most sequences run at once: each one holds a pipeline slot.
 const MOST_BATCH: usize = 64;
+/// The most rounding lanes: each holds its own device and pinned buffers.
+const MOST_LANES: usize = 64;
+/// The most mebibytes a size flag takes: its bytes fit in 64 bits.
+const MOST_MIB: u64 = u64::MAX >> 20;
+/// The parts of the resume key, in order, for the refusal that names what differs.
+const KEY_FIELDS: [&str; 10] = [
+    "the tokens file",
+    "the sequences",
+    "the sequence length",
+    "the recipe",
+    "act-order",
+    "damp",
+    "the model",
+    "the NVFP4 search",
+    "the batch",
+    "the tokens' contents",
+];
 /// What the trellis arm takes: refused by name.
 const TRELLIS_OPTIONS: [&str; 3] = ["--bits", "--viterbi-scratch-mib", "--write-buffer-mib"];
 /// What the command line accepts, for the message that refuses another option.
 const OPTIONS: &str = "--model, --quantization, --compressed, --output-head, --tokens, --draft-ids-from, --out, \
 --act-order, --damp, --batch, --sequences, --layers, --skip-mtp, --nvfp4-above, --nvfp4-scale-max, --format, \
 --config, --library (or --cuda-library), --cuda-libraries, --rounding-lanes, --memory-reserve-mib, --staging-mib, \
---lane-pinned-mib, --upload-chunk-mib";
+--lane-pinned-mib, --upload-chunk-mib, --fresh";
 
 /// The flags of a run, checked.
 #[derive(Debug)]
@@ -70,7 +90,9 @@ pub(crate) struct Flags {
     /// Pinned MiB the GPTQ lanes stage through.
     pub lane_pinned_mib: Option<u64>,
     /// MiB of one upload copy.
-    pub upload_chunk_mib: Option<usize>,
+    pub upload_chunk_mib: Option<u64>,
+    /// Remove the files of another run's manifest in `--out` instead of refusing.
+    pub fresh: bool,
 }
 
 fn trellis_refusal(option: &str) -> String {
@@ -79,7 +101,7 @@ fn trellis_refusal(option: &str) -> String {
 
 pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
     let (mut model, mut quantization, mut output_head, mut tokens, mut out) = (None, None, None, None, None);
-    let (mut compressed, mut act_order) = (false, false);
+    let (mut compressed, mut act_order, mut fresh) = (false, false, false);
     let (mut damp, mut batch, mut sequences, mut layers) = (DEFAULT_DAMP, DEFAULT_BATCH, 0, DEFAULT_LAYERS);
     let (mut above, mut scale_max) = (Nvfp4Search::DEFAULT.above(), Nvfp4Search::DEFAULT.scale_max());
     let (mut config, mut library) = (None, None);
@@ -96,6 +118,10 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
                 act_order = true;
                 continue;
             }
+            "--fresh" => {
+                fresh = true;
+                continue;
+            }
             // The MTP block is not rounded by this build either way.
             "--skip-mtp" => continue,
             _ => {}
@@ -107,16 +133,20 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
         let number = || {
             value
                 .parse::<usize>()
-                .map_err(|_| format!("{arg} needs a whole number"))
+                .map_err(|_| format!("{arg} needs a whole number, not {value}"))
         };
         let mebibytes = || {
             value
                 .parse::<u64>()
                 .ok()
-                .filter(|mib| *mib > 0)
-                .ok_or_else(|| format!("{arg} needs a positive whole number"))
+                .filter(|mib| (1..=MOST_MIB).contains(mib))
+                .ok_or_else(|| format!("{arg} needs a whole number of MiB from 1 to {MOST_MIB}, not {value}"))
         };
-        let real = || value.parse::<f32>().map_err(|_| format!("{arg} needs a number"));
+        let real = || {
+            value
+                .parse::<f32>()
+                .map_err(|_| format!("{arg} needs a number, not {value}"))
+        };
         match arg.as_str() {
             "--model" => model = Some(PathBuf::from(value)),
             "--quantization" => {
@@ -139,17 +169,24 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
             "--nvfp4-above" => {
                 above = value
                     .parse::<i32>()
-                    .map_err(|_| format!("{arg} needs a whole number"))?;
+                    .map_err(|_| format!("{arg} needs a whole number, not {value}"))?;
             }
             "--nvfp4-scale-max" => scale_max = real()?,
             "--config" => config = Some(PathBuf::from(value)),
             "--cuda-library" | "--library" => library = Some(PathBuf::from(value)),
             "--cuda-libraries" => math_directory = Some(PathBuf::from(value)),
-            "--rounding-lanes" => lanes = Some(mebibytes()? as usize),
+            "--rounding-lanes" => {
+                lanes = Some(
+                    number()
+                        .ok()
+                        .filter(|lanes| (1..=MOST_LANES).contains(lanes))
+                        .ok_or_else(|| format!("{arg} is 1 to {MOST_LANES}, not {value}"))?,
+                );
+            }
             "--memory-reserve-mib" => reserve = Some(mebibytes()?),
             "--staging-mib" => staging = Some(mebibytes()?),
             "--lane-pinned-mib" => lane_pinned = Some(mebibytes()?),
-            "--upload-chunk-mib" => chunk = Some(mebibytes()? as usize),
+            "--upload-chunk-mib" => chunk = Some(mebibytes()?),
             other => return Err(format!("unknown calibrate option {other}; the options are {OPTIONS}")),
         }
     }
@@ -192,6 +229,7 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
         staging_mib: staging,
         lane_pinned_mib: lane_pinned,
         upload_chunk_mib: chunk,
+        fresh,
     })
 }
 
@@ -243,6 +281,12 @@ fn read_tokens(path: &Path, limit: usize) -> Result<(Vec<i32>, usize), String> {
         return Err(format!("{}: no tokens", path.display()));
     }
     Ok((tokens, length))
+}
+
+/// `mib` mebibytes as bytes of the flag `flag`, refusing a size that does not fit.
+fn mib_bytes(flag: &str, mib: u64) -> Result<u64, String> {
+    mib.checked_mul(1 << 20)
+        .ok_or_else(|| format!("{flag} {mib} is too many bytes"))
 }
 
 /// The plan of a run of the model's `model_layers` layers that rounds `requested` of them, as Java's `--layers` is a
@@ -378,7 +422,8 @@ fn calibrated(
         &flags.batch.to_string(),
         &tokens_digest(&tokens),
     ]);
-    prepare(&flags.out, &key, model_layers).map_err(|error| error.to_string())?;
+    let prepared =
+        inspect(&flags.out, &key, model_layers, &KEY_FIELDS, flags.fresh).map_err(|error| error.to_string())?;
     let mut run = RunSettings::new(flags.out.clone(), recipe, key, tokens, length);
     run.search = search;
     run.damp = flags.damp;
@@ -387,15 +432,19 @@ fn calibrated(
     if let Some(lanes) = flags.rounding_lanes {
         run.lanes = lanes;
     }
-    run.device_reserve = flags.memory_reserve_mib.map(|mib| mib << 20);
+    run.manifest = Some(prepared.manifest().clone());
+    if let Some(mib) = flags.memory_reserve_mib {
+        run.device_reserve = Some(mib_bytes("--memory-reserve-mib", mib)?);
+    }
     if let Some(mib) = flags.staging_mib {
-        run.staging_bytes = mib << 20;
+        run.staging_bytes = mib_bytes("--staging-mib", mib)?;
     }
     if let Some(mib) = flags.lane_pinned_mib {
-        run.lane_pinned_bytes = mib << 20;
+        run.lane_pinned_bytes = mib_bytes("--lane-pinned-mib", mib)?;
     }
     if let Some(mib) = flags.upload_chunk_mib {
-        run.chunk_bytes = mib << 20;
+        run.chunk_bytes = usize::try_from(mib_bytes("--upload-chunk-mib", mib)?)
+            .map_err(|_| format!("--upload-chunk-mib {mib} is too many bytes"))?;
     }
     let (calibration, completions) = Calibration::open(
         run,
@@ -409,6 +458,8 @@ fn calibrated(
     for source in completions {
         rig.attach(source)?;
     }
+    // Everything the run needs is open: only now does it change the directory.
+    prepared.apply().map_err(|error| error.to_string())?;
     let plan = plan_for(flags.layers, model_layers);
     let (sender, receiver) = mpsc::channel();
     drive(
@@ -530,6 +581,29 @@ mod tests {
         );
         assert!(flags(&with(&["--rounding-lanes", "0"])).is_err());
         assert!(flags(&with(&["--memory-reserve-mib", "x"])).is_err());
+    }
+
+    #[test]
+    fn a_flag_that_is_refused_says_what_it_was_given_and_sizes_have_bounds() {
+        let why = flags(&with(&["--batch", "many"])).unwrap_err();
+        assert!(why.contains("many"), "{why}");
+        let why = flags(&with(&["--rounding-lanes", "65"])).unwrap_err();
+        assert!(why.contains("65") && why.contains("64"), "{why}");
+        assert!(flags(&with(&["--rounding-lanes", "64"])).is_ok());
+        let huge = (MOST_MIB + 1).to_string();
+        assert!(
+            flags(&with(&["--staging-mib", huge.as_str()]))
+                .unwrap_err()
+                .contains(&huge)
+        );
+        assert_eq!(mib_bytes("--x", MOST_MIB).unwrap(), MOST_MIB << 20);
+        assert!(mib_bytes("--x", MOST_MIB + 1).unwrap_err().contains("--x"));
+    }
+
+    #[test]
+    fn fresh_is_a_switch_and_off_unless_named() {
+        assert!(!flags(&with(&[])).unwrap().fresh);
+        assert!(flags(&with(&["--fresh"])).unwrap().fresh);
     }
 
     #[test]

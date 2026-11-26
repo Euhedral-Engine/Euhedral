@@ -109,61 +109,103 @@ def write_state(output, base_offset: int, state: QuantState) -> None:
 
 
 MANIFEST_FILE = "calibration.json"
-
-
 PRODUCER_FAKE_QUANT = "fake_quant"
 
+# The manifest of a codes directory (MANIFEST_FILE) says which files are the producer's and whether they are whole.
+# `quantization calibrate` writes {"key", "layers_done", "layers_total", "heads_done", "mtp_done", "files"}: the state
+# files it saved (file names), and how far it got. A producer that rounds the objects it chooses (fake_quant's export)
+# writes {"producer", "objects", "complete"}: the object names it saved, and whether the export is finished. The
+# converter takes a directory only when its manifest says it is whole and every file in it is listed, and refuses
+# listed files that are missing.
 
-def export_state(directory: Path, name: str, state: QuantState, producer: str = PRODUCER_FAKE_QUANT) -> None:
-    """Saves `state` as the file of object `name` in `directory` and lists the object in the manifest, which a producer
-    other than calibrate writes as {"producer", "objects", "complete"}: the producer covers exactly the objects it
-    lists, and the converter rounds the rest as usual."""
-    directory.mkdir(parents=True, exist_ok=True)
-    state.save(state_file(directory, name))
+
+def _read_manifest(directory: Path) -> dict:
     path = directory / MANIFEST_FILE
-    objects: list[str] = []
-    if path.is_file():
-        try:
-            manifest = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            manifest = {}
-        if manifest.get("producer") == producer:
-            objects = list(manifest.get("objects", []))
-    if name not in objects:
-        objects.append(name)
-    manifest = {"producer": producer, "objects": sorted(objects), "complete": True}
+    if not path.is_file():
+        return {}
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        fail(f"{path} is unreadable: {error}")
+    if not isinstance(manifest, dict):
+        fail(f"{path} is unreadable: not an object")
+    return manifest
+
+
+def _write_manifest(directory: Path, manifest: dict) -> None:
+    path = directory / MANIFEST_FILE
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
 
 
-def require_complete_codes(directory: Path) -> None:
-    """Fails unless `directory` holds a manifest (MANIFEST_FILE) that says its codes are whole: calibrate's, with every
-    layer, both heads and the MTP block written, or one an export_state producer wrote. The converter rounds any object
-    without a file itself, so a directory of a stopped run would otherwise be taken for a whole one."""
+def export_state(directory: Path, name: str, state: QuantState, producer: str = PRODUCER_FAKE_QUANT) -> None:
+    """Saves `state` as the file of object `name` in `directory` and lists the object in the manifest as one of
+    `producer`'s, not yet complete: finish_export says the export is whole. Refuses a directory whose manifest is
+    another producer's (calibrate's included), so an export never overwrites it."""
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest = _read_manifest(directory)
+    if manifest and manifest.get("producer") != producer:
+        fail(f"{directory} holds the {MANIFEST_FILE} of another producer ({manifest.get('producer', 'calibrate')}): "
+             "export to another directory")
+    state.save(state_file(directory, name))
+    objects = list(manifest.get("objects", []))
+    if name not in objects:
+        objects.append(name)
+    _write_manifest(directory, {"producer": producer, "objects": sorted(objects), "complete": False})
+
+
+def finish_export(directory: Path, producer: str = PRODUCER_FAKE_QUANT) -> None:
+    """Marks the export in `directory` complete: call it last, after every export_state."""
+    manifest = _read_manifest(directory)
+    if manifest.get("producer") != producer:
+        fail(f"{directory} has no {MANIFEST_FILE} of {producer}: nothing was exported")
+    _write_manifest(directory, {**manifest, "complete": True})
+
+
+def _strict(manifest: dict, key: str, kind: type, path: Path):
+    value = manifest.get(key)
+    if type(value) is not kind:
+        fail(f"{path} is unreadable: {key} is {value!r}, not {kind.__name__}")
+    return value
+
+
+def require_complete_codes(directory: Path, layers: int | None = None) -> None:
+    """Fails unless `directory` holds a manifest that says its codes are whole (see above): calibrate's with every
+    layer (of the model's `layers`), both heads and the MTP block written, or a finished export. Every file the
+    manifest lists must be there and every state file there must be listed: the converter rounds any object without a
+    file itself, so a stopped run would otherwise be taken for a whole one."""
     path = directory / MANIFEST_FILE
     if not path.is_file():
         fail(f"{directory} has no {MANIFEST_FILE}: it is not the output of a finished calibrate run or of an export")
-    try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-        producer = manifest.get("producer")
-        exported = producer == PRODUCER_FAKE_QUANT and manifest["complete"] is True \
-            and isinstance(manifest["objects"], list)
-        if producer is None:
-            layers_done, layers_total = int(manifest["layers_done"]), int(manifest["layers_total"])
-            heads_done, mtp_done = bool(manifest["heads_done"]), bool(manifest["mtp_done"])
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-        fail(f"{path} is unreadable: {error}")
-    if producer is not None:
-        if not exported:
-            fail(f"{path} is from producer {producer!r}, which is not a complete export of a known producer")
-        return
-    missing = []
-    if layers_done < layers_total:
-        missing.append(f"layers {layers_done} of {layers_total}")
-    if not heads_done:
-        missing.append("the heads")
-    if not mtp_done:
-        missing.append("the MTP block")
-    if missing:
-        fail(f"{directory} is not complete, calibrate wrote only: missing {', '.join(missing)}")
+    manifest = _read_manifest(directory)
+    if "producer" in manifest:
+        if manifest["producer"] != PRODUCER_FAKE_QUANT:
+            fail(f"{path} is from producer {manifest['producer']!r}, which is not a known producer")
+        if not _strict(manifest, "complete", bool, path):
+            fail(f"{directory} is not complete: the export did not finish")
+        objects = _strict(manifest, "objects", list, path)
+        listed = {state_file(directory, name).name for name in objects}
+    else:
+        layers_done = _strict(manifest, "layers_done", int, path)
+        layers_total = _strict(manifest, "layers_total", int, path)
+        heads_done = _strict(manifest, "heads_done", bool, path)
+        mtp_done = _strict(manifest, "mtp_done", bool, path)
+        listed = set(_strict(manifest, "files", list, path))
+        if layers is not None and layers_total != layers:
+            fail(f"{directory} is calibrate output of a model of {layers_total} layers, not {layers}")
+        missing = []
+        if layers_done < layers_total:
+            missing.append(f"layers {layers_done} of {layers_total}")
+        if not heads_done:
+            missing.append("the heads")
+        if not mtp_done:
+            missing.append("the MTP block")
+        if missing:
+            fail(f"{directory} is not complete, calibrate wrote only: missing {', '.join(missing)}")
+    absent = sorted(name for name in listed if not (directory / name).is_file())
+    if absent:
+        fail(f"{directory} lists files that are not there: {', '.join(absent)}")
+    unlisted = sorted(entry.name for entry in directory.glob("*.npz") if entry.name not in listed)
+    if unlisted:
+        fail(f"{directory} holds state files its {MANIFEST_FILE} does not list: {', '.join(unlisted)}")
