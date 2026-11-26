@@ -139,3 +139,76 @@ fn draft_head<H: Heads>(heads: Arc<H>, hessian: DraftHessian, done: Then<()>) {
         }),
     );
 }
+
+/// What a trellis run adds to the heads: its MTP block is the trellis writer's (the [`Heads::mtp`] call rounds and
+/// writes it, and moves no hidden states), and the checkpoint's closing files are written once the heads are rounded.
+pub trait TrellisHeads: Heads {
+    /// Writes the closing files of the checkpoint (the embedding, the final norm and head, the vision tower, the
+    /// copied files, the index and the configs); gives their names, which are saved once it ends.
+    fn close_checkpoint(&self, then: Then<Vec<String>>);
+}
+
+/// Seals `part` with `files`, then goes on to `next`.
+fn sealed_then<H: Heads>(
+    heads: Arc<H>,
+    part: Part,
+    files: Vec<String>,
+    done: Then<()>,
+    next: impl FnOnce(Arc<H>, Then<()>) + Send + 'static,
+) {
+    let sealing = Arc::clone(&heads);
+    sealing.seal(
+        part,
+        files,
+        Box::new(move |sealed| onward(sealed, done, move |(), done| next(heads, done))),
+    );
+}
+
+/// The heads of a trellis run, in Java's order: the MTP block (written by the trellis writer, whatever `--skip-mtp`
+/// says: the checkpoint carries it), the output head's Hessian, the output head and the draft head, both under that
+/// Hessian, then the checkpoint's closing files, and last the resume file's dropping.
+///
+/// The draft head is sealed after the closing files, so that the manifest never counts the heads written before the
+/// checkpoint is whole: a run that fails in between resumes at the heads, and rounds them again.
+pub fn run_trellis<H: TrellisHeads>(heads: Arc<H>, done: Then<()>) {
+    let first = Arc::clone(&heads);
+    first.mtp(Box::new(move |files| {
+        onward(files, done, move |files, done| {
+            sealed_then(heads, Part::Mtp, files, done, trellis_observe);
+        });
+    }));
+}
+
+fn trellis_observe<H: TrellisHeads>(heads: Arc<H>, done: Then<()>) {
+    let observing = Arc::clone(&heads);
+    observing.observe(Box::new(move |observed| {
+        onward(observed, done, move |(), done| {
+            let rounding = Arc::clone(&heads);
+            rounding.output_head(Box::new(move |files| {
+                onward(files, done, move |files, done| {
+                    sealed_then(heads, Part::OutputHead, files, done, trellis_draft);
+                });
+            }));
+        });
+    }));
+}
+
+fn trellis_draft<H: TrellisHeads>(heads: Arc<H>, done: Then<()>) {
+    let rounding = Arc::clone(&heads);
+    rounding.draft_head(
+        DraftHessian::OutputHead,
+        Box::new(move |drafted| {
+            onward(drafted, done, move |mut files, done| {
+                let closing = Arc::clone(&heads);
+                closing.close_checkpoint(Box::new(move |closed| {
+                    onward(closed, done, move |closed, done| {
+                        files.extend(closed);
+                        sealed_then(heads, Part::DraftHead, files, done, |heads, done| {
+                            heads.drop_checkpoint(done)
+                        });
+                    });
+                }));
+            });
+        }),
+    );
+}

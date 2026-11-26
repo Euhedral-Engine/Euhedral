@@ -388,3 +388,87 @@ fn a_save_that_cannot_open_fails_and_leaves_no_file() {
     assert!(!path.exists());
     world.finish();
 }
+
+/// A trellis run lists its heads' state files as `heads/<name>`: the one directory inside the output a listed name may
+/// be in.
+#[test]
+fn a_listed_name_may_be_inside_the_heads_directory_and_nowhere_deeper_or_outside() {
+    let listing = |names: &[&str]| {
+        let mut manifest = Manifest::new("A", 64);
+        manifest.files = names.iter().map(|name| name.to_string()).collect();
+        Manifest::parse(&manifest.to_bytes().unwrap())
+    };
+    assert!(listing(&["heads/text__output_head.npz", "layer.safetensors"]).is_ok());
+    for refused in [
+        "heads/deeper/x.npz",
+        "other/x.npz",
+        "heads/",
+        "heads/..",
+        "heads//x",
+        "../heads/x.npz",
+    ] {
+        assert!(listing(&[refused]).is_err(), "{refused} was accepted");
+    }
+}
+
+/// `--fresh` removes the files of the heads directory the manifest lists and no other file in it; the directory is
+/// made again by `apply` for the run that follows.
+#[test]
+fn fresh_removes_only_the_listed_files_of_the_heads_directory_and_apply_makes_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let heads = directory.path().join("heads");
+    fs::create_dir(&heads).unwrap();
+    fs::write(heads.join("listed.npz"), b"listed").unwrap();
+    fs::write(heads.join("note.txt"), b"mine").unwrap();
+    let mut manifest = Manifest::new("A", 64);
+    manifest.files = vec!["heads/listed.npz".to_owned()];
+    fs::write(directory.path().join("calibration.json"), manifest.to_bytes().unwrap()).unwrap();
+    let kept = inspect(directory.path(), "A", 64, &FIELDS, true).unwrap();
+    assert!(heads.join("listed.npz").exists(), "inspect changes nothing");
+    kept.creating("heads").apply().unwrap();
+    assert!(!heads.join("listed.npz").exists());
+    assert!(heads.join("note.txt").exists());
+
+    let fresh = tempfile::tempdir().unwrap();
+    inspect(fresh.path(), "A", 64, &FIELDS, false)
+        .unwrap()
+        .creating("heads")
+        .apply()
+        .unwrap();
+    assert!(fresh.path().join("heads").is_dir());
+}
+
+/// A resumed directory whose listed heads file is gone is refused, naming it.
+#[test]
+fn a_listed_heads_file_that_is_gone_refuses_the_resume() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manifest = Manifest::new("A", 64);
+    manifest.files = vec!["heads/gone.npz".to_owned()];
+    fs::write(directory.path().join("calibration.json"), manifest.to_bytes().unwrap()).unwrap();
+    let why = inspect(directory.path(), "A", 64, &FIELDS, false)
+        .unwrap_err()
+        .to_string();
+    assert!(why.contains("heads/gone.npz"), "{why}");
+}
+
+/// A trellis directory whose manifest is complete (the MTP block and the heads sealed, the heads in their directory) is
+/// finished: the run does nothing, and applying it, as the command does not, would change none of its files.
+#[test]
+fn a_complete_trellis_directory_is_finished_and_its_files_stay() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("heads")).unwrap();
+    fs::write(directory.path().join("heads/text__output_head.npz"), b"head").unwrap();
+    fs::write(directory.path().join("mtp.safetensors"), b"mtp").unwrap();
+    let mut manifest = Manifest::new("A", 2);
+    manifest.layers_done = 2;
+    manifest.mtp_done = true;
+    manifest.heads_done = true;
+    manifest.files = vec!["mtp.safetensors".to_owned(), "heads/text__output_head.npz".to_owned()];
+    fs::write(directory.path().join("calibration.json"), manifest.to_bytes().unwrap()).unwrap();
+    let before = fs::read(directory.path().join("calibration.json")).unwrap();
+    let prepared = inspect(directory.path(), "A", 2, &FIELDS, false).unwrap();
+    assert!(prepared.finished());
+    prepared.creating("heads").apply().unwrap();
+    assert_eq!(fs::read(directory.path().join("calibration.json")).unwrap(), before);
+    assert!(directory.path().join("heads/text__output_head.npz").exists());
+}

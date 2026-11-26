@@ -23,7 +23,7 @@ use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use euhedral_gpu::cuda::{CudaGpu, CudaModule, CudaQueue};
+use euhedral_gpu::cuda::{CudaGpu, CudaModule, CudaQueue, CudaStream};
 use euhedral_gpu::{Gpu, GpuError, Lane, Stream, StreamOptions, open_shared_lanes};
 use euhedral_graph::{Completions, DeviceQueue, Lake, LaneId, Marker};
 use euhedral_inference_cuda::launch::Modes;
@@ -39,9 +39,9 @@ use super::draft_ids::check_draft_ids;
 use super::driver::{Once, Then, end, single};
 use super::embedding;
 use super::files::{Region, resume, save, write_checkpoint};
-use super::heads::run as run_heads;
+use super::heads::{run as run_heads, run_trellis};
 use super::hessians::HessianSet;
-use super::manifest::{Ledger, MANIFEST_FILE, Manifest, RESUME_FILE};
+use super::manifest::{HEADS_DIRECTORY, Ledger, MANIFEST_FILE, Manifest, RESUME_FILE};
 use super::plan::{Plan, round_order};
 use super::rounding::{Ended, HEAD_ROWS, Linear, RoundSettings, Services, round_all};
 use super::{CalibrateError, Stages};
@@ -60,9 +60,13 @@ use crate::resume::ResumeFile;
 use crate::step::{Kind, idle, step};
 
 mod heads;
+mod trellis;
 
 use super::head_state::HeadState;
 use heads::{DeviceHeads, OUTPUT_HEAD};
+use trellis::{Opening, Trellis, TrellisDeviceHeads, round_layer};
+
+pub use trellis::TrellisRun;
 
 /// The checkpoint tensor the tokens are looked up in.
 const EMBEDDING: &str = "model.language_model.embed_tokens.weight";
@@ -120,6 +124,9 @@ pub struct Settings {
     /// The manifest the run starts from (a resumed directory's, or a new one): its key names the run in the resume
     /// file, and it is all the run resumes from.
     pub manifest: Manifest,
+    /// What a trellis run is, when it is one: the layers are then rounded in the trellis format and written as an exl3
+    /// checkpoint, and the GPTQ lanes only round the heads.
+    pub trellis: Option<TrellisRun>,
 }
 
 impl Settings {
@@ -142,6 +149,7 @@ impl Settings {
             skip_mtp: false,
             draft_ids: Vec::new(),
             manifest,
+            trellis: None,
         }
     }
 
@@ -195,6 +203,8 @@ struct Inner {
     pass_length: Arc<AtomicUsize>,
     /// What the heads keep on the card between their calls.
     heads: Handoff<HeadState<DeviceBuffer>>,
+    /// The trellis lanes and writer, when the run is a trellis run.
+    trellis: Option<Trellis>,
 }
 
 /// The calibration on the card; its calls are [`Stages`].
@@ -206,6 +216,19 @@ impl Debug for Calibration {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter.debug_struct("Calibration").finish_non_exhaustive()
     }
+}
+
+/// The math handles of `stream`'s lane, made on it.
+fn lane_handles(math: &Arc<MathLibraries>, stream: &mut CudaStream, what: &str) -> Result<LaneHandles, CalibrateError> {
+    let mut handles = None;
+    Stream::submit(stream, |_| {
+        handles = Some(math.lane_handles());
+        Ok(())
+    })
+    .map_err(|error| CalibrateError::failed(&format!("the {what} lane's handles"), error))?;
+    handles
+        .ok_or_else(|| CalibrateError::Failed(format!("the {what} lane made no handles")))?
+        .map_err(|error| CalibrateError::failed(&format!("the {what} lane's handles"), format!("{error:?}")))
 }
 
 fn gpu_error(error: impl Display) -> GpuError {
@@ -304,7 +327,13 @@ impl Calibration {
         let batch_states = DeviceBuffer::alloc(&library, batch * length * hidden * BF16_BYTES)
             .map_err(|error| CalibrateError::failed("the batch states", error))?;
 
-        let lane_names: Vec<String> = (0..settings.lanes.max(1)).map(|lane| format!("gptq{lane}")).collect();
+        // A trellis run's GPTQ lanes round the heads only, one at a time.
+        let gptq_lanes = if settings.trellis.is_some() {
+            1
+        } else {
+            settings.lanes.max(1)
+        };
+        let lane_names: Vec<String> = (0..gptq_lanes).map(|lane| format!("gptq{lane}")).collect();
         let lane_refs: Vec<&str> = lane_names.iter().map(String::as_str).collect();
         let (pool, streams) = gpu
             .open_lanes(&lane_refs, StreamOptions::default())
@@ -317,15 +346,7 @@ impl Calibration {
         };
         let mut lanes = Vec::new();
         for mut stream in streams {
-            let mut handles = None;
-            Stream::submit(&mut stream, |_| {
-                handles = Some(math.lane_handles());
-                Ok(())
-            })
-            .map_err(|error| CalibrateError::failed("the GPTQ lane's handles", error))?;
-            let handles = handles
-                .ok_or_else(|| CalibrateError::Failed("the GPTQ lane made no handles".to_owned()))?
-                .map_err(|error| CalibrateError::failed("the GPTQ lane's handles", format!("{error:?}")))?;
+            let handles = lane_handles(&math, &mut stream, "GPTQ")?;
             let memory = LaneMemory::new(Arc::clone(&library), Arc::clone(&lane_pinned));
             let lane = GptqLane::new(
                 stream,
@@ -364,6 +385,29 @@ impl Calibration {
             },
         ]);
         let owner = planner.open_owner(OwnerSpec::new("calibrate", Priority(0), Scope::Process));
+        // A trellis run's heads write their states beside, not among, the checkpoint's files.
+        let heads_out = match settings.trellis {
+            Some(_) => settings.out.join(HEADS_DIRECTORY),
+            None => settings.out.clone(),
+        };
+        let trellis = match &settings.trellis {
+            Some(run) => Some(trellis::open(
+                Opening {
+                    gpu: &gpu,
+                    math: &math,
+                    modules: &mut modules,
+                    library: &library,
+                    objects: &objects,
+                    lane_pinned: &lane_pinned,
+                    capacity,
+                    settings: &settings,
+                    io: &io,
+                    host: &host,
+                },
+                run,
+            )?),
+            None => None,
+        };
         let services = Arc::new(Services {
             planner,
             owner,
@@ -375,12 +419,16 @@ impl Calibration {
                 act_order: settings.act_order,
                 slice_rows: HEAD_ROWS,
             },
-            out: settings.out.clone(),
+            out: heads_out,
             io,
             host,
         });
         // The device and its lane pools stay open for the lanes' life: the queues hold them weakly.
         forget((gpu, shared, pool));
+        let (trellis, trellis_completions) = match trellis {
+            Some((trellis, completions)) => (Some(trellis), Some(completions)),
+            None => (None, None),
+        };
         let inner = Arc::new(Inner {
             settings,
             objects,
@@ -402,11 +450,14 @@ impl Calibration {
             hidden,
             pass_length: Arc::new(AtomicUsize::new(length)),
             heads: Handoff::empty(),
+            trellis,
         });
         inner.heads.send(HeadState::default());
         inner.handles.send(symmetric);
         inner.lanes.send(lanes);
-        Ok((Calibration { inner }, vec![completions, gptq_completions]))
+        let mut sources = vec![completions, gptq_completions];
+        sources.extend(trellis_completions);
+        Ok((Calibration { inner }, sources))
     }
 }
 
@@ -530,11 +581,15 @@ impl Stages for Calibration {
 
     /// The heads over the states the layers left: see [`heads`].
     fn finish(&self, then: Then<()>) {
-        run_heads(
-            Arc::new(DeviceHeads::new(Arc::clone(&self.inner))),
-            self.inner.settings.skip_mtp,
-            then,
-        );
+        if self.inner.trellis.is_some() {
+            run_trellis(Arc::new(TrellisDeviceHeads::new(Arc::clone(&self.inner))), then);
+        } else {
+            run_heads(
+                Arc::new(DeviceHeads::new(Arc::clone(&self.inner))),
+                self.inner.settings.skip_mtp,
+                then,
+            );
+        }
     }
 }
 
@@ -735,14 +790,14 @@ fn upload(inner: Arc<Inner>, target: Target, staged: StagedLayer, then: Once<()>
             let next = Arc::clone(&inner);
             after(&inner, marker, move || {
                 drop(staged);
-                observe(next, weights, then);
+                observe(next, target, weights, then);
             });
         }
     }
 }
 
 /// The observe pass: the layer runs over every sequence and the Hessians fill; its outputs are discarded.
-fn observe(inner: Arc<Inner>, weights: LayerWeights, then: Once<()>) {
+fn observe(inner: Arc<Inner>, target: Target, weights: LayerWeights, then: Once<()>) {
     let layer = Arc::new(weights);
     let back = Arc::new(Handoff::empty());
     let seen = Observed {
@@ -765,7 +820,7 @@ fn observe(inner: Arc<Inner>, weights: LayerWeights, then: Once<()>) {
                     Ok((weights, set))
                 });
             match outcome {
-                Ok((weights, set)) => complete(next, weights, set, ended),
+                Ok((weights, set)) => complete(next, target, weights, set, ended),
                 Err(error) => end(&ended, Err(error)),
             }
         }),
@@ -776,7 +831,10 @@ fn observe(inner: Arc<Inner>, weights: LayerWeights, then: Once<()>) {
 }
 
 /// Completes the Hessians and makes each linear's decoded weight, on the main lane, then rounds.
-fn complete(inner: Arc<Inner>, weights: LayerWeights, set: HessianSet<DeviceBuffer>, then: Once<()>) {
+fn complete(inner: Arc<Inner>, target: Target, weights: LayerWeights, set: HessianSet<DeviceBuffer>, then: Once<()>) {
+    if let (Some(_), Target::Layer(index)) = (&inner.trellis, target) {
+        return round_layer(inner, index, weights, set, then);
+    }
     let shapes = weights.shapes().to_vec();
     let order = round_order(&shapes);
     let submitted = inner.main.submit_marked(|queue| {

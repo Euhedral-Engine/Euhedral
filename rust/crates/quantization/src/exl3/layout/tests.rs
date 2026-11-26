@@ -131,6 +131,30 @@ fn a_file_written_again_replaces_its_entries() {
     assert_eq!(index["weight_map"]["x"], "a.safetensors");
 }
 
+// A run resumed from files an earlier run left records them after the MTP block it wrote itself; its index must still
+// be the one of a run that wrote them in turn.
+#[test]
+fn the_index_lists_layers_by_number_then_the_mtp_block_whatever_the_order_they_were_recorded_in() {
+    let stored = Stored {
+        dtype: "F16".to_owned(),
+        shape: vec![1],
+        bytes: 2,
+    };
+    let record = |ledger: &mut Ledger, file: &str, tensor: &str| {
+        ledger.record_file(file, &[(tensor.to_owned(), stored.clone())]);
+    };
+    let layer = |number: usize| format!("{TEXT}layers.{number}.safetensors");
+    let mut ledger = Ledger::default();
+    record(&mut ledger, "mtp.safetensors", "m");
+    record(&mut ledger, &layer(10), "l10");
+    record(&mut ledger, &layer(2), "l2");
+    record(&mut ledger, "lm_head.safetensors", "h");
+    record(&mut ledger, &layer(0), "l0");
+    let index = ledger.index();
+    let order: Vec<&String> = index["weight_map"].as_object().unwrap().keys().collect();
+    assert_eq!(order, ["l0", "l2", "l10", "m", "h"]);
+}
+
 // A mutant that writes a made-up name for a dtype with no torch name gives a loader a dtype that does not exist.
 #[test]
 fn a_dtype_without_a_torch_name_is_stored_as_null() {

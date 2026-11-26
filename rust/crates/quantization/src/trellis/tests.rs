@@ -364,3 +364,27 @@ fn a_grid_taller_than_the_device_allows_is_refused_when_planned() {
     assert!(too_tall(plan_tile_mean_square(8, 16 * 65536, 16, 16)));
     assert!(plan_tile_mean_square(8, 16 * 65535, 16, 16).is_ok());
 }
+
+#[test]
+fn normalising_a_hessian_divides_every_element_by_the_count_of_rows() {
+    let rig = rig();
+    let (_compiled, kernels) = trellis_kernels(&rig);
+    let steps = plan_normalise_hessian(8, 128, 4096).unwrap();
+    run(&rig, &kernels, &steps).unwrap();
+    let launched = rig.launched.lock().unwrap();
+    assert_eq!(launched.len(), 1);
+    let (name, _, args) = &launched[0];
+    assert_eq!(name, "scale_scalar");
+    assert_eq!(args.read::<u64>(1), Some(128 * 128));
+    assert_eq!(args.read::<f32>(2), Some(4096.0));
+    assert_eq!(args.read::<i32>(3), Some(1), "1 divides");
+}
+
+#[test]
+fn a_hessian_with_no_rows_or_no_address_is_not_normalised() {
+    assert!(plan_normalise_hessian(8, 128, 0).is_err());
+    assert!(matches!(
+        plan_normalise_hessian(0, 128, 4),
+        Err(TrellisError::NullAddress("x"))
+    ));
+}

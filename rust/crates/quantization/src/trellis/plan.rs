@@ -2,6 +2,7 @@
 
 use euhedral_gpu::{Args, Dim3, Launch};
 
+use super::launch::{Scaling, plan_scale_scalar};
 use super::rate::{Rate, TILE_WEIGHTS};
 use super::{Step, TrellisError};
 use crate::kernels::Module;
@@ -341,6 +342,25 @@ pub fn plan_fill_floats(x: u64, count: u64, value: f32) -> Result<Vec<Step>, Tre
         Dim3::x(elementwise(count)),
         256,
         Args::new().device(x).arg(signed).arg(value),
+    )?])
+}
+
+/// Divides the `k` by `k` FP32 Hessian at `hessian` by `count`, the rows it was summed over: the form the quantizer
+/// takes. The count is a float in the kernel, as Java's.
+pub fn plan_normalise_hessian(hessian: u64, k: u32, count: u64) -> Result<Vec<Step>, TrellisError> {
+    if count == 0 {
+        return Err(TrellisError::NotMultiple {
+            name: "count",
+            value: 0,
+            unit: 1,
+        });
+    }
+    let elements = u64::from(k) * u64::from(k);
+    Ok(vec![plan_scale_scalar(
+        hessian,
+        elements,
+        count as f32,
+        Scaling::Divide,
     )?])
 }
 

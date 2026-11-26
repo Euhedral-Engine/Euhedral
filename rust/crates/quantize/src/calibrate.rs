@@ -1,10 +1,17 @@
-//! The `calibrate` command for GPTQ: the BF16 checkpoint run layer by layer over calibration tokens, each layer's
+//! The `calibrate` command: the BF16 checkpoint run layer by layer over calibration tokens, each layer's
 //! linears rounded from the Hessians of their inputs and written to the output directory, with `calibration.json`
 //! listing the files saved (the resume file among them) and how far the run got. The output directory must be empty
 //! or hold the same run's manifest with every file it lists (the run resumes from what it lists); another run's
 //! manifest, or this run's with listed files missing, is refused unless `--fresh`, which removes only the files the
 //! manifest lists and starts over; any other content is refused, and nothing is removed or written before the
-//! checkpoint and the device have opened. The trellis arm is not part of this build.
+//! checkpoint and the device have opened.
+//!
+//! `--format trellis` (with `--bits`, the average bits per weight, and `--quantization trellis`) rounds each layer in
+//! the trellis format and writes the exl3 checkpoint to `--out`, with the output head and the draft head, rounded with
+//! the recipe, in `--out/heads`; `--viterbi-scratch-mib` and `--write-buffer-mib` size the rounding and the writer.
+//! The rates the allocation gives, and the Viterbi scratch, are checked before anything is touched, and the rate and the
+//! allocation are part of what names the run. The MTP block is written whatever `--skip-mtp` says in Java, so this
+//! build refuses `--skip-mtp` with the trellis format instead.
 //!
 //! A run of every layer then rounds, as Java does, the MTP block (unless `--skip-mtp`), `mtp/input_projection`, the
 //! output head and the draft head, and lists each in the manifest as it is written; the resume file is dropped after
@@ -21,13 +28,15 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
-use euhedral_inference_quantization::calibrate::device::{Calibration, Settings as RunSettings};
+use euhedral_inference_quantization::calibrate::allocation::Allocation;
+use euhedral_inference_quantization::calibrate::device::{Calibration, Settings as RunSettings, TrellisRun};
 use euhedral_inference_quantization::calibrate::draft_ids::read_draft_ids;
-use euhedral_inference_quantization::calibrate::manifest::inspect;
+use euhedral_inference_quantization::calibrate::manifest::{HEADS_DIRECTORY, inspect};
 use euhedral_inference_quantization::calibrate::plan::{resume_key, values_digest};
 use euhedral_inference_quantization::calibrate::{Plan, drive};
 use euhedral_inference_quantization::checkpoint::objects::Qwen38Objects;
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
+use euhedral_inference_quantization::exl3::linears::qwen38_of;
 use euhedral_inference_quantization::gptq::format::Nvfp4Search;
 use euhedral_inference_quantization::npy::Npy;
 use euhedral_inference_quantization::recipe::{Quantization, Recipe};
@@ -61,13 +70,43 @@ const KEY_FIELDS: [&str; 12] = [
     "--skip-mtp",
     "the draft ids",
 ];
-/// What the trellis arm takes: refused by name.
+/// The parts of a trellis run's resume key: a GPTQ run's, then the rate asked for and the allocation it gives.
+const TRELLIS_KEY_FIELDS: [&str; 14] = [
+    KEY_FIELDS[0],
+    KEY_FIELDS[1],
+    KEY_FIELDS[2],
+    KEY_FIELDS[3],
+    KEY_FIELDS[4],
+    KEY_FIELDS[5],
+    KEY_FIELDS[6],
+    KEY_FIELDS[7],
+    KEY_FIELDS[8],
+    KEY_FIELDS[9],
+    KEY_FIELDS[10],
+    KEY_FIELDS[11],
+    "--bits",
+    "the allocation",
+];
+/// The trellis options, which need `--format trellis`.
 const TRELLIS_OPTIONS: [&str; 3] = ["--bits", "--viterbi-scratch-mib", "--write-buffer-mib"];
+/// Java's defaults and the cap of the writer's buffer (its bytes fit an `int`).
+const DEFAULT_VITERBI_MIB: u64 = 256;
+const DEFAULT_WRITE_BUFFER_MIB: u64 = 16;
+const MOST_WRITE_BUFFER_MIB: u64 = 1023;
 /// What the command line accepts, for the message that refuses another option.
 const OPTIONS: &str = "--model, --quantization, --compressed, --output-head, --tokens, --draft-ids-from, --out, \
 --act-order, --damp, --batch, --sequences, --layers, --skip-mtp, --nvfp4-above, --nvfp4-scale-max, --format, \
---config, --library (or --cuda-library), --cuda-libraries, --rounding-lanes, --memory-reserve-mib, --staging-mib, \
---lane-pinned-mib, --upload-chunk-mib, --fresh";
+--bits, --viterbi-scratch-mib, --write-buffer-mib, --config, --library (or --cuda-library), --cuda-libraries, \
+--rounding-lanes, --memory-reserve-mib, --staging-mib, --lane-pinned-mib, --upload-chunk-mib, --fresh";
+
+/// What `--format trellis` takes.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TrellisFlags {
+    /// The average bits per weight.
+    pub bits: f64,
+    pub viterbi_scratch_mib: u64,
+    pub write_buffer_mib: u64,
+}
 
 /// The flags of a run, checked.
 #[derive(Debug)]
@@ -108,16 +147,15 @@ pub(crate) struct Flags {
     /// The artifact whose `text/draft_head_token_ids` name the output head's rows the draft head keeps; a run of
     /// every layer needs it.
     pub draft_ids_from: Option<PathBuf>,
-}
-
-fn trellis_refusal(option: &str) -> String {
-    format!("calibrate: {option} is a trellis option, and the trellis arm is not part of this build")
+    /// Set by `--format trellis`.
+    pub trellis: Option<TrellisFlags>,
 }
 
 pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
     let (mut model, mut quantization, mut output_head, mut tokens, mut out) = (None, None, None, None, None);
     let (mut compressed, mut act_order, mut fresh, mut skip_mtp) = (false, false, false, false);
     let mut draft_ids_from = None;
+    let (mut format_trellis, mut bits, mut viterbi_mib, mut write_buffer_mib) = (false, None, None, None);
     let (mut damp, mut batch, mut sequences, mut layers) = (DEFAULT_DAMP, DEFAULT_BATCH, 0, DEFAULT_LAYERS);
     let (mut above, mut scale_max) = (Nvfp4Search::DEFAULT.above(), Nvfp4Search::DEFAULT.scale_max());
     let (mut config, mut library) = (None, None);
@@ -144,9 +182,6 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
             }
             _ => {}
         }
-        if TRELLIS_OPTIONS.contains(&arg.as_str()) {
-            return Err(trellis_refusal(arg));
-        }
         let value = rest.next().ok_or_else(|| format!("{arg} needs a value"))?;
         let number = || {
             value
@@ -172,9 +207,28 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
             }
             "--format" => match value.as_str() {
                 "gptq" => {}
-                "trellis" => return Err(trellis_refusal("--format trellis")),
+                "trellis" => format_trellis = true,
                 other => return Err(format!("--format is gptq or trellis, not {other}")),
             },
+            "--bits" => {
+                bits = Some(
+                    value
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|bits| bits.is_finite() && *bits > 0.0)
+                        .ok_or_else(|| format!("{arg} needs a positive number, not {value}"))?,
+                );
+            }
+            "--viterbi-scratch-mib" => viterbi_mib = Some(mebibytes()?),
+            "--write-buffer-mib" => {
+                write_buffer_mib = Some(
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|mib| (1..=MOST_WRITE_BUFFER_MIB).contains(mib))
+                        .ok_or_else(|| format!("{arg} is 1 to {MOST_WRITE_BUFFER_MIB} MiB, not {value}"))?,
+                );
+            }
             "--output-head" => output_head = Some(value.clone()),
             "--tokens" => tokens = Some(PathBuf::from(value)),
             "--draft-ids-from" => draft_ids_from = Some(PathBuf::from(value)),
@@ -210,9 +264,32 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
     let (Some(model), Some(quantization), Some(tokens), Some(out)) = (model, quantization, tokens, out) else {
         return Err("calibrate needs --model, --quantization, --tokens and --out".to_owned());
     };
-    if quantization == Quantization::Trellis {
-        return Err(trellis_refusal("--quantization trellis"));
-    }
+    let given = [bits.is_some(), viterbi_mib.is_some(), write_buffer_mib.is_some()];
+    let trellis = match (format_trellis, quantization == Quantization::Trellis) {
+        (true, true) => {
+            if skip_mtp {
+                return Err(
+                    "--skip-mtp is refused with --format trellis: the checkpoint carries the MTP block".to_owned(),
+                );
+            }
+            Some(TrellisFlags {
+                bits: bits.ok_or_else(|| "--format trellis needs --bits".to_owned())?,
+                viterbi_scratch_mib: viterbi_mib.unwrap_or(DEFAULT_VITERBI_MIB),
+                write_buffer_mib: write_buffer_mib.unwrap_or(DEFAULT_WRITE_BUFFER_MIB),
+            })
+        }
+        (true, false) => return Err("--format trellis needs --quantization trellis".to_owned()),
+        (false, true) => return Err("--quantization trellis needs --format trellis".to_owned()),
+        (false, false) => {
+            if let Some(at) = given.iter().position(|given| *given) {
+                return Err(format!(
+                    "{} is a trellis option: it needs --format trellis",
+                    TRELLIS_OPTIONS[at]
+                ));
+            }
+            None
+        }
+    };
     if !(damp.is_finite() && damp > 0.0) {
         return Err(format!("--damp must be positive, not {damp}"));
     }
@@ -249,6 +326,7 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
         fresh,
         skip_mtp,
         draft_ids_from,
+        trellis,
     })
 }
 
@@ -432,30 +510,66 @@ fn draft_ids_flag(flags: &Flags) -> Result<&Path, String> {
         .ok_or_else(|| "a calibration rounds the draft head: it needs --draft-ids-from".to_owned())
 }
 
-/// What names a run, in the order of [`KEY_FIELDS`].
+/// What names a run, in the order of [`KEY_FIELDS`], or of [`TRELLIS_KEY_FIELDS`] for a trellis run: then the rate and
+/// the allocation follow.
 fn run_key(
     flags: &Flags,
     recipe: &Recipe,
     search: &Nvfp4Search,
     (tokens, length): (&[i32], usize),
     draft_ids: &[i32],
+    allocation: Option<&Allocation>,
 ) -> String {
     let tokens_path = fs::canonicalize(&flags.tokens).unwrap_or_else(|_| flags.tokens.clone());
     let model_path = fs::canonicalize(&flags.model).unwrap_or_else(|_| flags.model.clone());
-    resume_key(&[
-        &tokens_path.display().to_string(),
-        &(tokens.len() / length).to_string(),
-        &length.to_string(),
-        &format!("{recipe:?}"),
-        &flags.act_order.to_string(),
-        &flags.damp.to_string(),
-        &model_path.display().to_string(),
-        &format!("{search:?}"),
-        &flags.batch.to_string(),
-        &values_digest(tokens),
-        &flags.skip_mtp.to_string(),
-        &values_digest(draft_ids),
-    ])
+    let mut parts = vec![
+        tokens_path.display().to_string(),
+        (tokens.len() / length).to_string(),
+        length.to_string(),
+        format!("{recipe:?}"),
+        flags.act_order.to_string(),
+        flags.damp.to_string(),
+        model_path.display().to_string(),
+        format!("{search:?}"),
+        flags.batch.to_string(),
+        values_digest(tokens),
+        flags.skip_mtp.to_string(),
+        values_digest(draft_ids),
+    ];
+    if let (Some(trellis), Some(allocation)) = (&flags.trellis, allocation) {
+        parts.push(trellis.bits.to_string());
+        parts.push(allocation.digest());
+    }
+    resume_key(&parts.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// The regular files of the source checkpoint's directory, by name, which the checkpoint's copied files come from. A
+/// symbolic link to a file counts, as in a Hugging Face cache snapshot, where every file is one; a link to nothing does
+/// not. A source without `config.json` is refused, since the checkpoint it would write has no config to copy.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a binary: the directory is listed on its main thread before the run starts"
+)]
+fn source_files(model: &Path) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(model).map_err(|error| format!("{}: {error}", model.display()))? {
+        let entry = entry.map_err(|error| format!("{}: {error}", model.display()))?;
+        if entry.path().is_file() {
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|name| format!("{name:?} is not a file name in UTF-8"))?;
+            files.push(name);
+        }
+    }
+    files.sort();
+    if !files.iter().any(|name| name == "config.json") {
+        return Err(format!(
+            "--model {} has no config.json, which the trellis checkpoint copies",
+            model.display()
+        ));
+    }
+    Ok(files)
 }
 
 #[allow(
@@ -506,11 +620,39 @@ fn calibrated(
     let search = Nvfp4Search::new(flags.nvfp4_above, flags.nvfp4_scale_max).map_err(|error| error.to_string())?;
     let plan = plan_for(flags.layers, model_layers);
     let draft_ids = draft_ids(draft_ids_flag(flags)?, objects.config.vocabulary)?;
-    let key = run_key(flags, &recipe, &search, (&tokens, length), &draft_ids);
-    let prepared =
-        inspect(&flags.out, &key, model_layers, &KEY_FIELDS, flags.fresh).map_err(|error| error.to_string())?;
+    // The rates are refused before the directory or the device is touched.
+    let source_files = match &flags.trellis {
+        Some(_) => source_files(&flags.model)?,
+        None => Vec::new(),
+    };
+    let allocation = match &flags.trellis {
+        Some(trellis) => {
+            let linears = qwen38_of(&objects).map_err(|error| error.to_string())?;
+            let scratch = mib_bytes("--viterbi-scratch-mib", trellis.viterbi_scratch_mib)?;
+            Some(Allocation::refuse(&linears, model_layers, trellis.bits, scratch).map_err(|error| error.to_string())?)
+        }
+        None => None,
+    };
+    let key = run_key(
+        flags,
+        &recipe,
+        &search,
+        (&tokens, length),
+        &draft_ids,
+        allocation.as_ref(),
+    );
+    let fields: &[&str] = if allocation.is_some() {
+        &TRELLIS_KEY_FIELDS
+    } else {
+        &KEY_FIELDS
+    };
+    let mut prepared =
+        inspect(&flags.out, &key, model_layers, fields, flags.fresh).map_err(|error| error.to_string())?;
     if prepared.finished() {
         return Ok(Ended::AlreadyComplete);
+    }
+    if allocation.is_some() {
+        prepared = prepared.creating(HEADS_DIRECTORY);
     }
     let mut run = RunSettings::new(flags.out.clone(), recipe, prepared.manifest().clone(), tokens, length);
     run.search = search;
@@ -519,8 +661,23 @@ fn calibrated(
     run.batch = flags.batch;
     run.skip_mtp = flags.skip_mtp;
     run.draft_ids = draft_ids;
-    if let Some(lanes) = flags.rounding_lanes {
-        run.lanes = lanes;
+    match (&flags.trellis, allocation) {
+        (Some(trellis), Some(allocation)) => {
+            run.trellis = Some(TrellisRun {
+                allocation,
+                viterbi_scratch_bytes: mib_bytes("--viterbi-scratch-mib", trellis.viterbi_scratch_mib)?,
+                write_buffer_bytes: usize::try_from(mib_bytes("--write-buffer-mib", trellis.write_buffer_mib)?)
+                    .map_err(|_| "--write-buffer-mib is too many bytes".to_owned())?,
+                rounding_lanes: flags.rounding_lanes,
+                source: flags.model.clone(),
+                source_files,
+            });
+        }
+        _ => {
+            if let Some(lanes) = flags.rounding_lanes {
+                run.lanes = lanes;
+            }
+        }
     }
     if let Some(mib) = flags.memory_reserve_mib {
         run.device_reserve = Some(mib_bytes("--memory-reserve-mib", mib)?);
@@ -573,7 +730,48 @@ fn calibrated(
 mod tests {
     use super::*;
     use euhedral_inference_quantization::calibrate::manifest::{Manifest, differences};
+    use euhedral_inference_quantization::exl3::allocation::Linear;
     use euhedral_inference_quantization::npy::encode_elements;
+
+    #[cfg(unix)]
+    fn snapshot(files: &[&str]) -> tempfile::TempDir {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = dir.path().join("blobs");
+        fs::create_dir(&blobs).unwrap();
+        let snapshot = dir.path().join("snapshot");
+        fs::create_dir(&snapshot).unwrap();
+        for file in files {
+            fs::write(blobs.join(file), b"x").unwrap();
+            symlink(blobs.join(file), snapshot.join(file)).unwrap();
+        }
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_whose_files_are_all_symbolic_links_lists_them_all() {
+        let dir = snapshot(&["config.json", "tokenizer.json"]);
+        let listed = source_files(&dir.path().join("snapshot")).unwrap();
+        assert_eq!(listed, ["config.json", "tokenizer.json"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_nothing_is_not_a_source_file() {
+        use std::os::unix::fs::symlink;
+        let dir = snapshot(&["config.json"]);
+        symlink(dir.path().join("gone"), dir.path().join("snapshot").join("vocab.json")).unwrap();
+        assert_eq!(source_files(&dir.path().join("snapshot")).unwrap(), ["config.json"]);
+    }
+
+    #[test]
+    fn a_source_without_a_config_is_refused_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("tokenizer.json"), b"x").unwrap();
+        let refused = source_files(dir.path()).unwrap_err();
+        assert!(refused.contains("config.json"), "{refused}");
+    }
 
     fn words(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| word.to_string()).collect()
@@ -708,7 +906,7 @@ mod tests {
         let given = flags(&with(extra)).unwrap();
         let recipe = Recipe::new(given.quantization, given.compressed, given.output_head.as_deref()).unwrap();
         let search = Nvfp4Search::new(given.nvfp4_above, given.nvfp4_scale_max).unwrap();
-        run_key(&given, &recipe, &search, (&[1, 2, 3, 4], 2), draft_ids)
+        run_key(&given, &recipe, &search, (&[1, 2, 3, 4], 2), draft_ids, None)
     }
 
     #[test]
@@ -750,24 +948,125 @@ mod tests {
         );
     }
 
+    fn trellis_with(extra: &[&str]) -> Vec<String> {
+        let mut all = vec!["--format", "trellis"];
+        all.extend(extra);
+        let mut given = words(&BASE);
+        given[3] = "trellis".to_owned();
+        given.extend(words(&all));
+        given
+    }
+
     #[test]
-    fn every_trellis_option_is_refused_by_name() {
-        for option in ["--bits", "--viterbi-scratch-mib", "--write-buffer-mib"] {
-            let message = flags(&with(&[option, "3"])).unwrap_err();
-            assert!(message.contains(option) && message.contains("trellis"), "{message}");
+    fn the_trellis_format_takes_its_bits_and_sizes_with_java_defaults_and_bounds() {
+        let given = flags(&trellis_with(&["--bits", "3.5"])).unwrap().trellis.unwrap();
+        assert_eq!(
+            given,
+            TrellisFlags {
+                bits: 3.5,
+                viterbi_scratch_mib: 256,
+                write_buffer_mib: 16
+            }
+        );
+        let sized = flags(&trellis_with(&[
+            "--bits",
+            "2",
+            "--viterbi-scratch-mib",
+            "64",
+            "--write-buffer-mib",
+            "1023",
+        ]))
+        .unwrap()
+        .trellis
+        .unwrap();
+        assert_eq!((sized.viterbi_scratch_mib, sized.write_buffer_mib), (64, 1023));
+        for (option, value) in [
+            ("--write-buffer-mib", "0"),
+            ("--write-buffer-mib", "1024"),
+            ("--viterbi-scratch-mib", "0"),
+            ("--bits", "0"),
+            ("--bits", "-1"),
+            ("--bits", "nan"),
+            ("--bits", "x"),
+        ] {
+            let refused = flags(&trellis_with(&["--bits", "3", option, value])).unwrap_err();
+            assert!(refused.contains(option), "{option} {value}: {refused}");
         }
-        assert!(flags(&with(&["--format", "trellis"])).unwrap_err().contains("trellis"));
-        let trellis = words(&[
-            "--model",
-            "m",
-            "--quantization",
-            "trellis",
-            "--tokens",
-            "t",
-            "--out",
-            "o",
-        ]);
-        assert!(flags(&trellis).unwrap_err().contains("trellis"));
+    }
+
+    #[test]
+    fn the_trellis_format_and_its_options_need_each_other_and_each_refusal_names_what_it_refused() {
+        let missing = flags(&trellis_with(&[])).unwrap_err();
+        assert!(missing.contains("--bits"), "{missing}");
+        let format = flags(&with(&["--format", "trellis", "--bits", "3"])).unwrap_err();
+        assert!(
+            format.contains("--format trellis") && format.contains("--quantization trellis"),
+            "{format}"
+        );
+        let mut quantization = trellis_with(&["--bits", "3"]);
+        quantization.drain(quantization.len() - 4..quantization.len() - 2);
+        let quantization = flags(&quantization).unwrap_err();
+        assert!(quantization.contains("--quantization trellis"), "{quantization}");
+        for option in TRELLIS_OPTIONS {
+            let refused = flags(&with(&[option, "3"])).unwrap_err();
+            assert!(
+                refused.contains(option) && refused.contains("--format trellis"),
+                "{refused}"
+            );
+        }
+        let skipped = flags(&trellis_with(&["--bits", "3", "--skip-mtp"])).unwrap_err();
+        assert!(skipped.contains("--skip-mtp"), "{skipped}");
+    }
+
+    fn trellis_keys_of(extra: &[&str], target: f64) -> (String, String) {
+        let mut all = vec!["--bits"];
+        let bits = target.to_string();
+        all.push(&bits);
+        all.extend(extra);
+        let given = flags(&trellis_with(&all)).unwrap();
+        let recipe = Recipe::new(given.quantization, given.compressed, given.output_head.as_deref()).unwrap();
+        let search = Nvfp4Search::new(given.nvfp4_above, given.nvfp4_scale_max).unwrap();
+        let linears: Vec<Linear> = (0..4)
+            .flat_map(|layer| {
+                ["up", "down"].into_iter().map(move |role| Linear {
+                    name: format!("layers.{layer}.{role}"),
+                    layer,
+                    numel: 1 << 20,
+                    priority: 0,
+                    group: role.to_owned(),
+                })
+            })
+            .collect();
+        let allocation = Allocation::refuse(&linears, 4, target, 1 << 30).unwrap();
+        let plain = run_key(&given, &recipe, &search, (&[1, 2, 3, 4], 2), &[1, 2], None);
+        let trellis = run_key(&given, &recipe, &search, (&[1, 2, 3, 4], 2), &[1, 2], Some(&allocation));
+        (plain, trellis)
+    }
+
+    fn trellis_key_of(extra: &[&str], target: f64) -> String {
+        trellis_keys_of(extra, target).1
+    }
+
+    #[test]
+    fn a_trellis_key_carries_the_bits_and_the_allocation_and_a_gptq_key_is_unchanged() {
+        let key = trellis_key_of(&[], 3.0);
+        assert_eq!(key.split('|').count(), TRELLIS_KEY_FIELDS.len());
+        assert_eq!(
+            key,
+            trellis_key_of(&["--viterbi-scratch-mib", "64", "--write-buffer-mib", "2"], 3.0)
+        );
+        let fields = |other: &str| differences(&Manifest::new(&key, 4), &Manifest::new(other, 4), &TRELLIS_KEY_FIELDS);
+        let other = fields(&trellis_key_of(&[], 4.0));
+        assert!(
+            other.iter().any(|field| *field == "--bits") && other.iter().any(|field| *field == "the allocation"),
+            "{other:?}"
+        );
+        let (plain, _) = trellis_keys_of(&[], 3.0);
+        assert_eq!(plain.split('|').count(), KEY_FIELDS.len());
+        assert!(
+            key.starts_with(&format!("{plain}|")),
+            "the trellis parts follow the GPTQ ones"
+        );
     }
 
     #[test]
