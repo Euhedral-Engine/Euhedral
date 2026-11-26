@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use euhedral_core::frames::Frame;
 use euhedral_graph::Lake;
-use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer};
+use euhedral_inference_cuda::DeviceBuffer;
 use euhedral_inference_engine::Handoff;
 use euhedral_io::AsyncIo;
 use euhedral_memory::{LocationId, OwnerId, Planner};
@@ -41,7 +41,6 @@ pub struct RoundSettings {
 
 /// What rounding uses besides the lanes: the planner that accounts the lanes' memory, and the files.
 pub struct Services {
-    pub library: Arc<CudaLibrary>,
     pub planner: Arc<Planner>,
     pub owner: OwnerId,
     pub device: LocationId,
@@ -61,7 +60,8 @@ pub struct Linear {
     pub weight: u64,
     /// Device address of the complete FP32 Hessian `[columns, columns]`.
     pub hessian: u64,
-    /// The decoded BF16 weight, once rounded.
+    /// The decoded BF16 weight: given as a buffer of the weight's size, allocated in stream order on the lane that
+    /// owns the layer (the layer replaces the weight with it), and given back once rounded.
     pub decoded: Handoff<DeviceBuffer>,
 }
 
@@ -212,11 +212,18 @@ fn pull(round: &Arc<Round>, number: usize, lane: GptqLane) {
         return;
     };
     let linear = &round.linears[index];
-    let decoded = DeviceBuffer::alloc(&round.services.library, 2 * linear.rows as usize * linear.columns);
+    let decoded = linear.decoded.take();
     let format = round.services.settings.recipe.format(&linear.name);
     match (decoded, format) {
-        (Ok(decoded), Ok(format)) => factor(Box::new(Object::new(round, number, index, decoded, rounded(format))), lane),
-        (Err(error), _) => abort(round, number, lane, CalibrateError::failed("the decoded weight", error)),
+        (Some(decoded), Ok(format)) => {
+            factor(Box::new(Object::new(round, number, index, decoded, rounded(format))), lane);
+        }
+        (None, _) => abort(
+            round,
+            number,
+            lane,
+            CalibrateError::failed(&linear.name, "no buffer was given for the decoded weight"),
+        ),
         (_, Err(error)) => abort(round, number, lane, CalibrateError::failed(&linear.name, error)),
     }
 }
