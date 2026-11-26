@@ -1,5 +1,5 @@
 //! The rendering against the added tokens of the real artifact's tokenizer: untrusted text must never turn into an
-//! added token of the prompt. Needs `euhedral.qwen.rco-artifact` (in `~/.gradle/gradle.properties`, or
+//! added token of the prompt. Needs `euhedral.qwen.rco-artifact` (in `~/.config/euhedral/test.properties` or `~/.gradle/gradle.properties`, or
 //! `EUHEDRAL_TEST_QWEN_RCO_ARTIFACT`); reads only the tokenizer section, and skips without the key.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]

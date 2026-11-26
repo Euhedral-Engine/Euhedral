@@ -1,7 +1,7 @@
 //! What the linear format tests on a GPU share: the library and a lane, objects uploaded from the RCO artifact or made
 //! synthetic, activations, and one linear run and read back.
 //!
-//! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, or
+//! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, in `~/.config/euhedral/test.properties`, or
 //! `gradle.properties`) and the artifact from `euhedral.qwen.rco-artifact`; a test skips with a message when it is
 //! absent.
 

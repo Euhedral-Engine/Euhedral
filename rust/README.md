@@ -112,6 +112,8 @@ factor, inverse and solve) enqueue on the stream the lane lends. Nothing waits; 
 read after the queue retires the work. The device tests (`math_gpu`) take the directory from
 `euhedral.quantization.cuda-libraries` (`EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES`) and skip without it.
 
+Test settings are looked up in this order: `EUHEDRAL_TEST_<KEY>` in the environment, then `~/.config/euhedral/test.properties` (or the file named by `EUHEDRAL_TEST_CONFIG`), then `gradle.properties` in the Gradle user home.
+
 ## Benchmark
 
 `euhedral-bench` (crate `euhedral-inference-bench`) measures the Rust engine with the Java benchmark's configuration
@@ -123,8 +125,10 @@ cargo run --release -p euhedral-inference-bench -- run CONFIG.json [--fork-id ID
 cargo run --release -p euhedral-inference-bench -- dump --artifact FILE --prefix N --steps N --out FILE
 ```
 
-A configuration that asks for what the engine does not do is refused with the reason: `prefixCacheBytes` above 0,
-`cpus` other than `all`, `excludeCpus` / `excludeCores`, and `generation.mode` `sample`. The binary is a thin `main.rs`
+A configuration that asks for something this engine does not do is refused with the reason, never run with the request
+dropped: `prefixCacheBytes` above 0 (the prefix cache is on only for prefix scenarios), a negative value, unknown fields,
+and `temperature`, `topK` or `topP` without `generation.mode` `sample`. `cpus`, `excludeCpus` and `excludeCores` resolve
+to the set of processors the engine's workers may use, and `sample` runs the seeded sampler. The binary is a thin `main.rs`
 over the library: the library prints and exits nowhere, and its few blocking file calls are scoped exceptions; `main.rs`
 carries the print exceptions and starts, then waits for, each request. The decode rate runs from the first token found to
 the last token found.

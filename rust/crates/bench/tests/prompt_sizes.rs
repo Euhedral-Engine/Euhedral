@@ -1,7 +1,7 @@
 //! The prompts at the large sizes, built with the tokenizer of a real artifact: a prompt has the token count asked for
 //! (a chat prompt at most the target and most of it, a words prompt exactly the target), its ids are what the tokenizer
 //! makes of its text, its digest is the digest of that text, and building it twice gives the same text. Needs
-//! `euhedral.qwen.rco-artifact` (in `~/.gradle/gradle.properties`, or `EUHEDRAL_TEST_QWEN_RCO_ARTIFACT`); reads only
+//! `euhedral.qwen.rco-artifact` (in `~/.config/euhedral/test.properties` or `~/.gradle/gradle.properties`, or `EUHEDRAL_TEST_QWEN_RCO_ARTIFACT`); reads only
 //! the tokenizer section.
 //!
 //! ```text
