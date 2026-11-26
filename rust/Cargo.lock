@@ -550,6 +550,7 @@ dependencies = [
  "euhedral-io",
  "euhedral-memory",
  "same-file",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
