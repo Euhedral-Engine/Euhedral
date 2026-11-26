@@ -178,10 +178,15 @@ fn ended(shells: Vec<Linear>, settled: Settled<GptqLane, DeviceBuffer>) -> Ended
 }
 
 fn claims(services: &Services, bytes: StepBytes) -> Result<Claims, CalibrateError> {
+    claims_for(services, bytes, "gptq")
+}
+
+/// The planner's claims for a step that takes `bytes`, named `label` there.
+pub fn claims_for(services: &Services, bytes: StepBytes, label: &'static str) -> Result<Claims, CalibrateError> {
     let take = |location, bytes| {
         services
             .planner
-            .claim(services.owner, location, bytes, "gptq")
+            .claim(services.owner, location, bytes, label)
             .map_err(|error| CalibrateError::failed("the memory planner refused a claim", format!("{error:?}")))
     };
     Ok(Claims {

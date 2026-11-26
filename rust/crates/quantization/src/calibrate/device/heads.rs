@@ -86,9 +86,13 @@ struct Layout {
     write: Option<usize>,
 }
 
-type Context<'a, 'q> = LaneContext<'a, CudaLaneEnqueue<'q>>;
+pub(super) type Context<'a, 'q> = LaneContext<'a, CudaLaneEnqueue<'q>>;
 
-fn lane<'a, 'q>(inner: &'a Inner, queue: &'a mut CudaLaneEnqueue<'q>, handles: &'a mut LaneHandles) -> Context<'a, 'q> {
+pub(super) fn lane<'a, 'q>(
+    inner: &'a Inner,
+    queue: &'a mut CudaLaneEnqueue<'q>,
+    handles: &'a mut LaneHandles,
+) -> Context<'a, 'q> {
     let ops = RusteeOps::new(queue, &inner.table, Modes::default()).on_lane(&inner.library, inner.home);
     LaneContext::new(ops, handles, &inner.kernels)
 }
@@ -96,7 +100,7 @@ fn lane<'a, 'q>(inner: &'a Inner, queue: &'a mut CudaLaneEnqueue<'q>, handles: &
 /// Runs `work` on the main lane with its math handles, and gives `then` its value, with `keep`, in the frame that
 /// follows the marker. `keep` is what the work reads from the host: it stays until the lane has retired the work, and
 /// after a failed submission, which may have queued copies from it, it is never freed.
-fn on_main<K, T>(
+pub(super) fn on_main<K, T>(
     inner: &Arc<Inner>,
     what: &'static str,
     keep: K,
@@ -204,7 +208,7 @@ fn zeroed(context: &mut Context<'_, '_>, bytes: usize) -> Result<DeviceBuffer, F
 ///
 /// # Safety
 /// `memory` stays live, and unchanged, until the lane has retired the work queued up to this call.
-unsafe fn upload_pinned(
+pub(super) unsafe fn upload_pinned(
     inner: &Inner,
     context: &mut Context<'_, '_>,
     memory: &PooledPinned,
@@ -231,7 +235,10 @@ unsafe fn upload_pinned(
 }
 
 /// Frees `buffers` in stream order on the lane.
-fn free(context: &mut Context<'_, '_>, buffers: impl IntoIterator<Item = DeviceBuffer>) -> Result<(), ForwardError> {
+pub(super) fn free(
+    context: &mut Context<'_, '_>,
+    buffers: impl IntoIterator<Item = DeviceBuffer>,
+) -> Result<(), ForwardError> {
     for buffer in buffers {
         context.ops().free_async(buffer)?;
     }
@@ -256,7 +263,7 @@ fn free_in_stream(inner: &Arc<Inner>, buffers: Vec<DeviceBuffer>) {
 }
 
 /// Reads the tensors `names`, each whole, into the staging pool's pinned memory, in order.
-fn read_tensors(inner: &Arc<Inner>, names: Vec<String>, then: Then<Vec<PooledPinned>>) {
+pub(super) fn read_tensors(inner: &Arc<Inner>, names: Vec<String>, then: Then<Vec<PooledPinned>>) {
     let pending = names.into_iter().rev().collect();
     read_next(Arc::clone(inner), pending, Vec::new(), single(then));
 }
