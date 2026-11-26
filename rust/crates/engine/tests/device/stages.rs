@@ -47,7 +47,7 @@ use euhedral_inference_cuda::{
 };
 use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorDataType, WeightFormat, WeightLayout};
 use euhedral_inference_engine::Handoff;
-use euhedral_inference_engine::formats::{LinearFormat, LinearMode, Q3Embedding, ScratchRegion};
+use euhedral_inference_engine::formats::{LinearFormat, LinearMode, ScratchRegion, TokenEmbedding};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{ModelConfig, Residence, WeightRef};
 use euhedral_inference_engine::stages::attention::{AttentionCausal, KvAppend, KvSource, QkNormRope};
@@ -1961,7 +1961,7 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
     let reference = |ids: &[i32]| -> Vec<u8> {
         let input = upload(&rig.library, &id_bytes(ids));
         let output = DeviceBuffer::alloc(&rig.library, ids.len() * hidden * 2).unwrap();
-        rig.submit(|ops| Q3Embedding.submit(ops, &weight, input.ptr(), output.ptr(), ids.len()));
+        rig.submit(|ops| TokenEmbedding.submit(ops, &weight, input.ptr(), output.ptr(), ids.len()));
         download(&output)
     };
     let looked_up = |rows: usize| get(&workspace, BufferSlot::HiddenState, 0, rows * hidden * 2);

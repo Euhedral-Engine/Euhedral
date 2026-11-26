@@ -18,7 +18,7 @@ use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use super::PlanBuildError;
 use super::buffers::Access;
 use super::views::Variant;
-use crate::formats::LinearFormat;
+use crate::formats::{LinearFormat, TokenEmbedding};
 use crate::model::{LayerIndex, LayerKind, ModelConfig, MtpRole, NormKind, Role, WeightRef, Weights};
 use crate::stages::attention::{AttentionCausal, KvAppend, KvSource, QkNormRope};
 use crate::stages::elementwise::{ResidualAdd, Swiglu};
@@ -383,7 +383,11 @@ impl Make {
         let region = self.scratch_region(variant);
         let ptr = |weight: &WeightRef| weight.ptr;
         Ok(match self.clone() {
-            Make::Embed { table } => entry(self.kind(), Embed::new(table, HiddenState)),
+            Make::Embed { table } => {
+                // A table the lookup cannot read is refused here, not at its first launch.
+                TokenEmbedding::check(&table).map_err(PlanBuildError::Geometry)?;
+                entry(self.kind(), Embed::new(table, HiddenState))
+            }
             Make::RmsNorm {
                 input,
                 output,

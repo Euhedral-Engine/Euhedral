@@ -17,7 +17,7 @@ use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use euhedral_inference_engine::formats::{LinearFormat, LinearMode, Nvfp4Linear, Q3Linear, TrellisLinear};
 use euhedral_inference_engine::model::{LayerIndex, Residence, Role, WeightRef, object_key};
 use euhedral_inference_engine::plan::{Formats, Plan, PlanBuildError, StageKind, View, WeightLookup};
-use euhedral_inference_engine::residency::planner::{ResidencyPlan, plan as residency};
+use euhedral_inference_engine::residency::planner::{ResidencyPlan, nvfp4, plan as residency};
 use euhedral_inference_settings::TrellisKernelSettings;
 
 mod common;
@@ -195,4 +195,31 @@ fn a_q4_or_q5_tensor_with_the_compressed_layout_is_refused_at_plan_build() {
             "{error}"
         );
     }
+}
+
+/// A plain NVFP4 token table of a width that is a multiple of 128 builds into the plan; one of another width, and an
+/// SD4 one, are refused where the plan is built, by the table's name.
+#[test]
+fn an_nvfp4_embedding_is_checked_at_plan_build() {
+    let config = Arc::new(config());
+    let residency = residency_of(false);
+    let build = |format: WeightLayout, hidden: u64| {
+        let mut lookup = weights(&residency).0;
+        let table = lookup.get_mut(&(LayerIndex::GLOBAL, Role::Embedding)).unwrap();
+        let vocabulary = table.shape[0];
+        table.format = WeightFormat::Nvfp4;
+        table.layout = format;
+        table.shape = vec![vocabulary, hidden];
+        table.bytes = nvfp4::byte_size(vocabulary, hidden, format).unwrap();
+        let name = table.name.clone();
+        let built = Plan::build(&config, &Described(lookup), &residency, &formats(true), None, None);
+        (name, built.map(|_| ()))
+    };
+    assert!(build(WeightLayout::RowSplitK128V1, 5120).1.is_ok());
+    let (name, narrow) = build(WeightLayout::RowSplitK128V1, 5184);
+    let error = narrow.unwrap_err().to_string();
+    assert!(error.contains(&name) && error.contains("multiple of 128"), "{error}");
+    let (name, sd4) = build(WeightLayout::RowSplitK128Sd4V1, 5120);
+    let error = sd4.unwrap_err().to_string();
+    assert!(error.contains(&name) && error.contains("SD4"), "{error}");
 }

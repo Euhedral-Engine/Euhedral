@@ -5,12 +5,12 @@ use euhedral_graph::{Marker, Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{DevicePtr, KernelOps};
 
 use super::{Launch, Quantum, Segment, eager, fatal};
-use crate::formats::Q3Embedding;
+use crate::formats::TokenEmbedding;
 use crate::model::WeightRef;
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
 use crate::workspace::BufferSlot;
 
-/// Looks up the quantum's token ids in the Q3 embedding table into `output`.
+/// Looks up the quantum's token ids in the Q3 or NVFP4 embedding table into `output`.
 ///
 /// Rows that take their tokens from the step's tokens on the device (the quantum's
 /// [`Quantum::reading_draft_tokens`]) copy them into the input record first, where the lookup reads its ids; a
@@ -86,7 +86,7 @@ impl Launch for Embed {
                 .selected_token(previous.device_keys(), DevicePtr::NULL, ids)
                 .map_err(fatal)?;
         }
-        Q3Embedding
+        TokenEmbedding
             .submit(kernels, &self.table, ids, quantum.slot(self.output), rows)
             .map_err(fatal)?;
         if quantum.writes_current_token {
