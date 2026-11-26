@@ -176,16 +176,18 @@ fn measured(settings: &Settings, flags: &Flags, library: &Path) -> Result<CostTa
     measure(&sources, &plan, &mut bench, &mut report).map_err(|error| error.to_string())
 }
 
-/// Each source stores its base projections in the format its option names.
+/// Each source stores every projection of the base in the format its option names.
 fn check_sources(sources: &SourceSet) -> Result<(), MixedError> {
-    let Some(first) = sources.projections().first() else {
+    if sources.projections().is_empty() {
         return Err(MixedError::Invalid("the base has no projection".to_owned()));
-    };
+    }
     for option in sources.options() {
-        let entry = sources
-            .descriptor(option, first)
-            .map_err(|error| MixedError::Invalid(error.to_string()))?;
-        check_format(option, entry.format())?;
+        for name in sources.projections() {
+            let entry = sources
+                .descriptor(option, name)
+                .map_err(|error| MixedError::Invalid(error.to_string()))?;
+            check_format(option, entry.format())?;
+        }
     }
     Ok(())
 }

@@ -78,7 +78,6 @@ pub struct DeviceBench<'a> {
     gate_copies: usize,
     loaded: Option<Loaded>,
     operands: Option<Operands>,
-    shape: Shape,
 }
 
 impl<'a> DeviceBench<'a> {
@@ -114,7 +113,6 @@ impl<'a> DeviceBench<'a> {
             gate_copies: GATE_START_COPIES,
             loaded: None,
             operands: None,
-            shape: Shape { input: 0, output: 0 },
         })
     }
 
@@ -325,7 +323,6 @@ impl Bench for DeviceBench<'_> {
                 .map_err(|error| failed("the scratch", error))?,
         };
         self.settle()?;
-        self.shape = shape;
         self.loaded = Some(Loaded {
             option,
             weights,
