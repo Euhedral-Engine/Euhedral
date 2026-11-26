@@ -260,8 +260,6 @@ pub(crate) fn file_length(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use std::fs::File;
-
     use euhedral_core::generics::LatticeSource;
     use euhedral_io::AsyncIo;
 
@@ -290,9 +288,8 @@ mod tests {
         reason = "a test: a failed open stops it, and the file only has to exist"
     )]
     fn some_file() -> Arc<OwnedFile> {
-        Arc::new(OwnedFile::from(
-            File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap(),
-        ))
+        // An anonymous temporary file: a path under the crate is not there in a sandboxed test run.
+        Arc::new(OwnedFile::from(tempfile::tempfile().unwrap()))
     }
 
     // Mutant caught: a refused submission that leaves its `Next` armed, so the drop calls it with `LakeClosed`.
