@@ -137,8 +137,8 @@ const DRAFTER: [&str; 12] = [
     "q3_embedding_rows",
 ];
 
-/// The drafter's subset of the training operations.
-const TRAIN: [&str; 12] = [
+/// The drafter's subset of the training operations (the drafter's squared-error loss among them).
+const TRAIN: [&str; 13] = [
     "adam",
     "bf16_to_float",
     "copy_floats",
@@ -149,6 +149,7 @@ const TRAIN: [&str; 12] = [
     "qk_norm_rope_backward",
     "rms_norm_forward",
     "rms_norm_backward",
+    "squared_error",
     "swiglu_forward",
     "swiglu_backward",
 ];

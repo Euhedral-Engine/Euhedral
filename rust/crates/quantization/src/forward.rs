@@ -8,12 +8,16 @@
 //! - [`LaneContext`] is the lane's kernel operations, its cuBLAS handles and the kernels this module adds to the
 //!   engine's: the Hessian accumulation (upper blocks, then mirrored) and the row gather.
 //!
+//! - [`pipeline`] runs a layer over many sequences, a batch at a time, as frames on the lake: the head of a batch, one
+//!   frame per sequence on its own lane, then the tail, with the next batch behind it and no host wait.
+//!
 //! Sequences start at position 0 with a fresh GDN state; attention keeps its keys and values in the engine's NVFP4
 //! paged cache. Nothing here waits: every call queues work on the lane, and the caller learns of its completion from
 //! the lane's marker.
 
 mod layer;
 mod math;
+pub mod pipeline;
 mod weights;
 
 use euhedral_gpu::GpuError;
@@ -24,7 +28,7 @@ use thiserror::Error;
 use crate::checkpoint::CheckpointError;
 use crate::checkpoint::objects::Config;
 
-pub use layer::{LayerForward, Observation, Observer};
+pub use layer::{LayerForward, Observation, Observer, Slot};
 pub use math::{ForwardKernels, LaneContext, plan_gather_rows, plan_mirror_upper};
 pub use weights::{HostMemory, LayerWeights, Part, StagedLayer, Target, stage, transpose_convolution, widen_bf16};
 
@@ -46,6 +50,10 @@ pub enum ForwardError {
     /// An argument or a model dimension the layer cannot run with.
     #[error("{0}")]
     Invalid(String),
+    /// A pass ended while the device may still be using the buffers it was given (the lake closed, or no fence
+    /// could be made): the caller must not free or reuse them, and leaks them.
+    #[error("the device may still use the pass's buffers: {0}")]
+    Unfenced(String),
 }
 
 /// The widths the layer's kernels work in, derived from the model's configuration.
