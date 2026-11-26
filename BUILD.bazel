@@ -9,15 +9,7 @@ alias(
 
 # Files the crates include with include_str! from outside their package.
 exports_files([
-    "benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md",
     "native/src/trellis/codebook.cuh",
-    "quantization/src/main/resources/cuda/drafter.cu",
-    "quantization/src/main/resources/cuda/gptq.cu",
-    "quantization/src/main/resources/cuda/mtp.cu",
-    "quantization/src/main/resources/cuda/rows.cu",
-    "quantization/src/main/resources/cuda/score.cu",
-    "quantization/src/main/resources/cuda/train.cu",
-    "quantization/src/main/resources/cuda/trellis.cu",
 ])
 
 # The files the layout test of bazel-gen reads.
@@ -30,26 +22,6 @@ filegroup(
     srcs = glob(
         [
             "config/euhedral.example.yaml",
-        ],
-    ),
-    visibility = ["//visibility:public"],
-)
-
-filegroup(
-    name = "benchmark_configs",
-    srcs = glob(
-        [
-            "benchmark/configs/**",
-        ],
-    ),
-    visibility = ["//visibility:public"],
-)
-
-filegroup(
-    name = "gptq_fixture",
-    srcs = glob(
-        [
-            "quantization/src/test/resources/gptq-fixture/**",
         ],
     ),
     visibility = ["//visibility:public"],

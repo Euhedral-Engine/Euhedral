@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use euhedral_inference_quantization::npy::{Dtype, Npy, encode};
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../quantization/src/test/resources/gptq-fixture")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/fixtures/gptq-fixture")
 }
 
 /// Writes the array a file holds back out: the bytes must be the file's own.

@@ -115,7 +115,7 @@ read after the queue retires the work. The device tests (`math_gpu`) take the di
 ## Benchmark
 
 `euhedral-bench` (crate `euhedral-inference-bench`) measures the Rust engine with the Java benchmark's configuration
-files (`benchmark/configs`) and writes rows in its result schema (`euhedral-inference.benchmark-result` version 1,
+files (`rust/resources/bench/configs`) and writes rows in its result schema (`euhedral-inference.benchmark-result` version 1,
 `implementation` `rust`):
 
 ```text

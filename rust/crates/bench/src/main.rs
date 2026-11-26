@@ -47,7 +47,7 @@ const USAGE: &str = "usage:
         [--cuda-library FILE]
   drift --artifact FILE --prefix N --steps N --candidate host-tier|exact [--config YAML] [--cuda-library FILE]
 
-CONFIG.json is a Java benchmark configuration file (see benchmark/configs); it requires \"artifact\" and \"cudaLibrary\".
+CONFIG.json is a Java benchmark configuration file (see rust/resources/bench/configs); it requires \"artifact\" and \"cudaLibrary\".
 --fork-id labels this process as one externally launched fork.
 --validate-only checks the configuration and the prompts, prints the plan, and exits without touching the GPU.
 score appends each reference's summary to the results file and, with --values, writes DIR/NAME.values (header of three

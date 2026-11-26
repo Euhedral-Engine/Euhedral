@@ -1,6 +1,6 @@
 // The trellis (EXL3) decode: the one source of the mul1 codebook, the fractional ring window, the tensor-core element
 // order and the 128-point Hadamard butterfly. The engine's kernels (trellis/kernels.cu) and the quantization module's
-// (quantization/src/main/resources/cuda/trellis.cu, which compiles this header from its resources) both include it, so
+// (rust/kernels/quantization/trellis.cu, which compiles this header from its resources) both include it, so
 // the encoder's reconstruction and the engine's decode cannot drift apart.
 //
 // Portions ported from exllamav3 1.6.1 (MIT License, Copyright (c) 2025 Turboderp): codebook.cuh (mul1 decode) and
