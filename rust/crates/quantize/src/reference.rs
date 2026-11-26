@@ -9,7 +9,7 @@ use std::time::Duration;
 use euhedral_inference_engine::EngineRuntime;
 use euhedral_inference_quantization::kld::Reference;
 use euhedral_inference_quantization::reference::{DEFAULT_BATCH, DEFAULT_ROWS, Forcer, Options, tokenize, write};
-use euhedral_inference_settings::{Auto, ByteSize, ModelSettings, Settings, load_file, process_env};
+use euhedral_inference_settings::{Auto, ByteSize, ModelSettings, Settings, SpeculationMode, load_file, process_env};
 
 use crate::{EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, Outcome};
 
@@ -130,6 +130,8 @@ fn settings(flags: &Flags) -> Result<Settings, String> {
     settings.context.max_tokens = u32::try_from(flags.context.next_multiple_of(512))
         .map_err(|_| format!("a context of {} tokens is too long", flags.context))?;
     settings.prefix_cache.size = ByteSize::mib(0);
+    // Teacher-forced rows never draft: take no draft layer or draft state.
+    settings.speculation.mode = SpeculationMode::None;
     // The engine holds a sequence for each chunk in flight, each sized to verify `rows` forced tokens in a pass.
     settings.batching.max_sequences = u32::try_from(flags.batch).map_err(|_| "--batch is too large".to_owned())?;
     settings.batching.forced_rows = u32::try_from(flags.rows).map_err(|_| "--rows is too large".to_owned())?;
@@ -240,6 +242,12 @@ fn summary(out: &Path, chunks: usize) -> String {
 #[allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_engine_settings_turn_speculation_off() {
+        let parsed = flags(&words("--artifact a --text t --out o")).unwrap();
+        assert_eq!(settings(&parsed).unwrap().speculation.mode, SpeculationMode::None);
+    }
 
     fn words(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_owned).collect()

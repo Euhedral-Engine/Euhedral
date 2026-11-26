@@ -14,6 +14,7 @@ use serde_yaml_ng::{Mapping, Value};
 
 use crate::model::{
     Auto, CpuList, FusedVerifyFrom, HostLayerCompute, KvFormat, MIN_TENSOR_CORE_ROWS, ModelSettings, Settings,
+    SpeculationMode,
 };
 use crate::retired;
 use crate::sizes::{ByteSize, parse_duration};
@@ -408,6 +409,14 @@ fn kv_format(text: &str) -> Result<KvFormat, String> {
     }
 }
 
+fn speculation_mode(text: &str) -> Result<SpeculationMode, String> {
+    match text.to_ascii_lowercase().as_str() {
+        "artifact" => Ok(SpeculationMode::Artifact),
+        "none" => Ok(SpeculationMode::None),
+        _ => Err(format!("must be artifact or none: {text}")),
+    }
+}
+
 fn host_layer_compute(text: &str) -> Result<HostLayerCompute, String> {
     match text.to_ascii_lowercase().as_str() {
         "cpu" => Ok(HostLayerCompute::Cpu),
@@ -502,6 +511,9 @@ fn leaves() -> Vec<Leaf> {
         }),
         fixed("context.kv-cache-on-gpu-tokens", |s, t| {
             assign!(s.context.kv_cache_on_gpu_tokens, int(t, 0, COUNT_MAX))
+        }),
+        fixed("speculation.mode", |s, t| {
+            assign!(s.speculation.mode, speculation_mode(t))
         }),
         fixed("prefix-cache.size", |s, t| assign!(s.prefix_cache.size, size(t, 0))),
         fixed("prefix-cache.checkpoint-tokens", |s, t| {

@@ -1,7 +1,7 @@
 //! The model's dimensions, from the artifact's metadata, and the profile its tensors give it.
 
 use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorTable, WeightFormat, WeightLayout};
-use euhedral_inference_settings::KvFormat;
+use euhedral_inference_settings::{KvFormat, SpeculationMode};
 
 use crate::error::PlanError;
 
@@ -253,6 +253,19 @@ impl ArtifactProfile {
             speculation,
             draft_depth: config.draft_depth,
         })
+    }
+
+    /// The profile as the settings' speculation mode leaves it: `none` drops the drafter, so the depth is 0 and no
+    /// draft tensor is uploaded, whatever the artifact stores; `artifact` leaves the profile as read.
+    pub fn under(self, mode: SpeculationMode) -> Self {
+        match mode {
+            SpeculationMode::Artifact => self,
+            SpeculationMode::None => Self {
+                speculation: Speculation::None,
+                draft_depth: None,
+                ..self
+            },
+        }
     }
 
     /// The attention cache format a sequence takes unless the settings select one: BF16 for the unquantized model,
