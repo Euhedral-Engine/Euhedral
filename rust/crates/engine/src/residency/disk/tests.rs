@@ -912,3 +912,46 @@ fn a_missing_artifact_is_an_error() {
     let missing = Path::new("/nonexistent-disk-reader-test/artifact.bin");
     assert!(ArtifactFile::open(missing).is_err());
 }
+
+#[test]
+fn a_direct_read_larger_than_a_part_lands_every_byte_in_its_place() {
+    // A read of three parts (PART_BYTES is 4 MiB), through a slot that holds it.
+    let file_bytes = 10 << 20;
+    let bytes: Vec<u8> = (0..file_bytes).map(|index| (index % 251) as u8).collect();
+    let Some((_dir, path)) = file_in_scratch(&bytes) else {
+        return;
+    };
+    let settings = Settings::with_model(ModelSettings::default());
+    let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
+    let io = AsyncIo::open().expect("the ring opens");
+    lattice
+        .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
+        .expect("the lattice takes the ring");
+    let geometry = WindowGeometry {
+        slots: 1,
+        slot_bytes: 10 << 20,
+    };
+    let window = DiskWindow::on_heap(geometry);
+    let file = Arc::new(ArtifactFile::open(&path).expect("opens"));
+    let port = Arc::new(FilePort::new(Arc::clone(&io), file, window));
+    let reader = DiskReader::new(Arc::clone(&port) as Arc<dyn ReadPort>, geometry, inline());
+    let failures = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&failures);
+    let fail: FailHandle = Arc::new(move |_| {
+        counted.fetch_add(1, Ordering::SeqCst);
+    });
+    let (start, len) = (5000, 9 << 20);
+    reader
+        .enqueue(1, vec![use_of("wide", start, len, 0)], fail)
+        .expect("accepted");
+    reader.close().wait(BOUND).expect("the reads ended in time");
+    lattice.close();
+    assert_eq!(failures.load(Ordering::SeqCst), 0);
+    let lead = start as usize % BLOCK as usize;
+    // SAFETY: the read ended; the window is live.
+    let read = unsafe { from_raw_parts(port.window().slot_ptr(0).add(lead), len as usize) };
+    assert!(
+        read == &bytes[start as usize..][..len as usize],
+        "the parts landed out of place"
+    );
+}

@@ -62,6 +62,8 @@ use crate::handoff::Handoff;
 use crate::residency::offload::{HOST_ALIGNMENT, WindowGeometry};
 use crate::runtime::raw_file;
 
+use self::parts::{Join, parts_of};
+
 /// What the owner tells the quantum whose read failed (the text says which object and why). It must not block: it runs
 /// where the read's arrival is handled, and the gate of the quantum's copy is released after it.
 pub type FailHandle = Arc<dyn Fn(String) + Send + Sync>;
@@ -181,7 +183,7 @@ unsafe impl IoMemory for SlotMemory {
         match self {
             SlotMemory::Pinned(range) => IoMemory::as_mut_ptr(range),
             #[cfg(test)]
-            // SAFETY: `offset` lies inside the region (`slot_memory` checked it).
+            // SAFETY: `offset` lies inside the region (`slot_range` checked it).
             SlotMemory::Heap { region, offset, .. } => unsafe { region.pointer.as_ptr().add(*offset) },
         }
     }
@@ -267,10 +269,10 @@ impl DiskWindow {
         }
     }
 
-    /// The first `len` bytes of slot `slot`, as the memory a read fills.
-    fn slot_memory(&self, slot: usize, len: usize) -> Option<SlotMemory> {
-        assert!(slot < self.geometry.slots && len as u64 <= self.geometry.slot_bytes);
-        let offset = slot * self.geometry.slot_bytes as usize;
+    /// `len` bytes of slot `slot` from `start` bytes into it, as the memory a read of a part of the slot fills.
+    fn slot_range(&self, slot: usize, start: usize, len: usize) -> Option<SlotMemory> {
+        assert!(slot < self.geometry.slots && (start + len) as u64 <= self.geometry.slot_bytes);
+        let offset = slot * self.geometry.slot_bytes as usize + start;
         match &self.backing {
             Backing::Pinned(buffer) => {
                 // SAFETY: the slots are disjoint ranges of the buffer, and the reader reads one use of a slot at a
@@ -474,21 +476,48 @@ impl ReadPort for FilePort {
             (Some(direct), true) => direct,
             _ => &self.file.buffered,
         };
-        let memory = self
-            .window
-            .slot_memory(spec.slot, spec.len)
-            .ok_or_else(|| io::Error::other("the read does not lie in the window"))?;
-        let file = Arc::clone(&self.file);
-        let slot = spec.slot;
-        let then = Box::new(move |ended: IoDoneOwned<SlotMemory>| {
-            step(Kind::DiskRead, slot, move || {
-                // The file and the memory are let go before the arrival is told: nothing touches the range after it.
-                let IoDoneOwned { buf, result, .. } = ended;
-                drop((buf, file));
-                done(result);
-            })
-        });
-        self.io.read_into(raw_file(handle), spec.offset, memory, then)
+        // A direct read goes in parts the ring reads side by side; a buffered one is one part (the page cache copies it).
+        let parts = if spec.direct {
+            parts_of(spec.len)
+        } else {
+            vec![(0, spec.len)]
+        };
+        let join = Arc::new(Join::new(parts.iter().map(|&(_, len)| len).collect(), done));
+        for (index, &(start, len)) in parts.iter().enumerate() {
+            let started = self
+                .window
+                .slot_range(spec.slot, start, len)
+                .ok_or_else(|| io::Error::other("the read does not lie in the window"))
+                .and_then(|memory| {
+                    let (file, join, slot) = (Arc::clone(&self.file), Arc::clone(&join), spec.slot);
+                    let then = Box::new(move |ended: IoDoneOwned<SlotMemory>| {
+                        step(Kind::DiskRead, slot, move || {
+                            // The file and the memory are let go before the end is told: nothing touches the range after it.
+                            let IoDoneOwned { buf, result, .. } = ended;
+                            drop((buf, file));
+                            let last = join.ended(index, result);
+                            if let Some((done, result)) = last {
+                                done(result);
+                            }
+                        })
+                    });
+                    self.io
+                        .read_into(raw_file(handle), spec.offset + start as u64, memory, then)
+                });
+            if let Err(refused) = started {
+                if index == 0 {
+                    // Nothing started: the caller is told by this return, and `done` is dropped unrun.
+                    return Err(refused);
+                }
+                // Parts are in flight: the read ends with the refusal when they have.
+                let last = join.refused(index, refused);
+                if let Some((done, result)) = last {
+                    done(result);
+                }
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     fn has_direct(&self) -> bool {
@@ -1149,6 +1178,7 @@ impl DiskReader {
 /// The slots of a chunk of the inbox: messages are a few per use.
 const INBOX_CHUNK: usize = 64;
 
+mod parts;
 #[cfg(test)]
 #[allow(
     clippy::disallowed_methods,
