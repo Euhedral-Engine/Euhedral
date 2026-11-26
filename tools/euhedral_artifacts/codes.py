@@ -5,6 +5,7 @@ fake_quant.py exports these from trained modules."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 
 import numpy as np
@@ -105,3 +106,30 @@ def write_state(output, base_offset: int, state: QuantState) -> None:
         output.write(high)
     output.seek(base_offset + scale_offset)
     output.write(np.ascontiguousarray(state.scales.astype("<f2")).tobytes())
+
+
+MANIFEST_FILE = "calibration.json"
+
+
+def require_complete_codes(directory: Path) -> None:
+    """Fails unless `directory` holds the manifest calibrate writes (MANIFEST_FILE) and it says the run wrote every
+    layer, both heads and the MTP block: the converter rounds any object without a file itself, so a codes directory
+    of a stopped run would be taken for a whole one."""
+    path = directory / MANIFEST_FILE
+    if not path.is_file():
+        fail(f"{directory} has no {MANIFEST_FILE}: it is not the output of a finished calibrate run")
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        layers_done, layers_total = int(manifest["layers_done"]), int(manifest["layers_total"])
+        heads_done, mtp_done = bool(manifest["heads_done"]), bool(manifest["mtp_done"])
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        fail(f"{path} is unreadable: {error}")
+    missing = []
+    if layers_done < layers_total:
+        missing.append(f"layers {layers_done} of {layers_total}")
+    if not heads_done:
+        missing.append("the heads")
+    if not mtp_done:
+        missing.append("the MTP block")
+    if missing:
+        fail(f"{directory} is not complete, calibrate wrote only: missing {', '.join(missing)}")

@@ -1,4 +1,4 @@
-//! The calibration's calls on the card: the layer pipeline over the hidden states, the GPTQ lanes, and the resume file.
+//! The calibration's calls on the card: the layer pipeline over the hidden states, the GPTQ lanes, the resume file and the manifest.
 //!
 //! One layer is a chain of continuations, each started by the frame that ends the one before it:
 //! 1. upload the staged layer on the main lane;
@@ -8,7 +8,7 @@
 //! 4. round every linear on the GPTQ lanes ([`super::rounding`]), which write their states;
 //! 5. swap the decoded weights in, free the Hessians, on the main lane;
 //! 6. the write pass: the pipeline runs the rounded layer and its outputs replace the states;
-//! 7. free the layer.
+//! 7. free the layer, and record the layer in the manifest ([`super::manifest`]).
 //!
 //! The pipeline's lanes and the GPTQ lanes are two pools of one device, and the device cannot order work of one
 //! against the other. Every hand-off between them is therefore a frame the completions of the lanes that ended the
@@ -34,9 +34,12 @@ use euhedral_inference_engine::Handoff;
 use euhedral_io::AsyncIo;
 use euhedral_memory::{LocationId, LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope};
 
-use super::driver::Then;
+use super::driver::{Once, Then, end, single};
+use super::embedding;
+use super::files::{Region, read_states, save, write_checkpoint};
 use super::hessians::HessianSet;
-use super::plan::{Plan, resume_at, resume_header, round_order};
+use super::manifest::{MANIFEST_FILE, Manifest, RESUME_FILE};
+use super::plan::{Plan, resume_at, round_order};
 use super::rounding::{Ended, HEAD_ROWS, Linear, RoundSettings, Services, round_all};
 use super::{CalibrateError, Stages};
 use crate::checkpoint::CheckpointError;
@@ -49,13 +52,11 @@ use crate::gptq::{GptqKernels, GptqLane, GptqSettings};
 use crate::kernels::{Module, ModuleOptions, Modules};
 use crate::memory::LaneMemory;
 use crate::recipe::Recipe;
-use crate::resume::{HEADER, ResumeError, ResumeFile};
+use crate::resume::ResumeFile;
 use crate::step::{Kind, idle, step};
 
 /// The checkpoint tensor the tokens are looked up in.
 const EMBEDDING: &str = "model.language_model.embed_tokens.weight";
-/// The resume file's name in the output directory.
-pub const RESUME_FILE: &str = "hidden.bin";
 const BF16_BYTES: usize = 2;
 /// Bytes of the hidden states one read or write of the resume file moves.
 const STATES_CHUNK: usize = 256 << 20;
@@ -99,7 +100,9 @@ pub struct Settings {
     pub lanes: usize,
     pub staging_bytes: u64,
     pub lane_pinned_bytes: u64,
-    pub device_reserve: u64,
+    /// Device bytes left for what the planner does not account; none leaves a third of what is free, at most
+    /// [`DEVICE_RESERVE`].
+    pub device_reserve: Option<u64>,
     pub chunk_bytes: usize,
 }
 
@@ -119,7 +122,7 @@ impl Settings {
             lanes: ROUNDING_LANES,
             staging_bytes: STAGING_BYTES,
             lane_pinned_bytes: LANE_PINNED_BYTES,
-            device_reserve: DEVICE_RESERVE,
+            device_reserve: None,
             chunk_bytes: UPLOAD_CHUNK_BYTES,
         }
     }
@@ -167,6 +170,8 @@ struct Inner {
     lanes: Handoff<Vec<GptqLane>>,
     services: Arc<Services>,
     resume: OnceLock<ResumeFile>,
+    /// The manifest of a run that has written nothing.
+    manifest: Manifest,
     hidden: usize,
 }
 
@@ -183,21 +188,6 @@ impl Debug for Calibration {
 
 fn gpu_error(error: impl Display) -> GpuError {
     GpuError::Invalid(error.to_string())
-}
-
-/// A continuation taken once, from whichever call ends the chain.
-type Once<T> = Arc<Handoff<Then<T>>>;
-
-fn single<T>(then: Then<T>) -> Once<T> {
-    let cell = Arc::new(Handoff::empty());
-    cell.send(then);
-    cell
-}
-
-fn end<T>(cell: &Once<T>, result: Result<T, CalibrateError>) {
-    if let Some(then) = cell.take() {
-        then(result);
-    }
 }
 
 impl Calibration {
@@ -234,6 +224,7 @@ impl Calibration {
             ForwardKernels::new(&gptq, &rows).map_err(|error| CalibrateError::failed("the forward kernels", error))?,
         );
         let config = &objects.config;
+        let manifest = Manifest::new(&settings.key, config.layers);
         let (hidden, length, batch) = (config.hidden as usize, settings.length, settings.batch);
         let max_rows = u32::try_from(batch * length)
             .map_err(|_| CalibrateError::Invalid(format!("{batch} sequences of {length} tokens are too many rows")))?;
@@ -324,11 +315,13 @@ impl Calibration {
         let free = library
             .free_bytes()
             .map_err(|error| CalibrateError::failed("the free device memory", error))?;
-        let capacity = free.saturating_sub(settings.device_reserve);
+        let reserve = settings
+            .device_reserve
+            .unwrap_or_else(|| (free / 3).min(DEVICE_RESERVE));
+        let capacity = free.saturating_sub(reserve);
         if capacity == 0 {
             return Err(CalibrateError::Failed(format!(
-                "the device has {free} bytes free, no more than the {} the run leaves for the layer",
-                settings.device_reserve
+                "the device has {free} bytes free, no more than the {reserve} the run leaves for the layer"
             )));
         }
         let planner = Planner::new([
@@ -378,6 +371,7 @@ impl Calibration {
             lanes: Handoff::empty(),
             services,
             resume: OnceLock::new(),
+            manifest,
             hidden,
         });
         inner.handles.send(symmetric);
@@ -390,6 +384,12 @@ impl Inner {
     fn host_states(&self) -> HostStates {
         // SAFETY: the states are live as long as the pipeline, and no call but the one running touches them.
         unsafe { HostStates::new(self.states.pointer(), self.states.bytes) }
+    }
+
+    /// The hidden states as the resume file's region.
+    fn region(&self) -> Region {
+        // SAFETY: the states are the run's own, and the calls that read or write them run one after another.
+        unsafe { Region::new(self.states.pointer(), self.states.bytes) }
     }
 
     fn row_bytes(&self) -> usize {
@@ -497,18 +497,46 @@ impl Stages for Calibration {
         }
     }
 
+    /// The layer, then the manifest with the layer counted: its files are all written by then.
     fn layer(&self, layer: usize, staged: StagedLayer, then: Then<()>) {
-        upload(Arc::clone(&self.inner), layer, staged, single(then));
+        let inner = Arc::clone(&self.inner);
+        let recorded: Then<()> = Box::new(move |result| match result {
+            Ok(()) => record(&inner, layer + 1, then),
+            Err(error) => then(Err(error)),
+        });
+        upload(Arc::clone(&self.inner), layer, staged, single(recorded));
     }
 
     fn checkpoint(&self, done: usize, then: Then<()>) {
-        checkpoint(Arc::clone(&self.inner), done, single(then));
+        checkpoint(&self.inner, done, then);
     }
 
-    /// The heads and the MTP block are not rounded by this build; the layers' files are complete.
+    /// The layers' files are complete, and the manifest says so; the output head, the draft head and the MTP block are
+    /// not rounded by this build, so the run does not end well: its output is not whole.
     fn finish(&self, then: Then<()>) {
-        then(Ok(()));
+        then(Err(CalibrateError::Failed(format!(
+            "every layer is rounded and written, but this build does not round the output head, the draft head or the \
+             MTP block; {MANIFEST_FILE} records the output as incomplete"
+        ))));
     }
+}
+
+/// Writes the manifest of a run that has rounded `done` layers.
+fn record(inner: &Arc<Inner>, done: usize, then: Then<()>) {
+    let bytes = match inner.manifest.after(done).to_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => return then(Err(error)),
+    };
+    save(
+        &inner.services.io,
+        &inner.services.host,
+        inner.settings.out.join(MANIFEST_FILE),
+        bytes,
+        Box::new(move |saved| {
+            then(saved);
+            idle()
+        }),
+    );
 }
 
 // ---- begin: resume or embed ----
@@ -546,7 +574,15 @@ fn read_header(inner: Arc<Inner>, file: ResumeFile, layers: usize, then: Once<us
             Ok(header) => match resume_at(&header, &inner.settings.key, layers) {
                 0 => embed(inner, then),
                 done => match inner.resume_file().cloned() {
-                    Ok(file) => read_states(inner, file, 0, done, then),
+                    Ok(file) => {
+                        let ended = Arc::clone(&then);
+                        read_states(
+                            &file,
+                            inner.region(),
+                            STATES_CHUNK,
+                            Box::new(move |read| end(&ended, read.map(|()| done))),
+                        );
+                    }
                     Err(error) => end(&then, Err(error)),
                 },
             },
@@ -558,36 +594,6 @@ fn read_header(inner: Arc<Inner>, file: ResumeFile, layers: usize, then: Once<us
     }
 }
 
-/// Reads the states of the resume file into the pinned memory, a chunk after another, then starts at layer `done`.
-fn read_states(inner: Arc<Inner>, file: ResumeFile, at: usize, done: usize, then: Once<usize>) {
-    if at >= inner.states.bytes {
-        end(&then, Ok(done));
-        return;
-    }
-    let length = STATES_CHUNK.min(inner.states.bytes - at);
-    let failed = Arc::clone(&then);
-    let next = file.clone();
-    let started = file.read(
-        HEADER + at as u64,
-        length,
-        Box::new(move |bytes| {
-            match bytes {
-                Err(error) => end(&then, Err(CalibrateError::failed("the resume states", error))),
-                Ok(bytes) => {
-                    // SAFETY: the range is inside the states, which nothing else touches before the run starts.
-                    unsafe { slice::from_raw_parts_mut(inner.states.pointer().add(at), length) }
-                        .copy_from_slice(&bytes);
-                    read_states(inner, next, at + length, done, then);
-                }
-            }
-            idle()
-        }),
-    );
-    if let Err(error) = started {
-        end(&failed, Err(CalibrateError::failed("the resume states", error)));
-    }
-}
-
 /// Looks the tokens up in the embedding table: each token's row is copied into the states.
 fn embed(inner: Arc<Inner>, then: Once<usize>) {
     let store = Arc::clone(inner.objects.store());
@@ -595,15 +601,11 @@ fn embed(inner: Arc<Inner>, then: Once<usize>) {
         Ok(tensor) => tensor.clone(),
         Err(error) => return end(&then, Err(CalibrateError::failed("the embedding table", error))),
     };
-    let row_bytes = inner.row_bytes() as u64;
-    if tensor.bytes % row_bytes != 0 {
-        return end(
-            &then,
-            Err(CalibrateError::Failed(format!(
-                "the embedding table of {} bytes is not rows of {row_bytes} bytes",
-                tensor.bytes
-            ))),
-        );
+    let hidden = inner.hidden as u64;
+    let checked = embedding::vocabulary(&tensor.dtype, &tensor.shape, hidden)
+        .and_then(|vocabulary| embedding::check_tokens(&inner.settings.tokens, vocabulary));
+    if let Err(error) = checked {
+        return end(&then, Err(error));
     }
     let memory = match PinnedBuffer::alloc(&inner.library, tensor.bytes as usize) {
         Ok(memory) => memory,
@@ -616,7 +618,13 @@ fn embed(inner: Arc<Inner>, then: Once<usize>) {
         Arc::new(move |read: Result<PinnedBuffer, CheckpointError>| {
             let outcome = read
                 .map_err(|error| CalibrateError::failed("the embedding table", error))
-                .and_then(|memory| copy_rows(&inner, &memory, tensor.bytes / row_bytes));
+                .and_then(|memory| {
+                    // SAFETY: the table was read whole into the buffer, which nothing else touches.
+                    let table = unsafe { slice::from_raw_parts(memory.as_ptr(), tensor.bytes as usize) };
+                    // SAFETY: the states are the run's own and nothing touches them before the run starts.
+                    let states = unsafe { slice::from_raw_parts_mut(inner.states.pointer(), inner.states.bytes) };
+                    embedding::copy_rows(&inner.settings.tokens, table, inner.row_bytes(), states)
+                });
             end(&then, outcome.map(|()| 0));
         }),
     );
@@ -625,91 +633,12 @@ fn embed(inner: Arc<Inner>, then: Once<usize>) {
     }
 }
 
-fn copy_rows(inner: &Inner, table: &PinnedBuffer, vocabulary: u64) -> Result<(), CalibrateError> {
-    let row = inner.row_bytes();
-    let (source, target) = (table.as_ptr(), inner.states.pointer());
-    for (position, &token) in inner.settings.tokens.iter().enumerate() {
-        let token = u64::try_from(token)
-            .ok()
-            .filter(|token| *token < vocabulary)
-            .ok_or_else(|| {
-                CalibrateError::Invalid(format!(
-                    "token {token} at {position} is outside the {vocabulary} embeddings"
-                ))
-            })?;
-        // SAFETY: the token's row is inside the table, and the position's row is inside the states; they are two
-        // buffers.
-        unsafe {
-            target
-                .add(position * row)
-                .copy_from_nonoverlapping(source.add(token as usize * row), row)
-        };
-    }
-    Ok(())
-}
-
 // ---- checkpoint ----
 
-fn checkpoint(inner: Arc<Inner>, done: usize, then: Once<()>) {
-    let file = match inner.resume_file() {
-        Ok(file) => file.clone(),
-        Err(error) => return end(&then, Err(error)),
-    };
-    // The states are replaced: a header that names no layers first, so a stop in between resumes from the start.
-    let invalid = resume_header(&inner.settings.key, 0);
-    let failed = Arc::clone(&then);
-    let next = file.clone();
-    let started = file.set_header(
-        &invalid,
-        Box::new(move |set| {
-            match set {
-                Err(error) => end(&then, Err(CalibrateError::failed("the resume header", error))),
-                Ok(()) => write_states(inner, next, 0, done, then),
-            }
-            idle()
-        }),
-    );
-    if let Err(error) = started {
-        end(&failed, Err(CalibrateError::failed("the resume header", error)));
-    }
-}
-
-fn write_states(inner: Arc<Inner>, file: ResumeFile, at: usize, done: usize, then: Once<()>) {
-    let failed = Arc::clone(&then);
-    if at >= inner.states.bytes {
-        let valid = resume_header(&inner.settings.key, done);
-        let started = file.set_header(
-            &valid,
-            Box::new(move |set| {
-                end(
-                    &then,
-                    set.map_err(|error| CalibrateError::failed("the resume header", error)),
-                );
-                idle()
-            }),
-        );
-        if let Err(error) = started {
-            end(&failed, Err(CalibrateError::failed("the resume header", error)));
-        }
-        return;
-    }
-    let length = STATES_CHUNK.min(inner.states.bytes - at);
-    // SAFETY: the range is inside the states, which the run does not touch while it checkpoints.
-    let bytes = unsafe { slice::from_raw_parts(inner.states.pointer().add(at), length) }.to_vec();
-    let next = file.clone();
-    let started = file.write(
-        HEADER + at as u64,
-        bytes,
-        Box::new(move |wrote: Result<u64, ResumeError>| {
-            match wrote {
-                Err(error) => end(&then, Err(CalibrateError::failed("the resume states", error))),
-                Ok(_) => write_states(inner, next, at + length, done, then),
-            }
-            idle()
-        }),
-    );
-    if let Err(error) = started {
-        end(&failed, Err(CalibrateError::failed("the resume states", error)));
+fn checkpoint(inner: &Arc<Inner>, done: usize, then: Then<()>) {
+    match inner.resume_file() {
+        Ok(file) => write_checkpoint(file, &inner.settings.key, inner.region(), STATES_CHUNK, done, then),
+        Err(error) => then(Err(error)),
     }
 }
 

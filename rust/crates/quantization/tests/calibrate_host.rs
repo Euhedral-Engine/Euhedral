@@ -7,13 +7,20 @@
     reason = "a test: the fake records in a mutex and a failed unwrap is the failure"
 )]
 
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use euhedral_inference_quantization::calibrate::plan::{resume_at, resume_header, resume_key};
-use euhedral_inference_quantization::calibrate::{CalibrateError, HessianSet, Plan, Stages, Then, drive, round_order};
+use euhedral_inference_engine::Handoff;
+use euhedral_inference_quantization::calibrate::manifest::{Manifest, prepare};
+use euhedral_inference_quantization::calibrate::plan::{resume_at, resume_header, resume_key, tokens_digest};
+use euhedral_inference_quantization::calibrate::schedule::{Schedule, Settled};
+use euhedral_inference_quantization::calibrate::{
+    CalibrateError, HessianSet, Plan, Stages, Then, drive, embedding, round_order,
+};
 
 const HANG: Duration = Duration::from_secs(20);
 
@@ -427,4 +434,423 @@ fn a_plan_of_no_layers_only_finishes() {
     let fake = Fake::new(None, 0);
     run(&fake, Plan::new(0)).unwrap();
     assert_eq!(fake.events(), vec![Event::Finish]);
+}
+
+// ---- the driver's join, with the layer and the read of the next layer ending in either order ----
+
+/// What a gated fake holds back: the continuation of a call the test ends by hand.
+enum Held {
+    Layer(usize, Then<()>),
+    Stage(usize, Then<usize>),
+}
+
+/// A fake whose layers and reads (past the first) end when the test says.
+struct Gated {
+    log: Mutex<Vec<Event>>,
+    held: Mutex<Vec<Held>>,
+}
+
+impl Gated {
+    fn run(plan: Plan) -> (Arc<Gated>, Receiver<Result<(), CalibrateError>>) {
+        let fake = Arc::new(Gated {
+            log: Mutex::new(Vec::new()),
+            held: Mutex::new(Vec::new()),
+        });
+        let (done, receiver) = result_sink();
+        drive(Arc::clone(&fake), plan, done);
+        (fake, receiver)
+    }
+
+    fn events(&self) -> Vec<Event> {
+        self.log.lock().unwrap().clone()
+    }
+
+    /// Ends the held layer `layer`.
+    fn end_layer(&self, layer: usize) {
+        let then = self.take(|held| matches!(held, Held::Layer(at, _) if *at == layer));
+        if let Held::Layer(_, then) = then {
+            then(Ok(()));
+        }
+    }
+
+    /// Ends the held read of `layer`.
+    fn end_read(&self, layer: usize) {
+        let then = self.take(|held| matches!(held, Held::Stage(at, _) if *at == layer));
+        if let Held::Stage(at, then) = then {
+            then(Ok(at));
+        }
+    }
+
+    fn take(&self, wanted: impl Fn(&Held) -> bool) -> Held {
+        let mut held = self.held.lock().unwrap();
+        let at = held.iter().position(wanted).expect("the call is not held");
+        held.remove(at)
+    }
+}
+
+impl Stages for Gated {
+    type Staged = usize;
+
+    fn begin(&self, _plan: &Plan, then: Then<usize>) {
+        then(Ok(0));
+    }
+
+    fn stage(&self, layer: usize, then: Then<usize>) {
+        self.log.lock().unwrap().push(Event::Stage(layer));
+        if layer == 0 {
+            then(Ok(0));
+        } else {
+            self.held.lock().unwrap().push(Held::Stage(layer, then));
+        }
+    }
+
+    fn layer(&self, layer: usize, _staged: usize, then: Then<()>) {
+        self.log.lock().unwrap().push(Event::Layer(layer));
+        self.held.lock().unwrap().push(Held::Layer(layer, then));
+    }
+
+    fn checkpoint(&self, done: usize, then: Then<()>) {
+        self.log.lock().unwrap().push(Event::Checkpoint(done));
+        then(Ok(()));
+    }
+
+    fn finish(&self, then: Then<()>) {
+        self.log.lock().unwrap().push(Event::Finish);
+        then(Ok(()));
+    }
+}
+
+#[test]
+fn the_next_layer_is_read_while_the_layer_runs() {
+    let (fake, _receiver) = Gated::run(Plan::new(3));
+    assert_eq!(
+        fake.events(),
+        vec![Event::Stage(0), Event::Stage(1), Event::Layer(0)],
+        "layer 1 is read before layer 0 ends, and layer 0 runs without waiting for it"
+    );
+}
+
+#[test]
+fn the_next_layer_runs_when_the_read_ends_after_the_layer() {
+    let (fake, receiver) = Gated::run(Plan::new(2));
+    fake.end_layer(0);
+    assert!(!fake.events().contains(&Event::Layer(1)), "layer 1 waits for its read");
+    fake.end_read(1);
+    assert!(fake.events().contains(&Event::Layer(1)));
+    fake.end_layer(1);
+    receiver.recv_timeout(HANG).expect("the run never ended").unwrap();
+    assert_eq!(fake.events().last(), Some(&Event::Finish));
+}
+
+#[test]
+fn the_next_layer_runs_when_the_layer_ends_after_the_read() {
+    let (fake, receiver) = Gated::run(Plan::new(2));
+    fake.end_read(1);
+    assert!(!fake.events().contains(&Event::Layer(1)), "layer 1 waits for layer 0");
+    fake.end_layer(0);
+    assert!(fake.events().contains(&Event::Layer(1)));
+    fake.end_layer(1);
+    receiver.recv_timeout(HANG).expect("the run never ended").unwrap();
+}
+
+#[test]
+fn a_read_that_fails_after_its_layer_ended_ends_the_run_with_the_failure() {
+    let (fake, receiver) = Gated::run(Plan::new(2));
+    fake.end_layer(0);
+    let held = fake.take(|held| matches!(held, Held::Stage(1, _)));
+    if let Held::Stage(_, then) = held {
+        then(Err(CalibrateError::Failed("read failed".to_owned())));
+    }
+    let error = receiver.recv_timeout(HANG).expect("the run never ended").unwrap_err();
+    assert!(error.to_string().contains("read failed"));
+    assert!(!fake.events().contains(&Event::Layer(1)));
+}
+
+#[test]
+fn a_layer_that_fails_before_its_read_ended_ends_the_run_once() {
+    let (fake, receiver) = Gated::run(Plan::new(2));
+    let held = fake.take(|held| matches!(held, Held::Layer(0, _)));
+    if let Held::Layer(_, then) = held {
+        then(Err(CalibrateError::Failed("layer failed".to_owned())));
+    }
+    fake.end_read(1);
+    let error = receiver.recv_timeout(HANG).expect("the run never ended").unwrap_err();
+    assert!(error.to_string().contains("layer failed"));
+    assert!(receiver.try_recv().is_err(), "the run's result is told once");
+    assert!(!fake.events().contains(&Event::Layer(1)));
+}
+
+// ---- the rounding schedule, over fake lanes ----
+
+/// A fake lane: a number the test follows.
+#[derive(Debug, PartialEq, Eq)]
+struct FakeLane(usize);
+
+/// A fake decoded buffer: the index of the linear it belongs to.
+#[derive(Debug, PartialEq, Eq)]
+struct FakeBuffer(usize);
+
+type FakeSchedule = Schedule<FakeLane, FakeBuffer>;
+
+/// What a round ends with.
+type Ended = Result<Settled<FakeLane, FakeBuffer>, CalibrateError>;
+
+fn schedule(linears: usize, lanes: usize, order: Vec<usize>) -> (Arc<FakeSchedule>, Receiver<Ended>, usize) {
+    let decoded = (0..linears)
+        .map(|index| {
+            let held = Handoff::empty();
+            held.send(FakeBuffer(index));
+            held
+        })
+        .collect();
+    let (sender, receiver) = channel();
+    let (schedule, started) = Schedule::new(
+        (0..linears).map(|index| format!("linear{index}")).collect(),
+        order,
+        decoded,
+        lanes,
+        Box::new(move |settled| sender.send(settled).unwrap()),
+    );
+    (Arc::new(schedule), receiver, started)
+}
+
+/// A linear a lane took: which lane, which linear, with which buffer.
+type Taken = (usize, usize, FakeBuffer, FakeLane);
+
+/// Pulls for lane `number` and returns what it took, if anything.
+fn pull(schedule: &FakeSchedule, number: usize) -> Option<Taken> {
+    let mut taken = None;
+    schedule.pull(number, FakeLane(number), |index, buffer, lane| {
+        taken = Some((number, index, buffer, lane));
+    });
+    taken
+}
+
+#[test]
+fn lanes_take_the_linears_in_order_and_every_lane_and_buffer_comes_back() {
+    let (schedule, receiver, started) = schedule(4, 3, vec![2, 0, 3, 1]);
+    assert_eq!(started, 3);
+    let first: Vec<Taken> = (0..3).map(|number| pull(&schedule, number).unwrap()).collect();
+    assert_eq!(
+        first.iter().map(|taken| taken.1).collect::<Vec<_>>(),
+        vec![2, 0, 3],
+        "largest first"
+    );
+    let (number, index, buffer, lane) = first.into_iter().next().unwrap();
+    assert_eq!(
+        (buffer, &lane),
+        (FakeBuffer(index), &FakeLane(number)),
+        "a linear's own buffer and the lane's own"
+    );
+    schedule.keep(index, FakeBuffer(index));
+    let fourth = pull(&schedule, number).expect("the lane that ended takes the last linear");
+    assert_eq!(fourth.1, 1);
+    schedule.keep(fourth.1, fourth.2);
+    schedule.keep(0, FakeBuffer(0));
+    schedule.keep(3, FakeBuffer(3));
+    assert!(receiver.try_recv().is_err(), "the round has not ended while lanes work");
+    for lane in 0..3 {
+        assert!(pull(&schedule, lane).is_none(), "no linear is left");
+    }
+    let settled = receiver.recv_timeout(HANG).expect("the round never ended").unwrap();
+    assert_eq!(settled.lanes, vec![FakeLane(0), FakeLane(1), FakeLane(2)]);
+    assert_eq!(
+        settled.decoded,
+        (0..4).map(|index| Some(FakeBuffer(index))).collect::<Vec<_>>(),
+        "every decoded buffer is given back"
+    );
+}
+
+#[test]
+fn more_lanes_than_linears_start_only_as_many_as_there_are_linears_and_park_the_rest() {
+    let (schedule, receiver, started) = schedule(2, 3, vec![0, 1]);
+    assert_eq!(started, 2);
+    schedule.park(2, FakeLane(2));
+    for number in 0..2 {
+        let taken = pull(&schedule, number).unwrap();
+        schedule.keep(taken.1, taken.2);
+    }
+    for number in 0..2 {
+        assert!(pull(&schedule, number).is_none());
+    }
+    let settled = receiver.recv_timeout(HANG).expect("the round never ended").unwrap();
+    assert_eq!(settled.lanes.len(), 3, "the parked lane comes back with the others");
+}
+
+#[test]
+fn a_failure_while_others_are_in_flight_lets_them_end_takes_no_more_linears_and_tells_the_first_error() {
+    let (schedule, receiver, _) = schedule(5, 3, vec![0, 1, 2, 3, 4]);
+    let taken: Vec<Taken> = (0..3).map(|number| pull(&schedule, number).unwrap()).collect();
+    let mut taken = taken.into_iter();
+    let (failing, _, _, lane) = taken.next().unwrap();
+    schedule.abort(failing, lane, CalibrateError::Failed("first".to_owned()));
+    assert!(receiver.try_recv().is_err(), "the round waits for the lanes in flight");
+    let (second, index, buffer, _) = taken.next().unwrap();
+    schedule.keep(index, buffer);
+    assert!(pull(&schedule, second).is_none(), "a failed round hands out no linear");
+    assert!(receiver.try_recv().is_err(), "one lane is still in flight");
+    let (third, index, buffer, lane) = taken.next().unwrap();
+    schedule.abort(third, lane, CalibrateError::Failed("second".to_owned()));
+    schedule.keep(index, buffer);
+    let error = receiver.recv_timeout(HANG).expect("the round never ended").unwrap_err();
+    assert_eq!(error.to_string(), "first", "the first error is the round's");
+}
+
+#[test]
+fn a_linear_whose_buffer_was_not_given_fails_the_round_naming_it() {
+    let decoded = vec![Handoff::empty()];
+    let (sender, receiver) = channel();
+    let (schedule, _) = Schedule::<FakeLane, FakeBuffer>::new(
+        vec!["query_key".to_owned()],
+        vec![0],
+        decoded,
+        1,
+        Box::new(move |settled| sender.send(settled).unwrap()),
+    );
+    assert!(pull(&schedule, 0).is_none());
+    let error = receiver.recv_timeout(HANG).expect("the round never ended").unwrap_err();
+    assert!(error.to_string().contains("query_key"), "{error}");
+}
+
+// ---- the embedding ----
+
+#[test]
+fn the_embedding_table_must_be_bf16_with_one_row_per_token_of_the_hidden_size() {
+    assert_eq!(embedding::vocabulary("BF16", &[10, 4], 4).unwrap(), 10);
+    assert!(embedding::vocabulary("F32", &[10, 4], 4).is_err(), "another dtype");
+    assert!(embedding::vocabulary("BF16", &[10, 5], 4).is_err(), "another width");
+    assert!(embedding::vocabulary("BF16", &[40], 4).is_err(), "not a matrix");
+    assert!(embedding::vocabulary("BF16", &[0, 4], 4).is_err(), "no rows");
+    assert_eq!(embedding::row_bytes(4), 8);
+}
+
+#[test]
+fn a_token_outside_the_table_is_refused_by_position_before_any_row_is_copied() {
+    assert!(embedding::check_tokens(&[0, 9], 10).is_ok());
+    assert!(embedding::check_tokens(&[], 10).is_ok());
+    let past = embedding::check_tokens(&[3, 10], 10).unwrap_err().to_string();
+    assert!(past.contains("token 10 at 1"), "{past}");
+    let negative = embedding::check_tokens(&[-1], 10).unwrap_err().to_string();
+    assert!(negative.contains("token -1 at 0"), "{negative}");
+    let table = [0u8; 8];
+    let mut states = [7u8; 8];
+    assert!(embedding::copy_rows(&[0, 5], &table, 4, &mut states).is_err());
+    assert_eq!(states, [7u8; 8], "nothing was copied");
+}
+
+#[test]
+fn each_token_gets_its_own_row_in_its_own_position() {
+    let table: Vec<u8> = (0..12).collect();
+    let mut states = [0u8; 12];
+    embedding::copy_rows(&[2, 0, 2], &table, 4, &mut states).unwrap();
+    assert_eq!(states, [8, 9, 10, 11, 0, 1, 2, 3, 8, 9, 10, 11]);
+    let mut wrong = [0u8; 8];
+    assert!(
+        embedding::copy_rows(&[0, 1, 2], &table, 4, &mut wrong).is_err(),
+        "states of another size"
+    );
+}
+
+// ---- the manifest and the output directory ----
+
+fn touch(directory: &Path, names: &[&str]) {
+    for name in names {
+        fs::write(directory.join(name), name.as_bytes()).unwrap();
+    }
+}
+
+fn names(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_directory_of_another_key_keeps_only_the_new_runs_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let old = prepare(directory.path(), "old", 64).unwrap();
+    assert_eq!(old, Manifest::new("old", 64));
+    touch(
+        directory.path(),
+        &[
+            "a.npz",
+            "text.layers.40.mlp.npz",
+            "hidden.bin",
+            "b.npz.tmp",
+            "notes.txt",
+        ],
+    );
+    let fresh = prepare(directory.path(), "new", 64).unwrap();
+    assert_eq!(fresh, Manifest::new("new", 64));
+    assert_eq!(
+        names(directory.path()),
+        vec!["calibration.json".to_owned(), "notes.txt".to_owned()],
+        "the old run's states, resume file and torn writes are gone; a file no run writes stays"
+    );
+    let written = Manifest::parse(&fs::read(directory.path().join("calibration.json")).unwrap()).unwrap();
+    assert_eq!(written, fresh);
+}
+
+#[test]
+fn a_directory_of_the_same_key_keeps_its_files_and_progress() {
+    let directory = tempfile::tempdir().unwrap();
+    prepare(directory.path(), "run", 64).unwrap();
+    let progress = Manifest::new("run", 64).after(9);
+    fs::write(directory.path().join("calibration.json"), progress.to_bytes().unwrap()).unwrap();
+    touch(directory.path(), &["a.npz", "hidden.bin"]);
+    assert_eq!(prepare(directory.path(), "run", 64).unwrap(), progress);
+    assert_eq!(names(directory.path()), vec!["a.npz", "calibration.json", "hidden.bin"]);
+}
+
+#[test]
+fn files_without_a_readable_manifest_or_of_a_model_of_other_depth_are_not_kept() {
+    let directory = tempfile::tempdir().unwrap();
+    touch(directory.path(), &["a.npz", "hidden.bin"]);
+    prepare(directory.path(), "run", 64).unwrap();
+    assert_eq!(
+        names(directory.path()),
+        vec!["calibration.json"],
+        "no manifest: unknown files"
+    );
+    touch(directory.path(), &["a.npz"]);
+    fs::write(directory.path().join("calibration.json"), b"{ torn").unwrap();
+    prepare(directory.path(), "run", 64).unwrap();
+    assert_eq!(
+        names(directory.path()),
+        vec!["calibration.json"],
+        "an unreadable manifest"
+    );
+    touch(directory.path(), &["a.npz"]);
+    prepare(directory.path(), "run", 40).unwrap();
+    assert_eq!(
+        names(directory.path()),
+        vec!["calibration.json"],
+        "the same key over another model"
+    );
+}
+
+#[test]
+fn a_manifest_is_complete_only_when_every_layer_and_both_heads_and_the_mtp_block_are_written() {
+    let mut manifest = Manifest::new("run", 4);
+    assert!(!manifest.is_complete());
+    manifest = manifest.after(4);
+    assert!(!manifest.is_complete(), "every layer but no heads");
+    manifest.heads_done = true;
+    assert!(!manifest.is_complete(), "no MTP block");
+    manifest.mtp_done = true;
+    assert!(manifest.is_complete());
+    assert!(!manifest.after(3).is_complete());
+    assert_eq!(manifest.after(9).layers_done, 4, "never past the model");
+    assert_eq!(Manifest::parse(&manifest.to_bytes().unwrap()).unwrap(), manifest);
+    assert!(Manifest::parse(b"{}").is_err());
+}
+
+#[test]
+fn the_token_digest_follows_the_tokens_contents() {
+    assert_eq!(tokens_digest(&[1, 2, 3]), tokens_digest(&[1, 2, 3]));
+    assert_ne!(tokens_digest(&[1, 2, 3]), tokens_digest(&[1, 2, 4]));
+    assert_ne!(tokens_digest(&[1, 2]), tokens_digest(&[1, 2, 0]));
 }

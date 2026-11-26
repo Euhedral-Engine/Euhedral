@@ -16,6 +16,7 @@ import numpy as np
 from euhedral_artifacts import dflash2, q3_p2e2, tokenizer_section
 from euhedral_artifacts.edrl import (FORMAT_ORDINAL, HEADER_SIZE, LAYOUT_ORDINAL, MAGIC, VERSION, ObjectPlan,
                                      assign_offsets, encode_table, fail, read_table, sha256)
+from euhedral_artifacts.codes import require_complete_codes
 from euhedral_artifacts.importance import ImportanceMatrix
 from euhedral_artifacts.inventory import (VOCAB_SIZE, build_plans, draft_token_ids, encode_metadata, shortlist)
 from euhedral_artifacts.recipes import Recipe
@@ -120,7 +121,8 @@ def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path |
     `ranking_path` (token frequency counts, to choose the draft-head shortlist) and `draft_ids_from`
     (an existing artifact whose shortlist is reused) is required. `draft` adds the DFlash2 drafter.
     `imatrix` (a llama.cpp importance matrix) selects calibrated rounding. `codes_from` (a directory of
-    pre-rounded codes, codes.py) supplies the objects it holds files for. `trellis_from` (an EXL3 checkpoint
+    pre-rounded codes, codes.py, with the manifest of a finished calibrate run) supplies the objects it holds
+    files for. `trellis_from` (an EXL3 checkpoint
     directory) is required by the trellis recipe and refused by the others; the recipe's heads come from
     `codes_from`."""
     if output_path.exists() and not force:
@@ -133,6 +135,8 @@ def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path |
         fail("pass exactly one of --ranking and --draft-ids-from")
     config = read_json(model / "config.json")
     check_checkpoint(config)
+    if codes_from is not None and recipe.quantization != "trellis":
+        require_complete_codes(codes_from)
     selected = shortlist(model, ranking_path) if ranking_path is not None else draft_token_ids(draft_ids_from)
     importance = ImportanceMatrix(imatrix) if imatrix is not None else None
     trellis = None

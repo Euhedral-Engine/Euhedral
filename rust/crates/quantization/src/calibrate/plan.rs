@@ -3,6 +3,8 @@
 use crate::resume::Header;
 use std::cmp::Reverse;
 
+use sha2::{Digest, Sha256};
+
 /// Layers between two checkpoints of the hidden states, as Java's calibration.
 pub const CHECKPOINT_EVERY: usize = 8;
 
@@ -50,6 +52,16 @@ impl Plan {
     pub fn checkpoint_due(&self, done: usize) -> bool {
         self.checkpoint_every > 0 && done.is_multiple_of(self.checkpoint_every) && done < self.layers
     }
+}
+
+/// A digest of the calibration tokens' contents, in the resume key: the same file name over other tokens is another
+/// run.
+pub fn tokens_digest(tokens: &[i32]) -> String {
+    let mut hash = Sha256::new();
+    for token in tokens {
+        hash.update(token.to_le_bytes());
+    }
+    format!("{:x}", hash.finalize())
 }
 
 /// What names a run: a resume file of another run is not resumed. Java's key (the tokens file, the sequences, the

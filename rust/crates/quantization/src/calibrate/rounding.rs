@@ -8,9 +8,7 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::mem::take;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use euhedral_core::frames::Frame;
 use euhedral_graph::Lake;
 use euhedral_inference_cuda::DeviceBuffer;
 use euhedral_inference_engine::Handoff;
@@ -19,12 +17,13 @@ use euhedral_memory::{LocationId, OwnerId, Planner};
 
 use super::CalibrateError;
 use super::driver::Then;
+use super::files::save;
+use super::schedule::{Schedule, Settled};
 use crate::gptq::format::Format;
 use crate::gptq::state::QuantState;
 use crate::gptq::{DeviceRange, Factor, Finished, GptqLane, Refused, RoundRequest, TensorScales};
 use crate::memory::{Claims, StepBytes};
 use crate::recipe::{Format as StoredFormat, Recipe};
-use crate::resume::ResumeFile;
 use crate::step::idle;
 
 /// Rows of a linear one rounding step takes, as Java's: the factor and the tensor scales are shared by the slices.
@@ -66,18 +65,25 @@ pub struct Linear {
     pub decoded: Handoff<DeviceBuffer>,
 }
 
+impl Linear {
+    /// The same linear with no decoded weight held.
+    fn shell(&self) -> Linear {
+        Linear {
+            name: self.name.clone(),
+            rows: self.rows,
+            columns: self.columns,
+            weight: self.weight,
+            hessian: self.hessian,
+            decoded: Handoff::empty(),
+        }
+    }
+}
+
 /// A layer's rounding in progress, shared by its lanes.
 pub struct Round {
     services: Arc<Services>,
     linears: Vec<Linear>,
-    /// The linears' indices, largest first.
-    order: Vec<usize>,
-    next: AtomicUsize,
-    running: AtomicUsize,
-    failed: AtomicBool,
-    error: Handoff<CalibrateError>,
-    lanes: Vec<Handoff<GptqLane>>,
-    ended: Handoff<Then<Ended>>,
+    schedule: Schedule<GptqLane, DeviceBuffer>,
 }
 
 /// What a layer's rounding gives back: the lanes and the linears with their decoded weights.
@@ -125,25 +131,49 @@ pub unsafe fn round_all(
     order: Vec<usize>,
     then: Then<Ended>,
 ) {
-    let count = lanes.len().min(linears.len()).max(1);
+    let names = linears.iter().map(|linear| linear.name.clone()).collect();
+    let decoded = linears
+        .iter()
+        .map(|linear| {
+            let held = Handoff::empty();
+            if let Some(buffer) = linear.decoded.take() {
+                held.send(buffer);
+            }
+            held
+        })
+        .collect();
+    let shells: Vec<Linear> = linears.iter().map(Linear::shell).collect();
+    let (schedule, count) = Schedule::new(
+        names,
+        order,
+        decoded,
+        lanes.len(),
+        Box::new(move |settled| then(settled.map(|settled| ended(shells, settled)))),
+    );
     let round = Arc::new(Round {
         services,
-        order,
-        next: AtomicUsize::new(0),
-        running: AtomicUsize::new(count),
-        failed: AtomicBool::new(false),
-        error: Handoff::empty(),
-        lanes: lanes.iter().map(|_| Handoff::empty()).collect(),
         linears,
-        ended: Handoff::empty(),
+        schedule,
     });
-    round.ended.send(then);
     for (number, lane) in lanes.into_iter().enumerate() {
         if number < count {
             pull(&round, number, lane);
         } else {
-            round.lanes[number].send(lane);
+            round.schedule.park(number, lane);
         }
+    }
+}
+
+/// The linears with the decoded weights the round gave back.
+fn ended(shells: Vec<Linear>, settled: Settled<GptqLane, DeviceBuffer>) -> Ended {
+    for (shell, buffer) in shells.iter().zip(settled.decoded) {
+        if let Some(buffer) = buffer {
+            shell.decoded.send(buffer);
+        }
+    }
+    Ended {
+        lanes: settled.lanes,
+        linears: shells,
     }
 }
 
@@ -160,79 +190,22 @@ fn claims(services: &Services, bytes: StepBytes) -> Result<Claims, CalibrateErro
     })
 }
 
-/// The lane is done: it goes back to the round, and the last lane to end ends the round.
-fn give_back(round: &Arc<Round>, number: usize, lane: GptqLane) {
-    round.lanes[number].send(lane);
-    if round.running.fetch_sub(1, Ordering::AcqRel) != 1 {
-        return;
-    }
-    let lanes = round.lanes.iter().filter_map(Handoff::take).collect();
-    let Some(then) = round.ended.take() else { return };
-    if round.failed.load(Ordering::Acquire) {
-        let error = round
-            .error
-            .take()
-            .unwrap_or_else(|| CalibrateError::Failed("rounding failed".to_owned()));
-        then(Err(error));
-        return;
-    }
-    // Every lane has sent its end before the count reached 0, so no frame touches the round's linears any more.
-    let linears = round.linears.iter().map(|linear| Linear {
-        name: linear.name.clone(),
-        rows: linear.rows,
-        columns: linear.columns,
-        weight: linear.weight,
-        hessian: linear.hessian,
-        decoded: Handoff::empty(),
-    });
-    let linears: Vec<Linear> = linears
-        .zip(&round.linears)
-        .map(|(copy, own)| {
-            if let Some(buffer) = own.decoded.take() {
-                copy.decoded.send(buffer);
-            }
-            copy
-        })
-        .collect();
-    then(Ok(Ended { lanes, linears }));
-}
-
 fn abort(round: &Arc<Round>, number: usize, lane: GptqLane, error: CalibrateError) {
-    if !round.failed.swap(true, Ordering::AcqRel) {
-        round.error.send(error);
-    }
-    give_back(round, number, lane);
+    round.schedule.abort(number, lane, error);
 }
 
 /// Takes the next linear, or ends the lane.
 fn pull(round: &Arc<Round>, number: usize, lane: GptqLane) {
-    if round.failed.load(Ordering::Acquire) {
-        give_back(round, number, lane);
-        return;
-    }
-    let at = round.next.fetch_add(1, Ordering::AcqRel);
-    let Some(&index) = round.order.get(at) else {
-        give_back(round, number, lane);
-        return;
-    };
-    let linear = &round.linears[index];
-    let decoded = linear.decoded.take();
-    let format = round.services.settings.recipe.format(&linear.name);
-    match (decoded, format) {
-        (Some(decoded), Ok(format)) => {
-            factor(
+    round.schedule.pull(number, lane, |index, decoded, lane| {
+        let linear = &round.linears[index];
+        match round.services.settings.recipe.format(&linear.name) {
+            Ok(format) => factor(
                 Box::new(Object::new(round, number, index, decoded, rounded(format))),
                 lane,
-            );
+            ),
+            Err(error) => abort(round, number, lane, CalibrateError::failed(&linear.name, error)),
         }
-        (None, _) => abort(
-            round,
-            number,
-            lane,
-            CalibrateError::failed(&linear.name, "no buffer was given for the decoded weight"),
-        ),
-        (_, Err(error)) => abort(round, number, lane, CalibrateError::failed(&linear.name, error)),
-    }
+    });
 }
 
 /// One linear on its lane: its factor, its tensor scales and the slices rounded so far.
@@ -455,12 +428,13 @@ fn write(mut object: Box<Object>, lane: GptqLane) {
     let path = round.services.out.join(QuantState::file_name(&name));
     let index = object.index;
     let Object { decoded, .. } = *object;
-    round.linears[index].decoded.send(decoded);
+    round.schedule.keep(index, decoded);
     let parked = Arc::new(Handoff::<GptqLane>::empty());
     parked.send(lane);
     let (sender, next) = (parked, Arc::clone(&round));
     save(
-        &round.services,
+        &round.services.io,
+        &round.services.host,
         path,
         bytes,
         Box::new(move |saved| {
@@ -472,70 +446,6 @@ fn write(mut object: Box<Object>, lane: GptqLane) {
             idle()
         }),
     );
-}
-
-/// What a save tells its caller; the frame it returns is what the file's call hands the lake.
-pub type Saved = Box<dyn FnOnce(Result<(), CalibrateError>) -> Box<dyn Frame> + Send>;
-
-fn end(finish: &Handoff<Saved>, result: Result<(), CalibrateError>) -> Box<dyn Frame> {
-    match finish.take() {
-        Some(finish) => finish(result),
-        None => idle(),
-    }
-}
-
-/// Writes `bytes` whole to `path`: to a temporary file next to it, made durable and renamed over `path`.
-pub fn save(services: &Services, path: PathBuf, bytes: Vec<u8>, then: Saved) {
-    let finish = Arc::new(Handoff::<Saved>::empty());
-    finish.send(then);
-    let mut temporary = path.clone().into_os_string();
-    temporary.push(".tmp");
-    let len = bytes.len() as u64;
-    let open_finish = Arc::clone(&finish);
-    let opened = ResumeFile::open(
-        &services.io,
-        &services.host,
-        &PathBuf::from(temporary),
-        Box::new(move |opened| {
-            let file = match opened {
-                Ok(file) => file,
-                Err(error) => return end(&open_finish, Err(CalibrateError::failed("open", error))),
-            };
-            let write_finish = Arc::clone(&open_finish);
-            let sealing = file.clone();
-            let wrote = file.write(
-                0,
-                bytes,
-                Box::new(move |wrote| {
-                    if let Err(error) = wrote {
-                        return end(&write_finish, Err(CalibrateError::failed("write", error)));
-                    }
-                    let seal_finish = Arc::clone(&write_finish);
-                    let renamed = sealing.seal(
-                        len,
-                        &path,
-                        Box::new(move |sealed| {
-                            end(
-                                &seal_finish,
-                                sealed.map_err(|error| CalibrateError::failed("seal", error)),
-                            )
-                        }),
-                    );
-                    match renamed {
-                        Ok(()) => idle(),
-                        Err(error) => end(&write_finish, Err(CalibrateError::failed("seal", error))),
-                    }
-                }),
-            );
-            match wrote {
-                Ok(()) => idle(),
-                Err(error) => end(&open_finish, Err(CalibrateError::failed("write", error))),
-            }
-        }),
-    );
-    if let Err(error) = opened {
-        drop(end(&finish, Err(CalibrateError::failed("open", error))));
-    }
 }
 
 #[cfg(test)]

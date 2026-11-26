@@ -9,14 +9,24 @@
 //! - [`driver`]: the layer loop, generic over the device's calls ([`Stages`]): the next layer is read while this one
 //!   runs, and every step ends in the continuation of the call before it, never in a wait.
 //! - [`device`]: the calls on the card: the layer pipeline, the GPTQ lanes and the files.
+//! - [`schedule`]: which lane takes which linear of a layer, and the return of the lanes and the decoded weights.
+//! - [`files`], [`embedding`], [`manifest`]: a file saved whole and the resume states in chunks; the checked rows of
+//!   the embedding table; the manifest of how far a run got, and the output directory of a run of another key cleared.
+//!
+//! A run of the whole model writes every layer's objects but not the heads, the MTP block or a final cleanup:
+//! [`Stages::finish`] ends it with an error, the manifest stays incomplete and the resume file stays.
 //!
 //! The rounding arm is the GPTQ one. A format whose rounding differs (trellis) plugs in at [`Stages::layer`].
 
 pub mod device;
 pub mod driver;
+pub mod embedding;
+pub mod files;
 pub mod hessians;
+pub mod manifest;
 pub mod plan;
 pub mod rounding;
+pub mod schedule;
 
 use std::fmt::Display;
 use thiserror::Error;

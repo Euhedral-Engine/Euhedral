@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 from pathlib import Path
 import re
 import struct
@@ -321,6 +322,43 @@ class PipelineTest(unittest.TestCase):
                 mock.patch.object(pipeline, "draft_token_ids", lambda path: np.arange(4)):
             return pipeline.convert(Path("/model"), directory / "artifact.edrl", recipe,
                                     draft_ids_from=Path("/ids"), **kwargs)
+
+    def codes_directory(self, directory, manifest):
+        codes = Path(directory) / "codes"
+        codes.mkdir()
+        if manifest is not None:
+            (codes / "calibration.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return codes
+
+    def test_codes_without_a_manifest_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codes = self.codes_directory(tmp, None)
+            with self.assertRaisesRegex(ValueError, "no calibration.json"):
+                self.convert(recipes.Recipe("q3", False), Path(tmp), codes_from=codes)
+
+    def test_codes_of_a_run_that_stopped_early_are_refused_naming_the_gap(self):
+        complete = {"key": "k", "layers_done": 64, "layers_total": 64, "heads_done": True, "mtp_done": True}
+        for changes, named in (({"layers_done": 9}, "layers 9 of 64"), ({"heads_done": False}, "the heads"),
+                               ({"mtp_done": False}, "the MTP block")):
+            with self.subTest(named), tempfile.TemporaryDirectory() as tmp:
+                codes = self.codes_directory(tmp, {**complete, **changes})
+                with self.assertRaisesRegex(ValueError, named):
+                    self.convert(recipes.Recipe("q3", False), Path(tmp), codes_from=codes)
+                self.assertFalse((Path(tmp) / "artifact.edrl").exists())
+
+    def test_an_unreadable_manifest_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codes = self.codes_directory(tmp, None)
+            (codes / "calibration.json").write_text("{ torn", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unreadable"):
+                self.convert(recipes.Recipe("q3", False), Path(tmp), codes_from=codes)
+
+    def test_codes_of_a_finished_run_are_taken(self):
+        manifest = {"key": "k", "layers_done": 64, "layers_total": 64, "heads_done": True, "mtp_done": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            codes = self.codes_directory(tmp, manifest)
+            self.assertEqual(self.convert(recipes.Recipe("q3", False), Path(tmp), codes_from=codes)["codes_from"],
+                             str(codes))
 
     def test_expand_restores_the_transcoded_artifact_byte_for_byte(self):
         with tempfile.TemporaryDirectory() as tmp:

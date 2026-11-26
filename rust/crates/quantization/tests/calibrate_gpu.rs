@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use checkpoint_support::World;
+use euhedral_inference_cuda::DeviceBuffer;
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_quantization::calibrate::rounding::{Ended, Linear, RoundSettings, Services, round_all};
 use euhedral_inference_quantization::calibrate::{CalibrateError, round_order};
@@ -27,6 +28,7 @@ use euhedral_inference_quantization::gptq::state::QuantState;
 use euhedral_inference_quantization::gptq::{GptqSettings, RoundRequest, TensorScales};
 use euhedral_inference_quantization::npy::Npy;
 use euhedral_inference_quantization::recipe::{Quantization, Recipe};
+use euhedral_memory::LocationId;
 use gptq_rig::{range_of, rig};
 use serde_json::Value;
 
@@ -80,8 +82,8 @@ fn a_linear_rounded_in_slices_by_the_calibration_equals_the_library_called_direc
     let services = Arc::new(Services {
         planner,
         owner,
-        device: euhedral_memory::LocationId(0),
-        pinned: euhedral_memory::LocationId(1),
+        device: LocationId(0),
+        pinned: LocationId(1),
         settings: RoundSettings {
             recipe,
             damp,
@@ -92,7 +94,7 @@ fn a_linear_rounded_in_slices_by_the_calibration_equals_the_library_called_direc
         io: Arc::clone(&world.io),
         host: Arc::clone(&world.host),
     });
-    let decoded = euhedral_inference_cuda::DeviceBuffer::alloc(&rig.library, 2 * n * k).unwrap();
+    let decoded = DeviceBuffer::alloc(&rig.library, 2 * n * k).unwrap();
     let held = Handoff::empty();
     held.send(decoded);
     let linears = vec![Linear {

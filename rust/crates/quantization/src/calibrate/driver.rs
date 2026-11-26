@@ -2,7 +2,7 @@
 //!
 //! Layer `i` runs while layer `i + 1` is read from the checkpoint, as Java's chain does; the two calls end in either
 //! order and the later one goes on, so no thread waits for the other. The loop checkpoints after every
-//! [`Plan::checkpoint_every`] layers and, at the end of a full run, finishes: the heads, then the checkpoint dropped.
+//! [`Plan::checkpoint_every`] layers and, at the end of a run of the whole model, finishes.
 
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::Arc;
@@ -15,6 +15,23 @@ use super::plan::Plan;
 
 /// What a call tells its continuation.
 pub type Then<T> = Box<dyn FnOnce(Result<T, CalibrateError>) + Send>;
+
+/// A continuation taken once, from whichever call ends the chain.
+pub type Once<T> = Arc<Handoff<Then<T>>>;
+
+/// `then` as a continuation any of several calls may take.
+pub fn single<T>(then: Then<T>) -> Once<T> {
+    let cell = Arc::new(Handoff::empty());
+    cell.send(then);
+    cell
+}
+
+/// Ends the chain with `result`, unless a call already did.
+pub fn end<T>(cell: &Once<T>, result: Result<T, CalibrateError>) {
+    if let Some(then) = cell.take() {
+        then(result);
+    }
+}
 
 /// The calls of a calibration. Each takes the continuation to run once its work, which may run on other threads,
 /// is over; none waits.
@@ -36,7 +53,8 @@ pub trait Stages: Send + Sync + 'static {
     /// Saves the states after `done` layers as the point to resume from.
     fn checkpoint(&self, done: usize, then: Then<()>);
 
-    /// After the last layer: the heads rounded and the resume point dropped.
+    /// After the last layer of a run of the whole model: what is left to write besides the layers. A run that stops
+    /// early does not call it.
     fn finish(&self, then: Then<()>);
 }
 

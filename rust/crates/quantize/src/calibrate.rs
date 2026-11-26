@@ -1,15 +1,19 @@
 //! The `calibrate` command for GPTQ: the BF16 checkpoint run layer by layer over calibration tokens, each layer's
-//! linears rounded from the Hessians of their inputs and written to the output directory. The trellis arm is not part
-//! of this build, and so are the rounding of the heads and of the MTP block: a run stops after the layers it was
-//! asked for, which must be fewer than the model's, and keeps its resume file.
+//! linears rounded from the Hessians of their inputs and written to the output directory, with `calibration.json`
+//! recording how far the run got. The trellis arm is not part of this build. Nor is the rounding of the output head,
+//! the draft head and the MTP block: a run of fewer layers than the model's stops after them and exits 0, keeping its
+//! resume file; a run of every layer writes them all but the heads and the MTP block, then exits with an error naming
+//! that gap, and its manifest stays incomplete, so the converter refuses its output. The resume file is not removed.
 
+use std::env::consts;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
 use euhedral_inference_quantization::calibrate::device::{Calibration, Settings as RunSettings};
-use euhedral_inference_quantization::calibrate::plan::resume_key;
+use euhedral_inference_quantization::calibrate::manifest::prepare;
+use euhedral_inference_quantization::calibrate::plan::{resume_key, tokens_digest};
 use euhedral_inference_quantization::calibrate::{Plan, drive};
 use euhedral_inference_quantization::checkpoint::objects::Qwen38Objects;
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
@@ -27,21 +31,13 @@ const DEFAULT_BATCH: usize = 8;
 const DEFAULT_LAYERS: usize = 64;
 /// The most sequences run at once: each one holds a pipeline slot.
 const MOST_BATCH: usize = 64;
-/// Where the CUDA math libraries are when `--cuda-libraries` is not given.
-const DEFAULT_MATH_DIRECTORY: &str = "/usr/local/cuda/lib64";
-const DEFAULT_LIBRARY: &str = "build/native/linux-x64/lib/libeuhedral_cuda.so";
 /// What the trellis arm takes: refused by name.
-const TRELLIS_OPTIONS: [&str; 5] = [
-    "--bits",
-    "--rounding-lanes",
-    "--viterbi-scratch-mib",
-    "--memory-reserve-mib",
-    "--write-buffer-mib",
-];
+const TRELLIS_OPTIONS: [&str; 3] = ["--bits", "--viterbi-scratch-mib", "--write-buffer-mib"];
 /// What the command line accepts, for the message that refuses another option.
 const OPTIONS: &str = "--model, --quantization, --compressed, --output-head, --tokens, --draft-ids-from, --out, \
 --act-order, --damp, --batch, --sequences, --layers, --skip-mtp, --nvfp4-above, --nvfp4-scale-max, --format, \
---config, --library (or --cuda-library), --cuda-libraries";
+--config, --library (or --cuda-library), --cuda-libraries, --rounding-lanes, --memory-reserve-mib, --staging-mib, \
+--lane-pinned-mib, --upload-chunk-mib";
 
 /// The flags of a run, checked.
 #[derive(Debug)]
@@ -63,7 +59,18 @@ pub(crate) struct Flags {
     pub nvfp4_scale_max: f32,
     pub config: Option<PathBuf>,
     pub library: Option<PathBuf>,
-    pub math_directory: PathBuf,
+    pub math_directory: Option<PathBuf>,
+    /// Linears rounded at once (Java's `--rounding-lanes`); none takes the default.
+    pub rounding_lanes: Option<usize>,
+    /// Device MiB left for what the planner does not account (Java's `--memory-reserve-mib`); none sizes it from the
+    /// card.
+    pub memory_reserve_mib: Option<u64>,
+    /// Pinned MiB the layers are read into.
+    pub staging_mib: Option<u64>,
+    /// Pinned MiB the GPTQ lanes stage through.
+    pub lane_pinned_mib: Option<u64>,
+    /// MiB of one upload copy.
+    pub upload_chunk_mib: Option<usize>,
 }
 
 fn trellis_refusal(option: &str) -> String {
@@ -76,7 +83,8 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
     let (mut damp, mut batch, mut sequences, mut layers) = (DEFAULT_DAMP, DEFAULT_BATCH, 0, DEFAULT_LAYERS);
     let (mut above, mut scale_max) = (Nvfp4Search::DEFAULT.above(), Nvfp4Search::DEFAULT.scale_max());
     let (mut config, mut library) = (None, None);
-    let mut math_directory = PathBuf::from(DEFAULT_MATH_DIRECTORY);
+    let mut math_directory = None;
+    let (mut lanes, mut reserve, mut staging, mut lane_pinned, mut chunk) = (None, None, None, None, None);
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -100,6 +108,13 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
             value
                 .parse::<usize>()
                 .map_err(|_| format!("{arg} needs a whole number"))
+        };
+        let mebibytes = || {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|mib| *mib > 0)
+                .ok_or_else(|| format!("{arg} needs a positive whole number"))
         };
         let real = || value.parse::<f32>().map_err(|_| format!("{arg} needs a number"));
         match arg.as_str() {
@@ -129,7 +144,12 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
             "--nvfp4-scale-max" => scale_max = real()?,
             "--config" => config = Some(PathBuf::from(value)),
             "--cuda-library" | "--library" => library = Some(PathBuf::from(value)),
-            "--cuda-libraries" => math_directory = PathBuf::from(value),
+            "--cuda-libraries" => math_directory = Some(PathBuf::from(value)),
+            "--rounding-lanes" => lanes = Some(mebibytes()? as usize),
+            "--memory-reserve-mib" => reserve = Some(mebibytes()?),
+            "--staging-mib" => staging = Some(mebibytes()?),
+            "--lane-pinned-mib" => lane_pinned = Some(mebibytes()?),
+            "--upload-chunk-mib" => chunk = Some(mebibytes()? as usize),
             other => return Err(format!("unknown calibrate option {other}; the options are {OPTIONS}")),
         }
     }
@@ -167,7 +187,32 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
         config,
         library,
         math_directory,
+        rounding_lanes: lanes,
+        memory_reserve_mib: reserve,
+        staging_mib: staging,
+        lane_pinned_mib: lane_pinned,
+        upload_chunk_mib: chunk,
     })
+}
+
+/// The library the build puts the CUDA layer in, relative to the repository root, where this platform has one; other
+/// platforms name it with `--cuda-library`.
+fn default_library() -> Option<PathBuf> {
+    (consts::OS == "linux" && consts::ARCH == "x86_64")
+        .then(|| PathBuf::from("build/native/linux-x64/lib/libeuhedral_cuda.so"))
+}
+
+/// Where the CUDA math libraries are on a platform that has them in one place; other platforms name the directory with
+/// `--cuda-libraries`.
+fn default_math_directory() -> Option<PathBuf> {
+    (consts::OS == "linux").then(|| PathBuf::from("/usr/local/cuda/lib64"))
+}
+
+/// What the flag named, else the platform's default, else the refusal that names the flag.
+fn resolved(named: Option<PathBuf>, default: Option<PathBuf>, flag: &str) -> Result<PathBuf, String> {
+    named
+        .or(default)
+        .ok_or_else(|| format!("this platform has no default for {flag}: pass it"))
 }
 
 fn failed(message: String) -> Outcome {
@@ -200,15 +245,13 @@ fn read_tokens(path: &Path, limit: usize) -> Result<(Vec<i32>, usize), String> {
     Ok((tokens, length))
 }
 
-/// The layers a run rounds, as Java's `--layers`: a count, which a count at or above the model's layers makes a run
-/// of the whole model.
+/// The plan of a run of the model's `model_layers` layers that rounds `requested` of them, as Java's `--layers` is a
+/// count: a count at or above the model's makes a run of the whole model, which finishes; a smaller one stops early.
 pub(crate) fn plan_for(requested: usize, model_layers: usize) -> Plan {
-    Plan::new(requested.min(model_layers))
+    let mut plan = Plan::new(model_layers);
+    plan.stop_after = requested;
+    plan
 }
-
-/// Said after a run of the whole model: the heads and the MTP block are not rounded by this build.
-const HEADS_NOT_ROUNDED: &str = "calibrate: the layers are rounded; this build does not round the output head, the \
-draft head or the MTP block, so the output is not complete\n";
 
 /// Runs `calibrate` with the flags in `args`.
 #[allow(
@@ -225,7 +268,22 @@ pub fn run(args: &[String]) -> Outcome {
             };
         }
     };
-    let library = flags.library.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_LIBRARY));
+    let (library, math_directory) = match (
+        resolved(flags.library.clone(), default_library(), "--cuda-library"),
+        resolved(
+            flags.math_directory.clone(),
+            default_math_directory(),
+            "--cuda-libraries",
+        ),
+    ) {
+        (Ok(library), Ok(math)) => (library, math),
+        (Err(message), _) | (_, Err(message)) => {
+            return Outcome {
+                code: EXIT_USAGE,
+                message: format!("{message}\n"),
+            };
+        }
+    };
     let words: Vec<OsString> = flags
         .config
         .iter()
@@ -248,16 +306,12 @@ pub fn run(args: &[String]) -> Outcome {
         Ok(rig) => rig,
         Err(message) => return failed(message),
     };
-    let result = calibrated(&rig, &flags, &library, tokens, length);
+    let result = calibrated(&rig, &flags, (&library, &math_directory), tokens, length);
     rig.stop();
     match result {
-        Ok(whole) => Outcome {
+        Ok(()) => Outcome {
             code: EXIT_OK,
-            message: if whole {
-                HEADS_NOT_ROUNDED.to_owned()
-            } else {
-                String::new()
-            },
+            message: String::new(),
         },
         Err(message) => failed(message),
     }
@@ -267,7 +321,13 @@ pub fn run(args: &[String]) -> Outcome {
     clippy::disallowed_methods,
     reason = "a binary: its main thread opens the checkpoint and waits for the one completion of the run"
 )]
-fn calibrated(rig: &Rig, flags: &Flags, library: &Path, tokens: Vec<i32>, length: usize) -> Result<bool, String> {
+fn calibrated(
+    rig: &Rig,
+    flags: &Flags,
+    (library, math_directory): (&Path, &Path),
+    tokens: Vec<i32>,
+    length: usize,
+) -> Result<(), String> {
     let (sender, receiver) = mpsc::channel();
     let sent = sender.clone();
     Safetensors::open(
@@ -315,18 +375,33 @@ fn calibrated(rig: &Rig, flags: &Flags, library: &Path, tokens: Vec<i32>, length
         &flags.damp.to_string(),
         &model_path.display().to_string(),
         &format!("{search:?}"),
+        &flags.batch.to_string(),
+        &tokens_digest(&tokens),
     ]);
-    fs::create_dir_all(&flags.out).map_err(|error| format!("{}: {error}", flags.out.display()))?;
+    prepare(&flags.out, &key, model_layers).map_err(|error| error.to_string())?;
     let mut run = RunSettings::new(flags.out.clone(), recipe, key, tokens, length);
     run.search = search;
     run.damp = flags.damp;
     run.act_order = flags.act_order;
     run.batch = flags.batch;
+    if let Some(lanes) = flags.rounding_lanes {
+        run.lanes = lanes;
+    }
+    run.device_reserve = flags.memory_reserve_mib.map(|mib| mib << 20);
+    if let Some(mib) = flags.staging_mib {
+        run.staging_bytes = mib << 20;
+    }
+    if let Some(mib) = flags.lane_pinned_mib {
+        run.lane_pinned_bytes = mib << 20;
+    }
+    if let Some(mib) = flags.upload_chunk_mib {
+        run.chunk_bytes = mib << 20;
+    }
     let (calibration, completions) = Calibration::open(
         run,
         objects,
         library,
-        &flags.math_directory,
+        math_directory,
         Arc::clone(&rig.io),
         Arc::clone(&rig.host),
     )
@@ -335,7 +410,6 @@ fn calibrated(rig: &Rig, flags: &Flags, library: &Path, tokens: Vec<i32>, length
         rig.attach(source)?;
     }
     let plan = plan_for(flags.layers, model_layers);
-    let whole = flags.layers >= model_layers;
     let (sender, receiver) = mpsc::channel();
     drive(
         Arc::new(calibration),
@@ -348,13 +422,18 @@ fn calibrated(rig: &Rig, flags: &Flags, library: &Path, tokens: Vec<i32>, length
         .recv()
         .map_err(|_| "the run ended without a result".to_owned())?
         .map_err(|error| error.to_string())?;
-    Ok(whole)
+    Ok(())
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    reason = "a test: a failed unwrap is the failure, and it writes and reads its files on its own thread"
+)]
 mod tests {
     use super::*;
+    use euhedral_inference_quantization::npy::encode_elements;
 
     fn words(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| word.to_string()).collect()
@@ -410,20 +489,69 @@ mod tests {
     #[test]
     fn the_default_layers_run_the_whole_64_layer_model_and_a_count_below_it_a_part() {
         let default = flags(&with(&[])).unwrap();
-        assert_eq!(plan_for(default.layers, 64), Plan::new(64));
-        assert_eq!(plan_for(10, 64).layers, 10);
-        assert_eq!(plan_for(64, 40).layers, 40);
+        let whole = plan_for(default.layers, 64);
+        assert_eq!((whole.layers, whole.stop()), (64, 64));
+        assert!(
+            !whole.stops_early(),
+            "the default finishes: it is a run of the whole model"
+        );
+        let part = plan_for(10, 64);
+        assert_eq!((part.layers, part.stop()), (64, 10));
+        assert!(part.stops_early(), "a run of 10 layers never finishes");
+        assert!(
+            !plan_for(100, 64).stops_early(),
+            "a count past the model's is the whole model"
+        );
+        assert!(!plan_for(64, 64).stops_early());
+    }
+
+    #[test]
+    fn the_memory_and_lane_flags_are_accepted_and_sized_by_the_platform_when_absent() {
+        let defaults = flags(&with(&[])).unwrap();
+        assert!(defaults.rounding_lanes.is_none() && defaults.memory_reserve_mib.is_none());
+        assert!(defaults.library.is_none() && defaults.math_directory.is_none());
+        let named = flags(&with(&[
+            "--rounding-lanes",
+            "2",
+            "--memory-reserve-mib",
+            "512",
+            "--staging-mib",
+            "256",
+            "--lane-pinned-mib",
+            "128",
+            "--upload-chunk-mib",
+            "16",
+        ]))
+        .unwrap();
+        assert_eq!((named.rounding_lanes, named.memory_reserve_mib), (Some(2), Some(512)));
+        assert_eq!(
+            (named.staging_mib, named.lane_pinned_mib, named.upload_chunk_mib),
+            (Some(256), Some(128), Some(16))
+        );
+        assert!(flags(&with(&["--rounding-lanes", "0"])).is_err());
+        assert!(flags(&with(&["--memory-reserve-mib", "x"])).is_err());
+    }
+
+    #[test]
+    fn a_library_is_what_the_flag_names_else_the_platforms_default_else_a_refusal() {
+        let named = Some(PathBuf::from("a"));
+        let default = Some(PathBuf::from("b"));
+        assert_eq!(
+            resolved(named.clone(), default.clone(), "--x").unwrap(),
+            PathBuf::from("a")
+        );
+        assert_eq!(resolved(None, default, "--x").unwrap(), PathBuf::from("b"));
+        assert!(resolved(named.clone(), None, "--x").is_ok());
+        assert!(
+            resolved(None, None, "--cuda-library")
+                .unwrap_err()
+                .contains("--cuda-library")
+        );
     }
 
     #[test]
     fn every_trellis_option_is_refused_by_name() {
-        for option in [
-            "--bits",
-            "--rounding-lanes",
-            "--viterbi-scratch-mib",
-            "--memory-reserve-mib",
-            "--write-buffer-mib",
-        ] {
+        for option in ["--bits", "--viterbi-scratch-mib", "--write-buffer-mib"] {
             let message = flags(&with(&[option, "3"])).unwrap_err();
             assert!(message.contains(option) && message.contains("trellis"), "{message}");
         }
@@ -452,5 +580,38 @@ mod tests {
         assert!(flags(&with(&["--damp", "0"])).is_err());
         assert!(flags(&with(&["--nvfp4-scale-max", "449"])).is_err());
         assert!(flags(&with(&["--layers"])).is_err());
+    }
+
+    fn tokens_file(directory: &Path, shape: &[u64], values: &[i32]) -> PathBuf {
+        let path = directory.join("tokens.npy");
+        fs::write(&path, encode_elements(shape, values).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_tokens_are_the_first_sequences_of_the_file_or_all_of_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = tokens_file(directory.path(), &[3, 2], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(read_tokens(&path, 0).unwrap(), (vec![1, 2, 3, 4, 5, 6], 2));
+        assert_eq!(read_tokens(&path, 2).unwrap(), (vec![1, 2, 3, 4], 2));
+        assert_eq!(
+            read_tokens(&path, 9).unwrap(),
+            (vec![1, 2, 3, 4, 5, 6], 2),
+            "a limit past the end takes all"
+        );
+    }
+
+    #[test]
+    fn a_tokens_file_that_is_not_sequences_of_tokens_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let flat = tokens_file(directory.path(), &[4], &[1, 2, 3, 4]);
+        assert!(read_tokens(&flat, 0).unwrap_err().contains("[sequences, length]"));
+        let empty = tokens_file(directory.path(), &[0, 3], &[]);
+        assert!(read_tokens(&empty, 0).unwrap_err().contains("no tokens"));
+        let none_long = tokens_file(directory.path(), &[2, 0], &[]);
+        assert!(read_tokens(&none_long, 0).unwrap_err().contains("no tokens"));
+        assert!(read_tokens(&directory.path().join("missing.npy"), 0).is_err());
+        fs::write(directory.path().join("bad.npy"), b"not a npy").unwrap();
+        assert!(read_tokens(&directory.path().join("bad.npy"), 0).is_err());
     }
 }
