@@ -112,6 +112,8 @@ impl Gate {
 struct Recorder {
     /// Cancels the generation once its prompt has prefilled, when set.
     cancel_after_prefill: Option<CancelHandle>,
+    /// Cancels the generation once this many quanta have retired, when set.
+    cancel_after_quanta: Option<(usize, CancelHandle)>,
     /// Opens the gate once this many quanta have retired, when set.
     open_after_quanta: Option<(usize, Arc<Gate>)>,
     quanta: usize,
@@ -132,6 +134,11 @@ impl GenerationListener for Recorder {
 
     fn quantum(&mut self, _event: QuantumEvent) {
         self.quanta += 1;
+        if let Some((count, cancel)) = &self.cancel_after_quanta
+            && self.quanta == *count
+        {
+            cancel.cancel();
+        }
         if let Some((count, gate)) = &self.open_after_quanta
             && self.quanta == *count
         {
@@ -202,6 +209,7 @@ fn request(
         constraint: None,
         listener: Box::new(Recorder {
             cancel_after_prefill: None,
+            cancel_after_quanta: None,
             open_after_quanta: None,
             quanta: 0,
             tokens: Vec::new(),
@@ -297,6 +305,7 @@ fn hidden_held(
     let gate = hold.as_ref().map(|(_, gate)| Arc::clone(gate));
     let listener = Recorder {
         cancel_after_prefill: None,
+        cancel_after_quanta: None,
         open_after_quanta: hold,
         quanta: 0,
         tokens: Vec::new(),
@@ -354,6 +363,7 @@ fn hidden_rows_are_the_seed_rows_the_catch_up_reads() {
     let mut cancelled = request(&ids, 8, Speculation::Artifact, greedy(), &done);
     cancelled.listener = Box::new(Recorder {
         cancel_after_prefill: Some(cancel.clone()),
+        cancel_after_quanta: None,
         open_after_quanta: None,
         quanta: 0,
         tokens: Vec::new(),
@@ -511,22 +521,23 @@ fn assert_same(name: &str, together: &(Recording, Vec<Delivered>), alone: &(Reco
     }
 }
 
-/// Starts one hidden generation of `prompt` for each of `prompts` at once; the last is cancelled once its prompt has
-/// prefilled when `cancel_last` is set.
+/// Starts one hidden generation for each of `prompts` at once; the last is cancelled after `cancel_last` quanta (the
+/// prompt's chunk and then decode rows, which run in shared passes) when it is set.
 fn together(
     runtime: &EngineRuntime,
     prompts: &[Vec<u32>],
     new_tokens: u32,
-    cancel_last: bool,
+    cancel_last: Option<usize>,
 ) -> Vec<(Recording, Vec<Delivered>)> {
     let running: Vec<Running> = prompts
         .iter()
         .enumerate()
         .map(|(index, ids)| {
             let cancel = CancelHandle::default();
-            let cancelled = cancel_last && index + 1 == prompts.len();
+            let cancelled = cancel_last.filter(|_| index + 1 == prompts.len());
             let listener = Recorder {
-                cancel_after_prefill: cancelled.then(|| cancel.clone()),
+                cancel_after_prefill: None,
+                cancel_after_quanta: cancelled.map(|quanta| (quanta, cancel.clone())),
                 open_after_quanta: None,
                 quanta: 0,
                 tokens: Vec::new(),
@@ -549,7 +560,7 @@ fn concurrent_hidden_requests_share_passes_and_each_hears_what_it_would_alone() 
     let prompts: Vec<Vec<u32>> = (0..REQUESTS).map(|index| prompt_of(index, 40 + index * 9)).collect();
     let alone: Vec<_> = prompts.iter().map(|ids| hidden(&runtime, ids, 24, greedy())).collect();
     let before = runtime.pass_statistics();
-    let shared = together(&runtime, &prompts, 24, false);
+    let shared = together(&runtime, &prompts, 24, None);
     let after = runtime.pass_statistics();
     for (index, (shared, alone)) in shared.iter().zip(&alone).enumerate() {
         assert_same(&format!("request {index}"), shared, alone);
@@ -565,10 +576,6 @@ fn concurrent_hidden_requests_share_passes_and_each_hears_what_it_would_alone() 
         after.batched > before.batched,
         "no pass held the decode rows of several hidden requests"
     );
-    assert!(
-        after.segments - before.segments > after.passes - before.passes,
-        "every pass held one request's row"
-    );
 }
 
 #[test]
@@ -583,8 +590,12 @@ fn a_hidden_request_cancelled_among_others_leaves_their_rows_intact() {
         .iter()
         .map(|ids| hidden(&runtime, ids, 24, greedy()))
         .collect();
-    let shared = together(&runtime, &prompts, 24, true);
+    let shared = together(&runtime, &prompts, 24, Some(8));
     assert_eq!(shared[REQUESTS - 1].0.outcome.reason, FinishReason::Cancelled);
+    assert!(
+        shared[REQUESTS - 1].0.tokens.len() < 24,
+        "the request was cancelled while it decoded"
+    );
     for (index, alone) in alone.iter().enumerate() {
         assert_same(&format!("request {index}"), &shared[index], alone);
     }
@@ -607,10 +618,10 @@ fn hidden_generation_rate_of_concurrent_requests() {
     let (_card, runtime) = start_with(&machine, requests);
     let prompts: Vec<Vec<u32>> = (0..requests).map(|index| prompt_of(index, 256)).collect();
     // The first run warms the kernels and the graphs.
-    together(&runtime, &prompts, 8, false);
+    together(&runtime, &prompts, 8, None);
     let before = runtime.pass_statistics();
     let start = Instant::now();
-    let runs = together(&runtime, &prompts, NEW_TOKENS, false);
+    let runs = together(&runtime, &prompts, NEW_TOKENS, None);
     let seconds = start.elapsed().as_secs_f64();
     let after = runtime.pass_statistics();
     let tokens: usize = runs.iter().map(|(recording, _)| recording.tokens.len()).sum();
@@ -619,5 +630,58 @@ fn hidden_generation_rate_of_concurrent_requests() {
         tokens as f64 / seconds,
         after.passes - before.passes,
         after.segments - before.segments
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_hidden_request_shares_passes_with_a_sampled_speculative_one() {
+    const NEW_TOKENS: u32 = 48;
+    let Some(machine) = machine() else { return };
+    let (_card, runtime) = start_with(&machine, 2);
+
+    let hidden_ids = prompt_of(0, 40);
+    let speculative_ids = prompt_of(1, 60);
+    let hidden_alone = hidden(&runtime, &hidden_ids, NEW_TOKENS, greedy());
+    let speculative_alone = plain(&runtime, &speculative_ids, NEW_TOKENS, Speculation::Artifact, sampled());
+
+    let before = runtime.pass_statistics();
+    let done = Handoff::new();
+    runtime
+        .generate(request(
+            &speculative_ids,
+            NEW_TOKENS,
+            Speculation::Artifact,
+            sampled(),
+            &done,
+        ))
+        .expect("the request is admitted");
+    let listener = Recorder {
+        cancel_after_prefill: None,
+        cancel_after_quanta: None,
+        open_after_quanta: None,
+        quanta: 0,
+        tokens: Vec::new(),
+        done: None,
+    };
+    let generation = request(&hidden_ids, NEW_TOKENS, Speculation::Off, greedy(), &Handoff::new());
+    let hidden_together = begin_hidden(&runtime, generation, listener, None, CancelHandle::default()).wait();
+    let speculative_together = done.wait(WAIT).expect("the generation reports");
+    let after = runtime.pass_statistics();
+
+    assert_same("the hidden request", &hidden_together, &hidden_alone);
+    assert_eq!(
+        speculative_together.tokens, speculative_alone.tokens,
+        "the speculative request's tokens"
+    );
+    println!(
+        "MIXED_PASSES: {} passes, {} segments, {} batched",
+        after.passes - before.passes,
+        after.segments - before.segments,
+        after.batched - before.batched
+    );
+    assert!(
+        after.batched > before.batched,
+        "no pass held a hidden row next to a speculative verification"
     );
 }

@@ -1850,10 +1850,7 @@ impl Owner {
         }
         // The rows of a quantum become part of its cache; a verification's accepted prefix does, once it is known.
         let rows = flying.rows as u64;
-        let hidden = self.run.as_ref().is_some_and(|run| run.hidden.is_some());
         let committed = match flying.role {
-            // A hidden request's verification is its one decoded row, which no acceptance decides.
-            Role::Verify if hidden => self.sequence.kv.commit(rows),
             Role::Verify => Ok(()),
             Role::PromptCatchUp | Role::CatchUp | Role::Draft => match self.sequence.mtp_kv.as_mut() {
                 Some(cache) => cache.commit(rows),
@@ -1867,7 +1864,11 @@ impl Owner {
         let Some(run) = self.run.as_mut() else { return };
         let ran = retired.ran;
         let event = QuantumEvent {
-            kind: flying.kind,
+            kind: if flying.role == Role::Decode {
+                QuantumKind::Decode
+            } else {
+                flying.kind
+            },
             rows: flying.rows,
             start_position: flying.start,
             admitted: flying.admitted,
@@ -1884,7 +1885,7 @@ impl Owner {
             }
         }
         if run.hidden.is_some()
-            && matches!(flying.role, Role::Prefill { .. } | Role::Decode | Role::Verify)
+            && matches!(flying.role, Role::Prefill { .. } | Role::Decode)
             && let Err(why) = self.copy_hidden(flying)
         {
             return self.fail(why);
@@ -2181,9 +2182,19 @@ impl Owner {
                 return;
             }
         }
-        if let Some(run) = self.run.as_mut().filter(|run| run.next_step(chunk).is_none()) {
-            // Nothing will be chained behind the last quantum: let it retire.
-            run.end_chain();
+        if let Some(run) = self.run.as_mut() {
+            let ended = run.next_step(chunk).is_none();
+            if ended {
+                // Nothing will be chained behind the last quantum: let it retire.
+                run.end_chain();
+            }
+            // A hidden request that offers no step soon (its sink is far behind, or its context is full) must not hold
+            // the passes of the other sequences, which wait for each member of the last pass to offer or leave.
+            // Only with nothing in flight: a step still pending would be withdrawn.
+            let stalled = run.hidden.as_ref().is_some_and(|hidden| hidden.behind() || ended);
+            if stalled && run.in_flight.is_empty() {
+                run.leave_passes();
+            }
         }
     }
 
@@ -2239,15 +2250,9 @@ impl Owner {
                     run.depth > 1 && !checkpoint
                 },
             },
-            // A hidden request's decode is a one-row verification: row-exact, as the corpus's reference is, and offered to
-            // the workspace's passes so that concurrent requests read the weights once.
             Step::Decode => Admission {
-                role: if hidden { Role::Verify } else { Role::Decode },
-                kind: if hidden {
-                    QuantumKind::Verify
-                } else {
-                    QuantumKind::Decode
-                },
+                role: Role::Decode,
+                kind: QuantumKind::Decode,
                 rows: 1,
                 start,
                 source: KvSource::Base,
@@ -2258,7 +2263,7 @@ impl Owner {
                     _ => Vec::new(),
                 },
                 last_chunk: false,
-                more: !speculative && !hidden && run.depth > 1,
+                more: !speculative && run.depth > 1,
             },
             _ => return Ok(()),
         };
@@ -2357,8 +2362,13 @@ impl Owner {
         if run.in_flight.is_empty() {
             run.cursor = 0;
         }
-        // A step that is not part of a speculative one is not offered: the passes do not wait for the request.
-        if matches!(role, Role::Decode | Role::Settle | Role::Prefill { .. }) {
+        // A hidden request's decode runs as a one-row verification: row-exact, as the corpus's reference is, and offered
+        // to the workspace's passes so that concurrent requests read the weights once. It stays a decode for the
+        // request: its row commits at once, and its listener hears a decode.
+        let hidden_decode = role == Role::Decode && run.hidden.is_some();
+        let kind = if hidden_decode { QuantumKind::Verify } else { kind };
+        // A step that is not a verification is not offered: the passes do not wait for the request.
+        if !hidden_decode && matches!(role, Role::Decode | Role::Settle | Role::Prefill { .. }) {
             run.leave_passes();
         }
 
@@ -2433,7 +2443,7 @@ impl Owner {
         // after that would free the pinned record under the copy.
         quantum.validate().map_err(why("the quantum"))?;
         // A verification is offered for a pass, whose start uploads its record (its own, or the pass's).
-        let offered = role == Role::Verify;
+        let offered = role == Role::Verify || hidden_decode;
         if !offered {
             let (_, prepared) = core
                 .lane_table()
