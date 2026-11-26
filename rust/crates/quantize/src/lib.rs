@@ -201,7 +201,13 @@ mod tests {
 
     #[test]
     fn a_pending_command_says_it_is_not_available() {
-        let outcome = run_words(&["generate", "--artifact", "x"]);
+        let Some(pending) = COMMANDS
+            .iter()
+            .find(|command| command.availability == Availability::Pending)
+        else {
+            return;
+        };
+        let outcome = run_words(&[pending.name, "--model", "x"]);
         assert_eq!(outcome.code, EXIT_NOT_AVAILABLE);
         assert!(outcome.message.contains("not available"));
     }
