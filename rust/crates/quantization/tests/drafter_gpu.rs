@@ -318,7 +318,9 @@ fn directional_error(rig: &Rig) -> (f64, &'static str) {
 fn gradients_match_finite_differences_of_the_loss() {
     let rig = rig();
     let (error, name) = directional_error(&rig);
-    assert!(error < 3e-3, "{name}: the directional derivative is off by {error}");
+    // A correct drafter is within 1.1e-3 on every parameter (FP32 round-off over the step); a skipped lineage dot in
+    // the forward pass reaches 4.3e-1 and one in the backward pass 2.1e-1.
+    assert!(error < 1e-2, "{name}: the directional derivative is off by {error}");
 }
 
 #[test]

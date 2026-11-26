@@ -323,6 +323,15 @@ fn a_new_forward_pass_drops_the_deeper_passes_that_read_what_it_wrote() {
         Err(DrafterError::NotForwarded(2))
     ));
     assert!(drafter.backward(1, &next).is_ok());
+
+    // The same window again: depth 2 was planned over the first forward pass of depth 1, which this one replaces.
+    drafter.forward(2, &next, BASE, BASE).unwrap();
+    drafter.forward(1, &next, BASE, BASE).unwrap();
+    assert!(matches!(
+        drafter.forward(3, &next, BASE, BASE),
+        Err(DrafterError::NotForwarded(2))
+    ));
+    assert!(matches!(drafter.backward(2, &next), Err(DrafterError::NotForwarded(2))));
 }
 
 #[test]
