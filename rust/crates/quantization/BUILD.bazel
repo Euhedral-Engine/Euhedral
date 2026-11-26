@@ -165,6 +165,80 @@ rust_test(
 )
 
 rust_test(
+    name = "calibrate_host_test",
+    compile_data = glob(
+        [
+            "tests/**",
+            "src/**",
+            "Cargo.toml",
+            "README.md",
+        ],
+        exclude = ["tests/**/*.rs", "src/**/*.rs"],
+        allow_empty = True,
+    ) + [
+        "//:native/src/trellis/codebook.cuh",
+        "//rust/crates/api-protocol:tests/data/qwen-chat-template.jinja",
+        "//rust/crates/engine:tests/fixtures/rco_table.tsv",
+        "//rust:kernels/quantization/drafter.cu",
+        "//rust:kernels/quantization/gptq.cu",
+        "//rust:kernels/quantization/mtp.cu",
+        "//rust:kernels/quantization/rows.cu",
+        "//rust:kernels/quantization/score.cu",
+        "//rust:kernels/quantization/train.cu",
+        "//rust:kernels/quantization/trellis.cu",
+    ],
+    crate_features = ["test-hooks"],
+    crate_name = "calibrate_host",
+    crate_root = "tests/calibrate_host.rs",
+    data = glob(
+        [
+            "tests/**",
+            "src/**",
+            "Cargo.toml",
+            "README.md",
+        ],
+        exclude = ["tests/**/*.rs", "src/**/*.rs"],
+        allow_empty = True,
+    ),
+    deps = [
+        ":euhedral_inference_quantization",
+        "//rust/crates/api-protocol:euhedral_inference_api_protocol",
+        "//rust/crates/cuda:euhedral_inference_cuda",
+        "//rust/crates/edrl:euhedral_inference_edrl",
+        "//rust/crates/engine:euhedral_inference_engine",
+        "//rust/crates/settings:euhedral_inference_settings",
+        "//rust/crates/test-support:test_support",
+        "//rust/crates/tokenizer:euhedral_inference_tokenizer",
+        "@euhedral_crates//:crc32fast",
+        "@euhedral_crates//:same-file",
+        "@euhedral_crates//:serde_json",
+        "@euhedral_crates//:sha2",
+        "@euhedral_crates//:tempfile",
+        "@euhedral_crates//:thiserror",
+        "@euhedral_rustee//euhedral-core:euhedral_core_cuda_testing",
+        "@euhedral_rustee//euhedral-data-structures:euhedral_data_structures_cuda_testing",
+        "@euhedral_rustee//euhedral-gpu:euhedral_gpu_cuda_testing",
+        "@euhedral_rustee//euhedral-graph:euhedral_graph_cuda_testing",
+        "@euhedral_rustee//euhedral-hashing:euhedral_hashing_cuda_testing",
+        "@euhedral_rustee//euhedral-io:euhedral_io_cuda_testing",
+        "@euhedral_rustee//euhedral-memory:euhedral_memory_cuda_testing",
+    ],
+    edition = "2024",
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "rust/crates/quantization",
+        "CARGO_TARGET_TMPDIR": "unused-under-bazel",
+    },
+    srcs = glob(
+        [
+            "tests/calibrate_host.rs",
+            "tests/*/**/*.rs",
+        ],
+        allow_empty = True,
+    ),
+    version = "0.1.0",
+)
+
+rust_test(
     name = "checkpoint_objects_test",
     compile_data = glob(
         [
