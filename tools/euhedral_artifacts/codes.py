@@ -111,19 +111,53 @@ def write_state(output, base_offset: int, state: QuantState) -> None:
 MANIFEST_FILE = "calibration.json"
 
 
+PRODUCER_FAKE_QUANT = "fake_quant"
+
+
+def export_state(directory: Path, name: str, state: QuantState, producer: str = PRODUCER_FAKE_QUANT) -> None:
+    """Saves `state` as the file of object `name` in `directory` and lists the object in the manifest, which a producer
+    other than calibrate writes as {"producer", "objects", "complete"}: the producer covers exactly the objects it
+    lists, and the converter rounds the rest as usual."""
+    directory.mkdir(parents=True, exist_ok=True)
+    state.save(state_file(directory, name))
+    path = directory / MANIFEST_FILE
+    objects: list[str] = []
+    if path.is_file():
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            manifest = {}
+        if manifest.get("producer") == producer:
+            objects = list(manifest.get("objects", []))
+    if name not in objects:
+        objects.append(name)
+    manifest = {"producer": producer, "objects": sorted(objects), "complete": True}
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def require_complete_codes(directory: Path) -> None:
-    """Fails unless `directory` holds the manifest calibrate writes (MANIFEST_FILE) and it says the run wrote every
-    layer, both heads and the MTP block: the converter rounds any object without a file itself, so a codes directory
-    of a stopped run would be taken for a whole one."""
+    """Fails unless `directory` holds a manifest (MANIFEST_FILE) that says its codes are whole: calibrate's, with every
+    layer, both heads and the MTP block written, or one an export_state producer wrote. The converter rounds any object
+    without a file itself, so a directory of a stopped run would otherwise be taken for a whole one."""
     path = directory / MANIFEST_FILE
     if not path.is_file():
-        fail(f"{directory} has no {MANIFEST_FILE}: it is not the output of a finished calibrate run")
+        fail(f"{directory} has no {MANIFEST_FILE}: it is not the output of a finished calibrate run or of an export")
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
-        layers_done, layers_total = int(manifest["layers_done"]), int(manifest["layers_total"])
-        heads_done, mtp_done = bool(manifest["heads_done"]), bool(manifest["mtp_done"])
-    except (OSError, ValueError, KeyError, TypeError) as error:
+        producer = manifest.get("producer")
+        exported = producer == PRODUCER_FAKE_QUANT and manifest["complete"] is True \
+            and isinstance(manifest["objects"], list)
+        if producer is None:
+            layers_done, layers_total = int(manifest["layers_done"]), int(manifest["layers_total"])
+            heads_done, mtp_done = bool(manifest["heads_done"]), bool(manifest["mtp_done"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         fail(f"{path} is unreadable: {error}")
+    if producer is not None:
+        if not exported:
+            fail(f"{path} is from producer {producer!r}, which is not a complete export of a known producer")
+        return
     missing = []
     if layers_done < layers_total:
         missing.append(f"layers {layers_done} of {layers_total}")

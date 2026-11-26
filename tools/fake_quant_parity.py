@@ -29,7 +29,7 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from euhedral_artifacts import device  # noqa: E402
-from euhedral_artifacts.codes import QuantState, state_file, state_size, write_state  # noqa: E402
+from euhedral_artifacts.codes import QuantState, export_state, state_size, write_state  # noqa: E402
 from euhedral_artifacts.edrl import FORMAT_ORDINAL, LAYOUT_ORDINAL, align_up, read_table  # noqa: E402
 from euhedral_artifacts.importance import ImportanceMatrix  # noqa: E402
 from euhedral_artifacts.inventory import build_plans, draft_token_ids  # noqa: E402
@@ -161,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
             if not (equal and forward_equal):
                 mismatched += 1
             if args.export is not None:
-                state.save(state_file(args.export, plan.name))
+                export_state(args.export, plan.name, state)
             verdict = "ok" if equal and forward_equal else ("BYTES DIFFER" if not equal else "FORWARD DIFFERS")
             print(f"[{index + 1}/{len(plans)}] {plan.name} {plan.format_name}/{plan.layout} {verdict} "
                   f"({time.monotonic() - start:.1f} s)", flush=True)

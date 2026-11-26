@@ -346,6 +346,30 @@ class PipelineTest(unittest.TestCase):
                     self.convert(recipes.Recipe("q3", False), Path(tmp), codes_from=codes)
                 self.assertFalse((Path(tmp) / "artifact.edrl").exists())
 
+    def test_a_fake_quant_export_is_taken_and_a_hand_made_directory_is_not(self):
+        state = codes.QuantState("Q4G64_F16S", "row-split", (1, 128), np.zeros((1, 128), np.int8),
+                                 np.zeros((1, 2), np.float16))
+        with tempfile.TemporaryDirectory() as tmp:
+            exported = Path(tmp) / "exported"
+            codes.export_state(exported, "text/layers/0/mlp/down", state)
+            codes.export_state(exported, "text/layers/1/mlp/down", state)
+            manifest = json.loads((exported / "calibration.json").read_text(encoding="utf-8"))
+            self.assertEqual((manifest["producer"], manifest["objects"], manifest["complete"]),
+                             ("fake_quant", ["text/layers/0/mlp/down", "text/layers/1/mlp/down"], True))
+            self.assertEqual(self.convert(recipes.Recipe("q3", False), Path(tmp), codes_from=exported)["codes_from"],
+                             str(exported))
+            by_hand = Path(tmp) / "by-hand"
+            by_hand.mkdir()
+            state.save(codes.state_file(by_hand, "text/layers/0/mlp/down"))
+            with tempfile.TemporaryDirectory() as other, self.assertRaisesRegex(ValueError, "no calibration.json"):
+                self.convert(recipes.Recipe("q3", False), Path(other), codes_from=by_hand)
+
+    def test_a_manifest_of_an_unknown_producer_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codes_dir = self.codes_directory(tmp, {"producer": "other", "objects": [], "complete": True})
+            with self.assertRaisesRegex(ValueError, "known producer"):
+                self.convert(recipes.Recipe("q3", False), Path(tmp), codes_from=codes_dir)
+
     def test_an_unreadable_manifest_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             codes = self.codes_directory(tmp, None)
