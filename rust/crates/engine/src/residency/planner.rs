@@ -12,6 +12,8 @@
 //! the artifact file. A plan that does not fit even then is refused with the bytes it needed and the bytes there
 //! were, naming the memory that is short.
 
+use std::fmt;
+
 use euhedral_inference_cuda::launch::nvfp4::{SKINNY_MAX_ROWS, nvfp4_native_scratch_bytes, skinny_target_ctas};
 use euhedral_inference_cuda::launch::q3::linear_scratch_bytes_upto;
 use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFormat, WeightLayout};
@@ -287,6 +289,56 @@ impl ResidencyPlan {
     /// The placements held on the device.
     pub fn on_device(&self) -> impl Iterator<Item = &Placement> {
         self.device.iter().filter(|placement| placement.tier == Tier::Device)
+    }
+}
+
+/// What each tier of a plan holds: the objects and their payload bytes on the device, in pinned host memory and in the
+/// artifact file, and the pinned bytes of the window the file's objects are read through. Its `Display` is the line an
+/// operator reads at startup to see where the weights are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TierSummary {
+    pub device_objects: usize,
+    pub device_bytes: u64,
+    pub host_objects: usize,
+    pub host_bytes: u64,
+    pub disk_objects: usize,
+    pub disk_bytes: u64,
+    pub window_bytes: u64,
+}
+
+impl TierSummary {
+    /// The tiers of `plan`'s placements (the halves of a split projection counted for two).
+    pub fn of(plan: &ResidencyPlan) -> Self {
+        let mut summary = Self {
+            window_bytes: plan.offload.window_bytes(),
+            ..Self::default()
+        };
+        for placement in &plan.device {
+            let (objects, bytes) = match placement.tier {
+                Tier::Device => (&mut summary.device_objects, &mut summary.device_bytes),
+                Tier::Host { .. } => (&mut summary.host_objects, &mut summary.host_bytes),
+                Tier::Disk => (&mut summary.disk_objects, &mut summary.disk_bytes),
+            };
+            *objects += 1;
+            *bytes = bytes.saturating_add(placement.bytes);
+        }
+        summary
+    }
+}
+
+impl fmt::Display for TierSummary {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            out,
+            "weights: device {} objects {} bytes, host {} objects {} bytes, disk {} objects {} bytes (window {} bytes)",
+            self.device_objects,
+            self.device_bytes,
+            self.host_objects,
+            self.host_bytes,
+            self.disk_objects,
+            self.disk_bytes,
+            self.window_bytes
+        )
     }
 }
 

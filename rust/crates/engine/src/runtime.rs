@@ -43,7 +43,7 @@ use crate::quantum::body_fault::{BodyFault, Defect, HoldEvent, RunSnapshot, Sigh
 use crate::residency::accounting::{Consumer, MemoryAccount, PlanReservation};
 use crate::residency::disk::DiskReader;
 use crate::residency::planner::{
-    LocationBytes, PlanInputs, ResidencyPlan, forced_rows_of, pass_rows_limit, sequences_for,
+    LocationBytes, PlanInputs, ResidencyPlan, TierSummary, forced_rows_of, pass_rows_limit, sequences_for,
 };
 use crate::stages::LaneTable;
 use crate::startup;
@@ -388,6 +388,8 @@ pub struct StartupReport {
     pub piece_bytes: u64,
     /// Objects on the device (the halves of a split projection counted for two).
     pub objects: usize,
+    /// What each tier holds: the objects and bytes on the device, in pinned host memory and in the artifact file.
+    pub tiers: TierSummary,
     /// Payload bytes of the objects held in pinned host memory (the host arena's contents).
     pub host_backed_bytes: u64,
     /// Payload bytes of the objects the plan leaves in the artifact file, read through the disk window.

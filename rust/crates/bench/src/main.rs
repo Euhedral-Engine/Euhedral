@@ -195,6 +195,7 @@ fn run_command(args: &[String], command_line: &str, started: SystemTime) -> Resu
         report.allocated_bytes,
         report.ready.as_secs_f64()
     );
+    println!("{}", report.tiers);
 
     let pid = process::id();
     let context = Context {

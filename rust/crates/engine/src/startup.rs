@@ -50,7 +50,7 @@ use crate::residency::disk::{ArtifactFile, DiskReader, DiskWindow, FilePort};
 use crate::residency::footprint;
 use crate::residency::loader::{self, LoadOutcome, Ring};
 use crate::residency::offload::{self, Offload, WindowGeometry};
-use crate::residency::planner::{LocationBytes, Placement, PlanInputs, ResidencyPlan, Tier, plan_with};
+use crate::residency::planner::{LocationBytes, Placement, PlanInputs, ResidencyPlan, Tier, TierSummary, plan_with};
 use crate::runtime::{Core, EngineRuntime, ReadyHandoff, StartupReport, Units, free_arrival, raw_file};
 use crate::runtime::{lane_sizing, resolve_sequences};
 use crate::stages::transfer::DiskTier;
@@ -1036,6 +1036,7 @@ fn assemble(
         }
     };
     let objects = plan.on_device().count();
+    let tiers = TierSummary::of(&plan);
     let host_backed_bytes = host_backed_bytes(&plan);
     let disk_backed_bytes = disk_backed_bytes(&plan);
     let window_bytes = plan.offload.window_bytes();
@@ -1112,6 +1113,7 @@ fn assemble(
                 chains: ring.depth,
                 piece_bytes: ring.piece_bytes,
                 objects,
+                tiers,
                 host_backed_bytes,
                 disk_backed_bytes,
                 window_bytes,
