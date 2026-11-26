@@ -16,6 +16,7 @@ pub mod device;
 pub mod driver;
 pub mod hessians;
 pub mod plan;
+pub mod rounding;
 
 use thiserror::Error;
 
