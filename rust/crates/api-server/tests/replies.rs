@@ -11,7 +11,7 @@ mod common;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use common::{Fixture, PATIENCE, Raw, headers, json_headers, text};
+use common::{Fixture, HANG_GUARD, Raw, headers, json_headers, text};
 use euhedral_inference_api_server::answer::{owner_fault_is_held, release_owner_fault};
 use euhedral_inference_api_server::scripted::{LaunchFault, MODEL_ID, Script};
 use euhedral_inference_api_server::{Backend, BackendError, Counts, Generation, Limits};
@@ -109,9 +109,9 @@ fn json(response: &Response, status: u16) -> String {
     norm(text(response))
 }
 
-/// Waits, within the patience of a test, until no request holds or awaits a slot.
+/// Waits, within the hang guard, until no request holds or awaits a slot.
 fn settle(fx: &Fixture) {
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     while fx.server.admission().counts() != Counts::default() {
         assert!(Instant::now() < end, "slots held: {:?}", fx.server.admission().counts());
         sleep(Duration::from_millis(5));
@@ -120,7 +120,7 @@ fn settle(fx: &Fixture) {
 
 /// Waits until `check` holds.
 fn until(what: &str, check: impl Fn() -> bool) {
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     while !check() {
         assert!(Instant::now() < end, "never: {what}");
         sleep(Duration::from_millis(5));
@@ -737,7 +737,7 @@ fn a_client_leaving_as_its_request_starts_still_cancels_the_generation() {
     fx.backend.hold_open();
     let mut raw = Raw::connect(fx.addr);
     raw.send(&raw_post(CHAT, &chat_body(BIG)));
-    assert!(fx.backend.open_is_held(PATIENCE), "the open never started");
+    assert!(fx.backend.open_is_held(HANG_GUARD), "the open never started");
     drop(raw);
     // The owner has heard the client leave (the request is recorded as cancelled) before the open returns.
     until("the owner heard the client leave", || {
