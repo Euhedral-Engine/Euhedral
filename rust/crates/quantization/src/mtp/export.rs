@@ -31,7 +31,10 @@ use crate::assemble::{ArtifactFile, AssembleError, Piece, View, write};
 use crate::checkpoint::objects::{Config, Qwen38Objects};
 use crate::checkpoint::safetensors::Safetensors;
 use crate::checkpoint::writer::{DEFAULT_BUFFER_BYTES, bytes_source, write_file};
-use crate::checkpoint::{CheckpointError, io::open_read};
+use crate::checkpoint::{
+    CheckpointError,
+    io::{Next, open_read},
+};
 use crate::durable;
 use crate::mixed::QuantOption;
 use crate::resume::{HEADER, ResumeError, ResumeFile, Then};
@@ -441,7 +444,7 @@ fn assemble(
     payloads: &Path,
 ) -> Result<(), ExportError> {
     let file = Arc::new(call(|done| {
-        open_read(io, payloads, Box::new(move |opened| done(opened)))
+        open_read(io, payloads, Next::new(move |opened| done(opened)))
     })?);
     let composite = view(base, base.metadata().clone(), entries, (&file, payloads))?;
     call(|done| write(io, host, &composite, &settings.out, copy_buffer_bytes, done))

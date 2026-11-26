@@ -31,7 +31,7 @@ use super::stage::stage;
 use super::state::Placed;
 use super::wait::Reply;
 use super::window::Mode;
-use crate::checkpoint::io::read_exact;
+use crate::checkpoint::io::{Next as ReadNext, read_exact};
 use crate::resume::{HEADER, Header, ResumeFile, Then};
 use crate::step::idle;
 
@@ -320,7 +320,7 @@ fn read<L: Lane>(run: Step<L>, lane: L, window: Window) {
     let context = format!("the hidden rows of sequence {}", run.sequence);
     let claim = Claim::new(run, lane);
     let held = claim.clone();
-    let next = Box::new(move |bytes: Result<Vec<u8>, _>| {
+    let next = ReadNext::new(move |bytes: Result<Vec<u8>, _>| {
         held.resume(bytes.map_err(RunError::from), |run, lane, bytes| {
             launch(run, lane, window, bytes);
         });

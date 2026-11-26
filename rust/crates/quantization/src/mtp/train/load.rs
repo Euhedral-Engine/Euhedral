@@ -32,7 +32,7 @@ use super::state::{File, place};
 use super::wait::{call, done, then};
 use super::window::Addresses;
 use crate::assemble::ArtifactFile;
-use crate::checkpoint::io::{open_read, read_exact, read_file};
+use crate::checkpoint::io::{Next, open_read, read_exact, read_file};
 use crate::checkpoint::objects::{Config as ModelConfig, Qwen38Objects};
 use crate::checkpoint::safetensors::Safetensors;
 use crate::corpus::{self, Entry};
@@ -164,7 +164,7 @@ fn read(host: &Host<'_>, file: &Arc<OwnedFile>, offset: u64, len: u64, context: 
             offset,
             len,
             context.to_owned(),
-            Box::new(move |bytes| reply_to.send(bytes.map_err(RunError::from))),
+            Next::new(move |bytes| reply_to.send(bytes.map_err(RunError::from))),
         )
     })
 }
@@ -193,7 +193,7 @@ fn open_corpus(
         open_read(
             host.io,
             &path,
-            Box::new(move |opened| reply.send(opened.map(Arc::new).map_err(RunError::from))),
+            Next::new(move |opened| reply.send(opened.map(Arc::new).map_err(RunError::from))),
         )
     })?;
     let digest = corpus_digest(&entries, &token_bytes, &label_bytes, hidden_bytes);

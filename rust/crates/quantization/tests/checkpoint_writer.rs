@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use checkpoint_support::{Spec, World, safetensors, write};
+use checkpoint_support::{Spec, World, every_step_dropped_unrun, safetensors, write};
 use euhedral_inference_quantization::checkpoint::CheckpointError;
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
 use euhedral_inference_quantization::checkpoint::writer::{SafetensorsWriter, Source, bytes_source, write_file};
@@ -401,5 +401,21 @@ fn write_file_writes_whole_and_names_the_file_when_it_fails() {
     assert!(message.contains("cut") && message.contains("half.txt"), "{message}");
     assert!(!target.exists());
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1, "no part is left");
+    world.finish();
+}
+
+// Mutants caught: a step discarded unrun that drops the continuation with it (the caller waits for ever); a chain that
+// ends twice (once by the drop, once by the step); a write that completes and does not call the continuation once.
+#[test]
+fn a_step_accepted_and_discarded_unrun_ends_the_call_once_with_the_closing_error() {
+    let world = World::start();
+    let directory = tempfile::tempdir().unwrap();
+    let steps = every_step_dropped_unrun(|io, done| {
+        let mut writer = SafetensorsWriter::with_buffer(&directory.path().join("model.safetensors"), 8)?;
+        writer.add("a", "U8", &[16], (0..16).collect())?;
+        writer.finish(io, &world.host, done)
+    });
+    assert!(steps >= 4, "open, header, data and rename are steps: only {steps}");
+    assert!(directory.path().join("model.safetensors").exists());
     world.finish();
 }

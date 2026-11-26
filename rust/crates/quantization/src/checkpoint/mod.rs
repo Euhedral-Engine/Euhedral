@@ -9,7 +9,9 @@
 //! Every operation that touches a file goes through `AsyncIo` (the writer's durability barrier and cleanup, which it
 //! has no call for yet, go through [`durable`](crate::durable) on a host lake) and reports through a [`Done`] callback. The callback is
 //! called once, from a frame of the lattice that drives the `AsyncIo`, and must not wait: it hands the result on (to a
-//! lake, a hand-off) and returns. A function that returns `Err` started nothing and never calls its callback.
+//! lake, a hand-off) and returns. A function that returns `Err` started nothing and never calls its callback. A step that the lake or the `AsyncIo`
+//! accepted and later discards unrun (they are closing) ends its call with [`CheckpointError::LakeClosed`], so the
+//! callback is called once in every case.
 
 pub(crate) mod io;
 pub mod objects;
@@ -44,8 +46,10 @@ pub enum CheckpointError {
     /// A request that cannot be served: a range outside its tensor, a duplicate name, an unknown dtype.
     #[error("{0}")]
     Invalid(String),
-    /// The host lake would not take the call: it is closed, or no unit of it is admitted.
-    #[error("the host lake is closed: nothing was started")]
+    /// The host lake or the I/O engine would not take the call, or discarded a step of it unrun: it is closed, or no
+    /// unit of the lake is admitted. A call that returned this as `Err` started nothing; a continuation told this
+    /// ended partway, and a write may have left its `.part` file.
+    #[error("the host lake or the I/O engine is closed: the call did not complete")]
     LakeClosed,
 }
 

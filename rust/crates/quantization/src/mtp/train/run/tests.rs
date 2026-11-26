@@ -25,7 +25,7 @@ use euhedral_io::{AsyncIo, OwnedFile};
 
 use super::*;
 use crate::chain::{self, Scratch};
-use crate::checkpoint::io::open_read;
+use crate::checkpoint::io::{Next as OpenNext, open_read};
 use crate::corpus::Entry;
 use crate::mtp::train::data::Files;
 use crate::mtp::train::lane::Job;
@@ -176,7 +176,7 @@ impl World {
             open_read(
                 &self.io,
                 path,
-                Box::new(move |opened| reply.send(opened.map(Arc::new).map_err(RunError::from))),
+                OpenNext::new(move |opened| reply.send(opened.map(Arc::new).map_err(RunError::from))),
             )
         })
         .unwrap()
