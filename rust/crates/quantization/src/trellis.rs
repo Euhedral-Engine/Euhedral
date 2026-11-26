@@ -20,8 +20,8 @@ use thiserror::Error;
 
 pub use plan::{
     Reconstruction, plan_clean_row_scales, plan_decode, plan_fill_floats, plan_from_tiles, plan_hadamard_columns,
-    plan_hadamard_rows, plan_pack, plan_reconstruct, plan_sum_products, plan_tile_mean_square, plan_to_tiles,
-    plan_viterbi,
+    plan_hadamard_rows, plan_normalise_hessian, plan_pack, plan_reconstruct, plan_sum_products, plan_tile_mean_square,
+    plan_to_tiles, plan_viterbi,
 };
 pub use quantizer::{LaneParts, QuantizeError, Quantized, Refused, Request, TrellisLane, TrellisSettings};
 pub use rate::{Rate, TENSOR_CORE_ORDER, TILE_WEIGHTS};
