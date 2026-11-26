@@ -22,7 +22,7 @@ use std::sync::{Arc, OnceLock};
 
 use euhedral_gpu::cuda::{CudaGpu, CudaModule, CudaQueue};
 use euhedral_gpu::{Gpu, GpuError, Lane, Stream, StreamOptions, open_shared_lanes};
-use euhedral_graph::{Completions, DeviceQueue, LaneId, Lake, Marker};
+use euhedral_graph::{Completions, DeviceQueue, Lake, LaneId, Marker};
 use euhedral_inference_cuda::launch::Modes;
 use euhedral_inference_cuda::launch::load::{KernelSources, KernelTable, load};
 use euhedral_inference_cuda::launch::ops::RusteeOps;
@@ -40,8 +40,8 @@ use super::{CalibrateError, Stages};
 use crate::checkpoint::CheckpointError;
 use crate::checkpoint::objects::Qwen38Objects;
 use crate::forward::pipeline::device::{ForwardPipeline, HostStates, Parts, PipelineObserver, Request};
-use crate::forward::{LayerWeights, StagedLayer, Target, stage};
 use crate::forward::{ForwardError, ForwardKernels, LaneContext, LayerForward, Observation};
+use crate::forward::{LayerWeights, StagedLayer, Target, stage};
 use crate::gptq::format::Nvfp4Search;
 use crate::gptq::{GptqKernels, GptqLane, GptqSettings};
 use crate::kernels::{Module, ModuleOptions, Modules};
@@ -99,7 +99,17 @@ pub struct Settings {
 
 impl Settings {
     /// The settings of a run over `tokens` (`length` per sequence), with the sizes at their defaults.
-    pub fn new(out: PathBuf, recipe: Recipe, search: Nvfp4Search, damp: f32, act_order: bool, batch: usize, length: usize, tokens: Vec<i32>, key: String) -> Settings {
+    pub fn new(
+        out: PathBuf,
+        recipe: Recipe,
+        search: Nvfp4Search,
+        damp: f32,
+        act_order: bool,
+        batch: usize,
+        length: usize,
+        tokens: Vec<i32>,
+        key: String,
+    ) -> Settings {
         Settings {
             out,
             recipe,
@@ -207,16 +217,26 @@ impl Calibration {
         host: Arc<Lake>,
     ) -> Result<(Calibration, Vec<Arc<Completions>>), CalibrateError> {
         let library = CudaLibrary::load(library).map_err(|error| CalibrateError::failed("the CUDA library", error))?;
-        let math = MathLibraries::load(math_directory).map_err(|error| CalibrateError::failed("the math libraries", error))?;
+        let math =
+            MathLibraries::load(math_directory).map_err(|error| CalibrateError::failed("the math libraries", error))?;
         let gpu = CudaGpu::open(0).map_err(|error| CalibrateError::failed("the device", error))?;
-        let sources = KernelSources::beside(&library).map_err(|error| CalibrateError::failed("the kernel sources", error))?;
+        let sources =
+            KernelSources::beside(&library).map_err(|error| CalibrateError::failed("the kernel sources", error))?;
         let table = Arc::new(load(&gpu, &sources).map_err(|error| CalibrateError::failed("the kernels", error))?);
         let options = ModuleOptions::beside(&library).map_err(|error| CalibrateError::failed("the compiler", error))?;
-        let mut modules = Modules::<CudaModule>::open(&gpu, options).map_err(|error| CalibrateError::failed("the modules", error))?;
-        let gptq_kernels = GptqKernels::load(&mut modules).map_err(|error| CalibrateError::failed("the GPTQ kernels", error))?;
-        let gptq = modules.load(Module::Gptq).map_err(|error| CalibrateError::failed("the GPTQ module", error))?;
-        let rows = modules.load(Module::Rows).map_err(|error| CalibrateError::failed("the rows module", error))?;
-        let kernels = Arc::new(ForwardKernels::new(&gptq, &rows).map_err(|error| CalibrateError::failed("the forward kernels", error))?);
+        let mut modules =
+            Modules::<CudaModule>::open(&gpu, options).map_err(|error| CalibrateError::failed("the modules", error))?;
+        let gptq_kernels =
+            GptqKernels::load(&mut modules).map_err(|error| CalibrateError::failed("the GPTQ kernels", error))?;
+        let gptq = modules
+            .load(Module::Gptq)
+            .map_err(|error| CalibrateError::failed("the GPTQ module", error))?;
+        let rows = modules
+            .load(Module::Rows)
+            .map_err(|error| CalibrateError::failed("the rows module", error))?;
+        let kernels = Arc::new(
+            ForwardKernels::new(&gptq, &rows).map_err(|error| CalibrateError::failed("the forward kernels", error))?,
+        );
         let config = &objects.config;
         let (hidden, length, batch) = (config.hidden as usize, settings.length, settings.batch);
         let max_rows = u32::try_from(batch * length)
@@ -225,10 +245,16 @@ impl Calibration {
         let names: Vec<String> = std::iter::once("main".to_owned())
             .chain((0..batch).map(|slot| format!("slot{slot}")))
             .collect();
-        let named: Vec<(&str, StreamOptions)> = names.iter().map(|name| (name.as_str(), StreamOptions::default())).collect();
-        let shared = open_shared_lanes(&gpu, &named).map_err(|error| CalibrateError::failed("the pipeline lanes", error))?;
+        let named: Vec<(&str, StreamOptions)> = names
+            .iter()
+            .map(|name| (name.as_str(), StreamOptions::default()))
+            .collect();
+        let shared =
+            open_shared_lanes(&gpu, &named).map_err(|error| CalibrateError::failed("the pipeline lanes", error))?;
         let main = Arc::clone(shared.pool.lane(LaneId(0)));
-        let slots: Vec<Arc<CudaQueue>> = (1..=batch).map(|slot| Arc::clone(shared.pool.lane(LaneId(slot as u16)))).collect();
+        let slots: Vec<Arc<CudaQueue>> = (1..=batch)
+            .map(|slot| Arc::clone(shared.pool.lane(LaneId(slot as u16))))
+            .collect();
         let completions = Completions::new(&shared.queues);
         let staging = PinnedPool::new(&library, settings.staging_bytes);
         let home = Marker::new(DeviceQueue::id(&*main), Lane::lane(&*main), 0);
@@ -240,7 +266,8 @@ impl Calibration {
             let symmetric = math.lane_handles().map_err(|error| gpu_error(format!("{error:?}")))?;
             Ok((forward, pipeline_handles, symmetric))
         });
-        let ((forward, pipeline_handles, symmetric), _) = made.map_err(|error| CalibrateError::failed("the pipeline workspace", error))?;
+        let ((forward, pipeline_handles, symmetric), _) =
+            made.map_err(|error| CalibrateError::failed("the pipeline workspace", error))?;
         let pipeline = ForwardPipeline::new(Parts {
             forward,
             library: Arc::clone(&library),
@@ -256,7 +283,8 @@ impl Calibration {
 
         let states_bytes = settings.tokens.len() * hidden * BF16_BYTES;
         let states = States {
-            buffer: PinnedBuffer::alloc(&library, states_bytes).map_err(|error| CalibrateError::failed("the hidden states", error))?,
+            buffer: PinnedBuffer::alloc(&library, states_bytes)
+                .map_err(|error| CalibrateError::failed("the hidden states", error))?,
             bytes: states_bytes,
         };
         let batch_states = DeviceBuffer::alloc(&library, batch * length * hidden * BF16_BYTES)
@@ -285,12 +313,21 @@ impl Calibration {
                 .ok_or_else(|| CalibrateError::Failed("the GPTQ lane made no handles".to_owned()))?
                 .map_err(|error| CalibrateError::failed("the GPTQ lane's handles", format!("{error:?}")))?;
             let memory = LaneMemory::new(Arc::clone(&library), Arc::clone(&lane_pinned));
-            let lane = GptqLane::new(stream, handles, Arc::clone(&gptq_kernels), memory, Arc::clone(&gptq_completions), gptq_settings)
-                .map_err(|error| CalibrateError::failed("a GPTQ lane", error))?;
+            let lane = GptqLane::new(
+                stream,
+                handles,
+                Arc::clone(&gptq_kernels),
+                memory,
+                Arc::clone(&gptq_completions),
+                gptq_settings,
+            )
+            .map_err(|error| CalibrateError::failed("a GPTQ lane", error))?;
             lanes.push(lane);
         }
 
-        let free = library.free_bytes().map_err(|error| CalibrateError::failed("the free device memory", error))?;
+        let free = library
+            .free_bytes()
+            .map_err(|error| CalibrateError::failed("the free device memory", error))?;
         let capacity = free.saturating_sub(settings.device_reserve);
         if capacity == 0 {
             return Err(CalibrateError::Failed(format!(
@@ -453,7 +490,10 @@ impl Stages for Calibration {
             Target::Layer(layer),
             move |bytes| staging.acquire(bytes),
             Arc::new(move |staged: Result<StagedLayer<PooledPinned>, CheckpointError>| {
-                end(&ready, staged.map_err(|error| CalibrateError::failed("reading the layer", error)));
+                end(
+                    &ready,
+                    staged.map_err(|error| CalibrateError::failed("reading the layer", error)),
+                );
             }),
         );
         if let Err(error) = started {
@@ -540,7 +580,8 @@ fn read_states(inner: Arc<Inner>, file: ResumeFile, at: usize, done: usize, then
                 Err(error) => end(&then, Err(CalibrateError::failed("the resume states", error))),
                 Ok(bytes) => {
                     // SAFETY: the range is inside the states, which nothing else touches before the run starts.
-                    unsafe { slice::from_raw_parts_mut(inner.states.pointer().add(at), length) }.copy_from_slice(&bytes);
+                    unsafe { slice::from_raw_parts_mut(inner.states.pointer().add(at), length) }
+                        .copy_from_slice(&bytes);
                     read_states(inner, next, at + length, done, then);
                 }
             }
@@ -596,10 +637,18 @@ fn copy_rows(inner: &Inner, table: &PinnedBuffer, vocabulary: u64) -> Result<(),
         let token = u64::try_from(token)
             .ok()
             .filter(|token| *token < vocabulary)
-            .ok_or_else(|| CalibrateError::Invalid(format!("token {token} at {position} is outside the {vocabulary} embeddings")))?;
+            .ok_or_else(|| {
+                CalibrateError::Invalid(format!(
+                    "token {token} at {position} is outside the {vocabulary} embeddings"
+                ))
+            })?;
         // SAFETY: the token's row is inside the table, and the position's row is inside the states; they are two
         // buffers.
-        unsafe { target.add(position * row).copy_from_nonoverlapping(source.add(token as usize * row), row) };
+        unsafe {
+            target
+                .add(position * row)
+                .copy_from_nonoverlapping(source.add(token as usize * row), row)
+        };
     }
     Ok(())
 }
@@ -637,7 +686,10 @@ fn write_states(inner: Arc<Inner>, file: ResumeFile, at: usize, done: usize, the
         let started = file.set_header(
             &valid,
             Box::new(move |set| {
-                end(&then, set.map_err(|error| CalibrateError::failed("the resume header", error)));
+                end(
+                    &then,
+                    set.map_err(|error| CalibrateError::failed("the resume header", error)),
+                );
                 idle()
             }),
         );
@@ -683,7 +735,10 @@ fn upload(inner: Arc<Inner>, layer: usize, staged: StagedLayer, then: Once<()>) 
         Err(error) => {
             // The copies queued before the failure may still read the pinned memory: it is never returned.
             std::mem::forget(staged);
-            end(&then, Err(CalibrateError::failed(&format!("uploading layer {layer}"), error)));
+            end(
+                &then,
+                Err(CalibrateError::failed(&format!("uploading layer {layer}"), error)),
+            );
         }
         Ok((weights, marker)) => {
             let next = Arc::clone(&inner);
@@ -747,7 +802,11 @@ fn complete(inner: Arc<Inner>, weights: LayerWeights, set: HessianSet<DeviceBuff
             }
             shapes
                 .iter()
-                .map(|(_, (rows, columns))| Ok(context.ops().alloc_async(BF16_BYTES * (*rows as usize) * (*columns as usize))?))
+                .map(|(_, (rows, columns))| {
+                    Ok(context
+                        .ops()
+                        .alloc_async(BF16_BYTES * (*rows as usize) * (*columns as usize))?)
+                })
                 .collect()
         })();
         inner.handles.send(handles);
@@ -761,7 +820,14 @@ fn complete(inner: Arc<Inner>, weights: LayerWeights, set: HessianSet<DeviceBuff
     after(&inner, marker, move || round(next, weights, set, decoded, order, then));
 }
 
-fn round(inner: Arc<Inner>, weights: LayerWeights, set: HessianSet<DeviceBuffer>, decoded: Vec<DeviceBuffer>, order: Vec<usize>, then: Once<()>) {
+fn round(
+    inner: Arc<Inner>,
+    weights: LayerWeights,
+    set: HessianSet<DeviceBuffer>,
+    decoded: Vec<DeviceBuffer>,
+    order: Vec<usize>,
+    then: Once<()>,
+) {
     let built: Result<Vec<Linear>, CalibrateError> = weights
         .shapes()
         .iter()
@@ -788,7 +854,12 @@ fn round(inner: Arc<Inner>, weights: LayerWeights, set: HessianSet<DeviceBuffer>
     let (linears, lanes) = match (built, inner.lanes.take()) {
         (Ok(linears), Some(lanes)) => (linears, lanes),
         (Err(error), _) => return end(&then, Err(error)),
-        (_, None) => return end(&then, Err(CalibrateError::Failed("the GPTQ lanes are in use".to_owned()))),
+        (_, None) => {
+            return end(
+                &then,
+                Err(CalibrateError::Failed("the GPTQ lanes are in use".to_owned())),
+            );
+        }
     };
     let next = Arc::clone(&inner);
     // SAFETY: the weights and the Hessians move into the continuation and stay until the rounding has ended.
@@ -825,7 +896,10 @@ fn swap(inner: Arc<Inner>, mut weights: LayerWeights, set: HessianSet<DeviceBuff
         Ok(())
     });
     match submitted {
-        Err(error) => end(&then, Err(CalibrateError::failed("swapping in the rounded weights", error))),
+        Err(error) => end(
+            &then,
+            Err(CalibrateError::failed("swapping in the rounded weights", error)),
+        ),
         Ok(((), marker)) => {
             let next = Arc::clone(&inner);
             after(&inner, marker, move || write_pass(next, weights, then));
@@ -841,9 +915,12 @@ fn write_pass(inner: Arc<Inner>, weights: LayerWeights, then: Once<()>) {
     let started = inner.pipeline.run(
         request,
         Box::new(move |result| {
-            let outcome = result.map_err(|error| CalibrateError::failed("the write pass", error)).and_then(|()| {
-                Arc::try_unwrap(layer).map_err(|_| CalibrateError::Failed("the layer is still shared after its pass".to_owned()))
-            });
+            let outcome = result
+                .map_err(|error| CalibrateError::failed("the write pass", error))
+                .and_then(|()| {
+                    Arc::try_unwrap(layer)
+                        .map_err(|_| CalibrateError::Failed("the layer is still shared after its pass".to_owned()))
+                });
             match outcome {
                 Ok(weights) => release(next, weights, ended),
                 Err(error) => end(&ended, Err(error)),
