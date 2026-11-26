@@ -144,12 +144,18 @@ pub fn tokenize(
     limit: usize,
     parse_special: bool,
 ) -> Result<Vec<Vec<u32>>, ReferenceError> {
-    let tokenizer = if tokenizer.is_dir() {
-        read_checkpoint_tokenizer(tokenizer).map_err(|error| ReferenceError::Refused(error.to_string()))?
-    } else {
-        read_artifact_tokenizer(tokenizer).map_err(|error| ReferenceError::Refused(error.to_string()))?
-    };
+    let tokenizer = read_tokenizer(tokenizer).map_err(ReferenceError::Refused)?;
     chunk_text(&tokenizer, text, context, limit, parse_special)
+}
+
+/// The tokenizer at `path`: a checkpoint directory (its tokenizer files, as `package-tokenizer` reads them) or an
+/// artifact (its tokenizer section). Reads synchronously: call it on a thread that may wait, before the engine starts.
+pub fn read_tokenizer(path: &Path) -> Result<Tokenizer, String> {
+    if path.is_dir() {
+        read_checkpoint_tokenizer(path).map_err(|error| error.to_string())
+    } else {
+        read_artifact_tokenizer(path).map_err(|error| error.to_string())
+    }
 }
 
 /// The chunks of `text` as `tokenizer` makes them.
