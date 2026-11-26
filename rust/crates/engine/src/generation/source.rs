@@ -1850,7 +1850,10 @@ impl Owner {
         }
         // The rows of a quantum become part of its cache; a verification's accepted prefix does, once it is known.
         let rows = flying.rows as u64;
+        let hidden = self.run.as_ref().is_some_and(|run| run.hidden.is_some());
         let committed = match flying.role {
+            // A hidden request's verification is its one decoded row, which no acceptance decides.
+            Role::Verify if hidden => self.sequence.kv.commit(rows),
             Role::Verify => Ok(()),
             Role::PromptCatchUp | Role::CatchUp | Role::Draft => match self.sequence.mtp_kv.as_mut() {
                 Some(cache) => cache.commit(rows),
@@ -1881,8 +1884,8 @@ impl Owner {
             }
         }
         if run.hidden.is_some()
-            && matches!(flying.role, Role::Prefill { .. } | Role::Decode)
-            && let Err(why) = self.copy_hidden(flying, retired)
+            && matches!(flying.role, Role::Prefill { .. } | Role::Decode | Role::Verify)
+            && let Err(why) = self.copy_hidden(flying)
         {
             return self.fail(why);
         }
@@ -2076,10 +2079,9 @@ impl Owner {
 
     /// Queues the copy of the rows a retired quantum seeded, and of its logits row when it selected, to pinned memory on
     /// the owner's lane. The next quantum is admitted once the lane has reached the copy ([`Owner::hidden_copied`]).
-    fn copy_hidden(&mut self, flying: &Flying, retired: &Retired) -> Result<(), String> {
-        let Kept::Whole(_) = &retired.kept else {
-            return Err("a hidden request's quantum is not part of a pass".to_string());
-        };
+    fn copy_hidden(&mut self, flying: &Flying) -> Result<(), String> {
+        // The seed rows are the sequence's own, whether the quantum ran alone or as a part of a pass: each segment
+        // normalizes into its own sequence's rows.
         let seeds = self
             .sequence
             .device
@@ -2237,9 +2239,15 @@ impl Owner {
                     run.depth > 1 && !checkpoint
                 },
             },
+            // A hidden request's decode is a one-row verification: row-exact, as the corpus's reference is, and offered to
+            // the workspace's passes so that concurrent requests read the weights once.
             Step::Decode => Admission {
-                role: Role::Decode,
-                kind: QuantumKind::Decode,
+                role: if hidden { Role::Verify } else { Role::Decode },
+                kind: if hidden {
+                    QuantumKind::Verify
+                } else {
+                    QuantumKind::Decode
+                },
                 rows: 1,
                 start,
                 source: KvSource::Base,
@@ -2250,7 +2258,7 @@ impl Owner {
                     _ => Vec::new(),
                 },
                 last_chunk: false,
-                more: !speculative && run.depth > 1,
+                more: !speculative && !hidden && run.depth > 1,
             },
             _ => return Ok(()),
         };
