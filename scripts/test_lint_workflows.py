@@ -1,6 +1,7 @@
 """The workflow lint stops a request above 32G and any cpu form, and passes the repository's own workflows."""
 
 import importlib.util
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -148,6 +149,47 @@ class LintWorkflowsTest(unittest.TestCase):
     def test_a_path_with_no_workflows_is_an_error(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(lint_workflows.main([directory]), 2)
+
+
+def jobs_of(text):
+    """The job blocks of a workflow, by name, found by indentation (no YAML parser is installed on the runner)."""
+    _, _, body = text.partition("\njobs:\n")
+    parts = re.split(r"^  ([a-z][a-z-]*):\n", body, flags=re.MULTILINE)
+    return {parts[i]: parts[i + 1].rstrip("\n").split("\n") for i in range(1, len(parts), 2)}
+
+
+class FailFastTest(unittest.TestCase):
+    """One workflow runs for a pull request, and every job of it cancels the run when it fails."""
+
+    ACTION = "uses: ./.gitea/actions/fail-fast"
+    AGGREGATES = ("device", "gate-ok")  # cancelled with the run; they only report
+
+    def test_only_ci_runs_for_a_pull_request(self):
+        for path in sorted((ROOT / ".gitea/workflows").glob("*.y*ml")):
+            triggers = re.search(r"^on:\n((?:[ #].*\n|\n)*)", path.read_text(), flags=re.MULTILINE)
+            has_pull_request = triggers is not None and re.search(r"^  pull_request:", triggers.group(1), flags=re.MULTILINE)
+            self.assertEqual(bool(has_pull_request), path.name == "ci.yaml", path.name)
+
+    def test_the_workflow_may_cancel_its_own_run(self):
+        # Without `actions: write` the cancel call is refused (403) and a failed job stops nothing.
+        text = (ROOT / ".gitea/workflows/ci.yaml").read_text()
+        self.assertRegex(text, r"(?m)^permissions:\n(?:  .*\n)*  actions: write\n")
+
+    def test_every_job_ends_by_cancelling_the_run_when_it_fails(self):
+        jobs = jobs_of((ROOT / ".gitea/workflows/ci.yaml").read_text())
+        reusable = [name for name, lines in jobs.items() if any(line.startswith("    uses: ") for line in lines)]
+        self.assertTrue(reusable, "the Bazel jobs are reusable workflows")
+        for name, lines in jobs.items():
+            if name in self.AGGREGATES or name in reusable:
+                continue
+            last = [line for line in lines if line.strip() and not line.startswith("  #")][-1]
+            self.assertTrue(last.strip().endswith(self.ACTION), f"{name} does not end with the fail-fast step")
+            if not name.endswith("-failed"):
+                self.assertEqual(lines[lines.index(last) - 1], "        if: failure()", f"{name}: the step runs on failure only")
+        for name in reusable:
+            watcher = jobs.get(f"{name}-failed")
+            self.assertIsNotNone(watcher, f"{name} is a reusable workflow: it needs a {name}-failed job")
+            self.assertIn(f"    needs: {name}", watcher)
 
 
 if __name__ == "__main__":

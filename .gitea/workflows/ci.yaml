@@ -1,6 +1,11 @@
-# CI for Linux (Windows, ARM and the Intel SDE step stay on GitHub, which runs them
-# for the main pushes that forge-mirror sends). One workflow, so `rollover promote` finds one run per commit
-# (require_run = ["ci.yaml"]).
+# CI for Linux (ARM and the Intel SDE step stay on GitHub, which runs them for the main pushes that forge-mirror sends;
+# the Windows build of a pull request runs there too, dispatched by the `windows` job below). One workflow, so
+# `rollover promote` finds one run per commit (require_run = ["ci.yaml"]).
+#
+# It fails fast: the first job that fails cancels the whole run (the last step of each job, `.gitea/actions/fail-fast`;
+# the two Bazel jobs are reusable workflows with no steps of ours, so `gate-failed` and `windows-failed` do it for them).
+# A cancelled run is never green: the checks to require are `rust`, `native-package`, `device`, `gate-ok` and `windows`,
+# and the last four are cancelled with it.
 #
 # The runner labels are listed below with the jobs that use them.
 # Runs for a pull request that touches a path below, for a push to main or to an integration branch (rust/next*), and by hand.
@@ -32,12 +37,23 @@ on:
       - ".gitea/workflows/**"
       - "scripts/lint-workflows.py"
       - "scripts/test_lint_workflows.py"
+      - "MODULE.bazel"
+      - "MODULE.bazel.lock"
+      - ".bazelrc"
+      - ".bazelversion"
+      - ".bazelignore"
+      - "BUILD.bazel"
+      - "bazel/**"
+      - ".gitattributes"
+      - ".github/workflows/ci.yml"
   push:
     branches: [main, "rust/next*"]
   workflow_dispatch:
 
+# `actions: write` is for the cancel call of the fail-fast step, and nothing else.
 permissions:
   contents: read
+  actions: write
 
 # The event is part of the group, so a manual run on the integration branch never cancels the push run that
 # `rollover promote` requires for that commit. Each push to main has its own group (its sha), so no main run is
@@ -60,6 +76,7 @@ jobs:
     outputs:
       rust: ${{ steps.diff.outputs.rust }}
       native: ${{ steps.diff.outputs.native }}
+      bazel: ${{ steps.diff.outputs.bazel }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -80,7 +97,7 @@ jobs:
           set -euo pipefail
           zero=0000000000000000000000000000000000000000
 
-          # The path groups of each job. mise.toml and rust/** are in both groups.
+          # The path groups of each job. mise.toml and rust/** are in every group.
           rust_paths=(
             ':(glob)rust/**' ':(glob)native/include/**' ':(glob)mise.toml' ':(glob).gitea/workflows/ci.yaml'
           )
@@ -88,6 +105,13 @@ jobs:
             ':(glob)api/**' ':(glob)core/**' ':(glob)benchmark/**' ':(glob)gradle/**' ':(glob)settings.gradle.kts'
             ':(glob)gradle.properties' ':(glob)native/**' ':(glob)native.gradle.kts' ':(glob)build.gradle.kts'
             ':(glob)mise.toml' ':(glob)rust/**' ':(glob).gitea/workflows/ci.yaml'
+          )
+
+          # The Bazel gate: the workspace, the Bazel files, and the GitHub workflow the Windows leg runs.
+          bazel_paths=(
+            ':(glob)rust/**' ':(glob)MODULE.bazel' ':(glob)MODULE.bazel.lock' ':(glob).bazelrc' ':(glob).bazelversion'
+            ':(glob).bazelignore' ':(glob)BUILD.bazel' ':(glob)bazel/**' ':(glob).gitattributes' ':(glob)mise.toml'
+            ':(glob).gitea/workflows/ci.yaml' ':(glob).github/workflows/ci.yml'
           )
 
           # Guard: an integration branch other than the current one runs nothing heavy.
@@ -146,9 +170,15 @@ jobs:
           }
           rust=$(changed "${rust_paths[@]}")
           native=$(changed "${native_paths[@]}")
-          echo "event=$EVENT ref=$REF_NAME all=$all range=${range:-none} rust=$rust native=$native"
+          bazel=$(changed "${bazel_paths[@]}")
+          echo "event=$EVENT ref=$REF_NAME all=$all range=${range:-none} rust=$rust native=$native bazel=$bazel"
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
           echo "native=$native" >> "$GITHUB_OUTPUT"
+          echo "bazel=$bazel" >> "$GITHUB_OUTPUT"
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
 
   rust:
     name: rust
@@ -209,6 +239,10 @@ jobs:
         run: |
           eval "$(mise env -s bash)"
           cargo test --workspace
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
 
   # The ignored device tests of the workspace, on the card, in groups that each ask the arbiter for what their own tests need.
   # `device-build` builds the native library and the test binaries once, without the card, and uploads them as one artifact.
@@ -272,6 +306,10 @@ jobs:
           path: ${{ runner.temp }}/device-tests/*
           if-no-files-found: error
           retention-days: 2
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
 
   # The CUDA crate kernels and the quantization kernels.
   device-kernels:
@@ -316,6 +354,10 @@ jobs:
       - name: Skipped tests
         if: always()
         run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
 
   # The server, API server, benchmark and tokenizer tests: each starts its own engine.
   device-servers:
@@ -360,6 +402,10 @@ jobs:
       - name: Skipped tests
         if: always()
         run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
 
   # The engine binary, the tests that run on a reduced model: no engine of the model.
   device-engine-rig:
@@ -404,6 +450,10 @@ jobs:
       - name: Skipped tests
         if: always()
         run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
 
   # The engine binary, the modules whose engines have a short context.
   device-engine-small:
@@ -448,6 +498,10 @@ jobs:
       - name: Skipped tests
         if: always()
         run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
 
   # The engine binary, the modules that start the 4096-token engine and the loader.
   device-engine-big:
@@ -492,6 +546,10 @@ jobs:
       - name: Skipped tests
         if: always()
         run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
 
   # The one check to require: the groups above all passed. A group that did not run (an earlier job failed, or it was
   # cancelled) is a failure here, not a pass; only a run that touched no native path skips everything.
@@ -562,3 +620,90 @@ jobs:
           path: build/bundle/euhedral-server-linux-x64.tar.gz
           if-no-files-found: error
           retention-days: 2
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
+
+  # The Bazel gate of the Rust workspace, beside the Cargo jobs: `bazel test //... --config=ci` on Linux, the BUILD files'
+  # staleness check, and forge's repo check. The reusable workflows are pinned by the protected tag, by its full ref.
+  gate:
+    needs: changes
+    if: needs.changes.outputs.bazel == 'true'
+    uses: euhedral/ci/.gitea/workflows/bazel-gate.yml@refs/tags/v10
+    with:
+      stale-build: gazelle
+      bazel-mem: 16
+      bazel-est: 1200
+    secrets:
+      # Also read by the repo check's pin alignment (C5).
+      forge-read-token: ${{ secrets.FORGE_READ_TOKEN }}
+
+  # The same test on the Windows platform: GitHub runs it, dispatched by the proxy, for a pull request only.
+  windows:
+    needs: changes
+    if: needs.changes.outputs.bazel == 'true'
+    uses: euhedral/ci/.gitea/workflows/bazel-windows.yml@refs/tags/v10
+    with:
+      repo: Euhedral-Engine/Euhedral
+      permissions: contents:write,actions:write,workflows:write
+    secrets:
+      GH_APP_ID: ${{ secrets.GH_APP_ID }}
+      GH_APP_INSTALLATION_ID: ${{ secrets.GH_APP_INSTALLATION_ID }}
+      GH_APP_PRIVATE_KEY_B64: ${{ secrets.GH_APP_PRIVATE_KEY_B64 }}
+
+  # A reusable-workflow job has no step of ours to end with, so these two cancel the run when the job they follow fails.
+  gate-failed:
+    name: gate-failed
+    needs: gate
+    if: always() && needs.gate.result == 'failure'
+    runs-on: arbiter-docker
+    env:
+      ARBITER_ARGS: "--mem 1G"
+      ARBITER_EST: "60"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.gitea/actions/fail-fast
+
+  windows-failed:
+    name: windows-failed
+    needs: windows
+    if: always() && needs.windows.result == 'failure'
+    runs-on: arbiter-docker
+    env:
+      ARBITER_ARGS: "--mem 1G"
+      ARBITER_EST: "60"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.gitea/actions/fail-fast
+
+  # The one check to require for Bazel: a skipped gate (a caller's `if:`) is a failure here, not a pass, unless no Bazel
+  # path changed. The Windows workflow runs only for a pull request, so on a push or a manual run its result is `skipped`,
+  # and only then (or when no Bazel path changed) is that accepted.
+  gate-ok:
+    name: gate-ok
+    needs: [changes, gate, windows]
+    if: always()
+    runs-on: arbiter-docker
+    steps:
+      # The image's PATH starts with directories an earlier job can write: a planted `bash` could pass this step.
+      - name: The gate ran and passed
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
+        env:
+          PATH: /usr/bin:/bin
+          EVENT: ${{ github.event_name }}
+          CHANGES: ${{ needs.changes.result }}
+          BAZEL: ${{ needs.changes.outputs.bazel }}
+          GATE: ${{ needs.gate.result }}
+          WINDOWS: ${{ needs.windows.result }}
+        run: |
+          test "$CHANGES" = success
+          if test "$BAZEL" != true; then
+            exit 0
+          fi
+          test "$GATE" = success
+          if test "$EVENT" = pull_request; then
+            test "$WINDOWS" = success
+          else
+            test "$WINDOWS" = success -o "$WINDOWS" = skipped
+          fi
