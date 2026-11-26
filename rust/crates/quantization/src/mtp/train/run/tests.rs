@@ -589,6 +589,13 @@ fn rewrite_header(world: &World, out: &Path, name: &str, change: impl FnOnce(&mu
     call(|reply| file.set_header(&header, then(&reply))).unwrap();
 }
 
+/// The header of the file `name` in `out`. The handle is closed before this returns: Windows refuses to replace a
+/// file that another handle has open, and the run replaces these.
+fn header_of(world: &World, out: &Path, name: &str) -> Header {
+    let file = call(|reply| ResumeFile::open_read_only(&world.io, &world.lake, &out.join(name), then(&reply))).unwrap();
+    call(|reply| file.header(then(&reply))).unwrap()
+}
+
 /// A run stopped at its first saved state, whose best file is then made newer than the state knows: the state's best is
 /// two accepted drafts below the evaluation of this run's fake lane, and the best file holds `newer` less than it.
 /// Resumed, and given the whole run, what the resumed run did.
@@ -613,14 +620,8 @@ fn resumed_with_a_newer_best(newer_below: f64) -> (Arc<Script>, f64, Header) {
     });
     let second = Arc::new(Script::default());
     let mut next = ready(&world, out.path(), &second, Start::Continue, rows);
-    let file =
-        call(|reply| ResumeFile::open_read_only(&world.io, &world.lake, &out.path().join("resume.bin"), then(&reply)))
-            .unwrap();
-    let state = call(|reply| file.header(then(&reply))).unwrap();
-    let file =
-        call(|reply| ResumeFile::open_read_only(&world.io, &world.lake, &out.path().join("best.bin"), then(&reply)))
-            .unwrap();
-    let best = call(|reply| file.header(then(&reply))).unwrap();
+    let state = header_of(&world, out.path(), "resume.bin");
+    let best = header_of(&world, out.path(), "best.bin");
     let settings = settings();
     let resume = Progress::resume(
         settings,
@@ -637,13 +638,7 @@ fn resumed_with_a_newer_best(newer_below: f64) -> (Arc<Script>, f64, Header) {
     };
     next.progress = progress;
     run(&world, next, &options(out.path(), 0, 0)).outcome.unwrap();
-    let after = {
-        let file = call(|reply| {
-            ResumeFile::open_read_only(&world.io, &world.lake, &out.path().join("best.bin"), then(&reply))
-        })
-        .unwrap();
-        call(|reply| file.header(then(&reply))).unwrap()
-    };
+    let after = header_of(&world, out.path(), "best.bin");
     world.stop();
     (second, measured, after)
 }
