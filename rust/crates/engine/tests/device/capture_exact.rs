@@ -35,7 +35,8 @@ use euhedral_inference_settings::KvFormat;
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_quantum_is_never_captured_under_exact_numerics() {
-    let _light = common::light();
+    // The exact-numerics switch is process-wide: the test holds the card alone, so no other test runs under it.
+    let _card = common::card();
     let Some(path) = test_support::require_property("euhedral.cuda.library") else {
         return;
     };
