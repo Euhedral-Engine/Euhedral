@@ -187,7 +187,9 @@ fn an_overlay_of_an_overlay_keeps_the_first_rounds_replacements_and_replaces_the
 }
 
 // Mutants caught: a step discarded unrun that drops the overlay's continuation with it (the caller waits for ever), at
-// the index read, the link on the host lake, or the writes of the shard and the index; a call that ends twice.
+// the index read or the writes of the shard and the index, which are I/O-engine steps; a call that ends twice. The
+// link frame runs on the host lake, which this does not drop from: its guard is the overlay's own, ended by a refused
+// offer (the lake is closed) or by the drop of the overlay.
 #[test]
 fn an_overlay_step_discarded_unrun_ends_the_call_once_with_the_closing_error() {
     let world = World::start();

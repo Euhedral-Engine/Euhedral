@@ -338,6 +338,16 @@ impl Writing {
         let Some(then) = then.release() else {
             return;
         };
+        if matches!(error, CheckpointError::LakeClosed) {
+            // A closing lake or engine may be discarding this chain from the tail of a pull, where nothing may be
+            // offered: the removal is not offered, and the file is said to be left.
+            drop(unit);
+            then(Err(CheckpointError::io(
+                "the write was cut short and the .part file was left",
+                IoError::other(error.to_string()),
+            )));
+            return;
+        }
         let removal = Removal {
             error: Some(error),
             then,
@@ -471,6 +481,10 @@ impl Step {
                         "the source of {name} gave {} bytes for a chunk of {n}",
                         bytes.len()
                     )));
+                }
+                Err(CheckpointError::LakeClosed) => {
+                    drop(file);
+                    writing.fail(CheckpointError::LakeClosed);
                 }
                 Err(error) => {
                     drop(file);

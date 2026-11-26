@@ -1,4 +1,10 @@
 //! The asynchronous file steps the checkpoint readers and the writer chain: open, length, positioned read.
+//!
+//! A step that the I/O engine or a lake accepted and later discards unrun ends its call with
+//! [`CheckpointError::LakeClosed`] ([`Next`], [`Closing`]). RustEE may discard a frame from the tail of a pull, where a
+//! worker must not push, so a continuation that is told `LakeClosed` only records or reports the result: it never
+//! offers or submits new work (the writer does not offer the removal of its `.part` file then; it says the file was
+//! left). A function that returns `Err` started nothing: it disarms its [`Next`] and never calls it.
 
 use std::io::Error as IoError;
 use std::path::Path;
@@ -124,7 +130,7 @@ pub(crate) fn submit_error(context: &str, error: IoError) -> CheckpointError {
     CheckpointError::io(context, error)
 }
 
-/// Opens `path` for reading. `Err` started nothing, and drops `next`.
+/// Opens `path` for reading. `Err` started nothing, and `next` is never called.
 pub(crate) fn open_read(io: &AsyncIo, path: &Path, next: Next<OwnedFile>) -> Result<(), CheckpointError> {
     let context = path.display().to_string();
     let failed = context.clone();
@@ -143,7 +149,7 @@ pub(crate) fn open_read(io: &AsyncIo, path: &Path, next: Next<OwnedFile>) -> Res
 }
 
 /// Reads `len` bytes at `offset` of `file`; a file that ends first is an error. `file` stays open until `next` runs.
-/// `Err` started nothing, and drops `next`.
+/// `Err` started nothing, and `next` is never called.
 pub(crate) fn read_exact(
     io: &AsyncIo,
     file: Arc<OwnedFile>,
@@ -153,6 +159,7 @@ pub(crate) fn read_exact(
     next: Next<Vec<u8>>,
 ) -> Result<(), CheckpointError> {
     if len == 0 {
+        next.disarm();
         return Err(CheckpointError::Invalid(format!("{context}: a read of no bytes")));
     }
     let raw = raw_file(&file);
@@ -226,7 +233,7 @@ fn sized(io: Arc<AsyncIo>, file: Arc<OwnedFile>, context: String, then: Done<Vec
     }
 }
 
-/// The length of `file`. `file` stays open until `next` runs. `Err` started nothing, and drops `next`.
+/// The length of `file`. `file` stays open until `next` runs. `Err` started nothing, and `next` is never called.
 pub(crate) fn file_length(
     io: &AsyncIo,
     file: Arc<OwnedFile>,
@@ -247,4 +254,85 @@ pub(crate) fn file_length(
             }),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use std::fs::File;
+
+    use euhedral_core::generics::LatticeSource;
+    use euhedral_io::AsyncIo;
+
+    use super::*;
+
+    /// A `Next` that counts its calls.
+    fn counting<T: 'static>() -> (Arc<AtomicUsize>, Next<T>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let next = Next::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        (calls, next)
+    }
+
+    fn closed_io() -> Arc<AsyncIo> {
+        #[allow(clippy::unwrap_used, reason = "a test: a failed open stops it")]
+        let io = AsyncIo::open().unwrap();
+        io.complete();
+        io
+    }
+
+    #[allow(
+        clippy::unwrap_used,
+        clippy::disallowed_methods,
+        reason = "a test: a failed open stops it, and the file only has to exist"
+    )]
+    fn some_file() -> Arc<OwnedFile> {
+        Arc::new(OwnedFile::from(
+            File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap(),
+        ))
+    }
+
+    // Mutant caught: a refused submission that leaves its `Next` armed, so the drop calls it with `LakeClosed`.
+    #[test]
+    fn a_refused_open_length_or_read_returns_err_and_never_calls_next() {
+        let io = closed_io();
+        let (calls, next) = counting();
+        assert!(open_read(&io, Path::new("absent"), next).is_err());
+        let (length_calls, next) = counting();
+        assert!(file_length(&io, some_file(), "file".to_owned(), next).is_err());
+        let (read_calls, next) = counting();
+        assert!(read_exact(&io, some_file(), 0, 4, "file".to_owned(), next).is_err());
+        let counts = [calls, length_calls, read_calls].map(|calls| calls.load(Ordering::SeqCst));
+        assert_eq!(counts, [0, 0, 0]);
+    }
+
+    // Mutant caught: an early refusal (a read of no bytes) that drops its `Next` armed.
+    #[test]
+    fn a_read_of_no_bytes_returns_err_and_never_calls_next() {
+        let io = closed_io();
+        let (calls, next) = counting();
+        assert!(read_exact(&io, some_file(), 0, 0, "file".to_owned(), next).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Mutant caught: a `Next` or `Closing` dropped uncalled that says nothing (the caller waits for ever), or that
+    // runs a second time after it was called.
+    #[test]
+    fn a_next_dropped_uncalled_is_told_the_closing_error_once() {
+        let told = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&told);
+        let next = Next::<()>::new(move |result| {
+            assert!(matches!(result, Err(CheckpointError::LakeClosed)));
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        drop(next);
+        assert_eq!(told.load(Ordering::SeqCst), 1);
+
+        let (calls, next) = counting::<()>();
+        next.call(Ok(()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }
