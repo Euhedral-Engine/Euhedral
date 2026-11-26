@@ -12,6 +12,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use common::{Fixture, HANG_GUARD, Raw, assert_json, headers, small_limits, text};
+use euhedral_inference_api_server::Generation;
 use euhedral_inference_api_server::Limits;
 use euhedral_inference_api_server::metrics::{Api, ConstraintFailure, Outcome};
 use euhedral_inference_api_server::scripted::Script;
@@ -352,12 +353,14 @@ fn a_streamed_reply_is_timed_when_its_last_byte_is_written() {
     fixture.finish();
 }
 
-#[test]
-fn a_stream_still_open_is_not_yet_in_the_timings() {
-    let fixture = Fixture::with(roomy_limits(), Some(2));
+/// A streaming chat request whose generation the test drives: the backend holds it after the launch, and the test
+/// gives it its one piece, `tok0`, once the launch has happened. An unthrottled generator would instead outrun a
+/// loaded host's write of the head and the client's reads, and the server would rightly cut the stream of a
+/// reader that falls behind (`Limits::max_held_bytes`), which is not what these tests look at.
+fn open_stream(fixture: &Fixture) -> Raw {
     fixture.backend.set_max_active(1);
     fixture.backend.set_context_length(1 << 30);
-    fixture.backend.set_script(Script::Endless);
+    fixture.backend.set_script(Script::Hung);
     let body = r#"{"model":"euhedral-test-model","stream":true,"reasoning_effort":"none","max_tokens":100000000,"messages":[{"role":"user","content":"Hi"}]}"#;
     let request = format!(
         "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -365,28 +368,49 @@ fn a_stream_still_open_is_not_yet_in_the_timings() {
     );
     let mut raw = Raw::connect(fixture.addr);
     raw.send(&request);
+    let end = Instant::now() + HANG_GUARD;
+    while !fixture
+        .backend
+        .generations()
+        .first()
+        .is_some_and(|g| g.started().is_some())
+    {
+        assert!(Instant::now() < end, "the generation was never launched");
+        sleep(Duration::from_millis(5));
+    }
+    assert!(
+        fixture.backend.generations()[0].emit_held("tok0 "),
+        "the launched generation holds its listener"
+    );
     raw.read_until("tok0");
+    raw
+}
+
+#[test]
+fn a_stream_still_open_is_not_yet_in_the_timings() {
+    let fixture = Fixture::with(roomy_limits(), Some(2));
+    let raw = open_stream(&fixture);
     let scrape = text(&fixture.get("/metrics")).to_owned();
     assert!(!scrape.contains("uri=\"/v1/chat/completions\""), "{scrape}");
     drop(raw);
+    assert!(fixture.backend.generations()[0].finish_held_ok(1, false));
     fixture.finish();
 }
 
 #[test]
 fn a_stream_cut_after_its_head_is_timed_once() {
     let fixture = Fixture::with(roomy_limits(), Some(2));
-    fixture.backend.set_max_active(1);
-    fixture.backend.set_context_length(1 << 30);
-    fixture.backend.set_script(Script::Endless);
-    let body = r#"{"model":"euhedral-test-model","stream":true,"reasoning_effort":"none","max_tokens":100000000,"messages":[{"role":"user","content":"Hi"}]}"#;
-    let request = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    let mut raw = Raw::connect(fixture.addr);
-    raw.send(&request);
-    raw.read_until("tok0");
+    let raw = open_stream(&fixture);
     drop(raw);
+    // The server learns that the client is gone when a write fails, so the generation keeps saying a piece until the
+    // cut cancels it; the test then ends it as a cancelled one ends, and the request ends with it.
+    let end = Instant::now() + HANG_GUARD;
+    while !fixture.backend.generations()[0].is_cancelled() {
+        assert!(Instant::now() < end, "the cut never cancelled the generation");
+        assert!(fixture.backend.generations()[0].emit_held("tok "));
+        sleep(Duration::from_millis(5));
+    }
+    assert!(fixture.backend.generations()[0].finish_held_ok(1, false));
     let end = Instant::now() + HANG_GUARD;
     let counted = format!(
         "http_server_requests_seconds_count{{{APP},error=\"none\",exception=\"none\",method=\"POST\",outcome=\"SUCCESS\",status=\"200\",uri=\"/v1/chat/completions\"}} 1\n"

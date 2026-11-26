@@ -27,7 +27,7 @@ use crate::common;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,6 +68,27 @@ fn settings(artifact: &Path, max_tokens: u32) -> Settings {
     });
     settings.context.max_tokens = max_tokens;
     settings
+}
+
+/// The device memory this process holds, in MiB, as the driver accounts it for this pid (`nvidia-smi`), so another job
+/// on the shared card never moves it. The card's free memory is global and says nothing about who took it.
+fn own_device_mib() -> u64 {
+    let pid = process::id().to_string();
+    let output = Command::new("nvidia-smi")
+        .args(["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"])
+        .output()
+        .expect("nvidia-smi runs");
+    assert!(output.status.success(), "nvidia-smi failed: {:?}", output.status);
+    String::from_utf8(output.stdout)
+        .expect("nvidia-smi prints text")
+        .lines()
+        .filter_map(|line| line.split_once(','))
+        .find(|(listed, _)| listed.trim() == pid)
+        .unwrap_or_else(|| panic!("the driver lists no device memory for process {pid}"))
+        .1
+        .trim()
+        .parse()
+        .expect("the used memory is a number of MiB")
 }
 
 /// Starts the engine and waits for the hand-off, as `main` does.
@@ -410,9 +431,14 @@ fn a_plan_that_does_not_fit_fails_before_device_alloc() {
     let Some(machine) = machine() else { return };
     let _card = common::card();
     let library = CudaLibrary::load(&machine.library).unwrap();
-    let before = library.free_bytes().unwrap();
+    // Reading the free memory binds this process's context, so it is listed before the engine starts.
+    library.free_bytes().unwrap();
     let mut settings = settings(&machine.artifact, 4096);
     settings.memory.gpu_limit = euhedral_inference_settings::Auto::Value(ByteSize::gib(2));
+    // The first start loads the engine's kernels into the context; the one measured then moves nothing but its own
+    // allocations.
+    drop(start(&settings, &machine.library));
+    let before = own_device_mib();
     let (outcome, _guard) = start(&settings, &machine.library);
     let error = outcome.expect_err("12 GiB of weights do not fit in 2 GiB");
     // The plan holds what cannot stay on the device in host memory or in the file: the host budget is too small for
@@ -448,10 +474,10 @@ fn a_plan_that_does_not_fit_fails_before_device_alloc() {
         }
         other => panic!("expected the device, host or offload refusal, got {other:?}"),
     }
-    let after = library.free_bytes().unwrap();
-    assert!(
-        before.abs_diff(after) < (256 << 20),
-        "free memory moved from {before} to {after}"
+    let after = own_device_mib();
+    assert_eq!(
+        before, after,
+        "this process held {before} MiB of the card before the refused plan and {after} MiB after it"
     );
 }
 
