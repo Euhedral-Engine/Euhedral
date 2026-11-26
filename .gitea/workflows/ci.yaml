@@ -316,8 +316,9 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
+      # The engine sizes its host memory from the container headroom, so a learned cap starves it: limit to the full ask.
       # Measured: 0.5 GB on the card, 0.5 GB of host memory, 114 s.
-      ARBITER_ARGS: "--gpu shared:1.5 --mem 2G"
+      ARBITER_ARGS: "--gpu shared:1.5 --mem 2G --no-learned-cap"
       ARBITER_EST: "240"
     steps:
       - uses: actions/checkout@v4
@@ -365,7 +366,7 @@ jobs:
     runs-on: arbiter-gpu
     env:
       # Measured: 12.7 GB on the card (one engine at a time), 5.4 GB of host memory, 74 s.
-      ARBITER_ARGS: "--gpu shared:13.5 --mem 8G"
+      ARBITER_ARGS: "--gpu shared:13.5 --mem 8G --no-learned-cap"
       ARBITER_EST: "240"
     steps:
       - uses: actions/checkout@v4
@@ -413,7 +414,7 @@ jobs:
     runs-on: arbiter-gpu
     env:
       # Measured: 5.4 GB on the card (a reduced model), 12.2 GB of host memory, 140 s.
-      ARBITER_ARGS: "--gpu shared:6 --mem 14G"
+      ARBITER_ARGS: "--gpu shared:6 --mem 14G --no-learned-cap"
       ARBITER_EST: "300"
     steps:
       - uses: actions/checkout@v4
@@ -461,7 +462,7 @@ jobs:
     runs-on: arbiter-gpu
     env:
       # Measured: 13.1 GB on the card (a 512 and an 8192 token engine), 2.6 GB of host memory, 57 to 141 s.
-      ARBITER_ARGS: "--gpu shared:14 --mem 6G"
+      ARBITER_ARGS: "--gpu shared:14 --mem 6G --no-learned-cap"
       ARBITER_EST: "300"
     steps:
       - uses: actions/checkout@v4
@@ -509,7 +510,7 @@ jobs:
     runs-on: arbiter-gpu
     env:
       # Measured: 22.1 GB on the card, 23.4 GB of host memory, 53 model loads, 582 s.
-      ARBITER_ARGS: "--gpu shared:22.5 --mem 28G"
+      ARBITER_ARGS: "--gpu shared:22.5 --mem 28G --no-learned-cap"
       ARBITER_EST: "700"
     steps:
       - uses: actions/checkout@v4
