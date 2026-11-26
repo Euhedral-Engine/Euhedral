@@ -136,5 +136,63 @@ class FakeQuantTest(unittest.TestCase):
             codes.check_state(loaded, NVFP4_FORMAT, LAYOUT_ROW_SPLIT, (N, K))
 
 
+class ExportKeyTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.model = self.root / "model"
+        self.model.mkdir()
+        (self.model / "config.json").write_text('{"layers": 64}')
+        (self.model / "shard-1.safetensors").write_bytes(b"0123456789")
+        self.imatrix = self.root / "m.gguf"
+        self.imatrix.write_bytes(b"matrix")
+
+    def key(self):
+        return codes.checkpoint_export_key(self.model, self.root / "a.edrl", "nvfp4", False, self.imatrix)
+
+    def test_identity_is_stable_and_changes_with_a_config_byte_a_shard_size_or_a_shard(self):
+        base = codes.model_identity(self.model)
+        self.assertEqual(base, codes.model_identity(self.model))
+        (self.model / "shard-1.safetensors").write_bytes(b"abcdefghij")
+        self.assertEqual(base, codes.model_identity(self.model), "same size, other bytes")
+        (self.model / "shard-1.safetensors").write_bytes(b"0123456789a")
+        self.assertNotEqual(base, codes.model_identity(self.model), "a shard's size")
+        (self.model / "shard-1.safetensors").write_bytes(b"0123456789")
+        (self.model / "config.json").write_text('{"layers": 65}')
+        self.assertNotEqual(base, codes.model_identity(self.model), "a config byte")
+        (self.model / "config.json").write_text('{"layers": 64}')
+        (self.model / "shard-2.safetensors").write_bytes(b"")
+        self.assertNotEqual(base, codes.model_identity(self.model), "an added shard")
+        (self.model / "shard-2.safetensors").unlink()
+        (self.model / "shard-1.safetensors").unlink()
+        self.assertNotEqual(base, codes.model_identity(self.model), "a removed shard")
+
+    def test_a_shard_that_cannot_be_read_still_has_an_identity(self):
+        shard = self.model / "shard-1.safetensors"
+        base = codes.model_identity(self.model)
+        shard.chmod(0)
+        self.addCleanup(shard.chmod, 0o644)
+        self.assertEqual(base, codes.model_identity(self.model))
+
+    def test_a_rewritten_importance_matrix_or_model_gives_another_key_that_an_export_refuses(self):
+        directory = self.root / "export"
+        state = codes.QuantState("Q4G64_F16S", "row-split", (1, 128), np.zeros((1, 128), np.int8),
+                                 np.zeros((1, 2), np.float16))
+        first = self.key()
+        self.assertEqual(first, self.key())
+        codes.export_state(directory, "a", state, first)
+        codes.finish_export(directory, first)
+        self.imatrix.write_bytes(b"matriy")
+        rewritten = self.key()
+        self.assertNotEqual(first, rewritten)
+        with self.assertRaisesRegex(ValueError, "another run"):
+            codes.export_state(directory, "b", state, rewritten)
+        self.imatrix.write_bytes(b"matrix")
+        (self.model / "config.json").write_text('{"layers": 65}')
+        with self.assertRaisesRegex(ValueError, "another run"):
+            codes.export_state(directory, "b", state, self.key())
+
+
 if __name__ == "__main__":
     unittest.main()
