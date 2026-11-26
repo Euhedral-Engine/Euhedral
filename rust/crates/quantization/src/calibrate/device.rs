@@ -16,6 +16,8 @@
 
 use std::cell::RefCell;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
+use std::iter::once;
+use std::mem::forget;
 use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::{Arc, OnceLock};
@@ -60,6 +62,10 @@ const STATES_CHUNK: usize = 256 << 20;
 /// FP32 bytes of a Hessian element.
 const FP32_BYTES: usize = 4;
 
+/// Java's default dampening.
+pub const DEFAULT_DAMP: f32 = 0.01;
+/// Java's default sequences at once.
+pub const DEFAULT_BATCH: usize = 8;
 /// Rounding lanes: Java's `ROUNDING_FRAMES`.
 pub const ROUNDING_LANES: usize = 3;
 /// Device bytes the planner leaves for what it does not account: the layer, its Hessians, its decoded weights and the
@@ -98,25 +104,15 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// The settings of a run over `tokens` (`length` per sequence), with the sizes at their defaults.
-    pub fn new(
-        out: PathBuf,
-        recipe: Recipe,
-        search: Nvfp4Search,
-        damp: f32,
-        act_order: bool,
-        batch: usize,
-        length: usize,
-        tokens: Vec<i32>,
-        key: String,
-    ) -> Settings {
+    /// The settings of a run over `tokens` (`length` per sequence), everything else at its default.
+    pub fn new(out: PathBuf, recipe: Recipe, key: String, tokens: Vec<i32>, length: usize) -> Settings {
         Settings {
             out,
             recipe,
-            search,
-            damp,
-            act_order,
-            batch,
+            search: Nvfp4Search::DEFAULT,
+            damp: DEFAULT_DAMP,
+            act_order: false,
+            batch: DEFAULT_BATCH,
             length,
             tokens,
             key,
@@ -192,7 +188,7 @@ fn gpu_error(error: impl Display) -> GpuError {
 /// A continuation taken once, from whichever call ends the chain.
 type Once<T> = Arc<Handoff<Then<T>>>;
 
-fn once<T>(then: Then<T>) -> Once<T> {
+fn single<T>(then: Then<T>) -> Once<T> {
     let cell = Arc::new(Handoff::empty());
     cell.send(then);
     cell
@@ -242,7 +238,7 @@ impl Calibration {
         let max_rows = u32::try_from(batch * length)
             .map_err(|_| CalibrateError::Invalid(format!("{batch} sequences of {length} tokens are too many rows")))?;
 
-        let names: Vec<String> = std::iter::once("main".to_owned())
+        let names: Vec<String> = once("main".to_owned())
             .chain((0..batch).map(|slot| format!("slot{slot}")))
             .collect();
         let named: Vec<(&str, StreamOptions)> = names
@@ -364,7 +360,7 @@ impl Calibration {
             host,
         });
         // The device and its lane pools stay open for the lanes' life: the queues hold them weakly.
-        std::mem::forget((gpu, shared, pool));
+        forget((gpu, shared, pool));
         let inner = Arc::new(Inner {
             settings,
             objects,
@@ -478,11 +474,11 @@ impl Stages for Calibration {
     type Staged = StagedLayer;
 
     fn begin(&self, plan: &Plan, then: Then<usize>) {
-        begin(Arc::clone(&self.inner), plan.layers, once(then));
+        begin(Arc::clone(&self.inner), plan.layers, single(then));
     }
 
     fn stage(&self, layer: usize, then: Then<StagedLayer>) {
-        let cell = once(then);
+        let cell = single(then);
         let ready = Arc::clone(&cell);
         let staging = Arc::clone(&self.inner.staging);
         let started = stage(
@@ -502,11 +498,11 @@ impl Stages for Calibration {
     }
 
     fn layer(&self, layer: usize, staged: StagedLayer, then: Then<()>) {
-        upload(Arc::clone(&self.inner), layer, staged, once(then));
+        upload(Arc::clone(&self.inner), layer, staged, single(then));
     }
 
     fn checkpoint(&self, done: usize, then: Then<()>) {
-        checkpoint(Arc::clone(&self.inner), done, once(then));
+        checkpoint(Arc::clone(&self.inner), done, single(then));
     }
 
     fn finish(&self, then: Then<()>) {
@@ -734,7 +730,7 @@ fn upload(inner: Arc<Inner>, layer: usize, staged: StagedLayer, then: Once<()>) 
     match submitted {
         Err(error) => {
             // The copies queued before the failure may still read the pinned memory: it is never returned.
-            std::mem::forget(staged);
+            forget(staged);
             end(
                 &then,
                 Err(CalibrateError::failed(&format!("uploading layer {layer}"), error)),

@@ -18,6 +18,7 @@ pub mod hessians;
 pub mod plan;
 pub mod rounding;
 
+use std::fmt::Display;
 use thiserror::Error;
 
 pub use driver::{Stages, Then, drive};
@@ -37,7 +38,7 @@ pub enum CalibrateError {
 
 impl CalibrateError {
     /// A failure of `what`, with the error's own text.
-    pub fn failed(what: &str, error: impl std::fmt::Display) -> Self {
+    pub fn failed(what: &str, error: impl Display) -> Self {
         CalibrateError::Failed(format!("{what}: {error}"))
     }
 }

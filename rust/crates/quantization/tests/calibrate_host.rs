@@ -8,7 +8,7 @@
 )]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -85,7 +85,7 @@ impl Stages for Fake {
     }
 }
 
-fn result_sink() -> (Then<()>, std::sync::mpsc::Receiver<Result<(), CalibrateError>>) {
+fn result_sink() -> (Then<()>, Receiver<Result<(), CalibrateError>>) {
     let (sender, receiver) = channel();
     let sender: Sender<_> = sender;
     (Box::new(move |result| sender.send(result).unwrap()), receiver)
@@ -213,7 +213,7 @@ fn the_largest_linears_are_rounded_first_and_equals_keep_their_order() {
 }
 
 /// A fake matrix: the sum of `x^T x` over the rows it was given.
-fn add_rows(matrix: &mut Vec<f64>, rows: &[Vec<f64>]) {
+fn add_rows(matrix: &mut [f64], rows: &[Vec<f64>]) {
     let k = rows[0].len();
     for row in rows {
         for i in 0..k {

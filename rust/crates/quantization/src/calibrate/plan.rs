@@ -1,6 +1,7 @@
 //! What a calibration covers and how it resumes.
 
 use crate::resume::Header;
+use std::cmp::Reverse;
 
 /// Layers between two checkpoints of the hidden states, as Java's calibration.
 pub const CHECKPOINT_EVERY: usize = 8;
@@ -81,6 +82,6 @@ pub fn resume_header(key: &str, done: usize) -> Header {
 /// result is indices into `shapes`.
 pub fn round_order(shapes: &[(String, (u64, u64))]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..shapes.len()).collect();
-    order.sort_by_key(|&index| std::cmp::Reverse(shapes[index].1.0.saturating_mul(shapes[index].1.1)));
+    order.sort_by_key(|&index| Reverse(shapes[index].1.0.saturating_mul(shapes[index].1.1)));
     order
 }

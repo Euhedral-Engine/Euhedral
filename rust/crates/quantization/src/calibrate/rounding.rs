@@ -5,6 +5,7 @@
 //! retires goes on with the next step.
 
 use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::mem::take;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -99,7 +100,10 @@ impl Debug for Services {
 
 impl Debug for Linear {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
-        formatter.debug_struct("Linear").field("name", &self.name).finish_non_exhaustive()
+        formatter
+            .debug_struct("Linear")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
     }
 }
 
@@ -216,7 +220,10 @@ fn pull(round: &Arc<Round>, number: usize, lane: GptqLane) {
     let format = round.services.settings.recipe.format(&linear.name);
     match (decoded, format) {
         (Some(decoded), Ok(format)) => {
-            factor(Box::new(Object::new(round, number, index, decoded, rounded(format))), lane);
+            factor(
+                Box::new(Object::new(round, number, index, decoded, rounded(format))),
+                lane,
+            );
         }
         (None, _) => abort(
             round,
@@ -304,7 +311,9 @@ fn factor(object: Box<Object>, mut lane: GptqLane) {
     // SAFETY: the Hessian is live and complete until the round ends (the contract of `round_all`).
     let hessian = unsafe { DeviceRange::new(object.linear().hessian, 4 * (k * k) as u64) };
     let (damp, act_order) = (services.settings.damp, services.settings.act_order);
-    let outcome = lane.factor(hessian, k, damp, act_order, claims, move |finished| after_factor(object, finished));
+    let outcome = lane.factor(hessian, k, damp, act_order, claims, move |finished| {
+        after_factor(object, finished)
+    });
     started(&round, number, outcome);
 }
 
@@ -436,7 +445,7 @@ fn joined(slices: Vec<QuantState>) -> Option<QuantState> {
 fn write(mut object: Box<Object>, lane: GptqLane) {
     let (round, number) = (Arc::clone(&object.round), object.number);
     let name = object.linear().name.clone();
-    let Some(state) = joined(std::mem::take(&mut object.slices)) else {
+    let Some(state) = joined(take(&mut object.slices)) else {
         return object.fail(lane, CalibrateError::Failed(format!("{name}: no rows were rounded")));
     };
     let bytes = match state.to_npz() {
@@ -506,7 +515,10 @@ pub fn save(services: &Services, path: PathBuf, bytes: Vec<u8>, then: Saved) {
                         len,
                         &path,
                         Box::new(move |sealed| {
-                            end(&seal_finish, sealed.map_err(|error| CalibrateError::failed("seal", error)))
+                            end(
+                                &seal_finish,
+                                sealed.map_err(|error| CalibrateError::failed("seal", error)),
+                            )
                         }),
                     );
                     match renamed {

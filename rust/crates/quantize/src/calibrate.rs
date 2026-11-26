@@ -285,7 +285,7 @@ fn calibrated(rig: &Rig, flags: &Flags, library: &Path, tokens: Vec<i32>, length
             .map_err(|_| "the checkpoint's objects were not opened".to_owned())?
             .map_err(|error| error.to_string())?,
     );
-    let model_layers = objects.config.layers as usize;
+    let model_layers = objects.config.layers;
     if flags.layers >= model_layers {
         return Err(format!(
             "this build rounds the layers only, not the output head, the draft head or the MTP block: --layers must be \
@@ -310,17 +310,11 @@ fn calibrated(rig: &Rig, flags: &Flags, library: &Path, tokens: Vec<i32>, length
         &format!("{search:?}"),
     ]);
     fs::create_dir_all(&flags.out).map_err(|error| format!("{}: {error}", flags.out.display()))?;
-    let run = RunSettings::new(
-        flags.out.clone(),
-        recipe,
-        search,
-        flags.damp,
-        flags.act_order,
-        flags.batch,
-        length,
-        tokens,
-        key,
-    );
+    let mut run = RunSettings::new(flags.out.clone(), recipe, key, tokens, length);
+    run.search = search;
+    run.damp = flags.damp;
+    run.act_order = flags.act_order;
+    run.batch = flags.batch;
     let (calibration, completions) = Calibration::open(
         run,
         objects,
