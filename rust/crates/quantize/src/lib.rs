@@ -7,6 +7,8 @@
 
 mod assemble;
 mod calibrate;
+mod cost;
+mod export_drafter;
 mod generate;
 mod package;
 mod reference;
@@ -67,8 +69,8 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "export-drafter",
-        availability: Availability::Pending,
-        usage: "--model CHECKPOINT --artifact BASE_ARTIFACT --out ARTIFACT",
+        availability: Availability::Wired,
+        usage: "--model CHECKPOINT --artifact BASE_ARTIFACT --out ARTIFACT [--parameters PARAMETERS.bin] [--config YAML]",
     },
     Command {
         name: "train-blocks",
@@ -92,8 +94,8 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "cost",
-        availability: Availability::Pending,
-        usage: "--source OPTION=ARTIFACT... --base OPTION --out COSTS.json",
+        availability: Availability::Wired,
+        usage: "--source OPTION=ARTIFACT... --base OPTION --out COSTS.json [--rows A,B,...] [--repeats N] [--rotate-mib N] [--config YAML] [--cuda-library FILE]",
     },
     Command {
         name: "allocate",
@@ -152,6 +154,8 @@ pub fn run(args: &[String]) -> Outcome {
         Availability::Wired => match command.name {
             "assemble" => assemble::run(&args[1..]),
             "calibrate" => calibrate::run(&args[1..]),
+            "cost" => cost::run(&args[1..]),
+            "export-drafter" => export_drafter::run(&args[1..]),
             "generate" => generate::run(&args[1..]),
             "package-tokenizer" => package::run(&args[1..]),
             "reference" => reference::run(&args[1..]),
@@ -231,7 +235,7 @@ mod tests {
     fn a_dropped_command_is_known_but_not_listed() {
         for name in ["train-blocks", "train-model", "rotate"] {
             assert_eq!(run_words(&[name]).code, EXIT_NOT_AVAILABLE);
-            assert!(!usage().contains(name));
+            assert!(!usage().lines().any(|line| line.trim_start().starts_with(name)));
         }
     }
 }
