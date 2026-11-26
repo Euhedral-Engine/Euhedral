@@ -145,6 +145,13 @@ base model's token, on answer tokens; token embeddings are the artifact's Q3 row
 whose drafts all have targets, the leading drafts equal to the base model's tokens, the drafts a verification
 accepts. `out/best.bin` keeps the best evaluation's parameters; a run resumes from `out/resume.bin`.
 
+The Rust command saves each file to a sibling `.part` file and renames it over the target once whole, so a stop leaves
+the old file or the new one (a leftover `.part` is overwritten by the next save). A start refuses, naming what differs,
+when `out` holds a state of another corpus (a content digest, not a path), model, artifact or settings, a state that
+was torn, or `best.bin` without a state; `--fresh` starts over and replaces them. `--poison-memory` fills memory
+nothing has written with NaN, to show a read before a write, and `--fail-in-save N` fails the N-th state save halfway,
+to prove that the saved state survives it.
+
 `export-drafter` writes the base artifact with its MTP layer replaced: NVFP4 projections (round to nearest,
 `Nvfp4Rounding`, byte for byte the converter's `quantize_nvfp4_rows`) and BF16 norms, from a parameter file or, without
 one, from the checkpoint's MTP weights.
