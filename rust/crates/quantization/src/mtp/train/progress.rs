@@ -29,6 +29,9 @@ const EPOCH: &str = "epoch";
 const CURSOR: &str = "cursor";
 const STEP: &str = "step";
 const BEST: &str = "best";
+/// The header key of the step the best parameters that the state knows were found at. A state without it knows of no
+/// best file newer than itself.
+const BEST_STEP: &str = "best.step";
 const PENDING: &str = "pending";
 /// The header key of the best parameters' accepted drafts.
 const ACCEPTED: &str = "accepted";
@@ -159,6 +162,17 @@ struct Tally {
     count: [u64; DEPTH_SLOTS],
 }
 
+/// `best.bin` as the start found it.
+#[derive(Clone, Copy, Debug)]
+pub enum Best<'a> {
+    /// There is no file.
+    Missing,
+    /// The file is there but holds no readable header.
+    Unread,
+    /// The file's header.
+    Header(&'a Header),
+}
+
 /// The saved state's file as the start found it.
 #[derive(Clone, Copy, Debug)]
 pub enum Found<'a> {
@@ -192,6 +206,8 @@ pub struct Progress {
     /// Trained lineages waiting for an update.
     pending: u32,
     best: f64,
+    /// The step the best parameters were found at.
+    best_step: u32,
     evaluation_due: bool,
     tally: Tally,
 }
@@ -210,6 +226,7 @@ impl Progress {
             step: 0,
             pending: 0,
             best: -1.0,
+            best_step: 0,
             evaluation_due: false,
             tally: Tally::default(),
         }
@@ -327,6 +344,7 @@ impl Progress {
         let improved = mean > self.best;
         if improved {
             self.best = mean;
+            self.best_step = self.step;
         }
         let name = if initial {
             "before training".to_owned()
@@ -350,6 +368,7 @@ impl Progress {
         header.set(CURSOR, self.cursor.to_string());
         header.set(STEP, self.step.to_string());
         header.set(BEST, self.best.to_string());
+        header.set(BEST_STEP, self.best_step.to_string());
         header.set(PENDING, self.pending.to_string());
         header
     }
@@ -365,6 +384,13 @@ impl Progress {
 
     /// What the saved state `found` means for a run of `settings` over `training`, whose identity is `identity`.
     ///
+    /// `best_file` is what the start found of `best.bin`. The best parameters are sealed before the state,
+    /// so a stop between the two leaves `best.bin` ahead of the state. When the state records the step of the best it
+    /// knows and its header is this run's own and found at a later step with a better accepted value, that value is the
+    /// best to beat: a replay of the steps in between, which need not come out the same, must not replace parameters
+    /// that were better. A best file of another run or without a readable step is not used, and a state without the
+    /// record knows of no newer best: it continues as it always did.
+    ///
     /// Nothing that a run has saved is ever started over by accident: a state of another run, a torn one, or best
     /// parameters without a state refuse and say what differs. Only `fresh`, which the caller sets when the user asked
     /// to start over, takes the checkpoint again.
@@ -374,14 +400,14 @@ impl Progress {
         expected: u64,
         identity: &Identity,
         found: Found<'_>,
-        best_exists: bool,
+        best_file: Best<'_>,
         fresh: bool,
     ) -> Result<Resume, StateError> {
         if fresh {
             return Ok(Resume::Fresh);
         }
         let header = match found {
-            Found::Missing if best_exists => return Err(StateError::Leftover),
+            Found::Missing if !matches!(best_file, Best::Missing) => return Err(StateError::Leftover),
             Found::Missing => return Ok(Resume::Fresh),
             Found::Header(header) => header,
         };
@@ -420,6 +446,17 @@ impl Progress {
         progress.step = step;
         progress.best = best;
         progress.pending = pending;
+        let file = match best_file {
+            Best::Header(file) => Some(file),
+            Best::Missing | Best::Unread => None,
+        };
+        if let Ok(known) = field::<u32>(header, BEST_STEP) {
+            progress.best_step = known;
+            if let Some((step, accepted)) = file.and_then(|file| newer_best(identity, file, known, best)) {
+                progress.best = accepted;
+                progress.best_step = step;
+            }
+        }
         if !finished {
             progress.order = shuffled(&progress.training, epoch);
         }
@@ -429,6 +466,17 @@ impl Progress {
             Resume::Continue(progress)
         })
     }
+}
+
+/// The step and accepted value of the best parameters `file` holds, when they are this run's own, found after step
+/// `known` (the one a state knows) and strictly better than `best`.
+fn newer_best(identity: &Identity, file: &Header, known: u32, best: f64) -> Option<(u32, f64)> {
+    if !identity.differing(file).is_empty() {
+        return None;
+    }
+    let step: u32 = file.get(STEP)?.parse().ok()?;
+    let accepted: f64 = file.get(ACCEPTED)?.parse().ok()?;
+    (step > known && accepted.is_finite() && accepted > best).then_some((step, accepted))
 }
 
 /// What an evaluation decided.
@@ -547,7 +595,45 @@ mod tests {
 
     /// The decision for a state `found`, of the run `identity("a")`.
     fn decide(found: Found<'_>, best_exists: bool, fresh: bool) -> Result<Resume, StateError> {
-        Progress::resume(settings(), vec![1, 2, 4], 5, &identity("a"), found, best_exists, fresh)
+        Progress::resume(
+            settings(),
+            vec![1, 2, 4],
+            5,
+            &identity("a"),
+            found,
+            if best_exists { Best::Unread } else { Best::Missing },
+            fresh,
+        )
+    }
+
+    /// The best a state of the run `identity("a")` continues with when `best.bin` holds `file`.
+    fn continued_with(state: &Header, file: &Header) -> Progress {
+        let resume = Progress::resume(
+            settings(),
+            vec![1, 2, 4],
+            5,
+            &identity("a"),
+            Found::Header(state),
+            Best::Header(file),
+            false,
+        );
+        match resume {
+            Ok(Resume::Continue(progress)) => progress,
+            other => panic!("not a state to continue: {other:?}"),
+        }
+    }
+
+    /// A state that knows the best of step 10 with 1.5 accepted drafts, and the best file of a run at `step` with
+    /// `accepted` drafts, of the identity `corpus`.
+    fn state_and_best(step: u32, accepted: f64, corpus: &str) -> (Header, Header) {
+        let mut state = progress();
+        state.step = 12;
+        state.best = 1.5;
+        state.best_step = 10;
+        let mut file = progress();
+        file.step = step;
+        file.best = accepted;
+        (saved(&state), file.best_header(&identity(corpus)))
     }
 
     fn settings() -> Settings {
@@ -895,5 +981,63 @@ mod tests {
         progress.best = 0.5;
         let header = progress.best_header(&identity("a"));
         assert_eq!((header.get("step"), header.get("accepted")), (Some("4"), Some("0.5")));
+    }
+
+    #[test]
+    fn a_best_file_found_after_the_state_and_better_is_the_best_to_beat() {
+        let (state, file) = state_and_best(14, 1.75, "a");
+        let mut resumed = continued_with(&state, &file);
+        assert_eq!((resumed.best(), resumed.best_step), (1.75, 14));
+        // Between the state's best and the file's: not an improvement, so best.bin is not replaced.
+        let between = Evaluation::new(2);
+        assert!(!resumed.evaluated(&between, false, false).improved);
+        assert_eq!(resumed.best(), 1.75);
+    }
+
+    #[test]
+    fn an_evaluation_strictly_better_than_the_newer_best_file_still_improves_and_is_recorded_in_the_next_state() {
+        let (state, file) = state_and_best(14, 1.75, "a");
+        let mut resumed = continued_with(&state, &file);
+        let mut better = Evaluation::new(2);
+        better.add(false, 1, &[5, 6], &[5, 6]);
+        resumed.step = 20;
+        let verdict = resumed.evaluated(&better, false, false);
+        assert!(verdict.improved);
+        let header = resumed.header(&identity("a"));
+        assert_eq!(header.get(BEST_STEP), Some("20"));
+    }
+
+    #[test]
+    fn a_best_file_not_newer_or_not_better_or_not_the_runs_own_is_not_taken() {
+        for (step, accepted, corpus) in [
+            (10, 1.75, "a"),
+            (9, 1.75, "a"),
+            (14, 1.5, "a"),
+            (14, 1.25, "a"),
+            (14, 1.75, "b"),
+        ] {
+            let (state, file) = state_and_best(step, accepted, corpus);
+            let resumed = continued_with(&state, &file);
+            assert_eq!(
+                (resumed.best(), resumed.best_step),
+                (1.5, 10),
+                "{step} {accepted} {corpus}"
+            );
+        }
+        let (state, mut file) = state_and_best(14, 1.75, "a");
+        file.remove(ACCEPTED);
+        assert_eq!(continued_with(&state, &file).best(), 1.5);
+        file.set(ACCEPTED, "nan");
+        file.set(STEP, "14");
+        assert_eq!(continued_with(&state, &file).best(), 1.5);
+        assert_eq!(continued_with(&state, &Header::new()).best(), 1.5);
+    }
+
+    #[test]
+    fn a_state_without_the_record_of_its_best_step_knows_of_no_newer_best() {
+        let (mut state, file) = state_and_best(14, 1.75, "a");
+        state.remove(BEST_STEP);
+        let resumed = continued_with(&state, &file);
+        assert_eq!((resumed.best(), resumed.best_step), (1.5, 0));
     }
 }
